@@ -6,11 +6,13 @@
 //! fully-bound support check separately from proposal estimates.
 //!
 //! [`WgpuResidentRound`] initializes every estimate to its exact zero-peer
-//! count or the reserved dead sentinel, then overwrites one-peer
+//! count or a provisional invariant sentinel, then overwrites one-peer
 //! `PairDistinct` and two-peer `Restricted` arms through resident
 //! prefix-select and rank pipelines. Fully-bound source patterns are reduced
 //! through one canonical E-A-V membership pipeline and conjunctively update
-//! row viability with exactly one writer per row. The affine frontier,
+//! tri-state row viability with exactly one writer per row. Globally
+//! contradicted rounds use canonical zero estimates because viability already
+//! carries their semantics. The affine frontier,
 //! descriptors, scratch, estimate matrix, and planner choices remain in one
 //! compatibility domain without a readback.
 
@@ -28,7 +30,7 @@ use triblespace_core::blob::encodings::succinctarchive::{SuccinctRotation, Unive
 use crate::resident_round::{
     checked_device_product, validate_rows, ResidentRoundError, ResidentRoundInputs,
     ResidentRoundMetadata, ResidentRowChoices, ResidentRowPlanner, WgpuResidentRowPlanner,
-    DEAD_ROW_SENTINEL,
+    RESIDENT_U32_SENTINEL,
 };
 use crate::succinct_query::{WgpuBitVector, WgpuSuccinctArchive};
 
@@ -549,7 +551,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         let mut values = Vec::with_capacity(expected);
         for code in frontier.values() {
             let code = code.get();
-            if code as usize >= domain || code == DEAD_ROW_SENTINEL {
+            if code as usize >= domain || code == RESIDENT_U32_SENTINEL {
                 return Err(ResidentSupportError::FrontierCodeOutOfBounds { code, domain });
             }
             values.push(code);
@@ -747,7 +749,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 frontier.stride as u32,
                 group.arm_count as u32,
                 self.archive.archive().domain.len() as u32,
-                DEAD_ROW_SENTINEL,
+                RESIDENT_U32_SENTINEL,
             );
         }
 
@@ -762,7 +764,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 queries.output_arg(),
                 probes as u32,
                 self.archive.pair_changes(group.rotation).len() as u32,
-                DEAD_ROW_SENTINEL,
+                RESIDENT_U32_SENTINEL,
             );
         }
 
@@ -775,13 +777,15 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 dispatch.cube_count(),
                 dispatch.cube_dim(),
                 group.descriptors.input_arg(),
+                queries.input_arg(),
                 results.input_arg(),
                 estimates,
                 frontier.rows as u32,
                 group.arm_count as u32,
                 self.plan.metadata().arms().len() as u32,
+                changes.len() as u32,
                 changes.num_ones() as u32,
-                DEAD_ROW_SENTINEL,
+                RESIDENT_U32_SENTINEL,
             );
         }
         Ok(())
@@ -816,7 +820,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 frontier.stride as u32,
                 group.arm_count as u32,
                 self.archive.archive().domain.len() as u32,
-                DEAD_ROW_SENTINEL,
+                RESIDENT_U32_SENTINEL,
             );
         }
 
@@ -831,7 +835,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 positions.output_arg(),
                 probes as u32,
                 self.archive.ring_col(group.rotation).len() as u32,
-                DEAD_ROW_SENTINEL,
+                RESIDENT_U32_SENTINEL,
             );
         }
 
@@ -844,13 +848,14 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 dispatch.cube_count(),
                 dispatch.cube_dim(),
                 group.descriptors.input_arg(),
+                positions.input_arg(),
                 results.input_arg(),
                 estimates,
                 frontier.rows as u32,
                 group.arm_count as u32,
                 self.plan.metadata().arms().len() as u32,
                 ring.len() as u32,
-                DEAD_ROW_SENTINEL,
+                RESIDENT_U32_SENTINEL,
             );
         }
         Ok(())
@@ -889,41 +894,39 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 frontier.stride as u32,
                 group.support_count as u32,
                 self.archive.archive().domain.len() as u32,
-                DEAD_ROW_SENTINEL,
+                RESIDENT_U32_SENTINEL,
             );
         }
 
-        let mut entity_selected = context.empty_u32(endpoints)?;
+        // Each select result has no later consumer in its original coordinate
+        // system, so normalization converts both allocations in place.
+        let mut eva_positions = context.empty_u32(endpoints)?;
         self.archive
             .entity_prefix()
-            .select1_batch_into(&entity_queries, &mut entity_selected)?;
-        let mut attribute_selected = context.empty_u32(lanes)?;
+            .select1_batch_into(&entity_queries, &mut eva_positions)?;
+        let mut attribute_bases = context.empty_u32(lanes)?;
         self.archive
             .attribute_prefix()
-            .select1_batch_into(&attribute_queries, &mut attribute_selected)?;
+            .select1_batch_into(&attribute_queries, &mut attribute_bases)?;
 
         let eva = self.archive.ring_col(SuccinctRotation::Eva);
         let aev = self.archive.ring_col(SuccinctRotation::Aev);
-        let mut eva_positions = context.empty_u32(endpoints)?;
-        let mut attribute_bases = context.empty_u32(lanes)?;
         unsafe {
             normalize_prepare_eva::launch_unchecked::<WgpuRuntime>(
                 context.client(),
                 lane_dispatch.cube_count(),
                 lane_dispatch.cube_dim(),
-                entity_queries.output_arg(),
-                entity_selected.input_arg(),
-                attribute_queries.output_arg(),
-                attribute_selected.input_arg(),
-                eva_values.output_arg(),
-                aev_values.output_arg(),
+                entity_queries.input_arg(),
                 eva_positions.output_arg(),
+                attribute_queries.input_arg(),
                 attribute_bases.output_arg(),
+                eva_values.input_arg(),
+                aev_values.input_arg(),
                 lanes as u32,
                 eva.len() as u32,
                 aev.len() as u32,
                 self.archive.archive().domain.len() as u32,
-                DEAD_ROW_SENTINEL,
+                RESIDENT_U32_SENTINEL,
             );
         }
 
@@ -945,7 +948,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 eva.len() as u32,
                 aev.len() as u32,
                 self.archive.archive().domain.len() as u32,
-                DEAD_ROW_SENTINEL,
+                RESIDENT_U32_SENTINEL,
             );
         }
 
@@ -968,7 +971,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 frontier.rows as u32,
                 group.support_count as u32,
                 aev.len() as u32,
-                DEAD_ROW_SENTINEL,
+                RESIDENT_U32_SENTINEL,
             );
         }
         Ok(())
@@ -977,7 +980,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
 
 fn present_count(count: usize, quantity: &'static str) -> Result<u32, ResidentRoundError> {
     let count = u32::try_from(count).map_err(|_| ResidentRoundError::GeometryOverflow(quantity))?;
-    if count == DEAD_ROW_SENTINEL {
+    if count == RESIDENT_U32_SENTINEL {
         Err(ResidentRoundError::GeometryOverflow(quantity))
     } else {
         Ok(count)
@@ -1183,14 +1186,14 @@ fn group_arms(specs: &[ArmSpec]) -> Box<[ArmGroup]> {
 
 fn initial_estimates(plan: &ResidentRoundPlan) -> Box<[u32]> {
     if plan.is_global_dead() {
-        return vec![DEAD_ROW_SENTINEL; plan.metadata().arms().len()].into_boxed_slice();
+        return vec![0; plan.metadata().arms().len()].into_boxed_slice();
     }
     plan.arm_specs()
         .iter()
         .copied()
         .map(|spec| match spec {
             ArmSpec::Present { count, .. } => count,
-            ArmSpec::PairDistinct { .. } | ArmSpec::Restricted { .. } => DEAD_ROW_SENTINEL,
+            ArmSpec::PairDistinct { .. } | ArmSpec::Restricted { .. } => RESIDENT_U32_SENTINEL,
         })
         .collect::<Vec<_>>()
         .into_boxed_slice()
@@ -1523,11 +1526,13 @@ fn normalize_pair_range(
 #[allow(clippy::too_many_arguments)]
 fn scatter_pair_distinct(
     descriptors: &Array<u32>,
+    positions: &Array<u32>,
     ranks: &Array<u32>,
     estimates: &mut Array<u32>,
     rows: u32,
     local_arm_count: u32,
     global_arm_count: u32,
+    position_len: u32,
     pair_count: u32,
     dead: u32,
 ) {
@@ -1541,13 +1546,32 @@ fn scatter_pair_distinct(
             let global_arm = descriptors[descriptor];
             if global_arm < global_arm_count {
                 let destination = global_arm as usize * rows as usize + row;
-                if destination < estimates.len() {
-                    let pair = probe * 2usize;
+                let pair = probe * 2usize;
+                if destination < estimates.len()
+                    && pair + 1usize < positions.len()
+                    && pair + 1usize < ranks.len()
+                {
+                    let position_lo = positions[pair];
+                    let position_hi = positions[pair + 1usize];
                     let lo = ranks[pair];
                     let hi = ranks[pair + 1usize];
                     let mut count = dead;
-                    if lo != dead && hi != dead && lo <= hi && hi <= pair_count {
-                        count = hi - lo;
+                    if position_lo != dead
+                        && position_hi != dead
+                        && position_lo <= position_hi
+                        && position_hi <= position_len
+                        && lo != dead
+                        && hi != dead
+                        && lo <= hi
+                        && hi <= pair_count
+                        && lo <= position_lo
+                        && hi <= position_hi
+                    {
+                        let position_span = position_hi - position_lo;
+                        let rank_span = hi - lo;
+                        if rank_span <= position_span {
+                            count = rank_span;
+                        }
                     }
                     estimates[destination] = count;
                 }
@@ -1560,6 +1584,7 @@ fn scatter_pair_distinct(
 #[allow(clippy::too_many_arguments)]
 fn scatter_restricted(
     descriptors: &Array<u32>,
+    positions: &Array<u32>,
     ranks: &Array<u32>,
     estimates: &mut Array<u32>,
     rows: u32,
@@ -1579,12 +1604,31 @@ fn scatter_restricted(
             if global_arm < global_arm_count {
                 let destination = global_arm as usize * rows as usize + row;
                 let pair = probe * 2usize;
-                if destination < estimates.len() && pair + 1usize < ranks.len() {
+                if destination < estimates.len()
+                    && pair + 1usize < positions.len()
+                    && pair + 1usize < ranks.len()
+                {
+                    let position_lo = positions[pair];
+                    let position_hi = positions[pair + 1usize];
                     let lo = ranks[pair];
                     let hi = ranks[pair + 1usize];
                     let mut count = dead;
-                    if lo != dead && hi != dead && lo <= hi && hi <= ring_len {
-                        count = hi - lo;
+                    if position_lo != dead
+                        && position_hi != dead
+                        && position_lo <= position_hi
+                        && position_hi <= ring_len
+                        && lo != dead
+                        && hi != dead
+                        && lo <= hi
+                        && hi <= ring_len
+                        && lo <= position_lo
+                        && hi <= position_hi
+                    {
+                        let position_span = position_hi - position_lo;
+                        let rank_span = hi - lo;
+                        if rank_span <= position_span {
+                            count = rank_span;
+                        }
                     }
                     estimates[destination] = count;
                 }
@@ -1692,14 +1736,12 @@ fn prepare_fully_bound_support(
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 fn normalize_prepare_eva(
-    entity_queries: &mut Array<u32>,
-    entity_selected: &Array<u32>,
-    attribute_queries: &mut Array<u32>,
-    attribute_selected: &Array<u32>,
-    eva_values: &mut Array<u32>,
-    aev_values: &mut Array<u32>,
+    entity_queries: &Array<u32>,
     eva_positions: &mut Array<u32>,
+    attribute_queries: &Array<u32>,
     attribute_bases: &mut Array<u32>,
+    eva_values: &Array<u32>,
+    aev_values: &Array<u32>,
     lanes: u32,
     eva_len: u32,
     aev_len: u32,
@@ -1710,28 +1752,28 @@ fn normalize_prepare_eva(
     if lane < lanes as usize {
         let pair = lane * 2usize;
         if pair + 1usize < entity_queries.len()
-            && pair + 1usize < entity_selected.len()
+            && pair + 1usize < eva_positions.len()
             && lane < attribute_queries.len()
-            && lane < attribute_selected.len()
+            && lane < attribute_bases.len()
             && pair + 1usize < eva_values.len()
             && pair + 1usize < aev_values.len()
-            && pair + 1usize < eva_positions.len()
-            && lane < attribute_bases.len()
         {
-            eva_positions[pair] = dead;
-            eva_positions[pair + 1usize] = dead;
-            attribute_bases[lane] = dead;
-
+            // The select outputs become positions/bases in place. Read their
+            // old coordinate-system values before poisoning the derived view.
             let e0_query = entity_queries[pair];
             let e1_query = entity_queries[pair + 1usize];
-            let e0_selected = entity_selected[pair];
-            let e1_selected = entity_selected[pair + 1usize];
+            let e0_selected = eva_positions[pair];
+            let e1_selected = eva_positions[pair + 1usize];
             let attribute_query = attribute_queries[lane];
-            let attribute_selected = attribute_selected[lane];
+            let attribute_selected = attribute_bases[lane];
             let eva0_value = eva_values[pair];
             let eva1_value = eva_values[pair + 1usize];
             let aev0_value = aev_values[pair];
             let aev1_value = aev_values[pair + 1usize];
+
+            eva_positions[pair] = dead;
+            eva_positions[pair + 1usize] = dead;
+            attribute_bases[lane] = dead;
 
             let mut valid = e0_query != dead
                 && e1_query != dead
@@ -1776,17 +1818,12 @@ fn normalize_prepare_eva(
                 eva_positions[pair] = e0;
                 eva_positions[pair + 1usize] = e1;
                 attribute_bases[lane] = attribute_base;
-            } else {
-                // Any malformed delimiter result poisons every later Jerky
-                // value/position lane as well as the original query lanes.
-                entity_queries[pair] = dead;
-                entity_queries[pair + 1usize] = dead;
-                attribute_queries[lane] = dead;
-                eva_values[pair] = dead;
-                eva_values[pair + 1usize] = dead;
-                aev_values[pair] = dead;
-                aev_values[pair + 1usize] = dead;
             }
+            // Queries and values remain immutable; this stage owns only the
+            // in-place derived select buffers. Jerky's wm_rank_one initializes
+            // MAX and traverses only for position <= n, so a poisoned EVA
+            // position safely preserves failure without consuming its
+            // still-valid value. anchor independently revalidates AEV values.
         }
     }
 }
@@ -1843,6 +1880,16 @@ fn anchor_prepare_aev(
             let mut a0 = dead;
             let mut a1 = dead;
             if valid {
+                // Rank over an interval cannot grow faster than the interval
+                // itself. This catches internally inconsistent Jerky results
+                // even when every endpoint is individually in range.
+                let position_span = e1 - e0;
+                let rank_span = rank1 - rank0;
+                if rank_span > position_span {
+                    valid = false;
+                }
+            }
+            if valid {
                 // Guard both additions before executing either one. This also
                 // rejects a rank that is in the EVA range but cannot be
                 // anchored inside the AEV Ring.
@@ -1886,11 +1933,13 @@ fn reduce_fully_bound_support(
     if row < rows as usize && row < viable.len() {
         // This invocation is the sole writer of viability[row]. Support lanes
         // never race one another, including duplicate source patterns.
+        let mut invariant = viable[row] != 0u32 && viable[row] != 1u32;
         let mut supported = viable[row] == 1u32;
         let mut support = 0usize;
         while support < support_count as usize {
             let lane = support * rows as usize + row;
             let pair = lane * 2usize;
+            let mut lane_valid = false;
             let mut lane_supported = false;
             if pair + 1usize < aev_positions.len() && pair + 1usize < aev_ranks.len() {
                 let a0 = aev_positions[pair];
@@ -1907,15 +1956,26 @@ fn reduce_fully_bound_support(
                     && rank1 <= aev_len
                     && rank0 <= a0
                     && rank1 <= a1
-                    && rank1 > rank0
                 {
-                    lane_supported = true;
+                    // One exact E-A-V tuple is set-valued: the membership
+                    // delta is canonically zero (absence) or one (present).
+                    // A larger delta is structural corruption, not support.
+                    let delta = rank1 - rank0;
+                    let span = a1 - a0;
+                    lane_valid = delta <= span && delta <= 1u32;
+                    lane_supported = delta == 1u32;
                 }
             }
-            supported = supported && lane_supported;
+            if lane_valid {
+                supported = supported && lane_supported;
+            } else {
+                invariant = true;
+            }
             support += 1usize;
         }
-        if supported {
+        if invariant {
+            viable[row] = dead;
+        } else if supported {
             viable[row] = 1u32;
         } else {
             viable[row] = 0u32;

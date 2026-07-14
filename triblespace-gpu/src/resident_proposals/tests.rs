@@ -179,7 +179,7 @@ fn indirect_child_materialization_covers_zero_one_block_edge_and_forced_2d_fold(
             .chain(&inspection.candidate_owners[entities..])
             .chain(&inspection.proposer_arms[entities..])
             .chain(&inspection.child_body[entities..])
-            .all(|&word| word == DEAD_ROW_SENTINEL));
+            .all(|&word| word == RESIDENT_U32_SENTINEL));
     }
 }
 
@@ -235,7 +235,7 @@ fn destination_generator_forced_3x3_flattens_513_unique_destinations() {
         .chain(&inspection.candidate_owners[TOTAL..])
         .chain(&inspection.proposer_arms[TOTAL..])
         .chain(&inspection.child_body[TOTAL..])
-        .all(|&word| word == DEAD_ROW_SENTINEL));
+        .all(|&word| word == RESIDENT_U32_SENTINEL));
 }
 
 #[test]
@@ -289,7 +289,7 @@ fn destination_row_inversion_skips_long_zero_runs_across_cells_63_64_65() {
             if LIVE_ROWS.contains(&row) {
                 [0, arm, 1]
             } else {
-                [DEAD_ROW_SENTINEL, DEAD_ROW_SENTINEL, 0]
+                [RESIDENT_U32_SENTINEL, RESIDENT_U32_SENTINEL, 0]
             }
         })
         .collect();
@@ -326,7 +326,7 @@ fn destination_row_inversion_skips_long_zero_runs_across_cells_63_64_65() {
         .chain(&inspection.candidate_owners[LIVE_ROWS.len()..])
         .chain(&inspection.proposer_arms[LIVE_ROWS.len()..])
         .chain(&inspection.child_body[LIVE_ROWS.len() * inspection.child_stride as usize..])
-        .all(|&word| word == DEAD_ROW_SENTINEL));
+        .all(|&word| word == RESIDENT_U32_SENTINEL));
 }
 
 #[test]
@@ -417,7 +417,7 @@ fn destination_segment_inversion_skips_leading_internal_and_trailing_zero_segmen
         .chain(&inspection.candidate_owners[2..])
         .chain(&inspection.proposer_arms[2..])
         .chain(&inspection.child_body[2 * inspection.child_stride as usize..])
-        .all(|&word| word == DEAD_ROW_SENTINEL));
+        .all(|&word| word == RESIDENT_U32_SENTINEL));
 }
 
 #[test]
@@ -477,7 +477,7 @@ fn destination_segment_inversion_reaches_only_live_final_segment_near_program_li
         .chain(&inspection.candidate_owners[1..])
         .chain(&inspection.proposer_arms[1..])
         .chain(&inspection.child_body[1..])
-        .all(|&word| word == DEAD_ROW_SENTINEL));
+        .all(|&word| word == RESIDENT_U32_SENTINEL));
 }
 
 #[test]
@@ -590,7 +590,7 @@ fn destination_generator_preserves_mixed_axis_order_under_1_64_4096_skew() {
         .chain(&inspection.candidate_owners[TOTAL..])
         .chain(&inspection.proposer_arms[TOTAL..])
         .chain(&inspection.child_body[TOTAL * inspection.child_stride as usize..])
-        .all(|&word| word == DEAD_ROW_SENTINEL));
+        .all(|&word| word == RESIDENT_U32_SENTINEL));
 }
 
 #[test]
@@ -678,7 +678,7 @@ fn destination_generator_uses_each_rows_axis_for_two_arms_in_one_segment() {
         .chain(&inspection.candidate_owners[total..])
         .chain(&inspection.proposer_arms[total..])
         .chain(&inspection.child_body[total..])
-        .all(|&word| word == DEAD_ROW_SENTINEL));
+        .all(|&word| word == RESIDENT_U32_SENTINEL));
 }
 
 fn invert_destination_strict_ends(
@@ -1177,17 +1177,17 @@ fn mixed_variables_form_stable_segments_and_insert_canonically() {
 
     assert!(inspection.candidate_codes[expected..]
         .iter()
-        .all(|&word| word == DEAD_ROW_SENTINEL));
+        .all(|&word| word == RESIDENT_U32_SENTINEL));
     assert!(inspection.candidate_owners[expected..]
         .iter()
-        .all(|&word| word == DEAD_ROW_SENTINEL));
+        .all(|&word| word == RESIDENT_U32_SENTINEL));
     assert!(inspection.proposer_arms[expected..]
         .iter()
-        .all(|&word| word == DEAD_ROW_SENTINEL));
+        .all(|&word| word == RESIDENT_U32_SENTINEL));
     assert!(
         inspection.child_body[expected * inspection.child_stride as usize..]
             .iter()
-            .all(|&word| word == DEAD_ROW_SENTINEL)
+            .all(|&word| word == RESIDENT_U32_SENTINEL)
     );
 }
 
@@ -1259,10 +1259,10 @@ fn capacity_exact_one_short_and_zero_never_publish_a_partial_prefix() {
         assert_eq!(failed.required, required as u32);
         assert_eq!(failed.logical_len, 0);
         assert!(failed.segments.iter().all(|segment| {
-            segment.base == DEAD_ROW_SENTINEL
-                && segment.count == DEAD_ROW_SENTINEL
-                && segment.variable == DEAD_ROW_SENTINEL
-                && segment.insertion == DEAD_ROW_SENTINEL
+            segment.base == RESIDENT_U32_SENTINEL
+                && segment.count == RESIDENT_U32_SENTINEL
+                && segment.variable == RESIDENT_U32_SENTINEL
+                && segment.insertion == RESIDENT_U32_SENTINEL
         }));
         assert!(failed
             .candidate_codes
@@ -1270,7 +1270,7 @@ fn capacity_exact_one_short_and_zero_never_publish_a_partial_prefix() {
             .chain(&failed.candidate_owners)
             .chain(&failed.proposer_arms)
             .chain(&failed.child_body)
-            .all(|&word| word == DEAD_ROW_SENTINEL));
+            .all(|&word| word == RESIDENT_U32_SENTINEL));
     }
 }
 
@@ -1291,8 +1291,13 @@ fn malformed_private_choices_and_axis_descriptors_fail_before_capacity() {
         [3, 0, entity_count],
         [0, 1, entity_count],
         [0, 0, entity_count - 1],
-        [0, 0, DEAD_ROW_SENTINEL],
-        [DEAD_ROW_SENTINEL, DEAD_ROW_SENTINEL, 1],
+        [0, 0, RESIDENT_U32_SENTINEL],
+        [RESIDENT_U32_SENTINEL, RESIDENT_U32_SENTINEL, 1],
+        [
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+        ],
     ];
     for words in malformed {
         let choices = round
@@ -1303,13 +1308,13 @@ fn malformed_private_choices_and_axis_descriptors_fail_before_capacity() {
             .unwrap()
             .inspect();
         assert_eq!(inspection.status, STATUS_DEVICE_INVARIANT, "{words:?}");
-        assert_eq!(inspection.required, DEAD_ROW_SENTINEL);
+        assert_eq!(inspection.required, RESIDENT_U32_SENTINEL);
         assert_eq!(inspection.logical_len, 0);
         assert!(inspection.segments.iter().all(|segment| {
-            segment.base == DEAD_ROW_SENTINEL
-                && segment.count == DEAD_ROW_SENTINEL
-                && segment.variable == DEAD_ROW_SENTINEL
-                && segment.insertion == DEAD_ROW_SENTINEL
+            segment.base == RESIDENT_U32_SENTINEL
+                && segment.count == RESIDENT_U32_SENTINEL
+                && segment.variable == RESIDENT_U32_SENTINEL
+                && segment.insertion == RESIDENT_U32_SENTINEL
         }));
     }
 
@@ -1326,7 +1331,7 @@ fn malformed_private_choices_and_axis_descriptors_fail_before_capacity() {
         .unwrap()
         .inspect();
     assert_eq!(sticky.status, STATUS_DEVICE_INVARIANT);
-    assert_eq!(sticky.required, DEAD_ROW_SENTINEL);
+    assert_eq!(sticky.required, RESIDENT_U32_SENTINEL);
     assert_eq!(sticky.logical_len, 0);
 
     let valid = [0, 0, entity_count];
@@ -1352,7 +1357,7 @@ fn malformed_private_choices_and_axis_descriptors_fail_before_capacity() {
         .chain(&inspection.candidate_owners)
         .chain(&inspection.proposer_arms)
         .chain(&inspection.child_body)
-        .all(|&word| word == DEAD_ROW_SENTINEL));
+        .all(|&word| word == RESIDENT_U32_SENTINEL));
 }
 
 #[test]
@@ -1480,13 +1485,13 @@ fn unrepresentable_scan_total_has_a_distinct_geometry_status() {
     let mut workspace_words = vec![0; workspace_layout.words];
     // The second block would make the exact total equal the reserved sentinel.
     workspace_words[workspace_layout.block_sums..workspace_layout.block_sums + 2]
-        .copy_from_slice(&[DEAD_ROW_SENTINEL - 1, 1]);
+        .copy_from_slice(&[RESIDENT_U32_SENTINEL - 1, 1]);
     workspace_words[workspace_layout.block_errors..workspace_layout.block_errors + 2]
         .copy_from_slice(&[STATUS_OK, STATUS_OK]);
     let mut workspace = context.upload_u32(&workspace_words).unwrap();
     let plan = context.upload_u32(&[0, 0]).unwrap();
     let mut segment_records = context
-        .upload_u32(&[DEAD_ROW_SENTINEL; SEGMENT_RECORD_WORDS])
+        .upload_u32(&[RESIDENT_U32_SENTINEL; SEGMENT_RECORD_WORDS])
         .unwrap();
     let mut control = context.upload_u32(&[STATUS_OK, 0, 0, 1]).unwrap();
     let meta = context.batch_meta(0, 1).unwrap();
@@ -1521,13 +1526,13 @@ fn unrepresentable_scan_total_has_a_distinct_geometry_status() {
             workspace_layout.block_offsets as u32,
             0,
             BLOCK_ITEMS,
-            DEAD_ROW_SENTINEL,
+            RESIDENT_U32_SENTINEL,
             STATUS_CAPACITY,
             STATUS_DEVICE_INVARIANT,
             STATUS_GEOMETRY,
         );
     }
-    let poison = [DEAD_ROW_SENTINEL];
+    let poison = [RESIDENT_U32_SENTINEL];
     let arena = WgpuResidentProposals {
         context: context.clone(),
         round_owner: Arc::new(()),
@@ -1543,20 +1548,20 @@ fn unrepresentable_scan_total_has_a_distinct_geometry_status() {
         dispatch,
         segment_records,
         candidate_records: context
-            .upload_u32(&[DEAD_ROW_SENTINEL; CANDIDATE_RECORD_FIELDS])
+            .upload_u32(&[RESIDENT_U32_SENTINEL; CANDIDATE_RECORD_FIELDS])
             .unwrap(),
         child_body: context.upload_u32(&poison).unwrap(),
         stage_profiles: None,
     };
     let inspection = arena.inspect();
     assert_eq!(inspection.status, STATUS_GEOMETRY);
-    assert_eq!(inspection.required, DEAD_ROW_SENTINEL);
+    assert_eq!(inspection.required, RESIDENT_U32_SENTINEL);
     assert_eq!(inspection.logical_len, 0);
     assert!(inspection.segments.iter().all(|segment| {
-        segment.base == DEAD_ROW_SENTINEL
-            && segment.count == DEAD_ROW_SENTINEL
-            && segment.variable == DEAD_ROW_SENTINEL
-            && segment.insertion == DEAD_ROW_SENTINEL
+        segment.base == RESIDENT_U32_SENTINEL
+            && segment.count == RESIDENT_U32_SENTINEL
+            && segment.variable == RESIDENT_U32_SENTINEL
+            && segment.insertion == RESIDENT_U32_SENTINEL
     }));
 }
 
@@ -1565,12 +1570,12 @@ fn largest_representable_total_uses_overflow_safe_dispatch_geometry() {
     let context = crate::WgpuContext::on_wgpu();
     let workspace_layout = workspace_layout(1, 1, 0, 1).unwrap();
     let mut workspace_words = vec![0; workspace_layout.words];
-    workspace_words[workspace_layout.block_sums] = DEAD_ROW_SENTINEL - 1;
+    workspace_words[workspace_layout.block_sums] = RESIDENT_U32_SENTINEL - 1;
     workspace_words[workspace_layout.block_errors] = STATUS_OK;
     let mut workspace = context.upload_u32(&workspace_words).unwrap();
     let plan = context.upload_u32(&[0, 0]).unwrap();
     let mut segment_records = context
-        .upload_u32(&[DEAD_ROW_SENTINEL; SEGMENT_RECORD_WORDS])
+        .upload_u32(&[RESIDENT_U32_SENTINEL; SEGMENT_RECORD_WORDS])
         .unwrap();
     let mut control = context.upload_u32(&[STATUS_OK, 0, 0, 1]).unwrap();
     let hardware = &context.client().properties().hardware;
@@ -1592,7 +1597,7 @@ fn largest_representable_total_uses_overflow_safe_dispatch_geometry() {
             1,
             0,
             1,
-            DEAD_ROW_SENTINEL - 1,
+            RESIDENT_U32_SENTINEL - 1,
             max_x,
             max_y,
             THREADS,
@@ -1604,18 +1609,18 @@ fn largest_representable_total_uses_overflow_safe_dispatch_geometry() {
             workspace_layout.block_offsets as u32,
             0,
             BLOCK_ITEMS,
-            DEAD_ROW_SENTINEL,
+            RESIDENT_U32_SENTINEL,
             STATUS_CAPACITY,
             STATUS_DEVICE_INVARIANT,
             STATUS_GEOMETRY,
         );
     }
     let control = control.read();
-    let groups = 1 + (DEAD_ROW_SENTINEL - 2) / THREADS;
+    let groups = 1 + (RESIDENT_U32_SENTINEL - 2) / THREADS;
     let expected_y = 1 + (groups - 1) / max_x;
     let expected_x = 1 + (groups - 1) / expected_y;
     assert_eq!(control[CONTROL_STATUS], STATUS_OK);
-    assert_eq!(control[CONTROL_REQUIRED], DEAD_ROW_SENTINEL - 1);
+    assert_eq!(control[CONTROL_REQUIRED], RESIDENT_U32_SENTINEL - 1);
     assert_eq!(control[CONTROL_DISPATCH_X], expected_x);
     assert_eq!(control[CONTROL_DISPATCH_Y], expected_y);
     assert!((1..=max_x).contains(&expected_x));
@@ -1689,7 +1694,7 @@ fn global_dead_all_dead_all_zero_and_empty_frontiers_are_successful_empty_arenas
         .chain(&dead.candidate_owners)
         .chain(&dead.proposer_arms)
         .chain(&dead.child_body)
-        .all(|&word| word == DEAD_ROW_SENTINEL));
+        .all(|&word| word == RESIDENT_U32_SENTINEL));
 
     // Fully-bound support rejects the row, so ordinary (non-global) planning
     // emits one canonical dead choice and zero proposals.

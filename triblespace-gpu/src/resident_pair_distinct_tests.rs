@@ -107,7 +107,7 @@ fn expected_matrix(
                     };
                     cpu_pair_count(round.archive.archive(), rotation, peer)
                 }
-                ArmSpec::Restricted { .. } => DEAD_ROW_SENTINEL,
+                ArmSpec::Restricted { .. } => RESIDENT_U32_SENTINEL,
             };
             result.push(estimate);
         }
@@ -123,10 +123,12 @@ fn planner_oracle(
     let rows = viable.len();
     (0..rows)
         .map(|row| {
-            if viable[row] != 1
-                || (0..metadata.arms().len())
-                    .any(|arm| estimates[arm * rows + row] == DEAD_ROW_SENTINEL)
-            {
+            assert!(
+                (0..metadata.arms().len())
+                    .all(|arm| estimates[arm * rows + row] != RESIDENT_U32_SENTINEL),
+                "semantic oracle does not decode invariant poison"
+            );
+            if viable[row] != 1 {
                 return ResidentRowChoice::dead();
             }
             let mut best: Option<(ProgramVariable, usize, u32, u32, u32)> = None;
@@ -471,22 +473,100 @@ fn malformed_device_codes_poison_estimates_but_valid_zero_stays_viable() {
         rows: 4,
         stride: 1,
     };
-    let (viable, estimates, choices) = run_resident_outputs(&round, &frontier);
+    let inputs = round.initialize_inputs(&frontier).unwrap();
+    let choices = round.enqueue(&inputs).unwrap();
+    let (viable, estimates) = inputs.read_producer_outputs();
     assert_eq!(viable, vec![1; 4]);
     assert_eq!(estimates[0], 0);
     assert_eq!(estimates[4], 0);
-    assert_ne!(choices[0], ResidentRowChoice::dead());
-    assert_eq!(choices[0].proposal_count, 0);
     for row in 1..4 {
         assert!((0..round.metadata().arms().len())
-            .all(|arm| estimates[arm * 4 + row] == DEAD_ROW_SENTINEL));
-        assert_eq!(choices[row], ResidentRowChoice::dead());
+            .all(|arm| estimates[arm * 4 + row] == RESIDENT_U32_SENTINEL));
     }
+    assert!(matches!(
+        choices.read(),
+        Err(ResidentRoundError::PoisonedDeviceChoice { row: 1 })
+    ));
+
+    let valid_frontier = WgpuResidentFrontier {
+        archive: &resident,
+        owner: round.frontier_owner.clone(),
+        lineage: Arc::new(()),
+        values: resident.context().upload_u32(&[highest]).unwrap(),
+        variables: vec![v(0)].into_boxed_slice(),
+        rows: 1,
+        stride: 1,
+    };
+    let (_, valid_estimates, valid_choices) = run_resident_outputs(&round, &valid_frontier);
+    assert!(valid_estimates.iter().all(|&estimate| estimate == 0));
+    assert_ne!(valid_choices[0], ResidentRowChoice::dead());
+    assert_eq!(valid_choices[0].proposal_count, 0);
+}
+
+#[test]
+fn pair_scatter_rejects_noncanonical_and_non_lipschitz_rank_intervals() {
+    let (set, _) = fixture_set();
+    let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+    let resident = WgpuSuccinctArchive::new(archive).unwrap();
+    let context = resident.context();
+    let rows = 6usize;
+    let descriptors = context.upload_u32(&[0, CONSTANT_SOURCE, 0]).unwrap();
+    let positions = context
+        .upload_u32(&[
+            2,
+            2,
+            2,
+            5,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            5,
+            2,
+            4,
+            4,
+            4,
+            5,
+        ])
+        .unwrap();
+    let ranks = context
+        .upload_u32(&[1, 1, 1, 4, 0, 1, 1, 2, 1, 2, 1, 3])
+        .unwrap();
+    let mut estimates = context.upload_u32(&[77; 6]).unwrap();
+    let dispatch = context
+        .static_batch_dispatch(rows, rows, CubeDim::new_1d(THREADS))
+        .unwrap();
+    unsafe {
+        scatter_pair_distinct::launch_unchecked::<WgpuRuntime>(
+            context.client(),
+            dispatch.cube_count(),
+            dispatch.cube_dim(),
+            descriptors.input_arg(),
+            positions.input_arg(),
+            ranks.input_arg(),
+            estimates.output_arg(),
+            rows as u32,
+            1,
+            1,
+            10,
+            10,
+            RESIDENT_U32_SENTINEL,
+        );
+    }
+    assert_eq!(
+        estimates.read(),
+        vec![
+            0,
+            3,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+        ]
+    );
 }
 
 #[test]
 fn pair_geometry_excludes_the_reserved_sentinel() {
-    let limit = DEAD_ROW_SENTINEL as usize;
+    let limit = RESIDENT_U32_SENTINEL as usize;
     let largest = (limit - 1) / 2;
     assert_eq!(
         pair_group_geometry(1, largest).unwrap(),

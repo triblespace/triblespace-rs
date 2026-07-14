@@ -45,7 +45,7 @@ use triblespace_core::blob::encodings::succinctarchive::query_program::ProgramVa
 use triblespace_core::blob::encodings::succinctarchive::Universe;
 
 use crate::resident_round::{
-    checked_device_product, ResidentRoundError, ResidentRowChoices, DEAD_ROW_SENTINEL,
+    checked_device_product, ResidentRoundError, ResidentRowChoices, RESIDENT_U32_SENTINEL,
 };
 use crate::resident_support::{
     ArmSpec, ResidentAxis, ResidentSupportError, WgpuResidentFrontier, WgpuResidentRound,
@@ -352,7 +352,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                     workspace_layout.row_arms as u32,
                     workspace_layout.row_axes as u32,
                     workspace_layout.choice_errors as u32,
-                    DEAD_ROW_SENTINEL,
+                    RESIDENT_U32_SENTINEL,
                 );
             }
         }
@@ -394,7 +394,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                     workspace_layout.block_sums as u32,
                     workspace_layout.block_errors as u32,
                     BLOCK_ITEMS,
-                    DEAD_ROW_SENTINEL,
+                    RESIDENT_U32_SENTINEL,
                 );
             }
         }
@@ -445,7 +445,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                     segment_record_words as u32,
                     capacity as u32,
                     child_words as u32,
-                    DEAD_ROW_SENTINEL,
+                    RESIDENT_U32_SENTINEL,
                 );
             }
         }
@@ -478,7 +478,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 workspace_layout.block_offsets as u32,
                 plan_layout.segment_specs as u32,
                 BLOCK_ITEMS,
-                DEAD_ROW_SENTINEL,
+                RESIDENT_U32_SENTINEL,
                 STATUS_CAPACITY,
                 STATUS_DEVICE_INVARIANT,
                 STATUS_GEOMETRY,
@@ -537,7 +537,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 workspace_layout.local_offsets as u32,
                 workspace_layout.block_offsets as u32,
                 BLOCK_ITEMS,
-                DEAD_ROW_SENTINEL,
+                RESIDENT_U32_SENTINEL,
                 STATUS_OK,
             );
         };
@@ -577,7 +577,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 arm_count,
                 plan_layout.arm_descriptors as u32,
                 plan_layout.variable_to_segment as u32,
-                DEAD_ROW_SENTINEL,
+                RESIDENT_U32_SENTINEL,
                 STATUS_OK,
             );
         };
@@ -644,7 +644,7 @@ fn lower_present_admission<U: Universe>(
     let arm_count = metadata.arms().len();
     let descriptor_words =
         checked_device_product(arm_count, ARM_DESCRIPTOR_WORDS, "Present arm descriptors")?;
-    let mut arm_descriptors = vec![DEAD_ROW_SENTINEL; descriptor_words];
+    let mut arm_descriptors = vec![RESIDENT_U32_SENTINEL; descriptor_words];
 
     if !round.proposal_global_dead() {
         let specs = round.proposal_arm_specs();
@@ -668,7 +668,7 @@ fn lower_present_admission<U: Universe>(
                 ResidentAxis::Attribute => round.archive().present_attribute_codes().len(),
                 ResidentAxis::Value => round.archive().present_value_codes().len(),
             };
-            if count as usize != present_len || count == DEAD_ROW_SENTINEL {
+            if count as usize != present_len || count == RESIDENT_U32_SENTINEL {
                 return Err(ResidentProposalError::MalformedPlan);
             }
             let base = arm * ARM_DESCRIPTOR_WORDS;
@@ -680,7 +680,7 @@ fn lower_present_admission<U: Universe>(
 
     let bound = metadata.bound_variables();
     let mut segment_specs = Vec::new();
-    let mut variable_to_segment = vec![DEAD_ROW_SENTINEL; metadata.variable_count()];
+    let mut variable_to_segment = vec![RESIDENT_U32_SENTINEL; metadata.variable_count()];
     for variable in 0..metadata.variable_count() {
         let variable = ProgramVariable::new(variable as u8);
         if bound.binary_search(&variable).is_ok() {
@@ -777,7 +777,7 @@ fn ensure_below_sentinel(
     value: usize,
     quantity: &'static str,
 ) -> Result<(), ResidentProposalError> {
-    if value >= DEAD_ROW_SENTINEL as usize {
+    if value >= RESIDENT_U32_SENTINEL as usize {
         Err(ResidentProposalError::GeometryOverflow(quantity))
     } else {
         Ok(())

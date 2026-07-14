@@ -230,21 +230,36 @@ fn native_kernel_matches_oracle_for_mixed_choices_flips_ties_and_boundaries() {
 }
 
 #[test]
-fn reserved_estimate_in_a_proposer_or_non_proposer_arm_kills_the_row() {
+fn reserved_estimate_in_a_proposer_or_non_proposer_arm_poisons_the_row() {
     let planner = planner(&[variables()[4]]);
-    let rows = 3;
-    let mut estimates = vec![8; planner.metadata().arms().len() * rows];
+    let mut estimates = vec![8; planner.metadata().arms().len()];
 
     // Arm 2 is v2's sole arm, hence necessarily that variable's proposer.
-    set_estimate(&mut estimates, rows, 2, 0, u32::MAX);
-    // For v0, arm 0 remains the proposer while the looser arm 3 is poisoned.
-    set_estimate(&mut estimates, rows, 0, 1, 1);
-    set_estimate(&mut estimates, rows, 3, 1, u32::MAX);
+    set_estimate(&mut estimates, 1, 2, 0, u32::MAX);
+    let inputs = planner.upload_inputs(&[true], &estimates).unwrap();
+    let choices = planner.enqueue(&inputs).unwrap();
+    assert!(matches!(
+        choices.read(),
+        Err(ResidentRoundError::PoisonedDeviceChoice { row: 0 })
+    ));
 
-    let choices = run(&planner, &[true, true, true], &estimates);
-    assert_eq!(choices[0], ResidentRowChoice::dead());
-    assert_eq!(choices[1], ResidentRowChoice::dead());
-    assert_ne!(choices[2], ResidentRowChoice::dead());
+    // For v0, arm 0 remains the proposer while the looser arm 3 is poisoned.
+    estimates.fill(8);
+    set_estimate(&mut estimates, 1, 0, 0, 1);
+    set_estimate(&mut estimates, 1, 3, 0, u32::MAX);
+    let inputs = planner.upload_inputs(&[true], &estimates).unwrap();
+    let choices = planner.enqueue(&inputs).unwrap();
+    assert!(matches!(
+        choices.read(),
+        Err(ResidentRoundError::PoisonedDeviceChoice { row: 0 })
+    ));
+
+    estimates.fill(u32::MAX - 1);
+    let inputs = planner.upload_inputs(&[true], &estimates).unwrap();
+    let choice = planner.enqueue(&inputs).unwrap().read().unwrap()[0];
+    assert_eq!(choice.variable, Some(variables()[0]));
+    assert_eq!(choice.proposer_arm, Some(0));
+    assert_eq!(choice.proposal_count, u32::MAX - 1);
 }
 
 #[test]

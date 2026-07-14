@@ -16,9 +16,11 @@
 //!
 //! Proposal counts stay exact in `u32`: the resident Jerky archive admission
 //! rule requires every searchable ring length to be strictly below
-//! `u32::MAX`, so no pattern support count can exceed the representation. The
-//! same value remains reserved as the dead-row sentinel, and all flattened
-//! device-array geometries are therefore also kept strictly below it.
+//! `u32::MAX`, so no pattern support count can exceed the representation.
+//! `u32::MAX` is reserved for structural/invariant poison; semantic death is
+//! represented separately by a canonical zero viability or packed choice.
+//! Flattened device-array geometries are therefore also kept strictly below
+//! the reserved value.
 
 use std::error::Error;
 use std::fmt;
@@ -36,8 +38,8 @@ type WgpuRuntime = cubecl::wgpu::WgpuRuntime;
 const THREADS: u32 = 64;
 const CHOICE_WORDS: usize = 3;
 
-/// Device sentinel for a row which cannot take another transition.
-pub const DEAD_ROW_SENTINEL: u32 = u32::MAX;
+/// Device sentinel for invariant poison and absent choice fields.
+pub const RESIDENT_U32_SENTINEL: u32 = u32::MAX;
 
 /// Stable identity of one pattern arm for one target variable.
 ///
@@ -127,7 +129,7 @@ impl ResidentRoundMetadata {
             }
         }
         arms.sort_unstable_by_key(|arm| (arm.source_pattern_index, arm.target_variable.index()));
-        if arms.len() >= DEAD_ROW_SENTINEL as usize {
+        if arms.len() >= RESIDENT_U32_SENTINEL as usize {
             return Err(ResidentRoundError::GeometryOverflow("resident arm count"));
         }
 
@@ -261,6 +263,11 @@ pub enum ResidentRoundError {
         /// Row containing the malformed triple.
         row: usize,
     },
+    /// A preceding resident stage published canonical invariant poison.
+    PoisonedDeviceChoice {
+        /// Row containing `[MAX, MAX, MAX]`.
+        row: usize,
+    },
     /// Jerky rejected an allocation or launch geometry.
     Device(jerky::Error),
 }
@@ -303,6 +310,12 @@ impl fmt::Display for ResidentRoundError {
                     "resident row planner returned a malformed choice for row {row}"
                 )
             }
+            Self::PoisonedDeviceChoice { row } => {
+                write!(
+                    f,
+                    "resident row planner reported invariant poison for row {row}"
+                )
+            }
             Self::Device(error) => write!(f, "resident row planner failed: {error}"),
         }
     }
@@ -319,7 +332,8 @@ impl Error for ResidentRoundError {
             | Self::InputOwnership
             | Self::ChoiceOwnership
             | Self::MalformedChoiceBuffer
-            | Self::MalformedDeviceChoice { .. } => None,
+            | Self::MalformedDeviceChoice { .. }
+            | Self::PoisonedDeviceChoice { .. } => None,
         }
     }
 }
@@ -556,7 +570,7 @@ impl<R: Runtime> ResidentRowPlanner<R> {
                     inputs.rows as u32,
                     self.metadata.variable_count as u32,
                     self.metadata.arms.len() as u32,
-                    DEAD_ROW_SENTINEL,
+                    RESIDENT_U32_SENTINEL,
                 );
             }
         }
@@ -626,8 +640,9 @@ impl<R: Runtime> ResidentRowPlanner<R> {
 
 /// Packed resident choices produced by [`ResidentRowPlanner::enqueue`].
 ///
-/// Each row is `[variable, proposer_arm, exact_count]`; dead rows use
-/// [`DEAD_ROW_SENTINEL`] in the first two words and zero in the third.
+/// Each row is `[variable, proposer_arm, exact_count]`. Semantic-dead rows use
+/// [`RESIDENT_U32_SENTINEL`] in the first two words and zero in the third;
+/// invariant-poisoned rows use the sentinel in all three words.
 pub struct ResidentRowChoices<R: Runtime> {
     #[allow(dead_code)] // Consumed by the immediately following resident proposal slice.
     owner: Arc<()>,
@@ -664,6 +679,12 @@ impl<R: Runtime> ResidentRowChoices<R> {
         let words = self.words.read();
         decode_choices(&words, self.rows, self.variable_count, &self.arm_targets)
     }
+
+    /// Exact packed words for crate-internal adversarial tests.
+    #[cfg(test)]
+    pub(crate) fn read_words_for_test(&self) -> Vec<u32> {
+        self.words.read()
+    }
 }
 
 fn decode_choices(
@@ -685,12 +706,18 @@ fn decode_choices(
             let variable = choice[0];
             let arm = choice[1];
             let count = choice[2];
-            if variable == DEAD_ROW_SENTINEL && arm == DEAD_ROW_SENTINEL && count == 0 {
+            if variable == RESIDENT_U32_SENTINEL && arm == RESIDENT_U32_SENTINEL && count == 0 {
                 return Ok(ResidentRowChoice::dead());
+            }
+            if variable == RESIDENT_U32_SENTINEL
+                && arm == RESIDENT_U32_SENTINEL
+                && count == RESIDENT_U32_SENTINEL
+            {
+                return Err(ResidentRoundError::PoisonedDeviceChoice { row });
             }
             let target = arm_targets.get(arm as usize);
             if variable as usize >= variable_count
-                || count == DEAD_ROW_SENTINEL
+                || count == RESIDENT_U32_SENTINEL
                 || target.is_none_or(|target| target.index() != variable as usize)
             {
                 return Err(ResidentRoundError::MalformedDeviceChoice { row });
@@ -715,7 +742,7 @@ fn pattern_variables(pattern: ProgramPattern) -> Vec<ProgramVariable> {
 }
 
 pub(crate) fn validate_rows(rows: usize) -> Result<(), ResidentRoundError> {
-    if rows >= DEAD_ROW_SENTINEL as usize {
+    if rows >= RESIDENT_U32_SENTINEL as usize {
         Err(ResidentRoundError::GeometryOverflow("affine row count"))
     } else {
         Ok(())
@@ -730,7 +757,7 @@ pub(crate) fn checked_device_product(
     let product = left
         .checked_mul(right)
         .ok_or(ResidentRoundError::GeometryOverflow(quantity))?;
-    if product >= DEAD_ROW_SENTINEL as usize {
+    if product >= RESIDENT_U32_SENTINEL as usize {
         Err(ResidentRoundError::GeometryOverflow(quantity))
     } else {
         Ok(product)
@@ -741,7 +768,7 @@ pub(crate) fn checked_device_product(
 mod tests {
     use super::{
         checked_device_product, decode_choices, validate_rows, ResidentRoundError,
-        ResidentRowChoice, ResidentRowPlanner, CHOICE_WORDS, DEAD_ROW_SENTINEL,
+        ResidentRowChoice, ResidentRowPlanner, CHOICE_WORDS, RESIDENT_U32_SENTINEL,
     };
     use crate::succinct_query::WgpuContext;
     use std::sync::Arc;
@@ -753,7 +780,7 @@ mod tests {
 
     #[test]
     fn device_geometries_exclude_the_reserved_u32_sentinel() {
-        let limit = DEAD_ROW_SENTINEL as usize;
+        let limit = RESIDENT_U32_SENTINEL as usize;
         assert!(validate_rows(limit - 1).is_ok());
         assert!(matches!(
             validate_rows(limit),
@@ -776,7 +803,7 @@ mod tests {
 
     #[test]
     fn packed_choice_geometry_is_checked_after_multiplication() {
-        let limit = DEAD_ROW_SENTINEL as usize;
+        let limit = RESIDENT_U32_SENTINEL as usize;
         let largest_rows = (limit - 1) / CHOICE_WORDS;
         assert!(checked_device_product(largest_rows, CHOICE_WORDS, "packed").is_ok());
         assert!(matches!(
@@ -796,8 +823,21 @@ mod tests {
             Err(ResidentRoundError::MalformedDeviceChoice { row: 0 })
         ));
         assert!(matches!(
-            decode_choices(&[0, 0, DEAD_ROW_SENTINEL], 1, 2, &targets),
+            decode_choices(&[0, 0, RESIDENT_U32_SENTINEL], 1, 2, &targets),
             Err(ResidentRoundError::MalformedDeviceChoice { row: 0 })
+        ));
+        assert!(matches!(
+            decode_choices(
+                &[
+                    RESIDENT_U32_SENTINEL,
+                    RESIDENT_U32_SENTINEL,
+                    RESIDENT_U32_SENTINEL,
+                ],
+                1,
+                2,
+                &targets,
+            ),
+            Err(ResidentRoundError::PoisonedDeviceChoice { row: 0 })
         ));
         assert_eq!(
             decode_choices(&[0, 0, 7], 1, 2, &targets).unwrap(),
@@ -806,6 +846,94 @@ mod tests {
                 proposer_arm: Some(0),
                 proposal_count: 7,
             }]
+        );
+    }
+
+    #[test]
+    fn planner_preserves_poison_over_semantic_death_and_live_zero_counts() {
+        let archive: SuccinctArchive<OrderedUniverse> = (&TribleSet::new()).into();
+        let v0 = ProgramVariable::new(0);
+        let v1 = ProgramVariable::new(1);
+        let v2 = ProgramVariable::new(2);
+        let program = QueryProgram::compile(&archive, 3, [QueryPattern::new(v0, v1, v2)]).unwrap();
+        let planner =
+            ResidentRowPlanner::with_context(&program, &[], WgpuContext::on_wgpu()).unwrap();
+        let rows = 4usize;
+        let mut estimates = vec![0; planner.metadata.arms().len() * rows];
+        estimates[2 * rows + 1] = RESIDENT_U32_SENTINEL;
+        let inputs = super::ResidentRoundInputs {
+            owner: planner.owner.clone(),
+            frontier_lineage: None,
+            viable: planner
+                .context
+                .upload_u32(&[0, 0, 1, RESIDENT_U32_SENTINEL])
+                .unwrap(),
+            estimates: planner.context.upload_u32(&estimates).unwrap(),
+            rows,
+        };
+        let choices = planner.enqueue(&inputs).unwrap();
+        assert_eq!(
+            choices.words.read(),
+            vec![
+                RESIDENT_U32_SENTINEL,
+                RESIDENT_U32_SENTINEL,
+                0,
+                RESIDENT_U32_SENTINEL,
+                RESIDENT_U32_SENTINEL,
+                RESIDENT_U32_SENTINEL,
+                0,
+                0,
+                0,
+                RESIDENT_U32_SENTINEL,
+                RESIDENT_U32_SENTINEL,
+                RESIDENT_U32_SENTINEL,
+            ]
+        );
+        assert!(matches!(
+            choices.read(),
+            Err(ResidentRoundError::PoisonedDeviceChoice { row: 1 })
+        ));
+    }
+
+    #[test]
+    fn zero_arm_planner_distinguishes_semantic_and_noncanonical_viability() {
+        let archive: SuccinctArchive<OrderedUniverse> = (&TribleSet::new()).into();
+        let v0 = ProgramVariable::new(0);
+        let v1 = ProgramVariable::new(1);
+        let v2 = ProgramVariable::new(2);
+        let program = QueryProgram::compile(&archive, 3, [QueryPattern::new(v0, v1, v2)]).unwrap();
+        let planner =
+            ResidentRowPlanner::with_context(&program, &[v0, v1, v2], WgpuContext::on_wgpu())
+                .unwrap();
+        assert!(planner.metadata.arms().is_empty());
+        let rows = 4usize;
+        let inputs = super::ResidentRoundInputs {
+            owner: planner.owner.clone(),
+            frontier_lineage: None,
+            viable: planner
+                .context
+                .upload_u32(&[0, 1, RESIDENT_U32_SENTINEL, 2])
+                .unwrap(),
+            estimates: planner.context.upload_u32(&[]).unwrap(),
+            rows,
+        };
+        let choices = planner.enqueue(&inputs).unwrap();
+        assert_eq!(
+            choices.words.read(),
+            vec![
+                RESIDENT_U32_SENTINEL,
+                RESIDENT_U32_SENTINEL,
+                0,
+                RESIDENT_U32_SENTINEL,
+                RESIDENT_U32_SENTINEL,
+                0,
+                RESIDENT_U32_SENTINEL,
+                RESIDENT_U32_SENTINEL,
+                RESIDENT_U32_SENTINEL,
+                RESIDENT_U32_SENTINEL,
+                RESIDENT_U32_SENTINEL,
+                RESIDENT_U32_SENTINEL,
+            ]
         );
     }
 
@@ -863,77 +991,81 @@ fn exact_row_planner(
         let output_base = row * 3usize;
         output[output_base] = dead;
         output[output_base + 1usize] = dead;
-        output[output_base + 2usize] = 0u32;
+        output[output_base + 2usize] = dead;
 
-        // Treat every non-canonical viability value or reserved estimate as
-        // dead. The typed host path only emits 0/1 and exact counts strictly
-        // below `dead`; a future device producer therefore fails closed if it
-        // violates either contract.
-        if viable[row] == 1u32 {
-            let mut have_variable = false;
-            let mut valid_estimates = true;
-            let mut best_variable = 0u32;
-            let mut best_arm = 0u32;
-            let mut best_count = 0u32;
-            let mut best_magnitude = 0u32;
-            let mut best_influence = 0u32;
+        // Invariant poison is the default. Visit every variable/arm for every
+        // row, including semantically dead rows, so a contradicted sibling can
+        // never mask corruption in another producer lane. This is also the
+        // ordinary selection pass: each exact estimate is read only once.
+        let mut valid_estimates = true;
+        let mut have_variable = false;
+        let mut best_variable = 0u32;
+        let mut best_arm = 0u32;
+        let mut best_count = 0u32;
+        let mut best_magnitude = 0u32;
+        let mut best_influence = 0u32;
 
-            let mut variable = 0u32;
-            while variable < variable_count {
-                let start = variable_offsets[variable as usize];
-                let end = variable_offsets[variable as usize + 1usize];
-                if start < end && end <= arm_count {
-                    let mut cursor = start;
-                    let mut proposer = variable_arms[cursor as usize];
-                    let mut proposer_pattern = arm_patterns[proposer as usize];
-                    let mut proposal_count = estimates[proposer as usize * rows as usize + row];
-                    if proposal_count == dead {
+        let mut variable = 0u32;
+        while variable < variable_count {
+            let start = variable_offsets[variable as usize];
+            let end = variable_offsets[variable as usize + 1usize];
+            if start < end && end <= arm_count {
+                let mut cursor = start;
+                let mut proposer = variable_arms[cursor as usize];
+                let mut proposer_pattern = arm_patterns[proposer as usize];
+                let mut proposal_count = estimates[proposer as usize * rows as usize + row];
+                if proposal_count == dead {
+                    valid_estimates = false;
+                }
+                cursor += 1u32;
+                while cursor < end {
+                    let arm = variable_arms[cursor as usize];
+                    let count = estimates[arm as usize * rows as usize + row];
+                    if count == dead {
                         valid_estimates = false;
                     }
-                    cursor += 1u32;
-                    while cursor < end {
-                        let arm = variable_arms[cursor as usize];
-                        let count = estimates[arm as usize * rows as usize + row];
-                        if count == dead {
-                            valid_estimates = false;
-                        }
-                        let source_pattern = arm_patterns[arm as usize];
-                        if count < proposal_count
-                            || (count == proposal_count && source_pattern < proposer_pattern)
-                        {
-                            proposer = arm;
-                            proposer_pattern = source_pattern;
-                            proposal_count = count;
-                        }
-                        cursor += 1u32;
-                    }
-
-                    // Exact bit length, including QueryProgram's special
-                    // magnitude zero for an exact estimate of zero.
-                    let magnitude = 32u32 - proposal_count.leading_zeros();
-                    let influence = influence_counts[variable as usize];
-                    if !have_variable
-                        || magnitude < best_magnitude
-                        || (magnitude == best_magnitude && influence > best_influence)
+                    let source_pattern = arm_patterns[arm as usize];
+                    if count < proposal_count
+                        || (count == proposal_count && source_pattern < proposer_pattern)
                     {
-                        have_variable = true;
-                        best_variable = variable;
-                        best_arm = proposer;
-                        best_count = proposal_count;
-                        best_magnitude = magnitude;
-                        best_influence = influence;
+                        proposer = arm;
+                        proposer_pattern = source_pattern;
+                        proposal_count = count;
                     }
-                    // Equal magnitude and influence deliberately retain the
-                    // first (therefore lower-ID) variable.
+                    cursor += 1u32;
                 }
-                variable += 1u32;
-            }
 
-            if have_variable && valid_estimates {
-                output[output_base] = best_variable;
-                output[output_base + 1usize] = best_arm;
-                output[output_base + 2usize] = best_count;
+                // Exact bit length, including QueryProgram's special
+                // magnitude zero for an exact estimate of zero.
+                let magnitude = 32u32 - proposal_count.leading_zeros();
+                let influence = influence_counts[variable as usize];
+                if !have_variable
+                    || magnitude < best_magnitude
+                    || (magnitude == best_magnitude && influence > best_influence)
+                {
+                    have_variable = true;
+                    best_variable = variable;
+                    best_arm = proposer;
+                    best_count = proposal_count;
+                    best_magnitude = magnitude;
+                    best_influence = influence;
+                }
+                // Equal magnitude and influence deliberately retain the first
+                // (therefore lower-ID) variable.
             }
+            variable += 1u32;
+        }
+
+        if valid_estimates && viable[row] == 1u32 && have_variable {
+            output[output_base] = best_variable;
+            output[output_base + 1usize] = best_arm;
+            output[output_base + 2usize] = best_count;
+        } else if valid_estimates
+            && (viable[row] == 0u32 || (viable[row] == 1u32 && !have_variable))
+        {
+            // Canonical semantic contradiction. A live zero-arm frontier has
+            // no expansion, preserving the low-level zero-arm algebra.
+            output[output_base + 2usize] = 0u32;
         }
     }
 }

@@ -27,7 +27,7 @@ pub use resident_program::{ResidentTransitionError, WgpuQueryProgram};
 pub use resident_round::{
     ResidentRoundArm, ResidentRoundError, ResidentRoundInputs, ResidentRoundMetadata,
     ResidentRowChoice, ResidentRowChoices, ResidentRowPlanner, WgpuResidentRowPlanner,
-    DEAD_ROW_SENTINEL,
+    RESIDENT_U32_SENTINEL,
 };
 #[cfg(feature = "wgpu")]
 pub use resident_support::{ResidentSupportError, WgpuResidentFrontier, WgpuResidentRound};

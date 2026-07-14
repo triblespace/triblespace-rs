@@ -315,7 +315,7 @@ fn heterogeneous_arm_major_groups_cover_all_rotations_and_source_kinds() {
             assert!(estimates.contains(&1));
             assert!(estimates
                 .iter()
-                .any(|&count| count > 1 && count != DEAD_ROW_SENTINEL));
+                .any(|&count| count > 1 && count != RESIDENT_U32_SENTINEL));
         }
     }
 }
@@ -568,7 +568,7 @@ fn invalid_last_aliases_poison_queries_values_and_rank_positions_before_wavelet(
             2,
             1,
             domain,
-            DEAD_ROW_SENTINEL,
+            RESIDENT_U32_SENTINEL,
         );
     }
     let prepared_positions = positions.read();
@@ -578,12 +578,12 @@ fn invalid_last_aliases_poison_queries_values_and_rank_positions_before_wavelet(
     for row in 1..rows {
         assert_eq!(
             &prepared_positions[row * 2..row * 2 + 2],
-            &[DEAD_ROW_SENTINEL; 2],
+            &[RESIDENT_U32_SENTINEL; 2],
             "invalid row {row} leaked a prefix query"
         );
         assert_eq!(
             &prepared_values[row * 2..row * 2 + 2],
-            &[DEAD_ROW_SENTINEL; 2],
+            &[RESIDENT_U32_SENTINEL; 2],
             "invalid row {row} leaked a wavelet symbol"
         );
     }
@@ -602,14 +602,14 @@ fn invalid_last_aliases_poison_queries_values_and_rank_positions_before_wavelet(
             positions.output_arg(),
             probes as u32,
             resident.ring_col(SuccinctRotation::Eva).len() as u32,
-            DEAD_ROW_SENTINEL,
+            RESIDENT_U32_SENTINEL,
         );
     }
     let rank_positions = positions.read();
     for row in 1..rows {
         assert_eq!(
             &rank_positions[row * 2..row * 2 + 2],
-            &[DEAD_ROW_SENTINEL; 2],
+            &[RESIDENT_U32_SENTINEL; 2],
             "invalid row {row} reached wavelet rank"
         );
     }
@@ -650,14 +650,34 @@ fn invalid_last_aliases_fail_closed_in_the_complete_restricted_pipeline() {
         rows: 5,
         stride: 2,
     };
-    let (viable, estimates, choices) = run_resident_outputs(&round, &frontier);
+    let inputs = round.initialize_inputs(&frontier).unwrap();
+    let choices = round.enqueue(&inputs).unwrap();
+    let (viable, estimates) = inputs.read_producer_outputs();
     assert_eq!(viable, vec![1; 5]);
-    assert_ne!(estimates[0], DEAD_ROW_SENTINEL);
-    assert_ne!(choices[0], ResidentRowChoice::dead());
-    for row in 1..5 {
-        assert_eq!(estimates[row], DEAD_ROW_SENTINEL);
-        assert_eq!(choices[row], ResidentRowChoice::dead());
-    }
+    assert_ne!(estimates[0], RESIDENT_U32_SENTINEL);
+    assert!(estimates[1..5]
+        .iter()
+        .all(|&estimate| estimate == RESIDENT_U32_SENTINEL));
+    assert!(matches!(
+        choices.read(),
+        Err(ResidentRoundError::PoisonedDeviceChoice { row: 1 })
+    ));
+
+    let valid_frontier = WgpuResidentFrontier {
+        archive: &resident,
+        owner: round.frontier_owner.clone(),
+        lineage: Arc::new(()),
+        values: resident
+            .context()
+            .upload_u32(&[valid_first, valid_last])
+            .unwrap(),
+        variables: vec![v(0), v(1)].into_boxed_slice(),
+        rows: 1,
+        stride: 2,
+    };
+    let (_, valid_estimates, valid_choices) = run_resident_outputs(&round, &valid_frontier);
+    assert_ne!(valid_estimates[0], RESIDENT_U32_SENTINEL);
+    assert_ne!(valid_choices[0], ResidentRowChoice::dead());
 }
 
 #[test]
@@ -672,8 +692,8 @@ fn normalization_and_scatter_independently_reject_poison_reversal_and_range_erro
         .upload_u32(&[
             5,
             8,
-            DEAD_ROW_SENTINEL,
-            DEAD_ROW_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
             6,
             3,
             0,
@@ -694,7 +714,7 @@ fn normalization_and_scatter_independently_reject_poison_reversal_and_range_erro
             positions.output_arg(),
             probes as u32,
             10,
-            DEAD_ROW_SENTINEL,
+            RESIDENT_U32_SENTINEL,
         );
     }
     assert_eq!(
@@ -702,25 +722,25 @@ fn normalization_and_scatter_independently_reject_poison_reversal_and_range_erro
         vec![
             4,
             6,
-            DEAD_ROW_SENTINEL,
-            DEAD_ROW_SENTINEL,
-            DEAD_ROW_SENTINEL,
-            DEAD_ROW_SENTINEL,
-            DEAD_ROW_SENTINEL,
-            DEAD_ROW_SENTINEL,
-            DEAD_ROW_SENTINEL,
-            DEAD_ROW_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
         ]
     );
 
-    let rows = 6usize;
+    let rows = 8usize;
     let descriptors = context
         .upload_u32(&[0, CONSTANT_SOURCE, 0, CONSTANT_SOURCE, 0])
         .unwrap();
     let ranks = context
         .upload_u32(&[
-            DEAD_ROW_SENTINEL,
-            DEAD_ROW_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
             5,
             4,
             0,
@@ -731,9 +751,33 @@ fn normalization_and_scatter_independently_reject_poison_reversal_and_range_erro
             2,
             2,
             5,
+            3,
+            4,
+            1,
+            3,
         ])
         .unwrap();
-    let mut estimates = context.upload_u32(&[77; 6]).unwrap();
+    let positions = context
+        .upload_u32(&[
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            1,
+            2,
+            1,
+            2,
+            u32::MAX - 1,
+            u32::MAX - 1,
+            2,
+            2,
+            2,
+            5,
+            4,
+            4,
+            4,
+            5,
+        ])
+        .unwrap();
+    let mut estimates = context.upload_u32(&[77; 8]).unwrap();
     let dispatch = context
         .static_batch_dispatch(rows, rows, CubeDim::new_1d(THREADS))
         .unwrap();
@@ -743,31 +787,34 @@ fn normalization_and_scatter_independently_reject_poison_reversal_and_range_erro
             dispatch.cube_count(),
             dispatch.cube_dim(),
             descriptors.input_arg(),
+            positions.input_arg(),
             ranks.input_arg(),
             estimates.output_arg(),
             rows as u32,
             1,
             1,
             10,
-            DEAD_ROW_SENTINEL,
+            RESIDENT_U32_SENTINEL,
         );
     }
     assert_eq!(
         estimates.read(),
         vec![
-            DEAD_ROW_SENTINEL,
-            DEAD_ROW_SENTINEL,
-            DEAD_ROW_SENTINEL,
-            DEAD_ROW_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
             0,
             3,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
         ]
     );
 }
 
 #[test]
 fn restricted_geometry_excludes_the_reserved_sentinel() {
-    let limit = DEAD_ROW_SENTINEL as usize;
+    let limit = RESIDENT_U32_SENTINEL as usize;
     let largest = (limit - 1) / 2;
     assert_eq!(
         restricted_group_geometry(1, largest).unwrap(),
@@ -839,9 +886,7 @@ fn restricted_frontiers_preserve_round_ownership_and_global_dead_rows() {
         .unwrap();
     let (viable, estimates, choices) = run_outputs(&dead_round, &dead_host);
     assert_eq!(viable, vec![0; 65]);
-    assert!(estimates
-        .iter()
-        .all(|&estimate| estimate == DEAD_ROW_SENTINEL));
+    assert_eq!(estimates, vec![0; 65]);
     assert_eq!(choices, vec![ResidentRowChoice::dead(); 65]);
 }
 

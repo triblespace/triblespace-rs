@@ -1,6 +1,7 @@
 use super::*;
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use triblespace_core::blob::encodings::succinctarchive::query_program::{QueryPattern, QueryTerm};
 use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
@@ -489,6 +490,66 @@ fn absent_support_becomes_present_only_after_recompile_and_reencode() {
 }
 
 #[test]
+fn fully_bound_pipeline_preserves_present_absent_and_poison_states() {
+    let (set, ids) = fixture_set();
+    let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+    let resident = WgpuSuccinctArchive::new(archive).unwrap();
+    let program =
+        QueryProgram::compile(resident.archive(), 3, [QueryPattern::new(v(0), v(1), v(2))])
+            .unwrap();
+    let round = WgpuResidentRound::new(&resident, &program, &[v(0), v(1), v(2)]).unwrap();
+    let present = [
+        code(&program, ids.entities[0]),
+        code(&program, ids.attributes[0]),
+        code(&program, ids.values[0]),
+    ];
+    let absent = [
+        code(&program, ids.entities[1]),
+        code(&program, ids.attributes[0]),
+        code(&program, ids.values[1]),
+    ];
+    let domain = resident.archive().domain.len() as u32;
+    let frontier = WgpuResidentFrontier {
+        archive: &resident,
+        owner: round.frontier_owner.clone(),
+        lineage: Arc::new(()),
+        values: resident
+            .context()
+            .upload_u32(&[
+                present[0], present[1], present[2], absent[0], absent[1], absent[2], present[0],
+                present[1], domain,
+            ])
+            .unwrap(),
+        variables: vec![v(0), v(1), v(2)].into_boxed_slice(),
+        rows: 3,
+        stride: 3,
+    };
+    let inputs = round.initialize_inputs(&frontier).unwrap();
+    let choices = round.enqueue(&inputs).unwrap();
+    let (viability, estimates) = inputs.read_producer_outputs();
+    assert_eq!(viability, vec![1, 0, RESIDENT_U32_SENTINEL],);
+    assert!(estimates.is_empty());
+    assert_eq!(
+        choices.read_words_for_test(),
+        vec![
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            0,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            0,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+        ]
+    );
+    assert!(matches!(
+        choices.read(),
+        Err(ResidentRoundError::PoisonedDeviceChoice { row: 2 })
+    ));
+}
+
+#[test]
 fn pre_jerky_prepare_jointly_poisons_every_invalid_eav_source() {
     let (set, ids) = fixture_set();
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
@@ -507,9 +568,9 @@ fn pre_jerky_prepare_jointly_poisons_every_invalid_eav_source() {
         [domain, valid[1], valid[2]],
         [valid[0], domain, valid[2]],
         [valid[0], valid[1], domain],
-        [DEAD_ROW_SENTINEL, valid[1], valid[2]],
-        [valid[0], DEAD_ROW_SENTINEL, valid[2]],
-        [valid[0], valid[1], DEAD_ROW_SENTINEL],
+        [RESIDENT_U32_SENTINEL, valid[1], valid[2]],
+        [valid[0], RESIDENT_U32_SENTINEL, valid[2]],
+        [valid[0], valid[1], RESIDENT_U32_SENTINEL],
         [valid[0], u32::MAX - 1, valid[2]],
     ]
     .into_iter()
@@ -544,7 +605,7 @@ fn pre_jerky_prepare_jointly_poisons_every_invalid_eav_source() {
             3,
             1,
             domain,
-            DEAD_ROW_SENTINEL,
+            RESIDENT_U32_SENTINEL,
         );
     }
     let entity_queries = entity_queries.read();
@@ -558,11 +619,17 @@ fn pre_jerky_prepare_jointly_poisons_every_invalid_eav_source() {
     for row in 1..rows {
         assert_eq!(
             &entity_queries[row * 2..row * 2 + 2],
-            &[DEAD_ROW_SENTINEL; 2]
+            &[RESIDENT_U32_SENTINEL; 2]
         );
-        assert_eq!(attribute_queries[row], DEAD_ROW_SENTINEL);
-        assert_eq!(&eva_values[row * 2..row * 2 + 2], &[DEAD_ROW_SENTINEL; 2]);
-        assert_eq!(&aev_values[row * 2..row * 2 + 2], &[DEAD_ROW_SENTINEL; 2]);
+        assert_eq!(attribute_queries[row], RESIDENT_U32_SENTINEL);
+        assert_eq!(
+            &eva_values[row * 2..row * 2 + 2],
+            &[RESIDENT_U32_SENTINEL; 2]
+        );
+        assert_eq!(
+            &aev_values[row * 2..row * 2 + 2],
+            &[RESIDENT_U32_SENTINEL; 2]
+        );
     }
 
     // Malformed source kinds, out-of-stride columns, and sentinel constants
@@ -587,7 +654,7 @@ fn pre_jerky_prepare_jointly_poisons_every_invalid_eav_source() {
             CONSTANT_SOURCE,
             valid[1],
             CONSTANT_SOURCE,
-            DEAD_ROW_SENTINEL,
+            RESIDENT_U32_SENTINEL,
         ])
         .unwrap();
     let frontier = resident.context().upload_u32(&valid).unwrap();
@@ -615,43 +682,42 @@ fn pre_jerky_prepare_jointly_poisons_every_invalid_eav_source() {
             3,
             malformed_lanes as u32,
             domain,
-            DEAD_ROW_SENTINEL,
+            RESIDENT_U32_SENTINEL,
         );
     }
     assert_eq!(
         entity_queries.read(),
-        vec![DEAD_ROW_SENTINEL; malformed_lanes * 2]
+        vec![RESIDENT_U32_SENTINEL; malformed_lanes * 2]
     );
     assert_eq!(
         attribute_queries.read(),
-        vec![DEAD_ROW_SENTINEL; malformed_lanes]
+        vec![RESIDENT_U32_SENTINEL; malformed_lanes]
     );
     assert_eq!(
         eva_values.read(),
-        vec![DEAD_ROW_SENTINEL; malformed_lanes * 2]
+        vec![RESIDENT_U32_SENTINEL; malformed_lanes * 2]
     );
     assert_eq!(
         aev_values.read(),
-        vec![DEAD_ROW_SENTINEL; malformed_lanes * 2]
+        vec![RESIDENT_U32_SENTINEL; malformed_lanes * 2]
     );
 }
 
 #[test]
-fn normalization_rejects_sentinel_reversal_underflow_range_and_bad_codes() {
+fn normalization_poisons_only_derived_outputs_and_preserves_predecessors() {
     let (set, _) = fixture_set();
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
     let resident = WgpuSuccinctArchive::new(archive).unwrap();
     let context = resident.context();
-    let lanes = 7usize;
-    let mut entity_queries = context
-        .upload_u32(&[1, 2, 1, 2, 1, 2, 5, 6, 1, 2, 1, 2, 10, 11])
-        .unwrap();
-    let entity_selected = context
+    let lanes = 10usize;
+    let entity_query_words = [1, 2, 1, 2, 1, 2, 5, 6, 1, 2, 1, 2, 10, 11, 1, 2, 1, 2, 1, 2];
+    let entity_queries = context.upload_u32(&entity_query_words).unwrap();
+    let mut eva_positions = context
         .upload_u32(&[
             3,
             5,
-            DEAD_ROW_SENTINEL,
-            DEAD_ROW_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
             8,
             3,
             4,
@@ -662,16 +728,21 @@ fn normalization_rejects_sentinel_reversal_underflow_range_and_bad_codes() {
             5,
             12,
             13,
+            3,
+            5,
+            3,
+            5,
+            3,
+            5,
         ])
         .unwrap();
-    let mut attribute_queries = context.upload_u32(&[1, 1, 1, 1, 1, 5, 1]).unwrap();
-    let attribute_selected = context.upload_u32(&[4, 4, 4, 4, 4, 4, 4]).unwrap();
-    let mut eva_values = context
-        .upload_u32(&[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 5, 5, 1, 1])
-        .unwrap();
-    let mut aev_values = context.upload_u32(&[2; 14]).unwrap();
-    let mut eva_positions = context.empty_u32(14).unwrap();
-    let mut attribute_bases = context.empty_u32(lanes).unwrap();
+    let attribute_query_words = [1, 1, 1, 1, 1, 5, 1, 1, 1, 1];
+    let attribute_queries = context.upload_u32(&attribute_query_words).unwrap();
+    let mut attribute_bases = context.upload_u32(&[4; 10]).unwrap();
+    let eva_value_words = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 5, 5, 1, 1, 2, 2, 1, 1, 1, 1];
+    let eva_values = context.upload_u32(&eva_value_words).unwrap();
+    let aev_value_words = [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 10, 10, 2, 3];
+    let aev_values = context.upload_u32(&aev_value_words).unwrap();
     let dispatch = context
         .static_batch_dispatch(lanes, lanes, CubeDim::new_1d(THREADS))
         .unwrap();
@@ -680,42 +751,44 @@ fn normalization_rejects_sentinel_reversal_underflow_range_and_bad_codes() {
             context.client(),
             dispatch.cube_count(),
             dispatch.cube_dim(),
-            entity_queries.output_arg(),
-            entity_selected.input_arg(),
-            attribute_queries.output_arg(),
-            attribute_selected.input_arg(),
-            eva_values.output_arg(),
-            aev_values.output_arg(),
+            entity_queries.input_arg(),
             eva_positions.output_arg(),
+            attribute_queries.input_arg(),
             attribute_bases.output_arg(),
+            eva_values.input_arg(),
+            aev_values.input_arg(),
             lanes as u32,
             10,
             10,
             10,
-            DEAD_ROW_SENTINEL,
+            RESIDENT_U32_SENTINEL,
         );
     }
+    let mut eva_ranks = context.empty_u32(lanes * 2).unwrap();
+    resident
+        .ring_col(SuccinctRotation::Eva)
+        .rank_batch_into(&eva_positions, &eva_values, &mut eva_ranks)
+        .unwrap();
     let positions = eva_positions.read();
     let bases = attribute_bases.read();
+    let ranks = eva_ranks.read();
     assert_eq!(&positions[0..2], &[2, 3]);
     assert_eq!(bases[0], 3);
-    for lane in 1..lanes {
-        assert_eq!(&positions[lane * 2..lane * 2 + 2], &[DEAD_ROW_SENTINEL; 2]);
-        assert_eq!(bases[lane], DEAD_ROW_SENTINEL);
-    }
-    let entity_queries = entity_queries.read();
-    let attribute_queries = attribute_queries.read();
-    let eva_values = eva_values.read();
-    let aev_values = aev_values.read();
+    assert!(ranks[0..2]
+        .iter()
+        .all(|&rank| rank != RESIDENT_U32_SENTINEL));
     for lane in 1..lanes {
         assert_eq!(
-            &entity_queries[lane * 2..lane * 2 + 2],
-            &[DEAD_ROW_SENTINEL; 2]
+            &positions[lane * 2..lane * 2 + 2],
+            &[RESIDENT_U32_SENTINEL; 2]
         );
-        assert_eq!(attribute_queries[lane], DEAD_ROW_SENTINEL);
-        assert_eq!(&eva_values[lane * 2..lane * 2 + 2], &[DEAD_ROW_SENTINEL; 2]);
-        assert_eq!(&aev_values[lane * 2..lane * 2 + 2], &[DEAD_ROW_SENTINEL; 2]);
+        assert_eq!(bases[lane], RESIDENT_U32_SENTINEL);
+        assert_eq!(&ranks[lane * 2..lane * 2 + 2], &[RESIDENT_U32_SENTINEL; 2]);
     }
+    assert_eq!(entity_queries.read(), entity_query_words);
+    assert_eq!(attribute_queries.read(), attribute_query_words);
+    assert_eq!(eva_values.read(), eva_value_words);
+    assert_eq!(aev_values.read(), aev_value_words);
 }
 
 #[test]
@@ -724,13 +797,13 @@ fn anchor_rejects_malformed_ranks_positions_values_and_addition_overflow() {
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
     let resident = WgpuSuccinctArchive::new(archive).unwrap();
     let context = resident.context();
-    let lanes = 13usize;
+    let lanes = 15usize;
     let eva_positions = context
         .upload_u32(&[
             2,
             5,
-            DEAD_ROW_SENTINEL,
-            DEAD_ROW_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
             8,
             3,
             2,
@@ -753,6 +826,10 @@ fn anchor_rejects_malformed_ranks_positions_values_and_addition_overflow() {
             5,
             2,
             5,
+            3,
+            3,
+            3,
+            4,
         ])
         .unwrap();
     let eva_ranks = context
@@ -765,8 +842,8 @@ fn anchor_rejects_malformed_ranks_positions_values_and_addition_overflow() {
             3,
             1,
             3,
-            DEAD_ROW_SENTINEL,
-            DEAD_ROW_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
             4,
             2,
             1,
@@ -783,6 +860,10 @@ fn anchor_rejects_malformed_ranks_positions_values_and_addition_overflow() {
             3,
             1,
             3,
+            1,
+            2,
+            1,
+            3,
         ])
         .unwrap();
     let bases = context
@@ -795,8 +876,10 @@ fn anchor_rejects_malformed_ranks_positions_values_and_addition_overflow() {
             4,
             4,
             4,
-            DEAD_ROW_SENTINEL,
+            RESIDENT_U32_SENTINEL,
             u32::MAX - 2,
+            4,
+            4,
             4,
             4,
             4,
@@ -824,12 +907,16 @@ fn anchor_rejects_malformed_ranks_positions_values_and_addition_overflow() {
             2,
             2,
             2,
-            DEAD_ROW_SENTINEL,
-            DEAD_ROW_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
             10,
             10,
             2,
             3,
+            2,
+            2,
+            2,
+            2,
         ])
         .unwrap();
     let mut positions = context.empty_u32(lanes * 2).unwrap();
@@ -850,17 +937,20 @@ fn anchor_rejects_malformed_ranks_positions_values_and_addition_overflow() {
             20,
             u32::MAX - 1,
             10,
-            DEAD_ROW_SENTINEL,
+            RESIDENT_U32_SENTINEL,
         );
     }
     let positions = positions.read();
     assert_eq!(&positions[0..2], &[5, 7]);
     for lane in 1..lanes {
-        assert_eq!(&positions[lane * 2..lane * 2 + 2], &[DEAD_ROW_SENTINEL; 2]);
+        assert_eq!(
+            &positions[lane * 2..lane * 2 + 2],
+            &[RESIDENT_U32_SENTINEL; 2]
+        );
     }
     let values = values.read();
     for lane in 1..lanes {
-        assert_eq!(&values[lane * 2..lane * 2 + 2], &[DEAD_ROW_SENTINEL; 2]);
+        assert_eq!(&values[lane * 2..lane * 2 + 2], &[RESIDENT_U32_SENTINEL; 2]);
     }
 }
 
@@ -870,29 +960,44 @@ fn final_support_reduction_has_one_row_writer_and_fails_closed() {
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
     let resident = WgpuSuccinctArchive::new(archive).unwrap();
     let context = resident.context();
-    let rows = 7usize;
+    let present = ([1, 3], [0, 1]);
+    let absent = ([1, 3], [1, 1]);
+    let poisoned = ([RESIDENT_U32_SENTINEL; 2], [0, 1]);
+    let reversed = ([3, 1], [0, 1]);
+    let out_of_range = ([1, 3], [0, 11]);
+    let duplicate = ([2, 4], [0, 2]);
+    let first = [
+        present, present, present, present, present, present, present, present, absent, poisoned,
+        duplicate,
+    ];
+    let second = [
+        present,
+        absent,
+        poisoned,
+        reversed,
+        out_of_range,
+        poisoned,
+        present,
+        present,
+        poisoned,
+        absent,
+        present,
+    ];
+    let rows = first.len();
     let supports = 2usize;
     let mut positions = Vec::new();
     let mut ranks = Vec::new();
-    for _ in 0..rows {
-        positions.extend([1, 3]);
-        ranks.extend([0, 1]);
-    }
-    for row in 0..rows {
-        let (position, rank) = match row {
-            0 | 5 | 6 => ([1, 3], [0, 1]),
-            1 => ([1, 3], [1, 1]),
-            2 => ([DEAD_ROW_SENTINEL; 2], [0, 1]),
-            3 => ([3, 1], [0, 1]),
-            4 => ([1, 3], [0, 11]),
-            _ => unreachable!(),
-        };
-        positions.extend(position);
-        ranks.extend(rank);
+    for lanes in [&first, &second] {
+        for &(position, rank) in lanes {
+            positions.extend(position);
+            ranks.extend(rank);
+        }
     }
     let positions = context.upload_u32(&positions).unwrap();
     let ranks = context.upload_u32(&ranks).unwrap();
-    let mut viable = context.upload_u32(&[1, 1, 1, 1, 1, 0, 2]).unwrap();
+    let mut viable = context
+        .upload_u32(&[1, 1, 1, 1, 1, 0, 2, 0, 1, 1, 1])
+        .unwrap();
     let dispatch = context
         .static_batch_dispatch(rows, rows, CubeDim::new_1d(THREADS))
         .unwrap();
@@ -907,15 +1012,30 @@ fn final_support_reduction_has_one_row_writer_and_fails_closed() {
             rows as u32,
             supports as u32,
             10,
-            DEAD_ROW_SENTINEL,
+            RESIDENT_U32_SENTINEL,
         );
     }
-    assert_eq!(viable.read(), vec![1, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        viable.read(),
+        vec![
+            1,
+            0,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            0,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+        ]
+    );
 }
 
 #[test]
 fn fully_bound_geometry_excludes_the_reserved_sentinel() {
-    let limit = DEAD_ROW_SENTINEL as usize;
+    let limit = RESIDENT_U32_SENTINEL as usize;
     let largest = (limit - 1) / 2;
     assert_eq!(
         fully_bound_group_geometry(1, largest).unwrap(),
