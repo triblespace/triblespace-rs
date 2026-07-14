@@ -524,6 +524,23 @@ fn fixture(parents: usize) -> (IntersectionConstraint<TableChild>, Arc<Mutex<Tra
     (root, trace)
 }
 
+fn negative_fixture(
+    parents: usize,
+) -> (
+    IntersectionConstraint<OwnedConstraint>,
+    Arc<Mutex<Trace>>,
+    Arc<Mutex<VerbCounts>>,
+) {
+    let trace = Arc::new(Mutex::new(Trace::default()));
+    let (empty, empty_calls) = finite_domain(X, Vec::new(), 16);
+    let root = IntersectionConstraint::new(vec![
+        Box::new(TableChild::domain(parents, 0, Arc::clone(&trace))) as OwnedConstraint,
+        Box::new(TableChild::relation(Child::A, parents, Arc::clone(&trace))) as OwnedConstraint,
+        Box::new(empty) as OwnedConstraint,
+    ]);
+    (root, trace, empty_calls)
+}
+
 fn nested_fixture(parents: usize) -> (IntersectionConstraint<OwnedConstraint>, Arc<Mutex<Trace>>) {
     let trace = Arc::new(Mutex::new(Trace::default()));
     let tail = IntersectionConstraint::new(vec![
@@ -958,6 +975,180 @@ fn lazy_width_one_reaches_a_result_before_draining_sibling_parents() {
 }
 
 #[test]
+fn successful_first_path_has_the_same_ordered_trace_before_growth() {
+    const N: usize = 12;
+    let run = |growth| {
+        let (root, trace) = fixture(N);
+        let mut lazy = Query::new(root, project_pair)
+            .solve_residual_state_lazy()
+            .cap(8)
+            .start_width(1)
+            .growth(growth);
+        let first = lazy.next().expect("fixture has a first result");
+        let calls = trace.lock().unwrap().calls.clone();
+        let stats = lazy.stats().clone();
+        (first, calls, stats, lazy.current_width())
+    };
+
+    let (fixed_first, fixed_calls, fixed_stats, fixed_width) = run(1);
+    let (grown_first, grown_calls, grown_stats, grown_width) = run(2);
+
+    assert_eq!(fixed_first, grown_first);
+    assert_eq!(fixed_calls, grown_calls);
+    assert_eq!(fixed_stats.state_pops, grown_stats.state_pops);
+    assert_eq!(fixed_stats.propose_calls, grown_stats.propose_calls);
+    assert_eq!(fixed_stats.confirm_calls, grown_stats.confirm_calls);
+    assert_eq!(fixed_stats.max_propose_rows, 1);
+    assert_eq!(fixed_stats.max_confirm_rows, 1);
+    assert_eq!(grown_stats.max_propose_rows, 1);
+    assert_eq!(grown_stats.max_confirm_rows, 1);
+    assert_eq!(fixed_stats.dead_action_pops, 0);
+    assert_eq!(grown_stats.dead_action_pops, 0);
+    assert_eq!((fixed_width, fixed_stats.width_increases), (1, 0));
+    assert_eq!((grown_width, grown_stats.width_increases), (2, 1));
+}
+
+#[test]
+fn dead_paths_ramp_within_one_negative_pull() {
+    const N: usize = 16;
+    const CAP: usize = 8;
+    let run = |growth| {
+        let (root, trace, empty_calls) = negative_fixture(N);
+        let mut lazy = Query::new(root, project_same)
+            .solve_residual_state_lazy()
+            .cap(CAP)
+            .start_width(1)
+            .growth(growth);
+        assert_eq!(lazy.next(), None);
+        let calls = trace.lock().unwrap().calls.clone();
+        let empty_confirms = empty_calls.lock().unwrap().confirm;
+        let stats = lazy.stats().clone();
+        (calls, empty_confirms, stats, lazy.current_width())
+    };
+
+    let (fixed_calls, fixed_confirms, fixed, fixed_width) = run(1);
+    let (grown_calls, grown_confirms, grown, grown_width) = run(2);
+    let x_proposal_rows = |calls: &[Call]| {
+        calls
+            .iter()
+            .filter(|call| {
+                call.child == Child::A && call.verb == Verb::Propose && call.variable == X
+            })
+            .map(|call| call.rows)
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(x_proposal_rows(&fixed_calls), vec![1; N]);
+    assert_eq!(x_proposal_rows(&grown_calls), [1, 2, 4, 8, 1]);
+    assert_eq!((fixed_confirms, fixed.dead_action_pops), (N, N));
+    assert_eq!((grown_confirms, grown.dead_action_pops), (5, 5));
+    assert_eq!((fixed.max_propose_rows, fixed.max_confirm_rows), (1, 1));
+    assert_eq!((grown.max_propose_rows, grown.max_confirm_rows), (8, 8));
+    assert_eq!((fixed_width, fixed.width_increases), (1, 0));
+    assert_eq!((grown_width, grown.width_increases), (CAP, 3));
+    assert_eq!(fixed.emit_pops, 0);
+    assert_eq!(grown.emit_pops, 0);
+
+    assert_eq!(fixed.state_pops, 69);
+    assert_eq!(
+        (
+            fixed.ready_plan_pops,
+            fixed.propose_action_pops,
+            fixed.candidate_plan_pops,
+            fixed.confirm_action_pops,
+        ),
+        (17, 17, 18, 17)
+    );
+    assert_eq!((fixed.states_interned, fixed.state_reentries), (9, 45));
+    assert_eq!((fixed.rows_reentered, fixed.bucket_merges), (45, 0));
+    assert_eq!(
+        (fixed.full_pops, fixed.readiness_pops, fixed.partial_pops),
+        (69, 0, 15)
+    );
+    assert_eq!(
+        (
+            fixed.propose_calls,
+            fixed.confirm_calls,
+            fixed.propose_rows,
+            fixed.confirm_rows,
+        ),
+        (17, 17, 17, 17)
+    );
+
+    assert_eq!(grown.state_pops, 25);
+    assert_eq!(
+        (
+            grown.ready_plan_pops,
+            grown.propose_action_pops,
+            grown.candidate_plan_pops,
+            grown.confirm_action_pops,
+        ),
+        (6, 6, 7, 6)
+    );
+    assert_eq!((grown.states_interned, grown.state_reentries), (9, 12));
+    assert_eq!((grown.rows_reentered, grown.bucket_merges), (45, 0));
+    assert_eq!(
+        (grown.full_pops, grown.readiness_pops, grown.partial_pops),
+        (21, 4, 4)
+    );
+    assert_eq!(
+        (
+            grown.propose_calls,
+            grown.confirm_calls,
+            grown.propose_rows,
+            grown.confirm_rows,
+        ),
+        (6, 6, 17, 17)
+    );
+
+    let (eager_root, _, _) = negative_fixture(N);
+    let eager = Query::new(eager_root, project_same).solve_residual_state_profiled();
+    assert!(eager.results.is_empty());
+    let eager = eager.stats;
+    assert_eq!((eager.state_pops, eager.readiness_pops), (9, 9));
+    assert_eq!(eager.full_pops, 0);
+    assert_eq!(
+        (
+            eager.ready_plan_pops,
+            eager.propose_action_pops,
+            eager.candidate_plan_pops,
+            eager.confirm_action_pops,
+        ),
+        (2, 2, 3, 2)
+    );
+    assert_eq!((eager.dead_action_pops, eager.width_increases), (1, 0));
+    assert_eq!(
+        (
+            eager.propose_calls,
+            eager.confirm_calls,
+            eager.propose_rows,
+            eager.confirm_rows,
+            eager.max_propose_rows,
+            eager.max_confirm_rows,
+        ),
+        (2, 2, 17, 17, N, N)
+    );
+}
+
+#[test]
+fn rejected_projection_still_grows_after_raw_emit() {
+    let values: Vec<_> = (0..7).map(|index| encoded(b'e', index)).collect();
+    let (domain, _) = finite_domain(P, values, 1);
+    let root = IntersectionConstraint::new(vec![domain]);
+    let mut lazy = Query::new(root, |_: &Binding| None::<()>)
+        .solve_residual_state_lazy()
+        .cap(4)
+        .start_width(1)
+        .growth(2);
+
+    assert_eq!(lazy.next(), None);
+    assert_eq!(lazy.current_width(), 4);
+    assert_eq!(lazy.stats().emit_pops, 3);
+    assert_eq!(lazy.stats().width_increases, 2);
+    assert_eq!(lazy.stats().dead_action_pops, 0);
+}
+
+#[test]
 fn lazy_fixed_width_reopens_states_without_changing_the_result_bag() {
     const N: usize = 12;
     let (root, _) = fixture(N);
@@ -1243,6 +1434,7 @@ fn an_empty_zero_estimate_route_finishes_without_a_result() {
     let residual = Query::new(root, project_parent).solve_residual_state_profiled();
     assert!(residual.results.is_empty());
     assert_eq!(residual.stats.propose_calls, 1);
+    assert_eq!(residual.stats.dead_action_pops, 1);
 
     let calls = &trace.lock().unwrap().calls;
     assert_eq!(calls.len(), 1);
@@ -1270,12 +1462,18 @@ fn zero_variable_intersections_emit_the_empty_binding_iff_true() {
         Query::new(IntersectionConstraint::<Truth>::new(Vec::new()), project)
             .sequential()
             .collect();
-    let lazy_true: Vec<_> = Query::new(IntersectionConstraint::<Truth>::new(Vec::new()), project)
+    let mut lazy_true = Query::new(IntersectionConstraint::<Truth>::new(Vec::new()), project)
         .solve_residual_state_lazy()
-        .collect();
+        .cap(4)
+        .start_width(1)
+        .growth(2);
+    assert_eq!(lazy_true.next(), Some("empty binding"));
+    assert_eq!(lazy_true.current_width(), 2);
+    assert_eq!(lazy_true.stats().emit_pops, 1);
+    assert_eq!(lazy_true.stats().width_increases, 1);
+    assert_eq!(lazy_true.next(), None);
     assert_eq!(residual_true.results, ["empty binding"]);
     assert_eq!(residual_true.results, sequential_true);
-    assert_eq!(residual_true.results, lazy_true);
     assert_eq!(residual_true.stats.state_pops, 1);
 
     let residual_false = Query::new(IntersectionConstraint::new(vec![Truth(false)]), project)
@@ -1289,9 +1487,16 @@ fn zero_variable_intersections_emit_the_empty_binding_iff_true() {
     assert_eq!(residual_false.stats.state_pops, 0);
 
     let mut lazy_false = Query::new(IntersectionConstraint::new(vec![Truth(false)]), project)
-        .solve_residual_state_lazy();
+        .solve_residual_state_lazy()
+        .cap(4)
+        .start_width(1)
+        .growth(2);
     assert!(lazy_false.next().is_none());
     assert!(lazy_false.next().is_none());
+    assert_eq!(lazy_false.current_width(), 1);
+    assert_eq!(lazy_false.stats().width_increases, 0);
+    assert_eq!(lazy_false.stats().emit_pops, 0);
+    assert_eq!(lazy_false.stats().dead_action_pops, 0);
 }
 
 fn equality_fixture() -> (

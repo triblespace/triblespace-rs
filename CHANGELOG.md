@@ -25,16 +25,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   leaf-call batch measurements.
 - **Canonical residual states gain a demand-driven batch-fill iterator.**
   `solve_residual_state_lazy` starts with a narrow desired parent-atom width so
-  descendants can yield before sibling rows are evaluated, then widens between
-  output-producing resumptions on continued demand. The deepest live state able
-  to fill that width wins; when none can, minimum-rank readiness drains the
-  remaining feeder frontier. The saturation cap only bounds width growth.
-  Candidate chunks keep each parent and its complete ragged candidate group
-  together; this makes a parent a semantics-safe occupancy unit, though
-  candidate fanout means it is not a total-work estimate. Exact descriptors
-  remain interned so early states can safely reopen when later histories reach
-  them. Full drains preserve the eager solver's result bag; partial consumers
-  may drop the remaining affine frontier after the first useful result.
+  descendants can yield before sibling rows are evaluated. Filing a nonempty
+  successor—including a merge into an already-live bucket—keeps that width;
+  an action that compacts to no successor or raw terminal output grows it
+  geometrically. Successful first paths therefore retain their exact width-one
+  trace, while negative prefixes ramp within a single pull even when no result
+  is ever projected. The deepest live state able to fill the desired width
+  wins; when none can, minimum-rank readiness drains the remaining feeder
+  frontier. The saturation cap only bounds width growth. Candidate chunks keep
+  each parent and its complete ragged candidate group together; this makes a
+  parent a semantics-safe occupancy unit, though candidate fanout means it is
+  not a total-work estimate. Exact descriptors remain interned so early states
+  can safely reopen when later histories reach them. Full drains preserve the
+  eager solver's result bag; partial consumers may drop the remaining affine
+  frontier after the first useful result.
 - **Index homes use typed artifacts over exact commit-DAG ranges.** Recipe
   descriptors are self-marked, losslessly retained manifest headers with a
   repeated maximal certified frontier. Inclusive range records carry one LSM

@@ -19,6 +19,12 @@
 //! without sacrificing width-one depth-first latency. Parent atoms are a
 //! semantics-safe chunking unit, not a total-work estimate: ragged candidate
 //! fanout can make equally wide Confirm buckets cost different amounts.
+//! Execution classifies every pop as `Advanced`, `Dead`, or terminal `Emit`.
+//! Lazy width is unchanged while nonempty successors advance—even when they
+//! merge into an already-live bucket—and grows geometrically after an action
+//! dies or raw rows reach projection. A successful first depth-first path thus
+//! keeps its exact width-one trace, while a negative prefix can widen within a
+//! single pull.
 //!
 //! As with the other batched engines, flattened leaves must obey the
 //! [`Constraint::estimate`] protocol: relevance is a structural answer,
@@ -127,6 +133,9 @@ pub struct ResidualStateStats {
     pub propose_action_pops: usize,
     /// Explicit confirmation-action chunks that invoked one flattened leaf.
     pub confirm_action_pops: usize,
+    /// Proposal or confirmation action pops whose candidates compacted to no
+    /// successor rows.
+    pub dead_action_pops: usize,
     /// Terminal Ready-state chunks emitted for projection.
     pub emit_pops: usize,
     /// Full parent-atom-width chunks selected from the maximum eligible rank.
@@ -156,6 +165,9 @@ pub struct ResidualStateStats {
     pub max_propose_rows: usize,
     /// Largest flattened-leaf confirmation batch.
     pub max_confirm_rows: usize,
+    /// Numeric increases of the lazy scheduler's desired parent-atom width.
+    /// Saturated or growth-one attempts do not increment this counter.
+    pub width_increases: usize,
 }
 
 /// Results and measurements from [`Query::solve_residual_state_profiled`].
@@ -666,9 +678,9 @@ fn file(
     desc: StateDesc,
     bucket: StateBucket,
     stats: &mut ResidualStateStats,
-) {
+) -> bool {
     if bucket.row_count() == 0 {
-        return;
+        return false;
     }
     let rank = desc.rank(leaf_count);
     let (id, known) = interner.intern_with_status(desc, stats);
@@ -684,6 +696,7 @@ fn file(
         }
         level.insert(id, bucket);
     }
+    true
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -757,7 +770,7 @@ fn ready_plan_transition<'a, C: Constraint<'a> + 'a>(
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
-) {
+) -> bool {
     let leaf_count = plan.len();
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
     let view = rows_view(&vars, &rows.rows, rows.row_count);
@@ -852,7 +865,7 @@ fn ready_plan_transition<'a, C: Constraint<'a> + 'a>(
             },
             StateBucket::Rows(selected),
             stats,
-        );
+        )
     };
 
     if groups.len() == 1 {
@@ -860,12 +873,14 @@ fn ready_plan_transition<'a, C: Constraint<'a> + 'a>(
         debug_assert_eq!(indices.len(), rows.row_count);
         // The common case transfers ownership of the whole parent block:
         // no row copy is necessary when every row chose the same action.
-        file_propose_group(action, rows);
+        file_propose_group(action, rows)
     } else {
+        let mut advanced = false;
         for (action, indices) in groups {
             let selected = rows.selected(vars.len(), &indices);
-            file_propose_group(action, selected);
+            advanced |= file_propose_group(action, selected);
         }
+        advanced
     }
 }
 
@@ -880,7 +895,7 @@ fn propose_action_transition<'a, C: Constraint<'a> + 'a>(
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
-) {
+) -> bool {
     let leaf_count = plan.len();
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
     let view = rows_view(&vars, &rows.rows, rows.row_count);
@@ -918,7 +933,9 @@ fn propose_action_transition<'a, C: Constraint<'a> + 'a>(
             },
             StateBucket::Candidates(candidate),
             stats,
-        );
+        )
+    } else {
+        false
     }
 }
 
@@ -930,7 +947,7 @@ fn commit_candidates(
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
-) {
+) -> bool {
     let parent_vars: Vec<VariableId> = desc.bound.into_iter().collect();
     let mut next_bound = desc.bound;
     next_bound.set(variable);
@@ -970,7 +987,7 @@ fn commit_candidates(
             row_count,
         }),
         stats,
-    );
+    )
 }
 
 fn candidate_plan_transition<'a, C: Constraint<'a> + 'a>(
@@ -984,11 +1001,10 @@ fn candidate_plan_transition<'a, C: Constraint<'a> + 'a>(
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
-) {
+) -> bool {
     let leaf_count = plan.len();
     if relevant == checked {
-        commit_candidates(desc, variable, batch, leaf_count, worklist, interner, stats);
-        return;
+        return commit_candidates(desc, variable, batch, leaf_count, worklist, interner, stats);
     }
 
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
@@ -1046,18 +1062,20 @@ fn candidate_plan_transition<'a, C: Constraint<'a> + 'a>(
             },
             StateBucket::Candidates(selected),
             stats,
-        );
+        )
     };
 
     let first = confirmers[0];
     if confirmers.iter().all(|&leaf| leaf == first) {
         // The common case keeps ownership of the whole ragged block: no
         // parent copy, candidate rescan, or row-tag remap is necessary.
-        file_confirm_group(first, batch);
+        file_confirm_group(first, batch)
     } else {
+        let mut advanced = false;
         for (leaf, selected) in batch.partition(vars.len(), &confirmers) {
-            file_confirm_group(leaf, selected);
+            advanced |= file_confirm_group(leaf, selected);
         }
+        advanced
     }
 }
 
@@ -1073,7 +1091,7 @@ fn confirm_action_transition<'a, C: Constraint<'a> + 'a>(
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
-) {
+) -> bool {
     let leaf_count = plan.len();
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
     let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
@@ -1104,13 +1122,28 @@ fn confirm_action_transition<'a, C: Constraint<'a> + 'a>(
             },
             StateBucket::Candidates(batch),
             stats,
-        );
+        )
+    } else {
+        false
     }
 }
 
+/// Semantic result of executing one selected residual-state chunk.
+#[derive(Debug)]
+enum StepOutcome {
+    /// At least one nonempty successor was filed, including a merge into an
+    /// already-live canonical bucket.
+    Advanced,
+    /// An action compacted to no successor rows.
+    Dead,
+    /// Full-bound rows are ready for projection.
+    Emit(RowBatch),
+}
+
 /// Executes one canonical control state after the scheduler has selected its
-/// affine payload chunk. Full-bound rows are returned in raw form so eager and
-/// lazy callers can project or stage them without duplicating phase dispatch.
+/// affine payload chunk. The explicit outcome lets eager and lazy callers
+/// distinguish semantic progress, branch death, and terminal projection
+/// without inferring any of them from worklist size.
 fn execute_state<'a, C: Constraint<'a> + 'a>(
     root: &IntersectionConstraint<C>,
     plan: &ResidualPlan,
@@ -1122,15 +1155,15 @@ fn execute_state<'a, C: Constraint<'a> + 'a>(
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
-) -> Option<RowBatch> {
+) -> StepOutcome {
     match (&desc.phase, bucket) {
         (ResidualPhase::Ready, StateBucket::Rows(rows)) if desc.bound == full => {
             stats.emit_pops += 1;
-            Some(rows)
+            StepOutcome::Emit(rows)
         }
         (ResidualPhase::Ready, StateBucket::Rows(rows)) => {
             stats.ready_plan_pops += 1;
-            ready_plan_transition(
+            let advanced = ready_plan_transition(
                 root,
                 plan,
                 desc,
@@ -1142,7 +1175,8 @@ fn execute_state<'a, C: Constraint<'a> + 'a>(
                 interner,
                 stats,
             );
-            None
+            assert!(advanced, "Ready planning must file a nonempty action");
+            StepOutcome::Advanced
         }
         (
             ResidualPhase::Propose {
@@ -1153,10 +1187,15 @@ fn execute_state<'a, C: Constraint<'a> + 'a>(
             StateBucket::Rows(rows),
         ) => {
             stats.propose_action_pops += 1;
-            propose_action_transition(
+            let advanced = propose_action_transition(
                 root, plan, desc, *variable, relevant, *proposer, rows, worklist, interner, stats,
             );
-            None
+            if advanced {
+                StepOutcome::Advanced
+            } else {
+                stats.dead_action_pops += 1;
+                StepOutcome::Dead
+            }
         }
         (
             ResidualPhase::Candidate {
@@ -1167,10 +1206,11 @@ fn execute_state<'a, C: Constraint<'a> + 'a>(
             StateBucket::Candidates(batch),
         ) => {
             stats.candidate_plan_pops += 1;
-            candidate_plan_transition(
+            let advanced = candidate_plan_transition(
                 root, plan, desc, *variable, relevant, checked, batch, worklist, interner, stats,
             );
-            None
+            assert!(advanced, "Candidate planning must file a nonempty action");
+            StepOutcome::Advanced
         }
         (
             ResidualPhase::Confirm {
@@ -1182,11 +1222,16 @@ fn execute_state<'a, C: Constraint<'a> + 'a>(
             StateBucket::Candidates(batch),
         ) => {
             stats.confirm_action_pops += 1;
-            confirm_action_transition(
+            let advanced = confirm_action_transition(
                 root, plan, desc, *variable, relevant, checked, *confirmer, batch, worklist,
                 interner, stats,
             );
-            None
+            if advanced {
+                StepOutcome::Advanced
+            } else {
+                stats.dead_action_pops += 1;
+                StepOutcome::Dead
+            }
         }
         _ => panic!("canonical residual state received the wrong payload shape"),
     }
@@ -1331,11 +1376,11 @@ impl ResidualStateMachine {
         influences: &[VariableSet; 128],
         base_estimates: &[usize; 128],
         width: usize,
-    ) {
+    ) -> StepOutcome {
         let (desc, bucket) = self
             .take_next(width)
             .expect("pop_once requires a non-empty residual worklist");
-        if let Some(rows) = execute_state(
+        let outcome = execute_state(
             root,
             plan,
             &desc,
@@ -1346,14 +1391,27 @@ impl ResidualStateMachine {
             &mut self.worklist,
             &mut self.interner,
             &mut self.stats,
-        ) {
-            debug_assert!(self.emit_next >= self.emit_count);
+        );
+        if matches!(&outcome, StepOutcome::Emit(_)) {
             self.emit_vars.clear();
             self.emit_vars.extend(desc.bound);
-            self.emit_rows = rows.rows;
-            self.emit_next = 0;
-            self.emit_count = rows.row_count;
         }
+        outcome
+    }
+
+    fn increase_width(&mut self) {
+        let next = self.width.saturating_mul(self.growth).clamp(1, self.cap);
+        if next > self.width {
+            self.stats.width_increases += 1;
+        }
+        self.width = next;
+    }
+
+    fn stage_emit(&mut self, rows: RowBatch) {
+        debug_assert!(self.emit_next >= self.emit_count);
+        self.emit_rows = rows.rows;
+        self.emit_next = 0;
+        self.emit_count = rows.row_count;
     }
 
     fn pull<'a, C, P, R>(
@@ -1388,10 +1446,14 @@ impl ResidualStateMachine {
             }
 
             let width = self.width;
-            while self.emit_next >= self.emit_count && !self.worklist.is_empty() {
-                self.pop_once(root, plan, influences, base_estimates, width);
+            match self.pop_once(root, plan, influences, base_estimates, width) {
+                StepOutcome::Advanced => {}
+                StepOutcome::Dead => self.increase_width(),
+                StepOutcome::Emit(rows) => {
+                    self.stage_emit(rows);
+                    self.increase_width();
+                }
             }
-            self.width = self.width.saturating_mul(self.growth).clamp(1, self.cap);
         }
     }
 }
@@ -1400,9 +1462,10 @@ impl ResidualStateMachine {
 ///
 /// The iterator begins with a narrow desired parent-atom width, so full
 /// descendant buckets can produce a result before sibling rows are evaluated.
-/// With a growth factor above one, each output-producing engine resumption
-/// prepares a geometrically wider width for later frontier work. The deepest
-/// live bucket able to fill it wins; if none can, the minimum-rank bucket drains
+/// With a growth factor above one, semantic branch death or raw terminal output
+/// immediately prepares a geometrically wider width for later frontier work;
+/// filing any nonempty successor leaves the width unchanged. The deepest live
+/// bucket able to fill it wins; if none can, the minimum-rank bucket drains
 /// through the strict readiness gate. The cap only bounds geometric width
 /// growth and does not select a scheduling mode.
 ///
@@ -1529,7 +1592,7 @@ where
             debug_assert_eq!(desc.rank(leaf_count), rank);
             stats.state_pops += 1;
             stats.readiness_pops += 1;
-            if let Some(rows) = execute_state(
+            match execute_state(
                 root,
                 &plan,
                 &desc,
@@ -1541,15 +1604,18 @@ where
                 &mut interner,
                 &mut stats,
             ) {
-                let vars: Vec<VariableId> = desc.bound.into_iter().collect();
-                let view = rows_view(&vars, &rows.rows, rows.row_count);
-                for row in 0..rows.row_count {
-                    let row_view = view.row_view(row);
-                    for (column, &variable) in vars.iter().enumerate() {
-                        binding.set(variable, &row_view.row(0)[column]);
-                    }
-                    if let Some(result) = postprocessing(&binding) {
-                        results.push(result);
+                StepOutcome::Advanced | StepOutcome::Dead => {}
+                StepOutcome::Emit(rows) => {
+                    let vars: Vec<VariableId> = desc.bound.into_iter().collect();
+                    let view = rows_view(&vars, &rows.rows, rows.row_count);
+                    for row in 0..rows.row_count {
+                        let row_view = view.row_view(row);
+                        for (column, &variable) in vars.iter().enumerate() {
+                            binding.set(variable, &row_view.row(0)[column]);
+                        }
+                        if let Some(result) = postprocessing(&binding) {
+                            results.push(result);
+                        }
                     }
                 }
             }
@@ -1577,11 +1643,13 @@ where
 {
     /// Lazily executes a root intersection through canonical residual states.
     ///
-    /// The first pull uses a one-parent depth-first batch by default. Once a
-    /// pull stages output, later engine resumptions geometrically widen the
-    /// desired batch; whenever no live state can fill it, the minimum-rank state
-    /// drains readiness-safely. Result order may differ from the ordinary
-    /// iterator; a full drain preserves its result multiset.
+    /// The first pull uses a one-parent depth-first batch by default. Filing a
+    /// nonempty successor preserves that width; an action with no successor or
+    /// raw terminal output grows it geometrically for later work. This keeps a
+    /// successful first path at width one while allowing negative prefixes to
+    /// ramp within one pull. Whenever no live state can fill the desired width,
+    /// the minimum-rank state drains readiness-safely. Result order may differ
+    /// from the ordinary iterator; a full drain preserves its result multiset.
     ///
     /// # Panics
     ///
@@ -1835,6 +1903,51 @@ mod tests {
             if !self.accepts {
                 candidates.retain(|_, _| false);
             }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct FirstParentProposer {
+        parent: VariableId,
+        variable: VariableId,
+    }
+
+    impl Constraint<'static> for FirstParentProposer {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(self.parent).union(VariableSet::new_singleton(self.variable))
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != self.variable {
+                return false;
+            }
+            out.fill(1, view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            assert_eq!(variable, self.variable);
+            if view.len() != 0 {
+                candidates.push(0, raw(42));
+            }
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
         }
     }
 
@@ -2322,16 +2435,161 @@ mod tests {
         let influences = [VariableSet::new_empty(); 128];
         let base_estimates = [1; 128];
 
-        machine.pop_once(&root, &plan, &influences, &base_estimates, 1);
+        assert!(matches!(
+            machine.pop_once(&root, &plan, &influences, &base_estimates, 1),
+            StepOutcome::Advanced
+        ));
         assert_eq!(machine.stats.ready_plan_pops, 1);
         assert_eq!(machine.stats.propose_action_pops, 0);
         assert_eq!(machine.stats.propose_calls, 0);
         assert_eq!(proposes.load(Ordering::Relaxed), 0);
 
-        machine.pop_once(&root, &plan, &influences, &base_estimates, 1);
+        assert!(matches!(
+            machine.pop_once(&root, &plan, &influences, &base_estimates, 1),
+            StepOutcome::Advanced
+        ));
         assert_eq!(machine.stats.propose_action_pops, 1);
         assert_eq!(machine.stats.propose_calls, 1);
         assert_eq!(proposes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn successor_merge_into_an_already_live_state_is_advanced() {
+        let proposes = Arc::new(AtomicUsize::new(0));
+        let root = IntersectionConstraint::new(vec![VerbLeaf {
+            variable: 0,
+            estimate: 1,
+            accepts: true,
+            proposes: Arc::clone(&proposes),
+            confirms: Arc::new(AtomicUsize::new(0)),
+        }]);
+        let plan = ResidualPlan::compile(&root);
+        let mut relevant = ChildSet::empty(plan.len());
+        relevant.insert(0);
+        let mut checked = ChildSet::empty(plan.len());
+        checked.insert(0);
+        let candidate_desc = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Candidate {
+                variable: 0,
+                relevant: relevant.clone(),
+                checked,
+            },
+        };
+        let mut worklist = Worklist::new();
+        let mut interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        assert!(file(
+            &mut worklist,
+            &mut interner,
+            plan.len(),
+            candidate_desc,
+            StateBucket::Candidates(CandidateBatch {
+                parents: RowBatch::seed(),
+                candidates: vec![(0, raw(7))],
+            }),
+            &mut stats,
+        ));
+        let propose_desc = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Propose {
+                variable: 0,
+                relevant,
+                proposer: 0,
+            },
+        };
+
+        let outcome = execute_state(
+            &root,
+            &plan,
+            &propose_desc,
+            StateBucket::Rows(RowBatch::seed()),
+            root.variables(),
+            &[VariableSet::new_empty(); 128],
+            &[1; 128],
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+        );
+
+        assert!(matches!(outcome, StepOutcome::Advanced));
+        assert_eq!(stats.bucket_merges, 1);
+        assert_eq!(stats.rows_merged, 1);
+        assert_eq!(stats.dead_action_pops, 0);
+        assert_eq!(proposes.load(Ordering::Relaxed), 1);
+        let (_, level) = worklist.first_key_value().expect("candidate remains live");
+        assert_eq!(level.len(), 1);
+        assert_eq!(level.first_key_value().unwrap().1.row_count(), 2);
+    }
+
+    #[test]
+    fn action_with_partial_parent_survival_is_advanced() {
+        const PARENT: VariableId = 0;
+        const VARIABLE: VariableId = 1;
+        let root = IntersectionConstraint::new(vec![FirstParentProposer {
+            parent: PARENT,
+            variable: VARIABLE,
+        }]);
+        let plan = ResidualPlan::compile(&root);
+        let mut relevant = ChildSet::empty(plan.len());
+        relevant.insert(0);
+        let desc = StateDesc {
+            bound: VariableSet::new_singleton(PARENT),
+            phase: ResidualPhase::Propose {
+                variable: VARIABLE,
+                relevant,
+                proposer: 0,
+            },
+        };
+        let mut worklist = Worklist::new();
+        let mut interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+
+        let outcome = execute_state(
+            &root,
+            &plan,
+            &desc,
+            StateBucket::Rows(RowBatch {
+                rows: vec![raw(10), raw(11)],
+                row_count: 2,
+            }),
+            root.variables(),
+            &[VariableSet::new_empty(); 128],
+            &[1; 128],
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+        );
+
+        assert!(matches!(outcome, StepOutcome::Advanced));
+        assert_eq!(stats.dead_action_pops, 0);
+        assert_eq!((stats.propose_rows, stats.max_propose_rows), (2, 2));
+        let (_, level) = worklist.first_key_value().expect("one parent survived");
+        let bucket = level.first_key_value().unwrap().1;
+        assert_eq!(bucket.row_count(), 1);
+        let StateBucket::Candidates(batch) = bucket else {
+            panic!("partial proposal did not file candidates")
+        };
+        assert_eq!(batch.parents.rows, [raw(10)]);
+        assert_eq!(batch.candidates, [(0, raw(42))]);
+    }
+
+    #[test]
+    fn width_increases_count_only_numeric_growth_before_saturation() {
+        let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 0, Search::Done);
+        machine.width = 1;
+        machine.growth = 1;
+        machine.cap = 4;
+        machine.increase_width();
+        assert_eq!((machine.width, machine.stats.width_increases), (1, 0));
+
+        machine.growth = 2;
+        machine.increase_width();
+        assert_eq!((machine.width, machine.stats.width_increases), (2, 1));
+        machine.increase_width();
+        assert_eq!((machine.width, machine.stats.width_increases), (4, 2));
+        machine.increase_width();
+        assert_eq!((machine.width, machine.stats.width_increases), (4, 2));
     }
 
     #[test]
@@ -2378,19 +2636,21 @@ mod tests {
         let influences = [VariableSet::new_empty(); 128];
         let base_estimates = [1; 128];
 
-        assert!(execute_state(
-            &root,
-            &plan,
-            &candidate_desc,
-            candidate_bucket,
-            root.variables(),
-            &influences,
-            &base_estimates,
-            &mut worklist,
-            &mut interner,
-            &mut stats,
-        )
-        .is_none());
+        assert!(matches!(
+            execute_state(
+                &root,
+                &plan,
+                &candidate_desc,
+                candidate_bucket,
+                root.variables(),
+                &influences,
+                &base_estimates,
+                &mut worklist,
+                &mut interner,
+                &mut stats,
+            ),
+            StepOutcome::Advanced
+        ));
         assert_eq!(stats.candidate_plan_pops, 1);
         assert_eq!(stats.confirm_action_pops, 0);
         assert_eq!(stats.confirm_calls, 0);
@@ -2403,19 +2663,21 @@ mod tests {
         let (id, bucket) = level.pop_first().unwrap();
         assert!(level.is_empty());
         let action_desc = interner.get(id).clone();
-        assert!(execute_state(
-            &root,
-            &plan,
-            &action_desc,
-            bucket,
-            root.variables(),
-            &influences,
-            &base_estimates,
-            &mut worklist,
-            &mut interner,
-            &mut stats,
-        )
-        .is_none());
+        assert!(matches!(
+            execute_state(
+                &root,
+                &plan,
+                &action_desc,
+                bucket,
+                root.variables(),
+                &influences,
+                &base_estimates,
+                &mut worklist,
+                &mut interner,
+                &mut stats,
+            ),
+            StepOutcome::Advanced
+        ));
         assert_eq!(stats.confirm_action_pops, 1);
         assert_eq!(stats.confirm_calls, 1);
         assert_eq!(confirms.load(Ordering::Relaxed), 1);
@@ -2453,19 +2715,21 @@ mod tests {
         let influences = [VariableSet::new_empty(); 128];
         let base_estimates = [1; 128];
 
-        assert!(execute_state(
-            &root,
-            &plan,
-            &desc,
-            bucket,
-            root.variables(),
-            &influences,
-            &base_estimates,
-            &mut worklist,
-            &mut interner,
-            &mut stats,
-        )
-        .is_none());
+        assert!(matches!(
+            execute_state(
+                &root,
+                &plan,
+                &desc,
+                bucket,
+                root.variables(),
+                &influences,
+                &base_estimates,
+                &mut worklist,
+                &mut interner,
+                &mut stats,
+            ),
+            StepOutcome::Advanced
+        ));
         assert_eq!(stats.candidate_plan_pops, 1);
         assert_eq!(stats.propose_calls, 0);
         assert_eq!(stats.confirm_calls, 0);
@@ -2531,40 +2795,47 @@ mod tests {
         let influences = [VariableSet::new_empty(); 128];
         let base_estimates = [1; 128];
 
-        execute_state(
-            &root,
-            &plan,
-            &candidate_desc,
-            candidate_bucket,
-            root.variables(),
-            &influences,
-            &base_estimates,
-            &mut worklist,
-            &mut interner,
-            &mut stats,
-        );
+        assert!(matches!(
+            execute_state(
+                &root,
+                &plan,
+                &candidate_desc,
+                candidate_bucket,
+                root.variables(),
+                &influences,
+                &base_estimates,
+                &mut worklist,
+                &mut interner,
+                &mut stats,
+            ),
+            StepOutcome::Advanced
+        ));
         let (&rank, _) = worklist
             .first_key_value()
             .expect("confirm action was filed");
         let mut level = worklist.remove(&rank).unwrap();
         let (id, bucket) = level.pop_first().unwrap();
         let action_desc = interner.get(id).clone();
-        execute_state(
-            &root,
-            &plan,
-            &action_desc,
-            bucket,
-            root.variables(),
-            &influences,
-            &base_estimates,
-            &mut worklist,
-            &mut interner,
-            &mut stats,
-        );
+        assert!(matches!(
+            execute_state(
+                &root,
+                &plan,
+                &action_desc,
+                bucket,
+                root.variables(),
+                &influences,
+                &base_estimates,
+                &mut worklist,
+                &mut interner,
+                &mut stats,
+            ),
+            StepOutcome::Dead
+        ));
 
         assert!(worklist.is_empty());
         assert_eq!(stats.candidate_plan_pops, 1);
         assert_eq!(stats.confirm_action_pops, 1);
+        assert_eq!(stats.dead_action_pops, 1);
         assert_eq!(stats.confirm_calls, 1);
         assert_eq!(confirms.load(Ordering::Relaxed), 1);
     }
@@ -2633,18 +2904,21 @@ mod tests {
         let base_estimates = [1; 128];
 
         for first_parent in [0, 2] {
-            execute_state(
-                &root,
-                &plan,
-                &desc,
-                chunk(first_parent),
-                root.variables(),
-                &influences,
-                &base_estimates,
-                &mut worklist,
-                &mut interner,
-                &mut stats,
-            );
+            assert!(matches!(
+                execute_state(
+                    &root,
+                    &plan,
+                    &desc,
+                    chunk(first_parent),
+                    root.variables(),
+                    &influences,
+                    &base_estimates,
+                    &mut worklist,
+                    &mut interner,
+                    &mut stats,
+                ),
+                StepOutcome::Advanced
+            ));
         }
         assert_eq!(stats.candidate_plan_pops, 2);
         assert_eq!(stats.confirm_calls, 0);
@@ -2661,18 +2935,21 @@ mod tests {
         let level = worklist.remove(&rank).unwrap();
         for (id, bucket) in level {
             let action_desc = interner.get(id).clone();
-            execute_state(
-                &root,
-                &plan,
-                &action_desc,
-                bucket,
-                root.variables(),
-                &influences,
-                &base_estimates,
-                &mut worklist,
-                &mut interner,
-                &mut stats,
-            );
+            assert!(matches!(
+                execute_state(
+                    &root,
+                    &plan,
+                    &action_desc,
+                    bucket,
+                    root.variables(),
+                    &influences,
+                    &base_estimates,
+                    &mut worklist,
+                    &mut interner,
+                    &mut stats,
+                ),
+                StepOutcome::Advanced
+            ));
         }
         assert_eq!(stats.confirm_action_pops, 2);
         assert_eq!(stats.confirm_calls, 2);
