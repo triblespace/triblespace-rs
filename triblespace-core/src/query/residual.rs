@@ -1904,6 +1904,11 @@ impl ResidualStateMachine {
             emit_rows: Vec::new(),
             emit_next: 0,
             emit_count: 0,
+            continuation: None,
+            #[cfg(test)]
+            continuation_sprint_enabled: self.continuation_sprint_enabled,
+            last_selection: SelectionKind::Readiness,
+            last_was_action: false,
             width: self.width,
             growth: self.growth,
             cap: self.cap,
@@ -1927,6 +1932,11 @@ impl ResidualStateMachine {
         influences: &[VariableSet; 128],
         base_estimates: &[usize; 128],
     ) -> Option<Self> {
+        // A public producer only splits an unpulled iterator, so no latency
+        // continuation can be live here. Clear the physical preference
+        // defensively: dropping it never drops affine work, while retaining it
+        // across a bucket split could leave the receipt naming the wrong tail.
+        self.continuation = None;
         loop {
             debug_assert_eq!(
                 self.emit_next, 0,
@@ -2034,7 +2044,11 @@ impl ResidualStateMachine {
             // rather than manufacturing a second query from the seed.
             let width = self.width.max(1);
             match self.pop_once(root, plan, influences, base_estimates, width) {
-                StepOutcome::Advanced => {}
+                // Split negotiation is a saturated throughput path. It files
+                // every successor normally and deliberately does not arm the
+                // first-result continuation sprint before the frontier has
+                // been partitioned.
+                StepOutcome::Advanced(_) => {}
                 StepOutcome::Dead => self.increase_width(),
                 StepOutcome::Emit(rows) => {
                     self.stage_emit(rows);
