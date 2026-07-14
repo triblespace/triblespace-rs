@@ -226,6 +226,125 @@ pub struct ResidualStateSolve<R> {
     pub stats: ResidualStateStats,
 }
 
+/// Physical payload shape selected by one successful parallel residual split.
+///
+/// This is probe observability, not part of canonical residual identity or
+/// constraint semantics.
+#[cfg(feature = "parallel")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResidualParallelSplitKind {
+    StagedRows,
+    StagedSingleton,
+    RowBatch,
+    CandidateOccurrences,
+    CandidateParents,
+    WholeState,
+}
+
+/// Cheap scheduler quantities observed at one successful affine split.
+#[cfg(feature = "parallel")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidualParallelSplitRecord {
+    pub kind: ResidualParallelSplitKind,
+    pub rank: Option<usize>,
+    pub remaining_rank: Option<usize>,
+    pub live_states: usize,
+    pub total_atoms: usize,
+    pub selected_atoms: usize,
+    pub left_atoms: usize,
+    pub right_atoms: usize,
+}
+
+/// Aggregate probe measurements for one fully consumed parallel query.
+#[cfg(feature = "parallel")]
+#[doc(hidden)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ResidualParallelStats {
+    pub splits: Vec<ResidualParallelSplitRecord>,
+    pub shards_completed: usize,
+    pub bucket_merges: usize,
+    pub rows_merged: usize,
+    pub state_pops: usize,
+    pub propose_calls: usize,
+    pub confirm_calls: usize,
+    pub max_propose_rows: usize,
+    pub max_propose_candidates: usize,
+    pub max_confirm_rows: usize,
+    pub max_confirm_candidates: usize,
+}
+
+/// Opt-in process-wide counters used only by controlled parallel probes.
+#[cfg(feature = "parallel")]
+#[doc(hidden)]
+pub mod parallel_stats {
+    use super::{ResidualParallelSplitRecord, ResidualParallelStats, ResidualStateStats};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static STATS: Mutex<ResidualParallelStats> = Mutex::new(ResidualParallelStats {
+        splits: Vec::new(),
+        shards_completed: 0,
+        bucket_merges: 0,
+        rows_merged: 0,
+        state_pops: 0,
+        propose_calls: 0,
+        confirm_calls: 0,
+        max_propose_rows: 0,
+        max_propose_candidates: 0,
+        max_confirm_rows: 0,
+        max_confirm_candidates: 0,
+    });
+
+    pub fn set_enabled(enabled: bool) {
+        ENABLED.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn reset() {
+        *STATS.lock().expect("residual parallel stats poisoned") = ResidualParallelStats::default();
+    }
+
+    pub fn snapshot() -> ResidualParallelStats {
+        STATS
+            .lock()
+            .expect("residual parallel stats poisoned")
+            .clone()
+    }
+
+    pub(super) fn record_split(record: ResidualParallelSplitRecord) {
+        if ENABLED.load(Ordering::Relaxed) {
+            STATS
+                .lock()
+                .expect("residual parallel stats poisoned")
+                .splits
+                .push(record);
+        }
+    }
+
+    pub(super) fn record_completed_shard(stats: &ResidualStateStats) {
+        if !ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut aggregate = STATS.lock().expect("residual parallel stats poisoned");
+        aggregate.shards_completed += 1;
+        aggregate.bucket_merges += stats.bucket_merges;
+        aggregate.rows_merged += stats.rows_merged;
+        aggregate.state_pops += stats.state_pops;
+        aggregate.propose_calls += stats.propose_calls;
+        aggregate.confirm_calls += stats.confirm_calls;
+        aggregate.max_propose_rows = aggregate.max_propose_rows.max(stats.max_propose_rows);
+        aggregate.max_propose_candidates = aggregate
+            .max_propose_candidates
+            .max(stats.max_propose_candidates);
+        aggregate.max_confirm_rows = aggregate.max_confirm_rows.max(stats.max_confirm_rows);
+        aggregate.max_confirm_candidates = aggregate
+            .max_confirm_candidates
+            .max(stats.max_confirm_candidates);
+    }
+}
+
 /// A dynamic bitset of flattened leaf-occurrence IDs.
 ///
 /// Leaf identity is its deterministic preorder occurrence in the maximal root
@@ -1686,6 +1805,51 @@ impl ResidualStateMachine {
         }
     }
 
+    fn parallel_actionable_shape(&self, plan: &ResidualPlan) -> (usize, usize) {
+        let mut atoms = self.emit_count.saturating_sub(self.emit_next);
+        let mut states = usize::from(self.emit_count > self.emit_next);
+        for level in self.worklist.values() {
+            states = states.saturating_add(level.len());
+            for (&id, bucket) in level {
+                let desc = self.interner.get(id);
+                atoms = atoms.saturating_add(bucket.occupancy(desc.uses_candidate_pages(plan)));
+            }
+        }
+        (atoms, states)
+    }
+
+    fn record_parallel_split(
+        &self,
+        right: &Self,
+        plan: &ResidualPlan,
+        kind: ResidualParallelSplitKind,
+        rank: Option<usize>,
+        total_atoms: usize,
+        selected_atoms: usize,
+        live_states: usize,
+    ) {
+        let stride = self
+            .leaf_count
+            .checked_add(1)
+            .and_then(|value| value.checked_mul(2))
+            .expect("residual-state rank stride overflow");
+        let terminal_rank = self
+            .full
+            .count()
+            .checked_mul(stride)
+            .expect("residual-state rank overflow");
+        parallel_stats::record_split(ResidualParallelSplitRecord {
+            kind,
+            rank,
+            remaining_rank: rank.map(|rank| terminal_rank.saturating_sub(rank)),
+            live_states,
+            total_atoms,
+            selected_atoms,
+            left_atoms: self.parallel_actionable_shape(plan).0,
+            right_atoms: right.parallel_actionable_shape(plan).0,
+        });
+    }
+
     /// Partition the current affine remainder into two independent residual
     /// worklists without restarting from the seed.
     ///
@@ -1710,6 +1874,8 @@ impl ResidualStateMachine {
             );
 
             if self.emit_count >= 2 {
+                let (total_atoms, live_states) = self.parallel_actionable_shape(plan);
+                let selected_atoms = self.emit_count;
                 let right_count = self.emit_count / 2;
                 let left_count = self.emit_count - right_count;
                 let stride = self.emit_vars.len();
@@ -1720,17 +1886,36 @@ impl ResidualStateMachine {
                 right.emit_rows = self.emit_rows.split_off(left_count * stride);
                 right.emit_count = right_count;
                 self.emit_count = left_count;
+                self.record_parallel_split(
+                    &right,
+                    plan,
+                    ResidualParallelSplitKind::StagedRows,
+                    None,
+                    total_atoms,
+                    selected_atoms,
+                    live_states,
+                );
                 return Some(right);
             }
 
             // A staged singleton is already an exact affine component. Keep
             // it intact while the other shard owns the remaining worklist.
             if self.emit_count == 1 && !self.worklist.is_empty() {
+                let (total_atoms, live_states) = self.parallel_actionable_shape(plan);
                 let mut right = self.parallel_sibling();
                 right.emit_vars = std::mem::take(&mut self.emit_vars);
                 right.emit_rows = std::mem::take(&mut self.emit_rows);
                 right.emit_count = 1;
                 self.emit_count = 0;
+                self.record_parallel_split(
+                    &right,
+                    plan,
+                    ResidualParallelSplitKind::StagedSingleton,
+                    None,
+                    total_atoms,
+                    1,
+                    live_states,
+                );
                 return Some(right);
             }
 
@@ -1753,6 +1938,25 @@ impl ResidualStateMachine {
             if let Some((rank, id, candidate_pages)) = splittable {
                 let desc = self.interner.get(id);
                 let stride = desc.bound.count();
+                let (kind, selected_atoms) = match self
+                    .worklist
+                    .get(&rank)
+                    .and_then(|level| level.get(&id))
+                    .expect("selected residual payload is live")
+                {
+                    StateBucket::Rows(batch) => {
+                        (ResidualParallelSplitKind::RowBatch, batch.row_count)
+                    }
+                    StateBucket::Candidates(batch) if candidate_pages => (
+                        ResidualParallelSplitKind::CandidateOccurrences,
+                        batch.candidate_count(),
+                    ),
+                    StateBucket::Candidates(batch) => (
+                        ResidualParallelSplitKind::CandidateParents,
+                        batch.parents.row_count,
+                    ),
+                };
+                let (total_atoms, live_states) = self.parallel_actionable_shape(plan);
                 let right_bucket = self
                     .worklist
                     .get_mut(&rank)
@@ -1770,6 +1974,15 @@ impl ResidualStateMachine {
                         .is_none(),
                     "fresh residual sibling unexpectedly contained work"
                 );
+                self.record_parallel_split(
+                    &right,
+                    plan,
+                    kind,
+                    Some(rank),
+                    total_atoms,
+                    selected_atoms,
+                    live_states,
+                );
                 return Some(right);
             }
 
@@ -1777,6 +1990,7 @@ impl ResidualStateMachine {
             // neither currently contains two scheduling atoms.
             let bucket_count: usize = self.worklist.values().map(BTreeMap::len).sum();
             if bucket_count >= 2 {
+                let (total_atoms, live_states) = self.parallel_actionable_shape(plan);
                 let (&rank, level) = self
                     .worklist
                     .last_key_value()
@@ -1793,12 +2007,23 @@ impl ResidualStateMachine {
                     let bucket = level.remove(&id).expect("selected residual state exists");
                     (bucket, level.is_empty())
                 };
+                let desc = self.interner.get(id);
+                let selected_atoms = bucket.occupancy(desc.uses_candidate_pages(plan));
                 if remove_level {
                     self.worklist.remove(&rank);
                 }
 
                 let mut right = self.parallel_sibling();
                 right.worklist.entry(rank).or_default().insert(id, bucket);
+                self.record_parallel_split(
+                    &right,
+                    plan,
+                    ResidualParallelSplitKind::WholeState,
+                    Some(rank),
+                    total_atoms,
+                    selected_atoms,
+                    live_states,
+                );
                 return Some(right);
             }
 
@@ -2244,6 +2469,9 @@ mod parallel {
                     Some(item) => folder = folder.consume(item),
                     None => break,
                 }
+            }
+            if iter.state.worklist.is_empty() && iter.state.emit_next >= iter.state.emit_count {
+                parallel_stats::record_completed_shard(&iter.state.stats);
             }
             folder
         }

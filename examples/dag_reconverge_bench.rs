@@ -26,6 +26,16 @@
 //!     # Repeat only the controlled GPU matrix after the archive is built:
 //!     TRIBLES_WGPU_ONLY=1 cargo run --release --features gpu \
 //!         --example dag_reconverge_bench -- 2048 16 8
+//!     # Balanced residual shard-count sweep (reps must be a multiple of 10):
+//!     TRIBLES_SHARD_SWEEP=1 cargo run --release \
+//!         --example dag_reconverge_bench -- 2048 16 10
+//!     TRIBLES_SHARD_SWEEP=1 TRIBLES_SHARD_SWEEP_WGPU=1 \
+//!         cargo run --release --features gpu \
+//!         --example dag_reconverge_bench -- 2048 16 10
+//!     # Skip the repeated CPU treatments for a WGPU-only sweep:
+//!     TRIBLES_SHARD_SWEEP=1 TRIBLES_WGPU_ONLY=1 \
+//!         cargo run --release --features gpu \
+//!         --example dag_reconverge_bench -- 2048 16 10
 //!
 //! Runs sequential / ordinary parallel-scalar / explicit parallel-DAG /
 //! explicit parallel residual-state /
@@ -48,6 +58,10 @@ use std::time::Instant;
 use rayon::prelude::*;
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use triblespace::core::query::residual::ResidualStateStats;
+#[cfg(feature = "parallel")]
+use triblespace::core::query::residual::{
+    parallel_stats as residual_parallel_stats, ResidualParallelStats,
+};
 use triblespace::core::query::{blocked_stats, dag_stats, TriblePattern};
 use triblespace::core::trible::TribleSet;
 #[cfg(feature = "gpu")]
@@ -227,6 +241,7 @@ enum Mode {
     Grp,
     Dag,
     Residual,
+    ResidualSaturated,
     ResidualLazy,
     Agglomerative,
     DagU,
@@ -257,6 +272,7 @@ fn run_query<S: TriblePattern>(kb: &S, markers: (Id, Id, Id, Id, Id), mode: Mode
         Mode::Grp => tally(q.solve_blocked_grouped()),
         Mode::Dag => tally(q.solve_dag()),
         Mode::Residual => tally(q.solve_residual_state()),
+        Mode::ResidualSaturated => tally(q.solve_residual_state_lazy().start_width(usize::MAX)),
         Mode::ResidualLazy => tally(q.solve_residual_state_lazy()),
         Mode::Agglomerative => tally(
             q.solve_dag_lazy()
@@ -320,6 +336,299 @@ fn timing_summary(v: &[f64]) -> (f64, f64, f64) {
         s[middle]
     };
     (s[0], median, s[s.len() - 1])
+}
+
+#[cfg(feature = "parallel")]
+const SHARD_WORKERS: [usize; 5] = [1, 2, 4, 8, 16];
+
+/// A ten-row Williams-style order for five treatments. The first five rows
+/// rotate one base order; the second five reverse those rows. Each worker
+/// count therefore occupies every ordinal position twice and every directed
+/// adjacent pair is balanced over one complete ten-repetition block.
+#[cfg(feature = "parallel")]
+fn shard_worker_order(repetition: usize) -> [usize; 5] {
+    const BASE: [usize; 5] = [0, 1, 4, 2, 3];
+    let row = repetition % 5;
+    let reverse = repetition % 10 >= 5;
+    let mut order = std::array::from_fn(|column| (BASE[column] + row) % SHARD_WORKERS.len());
+    if reverse {
+        order.reverse();
+    }
+    order
+}
+
+#[cfg(feature = "parallel")]
+fn shard_pools() -> Vec<rayon::ThreadPool> {
+    SHARD_WORKERS
+        .iter()
+        .map(|&threads| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("failed to build shard-sweep Rayon pool")
+        })
+        .collect()
+}
+
+#[cfg(feature = "parallel")]
+fn format_residual_parallel_stats(stats: &ResidualParallelStats) -> String {
+    use std::collections::BTreeMap;
+
+    let mut kinds = BTreeMap::<String, usize>::new();
+    for split in &stats.splits {
+        *kinds.entry(format!("{:?}", split.kind)).or_default() += 1;
+    }
+    let kinds = kinds
+        .into_iter()
+        .map(|(kind, count)| format!("{kind}x{count}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let range = |values: Vec<usize>| {
+        values
+            .iter()
+            .min()
+            .zip(values.iter().max())
+            .map(|(min, max)| format!("{min}..{max}"))
+            .unwrap_or_else(|| "n/a".to_owned())
+    };
+    let selected = range(
+        stats
+            .splits
+            .iter()
+            .map(|split| split.selected_atoms)
+            .collect(),
+    );
+    let child = range(
+        stats
+            .splits
+            .iter()
+            .flat_map(|split| [split.left_atoms, split.right_atoms])
+            .collect(),
+    );
+    let rank_remaining = range(
+        stats
+            .splits
+            .iter()
+            .filter_map(|split| split.remaining_rank)
+            .collect(),
+    );
+    let live_states = range(stats.splits.iter().map(|split| split.live_states).collect());
+    format!(
+        "splits {} [{kinds}] / shards {} / selected atoms {selected} / child machine atoms {child} / remaining rank {rank_remaining} / live states {live_states} / merges {} ({} rows) / pops {} / propose/confirm {}/{} / max propose rows/candidates {}/{} / max confirm rows/candidates {}/{}",
+        stats.splits.len(),
+        stats.shards_completed,
+        stats.bucket_merges,
+        stats.rows_merged,
+        stats.state_pops,
+        stats.propose_calls,
+        stats.confirm_calls,
+        stats.max_propose_rows,
+        stats.max_propose_candidates,
+        stats.max_confirm_rows,
+        stats.max_confirm_candidates,
+    )
+}
+
+#[cfg(feature = "parallel")]
+fn profile_residual_parallel<S: TriblePattern + Sync>(
+    pool: &rayon::ThreadPool,
+    kb: &S,
+    markers: (Id, Id, Id, Id, Id),
+) -> ((usize, u64), ResidualParallelStats) {
+    residual_parallel_stats::reset();
+    residual_parallel_stats::set_enabled(true);
+    let signature = pool.install(|| run_query(kb, markers, Mode::ParResidual));
+    residual_parallel_stats::set_enabled(false);
+    (signature, residual_parallel_stats::snapshot())
+}
+
+/// Focused exact-bag and timing sweep for the explicit residual sharder.
+/// Worker-count treatments are interleaved rather than measured in five
+/// thermally ordered command invocations.
+#[cfg(feature = "parallel")]
+fn bench_residual_shard_sweep<S>(
+    label: &str,
+    kb: &S,
+    markers: (Id, Id, Id, Id, Id),
+    expected: usize,
+    reps: usize,
+) where
+    S: TriblePattern + Sync,
+{
+    assert!(
+        reps.is_multiple_of(10),
+        "TRIBLES_SHARD_SWEEP repetitions must be a multiple of 10"
+    );
+    let pools = shard_pools();
+    let mut canonical = collect_query(kb, markers, Mode::ResidualSaturated);
+    canonical.sort_unstable();
+    assert_eq!(canonical.len(), expected, "{label} canonical output count");
+
+    for (case, pool) in pools.iter().enumerate() {
+        let mut rows = pool.install(|| collect_query(kb, markers, Mode::ParResidual));
+        rows.sort_unstable();
+        assert_eq!(
+            rows, canonical,
+            "{label} exact output at {} workers",
+            SHARD_WORKERS[case],
+        );
+        let signature = pool.install(|| run_query(kb, markers, Mode::ParResidual));
+        assert_eq!(signature.0, expected, "{label} warm-up output count");
+    }
+
+    let canonical_signature = tally(canonical.iter());
+    let mut times: [Vec<f64>; 5] = std::array::from_fn(|_| Vec::with_capacity(reps));
+    for repetition in 0..reps {
+        for case in shard_worker_order(repetition) {
+            let started = Instant::now();
+            let signature = pools[case].install(|| run_query(kb, markers, Mode::ParResidual));
+            let elapsed_ms = started.elapsed().as_secs_f64() * 1e3;
+            assert_eq!(
+                signature,
+                canonical_signature,
+                "{label} timed output at {} workers, repetition {}",
+                SHARD_WORKERS[case],
+                repetition + 1,
+            );
+            times[case].push(elapsed_ms);
+        }
+    }
+
+    let one_worker = timing_summary(&times[0]).1;
+    println!("\n== Residual shard sweep: {label} (exact sorted bag parity: ok) ==");
+    for (case, &workers) in SHARD_WORKERS.iter().enumerate() {
+        let (min, median, max) = timing_summary(&times[case]);
+        let (profile_signature, profile) = profile_residual_parallel(&pools[case], kb, markers);
+        assert_eq!(
+            profile_signature, canonical_signature,
+            "{label} profiled output at {workers} workers",
+        );
+        println!(
+            "  workers {workers:>2}: min/median/max {min:>9.3}/{median:>9.3}/{max:>9.3} ms  speedup {speedup:>6.3}x",
+            speedup = one_worker / median,
+        );
+        println!("    {}", format_residual_parallel_stats(&profile));
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn bench_wgpu_residual_shard_sweep(
+    archive: &SuccinctArchive<OrderedUniverse>,
+    markers: (Id, Id, Id, Id, Id),
+    expected: usize,
+    reps: usize,
+) {
+    assert!(
+        reps.is_multiple_of(10),
+        "TRIBLES_SHARD_SWEEP_WGPU repetitions must be a multiple of 10"
+    );
+    let pools = shard_pools();
+    let mut canonical = collect_query(archive, markers, Mode::ResidualSaturated);
+    canonical.sort_unstable();
+    assert_eq!(
+        canonical.len(),
+        expected,
+        "canonical WGPU-sweep output count"
+    );
+    let canonical_signature = tally(canonical.iter());
+
+    let mut gpu = WgpuSuccinctArchive::new(archive.clone())
+        .expect("failed to prepare SuccinctArchive ring columns for WGPU shard sweep");
+    gpu.set_min_rank_batch(1);
+    gpu.reset_stats();
+    let setup_started = Instant::now();
+    let setup_signature = pools[0].install(|| run_query(&gpu, markers, Mode::ParResidual));
+    assert_eq!(
+        setup_signature, canonical_signature,
+        "first WGPU setup output"
+    );
+    eprintln!(
+        "first forced-WGPU residual setup query: {:?} ({:?})",
+        setup_started.elapsed(),
+        gpu.stats(),
+    );
+
+    let cases = [
+        ("wrapper-cpu-control", usize::MAX),
+        ("forced-wgpu-rank", 1),
+        ("gated-hybrid", DEFAULT_MIN_RANK_BATCH),
+    ];
+    println!(
+        "\n== Controlled WGPU residual shard sweep (exact sorted bag parity per treatment: ok) =="
+    );
+    for (case_name, threshold) in cases {
+        gpu.set_min_rank_batch(threshold);
+        for (worker_case, pool) in pools.iter().enumerate() {
+            gpu.reset_stats();
+            let mut rows = pool.install(|| collect_query(&gpu, markers, Mode::ParResidual));
+            rows.sort_unstable();
+            assert_eq!(
+                rows, canonical,
+                "{case_name} exact output at {} workers",
+                SHARD_WORKERS[worker_case],
+            );
+            gpu.reset_stats();
+            let signature = pool.install(|| run_query(&gpu, markers, Mode::ParResidual));
+            assert_eq!(signature, canonical_signature, "{case_name} warm-up output");
+        }
+
+        let mut times: [Vec<f64>; 5] = std::array::from_fn(|_| Vec::with_capacity(reps));
+        let mut stats: [Vec<WgpuQueryStats>; 5] = std::array::from_fn(|_| Vec::with_capacity(reps));
+        for repetition in 0..reps {
+            for worker_case in shard_worker_order(repetition) {
+                gpu.reset_stats();
+                let started = Instant::now();
+                let signature =
+                    pools[worker_case].install(|| run_query(&gpu, markers, Mode::ParResidual));
+                let elapsed_ms = started.elapsed().as_secs_f64() * 1e3;
+                let run_stats = gpu.stats();
+                assert_eq!(
+                    signature,
+                    canonical_signature,
+                    "{case_name} timed output at {} workers, repetition {}",
+                    SHARD_WORKERS[worker_case],
+                    repetition + 1,
+                );
+                times[worker_case].push(elapsed_ms);
+                stats[worker_case].push(run_stats);
+            }
+        }
+
+        let one_worker = timing_summary(&times[0]).1;
+        println!("\n  rank treatment: {case_name} (threshold {threshold})");
+        for (worker_case, &workers) in SHARD_WORKERS.iter().enumerate() {
+            let (min, median, max) = timing_summary(&times[worker_case]);
+            let first_stats = stats[worker_case][0];
+            assert!(
+                stats[worker_case]
+                    .iter()
+                    .all(|&run_stats| run_stats == first_stats),
+                "{case_name} dispatch shape varied at {workers} workers"
+            );
+            gpu.reset_stats();
+            let (profile_signature, profile) =
+                profile_residual_parallel(&pools[worker_case], &gpu, markers);
+            assert_eq!(
+                profile_signature, canonical_signature,
+                "{case_name} profiled output at {workers} workers",
+            );
+            assert_eq!(
+                gpu.stats(),
+                first_stats,
+                "{case_name} profiled dispatch shape at {workers} workers",
+            );
+            println!(
+                "    workers {workers:>2}: {min:>9.3}/{median:>9.3}/{max:>9.3} ms  speedup {speedup:>6.3}x; GPU batches/probes {gpu_batches}/{gpu_probes}; CPU batches/probes {cpu_batches}/{cpu_probes}; GPU batch min/max {gpu_range}",
+                speedup = one_worker / median,
+                gpu_batches = first_stats.gpu_dispatches,
+                gpu_probes = first_stats.gpu_probes,
+                cpu_batches = first_stats.cpu_fallback_batches,
+                cpu_probes = first_stats.cpu_fallback_probes,
+                gpu_range = format_batch_range(first_stats),
+            );
+            println!("      {}", format_residual_parallel_stats(&profile));
+        }
+    }
 }
 
 fn bench_backend<S: TriblePattern>(
@@ -459,7 +768,7 @@ fn format_batch_range(stats: WgpuQueryStats) -> String {
     }
 }
 
-#[cfg(feature = "gpu")]
+#[cfg(feature = "parallel")]
 type QueryRow = (
     Inline<inlineencodings::GenId>,
     Inline<inlineencodings::GenId>,
@@ -473,7 +782,7 @@ type QueryRow = (
 /// residual, and two affine Rayon scheduler shapes used by the controlled GPU
 /// comparison. Callers sort the result before comparison, because Rayon
 /// deliberately does not promise encounter order here.
-#[cfg(feature = "gpu")]
+#[cfg(feature = "parallel")]
 fn collect_query<S: TriblePattern>(
     kb: &S,
     markers: (Id, Id, Id, Id, Id),
@@ -494,6 +803,10 @@ fn collect_query<S: TriblePattern>(
     match mode {
         Mode::Dag => q.solve_dag(),
         Mode::Residual => q.solve_residual_state(),
+        Mode::ResidualSaturated => q
+            .solve_residual_state_lazy()
+            .start_width(usize::MAX)
+            .collect(),
         Mode::ParDag => q.into_par_dag_iter().collect(),
         Mode::ParResidual => q.into_par_residual_state_iter().collect(),
         _ => unreachable!("controlled WGPU comparison only uses affine schedulers"),
@@ -648,7 +961,7 @@ fn bench_wgpu_backend(
 
     let modes = [
         ("dag", Mode::Dag),
-        ("residual", Mode::Residual),
+        ("sat-residual", Mode::ResidualSaturated),
         ("par-dag", Mode::ParDag),
         ("par-residual", Mode::ParResidual),
     ];
@@ -792,6 +1105,10 @@ fn main() {
     let controlled_gpu_only = std::env::var_os("TRIBLES_WGPU_ONLY").is_some();
     #[cfg(not(feature = "gpu"))]
     let controlled_gpu_only = false;
+    #[cfg(feature = "parallel")]
+    let shard_sweep = std::env::var_os("TRIBLES_SHARD_SWEEP").is_some();
+    #[cfg(not(feature = "parallel"))]
+    let shard_sweep = false;
 
     eprintln!(
         "block row cap: {}",
@@ -808,6 +1125,26 @@ fn main() {
         kb.len(),
         t0.elapsed()
     );
+
+    #[cfg(feature = "parallel")]
+    if shard_sweep {
+        if !controlled_gpu_only {
+            bench_residual_shard_sweep("TribleSet", &kb, markers, expected, reps);
+        }
+
+        let t0 = Instant::now();
+        let archive: SuccinctArchive<OrderedUniverse> = (&kb).into();
+        eprintln!("\narchive built in {:?}", t0.elapsed());
+        if !controlled_gpu_only {
+            bench_residual_shard_sweep("SuccinctArchive", &archive, markers, expected, reps);
+        }
+
+        #[cfg(feature = "gpu")]
+        if controlled_gpu_only || std::env::var_os("TRIBLES_SHARD_SWEEP_WGPU").is_some() {
+            bench_wgpu_residual_shard_sweep(&archive, markers, expected, reps);
+        }
+        return;
+    }
 
     if !controlled_gpu_only {
         println!("\n== TribleSet backend (default blocked delegation) ==");
