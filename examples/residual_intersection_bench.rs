@@ -296,14 +296,14 @@ fn bench_backend<S: TriblePattern>(label: &str, kb: &S, expected: usize, reps: u
         "profiled lazy residual result signature mismatch"
     );
     println!(
-        "  lazy profile: states {} + hits {}, pops {} (sprint {} / harvest {} / partial {}), \
+        "  lazy profile: states {} + hits {}, pops {} (full {} / readiness {} / partial {}), \
          live merges {} ({} rows), reentries {} ({} rows); propose {} calls/{} rows/max {}, \
          confirm {} calls/{} rows/max {}",
         lazy_stats.states_interned,
         lazy_stats.interner_hits,
         lazy_stats.state_pops,
-        lazy_stats.sprint_pops,
-        lazy_stats.harvest_pops,
+        lazy_stats.full_pops,
+        lazy_stats.readiness_pops,
         lazy_stats.partial_pops,
         lazy_stats.bucket_merges,
         lazy_stats.rows_merged,

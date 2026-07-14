@@ -18,13 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remain opaque `Constraint` implementations, so nested unions and custom
   constraints keep the existing protocol; a profiled entry point reports
   interner, bucket-merge, and child-call batch measurements.
-- **Canonical residual states gain a demand-driven sprint-to-harvest
-  iterator.** `solve_residual_state_lazy` starts with narrow maximum-rank
-  chunks so descendants can yield before sibling rows are evaluated, widens
-  geometrically on continued demand, then switches to minimum-rank readiness
-  at its saturation cap. Candidate chunks keep each parent and its complete
-  ragged candidate group together, while exact descriptors remain interned so
-  early states can safely reopen when later histories reach them. Full drains
+- **Canonical residual states gain a demand-driven batch-fill iterator.**
+  `solve_residual_state_lazy` starts with narrow chunks so descendants can
+  yield before sibling rows are evaluated, then widens geometrically on
+  continued demand. At each width it runs the deepest canonical bucket able to
+  fill a complete batch; if none can, it drains the minimum-rank bucket through
+  the readiness gate. Candidate chunks keep each parent and its complete ragged
+  candidate group together, while exact descriptors remain interned so early
+  states can safely reopen when later histories reach them. Full drains
   preserve the eager solver's result bag; partial consumers may drop the
   remaining affine frontier after the first useful result.
 - **Index homes use typed artifacts over exact commit-DAG ranges.** Recipe

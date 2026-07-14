@@ -561,8 +561,8 @@ fn flipped_proposers_remerge_before_the_last_confirmation() {
     assert_eq!(residual.stats.rows_merged, N / 2);
     assert!(residual.stats.interner_hits >= 1);
     assert_eq!(residual.stats.max_confirm_rows, N);
-    assert_eq!(residual.stats.sprint_pops, 0);
-    assert_eq!(residual.stats.harvest_pops, residual.stats.state_pops);
+    assert_eq!(residual.stats.full_pops, 0);
+    assert_eq!(residual.stats.readiness_pops, residual.stats.state_pops);
     assert_eq!(
         residual.stats.interner_hits,
         residual.stats.bucket_merges + residual.stats.state_reentries
@@ -587,8 +587,8 @@ fn lazy_width_one_reaches_a_result_before_draining_sibling_parents() {
         2,
         "the first resumption must prepare a geometrically wider next chunk"
     );
-    assert_eq!(lazy.stats().harvest_pops, 0);
-    assert!(lazy.stats().sprint_pops > 0);
+    assert_eq!(lazy.stats().readiness_pops, 0);
+    assert!(lazy.stats().full_pops > 0);
     assert!(lazy.stats().partial_pops > 0);
     assert_eq!(lazy.stats().max_propose_rows, 1);
     assert_eq!(lazy.stats().max_confirm_rows, 1);
@@ -634,13 +634,13 @@ fn lazy_fixed_width_reopens_states_without_changing_the_result_bag() {
 
     assert_eq!(lazy.results, eager);
     assert_eq!(lazy.results, sequential);
-    assert_eq!(lazy.stats.harvest_pops, 0);
-    assert!(lazy.stats.sprint_pops > 0);
+    assert_eq!(lazy.stats.readiness_pops, 0);
+    assert!(lazy.stats.full_pops > 0);
     assert!(lazy.stats.state_reentries > 0);
     assert!(lazy.stats.rows_reentered > 0);
     assert_eq!(
         lazy.stats.state_pops,
-        lazy.stats.sprint_pops + lazy.stats.harvest_pops
+        lazy.stats.full_pops + lazy.stats.readiness_pops
     );
     assert_eq!(
         lazy.stats.interner_hits,
@@ -649,7 +649,7 @@ fn lazy_fixed_width_reopens_states_without_changing_the_result_bag() {
 }
 
 #[test]
-fn lazy_geometric_width_crosses_from_sprint_into_harvest() {
+fn lazy_geometric_width_uses_both_full_and_underfilled_choices() {
     const N: usize = 12;
     let (root, _) = fixture(N);
     let mut crossed = Query::new(root, project_pair)
@@ -667,11 +667,11 @@ fn lazy_geometric_width_crosses_from_sprint_into_harvest() {
     sequential.sort_unstable();
 
     assert_eq!(crossed.results, sequential);
-    assert!(crossed.stats.sprint_pops > 0);
-    assert!(crossed.stats.harvest_pops > 0);
+    assert!(crossed.stats.full_pops > 0);
+    assert!(crossed.stats.readiness_pops > 0);
     assert_eq!(
         crossed.stats.state_pops,
-        crossed.stats.sprint_pops + crossed.stats.harvest_pops
+        crossed.stats.full_pops + crossed.stats.readiness_pops
     );
     assert_eq!(
         crossed.stats.interner_hits,
@@ -680,13 +680,13 @@ fn lazy_geometric_width_crosses_from_sprint_into_harvest() {
 }
 
 #[test]
-fn lazy_forced_harvest_reconverges_before_states_are_popped() {
+fn lazy_width_above_the_frontier_reconverges_before_states_are_popped() {
     const N: usize = 12;
     let (root, _) = fixture(N);
-    let mut harvested = Query::new(root, project_pair)
+    let mut readiness = Query::new(root, project_pair)
         .solve_residual_state_lazy()
-        .cap(2)
-        .start_width(2)
+        .cap(usize::MAX)
+        .start_width(usize::MAX)
         .growth(1)
         .collect_profiled();
 
@@ -694,27 +694,27 @@ fn lazy_forced_harvest_reconverges_before_states_are_popped() {
     let mut sequential: Vec<_> = Query::new(sequential_root, project_pair)
         .sequential()
         .collect();
-    harvested.results.sort_unstable();
+    readiness.results.sort_unstable();
     sequential.sort_unstable();
 
-    assert_eq!(harvested.results, sequential);
-    assert_eq!(harvested.stats.sprint_pops, 0);
-    assert!(harvested.stats.harvest_pops > 0);
-    assert!(harvested.stats.partial_pops > 0);
+    assert_eq!(readiness.results, sequential);
+    assert_eq!(readiness.stats.full_pops, 0);
+    assert!(readiness.stats.readiness_pops > 0);
+    assert_eq!(readiness.stats.partial_pops, 0);
     assert_eq!(
-        harvested.stats.state_reentries, 0,
-        "minimum-rank harvest must drain every feeder before popping its target"
+        readiness.stats.state_reentries, 0,
+        "an underfilled minimum-rank drain must consume every feeder before its target"
     );
-    assert!(harvested.stats.bucket_merges > 0);
-    assert!(harvested.stats.rows_merged > 0);
-    assert!(harvested.stats.max_confirm_rows <= 2);
+    assert!(readiness.stats.bucket_merges > 0);
+    assert!(readiness.stats.rows_merged > 0);
+    assert_eq!(readiness.stats.max_confirm_rows, N);
     assert_eq!(
-        harvested.stats.state_pops,
-        harvested.stats.sprint_pops + harvested.stats.harvest_pops
+        readiness.stats.state_pops,
+        readiness.stats.full_pops + readiness.stats.readiness_pops
     );
     assert_eq!(
-        harvested.stats.interner_hits,
-        harvested.stats.bucket_merges + harvested.stats.state_reentries
+        readiness.stats.interner_hits,
+        readiness.stats.bucket_merges + readiness.stats.state_reentries
     );
 }
 
