@@ -31,13 +31,22 @@ where
         IntersectionConstraint { constraints }
     }
 
-    /// Borrows the direct conjuncts for query-engine lowering probes.
-    ///
-    /// This deliberately stays crate-internal: the public constraint
-    /// protocol remains opaque while experimental schedulers establish the
-    /// right general shape interface.
+    /// Direct children for the residual plan's one-edge static-dispatch path.
     pub(crate) fn children(&self) -> &[C] {
         &self.constraints
+    }
+}
+
+impl<'a, C> ConstraintChildren<'a> for IntersectionConstraint<C>
+where
+    C: Constraint<'a> + 'a,
+{
+    fn len(&self) -> usize {
+        self.constraints.len()
+    }
+
+    fn child(&self, index: usize) -> &dyn Constraint<'a> {
+        &self.constraints[index]
     }
 }
 
@@ -251,6 +260,10 @@ where
             .fold(VariableSet::new_empty(), |acc, c| {
                 acc.union(c.influence(variable))
             })
+    }
+
+    fn residual_shape(&self) -> ConstraintShape<'_, 'a> {
+        ConstraintShape::And(self)
     }
 }
 

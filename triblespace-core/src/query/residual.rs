@@ -2,17 +2,20 @@
 //!
 //! This is the smallest executable slice of a scheduler where a bucket is
 //! identified by its remaining computation rather than its history. It
-//! lowers only a root
-//! [`IntersectionConstraint`](crate::query::intersectionconstraint::IntersectionConstraint);
-//! every direct child remains an opaque ordinary [`Constraint`], so nested
-//! AND/OR/RPQ/custom constraints keep their existing semantics.
+//! lowers the maximal associative AND region rooted at an
+//! [`IntersectionConstraint`](crate::query::intersectionconstraint::IntersectionConstraint).
+//! Nested intersections become deterministic preorder leaf occurrences;
+//! union, ignore, and regular-path constraints remain opaque ordinary
+//! [`Constraint`] leaves; custom constraints do too unless they explicitly
+//! expose an associative AND shape.
 //!
-//! As with the other batched engines, direct children must obey the
+//! As with the other batched engines, flattened leaves must obey the
 //! [`Constraint::estimate`] protocol: relevance is a structural answer,
 //! uniform across every row with the same bound-variable schema. Constraint
-//! behavior and the query's planning metadata must also remain unchanged for
-//! the duration of a solve. Those laws make the canonical descriptor a total
-//! description of the future computation while row values remain payload.
+//! behavior, residual shape, child ordering, and the query's planning metadata
+//! must also remain unchanged for the duration of a solve. Those laws make the
+//! canonical descriptor and its stored paths a total description of the future
+//! computation while row values remain payload.
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
@@ -20,6 +23,73 @@ use std::sync::Arc;
 
 use super::intersectionconstraint::IntersectionConstraint;
 use super::*;
+
+/// One deterministic route from the owned root to an opaque residual leaf.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ConstraintPath(Box<[usize]>);
+
+/// Borrow-free lowering plan safe to store beside an owned `Arc` root.
+///
+/// Occurrence identity is the path's preorder position, not the address or
+/// concrete type of the resolved constraint. Thus repeating the same `Arc`
+/// twice in an AND produces two independent residual occurrences.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResidualPlan {
+    leaves: Vec<ConstraintPath>,
+}
+
+impl ResidualPlan {
+    fn compile<'a>(root: &dyn Constraint<'a>) -> Self {
+        fn visit<'a>(
+            constraint: &dyn Constraint<'a>,
+            path: &mut Vec<usize>,
+            leaves: &mut Vec<ConstraintPath>,
+        ) {
+            match constraint.residual_shape() {
+                ConstraintShape::And(children) => {
+                    for child in 0..children.len() {
+                        path.push(child);
+                        visit(children.child(child), path, leaves);
+                        path.pop();
+                    }
+                }
+                ConstraintShape::Opaque => {
+                    leaves.push(ConstraintPath(path.clone().into_boxed_slice()));
+                }
+            }
+        }
+
+        let mut leaves = Vec::new();
+        visit(root, &mut Vec::new(), &mut leaves);
+        Self { leaves }
+    }
+
+    fn len(&self) -> usize {
+        self.leaves.len()
+    }
+
+    fn direct_child(&self, occurrence: usize) -> Option<usize> {
+        let path = &self.leaves[occurrence].0;
+        (path.len() == 1).then(|| path[0])
+    }
+
+    fn resolve<'r, 'a>(
+        &self,
+        root: &'r dyn Constraint<'a>,
+        occurrence: usize,
+    ) -> &'r dyn Constraint<'a> {
+        let mut constraint = root;
+        for &child in self.leaves[occurrence].0.iter() {
+            constraint = match constraint.residual_shape() {
+                ConstraintShape::And(children) => children.child(child),
+                ConstraintShape::Opaque => {
+                    panic!("residual AND shape changed during query execution")
+                }
+            };
+        }
+        constraint
+    }
+}
 
 /// Measurements from one residual-state solve.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -49,17 +119,17 @@ pub struct ResidualStateStats {
     pub state_reentries: usize,
     /// Parent rows carried by [`state_reentries`](Self::state_reentries).
     pub rows_reentered: usize,
-    /// Direct-child proposal calls.
+    /// Flattened-leaf proposal calls.
     pub propose_calls: usize,
-    /// Direct-child confirmation calls.
+    /// Flattened-leaf confirmation calls.
     pub confirm_calls: usize,
     /// Parent rows passed to proposal calls.
     pub propose_rows: usize,
     /// Parent rows passed to confirmation calls.
     pub confirm_rows: usize,
-    /// Largest direct-child proposal batch.
+    /// Largest flattened-leaf proposal batch.
     pub max_propose_rows: usize,
-    /// Largest direct-child confirmation batch.
+    /// Largest flattened-leaf confirmation batch.
     pub max_confirm_rows: usize,
 }
 
@@ -74,17 +144,18 @@ pub struct ResidualStateSolve<R> {
     pub stats: ResidualStateStats,
 }
 
-/// A dynamic bitset of direct-child occurrence IDs.
+/// A dynamic bitset of flattened leaf-occurrence IDs.
 ///
-/// Child identity is its position in the root intersection, not its Rust type
-/// or variable set. A dynamic representation avoids aliasing intersections
-/// with more children than the query language's independent 128-variable cap.
+/// Leaf identity is its deterministic preorder occurrence in the maximal root
+/// AND region, not its Rust type, address, or variable set. A dynamic
+/// representation avoids aliasing conjunctions with more leaves than the query
+/// language's independent 128-variable cap.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ChildSet(Vec<u64>);
 
 impl ChildSet {
-    fn empty(child_count: usize) -> Self {
-        Self(vec![0; child_count.div_ceil(64)])
+    fn empty(leaf_count: usize) -> Self {
+        Self(vec![0; leaf_count.div_ceil(64)])
     }
 
     fn contains(&self, child: usize) -> bool {
@@ -110,7 +181,7 @@ impl ChildSet {
 enum ResidualPhase {
     /// Pick one joint `(variable, proposing child)` action per row.
     Ready,
-    /// A variable has speculative candidates and some direct children have
+    /// A variable has speculative candidates and some leaf occurrences have
     /// already accepted them.
     Candidate {
         variable: VariableId,
@@ -142,11 +213,11 @@ impl StateDesc {
     /// History-independent grade. Every transition strictly raises it, so
     /// draining the minimum grade is an exact readiness gate: once a state is
     /// popped, no unprocessed predecessor can still file into it.
-    fn rank(&self, child_count: usize) -> usize {
+    fn rank(&self, leaf_count: usize) -> usize {
         let base = self
             .bound
             .count()
-            .checked_mul(child_count.saturating_add(1))
+            .checked_mul(leaf_count.saturating_add(1))
             .expect("residual-state rank overflow");
         match &self.phase {
             ResidualPhase::Ready => base,
@@ -293,7 +364,7 @@ impl CandidateBatch {
     }
 
     /// Stable-partitions parents and their ragged candidate groups in one
-    /// pass according to a per-parent direct-child assignment.
+    /// pass according to a per-parent leaf-occurrence assignment.
     fn partition(self, stride: usize, assignment: &[usize]) -> BTreeMap<usize, Self> {
         let RowBatch { rows, row_count } = self.parents;
         assert_eq!(assignment.len(), row_count);
@@ -451,7 +522,7 @@ fn rows_view<'v>(vars: &'v [VariableId], rows: &'v [RawInline], row_count: usize
 fn file(
     worklist: &mut Worklist,
     interner: &mut StateInterner,
-    child_count: usize,
+    leaf_count: usize,
     desc: StateDesc,
     bucket: StateBucket,
     stats: &mut ResidualStateStats,
@@ -459,7 +530,7 @@ fn file(
     if bucket.row_count() == 0 {
         return;
     }
-    let rank = desc.rank(child_count);
+    let rank = desc.rank(leaf_count);
     let (id, known) = interner.intern_with_status(desc, stats);
     let level = worklist.entry(rank).or_default();
     if let Some(existing) = level.get_mut(&id) {
@@ -478,20 +549,21 @@ fn file(
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ProposeAction {
     variable_plan: usize,
-    child: usize,
+    leaf: usize,
 }
 
 struct VariablePlan {
     variable: VariableId,
     relevant: ChildSet,
-    /// Tightest direct child per row.
+    /// Tightest flattened leaf occurrence per row.
     proposers: Vec<usize>,
-    /// Elementwise minimum child estimate per row.
+    /// Elementwise minimum leaf estimate per row.
     estimates: Vec<usize>,
 }
 
 fn ready_transition<'a, C: Constraint<'a> + 'a>(
     root: &IntersectionConstraint<C>,
+    plan: &ResidualPlan,
     desc: &StateDesc,
     rows: RowBatch,
     full: VariableSet,
@@ -501,30 +573,42 @@ fn ready_transition<'a, C: Constraint<'a> + 'a>(
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
 ) {
-    let children = root.children();
-    let child_count = children.len();
+    let leaf_count = plan.len();
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
     let view = rows_view(&vars, &rows.rows, rows.row_count);
     let unbound: Vec<VariableId> = full.subtract(desc.bound).into_iter().collect();
     let mut plans = Vec::with_capacity(unbound.len());
 
     for variable in unbound {
-        let mut relevant = ChildSet::empty(child_count);
+        let mut relevant = ChildSet::empty(leaf_count);
         let mut proposers = vec![usize::MAX; rows.row_count];
         let mut estimates = vec![usize::MAX; rows.row_count];
         let mut column = Vec::with_capacity(rows.row_count);
-        for (child, constraint) in children.iter().enumerate() {
+        for leaf in 0..leaf_count {
             column.clear();
-            if constraint.estimate(variable, &view, &mut EstimateSink::Column(&mut column)) {
+            let is_relevant = if let Some(child) = plan.direct_child(leaf) {
+                root.children()[child].estimate(
+                    variable,
+                    &view,
+                    &mut EstimateSink::Column(&mut column),
+                )
+            } else {
+                plan.resolve(root, leaf).estimate(
+                    variable,
+                    &view,
+                    &mut EstimateSink::Column(&mut column),
+                )
+            };
+            if is_relevant {
                 assert_eq!(
                     column.len(),
                     rows.row_count,
                     "constraint estimate must append one value per row"
                 );
-                relevant.insert(child);
+                relevant.insert(leaf);
                 for row in 0..rows.row_count {
                     if proposers[row] == usize::MAX || column[row] < estimates[row] {
-                        proposers[row] = child;
+                        proposers[row] = leaf;
                         estimates[row] = column[row];
                     }
                 }
@@ -560,7 +644,7 @@ fn ready_transition<'a, C: Constraint<'a> + 'a>(
             );
             let action = ProposeAction {
                 variable_plan: pi,
-                child: plan.proposers[row],
+                leaf: plan.proposers[row],
             };
             if best.is_none_or(|(_, best_key)| key > best_key) {
                 best = Some((action, key));
@@ -573,20 +657,28 @@ fn ready_transition<'a, C: Constraint<'a> + 'a>(
     }
 
     let mut propose_group = |action: ProposeAction, selected: RowBatch| {
-        let plan = &plans[action.variable_plan];
+        let variable_plan = &plans[action.variable_plan];
         let selected_view = rows_view(&vars, &selected.rows, selected.row_count);
         let mut candidates = Vec::new();
-        children[action.child].propose(
-            plan.variable,
-            &selected_view,
-            &mut CandidateSink::Tagged(&mut candidates),
-        );
+        if let Some(child) = plan.direct_child(action.leaf) {
+            root.children()[child].propose(
+                variable_plan.variable,
+                &selected_view,
+                &mut CandidateSink::Tagged(&mut candidates),
+            );
+        } else {
+            plan.resolve(root, action.leaf).propose(
+                variable_plan.variable,
+                &selected_view,
+                &mut CandidateSink::Tagged(&mut candidates),
+            );
+        }
         stats.propose_calls += 1;
         stats.propose_rows += selected.row_count;
         stats.max_propose_rows = stats.max_propose_rows.max(selected.row_count);
 
-        let mut checked = ChildSet::empty(child_count);
-        checked.insert(action.child);
+        let mut checked = ChildSet::empty(leaf_count);
+        checked.insert(action.leaf);
         let candidate = CandidateBatch {
             parents: selected,
             candidates,
@@ -595,12 +687,12 @@ fn ready_transition<'a, C: Constraint<'a> + 'a>(
             file(
                 worklist,
                 interner,
-                child_count,
+                leaf_count,
                 StateDesc {
                     bound: desc.bound,
                     phase: ResidualPhase::Candidate {
-                        variable: plan.variable,
-                        relevant: plan.relevant.clone(),
+                        variable: variable_plan.variable,
+                        relevant: variable_plan.relevant.clone(),
                         checked,
                     },
                 },
@@ -628,7 +720,7 @@ fn commit_candidates(
     desc: &StateDesc,
     variable: VariableId,
     batch: CandidateBatch,
-    child_count: usize,
+    leaf_count: usize,
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
@@ -662,7 +754,7 @@ fn commit_candidates(
     file(
         worklist,
         interner,
-        child_count,
+        leaf_count,
         StateDesc {
             bound: next_bound,
             phase: ResidualPhase::Ready,
@@ -677,6 +769,7 @@ fn commit_candidates(
 
 fn candidate_transition<'a, C: Constraint<'a> + 'a>(
     root: &IntersectionConstraint<C>,
+    plan: &ResidualPlan,
     desc: &StateDesc,
     variable: VariableId,
     relevant: &ChildSet,
@@ -686,18 +779,9 @@ fn candidate_transition<'a, C: Constraint<'a> + 'a>(
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
 ) {
-    let children = root.children();
-    let child_count = children.len();
+    let leaf_count = plan.len();
     if relevant == checked {
-        commit_candidates(
-            desc,
-            variable,
-            batch,
-            child_count,
-            worklist,
-            interner,
-            stats,
-        );
+        commit_candidates(desc, variable, batch, leaf_count, worklist, interner, stats);
         return;
     }
 
@@ -706,13 +790,22 @@ fn candidate_transition<'a, C: Constraint<'a> + 'a>(
     let mut confirmers = vec![usize::MAX; batch.parents.row_count];
     let mut estimates = vec![usize::MAX; batch.parents.row_count];
     let mut column = Vec::with_capacity(batch.parents.row_count);
-    for (child, constraint) in children.iter().enumerate() {
-        if !relevant.contains(child) || checked.contains(child) {
+    for leaf in 0..leaf_count {
+        if !relevant.contains(leaf) || checked.contains(leaf) {
             continue;
         }
         column.clear();
+        let is_relevant = if let Some(child) = plan.direct_child(leaf) {
+            root.children()[child].estimate(variable, &view, &mut EstimateSink::Column(&mut column))
+        } else {
+            plan.resolve(root, leaf).estimate(
+                variable,
+                &view,
+                &mut EstimateSink::Column(&mut column),
+            )
+        };
         assert!(
-            constraint.estimate(variable, &view, &mut EstimateSink::Column(&mut column),),
+            is_relevant,
             "a relevant child became irrelevant before the candidate was committed"
         );
         assert_eq!(
@@ -722,7 +815,7 @@ fn candidate_transition<'a, C: Constraint<'a> + 'a>(
         );
         for row in 0..batch.parents.row_count {
             if confirmers[row] == usize::MAX || column[row] < estimates[row] {
-                confirmers[row] = child;
+                confirmers[row] = leaf;
                 estimates[row] = column[row];
             }
         }
@@ -732,13 +825,21 @@ fn candidate_transition<'a, C: Constraint<'a> + 'a>(
         "candidate state has no enabled transition"
     );
 
-    let mut confirm_group = |child: usize, mut selected: CandidateBatch| {
+    let mut confirm_group = |leaf: usize, mut selected: CandidateBatch| {
         let selected_view = rows_view(&vars, &selected.parents.rows, selected.parents.row_count);
-        children[child].confirm(
-            variable,
-            &selected_view,
-            &mut CandidateSink::Tagged(&mut selected.candidates),
-        );
+        if let Some(child) = plan.direct_child(leaf) {
+            root.children()[child].confirm(
+                variable,
+                &selected_view,
+                &mut CandidateSink::Tagged(&mut selected.candidates),
+            );
+        } else {
+            plan.resolve(root, leaf).confirm(
+                variable,
+                &selected_view,
+                &mut CandidateSink::Tagged(&mut selected.candidates),
+            );
+        }
         stats.confirm_calls += 1;
         stats.confirm_rows += selected.parents.row_count;
         stats.max_confirm_rows = stats.max_confirm_rows.max(selected.parents.row_count);
@@ -747,13 +848,13 @@ fn candidate_transition<'a, C: Constraint<'a> + 'a>(
             file(
                 worklist,
                 interner,
-                child_count,
+                leaf_count,
                 StateDesc {
                     bound: desc.bound,
                     phase: ResidualPhase::Candidate {
                         variable,
                         relevant: relevant.clone(),
-                        checked: checked.with_inserted(child),
+                        checked: checked.with_inserted(leaf),
                     },
                 },
                 StateBucket::Candidate(selected),
@@ -763,13 +864,13 @@ fn candidate_transition<'a, C: Constraint<'a> + 'a>(
     };
 
     let first = confirmers[0];
-    if confirmers.iter().all(|&child| child == first) {
+    if confirmers.iter().all(|&leaf| leaf == first) {
         // The common case keeps ownership of the whole ragged block: no
         // parent copy, candidate rescan, or row-tag remap is necessary.
         confirm_group(first, batch);
     } else {
-        for (child, selected) in batch.partition(vars.len(), &confirmers) {
-            confirm_group(child, selected);
+        for (leaf, selected) in batch.partition(vars.len(), &confirmers) {
+            confirm_group(leaf, selected);
         }
     }
 }
@@ -781,7 +882,7 @@ fn candidate_transition<'a, C: Constraint<'a> + 'a>(
 /// later filing simply reopens the same interned descriptor.
 struct ResidualStateMachine {
     full: VariableSet,
-    child_count: usize,
+    leaf_count: usize,
     interner: StateInterner,
     worklist: Worklist,
     stats: ResidualStateStats,
@@ -796,11 +897,11 @@ struct ResidualStateMachine {
 }
 
 impl ResidualStateMachine {
-    fn new(full: VariableSet, child_count: usize, mode: Search) -> Self {
+    fn new(full: VariableSet, leaf_count: usize, mode: Search) -> Self {
         let cap = block_row_cap();
         let mut state = Self {
             full,
-            child_count,
+            leaf_count,
             interner: StateInterner::default(),
             worklist: Worklist::new(),
             stats: ResidualStateStats::default(),
@@ -817,7 +918,7 @@ impl ResidualStateMachine {
             file(
                 &mut state.worklist,
                 &mut state.interner,
-                child_count,
+                leaf_count,
                 StateDesc {
                     bound: VariableSet::new_empty(),
                     phase: ResidualPhase::Ready,
@@ -868,7 +969,7 @@ impl ResidualStateMachine {
         }
 
         let desc = self.interner.get(id).clone();
-        debug_assert_eq!(desc.rank(self.child_count), rank);
+        debug_assert_eq!(desc.rank(self.leaf_count), rank);
         let before = bucket.row_count();
         let chunk = bucket.take_tail(desc.bound.count(), width);
         if bucket.row_count() != 0 {
@@ -896,6 +997,7 @@ impl ResidualStateMachine {
     fn pop_once<'a, C: Constraint<'a> + 'a>(
         &mut self,
         root: &IntersectionConstraint<C>,
+        plan: &ResidualPlan,
         influences: &[VariableSet; 128],
         base_estimates: &[usize; 128],
         width: usize,
@@ -914,6 +1016,7 @@ impl ResidualStateMachine {
             }
             (ResidualPhase::Ready, StateBucket::Ready(rows)) => ready_transition(
                 root,
+                plan,
                 &desc,
                 rows,
                 self.full,
@@ -932,6 +1035,7 @@ impl ResidualStateMachine {
                 StateBucket::Candidate(batch),
             ) => candidate_transition(
                 root,
+                plan,
                 &desc,
                 *variable,
                 relevant,
@@ -948,6 +1052,7 @@ impl ResidualStateMachine {
     fn pull<'a, C, P, R>(
         &mut self,
         root: &IntersectionConstraint<C>,
+        plan: &ResidualPlan,
         postprocessing: &P,
         influences: &[VariableSet; 128],
         base_estimates: &[usize; 128],
@@ -977,7 +1082,7 @@ impl ResidualStateMachine {
 
             let width = self.width;
             while self.emit_next >= self.emit_count && !self.worklist.is_empty() {
-                self.pop_once(root, influences, base_estimates, width);
+                self.pop_once(root, plan, influences, base_estimates, width);
             }
             self.width = self.width.saturating_mul(self.growth).clamp(1, self.cap);
         }
@@ -999,6 +1104,7 @@ impl ResidualStateMachine {
 #[must_use]
 pub struct ResidualStateIter<C, P: Fn(&Binding) -> Option<R>, R> {
     root: Arc<IntersectionConstraint<C>>,
+    plan: ResidualPlan,
     postprocessing: P,
     influences: [VariableSet; 128],
     base_estimates: [usize; 128],
@@ -1067,6 +1173,7 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         self.state.pull(
             self.root.as_ref(),
+            &self.plan,
             &self.postprocessing,
             &self.influences,
             &self.base_estimates,
@@ -1086,7 +1193,8 @@ where
     P: Fn(&Binding) -> Option<R>,
 {
     let full = root.variables();
-    let child_count = root.children().len();
+    let plan = ResidualPlan::compile(root);
+    let leaf_count = plan.len();
     let mut stats = ResidualStateStats::default();
     let mut interner = StateInterner::default();
     let mut worklist = Worklist::new();
@@ -1094,7 +1202,7 @@ where
         file(
             &mut worklist,
             &mut interner,
-            child_count,
+            leaf_count,
             StateDesc {
                 bound: VariableSet::new_empty(),
                 phase: ResidualPhase::Ready,
@@ -1112,7 +1220,7 @@ where
             .expect("observed worklist level exists");
         for (id, bucket) in level {
             let desc = interner.get(id).clone();
-            debug_assert_eq!(desc.rank(child_count), rank);
+            debug_assert_eq!(desc.rank(leaf_count), rank);
             stats.state_pops += 1;
             stats.harvest_pops += 1;
             match (&desc.phase, bucket) {
@@ -1131,6 +1239,7 @@ where
                 }
                 (ResidualPhase::Ready, StateBucket::Ready(rows)) => ready_transition(
                     root,
+                    &plan,
                     &desc,
                     rows,
                     full,
@@ -1149,6 +1258,7 @@ where
                     StateBucket::Candidate(batch),
                 ) => candidate_transition(
                     root,
+                    &plan,
                     &desc,
                     *variable,
                     relevant,
@@ -1203,30 +1313,35 @@ where
             ..
         } = self;
         let full = constraint.variables();
-        let child_count = constraint.children().len();
+        let plan = ResidualPlan::compile(constraint.as_ref());
+        let leaf_count = plan.len();
         ResidualStateIter {
             root: constraint,
+            plan,
             postprocessing,
             influences,
             base_estimates,
-            state: ResidualStateMachine::new(full, child_count, mode),
+            state: ResidualStateMachine::new(full, leaf_count, mode),
         }
     }
 
     /// Eagerly solves a root intersection through canonical residual states.
     ///
-    /// This experimental path jointly chooses the next variable and direct
-    /// proposing child, then represents each remaining confirmation set as an
-    /// interned state. Histories with identical future work append into one
-    /// bucket before that state runs. Nested composites remain opaque direct
-    /// children and continue through the ordinary [`Constraint`] protocol.
+    /// This experimental path recursively flattens the maximal nested AND
+    /// region, jointly chooses the next variable and proposing leaf occurrence,
+    /// then represents each remaining confirmation set as an interned state.
+    /// Histories with identical future work append into one bucket before that
+    /// state runs. Union, ignore, and regular-path constraints remain opaque
+    /// semantic boundaries; custom constraints do too unless they explicitly
+    /// expose an associative AND shape. Opaque leaves continue through the
+    /// ordinary [`Constraint`] protocol.
     ///
     /// Result order may differ from the ordinary iterator; the result
     /// multiset is the same. Use
     /// [`solve_residual_state_profiled`](Self::solve_residual_state_profiled)
     /// to inspect reconvergence and batch measurements.
     ///
-    /// Direct children must obey [`Constraint::estimate`]'s structural,
+    /// Flattened leaves must obey [`Constraint::estimate`]'s structural,
     /// block-uniform relevance law and remain semantically immutable during
     /// the solve.
     ///
@@ -1285,13 +1400,16 @@ where
             ..
         } = self;
         let full = constraint.variables();
-        let child_count = constraint.children().len();
+        let root = Arc::new(constraint);
+        let plan = ResidualPlan::compile(root.as_ref());
+        let leaf_count = plan.len();
         ResidualStateIter {
-            root: Arc::new(constraint),
+            root,
+            plan,
             postprocessing,
             influences,
             base_estimates,
-            state: ResidualStateMachine::new(full, child_count, mode),
+            state: ResidualStateMachine::new(full, leaf_count, mode),
         }
     }
 
@@ -1299,7 +1417,7 @@ where
     /// states, preserving the ordinary solver's result multiset while
     /// allowing result order to differ.
     ///
-    /// Direct children must obey [`Constraint::estimate`]'s structural,
+    /// Flattened leaves must obey [`Constraint::estimate`]'s structural,
     /// block-uniform relevance law and remain semantically immutable during
     /// the solve.
     ///
@@ -1338,11 +1456,196 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query::unionconstraint::UnionConstraint;
+
+    #[derive(Clone, Copy)]
+    struct ShapeLeaf(VariableId);
+
+    impl Constraint<'static> for ShapeLeaf {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(self.0)
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != self.0 {
+                return false;
+            }
+            out.fill(1, view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+    }
+
+    type ShapeConstraint = Box<dyn Constraint<'static> + Send + Sync>;
+
+    fn shape_leaf(variable: VariableId) -> ShapeConstraint {
+        Box::new(ShapeLeaf(variable))
+    }
+
+    fn shape_and(children: Vec<ShapeConstraint>) -> ShapeConstraint {
+        Box::new(IntersectionConstraint::new(children))
+    }
 
     fn raw(byte: u8) -> RawInline {
         let mut value = [0; 32];
         value[0] = byte;
         value
+    }
+
+    #[test]
+    fn box_and_arc_forward_object_safe_residual_shapes() {
+        let boxed: Box<dyn Constraint<'static> + Send + Sync> =
+            Box::new(IntersectionConstraint::new(vec![ShapeLeaf(0)]));
+        let boxed_children = match boxed.residual_shape() {
+            ConstraintShape::And(children) => children,
+            ConstraintShape::Opaque => panic!("boxed intersection stayed opaque"),
+        };
+        assert_eq!(boxed_children.len(), 1);
+        assert_eq!(
+            boxed_children.child(0).variables(),
+            VariableSet::new_singleton(0)
+        );
+
+        let arc: Arc<dyn Constraint<'static> + Send + Sync> =
+            Arc::new(IntersectionConstraint::new(vec![ShapeLeaf(1)]));
+        let arc_children = match arc.residual_shape() {
+            ConstraintShape::And(children) => children,
+            ConstraintShape::Opaque => panic!("Arc intersection stayed opaque"),
+        };
+        assert_eq!(arc_children.len(), 1);
+        assert_eq!(
+            arc_children.child(0).variables(),
+            VariableSet::new_singleton(1)
+        );
+    }
+
+    #[test]
+    fn nested_and_plan_is_deterministic_preorder_and_resolves_paths() {
+        let root = IntersectionConstraint::new(vec![
+            shape_leaf(0),
+            shape_and(vec![
+                shape_leaf(1),
+                shape_and(vec![shape_leaf(2), shape_leaf(3)]),
+            ]),
+            shape_leaf(4),
+        ]);
+        let plan = ResidualPlan::compile(&root);
+        let paths: Vec<Vec<usize>> = plan.leaves.iter().map(|path| path.0.to_vec()).collect();
+        assert_eq!(
+            paths,
+            [vec![0], vec![1, 0], vec![1, 1, 0], vec![1, 1, 1], vec![2]]
+        );
+        for variable in 0..5 {
+            assert_eq!(
+                plan.resolve(&root, variable).variables(),
+                VariableSet::new_singleton(variable)
+            );
+        }
+
+        let right = IntersectionConstraint::new(vec![shape_and(vec![
+            shape_leaf(0),
+            shape_and(vec![
+                shape_leaf(1),
+                shape_and(vec![shape_leaf(2), shape_leaf(3)]),
+            ]),
+        ])]);
+        let right_paths: Vec<Vec<usize>> = ResidualPlan::compile(&right)
+            .leaves
+            .iter()
+            .map(|path| path.0.to_vec())
+            .collect();
+        assert_eq!(
+            right_paths,
+            [
+                vec![0, 0],
+                vec![0, 1, 0],
+                vec![0, 1, 1, 0],
+                vec![0, 1, 1, 1]
+            ]
+        );
+    }
+
+    #[test]
+    fn repeated_objects_keep_distinct_occurrence_paths() {
+        let shared: Arc<dyn Constraint<'static> + Send + Sync> = Arc::new(ShapeLeaf(7));
+        let root = IntersectionConstraint::new(vec![Arc::clone(&shared), Arc::clone(&shared)]);
+        let plan = ResidualPlan::compile(&root);
+        assert_eq!(
+            plan.leaves,
+            vec![
+                ConstraintPath(vec![0].into_boxed_slice()),
+                ConstraintPath(vec![1].into_boxed_slice())
+            ]
+        );
+        assert_eq!(
+            plan.resolve(&root, 0).variables(),
+            VariableSet::new_singleton(7)
+        );
+        assert_eq!(
+            plan.resolve(&root, 1).variables(),
+            VariableSet::new_singleton(7)
+        );
+    }
+
+    #[test]
+    fn ignore_and_regular_path_wrappers_remain_single_opaque_occurrences() {
+        use crate::inline::encodings::genid::GenId;
+        use crate::trible::TribleSet;
+
+        let ignored = IgnoreConstraint::new(
+            VariableSet::new_singleton(0),
+            shape_and(vec![shape_leaf(0), shape_leaf(1)]),
+        );
+        let path = RegularPathConstraint::new(
+            TribleSet::new(),
+            Variable::<GenId>::new(2),
+            Variable::<GenId>::new(3),
+            &[PathOp::Attr([0; 16])],
+        );
+        let root = IntersectionConstraint::new(vec![
+            Box::new(ignored) as ShapeConstraint,
+            Box::new(path) as ShapeConstraint,
+        ]);
+        let plan = ResidualPlan::compile(&root);
+        assert_eq!(
+            plan.leaves,
+            vec![
+                ConstraintPath(vec![0].into_boxed_slice()),
+                ConstraintPath(vec![1].into_boxed_slice())
+            ]
+        );
+
+        let union = UnionConstraint::new(vec![
+            IntersectionConstraint::new(vec![shape_leaf(4), shape_leaf(5)]),
+            IntersectionConstraint::new(vec![shape_leaf(4), shape_leaf(5)]),
+        ]);
+        let root =
+            IntersectionConstraint::new(vec![shape_and(vec![Box::new(union) as ShapeConstraint])]);
+        assert_eq!(
+            ResidualPlan::compile(&root).leaves,
+            vec![ConstraintPath(vec![0, 0].into_boxed_slice())],
+            "an AND may contain a union, but lowering must not enter its AND arms"
+        );
     }
 
     #[test]

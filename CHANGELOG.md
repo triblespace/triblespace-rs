@@ -10,14 +10,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Root intersections gain an opt-in canonical residual-state solver.**
-  `solve_residual_state` jointly chooses each row's next variable and direct
-  proposing child, then interns the remaining confirmation set as an exact
+  `solve_residual_state` jointly chooses each row's next variable and proposing
+  leaf occurrence, then interns the remaining confirmation set as an exact
   control-state descriptor. A history-independent rank gate lets different
   proposal/confirmation and variable-order histories reconverge before their
-  shared state runs, while row payloads retain multiplicity. Direct children
-  remain opaque `Constraint` implementations, so nested unions and custom
-  constraints keep the existing protocol; a profiled entry point reports
-  interner, bucket-merge, and child-call batch measurements.
+  shared state runs, while row payloads retain multiplicity. The maximal nested
+  AND region is flattened into deterministic preorder leaf occurrences;
+  unions and ignore/path wrappers remain opaque semantic boundaries; custom
+  constraints do too unless they explicitly expose an associative AND shape.
+  A profiled entry point reports interner, bucket-merge, and leaf-call batch
+  measurements.
 - **Canonical residual states gain a demand-driven sprint-to-harvest
   iterator.** `solve_residual_state_lazy` starts with narrow maximum-rank
   chunks so descendants can yield before sibling rows are evaluated, widens

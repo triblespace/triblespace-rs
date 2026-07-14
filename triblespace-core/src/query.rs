@@ -689,6 +689,35 @@ pub fn confirm_per_row(
     }
 }
 
+/// Structural shape exposed to query-engine lowering probes.
+///
+/// This is deliberately not part of the ordinary constraint protocol. It lets
+/// opt-in engines flatten associative conjunctions without teaching them the
+/// concrete Rust type of every constraint. Semantic wrappers and custom
+/// constraints remain opaque unless they explicitly expose a shape.
+#[doc(hidden)]
+#[non_exhaustive]
+#[derive(Clone, Copy)]
+pub enum ConstraintShape<'s, 'a> {
+    /// One indivisible ordinary constraint occurrence.
+    Opaque,
+    /// An associative logical conjunction whose children may be inspected.
+    And(&'s dyn ConstraintChildren<'a>),
+}
+
+/// Object-safe child access for a structural constraint shape.
+#[doc(hidden)]
+pub trait ConstraintChildren<'a> {
+    /// Number of direct child occurrences.
+    fn len(&self) -> usize;
+
+    /// Borrows one direct child occurrence.
+    ///
+    /// Repeated references to the same constraint object at different indices
+    /// remain distinct occurrences to a lowering engine.
+    fn child(&self, index: usize) -> &dyn Constraint<'a>;
+}
+
 /// The cooperative protocol that every query participant implements.
 ///
 /// A constraint restricts the values that can be assigned to query
@@ -898,6 +927,22 @@ pub trait Constraint<'a> {
             VariableSet::new_empty()
         }
     }
+
+    /// Exposes associative structure to opt-in residual lowering engines.
+    ///
+    /// The default keeps the constraint opaque. Implementations must expose
+    /// only structure whose flattening preserves the ordinary protocol's
+    /// semantics; wrappers that change scope, multiplicity, or evaluation
+    /// meaning should retain the default. The exposed shape must be a finite,
+    /// acyclic tree. Its variants, child counts, and child order are structural
+    /// facts and MUST remain stable for the entire query execution. A
+    /// path-based engine may resolve the plan repeatedly, so changing shape
+    /// through interior mutability can silently select a different constraint
+    /// occurrence even when every individual borrow is memory-safe.
+    #[doc(hidden)]
+    fn residual_shape(&self) -> ConstraintShape<'_, 'a> {
+        ConstraintShape::Opaque
+    }
 }
 
 impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
@@ -945,6 +990,11 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         let inner: &T = self;
         inner.influence(variable)
     }
+
+    fn residual_shape(&self) -> ConstraintShape<'_, 'a> {
+        let inner: &T = self;
+        inner.residual_shape()
+    }
 }
 
 impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
@@ -991,6 +1041,11 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     fn influence(&self, variable: VariableId) -> VariableSet {
         let inner: &T = self;
         inner.influence(variable)
+    }
+
+    fn residual_shape(&self) -> ConstraintShape<'_, 'a> {
+        let inner: &T = self;
+        inner.residual_shape()
     }
 }
 

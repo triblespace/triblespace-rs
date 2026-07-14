@@ -154,6 +154,40 @@ fn run_lazy_residual_profiled<S: TriblePattern>(kb: &S) -> ((usize, u64), Residu
     (tally(solve.results), solve.stats)
 }
 
+fn run_nested_query<S: TriblePattern>(kb: &S, mode: Mode) -> (usize, u64) {
+    let query = find!(
+        (p: Inline<_>, x: Inline<_>),
+        and!(
+            pattern!(kb, [{ ?p @ world::a: ?x }]),
+            and!(
+                pattern!(kb, [{ ?p @ world::b: ?x }]),
+                pattern!(kb, [{ ?p @ world::c: ?x }]),
+            ),
+        )
+    );
+    match mode {
+        Mode::Sequential => tally(query.sequential()),
+        Mode::Dag => tally(query.solve_dag()),
+        Mode::Residual => tally(query.solve_residual_state()),
+        Mode::ResidualLazy => tally(query.solve_residual_state_lazy()),
+    }
+}
+
+fn run_nested_residual_profiled<S: TriblePattern>(kb: &S) -> ((usize, u64), ResidualStateStats) {
+    let solve = find!(
+        (p: Inline<_>, x: Inline<_>),
+        and!(
+            pattern!(kb, [{ ?p @ world::a: ?x }]),
+            and!(
+                pattern!(kb, [{ ?p @ world::b: ?x }]),
+                pattern!(kb, [{ ?p @ world::c: ?x }]),
+            ),
+        )
+    )
+    .solve_residual_state_profiled();
+    (tally(solve.results), solve.stats)
+}
+
 #[derive(Clone, Copy)]
 enum FirstMode {
     Sequential,
@@ -318,6 +352,62 @@ fn bench_backend<S: TriblePattern>(label: &str, kb: &S, expected: usize, reps: u
     );
 }
 
+fn bench_nested_backend<S: TriblePattern>(label: &str, kb: &S, expected: usize, reps: usize) {
+    let modes = [
+        ("seq", Mode::Sequential),
+        ("dag", Mode::Dag),
+        ("residual", Mode::Residual),
+        ("res-lazy", Mode::ResidualLazy),
+    ];
+    for &(_, mode) in &modes {
+        std::hint::black_box(run_nested_query(kb, mode));
+    }
+
+    println!("\n== {label}: explicit nested AND ==");
+    let mut samples = vec![Vec::with_capacity(reps); modes.len()];
+    let mut signatures = vec![(0, 0); modes.len()];
+    for repetition in 0..reps {
+        for offset in 0..modes.len() {
+            let mode_index = (repetition + offset) % modes.len();
+            let start = Instant::now();
+            signatures[mode_index] = run_nested_query(kb, modes[mode_index].1);
+            samples[mode_index].push(start.elapsed().as_secs_f64() * 1e3);
+        }
+    }
+
+    let reference = signatures[0];
+    for (mode_index, &(name, _)) in modes.iter().enumerate() {
+        let signature = signatures[mode_index];
+        let parity = signature == reference && signature.0 == expected;
+        println!(
+            "  {name:<9} {:>9.3} ms  signature ({:>7}, {:#018x})  {}",
+            median(&samples[mode_index]),
+            signature.0,
+            signature.1,
+            if parity { "ok" } else { "MISMATCH" },
+        );
+        assert!(parity, "{label} nested {name} result signature mismatch");
+    }
+
+    let (signature, stats) = run_nested_residual_profiled(kb);
+    assert_eq!(signature, reference, "profiled nested residual mismatch");
+    println!(
+        "  nested profile: states {} + hits {}, pops {}, bucket merges {} ({} rows); \
+         propose {} calls/{} rows/max {}, confirm {} calls/{} rows/max {}",
+        stats.states_interned,
+        stats.interner_hits,
+        stats.state_pops,
+        stats.bucket_merges,
+        stats.rows_merged,
+        stats.propose_calls,
+        stats.propose_rows,
+        stats.max_propose_rows,
+        stats.confirm_calls,
+        stats.confirm_rows,
+        stats.max_confirm_rows,
+    );
+}
+
 fn parse_arg(position: usize, default: usize) -> usize {
     std::env::args()
         .nth(position)
@@ -342,9 +432,11 @@ fn main() {
     );
 
     bench_backend("TribleSet", &kb, expected, reps);
+    bench_nested_backend("TribleSet", &kb, expected, reps);
 
     let start = Instant::now();
     let archive: SuccinctArchive<OrderedUniverse> = (&kb).into();
     eprintln!("archive built in {:?}", start.elapsed());
     bench_backend("SuccinctArchive", &archive, expected, reps);
+    bench_nested_backend("SuccinctArchive", &archive, expected, reps);
 }

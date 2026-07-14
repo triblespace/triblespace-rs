@@ -6,7 +6,8 @@ use triblespace_core::query::equalityconstraint::EqualityConstraint;
 use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
-    Binding, CandidateSink, Constraint, EstimateSink, Query, RowsView, VariableId, VariableSet,
+    Binding, CandidateSink, Constraint, EstimateSink, IgnoreConstraint, Query, RowsView,
+    VariableId, VariableSet,
 };
 
 // Deliberately put x before p. The residual solver first binds p, then has to
@@ -443,6 +444,60 @@ impl Constraint<'_> for FiniteDomain {
     }
 }
 
+#[derive(Clone, Copy)]
+struct BorrowedDomain<'v> {
+    variable: VariableId,
+    values: &'v [RawInline],
+}
+
+impl<'v> Constraint<'v> for BorrowedDomain<'v> {
+    fn variables(&self) -> VariableSet {
+        VariableSet::new_singleton(self.variable)
+    }
+
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        if variable != self.variable {
+            return false;
+        }
+        out.fill(self.values.len(), view.len());
+        true
+    }
+
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        if variable == self.variable {
+            for row in 0..view.len() {
+                candidates.extend_row(row as u32, self.values.iter().copied());
+            }
+        }
+    }
+
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        if variable == self.variable {
+            candidates.retain(|_, candidate| self.values.contains(candidate));
+        }
+    }
+
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        view.col(self.variable)
+            .is_none_or(|column| view.iter().all(|row| self.values.contains(&row[column])))
+    }
+}
+
 type OwnedConstraint = Box<dyn Constraint<'static> + Send + Sync>;
 
 fn finite_domain(
@@ -467,6 +522,81 @@ fn fixture(parents: usize) -> (IntersectionConstraint<TableChild>, Arc<Mutex<Tra
         TableChild::relation(Child::C, parents, Arc::clone(&trace)),
     ]);
     (root, trace)
+}
+
+fn nested_fixture(parents: usize) -> (IntersectionConstraint<OwnedConstraint>, Arc<Mutex<Trace>>) {
+    let trace = Arc::new(Mutex::new(Trace::default()));
+    let tail = IntersectionConstraint::new(vec![
+        Box::new(TableChild::relation(Child::B, parents, Arc::clone(&trace))) as OwnedConstraint,
+        Box::new(TableChild::relation(Child::C, parents, Arc::clone(&trace))) as OwnedConstraint,
+    ]);
+    let relations = IntersectionConstraint::new(vec![
+        Box::new(TableChild::relation(Child::A, parents, Arc::clone(&trace))) as OwnedConstraint,
+        Box::new(tail) as OwnedConstraint,
+    ]);
+    let root = IntersectionConstraint::new(vec![
+        Box::new(TableChild::domain(parents, 0, Arc::clone(&trace))) as OwnedConstraint,
+        Box::new(relations) as OwnedConstraint,
+    ]);
+    (root, trace)
+}
+
+#[derive(Clone, Copy)]
+enum AndNesting {
+    Flat,
+    Left,
+    Right,
+}
+
+fn and_nesting_fixture(nesting: AndNesting) -> IntersectionConstraint<OwnedConstraint> {
+    let values = [encoded(b'n', 0), encoded(b'n', 0), encoded(b'n', 1)];
+    let (parents, _) = finite_domain(P, values.to_vec(), 1);
+    let (xs, _) = finite_domain(X, vec![values[0], values[2]], 64);
+    let parent = Box::new(parents) as OwnedConstraint;
+    let x = Box::new(xs) as OwnedConstraint;
+    let equality = Box::new(EqualityConstraint::new(P, X)) as OwnedConstraint;
+
+    match nesting {
+        AndNesting::Flat => IntersectionConstraint::new(vec![parent, x, equality]),
+        AndNesting::Left => {
+            IntersectionConstraint::new(vec![Box::new(IntersectionConstraint::new(vec![
+                Box::new(IntersectionConstraint::new(vec![parent, x])) as OwnedConstraint,
+                equality,
+            ])) as OwnedConstraint])
+        }
+        AndNesting::Right => {
+            IntersectionConstraint::new(vec![Box::new(IntersectionConstraint::new(vec![
+                parent,
+                Box::new(IntersectionConstraint::new(vec![x, equality])) as OwnedConstraint,
+            ])) as OwnedConstraint])
+        }
+    }
+}
+
+fn nested_dead_union_fixture() -> IntersectionConstraint<OwnedConstraint> {
+    let p_live = encoded(b'u', 0);
+    let p_dead = encoded(b'u', 1);
+    let x_live = encoded(b'v', 0);
+    let x_dead = encoded(b'v', 1);
+    let (outer_p, _) = finite_domain(P, vec![p_live], 1);
+    let (arm_live_p, _) = finite_domain(P, vec![p_live], 8);
+    let (arm_live_x, _) = finite_domain(X, vec![x_live], 1);
+    let (arm_dead_p, _) = finite_domain(P, vec![p_dead], 8);
+    let (arm_dead_x, _) = finite_domain(X, vec![x_dead], 1);
+    let live = IntersectionConstraint::new(vec![
+        Box::new(arm_live_p) as OwnedConstraint,
+        Box::new(arm_live_x) as OwnedConstraint,
+    ]);
+    let dead = IntersectionConstraint::new(vec![
+        Box::new(arm_dead_p) as OwnedConstraint,
+        Box::new(arm_dead_x) as OwnedConstraint,
+    ]);
+    let union = UnionConstraint::new(vec![live, dead]);
+    let nested = IntersectionConstraint::new(vec![
+        Box::new(outer_p) as OwnedConstraint,
+        Box::new(union) as OwnedConstraint,
+    ]);
+    IntersectionConstraint::new(vec![Box::new(nested) as OwnedConstraint])
 }
 
 fn project_pair(binding: &Binding) -> Option<(RawInline, RawInline)> {
@@ -567,6 +697,221 @@ fn flipped_proposers_remerge_before_the_last_confirmation() {
         residual.stats.interner_hits,
         residual.stats.bucket_merges + residual.stats.state_reentries
     );
+}
+
+#[test]
+fn nested_and_flipped_proposers_remerge_before_the_last_confirmation() {
+    const N: usize = 12;
+    let (root, trace) = nested_fixture(N);
+    let mut residual = Query::new(root, project_pair).solve_residual_state_profiled();
+    let (sequential_root, _) = nested_fixture(N);
+    let mut sequential: Vec<_> = Query::new(sequential_root, project_pair)
+        .sequential()
+        .collect();
+    residual.results.sort_unstable();
+    sequential.sort_unstable();
+    assert_eq!(residual.results, sequential);
+
+    let trace = trace.lock().unwrap();
+    for leaf in [Child::A, Child::B] {
+        let proposals = matching_calls(&trace, leaf, Verb::Propose, X);
+        let confirmations = matching_calls(&trace, leaf, Verb::Confirm, X);
+        assert_eq!(proposals.len(), 1, "{leaf:?} nested proposal calls");
+        assert_eq!(confirmations.len(), 1, "{leaf:?} nested confirm calls");
+        assert_eq!(proposals[0].rows, N / 2);
+        assert_eq!(confirmations[0].rows, N / 2);
+    }
+    let c = matching_calls(&trace, Child::C, Verb::Confirm, X);
+    assert_eq!(c.len(), 1, "nested C must run after checked-set remerge");
+    assert_eq!((c[0].rows, c[0].candidates_after), (N, N));
+    assert_eq!(residual.stats.bucket_merges, 1);
+    assert_eq!(residual.stats.rows_merged, N / 2);
+    assert_eq!(residual.stats.max_confirm_rows, N);
+}
+
+#[test]
+fn flat_left_and_right_nested_forms_preserve_bags_and_outer_duplicates() {
+    let expected = vec![
+        (encoded(b'n', 0), encoded(b'n', 0)),
+        (encoded(b'n', 0), encoded(b'n', 0)),
+        (encoded(b'n', 1), encoded(b'n', 1)),
+    ];
+
+    for nesting in [AndNesting::Flat, AndNesting::Left, AndNesting::Right] {
+        let mut eager =
+            Query::new(and_nesting_fixture(nesting), project_pair).solve_residual_state();
+        let mut lazy: Vec<_> = Query::new(and_nesting_fixture(nesting), project_pair)
+            .solve_residual_state_lazy()
+            .cap(usize::MAX)
+            .start_width(1)
+            .growth(1)
+            .collect();
+        let mut sequential: Vec<_> = Query::new(and_nesting_fixture(nesting), project_pair)
+            .sequential()
+            .collect();
+        eager.sort_unstable();
+        lazy.sort_unstable();
+        sequential.sort_unstable();
+        assert_eq!(eager, expected);
+        assert_eq!(lazy, expected);
+        assert_eq!(sequential, expected);
+    }
+}
+
+#[test]
+fn nested_and_width_one_yields_before_draining_sibling_parents() {
+    const N: usize = 12;
+    let (root, trace) = nested_fixture(N);
+    let mut lazy = Query::new(root, project_pair)
+        .solve_residual_state_lazy()
+        .cap(usize::MAX)
+        .start_width(1)
+        .growth(1);
+    let first = lazy.next().expect("nested fixture has a first result");
+    assert_eq!(decode(&first.0, P_MARKER), decode(&first.1, X_MARKER));
+    assert_eq!(lazy.stats().harvest_pops, 0);
+    assert!(lazy.stats().partial_pops > 0);
+    assert_eq!(lazy.stats().max_propose_rows, 1);
+    assert_eq!(lazy.stats().max_confirm_rows, 1);
+
+    let trace = trace.lock().unwrap();
+    assert!(trace
+        .calls
+        .iter()
+        .filter(|call| call.variable == X)
+        .all(|call| call.rows == 1));
+}
+
+#[test]
+fn union_with_and_arms_stays_opaque_inside_a_nested_and_and_skips_dead_arms() {
+    let expected = vec![(encoded(b'u', 0), encoded(b'v', 0))];
+    let eager = Query::new(nested_dead_union_fixture(), project_pair).solve_residual_state();
+    let lazy: Vec<_> = Query::new(nested_dead_union_fixture(), project_pair)
+        .solve_residual_state_lazy()
+        .cap(usize::MAX)
+        .start_width(1)
+        .growth(1)
+        .collect();
+    let sequential: Vec<_> = Query::new(nested_dead_union_fixture(), project_pair)
+        .sequential()
+        .collect();
+    assert_eq!(eager, expected);
+    assert_eq!(lazy, expected);
+    assert_eq!(sequential, expected);
+}
+
+#[test]
+fn nested_zero_variable_ands_settle_true_and_false_like_sequential() {
+    let project = |_: &Binding| Some("empty binding");
+    let nested_true = || {
+        IntersectionConstraint::new(vec![
+            Box::new(IntersectionConstraint::<Truth>::new(Vec::new())) as OwnedConstraint,
+        ])
+    };
+    let nested_false = || {
+        IntersectionConstraint::new(vec![
+            Box::new(IntersectionConstraint::new(vec![Truth(false)])) as OwnedConstraint,
+        ])
+    };
+
+    let eager_true = Query::new(nested_true(), project).solve_residual_state();
+    let lazy_true: Vec<_> = Query::new(nested_true(), project)
+        .solve_residual_state_lazy()
+        .collect();
+    let sequential_true: Vec<_> = Query::new(nested_true(), project).sequential().collect();
+    assert_eq!(eager_true, ["empty binding"]);
+    assert_eq!(lazy_true, eager_true);
+    assert_eq!(sequential_true, eager_true);
+
+    let eager_false = Query::new(nested_false(), project).solve_residual_state();
+    let lazy_false: Vec<_> = Query::new(nested_false(), project)
+        .solve_residual_state_lazy()
+        .collect();
+    let sequential_false: Vec<_> = Query::new(nested_false(), project).sequential().collect();
+    assert!(eager_false.is_empty());
+    assert_eq!(lazy_false, eager_false);
+    assert_eq!(sequential_false, eager_false);
+}
+
+#[test]
+fn repeated_shared_arc_is_executed_once_per_and_occurrence() {
+    let values = vec![encoded(b'r', 0), encoded(b'r', 1)];
+    let calls = Arc::new(Mutex::new(VerbCounts::default()));
+    let shared = Arc::new(FiniteDomain::new(P, values.clone(), 1, Arc::clone(&calls)));
+    let root = IntersectionConstraint::new(vec![Arc::clone(&shared), Arc::clone(&shared)]);
+
+    let mut residual = Query::new(root, project_parent).solve_residual_state();
+    residual.sort_unstable();
+    assert_eq!(residual, values);
+    let calls = calls.lock().unwrap();
+    assert_eq!(
+        (calls.propose, calls.confirm),
+        (1, 1),
+        "the first shared occurrence proposes and the second independently confirms"
+    );
+}
+
+#[test]
+fn nested_ignore_keeps_hidden_only_children_inert_and_visible_slots_wildcarded() {
+    const N: usize = 4;
+    let make = || {
+        let trace = Arc::new(Mutex::new(Trace::default()));
+        let (empty_hidden, _) = finite_domain(X, Vec::new(), 0);
+        let inner = IntersectionConstraint::new(vec![
+            Box::new(TableChild::relation(Child::A, N, trace)) as OwnedConstraint,
+            Box::new(empty_hidden) as OwnedConstraint,
+        ]);
+        let ignored = IgnoreConstraint::new(VariableSet::new_singleton(X), Box::new(inner));
+        IntersectionConstraint::new(vec![Box::new(IntersectionConstraint::new(vec![
+            Box::new(ignored) as OwnedConstraint,
+        ])) as OwnedConstraint])
+    };
+    let mut expected: Vec<_> = (0..N).map(|parent| encoded(P_MARKER, parent)).collect();
+    let mut eager = Query::new(make(), project_parent).solve_residual_state();
+    let mut lazy: Vec<_> = Query::new(make(), project_parent)
+        .solve_residual_state_lazy()
+        .cap(usize::MAX)
+        .start_width(1)
+        .growth(1)
+        .collect();
+    let mut sequential: Vec<_> = Query::new(make(), project_parent).sequential().collect();
+    expected.sort_unstable();
+    eager.sort_unstable();
+    lazy.sort_unstable();
+    sequential.sort_unstable();
+    assert_eq!(eager, expected);
+    assert_eq!(lazy, expected);
+    assert_eq!(sequential, expected);
+}
+
+#[test]
+fn lazy_nested_plan_owns_paths_without_requiring_static_constraints() {
+    let values = vec![encoded(b'b', 0), encoded(b'b', 1)];
+    let make = || {
+        let inner = IntersectionConstraint::new(vec![
+            BorrowedDomain {
+                variable: P,
+                values: &values,
+            },
+            BorrowedDomain {
+                variable: P,
+                values: &values,
+            },
+        ]);
+        IntersectionConstraint::new(vec![inner])
+    };
+
+    let mut lazy: Vec<_> = Query::new(make(), project_parent)
+        .solve_residual_state_lazy()
+        .cap(usize::MAX)
+        .start_width(1)
+        .growth(1)
+        .collect();
+    let mut sequential: Vec<_> = Query::new(make(), project_parent).sequential().collect();
+    lazy.sort_unstable();
+    sequential.sort_unstable();
+    assert_eq!(lazy, values);
+    assert_eq!(lazy, sequential);
 }
 
 #[test]
