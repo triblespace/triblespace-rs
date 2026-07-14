@@ -615,7 +615,7 @@ fn benchmark_case<R>(
 
 fn print_residual_profile(label: &str, stats: &ResidualStateStats) {
     println!(
-        "  residual {label}: states {}+{}hits, pops {} (full/readiness/partial {}/{}/{}; dead {}; emit {}), merges {} rows/{}, reentries {} rows/{}, propose {} calls/{} rows/max {}, confirm {} calls/{} rows/max {}, width increases {}",
+        "  residual {label}: states {}+{}hits, pops {} (full/readiness/partial {}/{}/{}; dead {}; emit {}), ready groups preferred/scheduled/proposal {}/{}/{} ({} coalesced pops), candidate confirmer groups {}, merges {} rows/{}, reentries {} rows/{}, propose {} calls/{} rows/max {}, confirm {} calls/{} rows/max {}, width increases {}",
         stats.states_interned,
         stats.interner_hits,
         stats.state_pops,
@@ -624,6 +624,11 @@ fn print_residual_profile(label: &str, stats: &ResidualStateStats) {
         stats.partial_pops,
         stats.dead_action_pops,
         stats.emit_pops,
+        stats.ready_preferred_variable_groups,
+        stats.ready_scheduled_variable_groups,
+        stats.ready_proposal_groups,
+        stats.agglomerated_ready_pops,
+        stats.candidate_confirmation_groups,
         stats.bucket_merges,
         stats.rows_merged,
         stats.state_reentries,
