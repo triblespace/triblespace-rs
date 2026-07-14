@@ -23,6 +23,17 @@
 //! Here `r` denotes reallocations. Requested-byte traffic stayed essentially
 //! flat: inline child sets remove allocator latency and fragmentation rather
 //! than the storage frontiers that dominate byte volume.
+//!
+//! A subsequent bounded `ResidualScratch` probe pooled Ready/Candidate planning
+//! vectors. It reduced 120-route TribleSet first-result traffic from `278+35r`
+//! to `133+31r`, and full-drain traffic from `2320+720r` to `800+515r`.
+//! However, nine alternating checkpoint/prototype process pairs measured only
+//! a 3.6% direct median TTFR gain (normalized residual/DAG median: 2.7%), below
+//! the probe's 5% promotion threshold and still around 1.11x the DAG. The
+//! SuccinctArchive and one-leaf action/group profiles were byte-for-byte equal;
+//! TribleSet profiles vary between identical-process reruns because PATCH uses
+//! a per-process random SipHash key. The scratch implementation is therefore a
+//! useful negative result, not a promotion recommendation.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::hash_map::DefaultHasher;
@@ -32,6 +43,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
+use triblespace::core::query::residual::ResidualStateStats;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::trible::TribleSet;
 use triblespace::prelude::*;
@@ -268,6 +280,16 @@ fn one_leaf_full<S: TriblePattern>(kb: &S, root: &ExclusiveId, engine: Engine) -
     }
 }
 
+fn one_leaf_stats<S: TriblePattern>(kb: &S, root: &ExclusiveId) -> ResidualStateStats {
+    find!(
+        x: Inline<inlineencodings::GenId>,
+        pattern!(kb, [{ root @ world::p1: ?x }])
+    )
+    .solve_residual_state_lazy()
+    .collect_profiled()
+    .stats
+}
+
 fn route_first<S: TriblePattern>(kb: &S, markers: RouteMarkers, engine: Engine) -> bool {
     let (k1, k2, k3, k4, k5, kz) = markers;
     let query = find!(
@@ -322,6 +344,33 @@ fn route_full<S: TriblePattern>(kb: &S, markers: RouteMarkers, engine: Engine) -
         Engine::Dag => fold_digest(query.solve_dag_lazy()),
         Engine::Residual => fold_digest(query.solve_residual_state_lazy()),
     }
+}
+
+fn route_stats<S: TriblePattern>(kb: &S, markers: RouteMarkers) -> ResidualStateStats {
+    let (k1, k2, k3, k4, k5, kz) = markers;
+    find!(
+        (
+            e: Inline<inlineencodings::GenId>,
+            x1: Inline<inlineencodings::GenId>,
+            x2: Inline<inlineencodings::GenId>,
+            x3: Inline<inlineencodings::GenId>,
+            x4: Inline<inlineencodings::GenId>,
+            x5: Inline<inlineencodings::GenId>,
+            z: Inline<inlineencodings::GenId>
+        ),
+        pattern!(kb, [
+            { ?e @ world::p1: ?x1, world::p2: ?x2, world::p3: ?x3, world::p4: ?x4, world::p5: ?x5, world::z: ?z },
+            { ?x1 @ world::t1: k1 },
+            { ?x2 @ world::t2: k2 },
+            { ?x3 @ world::t3: k3 },
+            { ?x4 @ world::t4: k4 },
+            { ?x5 @ world::t5: k5 },
+            { ?z @ world::tz: kz },
+        ])
+    )
+    .solve_residual_state_lazy()
+    .collect_profiled()
+    .stats
 }
 
 fn median(samples: &mut [Duration]) -> Duration {
@@ -441,5 +490,21 @@ fn main() {
         || route_first(&routes_archive, markers, Engine::Residual),
         || route_full(&routes_archive, markers, Engine::Dag),
         || route_full(&routes_archive, markers, Engine::Residual),
+    );
+    println!(
+        "\nprofile one-leaf/TribleSet: {:?}",
+        one_leaf_stats(&one, &one_root)
+    );
+    println!(
+        "profile one-leaf/SuccinctArchive: {:?}",
+        one_leaf_stats(&one_archive, &one_root)
+    );
+    println!(
+        "profile routes/TribleSet: {:?}",
+        route_stats(&routes, markers)
+    );
+    println!(
+        "profile routes/SuccinctArchive: {:?}",
+        route_stats(&routes_archive, markers)
     );
 }

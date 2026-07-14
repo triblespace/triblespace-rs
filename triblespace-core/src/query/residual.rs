@@ -725,8 +725,27 @@ struct ProposeAction {
 struct VariablePlan {
     variable: VariableId,
     relevant: ChildSet,
-    /// Tightest flattened leaf occurrence per row.
+}
+
+/// Planning buffers retained by the lazy machine across state pops.
+#[derive(Default)]
+struct ResidualScratch {
+    vars: Vec<VariableId>,
+    unbound: Vec<VariableId>,
+    plans: Vec<VariablePlan>,
     proposers: Vec<usize>,
+    estimates: Vec<usize>,
+    column: Vec<usize>,
+    preferred: Vec<u32>,
+    preferred_counts: Vec<usize>,
+    scheduled: Vec<u32>,
+    owners: Vec<u32>,
+    group_sums: Vec<u128>,
+    compatible: Vec<bool>,
+    active: Vec<bool>,
+    actions: Vec<ProposeAction>,
+    confirmers: Vec<usize>,
+    candidate_estimates: Vec<usize>,
 }
 
 fn estimate_leaf<'a>(
@@ -773,47 +792,55 @@ fn ready_plan_transition<'a>(
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
+    scratch: &mut ResidualScratch,
 ) -> bool {
     let leaf_count = plan.len();
-    let vars: Vec<VariableId> = desc.bound.into_iter().collect();
-    let view = rows_view(&vars, &rows.rows, rows.row_count);
-    let unbound: Vec<VariableId> = full.subtract(desc.bound).into_iter().collect();
-    let mut plans = Vec::with_capacity(unbound.len());
-    let mut estimate_matrix = Vec::with_capacity(unbound.len() * rows.row_count);
+    scratch.vars.clear();
+    scratch.vars.extend(desc.bound);
+    let view = rows_view(&scratch.vars, &rows.rows, rows.row_count);
+    scratch.unbound.clear();
+    scratch.unbound.extend(full.subtract(desc.bound));
+    scratch.plans.clear();
+    scratch.proposers.clear();
+    scratch
+        .proposers
+        .resize(scratch.unbound.len() * rows.row_count, usize::MAX);
+    scratch.estimates.clear();
+    scratch
+        .estimates
+        .resize(scratch.unbound.len() * rows.row_count, usize::MAX);
 
-    for &variable in &unbound {
+    for (variable_plan, &variable) in scratch.unbound.iter().enumerate() {
         let mut relevant = ChildSet::empty(leaf_count);
-        let mut proposers = vec![usize::MAX; rows.row_count];
-        let estimate_start = estimate_matrix.len();
-        estimate_matrix.resize(estimate_start + rows.row_count, usize::MAX);
-        let estimates = &mut estimate_matrix[estimate_start..];
-        let mut column = Vec::with_capacity(rows.row_count);
+        let start = variable_plan * rows.row_count;
+        let estimates = &mut scratch.estimates[start..start + rows.row_count];
+        let proposers = &mut scratch.proposers[start..start + rows.row_count];
         for leaf in 0..leaf_count {
-            column.clear();
+            scratch.column.clear();
             let is_relevant = estimate_leaf(
                 root,
                 plan,
                 leaf,
                 variable,
                 &view,
-                &mut EstimateSink::Column(&mut column),
+                &mut EstimateSink::Column(&mut scratch.column),
             );
             if is_relevant {
                 assert_eq!(
-                    column.len(),
+                    scratch.column.len(),
                     rows.row_count,
                     "constraint estimate must append one value per row"
                 );
                 relevant.insert(leaf);
                 for row in 0..rows.row_count {
-                    if proposers[row] == usize::MAX || column[row] < estimates[row] {
+                    if proposers[row] == usize::MAX || scratch.column[row] < estimates[row] {
                         proposers[row] = leaf;
-                        estimates[row] = column[row];
+                        estimates[row] = scratch.column[row];
                     }
                 }
             } else {
                 assert_eq!(
-                    column.len(),
+                    scratch.column.len(),
                     0,
                     "irrelevant constraint estimate must leave its sink untouched"
                 );
@@ -823,19 +850,16 @@ fn ready_plan_transition<'a>(
             proposers.iter().all(|&child| child != usize::MAX),
             "unconstrained variable in residual-state query"
         );
-        plans.push(VariablePlan {
-            variable,
-            relevant,
-            proposers,
-        });
+        scratch.plans.push(VariablePlan { variable, relevant });
     }
 
-    let mut preferred = Vec::with_capacity(rows.row_count);
-    let mut preferred_counts = vec![0; plans.len()];
+    scratch.preferred.clear();
+    scratch.preferred_counts.clear();
+    scratch.preferred_counts.resize(scratch.plans.len(), 0);
     for row in 0..rows.row_count {
         let mut best: Option<(usize, (u64, u64, u64))> = None;
-        for (pi, plan) in plans.iter().enumerate() {
-            let estimate = estimate_matrix[pi * rows.row_count + row];
+        for (pi, plan) in scratch.plans.iter().enumerate() {
+            let estimate = scratch.estimates[pi * rows.row_count + row];
             let key = variable_order_key(
                 estimate,
                 base_estimates[plan.variable],
@@ -848,30 +872,31 @@ fn ready_plan_transition<'a>(
         let variable_plan = best
             .expect("a non-full ready state has an enabled proposal")
             .0;
-        preferred.push(variable_plan as u32);
-        preferred_counts[variable_plan] += 1;
+        scratch.preferred.push(variable_plan as u32);
+        scratch.preferred_counts[variable_plan] += 1;
     }
 
-    let preferred_groups = preferred_counts.iter().filter(|&&count| count > 0).count();
-    let mut scheduled = preferred.clone();
+    let preferred_groups = scratch
+        .preferred_counts
+        .iter()
+        .filter(|&&count| count > 0)
+        .count();
+    scratch.scheduled.clear();
+    scratch.scheduled.extend_from_slice(&scratch.preferred);
     let mut scheduled_groups = preferred_groups;
     if preferred_groups > 1 {
-        let mut owners = Vec::new();
-        let mut group_sums = Vec::new();
-        let mut compatible = Vec::new();
-        let mut active = Vec::new();
         let plan = plan_agglomerative_partition(
-            &estimate_matrix,
+            &scratch.estimates,
             rows.row_count,
-            &unbound,
+            &scratch.unbound,
             influences,
-            &preferred,
-            &preferred_counts,
-            &mut owners,
-            &mut scheduled,
-            &mut group_sums,
-            &mut compatible,
-            &mut active,
+            &scratch.preferred,
+            &scratch.preferred_counts,
+            &mut scratch.owners,
+            &mut scratch.scheduled,
+            &mut scratch.group_sums,
+            &mut scratch.compatible,
+            &mut scratch.active,
         );
         debug_assert_eq!(plan.preferred_groups, preferred_groups);
         scheduled_groups = plan.scheduled_groups;
@@ -882,19 +907,27 @@ fn ready_plan_transition<'a>(
     stats.ready_preferred_variable_groups += preferred_groups;
     stats.ready_scheduled_variable_groups += scheduled_groups;
 
-    let mut groups: BTreeMap<ProposeAction, Vec<usize>> = BTreeMap::new();
-    for (row, &variable_plan) in scheduled.iter().enumerate() {
+    scratch.actions.clear();
+    for (row, &variable_plan) in scratch.scheduled.iter().enumerate() {
         let variable_plan = variable_plan as usize;
-        let action = ProposeAction {
+        scratch.actions.push(ProposeAction {
             variable_plan,
-            leaf: plans[variable_plan].proposers[row],
-        };
-        groups.entry(action).or_default().push(row);
+            leaf: scratch.proposers[variable_plan * rows.row_count + row],
+        });
     }
-    stats.ready_proposal_groups += groups.len();
+
+    let first = scratch.actions[0];
+    let uniform = scratch.actions.iter().all(|&action| action == first);
+    let mut groups: BTreeMap<ProposeAction, Vec<usize>> = BTreeMap::new();
+    if !uniform {
+        for (row, &action) in scratch.actions.iter().enumerate() {
+            groups.entry(action).or_default().push(row);
+        }
+    }
+    stats.ready_proposal_groups += if uniform { 1 } else { groups.len() };
 
     let mut file_propose_group = |action: ProposeAction, selected: RowBatch| {
-        let variable_plan = &plans[action.variable_plan];
+        let variable_plan = &scratch.plans[action.variable_plan];
         file(
             worklist,
             interner,
@@ -912,16 +945,14 @@ fn ready_plan_transition<'a>(
         )
     };
 
-    if groups.len() == 1 {
-        let (action, indices) = groups.pop_first().expect("one proposal group was observed");
-        debug_assert_eq!(indices.len(), rows.row_count);
+    if uniform {
         // The common case transfers ownership of the whole parent block:
-        // no row copy is necessary when every row chose the same action.
-        file_propose_group(action, rows)
+        // no grouping allocation or row copy is necessary.
+        file_propose_group(first, rows)
     } else {
         let mut advanced = false;
         for (action, indices) in groups {
-            let selected = rows.selected(vars.len(), &indices);
+            let selected = rows.selected(scratch.vars.len(), &indices);
             advanced |= file_propose_group(action, selected);
         }
         advanced
@@ -1045,52 +1076,61 @@ fn candidate_plan_transition<'a>(
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
+    scratch: &mut ResidualScratch,
 ) -> bool {
     let leaf_count = plan.len();
     if relevant == checked {
         return commit_candidates(desc, variable, batch, leaf_count, worklist, interner, stats);
     }
 
-    let vars: Vec<VariableId> = desc.bound.into_iter().collect();
-    let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
-    let mut confirmers = vec![usize::MAX; batch.parents.row_count];
-    let mut estimates = vec![usize::MAX; batch.parents.row_count];
-    let mut column = Vec::with_capacity(batch.parents.row_count);
+    scratch.vars.clear();
+    scratch.vars.extend(desc.bound);
+    let view = rows_view(&scratch.vars, &batch.parents.rows, batch.parents.row_count);
+    scratch.confirmers.clear();
+    scratch
+        .confirmers
+        .resize(batch.parents.row_count, usize::MAX);
+    scratch.candidate_estimates.clear();
+    scratch
+        .candidate_estimates
+        .resize(batch.parents.row_count, usize::MAX);
     for leaf in 0..leaf_count {
         if !relevant.contains(leaf) || checked.contains(leaf) {
             continue;
         }
-        column.clear();
+        scratch.column.clear();
         let is_relevant = estimate_leaf(
             root,
             plan,
             leaf,
             variable,
             &view,
-            &mut EstimateSink::Column(&mut column),
+            &mut EstimateSink::Column(&mut scratch.column),
         );
         assert!(
             is_relevant,
             "a relevant child became irrelevant before the candidate was committed"
         );
         assert_eq!(
-            column.len(),
+            scratch.column.len(),
             batch.parents.row_count,
             "constraint estimate must append one value per row"
         );
         for row in 0..batch.parents.row_count {
-            if confirmers[row] == usize::MAX || column[row] < estimates[row] {
-                confirmers[row] = leaf;
-                estimates[row] = column[row];
+            if scratch.confirmers[row] == usize::MAX
+                || scratch.column[row] < scratch.candidate_estimates[row]
+            {
+                scratch.confirmers[row] = leaf;
+                scratch.candidate_estimates[row] = scratch.column[row];
             }
         }
     }
     assert!(
-        confirmers.iter().all(|&child| child != usize::MAX),
+        scratch.confirmers.iter().all(|&child| child != usize::MAX),
         "candidate state has no enabled transition"
     );
     let mut confirmer_groups = ChildSet::empty(leaf_count);
-    for &confirmer in &confirmers {
+    for &confirmer in &scratch.confirmers {
         confirmer_groups.insert(confirmer);
     }
     stats.candidate_confirmation_groups += confirmer_groups.count();
@@ -1114,14 +1154,14 @@ fn candidate_plan_transition<'a>(
         )
     };
 
-    let first = confirmers[0];
-    if confirmers.iter().all(|&leaf| leaf == first) {
+    let first = scratch.confirmers[0];
+    if scratch.confirmers.iter().all(|&leaf| leaf == first) {
         // The common case keeps ownership of the whole ragged block: no
         // parent copy, candidate rescan, or row-tag remap is necessary.
         file_confirm_group(first, batch)
     } else {
         let mut advanced = false;
-        for (leaf, selected) in batch.partition(vars.len(), &confirmers) {
+        for (leaf, selected) in batch.partition(scratch.vars.len(), &scratch.confirmers) {
             advanced |= file_confirm_group(leaf, selected);
         }
         advanced
@@ -1193,7 +1233,7 @@ enum StepOutcome {
 /// affine payload chunk. The explicit outcome lets eager and lazy callers
 /// distinguish semantic progress, branch death, and terminal projection
 /// without inferring any of them from worklist size.
-fn execute_state<'a>(
+fn execute_state_with_scratch<'a>(
     root: &dyn Constraint<'a>,
     plan: &ResidualPlan,
     desc: &StateDesc,
@@ -1204,6 +1244,7 @@ fn execute_state<'a>(
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
+    scratch: &mut ResidualScratch,
 ) -> StepOutcome {
     match (&desc.phase, bucket) {
         (ResidualPhase::Ready, StateBucket::Rows(rows)) if desc.bound == full => {
@@ -1223,6 +1264,7 @@ fn execute_state<'a>(
                 worklist,
                 interner,
                 stats,
+                scratch,
             );
             assert!(advanced, "Ready planning must file a nonempty action");
             StepOutcome::Advanced
@@ -1257,6 +1299,7 @@ fn execute_state<'a>(
             stats.candidate_plan_pops += 1;
             let advanced = candidate_plan_transition(
                 root, plan, desc, *variable, relevant, checked, batch, worklist, interner, stats,
+                scratch,
             );
             assert!(advanced, "Candidate planning must file a nonempty action");
             StepOutcome::Advanced
@@ -1286,6 +1329,33 @@ fn execute_state<'a>(
     }
 }
 
+fn execute_state<'a>(
+    root: &dyn Constraint<'a>,
+    plan: &ResidualPlan,
+    desc: &StateDesc,
+    bucket: StateBucket,
+    full: VariableSet,
+    influences: &[VariableSet; 128],
+    base_estimates: &[usize; 128],
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+) -> StepOutcome {
+    execute_state_with_scratch(
+        root,
+        plan,
+        desc,
+        bucket,
+        full,
+        influences,
+        base_estimates,
+        worklist,
+        interner,
+        stats,
+        &mut ResidualScratch::default(),
+    )
+}
+
 /// Resumable execution state for [`ResidualStateIter`].
 ///
 /// The exact interner deliberately outlives live buckets. Occupancy scheduling
@@ -1297,6 +1367,7 @@ struct ResidualStateMachine {
     interner: StateInterner,
     worklist: Worklist,
     stats: ResidualStateStats,
+    scratch: ResidualScratch,
     binding: Binding,
     emit_vars: Vec<VariableId>,
     emit_rows: Vec<RawInline>,
@@ -1316,6 +1387,7 @@ impl ResidualStateMachine {
             interner: StateInterner::default(),
             worklist: Worklist::new(),
             stats: ResidualStateStats::default(),
+            scratch: ResidualScratch::default(),
             binding: Binding::default(),
             emit_vars: Vec::new(),
             emit_rows: Vec::new(),
@@ -1429,7 +1501,7 @@ impl ResidualStateMachine {
         let (desc, bucket) = self
             .take_next(width)
             .expect("pop_once requires a non-empty residual worklist");
-        let outcome = execute_state(
+        let outcome = execute_state_with_scratch(
             root,
             plan,
             &desc,
@@ -1440,6 +1512,7 @@ impl ResidualStateMachine {
             &mut self.worklist,
             &mut self.interner,
             &mut self.stats,
+            &mut self.scratch,
         );
         if matches!(&outcome, StepOutcome::Emit(_)) {
             self.emit_vars.clear();
@@ -2096,6 +2169,7 @@ mod tests {
         let mut worklist = Worklist::new();
         let mut interner = StateInterner::default();
         let mut stats = ResidualStateStats::default();
+        let mut scratch = ResidualScratch::default();
 
         assert!(ready_plan_transition(
             &root,
@@ -2108,6 +2182,7 @@ mod tests {
             &mut worklist,
             &mut interner,
             &mut stats,
+            &mut scratch,
         ));
 
         let mut actions = Vec::new();
