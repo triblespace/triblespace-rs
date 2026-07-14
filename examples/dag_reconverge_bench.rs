@@ -25,7 +25,7 @@
 //!         2048 16 8
 //!
 //! Runs sequential / ordinary parallel-scalar / explicit parallel-DAG /
-//! blocked-v1 / grouped / dag / agglomerative / dag-unmerged on both backends
+//! blocked-v1 / grouped / dag / residual-state / agglomerative / dag-unmerged on both backends
 //! and prints per mode: min/median/max wall time, parity signature, and for the
 //! frontier engines the group/batch structure, materialized rows, peak live
 //! row-store cells, and the DAG's bucket/merge census.
@@ -42,6 +42,7 @@ use std::time::Instant;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
+use triblespace::core::query::residual::ResidualStateStats;
 use triblespace::core::query::{blocked_stats, dag_stats, TriblePattern};
 use triblespace::core::trible::TribleSet;
 #[cfg(feature = "gpu")]
@@ -218,6 +219,7 @@ enum Mode {
     Blk,
     Grp,
     Dag,
+    Residual,
     Agglomerative,
     DagU,
 }
@@ -244,6 +246,7 @@ fn run_query<S: TriblePattern>(kb: &S, markers: (Id, Id, Id, Id, Id), mode: Mode
         Mode::Blk => tally(q.solve_blocked()),
         Mode::Grp => tally(q.solve_blocked_grouped()),
         Mode::Dag => tally(q.solve_dag()),
+        Mode::Residual => tally(q.solve_residual_state()),
         Mode::Agglomerative => tally(
             q.solve_dag_lazy()
                 .start_width(1)
@@ -252,6 +255,26 @@ fn run_query<S: TriblePattern>(kb: &S, markers: (Id, Id, Id, Id, Id), mode: Mode
         ),
         Mode::DagU => tally(q.solve_dag_unmerged()),
     }
+}
+
+fn run_residual_profiled<S: TriblePattern>(
+    kb: &S,
+    markers: (Id, Id, Id, Id, Id),
+) -> ((usize, u64), ResidualStateStats) {
+    let (k1, k2, k3, k4, kz) = markers;
+    let solve = find!(
+        (e: Inline<_>, x1: Inline<_>, x2: Inline<_>, x3: Inline<_>, x4: Inline<_>, z: Inline<_>),
+        pattern!(kb, [
+            { ?e @ world::rp1: ?x1, world::rp2: ?x2, world::rp3: ?x3, world::rp4: ?x4, world::rs: ?z },
+            { ?x1 @ world::rt1: k1 },
+            { ?x2 @ world::rt2: k2 },
+            { ?x3 @ world::rt3: k3 },
+            { ?x4 @ world::rt4: k4 },
+            { ?z @ world::rtz: kz }
+        ])
+    )
+    .solve_residual_state_profiled();
+    (tally(solve.results), solve.stats)
 }
 
 fn timing_summary(v: &[f64]) -> (f64, f64, f64) {
@@ -281,22 +304,29 @@ fn bench_backend<S: TriblePattern>(
         ("blk", Mode::Blk),
         ("grp", Mode::Grp),
         ("dag", Mode::Dag),
+        ("residual", Mode::Residual),
         ("agglomerative", Mode::Agglomerative),
         ("dagu", Mode::DagU),
     ]);
-    let mut sigs = Vec::new();
+    for &(_, mode) in &modes {
+        std::hint::black_box(run_query(kb, markers, mode));
+    }
+
+    let mut sigs = vec![(0, 0); modes.len()];
+    let mut times = vec![Vec::with_capacity(reps); modes.len()];
+    for repetition in 0..reps {
+        for offset in 0..modes.len() {
+            let mode_index = (repetition + offset) % modes.len();
+            let t = Instant::now();
+            sigs[mode_index] = run_query(kb, markers, modes[mode_index].1);
+            times[mode_index].push(t.elapsed().as_secs_f64() * 1e3);
+        }
+    }
+
     let mut meds = Vec::new();
     let mut ranges = Vec::new();
-    for &(_, mode) in &modes {
-        let mut times = Vec::new();
-        let mut sig = (0, 0);
-        for _ in 0..reps {
-            let t = Instant::now();
-            sig = run_query(kb, markers, mode);
-            times.push(t.elapsed().as_secs_f64() * 1e3);
-        }
-        sigs.push(sig);
-        let (min, med, max) = timing_summary(&times);
+    for mode_times in &times {
+        let (min, med, max) = timing_summary(mode_times);
         meds.push(med);
         ranges.push((min, max));
     }
@@ -306,6 +336,7 @@ fn bench_backend<S: TriblePattern>(
         sigs[0].0,
         if parity { "ok" } else { "MISMATCH" }
     );
+    assert!(parity, "{label} result signature mismatch");
     for (((name, _), median), (min, max)) in modes.iter().zip(&meds).zip(&ranges) {
         println!("  {name:<14} {median:>10.3} ms  [{min:.3}..{max:.3}]");
     }
@@ -329,6 +360,21 @@ fn bench_backend<S: TriblePattern>(
     blocked_stats::set_enabled(true);
     dag_stats::set_enabled(true);
     for &(name, mode) in &modes[1..] {
+        if mode == Mode::Residual {
+            let (_, stats) = run_residual_profiled(kb, markers);
+            println!(
+                "  residual states: {} interned / {} hits / {} bucket merges ({} rows); calls propose {} (max {} rows), confirm {} (max {} rows)",
+                stats.states_interned,
+                stats.interner_hits,
+                stats.bucket_merges,
+                stats.rows_merged,
+                stats.propose_calls,
+                stats.max_propose_rows,
+                stats.confirm_calls,
+                stats.max_confirm_rows,
+            );
+            continue;
+        }
         blocked_stats::reset();
         dag_stats::reset();
         run_query(kb, markers, mode);

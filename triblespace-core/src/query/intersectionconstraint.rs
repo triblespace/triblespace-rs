@@ -30,6 +30,15 @@ where
     pub fn new(constraints: Vec<C>) -> Self {
         IntersectionConstraint { constraints }
     }
+
+    /// Borrows the direct conjuncts for query-engine lowering probes.
+    ///
+    /// This deliberately stays crate-internal: the public constraint
+    /// protocol remains opaque while experimental schedulers establish the
+    /// right general shape interface.
+    pub(crate) fn children(&self) -> &[C] {
+        &self.constraints
+    }
 }
 
 impl<'a, C> Constraint<'a> for IntersectionConstraint<C>

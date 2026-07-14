@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Root intersections gain an opt-in canonical residual-state solver.**
+  `solve_residual_state` jointly chooses each row's next variable and direct
+  proposing child, then interns the remaining confirmation set as an exact
+  control-state descriptor. A history-independent rank gate lets different
+  proposal/confirmation and variable-order histories reconverge before their
+  shared state runs, while row payloads retain multiplicity. Direct children
+  remain opaque `Constraint` implementations, so nested unions and custom
+  constraints keep the existing protocol; a profiled entry point reports
+  interner, bucket-merge, and child-call batch measurements. This first
+  experimental slice is deliberately eager and additive beside the lazy DAG
+  scheduler.
 - **Index homes use typed artifacts over exact commit-DAG ranges.** Recipe
   descriptors are self-marked, losslessly retained manifest headers with a
   repeated maximal certified frontier. Inclusive range records carry one LSM
