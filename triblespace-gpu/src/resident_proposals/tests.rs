@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use super::*;
+use jerky::bit_vector::{Rank, Select};
 use triblespace_core::blob::encodings::succinctarchive::query_program::{
     ProgramFrontier, QueryPattern, QueryProgram, QueryTerm,
 };
@@ -42,6 +43,14 @@ struct Fixture {
     values: [Id; 3],
 }
 
+struct PairFixture {
+    set: TribleSet,
+    entities: [Id; 3],
+    attributes: [Id; 3],
+    values: [Id; 3],
+    triples: Vec<(Id, Id, Id)>,
+}
+
 type SegmentContents = (Vec<u32>, Vec<u32>, Vec<u32>, Vec<Vec<u32>>);
 type SegmentMap = BTreeMap<u32, SegmentContents>;
 
@@ -62,6 +71,56 @@ fn fixture() -> Fixture {
         attributes,
         values,
     }
+}
+
+fn pair_fixture() -> PairFixture {
+    // The semantic axes are deliberately globally interleaved, so compact
+    // snapshot codes are E=[0,3,6], A=[1,4,7], V=[2,5,8]. Every expected
+    // Pair result below is derived from these source IDs, never from a
+    // Succinct rank/select oracle.
+    let entities = [ordered_id(1), ordered_id(4), ordered_id(7)];
+    let attributes = [ordered_id(2), ordered_id(5), ordered_id(8)];
+    let values = [ordered_id(3), ordered_id(6), ordered_id(9)];
+    let triples = vec![
+        (entities[0], attributes[0], values[0]),
+        (entities[0], attributes[0], values[1]),
+        (entities[0], attributes[0], values[2]),
+        (entities[0], attributes[1], values[0]),
+        (entities[0], attributes[2], values[0]),
+        (entities[1], attributes[0], values[0]),
+        (entities[2], attributes[1], values[0]),
+        (entities[2], attributes[1], values[1]),
+    ];
+    let mut set = TribleSet::new();
+    for &(entity, attribute, value) in &triples {
+        insert(&mut set, entity, attribute, value);
+    }
+    PairFixture {
+        set,
+        entities,
+        attributes,
+        values,
+        triples,
+    }
+}
+
+fn expected_pair_ids(fixture: &PairFixture, rotation: SuccinctRotation, peer: Id) -> Vec<Id> {
+    let mut expected: Vec<_> = fixture
+        .triples
+        .iter()
+        .filter_map(|&(entity, attribute, value)| match rotation {
+            SuccinctRotation::Eav if entity == peer => Some(attribute),
+            SuccinctRotation::Vea if value == peer => Some(entity),
+            SuccinctRotation::Ave if attribute == peer => Some(value),
+            SuccinctRotation::Vae if value == peer => Some(attribute),
+            SuccinctRotation::Eva if entity == peer => Some(value),
+            SuccinctRotation::Aev if attribute == peer => Some(entity),
+            _ => None,
+        })
+        .collect();
+    expected.sort_unstable();
+    expected.dedup();
+    expected
 }
 
 fn codes<U: Universe>(program: &QueryProgram<'_, U>, ids: &[Id]) -> Vec<u32> {
@@ -107,6 +166,66 @@ fn assert_success(inspection: &ProposalInspection, expected: usize) {
         inspection.capacity as usize,
         inspection.candidate_codes.len()
     );
+}
+
+fn pair_axes(rotation: SuccinctRotation) -> (ProgramVariable, ProgramVariable) {
+    let entity = ProgramVariable::new(0);
+    let attribute = ProgramVariable::new(1);
+    let value = ProgramVariable::new(2);
+    match rotation {
+        SuccinctRotation::Eav => (entity, attribute),
+        SuccinctRotation::Vea => (value, entity),
+        SuccinctRotation::Ave => (attribute, value),
+        SuccinctRotation::Vae => (value, attribute),
+        SuccinctRotation::Eva => (entity, value),
+        SuccinctRotation::Aev => (attribute, entity),
+    }
+}
+
+fn enqueue_pair_case<U: Universe>(
+    gpu: &crate::WgpuSuccinctArchive<U>,
+    program: &QueryProgram<'_, U>,
+    rotation: SuccinctRotation,
+    peer: Id,
+    capacity: usize,
+) -> (ProposalInspection, u32, u32, u32) {
+    let (bound, target) = pair_axes(rotation);
+    let round = WgpuResidentRound::new(gpu, program, &[bound]).unwrap();
+    let arm = round
+        .proposal_arm_specs()
+        .iter()
+        .position(|spec| {
+            matches!(
+                spec,
+                ArmSpec::PairDistinct {
+                    rotation: candidate,
+                    ..
+                } if *candidate == rotation
+            )
+        })
+        .expect("requested Pair rotation is admitted");
+    assert_eq!(round.proposal_arm_pair_rotation(arm), Some(rotation));
+    let peer_code = program.encode(&raw(peer)).unwrap().get();
+    let host = program
+        .frontier_from_indices(vec![bound], vec![peer_code], 1)
+        .unwrap();
+    let frontier = round.upload_frontier(&host).unwrap();
+    let inputs = round.initialize_inputs(&frontier).unwrap();
+    let witnesses = inputs.read_proposal_witnesses_for_test();
+    let witness = arm * PROPOSAL_WITNESS_WORDS;
+    let count = witnesses[witness + 3] - witnesses[witness + 2];
+    let choices = round
+        .force_choice_words_from_inputs_for_test(
+            &frontier,
+            &inputs,
+            &[target.index() as u32, arm as u32, count],
+        )
+        .unwrap();
+    let inspection = round
+        .enqueue_generic_proposals_for_test(&frontier, &choices, capacity)
+        .unwrap()
+        .inspect();
+    (inspection, arm as u32, peer_code, target.index() as u32)
 }
 
 struct DirectClassification {
@@ -399,7 +518,7 @@ fn gate_direct(
             STATUS_DEVICE_INVARIANT,
             STATUS_GEOMETRY,
         );
-        publish_present_dispatch::launch_unchecked::<WgpuRuntime>(
+        publish_proposal_dispatch::launch_unchecked::<WgpuRuntime>(
             context.client(),
             CubeCount::new_single(),
             CubeDim::new_single(),
@@ -431,7 +550,7 @@ fn gate_direct(
         }
     }
     unsafe {
-        publish_present_meta::launch_unchecked::<WgpuRuntime>(
+        publish_proposal_meta::launch_unchecked::<WgpuRuntime>(
             context.client(),
             CubeCount::new_single(),
             CubeDim::new_single(),
@@ -1929,6 +2048,7 @@ fn unrepresentable_scan_total_has_a_distinct_geometry_status() {
         _generation_dispatch: context
             .batch_dispatch(0, 1, CubeDim::new_1d(THREADS))
             .unwrap(),
+        _pair_generation: None,
         control,
         meta,
         dispatch,
@@ -2338,6 +2458,528 @@ fn non_present_arms_fail_host_admission_without_a_device_launch() {
         round.enqueue_present_proposals(&frontier, &choices, 8),
         Err(ResidentProposalError::UnsupportedProposer { .. })
     ));
+}
+
+#[test]
+fn pair_lf_all_six_rotations_match_independent_ordered_id_oracle() {
+    let fixture = pair_fixture();
+    let archive: SuccinctArchive<OrderedUniverse> = (&fixture.set).into();
+    let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+    let variables = [
+        ProgramVariable::new(0),
+        ProgramVariable::new(1),
+        ProgramVariable::new(2),
+    ];
+    let program = QueryProgram::compile(
+        gpu.archive(),
+        3,
+        [QueryPattern::new(variables[0], variables[1], variables[2])],
+    )
+    .unwrap();
+    let cases = [
+        (SuccinctRotation::Eav, fixture.entities[0]),
+        (SuccinctRotation::Vea, fixture.values[0]),
+        (SuccinctRotation::Ave, fixture.attributes[2]),
+        (SuccinctRotation::Vae, fixture.values[0]),
+        (SuccinctRotation::Eva, fixture.entities[0]),
+        (SuccinctRotation::Aev, fixture.attributes[0]),
+    ];
+    let mut seen = [false; 6];
+
+    for (rotation, peer) in cases {
+        let expected_ids = expected_pair_ids(&fixture, rotation, peer);
+        let expected_codes = codes(&program, &expected_ids);
+        let capacity = expected_codes.len() + 3;
+        let (inspection, arm, peer_code, target) =
+            enqueue_pair_case(&gpu, &program, rotation, peer, capacity);
+        assert_success(&inspection, expected_codes.len());
+        seen[rotation.index()] = true;
+
+        let segment = inspection
+            .segments
+            .iter()
+            .find(|segment| segment.variable == target)
+            .unwrap();
+        assert_eq!(segment.count as usize, expected_codes.len());
+        let start = segment.base as usize;
+        let end = start + segment.count as usize;
+        assert_eq!(&inspection.candidate_codes[start..end], expected_codes);
+        assert!(inspection.candidate_owners[start..end]
+            .iter()
+            .all(|&owner| owner == 0));
+        assert!(inspection.proposer_arms[start..end]
+            .iter()
+            .all(|&proposer| proposer == arm));
+
+        let (bound, target_variable) = pair_axes(rotation);
+        assert_eq!(target_variable.index() as u32, target);
+        let expected_children: Vec<Vec<u32>> = expected_codes
+            .iter()
+            .map(|&candidate| {
+                if target_variable < bound {
+                    vec![candidate, peer_code]
+                } else {
+                    vec![peer_code, candidate]
+                }
+            })
+            .collect();
+        let actual_children: Vec<Vec<u32>> = inspection.child_body
+            [start * inspection.child_stride as usize..end * inspection.child_stride as usize]
+            .chunks_exact(inspection.child_stride as usize)
+            .map(<[u32]>::to_vec)
+            .collect();
+        assert_eq!(actual_children, expected_children, "{rotation:?}");
+
+        assert!(inspection.candidate_codes[end..]
+            .iter()
+            .all(|&word| word == RESIDENT_U32_SENTINEL));
+        assert!(inspection.candidate_owners[end..]
+            .iter()
+            .all(|&word| word == RESIDENT_U32_SENTINEL));
+        assert!(inspection.proposer_arms[end..]
+            .iter()
+            .all(|&word| word == RESIDENT_U32_SENTINEL));
+        assert!(
+            inspection.child_body[end * inspection.child_stride as usize..]
+                .iter()
+                .all(|&word| word == RESIDENT_U32_SENTINEL)
+        );
+    }
+    assert!(seen.into_iter().all(|seen| seen));
+}
+
+#[test]
+fn pair_lf_zero_width_and_capacity_failure_are_atomic() {
+    let fixture = pair_fixture();
+    let archive: SuccinctArchive<OrderedUniverse> = (&fixture.set).into();
+    let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+    let variables = [
+        ProgramVariable::new(0),
+        ProgramVariable::new(1),
+        ProgramVariable::new(2),
+    ];
+    let program = QueryProgram::compile(
+        gpu.archive(),
+        3,
+        [QueryPattern::new(variables[0], variables[1], variables[2])],
+    )
+    .unwrap();
+
+    // An attribute code is in-domain but absent from the entity axis, so the
+    // exact EAV Pair witness is a live zero-width interval.
+    let (zero, _, _, _) = enqueue_pair_case(
+        &gpu,
+        &program,
+        SuccinctRotation::Eav,
+        fixture.attributes[2],
+        4,
+    );
+    assert_success(&zero, 0);
+    assert!(zero.segments.iter().all(|segment| segment.count == 0));
+    assert!(zero
+        .candidate_codes
+        .iter()
+        .chain(zero.candidate_owners.iter())
+        .chain(zero.proposer_arms.iter())
+        .chain(zero.child_body.iter())
+        .all(|&word| word == RESIDENT_U32_SENTINEL));
+
+    let expected = expected_pair_ids(&fixture, SuccinctRotation::Eav, fixture.entities[0]);
+    assert_eq!(expected.len(), 3);
+    let (short, _, _, _) = enqueue_pair_case(
+        &gpu,
+        &program,
+        SuccinctRotation::Eav,
+        fixture.entities[0],
+        expected.len() - 1,
+    );
+    assert_eq!(short.status, STATUS_CAPACITY);
+    assert_eq!(short.required, expected.len() as u32);
+    assert_eq!(short.logical_len, 0);
+    assert_eq!((short.dispatch_x, short.dispatch_y), (0, 1));
+    assert!(short
+        .candidate_codes
+        .iter()
+        .chain(short.candidate_owners.iter())
+        .chain(short.proposer_arms.iter())
+        .chain(short.child_body.iter())
+        .all(|&word| word == RESIDENT_U32_SENTINEL));
+}
+
+#[test]
+fn pair_query_generation_rejects_out_of_range_segment_before_cell_alias() {
+    let fixture = pair_fixture();
+    let archive: SuccinctArchive<OrderedUniverse> = (&fixture.set).into();
+    let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+    let context = gpu.context();
+
+    // S=1,R=1 makes segment=1 invalid. The following packed bases
+    // deliberately contain plausible values at the would-be aliased cell so
+    // the scalar segment bound, rather than an incidental buffer value, is
+    // what prevents route publication.
+    let mut workspace_words = vec![0u32; 16];
+    let counts_base = 0usize;
+    let local_offsets_base = 2usize;
+    let block_offsets_base = 4usize;
+    let row_arms_base = 5usize;
+    let row_families_base = 6usize;
+    let row_physicals_base = 7usize;
+    let row_segments_base = 8usize;
+    let row_counts_base = 9usize;
+    let row_enum_los_base = 10usize;
+    workspace_words[counts_base + 1] = 1;
+    workspace_words[local_offsets_base + 1] = 0;
+    workspace_words[block_offsets_base] = 0;
+    workspace_words[row_arms_base] = 7;
+    workspace_words[row_families_base] = FAMILY_PAIR_DISTINCT;
+    workspace_words[row_physicals_base] = SuccinctRotation::Eav.index() as u32;
+    workspace_words[row_segments_base] = 1;
+    workspace_words[row_counts_base] = 1;
+    workspace_words[row_enum_los_base] = 0;
+    let workspace = context.upload_u32(&workspace_words).unwrap();
+
+    let pair_counts_base = 0usize;
+    let pair_local_offsets_base = 1usize;
+    let pair_block_offsets_base = 2usize;
+    let pair_workspace = context.upload_u32(&[1, 0, 0]).unwrap();
+    let control = context.upload_u32(&[STATUS_OK, 1, 1, 1]).unwrap();
+    let mut queries = context.upload_u32(&[55]).unwrap();
+    let mut routes = context.upload_u32(&[55]).unwrap();
+    let mut candidates = context
+        .upload_u32(&[RESIDENT_U32_SENTINEL; CANDIDATE_RECORD_FIELDS])
+        .unwrap();
+    unsafe {
+        generate_pair_queries::launch_unchecked::<WgpuRuntime>(
+            context.client(),
+            CubeCount::new_single(),
+            CubeDim::new_single(),
+            workspace.input_arg(),
+            pair_workspace.input_arg(),
+            control.input_arg(),
+            queries.output_arg(),
+            routes.output_arg(),
+            candidates.output_arg(),
+            1,
+            1,
+            1,
+            0,
+            SuccinctRotation::Eav.index() as u32,
+            1,
+            counts_base as u32,
+            local_offsets_base as u32,
+            block_offsets_base as u32,
+            row_arms_base as u32,
+            row_families_base as u32,
+            row_physicals_base as u32,
+            row_segments_base as u32,
+            row_counts_base as u32,
+            row_enum_los_base as u32,
+            pair_counts_base as u32,
+            pair_local_offsets_base as u32,
+            pair_block_offsets_base as u32,
+            BLOCK_ITEMS,
+            RESIDENT_U32_SENTINEL,
+            STATUS_OK,
+        );
+    }
+    assert_eq!(queries.read(), [RESIDENT_U32_SENTINEL]);
+    assert_eq!(routes.read(), [RESIDENT_U32_SENTINEL]);
+    assert_eq!(
+        candidates.read(),
+        [RESIDENT_U32_SENTINEL; CANDIDATE_RECORD_FIELDS]
+    );
+}
+
+#[test]
+fn pair_lf_reuses_rotation_scratch_across_sixty_five_sparse_rows() {
+    const ROWS: usize = 65;
+    let fixture = pair_fixture();
+    let archive: SuccinctArchive<OrderedUniverse> = (&fixture.set).into();
+    let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+    let entity = ProgramVariable::new(0);
+    let attribute = ProgramVariable::new(1);
+    let value = ProgramVariable::new(2);
+    let present_entity = ProgramVariable::new(3);
+    let present_attribute = ProgramVariable::new(4);
+    let present_value = ProgramVariable::new(5);
+    let program = QueryProgram::compile(
+        gpu.archive(),
+        6,
+        [
+            QueryPattern::new(entity, attribute, value),
+            QueryPattern::new(present_entity, present_attribute, present_value),
+        ],
+    )
+    .unwrap();
+    let cpu = gpu.archive();
+    let changes = cpu.pair_changes(SuccinctRotation::Eav);
+    let current = cpu.ring_col(SuccinctRotation::Eav);
+    let adjacent = cpu.ring_col(SuccinctRotation::Vea);
+    let pair_count = changes.rank1(changes.len()).unwrap();
+    let rank_off_by_one_is_visible = (0..pair_count).any(|q| {
+        let index = changes.select1(q).unwrap();
+        let last = current.access(index).unwrap();
+        let selected = cpu.v_a.select1(last).unwrap();
+        let rank = current.rank(index, last).unwrap();
+        let position = selected - last + rank;
+        rank > 0
+            && position + 1 < adjacent.len()
+            && adjacent.access(position) != adjacent.access(position + 1)
+    });
+    assert!(
+        rank_off_by_one_is_visible,
+        "fixture must distinguish rank(idx,last) from rank(idx+1,last)"
+    );
+    let round = WgpuResidentRound::new(&gpu, &program, &[entity]).unwrap();
+    let eav_arm = round
+        .proposal_arm_specs()
+        .iter()
+        .position(|spec| {
+            matches!(
+                spec,
+                ArmSpec::PairDistinct {
+                    rotation: SuccinctRotation::Eav,
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    let eva_arm = round
+        .proposal_arm_specs()
+        .iter()
+        .position(|spec| {
+            matches!(
+                spec,
+                ArmSpec::PairDistinct {
+                    rotation: SuccinctRotation::Eva,
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    let present_entity_arm = round
+        .proposal_arm_specs()
+        .iter()
+        .position(|spec| {
+            matches!(
+                spec,
+                ArmSpec::Present {
+                    axis: ResidentAxis::Entity,
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    let present_attribute_arm = round
+        .proposal_arm_specs()
+        .iter()
+        .position(|spec| {
+            matches!(
+                spec,
+                ArmSpec::Present {
+                    axis: ResidentAxis::Attribute,
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    let present_value_arm = round
+        .proposal_arm_specs()
+        .iter()
+        .position(|spec| {
+            matches!(
+                spec,
+                ArmSpec::Present {
+                    axis: ResidentAxis::Value,
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    let peer_ids: Vec<_> = (0..ROWS)
+        .map(|row| match row % 4 {
+            0 => fixture.entities[0],
+            1 => fixture.entities[0],
+            2 => fixture.entities[2],
+            _ => fixture.entities[1],
+        })
+        .collect();
+    let peer_codes: Vec<_> = peer_ids
+        .iter()
+        .map(|&peer| program.encode(&raw(peer)).unwrap().get())
+        .collect();
+    let host = program
+        .frontier_from_indices(vec![entity], peer_codes.clone(), ROWS)
+        .unwrap();
+    let frontier = round.upload_frontier(&host).unwrap();
+    let inputs = round.initialize_inputs(&frontier).unwrap();
+    let witnesses = inputs.read_proposal_witnesses_for_test();
+    let mut choice_words = Vec::with_capacity(ROWS * CHOICE_WORDS);
+    let mut selected_arms = Vec::with_capacity(ROWS);
+    for row in 0..ROWS {
+        let arm = match row {
+            1 => present_entity_arm,
+            3 => present_attribute_arm,
+            5 => present_value_arm,
+            _ if row % 2 == 0 => eav_arm,
+            _ => eva_arm,
+        };
+        let target = round.metadata().arms()[arm].target_variable();
+        let witness = (arm * ROWS + row) * PROPOSAL_WITNESS_WORDS;
+        let count = witnesses[witness + 3] - witnesses[witness + 2];
+        choice_words.extend([target.index() as u32, arm as u32, count]);
+        selected_arms.push(arm);
+    }
+    let late_eav_witness = (eav_arm * ROWS + 2) * PROPOSAL_WITNESS_WORDS;
+    assert!(
+        witnesses[late_eav_witness + 2] > 0,
+        "late EAV peer must exercise nonzero enum_lo"
+    );
+    let choices = round
+        .force_choice_words_from_inputs_for_test(&frontier, &inputs, &choice_words)
+        .unwrap();
+    assert!(matches!(
+        round.enqueue_confirmed_generic_proposals_for_test(&frontier, &choices, 256),
+        Err(ResidentProposalError::MalformedPlan)
+    ));
+
+    let mut expected_codes = Vec::new();
+    let mut expected_owners = Vec::new();
+    let mut expected_arms = Vec::new();
+    let mut expected_children = Vec::new();
+    let mut expected_rotation_counts = [0usize; 6];
+    for target in 0..6 {
+        for row in 0..ROWS {
+            let arm = selected_arms[row];
+            if round.metadata().arms()[arm].target_variable().index() != target {
+                continue;
+            }
+            let ids = match round.proposal_arm_specs()[arm] {
+                ArmSpec::PairDistinct { rotation, .. } => {
+                    let ids = expected_pair_ids(&fixture, rotation, peer_ids[row]);
+                    expected_rotation_counts[rotation.index()] += ids.len();
+                    ids
+                }
+                ArmSpec::Present { axis, .. } => match axis {
+                    ResidentAxis::Entity => fixture.entities.to_vec(),
+                    ResidentAxis::Attribute => fixture.attributes.to_vec(),
+                    ResidentAxis::Value => fixture.values.to_vec(),
+                },
+                ArmSpec::Restricted { .. } => unreachable!(),
+            };
+            for code in codes(&program, &ids) {
+                expected_codes.push(code);
+                expected_owners.push(row as u32);
+                expected_arms.push(arm as u32);
+                expected_children.extend([peer_codes[row], code]);
+            }
+        }
+    }
+    let capacity = expected_codes.len() + 7;
+    let max_groups_y = capacity.div_ceil(THREADS as usize) as u32;
+    let first = round
+        .enqueue_generic_proposals_with_dispatch_limits_for_test(
+            &frontier,
+            &choices,
+            capacity,
+            1,
+            max_groups_y,
+        )
+        .unwrap();
+    let second = round
+        .enqueue_generic_proposals_with_dispatch_limits_for_test(
+            &frontier,
+            &choices,
+            capacity,
+            1,
+            max_groups_y,
+        )
+        .unwrap();
+    let second_trace = second.read_pair_rotation_trace_for_test();
+    let first_trace = first.read_pair_rotation_trace_for_test();
+    assert_eq!(first_trace, second_trace);
+    assert_eq!(
+        first_trace[SuccinctRotation::Eav.index()],
+        [
+            expected_rotation_counts[SuccinctRotation::Eav.index()] as u32,
+            1,
+            2
+        ],
+        "EAV must consume an actual two-dimensional private dispatch"
+    );
+    let second = second.inspect();
+    let first = first.inspect();
+    assert_eq!(
+        first, second,
+        "reused immutable inputs changed queued output"
+    );
+    assert_success(&first, expected_codes.len());
+    assert_eq!(
+        &first.candidate_codes[..expected_codes.len()],
+        expected_codes
+    );
+    assert_eq!(
+        &first.candidate_owners[..expected_owners.len()],
+        expected_owners
+    );
+    assert_eq!(&first.proposer_arms[..expected_arms.len()], expected_arms);
+    assert_eq!(
+        &first.child_body[..expected_children.len()],
+        expected_children
+    );
+    assert!(first.candidate_codes[expected_codes.len()..]
+        .iter()
+        .all(|&word| word == RESIDENT_U32_SENTINEL));
+    assert!(first.child_body[expected_children.len()..]
+        .iter()
+        .all(|&word| word == RESIDENT_U32_SENTINEL));
+
+    // Row-homomorphism at the 32/33 split: concatenate each canonical
+    // variable segment independently, rebasing only right-half owners.
+    let enqueue_range = |range: std::ops::Range<usize>| {
+        let rows = range.len();
+        let host = program
+            .frontier_from_indices(vec![entity], peer_codes[range.clone()].to_vec(), rows)
+            .unwrap();
+        let frontier = round.upload_frontier(&host).unwrap();
+        let inputs = round.initialize_inputs(&frontier).unwrap();
+        let witnesses = inputs.read_proposal_witnesses_for_test();
+        let mut words = Vec::with_capacity(rows * CHOICE_WORDS);
+        for (local_row, global_row) in range.clone().enumerate() {
+            let arm = selected_arms[global_row];
+            let target = round.metadata().arms()[arm].target_variable();
+            let witness = (arm * rows + local_row) * PROPOSAL_WITNESS_WORDS;
+            let count = witnesses[witness + 3] - witnesses[witness + 2];
+            words.extend([target.index() as u32, arm as u32, count]);
+        }
+        let choices = round
+            .force_choice_words_from_inputs_for_test(&frontier, &inputs, &words)
+            .unwrap();
+        round
+            .enqueue_generic_proposals_for_test(&frontier, &choices, 512)
+            .unwrap()
+            .inspect()
+    };
+    let split = 32usize;
+    let left = live_segments(&enqueue_range(0..split));
+    let right = live_segments(&enqueue_range(split..ROWS));
+    let whole = live_segments(&first);
+    for (variable, expected) in whole {
+        let left = left.get(&variable).unwrap();
+        let right = right.get(&variable).unwrap();
+        let mut codes = left.0.clone();
+        codes.extend_from_slice(&right.0);
+        let mut owners = left.1.clone();
+        owners.extend(right.1.iter().map(|owner| owner + split as u32));
+        let mut arms = left.2.clone();
+        arms.extend_from_slice(&right.2);
+        let mut bodies = left.3.clone();
+        bodies.extend_from_slice(&right.3);
+        assert_eq!(codes, expected.0, "variable {variable} split codes");
+        assert_eq!(owners, expected.1, "variable {variable} split owners");
+        assert_eq!(arms, expected.2, "variable {variable} split arms");
+        assert_eq!(bodies, expected.3, "variable {variable} split bodies");
+    }
 }
 
 #[test]

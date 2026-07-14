@@ -175,6 +175,8 @@ pub(crate) struct WgpuResidentProposals {
     _planning_control: DeviceU32Buffer<WgpuRuntime>,
     /// Private indirect rectangle consumed only by family generators.
     _generation_dispatch: DeviceDispatch<WgpuRuntime>,
+    /// Pair-only scan/LF allocations retained until every queued use finishes.
+    _pair_generation: Option<Box<PairGenerationBacking>>,
     control: DeviceU32Buffer<WgpuRuntime>,
     meta: DeviceBatchMeta<WgpuRuntime>,
     dispatch: DeviceDispatch<WgpuRuntime>,
@@ -200,6 +202,24 @@ struct ProvisionalBacking {
     _child_body: DeviceU32Buffer<WgpuRuntime>,
 }
 
+/// Reusable device state for the six sequential PairDistinct rotations.
+///
+/// These allocations are deliberately retained by the returned arena. CubeCL
+/// may pool a dropped handle while its commands are still queued; retaining
+/// the exact buffers also makes the storage/indirect reuse boundary explicit.
+struct PairGenerationBacking {
+    _control: DeviceU32Buffer<WgpuRuntime>,
+    _meta: DeviceBatchMeta<WgpuRuntime>,
+    _dispatch: DeviceDispatch<WgpuRuntime>,
+    _workspace: DeviceU32Buffer<WgpuRuntime>,
+    #[cfg(test)]
+    rotation_trace_base: usize,
+    _queries: DeviceU32Buffer<WgpuRuntime>,
+    _positions: DeviceU32Buffer<WgpuRuntime>,
+    _values: DeviceU32Buffer<WgpuRuntime>,
+    _ranks: DeviceU32Buffer<WgpuRuntime>,
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum PresentPublication {
     Provisional,
@@ -213,6 +233,9 @@ struct ProposalStageProfiles {
 }
 
 struct ProposalAdmission {
+    /// Whether this capability was lowered through the test-only generic
+    /// boundary, independent of whether semantic death erased family tags.
+    pair_capable: bool,
     arm_descriptors: Vec<u32>,
     /// CSR offsets for stable relevant-arm slices, one entry per variable plus
     /// the terminal arm count.
@@ -230,6 +253,10 @@ impl ProposalAdmission {
     /// primitive tests, but the wired nonterminal wrapper rejects this state.
     const fn is_terminal(&self) -> bool {
         self.segment_count == 0
+    }
+
+    fn admits_pair(&self) -> bool {
+        self.pair_capable
     }
 }
 
@@ -283,6 +310,20 @@ struct WorkspaceLayout {
     block_sums: usize,
     block_errors: usize,
     block_offsets: usize,
+    words: usize,
+}
+
+/// One row-sized scan reused serially by every PairDistinct rotation.
+#[derive(Clone, Copy)]
+struct PairWorkspaceLayout {
+    counts: usize,
+    local_offsets: usize,
+    block_sums: usize,
+    block_errors: usize,
+    block_offsets: usize,
+    #[cfg(test)]
+    rotation_trace: usize,
+    block_count: usize,
     words: usize,
 }
 
@@ -390,6 +431,83 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             capacity,
             None,
             None,
+            false,
+            PresentPublication::Provisional,
+        )
+    }
+
+    /// Test-only provisional capability admitting Present and PairDistinct.
+    ///
+    /// This boundary publishes structurally validated candidates and generic
+    /// children, then returns before Present confirmation. Production
+    /// entrypoints lower `PresentOnly`, and no Pair-tagged arena can obtain the
+    /// existing wired publication path.
+    #[cfg(test)]
+    fn enqueue_generic_proposals_for_test(
+        &self,
+        frontier: &WgpuResidentFrontier<'_, U>,
+        choices: &ResidentRowChoices<WgpuRuntime>,
+        capacity: usize,
+    ) -> Result<WgpuResidentProposals, ResidentProposalError> {
+        let inputs = self.proposal_inputs(frontier, choices)?;
+        let admission = lower_proposal_admission(self, ProposerPolicy::PresentAndPair)?;
+        let geometry = proposal_geometry(inputs.rows, inputs.parent_stride, capacity, &admission)?;
+        self.enqueue_present_proposals_with_inputs(
+            inputs,
+            ProposalPreflight {
+                admission: &admission,
+                geometry,
+            },
+            None,
+            None,
+            false,
+            PresentPublication::Provisional,
+        )
+    }
+
+    #[cfg(test)]
+    fn enqueue_confirmed_generic_proposals_for_test(
+        &self,
+        frontier: &WgpuResidentFrontier<'_, U>,
+        choices: &ResidentRowChoices<WgpuRuntime>,
+        capacity: usize,
+    ) -> Result<WgpuResidentProposals, ResidentProposalError> {
+        let inputs = self.proposal_inputs(frontier, choices)?;
+        let admission = lower_proposal_admission(self, ProposerPolicy::PresentAndPair)?;
+        let geometry = proposal_geometry(inputs.rows, inputs.parent_stride, capacity, &admission)?;
+        self.enqueue_present_proposals_with_inputs(
+            inputs,
+            ProposalPreflight {
+                admission: &admission,
+                geometry,
+            },
+            None,
+            None,
+            false,
+            PresentPublication::Confirmed,
+        )
+    }
+
+    #[cfg(test)]
+    fn enqueue_generic_proposals_with_dispatch_limits_for_test(
+        &self,
+        frontier: &WgpuResidentFrontier<'_, U>,
+        choices: &ResidentRowChoices<WgpuRuntime>,
+        capacity: usize,
+        max_groups_x: u32,
+        max_groups_y: u32,
+    ) -> Result<WgpuResidentProposals, ResidentProposalError> {
+        let inputs = self.proposal_inputs(frontier, choices)?;
+        let admission = lower_proposal_admission(self, ProposerPolicy::PresentAndPair)?;
+        let geometry = proposal_geometry(inputs.rows, inputs.parent_stride, capacity, &admission)?;
+        self.enqueue_present_proposals_with_inputs(
+            inputs,
+            ProposalPreflight {
+                admission: &admission,
+                geometry,
+            },
+            None,
+            Some((max_groups_x, max_groups_y)),
             false,
             PresentPublication::Provisional,
         )
@@ -540,6 +658,13 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
     ) -> Result<WgpuResidentProposals, ResidentProposalError> {
         let context = self.archive().context();
         let admission = preflight.admission;
+        if publication == PresentPublication::Confirmed && admission.admits_pair() {
+            // Pair sibling confirmation is a separate future capability. Do
+            // not let a test-only generic admission cross today's wired
+            // Present publication boundary, even if every device byte would
+            // otherwise be well formed.
+            return Err(ResidentProposalError::MalformedPlan);
+        }
         let ProposalGeometry {
             rows,
             parent_stride,
@@ -772,7 +897,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         // The planner publishes only the private family-generation rectangle.
         // The arena dispatch remains zero until the shared destination gate.
         unsafe {
-            publish_present_dispatch::launch_unchecked::<WgpuRuntime>(
+            publish_proposal_dispatch::launch_unchecked::<WgpuRuntime>(
                 context.client(),
                 CubeCount::new_single(),
                 CubeDim::new_single(),
@@ -841,6 +966,23 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         };
         #[cfg(not(test))]
         launch_candidates();
+
+        let pair_generation = if admission.admits_pair() {
+            Some(Box::new(self.enqueue_pair_distinct_candidates(
+                &workspace,
+                workspace_layout,
+                &planning_control,
+                &mut candidate_records,
+                &mut confirmation_workspace,
+                confirmation_layout.keep,
+                inputs.rows,
+                admission.segment_count,
+                capacity,
+                dispatch_limits,
+            )?))
+        } else {
+            None
+        };
 
         // Family generation is still private. Invert the canonical scan for
         // every active destination and prove that the whole capacity tail is
@@ -923,7 +1065,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 STATUS_DEVICE_INVARIANT,
                 STATUS_GEOMETRY,
             );
-            publish_present_dispatch::launch_unchecked::<WgpuRuntime>(
+            publish_proposal_dispatch::launch_unchecked::<WgpuRuntime>(
                 context.client(),
                 CubeCount::new_single(),
                 CubeDim::new_single(),
@@ -951,6 +1093,70 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                     STATUS_OK,
                 );
             }
+        }
+
+        if pair_generation.is_some() {
+            // Generic Pair admission stops at provisional publication. Child
+            // construction is family-neutral after the structural gate, but
+            // the Present confirmer and every confirmed/wired capability are
+            // intentionally unreachable from this branch.
+            unsafe {
+                materialize_proposal_children::launch_unchecked::<WgpuRuntime>(
+                    context.client(),
+                    dynamic_dispatch.cube_count(),
+                    dynamic_dispatch.cube_dim(),
+                    inputs.frontier,
+                    plan.input_arg(),
+                    segment_records.input_arg(),
+                    control.input_arg(),
+                    candidate_records.input_arg(),
+                    child_body.output_arg(),
+                    inputs.rows as u32,
+                    inputs.parent_stride as u32,
+                    child_stride as u32,
+                    admission.segment_count as u32,
+                    capacity as u32,
+                    self.metadata().arms().len() as u32,
+                    plan_layout.arm_descriptors as u32,
+                    plan_layout.variable_to_segment as u32,
+                    RESIDENT_U32_SENTINEL,
+                    STATUS_OK,
+                );
+                publish_proposal_meta::launch_unchecked::<WgpuRuntime>(
+                    context.client(),
+                    CubeCount::new_single(),
+                    CubeDim::new_single(),
+                    control.input_arg(),
+                    meta.output_arg(),
+                    capacity as u32,
+                    STATUS_OK,
+                );
+            }
+            return Ok(WgpuResidentProposals {
+                context: context.clone(),
+                round_owner: inputs.round_owner,
+                frontier_lineage: inputs.frontier_lineage,
+                arena_lineage: Arc::new(()),
+                rows: inputs.rows,
+                parent_stride: inputs.parent_stride,
+                child_stride,
+                segment_count: admission.segment_count,
+                capacity,
+                _planning_control: planning_control,
+                _generation_dispatch: generation_dispatch,
+                _pair_generation: pair_generation,
+                control,
+                meta,
+                dispatch: dynamic_dispatch,
+                segment_records,
+                candidate_records,
+                child_body,
+                confirmation_workspace,
+                confirmation_layout,
+                provisional_backing: None,
+                #[cfg(test)]
+                stage_profiles: None,
+            });
         }
 
         // One invocation confirms one provisional destination against every
@@ -990,7 +1196,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         // neither indirect consumer binds that exclusive buffer as storage.
         let arm_count = self.metadata().arms().len() as u32;
         let launch_child_body = || unsafe {
-            materialize_present_children::launch_unchecked::<WgpuRuntime>(
+            materialize_proposal_children::launch_unchecked::<WgpuRuntime>(
                 context.client(),
                 dynamic_dispatch.cube_count(),
                 dynamic_dispatch.cube_dim(),
@@ -1029,7 +1235,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         #[cfg(not(test))]
         launch_child_body();
         unsafe {
-            publish_present_meta::launch_unchecked::<WgpuRuntime>(
+            publish_proposal_meta::launch_unchecked::<WgpuRuntime>(
                 context.client(),
                 CubeCount::new_single(),
                 CubeDim::new_single(),
@@ -1131,7 +1337,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                     STATUS_DEVICE_INVARIANT,
                     STATUS_GEOMETRY,
                 );
-                publish_present_dispatch::launch_unchecked::<WgpuRuntime>(
+                publish_proposal_dispatch::launch_unchecked::<WgpuRuntime>(
                     context.client(),
                     CubeCount::new_single(),
                     CubeDim::new_single(),
@@ -1180,7 +1386,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
 
                 // Metadata is the sole completion publication and is written
                 // only after both distinct semantic scatters are enqueued.
-                publish_present_meta::launch_unchecked::<WgpuRuntime>(
+                publish_proposal_meta::launch_unchecked::<WgpuRuntime>(
                     context.client(),
                     CubeCount::new_single(),
                     CubeDim::new_single(),
@@ -1203,6 +1409,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 capacity,
                 _planning_control: planning_control,
                 _generation_dispatch: generation_dispatch,
+                _pair_generation: pair_generation,
                 control: final_control,
                 meta: final_meta,
                 dispatch: final_dispatch,
@@ -1242,6 +1449,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             capacity,
             _planning_control: planning_control,
             _generation_dispatch: generation_dispatch,
+            _pair_generation: pair_generation,
             control,
             meta,
             dispatch: dynamic_dispatch,
@@ -1259,6 +1467,254 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 }),
                 _ => None,
             },
+        })
+    }
+}
+
+impl<'a, U: Universe> WgpuResidentRound<'a, U> {
+    /// Enqueues all PairDistinct families into their disjoint canonical arena
+    /// destinations. One scan and one LF scratch set are reused in physical
+    /// rotation order; the order is unobservable after the final scatter.
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_pair_distinct_candidates(
+        &self,
+        workspace: &DeviceU32Buffer<WgpuRuntime>,
+        workspace_layout: WorkspaceLayout,
+        planning_control: &DeviceU32Buffer<WgpuRuntime>,
+        candidate_records: &mut DeviceU32Buffer<WgpuRuntime>,
+        route_scratch: &mut DeviceU32Buffer<WgpuRuntime>,
+        route_scratch_base: usize,
+        rows: usize,
+        segment_count: usize,
+        capacity: usize,
+        dispatch_limits: Option<(u32, u32)>,
+    ) -> Result<PairGenerationBacking, ResidentProposalError> {
+        let context = self.archive().context();
+        let pair_layout = pair_workspace_layout(rows)?;
+        let mut pair_workspace = context.empty_u32(pair_layout.words)?;
+        let mut pair_control =
+            context.upload_u32(&[STATUS_DEVICE_INVARIANT, RESIDENT_U32_SENTINEL, 0, 1])?;
+        let mut pair_meta = context.batch_meta(0, capacity)?;
+        let mut pair_dispatch = context.batch_dispatch(0, capacity, CubeDim::new_1d(THREADS))?;
+        let mut queries = context.empty_u32(capacity)?;
+        let mut positions = context.empty_u32(capacity)?;
+        let mut values = context.empty_u32(capacity)?;
+        let mut ranks = context.empty_u32(capacity)?;
+        let domain = self.archive().archive().domain.len() as u32;
+        let ring_len = self.archive().ring_col(SuccinctRotation::Eav).len() as u32;
+        let (pair_max_x, pair_max_y) =
+            dispatch_limits.unwrap_or((pair_dispatch.max_groups_x(), pair_dispatch.max_groups_y()));
+
+        for rotation in SuccinctRotation::ALL {
+            if rows != 0 {
+                let row_dispatch =
+                    context.static_batch_dispatch(rows, rows, CubeDim::new_1d(THREADS))?;
+                unsafe {
+                    prepare_pair_rotation_counts::launch_unchecked::<WgpuRuntime>(
+                        context.client(),
+                        row_dispatch.cube_count(),
+                        row_dispatch.cube_dim(),
+                        workspace.input_arg(),
+                        pair_workspace.output_arg(),
+                        rows as u32,
+                        rotation.index() as u32,
+                        workspace_layout.row_families as u32,
+                        workspace_layout.row_physicals as u32,
+                        workspace_layout.row_counts as u32,
+                        pair_layout.counts as u32,
+                    );
+                }
+            }
+            if pair_layout.block_count != 0 {
+                let block_dispatch = context.static_batch_dispatch(
+                    pair_layout.block_count,
+                    pair_layout.block_count,
+                    CubeDim::new_1d(1),
+                )?;
+                unsafe {
+                    scan_present_blocks::launch_unchecked::<WgpuRuntime>(
+                        context.client(),
+                        block_dispatch.cube_count(),
+                        block_dispatch.cube_dim(),
+                        pair_workspace.output_arg(),
+                        rows as u32,
+                        pair_layout.block_count as u32,
+                        pair_layout.counts as u32,
+                        pair_layout.local_offsets as u32,
+                        pair_layout.block_sums as u32,
+                        pair_layout.block_errors as u32,
+                        BLOCK_ITEMS,
+                        RESIDENT_U32_SENTINEL,
+                    );
+                }
+            }
+            let changes = self.archive().pair_changes(rotation);
+            unsafe {
+                finalize_pair_rotation_scan::launch_unchecked::<WgpuRuntime>(
+                    context.client(),
+                    CubeCount::new_single(),
+                    CubeDim::new_single(),
+                    pair_workspace.output_arg(),
+                    planning_control.input_arg(),
+                    pair_control.output_arg(),
+                    rows as u32,
+                    pair_layout.block_count as u32,
+                    capacity as u32,
+                    pair_max_x,
+                    pair_max_y,
+                    THREADS,
+                    pair_layout.block_sums as u32,
+                    pair_layout.block_errors as u32,
+                    pair_layout.block_offsets as u32,
+                    RESIDENT_U32_SENTINEL,
+                    STATUS_OK,
+                    STATUS_DEVICE_INVARIANT,
+                    STATUS_GEOMETRY,
+                );
+                #[cfg(test)]
+                record_pair_rotation_trace::launch_unchecked::<WgpuRuntime>(
+                    context.client(),
+                    CubeCount::new_single(),
+                    CubeDim::new_single(),
+                    pair_control.input_arg(),
+                    pair_workspace.output_arg(),
+                    rotation.index() as u32,
+                    pair_layout.rotation_trace as u32,
+                );
+                publish_proposal_dispatch::launch_unchecked::<WgpuRuntime>(
+                    context.client(),
+                    CubeCount::new_single(),
+                    CubeDim::new_single(),
+                    pair_control.input_arg(),
+                    pair_dispatch.output_arg(),
+                    STATUS_OK,
+                );
+                publish_proposal_meta::launch_unchecked::<WgpuRuntime>(
+                    context.client(),
+                    CubeCount::new_single(),
+                    CubeDim::new_single(),
+                    pair_control.input_arg(),
+                    pair_meta.output_arg(),
+                    capacity as u32,
+                    STATUS_OK,
+                );
+                generate_pair_queries::launch_unchecked::<WgpuRuntime>(
+                    context.client(),
+                    pair_dispatch.cube_count(),
+                    pair_dispatch.cube_dim(),
+                    workspace.input_arg(),
+                    pair_workspace.input_arg(),
+                    pair_control.input_arg(),
+                    queries.output_arg(),
+                    route_scratch.output_arg(),
+                    candidate_records.output_arg(),
+                    rows as u32,
+                    segment_count as u32,
+                    capacity as u32,
+                    route_scratch_base as u32,
+                    rotation.index() as u32,
+                    changes.num_ones() as u32,
+                    workspace_layout.counts as u32,
+                    workspace_layout.local_offsets as u32,
+                    workspace_layout.block_offsets as u32,
+                    workspace_layout.row_arms as u32,
+                    workspace_layout.row_families as u32,
+                    workspace_layout.row_physicals as u32,
+                    workspace_layout.row_segments as u32,
+                    workspace_layout.row_counts as u32,
+                    workspace_layout.row_enum_los as u32,
+                    pair_layout.counts as u32,
+                    pair_layout.local_offsets as u32,
+                    pair_layout.block_offsets as u32,
+                    BLOCK_ITEMS,
+                    RESIDENT_U32_SENTINEL,
+                    STATUS_OK,
+                );
+            }
+
+            changes.select1_batch_into_dynamic(
+                &queries,
+                &mut positions,
+                &pair_meta,
+                &pair_dispatch,
+            )?;
+            let current = self.archive().ring_col(rotation);
+            current.access_batch_into_dynamic(
+                &positions,
+                &mut values,
+                &pair_meta,
+                &pair_dispatch,
+            )?;
+            let prefix = match rotation {
+                SuccinctRotation::Eav | SuccinctRotation::Aev => self.archive().value_prefix(),
+                SuccinctRotation::Vea | SuccinctRotation::Eva => self.archive().attribute_prefix(),
+                SuccinctRotation::Ave | SuccinctRotation::Vae => self.archive().entity_prefix(),
+            };
+            prefix.select1_batch_into_dynamic(&values, &mut queries, &pair_meta, &pair_dispatch)?;
+            current.rank_batch_into_dynamic(
+                &positions,
+                &values,
+                &mut ranks,
+                &pair_meta,
+                &pair_dispatch,
+            )?;
+            unsafe {
+                finish_pair_lf::launch_unchecked::<WgpuRuntime>(
+                    context.client(),
+                    pair_dispatch.cube_count(),
+                    pair_dispatch.cube_dim(),
+                    positions.output_arg(),
+                    values.input_arg(),
+                    queries.input_arg(),
+                    ranks.input_arg(),
+                    pair_control.input_arg(),
+                    capacity as u32,
+                    ring_len,
+                    domain,
+                    RESIDENT_U32_SENTINEL,
+                    STATUS_OK,
+                );
+            }
+            let adjacent = match rotation {
+                SuccinctRotation::Eav => SuccinctRotation::Vea,
+                SuccinctRotation::Vea => SuccinctRotation::Ave,
+                SuccinctRotation::Ave => SuccinctRotation::Eav,
+                SuccinctRotation::Vae => SuccinctRotation::Eva,
+                SuccinctRotation::Eva => SuccinctRotation::Aev,
+                SuccinctRotation::Aev => SuccinctRotation::Vae,
+            };
+            self.archive()
+                .ring_col(adjacent)
+                .access_batch_into_dynamic(&positions, &mut values, &pair_meta, &pair_dispatch)?;
+            unsafe {
+                scatter_pair_candidates::launch_unchecked::<WgpuRuntime>(
+                    context.client(),
+                    pair_dispatch.cube_count(),
+                    pair_dispatch.cube_dim(),
+                    values.input_arg(),
+                    route_scratch.input_arg(),
+                    pair_control.input_arg(),
+                    candidate_records.output_arg(),
+                    capacity as u32,
+                    route_scratch_base as u32,
+                    domain,
+                    RESIDENT_U32_SENTINEL,
+                    STATUS_OK,
+                );
+            }
+        }
+
+        Ok(PairGenerationBacking {
+            _control: pair_control,
+            _meta: pair_meta,
+            _dispatch: pair_dispatch,
+            _workspace: pair_workspace,
+            #[cfg(test)]
+            rotation_trace_base: pair_layout.rotation_trace,
+            _queries: queries,
+            _positions: positions,
+            _values: values,
+            _ranks: ranks,
         })
     }
 }
@@ -1318,6 +1774,7 @@ fn lower_proposal_admission<U: Universe>(
     checked_device_product(segment_count, SEGMENT_SPEC_WORDS, "proposal segment specs")?;
 
     Ok(ProposalAdmission {
+        pair_capable: matches!(policy, ProposerPolicy::PresentAndPair),
         arm_descriptors,
         variable_offsets,
         variable_arms,
@@ -1538,6 +1995,34 @@ fn workspace_layout(
         block_sums,
         block_errors,
         block_offsets,
+        words,
+    })
+}
+
+fn pair_workspace_layout(rows: usize) -> Result<PairWorkspaceLayout, ResidentProposalError> {
+    let block_count = rows.div_ceil(BLOCK_ITEMS as usize);
+    ensure_below_sentinel(block_count, "PairDistinct row scan blocks")?;
+    let mut words = 0usize;
+    let counts = reserve_words(&mut words, rows, "PairDistinct row scan")?;
+    let local_offsets = reserve_words(&mut words, rows, "PairDistinct row scan")?;
+    let block_sums = reserve_words(&mut words, block_count, "PairDistinct row scan")?;
+    let block_errors = reserve_words(&mut words, block_count, "PairDistinct row scan")?;
+    let block_offsets = reserve_words(&mut words, block_count, "PairDistinct row scan")?;
+    #[cfg(test)]
+    let rotation_trace = reserve_words(
+        &mut words,
+        SuccinctRotation::ALL.len() * 3,
+        "PairDistinct rotation trace",
+    )?;
+    Ok(PairWorkspaceLayout {
+        counts,
+        local_offsets,
+        block_sums,
+        block_errors,
+        block_offsets,
+        #[cfg(test)]
+        rotation_trace,
+        block_count,
         words,
     })
 }
@@ -2381,6 +2866,352 @@ fn generate_present_candidates_by_destination(
                     }
                 }
             }
+        }
+    }
+}
+
+#[cube(launch_unchecked)]
+fn prepare_pair_rotation_counts(
+    workspace: &Array<u32>,
+    pair_workspace: &mut Array<u32>,
+    rows: u32,
+    rotation: u32,
+    row_families_base: u32,
+    row_physicals_base: u32,
+    row_counts_base: u32,
+    pair_counts_base: u32,
+) {
+    let row = ABSOLUTE_POS;
+    if row < rows as usize {
+        let family_word = row_families_base as usize + row;
+        let physical_word = row_physicals_base as usize + row;
+        let count_word = row_counts_base as usize + row;
+        let destination = pair_counts_base as usize + row;
+        if destination < pair_workspace.len() {
+            let mut count = 0u32;
+            if family_word < workspace.len()
+                && physical_word < workspace.len()
+                && count_word < workspace.len()
+                && workspace[family_word] == FAMILY_PAIR_DISTINCT
+                && workspace[physical_word] == rotation
+            {
+                // A malformed retained Pair row poisons its rotation scan,
+                // rather than silently disappearing as a zero-width row.
+                count = workspace[count_word];
+            }
+            pair_workspace[destination] = count;
+        }
+    }
+}
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn finalize_pair_rotation_scan(
+    pair_workspace: &mut Array<u32>,
+    planning_control: &Array<u32>,
+    pair_control: &mut Array<u32>,
+    rows: u32,
+    block_count: u32,
+    capacity: u32,
+    max_groups_x: u32,
+    max_groups_y: u32,
+    threads: u32,
+    block_sums_base: u32,
+    block_errors_base: u32,
+    block_offsets_base: u32,
+    dead: u32,
+    ok: u32,
+    invariant_status: u32,
+    geometry_status: u32,
+) {
+    if ABSOLUTE_POS == 0 {
+        let mut error = planning_control[CONTROL_STATUS];
+        let planned_total = planning_control[CONTROL_REQUIRED];
+        let mut total = 0u32;
+        let mut block = 0usize;
+        while block < block_count as usize {
+            pair_workspace[block_offsets_base as usize + block] = total;
+            let next_error = pair_workspace[block_errors_base as usize + block];
+            if error == ok && next_error != 0u32 {
+                error = geometry_status;
+            }
+            let next = pair_workspace[block_sums_base as usize + block];
+            if next == dead || next >= dead - total {
+                if error == ok {
+                    error = geometry_status;
+                }
+            } else {
+                total += next;
+            }
+            block += 1usize;
+        }
+        if error == ok
+            && (rows == dead
+                || planned_total == dead
+                || planned_total > capacity
+                || total > planned_total)
+        {
+            error = invariant_status;
+        }
+
+        let mut x = 0u32;
+        let mut y = 1u32;
+        if error == ok && total != 0u32 {
+            if threads == 0u32 || max_groups_x == 0u32 || max_groups_y == 0u32 {
+                error = geometry_status;
+            } else {
+                let groups = 1u32 + (total - 1u32) / threads;
+                y = 1u32 + (groups - 1u32) / max_groups_x;
+                if y == 0u32 || y > max_groups_y {
+                    error = geometry_status;
+                } else {
+                    x = 1u32 + (groups - 1u32) / y;
+                    if x == 0u32 || x > max_groups_x {
+                        error = geometry_status;
+                    }
+                }
+            }
+        }
+        pair_control[CONTROL_STATUS] = error;
+        pair_control[CONTROL_REQUIRED] = 0u32;
+        pair_control[CONTROL_DISPATCH_X] = 0u32;
+        pair_control[CONTROL_DISPATCH_Y] = 1u32;
+        if error == ok {
+            pair_control[CONTROL_REQUIRED] = total;
+            pair_control[CONTROL_DISPATCH_X] = x;
+            pair_control[CONTROL_DISPATCH_Y] = y;
+        }
+    }
+}
+
+#[cfg(test)]
+#[cube(launch_unchecked)]
+fn record_pair_rotation_trace(
+    pair_control: &Array<u32>,
+    pair_workspace: &mut Array<u32>,
+    rotation: u32,
+    trace_base: u32,
+) {
+    if ABSOLUTE_POS == 0 {
+        let base = trace_base as usize + rotation as usize * 3usize;
+        pair_workspace[base] = pair_control[CONTROL_REQUIRED];
+        pair_workspace[base + 1usize] = pair_control[CONTROL_DISPATCH_X];
+        pair_workspace[base + 2usize] = pair_control[CONTROL_DISPATCH_Y];
+    }
+}
+
+#[cube(launch_unchecked)]
+// The nested arithmetic guards keep every sentinel subtraction dominated by
+// an earlier non-sentinel proof in generated code.
+#[allow(clippy::too_many_arguments, clippy::collapsible_if)]
+fn generate_pair_queries(
+    workspace: &Array<u32>,
+    pair_workspace: &Array<u32>,
+    pair_control: &Array<u32>,
+    queries: &mut Array<u32>,
+    route_scratch: &mut Array<u32>,
+    candidate_records: &mut Array<u32>,
+    rows: u32,
+    segment_count: u32,
+    capacity: u32,
+    route_scratch_base: u32,
+    rotation: u32,
+    pair_count: u32,
+    counts_base: u32,
+    local_offsets_base: u32,
+    block_offsets_base: u32,
+    row_arms_base: u32,
+    row_families_base: u32,
+    row_physicals_base: u32,
+    row_segments_base: u32,
+    row_counts_base: u32,
+    row_enum_los_base: u32,
+    pair_counts_base: u32,
+    pair_local_offsets_base: u32,
+    pair_block_offsets_base: u32,
+    #[comptime] block_items: u32,
+    dead: u32,
+    ok: u32,
+) {
+    let group_destination = ABSOLUTE_POS;
+    if pair_control[CONTROL_STATUS] == ok
+        && group_destination < pair_control[CONTROL_REQUIRED] as usize
+        && group_destination < capacity as usize
+        && rows != 0u32
+    {
+        queries[group_destination] = dead;
+        route_scratch[route_scratch_base as usize + group_destination] = dead;
+        let d = group_destination as u32;
+
+        // Strict-end inversion skips every zero-width row and selects the
+        // unique Pair row whose compact rotation interval contains `d`.
+        let mut row_lo = 0u32;
+        let mut row_hi = rows;
+        while row_lo < row_hi {
+            let row_mid = row_lo + (row_hi - row_lo) / 2u32;
+            let block = row_mid as usize / block_items as usize;
+            let mut row_end = dead;
+            if pair_counts_base as usize + (row_mid as usize) < pair_workspace.len()
+                && pair_local_offsets_base as usize + (row_mid as usize) < pair_workspace.len()
+                && pair_block_offsets_base as usize + block < pair_workspace.len()
+            {
+                let block_base = pair_workspace[pair_block_offsets_base as usize + block];
+                let local = pair_workspace[pair_local_offsets_base as usize + row_mid as usize];
+                let count = pair_workspace[pair_counts_base as usize + row_mid as usize];
+                if block_base != dead && local != dead && count != dead {
+                    if local < dead - block_base {
+                        let start = block_base + local;
+                        if count < dead - start {
+                            row_end = start + count;
+                        }
+                    }
+                }
+            }
+            if row_end <= d {
+                row_lo = row_mid + 1u32;
+            } else {
+                row_hi = row_mid;
+            }
+        }
+
+        if row_lo < rows {
+            let row = row_lo;
+            let pair_block = row as usize / block_items as usize;
+            let pair_block_base = pair_workspace[pair_block_offsets_base as usize + pair_block];
+            let pair_local = pair_workspace[pair_local_offsets_base as usize + row as usize];
+            let pair_width = pair_workspace[pair_counts_base as usize + row as usize];
+            if pair_block_base != dead && pair_local != dead && pair_width != dead {
+                if pair_local < dead - pair_block_base {
+                    let pair_start = pair_block_base + pair_local;
+                    if pair_width < dead - pair_start {
+                        let pair_end = pair_start + pair_width;
+                        if d >= pair_start && d < pair_end {
+                            let ordinal = d - pair_start;
+                            let arm = workspace[row_arms_base as usize + row as usize];
+                            let family = workspace[row_families_base as usize + row as usize];
+                            let physical = workspace[row_physicals_base as usize + row as usize];
+                            let segment = workspace[row_segments_base as usize + row as usize];
+                            let retained_count = workspace[row_counts_base as usize + row as usize];
+                            let enum_lo = workspace[row_enum_los_base as usize + row as usize];
+                            if family == FAMILY_PAIR_DISTINCT
+                                && physical == rotation
+                                && arm != dead
+                                && segment != dead
+                                && segment < segment_count
+                            {
+                                let cell = segment as usize * rows as usize + row as usize;
+                                let block = cell / block_items as usize;
+                                if counts_base as usize + cell < workspace.len()
+                                    && local_offsets_base as usize + cell < workspace.len()
+                                    && block_offsets_base as usize + block < workspace.len()
+                                {
+                                    let canonical_count = workspace[counts_base as usize + cell];
+                                    let canonical_block =
+                                        workspace[block_offsets_base as usize + block];
+                                    let canonical_local =
+                                        workspace[local_offsets_base as usize + cell];
+                                    if canonical_count != dead
+                                        && canonical_block != dead
+                                        && canonical_local != dead
+                                        && retained_count == pair_width
+                                        && canonical_count == pair_width
+                                        && ordinal < pair_width
+                                        && enum_lo != dead
+                                    {
+                                        if ordinal < dead - enum_lo {
+                                            let q = enum_lo + ordinal;
+                                            if q < pair_count
+                                                && canonical_local < dead - canonical_block
+                                            {
+                                                let cell_start = canonical_block + canonical_local;
+                                                if ordinal < dead - cell_start {
+                                                    let destination = cell_start + ordinal;
+                                                    if destination < capacity {
+                                                        queries[group_destination] = q;
+                                                        route_scratch[route_scratch_base
+                                                            as usize
+                                                            + group_destination] = destination;
+                                                        candidate_records[capacity as usize
+                                                            + destination as usize] = row;
+                                                        candidate_records[capacity as usize
+                                                            * 2usize
+                                                            + destination as usize] = arm;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn finish_pair_lf(
+    positions: &mut Array<u32>,
+    values: &Array<u32>,
+    selected: &Array<u32>,
+    ranks: &Array<u32>,
+    pair_control: &Array<u32>,
+    capacity: u32,
+    ring_len: u32,
+    domain: u32,
+    dead: u32,
+    ok: u32,
+) {
+    let lane = ABSOLUTE_POS;
+    if pair_control[CONTROL_STATUS] == ok
+        && lane < pair_control[CONTROL_REQUIRED] as usize
+        && lane < capacity as usize
+    {
+        let position = positions[lane];
+        let last = values[lane];
+        let prefix_selected = selected[lane];
+        let rank = ranks[lane];
+        positions[lane] = dead;
+        if position != dead
+            && position < ring_len
+            && last != dead
+            && last < domain
+            && prefix_selected != dead
+            && prefix_selected >= last
+            && rank != dead
+        {
+            let base = prefix_selected - last;
+            if base < ring_len && rank < ring_len - base {
+                positions[lane] = base + rank;
+            }
+        }
+    }
+}
+
+#[cube(launch_unchecked)]
+fn scatter_pair_candidates(
+    candidates: &Array<u32>,
+    route_scratch: &Array<u32>,
+    pair_control: &Array<u32>,
+    candidate_records: &mut Array<u32>,
+    capacity: u32,
+    route_scratch_base: u32,
+    domain: u32,
+    dead: u32,
+    ok: u32,
+) {
+    let lane = ABSOLUTE_POS;
+    if pair_control[CONTROL_STATUS] == ok
+        && lane < pair_control[CONTROL_REQUIRED] as usize
+        && lane < capacity as usize
+    {
+        let candidate = candidates[lane];
+        let destination = route_scratch[route_scratch_base as usize + lane];
+        if candidate != dead && candidate < domain && destination < capacity {
+            candidate_records[destination as usize] = candidate;
         }
     }
 }
@@ -3399,7 +4230,7 @@ fn scatter_confirmed_children(
 }
 
 #[cube(launch_unchecked)]
-fn publish_present_dispatch(control: &Array<u32>, dispatch: &mut Array<u32>, ok: u32) {
+fn publish_proposal_dispatch(control: &Array<u32>, dispatch: &mut Array<u32>, ok: u32) {
     if ABSOLUTE_POS == 0 {
         if control[CONTROL_STATUS] == ok {
             dispatch[0] = control[CONTROL_DISPATCH_X];
@@ -3414,7 +4245,7 @@ fn publish_present_dispatch(control: &Array<u32>, dispatch: &mut Array<u32>, ok:
 
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
-fn materialize_present_children(
+fn materialize_proposal_children(
     frontier: &Array<u32>,
     plan: &Array<u32>,
     segment_records: &Array<u32>,
@@ -3444,9 +4275,15 @@ fn materialize_present_children(
         let arm = candidate_records[capacity as usize * 2usize + destination];
         if candidate != dead && owner < rows && arm < arm_count {
             let descriptor = arm_descriptors_base as usize + arm as usize * ARM_DESCRIPTOR_WORDS;
-            if descriptor + 3usize < plan.len() && plan[descriptor + 1usize] == FAMILY_PRESENT {
+            if descriptor + 3usize < plan.len() {
+                let family = plan[descriptor + 1usize];
+                let physical = plan[descriptor + 2usize];
+                let admitted_family = (family == FAMILY_PRESENT && physical < 3u32)
+                    || (family == FAMILY_PAIR_DISTINCT && physical < 6u32);
                 let variable = plan[descriptor];
-                if variable_to_segment_base as usize + (variable as usize) < plan.len() {
+                if admitted_family
+                    && variable_to_segment_base as usize + (variable as usize) < plan.len()
+                {
                     let segment = plan[variable_to_segment_base as usize + variable as usize];
                     let record = segment as usize * SEGMENT_RECORD_WORDS;
                     if segment < segment_count
@@ -3485,7 +4322,7 @@ fn materialize_present_children(
 }
 
 #[cube(launch_unchecked)]
-fn publish_present_meta(control: &Array<u32>, meta: &mut Array<u32>, capacity: u32, ok: u32) {
+fn publish_proposal_meta(control: &Array<u32>, meta: &mut Array<u32>, capacity: u32, ok: u32) {
     if ABSOLUTE_POS == 0 {
         meta[0] = 0u32;
         if control[CONTROL_STATUS] == ok
@@ -3535,6 +4372,19 @@ struct ResolvedProposalStageProfiles {
 
 #[cfg(test)]
 impl WgpuResidentProposals {
+    fn read_pair_rotation_trace_for_test(&self) -> Vec<[u32; 3]> {
+        let backing = self
+            ._pair_generation
+            .as_ref()
+            .expect("arena has no Pair generation backing");
+        let words = backing._workspace.read();
+        words[backing.rotation_trace_base
+            ..backing.rotation_trace_base + SuccinctRotation::ALL.len() * 3]
+            .chunks_exact(3)
+            .map(|entry| [entry[0], entry[1], entry[2]])
+            .collect()
+    }
+
     /// Reads the private tri-state confirmation vector for focused semantic
     /// tests, independent of whether this arena publishes provisional or
     /// confirmed semantic buffers.
