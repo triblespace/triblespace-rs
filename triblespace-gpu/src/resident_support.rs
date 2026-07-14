@@ -49,8 +49,12 @@ pub enum ResidentSupportError {
     ArchiveOwnership,
     /// A resident frontier was minted for another archive/context capability.
     FrontierOwnership,
+    /// Choices were computed from another exact resident frontier allocation.
+    ChoiceFrontierOwnership,
     /// The frontier schema or resident storage geometry does not match this round.
     MalformedFrontier,
+    /// Choice count or resident storage geometry does not match the frontier.
+    MalformedChoices,
     /// A host frontier contains a code outside this archive's local universe.
     FrontierCodeOutOfBounds {
         /// Invalid archive-local code.
@@ -72,8 +76,14 @@ impl fmt::Display for ResidentSupportError {
             Self::FrontierOwnership => {
                 f.write_str("resident frontier belongs to another archive/context")
             }
+            Self::ChoiceFrontierOwnership => {
+                f.write_str("resident row choices belong to another frontier allocation")
+            }
             Self::MalformedFrontier => {
                 f.write_str("resident frontier schema or storage geometry is malformed")
+            }
+            Self::MalformedChoices => {
+                f.write_str("resident row choices do not match the affine frontier")
             }
             Self::FrontierCodeOutOfBounds { code, domain } => write!(
                 f,
@@ -92,7 +102,9 @@ impl Error for ResidentSupportError {
             Self::Round(error) => Some(error),
             Self::ArchiveOwnership
             | Self::FrontierOwnership
+            | Self::ChoiceFrontierOwnership
             | Self::MalformedFrontier
+            | Self::MalformedChoices
             | Self::FrontierCodeOutOfBounds { .. }
             | Self::MalformedResidentPlan => None,
         }
@@ -351,7 +363,10 @@ impl ResidentRoundPlan {
 /// return this same type without exposing snapshot-local codes or raw handles.
 pub struct WgpuResidentFrontier<'a, U: Universe> {
     archive: &'a WgpuSuccinctArchive<U>,
+    /// Shared capability proving this frontier belongs to the round.
     owner: Arc<()>,
+    /// Unique allocation lineage propagated into inputs and choices.
+    lineage: Arc<()>,
     values: DeviceU32Buffer<WgpuRuntime>,
     variables: Box<[ProgramVariable]>,
     rows: usize,
@@ -488,6 +503,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         Ok(WgpuResidentFrontier {
             archive: self.archive,
             owner: self.frontier_owner.clone(),
+            lineage: Arc::new(()),
             values: self.archive.context().upload_u32(&values)?,
             variables: frontier.variables().to_vec().into_boxed_slice(),
             rows: frontier.len(),
@@ -509,6 +525,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         self.validate_frontier(frontier)?;
         let rows = frontier.rows;
         let mut inputs = self.planner.allocate_inputs(rows)?;
+        inputs.bind_frontier_lineage(frontier.lineage.clone())?;
         if rows == 0 {
             return Ok(inputs);
         }
@@ -552,6 +569,28 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         self.planner.enqueue(inputs)
     }
 
+    /// Produces the sole crate-private choice argument for later resident
+    /// proposal kernels after validating every capability on the host.
+    ///
+    /// Validation covers the exact archive/context and round owner, canonical
+    /// affine schema and storage geometry, unique frontier allocation lineage,
+    /// and the exact planner which produced the packed choices. No raw device
+    /// handle is exposed before all checks succeed.
+    #[allow(dead_code)] // Consumed by the immediately following resident proposal slice.
+    pub(crate) fn choice_input_arg(
+        &self,
+        frontier: &WgpuResidentFrontier<'_, U>,
+        choices: &ResidentRowChoices<WgpuRuntime>,
+    ) -> Result<ArrayArg<WgpuRuntime>, ResidentSupportError> {
+        self.validate_frontier(frontier)?;
+        if choices.len() != frontier.rows {
+            return Err(ResidentSupportError::MalformedChoices);
+        }
+        if !choices.has_frontier_lineage(&frontier.lineage) {
+            return Err(ResidentSupportError::ChoiceFrontierOwnership);
+        }
+        self.planner.choice_input_arg(choices).map_err(Into::into)
+    }
     fn validate_frontier(
         &self,
         frontier: &WgpuResidentFrontier<'_, U>,
@@ -1772,3 +1811,7 @@ mod restricted_tests;
 #[cfg(test)]
 #[path = "resident_fully_bound_tests.rs"]
 mod fully_bound_tests;
+
+#[cfg(test)]
+#[path = "resident_choice_capability_tests.rs"]
+mod choice_capability_tests;
