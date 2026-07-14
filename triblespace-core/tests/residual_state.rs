@@ -1425,7 +1425,7 @@ fn lazy_fixed_width_reopens_states_without_changing_the_result_bag() {
     assert!(lazy.stats.rows_reentered > 0);
     assert_eq!(
         lazy.stats.state_pops,
-        lazy.stats.full_pops + lazy.stats.readiness_pops
+        lazy.stats.full_pops + lazy.stats.readiness_pops + lazy.stats.continuation_pops
     );
     assert_eq!(
         lazy.stats.interner_hits,
@@ -1456,7 +1456,7 @@ fn lazy_geometric_width_uses_both_full_and_underfilled_choices() {
     assert!(crossed.stats.readiness_pops > 0);
     assert_eq!(
         crossed.stats.state_pops,
-        crossed.stats.full_pops + crossed.stats.readiness_pops
+        crossed.stats.full_pops + crossed.stats.readiness_pops + crossed.stats.continuation_pops
     );
     assert_eq!(
         crossed.stats.interner_hits,
@@ -1495,7 +1495,9 @@ fn lazy_width_above_the_frontier_reconverges_before_states_are_popped() {
     assert_eq!(readiness.stats.max_confirm_rows, N);
     assert_eq!(
         readiness.stats.state_pops,
-        readiness.stats.full_pops + readiness.stats.readiness_pops
+        readiness.stats.full_pops
+            + readiness.stats.readiness_pops
+            + readiness.stats.continuation_pops
     );
     assert_eq!(
         readiness.stats.interner_hits,
@@ -1534,7 +1536,10 @@ fn occupancy_plans_striped_ready_chunks_before_invoking_uniform_actions() {
     }
 
     let stats = filled.stats;
-    assert_eq!(stats.state_pops, stats.full_pops + stats.readiness_pops);
+    assert_eq!(
+        stats.state_pops,
+        stats.full_pops + stats.readiness_pops + stats.continuation_pops
+    );
     assert_eq!(stats.propose_action_pops, stats.propose_calls);
     assert_eq!(stats.confirm_action_pops, stats.confirm_calls);
     assert_eq!((stats.propose_calls, stats.propose_rows), (3, 5));
@@ -1597,7 +1602,7 @@ fn occupancy_shape_is_independent_of_whether_width_equals_the_cap() {
     assert_eq!(capped.stats.max_propose_rows, W);
     assert_eq!(
         capped.stats.state_pops,
-        capped.stats.full_pops + capped.stats.readiness_pops
+        capped.stats.full_pops + capped.stats.readiness_pops + capped.stats.continuation_pops
     );
 }
 

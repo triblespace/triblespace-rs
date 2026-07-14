@@ -20,9 +20,11 @@
 //! gate. When a full Propose or Confirm action advances to an underfilled
 //! successor, an exact physical filing token keeps at most that newly appended
 //! tail hot until it emits or dies. Readiness pops and planning-state splits do
-//! not start a sprint, so saturated reconvergence and uniform-action assembly
-//! remain intact. The token is not part of canonical state identity and never
-//! consumes an older cohort already merged under the same state. Ready and
+//! not themselves activate a sprint, so planning-created underfill still uses
+//! ordinary batch assembly. Once an action lineage is hot, however, it may
+//! intentionally defer reconvergence with an older cohort in exchange for
+//! first-result latency. The token is not part of canonical state identity and
+//! never consumes that older cohort. Ready and
 //! Propose states measure parent rows. Candidate and Confirm states remain
 //! parent-atomic while any unchecked whole-group confirmer remains; once the
 //! residual continuation contains only page-local confirms, they measure and
@@ -143,7 +145,9 @@ pub struct ResidualStateStats {
     pub bucket_merges: usize,
     /// Parent rows appended by those merge filings.
     pub rows_merged: usize,
-    /// Number of canonical bucket chunks processed.
+    /// Number of canonical bucket chunks processed. Every pop is selected by
+    /// exactly one physical policy, so this equals `full_pops +
+    /// readiness_pops + continuation_pops`.
     pub state_pops: usize,
     /// Ready-state chunks that planned row-local proposal actions without
     /// invoking the constraint protocol.
@@ -1672,8 +1676,9 @@ impl ResidualStateMachine {
     /// A global strict-deepest flag is insufficient here: another history may
     /// already occupy a deeper state, and an older cohort may already occupy
     /// this exact state. The token limits the tail cut to the newly filed
-    /// cohort, preserving DFS latency without weakening readiness or semantic
-    /// state merging.
+    /// cohort, preserving DFS latency without changing readiness legality or
+    /// canonical state identity. It may deliberately defer the opportunity to
+    /// merge this cohort with older work.
     fn take_continuation(
         &mut self,
         plan: &ResidualPlan,
@@ -1867,11 +1872,13 @@ impl ResidualStateMachine {
 /// Propose or Confirm action files fewer actionable atoms than that width, the
 /// exact newly appended physical cohort becomes hot and outranks cold sibling
 /// harvesting until it emits or dies. Planning splits and readiness pops do not
-/// activate a sprint, preserving their batching/reconvergence behavior. The
-/// token never changes canonical identity or consumes an older cohort merged
-/// under the same state. With no hot continuation, the deepest live bucket able
-/// to fill the width wins; if none can, the minimum-rank bucket drains through
-/// the strict readiness gate. The cap only bounds geometric width growth.
+/// activate a sprint on their own. With no hot lineage they retain ordinary
+/// batching; within a hot lineage they may continue its deliberate
+/// latency-for-reconvergence tradeoff. The token never changes canonical
+/// identity or consumes an older cohort merged under the same state. With no
+/// hot continuation, the deepest live bucket able to fill the width wins; if
+/// none can, the minimum-rank bucket drains through the strict readiness gate.
+/// The cap only bounds geometric width growth.
 ///
 /// Dropping the iterator discards its remaining affine frontier. Fully drained,
 /// it produces the same result multiset as [`Query::solve_residual_state`].
@@ -2051,11 +2058,12 @@ where
     /// confirmation action partially survives, only its exact newly appended
     /// physical cohort becomes the next continuation; it remains ahead of cold
     /// sibling harvesting until it emits or dies. Planning splits and
-    /// readiness-selected work continue to harvest normally. Death or raw
-    /// terminal output grows the width geometrically for later work. Whenever
-    /// no continuation is hot and no live state can fill the desired width, the
-    /// minimum-rank state drains readiness-safely. Result order may differ from
-    /// the ordinary iterator; a full drain preserves its result multiset.
+    /// readiness-selected work cannot activate a sprint themselves, but may
+    /// carry an already-hot lineage forward. Death or raw terminal output grows
+    /// the width geometrically for later work. Whenever no continuation is hot
+    /// and no live state can fill the desired width, the minimum-rank state
+    /// drains readiness-safely. Result order may differ from the ordinary
+    /// iterator; a full drain preserves its result multiset.
     ///
     /// # Panics
     ///
@@ -3393,6 +3401,11 @@ mod tests {
         assert_eq!(stats.candidates_confirmed, 6);
         assert_eq!(stats.max_confirm_candidates, 2);
         assert_eq!(stats.underfilled_continuation_pops, 2);
+        assert_eq!(
+            stats.state_pops,
+            stats.full_pops + stats.readiness_pops + stats.continuation_pops,
+            "every state pop has exactly one physical selection policy"
+        );
         assert_eq!(stats.width_increases, 2);
         assert_eq!(width, 4);
 
