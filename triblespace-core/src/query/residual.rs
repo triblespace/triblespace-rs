@@ -9,6 +9,14 @@
 //! [`Constraint`] leaves; custom constraints do too unless they explicitly
 //! expose an associative AND shape.
 //!
+//! Ready and Candidate descriptors are pure planning states: they estimate,
+//! partition rows by a uniform semantic action, and file explicit Propose or
+//! Confirm descriptors without invoking either protocol verb. The action state
+//! is what calls one flattened leaf. Under minimum-rank harvest scheduling,
+//! separately planned groups can therefore assemble in one canonical action
+//! bucket before the protocol call; maximum-rank sprinting deliberately keeps
+//! its low-latency execute-before-remainder behavior.
+//!
 //! As with the other batched engines, flattened leaves must obey the
 //! [`Constraint::estimate`] protocol: relevance is a structural answer,
 //! uniform across every row with the same bound-variable schema. Constraint
@@ -105,6 +113,17 @@ pub struct ResidualStateStats {
     pub rows_merged: usize,
     /// Number of canonical bucket chunks processed.
     pub state_pops: usize,
+    /// Ready-state chunks that planned row-local proposal actions without
+    /// invoking the constraint protocol.
+    pub ready_plan_pops: usize,
+    /// Candidate-state chunks that planned row-local confirmation actions (or
+    /// committed a fully checked candidate frontier) without invoking a
+    /// constraint verb.
+    pub candidate_plan_pops: usize,
+    /// Explicit proposal-action chunks that invoked one flattened leaf.
+    pub propose_action_pops: usize,
+    /// Explicit confirmation-action chunks that invoked one flattened leaf.
+    pub confirm_action_pops: usize,
     /// Bucket chunks processed while the geometric scheduler was below its
     /// saturation cap and therefore diving by maximum rank.
     pub sprint_pops: usize,
@@ -175,18 +194,47 @@ impl ChildSet {
     fn count(&self) -> usize {
         self.0.iter().map(|word| word.count_ones() as usize).sum()
     }
+
+    fn is_subset_of(&self, other: &Self) -> bool {
+        self.0
+            .iter()
+            .zip(&other.0)
+            .all(|(left, right)| left & !right == 0)
+    }
+
+    fn is_valid_for(&self, leaf_count: usize) -> bool {
+        if self.0.len() != leaf_count.div_ceil(64) {
+            return false;
+        }
+        let remainder = leaf_count % 64;
+        remainder == 0 || self.0.last().is_none_or(|word| word >> remainder == 0)
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum ResidualPhase {
-    /// Pick one joint `(variable, proposing child)` action per row.
+    /// Plan one joint `(variable, proposing child)` action per row.
     Ready,
+    /// Invoke one proposer over a row block whose action is uniform.
+    Propose {
+        variable: VariableId,
+        relevant: ChildSet,
+        proposer: usize,
+    },
     /// A variable has speculative candidates and some leaf occurrences have
-    /// already accepted them.
+    /// already accepted them. Plan the next confirmer per parent row.
     Candidate {
         variable: VariableId,
         relevant: ChildSet,
         checked: ChildSet,
+    },
+    /// Invoke one confirmer over a whole-parent candidate block whose action
+    /// is uniform.
+    Confirm {
+        variable: VariableId,
+        relevant: ChildSet,
+        checked: ChildSet,
+        confirmer: usize,
     },
 }
 
@@ -210,19 +258,103 @@ impl Hash for StateDesc {
 }
 
 impl StateDesc {
+    fn validate(&self, leaf_count: usize) {
+        let validate_variable = |variable: VariableId| {
+            assert!(
+                !self.bound.is_set(variable),
+                "residual action variable is already committed"
+            );
+        };
+        let validate_sets = |relevant: &ChildSet, checked: &ChildSet| {
+            assert!(
+                relevant.is_valid_for(leaf_count),
+                "residual relevant set contains a non-leaf occurrence"
+            );
+            assert!(
+                checked.is_valid_for(leaf_count),
+                "residual checked set contains a non-leaf occurrence"
+            );
+            assert!(relevant.count() > 0, "residual relevant set is empty");
+            assert!(checked.count() > 0, "residual checked set is empty");
+            assert!(
+                checked.is_subset_of(relevant),
+                "residual checked set is not a subset of the relevant set"
+            );
+        };
+
+        match &self.phase {
+            ResidualPhase::Ready => {}
+            ResidualPhase::Propose {
+                variable,
+                relevant,
+                proposer,
+            } => {
+                validate_variable(*variable);
+                assert!(
+                    relevant.is_valid_for(leaf_count),
+                    "residual relevant set contains a non-leaf occurrence"
+                );
+                assert!(relevant.count() > 0, "residual relevant set is empty");
+                assert!(
+                    *proposer < leaf_count && relevant.contains(*proposer),
+                    "residual proposer is not relevant"
+                );
+            }
+            ResidualPhase::Candidate {
+                variable,
+                relevant,
+                checked,
+            } => {
+                validate_variable(*variable);
+                validate_sets(relevant, checked);
+            }
+            ResidualPhase::Confirm {
+                variable,
+                relevant,
+                checked,
+                confirmer,
+            } => {
+                validate_variable(*variable);
+                validate_sets(relevant, checked);
+                assert!(
+                    *confirmer < leaf_count
+                        && relevant.contains(*confirmer)
+                        && !checked.contains(*confirmer),
+                    "residual confirmer is not an unchecked relevant leaf"
+                );
+            }
+        }
+    }
+
     /// History-independent grade. Every transition strictly raises it, so
     /// draining the minimum grade is an exact readiness gate: once a state is
     /// popped, no unprocessed predecessor can still file into it.
     fn rank(&self, leaf_count: usize) -> usize {
+        self.validate(leaf_count);
+        let stride = leaf_count
+            .checked_add(1)
+            .and_then(|value| value.checked_mul(2))
+            .expect("residual-state rank stride overflow");
         let base = self
             .bound
             .count()
-            .checked_mul(leaf_count.saturating_add(1))
+            .checked_mul(stride)
             .expect("residual-state rank overflow");
         match &self.phase {
             ResidualPhase::Ready => base,
-            ResidualPhase::Candidate { checked, .. } => base
-                .checked_add(checked.count())
+            ResidualPhase::Propose { .. } => {
+                base.checked_add(1).expect("residual-state rank overflow")
+            }
+            ResidualPhase::Candidate { checked, .. } => checked
+                .count()
+                .checked_mul(2)
+                .and_then(|grade| base.checked_add(grade))
+                .expect("residual-state rank overflow"),
+            ResidualPhase::Confirm { checked, .. } => checked
+                .count()
+                .checked_mul(2)
+                .and_then(|grade| grade.checked_add(1))
+                .and_then(|grade| base.checked_add(grade))
                 .expect("residual-state rank overflow"),
         }
     }
@@ -454,22 +586,22 @@ impl CandidateBatch {
 
 #[derive(Debug)]
 enum StateBucket {
-    Ready(RowBatch),
-    Candidate(CandidateBatch),
+    Rows(RowBatch),
+    Candidates(CandidateBatch),
 }
 
 impl StateBucket {
     fn row_count(&self) -> usize {
         match self {
-            StateBucket::Ready(rows) => rows.row_count,
-            StateBucket::Candidate(batch) => batch.parents.row_count,
+            StateBucket::Rows(rows) => rows.row_count,
+            StateBucket::Candidates(batch) => batch.parents.row_count,
         }
     }
 
     fn append(&mut self, other: Self) {
         match (self, other) {
-            (StateBucket::Ready(left), StateBucket::Ready(right)) => left.append(right),
-            (StateBucket::Candidate(left), StateBucket::Candidate(right)) => left.append(right),
+            (StateBucket::Rows(left), StateBucket::Rows(right)) => left.append(right),
+            (StateBucket::Candidates(left), StateBucket::Candidates(right)) => left.append(right),
             _ => panic!("one canonical residual state received incompatible payloads"),
         }
     }
@@ -477,11 +609,11 @@ impl StateBucket {
     /// Removes a tail chunk without bisecting a candidate parent group.
     fn take_tail(&mut self, stride: usize, width: usize) -> Self {
         match self {
-            StateBucket::Ready(batch) => {
+            StateBucket::Rows(batch) => {
                 let take = batch.row_count.min(width.max(1));
                 debug_assert!(take > 0);
                 if take == batch.row_count {
-                    return StateBucket::Ready(std::mem::replace(
+                    return StateBucket::Rows(std::mem::replace(
                         batch,
                         RowBatch {
                             rows: Vec::new(),
@@ -492,12 +624,14 @@ impl StateBucket {
                 let first = batch.row_count - take;
                 let rows = batch.rows.split_off(first * stride);
                 batch.row_count = first;
-                StateBucket::Ready(RowBatch {
+                StateBucket::Rows(RowBatch {
                     rows,
                     row_count: take,
                 })
             }
-            StateBucket::Candidate(batch) => StateBucket::Candidate(batch.take_tail(stride, width)),
+            StateBucket::Candidates(batch) => {
+                StateBucket::Candidates(batch.take_tail(stride, width))
+            }
         }
     }
 }
@@ -561,7 +695,52 @@ struct VariablePlan {
     estimates: Vec<usize>,
 }
 
-fn ready_transition<'a, C: Constraint<'a> + 'a>(
+fn estimate_leaf<'a, C: Constraint<'a> + 'a>(
+    root: &IntersectionConstraint<C>,
+    plan: &ResidualPlan,
+    leaf: usize,
+    variable: VariableId,
+    view: &RowsView<'_>,
+    out: &mut EstimateSink<'_>,
+) -> bool {
+    if let Some(child) = plan.direct_child(leaf) {
+        root.children()[child].estimate(variable, view, out)
+    } else {
+        plan.resolve(root, leaf).estimate(variable, view, out)
+    }
+}
+
+fn propose_leaf<'a, C: Constraint<'a> + 'a>(
+    root: &IntersectionConstraint<C>,
+    plan: &ResidualPlan,
+    leaf: usize,
+    variable: VariableId,
+    view: &RowsView<'_>,
+    candidates: &mut CandidateSink<'_>,
+) {
+    if let Some(child) = plan.direct_child(leaf) {
+        root.children()[child].propose(variable, view, candidates);
+    } else {
+        plan.resolve(root, leaf).propose(variable, view, candidates);
+    }
+}
+
+fn confirm_leaf<'a, C: Constraint<'a> + 'a>(
+    root: &IntersectionConstraint<C>,
+    plan: &ResidualPlan,
+    leaf: usize,
+    variable: VariableId,
+    view: &RowsView<'_>,
+    candidates: &mut CandidateSink<'_>,
+) {
+    if let Some(child) = plan.direct_child(leaf) {
+        root.children()[child].confirm(variable, view, candidates);
+    } else {
+        plan.resolve(root, leaf).confirm(variable, view, candidates);
+    }
+}
+
+fn ready_plan_transition<'a, C: Constraint<'a> + 'a>(
     root: &IntersectionConstraint<C>,
     plan: &ResidualPlan,
     desc: &StateDesc,
@@ -586,19 +765,14 @@ fn ready_transition<'a, C: Constraint<'a> + 'a>(
         let mut column = Vec::with_capacity(rows.row_count);
         for leaf in 0..leaf_count {
             column.clear();
-            let is_relevant = if let Some(child) = plan.direct_child(leaf) {
-                root.children()[child].estimate(
-                    variable,
-                    &view,
-                    &mut EstimateSink::Column(&mut column),
-                )
-            } else {
-                plan.resolve(root, leaf).estimate(
-                    variable,
-                    &view,
-                    &mut EstimateSink::Column(&mut column),
-                )
-            };
+            let is_relevant = estimate_leaf(
+                root,
+                plan,
+                leaf,
+                variable,
+                &view,
+                &mut EstimateSink::Column(&mut column),
+            );
             if is_relevant {
                 assert_eq!(
                     column.len(),
@@ -656,50 +830,23 @@ fn ready_transition<'a, C: Constraint<'a> + 'a>(
         groups.entry(action).or_default().push(row);
     }
 
-    let mut propose_group = |action: ProposeAction, selected: RowBatch| {
+    let mut file_propose_group = |action: ProposeAction, selected: RowBatch| {
         let variable_plan = &plans[action.variable_plan];
-        let selected_view = rows_view(&vars, &selected.rows, selected.row_count);
-        let mut candidates = Vec::new();
-        if let Some(child) = plan.direct_child(action.leaf) {
-            root.children()[child].propose(
-                variable_plan.variable,
-                &selected_view,
-                &mut CandidateSink::Tagged(&mut candidates),
-            );
-        } else {
-            plan.resolve(root, action.leaf).propose(
-                variable_plan.variable,
-                &selected_view,
-                &mut CandidateSink::Tagged(&mut candidates),
-            );
-        }
-        stats.propose_calls += 1;
-        stats.propose_rows += selected.row_count;
-        stats.max_propose_rows = stats.max_propose_rows.max(selected.row_count);
-
-        let mut checked = ChildSet::empty(leaf_count);
-        checked.insert(action.leaf);
-        let candidate = CandidateBatch {
-            parents: selected,
-            candidates,
-        };
-        if let Some(candidate) = candidate.compact(vars.len()) {
-            file(
-                worklist,
-                interner,
-                leaf_count,
-                StateDesc {
-                    bound: desc.bound,
-                    phase: ResidualPhase::Candidate {
-                        variable: variable_plan.variable,
-                        relevant: variable_plan.relevant.clone(),
-                        checked,
-                    },
+        file(
+            worklist,
+            interner,
+            leaf_count,
+            StateDesc {
+                bound: desc.bound,
+                phase: ResidualPhase::Propose {
+                    variable: variable_plan.variable,
+                    relevant: variable_plan.relevant.clone(),
+                    proposer: action.leaf,
                 },
-                StateBucket::Candidate(candidate),
-                stats,
-            );
-        }
+            },
+            StateBucket::Rows(selected),
+            stats,
+        );
     };
 
     if groups.len() == 1 {
@@ -707,12 +854,65 @@ fn ready_transition<'a, C: Constraint<'a> + 'a>(
         debug_assert_eq!(indices.len(), rows.row_count);
         // The common case transfers ownership of the whole parent block:
         // no row copy is necessary when every row chose the same action.
-        propose_group(action, rows);
+        file_propose_group(action, rows);
     } else {
         for (action, indices) in groups {
             let selected = rows.selected(vars.len(), &indices);
-            propose_group(action, selected);
+            file_propose_group(action, selected);
         }
+    }
+}
+
+fn propose_action_transition<'a, C: Constraint<'a> + 'a>(
+    root: &IntersectionConstraint<C>,
+    plan: &ResidualPlan,
+    desc: &StateDesc,
+    variable: VariableId,
+    relevant: &ChildSet,
+    proposer: usize,
+    rows: RowBatch,
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+) {
+    let leaf_count = plan.len();
+    let vars: Vec<VariableId> = desc.bound.into_iter().collect();
+    let view = rows_view(&vars, &rows.rows, rows.row_count);
+    let mut candidates = Vec::new();
+    propose_leaf(
+        root,
+        plan,
+        proposer,
+        variable,
+        &view,
+        &mut CandidateSink::Tagged(&mut candidates),
+    );
+    stats.propose_calls += 1;
+    stats.propose_rows += rows.row_count;
+    stats.max_propose_rows = stats.max_propose_rows.max(rows.row_count);
+
+    let mut checked = ChildSet::empty(leaf_count);
+    checked.insert(proposer);
+    let candidate = CandidateBatch {
+        parents: rows,
+        candidates,
+    };
+    if let Some(candidate) = candidate.compact(vars.len()) {
+        file(
+            worklist,
+            interner,
+            leaf_count,
+            StateDesc {
+                bound: desc.bound,
+                phase: ResidualPhase::Candidate {
+                    variable,
+                    relevant: relevant.clone(),
+                    checked,
+                },
+            },
+            StateBucket::Candidates(candidate),
+            stats,
+        );
     }
 }
 
@@ -759,7 +959,7 @@ fn commit_candidates(
             bound: next_bound,
             phase: ResidualPhase::Ready,
         },
-        StateBucket::Ready(RowBatch {
+        StateBucket::Rows(RowBatch {
             rows: next_rows,
             row_count,
         }),
@@ -767,7 +967,7 @@ fn commit_candidates(
     );
 }
 
-fn candidate_transition<'a, C: Constraint<'a> + 'a>(
+fn candidate_plan_transition<'a, C: Constraint<'a> + 'a>(
     root: &IntersectionConstraint<C>,
     plan: &ResidualPlan,
     desc: &StateDesc,
@@ -795,15 +995,14 @@ fn candidate_transition<'a, C: Constraint<'a> + 'a>(
             continue;
         }
         column.clear();
-        let is_relevant = if let Some(child) = plan.direct_child(leaf) {
-            root.children()[child].estimate(variable, &view, &mut EstimateSink::Column(&mut column))
-        } else {
-            plan.resolve(root, leaf).estimate(
-                variable,
-                &view,
-                &mut EstimateSink::Column(&mut column),
-            )
-        };
+        let is_relevant = estimate_leaf(
+            root,
+            plan,
+            leaf,
+            variable,
+            &view,
+            &mut EstimateSink::Column(&mut column),
+        );
         assert!(
             is_relevant,
             "a relevant child became irrelevant before the candidate was committed"
@@ -825,53 +1024,162 @@ fn candidate_transition<'a, C: Constraint<'a> + 'a>(
         "candidate state has no enabled transition"
     );
 
-    let mut confirm_group = |leaf: usize, mut selected: CandidateBatch| {
-        let selected_view = rows_view(&vars, &selected.parents.rows, selected.parents.row_count);
-        if let Some(child) = plan.direct_child(leaf) {
-            root.children()[child].confirm(
-                variable,
-                &selected_view,
-                &mut CandidateSink::Tagged(&mut selected.candidates),
-            );
-        } else {
-            plan.resolve(root, leaf).confirm(
-                variable,
-                &selected_view,
-                &mut CandidateSink::Tagged(&mut selected.candidates),
-            );
-        }
-        stats.confirm_calls += 1;
-        stats.confirm_rows += selected.parents.row_count;
-        stats.max_confirm_rows = stats.max_confirm_rows.max(selected.parents.row_count);
-
-        if let Some(selected) = selected.compact(vars.len()) {
-            file(
-                worklist,
-                interner,
-                leaf_count,
-                StateDesc {
-                    bound: desc.bound,
-                    phase: ResidualPhase::Candidate {
-                        variable,
-                        relevant: relevant.clone(),
-                        checked: checked.with_inserted(leaf),
-                    },
+    let mut file_confirm_group = |confirmer: usize, selected: CandidateBatch| {
+        file(
+            worklist,
+            interner,
+            leaf_count,
+            StateDesc {
+                bound: desc.bound,
+                phase: ResidualPhase::Confirm {
+                    variable,
+                    relevant: relevant.clone(),
+                    checked: checked.clone(),
+                    confirmer,
                 },
-                StateBucket::Candidate(selected),
-                stats,
-            );
-        }
+            },
+            StateBucket::Candidates(selected),
+            stats,
+        );
     };
 
     let first = confirmers[0];
     if confirmers.iter().all(|&leaf| leaf == first) {
         // The common case keeps ownership of the whole ragged block: no
         // parent copy, candidate rescan, or row-tag remap is necessary.
-        confirm_group(first, batch);
+        file_confirm_group(first, batch);
     } else {
         for (leaf, selected) in batch.partition(vars.len(), &confirmers) {
-            confirm_group(leaf, selected);
+            file_confirm_group(leaf, selected);
         }
+    }
+}
+
+fn confirm_action_transition<'a, C: Constraint<'a> + 'a>(
+    root: &IntersectionConstraint<C>,
+    plan: &ResidualPlan,
+    desc: &StateDesc,
+    variable: VariableId,
+    relevant: &ChildSet,
+    checked: &ChildSet,
+    confirmer: usize,
+    mut batch: CandidateBatch,
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+) {
+    let leaf_count = plan.len();
+    let vars: Vec<VariableId> = desc.bound.into_iter().collect();
+    let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
+    confirm_leaf(
+        root,
+        plan,
+        confirmer,
+        variable,
+        &view,
+        &mut CandidateSink::Tagged(&mut batch.candidates),
+    );
+    stats.confirm_calls += 1;
+    stats.confirm_rows += batch.parents.row_count;
+    stats.max_confirm_rows = stats.max_confirm_rows.max(batch.parents.row_count);
+
+    if let Some(batch) = batch.compact(vars.len()) {
+        file(
+            worklist,
+            interner,
+            leaf_count,
+            StateDesc {
+                bound: desc.bound,
+                phase: ResidualPhase::Candidate {
+                    variable,
+                    relevant: relevant.clone(),
+                    checked: checked.with_inserted(confirmer),
+                },
+            },
+            StateBucket::Candidates(batch),
+            stats,
+        );
+    }
+}
+
+/// Executes one canonical control state after the scheduler has selected its
+/// affine payload chunk. Full-bound rows are returned in raw form so eager and
+/// lazy callers can project or stage them without duplicating phase dispatch.
+fn execute_state<'a, C: Constraint<'a> + 'a>(
+    root: &IntersectionConstraint<C>,
+    plan: &ResidualPlan,
+    desc: &StateDesc,
+    bucket: StateBucket,
+    full: VariableSet,
+    influences: &[VariableSet; 128],
+    base_estimates: &[usize; 128],
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+) -> Option<RowBatch> {
+    match (&desc.phase, bucket) {
+        (ResidualPhase::Ready, StateBucket::Rows(rows)) if desc.bound == full => Some(rows),
+        (ResidualPhase::Ready, StateBucket::Rows(rows)) => {
+            stats.ready_plan_pops += 1;
+            ready_plan_transition(
+                root,
+                plan,
+                desc,
+                rows,
+                full,
+                influences,
+                base_estimates,
+                worklist,
+                interner,
+                stats,
+            );
+            None
+        }
+        (
+            ResidualPhase::Propose {
+                variable,
+                relevant,
+                proposer,
+            },
+            StateBucket::Rows(rows),
+        ) => {
+            stats.propose_action_pops += 1;
+            propose_action_transition(
+                root, plan, desc, *variable, relevant, *proposer, rows, worklist, interner, stats,
+            );
+            None
+        }
+        (
+            ResidualPhase::Candidate {
+                variable,
+                relevant,
+                checked,
+            },
+            StateBucket::Candidates(batch),
+        ) => {
+            stats.candidate_plan_pops += 1;
+            candidate_plan_transition(
+                root, plan, desc, *variable, relevant, checked, batch, worklist, interner, stats,
+            );
+            None
+        }
+        (
+            ResidualPhase::Confirm {
+                variable,
+                relevant,
+                checked,
+                confirmer,
+            },
+            StateBucket::Candidates(batch),
+        ) => {
+            stats.confirm_action_pops += 1;
+            confirm_action_transition(
+                root, plan, desc, *variable, relevant, checked, *confirmer, batch, worklist,
+                interner, stats,
+            );
+            None
+        }
+        _ => panic!("canonical residual state received the wrong payload shape"),
     }
 }
 
@@ -923,7 +1231,7 @@ impl ResidualStateMachine {
                     bound: VariableSet::new_empty(),
                     phase: ResidualPhase::Ready,
                 },
-                StateBucket::Ready(RowBatch::seed()),
+                StateBucket::Rows(RowBatch::seed()),
                 &mut state.stats,
             );
         }
@@ -1005,47 +1313,24 @@ impl ResidualStateMachine {
         let (desc, bucket) = self
             .take_next(width)
             .expect("pop_once requires a non-empty residual worklist");
-        match (&desc.phase, bucket) {
-            (ResidualPhase::Ready, StateBucket::Ready(rows)) if desc.bound == self.full => {
-                debug_assert!(self.emit_next >= self.emit_count);
-                self.emit_vars.clear();
-                self.emit_vars.extend(desc.bound);
-                self.emit_rows = rows.rows;
-                self.emit_next = 0;
-                self.emit_count = rows.row_count;
-            }
-            (ResidualPhase::Ready, StateBucket::Ready(rows)) => ready_transition(
-                root,
-                plan,
-                &desc,
-                rows,
-                self.full,
-                influences,
-                base_estimates,
-                &mut self.worklist,
-                &mut self.interner,
-                &mut self.stats,
-            ),
-            (
-                ResidualPhase::Candidate {
-                    variable,
-                    relevant,
-                    checked,
-                },
-                StateBucket::Candidate(batch),
-            ) => candidate_transition(
-                root,
-                plan,
-                &desc,
-                *variable,
-                relevant,
-                checked,
-                batch,
-                &mut self.worklist,
-                &mut self.interner,
-                &mut self.stats,
-            ),
-            _ => panic!("canonical residual state received the wrong bucket shape"),
+        if let Some(rows) = execute_state(
+            root,
+            plan,
+            &desc,
+            bucket,
+            self.full,
+            influences,
+            base_estimates,
+            &mut self.worklist,
+            &mut self.interner,
+            &mut self.stats,
+        ) {
+            debug_assert!(self.emit_next >= self.emit_count);
+            self.emit_vars.clear();
+            self.emit_vars.extend(desc.bound);
+            self.emit_rows = rows.rows;
+            self.emit_next = 0;
+            self.emit_count = rows.row_count;
         }
     }
 
@@ -1207,7 +1492,7 @@ where
                 bound: VariableSet::new_empty(),
                 phase: ResidualPhase::Ready,
             },
-            StateBucket::Ready(RowBatch::seed()),
+            StateBucket::Rows(RowBatch::seed()),
             &mut stats,
         );
     }
@@ -1223,52 +1508,29 @@ where
             debug_assert_eq!(desc.rank(leaf_count), rank);
             stats.state_pops += 1;
             stats.harvest_pops += 1;
-            match (&desc.phase, bucket) {
-                (ResidualPhase::Ready, StateBucket::Ready(rows)) if desc.bound == full => {
-                    let vars: Vec<VariableId> = desc.bound.into_iter().collect();
-                    let view = rows_view(&vars, &rows.rows, rows.row_count);
-                    for row in 0..rows.row_count {
-                        let row_view = view.row_view(row);
-                        for (column, &variable) in vars.iter().enumerate() {
-                            binding.set(variable, &row_view.row(0)[column]);
-                        }
-                        if let Some(result) = postprocessing(&binding) {
-                            results.push(result);
-                        }
+            if let Some(rows) = execute_state(
+                root,
+                &plan,
+                &desc,
+                bucket,
+                full,
+                &influences,
+                &base_estimates,
+                &mut worklist,
+                &mut interner,
+                &mut stats,
+            ) {
+                let vars: Vec<VariableId> = desc.bound.into_iter().collect();
+                let view = rows_view(&vars, &rows.rows, rows.row_count);
+                for row in 0..rows.row_count {
+                    let row_view = view.row_view(row);
+                    for (column, &variable) in vars.iter().enumerate() {
+                        binding.set(variable, &row_view.row(0)[column]);
+                    }
+                    if let Some(result) = postprocessing(&binding) {
+                        results.push(result);
                     }
                 }
-                (ResidualPhase::Ready, StateBucket::Ready(rows)) => ready_transition(
-                    root,
-                    &plan,
-                    &desc,
-                    rows,
-                    full,
-                    &influences,
-                    &base_estimates,
-                    &mut worklist,
-                    &mut interner,
-                    &mut stats,
-                ),
-                (
-                    ResidualPhase::Candidate {
-                        variable,
-                        relevant,
-                        checked,
-                    },
-                    StateBucket::Candidate(batch),
-                ) => candidate_transition(
-                    root,
-                    &plan,
-                    &desc,
-                    *variable,
-                    relevant,
-                    checked,
-                    batch,
-                    &mut worklist,
-                    &mut interner,
-                    &mut stats,
-                ),
-                _ => panic!("canonical residual state received the wrong bucket shape"),
             }
         }
     }
@@ -1329,12 +1591,15 @@ where
     ///
     /// This experimental path recursively flattens the maximal nested AND
     /// region, jointly chooses the next variable and proposing leaf occurrence,
-    /// then represents each remaining confirmation set as an interned state.
-    /// Histories with identical future work append into one bucket before that
-    /// state runs. Union, ignore, and regular-path constraints remain opaque
-    /// semantic boundaries; custom constraints do too unless they explicitly
-    /// expose an associative AND shape. Opaque leaves continue through the
-    /// ordinary [`Constraint`] protocol.
+    /// and represents planning plus uniform proposal/confirmation actions as
+    /// interned states. Planning states only estimate and partition; explicit
+    /// action states invoke one flattened leaf over their assembled row or
+    /// whole-parent candidate bucket. Histories with identical future work
+    /// append into one bucket before that state runs. Union, ignore, and
+    /// regular-path constraints remain opaque semantic boundaries; custom
+    /// constraints do too unless they explicitly expose an associative AND
+    /// shape. Opaque leaves continue through the ordinary [`Constraint`]
+    /// protocol.
     ///
     /// Result order may differ from the ordinary iterator; the result
     /// multiset is the same. Use
@@ -1457,6 +1722,7 @@ where
 mod tests {
     use super::*;
     use crate::query::unionconstraint::UnionConstraint;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Clone, Copy)]
     struct ShapeLeaf(VariableId);
@@ -1493,6 +1759,116 @@ mod tests {
             _view: &RowsView<'_>,
             _candidates: &mut CandidateSink<'_>,
         ) {
+        }
+    }
+
+    #[derive(Clone)]
+    struct VerbLeaf {
+        variable: VariableId,
+        estimate: usize,
+        accepts: bool,
+        proposes: Arc<AtomicUsize>,
+        confirms: Arc<AtomicUsize>,
+    }
+
+    impl Constraint<'static> for VerbLeaf {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(self.variable)
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != self.variable {
+                return false;
+            }
+            out.fill(self.estimate, view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            assert_eq!(variable, self.variable);
+            self.proposes.fetch_add(1, Ordering::Relaxed);
+            for row in 0..view.len() {
+                candidates.push(row as u32, raw(1));
+            }
+        }
+
+        fn confirm(
+            &self,
+            variable: VariableId,
+            _view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            assert_eq!(variable, self.variable);
+            self.confirms.fetch_add(1, Ordering::Relaxed);
+            if !self.accepts {
+                candidates.retain(|_, _| false);
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct StripedConfirmer {
+        variable: VariableId,
+        parent: VariableId,
+        parity: u8,
+        calls: Arc<AtomicUsize>,
+        rows: Arc<AtomicUsize>,
+    }
+
+    impl Constraint<'static> for StripedConfirmer {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(self.variable).union(VariableSet::new_singleton(self.parent))
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != self.variable {
+                return false;
+            }
+            let parent = view
+                .col(self.parent)
+                .expect("striped confirmer requires a bound parent");
+            out.extend(view.iter().map(|row| {
+                if row[parent][0] % 2 == self.parity {
+                    1
+                } else {
+                    8
+                }
+            }));
+            true
+        }
+
+        fn propose(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn confirm(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+            assert_eq!(variable, self.variable);
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.rows.fetch_add(view.len(), Ordering::Relaxed);
         }
     }
 
@@ -1677,6 +2053,389 @@ mod tests {
     }
 
     #[test]
+    fn ready_planning_pop_delays_the_proposal_verb_until_action_pop() {
+        let proposes = Arc::new(AtomicUsize::new(0));
+        let confirms = Arc::new(AtomicUsize::new(0));
+        let root = IntersectionConstraint::new(vec![VerbLeaf {
+            variable: 0,
+            estimate: 1,
+            accepts: true,
+            proposes: Arc::clone(&proposes),
+            confirms,
+        }]);
+        let plan = ResidualPlan::compile(&root);
+        let mut machine =
+            ResidualStateMachine::new(root.variables(), plan.len(), Search::NextVariable);
+        machine.cap = 1;
+        let influences = [VariableSet::new_empty(); 128];
+        let base_estimates = [1; 128];
+
+        machine.pop_once(&root, &plan, &influences, &base_estimates, 1);
+        assert_eq!(machine.stats.ready_plan_pops, 1);
+        assert_eq!(machine.stats.propose_action_pops, 0);
+        assert_eq!(machine.stats.propose_calls, 0);
+        assert_eq!(proposes.load(Ordering::Relaxed), 0);
+
+        machine.pop_once(&root, &plan, &influences, &base_estimates, 1);
+        assert_eq!(machine.stats.propose_action_pops, 1);
+        assert_eq!(machine.stats.propose_calls, 1);
+        assert_eq!(proposes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn candidate_planning_pop_delays_confirmation_until_action_pop() {
+        let proposes = Arc::new(AtomicUsize::new(0));
+        let confirms = Arc::new(AtomicUsize::new(0));
+        let root = IntersectionConstraint::new(vec![
+            VerbLeaf {
+                variable: 0,
+                estimate: 1,
+                accepts: true,
+                proposes: Arc::clone(&proposes),
+                confirms: Arc::clone(&confirms),
+            },
+            VerbLeaf {
+                variable: 0,
+                estimate: 2,
+                accepts: true,
+                proposes,
+                confirms: Arc::clone(&confirms),
+            },
+        ]);
+        let plan = ResidualPlan::compile(&root);
+        let mut relevant = ChildSet::empty(plan.len());
+        relevant.insert(0);
+        relevant.insert(1);
+        let mut checked = ChildSet::empty(plan.len());
+        checked.insert(0);
+        let candidate_desc = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Candidate {
+                variable: 0,
+                relevant,
+                checked,
+            },
+        };
+        let candidate_bucket = StateBucket::Candidates(CandidateBatch {
+            parents: RowBatch::seed(),
+            candidates: vec![(0, raw(1))],
+        });
+        let mut worklist = Worklist::new();
+        let mut interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let influences = [VariableSet::new_empty(); 128];
+        let base_estimates = [1; 128];
+
+        assert!(execute_state(
+            &root,
+            &plan,
+            &candidate_desc,
+            candidate_bucket,
+            root.variables(),
+            &influences,
+            &base_estimates,
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+        )
+        .is_none());
+        assert_eq!(stats.candidate_plan_pops, 1);
+        assert_eq!(stats.confirm_action_pops, 0);
+        assert_eq!(stats.confirm_calls, 0);
+        assert_eq!(confirms.load(Ordering::Relaxed), 0);
+
+        let (&rank, _) = worklist
+            .first_key_value()
+            .expect("confirm action was filed");
+        let mut level = worklist.remove(&rank).unwrap();
+        let (id, bucket) = level.pop_first().unwrap();
+        assert!(level.is_empty());
+        let action_desc = interner.get(id).clone();
+        assert!(execute_state(
+            &root,
+            &plan,
+            &action_desc,
+            bucket,
+            root.variables(),
+            &influences,
+            &base_estimates,
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+        )
+        .is_none());
+        assert_eq!(stats.confirm_action_pops, 1);
+        assert_eq!(stats.confirm_calls, 1);
+        assert_eq!(confirms.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn fully_checked_single_leaf_candidate_commits_to_ready_without_a_verb() {
+        let proposes = Arc::new(AtomicUsize::new(0));
+        let confirms = Arc::new(AtomicUsize::new(0));
+        let root = IntersectionConstraint::new(vec![VerbLeaf {
+            variable: 0,
+            estimate: 1,
+            accepts: true,
+            proposes: Arc::clone(&proposes),
+            confirms: Arc::clone(&confirms),
+        }]);
+        let plan = ResidualPlan::compile(&root);
+        let mut relevant = ChildSet::empty(plan.len());
+        relevant.insert(0);
+        let desc = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Candidate {
+                variable: 0,
+                relevant: relevant.clone(),
+                checked: relevant,
+            },
+        };
+        let bucket = StateBucket::Candidates(CandidateBatch {
+            parents: RowBatch::seed(),
+            candidates: vec![(0, raw(7))],
+        });
+        let mut worklist = Worklist::new();
+        let mut interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let influences = [VariableSet::new_empty(); 128];
+        let base_estimates = [1; 128];
+
+        assert!(execute_state(
+            &root,
+            &plan,
+            &desc,
+            bucket,
+            root.variables(),
+            &influences,
+            &base_estimates,
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+        )
+        .is_none());
+        assert_eq!(stats.candidate_plan_pops, 1);
+        assert_eq!(stats.propose_calls, 0);
+        assert_eq!(stats.confirm_calls, 0);
+        assert_eq!(proposes.load(Ordering::Relaxed), 0);
+        assert_eq!(confirms.load(Ordering::Relaxed), 0);
+
+        let (_, level) = worklist.first_key_value().expect("Ready state was filed");
+        let (&id, payload) = level.first_key_value().unwrap();
+        assert_eq!(
+            interner.get(id),
+            &StateDesc {
+                bound: VariableSet::new_singleton(0),
+                phase: ResidualPhase::Ready,
+            }
+        );
+        let StateBucket::Rows(rows) = payload else {
+            panic!("committed candidate did not become a row payload")
+        };
+        assert_eq!((rows.row_count, rows.rows.as_slice()), (1, &[raw(7)][..]));
+    }
+
+    #[test]
+    fn confirmation_action_that_rejects_every_candidate_files_no_successor() {
+        let proposes = Arc::new(AtomicUsize::new(0));
+        let confirms = Arc::new(AtomicUsize::new(0));
+        let root = IntersectionConstraint::new(vec![
+            VerbLeaf {
+                variable: 0,
+                estimate: 1,
+                accepts: true,
+                proposes: Arc::clone(&proposes),
+                confirms: Arc::clone(&confirms),
+            },
+            VerbLeaf {
+                variable: 0,
+                estimate: 2,
+                accepts: false,
+                proposes,
+                confirms: Arc::clone(&confirms),
+            },
+        ]);
+        let plan = ResidualPlan::compile(&root);
+        let mut relevant = ChildSet::empty(plan.len());
+        relevant.insert(0);
+        relevant.insert(1);
+        let mut checked = ChildSet::empty(plan.len());
+        checked.insert(0);
+        let candidate_desc = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Candidate {
+                variable: 0,
+                relevant,
+                checked,
+            },
+        };
+        let candidate_bucket = StateBucket::Candidates(CandidateBatch {
+            parents: RowBatch::seed(),
+            candidates: vec![(0, raw(1))],
+        });
+        let mut worklist = Worklist::new();
+        let mut interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let influences = [VariableSet::new_empty(); 128];
+        let base_estimates = [1; 128];
+
+        execute_state(
+            &root,
+            &plan,
+            &candidate_desc,
+            candidate_bucket,
+            root.variables(),
+            &influences,
+            &base_estimates,
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+        );
+        let (&rank, _) = worklist
+            .first_key_value()
+            .expect("confirm action was filed");
+        let mut level = worklist.remove(&rank).unwrap();
+        let (id, bucket) = level.pop_first().unwrap();
+        let action_desc = interner.get(id).clone();
+        execute_state(
+            &root,
+            &plan,
+            &action_desc,
+            bucket,
+            root.variables(),
+            &influences,
+            &base_estimates,
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+        );
+
+        assert!(worklist.is_empty());
+        assert_eq!(stats.candidate_plan_pops, 1);
+        assert_eq!(stats.confirm_action_pops, 1);
+        assert_eq!(stats.confirm_calls, 1);
+        assert_eq!(confirms.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn separately_planned_candidate_chunks_merge_uniform_confirm_actions() {
+        const PARENT: VariableId = 0;
+        const VARIABLE: VariableId = 1;
+        let proposer_calls = Arc::new(AtomicUsize::new(0));
+        let proposer_confirms = Arc::new(AtomicUsize::new(0));
+        let even_calls = Arc::new(AtomicUsize::new(0));
+        let even_rows = Arc::new(AtomicUsize::new(0));
+        let odd_calls = Arc::new(AtomicUsize::new(0));
+        let odd_rows = Arc::new(AtomicUsize::new(0));
+        let root = IntersectionConstraint::new(vec![
+            Box::new(VerbLeaf {
+                variable: VARIABLE,
+                estimate: 0,
+                accepts: true,
+                proposes: proposer_calls,
+                confirms: proposer_confirms,
+            }) as ShapeConstraint,
+            Box::new(StripedConfirmer {
+                variable: VARIABLE,
+                parent: PARENT,
+                parity: 0,
+                calls: Arc::clone(&even_calls),
+                rows: Arc::clone(&even_rows),
+            }) as ShapeConstraint,
+            Box::new(StripedConfirmer {
+                variable: VARIABLE,
+                parent: PARENT,
+                parity: 1,
+                calls: Arc::clone(&odd_calls),
+                rows: Arc::clone(&odd_rows),
+            }) as ShapeConstraint,
+        ]);
+        let plan = ResidualPlan::compile(&root);
+        let mut relevant = ChildSet::empty(plan.len());
+        relevant.insert(0);
+        relevant.insert(1);
+        relevant.insert(2);
+        let mut checked = ChildSet::empty(plan.len());
+        checked.insert(0);
+        let desc = StateDesc {
+            bound: VariableSet::new_singleton(PARENT),
+            phase: ResidualPhase::Candidate {
+                variable: VARIABLE,
+                relevant,
+                checked,
+            },
+        };
+        let chunk = |first_parent: u8| {
+            StateBucket::Candidates(CandidateBatch {
+                parents: RowBatch {
+                    rows: vec![raw(first_parent), raw(first_parent + 1)],
+                    row_count: 2,
+                },
+                candidates: vec![(0, raw(10)), (1, raw(11))],
+            })
+        };
+        let mut worklist = Worklist::new();
+        let mut interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let influences = [VariableSet::new_empty(); 128];
+        let base_estimates = [1; 128];
+
+        for first_parent in [0, 2] {
+            execute_state(
+                &root,
+                &plan,
+                &desc,
+                chunk(first_parent),
+                root.variables(),
+                &influences,
+                &base_estimates,
+                &mut worklist,
+                &mut interner,
+                &mut stats,
+            );
+        }
+        assert_eq!(stats.candidate_plan_pops, 2);
+        assert_eq!(stats.confirm_calls, 0);
+        assert_eq!(even_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(odd_calls.load(Ordering::Relaxed), 0);
+
+        let (&rank, level) = worklist
+            .first_key_value()
+            .expect("striped Confirm actions were filed");
+        assert_eq!(level.len(), 2);
+        assert!(level.values().all(|bucket| bucket.row_count() == 2));
+        assert_eq!((stats.bucket_merges, stats.rows_merged), (2, 2));
+
+        let level = worklist.remove(&rank).unwrap();
+        for (id, bucket) in level {
+            let action_desc = interner.get(id).clone();
+            execute_state(
+                &root,
+                &plan,
+                &action_desc,
+                bucket,
+                root.variables(),
+                &influences,
+                &base_estimates,
+                &mut worklist,
+                &mut interner,
+                &mut stats,
+            );
+        }
+        assert_eq!(stats.confirm_action_pops, 2);
+        assert_eq!(stats.confirm_calls, 2);
+        assert_eq!(
+            (
+                even_calls.load(Ordering::Relaxed),
+                even_rows.load(Ordering::Relaxed),
+                odd_calls.load(Ordering::Relaxed),
+                odd_rows.load(Ordering::Relaxed),
+            ),
+            (1, 2, 1, 2)
+        );
+    }
+
+    #[test]
     fn child_sets_do_not_alias_across_the_u128_boundary() {
         let mut set = ChildSet::empty(129);
         set.insert(0);
@@ -1729,6 +2488,8 @@ mod tests {
         relevant.insert(1);
         let mut checked = ChildSet::empty(3);
         checked.insert(0);
+        let mut relevant_all = relevant.clone();
+        relevant_all.insert(2);
         let candidate = StateDesc {
             bound: VariableSet::new_singleton(2),
             phase: ResidualPhase::Candidate {
@@ -1737,7 +2498,7 @@ mod tests {
                 checked: checked.clone(),
             },
         };
-        let variants = [
+        let variants = vec![
             StateDesc {
                 bound: VariableSet::new_singleton(3),
                 ..candidate.clone()
@@ -1753,12 +2514,8 @@ mod tests {
             StateDesc {
                 phase: ResidualPhase::Candidate {
                     variable: 4,
-                    relevant: {
-                        let mut other = relevant.clone();
-                        other.insert(2);
-                        other
-                    },
-                    checked,
+                    relevant: relevant_all.clone(),
+                    checked: checked.clone(),
                 },
                 ..candidate.clone()
             },
@@ -1778,6 +2535,57 @@ mod tests {
                 phase: ResidualPhase::Ready,
                 ..candidate.clone()
             },
+            StateDesc {
+                phase: ResidualPhase::Propose {
+                    variable: 4,
+                    relevant: relevant.clone(),
+                    proposer: 0,
+                },
+                ..candidate.clone()
+            },
+            StateDesc {
+                phase: ResidualPhase::Propose {
+                    variable: 4,
+                    relevant: relevant.clone(),
+                    proposer: 1,
+                },
+                ..candidate.clone()
+            },
+            StateDesc {
+                phase: ResidualPhase::Propose {
+                    variable: 4,
+                    relevant: relevant_all.clone(),
+                    proposer: 0,
+                },
+                ..candidate.clone()
+            },
+            StateDesc {
+                phase: ResidualPhase::Confirm {
+                    variable: 4,
+                    relevant: relevant.clone(),
+                    checked: checked.clone(),
+                    confirmer: 1,
+                },
+                ..candidate.clone()
+            },
+            StateDesc {
+                phase: ResidualPhase::Confirm {
+                    variable: 4,
+                    relevant: relevant_all.clone(),
+                    checked: checked.clone(),
+                    confirmer: 1,
+                },
+                ..candidate.clone()
+            },
+            StateDesc {
+                phase: ResidualPhase::Confirm {
+                    variable: 4,
+                    relevant: relevant_all,
+                    checked,
+                    confirmer: 2,
+                },
+                ..candidate.clone()
+            },
         ];
 
         let mut stats = ResidualStateStats::default();
@@ -1786,24 +2594,36 @@ mod tests {
         for variant in variants {
             assert_ne!(original, interner.intern_with_status(variant, &mut stats).0);
         }
-        assert_eq!(stats.states_interned, 6);
+        assert_eq!(stats.states_interned, 12);
         assert_eq!(stats.interner_hits, 0);
     }
 
     #[test]
-    fn rank_is_history_independent_and_strictly_increases() {
-        let child_count = 4;
+    fn action_ranks_are_history_independent_and_strictly_increase() {
+        let leaf_count = 4;
         let bound = VariableSet::new_singleton(1);
-        let mut relevant = ChildSet::empty(child_count);
+        let mut relevant = ChildSet::empty(leaf_count);
         relevant.insert(0);
         relevant.insert(1);
         relevant.insert(2);
-        let mut checked_a = ChildSet::empty(child_count);
+        let mut checked_a = ChildSet::empty(leaf_count);
         checked_a.insert(0);
-        let mut checked_b = ChildSet::empty(child_count);
+        let mut checked_b = ChildSet::empty(leaf_count);
         checked_b.insert(1);
         let checked_ab = checked_a.with_inserted(1);
 
+        let ready = StateDesc {
+            bound,
+            phase: ResidualPhase::Ready,
+        };
+        let propose = StateDesc {
+            bound,
+            phase: ResidualPhase::Propose {
+                variable: 3,
+                relevant: relevant.clone(),
+                proposer: 0,
+            },
+        };
         let candidate = |checked| StateDesc {
             bound,
             phase: ResidualPhase::Candidate {
@@ -1812,15 +2632,90 @@ mod tests {
                 checked,
             },
         };
-        assert_eq!(candidate(checked_a).rank(child_count), 6);
-        assert_eq!(candidate(checked_b).rank(child_count), 6);
-        assert_eq!(candidate(checked_ab.clone()).rank(child_count), 7);
+        let confirm = |checked, confirmer| StateDesc {
+            bound,
+            phase: ResidualPhase::Confirm {
+                variable: 3,
+                relevant: relevant.clone(),
+                checked,
+                confirmer,
+            },
+        };
+
+        // S = 2(L + 1) = 10. The action grades interleave planning
+        // states, so every concrete transition raises rank by exactly one
+        // until a complete candidate jumps to the next binding schema.
+        assert_eq!(ready.rank(leaf_count), 10);
+        assert_eq!(propose.rank(leaf_count), 11);
+        assert_eq!(candidate(checked_a.clone()).rank(leaf_count), 12);
+        assert_eq!(candidate(checked_b).rank(leaf_count), 12);
+        assert_eq!(confirm(checked_a, 1).rank(leaf_count), 13);
+        assert_eq!(candidate(checked_ab.clone()).rank(leaf_count), 14);
+        assert_eq!(confirm(checked_ab.clone(), 2).rank(leaf_count), 15);
 
         let full_candidate = candidate(checked_ab.with_inserted(2));
-        let ready = StateDesc {
+        assert_eq!(full_candidate.rank(leaf_count), 16);
+        let next_ready = StateDesc {
             bound: bound.union(VariableSet::new_singleton(3)),
             phase: ResidualPhase::Ready,
         };
-        assert!(full_candidate.rank(child_count) < ready.rank(child_count));
+        assert_eq!(next_ready.rank(leaf_count), 20);
+        assert!(full_candidate.rank(leaf_count) < next_ready.rank(leaf_count));
+    }
+
+    #[test]
+    fn action_descriptors_reject_noncanonical_child_sets() {
+        let leaf_count = 3;
+        let bound = VariableSet::new_singleton(0);
+        let mut relevant = ChildSet::empty(leaf_count);
+        relevant.insert(0);
+        relevant.insert(1);
+        let mut checked = ChildSet::empty(leaf_count);
+        checked.insert(0);
+
+        let irrelevant_proposer = StateDesc {
+            bound,
+            phase: ResidualPhase::Propose {
+                variable: 1,
+                relevant: relevant.clone(),
+                proposer: 2,
+            },
+        };
+        assert!(std::panic::catch_unwind(|| irrelevant_proposer.rank(leaf_count)).is_err());
+
+        let mut outside = checked.clone();
+        outside.insert(2);
+        let checked_outside_relevant = StateDesc {
+            bound,
+            phase: ResidualPhase::Candidate {
+                variable: 1,
+                relevant: relevant.clone(),
+                checked: outside,
+            },
+        };
+        assert!(std::panic::catch_unwind(|| checked_outside_relevant.rank(leaf_count)).is_err());
+
+        let already_checked_confirmer = StateDesc {
+            bound,
+            phase: ResidualPhase::Confirm {
+                variable: 1,
+                relevant,
+                checked,
+                confirmer: 0,
+            },
+        };
+        assert!(std::panic::catch_unwind(|| already_checked_confirmer.rank(leaf_count)).is_err());
+
+        let mut non_leaf_relevant = ChildSet::empty(leaf_count);
+        non_leaf_relevant.0[0] |= 1 << 63;
+        let non_leaf_proposer_set = StateDesc {
+            bound,
+            phase: ResidualPhase::Propose {
+                variable: 1,
+                relevant: non_leaf_relevant,
+                proposer: 0,
+            },
+        };
+        assert!(std::panic::catch_unwind(|| non_leaf_proposer_set.rank(leaf_count)).is_err());
     }
 }

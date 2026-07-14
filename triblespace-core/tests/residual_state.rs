@@ -1064,6 +1064,93 @@ fn lazy_forced_harvest_reconverges_before_states_are_popped() {
 }
 
 #[test]
+fn harvest_plans_striped_ready_chunks_before_invoking_uniform_actions() {
+    const N: usize = 4;
+    const W: usize = 2;
+    let (root, trace) = fixture(N);
+    let mut harvested = Query::new(root, project_pair)
+        .solve_residual_state_lazy()
+        .cap(W)
+        .start_width(W)
+        .growth(1)
+        .collect_profiled();
+    let (sequential_root, _) = fixture(N);
+    let mut sequential: Vec<_> = Query::new(sequential_root, project_pair)
+        .sequential()
+        .collect();
+    harvested.results.sort_unstable();
+    sequential.sort_unstable();
+    assert_eq!(harvested.results, sequential);
+
+    // Each Ready(P) chunk is striped: [2, 3] and [0, 1] independently
+    // choose one A and one B row. Since harvest drains the even-rank Ready
+    // planner before either odd-rank Propose action, the two one-row filings
+    // for each leaf merge into one width-W protocol call.
+    let trace = trace.lock().unwrap();
+    for child in [Child::A, Child::B] {
+        let calls = matching_calls(&trace, child, Verb::Propose, X);
+        assert_eq!(calls.len(), 1, "{child:?} proposal action calls");
+        assert_eq!((calls[0].rows, calls[0].candidates_after), (W, W));
+    }
+
+    let stats = harvested.stats;
+    assert_eq!(stats.sprint_pops, 0);
+    assert_eq!(stats.harvest_pops, stats.state_pops);
+    assert_eq!(stats.propose_action_pops, stats.propose_calls);
+    assert_eq!(stats.confirm_action_pops, stats.confirm_calls);
+    assert_eq!((stats.propose_calls, stats.propose_rows), (3, 5));
+    assert_eq!(stats.max_propose_rows, W);
+    assert!(stats.max_confirm_rows <= W);
+    assert_eq!(stats.state_reentries, 0);
+    assert_eq!(
+        stats.state_pops,
+        stats.ready_plan_pops
+            + stats.candidate_plan_pops
+            + stats.propose_action_pops
+            + stats.confirm_action_pops
+            + 2,
+        "the remaining two pops emit the four full rows in width-W chunks"
+    );
+}
+
+#[test]
+fn sprint_executes_striped_actions_before_later_planner_chunks_reopen_them() {
+    const N: usize = 4;
+    const W: usize = 2;
+    let (root, trace) = fixture(N);
+    let mut sprinted = Query::new(root, project_pair)
+        .solve_residual_state_lazy()
+        .cap(usize::MAX)
+        .start_width(W)
+        .growth(1)
+        .collect_profiled();
+    let (sequential_root, _) = fixture(N);
+    let mut sequential: Vec<_> = Query::new(sequential_root, project_pair)
+        .sequential()
+        .collect();
+    sprinted.results.sort_unstable();
+    sequential.sort_unstable();
+    assert_eq!(sprinted.results, sequential);
+
+    // Phase one intentionally retains the binary scheduler: maximum-rank
+    // sprinting executes each newly planned action before the Ready remainder.
+    // The same descriptor is therefore reopened by the later planner chunk
+    // instead of assembling cross-chunk batches. Occupancy scheduling is the
+    // follow-on that can generalize the harvest gain to sprint mode.
+    let trace = trace.lock().unwrap();
+    for child in [Child::A, Child::B] {
+        let calls = matching_calls(&trace, child, Verb::Propose, X);
+        assert_eq!(calls.len(), 2, "{child:?} sprint proposal calls");
+        assert!(calls.iter().all(|call| call.rows == 1));
+    }
+    assert!(sprinted.stats.sprint_pops > 0);
+    assert_eq!(sprinted.stats.harvest_pops, 0);
+    assert_eq!(sprinted.stats.propose_calls, 5);
+    assert_eq!(sprinted.stats.max_propose_rows, 1);
+    assert!(sprinted.stats.state_reentries > 0);
+}
+
+#[test]
 fn lazy_projection_panic_consumes_the_row_before_resume() {
     const N: usize = 4;
     let (root, _) = fixture(N);

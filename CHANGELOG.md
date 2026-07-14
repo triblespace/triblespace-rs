@@ -11,15 +11,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Root intersections gain an opt-in canonical residual-state solver.**
   `solve_residual_state` jointly chooses each row's next variable and proposing
-  leaf occurrence, then interns the remaining confirmation set as an exact
-  control-state descriptor. A history-independent rank gate lets different
-  proposal/confirmation and variable-order histories reconverge before their
-  shared state runs, while row payloads retain multiplicity. The maximal nested
-  AND region is flattened into deterministic preorder leaf occurrences;
-  unions and ignore/path wrappers remain opaque semantic boundaries; custom
-  constraints do too unless they explicitly expose an associative AND shape.
-  A profiled entry point reports interner, bucket-merge, and leaf-call batch
-  measurements.
+  leaf occurrence, then interns both planning states and uniform
+  `Propose`/`Confirm` protocol actions as exact control-state descriptors.
+  Planning only estimates and partitions rows; a separately scheduled action
+  invokes one flattened leaf over its assembled bucket. The interleaved
+  history-independent rank gate lets variable-order, proposal, confirmation,
+  and independently planned action histories reconverge before shared work
+  runs, while row payloads retain multiplicity. The maximal nested AND region
+  is flattened into deterministic preorder leaf occurrences; unions and
+  ignore/path wrappers remain opaque semantic boundaries; custom constraints
+  do too unless they explicitly expose an associative AND shape. A profiled
+  entry point reports planning/action pops, interner and bucket merges, and
+  leaf-call batch measurements.
 - **Canonical residual states gain a demand-driven sprint-to-harvest
   iterator.** `solve_residual_state_lazy` starts with narrow maximum-rank
   chunks so descendants can yield before sibling rows are evaluated, widens
