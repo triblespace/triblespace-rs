@@ -20,13 +20,12 @@
 //! for CubeCL's generated information buffer rather than depending on a
 //! high-binding desktop adapter.
 //!
-//! Generation currently assigns one invocation to each parent row and loops
-//! its exact Present width. That is the bounded correctness slice requested
-//! here, but it underutilizes the device for a seed frontier (`R = 1`) with a
-//! wide axis. A successor can publish the already-computed `T`-sized dispatch
-//! before candidate generation and invert monotone cell ends per destination
-//! without changing the arena layout or ordering law. This slice already uses
-//! the exact indirect rectangle for candidate-parallel child materialization.
+//! Generation assigns one invocation to each exact output destination. After
+//! finalization publishes the `T`-sized indirect rectangle, each invocation
+//! performs strict-end lower bounds over segment records and scanned row cells,
+//! then copies one candidate from the retained validated row axis. This makes
+//! seed-frontier width parallel without changing the stable ordering law. The
+//! same exact indirect rectangle drives child materialization.
 //!
 //! The poison-filled canonical child body is likewise a reference artifact in
 //! this slice: it proves insertion and ordered parity. Sibling confirmation can
@@ -161,6 +160,14 @@ pub(crate) struct WgpuResidentProposals {
     segment_records: DeviceU32Buffer<WgpuRuntime>,
     candidate_records: DeviceU32Buffer<WgpuRuntime>,
     child_body: DeviceU32Buffer<WgpuRuntime>,
+    #[cfg(test)]
+    stage_profiles: Option<ProposalStageProfiles>,
+}
+
+#[cfg(test)]
+struct ProposalStageProfiles {
+    candidates: cubecl::profile::ProfileDuration,
+    child_body: cubecl::profile::ProfileDuration,
 }
 
 struct PresentAdmission {
@@ -177,6 +184,8 @@ struct PresentAdmission {
 #[derive(Clone, Copy)]
 struct WorkspaceLayout {
     counts: usize,
+    row_arms: usize,
+    row_axes: usize,
     choice_errors: usize,
     validation_errors: usize,
     local_offsets: usize,
@@ -201,7 +210,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         choices: &ResidentRowChoices<WgpuRuntime>,
         capacity: usize,
     ) -> Result<WgpuResidentProposals, ResidentProposalError> {
-        self.enqueue_present_proposals_inner(frontier, choices, capacity, None, None)
+        self.enqueue_present_proposals_inner(frontier, choices, capacity, None, None, false)
     }
 
     #[cfg(test)]
@@ -218,6 +227,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             capacity,
             Some(arm_descriptors),
             None,
+            false,
         )
     }
 
@@ -238,7 +248,22 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             capacity,
             None,
             Some((max_groups_x, max_groups_y)),
+            false,
         )
+    }
+
+    /// Runs the ordinary fully published arena while recording device profiles
+    /// around candidate emission and reference child materialization. The
+    /// resulting arena remains semantically identical to production; profiling
+    /// only changes command-pass boundaries in this ignored benchmark seam.
+    #[cfg(test)]
+    fn enqueue_present_proposals_profiled_for_benchmark(
+        &self,
+        frontier: &WgpuResidentFrontier<'_, U>,
+        choices: &ResidentRowChoices<WgpuRuntime>,
+        capacity: usize,
+    ) -> Result<WgpuResidentProposals, ResidentProposalError> {
+        self.enqueue_present_proposals_inner(frontier, choices, capacity, None, None, true)
     }
 
     fn enqueue_present_proposals_inner(
@@ -248,9 +273,9 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         capacity: usize,
         descriptor_override: Option<&[u32]>,
         dispatch_limits: Option<(u32, u32)>,
+        _profile_stages: bool,
     ) -> Result<WgpuResidentProposals, ResidentProposalError> {
         let inputs = self.proposal_inputs(frontier, choices)?;
-        let generation_choices = self.choice_input_arg(frontier, choices)?;
         let admission = lower_present_admission(self)?;
         let context = self.archive().context();
 
@@ -324,6 +349,8 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                     plan_layout.arm_descriptors as u32,
                     plan_layout.variable_to_segment as u32,
                     workspace_layout.counts as u32,
+                    workspace_layout.row_arms as u32,
+                    workspace_layout.row_axes as u32,
                     workspace_layout.choice_errors as u32,
                     DEAD_ROW_SENTINEL,
                 );
@@ -458,107 +485,9 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             );
         }
 
-        // Generation is an infallible copy before publication. Exhaustively:
-        // the capability seam proves choice/frontier shapes and lineage;
-        // classification proves canonical dead triples or live
-        // variable/arm/axis/count/segment cells; the flat scan proves every
-        // cell prefix and total below the sentinel; the finalizer proves
-        // segment boundaries, insertion/schema, capacity, and provisional
-        // control geometry;
-        // archive construction proves each present list's exact length,
-        // ascending order and in-domain codes; and the checked host products
-        // prove candidate, owner, proposer and child-body bounds. Thus every
-        // defensive guard in the candidate and child kernels is implied by an
-        // earlier proof. Jerky metadata remains zero until both stages finish.
-        if inputs.rows != 0 {
-            let dispatch = context.static_batch_dispatch(
-                inputs.rows,
-                inputs.rows,
-                CubeDim::new_1d(THREADS),
-            )?;
-            unsafe {
-                generate_present_candidates::launch_unchecked::<WgpuRuntime>(
-                    context.client(),
-                    dispatch.cube_count(),
-                    dispatch.cube_dim(),
-                    generation_choices,
-                    plan.input_arg(),
-                    workspace.input_arg(),
-                    segment_records.input_arg(),
-                    self.archive().present_entity_codes().input_arg(),
-                    control.input_arg(),
-                    candidate_records.output_arg(),
-                    inputs.rows as u32,
-                    admission.segment_count as u32,
-                    capacity as u32,
-                    self.archive().archive().domain.len() as u32,
-                    0u32,
-                    plan_layout.arm_descriptors as u32,
-                    plan_layout.variable_to_segment as u32,
-                    workspace_layout.counts as u32,
-                    workspace_layout.local_offsets as u32,
-                    workspace_layout.block_offsets as u32,
-                    BLOCK_ITEMS,
-                    DEAD_ROW_SENTINEL,
-                    STATUS_OK,
-                );
-                generate_present_candidates::launch_unchecked::<WgpuRuntime>(
-                    context.client(),
-                    dispatch.cube_count(),
-                    dispatch.cube_dim(),
-                    self.choice_input_arg(frontier, choices)?,
-                    plan.input_arg(),
-                    workspace.input_arg(),
-                    segment_records.input_arg(),
-                    self.archive().present_attribute_codes().input_arg(),
-                    control.input_arg(),
-                    candidate_records.output_arg(),
-                    inputs.rows as u32,
-                    admission.segment_count as u32,
-                    capacity as u32,
-                    self.archive().archive().domain.len() as u32,
-                    1u32,
-                    plan_layout.arm_descriptors as u32,
-                    plan_layout.variable_to_segment as u32,
-                    workspace_layout.counts as u32,
-                    workspace_layout.local_offsets as u32,
-                    workspace_layout.block_offsets as u32,
-                    BLOCK_ITEMS,
-                    DEAD_ROW_SENTINEL,
-                    STATUS_OK,
-                );
-                generate_present_candidates::launch_unchecked::<WgpuRuntime>(
-                    context.client(),
-                    dispatch.cube_count(),
-                    dispatch.cube_dim(),
-                    self.choice_input_arg(frontier, choices)?,
-                    plan.input_arg(),
-                    workspace.input_arg(),
-                    segment_records.input_arg(),
-                    self.archive().present_value_codes().input_arg(),
-                    control.input_arg(),
-                    candidate_records.output_arg(),
-                    inputs.rows as u32,
-                    admission.segment_count as u32,
-                    capacity as u32,
-                    self.archive().archive().domain.len() as u32,
-                    2u32,
-                    plan_layout.arm_descriptors as u32,
-                    plan_layout.variable_to_segment as u32,
-                    workspace_layout.counts as u32,
-                    workspace_layout.local_offsets as u32,
-                    workspace_layout.block_offsets as u32,
-                    BLOCK_ITEMS,
-                    DEAD_ROW_SENTINEL,
-                    STATUS_OK,
-                );
-            }
-        }
-
-        // The indirect record becomes valid only after every candidate field
-        // has been generated. The child materializer is the real dynamic
-        // consumer; it proves 1-D and folded 2-D rectangles without binding
-        // the indirect buffer as storage in that same kernel.
+        // The finalizer has proved an exact successful total and legal folded
+        // dispatch rectangle (or a zero-work failure record), so the exclusive
+        // indirect record can now be published once for both consumers.
         unsafe {
             publish_present_dispatch::launch_unchecked::<WgpuRuntime>(
                 context.client(),
@@ -568,6 +497,68 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 dynamic_dispatch.output_arg(),
                 STATUS_OK,
             );
+        }
+
+        // Generation is an infallible destination-parallel copy. Exhaustively:
+        // the capability seam proves choice/frontier shapes and lineage;
+        // classification proves canonical dead triples or live
+        // variable/arm/axis/count/segment cells and retains each validated arm
+        // and axis by row; the flat scan proves every cell prefix and total
+        // below the sentinel; the finalizer proves segment boundaries,
+        // insertion/schema, capacity, and provisional control geometry;
+        // archive construction proves each present list's exact length,
+        // ascending order and in-domain codes; and the checked host products
+        // prove candidate, owner, proposer and child-body bounds. Thus every
+        // defensive guard in the candidate and child kernels is implied by an
+        // earlier proof. Jerky metadata remains zero until both stages finish.
+        let entity_present_codes = self.archive().present_entity_codes().input_arg();
+        let attribute_present_codes = self.archive().present_attribute_codes().input_arg();
+        let value_present_codes = self.archive().present_value_codes().input_arg();
+        let domain = self.archive().archive().domain.len() as u32;
+        let launch_candidates = || unsafe {
+            generate_present_candidates_by_destination::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                dynamic_dispatch.cube_count(),
+                dynamic_dispatch.cube_dim(),
+                workspace.input_arg(),
+                segment_records.input_arg(),
+                entity_present_codes,
+                attribute_present_codes,
+                value_present_codes,
+                control.input_arg(),
+                candidate_records.output_arg(),
+                inputs.rows as u32,
+                admission.segment_count as u32,
+                capacity as u32,
+                domain,
+                workspace_layout.row_arms as u32,
+                workspace_layout.row_axes as u32,
+                workspace_layout.counts as u32,
+                workspace_layout.local_offsets as u32,
+                workspace_layout.block_offsets as u32,
+                BLOCK_ITEMS,
+                DEAD_ROW_SENTINEL,
+                STATUS_OK,
+            );
+        };
+        #[cfg(test)]
+        let candidate_profile = if _profile_stages {
+            let ((), profile) = context
+                .client()
+                .profile(launch_candidates, "resident Present candidate emission")
+                .expect("CubeCL candidate profiling");
+            Some(profile)
+        } else {
+            launch_candidates();
+            None
+        };
+        #[cfg(not(test))]
+        launch_candidates();
+
+        // The child materializer consumes the same published indirect record;
+        // neither indirect consumer binds that exclusive buffer as storage.
+        let arm_count = self.metadata().arms().len() as u32;
+        let launch_child_body = || unsafe {
             materialize_present_children::launch_unchecked::<WgpuRuntime>(
                 context.client(),
                 dynamic_dispatch.cube_count(),
@@ -583,12 +574,30 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 child_stride as u32,
                 admission.segment_count as u32,
                 capacity as u32,
-                self.metadata().arms().len() as u32,
+                arm_count,
                 plan_layout.arm_descriptors as u32,
                 plan_layout.variable_to_segment as u32,
                 DEAD_ROW_SENTINEL,
                 STATUS_OK,
             );
+        };
+        #[cfg(test)]
+        let child_body_profile = if _profile_stages {
+            let ((), profile) = context
+                .client()
+                .profile(
+                    launch_child_body,
+                    "resident Present reference child materialization",
+                )
+                .expect("CubeCL child-body profiling");
+            Some(profile)
+        } else {
+            launch_child_body();
+            None
+        };
+        #[cfg(not(test))]
+        launch_child_body();
+        unsafe {
             publish_present_meta::launch_unchecked::<WgpuRuntime>(
                 context.client(),
                 CubeCount::new_single(),
@@ -616,6 +625,14 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             segment_records,
             candidate_records,
             child_body,
+            #[cfg(test)]
+            stage_profiles: match (candidate_profile, child_body_profile) {
+                (Some(candidates), Some(child_body)) => Some(ProposalStageProfiles {
+                    candidates,
+                    child_body,
+                }),
+                _ => None,
+            },
         })
     }
 }
@@ -694,6 +711,8 @@ fn workspace_layout(
 ) -> Result<WorkspaceLayout, ResidentProposalError> {
     let mut words = 0usize;
     let counts = reserve_words(&mut words, cells, "proposal workspace")?;
+    let row_arms = reserve_words(&mut words, rows, "proposal workspace")?;
+    let row_axes = reserve_words(&mut words, rows, "proposal workspace")?;
     let choice_errors = reserve_words(&mut words, rows, "proposal workspace")?;
     let validation_errors = reserve_words(&mut words, validation_blocks, "proposal workspace")?;
     let local_offsets = reserve_words(&mut words, cells, "proposal workspace")?;
@@ -702,6 +721,8 @@ fn workspace_layout(
     let block_offsets = reserve_words(&mut words, scan_blocks, "proposal workspace")?;
     Ok(WorkspaceLayout {
         counts,
+        row_arms,
+        row_axes,
         choice_errors,
         validation_errors,
         local_offsets,
@@ -779,6 +800,8 @@ fn classify_present_choices(
     arm_descriptors_base: u32,
     variable_to_segment_base: u32,
     counts_base: u32,
+    row_arms_base: u32,
+    row_axes_base: u32,
     choice_errors_base: u32,
     dead: u32,
 ) {
@@ -794,6 +817,12 @@ fn classify_present_choices(
         }
 
         let mut error = 2u32;
+        if row_arms_base as usize + row < workspace.len() {
+            workspace[row_arms_base as usize + row] = dead;
+        }
+        if row_axes_base as usize + row < workspace.len() {
+            workspace[row_axes_base as usize + row] = dead;
+        }
         let choice_base = row * CHOICE_WORDS;
         if choice_base + 2usize < choices.len() {
             let variable = choices[choice_base];
@@ -831,7 +860,13 @@ fn classify_present_choices(
                             counts_base as usize + selected_segment as usize * rows as usize + row;
                         if cell < workspace.len() {
                             workspace[cell] = count;
-                            error = 0u32;
+                            let arm_word = row_arms_base as usize + row;
+                            let axis_word = row_axes_base as usize + row;
+                            if arm_word < workspace.len() && axis_word < workspace.len() {
+                                workspace[arm_word] = arm;
+                                workspace[axis_word] = axis;
+                                error = 0u32;
+                            }
                         }
                     }
                 }
@@ -1140,22 +1175,23 @@ fn poison_proposal_outputs(
 }
 
 #[cube(launch_unchecked)]
+// Keep overflow guards nested so sentinel rejection structurally precedes
+// every `dead - base` expression in the generated device program.
 #[allow(clippy::too_many_arguments, clippy::collapsible_if)]
-fn generate_present_candidates(
-    choices: &Array<u32>,
-    plan: &Array<u32>,
+fn generate_present_candidates_by_destination(
     workspace: &Array<u32>,
     segment_records: &Array<u32>,
-    present_codes: &Array<u32>,
+    present_entities: &Array<u32>,
+    present_attributes: &Array<u32>,
+    present_values: &Array<u32>,
     control: &Array<u32>,
     candidate_records: &mut Array<u32>,
     rows: u32,
     segment_count: u32,
     capacity: u32,
     domain: u32,
-    axis: u32,
-    arm_descriptors_base: u32,
-    variable_to_segment_base: u32,
+    row_arms_base: u32,
+    row_axes_base: u32,
     counts_base: u32,
     local_offsets_base: u32,
     block_offsets_base: u32,
@@ -1163,67 +1199,134 @@ fn generate_present_candidates(
     dead: u32,
     ok: u32,
 ) {
-    let row = ABSOLUTE_POS;
-    if row < rows as usize
-        && control[CONTROL_STATUS] == ok
-        && control[CONTROL_REQUIRED] <= capacity
+    let destination = ABSOLUTE_POS;
+    if control[CONTROL_STATUS] == ok
+        && destination < control[CONTROL_REQUIRED] as usize
+        && destination < capacity as usize
+        && rows != 0u32
+        && segment_count as usize <= segment_records.len() / SEGMENT_RECORD_WORDS
         && capacity as usize * CANDIDATE_RECORD_FIELDS <= candidate_records.len()
     {
-        let choice = row * CHOICE_WORDS;
-        if choice + 2usize < choices.len() {
-            let variable = choices[choice];
-            let arm = choices[choice + 1usize];
-            let count = choices[choice + 2usize];
-            // Canonical dead rows are valid under a globally successful
-            // batch, but their sentinel words must never enter address
-            // arithmetic (CubeCL's device-side `usize` is u32).
-            if variable != dead && arm != dead && count != dead {
-                if variable_to_segment_base as usize + (variable as usize) < plan.len()
-                    && arm_descriptors_base as usize + arm as usize * ARM_DESCRIPTOR_WORDS + 2usize
-                        < plan.len()
-                {
-                    let segment = plan[variable_to_segment_base as usize + variable as usize];
-                    let descriptor =
-                        arm_descriptors_base as usize + arm as usize * ARM_DESCRIPTOR_WORDS;
-                    if segment < segment_count
-                        && plan[descriptor] == variable
-                        && plan[descriptor + 1usize] == axis
-                        && plan[descriptor + 2usize] == count
+        let destination_u32 = destination as u32;
+
+        // First strict-end lower bound: select the first segment whose
+        // half-open end is greater than d. `<= d` deliberately skips empty
+        // segments, including arbitrarily long equal-prefix runs.
+        let mut segment_lo = 0u32;
+        let mut segment_hi = segment_count;
+        while segment_lo < segment_hi {
+            let segment_mid = segment_lo + (segment_hi - segment_lo) / 2u32;
+            let record = segment_mid as usize * SEGMENT_RECORD_WORDS;
+            let mut segment_end = dead;
+            if record + 1usize < segment_records.len() {
+                let base = segment_records[record];
+                let count = segment_records[record + 1usize];
+                if base != dead && count != dead {
+                    if count < dead - base {
+                        segment_end = base + count;
+                    }
+                }
+            }
+            if segment_end <= destination_u32 {
+                segment_lo = segment_mid + 1u32;
+            } else {
+                segment_hi = segment_mid;
+            }
+        }
+
+        if segment_lo < segment_count {
+            let segment = segment_lo;
+            let record = segment as usize * SEGMENT_RECORD_WORDS;
+            let segment_base = segment_records[record];
+            let segment_width = segment_records[record + 1usize];
+            let mut segment_end = dead;
+            if segment_base != dead && segment_width != dead {
+                if segment_width < dead - segment_base {
+                    segment_end = segment_base + segment_width;
+                }
+            }
+            if destination_u32 >= segment_base && destination_u32 < segment_end {
+                // Second strict-end lower bound: within the selected segment,
+                // select the first row cell whose exact scanned end exceeds d.
+                let mut row_lo = 0u32;
+                let mut row_hi = rows;
+                while row_lo < row_hi {
+                    let row_mid = row_lo + (row_hi - row_lo) / 2u32;
+                    let cell = segment as usize * rows as usize + row_mid as usize;
+                    let block = cell / block_items as usize;
+                    let mut cell_end = dead;
+                    if counts_base as usize + cell < workspace.len()
+                        && local_offsets_base as usize + cell < workspace.len()
+                        && block_offsets_base as usize + block < workspace.len()
                     {
-                        let cell = segment as usize * rows as usize + row;
-                        let record = segment as usize * SEGMENT_RECORD_WORDS;
-                        if counts_base as usize + cell < workspace.len()
-                            && local_offsets_base as usize + cell < workspace.len()
-                            && record + 3usize < segment_records.len()
-                            && workspace[counts_base as usize + cell] == count
-                            && segment_records[record + 2usize] == variable
-                        {
-                            let block = cell / block_items as usize;
-                            if block_offsets_base as usize + block < workspace.len() {
-                                let global = workspace[block_offsets_base as usize + block]
-                                    + workspace[local_offsets_base as usize + cell];
-                                let mut ordinal = 0u32;
-                                while ordinal < count {
-                                    let destination = global + ordinal;
-                                    let candidate = if (ordinal as usize) < present_codes.len() {
-                                        present_codes[ordinal as usize]
-                                    } else {
-                                        dead
-                                    };
-                                    if destination < control[CONTROL_REQUIRED]
-                                        && destination < capacity
-                                        && candidate < domain
-                                        && candidate != dead
-                                    {
-                                        let destination = destination as usize;
-                                        candidate_records[destination] = candidate;
-                                        candidate_records[capacity as usize + destination] =
-                                            row as u32;
-                                        candidate_records
-                                            [capacity as usize * 2usize + destination] = arm;
-                                    }
-                                    ordinal += 1u32;
+                        let block_base = workspace[block_offsets_base as usize + block];
+                        let local = workspace[local_offsets_base as usize + cell];
+                        let count = workspace[counts_base as usize + cell];
+                        if block_base != dead && local != dead && count != dead {
+                            if local < dead - block_base {
+                                let start = block_base + local;
+                                if count < dead - start {
+                                    cell_end = start + count;
                                 }
+                            }
+                        }
+                    }
+                    if cell_end <= destination_u32 {
+                        row_lo = row_mid + 1u32;
+                    } else {
+                        row_hi = row_mid;
+                    }
+                }
+
+                if row_lo < rows {
+                    let row = row_lo;
+                    let cell = segment as usize * rows as usize + row as usize;
+                    let block = cell / block_items as usize;
+                    let mut cell_start = dead;
+                    let mut cell_end = dead;
+                    if counts_base as usize + cell < workspace.len()
+                        && local_offsets_base as usize + cell < workspace.len()
+                        && block_offsets_base as usize + block < workspace.len()
+                    {
+                        let block_base = workspace[block_offsets_base as usize + block];
+                        let local = workspace[local_offsets_base as usize + cell];
+                        let count = workspace[counts_base as usize + cell];
+                        if block_base != dead && local != dead && count != dead {
+                            if local < dead - block_base {
+                                let start = block_base + local;
+                                if count < dead - start {
+                                    cell_start = start;
+                                    cell_end = start + count;
+                                }
+                            }
+                        }
+                    }
+
+                    if destination_u32 >= cell_start && destination_u32 < cell_end {
+                        let arm_word = row_arms_base as usize + row as usize;
+                        let axis_word = row_axes_base as usize + row as usize;
+                        if arm_word < workspace.len() && axis_word < workspace.len() {
+                            let arm = workspace[arm_word];
+                            let axis = workspace[axis_word];
+                            let ordinal = (destination_u32 - cell_start) as usize;
+                            let mut candidate = dead;
+                            if axis == 0u32 {
+                                if ordinal < present_entities.len() {
+                                    candidate = present_entities[ordinal];
+                                }
+                            } else if axis == 1u32 {
+                                if ordinal < present_attributes.len() {
+                                    candidate = present_attributes[ordinal];
+                                }
+                            } else if axis == 2u32 {
+                                if ordinal < present_values.len() {
+                                    candidate = present_values[ordinal];
+                                }
+                            }
+                            if arm != dead && candidate != dead && candidate < domain {
+                                candidate_records[destination] = candidate;
+                                candidate_records[capacity as usize + destination] = row;
+                                candidate_records[capacity as usize * 2usize + destination] = arm;
                             }
                         }
                     }
@@ -1361,7 +1464,50 @@ struct ProposalInspection {
 }
 
 #[cfg(test)]
+struct ResolvedProposalStageProfiles {
+    candidate_method: cubecl::profile::TimingMethod,
+    candidate_duration: cubecl::profile::Duration,
+    child_body_method: cubecl::profile::TimingMethod,
+    child_body_duration: cubecl::profile::Duration,
+}
+
+#[cfg(test)]
 impl WgpuResidentProposals {
+    fn resolve_stage_profiles(&mut self) -> ResolvedProposalStageProfiles {
+        let profiles = self
+            .stage_profiles
+            .take()
+            .expect("arena was not enqueued through the profiling seam");
+        let candidate_method = profiles.candidates.timing_method();
+        let candidate_duration = cubecl::future::block_on(profiles.candidates.resolve()).duration();
+        let child_body_method = profiles.child_body.timing_method();
+        let child_body_duration =
+            cubecl::future::block_on(profiles.child_body.resolve()).duration();
+        ResolvedProposalStageProfiles {
+            candidate_method,
+            candidate_duration,
+            child_body_method,
+            child_body_duration,
+        }
+    }
+
+    /// Synchronizes a fully published arena with one fixed-size read. The
+    /// metadata word is written last, after candidate and body generation, so
+    /// this fence never scales its transfer volume with proposal capacity.
+    fn completion_fence(&self) -> u32 {
+        let mut marker = self.context.empty_u32(1).unwrap();
+        unsafe {
+            pack_proposal_completion::launch_unchecked::<WgpuRuntime>(
+                self.context.client(),
+                CubeCount::new_single(),
+                CubeDim::new_single(),
+                self.meta.input_arg(),
+                marker.output_arg(),
+            );
+        }
+        marker.read()[0]
+    }
+
     /// The sole test synchronization boundary: packs every ordinary arena
     /// allocation into one buffer, then performs one device read.
     fn inspect(&self) -> ProposalInspection {
@@ -1430,6 +1576,14 @@ impl WgpuResidentProposals {
             proposer_arms,
             child_body,
         }
+    }
+}
+
+#[cfg(test)]
+#[cube(launch_unchecked)]
+fn pack_proposal_completion(meta: &Array<u32>, marker: &mut Array<u32>) {
+    if ABSOLUTE_POS == 0 {
+        marker[0] = meta[0];
     }
 }
 

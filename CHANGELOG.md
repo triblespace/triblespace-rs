@@ -26,13 +26,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remains crate-private, carries distinct round, parent-frontier, and fresh
   arena lineages, performs no readback, and deliberately exposes no public
   transition before sibling confirmation and survivor compaction exist. This
-  correctness slice assigns
-  one invocation per parent row and loops its Present width; a later
-  candidate-parallel indirect generator should replace that seed-frontier
-  bottleneck without changing the scan or arena semantics. The canonical child
-  body is also a parity artifact for now: confirmation can use code, owner, and
-  the exact parent frontier, allowing production materialization to move after
-  survivor compaction.
+  correctness slice now publishes its validated indirect rectangle immediately
+  after finalization and assigns one invocation to every exact destination.
+  Strict-end lower bounds invert the monotone segment and row-cell prefixes,
+  including arbitrary zero-width runs, while validated proposer arms and axes
+  retained in packed scratch select among all three resident Present lists in
+  one seven-array kernel. This removes the seed-frontier serial-width
+  bottleneck without changing the scan, ordering, poison, or delayed-metadata
+  semantics. The canonical child body remains a parity artifact for now:
+  confirmation can use code, owner, and the exact parent frontier, allowing
+  production materialization to move after survivor compaction.
 - **Resident row choices now preserve exact planner and frontier lineage.**
   Packed choices retain the private planner capability plus a unique lineage
   propagated from the precise affine frontier through its estimate inputs.

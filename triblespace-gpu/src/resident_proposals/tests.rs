@@ -16,6 +16,13 @@ fn ordered_id(prefix: u8) -> Id {
     Id::new(raw).expect("fixture IDs are non-zero")
 }
 
+fn benchmark_id(axis: u8, ordinal: u64) -> Id {
+    let mut raw = [0u8; 16];
+    raw[0] = axis + 1;
+    raw[8..].copy_from_slice(&ordinal.to_be_bytes());
+    Id::new(raw).expect("benchmark IDs are non-zero")
+}
+
 fn raw(id: Id) -> RawInline {
     GenId::inline_from(id).raw
 }
@@ -133,15 +140,16 @@ fn indirect_child_materialization_covers_zero_one_block_edge_and_forced_2d_fold(
                 &[v0.index() as u32, entity_arm, entities as u32],
             )
             .unwrap();
+        let capacity = if entities == 65 { 128 } else { entities };
         let arena = if entities == 65 {
             round
                 .enqueue_present_proposals_with_dispatch_limits_for_test(
-                    &frontier, &choices, entities, 1, 2,
+                    &frontier, &choices, capacity, 1, 2,
                 )
                 .unwrap()
         } else {
             round
-                .enqueue_present_proposals(&frontier, &choices, entities)
+                .enqueue_present_proposals(&frontier, &choices, capacity)
                 .unwrap()
         };
         let inspection = arena.inspect();
@@ -151,7 +159,642 @@ fn indirect_child_materialization_covers_zero_one_block_edge_and_forced_2d_fold(
             expected_dispatch
         );
         assert_eq!(inspection.child_stride, 1);
-        assert_eq!(inspection.child_body, inspection.candidate_codes);
+        let expected_codes: Vec<_> = (1..=entities)
+            .map(|ordinal| {
+                program
+                    .encode(&raw(ordered_id(ordinal as u8)))
+                    .unwrap()
+                    .get()
+            })
+            .collect();
+        assert_eq!(&inspection.candidate_codes[..entities], expected_codes);
+        assert_eq!(&inspection.candidate_owners[..entities], &vec![0; entities]);
+        assert_eq!(
+            &inspection.proposer_arms[..entities],
+            &vec![entity_arm; entities]
+        );
+        assert_eq!(&inspection.child_body[..entities], expected_codes);
+        assert!(inspection.candidate_codes[entities..]
+            .iter()
+            .chain(&inspection.candidate_owners[entities..])
+            .chain(&inspection.proposer_arms[entities..])
+            .chain(&inspection.child_body[entities..])
+            .all(|&word| word == DEAD_ROW_SENTINEL));
+    }
+}
+
+#[test]
+fn destination_generator_forced_3x3_flattens_513_unique_destinations() {
+    const TOTAL: usize = 513;
+    const CAPACITY: usize = 576;
+    let attribute = benchmark_id(1, 0);
+    let value = benchmark_id(2, 0);
+    let mut set = TribleSet::new();
+    for ordinal in 0..TOTAL {
+        insert(&mut set, benchmark_id(0, ordinal as u64), attribute, value);
+    }
+    let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+    let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+    let v0 = ProgramVariable::new(0);
+    let v1 = ProgramVariable::new(1);
+    let v2 = ProgramVariable::new(2);
+    let program = QueryProgram::compile(gpu.archive(), 3, [QueryPattern::new(v0, v1, v2)]).unwrap();
+    let round = WgpuResidentRound::new(&gpu, &program, &[]).unwrap();
+    let frontier = round.upload_frontier(&ProgramFrontier::seed()).unwrap();
+    let arm = round
+        .metadata()
+        .arms()
+        .iter()
+        .position(|identity| identity.target_variable() == v0)
+        .unwrap() as u32;
+    let choices = round
+        .upload_choice_words_for_test(&frontier, &[v0.index() as u32, arm, TOTAL as u32])
+        .unwrap();
+    let inspection = round
+        .enqueue_present_proposals_with_dispatch_limits_for_test(
+            &frontier, &choices, CAPACITY, 3, 3,
+        )
+        .unwrap()
+        .inspect();
+    assert_success(&inspection, TOTAL);
+    assert_eq!((inspection.dispatch_x, inspection.dispatch_y), (3, 3));
+    let expected: Vec<_> = (0..TOTAL)
+        .map(|ordinal| {
+            program
+                .encode(&raw(benchmark_id(0, ordinal as u64)))
+                .unwrap()
+                .get()
+        })
+        .collect();
+    assert_eq!(&inspection.candidate_codes[..TOTAL], expected);
+    assert_eq!(&inspection.candidate_owners[..TOTAL], &vec![0; TOTAL]);
+    assert_eq!(&inspection.proposer_arms[..TOTAL], &vec![arm; TOTAL]);
+    assert_eq!(&inspection.child_body[..TOTAL], expected);
+    assert!(inspection.candidate_codes[TOTAL..]
+        .iter()
+        .chain(&inspection.candidate_owners[TOTAL..])
+        .chain(&inspection.proposer_arms[TOTAL..])
+        .chain(&inspection.child_body[TOTAL..])
+        .all(|&word| word == DEAD_ROW_SENTINEL));
+}
+
+#[test]
+fn destination_row_inversion_skips_long_zero_runs_across_cells_63_64_65() {
+    const ROWS: usize = 192;
+    const CAPACITY: usize = 8;
+    const LIVE_ROWS: [usize; 4] = [63, 64, 65, 130];
+    let entity = benchmark_id(0, 0);
+    let attribute = benchmark_id(1, 0);
+    let value = benchmark_id(2, 0);
+    let mut set = TribleSet::new();
+    insert(&mut set, entity, attribute, value);
+    let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+    let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+    let bound = vec![
+        ProgramVariable::new(1),
+        ProgramVariable::new(3),
+        ProgramVariable::new(5),
+    ];
+    let program = QueryProgram::compile(
+        gpu.archive(),
+        6,
+        [
+            QueryPattern::new(bound[0], bound[1], bound[2]),
+            QueryPattern::new(
+                ProgramVariable::new(0),
+                ProgramVariable::new(2),
+                ProgramVariable::new(4),
+            ),
+        ],
+    )
+    .unwrap();
+    let round = WgpuResidentRound::new(&gpu, &program, &bound).unwrap();
+    let parent = [
+        program.encode(&raw(entity)).unwrap().get(),
+        program.encode(&raw(attribute)).unwrap().get(),
+        program.encode(&raw(value)).unwrap().get(),
+    ];
+    let host_frontier = program
+        .frontier_from_indices(bound, (0..ROWS).flat_map(|_| parent).collect(), ROWS)
+        .unwrap();
+    let frontier = round.upload_frontier(&host_frontier).unwrap();
+    let arm = round
+        .metadata()
+        .arms()
+        .iter()
+        .position(|identity| identity.target_variable() == ProgramVariable::new(0))
+        .unwrap() as u32;
+    let words: Vec<_> = (0..ROWS)
+        .flat_map(|row| {
+            if LIVE_ROWS.contains(&row) {
+                [0, arm, 1]
+            } else {
+                [DEAD_ROW_SENTINEL, DEAD_ROW_SENTINEL, 0]
+            }
+        })
+        .collect();
+    let choices = round
+        .upload_choice_words_for_test(&frontier, &words)
+        .unwrap();
+    let inspection = round
+        .enqueue_present_proposals(&frontier, &choices, CAPACITY)
+        .unwrap()
+        .inspect();
+    assert_success(&inspection, LIVE_ROWS.len());
+    let entity_code = program.encode(&raw(entity)).unwrap().get();
+    assert_eq!(
+        &inspection.candidate_codes[..LIVE_ROWS.len()],
+        &vec![entity_code; LIVE_ROWS.len()]
+    );
+    assert_eq!(
+        &inspection.candidate_owners[..LIVE_ROWS.len()],
+        &LIVE_ROWS.map(|row| row as u32)
+    );
+    assert_eq!(
+        &inspection.proposer_arms[..LIVE_ROWS.len()],
+        &vec![arm; LIVE_ROWS.len()]
+    );
+    let expected_body: Vec<_> = (0..LIVE_ROWS.len())
+        .flat_map(|_| [entity_code, parent[0], parent[1], parent[2]])
+        .collect();
+    assert_eq!(
+        &inspection.child_body[..LIVE_ROWS.len() * inspection.child_stride as usize],
+        expected_body
+    );
+    assert!(inspection.candidate_codes[LIVE_ROWS.len()..]
+        .iter()
+        .chain(&inspection.candidate_owners[LIVE_ROWS.len()..])
+        .chain(&inspection.proposer_arms[LIVE_ROWS.len()..])
+        .chain(&inspection.child_body[LIVE_ROWS.len() * inspection.child_stride as usize..])
+        .all(|&word| word == DEAD_ROW_SENTINEL));
+}
+
+#[test]
+fn destination_segment_inversion_skips_leading_internal_and_trailing_zero_segments() {
+    let entity = benchmark_id(0, 0);
+    let attribute = benchmark_id(1, 0);
+    let value = benchmark_id(2, 0);
+    let mut set = TribleSet::new();
+    insert(&mut set, entity, attribute, value);
+    let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+    let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+    let bound = vec![
+        ProgramVariable::new(9),
+        ProgramVariable::new(10),
+        ProgramVariable::new(11),
+    ];
+    let program = QueryProgram::compile(
+        gpu.archive(),
+        12,
+        [
+            QueryPattern::new(bound[0], bound[1], bound[2]),
+            QueryPattern::new(
+                ProgramVariable::new(0),
+                ProgramVariable::new(1),
+                ProgramVariable::new(2),
+            ),
+            QueryPattern::new(
+                ProgramVariable::new(3),
+                ProgramVariable::new(4),
+                ProgramVariable::new(5),
+            ),
+            QueryPattern::new(
+                ProgramVariable::new(6),
+                ProgramVariable::new(7),
+                ProgramVariable::new(8),
+            ),
+        ],
+    )
+    .unwrap();
+    let round = WgpuResidentRound::new(&gpu, &program, &bound).unwrap();
+    let parent = [
+        program.encode(&raw(entity)).unwrap().get(),
+        program.encode(&raw(attribute)).unwrap().get(),
+        program.encode(&raw(value)).unwrap().get(),
+    ];
+    let host_frontier = program
+        .frontier_from_indices(bound, [parent, parent].concat(), 2)
+        .unwrap();
+    let frontier = round.upload_frontier(&host_frontier).unwrap();
+    let arm_for = |variable| {
+        round
+            .metadata()
+            .arms()
+            .iter()
+            .position(|identity| identity.target_variable() == ProgramVariable::new(variable))
+            .unwrap() as u32
+    };
+    let value_arm = arm_for(2);
+    let entity_arm = arm_for(6);
+    let choices = round
+        .upload_choice_words_for_test(&frontier, &[2, value_arm, 1, 6, entity_arm, 1])
+        .unwrap();
+    let inspection = round
+        .enqueue_present_proposals(&frontier, &choices, 4)
+        .unwrap()
+        .inspect();
+    assert_success(&inspection, 2);
+    assert_eq!(inspection.segments.len(), 9);
+    assert_eq!(
+        inspection
+            .segments
+            .iter()
+            .map(|segment| segment.count)
+            .collect::<Vec<_>>(),
+        vec![0, 0, 1, 0, 0, 0, 1, 0, 0]
+    );
+    assert_eq!(
+        &inspection.candidate_codes[..2],
+        &[
+            program.encode(&raw(value)).unwrap().get(),
+            program.encode(&raw(entity)).unwrap().get(),
+        ]
+    );
+    assert_eq!(&inspection.candidate_owners[..2], &[0, 1]);
+    assert_eq!(&inspection.proposer_arms[..2], &[value_arm, entity_arm]);
+    assert!(inspection.candidate_codes[2..]
+        .iter()
+        .chain(&inspection.candidate_owners[2..])
+        .chain(&inspection.proposer_arms[2..])
+        .chain(&inspection.child_body[2 * inspection.child_stride as usize..])
+        .all(|&word| word == DEAD_ROW_SENTINEL));
+}
+
+#[test]
+fn destination_segment_inversion_reaches_only_live_final_segment_near_program_limit() {
+    let entity = benchmark_id(0, 0);
+    let attribute = benchmark_id(1, 0);
+    let value = benchmark_id(2, 0);
+    let mut set = TribleSet::new();
+    insert(&mut set, entity, attribute, value);
+    let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+    let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+    // QueryProgram admits at most 128 variables; 126 is the largest multiple
+    // of three that keeps every disjoint arm a zero-peer Present primitive.
+    let patterns: Vec<_> = (0..42)
+        .map(|pattern| {
+            let base = pattern * 3;
+            QueryPattern::new(
+                ProgramVariable::new(base),
+                ProgramVariable::new(base + 1),
+                ProgramVariable::new(base + 2),
+            )
+        })
+        .collect();
+    let program = QueryProgram::compile(gpu.archive(), 126, patterns).unwrap();
+    let round = WgpuResidentRound::new(&gpu, &program, &[]).unwrap();
+    let frontier = round.upload_frontier(&ProgramFrontier::seed()).unwrap();
+    let final_variable = ProgramVariable::new(125);
+    let final_arm = round
+        .metadata()
+        .arms()
+        .iter()
+        .position(|identity| identity.target_variable() == final_variable)
+        .unwrap() as u32;
+    let choices = round
+        .upload_choice_words_for_test(&frontier, &[final_variable.index() as u32, final_arm, 1])
+        .unwrap();
+    let inspection = round
+        .enqueue_present_proposals(&frontier, &choices, 4)
+        .unwrap()
+        .inspect();
+    assert_success(&inspection, 1);
+    assert_eq!(inspection.segments.len(), 126);
+    assert!(inspection.segments[..125]
+        .iter()
+        .all(|segment| segment.base == 0 && segment.count == 0));
+    assert_eq!(inspection.segments[125].base, 0);
+    assert_eq!(inspection.segments[125].count, 1);
+    assert_eq!(inspection.segments[125].variable, 125);
+    assert_eq!(
+        inspection.candidate_codes[0],
+        program.encode(&raw(value)).unwrap().get()
+    );
+    assert_eq!(inspection.candidate_owners[0], 0);
+    assert_eq!(inspection.proposer_arms[0], final_arm);
+    assert!(inspection.candidate_codes[1..]
+        .iter()
+        .chain(&inspection.candidate_owners[1..])
+        .chain(&inspection.proposer_arms[1..])
+        .chain(&inspection.child_body[1..])
+        .all(|&word| word == DEAD_ROW_SENTINEL));
+}
+
+#[test]
+fn destination_generator_preserves_mixed_axis_order_under_1_64_4096_skew() {
+    const ATTRIBUTE_COUNT: usize = 64;
+    const VALUE_COUNT: usize = 4096;
+    const TOTAL: usize = 1 + ATTRIBUTE_COUNT + VALUE_COUNT;
+    const CAPACITY: usize = TOTAL + 7;
+    let entity = benchmark_id(0, 0);
+    let attributes: Vec<_> = (0..ATTRIBUTE_COUNT)
+        .map(|ordinal| benchmark_id(1, ordinal as u64))
+        .collect();
+    let values: Vec<_> = (0..VALUE_COUNT)
+        .map(|ordinal| benchmark_id(2, ordinal as u64))
+        .collect();
+    let mut set = TribleSet::new();
+    for (ordinal, &value) in values.iter().enumerate() {
+        insert(
+            &mut set,
+            entity,
+            attributes[ordinal % ATTRIBUTE_COUNT],
+            value,
+        );
+    }
+    let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+    let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+    let bound = vec![
+        ProgramVariable::new(1),
+        ProgramVariable::new(3),
+        ProgramVariable::new(5),
+    ];
+    let targets = [
+        ProgramVariable::new(0),
+        ProgramVariable::new(2),
+        ProgramVariable::new(4),
+    ];
+    let program = QueryProgram::compile(
+        gpu.archive(),
+        6,
+        [
+            QueryPattern::new(bound[0], bound[1], bound[2]),
+            QueryPattern::new(targets[0], targets[1], targets[2]),
+        ],
+    )
+    .unwrap();
+    let round = WgpuResidentRound::new(&gpu, &program, &bound).unwrap();
+    let parent = [
+        program.encode(&raw(entity)).unwrap().get(),
+        program.encode(&raw(attributes[0])).unwrap().get(),
+        program.encode(&raw(values[0])).unwrap().get(),
+    ];
+    let host_frontier = program
+        .frontier_from_indices(bound, [parent, parent, parent].concat(), 3)
+        .unwrap();
+    let frontier = round.upload_frontier(&host_frontier).unwrap();
+    let arms: Vec<_> = targets
+        .iter()
+        .map(|&target| {
+            round
+                .metadata()
+                .arms()
+                .iter()
+                .position(|identity| identity.target_variable() == target)
+                .unwrap() as u32
+        })
+        .collect();
+    let choices = round
+        .upload_choice_words_for_test(
+            &frontier,
+            &[
+                targets[0].index() as u32,
+                arms[0],
+                1,
+                targets[1].index() as u32,
+                arms[1],
+                ATTRIBUTE_COUNT as u32,
+                targets[2].index() as u32,
+                arms[2],
+                VALUE_COUNT as u32,
+            ],
+        )
+        .unwrap();
+    let inspection = round
+        .enqueue_present_proposals(&frontier, &choices, CAPACITY)
+        .unwrap()
+        .inspect();
+    assert_success(&inspection, TOTAL);
+    let mut expected_codes = vec![program.encode(&raw(entity)).unwrap().get()];
+    expected_codes.extend(
+        attributes
+            .iter()
+            .map(|&id| program.encode(&raw(id)).unwrap().get()),
+    );
+    expected_codes.extend(
+        values
+            .iter()
+            .map(|&id| program.encode(&raw(id)).unwrap().get()),
+    );
+    let mut expected_owners = vec![0];
+    expected_owners.extend(std::iter::repeat_n(1, ATTRIBUTE_COUNT));
+    expected_owners.extend(std::iter::repeat_n(2, VALUE_COUNT));
+    let mut expected_arms = vec![arms[0]];
+    expected_arms.extend(std::iter::repeat_n(arms[1], ATTRIBUTE_COUNT));
+    expected_arms.extend(std::iter::repeat_n(arms[2], VALUE_COUNT));
+    assert_eq!(&inspection.candidate_codes[..TOTAL], expected_codes);
+    assert_eq!(&inspection.candidate_owners[..TOTAL], expected_owners);
+    assert_eq!(&inspection.proposer_arms[..TOTAL], expected_arms);
+    assert!(inspection.candidate_codes[TOTAL..]
+        .iter()
+        .chain(&inspection.candidate_owners[TOTAL..])
+        .chain(&inspection.proposer_arms[TOTAL..])
+        .chain(&inspection.child_body[TOTAL * inspection.child_stride as usize..])
+        .all(|&word| word == DEAD_ROW_SENTINEL));
+}
+
+#[test]
+fn destination_generator_uses_each_rows_axis_for_two_arms_in_one_segment() {
+    let fixture = fixture();
+    let archive: SuccinctArchive<OrderedUniverse> = (&fixture.set).into();
+    let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+    let v0 = ProgramVariable::new(0);
+    let program = QueryProgram::compile(
+        gpu.archive(),
+        5,
+        [
+            QueryPattern::new(v0, ProgramVariable::new(1), ProgramVariable::new(2)),
+            QueryPattern::new(ProgramVariable::new(3), ProgramVariable::new(4), v0),
+        ],
+    )
+    .unwrap();
+    let round = WgpuResidentRound::new(&gpu, &program, &[]).unwrap();
+    let host_frontier = program
+        .frontier_from_indices(Vec::new(), Vec::new(), 2)
+        .unwrap();
+    let frontier = round.upload_frontier(&host_frontier).unwrap();
+    let target_arms: Vec<_> = round
+        .metadata()
+        .arms()
+        .iter()
+        .enumerate()
+        .filter(|(_, identity)| identity.target_variable() == v0)
+        .map(|(arm, _)| arm as u32)
+        .collect();
+    assert_eq!(target_arms.len(), 2);
+    let entity_arm = target_arms
+        .iter()
+        .copied()
+        .find(|&arm| round.proposal_arm_axis(arm as usize) == Some(ResidentAxis::Entity))
+        .unwrap();
+    let value_arm = target_arms
+        .iter()
+        .copied()
+        .find(|&arm| round.proposal_arm_axis(arm as usize) == Some(ResidentAxis::Value))
+        .unwrap();
+    let entity_count = fixture.entities.len() as u32;
+    let value_count = fixture.values.len() as u32;
+    let choices = round
+        .upload_choice_words_for_test(
+            &frontier,
+            &[
+                v0.index() as u32,
+                entity_arm,
+                entity_count,
+                v0.index() as u32,
+                value_arm,
+                value_count,
+            ],
+        )
+        .unwrap();
+    let total = entity_count as usize + value_count as usize;
+    let inspection = round
+        .enqueue_present_proposals(&frontier, &choices, total + 2)
+        .unwrap()
+        .inspect();
+    assert_success(&inspection, total);
+    let mut expected_codes = codes(&program, &fixture.entities);
+    expected_codes.extend(codes(&program, &fixture.values));
+    assert_eq!(&inspection.candidate_codes[..total], expected_codes);
+    assert_eq!(
+        &inspection.candidate_owners[..total],
+        &[
+            vec![0; entity_count as usize],
+            vec![1; value_count as usize]
+        ]
+        .concat()
+    );
+    assert_eq!(
+        &inspection.proposer_arms[..total],
+        &[
+            vec![entity_arm; entity_count as usize],
+            vec![value_arm; value_count as usize],
+        ]
+        .concat()
+    );
+    assert_eq!(&inspection.child_body[..total], expected_codes);
+    assert!(inspection.candidate_codes[total..]
+        .iter()
+        .chain(&inspection.candidate_owners[total..])
+        .chain(&inspection.proposer_arms[total..])
+        .chain(&inspection.child_body[total..])
+        .all(|&word| word == DEAD_ROW_SENTINEL));
+}
+
+fn invert_destination_strict_ends(
+    segments: usize,
+    rows: usize,
+    counts: &[u32],
+    destination: u32,
+) -> (usize, usize, u32) {
+    let segment_ends: Vec<_> = counts
+        .chunks_exact(rows)
+        .scan(0u32, |prefix, segment| {
+            *prefix += segment.iter().sum::<u32>();
+            Some(*prefix)
+        })
+        .collect();
+    let mut segment_lo = 0usize;
+    let mut segment_hi = segments;
+    while segment_lo < segment_hi {
+        let mid = segment_lo + (segment_hi - segment_lo) / 2;
+        if segment_ends[mid] <= destination {
+            segment_lo = mid + 1;
+        } else {
+            segment_hi = mid;
+        }
+    }
+    let segment = segment_lo;
+    let segment_base = if segment == 0 {
+        0
+    } else {
+        segment_ends[segment - 1]
+    };
+    let segment_counts = &counts[segment * rows..(segment + 1) * rows];
+    let mut row_ends = Vec::with_capacity(rows);
+    let mut prefix = segment_base;
+    for &count in segment_counts {
+        prefix += count;
+        row_ends.push(prefix);
+    }
+    let mut row_lo = 0usize;
+    let mut row_hi = rows;
+    while row_lo < row_hi {
+        let mid = row_lo + (row_hi - row_lo) / 2;
+        if row_ends[mid] <= destination {
+            row_lo = mid + 1;
+        } else {
+            row_hi = mid;
+        }
+    }
+    let row = row_lo;
+    let row_start = if row == 0 {
+        segment_base
+    } else {
+        row_ends[row - 1]
+    };
+    (segment, row, destination - row_start)
+}
+
+fn assert_host_inversion_matches_expansion(segments: usize, rows: usize, counts: &[u32]) {
+    let expanded: Vec<_> = (0..segments)
+        .flat_map(|segment| {
+            (0..rows).flat_map(move |row| {
+                (0..counts[segment * rows + row]).map(move |ordinal| (segment, row, ordinal))
+            })
+        })
+        .collect();
+    for (destination, expected) in expanded.iter().copied().enumerate() {
+        assert_eq!(
+            invert_destination_strict_ends(segments, rows, counts, destination as u32),
+            expected,
+            "segments={segments}, rows={rows}, counts={counts:?}, d={destination}"
+        );
+    }
+}
+
+#[test]
+fn host_inversion_exhausts_small_counts_and_all_large_zero_run_topologies() {
+    for segments in 1usize..=4 {
+        for rows in 1usize..=4 {
+            let cells = segments * rows;
+            if cells <= 9 {
+                for encoded in 0usize..4usize.pow(cells as u32) {
+                    let mut digits = encoded;
+                    let mut counts = vec![0u32; cells];
+                    for count in &mut counts {
+                        *count = (digits & 3) as u32;
+                        digits >>= 2;
+                    }
+                    assert_host_inversion_matches_expansion(segments, rows, &counts);
+                }
+            } else {
+                // Exhaust every zero/nonzero topology at the larger shapes and
+                // instantiate every permitted positive count. Full mixed-width
+                // enumeration at 4x4 would be 4^16 cases; the <=9-cell shapes
+                // above exhaust those interactions without a multi-billion-case
+                // unit test.
+                for positive in 1u32..=3 {
+                    for mask in 0usize..1usize << cells {
+                        let counts: Vec<_> = (0..cells)
+                            .map(|cell| {
+                                if mask & (1usize << cell) == 0 {
+                                    0
+                                } else {
+                                    positive
+                                }
+                            })
+                            .collect();
+                        assert_host_inversion_matches_expansion(segments, rows, &counts);
+                    }
+                }
+                for phase in 0..4 {
+                    let counts: Vec<_> =
+                        (0..cells).map(|cell| ((cell + phase) % 4) as u32).collect();
+                    assert_host_inversion_matches_expansion(segments, rows, &counts);
+                }
+            }
+        }
     }
 }
 
@@ -903,6 +1546,7 @@ fn unrepresentable_scan_total_has_a_distinct_geometry_status() {
             .upload_u32(&[DEAD_ROW_SENTINEL; CANDIDATE_RECORD_FIELDS])
             .unwrap(),
         child_body: context.upload_u32(&poison).unwrap(),
+        stage_profiles: None,
     };
     let inspection = arena.inspect();
     assert_eq!(inspection.status, STATUS_GEOMETRY);
@@ -1218,4 +1862,190 @@ fn non_present_arms_fail_host_admission_without_a_device_launch() {
         round.enqueue_present_proposals(&frontier, &choices, 8),
         Err(ResidentProposalError::UnsupportedProposer { .. })
     ));
+}
+
+struct ProposalBenchmarkSample {
+    candidate_method: cubecl::profile::TimingMethod,
+    candidate_seconds: f64,
+    child_body_method: cubecl::profile::TimingMethod,
+    child_body_seconds: f64,
+    wall_seconds: f64,
+}
+
+fn median(mut samples: Vec<f64>) -> f64 {
+    samples.sort_by(f64::total_cmp);
+    samples[samples.len() / 2]
+}
+
+fn measure_present_proposal_case(
+    entity_count: usize,
+    rows: usize,
+    seed: bool,
+    validate_contents: bool,
+) -> ProposalBenchmarkSample {
+    assert!(!seed || rows == 1);
+    let attribute = benchmark_id(1, 0);
+    let value = benchmark_id(2, 0);
+    let mut set = TribleSet::new();
+    for ordinal in 0..entity_count {
+        insert(&mut set, benchmark_id(0, ordinal as u64), attribute, value);
+    }
+    let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+    let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+    let v0 = ProgramVariable::new(0);
+    let v1 = ProgramVariable::new(1);
+    let v2 = ProgramVariable::new(2);
+    let (patterns, bound) = if seed {
+        (vec![QueryPattern::new(v0, v1, v2)], Vec::new())
+    } else {
+        (
+            vec![
+                QueryPattern::new(
+                    ProgramVariable::new(1),
+                    ProgramVariable::new(3),
+                    ProgramVariable::new(5),
+                ),
+                QueryPattern::new(
+                    ProgramVariable::new(0),
+                    ProgramVariable::new(2),
+                    ProgramVariable::new(4),
+                ),
+            ],
+            vec![
+                ProgramVariable::new(1),
+                ProgramVariable::new(3),
+                ProgramVariable::new(5),
+            ],
+        )
+    };
+    let variable_count = if seed { 3 } else { 6 };
+    let program = QueryProgram::compile(gpu.archive(), variable_count, patterns).unwrap();
+    let round = WgpuResidentRound::new(&gpu, &program, &bound).unwrap();
+    let host_frontier = if seed {
+        ProgramFrontier::seed()
+    } else {
+        let parent = [
+            program.encode(&raw(benchmark_id(0, 0))).unwrap().get(),
+            program.encode(&raw(attribute)).unwrap().get(),
+            program.encode(&raw(value)).unwrap().get(),
+        ];
+        program
+            .frontier_from_indices(
+                bound.clone(),
+                (0..rows).flat_map(|_| parent).collect(),
+                rows,
+            )
+            .unwrap()
+    };
+    let frontier = round.upload_frontier(&host_frontier).unwrap();
+    let entity_arm = round
+        .metadata()
+        .arms()
+        .iter()
+        .position(|identity| identity.target_variable() == v0)
+        .unwrap() as u32;
+    let choice_words: Vec<_> = (0..rows)
+        .flat_map(|_| [v0.index() as u32, entity_arm, entity_count as u32])
+        .collect();
+    let choices = round
+        .upload_choice_words_for_test(&frontier, &choice_words)
+        .unwrap();
+    let total = rows.checked_mul(entity_count).unwrap();
+
+    // Shader compilation and allocator warmup stay outside every sample.
+    let warm = round
+        .enqueue_present_proposals(&frontier, &choices, total)
+        .unwrap();
+    assert_eq!(warm.completion_fence(), total as u32);
+
+    const SAMPLES: usize = 5;
+    let mut candidate_seconds = Vec::with_capacity(SAMPLES);
+    let mut child_body_seconds = Vec::with_capacity(SAMPLES);
+    let mut candidate_method = None;
+    let mut child_body_method = None;
+    for sample in 0..SAMPLES {
+        let mut arena = round
+            .enqueue_present_proposals_profiled_for_benchmark(&frontier, &choices, total)
+            .unwrap();
+        let profiles = arena.resolve_stage_profiles();
+        assert_eq!(arena.completion_fence(), total as u32);
+        candidate_method = Some(profiles.candidate_method);
+        child_body_method = Some(profiles.child_body_method);
+        candidate_seconds.push(profiles.candidate_duration.as_secs_f64());
+        child_body_seconds.push(profiles.child_body_duration.as_secs_f64());
+
+        if validate_contents && sample == 0 {
+            let inspection = arena.inspect();
+            assert_success(&inspection, total);
+            let expected_codes: Vec<_> = (0..rows)
+                .flat_map(|_| {
+                    (0..entity_count).map(|ordinal| {
+                        program
+                            .encode(&raw(benchmark_id(0, ordinal as u64)))
+                            .unwrap()
+                            .get()
+                    })
+                })
+                .collect();
+            assert_eq!(&inspection.candidate_codes[..total], expected_codes);
+            assert_eq!(
+                &inspection.candidate_owners[..total],
+                &(0..rows as u32)
+                    .flat_map(|row| std::iter::repeat_n(row, entity_count))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(&inspection.proposer_arms[..total], &vec![entity_arm; total]);
+        }
+    }
+
+    let mut wall_seconds = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
+        let start = std::time::Instant::now();
+        let arena = round
+            .enqueue_present_proposals(&frontier, &choices, total)
+            .unwrap();
+        assert_eq!(arena.completion_fence(), total as u32);
+        wall_seconds.push(start.elapsed().as_secs_f64());
+    }
+
+    ProposalBenchmarkSample {
+        candidate_method: candidate_method.unwrap(),
+        candidate_seconds: median(candidate_seconds),
+        child_body_method: child_body_method.unwrap(),
+        child_body_seconds: median(child_body_seconds),
+        wall_seconds: median(wall_seconds),
+    }
+}
+
+#[test]
+#[ignore = "manual release-mode GPU benchmark"]
+fn benchmark_present_proposal_candidate_geometry() {
+    println!(
+        "case,rows,width,total,candidate_timing,candidate_us,candidate_mproposal_s,body_timing,body_us,body_mword_s,wall_us,wall_mproposal_s"
+    );
+    let mut validated = false;
+    let mut run = |label: &str, rows: usize, width: usize, seed: bool| {
+        let total = rows * width;
+        let sample = measure_present_proposal_case(width, rows, seed, !validated);
+        validated = true;
+        println!(
+            "{label},{rows},{width},{total},{},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3}",
+            sample.candidate_method,
+            sample.candidate_seconds * 1e6,
+            total as f64 / sample.candidate_seconds / 1e6,
+            sample.child_body_method,
+            sample.child_body_seconds * 1e6,
+            total as f64 * if seed { 1.0 } else { 4.0 } / sample.child_body_seconds / 1e6,
+            sample.wall_seconds * 1e6,
+            total as f64 / sample.wall_seconds / 1e6,
+        );
+    };
+
+    for exponent in 10..=18 {
+        run("seed_width", 1, 1usize << exponent, true);
+    }
+    const FIXED_TOTAL: usize = 1 << 18;
+    for rows in [1usize, 32, 64, 1024] {
+        run("fixed_total", rows, FIXED_TOTAL / rows, false);
+    }
 }
