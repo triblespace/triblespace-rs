@@ -229,6 +229,9 @@ enum PresentPublication {
 #[cfg(test)]
 struct ProposalStageProfiles {
     candidates: cubecl::profile::ProfileDuration,
+    destination_gate: cubecl::profile::ProfileDuration,
+    verdict_scan: cubecl::profile::ProfileDuration,
+    late_cleanup: cubecl::profile::ProfileDuration,
     child_body: cubecl::profile::ProfileDuration,
 }
 
@@ -598,9 +601,10 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
     }
 
     /// Runs the ordinary fully published arena while recording device profiles
-    /// around candidate emission and reference child materialization. The
-    /// resulting arena remains semantically identical to production; profiling
-    /// only changes command-pass boundaries in this ignored benchmark seam.
+    /// around candidate emission, structural publication stages, and reference
+    /// child materialization. The resulting arena remains semantically
+    /// identical to production; profiling only changes command-pass boundaries
+    /// in this ignored benchmark seam.
     #[cfg(test)]
     fn enqueue_present_proposals_profiled_for_benchmark(
         &self,
@@ -984,63 +988,105 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             None
         };
 
-        // Family generation is still private. Invert the canonical scan for
-        // every active destination and prove that the whole capacity tail is
-        // poison before publishing the arena's independent indirect record.
-        if capacity != 0 {
-            let dispatch =
-                context.static_batch_dispatch(capacity, capacity, CubeDim::new_1d(THREADS))?;
-            unsafe {
-                validate_proposal_destinations::launch_unchecked::<WgpuRuntime>(
-                    context.client(),
-                    dispatch.cube_count(),
-                    dispatch.cube_dim(),
-                    workspace.input_arg(),
-                    segment_records.input_arg(),
-                    candidate_records.input_arg(),
-                    planning_control.input_arg(),
-                    confirmation_workspace.output_arg(),
-                    inputs.rows as u32,
-                    admission.segment_count as u32,
-                    capacity as u32,
-                    domain,
-                    workspace_layout.row_arms as u32,
-                    workspace_layout.row_segments as u32,
-                    workspace_layout.row_counts as u32,
-                    workspace_layout.counts as u32,
-                    workspace_layout.local_offsets as u32,
-                    workspace_layout.block_offsets as u32,
-                    confirmation_layout.keep as u32,
-                    BLOCK_ITEMS,
-                    RESIDENT_U32_SENTINEL,
-                    STATUS_OK,
-                );
+        // Family generation is still private. Authenticate every generated
+        // owner against its unique canonical scan interval and prove that the
+        // whole capacity tail is poison before publishing the arena's
+        // independent indirect record.
+        let gate_rows = inputs.rows as u32;
+        let gate_segment_count = admission.segment_count as u32;
+        let gate_arm_count = self.metadata().arms().len() as u32;
+        let destination_gate_dispatch = if capacity != 0 {
+            Some(context.static_batch_dispatch(capacity, capacity, CubeDim::new_1d(THREADS))?)
+        } else {
+            None
+        };
+        let mut launch_destination_gate = || {
+            if let Some(dispatch) = &destination_gate_dispatch {
+                unsafe {
+                    validate_proposal_destinations::launch_unchecked::<WgpuRuntime>(
+                        context.client(),
+                        dispatch.cube_count(),
+                        dispatch.cube_dim(),
+                        workspace.input_arg(),
+                        candidate_records.input_arg(),
+                        planning_control.input_arg(),
+                        confirmation_workspace.output_arg(),
+                        gate_rows,
+                        gate_segment_count,
+                        capacity as u32,
+                        domain,
+                        gate_arm_count,
+                        workspace_layout.row_arms as u32,
+                        workspace_layout.row_segments as u32,
+                        workspace_layout.row_counts as u32,
+                        workspace_layout.counts as u32,
+                        workspace_layout.local_offsets as u32,
+                        workspace_layout.block_offsets as u32,
+                        confirmation_layout.keep as u32,
+                        BLOCK_ITEMS,
+                        RESIDENT_U32_SENTINEL,
+                        STATUS_OK,
+                    );
+                }
             }
-        }
-        if confirmation_layout.block_count != 0 {
-            let dispatch = context.static_batch_dispatch(
+        };
+        #[cfg(test)]
+        let destination_gate_profile = if _profile_stages {
+            let ((), profile) = context
+                .client()
+                .profile(launch_destination_gate, "resident destination gate")
+                .expect("CubeCL destination-gate profiling");
+            Some(profile)
+        } else {
+            launch_destination_gate();
+            None
+        };
+        #[cfg(not(test))]
+        launch_destination_gate();
+
+        let verdict_scan_dispatch = if confirmation_layout.block_count != 0 {
+            Some(context.static_batch_dispatch(
                 confirmation_layout.block_count,
                 confirmation_layout.block_count,
                 CubeDim::new_1d(1),
-            )?;
-            unsafe {
-                scan_confirmation_blocks::launch_unchecked::<WgpuRuntime>(
-                    context.client(),
-                    dispatch.cube_count(),
-                    dispatch.cube_dim(),
-                    confirmation_workspace.output_arg(),
-                    capacity as u32,
-                    confirmation_layout.block_count as u32,
-                    confirmation_layout.keep as u32,
-                    confirmation_layout.local_offsets as u32,
-                    confirmation_layout.block_sums as u32,
-                    confirmation_layout.block_errors as u32,
-                    BLOCK_ITEMS,
-                    RESIDENT_U32_SENTINEL,
-                    STATUS_DEVICE_INVARIANT,
-                );
+            )?)
+        } else {
+            None
+        };
+        let mut launch_verdict_scan = || {
+            if let Some(dispatch) = &verdict_scan_dispatch {
+                unsafe {
+                    scan_confirmation_blocks::launch_unchecked::<WgpuRuntime>(
+                        context.client(),
+                        dispatch.cube_count(),
+                        dispatch.cube_dim(),
+                        confirmation_workspace.output_arg(),
+                        capacity as u32,
+                        confirmation_layout.block_count as u32,
+                        confirmation_layout.keep as u32,
+                        confirmation_layout.local_offsets as u32,
+                        confirmation_layout.block_sums as u32,
+                        confirmation_layout.block_errors as u32,
+                        BLOCK_ITEMS,
+                        RESIDENT_U32_SENTINEL,
+                        STATUS_DEVICE_INVARIANT,
+                    );
+                }
             }
-        }
+        };
+        #[cfg(test)]
+        let verdict_scan_profile = if _profile_stages {
+            let ((), profile) = context
+                .client()
+                .profile(launch_verdict_scan, "resident destination verdict scan")
+                .expect("CubeCL destination-verdict profiling");
+            Some(profile)
+        } else {
+            launch_verdict_scan();
+            None
+        };
+        #[cfg(not(test))]
+        launch_verdict_scan();
         unsafe {
             finalize_proposal_destinations::launch_unchecked::<WgpuRuntime>(
                 context.client(),
@@ -1074,26 +1120,44 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 STATUS_OK,
             );
         }
-        if poison_len != 0 {
-            let dispatch =
-                context.static_batch_dispatch(poison_len, poison_len, CubeDim::new_1d(THREADS))?;
-            unsafe {
-                poison_failed_proposal_outputs::launch_unchecked::<WgpuRuntime>(
-                    context.client(),
-                    dispatch.cube_count(),
-                    dispatch.cube_dim(),
-                    control.input_arg(),
-                    segment_records.output_arg(),
-                    candidate_records.output_arg(),
-                    child_body.output_arg(),
-                    segment_record_words as u32,
-                    capacity as u32,
-                    child_words as u32,
-                    RESIDENT_U32_SENTINEL,
-                    STATUS_OK,
-                );
+        let late_cleanup_dispatch = if poison_len != 0 {
+            Some(context.static_batch_dispatch(poison_len, poison_len, CubeDim::new_1d(THREADS))?)
+        } else {
+            None
+        };
+        let mut launch_late_cleanup = || {
+            if let Some(dispatch) = &late_cleanup_dispatch {
+                unsafe {
+                    poison_failed_proposal_outputs::launch_unchecked::<WgpuRuntime>(
+                        context.client(),
+                        dispatch.cube_count(),
+                        dispatch.cube_dim(),
+                        control.input_arg(),
+                        segment_records.output_arg(),
+                        candidate_records.output_arg(),
+                        child_body.output_arg(),
+                        segment_record_words as u32,
+                        capacity as u32,
+                        child_words as u32,
+                        RESIDENT_U32_SENTINEL,
+                        STATUS_OK,
+                    );
+                }
             }
-        }
+        };
+        #[cfg(test)]
+        let late_cleanup_profile = if _profile_stages {
+            let ((), profile) = context
+                .client()
+                .profile(launch_late_cleanup, "resident late failure cleanup")
+                .expect("CubeCL late-cleanup profiling");
+            Some(profile)
+        } else {
+            launch_late_cleanup();
+            None
+        };
+        #[cfg(not(test))]
+        launch_late_cleanup();
 
         if pair_generation.is_some() {
             // Generic Pair admission stops at provisional publication. Child
@@ -1427,9 +1491,24 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                     _child_body: child_body,
                 })),
                 #[cfg(test)]
-                stage_profiles: match (candidate_profile, child_body_profile) {
-                    (Some(candidates), Some(child_body)) => Some(ProposalStageProfiles {
+                stage_profiles: match (
+                    candidate_profile,
+                    destination_gate_profile,
+                    verdict_scan_profile,
+                    late_cleanup_profile,
+                    child_body_profile,
+                ) {
+                    (
+                        Some(candidates),
+                        Some(destination_gate),
+                        Some(verdict_scan),
+                        Some(late_cleanup),
+                        Some(child_body),
+                    ) => Some(ProposalStageProfiles {
                         candidates,
+                        destination_gate,
+                        verdict_scan,
+                        late_cleanup,
                         child_body,
                     }),
                     _ => None,
@@ -1460,9 +1539,24 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             confirmation_layout,
             provisional_backing: None,
             #[cfg(test)]
-            stage_profiles: match (candidate_profile, child_body_profile) {
-                (Some(candidates), Some(child_body)) => Some(ProposalStageProfiles {
+            stage_profiles: match (
+                candidate_profile,
+                destination_gate_profile,
+                verdict_scan_profile,
+                late_cleanup_profile,
+                child_body_profile,
+            ) {
+                (
+                    Some(candidates),
+                    Some(destination_gate),
+                    Some(verdict_scan),
+                    Some(late_cleanup),
+                    Some(child_body),
+                ) => Some(ProposalStageProfiles {
                     candidates,
+                    destination_gate,
+                    verdict_scan,
+                    late_cleanup,
                     child_body,
                 }),
                 _ => None,
@@ -3222,7 +3316,6 @@ fn scatter_pair_candidates(
 #[allow(clippy::too_many_arguments, clippy::collapsible_if)]
 fn validate_proposal_destinations(
     workspace: &Array<u32>,
-    segment_records: &Array<u32>,
     candidate_records: &Array<u32>,
     planning_control: &Array<u32>,
     verdict_workspace: &mut Array<u32>,
@@ -3230,6 +3323,7 @@ fn validate_proposal_destinations(
     segment_count: u32,
     capacity: u32,
     domain: u32,
+    arm_count: u32,
     row_arms_base: u32,
     row_segments_base: u32,
     row_counts_base: u32,
@@ -3242,143 +3336,119 @@ fn validate_proposal_destinations(
     ok: u32,
 ) {
     let destination = ABSOLUTE_POS;
-    let verdict_word = verdict_base as usize + destination;
-    if destination < capacity as usize && verdict_word < verdict_workspace.len() {
-        let records_valid = capacity as usize * CANDIDATE_RECORD_FIELDS <= candidate_records.len();
-        let mut candidate = dead;
-        let mut owner = dead;
-        let mut proposer = dead;
-        if records_valid {
-            candidate = candidate_records[destination];
-            owner = candidate_records[capacity as usize + destination];
-            proposer = candidate_records[capacity as usize * 2usize + destination];
-        }
-
-        let mut verdict = dead;
-        if planning_control[CONTROL_STATUS] != ok {
-            if records_valid && candidate == dead && owner == dead && proposer == dead {
-                verdict = 0u32;
+    if destination < capacity as usize
+        && verdict_base != dead
+        && verdict_base as usize <= verdict_workspace.len()
+    {
+        let verdict_words = verdict_workspace.len() - verdict_base as usize;
+        if destination < verdict_words {
+            let verdict_word = verdict_base as usize + destination;
+            // Prove the planar record offsets before forming either one. The
+            // sentinel is the largest representable u32, so this also proves
+            // that every active record word is below it.
+            let records_valid = capacity <= dead / CANDIDATE_RECORD_FIELDS as u32
+                && capacity as usize * CANDIDATE_RECORD_FIELDS <= candidate_records.len();
+            let mut candidate = dead;
+            let mut owner = dead;
+            let mut proposer = dead;
+            if records_valid {
+                candidate = candidate_records[destination];
+                owner = candidate_records[capacity as usize + destination];
+                proposer = candidate_records[capacity as usize * 2usize + destination];
             }
-        } else {
-            let total = planning_control[CONTROL_REQUIRED];
-            if destination >= total as usize {
-                if records_valid && candidate == dead && owner == dead && proposer == dead {
-                    verdict = 0u32;
-                }
-            } else if rows != 0u32
-                && segment_count as usize <= segment_records.len() / SEGMENT_RECORD_WORDS
-            {
-                let destination_u32 = destination as u32;
-                let mut segment_lo = 0u32;
-                let mut segment_hi = segment_count;
-                while segment_lo < segment_hi {
-                    let segment_mid = segment_lo + (segment_hi - segment_lo) / 2u32;
-                    let record = segment_mid as usize * SEGMENT_RECORD_WORDS;
-                    let mut segment_end = dead;
-                    if record + 1usize < segment_records.len() {
-                        let base = segment_records[record];
-                        let count = segment_records[record + 1usize];
-                        if base != dead && count != dead && count < dead - base {
-                            segment_end = base + count;
-                        }
-                    }
-                    if segment_end <= destination_u32 {
-                        segment_lo = segment_mid + 1u32;
-                    } else {
-                        segment_hi = segment_mid;
-                    }
-                }
 
-                if segment_lo < segment_count {
-                    let segment = segment_lo;
-                    let record = segment as usize * SEGMENT_RECORD_WORDS;
-                    let segment_base = segment_records[record];
-                    let segment_width = segment_records[record + 1usize];
-                    let mut segment_end = dead;
-                    if segment_base != dead && segment_width != dead {
-                        if segment_width < dead - segment_base {
-                            segment_end = segment_base + segment_width;
-                        }
+            let mut verdict = dead;
+            if CONTROL_REQUIRED < planning_control.len() {
+                if planning_control[CONTROL_STATUS] != ok {
+                    if records_valid && candidate == dead && owner == dead && proposer == dead {
+                        verdict = 0u32;
                     }
-                    if destination_u32 >= segment_base && destination_u32 < segment_end {
-                        let mut row_lo = 0u32;
-                        let mut row_hi = rows;
-                        while row_lo < row_hi {
-                            let row_mid = row_lo + (row_hi - row_lo) / 2u32;
-                            let cell = segment as usize * rows as usize + row_mid as usize;
-                            let block = cell / block_items as usize;
-                            let mut cell_end = dead;
-                            if counts_base as usize + cell < workspace.len()
-                                && local_offsets_base as usize + cell < workspace.len()
-                                && block_offsets_base as usize + block < workspace.len()
+                } else {
+                    let total = planning_control[CONTROL_REQUIRED];
+                    if destination >= total as usize {
+                        if records_valid && candidate == dead && owner == dead && proposer == dead {
+                            verdict = 0u32;
+                        }
+                    } else if records_valid
+                        && candidate < domain
+                        && rows != 0u32
+                        && dead != 0u32
+                        && block_items != 0u32
+                        && owner < rows
+                        && row_arms_base != dead
+                        && row_segments_base != dead
+                        && row_counts_base != dead
+                        && row_arms_base as usize <= workspace.len()
+                        && row_segments_base as usize <= workspace.len()
+                        && row_counts_base as usize <= workspace.len()
+                    {
+                        let row = owner as usize;
+                        let arm_words = workspace.len() - row_arms_base as usize;
+                        let segment_words = workspace.len() - row_segments_base as usize;
+                        let count_words = workspace.len() - row_counts_base as usize;
+                        if row < arm_words && row < segment_words && row < count_words {
+                            let arm_word = row_arms_base as usize + row;
+                            let segment_word = row_segments_base as usize + row;
+                            let count_word = row_counts_base as usize + row;
+                            let arm = workspace[arm_word];
+                            let segment = workspace[segment_word];
+                            let retained_count = workspace[count_word];
+                            if arm < arm_count
+                                && proposer == arm
+                                && segment < segment_count
+                                && retained_count != dead
+                                // Exact guard for `segment * rows + owner < dead`.
+                                && segment <= (dead - 1u32 - owner) / rows
                             {
-                                let block_base = workspace[block_offsets_base as usize + block];
-                                let local = workspace[local_offsets_base as usize + cell];
-                                let count = workspace[counts_base as usize + cell];
-                                if block_base != dead && local != dead && count != dead {
-                                    if local < dead - block_base {
-                                        let start = block_base + local;
-                                        if count < dead - start {
-                                            cell_end = start + count;
+                                let cell_u32 = segment * rows + owner;
+                                let cell = cell_u32 as usize;
+                                let block = cell / block_items as usize;
+                                if counts_base != dead
+                                    && local_offsets_base != dead
+                                    && block_offsets_base != dead
+                                    && counts_base as usize <= workspace.len()
+                                    && local_offsets_base as usize <= workspace.len()
+                                    && block_offsets_base as usize <= workspace.len()
+                                {
+                                    let count_words = workspace.len() - counts_base as usize;
+                                    let local_words = workspace.len() - local_offsets_base as usize;
+                                    let block_words = workspace.len() - block_offsets_base as usize;
+                                    if cell < count_words
+                                        && cell < local_words
+                                        && block < block_words
+                                    {
+                                        let canonical_count =
+                                            workspace[counts_base as usize + cell];
+                                        let local = workspace[local_offsets_base as usize + cell];
+                                        let block_base =
+                                            workspace[block_offsets_base as usize + block];
+                                        if canonical_count != dead
+                                            && retained_count == canonical_count
+                                            && local != dead
+                                            && block_base != dead
+                                        {
+                                            if local < dead - block_base {
+                                                let start = block_base + local;
+                                                if canonical_count < dead - start {
+                                                    let end = start + canonical_count;
+                                                    let destination_u32 = destination as u32;
+                                                    if destination_u32 >= start
+                                                        && destination_u32 < end
+                                                    {
+                                                        verdict = 1u32;
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            if cell_end <= destination_u32 {
-                                row_lo = row_mid + 1u32;
-                            } else {
-                                row_hi = row_mid;
-                            }
-                        }
-
-                        if row_lo < rows {
-                            let row = row_lo;
-                            let cell = segment as usize * rows as usize + row as usize;
-                            let block = cell / block_items as usize;
-                            let mut cell_start = dead;
-                            let mut cell_end = dead;
-                            let mut cell_count = dead;
-                            if counts_base as usize + cell < workspace.len()
-                                && local_offsets_base as usize + cell < workspace.len()
-                                && block_offsets_base as usize + block < workspace.len()
-                            {
-                                let block_base = workspace[block_offsets_base as usize + block];
-                                let local = workspace[local_offsets_base as usize + cell];
-                                let count = workspace[counts_base as usize + cell];
-                                if block_base != dead && local != dead && count != dead {
-                                    if local < dead - block_base {
-                                        let start = block_base + local;
-                                        if count < dead - start {
-                                            cell_start = start;
-                                            cell_end = start + count;
-                                            cell_count = count;
-                                        }
-                                    }
-                                }
-                            }
-
-                            let arm_word = row_arms_base as usize + row as usize;
-                            let segment_word = row_segments_base as usize + row as usize;
-                            let count_word = row_counts_base as usize + row as usize;
-                            if destination_u32 >= cell_start
-                                && destination_u32 < cell_end
-                                && arm_word < workspace.len()
-                                && segment_word < workspace.len()
-                                && count_word < workspace.len()
-                                && candidate < domain
-                                && owner == row
-                                && proposer == workspace[arm_word]
-                                && workspace[segment_word] == segment
-                                && workspace[count_word] == cell_count
-                            {
-                                verdict = 1u32;
                             }
                         }
                     }
                 }
             }
+            verdict_workspace[verdict_word] = verdict;
         }
-        verdict_workspace[verdict_word] = verdict;
     }
 }
 
@@ -4366,6 +4436,12 @@ struct ProposalInspection {
 struct ResolvedProposalStageProfiles {
     candidate_method: cubecl::profile::TimingMethod,
     candidate_duration: cubecl::profile::Duration,
+    destination_gate_method: cubecl::profile::TimingMethod,
+    destination_gate_duration: cubecl::profile::Duration,
+    verdict_scan_method: cubecl::profile::TimingMethod,
+    verdict_scan_duration: cubecl::profile::Duration,
+    late_cleanup_method: cubecl::profile::TimingMethod,
+    late_cleanup_duration: cubecl::profile::Duration,
     child_body_method: cubecl::profile::TimingMethod,
     child_body_duration: cubecl::profile::Duration,
 }
@@ -4401,12 +4477,27 @@ impl WgpuResidentProposals {
             .expect("arena was not enqueued through the profiling seam");
         let candidate_method = profiles.candidates.timing_method();
         let candidate_duration = cubecl::future::block_on(profiles.candidates.resolve()).duration();
+        let destination_gate_method = profiles.destination_gate.timing_method();
+        let destination_gate_duration =
+            cubecl::future::block_on(profiles.destination_gate.resolve()).duration();
+        let verdict_scan_method = profiles.verdict_scan.timing_method();
+        let verdict_scan_duration =
+            cubecl::future::block_on(profiles.verdict_scan.resolve()).duration();
+        let late_cleanup_method = profiles.late_cleanup.timing_method();
+        let late_cleanup_duration =
+            cubecl::future::block_on(profiles.late_cleanup.resolve()).duration();
         let child_body_method = profiles.child_body.timing_method();
         let child_body_duration =
             cubecl::future::block_on(profiles.child_body.resolve()).duration();
         ResolvedProposalStageProfiles {
             candidate_method,
             candidate_duration,
+            destination_gate_method,
+            destination_gate_duration,
+            verdict_scan_method,
+            verdict_scan_duration,
+            late_cleanup_method,
+            late_cleanup_duration,
             child_body_method,
             child_body_duration,
         }

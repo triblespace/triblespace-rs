@@ -447,7 +447,6 @@ fn gate_direct(
                 launch.cube_count(),
                 launch.cube_dim(),
                 workspace.input_arg(),
-                segments.input_arg(),
                 candidates.input_arg(),
                 planning.input_arg(),
                 confirmation.output_arg(),
@@ -455,6 +454,7 @@ fn gate_direct(
                 segment_count as u32,
                 capacity as u32,
                 domain,
+                10,
                 workspace_layout.row_arms as u32,
                 workspace_layout.row_segments as u32,
                 workspace_layout.row_counts as u32,
@@ -605,6 +605,421 @@ fn canonical_gate_fixture() -> (WorkspaceLayout, Vec<u32>, Vec<u32>, Vec<u32>) {
     let dead = RESIDENT_U32_SENTINEL;
     let candidates = vec![0, 1, 2, dead, 0, 1, 2, dead, 7, 8, 9, dead];
     (layout, workspace, segments, candidates)
+}
+
+#[derive(Clone, Debug)]
+struct CanonicalGateModel {
+    rows: usize,
+    segments: usize,
+    counts: Vec<u32>,
+    prefixes: Vec<u32>,
+    row_arms: Vec<u32>,
+    row_segments: Vec<u32>,
+    row_counts: Vec<u32>,
+}
+
+impl CanonicalGateModel {
+    fn from_rows(
+        segments: usize,
+        row_arms: Vec<u32>,
+        row_segments: Vec<u32>,
+        row_counts: Vec<u32>,
+    ) -> Self {
+        let rows = row_arms.len();
+        assert_eq!(row_segments.len(), rows);
+        assert_eq!(row_counts.len(), rows);
+        assert!(segments != 0 || rows == 0);
+        let mut counts = vec![0; segments * rows];
+        for row in 0..rows {
+            let segment = row_segments[row] as usize;
+            assert!(segment < segments);
+            counts[segment * rows + row] = row_counts[row];
+        }
+        let mut prefixes: Vec<u32> = Vec::with_capacity(counts.len() + 1);
+        prefixes.push(0);
+        for &count in &counts {
+            prefixes.push(
+                prefixes
+                    .last()
+                    .copied()
+                    .unwrap()
+                    .checked_add(count)
+                    .unwrap(),
+            );
+        }
+        Self {
+            rows,
+            segments,
+            counts,
+            prefixes,
+            row_arms,
+            row_segments,
+            row_counts,
+        }
+    }
+
+    fn total(&self) -> u32 {
+        self.prefixes.last().copied().unwrap()
+    }
+
+    fn canonical_record(&self, destination: u32, domain: u32) -> [u32; 3] {
+        assert!(destination < self.total());
+        let cell = self
+            .prefixes
+            .windows(2)
+            .position(|window| destination < window[1])
+            .unwrap();
+        let row = cell % self.rows;
+        [destination % domain, row as u32, self.row_arms[row]]
+    }
+
+    fn slice(&self, range: std::ops::Range<usize>) -> Self {
+        Self::from_rows(
+            self.segments,
+            self.row_arms[range.clone()].to_vec(),
+            self.row_segments[range.clone()].to_vec(),
+            self.row_counts[range].to_vec(),
+        )
+    }
+
+    fn segment_route_shape(&self, owner_bias: u32) -> Vec<Vec<(u32, u32)>> {
+        (0..self.segments)
+            .map(|segment| {
+                (0..self.rows)
+                    .flat_map(|row| {
+                        std::iter::repeat_n(
+                            (owner_bias + row as u32, self.row_arms[row]),
+                            self.counts[segment * self.rows + row] as usize,
+                        )
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+}
+
+fn old_lower_bound_gate_verdict(
+    model: &CanonicalGateModel,
+    status: u32,
+    total: u32,
+    capacity: u32,
+    domain: u32,
+    destination: u32,
+    record: [u32; 3],
+) -> u32 {
+    let dead = RESIDENT_U32_SENTINEL;
+    if destination >= capacity {
+        return dead;
+    }
+    if status != STATUS_OK || destination >= total {
+        return if record == [dead; 3] { 0 } else { dead };
+    }
+    if model.rows == 0 || record[0] >= domain {
+        return dead;
+    }
+
+    let destination = destination as usize;
+    let segment = (0..model.segments)
+        .find(|segment| model.prefixes[(segment + 1) * model.rows] as usize > destination);
+    let Some(segment) = segment else {
+        return dead;
+    };
+    let row = (0..model.rows)
+        .find(|row| model.prefixes[segment * model.rows + row + 1] as usize > destination);
+    let Some(row) = row else {
+        return dead;
+    };
+    let cell = segment * model.rows + row;
+    let start = model.prefixes[cell] as usize;
+    let end = model.prefixes[cell + 1] as usize;
+    if destination >= start
+        && destination < end
+        && record[1] == row as u32
+        && record[2] == model.row_arms[row]
+        && model.row_segments[row] == segment as u32
+        && model.row_counts[row] == model.counts[cell]
+    {
+        1
+    } else {
+        dead
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn owner_indexed_gate_verdict(
+    model: &CanonicalGateModel,
+    status: u32,
+    total: u32,
+    capacity: u32,
+    domain: u32,
+    arm_count: u32,
+    destination: u32,
+    record: [u32; 3],
+) -> u32 {
+    let dead = RESIDENT_U32_SENTINEL;
+    if destination >= capacity {
+        return dead;
+    }
+    if status != STATUS_OK || destination >= total {
+        return if record == [dead; 3] { 0 } else { dead };
+    }
+    let row = record[1] as usize;
+    if record[0] >= domain || row >= model.rows {
+        return dead;
+    }
+    let arm = model.row_arms[row];
+    let segment = model.row_segments[row] as usize;
+    if arm >= arm_count
+        || record[2] != arm
+        || segment >= model.segments
+        || model.row_counts[row] == dead
+    {
+        return dead;
+    }
+    let Some(cell) = segment
+        .checked_mul(model.rows)
+        .and_then(|cell| cell.checked_add(row))
+    else {
+        return dead;
+    };
+    let Some((&count, prefix)) = model
+        .counts
+        .get(cell)
+        .zip(model.prefixes.get(cell..=cell + 1))
+    else {
+        return dead;
+    };
+    let start = prefix[0];
+    let end = prefix[1];
+    if model.row_counts[row] == count && destination >= start && destination < end {
+        1
+    } else {
+        dead
+    }
+}
+
+fn deterministic_gate_model(rows: usize, segments: usize, mut state: u64) -> CanonicalGateModel {
+    let mut row_arms = Vec::with_capacity(rows);
+    let mut row_segments = Vec::with_capacity(rows);
+    let mut row_counts = Vec::with_capacity(rows);
+    for row in 0..rows {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        row_arms.push(((state + row as u64) % 10) as u32);
+        row_segments.push(((state.rotate_left(19) + row as u64) % segments as u64) as u32);
+        // Include empty cells and duplicate-width runs around every scan edge.
+        row_counts.push(((state.rotate_left(41) + row as u64) % 4) as u32);
+    }
+    CanonicalGateModel::from_rows(segments, row_arms, row_segments, row_counts)
+}
+
+#[test]
+fn owner_indexed_gate_matches_old_lower_bound_on_canonical_matrices() {
+    const DOMAIN: u32 = 4096;
+    const ARM_COUNT: u32 = 10;
+    for rows in [0usize, 1, 2, 63, 64, 65] {
+        for segments in 1usize..=5 {
+            for seed in 0u64..32 {
+                let model = deterministic_gate_model(rows, segments, seed + 1);
+                let total = model.total();
+                let capacity = total + 1;
+                for destination in 0..total {
+                    let record = model.canonical_record(destination, DOMAIN);
+                    assert_eq!(
+                        owner_indexed_gate_verdict(
+                            &model,
+                            STATUS_OK,
+                            total,
+                            capacity,
+                            DOMAIN,
+                            ARM_COUNT,
+                            destination,
+                            record,
+                        ),
+                        old_lower_bound_gate_verdict(
+                            &model,
+                            STATUS_OK,
+                            total,
+                            capacity,
+                            DOMAIN,
+                            destination,
+                            record,
+                        ),
+                        "rows={rows} segments={segments} seed={seed} destination={destination}"
+                    );
+                }
+                for (status, destination) in [(STATUS_OK, total), (STATUS_CAPACITY, 0)] {
+                    assert_eq!(
+                        owner_indexed_gate_verdict(
+                            &model,
+                            status,
+                            total,
+                            capacity,
+                            DOMAIN,
+                            ARM_COUNT,
+                            destination,
+                            [RESIDENT_U32_SENTINEL; 3],
+                        ),
+                        old_lower_bound_gate_verdict(
+                            &model,
+                            status,
+                            total,
+                            capacity,
+                            DOMAIN,
+                            destination,
+                            [RESIDENT_U32_SENTINEL; 3],
+                        )
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn owner_indexed_gate_faults_and_row_splits_preserve_the_proof_boundary() {
+    const DOMAIN: u32 = 4096;
+    const ARM_COUNT: u32 = 10;
+    let model = deterministic_gate_model(65, 4, 0x5eed);
+    assert!(model.row_counts.contains(&0));
+    assert!(model.row_counts.iter().any(|&count| count != 0));
+    let total = model.total();
+    let capacity = total + 1;
+    for destination in 0..total {
+        let record = model.canonical_record(destination, DOMAIN);
+        let owner = record[1] as usize;
+        let mut faults = Vec::new();
+        let mut wrong_owner = record;
+        wrong_owner[1] = ((owner + 1) % model.rows) as u32;
+        faults.push(("wrong owner", model.clone(), wrong_owner));
+        let owner_segment = model.row_segments[owner];
+        let same_segment_owner = (0..model.rows)
+            .find(|&row| row != owner && model.row_segments[row] == owner_segment)
+            .unwrap();
+        let mut wrong_owner_same_segment = record;
+        wrong_owner_same_segment[1] = same_segment_owner as u32;
+        faults.push((
+            "wrong owner in the same segment",
+            model.clone(),
+            wrong_owner_same_segment,
+        ));
+        let other_segment_owner = (0..model.rows)
+            .find(|&row| model.row_segments[row] != owner_segment)
+            .unwrap();
+        let mut wrong_owner_other_segment = record;
+        wrong_owner_other_segment[1] = other_segment_owner as u32;
+        faults.push((
+            "wrong owner in another segment",
+            model.clone(),
+            wrong_owner_other_segment,
+        ));
+        let mut out_of_range_owner = record;
+        out_of_range_owner[1] = model.rows as u32;
+        faults.push(("out-of-range owner", model.clone(), out_of_range_owner));
+        let mut wrong_proposer = record;
+        wrong_proposer[2] = (record[2] + 1) % ARM_COUNT;
+        faults.push(("wrong proposer", model.clone(), wrong_proposer));
+        let mut wrong_segment = model.clone();
+        wrong_segment.row_segments[owner] = (wrong_segment.row_segments[owner] + 1) % 4;
+        faults.push(("wrong retained segment", wrong_segment, record));
+        let mut wrong_count = model.clone();
+        wrong_count.row_counts[owner] += 1;
+        faults.push(("wrong retained count", wrong_count, record));
+
+        for (name, faulty_model, faulty_record) in faults {
+            let old = old_lower_bound_gate_verdict(
+                &faulty_model,
+                STATUS_OK,
+                total,
+                capacity,
+                DOMAIN,
+                destination,
+                faulty_record,
+            );
+            let owner_indexed = owner_indexed_gate_verdict(
+                &faulty_model,
+                STATUS_OK,
+                total,
+                capacity,
+                DOMAIN,
+                ARM_COUNT,
+                destination,
+                faulty_record,
+            );
+            assert_eq!(owner_indexed, old, "{name} at destination {destination}");
+            assert_eq!(owner_indexed, RESIDENT_U32_SENTINEL, "{name}");
+        }
+    }
+
+    // Explicit arm-range authentication is a strengthening over the old
+    // lower-bound kernel on otherwise coherent retained words.
+    let destination = 0;
+    let record = model.canonical_record(destination, DOMAIN);
+    let owner = record[1] as usize;
+    let mut out_of_range_arm = model.clone();
+    out_of_range_arm.row_arms[owner] = ARM_COUNT;
+    let coherent_record = [record[0], record[1], ARM_COUNT];
+    assert_eq!(
+        old_lower_bound_gate_verdict(
+            &out_of_range_arm,
+            STATUS_OK,
+            total,
+            capacity,
+            DOMAIN,
+            destination,
+            coherent_record,
+        ),
+        1
+    );
+    assert_eq!(
+        owner_indexed_gate_verdict(
+            &out_of_range_arm,
+            STATUS_OK,
+            total,
+            capacity,
+            DOMAIN,
+            ARM_COUNT,
+            destination,
+            coherent_record,
+        ),
+        RESIDENT_U32_SENTINEL
+    );
+
+    for split in [0usize, 1, 32, 63, 64, 65] {
+        let left = model.slice(0..split);
+        let right = model.slice(split..model.rows);
+        let mut joined = left.segment_route_shape(0);
+        for (segment, right_routes) in right
+            .segment_route_shape(split as u32)
+            .into_iter()
+            .enumerate()
+        {
+            joined[segment].extend(right_routes);
+        }
+        assert_eq!(joined, model.segment_route_shape(0), "split {split}");
+
+        for half in [&left, &right] {
+            let half_total = half.total();
+            for half_destination in 0..half_total {
+                let half_record = half.canonical_record(half_destination, DOMAIN);
+                assert_eq!(
+                    owner_indexed_gate_verdict(
+                        half,
+                        STATUS_OK,
+                        half_total,
+                        half_total,
+                        DOMAIN,
+                        ARM_COUNT,
+                        half_destination,
+                        half_record,
+                    ),
+                    1,
+                    "split {split}, local destination {half_destination}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -3388,7 +3803,7 @@ fn generic_admission_authenticates_same_target_pair_rotation_independently() {
 }
 
 #[test]
-fn shared_destination_gate_rejects_every_identity_and_completeness_fault() {
+fn shared_destination_gate_rejects_every_structural_route_and_completeness_fault() {
     let (layout, workspace, segments, canonical) = canonical_gate_fixture();
     let valid = gate_direct(
         [STATUS_OK, 3, 1, 1],
@@ -3406,6 +3821,25 @@ fn shared_destination_gate_rejects_every_identity_and_completeness_fault() {
     assert_eq!(valid.logical_len, 3);
     assert_eq!(valid.verdicts, [1, 1, 1, 0]);
     assert_eq!(valid.indirect_marker, 1);
+
+    // Exact family semantics deliberately stay outside this shared proof:
+    // a different in-domain code on the same authenticated route is accepted.
+    let mut semantically_wrong_but_structural = canonical.clone();
+    semantically_wrong_but_structural[0] = 1;
+    let structural_only = gate_direct(
+        [STATUS_OK, 3, 1, 1],
+        &workspace,
+        layout,
+        3,
+        1,
+        4,
+        3,
+        &segments,
+        &semantically_wrong_but_structural,
+        &[55; 4],
+    );
+    assert_eq!(&structural_only.control[..2], &[STATUS_OK, 3]);
+    assert_eq!(structural_only.verdicts, [1, 1, 1, 0]);
 
     let mut faults = Vec::new();
     let mut middle_hole = canonical.clone();
@@ -3514,6 +3948,210 @@ fn shared_destination_gate_rejects_every_identity_and_completeness_fault() {
     assert_eq!(&exact_capacity.control[..2], &[STATUS_OK, 3]);
     assert_eq!(exact_capacity.verdicts, [1, 1, 1]);
     assert_eq!(exact_capacity.indirect_marker, 1);
+}
+
+#[test]
+fn owner_indexed_device_gate_rejects_range_sentinel_and_cell_overflow_faults() {
+    let (layout, workspace, segments, canonical) = canonical_gate_fixture();
+    let assert_failed = |name: &str,
+                         malformed_workspace: &[u32],
+                         malformed_layout: WorkspaceLayout,
+                         segment_count: usize,
+                         malformed_candidates: &[u32]| {
+        let failed = gate_direct(
+            [STATUS_OK, 3, 1, 1],
+            malformed_workspace,
+            malformed_layout,
+            3,
+            segment_count,
+            4,
+            3,
+            &segments,
+            malformed_candidates,
+            &[55; 4],
+        );
+        assert_eq!(
+            &failed.control[..2],
+            &[STATUS_DEVICE_INVARIANT, RESIDENT_U32_SENTINEL],
+            "{name}"
+        );
+        assert_eq!(failed.logical_len, 0, "{name}");
+        assert_eq!(failed.indirect_marker, 0, "{name}");
+    };
+
+    let mut out_of_range_arm_workspace = workspace.clone();
+    out_of_range_arm_workspace[layout.row_arms] = 10;
+    let mut out_of_range_arm_candidates = canonical.clone();
+    out_of_range_arm_candidates[8] = 10;
+    assert_failed(
+        "coherent out-of-range arm",
+        &out_of_range_arm_workspace,
+        layout,
+        1,
+        &out_of_range_arm_candidates,
+    );
+
+    let mut overflowing_cell_workspace = workspace.clone();
+    overflowing_cell_workspace[layout.row_segments] = RESIDENT_U32_SENTINEL - 1;
+    assert_failed(
+        "segment times rows overflows the non-sentinel cell domain",
+        &overflowing_cell_workspace,
+        layout,
+        RESIDENT_U32_SENTINEL as usize,
+        &canonical,
+    );
+
+    let mut dead_owner_candidates = canonical.clone();
+    dead_owner_candidates[4] = RESIDENT_U32_SENTINEL;
+    assert_failed("dead owner", &workspace, layout, 1, &dead_owner_candidates);
+    let mut out_of_range_segment_workspace = workspace.clone();
+    out_of_range_segment_workspace[layout.row_segments] = 1;
+    assert_failed(
+        "out-of-range retained segment",
+        &out_of_range_segment_workspace,
+        layout,
+        1,
+        &canonical,
+    );
+
+    let mut malformed_values = Vec::new();
+    let mut dead_canonical_count = workspace.clone();
+    dead_canonical_count[layout.counts] = RESIDENT_U32_SENTINEL;
+    malformed_values.push(("dead canonical count", dead_canonical_count));
+    let mut dead_local = workspace.clone();
+    dead_local[layout.local_offsets] = RESIDENT_U32_SENTINEL;
+    malformed_values.push(("dead local prefix", dead_local));
+    let mut dead_block = workspace.clone();
+    dead_block[layout.block_offsets] = RESIDENT_U32_SENTINEL;
+    malformed_values.push(("dead block prefix", dead_block));
+    let mut overflowing_local = workspace.clone();
+    overflowing_local[layout.block_offsets] = RESIDENT_U32_SENTINEL - 2;
+    overflowing_local[layout.local_offsets] = 2;
+    malformed_values.push(("local plus block reaches sentinel", overflowing_local));
+    let mut overflowing_count = workspace.clone();
+    overflowing_count[layout.block_offsets] = RESIDENT_U32_SENTINEL - 2;
+    overflowing_count[layout.local_offsets] = 1;
+    malformed_values.push(("count plus start reaches sentinel", overflowing_count));
+    for (name, malformed_workspace) in malformed_values {
+        assert_failed(name, &malformed_workspace, layout, 1, &canonical);
+    }
+
+    let dead = RESIDENT_U32_SENTINEL as usize;
+    let mut malformed_layouts = Vec::new();
+    let mut sentinel_arm_base = layout;
+    sentinel_arm_base.row_arms = dead;
+    malformed_layouts.push(("sentinel arm base", sentinel_arm_base));
+    let mut sentinel_segment_base = layout;
+    sentinel_segment_base.row_segments = dead;
+    malformed_layouts.push(("sentinel segment base", sentinel_segment_base));
+    let mut sentinel_count_base = layout;
+    sentinel_count_base.row_counts = dead;
+    malformed_layouts.push(("sentinel retained-count base", sentinel_count_base));
+    let mut sentinel_canonical_count_base = layout;
+    sentinel_canonical_count_base.counts = dead;
+    malformed_layouts.push((
+        "sentinel canonical-count base",
+        sentinel_canonical_count_base,
+    ));
+    let mut sentinel_local_base = layout;
+    sentinel_local_base.local_offsets = dead;
+    malformed_layouts.push(("sentinel local-prefix base", sentinel_local_base));
+    let mut sentinel_block_base = layout;
+    sentinel_block_base.block_offsets = dead;
+    malformed_layouts.push(("sentinel block-prefix base", sentinel_block_base));
+    let mut exhausted_row_base = layout;
+    exhausted_row_base.row_arms = workspace.len();
+    malformed_layouts.push(("row base with no remaining words", exhausted_row_base));
+
+    for (name, malformed_layout) in malformed_layouts {
+        assert_failed(name, &workspace, malformed_layout, 1, &canonical);
+    }
+
+    let poison_candidates = vec![RESIDENT_U32_SENTINEL; 4 * CANDIDATE_RECORD_FIELDS];
+    let zero_rows = gate_direct(
+        [STATUS_OK, 0, 99, 99],
+        &workspace,
+        layout,
+        0,
+        0,
+        4,
+        3,
+        &segments,
+        &poison_candidates,
+        &[55; 4],
+    );
+    assert_eq!(&zero_rows.control[..2], &[STATUS_OK, 0]);
+    assert_eq!(zero_rows.verdicts, [0, 0, 0, 0]);
+    assert_eq!(zero_rows.indirect_marker, 0);
+
+    // Isolate the validator from failure cleanup so malformed buffer shapes
+    // can prove fail-closed bounds without asking a downstream poison kernel
+    // to write the deliberately truncated candidate planes.
+    let validate_only = |planning_words: &[u32],
+                         candidate_words: &[u32],
+                         verdict_base: u32,
+                         initial_verdicts: &[u32]| {
+        let context = crate::WgpuContext::on_wgpu();
+        let workspace = context.upload_u32(&workspace).unwrap();
+        let candidates = context.upload_u32(candidate_words).unwrap();
+        let planning = context.upload_u32(planning_words).unwrap();
+        let mut verdicts = context.upload_u32(initial_verdicts).unwrap();
+        let launch = context
+            .static_batch_dispatch(4, 4, CubeDim::new_1d(THREADS))
+            .unwrap();
+        unsafe {
+            validate_proposal_destinations::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                launch.cube_count(),
+                launch.cube_dim(),
+                workspace.input_arg(),
+                candidates.input_arg(),
+                planning.input_arg(),
+                verdicts.output_arg(),
+                3,
+                1,
+                4,
+                3,
+                10,
+                layout.row_arms as u32,
+                layout.row_segments as u32,
+                layout.row_counts as u32,
+                layout.counts as u32,
+                layout.local_offsets as u32,
+                layout.block_offsets as u32,
+                verdict_base,
+                BLOCK_ITEMS,
+                RESIDENT_U32_SENTINEL,
+                STATUS_OK,
+            );
+        }
+        verdicts.read()
+    };
+    assert_eq!(
+        validate_only(
+            &[STATUS_OK, 3, 1, 1],
+            &canonical[..canonical.len() - 1],
+            0,
+            &[0; 4],
+        ),
+        [RESIDENT_U32_SENTINEL; 4],
+        "truncated candidate-record storage must fail every lane closed"
+    );
+    assert_eq!(
+        validate_only(&[STATUS_OK], &canonical, 0, &[0; 4]),
+        [RESIDENT_U32_SENTINEL; 4],
+        "truncated planning control must fail every lane closed"
+    );
+    assert_eq!(
+        validate_only(
+            &[STATUS_OK, 3, 1, 1],
+            &canonical,
+            RESIDENT_U32_SENTINEL,
+            &[42; 4],
+        ),
+        [42; 4],
+        "sentinel verdict base must form no output address"
+    );
 }
 
 #[test]
@@ -3735,6 +4373,12 @@ fn destination_finalizer_rejects_equal_total_with_a_hole_and_live_tail() {
 struct ProposalBenchmarkSample {
     candidate_method: cubecl::profile::TimingMethod,
     candidate_seconds: f64,
+    destination_gate_method: cubecl::profile::TimingMethod,
+    destination_gate_seconds: f64,
+    verdict_scan_method: cubecl::profile::TimingMethod,
+    verdict_scan_seconds: f64,
+    late_cleanup_method: cubecl::profile::TimingMethod,
+    late_cleanup_seconds: f64,
     child_body_method: cubecl::profile::TimingMethod,
     child_body_seconds: f64,
     wall_seconds: f64,
@@ -3828,8 +4472,14 @@ fn measure_present_proposal_case(
 
     const SAMPLES: usize = 5;
     let mut candidate_seconds = Vec::with_capacity(SAMPLES);
+    let mut destination_gate_seconds = Vec::with_capacity(SAMPLES);
+    let mut verdict_scan_seconds = Vec::with_capacity(SAMPLES);
+    let mut late_cleanup_seconds = Vec::with_capacity(SAMPLES);
     let mut child_body_seconds = Vec::with_capacity(SAMPLES);
     let mut candidate_method = None;
+    let mut destination_gate_method = None;
+    let mut verdict_scan_method = None;
+    let mut late_cleanup_method = None;
     let mut child_body_method = None;
     for sample in 0..SAMPLES {
         let mut arena = round
@@ -3838,8 +4488,14 @@ fn measure_present_proposal_case(
         let profiles = arena.resolve_stage_profiles();
         assert_eq!(arena.completion_fence(), total as u32);
         candidate_method = Some(profiles.candidate_method);
+        destination_gate_method = Some(profiles.destination_gate_method);
+        verdict_scan_method = Some(profiles.verdict_scan_method);
+        late_cleanup_method = Some(profiles.late_cleanup_method);
         child_body_method = Some(profiles.child_body_method);
         candidate_seconds.push(profiles.candidate_duration.as_secs_f64());
+        destination_gate_seconds.push(profiles.destination_gate_duration.as_secs_f64());
+        verdict_scan_seconds.push(profiles.verdict_scan_duration.as_secs_f64());
+        late_cleanup_seconds.push(profiles.late_cleanup_duration.as_secs_f64());
         child_body_seconds.push(profiles.child_body_duration.as_secs_f64());
 
         if validate_contents && sample == 0 {
@@ -3879,6 +4535,12 @@ fn measure_present_proposal_case(
     ProposalBenchmarkSample {
         candidate_method: candidate_method.unwrap(),
         candidate_seconds: median(candidate_seconds),
+        destination_gate_method: destination_gate_method.unwrap(),
+        destination_gate_seconds: median(destination_gate_seconds),
+        verdict_scan_method: verdict_scan_method.unwrap(),
+        verdict_scan_seconds: median(verdict_scan_seconds),
+        late_cleanup_method: late_cleanup_method.unwrap(),
+        late_cleanup_seconds: median(late_cleanup_seconds),
         child_body_method: child_body_method.unwrap(),
         child_body_seconds: median(child_body_seconds),
         wall_seconds: median(wall_seconds),
@@ -3889,7 +4551,7 @@ fn measure_present_proposal_case(
 #[ignore = "manual release-mode GPU benchmark"]
 fn benchmark_present_proposal_candidate_geometry() {
     println!(
-        "case,rows,width,total,candidate_timing,candidate_us,candidate_mproposal_s,body_timing,body_us,body_mword_s,wall_us,wall_mproposal_s"
+        "case,rows,width,total,candidate_timing,candidate_us,candidate_mproposal_s,gate_timing,gate_us,gate_mproposal_s,verdict_scan_timing,verdict_scan_us,cleanup_timing,cleanup_us,body_timing,body_us,body_mword_s,wall_us,wall_mproposal_s"
     );
     let mut validated = false;
     let mut run = |label: &str, rows: usize, width: usize, seed: bool| {
@@ -3897,10 +4559,17 @@ fn benchmark_present_proposal_candidate_geometry() {
         let sample = measure_present_proposal_case(width, rows, seed, !validated);
         validated = true;
         println!(
-            "{label},{rows},{width},{total},{},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3}",
+            "{label},{rows},{width},{total},{},{:.3},{:.3},{},{:.3},{:.3},{},{:.3},{},{:.3},{},{:.3},{:.3},{:.3},{:.3}",
             sample.candidate_method,
             sample.candidate_seconds * 1e6,
             total as f64 / sample.candidate_seconds / 1e6,
+            sample.destination_gate_method,
+            sample.destination_gate_seconds * 1e6,
+            total as f64 / sample.destination_gate_seconds / 1e6,
+            sample.verdict_scan_method,
+            sample.verdict_scan_seconds * 1e6,
+            sample.late_cleanup_method,
+            sample.late_cleanup_seconds * 1e6,
             sample.child_body_method,
             sample.child_body_seconds * 1e6,
             total as f64 * if seed { 1.0 } else { 4.0 } / sample.child_body_seconds / 1e6,
