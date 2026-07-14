@@ -4271,6 +4271,61 @@ mod tests {
 
     #[cfg(feature = "parallel")]
     #[test]
+    fn parallel_split_clears_live_continuation_without_losing_affine_rows() {
+        let root = ShapeLeaf(0);
+        let plan = ResidualPlan::compile(&root);
+        let influences = [VariableSet::new_empty(); 128];
+        let base_estimates = [usize::MAX; 128];
+        let expected: Vec<_> = (0..6).map(raw).collect();
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        let continuation = file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            plan.len(),
+            ready_desc(1),
+            StateBucket::Rows(RowBatch {
+                rows: expected.clone(),
+                row_count: expected.len(),
+            }),
+            &mut machine.stats,
+        )
+        .expect("fixture files a live continuation cohort");
+        machine.continuation = Some(continuation);
+
+        let mut right = machine
+            .split_for_parallel(&root, &plan, &influences, &base_estimates)
+            .expect("six continuation rows are splittable");
+        assert!(machine.continuation.is_none());
+        assert!(right.continuation.is_none());
+
+        let project = |binding: &Binding| binding.get(0).copied();
+        let drain = |machine: &mut ResidualStateMachine| {
+            std::iter::from_fn(|| {
+                machine.pull(&root, &plan, &project, &influences, &base_estimates)
+            })
+            .collect::<Vec<_>>()
+        };
+        let left_rows = drain(&mut machine);
+        let right_rows = drain(&mut right);
+        assert!(!left_rows.is_empty());
+        assert!(!right_rows.is_empty());
+        let mut actual = left_rows;
+        actual.extend(right_rows);
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
+
+        for stats in [&machine.stats, &right.stats] {
+            assert!(stats.state_pops > 0);
+            assert_eq!(
+                stats.state_pops,
+                stats.full_pops + stats.readiness_pops + stats.continuation_pops,
+                "every shard pop has exactly one physical selection policy"
+            );
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
     fn parallel_atomic_custom_and_union_keep_parent_run_whole() {
         let whole_calls = Arc::new(Mutex::new(Vec::new()));
         let suffix_calls = Arc::new(Mutex::new(Vec::new()));
