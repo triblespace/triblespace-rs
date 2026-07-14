@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::*;
+use crate::resident_ordered_oracle::witnessed_transition;
 use jerky::bit_vector::{Rank, Select};
 use triblespace_core::blob::encodings::succinctarchive::query_program::{
     ProgramFrontier, QueryPattern, QueryProgram, QueryTerm,
@@ -367,6 +368,105 @@ fn assert_success(inspection: &ProposalInspection, expected: usize) {
         inspection.capacity as usize,
         inspection.candidate_codes.len()
     );
+}
+
+/// Runs the real wired planner and compares confirmed publication against the
+/// CPU transition, including stable variable grouping, parent multiplicity,
+/// child bytes, candidate order, and poison tails. Proposer identity is a
+/// planner witness rather than part of `QueryProgram::transition`, so it is
+/// authenticated against the exact relevant-arm slice instead of guessed.
+fn assert_wired_matches_cpu(
+    wired: &WgpuResidentWiredRound<'_, OrderedUniverse>,
+    program: &QueryProgram<'_, OrderedUniverse>,
+    parent: &ProgramFrontier,
+    capacity_slack: usize,
+) -> ProposalInspection {
+    let expected = witnessed_transition(program, 0, parent, 0).unwrap();
+    let expected_count = expected
+        .iter()
+        .map(|segment| segment.frontier.len())
+        .sum::<usize>();
+    let resident = wired.upload_frontier(parent).unwrap();
+    let inspection = wired
+        .enqueue(&resident, expected_count + capacity_slack)
+        .unwrap()
+        .inspect();
+    assert_success(&inspection, expected_count);
+
+    let expected_variables = expected
+        .iter()
+        .map(|segment| segment.variable.unwrap())
+        .collect::<BTreeSet<_>>();
+    for record in &inspection.segments {
+        let variable = ProgramVariable::new(record.variable as u8);
+        if !expected_variables.contains(&variable) {
+            assert_eq!(record.count, 0, "unexpected live variable {variable:?}");
+        }
+    }
+
+    for segment in expected {
+        let variable = segment.variable.unwrap();
+        let record = inspection
+            .segments
+            .iter()
+            .find(|record| record.variable == variable.index() as u32)
+            .expect("wired publication contains every unbound-variable segment");
+        let start = record.base as usize;
+        let end = start + record.count as usize;
+        assert_eq!(end - start, segment.frontier.len());
+        assert_eq!(
+            &inspection.candidate_codes[start..end],
+            &segment
+                .candidates
+                .iter()
+                .map(|candidate| candidate.code.get())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            &inspection.candidate_owners[start..end],
+            &segment
+                .candidates
+                .iter()
+                .map(|candidate| candidate.parent_row as u32)
+                .collect::<Vec<_>>()
+        );
+        let body_start = start * inspection.child_stride as usize;
+        let body_end = end * inspection.child_stride as usize;
+        assert_eq!(
+            &inspection.child_body[body_start..body_end],
+            &segment
+                .frontier
+                .values()
+                .iter()
+                .map(|code| code.get())
+                .collect::<Vec<_>>()
+        );
+
+        let relevant = wired
+            .staged_round()
+            .metadata()
+            .relevant_arm_ids(variable)
+            .unwrap();
+        for &proposer in &inspection.proposer_arms[start..end] {
+            assert!(relevant.contains(&proposer));
+            assert_eq!(
+                wired.staged_round().metadata().arms()[proposer as usize].target_variable(),
+                variable
+            );
+        }
+    }
+
+    assert!(inspection.candidate_codes[expected_count..]
+        .iter()
+        .chain(&inspection.candidate_owners[expected_count..])
+        .chain(&inspection.proposer_arms[expected_count..])
+        .all(|&word| word == RESIDENT_U32_SENTINEL));
+    assert!(
+        inspection.child_body[expected_count * inspection.child_stride as usize..]
+            .iter()
+            .all(|&word| word == RESIDENT_U32_SENTINEL)
+    );
+    inspection
 }
 
 fn pair_axes(rotation: SuccinctRotation) -> (ProgramVariable, ProgramVariable) {
@@ -916,6 +1016,13 @@ fn confirmed_physical_restricted_all_six_rotations_match_cpu_selected_rows() {
             .iter()
             .map(|code| code.get())
             .collect::<Vec<_>>();
+        let wired =
+            WgpuResidentWiredRound::new(&gpu, &program, &[first_variable, last_variable]).unwrap();
+        assert_eq!(
+            proposer_policy_for_specs(wired.staged_round().proposal_arm_specs()),
+            ProposerPolicy::RestrictedNatural
+        );
+        let wired_inspection = assert_wired_matches_cpu(&wired, &program, &host, 0);
 
         let frontier = round.upload_frontier(&host).unwrap();
         let inputs = round.initialize_inputs(&frontier).unwrap();
@@ -944,6 +1051,10 @@ fn confirmed_physical_restricted_all_six_rotations_match_cpu_selected_rows() {
         let trace = arena.read_semantic_confirmation_work_for_test();
         assert_eq!(trace[arm], [(expected * 2) as u32, pairs.len() as u32]);
         let inspection = arena.inspect();
+        assert_eq!(
+            wired_inspection, inspection,
+            "wired planner diverged from canonical Restricted choice for {rotation:?}"
+        );
         assert_success(&inspection, expected);
         assert_eq!(inspection.child_body, cpu_body, "{rotation:?}");
         assert_eq!(inspection.candidate_owners, expected_owners, "{rotation:?}");
@@ -1403,6 +1514,31 @@ fn confirmed_mixed_present_pair_restricted_is_stable_and_row_homomorphic() {
     let host = program
         .frontier_from_indices(vec![entity_peer, attribute_peer], parent_values, ROWS)
         .unwrap();
+    let wired =
+        WgpuResidentWiredRound::new(&gpu, &program, &[entity_peer, attribute_peer]).unwrap();
+    assert_eq!(
+        proposer_policy_for_specs(wired.staged_round().proposal_arm_specs()),
+        ProposerPolicy::RestrictedNatural
+    );
+    let max_axis_width = fixture
+        .entities
+        .len()
+        .max(fixture.attributes.len())
+        .max(fixture.values.len());
+    let wired_capacity_slack = ROWS * max_axis_width;
+    let wired_whole = assert_wired_matches_cpu(&wired, &program, &host, wired_capacity_slack);
+    let wired_segments = live_segments(&wired_whole);
+    for split in 0..=ROWS {
+        let left_host = host.slice(0..split).unwrap();
+        let right_host = host.slice(split..ROWS).unwrap();
+        let left = assert_wired_matches_cpu(&wired, &program, &left_host, wired_capacity_slack);
+        let right = assert_wired_matches_cpu(&wired, &program, &right_host, wired_capacity_slack);
+        assert_eq!(
+            concatenate_segment_maps(&left, &right, split as u32),
+            wired_segments,
+            "wired mixed-family row homomorphism split {split}"
+        );
+    }
 
     let source_id = |source: CodeSource, parent: [Id; 2]| match source {
         CodeSource::Column(column) => parent[usize::from(column)],
@@ -1664,6 +1800,12 @@ fn confirmed_shared_target_filters_cross_family_sibling_misses_stably() {
     let host = program
         .frontier_from_indices(bound.to_vec(), parent_codes.clone(), ROWS)
         .unwrap();
+    let wired = WgpuResidentWiredRound::new(&gpu, &program, &bound).unwrap();
+    assert_eq!(
+        proposer_policy_for_specs(wired.staged_round().proposal_arm_specs()),
+        ProposerPolicy::RestrictedNatural
+    );
+    let wired_confirmed = assert_wired_matches_cpu(&wired, &program, &host, 5);
     let frontier = round.upload_frontier(&host).unwrap();
     let inputs = round.initialize_inputs(&frontier).unwrap();
     let witnesses = inputs.read_proposal_witnesses_for_test();
@@ -1716,6 +1858,48 @@ fn confirmed_shared_target_filters_cross_family_sibling_misses_stably() {
         .unwrap();
     let provisional_count = provisional_ids.iter().map(Vec::len).sum::<usize>();
     let capacity = provisional_count + 5;
+    assert!(wired_confirmed.required < provisional_count as u32);
+
+    // The exact target's relevant-arm order follows source-pattern order:
+    // Present rejects some provisional candidates before the final Restricted
+    // sibling. Corrupting only that later descriptor through this private test
+    // seam must still poison the complete wired publication.
+    let relevant = wired
+        .staged_round()
+        .metadata()
+        .relevant_arm_ids(target)
+        .unwrap();
+    assert_eq!(
+        relevant,
+        &[present_arm as u32, pair_arm as u32, restricted_arm as u32]
+    );
+    let mut poisoned_wired = WgpuResidentWiredRound::new(&gpu, &program, &bound).unwrap();
+    let later_descriptor = restricted_arm * ARM_DESCRIPTOR_WORDS;
+    poisoned_wired.admission.arm_descriptors[later_descriptor + 2] =
+        SuccinctRotation::ALL.len() as u32;
+    let poisoned_frontier = poisoned_wired.upload_frontier(&host).unwrap();
+    let poisoned = poisoned_wired
+        .enqueue(&poisoned_frontier, capacity)
+        .unwrap()
+        .inspect();
+    assert_eq!(poisoned.status, STATUS_DEVICE_INVARIANT);
+    assert_eq!(poisoned.required, RESIDENT_U32_SENTINEL);
+    assert_eq!(poisoned.logical_len, 0);
+    assert_eq!((poisoned.dispatch_x, poisoned.dispatch_y), (0, 1));
+    assert!(poisoned.segments.iter().all(|segment| {
+        segment.base == RESIDENT_U32_SENTINEL
+            && segment.count == RESIDENT_U32_SENTINEL
+            && segment.variable == RESIDENT_U32_SENTINEL
+            && segment.insertion == RESIDENT_U32_SENTINEL
+    }));
+    assert!(poisoned
+        .candidate_codes
+        .iter()
+        .chain(&poisoned.candidate_owners)
+        .chain(&poisoned.proposer_arms)
+        .chain(&poisoned.child_body)
+        .all(|&word| word == RESIDENT_U32_SENTINEL));
+
     let provisional = round
         .enqueue_generic_proposals_for_test(&frontier, &choices, capacity)
         .unwrap()
@@ -2500,7 +2684,7 @@ fn restricted_faults_fail_closed_and_outrank_capacity() {
         )
         .unwrap();
         let failed = round
-            .enqueue_present_proposals_with_inputs(
+            .enqueue_proposals_with_inputs(
                 proposal_inputs,
                 ProposalPreflight {
                     admission: &corrupted,
@@ -2509,7 +2693,7 @@ fn restricted_faults_fail_closed_and_outrank_capacity() {
                 None,
                 None,
                 false,
-                PresentPublication::Confirmed,
+                ProposalPublication::Confirmed,
             )
             .unwrap()
             .inspect();
@@ -5702,6 +5886,134 @@ fn non_present_arms_fail_host_admission_without_a_device_launch() {
 }
 
 #[test]
+fn schema_family_policy_is_the_permutation_invariant_maximum_family() {
+    let present = ArmSpec::Present {
+        arm: 0,
+        axis: ResidentAxis::Entity,
+        count: 0,
+    };
+    let pair = ArmSpec::PairDistinct {
+        arm: 1,
+        rotation: SuccinctRotation::Eav,
+        peer: CodeSource::Column(0),
+    };
+    let restricted = ArmSpec::Restricted {
+        arm: 2,
+        rotation: SuccinctRotation::Eav,
+        first: CodeSource::Column(0),
+        last: CodeSource::Column(1),
+    };
+    for (specs, expected) in [
+        (vec![], ProposerPolicy::PresentOnly),
+        (vec![present], ProposerPolicy::PresentOnly),
+        (vec![pair], ProposerPolicy::PresentPair),
+        (vec![restricted], ProposerPolicy::RestrictedNatural),
+        (vec![present, pair], ProposerPolicy::PresentPair),
+        (vec![pair, present], ProposerPolicy::PresentPair),
+        (vec![present, restricted], ProposerPolicy::RestrictedNatural),
+        (vec![restricted, present], ProposerPolicy::RestrictedNatural),
+        (vec![pair, restricted], ProposerPolicy::RestrictedNatural),
+        (vec![restricted, pair], ProposerPolicy::RestrictedNatural),
+        (
+            vec![present, pair, restricted],
+            ProposerPolicy::RestrictedNatural,
+        ),
+        (
+            vec![restricted, pair, present],
+            ProposerPolicy::RestrictedNatural,
+        ),
+    ] {
+        assert_eq!(proposer_policy_for_specs(&specs), expected);
+        assert_ne!(
+            proposer_policy_for_specs(&specs),
+            ProposerPolicy::RestrictedPhysical
+        );
+    }
+}
+
+#[test]
+fn wired_admission_selects_the_least_exact_schema_family_tier() {
+    let fixture = restricted_fixture();
+    let archive: SuccinctArchive<OrderedUniverse> = (&fixture.set).into();
+    let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+    let variables = [
+        ProgramVariable::new(0),
+        ProgramVariable::new(1),
+        ProgramVariable::new(2),
+    ];
+    let program = QueryProgram::compile(
+        gpu.archive(),
+        3,
+        [QueryPattern::new(variables[0], variables[1], variables[2])],
+    )
+    .unwrap();
+
+    let present = WgpuResidentWiredRound::new(&gpu, &program, &[]).unwrap();
+    assert_eq!(
+        proposer_policy_for_specs(present.staged_round().proposal_arm_specs()),
+        ProposerPolicy::PresentOnly
+    );
+    assert!(!present.admission.admits_pair());
+    assert!(!present.admission.admits_restricted());
+    assert!(present.admission.restricted_sources.is_empty());
+    let seed = ProgramFrontier::seed();
+    let present_count = program
+        .transition(&seed)
+        .unwrap()
+        .iter()
+        .map(ProgramFrontier::len)
+        .sum();
+    let present_frontier = present.upload_frontier(&seed).unwrap();
+    let present_arena = present.enqueue(&present_frontier, present_count).unwrap();
+    assert!(present_arena._pair_generation.is_none());
+    assert!(present_arena._restricted_generation.is_none());
+    assert!(present_arena._semantic_confirmation.is_none());
+    assert_success(&present_arena.inspect(), present_count);
+
+    let pair = WgpuResidentWiredRound::new(&gpu, &program, &variables[..1]).unwrap();
+    assert_eq!(
+        proposer_policy_for_specs(pair.staged_round().proposal_arm_specs()),
+        ProposerPolicy::PresentPair
+    );
+    assert!(pair.admission.admits_pair());
+    assert!(!pair.admission.admits_restricted());
+    assert!(pair.admission.restricted_sources.is_empty());
+
+    let restricted = WgpuResidentWiredRound::new(&gpu, &program, &variables[..2]).unwrap();
+    assert_eq!(
+        proposer_policy_for_specs(restricted.staged_round().proposal_arm_specs()),
+        ProposerPolicy::RestrictedNatural
+    );
+    assert!(restricted.admission.admits_pair());
+    assert!(restricted.admission.admits_restricted());
+    assert_eq!(
+        restricted.admission.restricted_sources,
+        [COLUMN_SOURCE, 0, COLUMN_SOURCE, 1]
+    );
+
+    // Semantic death lowers no physical specs and therefore retains the same
+    // allocation-free Present tier even though stable semantic arms remain.
+    let missing = ordered_id(250);
+    let dead_program = QueryProgram::compile(
+        gpu.archive(),
+        2,
+        [QueryPattern::new(
+            variables[0],
+            QueryTerm::Constant(raw(missing)),
+            variables[1],
+        )],
+    )
+    .unwrap();
+    let dead = WgpuResidentWiredRound::new(&gpu, &dead_program, &[]).unwrap();
+    assert!(dead.staged_round().proposal_arm_specs().is_empty());
+    assert_eq!(
+        proposer_policy_for_specs(dead.staged_round().proposal_arm_specs()),
+        ProposerPolicy::PresentOnly
+    );
+    assert!(!dead.admission.is_generic());
+}
+
+#[test]
 fn pair_lf_all_six_rotations_match_independent_ordered_id_oracle() {
     let fixture = pair_fixture();
     let archive: SuccinctArchive<OrderedUniverse> = (&fixture.set).into();
@@ -5845,6 +6157,12 @@ fn confirmed_pair_all_six_rotations_match_cpu_order_and_parent_multiplicity() {
             .iter()
             .map(|code| code.get())
             .collect::<Vec<_>>();
+        let wired = WgpuResidentWiredRound::new(&gpu, &program, &[bound]).unwrap();
+        assert_eq!(
+            proposer_policy_for_specs(wired.staged_round().proposal_arm_specs()),
+            ProposerPolicy::PresentPair
+        );
+        let wired_inspection = assert_wired_matches_cpu(&wired, &program, &host, 0);
 
         let frontier = round.upload_frontier(&host).unwrap();
         let inputs = round.initialize_inputs(&frontier).unwrap();
@@ -5871,6 +6189,10 @@ fn confirmed_pair_all_six_rotations_match_cpu_order_and_parent_multiplicity() {
             .enqueue_confirmed_generic_proposals_for_test(&frontier, &choices, expected)
             .unwrap()
             .inspect();
+        assert_eq!(
+            wired_inspection, inspection,
+            "wired planner diverged from forced Pair choice for {rotation:?}"
+        );
         assert_success(&inspection, expected);
         assert_eq!(inspection.child_body, cpu_body, "{rotation:?}");
         assert_eq!(inspection.candidate_owners, expected_owners, "{rotation:?}");
@@ -6394,7 +6716,7 @@ fn generic_pair_descriptors_cover_all_six_rotations_and_classify_exact_witnesses
 
     for bound_index in 0..3 {
         let round = WgpuResidentRound::new(&gpu, &program, &[variables[bound_index]]).unwrap();
-        let admission = lower_proposal_admission(&round, ProposerPolicy::PairGeneric).unwrap();
+        let admission = lower_proposal_admission(&round, ProposerPolicy::PresentPair).unwrap();
         let host = program
             .frontier_from_indices(
                 vec![variables[bound_index]],
@@ -6487,7 +6809,7 @@ fn pair_classifier_rejects_bad_tags_limits_and_interval_shapes_before_capacity()
     )
     .unwrap();
     let round = WgpuResidentRound::new(&gpu, &program, &[variables[0]]).unwrap();
-    let admission = lower_proposal_admission(&round, ProposerPolicy::PairGeneric).unwrap();
+    let admission = lower_proposal_admission(&round, ProposerPolicy::PresentPair).unwrap();
     let arm = round
         .metadata()
         .arms()
@@ -6700,7 +7022,7 @@ fn present_classifier_authenticates_unchosen_physical_witnesses_before_semantics
 }
 
 #[test]
-fn restricted_admission_is_test_only_and_pair_policy_still_rejects_it() {
+fn restricted_natural_admission_is_canonical_and_pair_tier_rejects_it() {
     let fixture = fixture();
     let archive: SuccinctArchive<OrderedUniverse> = (&fixture.set).into();
     let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
@@ -6717,7 +7039,7 @@ fn restricted_admission_is_test_only_and_pair_policy_still_rejects_it() {
     .unwrap();
     let round = WgpuResidentRound::new(&gpu, &program, &variables[..2]).unwrap();
     assert!(matches!(
-        lower_proposal_admission(&round, ProposerPolicy::PairGeneric),
+        lower_proposal_admission(&round, ProposerPolicy::PresentPair),
         Err(ResidentProposalError::UnsupportedProposer { .. })
     ));
     let admission = lower_proposal_admission(&round, ProposerPolicy::RestrictedNatural).unwrap();
@@ -6768,7 +7090,7 @@ fn generic_admission_authenticates_same_target_pair_rotation_independently() {
                 rotation: SuccinctRotation::Eav,
                 peer,
             },
-            ProposerPolicy::PairGeneric,
+            ProposerPolicy::PresentPair,
             ring_len,
             pair_counts,
         ),

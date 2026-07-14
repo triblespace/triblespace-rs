@@ -9,11 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The private wired resident round now publishes canonical PairDistinct and
+  Restricted proposals through the confirmed no-readback path.** Construction
+  selects the least exact schema tier—Present-only, Present+PairDistinct, or
+  Natural Restricted—without data-size thresholds; the Present-only tier still
+  allocates no non-Present generation or semantic-confirmation backing. Wired
+  CPU parity covers all six Pair and Restricted query orientations,
+  mixed-family row splits, shared-target sibling misses, and later-sibling
+  invariant poison. Source-swapped physical Restricted admission remains a
+  test-only structural harness.
 - **Resident proposal planning now carries explicit family-tagged physical
   descriptors and validates every generated destination route before
   publication.**
   The exact classifier accepts Present and PairDistinct witness shapes while
-  the low-level and wired execution policies remain strictly Present-only.
+  the low-level staging policy remains strictly Present-only.
   A family-neutral capacity-wide gate proves canonical segment, row, proposer,
   in-domain code, and poison-tail identity before publishing a distinct arena
   dispatch; late faults atomically re-poison all semantic outputs and leave
@@ -50,7 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wired stable publication without host readback.
 - **A private schema-specialized resident round now wires exact support through
   confirmed Present children without an intermediate readback.** One cached
-  admission rejects terminal and non-Present schemas before producer kernels;
+  admission rejects terminal schemas before producer kernels;
   each execution then freezes capacity geometry, evaluates tri-state support
   and exact estimates, plans every row, and feeds the existing stable
   destination-parallel arena plus indirect reference child materializer. The

@@ -1,9 +1,9 @@
 //! Private confirmed proposal arena for one archive-resident affine round.
 //!
-//! Published execution still admits only zero-peer [`ArmSpec::Present`]
-//! proposers. Internal generic harnesses use explicit Present, PairDistinct,
-//! and Restricted family tags plus exact retained interval witnesses without
-//! widening the production capability. They
+//! Published execution admits the least exact family tier required by one
+//! immutable schema: Present-only, Present+PairDistinct, or canonical Natural
+//! Restricted (which also admits the simpler families). Every tier uses
+//! explicit family tags plus exact retained interval witnesses. The planner
 //! classifies packed row choices into a variable-major `S * R` width vector,
 //! performs one exact stable scan over that flat order, and writes candidates
 //! directly into ascending-variable segments. The layout itself is therefore
@@ -211,7 +211,7 @@ pub(crate) struct WgpuResidentProposals {
     confirmation_workspace: DeviceU32Buffer<WgpuRuntime>,
     confirmation_layout: ConfirmationWorkspaceLayout,
     /// Reusable arm-serial rank/select state retained beneath confirmed
-    /// generic publication. Production Present-only arenas need no such state.
+    /// non-Present publication. Present-only arenas need no such state.
     _semantic_confirmation: Option<Box<SemanticConfirmationBacking>>,
     /// Confirmed publication retains every provisional source allocation on
     /// which its already-enqueued stable scatters depend.
@@ -289,7 +289,7 @@ struct SemanticConfirmationBacking {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum PresentPublication {
+enum ProposalPublication {
     Provisional,
     Confirmed,
 }
@@ -304,10 +304,10 @@ struct ProposalStageProfiles {
 }
 
 struct ProposalAdmission {
-    /// Whether this capability was lowered through the test-only generic
-    /// boundary, independent of whether semantic death erased family tags.
+    /// Whether this exact schema tier admits PairDistinct arms, independent of
+    /// whether semantic death erased family tags.
     pair_capable: bool,
-    /// Whether the test-only provisional capability admits Restricted arms.
+    /// Whether this exact schema tier admits canonical Restricted arms.
     restricted_capable: bool,
     arm_descriptors: Vec<u32>,
     /// Four words per global arm: first kind/payload, last kind/payload.
@@ -373,13 +373,12 @@ struct ProposalPreflight<'admission> {
     geometry: ProposalGeometry,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProposerPolicy {
     PresentOnly,
-    PairGeneric,
-    /// Strict natural two-peer lowering. This variant cannot exist in a
-    /// production build; published entrypoints therefore have no route to it.
-    #[cfg(test)]
+    PresentPair,
+    /// Strict canonical two-peer lowering. This is the broadest production
+    /// tier and also admits Present and PairDistinct arms.
     RestrictedNatural,
     /// Structural all-six physical harness. Each arm admits only its canonical
     /// lowering or exact source-swapped inverse and remains test-only.
@@ -393,13 +392,11 @@ impl ProposerPolicy {
     }
 
     const fn allows_restricted(self) -> bool {
-        #[cfg(test)]
-        {
-            matches!(self, Self::RestrictedNatural | Self::RestrictedPhysical)
-        }
-        #[cfg(not(test))]
-        {
-            false
+        match self {
+            Self::RestrictedNatural => true,
+            #[cfg(test)]
+            Self::RestrictedPhysical => true,
+            Self::PresentOnly | Self::PresentPair => false,
         }
     }
 
@@ -412,6 +409,29 @@ impl ProposerPolicy {
         {
             false
         }
+    }
+}
+
+/// Selects the least exact admission tier covering one immutable schema.
+///
+/// This is a finite family lattice, not a size-dependent heuristic: empty and
+/// Present-only schemas retain the allocation-free fast path, PairDistinct
+/// adds only Pair machinery, and any canonical Restricted arm selects the
+/// Natural superset. The test-only physical Restricted policy is never a
+/// possible result.
+fn proposer_policy_for_specs(specs: &[ArmSpec]) -> ProposerPolicy {
+    if specs
+        .iter()
+        .any(|spec| matches!(spec, ArmSpec::Restricted { .. }))
+    {
+        ProposerPolicy::RestrictedNatural
+    } else if specs
+        .iter()
+        .any(|spec| matches!(spec, ArmSpec::PairDistinct { .. }))
+    {
+        ProposerPolicy::PresentPair
+    } else {
+        ProposerPolicy::PresentOnly
     }
 }
 
@@ -494,10 +514,10 @@ struct PlanLayout {
     variable_to_segment: usize,
 }
 
-/// Schema-specialized capability for one confirmed Present-only round.
+/// Schema-specialized capability for one confirmed resident proposal round.
 ///
 /// This private object is reusable across affine frontiers with the same
-/// `(program, bound-variable mask)`. It lowers Present admission once, rejects
+/// `(program, bound-variable mask)`. It lowers exact family admission once, rejects
 /// terminal and unsupported schemas before any producer kernel can launch,
 /// then wires support, tri-state planning, destination-parallel proposals and
 /// reference child materialization, exact confirmation, and stable survivor
@@ -508,7 +528,7 @@ struct WgpuResidentWiredRound<'a, U: Universe> {
 }
 
 impl<'a, U: Universe> WgpuResidentWiredRound<'a, U> {
-    /// Compiles one reusable Present-only nonterminal schema capability.
+    /// Compiles one reusable nonterminal capability at its least family tier.
     fn new(
         archive: &'a crate::succinct_query::WgpuSuccinctArchive<U>,
         program: &QueryProgram<'_, U>,
@@ -517,7 +537,8 @@ impl<'a, U: Universe> WgpuResidentWiredRound<'a, U> {
         // Construction may upload immutable metadata, but it launches no
         // kernels. Admission therefore still fails before resident execution.
         let round = WgpuResidentRound::new(archive, program, bound_variables)?;
-        let admission = lower_proposal_admission(&round, ProposerPolicy::PresentOnly)?;
+        let policy = proposer_policy_for_specs(round.proposal_arm_specs());
+        let admission = lower_proposal_admission(&round, policy)?;
         if admission.is_terminal() {
             return Err(ResidentProposalError::TerminalSchema);
         }
@@ -541,17 +562,17 @@ impl<'a, U: Universe> WgpuResidentWiredRound<'a, U> {
         // Every host-known capacity quantity and the exact frontier capability
         // are validated before the first support kernel is submitted.
         let geometry =
-            preflight_present_geometry(&self.round, frontier, capacity, &self.admission)?;
+            preflight_proposal_geometry(&self.round, frontier, capacity, &self.admission)?;
         let inputs = self.round.initialize_inputs(frontier)?;
         let choices = self.round.enqueue(&inputs)?;
-        self.round.enqueue_admitted_present_proposals(
+        self.round.enqueue_admitted_proposals(
             frontier,
             &choices,
             ProposalPreflight {
                 admission: &self.admission,
                 geometry,
             },
-            PresentPublication::Confirmed,
+            ProposalPublication::Confirmed,
         )
     }
 
@@ -576,17 +597,17 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             None,
             None,
             false,
-            PresentPublication::Provisional,
+            ProposalPublication::Provisional,
         )
     }
 
-    /// Test-only provisional capability admitting Present, PairDistinct, and
+    /// Test-only provisional seam admitting Present, PairDistinct, and
     /// naturally lowered Restricted arms.
     ///
     /// This boundary publishes structurally validated candidates and generic
-    /// children, then returns before Present confirmation. Production
-    /// entrypoints lower `PresentOnly`, and no generic-family arena can obtain
-    /// the existing wired publication path.
+    /// children, then returns before semantic confirmation. Production uses
+    /// the same canonical family lowering only through the confirmed wired
+    /// boundary; this provisional return remains test-only.
     #[cfg(test)]
     fn enqueue_generic_proposals_for_test(
         &self,
@@ -597,7 +618,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         let inputs = self.proposal_inputs(frontier, choices)?;
         let admission = lower_proposal_admission(self, ProposerPolicy::RestrictedNatural)?;
         let geometry = proposal_geometry(inputs.rows, inputs.parent_stride, capacity, &admission)?;
-        self.enqueue_present_proposals_with_inputs(
+        self.enqueue_proposals_with_inputs(
             inputs,
             ProposalPreflight {
                 admission: &admission,
@@ -606,7 +627,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             None,
             None,
             false,
-            PresentPublication::Provisional,
+            ProposalPublication::Provisional,
         )
     }
 
@@ -620,7 +641,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         let inputs = self.proposal_inputs(frontier, choices)?;
         let admission = lower_proposal_admission(self, ProposerPolicy::RestrictedNatural)?;
         let geometry = proposal_geometry(inputs.rows, inputs.parent_stride, capacity, &admission)?;
-        self.enqueue_present_proposals_with_inputs(
+        self.enqueue_proposals_with_inputs(
             inputs,
             ProposalPreflight {
                 admission: &admission,
@@ -629,7 +650,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             None,
             None,
             false,
-            PresentPublication::Confirmed,
+            ProposalPublication::Confirmed,
         )
     }
 
@@ -645,7 +666,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         let inputs = self.proposal_inputs(frontier, choices)?;
         let admission = lower_proposal_admission(self, ProposerPolicy::RestrictedNatural)?;
         let geometry = proposal_geometry(inputs.rows, inputs.parent_stride, capacity, &admission)?;
-        self.enqueue_present_proposals_with_inputs(
+        self.enqueue_proposals_with_inputs(
             inputs,
             ProposalPreflight {
                 admission: &admission,
@@ -654,7 +675,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             None,
             Some((max_groups_x, max_groups_y)),
             false,
-            PresentPublication::Provisional,
+            ProposalPublication::Provisional,
         )
     }
 
@@ -671,7 +692,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         let inputs = self.proposal_inputs(frontier, choices)?;
         let admission = lower_proposal_admission(self, ProposerPolicy::RestrictedPhysical)?;
         let geometry = proposal_geometry(inputs.rows, inputs.parent_stride, capacity, &admission)?;
-        self.enqueue_present_proposals_with_inputs(
+        self.enqueue_proposals_with_inputs(
             inputs,
             ProposalPreflight {
                 admission: &admission,
@@ -680,7 +701,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             None,
             None,
             false,
-            PresentPublication::Provisional,
+            ProposalPublication::Provisional,
         )
     }
 
@@ -696,7 +717,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         let inputs = self.proposal_inputs(frontier, choices)?;
         let admission = lower_proposal_admission(self, ProposerPolicy::RestrictedPhysical)?;
         let geometry = proposal_geometry(inputs.rows, inputs.parent_stride, capacity, &admission)?;
-        self.enqueue_present_proposals_with_inputs(
+        self.enqueue_proposals_with_inputs(
             inputs,
             ProposalPreflight {
                 admission: &admission,
@@ -705,7 +726,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             None,
             None,
             false,
-            PresentPublication::Confirmed,
+            ProposalPublication::Confirmed,
         )
     }
 
@@ -715,22 +736,15 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
     /// all capacity-dependent host geometry before it launches support. This
     /// method revalidates the exact frontier/planner lineage, but performs no
     /// semantic lowering and no host geometry recomputation.
-    fn enqueue_admitted_present_proposals(
+    fn enqueue_admitted_proposals(
         &self,
         frontier: &WgpuResidentFrontier<'_, U>,
         choices: &ResidentRowChoices<WgpuRuntime>,
         preflight: ProposalPreflight<'_>,
-        publication: PresentPublication,
+        publication: ProposalPublication,
     ) -> Result<WgpuResidentProposals, ResidentProposalError> {
         let inputs = self.proposal_inputs(frontier, choices)?;
-        self.enqueue_present_proposals_with_inputs(
-            inputs,
-            preflight,
-            None,
-            None,
-            false,
-            publication,
-        )
+        self.enqueue_proposals_with_inputs(inputs, preflight, None, None, false, publication)
     }
 
     #[cfg(test)]
@@ -748,7 +762,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             Some(arm_descriptors),
             None,
             false,
-            PresentPublication::Provisional,
+            ProposalPublication::Provisional,
         )
     }
 
@@ -767,7 +781,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             Some(arm_descriptors),
             None,
             false,
-            PresentPublication::Confirmed,
+            ProposalPublication::Confirmed,
         )
     }
 
@@ -789,7 +803,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             None,
             Some((max_groups_x, max_groups_y)),
             false,
-            PresentPublication::Provisional,
+            ProposalPublication::Provisional,
         )
     }
 
@@ -812,7 +826,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             None,
             None,
             true,
-            PresentPublication::Provisional,
+            ProposalPublication::Provisional,
         )
     }
 
@@ -825,12 +839,12 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         descriptor_override: Option<&[u32]>,
         dispatch_limits: Option<(u32, u32)>,
         _profile_stages: bool,
-        publication: PresentPublication,
+        publication: ProposalPublication,
     ) -> Result<WgpuResidentProposals, ResidentProposalError> {
         let inputs = self.proposal_inputs(frontier, choices)?;
         let admission = lower_proposal_admission(self, ProposerPolicy::PresentOnly)?;
         let geometry = proposal_geometry(inputs.rows, inputs.parent_stride, capacity, &admission)?;
-        self.enqueue_present_proposals_with_inputs(
+        self.enqueue_proposals_with_inputs(
             inputs,
             ProposalPreflight {
                 admission: &admission,
@@ -844,14 +858,14 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn enqueue_present_proposals_with_inputs(
+    fn enqueue_proposals_with_inputs(
         &self,
         inputs: ResidentProposalInputs,
         preflight: ProposalPreflight<'_>,
         descriptor_override: Option<&[u32]>,
         dispatch_limits: Option<(u32, u32)>,
         _profile_stages: bool,
-        publication: PresentPublication,
+        publication: ProposalPublication,
     ) -> Result<WgpuResidentProposals, ResidentProposalError> {
         let context = self.archive().context();
         let admission = preflight.admission;
@@ -888,8 +902,8 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         }
 
         // The override is deliberately a trusted test seam: production always
-        // uploads strict Present-only lowering after its independent source-axis
-        // check. Equal-cardinality wrong-axis words cannot be rediscovered from
+        // uploads independently lowered family descriptors after source-axis
+        // checks. Equal-cardinality wrong-axis words cannot be rediscovered from
         // the packed descriptor alone and are outside the device threat model.
         let (plan_words, plan_layout) = packed_plan(admission, descriptors)?;
         let plan = context.upload_u32(&plan_words)?;
@@ -1393,11 +1407,10 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         #[cfg(not(test))]
         launch_late_cleanup();
 
-        if admission.is_generic() && publication == PresentPublication::Provisional {
-            // Generic non-Present admission stops at provisional publication.
-            // Child construction is family-neutral after the structural gate,
-            // but the Present confirmer and every confirmed/wired capability
-            // are intentionally unreachable from this branch.
+        if admission.is_generic() && publication == ProposalPublication::Provisional {
+            // Non-Present provisional admission stops before semantic
+            // confirmation. Child construction is family-neutral after the
+            // structural gate, but only test seams can select this return.
             unsafe {
                 materialize_proposal_children::launch_unchecked::<WgpuRuntime>(
                     context.client(),
@@ -1577,7 +1590,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             );
         }
 
-        if publication == PresentPublication::Confirmed {
+        if publication == ProposalPublication::Confirmed {
             // Scan the whole capacity, not merely provisional T. The poison
             // initializer made the tail canonical zero, and the finalizer
             // explicitly proves that no survivor leaked into that tail.
@@ -2986,7 +2999,7 @@ const fn rotation_target_axis(rotation: SuccinctRotation) -> ResidentAxis {
 /// Freezes every capacity-dependent host quantity before any wired producer
 /// kernel is launched. Ordinary one-short capacity remains a device-reported,
 /// sticky arena status; only unrepresentable host geometry fails here.
-fn preflight_present_geometry<U: Universe>(
+fn preflight_proposal_geometry<U: Universe>(
     round: &WgpuResidentRound<'_, U>,
     frontier: &WgpuResidentFrontier<'_, U>,
     capacity: usize,

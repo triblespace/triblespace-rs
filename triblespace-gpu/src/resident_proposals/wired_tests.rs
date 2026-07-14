@@ -416,7 +416,7 @@ fn wired_capacity_is_atomic_and_preflight_rejects_unrepresentable_geometry() {
 }
 
 #[test]
-fn wired_admission_rejects_terminal_and_non_present_but_keeps_semantic_death() {
+fn wired_admission_rejects_terminal_and_keeps_semantic_death() {
     let fixture = fixture();
     let archive: SuccinctArchive<OrderedUniverse> = (&fixture.set).into();
     let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
@@ -465,10 +465,9 @@ fn wired_admission_rejects_terminal_and_non_present_but_keeps_semantic_death() {
         WgpuResidentWiredRound::new(&gpu, &complete, &[entity, attribute, value]),
         Err(ResidentProposalError::TerminalSchema)
     ));
-    assert!(matches!(
-        WgpuResidentWiredRound::new(&gpu, &complete, &[entity]),
-        Err(ResidentProposalError::UnsupportedProposer { .. })
-    ));
+    let pair = WgpuResidentWiredRound::new(&gpu, &complete, &[entity]).unwrap();
+    assert!(pair.admission.admits_pair());
+    assert!(!pair.admission.admits_restricted());
 
     let missing = ordered_id(9, 999);
     let dead = QueryProgram::compile(
