@@ -5,31 +5,36 @@
 //! their physical primitive and canonical Ring rotation, and records every
 //! fully-bound support check separately from proposal estimates.
 //!
-//! [`WgpuResidentRound`] deliberately implements only the zero-peer edge of
-//! that IR today. It initializes exact `Present` estimates and the viability
-//! baseline directly into planner-owned buffers without a readback. One-peer,
-//! two-peer, and fully-bound support primitives fail explicitly before any
-//! producer launch; their IR is retained so later slices can add kernels
-//! without changing semantic lowering or arm identity.
+//! [`WgpuResidentRound`] initializes every estimate to its exact zero-peer
+//! count or the reserved dead sentinel, then overwrites one-peer
+//! `PairDistinct` arms through resident prefix-select and pair-boundary-rank
+//! pipelines. The affine frontier, descriptors, scratch, estimate matrix, and
+//! planner choices remain in one compatibility domain without a readback.
+//! Two-peer and fully-bound support primitives still fail explicitly.
 
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 use cubecl::prelude::*;
 use jerky::gpu::DeviceU32Buffer;
 use triblespace_core::blob::encodings::succinctarchive::query_program::{
-    ProgramPattern, ProgramTerm, ProgramVariable, QueryProgram,
+    ProgramFrontier, ProgramPattern, ProgramTerm, ProgramVariable, QueryProgram,
 };
 use triblespace_core::blob::encodings::succinctarchive::{SuccinctRotation, Universe};
 
 use crate::resident_round::{
-    ResidentRoundError, ResidentRoundInputs, ResidentRoundMetadata, ResidentRowChoices,
-    ResidentRowPlanner, WgpuResidentRowPlanner, DEAD_ROW_SENTINEL,
+    checked_device_product, validate_rows, ResidentRoundError, ResidentRoundInputs,
+    ResidentRoundMetadata, ResidentRowChoices, ResidentRowPlanner, WgpuResidentRowPlanner,
+    DEAD_ROW_SENTINEL,
 };
-use crate::succinct_query::WgpuSuccinctArchive;
+use crate::succinct_query::{WgpuBitVector, WgpuSuccinctArchive};
 
 type WgpuRuntime = cubecl::wgpu::WgpuRuntime;
 const THREADS: u32 = 64;
+const PAIR_DESCRIPTOR_WORDS: usize = 3;
+const CONSTANT_SOURCE: u32 = 0;
+const COLUMN_SOURCE: u32 = 1;
 
 /// Failure to bind or execute the bounded resident producer stage.
 #[derive(Debug)]
@@ -38,13 +43,6 @@ pub enum ResidentSupportError {
     Round(ResidentRoundError),
     /// The compiled program belongs to another immutable archive snapshot.
     ArchiveOwnership,
-    /// This first producer slice cannot yet evaluate a one-peer estimate.
-    UnsupportedPairDistinctEstimate {
-        /// Stable arm ID which requires the unavailable probe.
-        arm: u32,
-        /// Ring rotation required by the probe.
-        rotation: SuccinctRotation,
-    },
     /// This first producer slice cannot yet evaluate a two-peer estimate.
     UnsupportedRestrictedEstimate {
         /// Stable arm ID which requires the unavailable probe.
@@ -57,6 +55,19 @@ pub enum ResidentSupportError {
         /// Stable source-pattern position requiring a support probe.
         source_pattern_index: u32,
     },
+    /// A resident frontier was minted for another archive/context capability.
+    FrontierOwnership,
+    /// The frontier schema or resident storage geometry does not match this round.
+    MalformedFrontier,
+    /// A host frontier contains a code outside this archive's local universe.
+    FrontierCodeOutOfBounds {
+        /// Invalid archive-local code.
+        code: u32,
+        /// Number of codes in the exact archive snapshot.
+        domain: usize,
+    },
+    /// Private lowering and its persistent descriptor table disagree.
+    MalformedResidentPlan,
 }
 
 impl fmt::Display for ResidentSupportError {
@@ -66,10 +77,6 @@ impl fmt::Display for ResidentSupportError {
             Self::ArchiveOwnership => {
                 f.write_str("resident round program belongs to another archive snapshot")
             }
-            Self::UnsupportedPairDistinctEstimate { arm, rotation } => write!(
-                f,
-                "resident estimate arm {arm} requires an unsupported {rotation:?} pair-distinct probe"
-            ),
             Self::UnsupportedRestrictedEstimate { arm, rotation } => write!(
                 f,
                 "resident estimate arm {arm} requires an unsupported {rotation:?} restricted probe"
@@ -80,6 +87,19 @@ impl fmt::Display for ResidentSupportError {
                 f,
                 "resident source pattern {source_pattern_index} requires an unsupported fully-bound support probe"
             ),
+            Self::FrontierOwnership => {
+                f.write_str("resident frontier belongs to another archive/context")
+            }
+            Self::MalformedFrontier => {
+                f.write_str("resident frontier schema or storage geometry is malformed")
+            }
+            Self::FrontierCodeOutOfBounds { code, domain } => write!(
+                f,
+                "resident frontier code {code} lies outside archive domain {domain}"
+            ),
+            Self::MalformedResidentPlan => {
+                f.write_str("resident lowering produced an inconsistent descriptor table")
+            }
         }
     }
 }
@@ -89,9 +109,12 @@ impl Error for ResidentSupportError {
         match self {
             Self::Round(error) => Some(error),
             Self::ArchiveOwnership
-            | Self::UnsupportedPairDistinctEstimate { .. }
             | Self::UnsupportedRestrictedEstimate { .. }
-            | Self::UnsupportedFullyBoundSupport { .. } => None,
+            | Self::UnsupportedFullyBoundSupport { .. }
+            | Self::FrontierOwnership
+            | Self::MalformedFrontier
+            | Self::FrontierCodeOutOfBounds { .. }
+            | Self::MalformedResidentPlan => None,
         }
     }
 }
@@ -340,12 +363,53 @@ impl ResidentRoundPlan {
     }
 }
 
+/// Opaque row-major affine frontier resident in one exact round capability.
+///
+/// Callers can inspect its logical shape but cannot obtain or relabel the
+/// underlying device buffer. A later resident proposal stage can therefore
+/// return this same type without exposing snapshot-local codes or raw handles.
+pub struct WgpuResidentFrontier<'a, U: Universe> {
+    archive: &'a WgpuSuccinctArchive<U>,
+    owner: Arc<()>,
+    values: DeviceU32Buffer<WgpuRuntime>,
+    variables: Box<[ProgramVariable]>,
+    rows: usize,
+    stride: usize,
+}
+
+impl<U: Universe> WgpuResidentFrontier<'_, U> {
+    /// Number of affine rows.
+    pub const fn len(&self) -> usize {
+        self.rows
+    }
+
+    /// Whether the frontier has no rows.
+    pub const fn is_empty(&self) -> bool {
+        self.rows == 0
+    }
+
+    /// Number of canonically ordered bound-variable columns.
+    pub const fn stride(&self) -> usize {
+        self.stride
+    }
+}
+
+/// One persistent one-peer dispatch group in a fixed canonical rotation.
+struct WgpuPairGroup {
+    rotation: SuccinctRotation,
+    arm_count: usize,
+    /// Three words per local arm: global arm, source kind, source payload.
+    descriptors: DeviceU32Buffer<WgpuRuntime>,
+}
+
 /// WGPU facade binding one plan and planner to one exact resident archive.
 pub struct WgpuResidentRound<'a, U: Universe> {
     archive: &'a WgpuSuccinctArchive<U>,
     plan: ResidentRoundPlan,
     planner: WgpuResidentRowPlanner,
-    present_counts: Option<DeviceU32Buffer<WgpuRuntime>>,
+    frontier_owner: Arc<()>,
+    initial_estimates: DeviceU32Buffer<WgpuRuntime>,
+    pair_groups: Box<[WgpuPairGroup]>,
 }
 
 impl<'a, U: Universe> WgpuResidentRound<'a, U> {
@@ -366,17 +430,15 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         let plan = ResidentRoundPlan::lower(program, bound_variables)?;
         let planner =
             ResidentRowPlanner::from_metadata(plan.metadata().clone(), archive.context().clone())?;
-
-        let counts = initial_present_counts(&plan);
-        let present_counts = counts
-            .as_deref()
-            .map(|counts| archive.context().upload_u32(counts))
-            .transpose()?;
+        let initial_estimates = archive.context().upload_u32(&initial_estimates(&plan))?;
+        let pair_groups = build_pair_groups(archive, &plan)?;
         Ok(Self {
             archive,
             plan,
             planner,
-            present_counts,
+            frontier_owner: Arc::new(()),
+            initial_estimates,
+            pair_groups,
         })
     }
 
@@ -390,24 +452,65 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         self.plan.metadata()
     }
 
-    /// Allocates planner-owned inputs and enqueues zero-peer initialization.
+    /// Test/reference convenience which validates and uploads one CPU frontier.
     ///
-    /// No device read or synchronization occurs. Unsupported physical specs
-    /// are reported before allocation/launch rather than replaced by estimates.
+    /// [`ProgramFrontier`] codes are intentionally unbranded integers, so this
+    /// method relies on that type's documented caller provenance contract; it
+    /// cannot infer the source snapshot from equal in-range numbers. After
+    /// validating the schema and numeric domain, the returned opaque capability
+    /// brands the resident buffer with this exact archive and round owner.
+    /// Production stages should pass this type device-to-device instead.
+    pub fn upload_frontier(
+        &self,
+        frontier: &ProgramFrontier,
+    ) -> Result<WgpuResidentFrontier<'a, U>, ResidentSupportError> {
+        if frontier.variables() != self.plan.metadata().bound_variables() {
+            return Err(ResidentSupportError::MalformedFrontier);
+        }
+        validate_rows(frontier.len())?;
+        let stride = frontier.variables().len();
+        let expected =
+            checked_device_product(frontier.len(), stride, "flat resident affine frontier")?;
+        if frontier.values().len() != expected {
+            return Err(ResidentSupportError::MalformedFrontier);
+        }
+        let domain = self.archive.archive().domain.len();
+        let mut values = Vec::with_capacity(expected);
+        for code in frontier.values() {
+            let code = code.get();
+            if code as usize >= domain || code == DEAD_ROW_SENTINEL {
+                return Err(ResidentSupportError::FrontierCodeOutOfBounds { code, domain });
+            }
+            values.push(code);
+        }
+        Ok(WgpuResidentFrontier {
+            archive: self.archive,
+            owner: self.frontier_owner.clone(),
+            values: self.archive.context().upload_u32(&values)?,
+            variables: frontier.variables().to_vec().into_boxed_slice(),
+            rows: frontier.len(),
+            stride,
+        })
+    }
+
+    /// Allocates planner-owned inputs and enqueues exact zero/one-peer estimates.
+    ///
+    /// The common launch initializes viability plus every arm-major cell.
+    /// Each nonempty pair rotation then performs prepare, prefix select,
+    /// normalization, pair-change rank, and scatter without a device read.
+    /// Unsupported restricted/support specs fail before allocation or launch.
     pub fn initialize_inputs(
         &self,
-        rows: usize,
+        frontier: &WgpuResidentFrontier<'_, U>,
     ) -> Result<ResidentRoundInputs<WgpuRuntime>, ResidentSupportError> {
         self.require_supported_slice()?;
+        self.validate_frontier(frontier)?;
+        let rows = frontier.rows;
         let mut inputs = self.planner.allocate_inputs(rows)?;
         if rows == 0 {
             return Ok(inputs);
         }
 
-        let counts = self
-            .present_counts
-            .as_ref()
-            .expect("supported plans upload their initialization constants");
         let dispatch =
             self.planner
                 .context()
@@ -418,13 +521,17 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 self.planner.context().client(),
                 dispatch.cube_count(),
                 dispatch.cube_dim(),
-                counts.input_arg(),
+                self.initial_estimates.input_arg(),
                 viable,
                 estimates,
                 rows as u32,
                 self.plan.metadata().arms().len() as u32,
                 u32::from(!self.plan.is_global_dead()),
             );
+        }
+
+        for group in &self.pair_groups {
+            self.enqueue_pair_group(group, frontier, &mut inputs)?;
         }
         Ok(inputs)
     }
@@ -443,13 +550,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         }
         for &spec in self.plan.arm_specs() {
             match spec {
-                ArmSpec::Present { .. } => {}
-                ArmSpec::PairDistinct { arm, rotation, .. } => {
-                    return Err(ResidentSupportError::UnsupportedPairDistinctEstimate {
-                        arm,
-                        rotation,
-                    });
-                }
+                ArmSpec::Present { .. } | ArmSpec::PairDistinct { .. } => {}
                 ArmSpec::Restricted { arm, rotation, .. } => {
                     return Err(ResidentSupportError::UnsupportedRestrictedEstimate {
                         arm,
@@ -462,6 +563,99 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             return Err(ResidentSupportError::UnsupportedFullyBoundSupport {
                 source_pattern_index: support.source_pattern_index(),
             });
+        }
+        Ok(())
+    }
+
+    fn validate_frontier(
+        &self,
+        frontier: &WgpuResidentFrontier<'_, U>,
+    ) -> Result<(), ResidentSupportError> {
+        if !std::ptr::eq(self.archive, frontier.archive)
+            || !Arc::ptr_eq(&self.frontier_owner, &frontier.owner)
+        {
+            return Err(ResidentSupportError::FrontierOwnership);
+        }
+        validate_rows(frontier.rows)?;
+        if frontier.variables.as_ref() != self.plan.metadata().bound_variables()
+            || frontier.stride != frontier.variables.len()
+        {
+            return Err(ResidentSupportError::MalformedFrontier);
+        }
+        let expected = checked_device_product(
+            frontier.rows,
+            frontier.stride,
+            "flat resident affine frontier",
+        )?;
+        if frontier.values.len() != expected {
+            return Err(ResidentSupportError::MalformedFrontier);
+        }
+        Ok(())
+    }
+
+    fn enqueue_pair_group(
+        &self,
+        group: &WgpuPairGroup,
+        frontier: &WgpuResidentFrontier<'_, U>,
+        inputs: &mut ResidentRoundInputs<WgpuRuntime>,
+    ) -> Result<(), ResidentSupportError> {
+        let (probes, endpoints) = pair_group_geometry(group.arm_count, frontier.rows)?;
+        if probes == 0 {
+            return Ok(());
+        }
+
+        let context = self.planner.context();
+        let dispatch = context.static_batch_dispatch(probes, probes, CubeDim::new_1d(THREADS))?;
+        let mut queries = context.empty_u32(endpoints)?;
+        let mut results = context.empty_u32(endpoints)?;
+        unsafe {
+            prepare_pair_distinct::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                dispatch.cube_count(),
+                dispatch.cube_dim(),
+                group.descriptors.input_arg(),
+                frontier.values.input_arg(),
+                queries.output_arg(),
+                frontier.rows as u32,
+                frontier.stride as u32,
+                group.arm_count as u32,
+                self.archive.archive().domain.len() as u32,
+                DEAD_ROW_SENTINEL,
+            );
+        }
+
+        let prefix = first_axis_prefix(self.archive, group.rotation);
+        prefix.select1_batch_into(&queries, &mut results)?;
+        unsafe {
+            normalize_pair_range::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                dispatch.cube_count(),
+                dispatch.cube_dim(),
+                results.input_arg(),
+                queries.output_arg(),
+                probes as u32,
+                self.archive.pair_changes(group.rotation).len() as u32,
+                DEAD_ROW_SENTINEL,
+            );
+        }
+
+        let changes = self.archive.pair_changes(group.rotation);
+        changes.rank1_batch_into(&queries, &mut results)?;
+        let estimates = inputs.estimates_output_arg();
+        unsafe {
+            scatter_pair_distinct::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                dispatch.cube_count(),
+                dispatch.cube_dim(),
+                group.descriptors.input_arg(),
+                results.input_arg(),
+                estimates,
+                frontier.rows as u32,
+                group.arm_count as u32,
+                self.plan.metadata().arms().len() as u32,
+                changes.num_ones() as u32,
+                DEAD_ROW_SENTINEL,
+            );
         }
         Ok(())
     }
@@ -649,27 +843,86 @@ fn group_arms(specs: &[ArmSpec]) -> Box<[ArmGroup]> {
         .into_boxed_slice()
 }
 
-fn initial_present_counts(plan: &ResidentRoundPlan) -> Option<Box<[u32]>> {
+fn initial_estimates(plan: &ResidentRoundPlan) -> Box<[u32]> {
     if plan.is_global_dead() {
-        return Some(vec![DEAD_ROW_SENTINEL; plan.metadata().arms().len()].into_boxed_slice());
-    }
-    if !plan.fully_bound_supports().is_empty() {
-        return None;
+        return vec![DEAD_ROW_SENTINEL; plan.metadata().arms().len()].into_boxed_slice();
     }
     plan.arm_specs()
         .iter()
         .copied()
         .map(|spec| match spec {
-            ArmSpec::Present { count, .. } => Some(count),
-            ArmSpec::PairDistinct { .. } | ArmSpec::Restricted { .. } => None,
+            ArmSpec::Present { count, .. } => count,
+            ArmSpec::PairDistinct { .. } | ArmSpec::Restricted { .. } => DEAD_ROW_SENTINEL,
         })
-        .collect::<Option<Vec<_>>>()
-        .map(Vec::into_boxed_slice)
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
+fn pair_group_geometry(
+    arm_count: usize,
+    rows: usize,
+) -> Result<(usize, usize), ResidentRoundError> {
+    let probes = checked_device_product(arm_count, rows, "resident pair-distinct probes")?;
+    let endpoints = checked_device_product(probes, 2, "resident pair-distinct endpoints")?;
+    Ok((probes, endpoints))
+}
+
+fn build_pair_groups<U: Universe>(
+    archive: &WgpuSuccinctArchive<U>,
+    plan: &ResidentRoundPlan,
+) -> Result<Box<[WgpuPairGroup]>, ResidentSupportError> {
+    let mut groups = Vec::new();
+    for group in plan.arm_groups.iter() {
+        let ArmGroupKind::PairDistinct(rotation) = group.kind else {
+            continue;
+        };
+        checked_device_product(
+            group.arm_ids.len(),
+            PAIR_DESCRIPTOR_WORDS,
+            "resident pair descriptor table",
+        )?;
+        let mut descriptors = Vec::with_capacity(group.arm_ids.len() * PAIR_DESCRIPTOR_WORDS);
+        for &arm in group.arm_ids.iter() {
+            let Some(ArmSpec::PairDistinct {
+                rotation: spec_rotation,
+                peer,
+                ..
+            }) = plan.arm_specs().get(arm as usize).copied()
+            else {
+                return Err(ResidentSupportError::MalformedResidentPlan);
+            };
+            if spec_rotation != rotation {
+                return Err(ResidentSupportError::MalformedResidentPlan);
+            }
+            let (kind, payload) = match peer {
+                CodeSource::Constant(code) => (CONSTANT_SOURCE, code),
+                CodeSource::Column(column) => (COLUMN_SOURCE, u32::from(column)),
+            };
+            descriptors.extend([arm, kind, payload]);
+        }
+        groups.push(WgpuPairGroup {
+            rotation,
+            arm_count: group.arm_ids.len(),
+            descriptors: archive.context().upload_u32(&descriptors)?,
+        });
+    }
+    Ok(groups.into_boxed_slice())
+}
+
+fn first_axis_prefix<U: Universe>(
+    archive: &WgpuSuccinctArchive<U>,
+    rotation: SuccinctRotation,
+) -> &WgpuBitVector {
+    match rotation {
+        SuccinctRotation::Eav | SuccinctRotation::Eva => archive.entity_prefix(),
+        SuccinctRotation::Aev | SuccinctRotation::Ave => archive.attribute_prefix(),
+        SuccinctRotation::Vea | SuccinctRotation::Vae => archive.value_prefix(),
+    }
 }
 
 #[cube(launch_unchecked)]
 fn initialize_present_round(
-    present_counts: &Array<u32>,
+    initial_estimates: &Array<u32>,
     viable: &mut Array<u32>,
     estimates: &mut Array<u32>,
     rows: u32,
@@ -681,8 +934,124 @@ fn initialize_present_round(
         viable[row] = initial_viability;
         let mut arm = 0u32;
         while arm < arm_count {
-            estimates[arm as usize * rows as usize + row] = present_counts[arm as usize];
+            estimates[arm as usize * rows as usize + row] = initial_estimates[arm as usize];
             arm += 1u32;
+        }
+    }
+}
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn prepare_pair_distinct(
+    descriptors: &Array<u32>,
+    frontier: &Array<u32>,
+    queries: &mut Array<u32>,
+    rows: u32,
+    stride: u32,
+    arm_count: u32,
+    domain: u32,
+    dead: u32,
+) {
+    let probe = ABSOLUTE_POS;
+    let probes = rows as usize * arm_count as usize;
+    if probe < probes {
+        let pair = probe * 2usize;
+        queries[pair] = dead;
+        queries[pair + 1usize] = dead;
+
+        let local_arm = probe / rows as usize;
+        let row = probe % rows as usize;
+        let descriptor = local_arm * PAIR_DESCRIPTOR_WORDS;
+        if descriptor + 2usize < descriptors.len() {
+            let kind = descriptors[descriptor + 1usize];
+            let payload = descriptors[descriptor + 2usize];
+            let mut peer = dead;
+            if kind == CONSTANT_SOURCE {
+                peer = payload;
+            } else if kind == COLUMN_SOURCE && payload < stride {
+                let offset = row * stride as usize + payload as usize;
+                if offset < frontier.len() {
+                    peer = frontier[offset];
+                }
+            }
+            if peer < domain && peer < dead - 1u32 {
+                let next = peer + 1u32;
+                queries[pair] = peer;
+                queries[pair + 1usize] = next;
+            }
+        }
+    }
+}
+
+#[cube(launch_unchecked)]
+fn normalize_pair_range(
+    selected: &Array<u32>,
+    positions: &mut Array<u32>,
+    probes: u32,
+    ring_len: u32,
+    dead: u32,
+) {
+    let probe = ABSOLUTE_POS;
+    if probe < probes as usize {
+        let pair = probe * 2usize;
+        let lo_query = positions[pair];
+        let hi_query = positions[pair + 1usize];
+        let lo_selected = selected[pair];
+        let hi_selected = selected[pair + 1usize];
+        let mut lo = dead;
+        let mut hi = dead;
+        if lo_query != dead
+            && hi_query != dead
+            && lo_selected != dead
+            && hi_selected != dead
+            && lo_selected >= lo_query
+            && hi_selected >= hi_query
+        {
+            let candidate_lo = lo_selected - lo_query;
+            let candidate_hi = hi_selected - hi_query;
+            if candidate_lo <= candidate_hi && candidate_hi <= ring_len {
+                lo = candidate_lo;
+                hi = candidate_hi;
+            }
+        }
+        positions[pair] = lo;
+        positions[pair + 1usize] = hi;
+    }
+}
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn scatter_pair_distinct(
+    descriptors: &Array<u32>,
+    ranks: &Array<u32>,
+    estimates: &mut Array<u32>,
+    rows: u32,
+    local_arm_count: u32,
+    global_arm_count: u32,
+    pair_count: u32,
+    dead: u32,
+) {
+    let probe = ABSOLUTE_POS;
+    let probes = rows as usize * local_arm_count as usize;
+    if probe < probes {
+        let local_arm = probe / rows as usize;
+        let row = probe % rows as usize;
+        let descriptor = local_arm * PAIR_DESCRIPTOR_WORDS;
+        if descriptor + 2usize < descriptors.len() {
+            let global_arm = descriptors[descriptor];
+            if global_arm < global_arm_count {
+                let destination = global_arm as usize * rows as usize + row;
+                if destination < estimates.len() {
+                    let pair = probe * 2usize;
+                    let lo = ranks[pair];
+                    let hi = ranks[pair + 1usize];
+                    let mut count = dead;
+                    if lo != dead && hi != dead && lo <= hi && hi <= pair_count {
+                        count = hi - lo;
+                    }
+                    estimates[destination] = count;
+                }
+            }
         }
     }
 }
@@ -690,3 +1059,7 @@ fn initialize_present_round(
 #[cfg(test)]
 #[path = "resident_support_lowering_tests.rs"]
 mod lowering_tests;
+
+#[cfg(test)]
+#[path = "resident_pair_distinct_tests.rs"]
+mod pair_distinct_tests;

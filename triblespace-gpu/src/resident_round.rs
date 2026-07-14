@@ -342,6 +342,15 @@ impl<R: Runtime> ResidentRoundInputs<R> {
     pub(crate) fn producer_output_args(&mut self) -> (ArrayArg<R>, ArrayArg<R>) {
         (self.viable.output_arg(), self.estimates.output_arg())
     }
+
+    pub(crate) fn estimates_output_arg(&mut self) -> ArrayArg<R> {
+        self.estimates.output_arg()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_producer_outputs(&self) -> (Vec<u32>, Vec<u32>) {
+        (self.viable.read(), self.estimates.read())
+    }
 }
 
 /// Device-resident exact row planner, generic over the CubeCL runtime.
@@ -600,7 +609,7 @@ fn pattern_variables(pattern: ProgramPattern) -> Vec<ProgramVariable> {
         .collect()
 }
 
-fn validate_rows(rows: usize) -> Result<(), ResidentRoundError> {
+pub(crate) fn validate_rows(rows: usize) -> Result<(), ResidentRoundError> {
     if rows >= DEAD_ROW_SENTINEL as usize {
         Err(ResidentRoundError::GeometryOverflow("affine row count"))
     } else {
@@ -608,7 +617,7 @@ fn validate_rows(rows: usize) -> Result<(), ResidentRoundError> {
     }
 }
 
-fn checked_device_product(
+pub(crate) fn checked_device_product(
     left: usize,
     right: usize,
     quantity: &'static str,

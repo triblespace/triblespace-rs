@@ -84,7 +84,13 @@ fn facade_rejects_foreign_archive_and_cross_round_inputs() {
 
     let first = WgpuResidentRound::new(&first_archive, &program, &[]).unwrap();
     let second = WgpuResidentRound::new(&first_archive, &program, &[]).unwrap();
-    let inputs = first.initialize_inputs(1).unwrap();
+    let host = ProgramFrontier::new(Vec::new(), Vec::new(), 1).unwrap();
+    let frontier = first.upload_frontier(&host).unwrap();
+    assert!(matches!(
+        second.initialize_inputs(&frontier),
+        Err(ResidentSupportError::FrontierOwnership)
+    ));
+    let inputs = first.initialize_inputs(&frontier).unwrap();
     assert!(matches!(
         second.enqueue(&inputs),
         Err(ResidentRoundError::InputOwnership)
@@ -100,24 +106,22 @@ fn facade_rejects_foreign_archive_and_cross_round_inputs() {
 }
 
 #[test]
-fn unsupported_physical_specs_fail_before_fabricating_inputs() {
+fn pair_is_supported_while_restricted_and_support_fail_before_inputs() {
     let source = fixture();
     let archive = WgpuSuccinctArchive::new(source.archive).unwrap();
     let program =
         QueryProgram::compile(archive.archive(), 3, [QueryPattern::new(v(0), v(1), v(2))]).unwrap();
 
     let pair = WgpuResidentRound::new(&archive, &program, &[v(0)]).unwrap();
-    assert!(matches!(
-        pair.initialize_inputs(1),
-        Err(ResidentSupportError::UnsupportedPairDistinctEstimate {
-            arm: 0,
-            rotation: SuccinctRotation::Eav,
-        })
-    ));
+    let pair_host = ProgramFrontier::new(vec![v(0)], Vec::new(), 0).unwrap();
+    let pair_frontier = pair.upload_frontier(&pair_host).unwrap();
+    assert!(pair.initialize_inputs(&pair_frontier).is_ok());
 
     let restricted = WgpuResidentRound::new(&archive, &program, &[v(0), v(1)]).unwrap();
+    let restricted_host = ProgramFrontier::new(vec![v(0), v(1)], Vec::new(), 0).unwrap();
+    let restricted_frontier = restricted.upload_frontier(&restricted_host).unwrap();
     assert!(matches!(
-        restricted.initialize_inputs(1),
+        restricted.initialize_inputs(&restricted_frontier),
         Err(ResidentSupportError::UnsupportedRestrictedEstimate {
             arm: 0,
             rotation: SuccinctRotation::Eva,
@@ -125,8 +129,10 @@ fn unsupported_physical_specs_fail_before_fabricating_inputs() {
     ));
 
     let support = WgpuResidentRound::new(&archive, &program, &[v(0), v(1), v(2)]).unwrap();
+    let support_host = ProgramFrontier::new(vec![v(0), v(1), v(2)], Vec::new(), 0).unwrap();
+    let support_frontier = support.upload_frontier(&support_host).unwrap();
     assert!(matches!(
-        support.initialize_inputs(1),
+        support.initialize_inputs(&support_frontier),
         Err(ResidentSupportError::UnsupportedFullyBoundSupport {
             source_pattern_index: 0,
         })
@@ -155,7 +161,9 @@ fn native_choices(
     round: &WgpuResidentRound<'_, OrderedUniverse>,
     rows: usize,
 ) -> Vec<ResidentRowChoice> {
-    let inputs = round.initialize_inputs(rows).unwrap();
+    let host = ProgramFrontier::new(Vec::new(), Vec::new(), rows).unwrap();
+    let frontier = round.upload_frontier(&host).unwrap();
+    let inputs = round.initialize_inputs(&frontier).unwrap();
     round.enqueue(&inputs).unwrap().read().unwrap()
 }
 

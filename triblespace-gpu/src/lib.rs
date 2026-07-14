@@ -28,7 +28,7 @@ pub use resident_round::{
     DEAD_ROW_SENTINEL,
 };
 #[cfg(feature = "wgpu")]
-pub use resident_support::{ResidentSupportError, WgpuResidentRound};
+pub use resident_support::{ResidentSupportError, WgpuResidentFrontier, WgpuResidentRound};
 #[cfg(feature = "wgpu")]
 pub use succinct_query::{
     WgpuBitVector, WgpuContext, WgpuQueryStats, WgpuSuccinctArchive, WgpuWaveletMatrix,

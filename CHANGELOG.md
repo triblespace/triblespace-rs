@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Resident affine rounds now produce exact one-peer estimates entirely on
+  WGPU.** `WgpuResidentRound` retains private per-rotation arm descriptors and
+  accepts an opaque archive-branded affine frontier, initializes every
+  arm-major estimate to an exact zero-peer count or the dead sentinel, then
+  evaluates each nonempty `PairDistinct` group through resident prefix select,
+  normalized range, pair-change rank, and exact global-arm scatter stages. The
+  five-launch group pipeline has no per-execution transfer or intermediate
+  readback, preserves valid zero estimates, and fails closed on foreign
+  frontiers, schema/geometry mismatches, invalid codes, and sentinel results;
+  restricted estimates and fully-bound support remain explicit later slices.
 - **Resident affine rounds gain their first exact estimate/support lowering and
   zero-peer producer.** A pure host IR maps every target and zero/one/two-peer
   state to canonical `Present`, pair-distinct, or restricted Ring primitives,
