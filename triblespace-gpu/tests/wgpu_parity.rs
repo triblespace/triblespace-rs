@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
-use jerky::bit_vector::{NumBits, Rank, Select};
+use jerky::bit_vector::rank9sel::Rank9SelIndex;
+use jerky::bit_vector::{BitVector, BitVectorData, NumBits, Rank, Select};
 use rayon::prelude::*;
 use triblespace_core::and;
 use triblespace_core::blob::encodings::succinctarchive::{
@@ -58,6 +59,12 @@ fn role_trible(entity: Id, attribute: Id, value: Id) -> Trible {
         &attribute,
         &GenId::inline_from(value),
     )
+}
+
+fn indexed_bits(bits: Vec<bool>) -> BitVector<Rank9SelIndex> {
+    let data = BitVectorData::from_bits(bits);
+    let index = Rank9SelIndex::new(&data);
+    BitVector::new(data, index)
 }
 
 #[test]
@@ -313,6 +320,34 @@ fn wgpu_present_axis_codes_match_sparse_interleaved_cpu_domain() {
             "axis count {axis} must be validated"
         );
     }
+
+    // Length, one-count, per-code range monotonicity, and distinct-code count
+    // do not by themselves prove a canonical unary prefix. Moving an endpoint
+    // delimiter into a nonempty first/last run preserves all those weaker
+    // properties while silently dropping one trible from the represented
+    // ranges. Resident construction must reject both directions.
+    let mut endpoint_set = TribleSet::new();
+    endpoint_set.insert(&role_trible(entities[0], attributes[0], values[0]));
+    endpoint_set.insert(&role_trible(entities[0], attributes[1], values[1]));
+    endpoint_set.insert(&role_trible(entities[1], attributes[0], values[1]));
+    let endpoint_archive: SuccinctArchive<OrderedUniverse> = (&endpoint_set).into();
+
+    let mut missing_first = endpoint_archive.clone();
+    let mut entity_bits = missing_first.e_a.to_vec();
+    assert!(entity_bits[0] && !entity_bits[1]);
+    entity_bits[0] = false;
+    entity_bits[1] = true;
+    missing_first.e_a = indexed_bits(entity_bits);
+    assert!(WgpuSuccinctArchive::new(missing_first).is_err());
+
+    let mut missing_final = endpoint_archive;
+    let mut value_bits = missing_final.v_a.to_vec();
+    let final_bit = value_bits.len() - 1;
+    assert!(!value_bits[final_bit - 1] && value_bits[final_bit]);
+    value_bits[final_bit - 1] = true;
+    value_bits[final_bit] = false;
+    missing_final.v_a = indexed_bits(value_bits);
+    assert!(WgpuSuccinctArchive::new(missing_final).is_err());
 }
 
 #[test]

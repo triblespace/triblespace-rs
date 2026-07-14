@@ -363,6 +363,12 @@ fn collect_present_codes(
             "{axis} prefix geometry does not match the archive domain and ring"
         )));
     }
+    let final_delimiter = expected_prefix_len - 1;
+    if prefix.select1(0) != Some(0) || prefix.select1(domain_len) != Some(final_delimiter) {
+        return Err(jerky::Error::invalid_argument(format!(
+            "{axis} prefix must start and end with canonical delimiters"
+        )));
+    }
 
     let mut codes = Vec::with_capacity(expected_count);
     for code in 0..domain_len {

@@ -9,10 +9,10 @@
 //! Setup and each archive's first execution/synchronization are reported
 //! separately from warm samples. A warm resident sample remains end-to-end: it
 //! includes the 8-byte status upload, all allocations and kernels, and one full
-//! packed final D2H read. Its fourteen host-exact local launches use direct
-//! rectangles rather than uploaded indirect-dispatch records. Run with
-//! `--release` for publishable measurements; debug builds are useful only as
-//! smoke tests.
+//! packed final D2H read. Its fourteen host-exact dispatch plans use direct
+//! rectangles rather than uploaded indirect-dispatch records; rectangles may
+//! be reused by multiple kernels. Run with `--release` for publishable
+//! measurements; debug builds are useful only as smoke tests.
 
 use std::env;
 use std::hint::black_box;
@@ -33,7 +33,7 @@ const DEFAULT_WARMUPS: usize = 3;
 const HEADER_WORDS: usize = 2;
 const EAV_STRIDE: usize = 3;
 const STATUS_UPLOAD_BYTES: usize = 2 * std::mem::size_of::<u32>();
-const WARM_CONTROL_H2D_BYTES: usize = STATUS_UPLOAD_BYTES;
+const WARM_EXPLICIT_QUERY_H2D_BYTES: usize = STATUS_UPLOAD_BYTES;
 
 #[derive(Clone, Copy)]
 struct TimingSummary {
@@ -405,7 +405,7 @@ fn benchmark_shape(
     let cpu_over_resident = cpu.p50.as_secs_f64() / resident_timing.p50.as_secs_f64();
 
     println!(
-        "{name},{},{},{},{domain_rows},{e_rows},{ea_rows},{eav_rows},{total_transitioned_rows},{final_read_bytes},{WARM_CONTROL_H2D_BYTES},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{cpu_eav_throughput:.3},{resident_eav_throughput:.3},{cpu_total_throughput:.3},{resident_total_throughput:.3},{resident_over_cpu:.6},{cpu_over_resident:.6}",
+        "{name},{},{},{},{domain_rows},{e_rows},{ea_rows},{eav_rows},{total_transitioned_rows},{final_read_bytes},{WARM_EXPLICIT_QUERY_H2D_BYTES},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{cpu_eav_throughput:.3},{resident_eav_throughput:.3},{cpu_total_throughput:.3},{resident_total_throughput:.3},{resident_over_cpu:.6},{cpu_over_resident:.6}",
         geometry.attributes,
         geometry.values,
         set.len(),
@@ -439,7 +439,7 @@ fn main() {
         "# semantics=one all-variable pattern; fixed canonical trible count; archive shape varies; forced CPU E->A->V versus resident execute_eav(1)"
     );
     println!(
-        "# setup=excluded; warm_resident=8-byte control H2D (status only; 14 host-exact launches use direct rectangles) + all allocations/kernels + one full packed final D2H"
+        "# setup=excluded; warm_resident=8-byte explicit query-buffer H2D (status only; driver/launch-parameter encoding not counted; 14 host-exact dispatch plans use direct rectangles) + all allocations/kernels + one full packed final D2H"
     );
     println!(
         "# first_execution_sync=first synchronization for each archive and any not-yet-process-cached pipeline setup; later shapes may reuse globally cached shader pipelines"
@@ -451,7 +451,7 @@ fn main() {
         "# config=shape_n={tribles} repetitions={repetitions} warmups={warmups} profile={profile}; use --release for measurements"
     );
     println!(
-        "shape,distinct_attributes,distinct_values,tribles,domain_rows,e_rows,ea_rows,eav_rows,total_transitioned_rows,final_read_bytes,warm_control_h2d_bytes,fixture_ms,archive_ms,resident_enqueue_ms,program_compile_ms,wgpu_admission_ms,first_execution_sync_ms,cpu_min_ms,cpu_p50_ms,cpu_max_ms,resident_min_ms,resident_p50_ms,resident_max_ms,cpu_eav_rows_per_s,resident_eav_rows_per_s,cpu_total_rows_per_s,resident_total_rows_per_s,resident_over_cpu_p50,cpu_over_resident_speedup"
+        "shape,distinct_attributes,distinct_values,tribles,domain_rows,e_rows,ea_rows,eav_rows,total_transitioned_rows,final_read_bytes,warm_explicit_query_h2d_bytes,fixture_ms,archive_ms,resident_build_enqueue_ms,program_compile_ms,wgpu_admission_ms,first_execution_sync_ms,cpu_min_ms,cpu_p50_ms,cpu_max_ms,resident_min_ms,resident_p50_ms,resident_max_ms,cpu_eav_rows_per_s,resident_eav_rows_per_s,cpu_total_rows_per_s,resident_total_rows_per_s,resident_over_cpu_p50,cpu_over_resident_speedup"
     );
 
     let fixture_started = Instant::now();

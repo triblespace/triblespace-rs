@@ -144,12 +144,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Host-exact resident E/A/V launches use Jerky's direct CubeCL rectangles.**
-  The fourteen local launches in one warm `execute_eav` no longer allocate or
-  upload indirect-dispatch records intended for device-produced lengths. The
-  shared checked planner retains the device limits, capacity envelope, and
-  flattened-`u32` safety proof; the dynamic two-bound transition keeps its
-  device-written `DeviceDispatch` unchanged.
+- **Host-exact resident E/A/V dispatch plans use Jerky's direct CubeCL
+  rectangles.** The fourteen exact-geometry plans in one warm `execute_eav`
+  no longer allocate or upload indirect-dispatch records intended for
+  device-produced lengths. The shared checked planner retains the device
+  limits, capacity envelope, and flattened-`u32` safety proof; the dynamic
+  two-bound transition keeps its device-written `DeviceDispatch` unchanged.
 - **PATCH-backed triple patterns reuse adjacent identical lookup prefixes.**
   Block estimates and proposals replay the prior PATCH result when consecutive
   rows bind the pattern to the same prefix; confirmation additionally requires

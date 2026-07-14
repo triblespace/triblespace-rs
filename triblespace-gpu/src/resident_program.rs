@@ -1217,7 +1217,6 @@ fn eav_geometry<U: Universe>(
     let quantities = [
         ("seed-row count", seed_rows),
         ("archive code domain", domain),
-        ("paired domain select probes", domain.saturating_mul(2)),
         ("distinct entity count", entities),
         ("distinct E/A pair count", pairs),
         ("archive trible count", triples),
