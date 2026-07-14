@@ -42,6 +42,8 @@ use std::hash::{Hash, Hasher};
 #[cfg(test)]
 use std::sync::Arc;
 
+use smallvec::SmallVec;
+
 use super::*;
 
 /// One deterministic route from the owned root to an opaque residual leaf.
@@ -201,11 +203,13 @@ pub struct ResidualStateSolve<R> {
 /// representation avoids aliasing conjunctions with more leaves than the query
 /// language's independent 128-variable cap.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct ChildSet(Vec<u64>);
+struct ChildSet(SmallVec<[u64; 2]>);
 
 impl ChildSet {
     fn empty(leaf_count: usize) -> Self {
-        Self(vec![0; leaf_count.div_ceil(64)])
+        let mut words = SmallVec::new();
+        words.resize(leaf_count.div_ceil(64), 0);
+        Self(words)
     }
 
     fn contains(&self, child: usize) -> bool {
