@@ -404,6 +404,7 @@ struct DirectGate {
     child: Vec<u32>,
     verdicts: Vec<u32>,
     indirect_marker: u32,
+    failure_indirect_marker: u32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -431,6 +432,10 @@ fn gate_direct(
     let mut meta = context.batch_meta(0, capacity).unwrap();
     let mut dispatch = context
         .batch_dispatch(0, capacity, CubeDim::new_1d(THREADS))
+        .unwrap();
+    let semantic_poison_len = segment_words.len().max(capacity).max(child_words.len());
+    let mut failure_dispatch = context
+        .batch_dispatch(0, semantic_poison_len, CubeDim::new_1d(THREADS))
         .unwrap();
     let confirmation_layout = confirmation_workspace_layout(capacity).unwrap();
     let mut confirmation = context
@@ -494,6 +499,8 @@ fn gate_direct(
             );
         }
     }
+    let failure_groups_x = failure_dispatch.max_groups_x();
+    let failure_groups_y = failure_dispatch.max_groups_y();
     unsafe {
         finalize_proposal_destinations::launch_unchecked::<WgpuRuntime>(
             context.client(),
@@ -518,36 +525,33 @@ fn gate_direct(
             STATUS_DEVICE_INVARIANT,
             STATUS_GEOMETRY,
         );
-        publish_proposal_dispatch::launch_unchecked::<WgpuRuntime>(
+        publish_proposal_and_failure_dispatch::launch_unchecked::<WgpuRuntime>(
             context.client(),
             CubeCount::new_single(),
             CubeDim::new_single(),
             control.input_arg(),
             dispatch.output_arg(),
+            failure_dispatch.output_arg(),
+            failure_groups_x,
+            failure_groups_y,
             STATUS_OK,
         );
     }
-    let poison_len = segment_words.len().max(capacity).max(child_words.len());
-    if poison_len != 0 {
-        let launch = context
-            .static_batch_dispatch(poison_len, poison_len, CubeDim::new_1d(THREADS))
-            .unwrap();
-        unsafe {
-            poison_failed_proposal_outputs::launch_unchecked::<WgpuRuntime>(
-                context.client(),
-                launch.cube_count(),
-                launch.cube_dim(),
-                control.input_arg(),
-                segments.output_arg(),
-                candidates.output_arg(),
-                child.output_arg(),
-                segment_words.len() as u32,
-                capacity as u32,
-                child_words.len() as u32,
-                RESIDENT_U32_SENTINEL,
-                STATUS_OK,
-            );
-        }
+    unsafe {
+        poison_failed_proposal_outputs::launch_unchecked::<WgpuRuntime>(
+            context.client(),
+            failure_dispatch.cube_count(),
+            failure_dispatch.cube_dim(),
+            control.input_arg(),
+            segments.output_arg(),
+            candidates.output_arg(),
+            child.output_arg(),
+            segment_words.len() as u32,
+            capacity as u32,
+            child_words.len() as u32,
+            RESIDENT_U32_SENTINEL,
+            STATUS_OK,
+        );
     }
     unsafe {
         publish_proposal_meta::launch_unchecked::<WgpuRuntime>(
@@ -561,12 +565,19 @@ fn gate_direct(
         );
     }
     let mut indirect_marker = context.upload_u32(&[0]).unwrap();
+    let mut failure_indirect_marker = context.upload_u32(&[0]).unwrap();
     unsafe {
         mark_indirect_dispatch::launch_unchecked::<WgpuRuntime>(
             context.client(),
             dispatch.cube_count(),
             dispatch.cube_dim(),
             indirect_marker.output_arg(),
+        );
+        mark_indirect_dispatch::launch_unchecked::<WgpuRuntime>(
+            context.client(),
+            failure_dispatch.cube_count(),
+            failure_dispatch.cube_dim(),
+            failure_indirect_marker.output_arg(),
         );
     }
     let mut meta_marker = context.empty_u32(1).unwrap();
@@ -589,6 +600,7 @@ fn gate_direct(
         verdicts: confirmation[confirmation_layout.keep..confirmation_layout.keep + capacity]
             .to_vec(),
         indirect_marker: indirect_marker.read()[0],
+        failure_indirect_marker: failure_indirect_marker.read()[0],
     }
 }
 
@@ -605,6 +617,146 @@ fn canonical_gate_fixture() -> (WorkspaceLayout, Vec<u32>, Vec<u32>, Vec<u32>) {
     let dead = RESIDENT_U32_SENTINEL;
     let candidates = vec![0, 1, 2, dead, 0, 1, 2, dead, 7, 8, 9, dead];
     (layout, workspace, segments, candidates)
+}
+
+#[test]
+fn dual_dispatch_publication_is_mutually_exclusive_and_reuse_safe() {
+    let context = crate::WgpuContext::on_wgpu();
+    let capacity = 65usize;
+    let mut public_dispatch = context
+        .batch_dispatch(0, capacity, CubeDim::new_1d(THREADS))
+        .unwrap();
+    let mut failure_dispatch = context
+        .batch_dispatch(0, capacity, CubeDim::new_1d(THREADS))
+        .unwrap();
+
+    // Alternate both directions through the same two persistent records. The
+    // forced 1x2 rectangles make stale Y/Z words observable instead of letting
+    // the ordinary 2x1 host geometry mask an incomplete overwrite.
+    let control_words = [
+        [STATUS_OK, capacity as u32, 1, 2],
+        [STATUS_CAPACITY, capacity as u32 + 1, 99, 99],
+        [STATUS_OK, capacity as u32, 1, 2],
+        [STATUS_DEVICE_INVARIANT, RESIDENT_U32_SENTINEL, 99, 99],
+        [STATUS_OK, capacity as u32, 1, 2],
+        [STATUS_GEOMETRY, RESIDENT_U32_SENTINEL, 99, 99],
+        [STATUS_OK, capacity as u32, 1, 2],
+        [99, RESIDENT_U32_SENTINEL, 99, 99],
+        [STATUS_OK, 0, 0, 1],
+    ];
+    let controls = control_words.map(|words| context.upload_u32(&words).unwrap());
+    let mut packed = context.empty_u32(controls.len() * 6).unwrap();
+
+    for (case, control) in controls.iter().enumerate() {
+        unsafe {
+            publish_proposal_and_failure_dispatch::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                CubeCount::new_single(),
+                CubeDim::new_single(),
+                control.input_arg(),
+                public_dispatch.output_arg(),
+                failure_dispatch.output_arg(),
+                1,
+                2,
+                STATUS_OK,
+            );
+            pack_dispatch_pair::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                CubeCount::new_single(),
+                CubeDim::new_single(),
+                public_dispatch.output_arg(),
+                failure_dispatch.output_arg(),
+                packed.output_arg(),
+                (case * 6) as u32,
+            );
+        }
+    }
+
+    let packed = packed.read();
+    for case in 0..control_words.len() {
+        let words = &packed[case * 6..case * 6 + 6];
+        if control_words[case][CONTROL_STATUS] == STATUS_OK {
+            let expected_public = if case + 1 == controls.len() {
+                [0, 1, 1]
+            } else {
+                [1, 2, 1]
+            };
+            assert_eq!(&words[..3], &expected_public, "success case {case}");
+            assert_eq!(&words[3..], &[0, 1, 1], "success case {case}");
+        } else {
+            assert_eq!(&words[..3], &[0, 1, 1], "failure case {case}");
+            assert_eq!(&words[3..], &[1, 2, 1], "failure case {case}");
+        }
+    }
+}
+
+#[test]
+fn forced_two_dimensional_failure_cleanup_reaches_lane_64() {
+    let context = crate::WgpuContext::on_wgpu();
+    let capacity = 65usize;
+    let mut public_dispatch = context
+        .batch_dispatch(0, capacity, CubeDim::new_1d(THREADS))
+        .unwrap();
+    let mut failure_dispatch = context
+        .batch_dispatch(0, capacity, CubeDim::new_1d(THREADS))
+        .unwrap();
+    let control = context
+        .upload_u32(&[STATUS_DEVICE_INVARIANT, RESIDENT_U32_SENTINEL, 99, 99])
+        .unwrap();
+    let mut segments = context.upload_u32(&[17; SEGMENT_RECORD_WORDS]).unwrap();
+    let mut candidates = context
+        .upload_u32(&vec![17; capacity * CANDIDATE_RECORD_FIELDS])
+        .unwrap();
+    let mut children = context.upload_u32(&vec![17; capacity]).unwrap();
+
+    unsafe {
+        publish_proposal_and_failure_dispatch::launch_unchecked::<WgpuRuntime>(
+            context.client(),
+            CubeCount::new_single(),
+            CubeDim::new_single(),
+            control.input_arg(),
+            public_dispatch.output_arg(),
+            failure_dispatch.output_arg(),
+            1,
+            2,
+            STATUS_OK,
+        );
+        poison_failed_proposal_outputs::launch_unchecked::<WgpuRuntime>(
+            context.client(),
+            failure_dispatch.cube_count(),
+            failure_dispatch.cube_dim(),
+            control.input_arg(),
+            segments.output_arg(),
+            candidates.output_arg(),
+            children.output_arg(),
+            SEGMENT_RECORD_WORDS as u32,
+            capacity as u32,
+            capacity as u32,
+            RESIDENT_U32_SENTINEL,
+            STATUS_OK,
+        );
+    }
+
+    let candidates = candidates.read();
+    assert_eq!(candidates[64], RESIDENT_U32_SENTINEL);
+    assert_eq!(candidates[capacity + 64], RESIDENT_U32_SENTINEL);
+    assert_eq!(candidates[capacity * 2 + 64], RESIDENT_U32_SENTINEL);
+    assert_eq!(children.read()[64], RESIDENT_U32_SENTINEL);
+    assert!(segments
+        .read()
+        .iter()
+        .all(|&word| word == RESIDENT_U32_SENTINEL));
+}
+
+#[test]
+fn confirmation_workspace_does_not_inflate_failure_cleanup_geometry() {
+    let capacity = 65usize;
+    let confirmation = confirmation_workspace_layout(capacity).unwrap();
+    let (initial_poison_len, semantic_poison_len) =
+        proposal_poison_lengths(SEGMENT_RECORD_WORDS, capacity, capacity, confirmation.words);
+    assert!(confirmation.words > semantic_poison_len);
+    assert_eq!(initial_poison_len, confirmation.words);
+    assert_eq!(semantic_poison_len, capacity);
 }
 
 #[derive(Clone, Debug)]
@@ -2467,6 +2619,7 @@ fn unrepresentable_scan_total_has_a_distinct_geometry_status() {
         control,
         meta,
         dispatch,
+        _failure_dispatch: None,
         segment_records,
         candidate_records: context
             .upload_u32(&[RESIDENT_U32_SENTINEL; CANDIDATE_RECORD_FIELDS])
@@ -3821,6 +3974,7 @@ fn shared_destination_gate_rejects_every_structural_route_and_completeness_fault
     assert_eq!(valid.logical_len, 3);
     assert_eq!(valid.verdicts, [1, 1, 1, 0]);
     assert_eq!(valid.indirect_marker, 1);
+    assert_eq!(valid.failure_indirect_marker, 0);
 
     // Exact family semantics deliberately stay outside this shared proof:
     // a different in-domain code on the same authenticated route is accepted.
@@ -3890,6 +4044,7 @@ fn shared_destination_gate_rejects_every_structural_route_and_completeness_fault
         assert_eq!((failed.control[2], failed.control[3]), (0, 1), "{name}");
         assert_eq!(failed.logical_len, 0, "{name}");
         assert_eq!(failed.indirect_marker, 0, "{name}");
+        assert_eq!(failed.failure_indirect_marker, 1, "{name}");
         assert!(
             failed
                 .segments
@@ -3948,6 +4103,7 @@ fn shared_destination_gate_rejects_every_structural_route_and_completeness_fault
     assert_eq!(&exact_capacity.control[..2], &[STATUS_OK, 3]);
     assert_eq!(exact_capacity.verdicts, [1, 1, 1]);
     assert_eq!(exact_capacity.indirect_marker, 1);
+    assert_eq!(exact_capacity.failure_indirect_marker, 0);
 }
 
 #[test]
@@ -4083,6 +4239,7 @@ fn owner_indexed_device_gate_rejects_range_sentinel_and_cell_overflow_faults() {
     assert_eq!(&zero_rows.control[..2], &[STATUS_OK, 0]);
     assert_eq!(zero_rows.verdicts, [0, 0, 0, 0]);
     assert_eq!(zero_rows.indirect_marker, 0);
+    assert_eq!(zero_rows.failure_indirect_marker, 0);
 
     // Isolate the validator from failure cleanup so malformed buffer shapes
     // can prove fail-closed bounds without asking a downstream poison kernel
@@ -4179,6 +4336,7 @@ fn destination_gate_preserves_the_closed_upstream_error_lattice() {
     assert_eq!(&capacity.control[..2], &[STATUS_CAPACITY, 5]);
     assert_eq!(capacity.logical_len, 0);
     assert_eq!(capacity.indirect_marker, 0);
+    assert_eq!(capacity.failure_indirect_marker, 1);
     assert!(capacity
         .segments
         .iter()
@@ -4199,6 +4357,15 @@ fn destination_gate_preserves_the_closed_upstream_error_lattice() {
     assert_eq!(&unknown.control[..2], &[STATUS_DEVICE_INVARIANT, dead]);
     let geometry = run([STATUS_GEOMETRY, dead, 0, 1], &polluted);
     assert_eq!(&geometry.control[..2], &[STATUS_GEOMETRY, dead]);
+    for (name, failed) in [
+        ("capacity pollution", &capacity_pollution),
+        ("device invariant", &invariant),
+        ("unknown status", &unknown),
+        ("geometry", &geometry),
+    ] {
+        assert_eq!(failed.indirect_marker, 0, "{name}");
+        assert_eq!(failed.failure_indirect_marker, 1, "{name}");
+    }
     for malformed in [[STATUS_CAPACITY, dead, 0, 1], [STATUS_CAPACITY, 4, 0, 1]] {
         let result = run(malformed, &poison_candidates);
         assert_eq!(&result.control[..2], &[STATUS_DEVICE_INVARIANT, dead]);
@@ -4206,6 +4373,7 @@ fn destination_gate_preserves_the_closed_upstream_error_lattice() {
 
     let zero = run([STATUS_OK, 0, 0, 1], &poison_candidates);
     assert_eq!(&zero.control[..2], &[STATUS_OK, 0]);
+    assert_eq!(zero.failure_indirect_marker, 0);
     let zero_pollution = run([STATUS_OK, 0, 0, 1], &polluted);
     assert_eq!(
         &zero_pollution.control[..2],

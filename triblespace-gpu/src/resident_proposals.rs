@@ -180,6 +180,11 @@ pub(crate) struct WgpuResidentProposals {
     control: DeviceU32Buffer<WgpuRuntime>,
     meta: DeviceBatchMeta<WgpuRuntime>,
     dispatch: DeviceDispatch<WgpuRuntime>,
+    /// Failure-only indirect rectangle for late semantic re-poisoning.
+    ///
+    /// Confirmed publication moves the provisional record into
+    /// [`ProvisionalBacking`]; provisional arenas retain it here directly.
+    _failure_dispatch: Option<DeviceDispatch<WgpuRuntime>>,
     segment_records: DeviceU32Buffer<WgpuRuntime>,
     candidate_records: DeviceU32Buffer<WgpuRuntime>,
     child_body: DeviceU32Buffer<WgpuRuntime>,
@@ -197,6 +202,7 @@ struct ProvisionalBacking {
     _control: DeviceU32Buffer<WgpuRuntime>,
     _meta: DeviceBatchMeta<WgpuRuntime>,
     _dispatch: DeviceDispatch<WgpuRuntime>,
+    _failure_dispatch: DeviceDispatch<WgpuRuntime>,
     _segment_records: DeviceU32Buffer<WgpuRuntime>,
     _candidate_records: DeviceU32Buffer<WgpuRuntime>,
     _child_body: DeviceU32Buffer<WgpuRuntime>,
@@ -803,6 +809,14 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         let mut generation_dispatch =
             context.batch_dispatch(0, capacity, CubeDim::new_1d(THREADS))?;
         let mut dynamic_dispatch = context.batch_dispatch(0, capacity, CubeDim::new_1d(THREADS))?;
+        let (initial_poison_len, semantic_poison_len) = proposal_poison_lengths(
+            segment_record_words,
+            capacity,
+            child_words,
+            confirmation_layout.words,
+        );
+        let mut failure_dispatch =
+            context.batch_dispatch(0, semantic_poison_len, CubeDim::new_1d(THREADS))?;
         let (generation_max_x, generation_max_y, publication_max_x, publication_max_y) =
             if let Some((x, y)) = dispatch_limits {
                 // Jerky's capacity rectangle prefers 1-D whenever it fits. The
@@ -838,13 +852,12 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         let mut child_body = context.empty_u32(child_words)?;
         let mut confirmation_workspace = context.empty_u32(confirmation_layout.words)?;
 
-        let poison_len = segment_record_words
-            .max(capacity)
-            .max(child_words)
-            .max(confirmation_layout.words);
-        if poison_len != 0 {
-            let dispatch =
-                context.static_batch_dispatch(poison_len, poison_len, CubeDim::new_1d(THREADS))?;
+        if initial_poison_len != 0 {
+            let dispatch = context.static_batch_dispatch(
+                initial_poison_len,
+                initial_poison_len,
+                CubeDim::new_1d(THREADS),
+            )?;
             unsafe {
                 poison_proposal_outputs::launch_unchecked::<WgpuRuntime>(
                     context.client(),
@@ -1111,39 +1124,41 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 STATUS_DEVICE_INVARIANT,
                 STATUS_GEOMETRY,
             );
-            publish_proposal_dispatch::launch_unchecked::<WgpuRuntime>(
+            let (failure_groups_x, failure_groups_y) = dispatch_limits
+                .filter(|&(x, y)| {
+                    x as usize * y as usize == semantic_poison_len.div_ceil(THREADS as usize)
+                })
+                .unwrap_or((
+                    failure_dispatch.max_groups_x(),
+                    failure_dispatch.max_groups_y(),
+                ));
+            publish_proposal_and_failure_dispatch::launch_unchecked::<WgpuRuntime>(
                 context.client(),
                 CubeCount::new_single(),
                 CubeDim::new_single(),
                 control.input_arg(),
                 dynamic_dispatch.output_arg(),
+                failure_dispatch.output_arg(),
+                failure_groups_x,
+                failure_groups_y,
                 STATUS_OK,
             );
         }
-        let late_cleanup_dispatch = if poison_len != 0 {
-            Some(context.static_batch_dispatch(poison_len, poison_len, CubeDim::new_1d(THREADS))?)
-        } else {
-            None
-        };
-        let mut launch_late_cleanup = || {
-            if let Some(dispatch) = &late_cleanup_dispatch {
-                unsafe {
-                    poison_failed_proposal_outputs::launch_unchecked::<WgpuRuntime>(
-                        context.client(),
-                        dispatch.cube_count(),
-                        dispatch.cube_dim(),
-                        control.input_arg(),
-                        segment_records.output_arg(),
-                        candidate_records.output_arg(),
-                        child_body.output_arg(),
-                        segment_record_words as u32,
-                        capacity as u32,
-                        child_words as u32,
-                        RESIDENT_U32_SENTINEL,
-                        STATUS_OK,
-                    );
-                }
-            }
+        let mut launch_late_cleanup = || unsafe {
+            poison_failed_proposal_outputs::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                failure_dispatch.cube_count(),
+                failure_dispatch.cube_dim(),
+                control.input_arg(),
+                segment_records.output_arg(),
+                candidate_records.output_arg(),
+                child_body.output_arg(),
+                segment_record_words as u32,
+                capacity as u32,
+                child_words as u32,
+                RESIDENT_U32_SENTINEL,
+                STATUS_OK,
+            );
         };
         #[cfg(test)]
         let late_cleanup_profile = if _profile_stages {
@@ -1212,6 +1227,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 control,
                 meta,
                 dispatch: dynamic_dispatch,
+                _failure_dispatch: Some(failure_dispatch),
                 segment_records,
                 candidate_records,
                 child_body,
@@ -1477,6 +1493,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 control: final_control,
                 meta: final_meta,
                 dispatch: final_dispatch,
+                _failure_dispatch: None,
                 segment_records: final_segments,
                 candidate_records: final_candidates,
                 child_body: final_child_body,
@@ -1486,6 +1503,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                     _control: control,
                     _meta: meta,
                     _dispatch: dynamic_dispatch,
+                    _failure_dispatch: failure_dispatch,
                     _segment_records: segment_records,
                     _candidate_records: candidate_records,
                     _child_body: child_body,
@@ -1532,6 +1550,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             control,
             meta,
             dispatch: dynamic_dispatch,
+            _failure_dispatch: Some(failure_dispatch),
             segment_records,
             candidate_records,
             child_body,
@@ -2053,6 +2072,25 @@ fn confirmation_workspace_layout(
         block_count,
         words,
     })
+}
+
+/// Returns `(initial_poison_len, semantic_poison_len)`.
+///
+/// Initialization covers the private confirmation workspace as well as all
+/// semantic outputs. Late failure cleanup deliberately covers only semantic
+/// outputs; confirmation scratch is never published and therefore must not
+/// inflate the failure-only indirect rectangle.
+fn proposal_poison_lengths(
+    segment_words: usize,
+    capacity: usize,
+    child_words: usize,
+    confirmation_words: usize,
+) -> (usize, usize) {
+    let semantic_poison_len = segment_words.max(capacity).max(child_words);
+    (
+        semantic_poison_len.max(confirmation_words),
+        semantic_poison_len,
+    )
 }
 
 fn workspace_layout(
@@ -4313,6 +4351,35 @@ fn publish_proposal_dispatch(control: &Array<u32>, dispatch: &mut Array<u32>, ok
     }
 }
 
+/// Publishes mutually exclusive success and failure work from one finalized
+/// status word. Both persistent records are overwritten in full, so reuse
+/// cannot retain a stale Y or Z dimension from the opposite outcome.
+#[cube(launch_unchecked)]
+fn publish_proposal_and_failure_dispatch(
+    control: &Array<u32>,
+    public_dispatch: &mut Array<u32>,
+    failure_dispatch: &mut Array<u32>,
+    failure_groups_x: u32,
+    failure_groups_y: u32,
+    ok: u32,
+) {
+    if ABSOLUTE_POS == 0 {
+        if control[CONTROL_STATUS] == ok {
+            public_dispatch[0] = control[CONTROL_DISPATCH_X];
+            public_dispatch[1] = control[CONTROL_DISPATCH_Y];
+            failure_dispatch[0] = 0u32;
+            failure_dispatch[1] = 1u32;
+        } else {
+            public_dispatch[0] = 0u32;
+            public_dispatch[1] = 1u32;
+            failure_dispatch[0] = failure_groups_x;
+            failure_dispatch[1] = failure_groups_y;
+        }
+        public_dispatch[2] = 1u32;
+        failure_dispatch[2] = 1u32;
+    }
+}
+
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 fn materialize_proposal_children(
@@ -4604,6 +4671,24 @@ fn pack_proposal_completion(meta: &Array<u32>, marker: &mut Array<u32>) {
 fn mark_indirect_dispatch(marker: &mut Array<u32>) {
     if ABSOLUTE_POS == 0 {
         marker[0] = 1u32;
+    }
+}
+
+#[cfg(test)]
+#[cube(launch_unchecked)]
+fn pack_dispatch_pair(
+    public_dispatch: &mut Array<u32>,
+    failure_dispatch: &mut Array<u32>,
+    packed: &mut Array<u32>,
+    base: u32,
+) {
+    if ABSOLUTE_POS == 0 {
+        let mut word = 0usize;
+        while word < 3usize {
+            packed[base as usize + word] = public_dispatch[word];
+            packed[base as usize + 3usize + word] = failure_dispatch[word];
+            word += 1usize;
+        }
     }
 }
 
