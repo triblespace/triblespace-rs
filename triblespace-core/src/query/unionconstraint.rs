@@ -223,6 +223,23 @@ where
                 acc.union(c.influence(variable))
             })
     }
+
+    fn residual_union_children(&self) -> Option<&dyn ConstraintChildren<'a>> {
+        Some(self)
+    }
+}
+
+impl<'a, C> ConstraintChildren<'a> for UnionConstraint<C>
+where
+    C: Constraint<'a> + 'a,
+{
+    fn len(&self) -> usize {
+        self.constraints.len()
+    }
+
+    fn child(&self, index: usize) -> &dyn Constraint<'a> {
+        &self.constraints[index]
+    }
 }
 
 /// Combines constraints into a [`UnionConstraint`] (logical OR).

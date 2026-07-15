@@ -981,6 +981,17 @@ pub trait Constraint<'a> {
         ConstraintShape::Opaque
     }
 
+    /// Exposes the finite arms of an otherwise opaque logical union.
+    ///
+    /// Ordinary residual lowering deliberately ignores this capability, so a
+    /// union retains its existing indivisible [`Constraint`] semantics unless
+    /// the caller explicitly selects finite-union lowering. The child count
+    /// and order are structural facts and must remain stable for the solve.
+    #[doc(hidden)]
+    fn residual_union_children(&self) -> Option<&dyn ConstraintChildren<'a>> {
+        None
+    }
+
     /// Reports whether residual execution may partition one parent's ordered
     /// candidate sequence into disjoint pages before calling `confirm`.
     ///
@@ -1061,6 +1072,11 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.residual_shape()
     }
 
+    fn residual_union_children(&self) -> Option<&dyn ConstraintChildren<'a>> {
+        let inner: &T = self;
+        inner.residual_union_children()
+    }
+
     fn residual_confirm_is_page_local(&self) -> bool {
         let inner: &T = self;
         inner.residual_confirm_is_page_local()
@@ -1116,6 +1132,11 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     fn residual_shape(&self) -> ConstraintShape<'_, 'a> {
         let inner: &T = self;
         inner.residual_shape()
+    }
+
+    fn residual_union_children(&self) -> Option<&dyn ConstraintChildren<'a>> {
+        let inner: &T = self;
+        inner.residual_union_children()
     }
 
     fn residual_confirm_is_page_local(&self) -> bool {
