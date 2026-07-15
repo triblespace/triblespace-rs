@@ -179,7 +179,27 @@ where
 /// let observed_gpu = gpu.observe_residual_actions();
 /// let constraint = observed_gpu.pattern(entity, attribute, value);
 /// ```
+///
+/// The embedded rank backend is private: callers cannot use this public view
+/// to label arbitrary rank work as a Succinct confirmation.
+///
+/// ```compile_fail
+/// use triblespace_core::blob::encodings::succinctarchive::{
+///     OrderedUniverse, RingBatchQuery,
+/// };
+/// use triblespace_gpu::ObservedWgpuSuccinctArchive;
+///
+/// fn require_ring_batch<T: RingBatchQuery>() {}
+/// require_ring_batch::<ObservedWgpuSuccinctArchive<'static, OrderedUniverse>>();
+/// ```
 pub struct ObservedWgpuSuccinctArchive<'a, U>
+where
+    U: Universe,
+{
+    ring_batch: ObservedRingBatch<'a, U>,
+}
+
+struct ObservedRingBatch<'a, U>
 where
     U: Universe,
 {
@@ -196,6 +216,17 @@ where
 }
 
 impl<U> Copy for ObservedWgpuSuccinctArchive<'_, U> where U: Universe {}
+
+impl<U> Clone for ObservedRingBatch<'_, U>
+where
+    U: Universe,
+{
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<U> Copy for ObservedRingBatch<'_, U> where U: Universe {}
 
 impl<U> WgpuSuccinctArchive<U>
 where
@@ -269,7 +300,9 @@ where
     /// the returned adapter to a local before pattern construction; the
     /// resulting constraint borrows it through [`TriblePattern`]'s GAT.
     pub fn observe_residual_actions(&self) -> ObservedWgpuSuccinctArchive<'_, U> {
-        ObservedWgpuSuccinctArchive { inner: self }
+        ObservedWgpuSuccinctArchive {
+            ring_batch: ObservedRingBatch { inner: self },
+        }
     }
 
     /// Removes the resident adapter and returns its canonical CPU archive.
@@ -366,7 +399,7 @@ where
     }
 }
 
-impl<U> RingBatchQuery for ObservedWgpuSuccinctArchive<'_, U>
+impl<U> RingBatchQuery for ObservedRingBatch<'_, U>
 where
     U: Universe + Send + Sync,
 {
@@ -394,7 +427,7 @@ where
     }
 }
 
-impl<U> ObservedWgpuSuccinctArchive<'_, U>
+impl<U> ObservedRingBatch<'_, U>
 where
     U: Universe + Send + Sync,
 {
@@ -466,7 +499,13 @@ where
         a: impl Into<Term<GenId>>,
         v: impl Into<Term<V>>,
     ) -> Self::PatternConstraint<'a> {
-        SuccinctArchiveConstraint::with_ring_batch(e, a, v, self.inner.archive(), self)
+        SuccinctArchiveConstraint::with_ring_batch(
+            e,
+            a,
+            v,
+            self.ring_batch.inner.archive(),
+            &self.ring_batch,
+        )
     }
 }
 

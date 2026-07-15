@@ -109,6 +109,27 @@ fn observed_rank_query(
     .collect_profiled()
 }
 
+fn unshadowed_observed_rank_query(
+    observed: ObservedWgpuSuccinctArchive<'_, OrderedUniverse>,
+    entity: Inline<GenId>,
+    attribute: Inline<GenId>,
+    allowed: &HashSet<Inline<UnknownInline>>,
+) -> Vec<RawInline> {
+    let mut context = VariableContext::new();
+    let value: Variable<UnknownInline> = context.next_variable();
+    Query::new(
+        and!(
+            allowed.has(value),
+            observed.pattern(entity, attribute, value)
+        ),
+        move |binding: &Binding| binding.get(value.index).copied(),
+    )
+    .solve_residual_state_lazy()
+    .cap(64)
+    .start_width(64)
+    .collect()
+}
+
 fn direct_rank_query(
     gpu: &WgpuSuccinctArchive<OrderedUniverse>,
     entity: Inline<GenId>,
@@ -411,17 +432,16 @@ fn observed_wgpu_rank_cpu_route_is_opt_in_and_exact() {
     // and cannot attach to a previously closed epoch.
     assert!(current_residual_action().is_none());
     gpu.reset_stats();
-    let expected = RingBatchQuery::rank_batch(&gpu, SuccinctRotation::Eav, &[0], &[0]);
-    gpu.reset_stats();
     let closed_snapshot = observed_epoch.snapshot();
-    let actual = RingBatchQuery::rank_batch(&observed, SuccinctRotation::Eav, &[0], &[0]);
-    assert_eq!(actual, expected);
+    let actual =
+        unshadowed_observed_rank_query(observed, fixture.entity, fixture.attribute, &allowed);
+    assert_eq!(actual, direct.results);
     assert_eq!(observed_epoch.snapshot(), closed_snapshot);
     assert_eq!(
         gpu.stats(),
         WgpuQueryStats {
             cpu_fallback_batches: 1,
-            cpu_fallback_probes: 1,
+            cpu_fallback_probes: 8,
             ..WgpuQueryStats::default()
         }
     );
