@@ -1009,6 +1009,17 @@ pub trait Constraint<'a> {
         false
     }
 
+    /// Whether a supported delta confirmation must retain each parent's
+    /// complete ordered candidate group until its cyclic reducer quiesces.
+    ///
+    /// This is separate from `residual_confirm_is_page_local`: the ordinary
+    /// confirmation may be elementwise while the lowered implementation
+    /// intentionally traverses once and filters the immutable original group.
+    #[doc(hidden)]
+    fn residual_delta_confirm_is_grouped(&self) -> bool {
+        false
+    }
+
     /// Seeds an engine-owned cyclic proposal for each parent row.
     ///
     /// Returning `true` opts this exact `(constraint, variable, bound schema)`
@@ -1096,6 +1107,11 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.residual_confirm_is_page_local()
     }
 
+    fn residual_delta_confirm_is_grouped(&self) -> bool {
+        let inner: &T = self;
+        inner.residual_delta_confirm_is_grouped()
+    }
+
     fn residual_delta_seeds(
         &self,
         variable: VariableId,
@@ -1171,6 +1187,11 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     fn residual_confirm_is_page_local(&self) -> bool {
         let inner: &T = self;
         inner.residual_confirm_is_page_local()
+    }
+
+    fn residual_delta_confirm_is_grouped(&self) -> bool {
+        let inner: &T = self;
+        inner.residual_delta_confirm_is_grouped()
     }
 
     fn residual_delta_seeds(

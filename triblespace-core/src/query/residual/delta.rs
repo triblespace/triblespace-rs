@@ -15,6 +15,7 @@ static NEXT_REGISTRY_BRAND: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum DeltaVerb {
     Propose,
+    Confirm,
 }
 
 /// Canonical cyclic work key. Activation-specific state is deliberately absent.
@@ -41,6 +42,23 @@ impl DeltaDesc {
             variable,
             leaf,
             verb: DeltaVerb::Propose,
+            relevant,
+            checked,
+        }
+    }
+
+    pub(super) fn confirm(
+        bound: VariableSet,
+        variable: VariableId,
+        leaf: usize,
+        relevant: ChildSet,
+        checked: ChildSet,
+    ) -> Self {
+        Self {
+            bound,
+            variable,
+            leaf,
+            verb: DeltaVerb::Confirm,
             relevant,
             checked,
         }
@@ -126,8 +144,15 @@ enum ActivationStatus {
 }
 
 #[derive(Clone)]
+enum DeltaReducer {
+    Propose,
+    Confirm { original: Box<[RawInline]> },
+}
+
+#[derive(Clone)]
 struct Activation {
     parent: Box<[RawInline]>,
+    reducer: DeltaReducer,
     seen: HashSet<RawInline>,
     accepted: HashSet<RawInline>,
     live: BTreeSet<CreditNonce>,
@@ -160,6 +185,11 @@ struct ReplaceOutcome {
     quiescence: Option<QuiescenceProof>,
 }
 
+struct ReducedConfirm {
+    parent: Vec<RawInline>,
+    candidates: Vec<(u32, RawInline)>,
+}
+
 impl ProducerRegistry {
     fn new() -> Self {
         Self {
@@ -173,7 +203,11 @@ impl ProducerRegistry {
         }
     }
 
-    fn start(&mut self, parent: Box<[RawInline]>) -> (ActivationId, ProducerCredit) {
+    fn start(
+        &mut self,
+        parent: Box<[RawInline]>,
+        reducer: DeltaReducer,
+    ) -> (ActivationId, ProducerCredit) {
         let activation = ActivationId(take_monotonic(
             &mut self.state.next_activation,
             "activation",
@@ -192,6 +226,7 @@ impl ProducerRegistry {
                     activation,
                     Activation {
                         parent,
+                        reducer,
                         seen: HashSet::new(),
                         accepted: HashSet::new(),
                         live,
@@ -310,6 +345,31 @@ impl ProducerRegistry {
             .parent
     }
 
+    fn reduce_confirm(&self, proof: QuiescenceProof) -> ReducedConfirm {
+        let activation = self
+            .state
+            .activations
+            .get(&proof.activation)
+            .expect("unknown delta activation");
+        assert_eq!(activation.status, ActivationStatus::Quiescent);
+        let DeltaReducer::Confirm { original } = &activation.reducer else {
+            panic!("proposal activation received a confirmation proof");
+        };
+        // The reducer scans the immutable input sequence after quiescence.
+        // Membership comes from Accepted, while order and multiplicity come
+        // exclusively from the original candidates.
+        let candidates = original
+            .iter()
+            .filter(|candidate| activation.accepted.contains(*candidate))
+            .copied()
+            .map(|candidate| (0, candidate))
+            .collect();
+        ReducedConfirm {
+            parent: activation.parent.to_vec(),
+            candidates,
+        }
+    }
+
     fn deep_clone(&self) -> (Self, BTreeMap<CreditKey, ProducerCredit>) {
         let state = self.state.clone();
         let brand = RegistryBrand::fresh();
@@ -380,6 +440,7 @@ impl DeltaScheduler {
         parents: RowBatch,
         seeds: Vec<RawInline>,
     ) {
+        assert_eq!(desc.verb, DeltaVerb::Propose);
         assert_eq!(
             seeds.len(),
             parents.row_count,
@@ -392,13 +453,63 @@ impl DeltaScheduler {
             let parent = parents.rows[start..start + stride]
                 .to_vec()
                 .into_boxed_slice();
-            let (activation, credit) = self.registry.start(parent);
+            let (activation, credit) = self.registry.start(parent, DeltaReducer::Propose);
             tasks.push(DeltaTask {
                 activation,
                 credit,
                 node: seed,
             });
         }
+        self.file(desc, tasks);
+    }
+
+    pub(super) fn seed_confirms(
+        &mut self,
+        desc: DeltaDesc,
+        batch: CandidateBatch,
+        seeds: Vec<RawInline>,
+    ) {
+        assert_eq!(desc.verb, DeltaVerb::Confirm);
+        assert_eq!(
+            seeds.len(),
+            batch.parents.row_count,
+            "delta seed hook must emit one node per parent"
+        );
+        let stride = desc.bound.count();
+        let mut tasks = Vec::with_capacity(batch.parents.row_count);
+        let mut cursor = 0usize;
+        for (row, seed) in seeds.into_iter().enumerate() {
+            let start = row * stride;
+            let parent = batch.parents.rows[start..start + stride]
+                .to_vec()
+                .into_boxed_slice();
+            let begin = cursor;
+            while cursor < batch.candidates.len() && batch.candidates[cursor].0 as usize == row {
+                cursor += 1;
+            }
+            assert!(
+                begin < cursor,
+                "compacted delta confirmation parent has no candidates"
+            );
+            let original = batch.candidates[begin..cursor]
+                .iter()
+                .map(|(_, value)| *value)
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            let (activation, credit) = self
+                .registry
+                .start(parent, DeltaReducer::Confirm { original });
+            tasks.push(DeltaTask {
+                activation,
+                credit,
+                node: seed,
+            });
+        }
+        assert_eq!(
+            cursor,
+            batch.candidates.len(),
+            "delta confirmation candidate tags are invalid or ungrouped"
+        );
         self.file(desc, tasks);
     }
 
@@ -450,7 +561,6 @@ impl DeltaScheduler {
         stats: &mut ResidualStateStats,
     ) -> Option<ContinuationToken> {
         let (desc, tasks) = self.pop(width);
-        assert_eq!(desc.verb, DeltaVerb::Propose);
         let nodes: Vec<_> = tasks.iter().map(|task| task.node).collect();
         let mut successors = Vec::new();
         assert!(
@@ -484,9 +594,6 @@ impl DeltaScheduler {
                 task.credit,
                 successors[begin..cursor].iter().map(|(_, value)| *value),
             );
-            if let Some(proof) = outcome.quiescence {
-                assert_eq!(proof.activation, task.activation);
-            }
             for (node, credit) in outcome.children {
                 next_tasks.push(DeltaTask {
                     activation: task.activation,
@@ -494,40 +601,79 @@ impl DeltaScheduler {
                     node,
                 });
             }
-            if !outcome.accepted.is_empty() {
-                stats.candidates_proposed += outcome.accepted.len();
-                stats.max_propose_candidates =
-                    stats.max_propose_candidates.max(outcome.accepted.len());
-                let parent = self.registry.parent(task.activation).to_vec();
-                let candidates = outcome
-                    .accepted
-                    .into_iter()
-                    .map(|value| (0, value))
-                    .collect();
-                prefer_continuation(
-                    &mut continuation,
-                    file(
-                        stable,
-                        stable_interner,
-                        plan.len(),
-                        StateDesc {
-                            bound: desc.bound,
-                            phase: ResidualPhase::Candidate {
-                                variable: desc.variable,
-                                relevant: desc.relevant.clone(),
-                                checked: desc.checked.clone(),
-                            },
-                        },
-                        StateBucket::Candidates(CandidateBatch {
-                            parents: RowBatch {
-                                rows: parent,
-                                row_count: 1,
-                            },
-                            candidates,
-                        }),
-                        stats,
-                    ),
-                );
+            match desc.verb {
+                DeltaVerb::Propose => {
+                    if let Some(proof) = outcome.quiescence {
+                        assert_eq!(proof.activation, task.activation);
+                    }
+                    if !outcome.accepted.is_empty() {
+                        stats.candidates_proposed += outcome.accepted.len();
+                        stats.max_propose_candidates =
+                            stats.max_propose_candidates.max(outcome.accepted.len());
+                        let parent = self.registry.parent(task.activation).to_vec();
+                        let candidates = outcome
+                            .accepted
+                            .into_iter()
+                            .map(|value| (0, value))
+                            .collect();
+                        prefer_continuation(
+                            &mut continuation,
+                            file(
+                                stable,
+                                stable_interner,
+                                plan.len(),
+                                StateDesc {
+                                    bound: desc.bound,
+                                    phase: ResidualPhase::Candidate {
+                                        variable: desc.variable,
+                                        relevant: desc.relevant.clone(),
+                                        checked: desc.checked.clone(),
+                                    },
+                                },
+                                StateBucket::Candidates(CandidateBatch {
+                                    parents: RowBatch {
+                                        rows: parent,
+                                        row_count: 1,
+                                    },
+                                    candidates,
+                                }),
+                                stats,
+                            ),
+                        );
+                    }
+                }
+                DeltaVerb::Confirm => {
+                    if let Some(proof) = outcome.quiescence {
+                        assert_eq!(proof.activation, task.activation);
+                        let reduced = self.registry.reduce_confirm(proof);
+                        if !reduced.candidates.is_empty() {
+                            prefer_continuation(
+                                &mut continuation,
+                                file(
+                                    stable,
+                                    stable_interner,
+                                    plan.len(),
+                                    StateDesc {
+                                        bound: desc.bound,
+                                        phase: ResidualPhase::Candidate {
+                                            variable: desc.variable,
+                                            relevant: desc.relevant.clone(),
+                                            checked: desc.checked.with_inserted(desc.leaf),
+                                        },
+                                    },
+                                    StateBucket::Candidates(CandidateBatch {
+                                        parents: RowBatch {
+                                            rows: reduced.parent,
+                                            row_count: 1,
+                                        },
+                                        candidates: reduced.candidates,
+                                    }),
+                                    stats,
+                                ),
+                            );
+                        }
+                    }
+                }
             }
         }
         assert_eq!(cursor, successors.len());
@@ -567,5 +713,50 @@ impl DeltaScheduler {
 impl Clone for DeltaScheduler {
     fn clone(&self) -> Self {
         self.deep_clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn value(byte: u8) -> RawInline {
+        [byte; 32]
+    }
+
+    #[test]
+    fn confirm_reducer_filters_the_immutable_sequence_after_quiescence() {
+        let seed = value(1);
+        let first = value(2);
+        let second = value(3);
+        let rejected = value(4);
+        let mut registry = ProducerRegistry::new();
+        let (activation, root) = registry.start(
+            vec![value(9)].into_boxed_slice(),
+            DeltaReducer::Confirm {
+                original: vec![second, seed, first, rejected, second].into_boxed_slice(),
+            },
+        );
+
+        let root_outcome = registry.replace(root, [first, second]);
+        assert_eq!(root_outcome.accepted, vec![first, second]);
+        assert!(root_outcome.quiescence.is_none());
+        let mut proof = None;
+        for (_, child) in root_outcome.children {
+            let outcome = registry.replace(child, []);
+            assert!(outcome.accepted.is_empty());
+            if outcome.quiescence.is_some() {
+                assert!(proof.replace(outcome.quiescence.unwrap()).is_none());
+            }
+        }
+
+        let proof = proof.expect("last producer must prove quiescence");
+        assert_eq!(proof.activation, activation);
+        let reduced = registry.reduce_confirm(proof);
+        assert_eq!(reduced.parent, vec![value(9)]);
+        assert_eq!(
+            reduced.candidates,
+            vec![(0, second), (0, first), (0, second)]
+        );
     }
 }

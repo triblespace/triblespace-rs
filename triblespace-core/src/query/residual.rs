@@ -72,6 +72,9 @@ struct ResidualPlan {
     /// Whether each opaque leaf's confirmation is homomorphic over ordered
     /// pages of one parent's candidate sequence.
     page_local_confirms: Vec<bool>,
+    /// Whether a lowered cyclic confirmation needs the immutable complete
+    /// candidate sequence for each parent until traversal quiescence.
+    grouped_delta_confirms: Vec<bool>,
 }
 
 impl ResidualPlan {
@@ -81,28 +84,44 @@ impl ResidualPlan {
             path: &mut Vec<usize>,
             leaves: &mut Vec<ConstraintPath>,
             page_local_confirms: &mut Vec<bool>,
+            grouped_delta_confirms: &mut Vec<bool>,
         ) {
             match constraint.residual_shape() {
                 ConstraintShape::And(children) => {
                     for child in 0..children.len() {
                         path.push(child);
-                        visit(children.child(child), path, leaves, page_local_confirms);
+                        visit(
+                            children.child(child),
+                            path,
+                            leaves,
+                            page_local_confirms,
+                            grouped_delta_confirms,
+                        );
                         path.pop();
                     }
                 }
                 ConstraintShape::Opaque => {
                     leaves.push(ConstraintPath(path.clone().into_boxed_slice()));
                     page_local_confirms.push(constraint.residual_confirm_is_page_local());
+                    grouped_delta_confirms.push(constraint.residual_delta_confirm_is_grouped());
                 }
             }
         }
 
         let mut leaves = Vec::new();
         let mut page_local_confirms = Vec::new();
-        visit(root, &mut Vec::new(), &mut leaves, &mut page_local_confirms);
+        let mut grouped_delta_confirms = Vec::new();
+        visit(
+            root,
+            &mut Vec::new(),
+            &mut leaves,
+            &mut page_local_confirms,
+            &mut grouped_delta_confirms,
+        );
         Self {
             leaves,
             page_local_confirms,
+            grouped_delta_confirms,
         }
     }
 
@@ -134,6 +153,18 @@ impl ResidualPlan {
         (0..self.len()).all(|leaf| {
             !relevant.contains(leaf) || checked.contains(leaf) || self.page_local_confirms[leaf]
         })
+    }
+
+    /// Whether candidate occurrences may be consumed as independent pages.
+    /// A grouped delta reducer is deliberately parent-atomic even when its
+    /// ordinary protocol confirmation is elementwise.
+    fn remaining_confirms_accept_pages(&self, relevant: &ChildSet, checked: &ChildSet) -> bool {
+        self.remaining_confirms_are_page_local(relevant, checked)
+            && (0..self.len()).all(|leaf| {
+                !relevant.contains(leaf)
+                    || checked.contains(leaf)
+                    || !self.grouped_delta_confirms[leaf]
+            })
     }
 }
 
@@ -1133,10 +1164,10 @@ impl StateDesc {
         match &self.phase {
             ResidualPhase::Candidate {
                 relevant, checked, ..
-            } => relevant != checked && plan.remaining_confirms_are_page_local(relevant, checked),
+            } => relevant != checked && plan.remaining_confirms_accept_pages(relevant, checked),
             ResidualPhase::Confirm {
                 relevant, checked, ..
-            } => plan.remaining_confirms_are_page_local(relevant, checked),
+            } => plan.remaining_confirms_accept_pages(relevant, checked),
             ResidualPhase::Ready | ResidualPhase::Propose { .. } => false,
         }
     }
@@ -2748,7 +2779,7 @@ impl ResidualStateMachine {
 
         let mut checked = ChildSet::empty(plan.len());
         checked.insert(*proposer);
-        if !plan.remaining_confirms_are_page_local(relevant, &checked) {
+        if !plan.remaining_confirms_accept_pages(relevant, &checked) {
             return Err(task);
         }
         let variable = *variable;
@@ -2794,6 +2825,82 @@ impl ResidualStateMachine {
         Ok(())
     }
 
+    /// Converts one eligible confirmer into one cyclic activation per parent
+    /// candidate group. The reducer retains the immutable original candidate
+    /// sequence and filters it only after reachability quiesces.
+    fn seed_delta_confirm<'a>(
+        &mut self,
+        root: &dyn Constraint<'a>,
+        plan: &ResidualPlan,
+        task: SelectedResidualTask,
+    ) -> Result<(), SelectedResidualTask> {
+        let (
+            ResidualPhase::Confirm {
+                variable,
+                relevant,
+                checked,
+                confirmer,
+            },
+            StateBucket::Candidates(batch),
+        ) = (&task.desc.phase, &task.bucket)
+        else {
+            return Err(task);
+        };
+        if !plan.grouped_delta_confirms[*confirmer] {
+            return Err(task);
+        }
+        assert!(
+            !task.desc.uses_candidate_pages(plan),
+            "grouped delta confirmation was split into candidate pages"
+        );
+
+        let variable = *variable;
+        let confirmer = *confirmer;
+        let relevant = relevant.clone();
+        let checked = checked.clone();
+        let vars: Vec<VariableId> = task.desc.bound.into_iter().collect();
+        let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
+        let mut seeds = Vec::new();
+        let supported = plan
+            .resolve(root, confirmer)
+            .residual_delta_seeds(variable, &view, &mut seeds);
+        if !supported {
+            assert!(
+                seeds.is_empty(),
+                "unsupported delta seed hook mutated its output"
+            );
+            return Err(task);
+        }
+        assert_eq!(
+            seeds.len(),
+            batch.parents.row_count,
+            "supported delta seed hook must emit one node per parent"
+        );
+
+        let SelectedResidualTask {
+            state: _,
+            desc,
+            bucket,
+        } = task;
+        let StateBucket::Candidates(batch) = bucket else {
+            unreachable!("delta confirmer was checked above")
+        };
+        let candidates_before = batch.candidate_count();
+        self.stats.confirm_action_pops += 1;
+        self.stats.confirm_calls += 1;
+        self.stats.confirm_rows += batch.parents.row_count;
+        self.stats.max_confirm_rows = self.stats.max_confirm_rows.max(batch.parents.row_count);
+        self.stats.candidates_confirmed += candidates_before;
+        self.stats.max_confirm_candidates =
+            self.stats.max_confirm_candidates.max(candidates_before);
+        self.delta.seed_confirms(
+            DeltaDesc::confirm(desc.bound, variable, confirmer, relevant, checked),
+            batch,
+            seeds,
+        );
+        Ok(())
+    }
+
     fn pop_once<'a>(
         &mut self,
         root: &dyn Constraint<'a>,
@@ -2810,6 +2917,10 @@ impl ResidualStateMachine {
         };
         self.last_was_action = task.is_action();
         let task = match self.seed_delta_proposal(root, plan, task) {
+            Ok(()) => return MachineStep::DeltaSeeded,
+            Err(task) => task,
+        };
+        let task = match self.seed_delta_confirm(root, plan, task) {
             Ok(()) => return MachineStep::DeltaSeeded,
             Err(task) => task,
         };

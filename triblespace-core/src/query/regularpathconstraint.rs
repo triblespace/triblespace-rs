@@ -1300,6 +1300,15 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         true
     }
 
+    fn residual_delta_confirm_is_grouped(&self) -> bool {
+        matches!(
+            &self.expr,
+            PathExpr::Plus(body)
+                if matches!(body.as_ref(), PathExpr::Attr(_) | PathExpr::InverseAttr(_))
+                    && self.start != self.end
+        )
+    }
+
     fn residual_delta_seeds(
         &self,
         variable: VariableId,
