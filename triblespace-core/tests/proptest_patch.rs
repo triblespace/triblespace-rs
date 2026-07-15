@@ -2,7 +2,11 @@ use proptest::collection::vec;
 use proptest::prelude::*;
 use triblespace_core::patch::{Entry, IdentitySchema, PATCH};
 
+triblespace_core::key_segmentation!(ThreeSegments, 12, [4, 4, 4]);
+triblespace_core::key_schema!(ThreeSegmentSchema, ThreeSegments, 12, [0, 1, 2]);
+
 type TestPatch = PATCH<8, IdentitySchema, ()>;
+type SegmentedPatch = PATCH<12, ThreeSegmentSchema, ()>;
 
 fn arb_key() -> impl Strategy<Value = [u8; 8]> {
     prop::array::uniform8(any::<u8>())
@@ -138,6 +142,81 @@ proptest! {
         unordered.sort();
         ordered.sort();
         prop_assert_eq!(unordered, ordered);
+    }
+
+    // ── Ordered infix lower bounds ───────────────────────────────────
+
+    #[test]
+    fn first_full_key_in_range_matches_eager_minimum(
+        keys in vec(arb_key(), 0..80),
+        a in arb_key(),
+        b in arb_key(),
+    ) {
+        let mut patch = TestPatch::new();
+        for key in keys {
+            patch.insert(&Entry::new(&key));
+        }
+        let (min, max) = if a <= b { (a, b) } else { (b, a) };
+        let mut eager = std::collections::HashSet::new();
+        patch.infixes_range(&[], &min, &max, |infix| {
+            eager.insert(*infix);
+        });
+
+        prop_assert_eq!(
+            patch.first_infix_range(&[], &min, &max),
+            eager.into_iter().min(),
+        );
+    }
+
+    #[test]
+    fn strict_full_key_successor_matches_eager_minimum(
+        keys in vec(arb_key(), 0..80),
+        after in arb_key(),
+        max in arb_key(),
+    ) {
+        let mut patch = TestPatch::new();
+        for key in keys {
+            patch.insert(&Entry::new(&key));
+        }
+        let expected = patch
+            .iter()
+            .copied()
+            .filter(|key| key > &after && key <= &max)
+            .min();
+        prop_assert_eq!(patch.next_infix_after(&[], &after, &max), expected);
+    }
+
+    #[test]
+    fn segmented_compressed_path_lower_bound_matches_eager_minimum(
+        prefix in prop::array::uniform4(any::<u8>()),
+        entries in vec(
+            (
+                prop::array::uniform4(any::<u8>()),
+                prop::array::uniform4(any::<u8>()),
+            ),
+            0..80,
+        ),
+        a in prop::array::uniform4(any::<u8>()),
+        b in prop::array::uniform4(any::<u8>()),
+    ) {
+        let mut patch = SegmentedPatch::new();
+        for (infix, suffix) in entries {
+            let mut key = [0u8; 12];
+            key[..4].copy_from_slice(&prefix);
+            key[4..8].copy_from_slice(&infix);
+            key[8..].copy_from_slice(&suffix);
+            patch.insert(&Entry::new(&key));
+        }
+        let (min, max) = if a <= b { (a, b) } else { (b, a) };
+        let mut eager = std::collections::HashSet::new();
+        patch.infixes_range(&prefix, &min, &max, |infix| {
+            eager.insert(*infix);
+        });
+
+        prop_assert_eq!(
+            patch.first_infix_range(&prefix, &min, &max),
+            eager.into_iter().min(),
+        );
     }
 
     // ── Equality ─────────────────────────────────────────────────────

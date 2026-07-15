@@ -1578,6 +1578,27 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         }
     }
 
+    pub(crate) fn first_infix_range<const PREFIX_LEN: usize, const INFIX_LEN: usize>(
+        &self,
+        prefix: &[u8; PREFIX_LEN],
+        at_depth: usize,
+        min_infix: &[u8; INFIX_LEN],
+        max_infix: &[u8; INFIX_LEN],
+    ) -> Option<[u8; INFIX_LEN]> {
+        match self.body_ref() {
+            BodyRef::Leaf(leaf) => leaf.first_infix_range::<PREFIX_LEN, INFIX_LEN, O>(
+                prefix, at_depth, min_infix, max_infix,
+            ),
+            BodyRef::LocalLeaf(bytes) => {
+                leaf::key_ops::first_infix_range::<KEY_LEN, PREFIX_LEN, INFIX_LEN, O>(
+                    bytes, prefix, at_depth, min_infix, max_infix,
+                )
+            }
+            BodyRef::Branch(branch) => branch
+                .first_infix_range::<PREFIX_LEN, INFIX_LEN>(prefix, at_depth, min_infix, max_infix),
+        }
+    }
+
     pub(crate) fn count_range<const PREFIX_LEN: usize, const INFIX_LEN: usize>(
         &self,
         prefix: &[u8; PREFIX_LEN],
@@ -2176,6 +2197,65 @@ where
         if let Some(root) = &self.root {
             root.infixes_range(prefix, 0, min_infix, max_infix, &mut for_each);
         }
+    }
+
+    /// Return the lexicographically first distinct infix in the inclusive
+    /// range `[min_infix, max_infix]` for `prefix`.
+    ///
+    /// This performs ordered lower-bound descent through the PATCH trie. It
+    /// does not depend on the physical cuckoo-table order and does not
+    /// materialize or sort the matching infixes.
+    pub fn first_infix_range<const PREFIX_LEN: usize, const INFIX_LEN: usize>(
+        &self,
+        prefix: &[u8; PREFIX_LEN],
+        min_infix: &[u8; INFIX_LEN],
+        max_infix: &[u8; INFIX_LEN],
+    ) -> Option<[u8; INFIX_LEN]> {
+        const {
+            assert!(PREFIX_LEN + INFIX_LEN <= KEY_LEN);
+        }
+        assert!(
+            O::same_segment_tree(PREFIX_LEN, PREFIX_LEN + INFIX_LEN - 1)
+                && (PREFIX_LEN + INFIX_LEN == KEY_LEN
+                    || !O::same_segment_tree(PREFIX_LEN + INFIX_LEN - 1, PREFIX_LEN + INFIX_LEN)),
+            "INFIX_LEN must cover a whole segment"
+        );
+        if min_infix > max_infix {
+            return None;
+        }
+        self.root
+            .as_ref()
+            .and_then(|root| root.first_infix_range(prefix, 0, min_infix, max_infix))
+    }
+
+    /// Return the first distinct infix strictly after `after`, bounded above
+    /// by `max_infix` (inclusive).
+    ///
+    /// The successor is computed in lexicographic byte order and then passed
+    /// to [`Self::first_infix_range`]. `None` is returned when `after` is the
+    /// all-`0xff` value or when no later infix exists.
+    pub fn next_infix_after<const PREFIX_LEN: usize, const INFIX_LEN: usize>(
+        &self,
+        prefix: &[u8; PREFIX_LEN],
+        after: &[u8; INFIX_LEN],
+        max_infix: &[u8; INFIX_LEN],
+    ) -> Option<[u8; INFIX_LEN]> {
+        let mut lower = *after;
+        let mut cursor = INFIX_LEN;
+        loop {
+            if cursor == 0 {
+                return None;
+            }
+            cursor -= 1;
+            if lower[cursor] != u8::MAX {
+                lower[cursor] += 1;
+                for byte in &mut lower[cursor + 1..] {
+                    *byte = u8::MIN;
+                }
+                break;
+            }
+        }
+        self.first_infix_range(prefix, &lower, max_infix)
     }
 
     /// Count entries whose infix falls within [min_infix, max_infix].
@@ -2830,6 +2910,57 @@ mod tests {
         let entry = Entry::new(&[0; KEY_SIZE]);
         tree.insert(&entry);
         tree.insert(&entry);
+    }
+
+    #[test]
+    fn ordered_infix_bounds_include_all_zero_and_all_ff() {
+        let mut tree = PATCH::<4, IdentitySchema, ()>::new();
+        tree.insert(&Entry::new(&[0x00; 4]));
+        tree.insert(&Entry::new(&[0x80, 0x00, 0x00, 0x00]));
+        tree.insert(&Entry::new(&[0xff; 4]));
+
+        assert_eq!(
+            tree.first_infix_range(&[], &[0x00; 4], &[0xff; 4]),
+            Some([0x00; 4]),
+        );
+        assert_eq!(
+            tree.next_infix_after(&[], &[0x00; 4], &[0xff; 4]),
+            Some([0x80, 0x00, 0x00, 0x00]),
+        );
+        assert_eq!(
+            tree.first_infix_range(&[], &[0xff; 4], &[0xff; 4]),
+            Some([0xff; 4]),
+        );
+        assert_eq!(tree.next_infix_after(&[], &[0xff; 4], &[0xff; 4]), None,);
+        assert_eq!(tree.first_infix_range(&[], &[0xff; 4], &[0x00; 4]), None,);
+    }
+
+    #[test]
+    fn ordered_infix_descent_reads_local_leaves() {
+        #[repr(C, align(16))]
+        struct AlignedKey([u8; 16]);
+
+        let storage = std::sync::Arc::new([
+            AlignedKey([0x10; 16]),
+            AlignedKey([0x20; 16]),
+            AlignedKey([0xf0; 16]),
+        ]);
+        let owner: std::sync::Arc<dyn ArchiveOwner> = storage.clone();
+        let mut tree = PATCH::<16, IdentitySchema, ()>::new();
+        for key in storage.iter() {
+            let entry = unsafe { ArchiveEntry::new(NonNull::from(&key.0), &owner) };
+            tree.insert_archive(&entry);
+        }
+
+        assert!(tree.node_stats().3 > 0, "fixture must contain a LocalLeaf");
+        assert_eq!(
+            tree.first_infix_range(&[], &[0x11; 16], &[0xff; 16]),
+            Some([0x20; 16]),
+        );
+        assert_eq!(
+            tree.next_infix_after(&[], &[0x20; 16], &[0xff; 16]),
+            Some([0xf0; 16]),
+        );
     }
 
     #[test]
