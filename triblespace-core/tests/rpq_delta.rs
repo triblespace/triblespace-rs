@@ -453,6 +453,11 @@ fn root_formula_effects() -> ResidualCapabilities {
     ResidualCapabilities::default().root_formula().cyclic_rpq()
 }
 
+#[cfg(feature = "parallel")]
+fn all_formula_effects() -> ResidualCapabilities {
+    root_formula_effects().finite_unions()
+}
+
 fn repeated(attribute: Id, inverse: bool) -> Vec<PathOp> {
     if inverse {
         vec![PathOp::Attr(attribute.raw()), PathOp::Inverse, PathOp::Plus]
@@ -1790,43 +1795,106 @@ fn formula_cyclic_activations_preserve_duplicate_outer_parents() {
 
 #[cfg(feature = "parallel")]
 #[test]
-fn formula_cyclic_parallel_split_preserves_affine_activations() {
+fn all_capability_formula_cyclic_plan_survives_clone_and_parallel_split() {
     let graph = Graph::new(3, &[(0, 1), (1, 2)]);
     let ops = repeated(graph.attribute, false);
     let outer_values = [genid(&rngid().id).raw, genid(&rngid().id).raw];
     let make = || {
+        let seeded = Arc::new(AtomicUsize::new(0));
+        let expanded = Arc::new(AtomicUsize::new(0));
         let start_var = Variable::<GenId>::new(START);
         let end_var = Variable::<GenId>::new(END);
         let arm = Box::new(CountingPath {
             inner: RegularPathConstraint::new(graph.set.clone(), start_var, end_var, &ops),
-            seeded_roots: None,
+            seeded_roots: Some(Arc::clone(&seeded)),
             source_pages: None,
-            expanded_nodes: Arc::new(AtomicUsize::new(0)),
+            expanded_nodes: Arc::clone(&expanded),
         }) as DynConstraint;
-        Arc::new(IntersectionConstraint::new(vec![
-            Box::new(DuplicateParents {
-                outer_values,
-                start: graph.value(0).raw,
-            }) as DynConstraint,
-            Box::new(UnionConstraint::new(vec![arm])) as DynConstraint,
-        ]))
+        (
+            Arc::new(IntersectionConstraint::new(vec![
+                Box::new(DuplicateParents {
+                    outer_values,
+                    start: graph.value(0).raw,
+                }) as DynConstraint,
+                Box::new(UnionConstraint::new(vec![arm])) as DynConstraint,
+            ])),
+            seeded,
+            expanded,
+        )
+    };
+    let configured = |capabilities| {
+        let (root, seeded, expanded) = make();
+        (
+            Query::new(root, project_end)
+                .solve_residual_state_lazy_with(capabilities)
+                .cap(2)
+                .start_width(2),
+            seeded,
+            expanded,
+        )
+    };
+    let sorted = |mut rows: Vec<RawInline>| {
+        rows.sort_unstable();
+        rows
     };
 
-    let mut serial: Vec<_> = Query::new(make(), project_end)
-        .solve_residual_state_lazy_with(combined_effects())
-        .cap(2)
-        .start_width(2)
-        .collect();
-    let mut parallel: Vec<_> = Query::new(make(), project_end)
-        .solve_residual_state_lazy_with(combined_effects())
-        .cap(2)
-        .start_width(2)
-        .into_par_iter()
-        .collect();
-    serial.sort_unstable();
-    parallel.sort_unstable();
-    assert_eq!(parallel, serial);
-    assert_eq!(parallel.len(), 4);
+    let (root, _, _) = make();
+    let scalar = sorted(Query::new(root, project_end).sequential().collect());
+    let expected = sorted(vec![
+        graph.value(1).raw,
+        graph.value(1).raw,
+        graph.value(2).raw,
+        graph.value(2).raw,
+    ]);
+    assert_eq!(scalar, expected);
+
+    // `root_formula` recursively owns finite AND/OR structure, so enabling the
+    // narrower `finite_unions` capability as well must not change the exact
+    // result bag or activation multiplicity.
+    let (root_formula, root_seeded, root_expanded) = configured(root_formula_effects());
+    let root_formula = sorted(root_formula.collect());
+    assert_eq!(root_formula, scalar);
+    assert!(root_seeded.load(Ordering::Relaxed) > 0);
+    assert!(root_expanded.load(Ordering::Relaxed) > 0);
+
+    let (all_capabilities, seeded_before, expanded_before) = configured(all_formula_effects());
+    let exact_clone = all_capabilities.clone();
+    let original = all_capabilities.collect::<Vec<_>>();
+    let cloned = exact_clone.collect::<Vec<_>>();
+    assert_eq!(cloned, original, "a fresh clone changed the exact stream");
+    assert_eq!(sorted(original), root_formula);
+    assert!(seeded_before.load(Ordering::Relaxed) > 0);
+    assert!(expanded_before.load(Ordering::Relaxed) > 0);
+
+    let (mut started, seeded_after, expanded_after) = configured(all_formula_effects());
+    let first = started
+        .next()
+        .expect("the configured query has four results");
+    let exact_remainder = started.clone();
+    let remainder = started.collect::<Vec<_>>();
+    let cloned_remainder = exact_remainder.collect::<Vec<_>>();
+    assert_eq!(
+        cloned_remainder, remainder,
+        "a started clone changed the exact remainder"
+    );
+    assert_eq!(
+        sorted(std::iter::once(first).chain(remainder).collect()),
+        scalar
+    );
+    assert!(seeded_after.load(Ordering::Relaxed) > 0);
+    assert!(expanded_after.load(Ordering::Relaxed) > 0);
+
+    for workers in [1, 4] {
+        let (parallel, seeded, expanded) = configured(all_formula_effects());
+        let parallel = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()
+            .unwrap()
+            .install(|| parallel.into_par_iter().collect::<Vec<_>>());
+        assert_eq!(sorted(parallel), scalar, "workers={workers}");
+        assert!(seeded.load(Ordering::Relaxed) > 0, "workers={workers}");
+        assert!(expanded.load(Ordering::Relaxed) > 0, "workers={workers}");
+    }
 }
 
 #[test]
