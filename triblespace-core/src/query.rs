@@ -742,6 +742,29 @@ pub enum ConstraintShape<'s, 'a> {
     And(&'s dyn ConstraintChildren<'a>),
 }
 
+/// One engine-owned node in a cyclic residual fixpoint.
+///
+/// `value` is the data-plane term and `continuation` is a constraint-defined
+/// canonical program point. Novelty is over the pair: the same term reached
+/// under different residual programs may have different future computation.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ResidualDeltaNode {
+    pub value: RawInline,
+    pub continuation: u32,
+}
+
+/// One cyclic work item plus its endpoint effect.
+///
+/// `accepted` is not part of work identity. A well-formed constraint must
+/// report it consistently for every occurrence of the same node.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidualDeltaOutput {
+    pub node: ResidualDeltaNode,
+    pub accepted: bool,
+}
+
 /// Object-safe child access for a structural constraint shape.
 #[doc(hidden)]
 pub trait ConstraintChildren<'a> {
@@ -1020,22 +1043,24 @@ pub trait Constraint<'a> {
         false
     }
 
-    /// Seeds an engine-owned cyclic proposal for each parent row.
+    /// Seeds one engine-owned cyclic fixpoint for each parent row.
     ///
     /// Returning `true` opts this exact `(constraint, variable, bound schema)`
-    /// action into residual delta execution and must append exactly one node
-    /// per input row. The conservative default retains ordinary `propose`.
+    /// action into residual delta execution and must append exactly one output
+    /// per input row. A nullable program may mark its seed accepted without
+    /// adding it to work novelty. The conservative default retains the
+    /// ordinary protocol action.
     #[doc(hidden)]
     fn residual_delta_seeds(
         &self,
         _variable: VariableId,
         _view: &RowsView<'_>,
-        _seeds: &mut Vec<RawInline>,
+        _seeds: &mut Vec<ResidualDeltaOutput>,
     ) -> bool {
         false
     }
 
-    /// Expands one block of engine-owned cyclic proposal nodes.
+    /// Expands one block of engine-owned cyclic fixpoint nodes.
     ///
     /// Successors are tagged by input-node index and grouped in ascending tag
     /// order. A constraint that returned `true` from `residual_delta_seeds`
@@ -1044,8 +1069,8 @@ pub trait Constraint<'a> {
     fn residual_delta_expand(
         &self,
         _variable: VariableId,
-        _nodes: &[RawInline],
-        _successors: &mut Vec<(u32, RawInline)>,
+        _nodes: &[ResidualDeltaNode],
+        _successors: &mut Vec<(u32, ResidualDeltaOutput)>,
     ) -> bool {
         false
     }
@@ -1116,7 +1141,7 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         &self,
         variable: VariableId,
         view: &RowsView<'_>,
-        seeds: &mut Vec<RawInline>,
+        seeds: &mut Vec<ResidualDeltaOutput>,
     ) -> bool {
         let inner: &T = self;
         inner.residual_delta_seeds(variable, view, seeds)
@@ -1125,8 +1150,8 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
     fn residual_delta_expand(
         &self,
         variable: VariableId,
-        nodes: &[RawInline],
-        successors: &mut Vec<(u32, RawInline)>,
+        nodes: &[ResidualDeltaNode],
+        successors: &mut Vec<(u32, ResidualDeltaOutput)>,
     ) -> bool {
         let inner: &T = self;
         inner.residual_delta_expand(variable, nodes, successors)
@@ -1198,7 +1223,7 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
         &self,
         variable: VariableId,
         view: &RowsView<'_>,
-        seeds: &mut Vec<RawInline>,
+        seeds: &mut Vec<ResidualDeltaOutput>,
     ) -> bool {
         let inner: &T = self;
         inner.residual_delta_seeds(variable, view, seeds)
@@ -1207,8 +1232,8 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     fn residual_delta_expand(
         &self,
         variable: VariableId,
-        nodes: &[RawInline],
-        successors: &mut Vec<(u32, RawInline)>,
+        nodes: &[ResidualDeltaNode],
+        successors: &mut Vec<(u32, ResidualDeltaOutput)>,
     ) -> bool {
         let inner: &T = self;
         inner.residual_delta_expand(variable, nodes, successors)
