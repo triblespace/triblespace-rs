@@ -392,6 +392,50 @@ impl<'a> Constraint<'a> for PageTraceFilter {
     }
 }
 
+#[derive(Clone)]
+struct PageLocalDomain(OrderedDomain);
+
+impl<'a> Constraint<'a> for PageLocalDomain {
+    fn variables(&self) -> VariableSet {
+        self.0.variables()
+    }
+
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        self.0.estimate(variable, view, out)
+    }
+
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.0.propose(variable, view, candidates);
+    }
+
+    fn confirm(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.0.confirm(variable, view, candidates);
+    }
+
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        self.0.satisfied(view)
+    }
+
+    fn residual_confirm_is_page_local(&self) -> bool {
+        true
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Scheduler {
     Ordinary,
@@ -402,6 +446,10 @@ enum Scheduler {
 
 fn combined_effects() -> ResidualCapabilities {
     ResidualCapabilities::default().finite_unions().cyclic_rpq()
+}
+
+fn root_formula_effects() -> ResidualCapabilities {
+    ResidualCapabilities::default().root_formula().cyclic_rpq()
 }
 
 fn repeated(attribute: Id, inverse: bool) -> Vec<PathOp> {
@@ -566,6 +614,37 @@ fn formula_and_bound_start_root(
         Box::new(start_var.is(start)) as DynConstraint,
         Box::new(UnionConstraint::new(vec![Box::new(arm) as DynConstraint])) as DynConstraint,
     ]))
+}
+
+fn linear_formula_bound_start_filter_root(
+    set: TribleSet,
+    start: Inline<GenId>,
+    allowed: Vec<RawInline>,
+    nested_and: bool,
+    ops: &[PathOp],
+    expanded_nodes: Arc<AtomicUsize>,
+) -> Root {
+    let start_var = Variable::<GenId>::new(START);
+    let end_var = Variable::<GenId>::new(END);
+    let path = Box::new(CountingPath {
+        inner: RegularPathConstraint::new(set, start_var, end_var, ops),
+        seeded_roots: None,
+        source_pages: None,
+        expanded_nodes,
+    }) as DynConstraint;
+    let filter = Box::new(PageLocalDomain(OrderedDomain {
+        variable: END,
+        gate: END,
+        unbound_estimate: 100,
+        values: allowed,
+    })) as DynConstraint;
+    let mut children = vec![Box::new(start_var.is(start)) as DynConstraint];
+    if nested_and {
+        children.push(Box::new(IntersectionConstraint::new(vec![path, filter])) as DynConstraint);
+    } else {
+        children.extend([path, filter]);
+    }
+    Arc::new(IntersectionConstraint::new(children))
 }
 
 fn pair_end_arm(start: Inline<GenId>, values: Vec<RawInline>, estimate: usize) -> DynConstraint {
@@ -1266,6 +1345,192 @@ fn cyclic_rpq_resumes_through_recursive_or_and_or_frames() {
         );
         assert!(expanded.load(Ordering::Relaxed) >= 3);
     }
+}
+
+#[test]
+fn synthetic_root_atom_streams_a_cycle_before_fixpoint_cleanup() {
+    let graph = Graph::new(3, &[(0, 0), (1, 2)]);
+    let node = Variable::<GenId>::new(START);
+    let expanded = Arc::new(AtomicUsize::new(0));
+    let root = Arc::new(CountingPath {
+        inner: RegularPathConstraint::new(
+            graph.set.clone(),
+            node,
+            node,
+            &repeated(graph.attribute, false),
+        ),
+        seeded_roots: None,
+        source_pages: None,
+        expanded_nodes: Arc::clone(&expanded),
+    });
+    let mut query = Query::new(root, project_start)
+        .solve_residual_state_lazy_with(root_formula_effects())
+        .cap(1)
+        .start_width(1);
+
+    assert_eq!(query.next(), Some(graph.value(0).raw));
+    assert_eq!(expanded.load(Ordering::Relaxed), 1);
+    assert_eq!(query.next(), None);
+    assert_eq!(expanded.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn synthetic_root_and_streams_early_and_late_page_local_survivors() {
+    for (accepted_node, expected_before_emit, nested_and) in [(1, 1, false), (4, 4, true)] {
+        let graph = Graph::new(5, &[(0, 1), (1, 2), (2, 3), (3, 4)]);
+        let ops = repeated(graph.attribute, false);
+        let expanded = Arc::new(AtomicUsize::new(0));
+        let expected = graph.value(accepted_node).raw;
+        let root = linear_formula_bound_start_filter_root(
+            graph.set.clone(),
+            graph.value(0),
+            vec![expected],
+            nested_and,
+            &ops,
+            Arc::clone(&expanded),
+        );
+        let mut query = Query::new(root, project_end)
+            .solve_residual_state_lazy_with(root_formula_effects())
+            .cap(1)
+            .start_width(1);
+
+        assert_eq!(query.next(), Some(expected));
+        assert_eq!(
+            expanded.load(Ordering::Relaxed),
+            expected_before_emit,
+            "accepted_node={accepted_node}, nested_and={nested_and}"
+        );
+        assert_eq!(query.next(), None);
+        assert_eq!(expanded.load(Ordering::Relaxed), 5);
+    }
+}
+
+#[test]
+fn synthetic_root_and_empty_filter_waits_for_cleanup_without_replay() {
+    let graph = Graph::new(5, &[(0, 1), (1, 2), (2, 3), (3, 4)]);
+    let ops = repeated(graph.attribute, false);
+    let expanded = Arc::new(AtomicUsize::new(0));
+    let root = linear_formula_bound_start_filter_root(
+        graph.set.clone(),
+        graph.value(0),
+        vec![genid(&rngid().id).raw],
+        false,
+        &ops,
+        Arc::clone(&expanded),
+    );
+    let mut query = Query::new(root, project_end)
+        .solve_residual_state_lazy_with(root_formula_effects())
+        .cap(1)
+        .start_width(1);
+
+    assert_eq!(query.next(), None);
+    assert_eq!(expanded.load(Ordering::Relaxed), 5);
+    assert_eq!(
+        query.stats().candidates_proposed,
+        5,
+        "one bound-start candidate plus four streamed RPQ endpoints"
+    );
+}
+
+#[test]
+fn linear_formula_streaming_matches_the_always_quiescent_union_bag() {
+    let graph = Graph::new(7, &[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6)]);
+    let ops = repeated(graph.attribute, false);
+    let allowed = vec![graph.value(1).raw, graph.value(3).raw, graph.value(6).raw];
+    let streaming = linear_formula_bound_start_filter_root(
+        graph.set.clone(),
+        graph.value(0),
+        allowed.clone(),
+        true,
+        &ops,
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let quiescent = formula_and_bound_start_root(
+        graph.set.clone(),
+        graph.value(0),
+        allowed,
+        true,
+        &ops,
+        None,
+        Arc::new(AtomicUsize::new(0)),
+    );
+
+    let mut streamed: Vec<_> = Query::new(streaming, project_end)
+        .solve_residual_state_lazy_with(root_formula_effects())
+        .cap(1)
+        .start_width(1)
+        .collect();
+    let mut always_quiescent: Vec<_> = Query::new(quiescent, project_end)
+        .solve_residual_state_lazy_with(combined_effects())
+        .cap(1)
+        .start_width(1)
+        .collect();
+    streamed.sort_unstable();
+    always_quiescent.sort_unstable();
+    assert_eq!(streamed, always_quiescent);
+    assert_eq!(streamed.len(), 3);
+}
+
+#[test]
+fn linear_formula_streaming_keeps_byte_identical_parent_activations_distinct() {
+    let graph = Graph::new(3, &[(0, 1), (1, 2)]);
+    let outer = genid(&rngid().id).raw;
+    let root = duplicate_parent_root(
+        graph.set.clone(),
+        graph.value(0).raw,
+        [outer, outer],
+        &repeated(graph.attribute, false),
+    );
+    let mut actual: Vec<_> = Query::new(root, project_end)
+        .solve_residual_state_lazy_with(root_formula_effects())
+        .cap(1)
+        .start_width(1)
+        .collect();
+    actual.sort_unstable();
+    let mut expected = vec![
+        graph.value(1).raw,
+        graph.value(1).raw,
+        graph.value(2).raw,
+        graph.value(2).raw,
+    ];
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn clone_and_drop_preserve_a_live_linear_formula_stream() {
+    let graph = Graph::new(4, &[(0, 1), (1, 2), (2, 3)]);
+    let expanded = Arc::new(AtomicUsize::new(0));
+    let root = bound_start_root(
+        graph.set.clone(),
+        graph.value(0),
+        &repeated(graph.attribute, false),
+        Arc::clone(&expanded),
+    );
+    let mut query = Query::new(root, project_end)
+        .solve_residual_state_lazy_with(root_formula_effects())
+        .cap(1)
+        .start_width(1);
+
+    let first = query.next().expect("the first endpoint streamed");
+    assert_eq!(first, graph.value(1).raw);
+    assert_eq!(expanded.load(Ordering::Relaxed), 1);
+    let exact_clone = query.clone();
+    let cancelled = query.clone();
+    drop(cancelled);
+    assert_eq!(expanded.load(Ordering::Relaxed), 1);
+
+    let mut original = vec![first];
+    original.extend(query);
+    let mut cloned = vec![first];
+    cloned.extend(exact_clone);
+    original.sort_unstable();
+    cloned.sort_unstable();
+    assert_eq!(cloned, original);
+    let mut expected = vec![graph.value(1).raw, graph.value(2).raw, graph.value(3).raw];
+    expected.sort_unstable();
+    assert_eq!(original, expected);
+    assert_eq!(expanded.load(Ordering::Relaxed), 7);
 }
 
 #[test]

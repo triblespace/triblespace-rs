@@ -143,12 +143,23 @@ enum ActivationStatus {
 enum DeltaReducer {
     /// Accepted values may immediately enter an ordinary Candidate state.
     StreamProposal,
+    /// Accepted values may immediately resume an activation-local formula
+    /// continuation whose exact PC has been proved linear and page-local.
+    /// Emission inherits the ordinary streaming proposal's discovery order;
+    /// only bag equality with the sorted quiescent formula result is promised.
+    StreamFormulaProposal,
     /// Accepted values remain private until the enclosing formula action has
     /// proved quiescence.
     QuiescentProposal,
     Confirm {
         original: Box<[RawInline]>,
     },
+}
+
+impl DeltaReducer {
+    fn streams(&self) -> bool {
+        matches!(self, Self::StreamProposal | Self::StreamFormulaProposal)
+    }
 }
 
 /// Exact affine continuation owned by one reducer activation.
@@ -249,8 +260,8 @@ struct StartOutcome {
 struct CompletedActivation {
     return_to: DeltaReturn,
     /// Complete quiescent action result. Streaming proposals have already
-    /// released every accepted value and therefore finish with an empty set.
-    result: Candidates,
+    /// released every accepted value and therefore finish with cleanup only.
+    result: Option<Candidates>,
 }
 
 impl ProducerRegistry {
@@ -469,7 +480,7 @@ impl ProducerRegistry {
             .expect("unknown delta activation");
         assert!(activation.live.remove(&parent.key.nonce));
         assert!(activation.retired.insert(parent.key.nonce));
-        if !accepted.is_empty() && matches!(activation.reducer, DeltaReducer::StreamProposal) {
+        if !accepted.is_empty() && activation.reducer.streams() {
             if let Some(page) = &mut activation.suspended_source_page {
                 page.had_stable_effect = true;
             }
@@ -534,8 +545,7 @@ impl ProducerRegistry {
                     accepted.push(output.node.value);
                 }
             }
-            had_stable_effect =
-                matches!(activation.reducer, DeltaReducer::StreamProposal) && !accepted.is_empty();
+            had_stable_effect = activation.reducer.streams() && !accepted.is_empty();
             activation.suspended_source_page = Some(SuspendedSourcePage {
                 next,
                 had_stable_effect,
@@ -657,19 +667,24 @@ impl ProducerRegistry {
         )
     }
 
-    fn streaming_return(&self, activation: ActivationId) -> Option<(StateDesc, Vec<RawInline>)> {
+    fn streaming_return(&self, activation: ActivationId) -> Option<DeltaReturn> {
         let activation = self
             .state
             .activations
             .get(&activation)
             .expect("unknown delta activation");
-        if !matches!(activation.reducer, DeltaReducer::StreamProposal) {
+        if !activation.reducer.streams() {
             return None;
         }
-        let DeltaReturn::Stable { desc, parent } = &activation.return_to else {
-            panic!("a streaming delta proposal suspended a formula continuation")
-        };
-        Some((desc.clone(), parent.to_vec()))
+        assert!(matches!(
+            (&activation.reducer, &activation.return_to),
+            (DeltaReducer::StreamProposal, DeltaReturn::Stable { .. })
+                | (
+                    DeltaReducer::StreamFormulaProposal,
+                    DeltaReturn::Formula { .. }
+                )
+        ));
+        Some(activation.return_to.clone())
     }
 
     /// Consumes the unique quiescence proof and releases the exact affine
@@ -693,8 +708,8 @@ impl ProducerRegistry {
             );
         }
 
-        let result: Candidates = match activation.reducer {
-            DeltaReducer::StreamProposal => Vec::new(),
+        let result = match activation.reducer {
+            DeltaReducer::StreamProposal | DeltaReducer::StreamFormulaProposal => None,
             DeltaReducer::QuiescentProposal => {
                 let mut result: Candidates = activation
                     .accepted
@@ -702,14 +717,16 @@ impl ProducerRegistry {
                     .map(|value| (0, value))
                     .collect();
                 result.sort_unstable();
-                result
+                Some(result)
             }
-            DeltaReducer::Confirm { original } => original
-                .iter()
-                .filter(|candidate| activation.accepted.contains(*candidate))
-                .copied()
-                .map(|candidate| (0, candidate))
-                .collect(),
+            DeltaReducer::Confirm { original } => Some(
+                original
+                    .iter()
+                    .filter(|candidate| activation.accepted.contains(*candidate))
+                    .copied()
+                    .map(|candidate| (0, candidate))
+                    .collect(),
+            ),
         };
         CompletedActivation {
             return_to: activation.return_to,
@@ -869,7 +886,7 @@ impl DeltaScheduler {
             }));
             if let Some(proof) = started.quiescence {
                 let completed = self.registry.finish(proof);
-                assert!(completed.result.is_empty());
+                assert!(completed.result.is_none());
                 assert!(matches!(completed.return_to, DeltaReturn::Stable { .. }));
             }
         }
@@ -960,7 +977,7 @@ impl DeltaScheduler {
             }));
             if let Some(proof) = started.quiescence {
                 let completed = self.registry.finish(proof);
-                assert!(completed.result.is_empty());
+                assert!(completed.result.as_ref().is_some_and(Vec::is_empty));
                 assert!(matches!(completed.return_to, DeltaReturn::Stable { .. }));
             }
         }
@@ -1035,6 +1052,7 @@ impl DeltaScheduler {
         counter: FormulaProgramCounter,
         batch: FormulaBatch,
         seeds: Vec<ResidualDeltaSeed>,
+        stream_proposal: bool,
         plan: &ResidualPlan,
         stable: &mut Worklist,
         stable_interner: &mut StateInterner,
@@ -1052,6 +1070,7 @@ impl DeltaScheduler {
         let mut completed = Vec::new();
         for (batch, range) in singletons.into_iter().zip(ranges) {
             let reducer = match stage {
+                FormulaStage::Propose if stream_proposal => DeltaReducer::StreamFormulaProposal,
                 FormulaStage::Propose => DeltaReducer::QuiescentProposal,
                 FormulaStage::Confirm => DeltaReducer::Confirm {
                     original: batch
@@ -1101,6 +1120,7 @@ impl DeltaScheduler {
         bound: VariableSet,
         counter: FormulaProgramCounter,
         batch: FormulaBatch,
+        stream_proposal: bool,
     ) {
         let stage = match counter.focus {
             FormulaFocus::Action { stage, .. } => stage,
@@ -1110,6 +1130,9 @@ impl DeltaScheduler {
         let mut tasks = Vec::with_capacity(singletons.len());
         for batch in singletons {
             let (reducer, source_candidates) = match stage {
+                FormulaStage::Propose if stream_proposal => {
+                    (DeltaReducer::StreamFormulaProposal, None)
+                }
                 FormulaStage::Propose => (DeltaReducer::QuiescentProposal, None),
                 FormulaStage::Confirm => {
                     let original = batch
@@ -1152,9 +1175,16 @@ impl DeltaScheduler {
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
     ) -> Option<ContinuationToken> {
+        let Some(result) = completed.result else {
+            // A streaming activation has already resumed one affine copy of
+            // its continuation per accepted endpoint chunk. Quiescence only
+            // retires producer credits; replaying the template here would
+            // duplicate publication (and make an empty chunk observable).
+            return None;
+        };
         match completed.return_to {
             DeltaReturn::Stable { desc, parent } => {
-                if completed.result.is_empty() {
+                if result.is_empty() {
                     return None;
                 }
                 file_with_plan(
@@ -1167,7 +1197,7 @@ impl DeltaScheduler {
                             rows: parent.into_vec(),
                             row_count: 1,
                         },
-                        candidates: completed.result,
+                        candidates: result,
                     }),
                     stats,
                 )
@@ -1184,21 +1214,65 @@ impl DeltaScheduler {
                         ..
                     }
                 ) {
-                    stats.candidates_proposed += completed.result.len();
-                    stats.max_propose_candidates =
-                        stats.max_propose_candidates.max(completed.result.len());
+                    stats.candidates_proposed += result.len();
+                    stats.max_propose_candidates = stats.max_propose_candidates.max(result.len());
                 }
                 finish_formula_action_result(
                     plan,
                     bound,
                     &counter,
                     batch,
-                    completed.result,
+                    result,
                     stable,
                     stable_interner,
                     stats,
                 )
             }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn release_streaming(
+        return_to: DeltaReturn,
+        accepted: Vec<RawInline>,
+        plan: &ResidualPlan,
+        stable: &mut Worklist,
+        stable_interner: &mut StateInterner,
+        stats: &mut ResidualStateStats,
+    ) -> Option<ContinuationToken> {
+        debug_assert!(!accepted.is_empty());
+        stats.candidates_proposed += accepted.len();
+        stats.max_propose_candidates = stats.max_propose_candidates.max(accepted.len());
+        let candidates = accepted.into_iter().map(|value| (0, value)).collect();
+        match return_to {
+            DeltaReturn::Stable { desc, parent } => file_with_plan(
+                stable,
+                stable_interner,
+                plan,
+                desc,
+                StateBucket::Candidates(CandidateBatch {
+                    parents: RowBatch {
+                        rows: parent.into_vec(),
+                        row_count: 1,
+                    },
+                    candidates,
+                }),
+                stats,
+            ),
+            DeltaReturn::Formula {
+                bound,
+                counter,
+                batch,
+            } => finish_formula_action_result(
+                plan,
+                bound,
+                &counter,
+                batch,
+                candidates,
+                stable,
+                stable_interner,
+                stats,
+            ),
         }
     }
 
@@ -1336,30 +1410,15 @@ impl DeltaScheduler {
                 });
             }
             if !outcome.accepted.is_empty() {
-                if let Some((return_desc, parent)) = self.registry.streaming_return(task.activation)
-                {
-                    stats.candidates_proposed += outcome.accepted.len();
-                    stats.max_propose_candidates =
-                        stats.max_propose_candidates.max(outcome.accepted.len());
-                    let candidates = outcome
-                        .accepted
-                        .into_iter()
-                        .map(|value| (0, value))
-                        .collect();
+                if let Some(return_to) = self.registry.streaming_return(task.activation) {
                     prefer_continuation(
                         &mut task_continuation,
-                        file_with_plan(
+                        Self::release_streaming(
+                            return_to,
+                            outcome.accepted,
+                            plan,
                             stable,
                             stable_interner,
-                            plan,
-                            return_desc,
-                            StateBucket::Candidates(CandidateBatch {
-                                parents: RowBatch {
-                                    rows: parent,
-                                    row_count: 1,
-                                },
-                                candidates,
-                            }),
                             stats,
                         ),
                     );
@@ -1458,27 +1517,13 @@ impl DeltaScheduler {
 
         let mut continuation = None;
         if !outcome.accepted.is_empty() {
-            if let Some((return_desc, parent)) = self.registry.streaming_return(task.activation) {
-                stats.candidates_proposed += outcome.accepted.len();
-                stats.max_propose_candidates =
-                    stats.max_propose_candidates.max(outcome.accepted.len());
-                let candidates = outcome
-                    .accepted
-                    .into_iter()
-                    .map(|value| (0, value))
-                    .collect();
-                continuation = file_with_plan(
+            if let Some(return_to) = self.registry.streaming_return(task.activation) {
+                continuation = Self::release_streaming(
+                    return_to,
+                    outcome.accepted,
+                    plan,
                     stable,
                     stable_interner,
-                    plan,
-                    return_desc,
-                    StateBucket::Candidates(CandidateBatch {
-                        parents: RowBatch {
-                            rows: parent,
-                            row_count: 1,
-                        },
-                        candidates,
-                    }),
                     stats,
                 );
             }
@@ -1801,7 +1846,7 @@ mod tests {
         let proof = proof.expect("all root credits quiesced");
         assert_eq!(proof.activation, activation);
         let completed = registry.finish(proof);
-        assert_eq!(completed.result, vec![(0, candidate), (0, candidate)]);
+        assert_eq!(completed.result, Some(vec![(0, candidate), (0, candidate)]));
     }
 
     #[test]
@@ -1849,7 +1894,10 @@ mod tests {
             panic!("confirm returned to a formula continuation")
         };
         assert_eq!(parent.as_ref(), &[value(9)]);
-        assert_eq!(completed.result, vec![(0, second), (0, first), (0, second)]);
+        assert_eq!(
+            completed.result,
+            Some(vec![(0, second), (0, first), (0, second)])
+        );
     }
 
     #[test]
@@ -1951,7 +1999,7 @@ mod tests {
         assert_eq!(proof.activation, activation);
         assert_eq!(
             registry.finish(proof).result,
-            vec![(0, second), (0, first), (0, first)]
+            Some(vec![(0, second), (0, first), (0, first)])
         );
     }
 
@@ -2052,7 +2100,7 @@ mod tests {
             .quiescence
             .expect("clone quiesced independently");
         for completed in [original.finish(original_proof), cloned.finish(cloned_proof)] {
-            assert_eq!(completed.result, vec![(0, value(7))]);
+            assert_eq!(completed.result, Some(vec![(0, value(7))]));
             let DeltaReturn::Formula {
                 bound: returned_bound,
                 counter: returned_counter,
@@ -2148,7 +2196,7 @@ mod tests {
             complete(&mut original, original_credit),
             complete(&mut cloned, cloned_credit),
         ] {
-            assert_eq!(completed.result, vec![(0, value(7))]);
+            assert_eq!(completed.result, Some(vec![(0, value(7))]));
             let DeltaReturn::Formula {
                 bound: returned_bound,
                 counter: returned_counter,
