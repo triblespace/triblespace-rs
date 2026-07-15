@@ -8,16 +8,35 @@
 //! `?x` cardinality, `?p` binds first; the next joint action then splits by
 //! population before both histories reconverge at checked `{a, b}`.
 //!
+//! The coalescing ablation keeps canonical `StateDesc` interning in both arms.
+//! Its isolated arm merely gives every nonempty filing a separate physical
+//! bucket. Saturated full drains therefore isolate cross-history
+//! reconvergence; lazy first-result measurements include the value of all
+//! physical coalescing, including same-history reassembly. Both arms retain
+//! the canonical readiness scheduler, so this is not a separately tuned
+//! no-merge executor.
+//!
 //! Usage:
 //!     cargo run --release --example residual_intersection_bench -- \
 //!         [n_per_parity=512] [fan=32] [c_fan=96] [reps=5]
+//!     cargo run --release --features gpu \
+//!         --example residual_intersection_bench -- 512 32 96 5
+//!
+//! With `gpu`, the benchmark additionally discovers a final-confirm action
+//! whose canonical rank stream is wider than every corresponding isolated
+//! stream, places WGPU admission strictly between them, and reports exact
+//! shadow-attributed routes plus global dispatch/fallback counters.
 
 use std::time::Instant;
 
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use triblespace::core::query::residual::ResidualStateStats;
+#[cfg(feature = "gpu")]
+use triblespace::core::query::residual::{ActionSite, ResidualShadowEpoch, ResidualShadowSnapshot};
 use triblespace::core::query::TriblePattern;
 use triblespace::core::trible::TribleSet;
+#[cfg(feature = "gpu")]
+use triblespace::gpu::{WgpuQueryStats, WgpuSuccinctArchive};
 use triblespace::prelude::*;
 
 mod world {
@@ -154,6 +173,147 @@ fn run_lazy_residual_profiled<S: TriblePattern>(kb: &S) -> ((usize, u64), Residu
     (tally(solve.results), solve.stats)
 }
 
+#[derive(Clone, Copy)]
+enum CoalescingMode {
+    Canonical,
+    IsolatedFilings,
+}
+
+impl CoalescingMode {
+    fn isolated(self) -> bool {
+        matches!(self, Self::IsolatedFilings)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Canonical => "canonical",
+            Self::IsolatedFilings => "isolated",
+        }
+    }
+}
+
+fn run_saturated_ablation<S: TriblePattern>(kb: &S, mode: CoalescingMode) -> (usize, u64) {
+    let residual = find!(
+        (p: Inline<_>, x: Inline<_>),
+        pattern!(kb, [{ ?p @ world::a: ?x, world::b: ?x, world::c: ?x }])
+    )
+    .solve_residual_state_lazy()
+    .cap(usize::MAX)
+    .start_width(usize::MAX)
+    .growth(1);
+    let residual = if mode.isolated() {
+        residual.isolated_filing_buckets()
+    } else {
+        residual
+    };
+    tally(residual)
+}
+
+fn run_saturated_ablation_profiled<S: TriblePattern>(
+    kb: &S,
+    mode: CoalescingMode,
+) -> ((usize, u64), ResidualStateStats) {
+    let residual = find!(
+        (p: Inline<_>, x: Inline<_>),
+        pattern!(kb, [{ ?p @ world::a: ?x, world::b: ?x, world::c: ?x }])
+    )
+    .solve_residual_state_lazy()
+    .cap(usize::MAX)
+    .start_width(usize::MAX)
+    .growth(1);
+    let residual = if mode.isolated() {
+        residual.isolated_filing_buckets()
+    } else {
+        residual
+    };
+    let solve = residual.collect_profiled();
+    (tally(solve.results), solve.stats)
+}
+
+fn run_lazy_ablation_profiled<S: TriblePattern>(
+    kb: &S,
+    mode: CoalescingMode,
+) -> ((usize, u64), ResidualStateStats) {
+    let residual = find!(
+        (p: Inline<_>, x: Inline<_>),
+        pattern!(kb, [{ ?p @ world::a: ?x, world::b: ?x, world::c: ?x }])
+    )
+    .solve_residual_state_lazy();
+    let residual = if mode.isolated() {
+        residual.isolated_filing_buckets()
+    } else {
+        residual
+    };
+    let solve = residual.collect_profiled();
+    (tally(solve.results), solve.stats)
+}
+
+fn run_lazy_ablation<S: TriblePattern>(kb: &S, mode: CoalescingMode) -> (usize, u64) {
+    let residual = find!(
+        (p: Inline<_>, x: Inline<_>),
+        pattern!(kb, [{ ?p @ world::a: ?x, world::b: ?x, world::c: ?x }])
+    )
+    .solve_residual_state_lazy();
+    let residual = if mode.isolated() {
+        residual.isolated_filing_buckets()
+    } else {
+        residual
+    };
+    tally(residual)
+}
+
+fn run_lazy_ablation_first<S: TriblePattern>(kb: &S, mode: CoalescingMode) -> (usize, u64) {
+    let residual = find!(
+        (p: Inline<_>, x: Inline<_>),
+        pattern!(kb, [{ ?p @ world::a: ?x, world::b: ?x, world::c: ?x }])
+    )
+    .solve_residual_state_lazy();
+    let residual = if mode.isolated() {
+        residual.isolated_filing_buckets()
+    } else {
+        residual
+    };
+    tally(residual.take(1))
+}
+
+fn run_nonreconvergent_control<S: TriblePattern>(kb: &S, mode: CoalescingMode) -> (usize, u64) {
+    let residual = find!(
+        (p: Inline<_>, x: Inline<_>),
+        pattern!(kb, [{ ?p @ world::a: ?x }])
+    )
+    .solve_residual_state_lazy()
+    .cap(usize::MAX)
+    .start_width(usize::MAX)
+    .growth(1);
+    let residual = if mode.isolated() {
+        residual.isolated_filing_buckets()
+    } else {
+        residual
+    };
+    tally(residual)
+}
+
+fn run_nonreconvergent_control_profiled<S: TriblePattern>(
+    kb: &S,
+    mode: CoalescingMode,
+) -> ((usize, u64), ResidualStateStats) {
+    let residual = find!(
+        (p: Inline<_>, x: Inline<_>),
+        pattern!(kb, [{ ?p @ world::a: ?x }])
+    )
+    .solve_residual_state_lazy()
+    .cap(usize::MAX)
+    .start_width(usize::MAX)
+    .growth(1);
+    let residual = if mode.isolated() {
+        residual.isolated_filing_buckets()
+    } else {
+        residual
+    };
+    let solve = residual.collect_profiled();
+    (tally(solve.results), solve.stats)
+}
+
 fn run_nested_query<S: TriblePattern>(kb: &S, mode: Mode) -> (usize, u64) {
     let query = find!(
         (p: Inline<_>, x: Inline<_>),
@@ -218,6 +378,339 @@ fn median(samples: &[f64]) -> f64 {
     } else {
         sorted[middle]
     }
+}
+
+fn distribution(samples: &[f64]) -> (f64, f64, f64) {
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    (
+        *sorted.first().unwrap(),
+        median(&sorted),
+        *sorted.last().unwrap(),
+    )
+}
+
+fn print_ablation_stats(label: &str, stats: &ResidualStateStats) {
+    println!(
+        "      {label:<20} states {} + hits {}; merges {} / {} rows; \
+         isolated {} / {} rows; reentries {} / {} rows; \
+         pops {} [full {} ready {} continuation {} partial {}]; \
+         Ready plan {} [preferred {} scheduled {} proposal {} agglomerated {}]; \
+         Candidate plan {} [confirmation groups {}]; \
+         propose {} calls / {} rows / max rows {} / max candidates {}; \
+         confirm {} calls / {} rows / max rows {} / max candidates {}",
+        stats.states_interned,
+        stats.interner_hits,
+        stats.bucket_merges,
+        stats.rows_merged,
+        stats.isolated_filings,
+        stats.rows_isolated,
+        stats.state_reentries,
+        stats.rows_reentered,
+        stats.state_pops,
+        stats.full_pops,
+        stats.readiness_pops,
+        stats.continuation_pops,
+        stats.partial_pops,
+        stats.ready_plan_pops,
+        stats.ready_preferred_variable_groups,
+        stats.ready_scheduled_variable_groups,
+        stats.ready_proposal_groups,
+        stats.agglomerated_ready_pops,
+        stats.candidate_plan_pops,
+        stats.candidate_confirmation_groups,
+        stats.propose_calls,
+        stats.propose_rows,
+        stats.max_propose_rows,
+        stats.max_propose_candidates,
+        stats.confirm_calls,
+        stats.confirm_rows,
+        stats.max_confirm_rows,
+        stats.max_confirm_candidates,
+    );
+}
+
+fn bench_coalescing_ablation<S: TriblePattern>(
+    label: &str,
+    kb: &S,
+    reference: (usize, u64),
+    reps: usize,
+) {
+    let modes = [CoalescingMode::Canonical, CoalescingMode::IsolatedFilings];
+    for &mode in &modes {
+        std::hint::black_box(run_lazy_ablation_first(kb, mode));
+        std::hint::black_box(run_lazy_ablation(kb, mode));
+        std::hint::black_box(run_saturated_ablation(kb, mode));
+        std::hint::black_box(run_nonreconvergent_control(kb, mode));
+    }
+
+    let mut first_samples = vec![Vec::with_capacity(reps); modes.len()];
+    let mut first_signatures = vec![(0, 0); modes.len()];
+    let mut lazy_samples = vec![Vec::with_capacity(reps); modes.len()];
+    let mut lazy_signatures = vec![(0, 0); modes.len()];
+    let mut drain_samples = vec![Vec::with_capacity(reps); modes.len()];
+    let mut drain_signatures = vec![(0, 0); modes.len()];
+    let mut control_samples = vec![Vec::with_capacity(reps); modes.len()];
+    let mut control_signatures = vec![(0, 0); modes.len()];
+    for repetition in 0..reps {
+        for offset in 0..modes.len() {
+            let mode_index = (repetition + offset) % modes.len();
+            let start = Instant::now();
+            first_signatures[mode_index] = run_lazy_ablation_first(kb, modes[mode_index]);
+            first_samples[mode_index].push(start.elapsed().as_secs_f64() * 1e3);
+        }
+        for offset in 0..modes.len() {
+            let mode_index = (repetition + offset + 1) % modes.len();
+            let start = Instant::now();
+            lazy_signatures[mode_index] = run_lazy_ablation(kb, modes[mode_index]);
+            lazy_samples[mode_index].push(start.elapsed().as_secs_f64() * 1e3);
+        }
+        for offset in 0..modes.len() {
+            let mode_index = (repetition + offset) % modes.len();
+            let start = Instant::now();
+            drain_signatures[mode_index] = run_saturated_ablation(kb, modes[mode_index]);
+            drain_samples[mode_index].push(start.elapsed().as_secs_f64() * 1e3);
+        }
+        for offset in 0..modes.len() {
+            let mode_index = (repetition + offset + 1) % modes.len();
+            let start = Instant::now();
+            control_signatures[mode_index] = run_nonreconvergent_control(kb, modes[mode_index]);
+            control_samples[mode_index].push(start.elapsed().as_secs_f64() * 1e3);
+        }
+    }
+
+    println!("  physical-coalescing ablation ({label}):");
+    println!("    lazy first result (min / p50 / max):");
+    for (index, mode) in modes.iter().copied().enumerate() {
+        assert_eq!(
+            first_signatures[index].0,
+            1,
+            "{label} {} must produce one first result",
+            mode.label()
+        );
+        let (minimum, p50, maximum) = distribution(&first_samples[index]);
+        println!(
+            "      {:<10} {:>9.3} / {:>9.3} / {:>9.3} ms",
+            mode.label(),
+            minimum,
+            p50,
+            maximum
+        );
+    }
+    println!("    geometric lazy full drain (min / p50 / max):");
+    for (index, mode) in modes.iter().copied().enumerate() {
+        assert_eq!(
+            lazy_signatures[index],
+            reference,
+            "{label} {} lazy result signature mismatch",
+            mode.label()
+        );
+        let (minimum, p50, maximum) = distribution(&lazy_samples[index]);
+        println!(
+            "      {:<10} {:>9.3} / {:>9.3} / {:>9.3} ms",
+            mode.label(),
+            minimum,
+            p50,
+            maximum
+        );
+    }
+    println!("    saturated full drain (min / p50 / max):");
+    for (index, mode) in modes.iter().copied().enumerate() {
+        assert_eq!(
+            drain_signatures[index],
+            reference,
+            "{label} {} saturated result signature mismatch",
+            mode.label()
+        );
+        let (minimum, p50, maximum) = distribution(&drain_samples[index]);
+        println!(
+            "      {:<10} {:>9.3} / {:>9.3} / {:>9.3} ms",
+            mode.label(),
+            minimum,
+            p50,
+            maximum
+        );
+    }
+    assert_eq!(control_signatures[0], control_signatures[1]);
+    println!("    nonreconvergent one-leaf control (min / p50 / max):");
+    for (index, mode) in modes.iter().copied().enumerate() {
+        let (minimum, p50, maximum) = distribution(&control_samples[index]);
+        println!(
+            "      {:<10} {:>9.3} / {:>9.3} / {:>9.3} ms",
+            mode.label(),
+            minimum,
+            p50,
+            maximum
+        );
+    }
+
+    println!("    action/bucket profiles:");
+    for &mode in &modes {
+        let (signature, stats) = run_saturated_ablation_profiled(kb, mode);
+        assert_eq!(signature, reference);
+        print_ablation_stats(&format!("saturated {}", mode.label()), &stats);
+        let (signature, stats) = run_lazy_ablation_profiled(kb, mode);
+        assert_eq!(signature, reference);
+        print_ablation_stats(&format!("lazy {}", mode.label()), &stats);
+    }
+    for &mode in &modes {
+        let (signature, stats) = run_nonreconvergent_control_profiled(kb, mode);
+        assert_eq!(signature, control_signatures[0]);
+        assert_eq!(
+            stats.isolated_filings,
+            0,
+            "one-leaf control unexpectedly reconverged in {} mode",
+            mode.label()
+        );
+        print_ablation_stats(&format!("control {}", mode.label()), &stats);
+    }
+}
+
+#[cfg(feature = "gpu")]
+struct WgpuProbeRun {
+    signature: (usize, u64),
+    gpu: WgpuQueryStats,
+    shadow: ResidualShadowSnapshot,
+}
+
+#[cfg(feature = "gpu")]
+fn run_observed_wgpu_ablation(
+    gpu: &WgpuSuccinctArchive<OrderedUniverse>,
+    mode: CoalescingMode,
+) -> WgpuProbeRun {
+    gpu.reset_stats();
+    let observed = gpu.observe_residual_actions();
+    let epoch = ResidualShadowEpoch::new();
+    let residual = find!(
+        (p: Inline<_>, x: Inline<_>),
+        pattern!(&observed, [{ ?p @ world::a: ?x, world::b: ?x, world::c: ?x }])
+    )
+    .solve_residual_state_lazy()
+    .cap(usize::MAX)
+    .start_width(usize::MAX)
+    .growth(1);
+    let residual = if mode.isolated() {
+        residual.isolated_filing_buckets()
+    } else {
+        residual
+    };
+    let solve = residual.shadow(epoch).collect_profiled();
+    WgpuProbeRun {
+        signature: tally(solve.results),
+        gpu: gpu.stats(),
+        shadow: solve.shadow,
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn sampled_site_geometry(
+    snapshot: &ResidualShadowSnapshot,
+    site: ActionSite,
+) -> Vec<(usize, usize, usize, &'static str)> {
+    snapshot
+        .events
+        .iter()
+        .filter(|event| event.site == site)
+        .flat_map(|event| {
+            event.executor_samples.iter().map(move |sample| {
+                (
+                    event.geometry.parent_rows,
+                    event.geometry.candidate_occurrences,
+                    sample.measurement.work_units,
+                    sample.measurement.executor,
+                )
+            })
+        })
+        .collect()
+}
+
+#[cfg(feature = "gpu")]
+fn print_wgpu_stats(label: &str, stats: WgpuQueryStats) {
+    println!(
+        "    {label:<10} GPU dispatches/probes {}/{} (batch {:?}..{:?}); \
+         CPU fallback batches/probes {}/{}",
+        stats.gpu_dispatches,
+        stats.gpu_probes,
+        stats.min_gpu_batch,
+        stats.max_gpu_batch,
+        stats.cpu_fallback_batches,
+        stats.cpu_fallback_probes,
+    );
+}
+
+#[cfg(feature = "gpu")]
+fn bench_wgpu_coalescing_admission(archive: &SuccinctArchive<OrderedUniverse>) {
+    let mut gpu = WgpuSuccinctArchive::new(archive.clone())
+        .expect("failed to prepare SuccinctArchive ring columns for WGPU");
+    gpu.set_min_rank_batch(usize::MAX);
+    let canonical_cpu = run_observed_wgpu_ablation(&gpu, CoalescingMode::Canonical);
+    let isolated_cpu = run_observed_wgpu_ablation(&gpu, CoalescingMode::IsolatedFilings);
+    let cpu_reference = run_saturated_ablation(archive, CoalescingMode::Canonical);
+    assert_eq!(canonical_cpu.signature, cpu_reference);
+    assert_eq!(isolated_cpu.signature, cpu_reference);
+
+    let mut discriminating = None;
+    for event in &canonical_cpu.shadow.events {
+        if event.executor_samples.len() != 1 {
+            continue;
+        }
+        let canonical_probes = event.executor_samples[0].measurement.work_units;
+        let isolated = sampled_site_geometry(&isolated_cpu.shadow, event.site);
+        let isolated_max = isolated
+            .iter()
+            .map(|(_, _, probes, _)| *probes)
+            .max()
+            .unwrap_or(0);
+        if isolated.len() >= 2 && isolated_max + 1 < canonical_probes {
+            let replace = discriminating
+                .as_ref()
+                .is_none_or(|(_, best, _)| canonical_probes > *best);
+            if replace {
+                discriminating = Some((event.site, canonical_probes, isolated_max));
+            }
+        }
+    }
+    let (site, canonical_probes, isolated_max) = discriminating
+        .expect("reconvergent fixture exposed no canonical action wider than its isolated filings");
+    let threshold = isolated_max + (canonical_probes - isolated_max) / 2;
+    assert!(isolated_max < threshold && threshold < canonical_probes);
+    let canonical_discovery = sampled_site_geometry(&canonical_cpu.shadow, site);
+    let isolated_discovery = sampled_site_geometry(&isolated_cpu.shadow, site);
+    assert!(canonical_discovery
+        .iter()
+        .all(|(_, _, _, executor)| *executor == "cpu"));
+    assert!(isolated_discovery
+        .iter()
+        .all(|(_, _, _, executor)| *executor == "cpu"));
+
+    gpu.set_min_rank_batch(threshold);
+    let canonical = run_observed_wgpu_ablation(&gpu, CoalescingMode::Canonical);
+    let isolated = run_observed_wgpu_ablation(&gpu, CoalescingMode::IsolatedFilings);
+    assert_eq!(canonical.signature, cpu_reference);
+    assert_eq!(isolated.signature, cpu_reference);
+    let canonical_routed = sampled_site_geometry(&canonical.shadow, site);
+    let isolated_routed = sampled_site_geometry(&isolated.shadow, site);
+    assert!(canonical_routed
+        .iter()
+        .all(|(_, _, _, executor)| *executor == "wgpu"));
+    assert!(isolated_routed
+        .iter()
+        .all(|(_, _, _, executor)| *executor == "cpu"));
+
+    println!("\n== Observed WGPU coalescing admission probe ==");
+    println!(
+        "  target site: {:?}; discovered canonical/isolated-max probes {}/{}; threshold {}",
+        site, canonical_probes, isolated_max, threshold
+    );
+    println!("  CPU discovery geometry (parent rows, candidates, probes, executor):");
+    println!("    canonical {canonical_discovery:?}");
+    println!("    isolated  {isolated_discovery:?}");
+    println!("  routed target geometry:");
+    println!("    canonical {canonical_routed:?}");
+    println!("    isolated  {isolated_routed:?}");
+    print_wgpu_stats("canonical", canonical.gpu);
+    print_wgpu_stats("isolated", isolated.gpu);
+    println!("  exact result-bag parity: ok ({})", cpu_reference.0);
 }
 
 fn bench_first_result<S: TriblePattern>(label: &str, kb: &S, reps: usize) {
@@ -298,6 +791,8 @@ fn bench_backend<S: TriblePattern>(label: &str, kb: &S, expected: usize, reps: u
         );
         assert!(parity, "{label} {name} result signature mismatch");
     }
+
+    bench_coalescing_ablation(label, kb, reference, reps);
 
     let (signature, stats) = run_residual_profiled(kb);
     assert_eq!(
@@ -439,4 +934,6 @@ fn main() {
     eprintln!("archive built in {:?}", start.elapsed());
     bench_backend("SuccinctArchive", &archive, expected, reps);
     bench_nested_backend("SuccinctArchive", &archive, expected, reps);
+    #[cfg(feature = "gpu")]
+    bench_wgpu_coalescing_admission(&archive);
 }
