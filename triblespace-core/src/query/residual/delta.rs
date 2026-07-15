@@ -1,4 +1,4 @@
-//! Cyclic traversal stratum for the canonical residual scheduler.
+//! Cyclic fixpoint stratum for the canonical residual scheduler.
 //!
 //! Delta state identity is structural. Activation identity, novelty, affine
 //! producer credits, and parent rows remain payload, so unrelated traversals
@@ -153,8 +153,9 @@ enum DeltaReducer {
 struct Activation {
     parent: Box<[RawInline]>,
     reducer: DeltaReducer,
-    seen: HashSet<RawInline>,
+    seen: HashMap<ResidualDeltaNode, bool>,
     accepted: HashSet<RawInline>,
+    pending_accepted: Vec<RawInline>,
     live: BTreeSet<CreditNonce>,
     retired: BTreeSet<CreditNonce>,
     status: ActivationStatus,
@@ -180,7 +181,7 @@ struct QuiescenceProof {
 
 #[derive(Debug)]
 struct ReplaceOutcome {
-    children: Vec<(RawInline, ProducerCredit)>,
+    children: Vec<(ResidualDeltaNode, ProducerCredit)>,
     accepted: Vec<RawInline>,
     quiescence: Option<QuiescenceProof>,
 }
@@ -207,6 +208,7 @@ impl ProducerRegistry {
         &mut self,
         parent: Box<[RawInline]>,
         reducer: DeltaReducer,
+        seed: ResidualDeltaOutput,
     ) -> (ActivationId, ProducerCredit) {
         let activation = ActivationId(take_monotonic(
             &mut self.state.next_activation,
@@ -219,6 +221,12 @@ impl ProducerRegistry {
         );
         let mut live = BTreeSet::new();
         assert!(live.insert(nonce));
+        let mut accepted = HashSet::new();
+        let mut pending_accepted = Vec::new();
+        if seed.accepted {
+            assert!(accepted.insert(seed.node.value));
+            pending_accepted.push(seed.node.value);
+        }
         assert!(
             self.state
                 .activations
@@ -227,8 +235,9 @@ impl ProducerRegistry {
                     Activation {
                         parent,
                         reducer,
-                        seen: HashSet::new(),
-                        accepted: HashSet::new(),
+                        seen: HashMap::new(),
+                        accepted,
+                        pending_accepted,
                         live,
                         retired: BTreeSet::new(),
                         status: ActivationStatus::Open,
@@ -249,7 +258,7 @@ impl ProducerRegistry {
     fn replace(
         &mut self,
         parent: ProducerCredit,
-        successors: impl IntoIterator<Item = RawInline>,
+        successors: impl IntoIterator<Item = ResidualDeltaOutput>,
     ) -> ReplaceOutcome {
         assert_eq!(parent.brand, self.brand, "delta credit crossed registries");
         let owner = self
@@ -275,12 +284,22 @@ impl ProducerRegistry {
         );
 
         let mut novel = Vec::new();
-        let mut accepted = Vec::new();
+        let mut accepted = std::mem::take(&mut activation.pending_accepted);
         for successor in successors {
-            if activation.seen.insert(successor) {
-                novel.push(successor);
-                assert!(activation.accepted.insert(successor));
-                accepted.push(successor);
+            if let Some(&previous) = activation.seen.get(&successor.node) {
+                assert_eq!(
+                    previous, successor.accepted,
+                    "one delta node changed its endpoint effect"
+                );
+                continue;
+            }
+            assert!(activation
+                .seen
+                .insert(successor.node, successor.accepted)
+                .is_none());
+            novel.push(successor.node);
+            if successor.accepted && activation.accepted.insert(successor.node.value) {
+                accepted.push(successor.node.value);
             }
         }
 
@@ -399,7 +418,7 @@ fn take_monotonic(counter: &mut u64, kind: &str) -> u64 {
 struct DeltaTask {
     activation: ActivationId,
     credit: ProducerCredit,
-    node: RawInline,
+    node: ResidualDeltaNode,
 }
 
 #[derive(Default)]
@@ -438,7 +457,7 @@ impl DeltaScheduler {
         &mut self,
         desc: DeltaDesc,
         parents: RowBatch,
-        seeds: Vec<RawInline>,
+        seeds: Vec<ResidualDeltaOutput>,
     ) {
         assert_eq!(desc.verb, DeltaVerb::Propose);
         assert_eq!(
@@ -453,11 +472,11 @@ impl DeltaScheduler {
             let parent = parents.rows[start..start + stride]
                 .to_vec()
                 .into_boxed_slice();
-            let (activation, credit) = self.registry.start(parent, DeltaReducer::Propose);
+            let (activation, credit) = self.registry.start(parent, DeltaReducer::Propose, seed);
             tasks.push(DeltaTask {
                 activation,
                 credit,
-                node: seed,
+                node: seed.node,
             });
         }
         self.file(desc, tasks);
@@ -467,7 +486,7 @@ impl DeltaScheduler {
         &mut self,
         desc: DeltaDesc,
         batch: CandidateBatch,
-        seeds: Vec<RawInline>,
+        seeds: Vec<ResidualDeltaOutput>,
     ) {
         assert_eq!(desc.verb, DeltaVerb::Confirm);
         assert_eq!(
@@ -496,13 +515,13 @@ impl DeltaScheduler {
                 .map(|(_, value)| *value)
                 .collect::<Vec<_>>()
                 .into_boxed_slice();
-            let (activation, credit) = self
-                .registry
-                .start(parent, DeltaReducer::Confirm { original });
+            let (activation, credit) =
+                self.registry
+                    .start(parent, DeltaReducer::Confirm { original }, seed);
             tasks.push(DeltaTask {
                 activation,
                 credit,
-                node: seed,
+                node: seed.node,
             });
         }
         assert_eq!(
@@ -549,8 +568,9 @@ impl DeltaScheduler {
         (self.interner.get(id).clone(), tasks)
     }
 
-    /// Executes one structural cohort and files proposed or reduced endpoints
-    /// back into the ordinary acyclic Candidate continuation.
+    /// Executes one structural product-state cohort and files accepted
+    /// proposal endpoints or quiescent confirmation reductions back into the
+    /// ordinary acyclic Candidate continuation.
     pub(super) fn step<'a>(
         &mut self,
         root: &dyn Constraint<'a>,
@@ -726,6 +746,16 @@ mod tests {
         [byte; 32]
     }
 
+    fn output(byte: u8, continuation: u32, accepted: bool) -> ResidualDeltaOutput {
+        ResidualDeltaOutput {
+            node: ResidualDeltaNode {
+                value: value(byte),
+                continuation,
+            },
+            accepted,
+        }
+    }
+
     #[test]
     fn confirm_reducer_filters_the_immutable_sequence_after_quiescence() {
         let seed = value(1);
@@ -738,9 +768,10 @@ mod tests {
             DeltaReducer::Confirm {
                 original: vec![second, seed, first, rejected, second].into_boxed_slice(),
             },
+            output(1, 0, false),
         );
 
-        let root_outcome = registry.replace(root, [first, second]);
+        let root_outcome = registry.replace(root, [output(2, 1, true), output(3, 1, true)]);
         assert_eq!(root_outcome.accepted, vec![first, second]);
         assert!(root_outcome.quiescence.is_none());
         let mut proof = None;

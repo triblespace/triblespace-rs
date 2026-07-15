@@ -9,7 +9,8 @@ use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace_core::query::residual::ResidualCapabilities;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, ConstraintShape, EstimateSink, PathOp, Query,
-    RegularPathConstraint, RowsView, Variable, VariableId, VariableSet,
+    RegularPathConstraint, ResidualDeltaNode, ResidualDeltaOutput, RowsView, Variable, VariableId,
+    VariableSet,
 };
 use triblespace_core::trible::{Trible, TribleSet};
 
@@ -58,6 +59,14 @@ fn genid(id: &Id) -> Inline<GenId> {
     let mut value = [0; 32];
     value[16..].copy_from_slice(&id[..]);
     Inline::new(value)
+}
+
+fn other_attribute() -> Id {
+    Id::new([
+        0x4C, 0xEC, 0x06, 0xD5, 0x51, 0xFA, 0xCF, 0x4B, 0xAF, 0xBA, 0x7A, 0x59, 0xA3, 0x50, 0x49,
+        0xCE,
+    ])
+    .expect("minted nonzero attribute")
 }
 
 struct CountingPath {
@@ -121,7 +130,7 @@ impl<'a> Constraint<'a> for CountingPath {
         &self,
         variable: VariableId,
         view: &RowsView<'_>,
-        seeds: &mut Vec<RawInline>,
+        seeds: &mut Vec<ResidualDeltaOutput>,
     ) -> bool {
         self.inner.residual_delta_seeds(variable, view, seeds)
     }
@@ -129,8 +138,8 @@ impl<'a> Constraint<'a> for CountingPath {
     fn residual_delta_expand(
         &self,
         variable: VariableId,
-        nodes: &[RawInline],
-        successors: &mut Vec<(u32, RawInline)>,
+        nodes: &[ResidualDeltaNode],
+        successors: &mut Vec<(u32, ResidualDeltaOutput)>,
     ) -> bool {
         self.expanded_nodes
             .fetch_add(nodes.len(), Ordering::Relaxed);
@@ -444,6 +453,165 @@ fn plus_attr_handles_chain_diamond_self_loop_and_long_cycle() {
 }
 
 #[test]
+fn star_and_optional_epsilon_acceptance_obey_the_graph_term_gate() {
+    let graph = Graph::new(3, &[(0, 1), (1, 2)]);
+    let star = vec![PathOp::Attr(graph.attribute.raw()), PathOp::Star];
+    let optional_or_plus = vec![
+        PathOp::Attr(graph.attribute.raw()),
+        PathOp::Optional,
+        PathOp::Attr(graph.attribute.raw()),
+        PathOp::Plus,
+        PathOp::Union,
+    ];
+    let expected = vec![graph.value(0).raw, graph.value(1).raw, graph.value(2).raw];
+    for ops in [&star, &optional_or_plus] {
+        assert_all_schedulers(
+            || {
+                bound_start_root(
+                    graph.set.clone(),
+                    graph.value(0),
+                    ops,
+                    Arc::new(AtomicUsize::new(0)),
+                )
+            },
+            project_end,
+            expected.clone(),
+        );
+
+        let absent = genid(&rngid().id);
+        assert_all_schedulers(
+            || {
+                bound_start_root(
+                    graph.set.clone(),
+                    absent,
+                    ops,
+                    Arc::new(AtomicUsize::new(0)),
+                )
+            },
+            project_end,
+            Vec::new(),
+        );
+    }
+
+    let expanded = Arc::new(AtomicUsize::new(0));
+    let _ = run(
+        bound_start_root(
+            graph.set.clone(),
+            graph.value(0),
+            &star,
+            Arc::clone(&expanded),
+        ),
+        Scheduler::Residual,
+        project_end,
+    );
+    assert!(expanded.load(Ordering::Relaxed) > 0);
+}
+
+#[test]
+fn one_term_at_two_program_counters_keeps_both_futures() {
+    let graph = Graph::new(2, &[(0, 1)]);
+    // ((p / p) | (p / ^p))+. Both arms reach node 1 after their first
+    // transition. The left continuation dies there; the right continuation
+    // walks back to node 0 and accepts it. Novelty by term alone loses the
+    // result, while novelty by (term, program counter) preserves it.
+    let ops = vec![
+        PathOp::Attr(graph.attribute.raw()),
+        PathOp::Attr(graph.attribute.raw()),
+        PathOp::Concat,
+        PathOp::Attr(graph.attribute.raw()),
+        PathOp::Attr(graph.attribute.raw()),
+        PathOp::Inverse,
+        PathOp::Concat,
+        PathOp::Union,
+        PathOp::Plus,
+    ];
+    assert_all_schedulers(
+        || {
+            bound_start_root(
+                graph.set.clone(),
+                graph.value(0),
+                &ops,
+                Arc::new(AtomicUsize::new(0)),
+            )
+        },
+        project_end,
+        vec![graph.value(0).raw],
+    );
+}
+
+#[test]
+fn compound_concat_fixpoint_runs_in_both_endpoint_orientations() {
+    let graph = Graph::new(5, &[(0, 1), (1, 2), (2, 3), (3, 4)]);
+    let ops = vec![
+        PathOp::Attr(graph.attribute.raw()),
+        PathOp::Attr(graph.attribute.raw()),
+        PathOp::Concat,
+        PathOp::Plus,
+    ];
+    assert_all_schedulers(
+        || {
+            bound_start_root(
+                graph.set.clone(),
+                graph.value(0),
+                &ops,
+                Arc::new(AtomicUsize::new(0)),
+            )
+        },
+        project_end,
+        vec![graph.value(2).raw, graph.value(4).raw],
+    );
+    assert_all_schedulers(
+        || {
+            bound_end_root(
+                graph.set.clone(),
+                graph.value(4),
+                &ops,
+                Arc::new(AtomicUsize::new(0)),
+            )
+        },
+        project_start,
+        vec![graph.value(0).raw, graph.value(2).raw],
+    );
+}
+
+#[test]
+fn repeated_negated_attribute_uses_the_same_product_fixpoint() {
+    let mut graph = Graph::new(3, &[]);
+    let other = other_attribute();
+    graph
+        .set
+        .insert(&Trible::new(&graph.nodes[0], &other, &graph.value(1)));
+    graph
+        .set
+        .insert(&Trible::new(&graph.nodes[1], &other, &graph.value(2)));
+    let ops = vec![PathOp::NotAttr(graph.attribute.raw()), PathOp::Plus];
+    assert_all_schedulers(
+        || {
+            bound_start_root(
+                graph.set.clone(),
+                graph.value(0),
+                &ops,
+                Arc::new(AtomicUsize::new(0)),
+            )
+        },
+        project_end,
+        vec![graph.value(1).raw, graph.value(2).raw],
+    );
+    assert_all_schedulers(
+        || {
+            bound_end_root(
+                graph.set.clone(),
+                graph.value(2),
+                &ops,
+                Arc::new(AtomicUsize::new(0)),
+            )
+        },
+        project_start,
+        vec![graph.value(0).raw, graph.value(1).raw],
+    );
+}
+
+#[test]
 fn all_attr_inverse_and_bound_endpoint_routes_match_oracles() {
     let graph = Graph::new(3, &[(0, 1), (1, 2)]);
     let forward = repeated(graph.attribute, false);
@@ -577,6 +745,62 @@ fn target_confirm_traverses_once_and_preserves_reachable_duplicate_candidates() 
             "one traversal should expand each reachable frontier node once"
         );
     }
+}
+
+#[test]
+fn automaton_target_confirm_filters_the_original_duplicate_sequence() {
+    let graph = Graph::new(3, &[(0, 1), (1, 2)]);
+    let ops = vec![
+        PathOp::Attr(graph.attribute.raw()),
+        PathOp::Optional,
+        PathOp::Attr(graph.attribute.raw()),
+        PathOp::Plus,
+        PathOp::Union,
+    ];
+    let absent = genid(&rngid().id);
+    let candidates = vec![
+        graph.value(2).raw,
+        graph.value(0).raw,
+        graph.value(2).raw,
+        absent.raw,
+        graph.value(1).raw,
+    ];
+    let expected = vec![
+        graph.value(2).raw,
+        graph.value(0).raw,
+        graph.value(2).raw,
+        graph.value(1).raw,
+    ];
+    let expanded = Arc::new(AtomicUsize::new(0));
+    let residual = run(
+        target_confirm_root(
+            graph.set.clone(),
+            END,
+            graph.value(0),
+            candidates.clone(),
+            &ops,
+            Arc::clone(&expanded),
+        ),
+        Scheduler::Residual,
+        project_end,
+    );
+    let dag = run(
+        target_confirm_root(
+            graph.set.clone(),
+            END,
+            graph.value(0),
+            candidates,
+            &ops,
+            Arc::new(AtomicUsize::new(0)),
+        ),
+        Scheduler::Dag,
+        project_end,
+    );
+    let mut expected = expected;
+    expected.sort_unstable();
+    assert_eq!(residual, expected);
+    assert_eq!(dag, expected);
+    assert!(expanded.load(Ordering::Relaxed) > 0);
 }
 
 #[test]
@@ -723,7 +947,7 @@ fn clone_after_first_result_has_two_independent_exact_remainders() {
 }
 
 #[test]
-fn generated_small_graphs_match_sequential_and_dag_bags() {
+fn generated_product_programs_match_sequential_and_dag_bags() {
     let edge_universe = [(0, 0), (0, 1), (0, 2), (1, 2), (2, 3), (3, 0)];
     for mask in 0u16..64 {
         let edges: Vec<_> = edge_universe
@@ -732,29 +956,58 @@ fn generated_small_graphs_match_sequential_and_dag_bags() {
             .filter_map(|(bit, &edge)| (mask & (1 << bit) != 0).then_some(edge))
             .collect();
         let graph = Graph::new(4, &edges);
-        let ops = repeated(graph.attribute, false);
-        let make_root = || {
-            bound_start_root(
-                graph.set.clone(),
-                graph.value(0),
-                &ops,
-                Arc::new(AtomicUsize::new(0)),
-            )
-        };
-        let residual = run(make_root(), Scheduler::Residual, project_end);
-        assert_eq!(residual, run(make_root(), Scheduler::Dag, project_end));
-        assert_eq!(
-            residual,
-            run(make_root(), Scheduler::Sequential, project_end)
-        );
+        let attribute = graph.attribute.raw();
+        let expressions = [
+            vec![PathOp::Attr(attribute), PathOp::Plus],
+            vec![PathOp::Attr(attribute), PathOp::Star],
+            vec![
+                PathOp::Attr(attribute),
+                PathOp::Attr(attribute),
+                PathOp::Concat,
+                PathOp::Plus,
+            ],
+            vec![
+                PathOp::Attr(attribute),
+                PathOp::Optional,
+                PathOp::Attr(attribute),
+                PathOp::Plus,
+                PathOp::Union,
+            ],
+            vec![
+                PathOp::Attr(attribute),
+                PathOp::Attr(attribute),
+                PathOp::Concat,
+                PathOp::Attr(attribute),
+                PathOp::Attr(attribute),
+                PathOp::Inverse,
+                PathOp::Concat,
+                PathOp::Union,
+                PathOp::Plus,
+            ],
+        ];
+        for ops in expressions {
+            let make_root = || {
+                bound_start_root(
+                    graph.set.clone(),
+                    graph.value(0),
+                    &ops,
+                    Arc::new(AtomicUsize::new(0)),
+                )
+            };
+            let residual = run(make_root(), Scheduler::Residual, project_end);
+            assert_eq!(residual, run(make_root(), Scheduler::Dag, project_end));
+            assert_eq!(
+                residual,
+                run(make_root(), Scheduler::Sequential, project_end)
+            );
+        }
     }
 }
 
 #[test]
-fn star_concat_union_and_not_attr_stay_on_the_opaque_fallback() {
+fn finite_concat_union_and_not_attr_stay_on_the_opaque_fallback() {
     let graph = Graph::new(3, &[(0, 1), (1, 2)]);
     let cases = [
-        vec![PathOp::Attr(graph.attribute.raw()), PathOp::Star],
         vec![
             PathOp::Attr(graph.attribute.raw()),
             PathOp::Attr(graph.attribute.raw()),

@@ -15,6 +15,8 @@ use crate::query::CandidateSink;
 use crate::query::Constraint;
 use crate::query::EstimateSink;
 use crate::query::Query;
+use crate::query::ResidualDeltaNode;
+use crate::query::ResidualDeltaOutput;
 use crate::query::RowsView;
 use crate::query::TriblePattern;
 use crate::query::Variable;
@@ -428,6 +430,23 @@ fn has_unbounded_closure(expr: &PathExpr) -> bool {
             has_unbounded_closure(a) || has_unbounded_closure(b)
         }
         PathExpr::Optional(body) => has_unbounded_closure(body),
+    }
+}
+
+/// Whether evaluation needs a genuine least fixpoint. This is intentionally
+/// narrower than `has_unbounded_closure`, whose historical name also covers
+/// finite negated-attribute scans for WCO fallback purposes.
+fn has_repetition(expr: &PathExpr) -> bool {
+    match expr {
+        PathExpr::Plus(_) | PathExpr::Star(_) => true,
+        PathExpr::Concat(left, right) | PathExpr::Union(left, right) => {
+            has_repetition(left) || has_repetition(right)
+        }
+        PathExpr::Optional(body) => has_repetition(body),
+        PathExpr::Attr(_)
+        | PathExpr::InverseAttr(_)
+        | PathExpr::NotAttr(_)
+        | PathExpr::InverseNotAttr(_) => false,
     }
 }
 
@@ -944,13 +963,166 @@ pub struct RegularPathConstraint {
     /// one-time clone-and-invert at construction pays for
     /// itself.
     inverse_expr: PathExpr,
+    /// Thompson-style programs for the forward and inverse expressions.
+    /// Epsilon closure is compiled into each state's accepting bit and labeled
+    /// frontier, so runtime delta nodes need only `(term, program counter)`.
+    delta_program: Option<DeltaProgram>,
+    inverse_delta_program: Option<DeltaProgram>,
     set: TribleSet,
 }
 
-#[derive(Clone, Copy)]
-enum DeltaAttrRoute {
-    Forward(RawId),
-    Inverse(RawId),
+#[derive(Clone, Copy, Debug)]
+enum DeltaStep {
+    Attr(RawId),
+    InverseAttr(RawId),
+    NotAttr(RawId),
+    InverseNotAttr(RawId),
+}
+
+#[derive(Default)]
+struct ThompsonState {
+    epsilon: Vec<u32>,
+    steps: Vec<(DeltaStep, u32)>,
+}
+
+struct DeltaProgram {
+    start: u32,
+    accepting: Vec<bool>,
+    steps: Vec<Vec<(DeltaStep, u32)>>,
+}
+
+impl DeltaProgram {
+    fn compile(expr: &PathExpr) -> Self {
+        fn state(states: &mut Vec<ThompsonState>) -> u32 {
+            let id = u32::try_from(states.len()).expect("RPQ delta program is too large");
+            states.push(ThompsonState::default());
+            id
+        }
+
+        fn fragment(expr: &PathExpr, states: &mut Vec<ThompsonState>) -> (u32, u32) {
+            match expr {
+                PathExpr::Attr(attribute) => {
+                    let start = state(states);
+                    let end = state(states);
+                    states[start as usize]
+                        .steps
+                        .push((DeltaStep::Attr(*attribute), end));
+                    (start, end)
+                }
+                PathExpr::InverseAttr(attribute) => {
+                    let start = state(states);
+                    let end = state(states);
+                    states[start as usize]
+                        .steps
+                        .push((DeltaStep::InverseAttr(*attribute), end));
+                    (start, end)
+                }
+                PathExpr::NotAttr(attribute) => {
+                    let start = state(states);
+                    let end = state(states);
+                    states[start as usize]
+                        .steps
+                        .push((DeltaStep::NotAttr(*attribute), end));
+                    (start, end)
+                }
+                PathExpr::InverseNotAttr(attribute) => {
+                    let start = state(states);
+                    let end = state(states);
+                    states[start as usize]
+                        .steps
+                        .push((DeltaStep::InverseNotAttr(*attribute), end));
+                    (start, end)
+                }
+                PathExpr::Concat(left, right) => {
+                    let (left_start, left_end) = fragment(left, states);
+                    let (right_start, right_end) = fragment(right, states);
+                    states[left_end as usize].epsilon.push(right_start);
+                    (left_start, right_end)
+                }
+                PathExpr::Union(left, right) => {
+                    let start = state(states);
+                    let end = state(states);
+                    let (left_start, left_end) = fragment(left, states);
+                    let (right_start, right_end) = fragment(right, states);
+                    states[start as usize]
+                        .epsilon
+                        .extend([left_start, right_start]);
+                    states[left_end as usize].epsilon.push(end);
+                    states[right_end as usize].epsilon.push(end);
+                    (start, end)
+                }
+                PathExpr::Star(body) => {
+                    let start = state(states);
+                    let end = state(states);
+                    let (body_start, body_end) = fragment(body, states);
+                    states[start as usize].epsilon.extend([end, body_start]);
+                    states[body_end as usize].epsilon.extend([end, body_start]);
+                    (start, end)
+                }
+                PathExpr::Plus(body) => {
+                    let end = state(states);
+                    let (body_start, body_end) = fragment(body, states);
+                    states[body_end as usize].epsilon.extend([end, body_start]);
+                    (body_start, end)
+                }
+                PathExpr::Optional(body) => {
+                    let start = state(states);
+                    let end = state(states);
+                    let (body_start, body_end) = fragment(body, states);
+                    states[start as usize].epsilon.extend([end, body_start]);
+                    states[body_end as usize].epsilon.push(end);
+                    (start, end)
+                }
+            }
+        }
+
+        let mut states = Vec::new();
+        let (start, accept) = fragment(expr, &mut states);
+        assert!(
+            states.len() <= u32::MAX as usize,
+            "RPQ delta continuation space exhausted"
+        );
+        let mut accepting = Vec::with_capacity(states.len());
+        let mut steps = Vec::with_capacity(states.len());
+        for origin in 0..states.len() {
+            let mut closure = vec![origin as u32];
+            let mut seen = vec![false; states.len()];
+            seen[origin] = true;
+            let mut cursor = 0usize;
+            while cursor < closure.len() {
+                let current = closure[cursor] as usize;
+                cursor += 1;
+                for &next in &states[current].epsilon {
+                    if !std::mem::replace(&mut seen[next as usize], true) {
+                        closure.push(next);
+                    }
+                }
+            }
+            accepting.push(seen[accept as usize]);
+            steps.push(
+                closure
+                    .into_iter()
+                    .flat_map(|state| states[state as usize].steps.iter().copied())
+                    .collect(),
+            );
+        }
+        Self {
+            start,
+            accepting,
+            steps,
+        }
+    }
+
+    fn encode(&self, state: u32) -> u32 {
+        assert!((state as usize) < self.steps.len());
+        state
+    }
+
+    fn decode(&self, continuation: u32) -> usize {
+        let state = continuation as usize;
+        assert!(state < self.steps.len(), "invalid RPQ delta continuation");
+        state
+    }
 }
 
 impl RegularPathConstraint {
@@ -972,11 +1144,16 @@ impl RegularPathConstraint {
     ) -> Self {
         let expr = PathExpr::from_postfix(ops);
         let inverse_expr = invert(expr.clone());
+        let delta_program = has_repetition(&expr).then(|| DeltaProgram::compile(&expr));
+        let inverse_delta_program =
+            has_repetition(&inverse_expr).then(|| DeltaProgram::compile(&inverse_expr));
         RegularPathConstraint {
             start: start.index,
             end: end.index,
             expr,
             inverse_expr,
+            delta_program,
+            inverse_delta_program,
             set,
         }
     }
@@ -996,62 +1173,80 @@ impl RegularPathConstraint {
         term_set.into_iter().collect()
     }
 
-    /// The deliberately narrow cyclic lowering admitted by the residual
-    /// scheduler: one repeated positive attribute hop, possibly inverted.
-    /// Proposing the start from a bound end reverses the route.
-    fn delta_attr_route(&self, variable: VariableId) -> Option<(VariableId, DeltaAttrRoute)> {
-        let PathExpr::Plus(body) = &self.expr else {
+    /// Selects the automaton orientation for a bound-endpoint fixpoint.
+    /// Finite expressions retain their WCO/ordinary path; every expression
+    /// with repetition uses the same product-state program regardless of its
+    /// inner Concat, Union, Optional, inverse, or negated-attribute structure.
+    fn residual_delta_program(&self, variable: VariableId) -> Option<(VariableId, &DeltaProgram)> {
+        if self.start == self.end {
             return None;
-        };
-        let route = match body.as_ref() {
-            PathExpr::Attr(attribute) => DeltaAttrRoute::Forward(*attribute),
-            PathExpr::InverseAttr(attribute) => DeltaAttrRoute::Inverse(*attribute),
-            _ => return None,
-        };
-        if variable == self.end && self.start != self.end {
-            Some((self.start, route))
-        } else if variable == self.start && self.start != self.end {
-            let route = match route {
-                DeltaAttrRoute::Forward(attribute) => DeltaAttrRoute::Inverse(attribute),
-                DeltaAttrRoute::Inverse(attribute) => DeltaAttrRoute::Forward(attribute),
-            };
-            Some((self.end, route))
+        }
+        if variable == self.end {
+            Some((self.start, self.delta_program.as_ref()?))
+        } else if variable == self.start {
+            Some((self.end, self.inverse_delta_program.as_ref()?))
         } else {
             None
         }
     }
 
-    fn expand_delta_attr(
+    fn expand_delta_program(
         &self,
-        route: DeltaAttrRoute,
-        nodes: &[RawInline],
-        successors: &mut Vec<(u32, RawInline)>,
+        program: &DeltaProgram,
+        nodes: &[ResidualDeltaNode],
+        successors: &mut Vec<(u32, ResidualDeltaOutput)>,
     ) {
         for (index, node) in nodes.iter().enumerate() {
             let index = u32::try_from(index).expect("too many residual delta nodes");
-            match route {
-                DeltaAttrRoute::Forward(attribute) => {
-                    let Some(entity) = value_as_entity(node) else {
-                        continue;
-                    };
-                    let mut prefix = [0u8; ID_LEN * 2];
-                    prefix[..ID_LEN].copy_from_slice(&entity);
-                    prefix[ID_LEN..].copy_from_slice(&attribute);
-                    self.set
-                        .eav
-                        .infixes::<{ ID_LEN * 2 }, 32, _>(&prefix, |value: &[u8; 32]| {
-                            successors.push((index, *value))
-                        });
-                }
-                DeltaAttrRoute::Inverse(attribute) => {
-                    let mut prefix = [0u8; 32 + ID_LEN];
-                    prefix[..32].copy_from_slice(node);
-                    prefix[32..].copy_from_slice(&attribute);
-                    self.set
-                        .vae
-                        .infixes::<{ 32 + ID_LEN }, ID_LEN, _>(&prefix, |entity: &[u8; ID_LEN]| {
-                            successors.push((index, id_into_value(entity)))
-                        });
+            let state = program.decode(node.continuation);
+            for &(step, target) in &program.steps[state] {
+                let continuation = program.encode(target);
+                let accepted = program.accepting[target as usize];
+                let mut push = |value| {
+                    successors.push((
+                        index,
+                        ResidualDeltaOutput {
+                            node: ResidualDeltaNode {
+                                value,
+                                continuation,
+                            },
+                            accepted,
+                        },
+                    ));
+                };
+                match step {
+                    DeltaStep::Attr(attribute) => {
+                        let Some(entity) = value_as_entity(&node.value) else {
+                            continue;
+                        };
+                        let mut prefix = [0u8; ID_LEN * 2];
+                        prefix[..ID_LEN].copy_from_slice(&entity);
+                        prefix[ID_LEN..].copy_from_slice(&attribute);
+                        self.set
+                            .eav
+                            .infixes::<{ ID_LEN * 2 }, 32, _>(&prefix, |value: &[u8; 32]| {
+                                push(*value)
+                            });
+                    }
+                    DeltaStep::InverseAttr(attribute) => {
+                        let mut prefix = [0u8; 32 + ID_LEN];
+                        prefix[..32].copy_from_slice(&node.value);
+                        prefix[32..].copy_from_slice(&attribute);
+                        self.set.vae.infixes::<{ 32 + ID_LEN }, ID_LEN, _>(
+                            &prefix,
+                            |entity: &[u8; ID_LEN]| push(id_into_value(entity)),
+                        );
+                    }
+                    DeltaStep::NotAttr(excluded) => {
+                        for value in eval_not_attr(&self.set, &excluded, &node.value) {
+                            push(value);
+                        }
+                    }
+                    DeltaStep::InverseNotAttr(excluded) => {
+                        for value in eval_not_attr_inverse(&self.set, &excluded, &node.value) {
+                            push(value);
+                        }
+                    }
                 }
             }
         }
@@ -1301,40 +1496,45 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
     }
 
     fn residual_delta_confirm_is_grouped(&self) -> bool {
-        matches!(
-            &self.expr,
-            PathExpr::Plus(body)
-                if matches!(body.as_ref(), PathExpr::Attr(_) | PathExpr::InverseAttr(_))
-                    && self.start != self.end
-        )
+        self.start != self.end && has_repetition(&self.expr)
     }
 
     fn residual_delta_seeds(
         &self,
         variable: VariableId,
         view: &RowsView<'_>,
-        seeds: &mut Vec<RawInline>,
+        seeds: &mut Vec<ResidualDeltaOutput>,
     ) -> bool {
-        let Some((source, _)) = self.delta_attr_route(variable) else {
+        let Some((source, program)) = self.residual_delta_program(variable) else {
             return false;
         };
         let Some(column) = view.col(source) else {
             return false;
         };
-        seeds.extend(view.iter().map(|row| row[column]));
+        seeds.extend(view.iter().map(|row| {
+            let value = row[column];
+            ResidualDeltaOutput {
+                node: ResidualDeltaNode {
+                    value,
+                    continuation: program.encode(program.start),
+                },
+                accepted: program.accepting[program.start as usize]
+                    && is_graph_term(&self.set, &value),
+            }
+        }));
         true
     }
 
     fn residual_delta_expand(
         &self,
         variable: VariableId,
-        nodes: &[RawInline],
-        successors: &mut Vec<(u32, RawInline)>,
+        nodes: &[ResidualDeltaNode],
+        successors: &mut Vec<(u32, ResidualDeltaOutput)>,
     ) -> bool {
-        let Some((_, route)) = self.delta_attr_route(variable) else {
+        let Some((_, program)) = self.residual_delta_program(variable) else {
             return false;
         };
-        self.expand_delta_attr(route, nodes, successors);
+        self.expand_delta_program(program, nodes, successors);
         true
     }
 
