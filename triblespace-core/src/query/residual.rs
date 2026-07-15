@@ -535,6 +535,12 @@ impl ShadowEvent {
     }
 
     fn abort(&self, wall: Duration) {
+        #[cfg(test)]
+        SHADOW_ABORT_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook(self.event);
+            }
+        });
         let Some(epoch) = self.epoch.upgrade() else {
             let mut completion = self
                 .completion
@@ -827,6 +833,11 @@ impl ActionCorrelation {
 
 thread_local! {
     static CURRENT_SHADOW_ACTION: RefCell<Vec<ActionCorrelation>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static SHADOW_ABORT_HOOK: RefCell<Option<Box<dyn FnOnce(ActionEventId)>>> = RefCell::new(None);
 }
 
 /// Returns the innermost observed residual action on this thread, if any.
@@ -2338,8 +2349,11 @@ fn execute_task_shadowed<'a>(
         );
     };
     let (site, geometry) = action.observation();
-    let mut span = epoch.begin(site, geometry);
-    let scope = ShadowActionScope::enter(span.correlation());
+    let pending = epoch.begin(site, geometry);
+    let scope = ShadowActionScope::enter(pending.correlation());
+    // The timed span is deliberately bound after the TLS scope. Reverse drop
+    // order then captures aborted wall time before observer scope teardown.
+    let mut span = pending;
     span.start();
     let outcome = execute_task(
         root,
@@ -2843,7 +2857,8 @@ impl ResidualStateMachine {
 
     /// Separate observed pull loop. Keeping it out of [`Self::pull`] makes the
     /// ordinary iterator structurally free of observer fields, clock reads,
-    /// TLS access, geometry materialization, allocation, and dispatch branches.
+    /// TLS access, geometry materialization, observer allocation, and observer
+    /// dispatch branches.
     fn pull_shadow<'a, P, R>(
         &mut self,
         epoch: &ResidualShadowEpoch,
@@ -4036,7 +4051,7 @@ mod tests {
     use crate::query::unionconstraint::UnionConstraint;
     #[cfg(feature = "parallel")]
     use rayon::prelude::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     #[derive(Clone, Copy)]
@@ -6113,6 +6128,16 @@ mod tests {
     #[test]
     fn residual_shadow_action_unwind_records_aborted_and_never_closes() {
         let epoch = ResidualShadowEpoch::new();
+        let aborted_before_scope_drop = Arc::new(AtomicBool::new(false));
+        SHADOW_ABORT_HOOK.with(|hook| {
+            let observed = Arc::clone(&aborted_before_scope_drop);
+            *hook.borrow_mut() = Some(Box::new(move |event| {
+                observed.store(
+                    current_residual_action().map(|action| action.event()) == Some(event),
+                    Ordering::Release,
+                );
+            }));
+        });
         let mut observed = Query::new(panic_leaf(PanicPhase::Propose), |binding: &Binding| {
             binding.get(0).copied()
         })
@@ -6121,6 +6146,8 @@ mod tests {
 
         let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observed.next()));
         assert!(unwind.is_err());
+        assert!(aborted_before_scope_drop.load(Ordering::Acquire));
+        assert!(current_residual_action().is_none());
         let snapshot = epoch.snapshot();
         assert_eq!(snapshot.status, ResidualShadowStatus::Invalidated);
         assert_eq!(snapshot.events.len(), 1);
