@@ -6,12 +6,14 @@
 //! multiset on both in-memory and succinct backends.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Debug;
 use std::hash::Hash;
 
 use proptest::prelude::*;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
+use triblespace::core::query::{Binding, Constraint, Query};
 use triblespace::prelude::inlineencodings::GenId;
 use triblespace::prelude::*;
 
@@ -70,6 +72,91 @@ fn parallel_pool(threads: usize) -> &'static rayon::ThreadPool {
                 .unwrap()
         }),
         _ => unreachable!("oracle only exercises one and four workers"),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RpqEngine {
+    Sequential,
+    Ordinary,
+    LazyDag,
+    ResidualCursor,
+    ResidualEager,
+    ResidualLazy,
+    #[cfg(feature = "parallel")]
+    ResidualParallel(usize),
+}
+
+/// Run one RPQ query shape through every scheduler relevant to residual
+/// promotion while allocating only one `Query` local at a time. Keeping the
+/// scheduler choice in a runtime loop avoids the very large debug stack frames
+/// produced by expanding a fresh `find!` temporary in every assertion.
+fn assert_rpq_engines<'a, C, P, R, F>(
+    label: &str,
+    expected: &[R],
+    expected_ordinary_scheduler: &str,
+    make_query: F,
+) where
+    C: Constraint<'a> + Clone + Send + 'a,
+    P: Fn(&Binding) -> Option<R> + Clone + Send,
+    R: Debug + Ord + Send,
+    F: Fn() -> Query<C, P, R>,
+{
+    let mut engines = vec![
+        RpqEngine::Sequential,
+        RpqEngine::Ordinary,
+        RpqEngine::LazyDag,
+        RpqEngine::ResidualCursor,
+        RpqEngine::ResidualEager,
+        RpqEngine::ResidualLazy,
+    ];
+    #[cfg(feature = "parallel")]
+    engines.extend([
+        RpqEngine::ResidualParallel(1),
+        RpqEngine::ResidualParallel(4),
+    ]);
+
+    for engine in engines {
+        let mut actual = match engine {
+            RpqEngine::Sequential => make_query().sequential().collect::<Vec<_>>(),
+            RpqEngine::Ordinary => {
+                let mut query = make_query();
+                let rows = query.by_ref().collect::<Vec<_>>();
+                let state = format!("{query:?}");
+                assert!(
+                    state.contains(&format!("scheduler: {expected_ordinary_scheduler}")),
+                    "{label}: unexpected ordinary scheduler: {state}"
+                );
+                rows
+            }
+            RpqEngine::LazyDag => make_query().solve_dag_lazy().collect::<Vec<_>>(),
+            RpqEngine::ResidualCursor => {
+                make_query().residual_state_scheduler().collect::<Vec<_>>()
+            }
+            RpqEngine::ResidualEager => make_query().solve_residual_state(),
+            RpqEngine::ResidualLazy => make_query().solve_residual_state_lazy().collect::<Vec<_>>(),
+            #[cfg(feature = "parallel")]
+            RpqEngine::ResidualParallel(threads) => {
+                let query = make_query();
+                parallel_pool(threads)
+                    .install(move || query.into_par_residual_state_iter().collect::<Vec<_>>())
+            }
+        };
+        actual.sort_unstable();
+        assert_eq!(actual, expected, "{label}: {engine:?}");
+    }
+}
+
+fn rpq_proptest_config() -> ProptestConfig {
+    let cases = std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(64)
+        .clamp(1, 512);
+    ProptestConfig {
+        cases,
+        rng_seed: proptest::test_runner::RngSeed::Fixed(0x5250_515f_5245_5349),
+        ..ProptestConfig::default()
     }
 }
 
@@ -334,6 +421,188 @@ proptest! {
             "residual-union/archive",
             union_oracle,
             union_query!(&archive)
+        );
+    }
+}
+
+proptest! {
+    #![proptest_config(rpq_proptest_config())]
+
+    /// Generated RPQ oracle covering the opaque-root completeness path and
+    /// the shape-selected residual composition path.
+    ///
+    /// The random part is a pair of labelled relations on four nodes. The
+    /// expression closes the alternation `p | ^r`, so the independent oracle
+    /// transposes `r`. Every case also contains a forced two-cycle, two
+    /// differently labelled path steps to the same endpoint, a second route to
+    /// that endpoint, and a fifth
+    /// graph term with no `p`/`r` edge. Thus closure, cycles, duplicate path
+    /// witnesses, endpoint fan-in, and absent paths are exercised in every
+    /// case rather than merely left to the generator. The independent oracle
+    /// is Warshall closure over the generated union relation; it contains one
+    /// row per reachable endpoint pair, so exact sorted-bag comparison also
+    /// catches duplicate leakage from multiple witnesses.
+    #[test]
+    fn rpq_schedulers_match_generated_reachability_oracle(
+        p_masks in prop::array::uniform4(0u8..16),
+        r_masks in prop::array::uniform4(0u8..16),
+        marked_mask in 0u8..16,
+    ) {
+        const RANDOM_N: usize = 4;
+        const N: usize = 5;
+
+        let nodes: [Id; N] = std::array::from_fn(|i| fixture_id(61 + i as u8));
+        let marker = fixture_id(71);
+        let other = fixture_id(72);
+        let mut graph = TribleSet::new();
+        let mut reachable = [[false; N]; N];
+
+        // Every node, including the deliberately path-isolated fifth node,
+        // occurs in the graph independently of the p/r topology.
+        for (i, node) in nodes.iter().enumerate() {
+            insert_edge(&mut graph, node, &oracle::kind, &other);
+            if i == 2 || i == N - 1 || has_bit(marked_mask, i) {
+                insert_edge(&mut graph, node, &oracle::kind, &marker);
+            }
+        }
+
+        for i in 0..RANDOM_N {
+            for j in 0..RANDOM_N {
+                if has_bit(p_masks[i], j) {
+                    insert_edge(&mut graph, &nodes[i], &oracle::p, &nodes[j]);
+                    reachable[i][j] = true;
+                }
+                if has_bit(r_masks[i], j) {
+                    insert_edge(&mut graph, &nodes[i], &oracle::r, &nodes[j]);
+                    reachable[j][i] = true;
+                }
+            }
+        }
+
+        // Guaranteed 0↔1 cycle. Endpoint 2 has parallel `p` and inverse-`r`
+        // witnesses from 0 and a second source/path through 1.
+        for &(from, to) in &[(0, 1), (1, 0), (0, 2), (1, 2)] {
+            insert_edge(&mut graph, &nodes[from], &oracle::p, &nodes[to]);
+            reachable[from][to] = true;
+        }
+        insert_edge(&mut graph, &nodes[2], &oracle::r, &nodes[0]);
+        reachable[0][2] = true;
+
+        // Positive transitive closure: unlike `*`, diagonal entries appear
+        // only when a nonempty cycle reaches them.
+        for via in 0..N {
+            for from in 0..N {
+                for to in 0..N {
+                    reachable[from][to] |= reachable[from][via] && reachable[via][to];
+                }
+            }
+        }
+        assert!(reachable[0][0] && reachable[1][1], "forced cycle vanished");
+        assert!(
+            (0..N).all(|i| !reachable[N - 1][i] && !reachable[i][N - 1]),
+            "isolated graph term unexpectedly acquired a path"
+        );
+
+        let mut expected = Vec::new();
+        let mut expected_marked = Vec::new();
+        for from in 0..N {
+            for to in 0..N {
+                if reachable[from][to] {
+                    let pair = (nodes[from].to_inline(), nodes[to].to_inline());
+                    expected.push(pair);
+                    if to == 2 || to == N - 1 || has_bit(marked_mask, to) {
+                        // Projecting only the endpoint below deliberately keeps
+                        // one occurrence per reachable source. Multiple sources
+                        // therefore become genuine bag multiplicity.
+                        expected_marked.push(nodes[to].to_inline());
+                    }
+                }
+            }
+        }
+        expected.sort_unstable();
+        expected_marked.sort_unstable();
+        let endpoint_two = nodes[2].to_inline();
+        assert!(
+            expected_marked
+                .iter()
+                .filter(|&&endpoint| endpoint == endpoint_two)
+                .count()
+                >= 2,
+            "forced shared endpoint lost its projected bag multiplicity"
+        );
+
+        let archive: SuccinctArchive<OrderedUniverse> = (&graph).into();
+        let archive_roundtrip_graph: TribleSet = archive.iter().collect();
+        assert_eq!(archive_roundtrip_graph, graph);
+
+        // `RegularPathConstraint` currently owns a concrete TribleSet. The
+        // second opaque-root gate is therefore honestly an archive roundtrip
+        // of the graph data followed by TribleSet RPQ execution, not a claim
+        // that the RPQ itself probes SuccinctArchive natively.
+        assert_rpq_engines(
+            "opaque-rpq/tribleset",
+            &expected,
+            "LazyDag",
+            || {
+                find!(
+                    (src: Inline<GenId>, dst: Inline<GenId>),
+                    std::sync::Arc::new(path!(graph, src (oracle::p | ^oracle::r)+ dst))
+                )
+            },
+        );
+        assert_rpq_engines(
+            "opaque-rpq/archive-roundtrip-graph",
+            &expected,
+            "LazyDag",
+            || {
+                find!(
+                    (src: Inline<GenId>, dst: Inline<GenId>),
+                    std::sync::Arc::new(path!(
+                        archive_roundtrip_graph,
+                        src (oracle::p | ^oracle::r)+ dst
+                    ))
+                )
+            },
+        );
+
+        // Here the RPQ leaf and the native pattern leaf share `dst`, so the
+        // exposed AND must choose ResidualState by default. The archive case
+        // is the real heterogeneous composition gate: RPQ traversal uses the
+        // roundtripped TribleSet graph while its sibling's estimate/propose/
+        // confirm verbs run natively against SuccinctArchive.
+        assert_rpq_engines(
+            "rpq-and-pattern/tribleset",
+            &expected_marked,
+            "ResidualState",
+            || {
+                find!(
+                    dst: Inline<GenId>,
+                    temp!((src), {
+                        let src: Variable<GenId> = src;
+                        and!(
+                            path!(graph, src (oracle::p | ^oracle::r)+ dst),
+                            pattern!(&graph, [{ ?dst @ oracle::kind: &marker }]),
+                        )
+                    })
+                )
+            },
+        );
+        assert_rpq_engines(
+            "rpq-and-pattern/succinctarchive-sibling",
+            &expected_marked,
+            "ResidualState",
+            || {
+                find!(
+                    dst: Inline<GenId>,
+                    temp!((src), {
+                        let src: Variable<GenId> = src;
+                        and!(
+                            path!(archive_roundtrip_graph, src (oracle::p | ^oracle::r)+ dst),
+                            pattern!(&archive, [{ ?dst @ oracle::kind: &marker }]),
+                        )
+                    })
+                )
+            },
         );
     }
 }
