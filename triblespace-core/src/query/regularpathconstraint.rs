@@ -18,6 +18,8 @@ use crate::query::Query;
 use crate::query::ResidualDeltaNode;
 use crate::query::ResidualDeltaOutput;
 use crate::query::ResidualDeltaSeed;
+use crate::query::ResidualDeltaSourceCursor;
+use crate::query::ResidualDeltaSourcePage;
 use crate::query::RowsView;
 use crate::query::TriblePattern;
 use crate::query::Variable;
@@ -735,6 +737,7 @@ fn nullable(expr: &PathExpr) -> bool {
 }
 
 /// One way a non-empty path may begin.
+#[derive(Clone, Copy)]
 enum FirstStep {
     /// Forward hop over this attribute — the start must occur as a
     /// subject of it.
@@ -742,9 +745,14 @@ enum FirstStep {
     /// Inverse hop over this attribute — the start must occur as a
     /// value of it.
     Inv(RawId),
-    /// Negated forward hop — any subject may start.
+    /// Negated forward hop — enumerate subjects, then require an outgoing
+    /// attribute other than the excluded one.
+    NotFwd(RawId),
+    /// Negated inverse hop — enumerate values, then require an incoming
+    /// attribute other than the excluded one.
+    NotInv(RawId),
+    /// Unrestricted subject/value scans used only to stream NODES(G).
     AnyFwd,
-    /// Negated inverse hop — any value may start.
     AnyInv,
 }
 
@@ -754,8 +762,8 @@ fn first_steps(expr: &PathExpr, out: &mut Vec<FirstStep>) {
     match expr {
         PathExpr::Attr(a) => out.push(FirstStep::Fwd(*a)),
         PathExpr::InverseAttr(a) => out.push(FirstStep::Inv(*a)),
-        PathExpr::NotAttr(_) => out.push(FirstStep::AnyFwd),
-        PathExpr::InverseNotAttr(_) => out.push(FirstStep::AnyInv),
+        PathExpr::NotAttr(a) => out.push(FirstStep::NotFwd(*a)),
+        PathExpr::InverseNotAttr(a) => out.push(FirstStep::NotInv(*a)),
         PathExpr::Concat(l, r) => {
             first_steps(l, out);
             if nullable(l) {
@@ -791,13 +799,13 @@ fn first_step_seeds(set: &TribleSet, expr: &PathExpr) -> HashSet<RawInline> {
                     seeds.insert(*v);
                 });
             }
-            FirstStep::AnyFwd => {
+            FirstStep::NotFwd(_) | FirstStep::AnyFwd => {
                 set.eav
                     .infixes::<0, ID_LEN, _>(&[0u8; 0], |e: &[u8; ID_LEN]| {
                         seeds.insert(id_into_value(e));
                     });
             }
-            FirstStep::AnyInv => {
+            FirstStep::NotInv(_) | FirstStep::AnyInv => {
                 set.vea.infixes::<0, 32, _>(&[0u8; 0], |v: &[u8; 32]| {
                     seeds.insert(*v);
                 });
@@ -831,6 +839,18 @@ fn can_take_first_step(set: &TribleSet, steps: &[FirstStep], term: &RawInline) -
                     return true;
                 }
             }
+            FirstStep::NotFwd(excluded) => {
+                if let Some(id) = value_as_entity(term) {
+                    if has_other_attribute(&set.eav, &id, excluded) {
+                        return true;
+                    }
+                }
+            }
+            FirstStep::NotInv(excluded) => {
+                if has_other_attribute(&set.vae, term, excluded) {
+                    return true;
+                }
+            }
             FirstStep::AnyFwd => {
                 if let Some(id) = value_as_entity(term) {
                     if set.eav.has_prefix(&id) {
@@ -846,6 +866,78 @@ fn can_take_first_step(set: &TribleSet, steps: &[FirstStep], term: &RawInline) -
         }
     }
     false
+}
+
+fn has_other_attribute<const PREFIX_LEN: usize, O>(
+    index: &crate::patch::PATCH<{ crate::trible::TRIBLE_LEN }, O, ()>,
+    prefix: &[u8; PREFIX_LEN],
+    excluded: &RawId,
+) -> bool
+where
+    O: crate::patch::KeySchema<{ crate::trible::TRIBLE_LEN }>,
+{
+    let Some(first) = index.first_infix_range(prefix, &[u8::MIN; ID_LEN], &[u8::MAX; ID_LEN])
+    else {
+        return false;
+    };
+    first != *excluded
+        || index
+            .next_infix_after(prefix, &first, &[u8::MAX; ID_LEN])
+            .is_some()
+}
+
+fn next_entity_source<const PREFIX_LEN: usize, O>(
+    index: &crate::patch::PATCH<{ crate::trible::TRIBLE_LEN }, O, ()>,
+    prefix: &[u8; PREFIX_LEN],
+    after: Option<&RawInline>,
+) -> Option<RawInline>
+where
+    O: crate::patch::KeySchema<{ crate::trible::TRIBLE_LEN }>,
+{
+    let id = match after {
+        None => index.first_infix_range(prefix, &[u8::MIN; ID_LEN], &[u8::MAX; ID_LEN]),
+        Some(value) => {
+            let id = value_as_entity(value)?;
+            index.next_infix_after(prefix, &id, &[u8::MAX; ID_LEN])
+        }
+    }?;
+    Some(id_into_value(&id))
+}
+
+fn next_value_source<const PREFIX_LEN: usize, O>(
+    index: &crate::patch::PATCH<{ crate::trible::TRIBLE_LEN }, O, ()>,
+    prefix: &[u8; PREFIX_LEN],
+    after: Option<&RawInline>,
+) -> Option<RawInline>
+where
+    O: crate::patch::KeySchema<{ crate::trible::TRIBLE_LEN }>,
+{
+    match after {
+        None => index.first_infix_range(prefix, &[u8::MIN; 32], &[u8::MAX; 32]),
+        Some(value) => index.next_infix_after(prefix, value, &[u8::MAX; 32]),
+    }
+}
+
+/// Strict successor of the sorted union denoted by a FIRST-step set.
+///
+/// Every arm performs one ordered PATCH lower-bound descent. Taking the
+/// minimum and advancing all arms through one shared exclusive bound both
+/// preserves lexical order and deduplicates repeated FIRST arms without
+/// materializing their domains.
+fn next_first_source(
+    set: &TribleSet,
+    steps: &[FirstStep],
+    after: Option<&RawInline>,
+) -> Option<RawInline> {
+    steps
+        .iter()
+        .filter_map(|step| match step {
+            FirstStep::Fwd(attribute) => next_entity_source(&set.aev, attribute, after),
+            FirstStep::Inv(attribute) => next_value_source(&set.ave, attribute, after),
+            FirstStep::NotFwd(_) | FirstStep::AnyFwd => next_entity_source(&set.eav, &[], after),
+            FirstStep::NotInv(_) | FirstStep::AnyInv => next_value_source(&set.vea, &[], after),
+        })
+        .min()
 }
 
 /// Is the expression a pure forward/inverse hop chain — the shape
@@ -1200,6 +1292,111 @@ impl RegularPathConstraint {
         }
     }
 
+    fn same_variable_source_output(
+        program: &DeltaProgram,
+        source: RawInline,
+    ) -> ResidualDeltaOutput {
+        ResidualDeltaOutput {
+            node: ResidualDeltaNode {
+                source: Some(source),
+                value: source,
+                continuation: program.encode(program.start),
+            },
+            accepted: program.accepting[program.start as usize],
+        }
+    }
+
+    fn same_variable_source_is_exact(
+        &self,
+        source: &RawInline,
+        first: &[FirstStep],
+        last: &[FirstStep],
+    ) -> bool {
+        if nullable(&self.expr) {
+            is_graph_term(&self.set, source)
+        } else {
+            can_take_first_step(&self.set, first, source)
+                && can_take_first_step(&self.set, last, source)
+        }
+    }
+
+    fn same_variable_source_page(
+        &self,
+        program: &DeltaProgram,
+        candidates: Option<&[RawInline]>,
+        cursor: ResidualDeltaSourceCursor,
+        limit: usize,
+        roots: &mut Vec<ResidualDeltaOutput>,
+    ) -> ResidualDeltaSourcePage {
+        assert!(limit > 0, "residual source pages require positive demand");
+        let after = match cursor {
+            ResidualDeltaSourceCursor::Start => None,
+            ResidualDeltaSourceCursor::After(value) => Some(value),
+        };
+        let mut first = Vec::new();
+        let mut last = Vec::new();
+        first_steps(&self.expr, &mut first);
+        first_steps(&self.inverse_expr, &mut last);
+
+        if let Some(candidates) = candidates {
+            debug_assert!(candidates.windows(2).all(|pair| pair[0] < pair[1]));
+            let begin = after.map_or(0, |after| {
+                candidates.partition_point(|candidate| *candidate <= after)
+            });
+            let end = begin.saturating_add(limit).min(candidates.len());
+            for &source in &candidates[begin..end] {
+                if self.same_variable_source_is_exact(&source, &first, &last) {
+                    roots.push(Self::same_variable_source_output(program, source));
+                }
+            }
+            return ResidualDeltaSourcePage {
+                next: (end < candidates.len()).then(|| {
+                    ResidualDeltaSourceCursor::After(
+                        *candidates
+                            .get(end - 1)
+                            .expect("a nonterminal positive page examined a candidate"),
+                    )
+                }),
+                examined: end - begin,
+            };
+        }
+
+        // Nullable NODES(G) is the sorted union of EAV subjects and VEA
+        // values. A nonnullable source frontier is the sorted union of its
+        // FIRST arms, followed by the exact inverse-FIRST (LAST) membership
+        // test. Rejected LAST candidates still consume page budget: otherwise
+        // a long negative prefix could hide unbounded work behind width one.
+        let source_steps: &[FirstStep] = if nullable(&self.expr) {
+            &[FirstStep::AnyFwd, FirstStep::AnyInv]
+        } else {
+            &first
+        };
+        let mut examined = 0usize;
+        let mut current = after;
+        while examined < limit {
+            let Some(source) = next_first_source(&self.set, source_steps, current.as_ref()) else {
+                return ResidualDeltaSourcePage {
+                    next: None,
+                    examined,
+                };
+            };
+            current = Some(source);
+            examined += 1;
+            if nullable(&self.expr)
+                || (can_take_first_step(&self.set, &first, &source)
+                    && can_take_first_step(&self.set, &last, &source))
+            {
+                roots.push(Self::same_variable_source_output(program, source));
+            }
+        }
+        let last_examined = current.expect("a full positive page examined a source");
+        ResidualDeltaSourcePage {
+            next: next_first_source(&self.set, source_steps, Some(&last_examined))
+                .map(|_| ResidualDeltaSourceCursor::After(last_examined)),
+            examined,
+        }
+    }
+
     /// Selects the automaton orientation for a bound-endpoint fixpoint.
     /// Finite expressions retain their WCO/ordinary path; every expression
     /// with repetition uses the same product-state program regardless of its
@@ -1538,6 +1735,33 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         has_repetition(&self.expr)
     }
 
+    fn residual_delta_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
+        matches!(
+            self.residual_delta_program(variable),
+            Some(ResidualDeltaRoute::SameVariable { .. })
+        ) && view.col(variable).is_none()
+    }
+
+    fn residual_delta_source_page(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: Option<&[RawInline]>,
+        cursor: ResidualDeltaSourceCursor,
+        limit: usize,
+        roots: &mut Vec<ResidualDeltaOutput>,
+    ) -> Option<ResidualDeltaSourcePage> {
+        let Some(ResidualDeltaRoute::SameVariable { program }) =
+            self.residual_delta_program(variable)
+        else {
+            return None;
+        };
+        if view.len() != 1 || view.col(variable).is_some() {
+            return None;
+        }
+        Some(self.same_variable_source_page(program, candidates, cursor, limit, roots))
+    }
+
     fn residual_delta_seeds(
         &self,
         variable: VariableId,
@@ -1569,26 +1793,11 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
                 }));
             }
             ResidualDeltaRoute::SameVariable { program } => {
-                if view.col(variable).is_some() {
-                    return false;
-                }
-                let sources = self.same_variable_sources();
-                for parent in 0..view.len() {
-                    let parent = u32::try_from(parent).expect("too many residual parent rows");
-                    seeds.extend(sources.iter().map(|&source| ResidualDeltaSeed {
-                        parent,
-                        output: ResidualDeltaOutput {
-                            node: ResidualDeltaNode {
-                                source: Some(source),
-                                value: source,
-                                continuation: program.encode(program.start),
-                            },
-                            // Every speculative source comes from NODES(G), so
-                            // epsilon acceptance is already graph-gated.
-                            accepted: program.accepting[program.start as usize],
-                        },
-                    }));
-                }
+                let _ = program;
+                // Same-variable roots are supplied exclusively through the
+                // bounded source-page hook. Falling back to this eager hook
+                // would silently restore a graph-universe bootstrap scan.
+                return false;
             }
         }
         true
