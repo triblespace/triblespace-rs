@@ -73,6 +73,10 @@ impl<'a, S: InlineEncoding> Constraint<'a> for PatchValueConstraint<'a, S> {
         }
     }
 
+    fn residual_confirm_is_page_local(&self) -> bool {
+        true
+    }
+
     /// Exact when the variable is bound: checks whether every row's bound
     /// value is present in the patch. Returns `true` optimistically while
     /// the variable is unbound.
@@ -168,6 +172,10 @@ where
                 }
             });
         }
+    }
+
+    fn residual_confirm_is_page_local(&self) -> bool {
+        true
     }
 
     /// Exact when the variable is bound: checks whether every row's bound

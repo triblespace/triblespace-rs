@@ -87,6 +87,10 @@ impl<'a> Constraint<'a> for InlineRange {
         }
     }
 
+    fn residual_confirm_is_page_local(&self) -> bool {
+        true
+    }
+
     /// Returns `false` when any row binds the variable outside the range.
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match view.col(self.variable) {
