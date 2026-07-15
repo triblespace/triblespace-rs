@@ -1232,8 +1232,9 @@ impl ResidualCapabilities {
     /// Lowers the maximal exposed query root as one synthetic formula
     /// occurrence after variable selection. The outer Ready/commit protocol
     /// remains intact; AND/OR child progress becomes canonical formula state.
-    /// This is an explicit probe capability and does not affect ordinary
-    /// query selection.
+    /// This capability does not affect scheduler selection. Ordinary queries
+    /// admitted by the independent structural selector enable it, while the
+    /// explicit residual controls retain `ResidualCapabilities::default()`.
     pub fn root_formula(mut self) -> Self {
         self.root_formula = true;
         self
@@ -4893,9 +4894,13 @@ pub(super) struct ResidualQueryState {
 }
 
 impl ResidualQueryState {
-    pub(super) fn new<'a>(root: &dyn Constraint<'a>, mode: Search) -> Self {
-        let plan = ResidualPlan::compile(root);
-        let machine = ResidualStateMachine::new(root.variables(), plan.len(), mode);
+    pub(super) fn new<'a>(
+        root: &dyn Constraint<'a>,
+        mode: Search,
+        capabilities: ResidualCapabilities,
+    ) -> Self {
+        let plan = ResidualPlan::compile_capabilities(root, capabilities);
+        let machine = ResidualStateMachine::new_for_plan(root.variables(), &plan, mode);
         Self { plan, machine }
     }
 
@@ -4915,6 +4920,7 @@ impl ResidualQueryState {
 }
 
 impl ResidualStateMachine {
+    #[cfg(test)]
     fn new(full: VariableSet, leaf_count: usize, mode: Search) -> Self {
         Self::new_with_span(full, leaf_count, 2, mode)
     }
@@ -10729,7 +10735,8 @@ mod tests {
                 calls: Arc::new(Mutex::new(Vec::new())),
             }) as ShapeConstraint,
         ]));
-        let mut query = Query::new(root, |binding: &Binding| binding.get(0).copied());
+        let mut query = Query::new(root, |binding: &Binding| binding.get(0).copied())
+            .residual_state_scheduler();
 
         assert_eq!(query.next(), Some(raw(63)));
         let runtime = query.residual.as_deref().expect("residual cursor started");
@@ -10742,6 +10749,50 @@ mod tests {
 
         let cloned = query.clone();
         assert_eq!(query.collect::<Vec<_>>(), cloned.collect::<Vec<_>>());
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn ordinary_query_clone_snapshots_parked_formula_remainder() {
+        let values: Vec<_> = (0..64).map(raw).collect();
+        let root = Arc::new(IntersectionConstraint::new(vec![
+            Box::new(FanoutLeaf {
+                variable: 0,
+                values: Arc::new(values.clone()),
+            }) as ShapeConstraint,
+            Box::new(PageFilterLeaf {
+                variable: 0,
+                estimate: values.len() + 1,
+                accepted: None,
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }) as ShapeConstraint,
+        ]));
+        let mut query = Query::new(root, |binding: &Binding| binding.get(0).copied());
+
+        let first = query.next().expect("the formula frontier is nonempty");
+        let runtime = query.residual.as_deref().expect("residual cursor started");
+        assert!(runtime.machine.worklist.values().any(|level| {
+            level
+                .values()
+                .any(|bucket| matches!(bucket, StateBucket::Formula(_)))
+        }));
+        assert!(runtime.machine.stats.partial_pops > 0);
+
+        let cloned = query.clone();
+        let mut left = query.collect::<Vec<_>>();
+        let mut right = cloned.collect::<Vec<_>>();
+        let mut expected = values;
+        expected.remove(
+            expected
+                .iter()
+                .position(|value| *value == first)
+                .expect("the emitted value belongs to the proposal domain"),
+        );
+        left.sort_unstable();
+        right.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(left, expected);
+        assert_eq!(right, expected);
     }
 
     #[cfg(feature = "parallel")]
@@ -12927,8 +12978,7 @@ mod tests {
 
     #[test]
     fn mixed_delta_feedback_arms_probe_without_widening() {
-        let mut machine =
-            ResidualStateMachine::new(VariableSet::new_empty(), 1, Search::Done);
+        let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 1, Search::Done);
         machine.width = 4;
         machine.cap = 64;
         let token = ContinuationToken {

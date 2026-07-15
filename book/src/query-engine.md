@@ -150,11 +150,21 @@ there is no useful frontier to fuse.
 ## Canonical residual-state engine
 
 The residual engine keys a bucket by its **remaining computation**, not merely
-by the bindings or the route that produced it. It recursively flattens the
-maximal associative AND region exposed at the root into deterministic preorder
-leaf occurrences. Union, regular-path, ignore, and custom constraints remain
-opaque leaves unless they explicitly expose associative AND structure, so
-flattening never crosses a semantic boundary.
+by the bindings or the route that produced it. Its conservative explicit
+controls recursively flatten the maximal associative AND region exposed at the
+root into deterministic preorder leaf occurrences. Union, regular-path,
+ignore, and custom constraints remain opaque leaves unless a capability
+explicitly exposes more structure, so lowering never crosses an undeclared
+semantic boundary.
+
+When the ordinary structural selector admits a root, that root runs as one
+finite formula after variable selection. Exposed AND/OR progress then becomes
+canonical formula state, and eligible cyclic regular paths run through the
+delta submachine. Unsupported path programs and custom atoms keep using their
+ordinary opaque `Constraint` actions. The `root_formula` capability currently
+subsumes finite-union exposure on this path; the ordinary policy nevertheless
+names both capabilities explicitly so they remain separate composable controls
+for other residual entry points.
 
 Each canonical descriptor includes the bound-variable schema and one of four
 phases:
@@ -193,9 +203,15 @@ machine. This deliberately conservative selector follows measured evidence:
 forcing residual control states on arbitrary opaque or one-leaf roots can
 regress work and latency without opening a reconvergence opportunity.
 
+The selector and the lowering policy are independent. A root admitted by the
+selector receives root-formula, finite-union, and eligible cyclic-RPQ lowering;
+roots rejected by that same selector still use the lazy DAG.
+
 [`Query::residual_state_scheduler`](triblespace::core::query::Query::residual_state_scheduler)
 forces the residual cursor for any root and remains the completeness and
-comparison control. `solve_residual_state_lazy` exposes its width policy;
+comparison control with conservative opaque-composite lowering.
+`solve_residual_state_lazy` is the same conservative capability control and
+exposes its width policy;
 `solve_residual_state` is the eager saturated form, and
 `solve_residual_state_profiled` reports state, merge, action, and batch
 measurements. Fully drained variants preserve the result multiset, but may

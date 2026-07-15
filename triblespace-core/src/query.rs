@@ -1407,6 +1407,11 @@ enum QueryScheduler {
 /// [`Query::residual_state_scheduler`] or
 /// [`Query::lazy_dag_scheduler`] to override that structural default, and
 /// [`Query::sequential`] for the scalar depth-first specialization.
+/// A root admitted by the ordinary selector runs as one finite AND/OR formula
+/// and enables eligible cyclic regular paths inside that formula. Unsupported
+/// path programs remain ordinary opaque constraint actions. The explicit
+/// residual override retains conservative opaque-composite lowering so
+/// scheduler selection and structural capability remain separate controls.
 /// The query engine is designed to be simple and efficient, providing low, consistent,
 /// and predictable latency, skew resistance, and no required (or possible) tuning.
 /// The query engine is designed to be used in combination with the [Constraint] trait,
@@ -1421,6 +1426,11 @@ pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
     constraint: C,
     postprocessing: P,
     scheduler: QueryScheduler,
+    /// Structural lowering selected together with the ordinary residual
+    /// scheduler. Explicit scheduler overrides retain the conservative
+    /// capability set so scheduler choice and lowering capability remain two
+    /// independently testable axes.
+    residual_capabilities: residual::ResidualCapabilities,
     mode: Search,
     /// Whether [`Iterator::next`] has ever been called on this query.
     ///
@@ -1486,6 +1496,7 @@ where
             constraint: self.constraint.clone(),
             postprocessing: self.postprocessing.clone(),
             scheduler: self.scheduler,
+            residual_capabilities: self.residual_capabilities,
             mode: self.mode,
             iteration_started: self.iteration_started,
             influences: self.influences,
@@ -1660,7 +1671,10 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// conjunctions with shared-variable leaf work. This override preserves
     /// arbitrary-root completeness for opaque, one-leaf, disjoint, and
     /// seed-rejected constraints, and is useful for scheduler comparison. The
-    /// runtime cursor remains behind `Query::next`, so cloning a started query
+    /// override uses conservative opaque-composite lowering; it does not
+    /// inherit the richer formula and cyclic-path capabilities of an ordinary
+    /// shape-selected residual query. The runtime cursor remains behind
+    /// `Query::next`, so cloning a started query
     /// snapshots its exact raw remainder. Ordinary Rayon conversion of an
     /// unstarted query still uses the established scalar splitter; use
     /// `Query::into_par_residual_state_iter` (with the `parallel` feature) to
@@ -1676,6 +1690,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             "cannot select the residual-state query scheduler after iteration has started"
         );
         self.scheduler = QueryScheduler::ResidualState;
+        self.residual_capabilities = residual::ResidualCapabilities::default();
         self
     }
 
@@ -1766,11 +1781,26 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         } else {
             QueryScheduler::LazyDag
         };
+        let residual_capabilities = if scheduler == QueryScheduler::ResidualState {
+            // `root_formula` currently exposes finite ORs throughout this
+            // selected root, so `finite_unions` is operationally redundant in
+            // this exact combination. Keep the complete policy named here:
+            // the capabilities remain independently meaningful on explicit
+            // residual solves, and a future lowering split must not silently
+            // narrow the ordinary default.
+            residual::ResidualCapabilities::default()
+                .root_formula()
+                .finite_unions()
+                .cyclic_rpq()
+        } else {
+            residual::ResidualCapabilities::default()
+        };
 
         Query {
             constraint,
             postprocessing,
             scheduler,
+            residual_capabilities,
             mode,
             iteration_started: false,
             influences,
@@ -3568,6 +3598,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
                 .insert(Box::new(residual::ResidualQueryState::new(
                     &self.constraint,
                     self.mode,
+                    self.residual_capabilities,
                 )));
             return state.pull(
                 &self.constraint,
