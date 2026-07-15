@@ -5,6 +5,7 @@ use triblespace_core::id::{rngid, ExclusiveId, Id};
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
+use triblespace_core::query::residual::ResidualCapabilities;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, ConstraintShape, EstimateSink, PathOp, Query,
     RegularPathConstraint, RowsView, Variable, VariableId, VariableSet,
@@ -209,6 +210,10 @@ enum Scheduler {
     Sequential,
 }
 
+fn combined_effects() -> ResidualCapabilities {
+    ResidualCapabilities::default().finite_unions().cyclic_rpq()
+}
+
 fn repeated(attribute: Id, inverse: bool) -> Vec<PathOp> {
     if inverse {
         vec![PathOp::Attr(attribute.raw()), PathOp::Inverse, PathOp::Plus]
@@ -287,7 +292,9 @@ fn run(
     let query = Query::new(root, project);
     let mut results: Vec<_> = match scheduler {
         Scheduler::Ordinary => query.collect(),
-        Scheduler::Residual => query.residual_state_scheduler().collect(),
+        Scheduler::Residual => query
+            .solve_residual_state_lazy_with(combined_effects())
+            .collect(),
         Scheduler::Dag => query.lazy_dag_scheduler().collect(),
         Scheduler::Sequential => query.sequential().collect(),
     };
@@ -417,6 +424,30 @@ fn duplicate_outer_parents_preserve_endpoint_bag_multiplicity() {
 }
 
 #[test]
+fn default_residual_capabilities_keep_plus_opaque() {
+    let graph = Graph::new(3, &[(0, 1), (1, 2)]);
+    let expanded = Arc::new(AtomicUsize::new(0));
+    let root = bound_start_root(
+        graph.set.clone(),
+        graph.value(0),
+        &repeated(graph.attribute, false),
+        Arc::clone(&expanded),
+    );
+    let mut actual: Vec<_> = Query::new(root, project_end)
+        .solve_residual_state_lazy()
+        .collect();
+    actual.sort_unstable();
+    let mut expected = [graph.value(1).raw, graph.value(2).raw];
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
+    assert_eq!(
+        expanded.load(Ordering::Relaxed),
+        0,
+        "cyclic RPQ lowering must remain explicitly opt-in"
+    );
+}
+
+#[test]
 fn first_result_requires_one_expansion_and_drop_cancels_the_remainder() {
     let graph = Graph::new(5, &[(0, 1), (1, 2), (2, 3), (3, 4)]);
     let expanded = Arc::new(AtomicUsize::new(0));
@@ -426,7 +457,8 @@ fn first_result_requires_one_expansion_and_drop_cancels_the_remainder() {
         &repeated(graph.attribute, false),
         Arc::clone(&expanded),
     );
-    let mut query = Query::new(root, project_end).residual_state_scheduler();
+    let mut query =
+        Query::new(root, project_end).solve_residual_state_lazy_with(combined_effects());
 
     assert_eq!(query.next(), Some(graph.value(1).raw));
     assert_eq!(expanded.load(Ordering::Relaxed), 1);
@@ -443,7 +475,8 @@ fn clone_after_first_result_has_two_independent_exact_remainders() {
         &repeated(graph.attribute, false),
         Arc::new(AtomicUsize::new(0)),
     );
-    let mut query = Query::new(root, project_end).residual_state_scheduler();
+    let mut query =
+        Query::new(root, project_end).solve_residual_state_lazy_with(combined_effects());
     assert_eq!(query.next(), Some(graph.value(1).raw));
     let clone = query.clone();
 

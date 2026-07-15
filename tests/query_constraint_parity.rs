@@ -13,6 +13,7 @@ use std::hash::Hash;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use triblespace::core::debug::query::EstimateOverrideConstraint;
+use triblespace::core::query::residual::ResidualCapabilities;
 use triblespace::core::query::{Binding, Constraint, Query};
 use triblespace::prelude::inlineencodings::GenId;
 use triblespace::prelude::*;
@@ -50,22 +51,21 @@ fn multiset<T: Eq + Hash>(items: impl IntoIterator<Item = T>) -> HashMap<T, usiz
     counts
 }
 
+fn combined_effects() -> ResidualCapabilities {
+    ResidualCapabilities::default().finite_unions().cyclic_rpq()
+}
+
 /// Runs the stable schedulers around one replaceable residual-capability seam.
 ///
 /// Union/RPQ lowering experiments can swap only `run_residual`; the oracle and
 /// all surrounding engine comparisons remain unchanged, so capability work
 /// does not proliferate public solver entry points or bespoke fixtures.
-fn assert_scheduler_matrix<'a, C, P, R, Make, Residual>(
-    label: &str,
-    expected: Vec<R>,
-    make_query: Make,
-    run_residual: Residual,
-) where
+fn assert_scheduler_matrix<'a, C, P, R, Make>(label: &str, expected: Vec<R>, make_query: Make)
+where
     C: Constraint<'a> + Clone + Send + 'a,
     P: Fn(&Binding) -> Option<R> + Clone + Send,
     R: Clone + Debug + Eq + Hash + Send,
     Make: Fn() -> Query<C, P, R>,
-    Residual: Fn(Query<C, P, R>) -> Vec<R>,
 {
     let expected = multiset(expected);
     let assert_engine = |engine: &str, actual: Vec<R>| {
@@ -86,6 +86,14 @@ fn assert_scheduler_matrix<'a, C, P, R, Make, Residual>(
     let lazy_all = first.into_iter().chain(lazy).collect();
     assert_engine("lazy DAG after first pull", lazy_all);
 
+    // This is the single integration seam for every fixture below. Composite
+    // effects are selected together; adding another structural capability
+    // must extend this value rather than create a solver-specific entry point.
+    let run_residual = |query: Query<C, P, R>| {
+        query
+            .solve_residual_state_lazy_with(combined_effects())
+            .collect()
+    };
     assert_engine("combined residual capability", run_residual(make_query()));
 
     #[cfg(feature = "parallel")]
@@ -101,7 +109,8 @@ fn assert_scheduler_matrix<'a, C, P, R, Make, Residual>(
         assert_engine(
             "parallel residual",
             make_query()
-                .into_par_residual_state_iter()
+                .solve_residual_state_lazy_with(combined_effects())
+                .into_par_iter()
                 .collect::<Vec<_>>(),
         );
     }
@@ -134,22 +143,17 @@ fn union_dead_arms_are_row_local_and_duplicate_activations_are_affine() {
     insert_relation(&mut activations, &activation_3, &parity::activates, &b);
 
     let expected = vec![(a_v, y_a_v), (a_v, y_a_v), (b_v, y_b_v)];
-    assert_scheduler_matrix(
-        "row-varying-dead-union-arm",
-        expected,
-        || {
-            find!((x: Inline<GenId>, y: Inline<GenId>),
-                and!(
-                    pattern!(&activations, [{ _?activation @ parity::activates: ?x }]),
-                    or!(
-                        and!(x.is(a_v), y.is(y_a_v)),
-                        and!(x.is(b_v), y.is(y_b_v)),
-                    ),
-                )
+    assert_scheduler_matrix("row-varying-dead-union-arm", expected, || {
+        find!((x: Inline<GenId>, y: Inline<GenId>),
+            and!(
+                pattern!(&activations, [{ _?activation @ parity::activates: ?x }]),
+                or!(
+                    and!(x.is(a_v), y.is(y_a_v)),
+                    and!(x.is(b_v), y.is(y_b_v)),
+                ),
             )
-        },
-        |query| query.solve_residual_state(),
-    );
+        )
+    });
 }
 
 /// Union confirmation is a finite set reducer, not a pointwise filter: equal
@@ -160,18 +164,13 @@ fn union_confirm_deduplicates_equal_candidates_within_one_parent() {
     let candidates = [a_v, a_v];
     let candidates = SortedSlice::new(&candidates).unwrap();
 
-    assert_scheduler_matrix(
-        "union-confirm-deduplicates-one-parent",
-        vec![a_v],
-        || {
-            find!(x: Inline<GenId>, {
-                let mut source = EstimateOverrideConstraint::new(candidates.has(x));
-                source.set_estimate(x.index, 0);
-                and!(source, or!(x.is(a_v), x.is(a_v)))
-            })
-        },
-        |query| query.solve_residual_state(),
-    );
+    assert_scheduler_matrix("union-confirm-deduplicates-one-parent", vec![a_v], || {
+        find!(x: Inline<GenId>, {
+            let mut source = EstimateOverrideConstraint::new(candidates.has(x));
+            source.set_estimate(x.index, 0);
+            and!(source, or!(x.is(a_v), x.is(a_v)))
+        })
+    });
 }
 
 /// A recursive fixpoint's visited/frontier/result sets are activation-private.
@@ -208,20 +207,15 @@ fn rpq_plus_deduplicates_witnesses_not_outer_activations() {
         (b_v, b_v),
         (b_v, c_v),
     ];
-    assert_scheduler_matrix(
-        "rpq-plus-affine-fixpoint",
-        expected,
-        || {
-            find!(
-                (source: Inline<GenId>, target: Inline<GenId>),
-                and!(
-                    outer.has(source),
-                    path!(graph.clone(), source parity::edge+ target),
-                )
+    assert_scheduler_matrix("rpq-plus-affine-fixpoint", expected, || {
+        find!(
+            (source: Inline<GenId>, target: Inline<GenId>),
+            and!(
+                outer.has(source),
+                path!(graph.clone(), source parity::edge+ target),
             )
-        },
-        |query| query.solve_residual_state(),
-    );
+        )
+    });
 }
 
 /// In contrast to Union, RPQ confirmation is a pointwise reachability filter.
@@ -254,6 +248,36 @@ fn rpq_confirm_preserves_equal_candidate_occurrences() {
                 )
             })
         },
-        |query| query.solve_residual_state(),
     );
+}
+
+/// Both effect families activate sequentially in one root without sharing
+/// affine state. The finite Union proposes `source`; once that value is bound,
+/// the eligible `edge+` RPQ delta-proposes `target` for each resulting row.
+#[test]
+fn finite_union_and_cyclic_rpq_coexist_in_one_root() {
+    let a = fixture_id(61);
+    let b = fixture_id(62);
+    let c = fixture_id(63);
+    let d = fixture_id(64);
+    let a_v: Inline<GenId> = (&a).to_inline();
+    let b_v: Inline<GenId> = (&b).to_inline();
+    let c_v: Inline<GenId> = (&c).to_inline();
+    let d_v: Inline<GenId> = (&d).to_inline();
+    let mut graph = TribleSet::new();
+    insert_edge(&mut graph, &a, &b);
+    insert_edge(&mut graph, &b, &a);
+    insert_edge(&mut graph, &b, &c);
+    insert_edge(&mut graph, &d, &c);
+
+    let expected = vec![(a_v, a_v), (a_v, b_v), (a_v, c_v), (d_v, c_v)];
+    assert_scheduler_matrix("finite-union-plus-cyclic-rpq", expected, || {
+        find!(
+            (source: Inline<GenId>, target: Inline<GenId>),
+            and!(
+                or!(source.is(a_v), source.is(d_v)),
+                path!(graph.clone(), source parity::edge+ target),
+            )
+        )
+    });
 }

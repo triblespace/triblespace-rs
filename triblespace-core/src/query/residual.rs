@@ -107,6 +107,7 @@ impl ResidualPlan {
         Self::compile_mode(root, ResidualCompileMode::OpaqueUnions, false)
     }
 
+    #[cfg(test)]
     fn compile_finite_unions<'a>(root: &dyn Constraint<'a>) -> Self {
         Self::compile_mode(root, ResidualCompileMode::FiniteUnions, false)
     }
@@ -4313,6 +4314,26 @@ pub struct ResidualStateIter<C, P: Fn(&Binding) -> Option<R>, R> {
     /// may still be drained in parallel, but is conservatively kept as one
     /// Rayon leaf rather than split or restarted.
     iteration_started: bool,
+}
+
+// Manual implementation avoids the unnecessary `R: Clone` bound that derive
+// would add: projected values are never retained in the exact raw remainder.
+impl<C, P, R> Clone for ResidualStateIter<C, P, R>
+where
+    C: Clone,
+    P: Fn(&Binding) -> Option<R> + Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            root: self.root.clone(),
+            plan: self.plan.clone(),
+            postprocessing: self.postprocessing.clone(),
+            influences: self.influences,
+            base_estimates: self.base_estimates,
+            state: self.state.clone(),
+            iteration_started: self.iteration_started,
+        }
+    }
 }
 
 /// Result of fully draining an opt-in [`ResidualShadowIter`].
