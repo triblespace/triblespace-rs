@@ -6,10 +6,10 @@
 //! opaque root is one leaf at the empty path. Union, ignore, and regular-path
 //! constraints therefore remain ordinary indivisible leaves, as do custom
 //! constraints unless they explicitly expose an associative AND shape.
-//! When finite-formula lowering is enabled, a residual Union executes its
-//! direct AND arms through the same canonical formula PC and an affine payload
-//! frame stack. AND children remain opaque actions in this slice; deeper
-//! connectives therefore retain their existing constraint semantics.
+//! When finite-formula lowering is enabled, a residual Union executes an
+//! arbitrary finite tree of AND/OR frames through the same canonical formula
+//! PC and an affine payload-frame stack. Only Atom nodes invoke the opaque
+//! constraint protocol; connective nesting remains explicit control.
 //!
 //! Ready and Candidate descriptors are pure planning states: they estimate,
 //! partition rows by a uniform semantic action, and file explicit Propose or
@@ -374,9 +374,9 @@ impl FiniteFormulaProgram {
     }
 
     /// Selects a child as one opaque protocol action even when its compiled
-    /// kind is composite. The mixed executor uses this for every direct child
-    /// of an active AND frame; deeper connectives keep their ordinary
-    /// constraint behavior until that structural boundary is enabled too.
+    /// kind is composite. Recursive execution uses this only for Atom nodes;
+    /// retaining the explicit operation keeps compiler control tests able to
+    /// describe a deliberately opaque structural boundary.
     fn select_child_as_action(
         &self,
         counter: &FormulaProgramCounter,
@@ -892,8 +892,9 @@ pub struct ResidualCapabilities {
 }
 
 impl ResidualCapabilities {
-    /// Lowers finite logical unions into canonical formula continuations while
-    /// keeping each direct non-Union child as one opaque protocol action.
+    /// Lowers finite logical unions and their recursively exposed AND/OR
+    /// descendants into canonical formula continuations. Atom nodes retain
+    /// the ordinary opaque constraint protocol.
     pub fn finite_unions(mut self) -> Self {
         self.finite_unions = true;
         self
@@ -3679,6 +3680,30 @@ fn formula_plan_transition<'a>(
     }
 }
 
+fn select_formula_child(
+    program: &FiniteFormulaProgram,
+    counter: &FormulaProgramCounter,
+    children: &[FormulaNodeId],
+    child: usize,
+) -> FormulaProgramCounter {
+    match &program.node(children[child]).kind {
+        FiniteFormulaNodeKind::Atom => program.select_child_as_action(counter, child),
+        FiniteFormulaNodeKind::And { .. } | FiniteFormulaNodeKind::Or { .. } => {
+            program.select_child(counter, child)
+        }
+    }
+}
+
+fn enter_selected_formula_frame(
+    program: &FiniteFormulaProgram,
+    counter: &FormulaProgramCounter,
+    batch: &mut FormulaBatch,
+) {
+    if let FormulaFocus::Plan { node, stage, .. } = &counter.focus {
+        batch.enter(&program.node(*node).kind, *stage);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn formula_or_plan_transition<'a>(
     root: &dyn Constraint<'a>,
@@ -3691,14 +3716,13 @@ fn formula_or_plan_transition<'a>(
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
 ) -> Option<ContinuationToken> {
-    let FormulaFocus::Plan { node, done, .. } = &counter.focus else {
+    let FormulaFocus::Plan { done, .. } = &counter.focus else {
         unreachable!("OR planning received an action continuation")
     };
-    assert_eq!(
-        plan.finite_formula.root(counter.resume.occurrence),
-        Some(*node),
-        "this execution slice only plans the root OR"
-    );
+    assert!(matches!(
+        batch.frames.last(),
+        Some(FormulaPayloadFrame::Or { .. })
+    ));
     let child_count = children.len();
     assert!(
         done.is_valid_for(child_count),
@@ -3780,21 +3804,10 @@ fn formula_or_plan_transition<'a>(
 
         let successors: Vec<_> = assignments
             .into_iter()
-            .map(|child| {
-                if matches!(
-                    plan.finite_formula.node(children[child]).kind,
-                    FiniteFormulaNodeKind::And { .. }
-                ) {
-                    plan.finite_formula.select_child(&counter, child)
-                } else {
-                    plan.finite_formula.select_child_as_action(&counter, child)
-                }
-            })
+            .map(|child| select_formula_child(&plan.finite_formula, &counter, children, child))
             .collect();
         for (counter, mut batch) in batch.partition(vars.len(), &successors) {
-            if let FormulaFocus::Plan { node, stage, .. } = &counter.focus {
-                batch.enter(&plan.finite_formula.node(*node).kind, *stage);
-            }
+            enter_selected_formula_frame(&plan.finite_formula, &counter, &mut batch);
             prefer_continuation(
                 &mut continuation,
                 continue_formula_transition(plan, desc, counter, batch, worklist, interner, stats),
@@ -3878,12 +3891,13 @@ fn formula_and_plan_transition<'a>(
         }
     }
 
-    let actions: Vec<_> = assignments
+    let successors: Vec<_> = assignments
         .into_iter()
-        .map(|child| plan.finite_formula.select_child_as_action(&next, child))
+        .map(|child| select_formula_child(&plan.finite_formula, &next, children, child))
         .collect();
     let mut continuation = None;
-    for (counter, batch) in batch.partition(vars.len(), &actions) {
+    for (counter, mut batch) in batch.partition(vars.len(), &successors) {
+        enter_selected_formula_frame(&plan.finite_formula, &counter, &mut batch);
         prefer_continuation(
             &mut continuation,
             continue_formula_transition(plan, desc, counter, batch, worklist, interner, stats),
@@ -3992,7 +4006,7 @@ fn formula_action_transition<'a>(
 
     let completed = plan.finite_formula.complete(counter);
     let FormulaSuccessor::Formula(next) = plan.finite_formula.resume(&completed) else {
-        panic!("a root OR action returned directly to its outer continuation")
+        panic!("an Atom action returned directly past the formula root")
     };
     continue_formula_transition(plan, desc, next, batch, worklist, interner, stats)
 }
@@ -6953,7 +6967,7 @@ mod tests {
     struct RowAdaptiveLeaf {
         parent: VariableId,
         variable: VariableId,
-        estimates: [usize; 2],
+        estimates: [usize; 4],
         value: RawInline,
         proposed_parents: Arc<Mutex<Vec<Vec<RawInline>>>>,
     }
@@ -6975,7 +6989,7 @@ mod tests {
             if let Some(parent) = view.col(self.parent) {
                 out.extend(
                     view.iter()
-                        .map(|row| self.estimates[(row[parent][0] & 1) as usize]),
+                        .map(|row| self.estimates[(row[parent][0] & 3) as usize]),
                 );
             } else {
                 out.fill(100, view.len());
@@ -7670,6 +7684,74 @@ mod tests {
             run(1, 0),
             "the done set and parent return site must erase AND child history"
         );
+    }
+
+    #[test]
+    fn recursive_formula_orders_return_to_one_exact_pc_at_every_zipper_depth() {
+        let inner = UnionConstraint::new(vec![shape_leaf(0), shape_leaf(0)]);
+        let guarded =
+            IntersectionConstraint::new(vec![Box::new(inner) as ShapeConstraint, shape_leaf(0)]);
+        let root = UnionConstraint::new(vec![Box::new(guarded) as ShapeConstraint]);
+        let plan = ResidualPlan::compile_finite_unions(&root);
+        let program = &plan.finite_formula;
+        let mut relevant = ChildSet::empty(plan.len());
+        relevant.insert(0);
+        let outer = program.start(0, 0, UnionVerb::Propose { relevant });
+
+        let assert_advance = |before: &FormulaProgramCounter, after: &FormulaProgramCounter| {
+            assert!(
+                program.grade(after) > program.grade(before),
+                "recursive formula grade did not advance: {before:?} -> {after:?}"
+            );
+        };
+        let finish_atom = |parent: &FormulaProgramCounter, child| {
+            let action = program.select_child_as_action(parent, child);
+            assert_advance(parent, &action);
+            let complete = program.complete(&action);
+            assert_advance(&action, &complete);
+            let FormulaSuccessor::Formula(next) = program.resume(&complete) else {
+                panic!("nested Atom returned past the formula root")
+            };
+            assert_advance(&complete, &next);
+            next
+        };
+        let finish_inner = |and: &FormulaProgramCounter, order: [usize; 2]| {
+            let mut inner = program.select_child(and, 0);
+            assert_advance(and, &inner);
+            inner = finish_atom(&inner, order[0]);
+            inner = finish_atom(&inner, order[1]);
+            let complete = program.complete(&inner);
+            assert_advance(&inner, &complete);
+            let FormulaSuccessor::Formula(and) = program.resume(&complete) else {
+                panic!("inner OR returned past its enclosing AND")
+            };
+            assert_advance(&complete, &and);
+            and
+        };
+        let run = |nested_first: bool, inner_order: [usize; 2]| {
+            let mut and = program.select_child(&outer, 0);
+            assert_advance(&outer, &and);
+            if nested_first {
+                and = finish_inner(&and, inner_order);
+                and = finish_atom(&and, 1);
+            } else {
+                and = finish_atom(&and, 1);
+                and = finish_inner(&and, inner_order);
+            }
+            let complete = program.complete(&and);
+            assert_advance(&and, &complete);
+            let FormulaSuccessor::Formula(outer_done) = program.resume(&complete) else {
+                panic!("nested AND returned past its enclosing OR")
+            };
+            assert_advance(&complete, &outer_done);
+            outer_done
+        };
+
+        let canonical = run(true, [0, 1]);
+        for equivalent in [run(true, [1, 0]), run(false, [0, 1]), run(false, [1, 0])] {
+            assert_eq!(equivalent, canonical);
+            assert_eq!(program.grade(&equivalent), program.grade(&canonical));
+        }
     }
 
     #[test]
@@ -10152,14 +10234,14 @@ mod tests {
                 Box::new(RowAdaptiveLeaf {
                     parent: 0,
                     variable: 1,
-                    estimates: [1, 10],
+                    estimates: [1, 10, 1, 10],
                     value: raw(7),
                     proposed_parents: left_proposals,
                 }) as ShapeConstraint,
                 Box::new(RowAdaptiveLeaf {
                     parent: 0,
                     variable: 1,
-                    estimates: [10, 1],
+                    estimates: [10, 1, 10, 1],
                     value: raw(7),
                     proposed_parents: right_proposals,
                 }) as ShapeConstraint,
@@ -10205,7 +10287,101 @@ mod tests {
     }
 
     #[test]
-    fn recursive_union_flattens_nested_or_and_stops_at_and_terminals() {
+    fn recursive_formula_remerges_opposite_row_orders_at_inner_and_outer_depths() {
+        let left_proposals = Arc::new(Mutex::new(Vec::new()));
+        let right_proposals = Arc::new(Mutex::new(Vec::new()));
+        let outer_proposals = Arc::new(Mutex::new(Vec::new()));
+        let make = |left_proposals: Arc<Mutex<Vec<Vec<RawInline>>>>,
+                    right_proposals: Arc<Mutex<Vec<Vec<RawInline>>>>,
+                    outer_proposals: Arc<Mutex<Vec<Vec<RawInline>>>>| {
+            let inner_or = UnionConstraint::new(vec![
+                Box::new(RowAdaptiveLeaf {
+                    parent: 0,
+                    variable: 1,
+                    estimates: [1, 10, 1, 10],
+                    value: raw(7),
+                    proposed_parents: left_proposals,
+                }) as ShapeConstraint,
+                Box::new(RowAdaptiveLeaf {
+                    parent: 0,
+                    variable: 1,
+                    estimates: [10, 1, 10, 1],
+                    value: raw(7),
+                    proposed_parents: right_proposals,
+                }) as ShapeConstraint,
+            ]);
+            let outer_and = IntersectionConstraint::new(vec![
+                Box::new(inner_or) as ShapeConstraint,
+                Box::new(RowAdaptiveLeaf {
+                    parent: 0,
+                    variable: 1,
+                    estimates: [20, 20, 1, 1],
+                    value: raw(7),
+                    proposed_parents: outer_proposals,
+                }) as ShapeConstraint,
+            ]);
+            IntersectionConstraint::new(vec![
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(vec![raw(0), raw(1), raw(2), raw(3)]),
+                }) as ShapeConstraint,
+                Box::new(UnionConstraint::new(vec![outer_and])) as ShapeConstraint,
+            ])
+        };
+        let project =
+            |binding: &Binding| Some((binding.get(0).copied()?, binding.get(1).copied()?));
+        let blank = || Arc::new(Mutex::new(Vec::new()));
+        let mut sequential: Vec<_> = Query::new(make(blank(), blank(), blank()), project)
+            .sequential()
+            .collect();
+        let mut opaque: Vec<_> = Query::new(make(blank(), blank(), blank()), project)
+            .solve_residual_state_lazy()
+            .collect();
+        let mut lowered = Query::new(
+            make(
+                Arc::clone(&left_proposals),
+                Arc::clone(&right_proposals),
+                Arc::clone(&outer_proposals),
+            ),
+            project,
+        )
+        .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+        .cap(4)
+        .start_width(4)
+        .growth(1)
+        .collect_profiled();
+        sequential.sort_unstable();
+        opaque.sort_unstable();
+        lowered.results.sort_unstable();
+        assert_eq!(
+            lowered.results,
+            [
+                (raw(0), raw(7)),
+                (raw(1), raw(7)),
+                (raw(2), raw(7)),
+                (raw(3), raw(7)),
+            ]
+        );
+        assert_eq!(lowered.results, sequential);
+        assert_eq!(lowered.results, opaque);
+
+        let flatten = |log: &Arc<Mutex<Vec<Vec<RawInline>>>>| {
+            let mut parents: Vec<_> = log.lock().unwrap().iter().flatten().copied().collect();
+            parents.sort_unstable();
+            parents
+        };
+        assert_eq!(flatten(&left_proposals), [raw(0), raw(1)]);
+        assert_eq!(flatten(&right_proposals), [raw(0), raw(1)]);
+        assert_eq!(flatten(&outer_proposals), [raw(2), raw(3)]);
+        assert!(
+            lowered.stats.bucket_merges >= 3,
+            "recursive opposite-order histories did not remerge at multiple zipper depths: {:?}",
+            lowered.stats
+        );
+    }
+
+    #[test]
+    fn recursive_union_compiler_flattens_or_but_preserves_and_nodes() {
         let terminal = |values: Vec<RawInline>, accepted: RawInline| {
             Box::new(IntersectionConstraint::new(vec![
                 Box::new(FanoutLeaf {
@@ -10331,7 +10507,7 @@ mod tests {
     }
 
     #[test]
-    fn recursive_union_does_not_flatten_across_an_and_frame() {
+    fn recursive_union_crosses_and_without_flattening_away_its_sibling() {
         let make = || {
             let nested = UnionConstraint::new(vec![
                 Box::new(FanoutLeaf {
@@ -10363,9 +10539,9 @@ mod tests {
 
         // Descending through the AND and treating its nested Union children as
         // outer arms would drop the sibling filter and incorrectly admit 1.
-        // OR flattening therefore stops at the AND occurrence. Execution may
-        // cross that boundary using an activation-private current frame, but
-        // the nested OR remains one opaque AND-child action in this slice.
+        // OR flattening therefore stops at the AND occurrence. Execution
+        // crosses the connective boundary with an activation-private current
+        // frame, then enters the nested OR as another explicit frame.
         let plan = ResidualPlan::compile_finite_unions(&make());
         let formula_root = plan.finite_formula.root(0).unwrap();
         let FiniteFormulaNodeKind::Or { children } = &plan.finite_formula.node(formula_root).kind
@@ -10373,6 +10549,16 @@ mod tests {
             panic!("lowered guarded union is not an OR")
         };
         assert_eq!(children.len(), 2);
+        let FiniteFormulaNodeKind::And {
+            children: and_children,
+        } = &plan.finite_formula.node(children[0]).kind
+        else {
+            panic!("guarded outer arm is not an AND")
+        };
+        assert!(matches!(
+            plan.finite_formula.node(and_children[0]).kind,
+            FiniteFormulaNodeKind::Or { .. }
+        ));
         assert_eq!(
             children
                 .iter()
@@ -10386,14 +10572,379 @@ mod tests {
 
         let project = |binding: &Binding| binding.get(0).copied();
         let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
+        let mut opaque = Query::new(make(), project)
+            .solve_residual_state_lazy()
+            .collect_profiled();
+        let mut lowered = Query::new(make(), project)
+            .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+            .collect_profiled();
+        sequential.sort_unstable();
+        opaque.results.sort_unstable();
+        lowered.results.sort_unstable();
+        assert_eq!(lowered.results, [raw(2), raw(4)]);
+        assert_eq!(lowered.results, sequential);
+        assert_eq!(lowered.results, opaque.results);
+        assert!(!lowered.results.contains(&raw(1)));
+        assert_eq!(lowered.stats.propose_calls, 3);
+        assert_eq!(lowered.stats.confirm_calls, 1);
+        assert_eq!(opaque.stats.propose_calls, 1);
+        assert_eq!(opaque.stats.confirm_calls, 0);
+    }
+
+    #[test]
+    fn recursive_union_confirm_threads_inner_or_result_through_enclosing_and() {
+        let zero_calls = Arc::new(Mutex::new(Vec::new()));
+        let one_calls = Arc::new(Mutex::new(Vec::new()));
+        let and_calls = Arc::new(Mutex::new(Vec::new()));
+        let outer_calls = Arc::new(Mutex::new(Vec::new()));
+        let make = |zero_calls: Arc<Mutex<Vec<usize>>>,
+                    one_calls: Arc<Mutex<Vec<usize>>>,
+                    and_calls: Arc<Mutex<Vec<usize>>>,
+                    outer_calls: Arc<Mutex<Vec<usize>>>| {
+            let inner = UnionConstraint::new(vec![
+                Box::new(PageFilterLeaf {
+                    variable: 0,
+                    estimate: 1,
+                    accepted: Some(raw(0)),
+                    calls: zero_calls,
+                }) as ShapeConstraint,
+                Box::new(PageFilterLeaf {
+                    variable: 0,
+                    estimate: 2,
+                    accepted: Some(raw(1)),
+                    calls: one_calls,
+                }) as ShapeConstraint,
+            ]);
+            let guarded = IntersectionConstraint::new(vec![
+                Box::new(inner) as ShapeConstraint,
+                Box::new(PageFilterLeaf {
+                    variable: 0,
+                    estimate: 10,
+                    accepted: Some(raw(1)),
+                    calls: and_calls,
+                }) as ShapeConstraint,
+            ]);
+            let root_union = UnionConstraint::new(vec![
+                Box::new(guarded) as ShapeConstraint,
+                Box::new(PageFilterLeaf {
+                    variable: 0,
+                    estimate: 20,
+                    accepted: Some(raw(3)),
+                    calls: outer_calls,
+                }) as ShapeConstraint,
+            ]);
+            IntersectionConstraint::new(vec![
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(vec![raw(0), raw(1), raw(2), raw(3)]),
+                }) as ShapeConstraint,
+                Box::new(root_union) as ShapeConstraint,
+            ])
+        };
+        let project = |binding: &Binding| binding.get(0).copied();
+        let blank = || Arc::new(Mutex::new(Vec::new()));
+        let mut sequential: Vec<_> = Query::new(make(blank(), blank(), blank(), blank()), project)
+            .sequential()
+            .collect();
+        let mut opaque: Vec<_> = Query::new(make(blank(), blank(), blank(), blank()), project)
+            .solve_residual_state_lazy()
+            .collect();
+        let mut lowered: Vec<_> = Query::new(
+            make(
+                Arc::clone(&zero_calls),
+                Arc::clone(&one_calls),
+                Arc::clone(&and_calls),
+                Arc::clone(&outer_calls),
+            ),
+            project,
+        )
+        .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+        .collect();
+        sequential.sort_unstable();
+        opaque.sort_unstable();
+        lowered.sort_unstable();
+        assert_eq!(lowered, [raw(1), raw(3)]);
+        assert_eq!(lowered, sequential);
+        assert_eq!(lowered, opaque);
+        assert_eq!(*zero_calls.lock().unwrap(), [4]);
+        assert_eq!(*one_calls.lock().unwrap(), [4]);
+        assert_eq!(*and_calls.lock().unwrap(), [2]);
+        assert_eq!(*outer_calls.lock().unwrap(), [4]);
+    }
+
+    #[test]
+    fn recursive_inner_or_deduplicates_before_its_and_sibling() {
+        let sibling_calls = Arc::new(Mutex::new(Vec::new()));
+        let make = |sibling_calls: Arc<Mutex<Vec<usize>>>| {
+            let inner = UnionConstraint::new(vec![
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(vec![raw(5), raw(5), raw(5)]),
+                }) as ShapeConstraint,
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(vec![raw(5), raw(5)]),
+                }) as ShapeConstraint,
+            ]);
+            let guarded = IntersectionConstraint::new(vec![
+                Box::new(inner) as ShapeConstraint,
+                Box::new(PageFilterLeaf {
+                    variable: 0,
+                    estimate: 20,
+                    accepted: Some(raw(5)),
+                    calls: sibling_calls,
+                }) as ShapeConstraint,
+            ]);
+            UnionConstraint::new(vec![guarded])
+        };
+        let project = |binding: &Binding| binding.get(0).copied();
+        let mut sequential: Vec<_> = Query::new(make(Arc::new(Mutex::new(Vec::new()))), project)
+            .sequential()
+            .collect();
+        let mut opaque: Vec<_> = Query::new(make(Arc::new(Mutex::new(Vec::new()))), project)
+            .solve_residual_state_lazy()
+            .collect();
+        let mut lowered: Vec<_> = Query::new(make(Arc::clone(&sibling_calls)), project)
+            .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+            .collect();
+        sequential.sort_unstable();
+        opaque.sort_unstable();
+        lowered.sort_unstable();
+        assert_eq!(lowered, [raw(5)]);
+        assert_eq!(lowered, sequential);
+        assert_eq!(lowered, opaque);
+        assert_eq!(
+            *sibling_calls.lock().unwrap(),
+            [1],
+            "the enclosing AND observed an unnormalized inner OR output"
+        );
+    }
+
+    #[test]
+    fn recursive_formula_executes_two_connective_alternations_and_nested_and() {
+        let make = || {
+            let deepest_and = IntersectionConstraint::new(vec![
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(vec![raw(1), raw(2)]),
+                }) as ShapeConstraint,
+                Box::new(PageFilterLeaf {
+                    variable: 0,
+                    estimate: 20,
+                    accepted: Some(raw(2)),
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                }) as ShapeConstraint,
+            ]);
+            let middle_or = UnionConstraint::new(vec![
+                Box::new(deepest_and) as ShapeConstraint,
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(vec![raw(3)]),
+                }) as ShapeConstraint,
+            ]);
+            let outer_and = IntersectionConstraint::new(vec![
+                Box::new(middle_or) as ShapeConstraint,
+                Box::new(PageFilterLeaf {
+                    variable: 0,
+                    estimate: 30,
+                    accepted: Some(raw(2)),
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                }) as ShapeConstraint,
+            ]);
+            UnionConstraint::new(vec![
+                Box::new(outer_and) as ShapeConstraint,
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(vec![raw(4)]),
+                }) as ShapeConstraint,
+            ])
+        };
+        let project = |binding: &Binding| binding.get(0).copied();
+        let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
+        let mut opaque: Vec<_> = Query::new(make(), project)
+            .solve_residual_state_lazy()
+            .collect();
         let mut lowered: Vec<_> = Query::new(make(), project)
             .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
             .collect();
         sequential.sort_unstable();
+        opaque.sort_unstable();
         lowered.sort_unstable();
         assert_eq!(lowered, [raw(2), raw(4)]);
         assert_eq!(lowered, sequential);
-        assert!(!lowered.contains(&raw(1)));
+        assert_eq!(lowered, opaque);
+    }
+
+    #[test]
+    fn recursive_empty_inner_or_annihilates_only_its_enclosing_and_branch() {
+        let skipped_calls = Arc::new(Mutex::new(Vec::new()));
+        let make = |skipped_calls: Arc<Mutex<Vec<usize>>>| {
+            let empty_inner = UnionConstraint::new(vec![
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(Vec::new()),
+                }) as ShapeConstraint,
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(Vec::new()),
+                }) as ShapeConstraint,
+            ]);
+            let empty_and = IntersectionConstraint::new(vec![
+                Box::new(empty_inner) as ShapeConstraint,
+                Box::new(PageFilterLeaf {
+                    variable: 0,
+                    estimate: 20,
+                    accepted: None,
+                    calls: skipped_calls,
+                }) as ShapeConstraint,
+            ]);
+            UnionConstraint::new(vec![
+                Box::new(empty_and) as ShapeConstraint,
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(vec![raw(9)]),
+                }) as ShapeConstraint,
+            ])
+        };
+        let project = |binding: &Binding| binding.get(0).copied();
+        let mut sequential: Vec<_> = Query::new(make(Arc::new(Mutex::new(Vec::new()))), project)
+            .sequential()
+            .collect();
+        let mut opaque: Vec<_> = Query::new(make(Arc::new(Mutex::new(Vec::new()))), project)
+            .solve_residual_state_lazy()
+            .collect();
+        let mut lowered: Vec<_> = Query::new(make(Arc::clone(&skipped_calls)), project)
+            .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+            .collect();
+        sequential.sort_unstable();
+        opaque.sort_unstable();
+        lowered.sort_unstable();
+        assert_eq!(lowered, [raw(9)]);
+        assert_eq!(lowered, sequential);
+        assert_eq!(lowered, opaque);
+        assert!(
+            skipped_calls.lock().unwrap().is_empty(),
+            "an annihilated recursive AND continued into a sibling action"
+        );
+    }
+
+    #[test]
+    fn recursive_inner_or_skips_row_dead_arms_and_remerges_the_live_results() {
+        let even_rows = Arc::new(AtomicUsize::new(0));
+        let odd_rows = Arc::new(AtomicUsize::new(0));
+        let make = |even_rows: Arc<AtomicUsize>, odd_rows: Arc<AtomicUsize>| {
+            let inner = UnionConstraint::new(vec![
+                Box::new(MaskedUnionArm {
+                    parent: 0,
+                    variable: 1,
+                    live_parity: 0,
+                    value: raw(10),
+                    proposal_rows: even_rows,
+                }) as ShapeConstraint,
+                Box::new(MaskedUnionArm {
+                    parent: 0,
+                    variable: 1,
+                    live_parity: 1,
+                    value: raw(20),
+                    proposal_rows: odd_rows,
+                }) as ShapeConstraint,
+            ]);
+            let guarded = IntersectionConstraint::new(vec![
+                Box::new(inner) as ShapeConstraint,
+                Box::new(PageFilterLeaf {
+                    variable: 1,
+                    estimate: 200,
+                    accepted: None,
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                }) as ShapeConstraint,
+            ]);
+            IntersectionConstraint::new(vec![
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(vec![raw(0), raw(1)]),
+                }) as ShapeConstraint,
+                Box::new(UnionConstraint::new(vec![guarded])) as ShapeConstraint,
+            ])
+        };
+        let project =
+            |binding: &Binding| Some((binding.get(0).copied()?, binding.get(1).copied()?));
+        let mut sequential: Vec<_> = Query::new(
+            make(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))),
+            project,
+        )
+        .sequential()
+        .collect();
+        let mut opaque: Vec<_> = Query::new(
+            make(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))),
+            project,
+        )
+        .solve_residual_state_lazy()
+        .collect();
+        let mut lowered: Vec<_> =
+            Query::new(make(Arc::clone(&even_rows), Arc::clone(&odd_rows)), project)
+                .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+                .collect();
+        sequential.sort_unstable();
+        opaque.sort_unstable();
+        lowered.sort_unstable();
+        assert_eq!(lowered, [(raw(0), raw(10)), (raw(1), raw(20))]);
+        assert_eq!(lowered, sequential);
+        assert_eq!(lowered, opaque);
+        assert_eq!(even_rows.load(Ordering::Relaxed), 1);
+        assert_eq!(odd_rows.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn recursive_formula_preserves_duplicate_affine_parent_occurrences() {
+        let make = || {
+            let inner = UnionConstraint::new(vec![
+                Box::new(VerbLeaf {
+                    variable: 1,
+                    estimate: 10,
+                    accepts: true,
+                    proposes: Arc::new(AtomicUsize::new(0)),
+                    confirms: Arc::new(AtomicUsize::new(0)),
+                }) as ShapeConstraint,
+                Box::new(VerbLeaf {
+                    variable: 1,
+                    estimate: 11,
+                    accepts: true,
+                    proposes: Arc::new(AtomicUsize::new(0)),
+                    confirms: Arc::new(AtomicUsize::new(0)),
+                }) as ShapeConstraint,
+            ]);
+            let guarded = IntersectionConstraint::new(vec![
+                Box::new(inner) as ShapeConstraint,
+                Box::new(PageFilterLeaf {
+                    variable: 1,
+                    estimate: 30,
+                    accepted: Some(raw(1)),
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                }) as ShapeConstraint,
+            ]);
+            IntersectionConstraint::new(vec![
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(vec![raw(7), raw(7)]),
+                }) as ShapeConstraint,
+                Box::new(UnionConstraint::new(vec![guarded])) as ShapeConstraint,
+            ])
+        };
+        let project =
+            |binding: &Binding| Some((binding.get(0).copied()?, binding.get(1).copied()?));
+        let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
+        let mut opaque: Vec<_> = Query::new(make(), project)
+            .solve_residual_state_lazy()
+            .collect();
+        let mut lowered: Vec<_> = Query::new(make(), project)
+            .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+            .collect();
+        sequential.sort_unstable();
+        opaque.sort_unstable();
+        lowered.sort_unstable();
+        assert_eq!(lowered, [(raw(7), raw(1)), (raw(7), raw(1))]);
+        assert_eq!(lowered, sequential);
+        assert_eq!(lowered, opaque);
     }
 
     #[test]
@@ -10439,7 +10990,7 @@ mod tests {
 
     #[cfg(feature = "parallel")]
     #[test]
-    fn finite_union_mixed_and_parallel_split_preserves_affine_frames() {
+    fn recursive_formula_parallel_split_preserves_deep_affine_frame_stack() {
         let make = || {
             let leaf = |estimate| VerbLeaf {
                 variable: 1,
@@ -10449,9 +11000,17 @@ mod tests {
                 confirms: Arc::new(AtomicUsize::new(0)),
             };
             let arm = |estimate| {
-                parallel_shape(IntersectionConstraint::new(vec![
+                let deepest_and = parallel_shape(IntersectionConstraint::new(vec![
                     parallel_shape(leaf(estimate)),
                     parallel_shape(leaf(estimate + 100)),
+                ]));
+                let inner_or = parallel_shape(UnionConstraint::new(vec![
+                    deepest_and,
+                    parallel_shape(leaf(estimate + 200)),
+                ]));
+                parallel_shape(IntersectionConstraint::new(vec![
+                    inner_or,
+                    parallel_shape(leaf(estimate + 1_000)),
                 ]))
             };
             Arc::new(IntersectionConstraint::new(vec![
