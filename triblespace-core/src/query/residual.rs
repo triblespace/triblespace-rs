@@ -54,6 +54,9 @@ use std::time::{Duration, Instant};
 
 use super::*;
 
+mod delta;
+use delta::{DeltaDesc, DeltaScheduler};
+
 /// One deterministic route from the owned root to an opaque residual leaf.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ConstraintPath(Box<[usize]>);
@@ -94,18 +97,37 @@ struct ResidualPlan {
     /// Whether each opaque leaf's confirmation is homomorphic over ordered
     /// pages of one parent's candidate sequence.
     page_local_confirms: Vec<bool>,
+    /// Whether eligible opaque RPQ proposal leaves may enter the cyclic delta
+    /// submachine for this exact solve.
+    cyclic_rpq: bool,
 }
 
 impl ResidualPlan {
     fn compile<'a>(root: &dyn Constraint<'a>) -> Self {
-        Self::compile_mode(root, ResidualCompileMode::OpaqueUnions)
+        Self::compile_mode(root, ResidualCompileMode::OpaqueUnions, false)
     }
 
     fn compile_finite_unions<'a>(root: &dyn Constraint<'a>) -> Self {
-        Self::compile_mode(root, ResidualCompileMode::FiniteUnions)
+        Self::compile_mode(root, ResidualCompileMode::FiniteUnions, false)
     }
 
-    fn compile_mode<'a>(root: &dyn Constraint<'a>, mode: ResidualCompileMode) -> Self {
+    fn compile_capabilities<'a>(
+        root: &dyn Constraint<'a>,
+        capabilities: ResidualCapabilities,
+    ) -> Self {
+        let mode = if capabilities.finite_unions {
+            ResidualCompileMode::FiniteUnions
+        } else {
+            ResidualCompileMode::OpaqueUnions
+        };
+        Self::compile_mode(root, mode, capabilities.cyclic_rpq)
+    }
+
+    fn compile_mode<'a>(
+        root: &dyn Constraint<'a>,
+        mode: ResidualCompileMode,
+        cyclic_rpq: bool,
+    ) -> Self {
         fn visit<'a>(
             constraint: &dyn Constraint<'a>,
             mode: ResidualCompileMode,
@@ -168,6 +190,7 @@ impl ResidualPlan {
         Self {
             leaves,
             page_local_confirms,
+            cyclic_rpq,
         }
     }
 
@@ -302,6 +325,7 @@ pub(super) fn useful_default_shape<'a>(root: &dyn Constraint<'a>) -> bool {
 #[must_use]
 pub struct ResidualCapabilities {
     finite_unions: bool,
+    cyclic_rpq: bool,
 }
 
 impl ResidualCapabilities {
@@ -309,6 +333,14 @@ impl ResidualCapabilities {
     /// keeping each arm itself opaque.
     pub fn finite_unions(mut self) -> Self {
         self.finite_unions = true;
+        self
+    }
+
+    /// Executes eligible proposer-side `+` regular paths through the cyclic
+    /// delta submachine. Unsupported RPQ shapes and confirmation actions stay
+    /// on the ordinary opaque constraint protocol.
+    pub fn cyclic_rpq(mut self) -> Self {
+        self.cyclic_rpq = true;
         self
     }
 }
@@ -3030,6 +3062,14 @@ enum StepOutcome {
     Emit(RowBatch),
 }
 
+/// One pull of the mixed stable/delta machine. Delta seeding is progress but
+/// has no strict-rank continuation until an expansion accepts an endpoint.
+#[derive(Debug)]
+enum MachineStep {
+    Stable(StepOutcome),
+    DeltaSeeded,
+}
+
 /// Executes one canonical control state after the scheduler has selected its
 /// affine payload chunk. The explicit owned task is the common eager/lazy
 /// dispatch boundary; its action-only view is where a future executor can
@@ -3304,6 +3344,9 @@ struct ResidualStateMachine {
     next_activation: u64,
     interner: StateInterner,
     worklist: Worklist,
+    /// Reopenable cyclic work. Its canonical keys are structural, while
+    /// activation identity and novelty live behind affine payload credits.
+    delta: DeltaScheduler,
     stats: ResidualStateStats,
     binding: Binding,
     emit_vars: Vec<VariableId>,
@@ -3379,6 +3422,7 @@ impl ResidualStateMachine {
             next_activation: 0,
             interner: StateInterner::default(),
             worklist: Worklist::new(),
+            delta: DeltaScheduler::new(),
             stats: ResidualStateStats::default(),
             binding: Binding::default(),
             emit_vars: Vec::new(),
@@ -3591,6 +3635,97 @@ impl ResidualStateMachine {
         }
     }
 
+    /// Whether ordinary acyclic work can fill the current demand width
+    /// without invoking the minimum-rank readiness lemma.
+    fn has_full_stable(&self, plan: &ResidualPlan, width: usize) -> bool {
+        let width = width.max(1);
+        self.worklist.values().any(|level| {
+            level.iter().any(|(&id, bucket)| {
+                let desc = self.interner.get(id);
+                bucket.occupancy(desc.uses_candidate_pages(plan)) >= width
+            })
+        })
+    }
+
+    /// Converts one eligible proposer action into activation-owned cyclic
+    /// work. Confirm remains on the ordinary opaque protocol until its reducer
+    /// lowering is implemented.
+    fn seed_delta_proposal<'a>(
+        &mut self,
+        root: &dyn Constraint<'a>,
+        plan: &ResidualPlan,
+        task: SelectedResidualTask,
+    ) -> Result<(), SelectedResidualTask> {
+        if !plan.cyclic_rpq {
+            return Err(task);
+        }
+        let (
+            ResidualPhase::Propose {
+                variable,
+                relevant,
+                proposer,
+            },
+            StateBucket::Rows(rows),
+        ) = (&task.desc.phase, &task.bucket)
+        else {
+            return Err(task);
+        };
+
+        // Finite reducers own their proposal lifecycle. A cyclic capability
+        // may replace only an ordinary opaque leaf action; RPQs nested inside
+        // a lowered Union arm deliberately remain behind that arm boundary.
+        if plan.union_arm_count(*proposer).is_some() {
+            return Err(task);
+        }
+
+        let mut checked = ChildSet::empty(plan.len());
+        checked.insert(*proposer);
+        if !plan.remaining_confirms_are_page_local(relevant, &checked) {
+            return Err(task);
+        }
+        let variable = *variable;
+        let proposer = *proposer;
+        let relevant = relevant.clone();
+
+        let vars: Vec<VariableId> = task.desc.bound.into_iter().collect();
+        let view = rows_view(&vars, &rows.rows, rows.row_count);
+        let mut seeds = Vec::new();
+        let supported = plan
+            .resolve(root, proposer)
+            .residual_delta_seeds(variable, &view, &mut seeds);
+        if !supported {
+            assert!(
+                seeds.is_empty(),
+                "unsupported delta seed hook mutated its output"
+            );
+            return Err(task);
+        }
+        assert_eq!(
+            seeds.len(),
+            rows.row_count,
+            "supported delta seed hook must emit one node per parent"
+        );
+
+        let SelectedResidualTask {
+            state: _,
+            desc,
+            bucket,
+        } = task;
+        let StateBucket::Rows(rows) = bucket else {
+            unreachable!("delta proposer was checked above")
+        };
+        self.stats.propose_action_pops += 1;
+        self.stats.propose_calls += 1;
+        self.stats.propose_rows += rows.row_count;
+        self.stats.max_propose_rows = self.stats.max_propose_rows.max(rows.row_count);
+        self.delta.seed_proposals(
+            DeltaDesc::propose(desc.bound, variable, proposer, relevant, checked),
+            rows,
+            seeds,
+        );
+        Ok(())
+    }
+
     fn pop_once<'a>(
         &mut self,
         root: &dyn Constraint<'a>,
@@ -3598,7 +3733,7 @@ impl ResidualStateMachine {
         influences: &[VariableSet; 128],
         base_estimates: &[usize; 128],
         width: usize,
-    ) -> StepOutcome {
+    ) -> MachineStep {
         let task = if let Some(token) = self.continuation.take() {
             self.take_continuation(plan, token, width)
         } else {
@@ -3606,6 +3741,10 @@ impl ResidualStateMachine {
                 .expect("pop_once requires a non-empty residual worklist")
         };
         self.last_was_action = task.is_action_for_plan(plan);
+        let task = match self.seed_delta_proposal(root, plan, task) {
+            Ok(()) => return MachineStep::DeltaSeeded,
+            Err(task) => task,
+        };
         let emit_bound = task.desc.bound;
         let outcome = execute_task(
             root,
@@ -3623,7 +3762,7 @@ impl ResidualStateMachine {
             self.emit_vars.clear();
             self.emit_vars.extend(emit_bound);
         }
-        outcome
+        MachineStep::Stable(outcome)
     }
 
     fn increase_width(&mut self) {
@@ -3688,23 +3827,43 @@ impl ResidualStateMachine {
                     return Some(result);
                 }
             }
-            if self.worklist.is_empty() {
+            if self.worklist.is_empty() && self.delta.is_empty() {
                 return None;
             }
 
             let width = self.width;
+            // An underfilled stable bucket is readiness-safe only after every
+            // cyclic feeder is quiescent. Full stable work and explicit
+            // latency continuations need no harvest lemma and may run first.
+            if self.continuation.is_none()
+                && !self.delta.is_empty()
+                && !self.has_full_stable(plan, width)
+            {
+                self.continuation = self.delta.step(
+                    root,
+                    plan,
+                    width,
+                    &mut self.worklist,
+                    &mut self.interner,
+                    &mut self.stats,
+                );
+                continue;
+            }
             match self.pop_once(root, plan, influences, base_estimates, width) {
-                StepOutcome::Advanced(continuation) => {
+                MachineStep::Stable(StepOutcome::Advanced(continuation)) => {
                     self.continuation = self.continuation_after_advanced(plan, width, continuation);
                 }
-                StepOutcome::Dead => {
+                MachineStep::Stable(StepOutcome::Dead) => {
                     self.continuation = None;
                     self.increase_width();
                 }
-                StepOutcome::Emit(rows) => {
+                MachineStep::Stable(StepOutcome::Emit(rows)) => {
                     self.continuation = None;
                     self.stage_emit(rows);
                     self.increase_width();
+                }
+                MachineStep::DeltaSeeded => {
+                    self.continuation = None;
                 }
             }
         }
@@ -3817,6 +3976,7 @@ impl ResidualStateMachine {
             next_activation: self.next_activation,
             interner: self.interner.clone(),
             worklist: Worklist::new(),
+            delta: DeltaScheduler::new(),
             stats: ResidualStateStats::default(),
             binding: Binding::default(),
             emit_vars: Vec::new(),
@@ -3878,7 +4038,7 @@ impl ResidualStateMachine {
 
             // A staged singleton is already an exact affine component. Keep
             // it intact while the other shard owns the remaining worklist.
-            if self.emit_count == 1 && !self.worklist.is_empty() {
+            if self.emit_count == 1 && (!self.worklist.is_empty() || !self.delta.is_empty()) {
                 let mut right = self.parallel_sibling();
                 right.emit_vars = std::mem::take(&mut self.emit_vars);
                 right.emit_rows = std::mem::take(&mut self.emit_rows);
@@ -3956,21 +4116,31 @@ impl ResidualStateMachine {
                 return Some(right);
             }
 
-            if self.worklist.is_empty() {
-                return None;
-            }
-
             // One unsplittable affine atom remains. Advance the exact machine
             // rather than manufacturing a second query from the seed.
             let width = self.width.max(1);
+            if !self.delta.is_empty() && !self.has_full_stable(plan, width) {
+                let _ = self.delta.step(
+                    root,
+                    plan,
+                    width,
+                    &mut self.worklist,
+                    &mut self.interner,
+                    &mut self.stats,
+                );
+                continue;
+            }
+            if self.worklist.is_empty() {
+                return None;
+            }
             match self.pop_once(root, plan, influences, base_estimates, width) {
                 // Split negotiation is a saturated throughput path. It files
                 // every successor normally and deliberately does not arm the
                 // first-result continuation sprint before the frontier has
                 // been partitioned.
-                StepOutcome::Advanced(_) => {}
-                StepOutcome::Dead => self.increase_width(),
-                StepOutcome::Emit(rows) => {
+                MachineStep::Stable(StepOutcome::Advanced(_)) | MachineStep::DeltaSeeded => {}
+                MachineStep::Stable(StepOutcome::Dead) => self.increase_width(),
+                MachineStep::Stable(StepOutcome::Emit(rows)) => {
                     self.stage_emit(rows);
                     self.increase_width();
                 }
@@ -4510,11 +4680,7 @@ where
             ..
         } = self;
         let full = constraint.variables();
-        let plan = if capabilities.finite_unions {
-            ResidualPlan::compile_finite_unions(&constraint)
-        } else {
-            ResidualPlan::compile(&constraint)
-        };
+        let plan = ResidualPlan::compile_capabilities(&constraint, capabilities);
         let state = ResidualStateMachine::new_for_plan(full, &plan, mode);
         ResidualStateIter {
             root: constraint,
@@ -9044,7 +9210,7 @@ mod tests {
 
         assert!(matches!(
             machine.pop_once(&root, &plan, &influences, &base_estimates, 1),
-            StepOutcome::Advanced(_)
+            MachineStep::Stable(StepOutcome::Advanced(_))
         ));
         assert_eq!(machine.stats.ready_plan_pops, 1);
         assert_eq!(machine.stats.ready_preferred_variable_groups, 1);
@@ -9057,7 +9223,7 @@ mod tests {
 
         assert!(matches!(
             machine.pop_once(&root, &plan, &influences, &base_estimates, 1),
-            StepOutcome::Advanced(_)
+            MachineStep::Stable(StepOutcome::Advanced(_))
         ));
         assert_eq!(machine.stats.propose_action_pops, 1);
         assert_eq!(machine.stats.propose_calls, 1);
