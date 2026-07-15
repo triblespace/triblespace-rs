@@ -201,6 +201,19 @@ comparison control. `solve_residual_state_lazy` exposes its width policy;
 measurements. Fully drained variants preserve the result multiset, but may
 change result order.
 
+For diagnostic attribution,
+[`ResidualStateIter::isolated_filing_buckets`](triblespace::core::query::residual::ResidualStateIter::isolated_filing_buckets)
+keeps semantic descriptor interning canonical while assigning every nonempty
+filing a fresh physical bucket. A saturated whole-bucket comparison against
+the default cleanly measures cross-history reconvergence. Under geometric lazy
+widths it also prevents separate filings from one history from reassembling,
+so that comparison measures the value of all physical coalescing. The ablation
+deliberately retains the default readiness scheduler rather than tuning a
+second no-merge policy. Its different block composition can alter later
+row-local planning, agglomeration, and executor routes; it is therefore an
+end-to-end coalescing experiment, not a fusion-only replay mode or a
+recommended production scheduler.
+
 ## DAG worklist engine
 
 The DAG engine replaces the recursive search stack with buckets keyed by the

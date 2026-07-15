@@ -46,6 +46,7 @@
 //! computation while row values remain payload.
 
 use std::cell::RefCell;
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
@@ -193,7 +194,12 @@ pub struct ResidualStateStats {
     pub bucket_merges: usize,
     /// Parent rows appended by those merge filings.
     pub rows_merged: usize,
-    /// Number of canonical bucket chunks processed. Every pop is selected by
+    /// Opt-in isolated filings kept separate despite an already-live
+    /// bucket with the same canonical state.
+    pub isolated_filings: usize,
+    /// Parent rows carried by [`isolated_filings`](Self::isolated_filings).
+    pub rows_isolated: usize,
+    /// Number of physical bucket chunks processed. Every pop is selected by
     /// exactly one physical policy, so this equals `full_pops +
     /// readiness_pops + continuation_pops`.
     pub state_pops: usize,
@@ -233,8 +239,8 @@ pub struct ResidualStateStats {
     /// or a candidate occurrence for an entirely page-local continuation.
     pub full_pops: usize,
     /// Underfilled buckets drained through the minimum-rank readiness gate
-    /// because no live state could fill the desired width. The eager solver
-    /// counts every one of its readiness-gated pops here.
+    /// because no live physical bucket could fill the desired width. The eager
+    /// solver counts every one of its readiness-gated pops here.
     pub readiness_pops: usize,
     /// Physical continuation-cohort chunks selected after a full action
     /// partially survived. These pops deliberately bypass global occupancy
@@ -244,10 +250,10 @@ pub struct ResidualStateStats {
     /// than the current desired width.
     pub underfilled_continuation_pops: usize,
     /// Pops that left unprocessed parent rows or candidate occurrences live
-    /// under the same state.
+    /// under the same physical bucket key.
     pub partial_pops: usize,
-    /// Filings that reopened an interned state after its live bucket had
-    /// already been consumed.
+    /// Filings that reopened an interned state after all live physical buckets
+    /// for that descriptor had already been consumed.
     pub state_reentries: usize,
     /// Parent rows carried by [`state_reentries`](Self::state_reentries).
     pub rows_reentered: usize,
@@ -1092,8 +1098,11 @@ impl StateDesc {
     }
 
     /// History-independent grade. Every transition strictly raises it, so
-    /// draining the minimum grade is an exact readiness gate: once a state is
-    /// popped, no unprocessed predecessor can still file into it.
+    /// draining the minimum grade is an exact readiness gate: no unprocessed
+    /// predecessor can later file at that grade. In canonical mode this also
+    /// completes the live semantic bucket. The isolated-filing ablation may
+    /// retain peer physical buckets with the same descriptor and grade, but
+    /// each remains independently transition-safe.
     fn rank(&self, leaf_count: usize) -> usize {
         self.validate(leaf_count);
         let stride = leaf_count
@@ -1645,7 +1654,112 @@ impl SelectedResidualTask {
     }
 }
 
-type Worklist = BTreeMap<usize, BTreeMap<StateId, StateBucket>>;
+/// Physical address of one live residual payload bucket.
+///
+/// `state` remains the complete semantic continuation. `filing` is an
+/// execution-only ablation label: ordinary canonical execution always uses
+/// zero, while the opt-in isolated-filing scheduler gives every nonempty
+/// filing its own label so equal semantic states cannot physically coalesce.
+/// The label is local to one affine worklist. Parallel siblings have
+/// independent namespaces and disjoint affine payloads, so equal numeric keys
+/// across siblings are unrelated.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct PhysicalBucketKey {
+    state: StateId,
+    filing: u64,
+}
+
+/// Ranked residual payloads plus their physical-bucketing policy.
+///
+/// Keeping the allocator here makes physical identity a property of the
+/// worklist rather than of [`StateDesc`] or [`StateInterner`]. The latter two
+/// therefore remain canonical in both the production scheduler and the
+/// isolated-filing ablation.
+#[derive(Clone, Default)]
+struct Worklist {
+    levels: BTreeMap<usize, BTreeMap<PhysicalBucketKey, StateBucket>>,
+    isolate_filings: bool,
+    next_filing: u64,
+}
+
+impl Worklist {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn key_for_filing(&mut self, state: StateId) -> PhysicalBucketKey {
+        let filing = if self.isolate_filings {
+            let filing = self.next_filing;
+            self.next_filing = self
+                .next_filing
+                .checked_add(1)
+                .expect("residual physical filing ID overflow");
+            filing
+        } else {
+            0
+        };
+        PhysicalBucketKey { state, filing }
+    }
+
+    /// Switches an unstarted worklist to the isolated-filing ablation.
+    /// Existing buckets are re-keyed independently; the public builder only
+    /// permits this before the seed has been pulled, so no prior canonical
+    /// merge can be hidden by the conversion.
+    fn enable_isolated_filing_buckets(&mut self) {
+        if self.isolate_filings {
+            return;
+        }
+        self.isolate_filings = true;
+        self.next_filing = 1;
+        let levels = std::mem::take(&mut self.levels);
+        for (rank, level) in levels {
+            let target = self.levels.entry(rank).or_default();
+            for (key, bucket) in level {
+                debug_assert_eq!(key.filing, 0);
+                let filing = self.next_filing;
+                self.next_filing = self
+                    .next_filing
+                    .checked_add(1)
+                    .expect("residual physical filing ID overflow");
+                assert!(
+                    target
+                        .insert(
+                            PhysicalBucketKey {
+                                state: key.state,
+                                filing,
+                            },
+                            bucket,
+                        )
+                        .is_none(),
+                    "fresh residual filing ID collided while enabling the ablation"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    fn empty_sibling(&self) -> Self {
+        Self {
+            levels: BTreeMap::new(),
+            isolate_filings: self.isolate_filings,
+            next_filing: self.next_filing,
+        }
+    }
+}
+
+impl std::ops::Deref for Worklist {
+    type Target = BTreeMap<usize, BTreeMap<PhysicalBucketKey, StateBucket>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.levels
+    }
+}
+
+impl std::ops::DerefMut for Worklist {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.levels
+    }
+}
 
 /// Exact physical tail appended by one transition to a canonical state.
 ///
@@ -1658,7 +1772,7 @@ type Worklist = BTreeMap<usize, BTreeMap<StateId, StateBucket>>;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ContinuationToken {
     rank: usize,
-    state: StateId,
+    bucket: PhysicalBucketKey,
     rows: usize,
     candidates: usize,
 }
@@ -1672,8 +1786,8 @@ impl ContinuationToken {
         }
     }
 
-    fn scheduling_key(self) -> (usize, StateId) {
-        (self.rank, self.state)
+    fn scheduling_key(self) -> (usize, PhysicalBucketKey) {
+        (self.rank, self.bucket)
     }
 }
 
@@ -1717,21 +1831,56 @@ fn file(
     };
     let rank = desc.rank(leaf_count);
     let (id, known) = interner.intern_with_status(desc, stats);
-    let level = worklist.entry(rank).or_default();
-    if let Some(existing) = level.get_mut(&id) {
-        stats.bucket_merges += 1;
-        stats.rows_merged += rows;
-        existing.append(bucket);
-    } else {
-        if known {
+    let key;
+    if worklist.isolate_filings {
+        key = worklist.key_for_filing(id);
+        let level = worklist.entry(rank).or_default();
+        let state_was_live = level
+            .range(
+                PhysicalBucketKey {
+                    state: id,
+                    filing: 0,
+                }..=PhysicalBucketKey {
+                    state: id,
+                    filing: u64::MAX,
+                },
+            )
+            .next()
+            .is_some();
+        if state_was_live {
+            stats.isolated_filings += 1;
+            stats.rows_isolated += rows;
+        } else if known {
             stats.state_reentries += 1;
             stats.rows_reentered += rows;
         }
-        level.insert(id, bucket);
+        assert!(
+            level.insert(key, bucket).is_none(),
+            "fresh residual physical bucket key collided"
+        );
+    } else {
+        key = PhysicalBucketKey {
+            state: id,
+            filing: 0,
+        };
+        match worklist.entry(rank).or_default().entry(key) {
+            Entry::Occupied(mut occupied) => {
+                stats.bucket_merges += 1;
+                stats.rows_merged += rows;
+                occupied.get_mut().append(bucket);
+            }
+            Entry::Vacant(vacant) => {
+                if known {
+                    stats.state_reentries += 1;
+                    stats.rows_reentered += rows;
+                }
+                vacant.insert(bucket);
+            }
+        }
     }
     Some(ContinuationToken {
         rank,
-        state: id,
+        bucket: key,
         rows,
         candidates,
     })
@@ -2525,10 +2674,10 @@ impl ResidualStateMachine {
     /// only page-local confirms, at which point candidate occurrences are the
     /// unit. If no bucket is large enough, the minimum-rank bucket is drained;
     /// strict rank growth makes that underfilled pop readiness-safe. Thus
-    /// width one preserves maximum-rank, highest-ID traversal, while a width
-    /// above every live bucket is exact minimum-rank scheduling. Partial
-    /// remainders are reinserted directly and are not counted as canonical
-    /// merges or reentries.
+    /// width one preserves maximum-rank, highest-`(StateId, filing)` traversal,
+    /// while a width above every live bucket is exact minimum-rank scheduling.
+    /// Partial remainders are reinserted directly and are not counted as
+    /// canonical merges, isolated filings, or reentries.
     #[cfg(test)]
     fn take_next(&mut self, width: usize) -> Option<(StateDesc, StateBucket)> {
         self.take_next_inner(None, width)
@@ -2550,26 +2699,26 @@ impl ResidualStateMachine {
     ) -> Option<SelectedResidualTask> {
         let width = width.max(1);
         let full_state = self.worklist.iter().rev().find_map(|(&rank, level)| {
-            level.iter().rev().find_map(|(&id, bucket)| {
-                let desc = self.interner.get(id);
+            level.iter().rev().find_map(|(&key, bucket)| {
+                let desc = self.interner.get(key.state);
                 let candidate_pages = plan.is_some_and(|plan| desc.uses_candidate_pages(plan));
-                (bucket.occupancy(candidate_pages) >= width).then_some((rank, id))
+                (bucket.occupancy(candidate_pages) >= width).then_some((rank, key))
             })
         });
-        let (rank, id, is_full) = if let Some((rank, id)) = full_state {
-            (rank, id, true)
+        let (rank, key, is_full) = if let Some((rank, key)) = full_state {
+            (rank, key, true)
         } else {
             let (&rank, level) = self.worklist.first_key_value()?;
-            let (&id, bucket) = level
+            let (&key, bucket) = level
                 .last_key_value()
                 .expect("residual rank has a live state");
-            let desc = self.interner.get(id);
+            let desc = self.interner.get(key.state);
             let candidate_pages = plan.is_some_and(|plan| desc.uses_candidate_pages(plan));
             assert!(
                 bucket.occupancy(candidate_pages) < width,
                 "readiness selected while a full residual bucket existed"
             );
-            (rank, id, false)
+            (rank, key, false)
         };
 
         let (mut bucket, remove_level) = {
@@ -2577,14 +2726,14 @@ impl ResidualStateMachine {
                 .worklist
                 .get_mut(&rank)
                 .expect("selected residual rank exists");
-            let bucket = level.remove(&id).expect("selected residual state exists");
+            let bucket = level.remove(&key).expect("selected residual bucket exists");
             (bucket, level.is_empty())
         };
         if remove_level {
             self.worklist.remove(&rank);
         }
 
-        let desc = self.interner.get(id).clone();
+        let desc = self.interner.get(key.state).clone();
         debug_assert_eq!(desc.rank(self.leaf_count), rank);
         let candidate_pages = plan.is_some_and(|plan| desc.uses_candidate_pages(plan));
         let before = bucket.occupancy(candidate_pages);
@@ -2597,7 +2746,7 @@ impl ResidualStateMachine {
                 self.worklist
                     .entry(rank)
                     .or_default()
-                    .insert(id, bucket)
+                    .insert(key, bucket)
                     .is_none(),
                 "a residual-state remainder collided with another live bucket"
             );
@@ -2619,7 +2768,7 @@ impl ResidualStateMachine {
             self.last_selection = SelectionKind::Readiness;
         }
         Some(SelectedResidualTask {
-            state: id,
+            state: key.state,
             desc,
             bucket: chunk,
         })
@@ -2640,7 +2789,7 @@ impl ResidualStateMachine {
         token: ContinuationToken,
         width: usize,
     ) -> SelectedResidualTask {
-        let desc = self.interner.get(token.state).clone();
+        let desc = self.interner.get(token.bucket.state).clone();
         assert_eq!(
             desc.rank(self.leaf_count),
             token.rank,
@@ -2657,8 +2806,8 @@ impl ResidualStateMachine {
                 .get_mut(&token.rank)
                 .expect("continuation rank remains live");
             let bucket = level
-                .remove(&token.state)
-                .expect("continuation state remains live");
+                .remove(&token.bucket)
+                .expect("continuation bucket remains live");
             (bucket, level.is_empty())
         };
         if remove_level {
@@ -2678,7 +2827,7 @@ impl ResidualStateMachine {
                 self.worklist
                     .entry(token.rank)
                     .or_default()
-                    .insert(token.state, bucket)
+                    .insert(token.bucket, bucket)
                     .is_none(),
                 "a continuation remainder collided with another live bucket"
             );
@@ -2692,7 +2841,7 @@ impl ResidualStateMachine {
             self.stats.underfilled_continuation_pops += 1;
         }
         SelectedResidualTask {
-            state: token.state,
+            state: token.bucket.state,
             desc,
             bucket: chunk,
         }
@@ -2750,7 +2899,7 @@ impl ResidualStateMachine {
         if !self.continuation_sprint_enabled {
             return None;
         }
-        let desc = self.interner.get(continuation.state);
+        let desc = self.interner.get(continuation.bucket.state);
         let successor_is_underfilled = continuation.occupancy(desc, plan) < width.max(1);
         match self.last_selection {
             SelectionKind::Continuation => Some(continuation),
@@ -2919,7 +3068,7 @@ impl ResidualStateMachine {
             full: self.full,
             leaf_count: self.leaf_count,
             interner: self.interner.clone(),
-            worklist: Worklist::new(),
+            worklist: self.worklist.empty_sibling(),
             stats: ResidualStateStats::default(),
             binding: Binding::default(),
             emit_vars: Vec::new(),
@@ -2993,8 +3142,8 @@ impl ResidualStateMachine {
             // Prefer splitting inside one exact state so both workers retain
             // similarly shaped block-native continuations.
             let splittable = self.worklist.iter().rev().find_map(|(&rank, level)| {
-                level.iter().rev().find_map(|(&id, bucket)| {
-                    let desc = self.interner.get(id);
+                level.iter().rev().find_map(|(&key, bucket)| {
+                    let desc = self.interner.get(key.state);
                     let candidate_pages = desc.uses_candidate_pages(plan);
                     let can_split = match bucket {
                         StateBucket::Rows(batch) => batch.row_count >= 2,
@@ -3003,16 +3152,16 @@ impl ResidualStateMachine {
                         }
                         StateBucket::Candidates(batch) => batch.parents.row_count >= 2,
                     };
-                    can_split.then_some((rank, id, candidate_pages))
+                    can_split.then_some((rank, key, candidate_pages))
                 })
             });
-            if let Some((rank, id, candidate_pages)) = splittable {
-                let desc = self.interner.get(id);
+            if let Some((rank, key, candidate_pages)) = splittable {
+                let desc = self.interner.get(key.state);
                 let stride = desc.bound.count();
                 let right_bucket = self
                     .worklist
                     .get_mut(&rank)
-                    .and_then(|level| level.get_mut(&id))
+                    .and_then(|level| level.get_mut(&key))
                     .and_then(|bucket| bucket.split_for_parallel(stride, candidate_pages))
                     .expect("selected residual payload is splittable");
 
@@ -3022,7 +3171,7 @@ impl ResidualStateMachine {
                         .worklist
                         .entry(rank)
                         .or_default()
-                        .insert(id, right_bucket)
+                        .insert(key, right_bucket)
                         .is_none(),
                     "fresh residual sibling unexpectedly contained work"
                 );
@@ -3037,7 +3186,7 @@ impl ResidualStateMachine {
                     .worklist
                     .last_key_value()
                     .expect("two buckets imply a nonempty worklist");
-                let id = *level
+                let key = *level
                     .last_key_value()
                     .expect("live residual rank has a bucket")
                     .0;
@@ -3046,7 +3195,7 @@ impl ResidualStateMachine {
                         .worklist
                         .get_mut(&rank)
                         .expect("selected residual rank exists");
-                    let bucket = level.remove(&id).expect("selected residual state exists");
+                    let bucket = level.remove(&key).expect("selected residual bucket exists");
                     (bucket, level.is_empty())
                 };
                 if remove_level {
@@ -3054,7 +3203,7 @@ impl ResidualStateMachine {
                 }
 
                 let mut right = self.parallel_sibling();
-                right.worklist.entry(rank).or_default().insert(id, bucket);
+                right.worklist.entry(rank).or_default().insert(key, bucket);
                 return Some(right);
             }
 
@@ -3123,8 +3272,8 @@ impl ResidualStateMachine {
             }
 
             let splittable = self.worklist.iter().rev().find_map(|(&rank, level)| {
-                level.iter().rev().find_map(|(&id, bucket)| {
-                    let desc = self.interner.get(id);
+                level.iter().rev().find_map(|(&key, bucket)| {
+                    let desc = self.interner.get(key.state);
                     let candidate_pages = desc.uses_candidate_pages(plan);
                     let can_split = match bucket {
                         StateBucket::Rows(batch) => batch.row_count >= 2,
@@ -3133,16 +3282,16 @@ impl ResidualStateMachine {
                         }
                         StateBucket::Candidates(batch) => batch.parents.row_count >= 2,
                     };
-                    can_split.then_some((rank, id, candidate_pages))
+                    can_split.then_some((rank, key, candidate_pages))
                 })
             });
-            if let Some((rank, id, candidate_pages)) = splittable {
-                let desc = self.interner.get(id);
+            if let Some((rank, key, candidate_pages)) = splittable {
+                let desc = self.interner.get(key.state);
                 let stride = desc.bound.count();
                 let right_bucket = self
                     .worklist
                     .get_mut(&rank)
-                    .and_then(|level| level.get_mut(&id))
+                    .and_then(|level| level.get_mut(&key))
                     .and_then(|bucket| bucket.split_for_parallel(stride, candidate_pages))
                     .expect("selected residual payload is splittable");
 
@@ -3152,7 +3301,7 @@ impl ResidualStateMachine {
                         .worklist
                         .entry(rank)
                         .or_default()
-                        .insert(id, right_bucket)
+                        .insert(key, right_bucket)
                         .is_none(),
                     "fresh residual sibling unexpectedly contained work"
                 );
@@ -3165,7 +3314,7 @@ impl ResidualStateMachine {
                     .worklist
                     .last_key_value()
                     .expect("two buckets imply a nonempty worklist");
-                let id = *level
+                let key = *level
                     .last_key_value()
                     .expect("live residual rank has a bucket")
                     .0;
@@ -3174,7 +3323,7 @@ impl ResidualStateMachine {
                         .worklist
                         .get_mut(&rank)
                         .expect("selected residual rank exists");
-                    let bucket = level.remove(&id).expect("selected residual state exists");
+                    let bucket = level.remove(&key).expect("selected residual bucket exists");
                     (bucket, level.is_empty())
                 };
                 if remove_level {
@@ -3182,7 +3331,7 @@ impl ResidualStateMachine {
                 }
 
                 let mut right = self.parallel_sibling();
-                right.worklist.entry(rank).or_default().insert(id, bucket);
+                right.worklist.entry(rank).or_default().insert(key, bucket);
                 return Some(right);
             }
 
@@ -3332,6 +3481,40 @@ impl<C, P: Fn(&Binding) -> Option<R>, R> ResidualShadowIter<C, P, R> {
 }
 
 impl<C, P: Fn(&Binding) -> Option<R>, R> ResidualStateIter<C, P, R> {
+    /// Disables physical coalescing between equal canonical states.
+    ///
+    /// This is a diagnostic scheduler ablation, not a recommended execution
+    /// policy. Semantic state-descriptor interning remains canonical, but every nonempty
+    /// filing receives a fresh physical bucket. Comparing this mode
+    /// with the default measures the end-to-end downstream effects of physical
+    /// coalescing while preserving canonical descriptors, the constraint
+    /// protocol, and result bags. Because block composition changes, later
+    /// row-local planning choices and executor routes may change too; this is
+    /// not a fusion-only replay experiment.
+    /// Saturated whole-bucket runs cleanly isolate cross-history
+    /// reconvergence. Under lazy widths or candidate paging the same switch
+    /// also prevents separate filings from one causal history from
+    /// reassembling, so that comparison measures the value of all physical
+    /// coalescing rather than historical reconvergence alone. It deliberately
+    /// retains the canonical scheduler's readiness policy; it is not a
+    /// separately tuned no-merge scheduler.
+    ///
+    /// The setting is retained by [`Self::shadow`] and by explicit parallel
+    /// conversion. It must be selected before the iterator is first pulled so
+    /// no earlier canonical merge is hidden by the comparison.
+    ///
+    /// # Panics
+    ///
+    /// Panics if iteration has already started.
+    pub fn isolated_filing_buckets(mut self) -> Self {
+        assert!(
+            !self.iteration_started,
+            "cannot isolate residual filing buckets after iteration starts"
+        );
+        self.state.worklist.enable_isolated_filing_buckets();
+        self
+    }
+
     /// Overrides the initial chunk width, clamped to `1..=cap`.
     pub fn start_width(mut self, width: usize) -> Self {
         self.state.width = width.clamp(1, self.state.cap);
@@ -3505,8 +3688,8 @@ where
         let level = worklist
             .remove(&rank)
             .expect("observed worklist level exists");
-        for (id, bucket) in level {
-            let desc = interner.get(id).clone();
+        for (key, bucket) in level {
+            let desc = interner.get(key.state).clone();
             debug_assert_eq!(desc.rank(leaf_count), rank);
             let emit_bound = desc.bound;
             stats.state_pops += 1;
@@ -3515,7 +3698,7 @@ where
                 root,
                 &plan,
                 SelectedResidualTask {
-                    state: id,
+                    state: key.state,
                     desc,
                     bucket,
                 },
@@ -3573,9 +3756,9 @@ where
     /// readiness-selected work cannot activate a sprint themselves, but may
     /// carry an already-hot lineage forward. Death or raw terminal output grows
     /// the width geometrically for later work. Whenever no continuation is hot
-    /// and no live state can fill the desired width, the minimum-rank state
-    /// drains readiness-safely. Result order may differ from the ordinary
-    /// iterator; a full drain preserves its result multiset.
+    /// and no live physical bucket can fill the desired width, the
+    /// minimum-rank bucket drains readiness-safely. Result order may differ
+    /// from the ordinary iterator; a full drain preserves its result multiset.
     ///
     /// # Panics
     ///
@@ -4798,6 +4981,136 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct ParentDomainLeaf {
+        parent: VariableId,
+        values: Arc<Vec<RawInline>>,
+    }
+
+    impl Constraint<'static> for ParentDomainLeaf {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(self.parent)
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != self.parent {
+                return false;
+            }
+            out.fill(self.values.len(), view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            assert_eq!(variable, self.parent);
+            for row in 0..view.len() {
+                candidates.extend_row(row as u32, self.values.iter().copied());
+            }
+        }
+
+        fn confirm(
+            &self,
+            variable: VariableId,
+            _view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            assert_eq!(variable, self.parent);
+            candidates.retain(|_, value| self.values.contains(value));
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum FlipRole {
+        A,
+        B,
+        C,
+    }
+
+    #[derive(Clone)]
+    struct FlippedJoinLeaf {
+        parent: VariableId,
+        variable: VariableId,
+        role: FlipRole,
+        final_calls: Arc<Mutex<Vec<(usize, usize)>>>,
+    }
+
+    impl Constraint<'static> for FlippedJoinLeaf {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(self.parent).union(VariableSet::new_singleton(self.variable))
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != self.variable {
+                return false;
+            }
+            let Some(parent) = view.col(self.parent) else {
+                // Keep the parent domain strictly preferable at the seed.
+                out.fill(1 << 20, view.len());
+                return true;
+            };
+            out.extend(view.iter().map(|row| match self.role {
+                FlipRole::A if row[parent][0] & 1 == 0 => 1,
+                FlipRole::B if row[parent][0] & 1 == 1 => 1,
+                FlipRole::A | FlipRole::B => 4,
+                FlipRole::C => 8,
+            }));
+            true
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            assert_eq!(variable, self.variable);
+            let parent = view
+                .col(self.parent)
+                .expect("flipped proposer requires the parent binding");
+            for (row, binding) in view.iter().enumerate() {
+                let value = binding[parent];
+                // Deliberate duplicates make bag preservation visible through
+                // canonical merging, isolated filing buckets, and paging.
+                candidates.push(row as u32, value);
+                candidates.push(row as u32, value);
+            }
+        }
+
+        fn confirm(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            assert_eq!(variable, self.variable);
+            if self.role == FlipRole::C {
+                self.final_calls
+                    .lock()
+                    .unwrap()
+                    .push((view.len(), candidates.len()));
+            }
+            let parent = view
+                .col(self.parent)
+                .expect("flipped confirmer requires the parent binding");
+            let parents: Vec<_> = view.iter().map(|row| row[parent]).collect();
+            candidates.retain(|row, value| *value == parents[row as usize]);
+        }
+    }
+
     type ShapeConstraint = Box<dyn Constraint<'static> + Send + Sync>;
 
     #[cfg(feature = "parallel")]
@@ -4858,6 +5171,526 @@ mod tests {
         let mut value = [0; 32];
         value[0] = byte;
         value
+    }
+
+    const FLIP_PARENT: VariableId = 0;
+    const FLIP_VALUE: VariableId = 1;
+
+    fn flipped_reconvergence_root(
+        parent_count: usize,
+        final_calls: Arc<Mutex<Vec<(usize, usize)>>>,
+    ) -> IntersectionConstraint<ShapeConstraint> {
+        assert!(parent_count > 0 && parent_count <= 256 && parent_count.is_multiple_of(2));
+        let parents = Arc::new((0..parent_count).map(|value| raw(value as u8)).collect());
+        IntersectionConstraint::new(vec![
+            Box::new(ParentDomainLeaf {
+                parent: FLIP_PARENT,
+                values: parents,
+            }) as ShapeConstraint,
+            Box::new(FlippedJoinLeaf {
+                parent: FLIP_PARENT,
+                variable: FLIP_VALUE,
+                role: FlipRole::A,
+                final_calls: Arc::clone(&final_calls),
+            }) as ShapeConstraint,
+            Box::new(FlippedJoinLeaf {
+                parent: FLIP_PARENT,
+                variable: FLIP_VALUE,
+                role: FlipRole::B,
+                final_calls: Arc::clone(&final_calls),
+            }) as ShapeConstraint,
+            Box::new(FlippedJoinLeaf {
+                parent: FLIP_PARENT,
+                variable: FLIP_VALUE,
+                role: FlipRole::C,
+                final_calls,
+            }) as ShapeConstraint,
+        ])
+    }
+
+    fn flipped_saturated_profile(
+        parent_count: usize,
+        isolate_filings: bool,
+        final_calls: Arc<Mutex<Vec<(usize, usize)>>>,
+    ) -> ResidualStateSolve<(RawInline, RawInline)> {
+        let project = |binding: &Binding| {
+            Some((
+                *binding.get(FLIP_PARENT).unwrap(),
+                *binding.get(FLIP_VALUE).unwrap(),
+            ))
+        };
+        let residual = Query::new(
+            flipped_reconvergence_root(parent_count, final_calls),
+            project,
+        )
+        .solve_residual_state_lazy()
+        .cap(usize::MAX)
+        .start_width(usize::MAX)
+        .growth(1);
+        let residual = if isolate_filings {
+            residual.isolated_filing_buckets()
+        } else {
+            residual
+        };
+        residual.collect_profiled()
+    }
+
+    #[test]
+    fn isolated_filings_keep_semantic_states_but_prevent_flipped_history_coalescing() {
+        const PARENTS: usize = 8;
+        let canonical_calls = Arc::new(Mutex::new(Vec::new()));
+        let isolated_calls = Arc::new(Mutex::new(Vec::new()));
+        let mut canonical = flipped_saturated_profile(PARENTS, false, Arc::clone(&canonical_calls));
+        let mut isolated = flipped_saturated_profile(PARENTS, true, Arc::clone(&isolated_calls));
+
+        canonical.results.sort_unstable();
+        isolated.results.sort_unstable();
+        let mut expected = Vec::new();
+        for parent in 0..PARENTS {
+            expected.push((raw(parent as u8), raw(parent as u8)));
+            expected.push((raw(parent as u8), raw(parent as u8)));
+        }
+        assert_eq!(canonical.results, expected);
+        assert_eq!(isolated.results, expected);
+
+        assert_eq!(&*canonical_calls.lock().unwrap(), &[(PARENTS, 2 * PARENTS)]);
+        let mut isolated_calls = isolated_calls.lock().unwrap().clone();
+        isolated_calls.sort_unstable();
+        assert_eq!(
+            isolated_calls,
+            [(PARENTS / 2, PARENTS), (PARENTS / 2, PARENTS)]
+        );
+
+        assert_eq!(
+            canonical.stats.states_interned, isolated.stats.states_interned,
+            "physical bucketing must not change the semantic interner vocabulary"
+        );
+        assert!(canonical.stats.bucket_merges > 0);
+        assert_eq!(canonical.stats.isolated_filings, 0);
+        assert_eq!(isolated.stats.bucket_merges, 0);
+        assert!(isolated.stats.isolated_filings > 0);
+        for stats in [&canonical.stats, &isolated.stats] {
+            assert_eq!(
+                stats.interner_hits,
+                stats.bucket_merges + stats.isolated_filings + stats.state_reentries
+            );
+        }
+    }
+
+    #[test]
+    fn isolated_filings_are_invisible_to_shadow_site_identity_but_split_geometry() {
+        const PARENTS: usize = 8;
+        let run = |isolate_filings| {
+            let epoch = ResidualShadowEpoch::new();
+            let project = |binding: &Binding| {
+                Some((
+                    *binding.get(FLIP_PARENT).unwrap(),
+                    *binding.get(FLIP_VALUE).unwrap(),
+                ))
+            };
+            let residual = Query::new(
+                flipped_reconvergence_root(PARENTS, Arc::new(Mutex::new(Vec::new()))),
+                project,
+            )
+            .solve_residual_state_lazy()
+            .cap(usize::MAX)
+            .start_width(usize::MAX)
+            .growth(1);
+            let residual = if isolate_filings {
+                residual.isolated_filing_buckets()
+            } else {
+                residual
+            };
+            let mut solved = residual.shadow(epoch).collect_profiled();
+            solved.results.sort_unstable();
+            let final_confirms = solved
+                .shadow
+                .events
+                .iter()
+                .filter(|event| {
+                    event.site.verb == ActionVerb::Confirm && event.site.leaf_occurrence == 3
+                })
+                .map(|event| {
+                    (
+                        event.site.clone(),
+                        event.geometry.parent_rows,
+                        event.geometry.candidate_occurrences,
+                    )
+                })
+                .collect::<Vec<_>>();
+            (solved.results, final_confirms)
+        };
+
+        let canonical = run(false);
+        let isolated = run(true);
+        assert_eq!(isolated.0, canonical.0);
+        assert_eq!(canonical.1.len(), 1);
+        assert_eq!(isolated.1.len(), 2);
+        assert_eq!(canonical.1[0].1, PARENTS);
+        assert_eq!(canonical.1[0].2, 2 * PARENTS);
+        assert!(
+            isolated
+                .1
+                .iter()
+                .all(|(site, _, _)| site == &canonical.1[0].0),
+            "physical filing labels must not leak into semantic shadow sites"
+        );
+        assert_eq!(
+            isolated
+                .1
+                .iter()
+                .map(|(_, parents, _)| parents)
+                .sum::<usize>(),
+            PARENTS
+        );
+        assert_eq!(
+            isolated
+                .1
+                .iter()
+                .map(|(_, _, candidates)| candidates)
+                .sum::<usize>(),
+            2 * PARENTS
+        );
+        assert!(isolated
+            .1
+            .iter()
+            .all(|(_, parents, candidates)| { *parents == PARENTS / 2 && *candidates == PARENTS }));
+    }
+
+    #[test]
+    fn isolated_filings_preserve_width_one_depth_first_action_prefix() {
+        const PARENTS: usize = 8;
+        let run = |isolate_filings| {
+            let final_calls = Arc::new(Mutex::new(Vec::new()));
+            let project = |binding: &Binding| {
+                Some((
+                    *binding.get(FLIP_PARENT).unwrap(),
+                    *binding.get(FLIP_VALUE).unwrap(),
+                ))
+            };
+            let residual = Query::new(flipped_reconvergence_root(PARENTS, final_calls), project)
+                .solve_residual_state_lazy()
+                .cap(1)
+                .start_width(1)
+                .growth(1);
+            let residual = if isolate_filings {
+                residual.isolated_filing_buckets()
+            } else {
+                residual
+            };
+            let epoch = ResidualShadowEpoch::new();
+            let mut shadow = residual.shadow(epoch.clone());
+            let first = shadow.next();
+            let actions = epoch
+                .snapshot()
+                .events
+                .into_iter()
+                .map(|event| {
+                    (
+                        event.site.verb,
+                        event.site.leaf_occurrence,
+                        event.geometry.parent_rows,
+                        event.geometry.candidate_occurrences,
+                    )
+                })
+                .collect::<Vec<_>>();
+            drop(shadow);
+            (first, actions)
+        };
+
+        let canonical = run(false);
+        let isolated = run(true);
+        assert_eq!(canonical, isolated);
+        assert!(canonical.0.is_some());
+        assert_eq!(
+            canonical.1,
+            [
+                (ActionVerb::Propose, 0, 1, 0),
+                (ActionVerb::Propose, 2, 1, 0),
+                (ActionVerb::Confirm, 1, 1, 2),
+                (ActionVerb::Confirm, 3, 1, 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn isolated_filing_tokens_and_remainders_keep_the_exact_physical_bucket() {
+        let root = ShapeLeaf(0);
+        let plan = ResidualPlan::compile(&root);
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        machine.worklist.enable_isolated_filing_buckets();
+        let desc = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Ready,
+        };
+        let first = file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            plan.len(),
+            desc.clone(),
+            StateBucket::Rows(RowBatch {
+                rows: Vec::new(),
+                row_count: 3,
+            }),
+            &mut machine.stats,
+        )
+        .unwrap();
+        let second = file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            plan.len(),
+            desc,
+            StateBucket::Rows(RowBatch {
+                rows: Vec::new(),
+                row_count: 2,
+            }),
+            &mut machine.stats,
+        )
+        .unwrap();
+
+        assert_eq!(first.bucket.state, second.bucket.state);
+        assert_ne!(first.bucket, second.bucket);
+        assert_eq!(
+            machine.worklist.values().map(BTreeMap::len).sum::<usize>(),
+            2
+        );
+        assert_eq!(machine.stats.bucket_merges, 0);
+        assert_eq!(
+            (machine.stats.isolated_filings, machine.stats.rows_isolated),
+            (1, 2)
+        );
+
+        let allocator_before = machine.worklist.next_filing;
+        let filing_stats_before = (
+            machine.stats.bucket_merges,
+            machine.stats.isolated_filings,
+            machine.stats.state_reentries,
+        );
+        let task = machine.take_continuation(&plan, second, 1);
+        assert_eq!(task.state, second.bucket.state);
+        assert_eq!(task.bucket.row_count(), 1);
+        assert_eq!(machine.worklist.next_filing, allocator_before);
+        assert_eq!(
+            (
+                machine.stats.bucket_merges,
+                machine.stats.isolated_filings,
+                machine.stats.state_reentries,
+            ),
+            filing_stats_before
+        );
+
+        let level = machine
+            .worklist
+            .first_key_value()
+            .expect("both zero-stride physical buckets remain live")
+            .1;
+        assert_eq!(level.get(&first.bucket).unwrap().row_count(), 3);
+        assert_eq!(level.get(&second.bucket).unwrap().row_count(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot isolate residual filing buckets after iteration starts")]
+    fn isolated_filing_builder_rejects_a_started_iterator() {
+        let mut residual = Query::new(
+            FanoutLeaf {
+                variable: 0,
+                values: Arc::new(vec![raw(1), raw(2)]),
+            },
+            |binding: &Binding| binding.get(0).copied(),
+        )
+        .solve_residual_state_lazy();
+        assert!(residual.next().is_some());
+        let _ = residual.isolated_filing_buckets();
+    }
+
+    #[test]
+    fn isolated_filings_preserve_opaque_union_and_rpq_bags() {
+        let make_union = || {
+            UnionConstraint::new(vec![
+                FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(vec![raw(1), raw(2)]),
+                },
+                FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(vec![raw(2), raw(3)]),
+                },
+            ])
+        };
+        assert_eq!(ResidualPlan::compile(&make_union()).len(), 1);
+        let project_one = |binding: &Binding| binding.get(0).copied();
+        let mut sequential_union: Vec<_> =
+            Query::new(make_union(), project_one).sequential().collect();
+        let mut isolated_union: Vec<_> = Query::new(make_union(), project_one)
+            .solve_residual_state_lazy()
+            .isolated_filing_buckets()
+            .collect();
+        sequential_union.sort_unstable();
+        isolated_union.sort_unstable();
+        assert_eq!(isolated_union, sequential_union);
+
+        use crate::inline::encodings::genid::GenId;
+        use crate::inline::IntoInline;
+        use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
+        use crate::trible::{Trible, TribleSet};
+        let a = crate::id::rngid();
+        let b = crate::id::rngid();
+        let c = crate::id::rngid();
+        let attribute = crate::id::Id::new([0x52; crate::id::ID_LEN]).unwrap();
+        let b_value: Inline<GenId> = (&b).to_inline();
+        let c_value: Inline<GenId> = (&c).to_inline();
+        let mut graph = TribleSet::new();
+        graph.insert(&Trible::new(&a, &attribute, &b_value));
+        graph.insert(&Trible::new(&a, &attribute, &c_value));
+        graph.insert(&Trible::new(&b, &attribute, &c_value));
+        let make_rpq = || {
+            RegularPathConstraint::new(
+                graph.clone(),
+                Variable::<GenId>::new(0),
+                Variable::<GenId>::new(1),
+                &[PathOp::Attr(attribute.raw())],
+            )
+        };
+        assert_eq!(ResidualPlan::compile(&make_rpq()).len(), 1);
+        let project_pair =
+            |binding: &Binding| Some((*binding.get(0).unwrap(), *binding.get(1).unwrap()));
+        let mut sequential_rpq: Vec<_> =
+            Query::new(make_rpq(), project_pair).sequential().collect();
+        let mut isolated_rpq: Vec<_> = Query::new(make_rpq(), project_pair)
+            .solve_residual_state_lazy()
+            .isolated_filing_buckets()
+            .collect();
+        sequential_rpq.sort_unstable();
+        isolated_rpq.sort_unstable();
+        assert_eq!(isolated_rpq, sequential_rpq);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn isolated_parallel_split_preserves_policy_allocator_and_zero_stride_rows() {
+        let root = ZeroVariableTruth(true);
+        let plan = ResidualPlan::compile(&root);
+        let influences = [VariableSet::new_empty(); 128];
+        let base_estimates = [usize::MAX; 128];
+        let desc = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Ready,
+        };
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        machine.worklist.enable_isolated_filing_buckets();
+        file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            plan.len(),
+            desc.clone(),
+            StateBucket::Rows(RowBatch {
+                rows: Vec::new(),
+                row_count: 6,
+            }),
+            &mut machine.stats,
+        );
+        assert_eq!(machine.worklist.next_filing, 2);
+
+        let mut right = machine
+            .split_for_parallel(&root, &plan, &influences, &base_estimates)
+            .expect("six zero-stride rows are splittable");
+        for shard in [&machine, &right] {
+            assert!(shard.worklist.isolate_filings);
+            assert_eq!(shard.worklist.next_filing, 2);
+            assert_eq!(
+                shard
+                    .worklist
+                    .values()
+                    .flat_map(BTreeMap::values)
+                    .map(StateBucket::row_count)
+                    .sum::<usize>(),
+                3
+            );
+        }
+
+        for shard in [&mut machine, &mut right] {
+            file(
+                &mut shard.worklist,
+                &mut shard.interner,
+                plan.len(),
+                desc.clone(),
+                StateBucket::Rows(RowBatch {
+                    rows: Vec::new(),
+                    row_count: 1,
+                }),
+                &mut shard.stats,
+            );
+            assert_eq!(shard.worklist.next_filing, 3);
+            assert_eq!(shard.stats.isolated_filings, 1);
+            assert_eq!(shard.stats.rows_isolated, 1);
+            assert_eq!(
+                shard
+                    .worklist
+                    .values()
+                    .flat_map(BTreeMap::values)
+                    .map(StateBucket::row_count)
+                    .sum::<usize>(),
+                4
+            );
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn isolated_filings_preserve_parallel_duplicate_bags_and_shadow_conversion() {
+        const PARENTS: usize = 32;
+        let project = |binding: &Binding| {
+            Some((
+                *binding.get(FLIP_PARENT).unwrap(),
+                *binding.get(FLIP_VALUE).unwrap(),
+            ))
+        };
+        let make = || {
+            Arc::new(flipped_reconvergence_root(
+                PARENTS,
+                Arc::new(Mutex::new(Vec::new())),
+            ))
+        };
+        let mut serial: Vec<_> = Query::new(make(), project)
+            .solve_residual_state_lazy()
+            .isolated_filing_buckets()
+            .collect();
+        let mut parallel = with_parallel_workers(4, || {
+            Query::new(make(), project)
+                .solve_residual_state_lazy()
+                .isolated_filing_buckets()
+                .into_par_iter()
+                .collect::<Vec<_>>()
+        });
+        let epoch = ResidualShadowEpoch::new();
+        let run_epoch = epoch.clone();
+        let mut shadowed = with_parallel_workers(4, || {
+            Query::new(make(), project)
+                .solve_residual_state_lazy()
+                .isolated_filing_buckets()
+                .shadow(run_epoch)
+                .into_par_iter()
+                .collect::<Vec<_>>()
+        });
+        serial.sort_unstable();
+        parallel.sort_unstable();
+        shadowed.sort_unstable();
+        assert_eq!(parallel, serial);
+        assert_eq!(shadowed, serial);
+        assert_eq!(serial.len(), 2 * PARENTS);
+        assert_eq!(epoch.status(), ResidualShadowStatus::Closed);
+
+        for truth in [false, true] {
+            let expected = if truth { vec![()] } else { Vec::new() };
+            let observed = with_parallel_workers(4, || {
+                Query::new(ZeroVariableTruth(truth), |_| Some(()))
+                    .solve_residual_state_lazy()
+                    .isolated_filing_buckets()
+                    .into_par_iter()
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(observed, expected);
+        }
     }
 
     fn ready_desc(bound_count: usize) -> StateDesc {
@@ -4931,7 +5764,7 @@ mod tests {
             for (&id, bucket) in level {
                 let ResidualPhase::Propose {
                     variable, proposer, ..
-                } = interner.get(id).phase
+                } = interner.get(id.state).phase
                 else {
                     panic!("Ready planning filed a non-proposal state")
                 };
@@ -5597,7 +6430,7 @@ mod tests {
         let task = machine
             .take_next_with_plan(&plan, 2)
             .expect("page-local candidates are live");
-        assert_eq!(task.state, token.state);
+        assert_eq!(task.state, token.bucket.state);
         assert_eq!(task.desc, desc);
         let StateBucket::Candidates(page) = task.bucket else {
             panic!("candidate state returned row payload")
@@ -5610,7 +6443,7 @@ mod tests {
             .first_key_value()
             .expect("candidate remainder stays under the same rank");
         let (&id, remainder) = level.first_key_value().unwrap();
-        assert_eq!(machine.interner.get(id), &desc);
+        assert_eq!(machine.interner.get(id.state), &desc);
         assert_eq!(remainder.occupancy(true), 6);
         assert_eq!(machine.stats.partial_pops, 1);
     }
@@ -7401,7 +8234,7 @@ mod tests {
         );
 
         let task = machine.take_continuation(&plan, hot, 8);
-        assert_eq!(task.state, hot.state);
+        assert_eq!(task.state, hot.bucket.state);
         assert_eq!(task.desc, desc);
         let StateBucket::Candidates(chunk) = task.bucket else {
             panic!("continuation returned a row payload")
@@ -7429,7 +8262,7 @@ mod tests {
             .worklist
             .values()
             .flat_map(|level| level.keys())
-            .any(|&id| machine.interner.get(id) == &ready_desc(3)));
+            .any(|&id| machine.interner.get(id.state) == &ready_desc(3)));
     }
 
     #[test]
@@ -7909,7 +8742,7 @@ mod tests {
         let mut level = worklist.remove(&rank).unwrap();
         let (id, bucket) = level.pop_first().unwrap();
         assert!(level.is_empty());
-        let action_desc = interner.get(id).clone();
+        let action_desc = interner.get(id.state).clone();
         assert!(matches!(
             execute_state(
                 &root,
@@ -7986,7 +8819,7 @@ mod tests {
         let (_, level) = worklist.first_key_value().expect("Ready state was filed");
         let (&id, payload) = level.first_key_value().unwrap();
         assert_eq!(
-            interner.get(id),
+            interner.get(id.state),
             &StateDesc {
                 bound: VariableSet::new_singleton(0),
                 phase: ResidualPhase::Ready,
@@ -8062,7 +8895,7 @@ mod tests {
             .expect("confirm action was filed");
         let mut level = worklist.remove(&rank).unwrap();
         let (id, bucket) = level.pop_first().unwrap();
-        let action_desc = interner.get(id).clone();
+        let action_desc = interner.get(id.state).clone();
         assert!(matches!(
             execute_state(
                 &root,
@@ -8182,7 +9015,7 @@ mod tests {
 
         let level = worklist.remove(&rank).unwrap();
         for (id, bucket) in level {
-            let action_desc = interner.get(id).clone();
+            let action_desc = interner.get(id.state).clone();
             assert!(matches!(
                 execute_state(
                     &root,

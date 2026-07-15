@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Residual-state execution gains an isolated-filing coalescence ablation.**
+  `ResidualStateIter::isolated_filing_buckets()` preserves canonical semantic
+  descriptors while giving every nonempty filing a separate physical bucket.
+  Exact continuation tokens and partial remainders retain their physical key;
+  serial, shadow-observed, and Rayon execution preserve result bags. New
+  profile counters distinguish live canonical merges, isolated same-state
+  filings, and true state reentries. The mode is diagnostic: saturated runs
+  isolate cross-history reconvergence, while geometric lazy runs measure all
+  physical coalescing under the unchanged production readiness policy.
 - **WGPU Succinct confirmation can opt into exact residual-action executor
   samples.** `WgpuSuccinctArchive::observe_residual_actions()` returns a
   borrowing, non-`Deref` `ObservedWgpuSuccinctArchive` whose pattern route
