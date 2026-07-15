@@ -29,6 +29,7 @@ use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::patch::{Entry, IdentitySchema, PATCH};
 use triblespace_core::prelude::*;
 use triblespace_core::query::regularpathconstraint::{PathOp, RegularPathConstraint};
+use triblespace_core::query::residual::ResidualCapabilities;
 use triblespace_core::query::sortedsliceconstraint::SortedSlice;
 use triblespace_core::query::{
     Constraint, ContainsConstraint, RowsView, TriblePattern, Variable, VariableContext,
@@ -138,8 +139,31 @@ fn pattern_changes_monotone_growth_keeps_results() {
         .collect()
     };
 
+    let finite_union_query = |full: &TribleSet, delta: &TribleSet| -> HashSet<[u8; 32]> {
+        find!(
+            e: Inline<GenId>,
+            pattern_changes!(full, delta, [
+                { ?e @ test_ns::rel_r: _?rv, test_ns::rel_s: _?sv }
+            ])
+        )
+        .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+        .map(|e: Inline<GenId>| e.raw)
+        .collect()
+    };
+
     let before = query(&full1, &delta1);
     let after = query(&full2, &delta2);
+    let finite_before = finite_union_query(&full1, &delta1);
+    let finite_after = finite_union_query(&full2, &delta2);
+
+    assert_eq!(
+        finite_before, before,
+        "finite-union residual lowering must match the ordinary scheduler before growth"
+    );
+    assert_eq!(
+        finite_after, after,
+        "finite-union residual lowering must match the ordinary scheduler after growth"
+    );
 
     let a_val: Inline<GenId> = (&a).to_inline();
     assert!(
@@ -153,6 +177,10 @@ fn pattern_changes_monotone_growth_keeps_results() {
     assert!(
         before.is_subset(&after),
         "monotonicity: Q(A) ⊆ Q(A ∪ B) for pattern_changes!"
+    );
+    assert!(
+        finite_before.is_subset(&finite_after),
+        "finite-union residual lowering must preserve monotone pattern_changes! growth"
     );
 }
 

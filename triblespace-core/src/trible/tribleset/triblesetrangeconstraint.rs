@@ -111,6 +111,10 @@ impl<'a> Constraint<'a> for TribleSetRangeConstraint {
         }
     }
 
+    fn residual_confirm_is_page_local(&self) -> bool {
+        true
+    }
+
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match view.col(self.variable_v) {
             Some(col) => view

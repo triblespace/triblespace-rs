@@ -100,6 +100,10 @@ impl<'a> Constraint<'a> for EntityRangeConstraint {
         }
     }
 
+    fn residual_confirm_is_page_local(&self) -> bool {
+        true
+    }
+
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match view.col(self.variable_e) {
             Some(col) => view.iter().all(|row| {
@@ -198,6 +202,10 @@ impl<'a> Constraint<'a> for AttributeRangeConstraint {
                 id >= self.min && id <= self.max
             });
         }
+    }
+
+    fn residual_confirm_is_page_local(&self) -> bool {
+        true
     }
 
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
