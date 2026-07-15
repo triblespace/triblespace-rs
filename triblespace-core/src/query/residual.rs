@@ -64,6 +64,54 @@ struct ConstraintPath(Box<[usize]>);
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct UnionArmPath(Box<[usize]>);
 
+fn finite_union_terminal_paths<'a>(union: &dyn Constraint<'a>) -> Vec<UnionArmPath> {
+    fn collect<'a>(
+        union: &dyn Constraint<'a>,
+        path: &mut Vec<usize>,
+        arms: &mut Vec<UnionArmPath>,
+    ) {
+        let children = union
+            .residual_union_children()
+            .expect("recursive union collection entered an opaque constraint");
+        assert!(
+            children.len() > 0,
+            "a residual finite union must expose at least one arm"
+        );
+        for child in 0..children.len() {
+            path.push(child);
+            let constraint = children.child(child);
+            if constraint.residual_union_children().is_some() {
+                collect(constraint, path, arms);
+            } else {
+                arms.push(UnionArmPath(path.clone().into_boxed_slice()));
+            }
+            path.pop();
+        }
+    }
+
+    let mut arms = Vec::new();
+    collect(union, &mut Vec::new(), &mut arms);
+    arms
+}
+
+fn resolve_union_terminal<'r, 'a>(
+    union: &'r dyn Constraint<'a>,
+    path: &UnionArmPath,
+) -> &'r dyn Constraint<'a> {
+    let mut constraint = union;
+    for &child in path.0.iter() {
+        let children = constraint
+            .residual_union_children()
+            .expect("residual nested-union shape changed during query execution");
+        constraint = children.child(child);
+    }
+    assert!(
+        constraint.residual_union_children().is_none(),
+        "residual nested-union terminal became another union"
+    );
+    constraint
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LeafLowering {
     Opaque,
@@ -101,6 +149,10 @@ struct ResidualPlan {
     /// Whether each opaque leaf's confirmation is homomorphic over ordered
     /// pages of one parent's candidate sequence.
     page_local_confirms: Vec<bool>,
+    /// Finite grade reserved for one outer Union arm. Two is the ordinary
+    /// plan/action pair; a nested Union under an AND terminal expands the
+    /// slot enough for its own plan/action progress and return edge.
+    union_arm_span: usize,
 }
 
 impl ResidualPlan {
@@ -135,35 +187,11 @@ impl ResidualPlan {
                     }
                 }
                 ConstraintShape::Opaque => {
-                    fn collect_union_arms<'a>(
-                        union: &dyn Constraint<'a>,
-                        path: &mut Vec<usize>,
-                        arms: &mut Vec<UnionArmPath>,
-                    ) {
-                        let children = union
-                            .residual_union_children()
-                            .expect("recursive union collection entered an opaque constraint");
-                        assert!(
-                            children.len() > 0,
-                            "a residual finite union must expose at least one arm"
-                        );
-                        for child in 0..children.len() {
-                            path.push(child);
-                            let constraint = children.child(child);
-                            if constraint.residual_union_children().is_some() {
-                                collect_union_arms(constraint, path, arms);
-                            } else {
-                                arms.push(UnionArmPath(path.clone().into_boxed_slice()));
-                            }
-                            path.pop();
-                        }
-                    }
-
                     let mut union_arms = Vec::new();
                     let lowering = if mode == ResidualCompileMode::FiniteUnions
                         && constraint.residual_union_children().is_some()
                     {
-                        collect_union_arms(constraint, &mut Vec::new(), &mut union_arms);
+                        union_arms = finite_union_terminal_paths(constraint);
                         LeafLowering::FiniteUnion {
                             arm_count: union_arms.len(),
                         }
@@ -192,10 +220,45 @@ impl ResidualPlan {
             &mut leaves,
             &mut page_local_confirms,
         );
-        Self {
+        let mut plan = Self {
             leaves,
             page_local_confirms,
+            union_arm_span: 2,
+        };
+
+        fn nested_union_terminals<'a>(constraint: &dyn Constraint<'a>) -> usize {
+            constraint.residual_union_children().map_or(1, |children| {
+                (0..children.len())
+                    .map(|child| nested_union_terminals(children.child(child)))
+                    .sum()
+            })
         }
+        let mut max_nested_arms = 0usize;
+        for union in 0..plan.len() {
+            let Some(arm_count) = plan.union_arm_count(union) else {
+                continue;
+            };
+            for arm in 0..arm_count {
+                if let ConstraintShape::And(children) =
+                    plan.resolve_union_arm(root, union, arm).residual_shape()
+                {
+                    for child in 0..children.len() {
+                        let constraint = children.child(child);
+                        if constraint.residual_union_children().is_some() {
+                            max_nested_arms =
+                                max_nested_arms.max(nested_union_terminals(constraint));
+                        }
+                    }
+                }
+            }
+        }
+        if max_nested_arms > 0 {
+            plan.union_arm_span = max_nested_arms
+                .checked_mul(2)
+                .and_then(|span| span.checked_add(4))
+                .expect("residual nested-union arm span overflow");
+        }
+        plan
     }
 
     fn len(&self) -> usize {
@@ -215,9 +278,13 @@ impl ResidualPlan {
 
     fn action_span(&self) -> usize {
         self.max_union_arms()
-            .checked_mul(2)
+            .checked_mul(self.union_arm_span)
             .and_then(|span| span.checked_add(2))
             .expect("residual union action span overflow")
+    }
+
+    fn union_arm_span(&self) -> usize {
+        self.union_arm_span
     }
 
     fn union_arm_count(&self, occurrence: usize) -> Option<usize> {
@@ -252,18 +319,7 @@ impl ResidualPlan {
     ) -> &'r dyn Constraint<'a> {
         let union = self.resolve(root, occurrence);
         let path = &self.leaves[occurrence].union_arms[arm];
-        let mut constraint = union;
-        for &child in path.0.iter() {
-            let children = constraint
-                .residual_union_children()
-                .expect("residual nested-union shape changed during query execution");
-            constraint = children.child(child);
-        }
-        assert!(
-            constraint.residual_union_children().is_none(),
-            "residual nested-union terminal became another union"
-        );
-        constraint
+        resolve_union_terminal(union, path)
     }
 
     /// True exactly when every unchecked relevant confirmer can process
@@ -1159,6 +1215,24 @@ impl UnionVerb {
     }
 }
 
+/// Structural return address for one nested Union evaluated inside an AND
+/// terminal of an outer Union arm. Candidate streams and reducer buffers are
+/// deliberately absent; they travel only with the affine activation payload.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct AndReturnFrame {
+    variable: VariableId,
+    union: usize,
+    verb: UnionVerb,
+    outer_done: ChildSet,
+    outer_arm: usize,
+    and_child: usize,
+    /// Remaining AND children in the exact estimate order chosen when this
+    /// activation entered the frame. Keeping the order structural lets
+    /// equivalent continuations merge without putting candidate values in
+    /// canonical state.
+    suffix: Box<[usize]>,
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum ResidualPhase {
     /// Plan one joint `(variable, proposing child)` action per row.
@@ -1191,6 +1265,7 @@ enum ResidualPhase {
         union: usize,
         verb: UnionVerb,
         done: ChildSet,
+        arm_span: usize,
     },
     /// Invokes one opaque arm over activations sharing the same canonical
     /// union continuation.
@@ -1200,6 +1275,21 @@ enum ResidualPhase {
         verb: UnionVerb,
         done: ChildSet,
         arm: usize,
+        arm_span: usize,
+    },
+    /// Plans one terminal arm of the nested Union named by an activation-
+    /// private AND return frame.
+    UnionNestedPlan {
+        frame: AndReturnFrame,
+        done: ChildSet,
+        arm_span: usize,
+    },
+    /// Confirms the frame's immutable child input through one nested terminal.
+    UnionNestedArm {
+        frame: AndReturnFrame,
+        done: ChildSet,
+        arm: usize,
+        arm_span: usize,
     },
 }
 
@@ -1319,6 +1409,27 @@ impl StateDesc {
                     }
                 }
             }
+            ResidualPhase::UnionNestedPlan { frame, .. }
+            | ResidualPhase::UnionNestedArm { frame, .. } => {
+                validate_variable(frame.variable);
+                assert!(
+                    frame.union < leaf_count,
+                    "nested residual union return names a non-leaf occurrence"
+                );
+                match &frame.verb {
+                    UnionVerb::Propose { relevant } => {
+                        assert!(relevant.is_valid_for(leaf_count));
+                        assert!(relevant.contains(frame.union));
+                    }
+                    UnionVerb::Confirm { relevant, checked } => {
+                        validate_sets(relevant, checked);
+                        assert!(
+                            relevant.contains(frame.union) && !checked.contains(frame.union),
+                            "nested residual union return names a checked outer leaf"
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -1358,26 +1469,83 @@ impl StateDesc {
                 .and_then(|grade| grade.checked_add(1))
                 .and_then(|grade| base.checked_add(grade))
                 .expect("residual-state rank overflow"),
-            ResidualPhase::UnionPlan { verb, done, .. } => verb
+            ResidualPhase::UnionPlan {
+                verb,
+                done,
+                arm_span,
+                ..
+            } => verb
                 .checked_count()
                 .checked_mul(action_span)
                 .and_then(|grade| {
                     done.count()
-                        .checked_mul(2)
+                        .checked_mul(*arm_span)
                         .and_then(|done| grade.checked_add(done))
                 })
                 .and_then(|grade| grade.checked_add(2))
                 .and_then(|grade| base.checked_add(grade))
                 .expect("residual-state rank overflow"),
-            ResidualPhase::UnionArm { verb, done, .. } => verb
+            ResidualPhase::UnionArm {
+                verb,
+                done,
+                arm_span,
+                ..
+            } => verb
                 .checked_count()
                 .checked_mul(action_span)
+                .and_then(|grade| {
+                    done.count()
+                        .checked_mul(*arm_span)
+                        .and_then(|done| grade.checked_add(done))
+                })
+                .and_then(|grade| grade.checked_add(3))
+                .and_then(|grade| base.checked_add(grade))
+                .expect("residual-state rank overflow"),
+            ResidualPhase::UnionNestedPlan {
+                frame,
+                done,
+                arm_span,
+            } => frame
+                .verb
+                .checked_count()
+                .checked_mul(action_span)
+                .and_then(|grade| {
+                    frame
+                        .outer_done
+                        .count()
+                        .checked_mul(*arm_span)
+                        .and_then(|outer| grade.checked_add(outer))
+                })
                 .and_then(|grade| {
                     done.count()
                         .checked_mul(2)
                         .and_then(|done| grade.checked_add(done))
                 })
-                .and_then(|grade| grade.checked_add(3))
+                .and_then(|grade| grade.checked_add(4))
+                .and_then(|grade| base.checked_add(grade))
+                .expect("residual-state rank overflow"),
+            ResidualPhase::UnionNestedArm {
+                frame,
+                done,
+                arm_span,
+                ..
+            } => frame
+                .verb
+                .checked_count()
+                .checked_mul(action_span)
+                .and_then(|grade| {
+                    frame
+                        .outer_done
+                        .count()
+                        .checked_mul(*arm_span)
+                        .and_then(|outer| grade.checked_add(outer))
+                })
+                .and_then(|grade| {
+                    done.count()
+                        .checked_mul(2)
+                        .and_then(|done| grade.checked_add(done))
+                })
+                .and_then(|grade| grade.checked_add(5))
                 .and_then(|grade| base.checked_add(grade))
                 .expect("residual-state rank overflow"),
         }
@@ -1396,7 +1564,9 @@ impl StateDesc {
             ResidualPhase::Ready
             | ResidualPhase::Propose { .. }
             | ResidualPhase::UnionPlan { .. }
-            | ResidualPhase::UnionArm { .. } => false,
+            | ResidualPhase::UnionArm { .. }
+            | ResidualPhase::UnionNestedPlan { .. }
+            | ResidualPhase::UnionNestedArm { .. } => false,
         }
     }
 }
@@ -1706,6 +1876,12 @@ struct UnionBatch {
     /// Arm outputs accumulated by parent. It is normalized only when every
     /// arm is done, keeping intermediate values out of canonical state.
     accumulated: Candidates,
+    /// Activation-private candidate stream owned by an open AND return frame.
+    working: Candidates,
+    /// Immutable input and reducer output owned by the nested Union child of
+    /// that frame. These are payload state; their values never enter StateId.
+    child_original: Candidates,
+    child_accumulated: Candidates,
 }
 
 impl UnionBatch {
@@ -1716,6 +1892,9 @@ impl UnionBatch {
             parents,
             original: Vec::new(),
             accumulated: Vec::new(),
+            working: Vec::new(),
+            child_original: Vec::new(),
+            child_accumulated: Vec::new(),
         }
     }
 
@@ -1727,6 +1906,9 @@ impl UnionBatch {
             parents: batch.parents,
             original: batch.candidates,
             accumulated: Vec::new(),
+            working: Vec::new(),
+            child_original: Vec::new(),
+            child_accumulated: Vec::new(),
         }
     }
 
@@ -1748,6 +1930,21 @@ impl UnionBatch {
                     value,
                 )
             }));
+        fn append_tagged(left: &mut Candidates, right: &mut Candidates, offset: u32) {
+            left.extend(right.drain(..).map(|(parent, value)| {
+                (
+                    parent.checked_add(offset).expect("union parent overflow"),
+                    value,
+                )
+            }));
+        }
+        append_tagged(&mut self.working, &mut other.working, offset);
+        append_tagged(&mut self.child_original, &mut other.child_original, offset);
+        append_tagged(
+            &mut self.child_accumulated,
+            &mut other.child_accumulated,
+            offset,
+        );
     }
 
     fn take_tail(&mut self, stride: usize, width: usize) -> Self {
@@ -1765,6 +1962,9 @@ impl UnionBatch {
                 ),
                 original: std::mem::take(&mut self.original),
                 accumulated: std::mem::take(&mut self.accumulated),
+                working: std::mem::take(&mut self.working),
+                child_original: std::mem::take(&mut self.child_original),
+                child_accumulated: std::mem::take(&mut self.child_accumulated),
             };
         }
 
@@ -1787,6 +1987,9 @@ impl UnionBatch {
 
         let original = take_tagged_tail(&mut self.original, first);
         let accumulated = take_tagged_tail(&mut self.accumulated, first);
+        let working = take_tagged_tail(&mut self.working, first);
+        let child_original = take_tagged_tail(&mut self.child_original, first);
+        let child_accumulated = take_tagged_tail(&mut self.child_accumulated, first);
         Self {
             activations,
             parents: RowBatch {
@@ -1795,6 +1998,9 @@ impl UnionBatch {
             },
             original,
             accumulated,
+            working,
+            child_original,
+            child_accumulated,
         }
     }
 
@@ -1821,6 +2027,9 @@ impl UnionBatch {
                 },
                 original: Vec::new(),
                 accumulated: Vec::new(),
+                working: Vec::new(),
+                child_original: Vec::new(),
+                child_accumulated: Vec::new(),
             });
             remap[parent] =
                 u32::try_from(group.parents.row_count).expect("too many partitioned union parents");
@@ -1838,7 +2047,7 @@ impl UnionBatch {
             assignment: &[K],
             remap: &[u32],
             groups: &mut BTreeMap<K, UnionBatch>,
-            original: bool,
+            slot: u8,
         ) where
             K: Clone + Ord,
         {
@@ -1847,15 +2056,21 @@ impl UnionBatch {
                 let target = groups
                     .get_mut(&assignment[parent])
                     .expect("every union assignment created its group");
-                if original {
-                    target.original.push((remap[parent], value));
-                } else {
-                    target.accumulated.push((remap[parent], value));
+                match slot {
+                    0 => target.original.push((remap[parent], value)),
+                    1 => target.accumulated.push((remap[parent], value)),
+                    2 => target.working.push((remap[parent], value)),
+                    3 => target.child_original.push((remap[parent], value)),
+                    4 => target.child_accumulated.push((remap[parent], value)),
+                    _ => unreachable!("unknown union payload slot"),
                 }
             }
         }
-        partition_values(self.original, assignment, &remap, &mut groups, true);
-        partition_values(self.accumulated, assignment, &remap, &mut groups, false);
+        partition_values(self.original, assignment, &remap, &mut groups, 0);
+        partition_values(self.accumulated, assignment, &remap, &mut groups, 1);
+        partition_values(self.working, assignment, &remap, &mut groups, 2);
+        partition_values(self.child_original, assignment, &remap, &mut groups, 3);
+        partition_values(self.child_accumulated, assignment, &remap, &mut groups, 4);
         groups
     }
 
@@ -2051,9 +2266,11 @@ impl SelectedResidualTask {
             ResidualPhase::Propose { proposer, .. } => plan.union_arm_count(*proposer).is_none(),
             ResidualPhase::Confirm { confirmer, .. } => plan.union_arm_count(*confirmer).is_none(),
             ResidualPhase::UnionArm { .. } => true,
+            ResidualPhase::UnionNestedArm { .. } => true,
             ResidualPhase::Ready
             | ResidualPhase::Candidate { .. }
-            | ResidualPhase::UnionPlan { .. } => false,
+            | ResidualPhase::UnionPlan { .. }
+            | ResidualPhase::UnionNestedPlan { .. } => false,
         }
     }
 
@@ -2064,6 +2281,7 @@ impl SelectedResidualTask {
             ResidualPhase::Propose { .. }
                 | ResidualPhase::Confirm { .. }
                 | ResidualPhase::UnionArm { .. }
+                | ResidualPhase::UnionNestedArm { .. }
         )
     }
 
@@ -2124,10 +2342,18 @@ impl SelectedResidualTask {
                 };
                 (action, candidates)
             }
+            (ResidualPhase::UnionNestedArm { frame, .. }, StateBucket::Union(batch)) => (
+                ResidualAction::Confirm {
+                    variable: frame.variable,
+                    leaf: frame.union,
+                },
+                batch.child_original.len(),
+            ),
             (
                 ResidualPhase::Ready
                 | ResidualPhase::Candidate { .. }
-                | ResidualPhase::UnionPlan { .. },
+                | ResidualPhase::UnionPlan { .. }
+                | ResidualPhase::UnionNestedPlan { .. },
                 _,
             ) => return None,
             (ResidualPhase::Propose { proposer, .. }, StateBucket::Rows(_))
@@ -2143,7 +2369,8 @@ impl SelectedResidualTask {
             (
                 ResidualPhase::Propose { .. }
                 | ResidualPhase::Confirm { .. }
-                | ResidualPhase::UnionArm { .. },
+                | ResidualPhase::UnionArm { .. }
+                | ResidualPhase::UnionNestedArm { .. },
                 _,
             ) => {
                 panic!("canonical residual action received the wrong payload shape")
@@ -2320,6 +2547,48 @@ fn confirm_leaf<'a>(
     candidates: &mut CandidateSink<'_>,
 ) {
     plan.resolve(root, leaf).confirm(variable, view, candidates);
+}
+
+fn resolve_frame_and_children<'r, 'a>(
+    root: &'r dyn Constraint<'a>,
+    plan: &ResidualPlan,
+    frame: &AndReturnFrame,
+) -> &'r dyn ConstraintChildren<'a> {
+    match plan
+        .resolve_union_arm(root, frame.union, frame.outer_arm)
+        .residual_shape()
+    {
+        ConstraintShape::And(children) => children,
+        ConstraintShape::Opaque => {
+            panic!("nested residual Union return site stopped being an AND")
+        }
+    }
+}
+
+fn resolve_nested_union_terminal<'r, 'a>(
+    root: &'r dyn Constraint<'a>,
+    plan: &ResidualPlan,
+    frame: &AndReturnFrame,
+    arm: usize,
+) -> &'r dyn Constraint<'a> {
+    let children = resolve_frame_and_children(root, plan, frame);
+    let union = children.child(frame.and_child);
+    let paths = finite_union_terminal_paths(union);
+    resolve_union_terminal(
+        union,
+        paths
+            .get(arm)
+            .expect("nested residual Union arm is out of range"),
+    )
+}
+
+fn nested_union_arm_count<'a>(
+    root: &dyn Constraint<'a>,
+    plan: &ResidualPlan,
+    frame: &AndReturnFrame,
+) -> usize {
+    let children = resolve_frame_and_children(root, plan, frame);
+    finite_union_terminal_paths(children.child(frame.and_child)).len()
 }
 
 fn ready_plan_transition<'a>(
@@ -2519,6 +2788,7 @@ fn propose_action_transition<'a>(
                         relevant: relevant.clone(),
                     },
                     done: ChildSet::empty(arm_count),
+                    arm_span: plan.union_arm_span(),
                 },
             },
             StateBucket::Union(UnionBatch::from_proposal(rows, activations)),
@@ -2760,6 +3030,7 @@ fn confirm_action_transition<'a>(
                         checked: checked.clone(),
                     },
                     done: ChildSet::empty(arm_count),
+                    arm_span: plan.union_arm_span(),
                 },
             },
             StateBucket::Union(UnionBatch::from_confirmation(batch, activations)),
@@ -2948,6 +3219,7 @@ fn union_plan_transition<'a>(
                             verb: verb.clone(),
                             done: done.clone(),
                             arm,
+                            arm_span: plan.union_arm_span(),
                         },
                     },
                     StateBucket::Union(batch),
@@ -2989,6 +3261,84 @@ fn union_arm_transition<'a>(
         (0..batch.parents.row_count).all(|parent| constraint.satisfied(&view.row_view(parent))),
         "a union arm became dead between planning and action"
     );
+
+    // A confirming AND terminal may lower its first estimate-ordered Union
+    // child into a resumable finite submachine. Prefix siblings run before
+    // entry and the structural suffix is frozen in the return address, so
+    // returning from the child is observationally the same continuation as
+    // the opaque IntersectionConstraint::confirm call. Proposal is left
+    // opaque: its per-row proposer choice needs a richer continuation graph.
+    if matches!(verb, UnionVerb::Confirm { .. }) {
+        if let ConstraintShape::And(children) = constraint.residual_shape() {
+            let first = view.row_view(0);
+            let mut order = Vec::with_capacity(children.len());
+            for child in 0..children.len() {
+                let mut estimate = 0usize;
+                if children.child(child).estimate(
+                    variable,
+                    &first,
+                    &mut EstimateSink::Scalar(&mut estimate),
+                ) {
+                    order.push((estimate, child));
+                }
+            }
+            order.sort_unstable_by_key(|&(estimate, _)| estimate);
+            if let Some(position) = order
+                .iter()
+                .position(|&(_, child)| children.child(child).residual_union_children().is_some())
+            {
+                batch.working = batch.original.clone();
+                for &(_, child) in &order[..position] {
+                    let candidates_before = batch.working.len();
+                    children.child(child).confirm(
+                        variable,
+                        &view,
+                        &mut CandidateSink::Tagged(&mut batch.working),
+                    );
+                    stats.confirm_calls += 1;
+                    stats.confirm_rows += batch.parents.row_count;
+                    stats.max_confirm_rows = stats.max_confirm_rows.max(batch.parents.row_count);
+                    stats.candidates_confirmed += candidates_before;
+                    stats.max_confirm_candidates =
+                        stats.max_confirm_candidates.max(candidates_before);
+                }
+
+                let and_child = order[position].1;
+                batch.child_original = std::mem::take(&mut batch.working);
+                batch.child_accumulated.clear();
+                let nested_arm_count = finite_union_terminal_paths(children.child(and_child)).len();
+                let frame = AndReturnFrame {
+                    variable,
+                    union,
+                    verb: verb.clone(),
+                    outer_done: done.clone(),
+                    outer_arm: arm,
+                    and_child,
+                    suffix: order[position + 1..]
+                        .iter()
+                        .map(|&(_, child)| child)
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                };
+                return file_with_span(
+                    worklist,
+                    interner,
+                    leaf_count,
+                    plan.action_span(),
+                    StateDesc {
+                        bound: desc.bound,
+                        phase: ResidualPhase::UnionNestedPlan {
+                            frame,
+                            done: ChildSet::empty(nested_arm_count),
+                            arm_span: plan.union_arm_span(),
+                        },
+                    },
+                    StateBucket::Union(batch),
+                    stats,
+                );
+            }
+        }
+    }
 
     match verb {
         UnionVerb::Propose { .. } => {
@@ -3041,6 +3391,274 @@ fn union_arm_transition<'a>(
                     union,
                     verb: verb.clone(),
                     done: next_done,
+                    arm_span: plan.union_arm_span(),
+                },
+            },
+            StateBucket::Union(batch),
+            stats,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_nested_union_frame<'a>(
+    root: &dyn Constraint<'a>,
+    plan: &ResidualPlan,
+    desc: &StateDesc,
+    frame: &AndReturnFrame,
+    mut batch: UnionBatch,
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+) -> Option<ContinuationToken> {
+    assert!(matches!(frame.verb, UnionVerb::Confirm { .. }));
+    let leaf_count = plan.len();
+    let children = resolve_frame_and_children(root, plan, frame);
+    assert!(frame.and_child < children.len());
+    assert!(frame.suffix.iter().all(|&child| child < children.len()));
+
+    batch.child_accumulated.sort_unstable();
+    batch.child_accumulated.dedup();
+    batch.working = std::mem::take(&mut batch.child_accumulated);
+    batch.child_original.clear();
+
+    let vars: Vec<VariableId> = desc.bound.into_iter().collect();
+    let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
+    for &child in frame.suffix.iter() {
+        let candidates_before = batch.working.len();
+        children.child(child).confirm(
+            frame.variable,
+            &view,
+            &mut CandidateSink::Tagged(&mut batch.working),
+        );
+        stats.confirm_calls += 1;
+        stats.confirm_rows += batch.parents.row_count;
+        stats.max_confirm_rows = stats.max_confirm_rows.max(batch.parents.row_count);
+        stats.candidates_confirmed += candidates_before;
+        stats.max_confirm_candidates = stats.max_confirm_candidates.max(candidates_before);
+    }
+    assert!(
+        batch
+            .working
+            .iter()
+            .all(|(parent, _)| (*parent as usize) < batch.parents.row_count),
+        "nested residual AND continuation emitted an invalid candidate row tag"
+    );
+    batch.accumulated.append(&mut batch.working);
+    batch.accumulated.sort_unstable();
+
+    let outer_arm_count = plan
+        .union_arm_count(frame.union)
+        .expect("nested residual Union return names an opaque outer leaf");
+    assert!(frame.outer_arm < outer_arm_count);
+    assert!(!frame.outer_done.contains(frame.outer_arm));
+    let next_done = frame.outer_done.with_inserted(frame.outer_arm);
+    if next_done.count() == outer_arm_count {
+        finish_union_transition(
+            plan,
+            desc,
+            frame.variable,
+            frame.union,
+            &frame.verb,
+            batch,
+            worklist,
+            interner,
+            stats,
+        )
+    } else {
+        file_with_span(
+            worklist,
+            interner,
+            leaf_count,
+            plan.action_span(),
+            StateDesc {
+                bound: desc.bound,
+                phase: ResidualPhase::UnionPlan {
+                    variable: frame.variable,
+                    union: frame.union,
+                    verb: frame.verb.clone(),
+                    done: next_done,
+                    arm_span: plan.union_arm_span(),
+                },
+            },
+            StateBucket::Union(batch),
+            stats,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn union_nested_plan_transition<'a>(
+    root: &dyn Constraint<'a>,
+    plan: &ResidualPlan,
+    desc: &StateDesc,
+    frame: &AndReturnFrame,
+    done: &ChildSet,
+    batch: UnionBatch,
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+) -> Option<ContinuationToken> {
+    let leaf_count = plan.len();
+    let arm_count = nested_union_arm_count(root, plan, frame);
+    assert!(
+        done.is_valid_for(arm_count),
+        "nested residual Union done set contains a non-arm occurrence"
+    );
+
+    let vars: Vec<VariableId> = desc.bound.into_iter().collect();
+    let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
+    let mut augmented = Vec::with_capacity(batch.parents.row_count);
+    for parent in 0..batch.parents.row_count {
+        let row = view.row_view(parent);
+        let mut next = done.clone();
+        for arm in 0..arm_count {
+            if !next.contains(arm)
+                && !resolve_nested_union_terminal(root, plan, frame, arm).satisfied(&row)
+            {
+                next.insert(arm);
+            }
+        }
+        augmented.push(next);
+    }
+
+    let mut continuation = None;
+    for (done, batch) in batch.partition(vars.len(), &augmented) {
+        if done.count() == arm_count {
+            prefer_continuation(
+                &mut continuation,
+                finish_nested_union_frame(
+                    root, plan, desc, frame, batch, worklist, interner, stats,
+                ),
+            );
+            continue;
+        }
+
+        let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
+        let first_undone = (0..arm_count)
+            .find(|&arm| !done.contains(arm))
+            .expect("unfinished nested residual Union has an enabled arm");
+        let mut assignments = vec![first_undone; batch.parents.row_count];
+        let mut estimates = vec![usize::MAX; batch.parents.row_count];
+        let mut column = Vec::with_capacity(batch.parents.row_count);
+        for arm in 0..arm_count {
+            if done.contains(arm) {
+                continue;
+            }
+            column.clear();
+            if resolve_nested_union_terminal(root, plan, frame, arm).estimate(
+                frame.variable,
+                &view,
+                &mut EstimateSink::Column(&mut column),
+            ) {
+                assert_eq!(
+                    column.len(),
+                    batch.parents.row_count,
+                    "nested residual Union arm estimate must append one value per row"
+                );
+                for parent in 0..batch.parents.row_count {
+                    if column[parent] < estimates[parent] {
+                        estimates[parent] = column[parent];
+                        assignments[parent] = arm;
+                    }
+                }
+            } else {
+                assert!(
+                    column.is_empty(),
+                    "irrelevant nested residual Union arm estimate must leave its sink untouched"
+                );
+            }
+        }
+
+        for (arm, batch) in batch.partition(vars.len(), &assignments) {
+            prefer_continuation(
+                &mut continuation,
+                file_with_span(
+                    worklist,
+                    interner,
+                    leaf_count,
+                    plan.action_span(),
+                    StateDesc {
+                        bound: desc.bound,
+                        phase: ResidualPhase::UnionNestedArm {
+                            frame: frame.clone(),
+                            done: done.clone(),
+                            arm,
+                            arm_span: plan.union_arm_span(),
+                        },
+                    },
+                    StateBucket::Union(batch),
+                    stats,
+                ),
+            );
+        }
+    }
+    continuation
+}
+
+#[allow(clippy::too_many_arguments)]
+fn union_nested_arm_transition<'a>(
+    root: &dyn Constraint<'a>,
+    plan: &ResidualPlan,
+    desc: &StateDesc,
+    frame: &AndReturnFrame,
+    done: &ChildSet,
+    arm: usize,
+    mut batch: UnionBatch,
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+) -> Option<ContinuationToken> {
+    let leaf_count = plan.len();
+    let arm_count = nested_union_arm_count(root, plan, frame);
+    assert!(arm < arm_count && !done.contains(arm));
+    assert!(done.is_valid_for(arm_count));
+    assert_eq!(batch.activations.len(), batch.parents.row_count);
+
+    let vars: Vec<VariableId> = desc.bound.into_iter().collect();
+    let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
+    let constraint = resolve_nested_union_terminal(root, plan, frame, arm);
+    debug_assert!(
+        (0..batch.parents.row_count).all(|parent| constraint.satisfied(&view.row_view(parent))),
+        "a nested residual Union arm became dead between planning and action"
+    );
+    let mut survivors = batch.child_original.clone();
+    let candidates_before = survivors.len();
+    constraint.confirm(
+        frame.variable,
+        &view,
+        &mut CandidateSink::Tagged(&mut survivors),
+    );
+    stats.confirm_calls += 1;
+    stats.confirm_rows += batch.parents.row_count;
+    stats.max_confirm_rows = stats.max_confirm_rows.max(batch.parents.row_count);
+    stats.candidates_confirmed += candidates_before;
+    stats.max_confirm_candidates = stats.max_confirm_candidates.max(candidates_before);
+    batch.child_accumulated.extend(survivors);
+    assert!(
+        batch
+            .child_accumulated
+            .iter()
+            .all(|(parent, _)| (*parent as usize) < batch.parents.row_count),
+        "nested residual Union arm emitted an invalid candidate row tag"
+    );
+    batch.child_accumulated.sort_unstable();
+
+    let next_done = done.with_inserted(arm);
+    if next_done.count() == arm_count {
+        finish_nested_union_frame(root, plan, desc, frame, batch, worklist, interner, stats)
+    } else {
+        file_with_span(
+            worklist,
+            interner,
+            leaf_count,
+            plan.action_span(),
+            StateDesc {
+                bound: desc.bound,
+                phase: ResidualPhase::UnionNestedPlan {
+                    frame: frame.clone(),
+                    done: next_done,
+                    arm_span: plan.union_arm_span(),
                 },
             },
             StateBucket::Union(batch),
@@ -3189,6 +3807,7 @@ fn execute_task<'a>(
                 union,
                 verb,
                 done,
+                ..
             },
             StateBucket::Union(batch),
         ) => {
@@ -3204,6 +3823,7 @@ fn execute_task<'a>(
                 verb,
                 done,
                 arm,
+                ..
             },
             StateBucket::Union(batch),
         ) => {
@@ -3214,6 +3834,29 @@ fn execute_task<'a>(
             let continuation = union_arm_transition(
                 root, plan, &desc, *variable, *union, verb, done, *arm, batch, worklist, interner,
                 stats,
+            );
+            if let Some(continuation) = continuation {
+                StepOutcome::Advanced(continuation)
+            } else {
+                stats.dead_action_pops += 1;
+                StepOutcome::Dead
+            }
+        }
+        (ResidualPhase::UnionNestedPlan { frame, done, .. }, StateBucket::Union(batch)) => {
+            let continuation = union_nested_plan_transition(
+                root, plan, &desc, frame, done, batch, worklist, interner, stats,
+            );
+            continuation.map_or(StepOutcome::Dead, StepOutcome::Advanced)
+        }
+        (
+            ResidualPhase::UnionNestedArm {
+                frame, done, arm, ..
+            },
+            StateBucket::Union(batch),
+        ) => {
+            stats.confirm_action_pops += 1;
+            let continuation = union_nested_arm_transition(
+                root, plan, &desc, frame, done, *arm, batch, worklist, interner, stats,
             );
             if let Some(continuation) = continuation {
                 StepOutcome::Advanced(continuation)
@@ -8450,6 +9093,89 @@ mod tests {
     }
 
     #[test]
+    fn recursive_union_confirm_resumes_the_exact_and_continuation() {
+        type Calls = Arc<Mutex<Vec<usize>>>;
+        let fresh = || Arc::new(Mutex::new(Vec::new()));
+        let make = |prefix_calls: Calls,
+                    zero_calls: Calls,
+                    one_calls: Calls,
+                    suffix_calls: Calls,
+                    outer_calls: Calls| {
+            let filter = |estimate, accepted, calls| {
+                Box::new(PageFilterLeaf {
+                    variable: 0,
+                    estimate,
+                    accepted,
+                    calls,
+                }) as ShapeConstraint
+            };
+            let nested = UnionConstraint::new(vec![
+                filter(10, Some(raw(0)), zero_calls),
+                filter(11, Some(raw(1)), one_calls),
+            ]);
+            let guarded = IntersectionConstraint::new(vec![
+                filter(8, None, prefix_calls),
+                Box::new(nested) as ShapeConstraint,
+                filter(30, Some(raw(1)), suffix_calls),
+            ]);
+            let outer = UnionConstraint::new(vec![
+                Box::new(guarded) as ShapeConstraint,
+                filter(40, Some(raw(2)), outer_calls),
+            ]);
+            IntersectionConstraint::new(vec![
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(vec![raw(0), raw(0), raw(1), raw(2), raw(3)]),
+                }) as ShapeConstraint,
+                Box::new(outer) as ShapeConstraint,
+            ])
+        };
+        let silent = || make(fresh(), fresh(), fresh(), fresh(), fresh());
+        let project = |binding: &Binding| binding.get(0).copied();
+
+        let plan = ResidualPlan::compile_finite_unions(&silent());
+        assert_eq!(plan.union_arm_count(1), Some(2));
+        assert_eq!(plan.union_arm_span(), 8);
+
+        let mut sequential: Vec<_> = Query::new(silent(), project).sequential().collect();
+        let mut dag: Vec<_> = Query::new(silent(), project).lazy_dag_scheduler().collect();
+        let mut opaque: Vec<_> = Query::new(silent(), project)
+            .solve_residual_state_lazy()
+            .collect();
+        let prefix_calls = fresh();
+        let zero_calls = fresh();
+        let one_calls = fresh();
+        let suffix_calls = fresh();
+        let outer_calls = fresh();
+        let mut lowered: Vec<_> = Query::new(
+            make(
+                Arc::clone(&prefix_calls),
+                Arc::clone(&zero_calls),
+                Arc::clone(&one_calls),
+                Arc::clone(&suffix_calls),
+                Arc::clone(&outer_calls),
+            ),
+            project,
+        )
+        .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+        .collect();
+        sequential.sort_unstable();
+        dag.sort_unstable();
+        opaque.sort_unstable();
+        lowered.sort_unstable();
+
+        assert_eq!(lowered, [raw(1), raw(2)]);
+        assert_eq!(lowered, sequential);
+        assert_eq!(lowered, dag);
+        assert_eq!(lowered, opaque);
+        assert_eq!(*prefix_calls.lock().unwrap(), [5]);
+        assert_eq!(*zero_calls.lock().unwrap(), [5]);
+        assert_eq!(*one_calls.lock().unwrap(), [5]);
+        assert_eq!(*suffix_calls.lock().unwrap(), [2]);
+        assert_eq!(*outer_calls.lock().unwrap(), [5]);
+    }
+
+    #[test]
     fn repeated_finite_union_object_has_distinct_outer_occurrences() {
         let make = || {
             let union = Arc::new(UnionConstraint::new(vec![
@@ -8521,6 +9247,63 @@ mod tests {
         parallel.sort_unstable();
         assert_eq!(parallel, expected);
         assert_eq!(parallel.len(), 128);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn recursive_union_and_frame_survives_parallel_affine_splits() {
+        let make = || {
+            let filter = |estimate, accepted| {
+                parallel_shape(PageFilterLeaf {
+                    variable: 1,
+                    estimate,
+                    accepted,
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                })
+            };
+            let nested =
+                UnionConstraint::new(vec![filter(10, Some(raw(0))), filter(11, Some(raw(1)))]);
+            let guarded = IntersectionConstraint::new(vec![
+                filter(8, None),
+                parallel_shape(nested),
+                filter(30, Some(raw(1))),
+            ]);
+            let outer =
+                UnionConstraint::new(vec![parallel_shape(guarded), filter(40, Some(raw(2)))]);
+            Arc::new(IntersectionConstraint::new(vec![
+                parallel_shape(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new((0..128).map(raw).collect()),
+                }),
+                parallel_shape(FanoutLeaf {
+                    variable: 1,
+                    values: Arc::new(vec![raw(0), raw(0), raw(1), raw(2), raw(3)]),
+                }),
+                parallel_shape(outer),
+            ]))
+        };
+        let project =
+            |binding: &Binding| Some((binding.get(0).copied()?, binding.get(1).copied()?));
+        let mut serial: Vec<_> = Query::new(make(), project)
+            .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+            .cap(128)
+            .start_width(128)
+            .collect();
+        let mut parallel: Vec<_> = with_parallel_workers(4, || {
+            Query::new(make(), project)
+                .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+                .cap(128)
+                .start_width(128)
+                .into_par_iter()
+                .collect()
+        });
+        serial.sort_unstable();
+        parallel.sort_unstable();
+        assert_eq!(parallel, serial);
+        assert_eq!(parallel.len(), 256);
+        assert!(parallel
+            .chunks_exact(2)
+            .all(|pair| pair[0].1 == raw(1) && pair[1].1 == raw(2)));
     }
 
     #[cfg(feature = "parallel")]
