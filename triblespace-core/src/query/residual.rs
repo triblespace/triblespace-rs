@@ -46,6 +46,7 @@
 //! computation while row values remain payload.
 
 use std::cell::RefCell;
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
@@ -1718,16 +1719,19 @@ fn file(
     let rank = desc.rank(leaf_count);
     let (id, known) = interner.intern_with_status(desc, stats);
     let level = worklist.entry(rank).or_default();
-    if let Some(existing) = level.get_mut(&id) {
-        stats.bucket_merges += 1;
-        stats.rows_merged += rows;
-        existing.append(bucket);
-    } else {
-        if known {
-            stats.state_reentries += 1;
-            stats.rows_reentered += rows;
+    match level.entry(id) {
+        Entry::Occupied(mut occupied) => {
+            stats.bucket_merges += 1;
+            stats.rows_merged += rows;
+            occupied.get_mut().append(bucket);
         }
-        level.insert(id, bucket);
+        Entry::Vacant(vacant) => {
+            if known {
+                stats.state_reentries += 1;
+                stats.rows_reentered += rows;
+            }
+            vacant.insert(bucket);
+        }
     }
     Some(ContinuationToken {
         rank,
