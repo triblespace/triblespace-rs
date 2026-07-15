@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use triblespace_core::id::{rngid, ExclusiveId, Id};
 use triblespace_core::inline::encodings::genid::GenId;
+use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace_core::query::residual::ResidualCapabilities;
@@ -112,6 +113,10 @@ impl<'a> Constraint<'a> for CountingPath {
         self.inner.residual_confirm_is_page_local()
     }
 
+    fn residual_delta_confirm_is_grouped(&self) -> bool {
+        self.inner.residual_delta_confirm_is_grouped()
+    }
+
     fn residual_delta_seeds(
         &self,
         variable: VariableId,
@@ -202,6 +207,66 @@ impl<'a> Constraint<'a> for DuplicateParents {
     }
 }
 
+#[derive(Clone)]
+struct OrderedDomain {
+    variable: VariableId,
+    gate: VariableId,
+    values: Vec<RawInline>,
+}
+
+impl<'a> Constraint<'a> for OrderedDomain {
+    fn variables(&self) -> VariableSet {
+        VariableSet::new_singleton(self.variable)
+    }
+
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        if variable != self.variable {
+            return false;
+        }
+        // Let the opposite endpoint bind first, then deliberately win the
+        // proposer choice so the RPQ is exercised as a grouped confirmer.
+        out.fill(
+            if view.col(self.gate).is_some() { 1 } else { 4 },
+            view.len(),
+        );
+        true
+    }
+
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        if variable == self.variable {
+            for row in 0..view.len() {
+                candidates.extend_row(row as u32, self.values.iter().copied());
+            }
+        }
+    }
+
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        if variable == self.variable {
+            candidates.retain(|_, candidate| self.values.contains(candidate));
+        }
+    }
+
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        view.col(self.variable)
+            .is_none_or(|column| view.iter().all(|row| self.values.contains(&row[column])))
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Scheduler {
     Ordinary,
@@ -249,6 +314,36 @@ fn bound_end_root(
     let end_var = Variable::<GenId>::new(END);
     Arc::new(IntersectionConstraint::new(vec![
         Box::new(end_var.is(end)) as DynConstraint,
+        Box::new(CountingPath {
+            inner: RegularPathConstraint::new(set, start_var, end_var, ops),
+            expanded_nodes,
+        }) as DynConstraint,
+    ]))
+}
+
+fn target_confirm_root(
+    set: TribleSet,
+    candidate_variable: VariableId,
+    bound: Inline<GenId>,
+    candidates: Vec<RawInline>,
+    ops: &[PathOp],
+    expanded_nodes: Arc<AtomicUsize>,
+) -> Root {
+    let start_var = Variable::<GenId>::new(START);
+    let end_var = Variable::<GenId>::new(END);
+    let (fixed, gate): (DynConstraint, VariableId) = if candidate_variable == END {
+        (Box::new(start_var.is(bound)), START)
+    } else {
+        assert_eq!(candidate_variable, START);
+        (Box::new(end_var.is(bound)), END)
+    };
+    Arc::new(IntersectionConstraint::new(vec![
+        fixed,
+        Box::new(OrderedDomain {
+            variable: candidate_variable,
+            gate,
+            values: candidates,
+        }) as DynConstraint,
         Box::new(CountingPath {
             inner: RegularPathConstraint::new(set, start_var, end_var, ops),
             expanded_nodes,
@@ -405,6 +500,116 @@ fn all_attr_inverse_and_bound_endpoint_routes_match_oracles() {
 }
 
 #[test]
+fn target_confirm_traverses_once_and_preserves_reachable_duplicate_candidates() {
+    let graph = Graph::new(4, &[(0, 1), (1, 2)]);
+    let forward = repeated(graph.attribute, false);
+    let inverse = repeated(graph.attribute, true);
+    let cases = vec![
+        (
+            END,
+            graph.value(0),
+            forward.clone(),
+            vec![
+                graph.value(2).raw,
+                graph.value(3).raw,
+                graph.value(2).raw,
+                graph.value(1).raw,
+            ],
+            vec![graph.value(2).raw, graph.value(2).raw, graph.value(1).raw],
+            project_end as fn(&Binding) -> Option<RawInline>,
+        ),
+        (
+            END,
+            graph.value(2),
+            inverse.clone(),
+            vec![
+                graph.value(0).raw,
+                graph.value(3).raw,
+                graph.value(0).raw,
+                graph.value(1).raw,
+            ],
+            vec![graph.value(0).raw, graph.value(0).raw, graph.value(1).raw],
+            project_end,
+        ),
+        (
+            START,
+            graph.value(2),
+            forward,
+            vec![
+                graph.value(0).raw,
+                graph.value(3).raw,
+                graph.value(0).raw,
+                graph.value(1).raw,
+            ],
+            vec![graph.value(0).raw, graph.value(0).raw, graph.value(1).raw],
+            project_start,
+        ),
+        (
+            START,
+            graph.value(0),
+            inverse,
+            vec![
+                graph.value(2).raw,
+                graph.value(3).raw,
+                graph.value(2).raw,
+                graph.value(1).raw,
+            ],
+            vec![graph.value(2).raw, graph.value(2).raw, graph.value(1).raw],
+            project_start,
+        ),
+    ];
+
+    for (candidate_variable, bound, ops, candidates, mut expected, project) in cases {
+        let expanded = Arc::new(AtomicUsize::new(0));
+        let root = target_confirm_root(
+            graph.set.clone(),
+            candidate_variable,
+            bound,
+            candidates,
+            &ops,
+            Arc::clone(&expanded),
+        );
+        expected.sort_unstable();
+        assert_eq!(run(root, Scheduler::Residual, project), expected);
+        assert_eq!(
+            expanded.load(Ordering::Relaxed),
+            3,
+            "one traversal should expand each reachable frontier node once"
+        );
+    }
+}
+
+#[test]
+fn bound_literal_endpoint_uses_the_inverse_delta_route() {
+    let mut graph = Graph::new(2, &[]);
+    let literal = Inline::<UnknownInline>::new([0xA5; 32]);
+    graph
+        .set
+        .insert(&Trible::new(&graph.nodes[0], &graph.attribute, &literal));
+    let start_var = Variable::<GenId>::new(START);
+    let end_var = Variable::<UnknownInline>::new(END);
+    let expanded = Arc::new(AtomicUsize::new(0));
+    let root = Arc::new(IntersectionConstraint::new(vec![
+        Box::new(end_var.is(literal)) as DynConstraint,
+        Box::new(CountingPath {
+            inner: RegularPathConstraint::new(
+                graph.set.clone(),
+                start_var,
+                end_var,
+                &repeated(graph.attribute, false),
+            ),
+            expanded_nodes: Arc::clone(&expanded),
+        }) as DynConstraint,
+    ]));
+
+    assert_eq!(
+        run(root, Scheduler::Residual, project_start),
+        vec![graph.value(0).raw]
+    );
+    assert_eq!(expanded.load(Ordering::Relaxed), 2);
+}
+
+#[test]
 fn duplicate_outer_parents_preserve_endpoint_bag_multiplicity() {
     let graph = Graph::new(3, &[(0, 1), (1, 2)]);
     let ops = repeated(graph.attribute, false);
@@ -426,12 +631,12 @@ fn duplicate_outer_parents_preserve_endpoint_bag_multiplicity() {
 #[test]
 fn default_residual_capabilities_keep_plus_opaque() {
     let graph = Graph::new(3, &[(0, 1), (1, 2)]);
-    let expanded = Arc::new(AtomicUsize::new(0));
+    let proposed = Arc::new(AtomicUsize::new(0));
     let root = bound_start_root(
         graph.set.clone(),
         graph.value(0),
         &repeated(graph.attribute, false),
-        Arc::clone(&expanded),
+        Arc::clone(&proposed),
     );
     let mut actual: Vec<_> = Query::new(root, project_end)
         .solve_residual_state_lazy()
@@ -441,9 +646,36 @@ fn default_residual_capabilities_keep_plus_opaque() {
     expected.sort_unstable();
     assert_eq!(actual, expected);
     assert_eq!(
-        expanded.load(Ordering::Relaxed),
+        proposed.load(Ordering::Relaxed),
         0,
-        "cyclic RPQ lowering must remain explicitly opt-in"
+        "cyclic RPQ proposal lowering must remain explicitly opt-in"
+    );
+
+    let confirmed = Arc::new(AtomicUsize::new(0));
+    let root = target_confirm_root(
+        graph.set.clone(),
+        END,
+        graph.value(0),
+        vec![
+            graph.value(2).raw,
+            graph.value(0).raw,
+            graph.value(2).raw,
+            graph.value(1).raw,
+        ],
+        &repeated(graph.attribute, false),
+        Arc::clone(&confirmed),
+    );
+    let mut actual: Vec<_> = Query::new(root, project_end)
+        .solve_residual_state_lazy()
+        .collect();
+    actual.sort_unstable();
+    let mut expected = [graph.value(2).raw, graph.value(2).raw, graph.value(1).raw];
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
+    assert_eq!(
+        confirmed.load(Ordering::Relaxed),
+        0,
+        "cyclic RPQ confirmation lowering must remain explicitly opt-in"
     );
 }
 
@@ -519,18 +751,45 @@ fn generated_small_graphs_match_sequential_and_dag_bags() {
 }
 
 #[test]
-fn star_stays_on_the_opaque_fallback() {
+fn star_concat_union_and_not_attr_stay_on_the_opaque_fallback() {
     let graph = Graph::new(3, &[(0, 1), (1, 2)]);
-    let expanded = Arc::new(AtomicUsize::new(0));
-    let root = bound_start_root(
-        graph.set.clone(),
-        graph.value(0),
-        &[PathOp::Attr(graph.attribute.raw()), PathOp::Star],
-        Arc::clone(&expanded),
-    );
-    let results = run(root, Scheduler::Residual, project_end);
-    let mut expected = vec![graph.value(0).raw, graph.value(1).raw, graph.value(2).raw];
-    expected.sort_unstable();
-    assert_eq!(results, expected);
-    assert_eq!(expanded.load(Ordering::Relaxed), 0);
+    let cases = [
+        vec![PathOp::Attr(graph.attribute.raw()), PathOp::Star],
+        vec![
+            PathOp::Attr(graph.attribute.raw()),
+            PathOp::Attr(graph.attribute.raw()),
+            PathOp::Concat,
+        ],
+        vec![
+            PathOp::Attr(graph.attribute.raw()),
+            PathOp::Attr(graph.attribute.raw()),
+            PathOp::Union,
+        ],
+        vec![PathOp::NotAttr(graph.attribute.raw())],
+    ];
+    for ops in cases {
+        let expanded = Arc::new(AtomicUsize::new(0));
+        let residual = run(
+            bound_start_root(
+                graph.set.clone(),
+                graph.value(0),
+                &ops,
+                Arc::clone(&expanded),
+            ),
+            Scheduler::Residual,
+            project_end,
+        );
+        let dag = run(
+            bound_start_root(
+                graph.set.clone(),
+                graph.value(0),
+                &ops,
+                Arc::new(AtomicUsize::new(0)),
+            ),
+            Scheduler::Dag,
+            project_end,
+        );
+        assert_eq!(residual, dag);
+        assert_eq!(expanded.load(Ordering::Relaxed), 0);
+    }
 }

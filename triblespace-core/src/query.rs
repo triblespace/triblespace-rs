@@ -1020,11 +1020,23 @@ pub trait Constraint<'a> {
         false
     }
 
-    /// Seeds an engine-owned cyclic proposal for each parent row.
+    /// Whether a supported delta confirmation must retain each parent's
+    /// complete ordered candidate group until its cyclic reducer quiesces.
+    ///
+    /// This is separate from `residual_confirm_is_page_local`: the ordinary
+    /// confirmation may be elementwise while the lowered implementation
+    /// intentionally traverses once and filters the immutable original group.
+    #[doc(hidden)]
+    fn residual_delta_confirm_is_grouped(&self) -> bool {
+        false
+    }
+
+    /// Seeds one engine-owned cyclic traversal for each parent row.
     ///
     /// Returning `true` opts this exact `(constraint, variable, bound schema)`
-    /// action into residual delta execution and must append exactly one node
-    /// per input row. The conservative default retains ordinary `propose`.
+    /// proposal or grouped-confirm action into residual delta execution and
+    /// must append exactly one node per input row. The conservative default
+    /// retains the ordinary constraint protocol.
     #[doc(hidden)]
     fn residual_delta_seeds(
         &self,
@@ -1035,7 +1047,7 @@ pub trait Constraint<'a> {
         false
     }
 
-    /// Expands one block of engine-owned cyclic proposal nodes.
+    /// Expands one block of engine-owned cyclic traversal nodes.
     ///
     /// Successors are tagged by input-node index and grouped in ascending tag
     /// order. A constraint that returned `true` from `residual_delta_seeds`
@@ -1110,6 +1122,11 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
     fn residual_confirm_is_page_local(&self) -> bool {
         let inner: &T = self;
         inner.residual_confirm_is_page_local()
+    }
+
+    fn residual_delta_confirm_is_grouped(&self) -> bool {
+        let inner: &T = self;
+        inner.residual_delta_confirm_is_grouped()
     }
 
     fn residual_delta_seeds(
@@ -1192,6 +1209,11 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     fn residual_confirm_is_page_local(&self) -> bool {
         let inner: &T = self;
         inner.residual_confirm_is_page_local()
+    }
+
+    fn residual_delta_confirm_is_grouped(&self) -> bool {
+        let inner: &T = self;
+        inner.residual_delta_confirm_is_grouped()
     }
 
     fn residual_delta_seeds(
