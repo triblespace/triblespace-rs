@@ -1311,7 +1311,7 @@ pub struct ResidualStateStats {
     /// partially survived. These pops deliberately bypass global occupancy
     /// harvesting without changing canonical state identity.
     pub continuation_pops: usize,
-    /// Continuation-cohort pops whose retained receipt occupancy was smaller
+    /// Continuation-cohort pops whose coalesced receipt occupancy was smaller
     /// than the current desired width.
     pub underfilled_continuation_pops: usize,
     /// Pops that left unprocessed parent rows or candidate occurrences live
@@ -3383,10 +3383,10 @@ type Worklist = BTreeMap<usize, BTreeMap<StateId, StateBucket>>;
 /// This token is deliberately absent from [`StateDesc`] and the interner: two
 /// histories with identical future computation retain one semantic state even
 /// while the lazy scheduler temporarily keeps the newly advanced cohort hot.
-/// Single-threaded filing appends at the payload tail, so the receipt bounds a
-/// tail removal without consuming older work. If several receipts target the
-/// same canonical key before selection, the retained receipt may name an
-/// equivalent final tail rather than the literal rows from its own filing.
+/// Single-threaded filing appends at the payload tail. Equal `(rank, state)`
+/// receipts in one transition reduction are coalesced by occupancy, so the
+/// selected token names their complete appended tail without consuming older
+/// work already present under the same canonical key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ContinuationToken {
     rank: usize,
@@ -3447,9 +3447,30 @@ fn prefer_continuation(
     selected: &mut Option<ContinuationToken>,
     candidate: Option<ContinuationToken>,
 ) {
-    if let Some(candidate) = candidate {
-        if selected.is_none_or(|current| candidate.scheduling_key() > current.scheduling_key()) {
-            *selected = Some(candidate);
+    let Some(candidate) = candidate else {
+        return;
+    };
+    let Some(current) = selected else {
+        *selected = Some(candidate);
+        return;
+    };
+    match candidate.scheduling_key().cmp(&current.scheduling_key()) {
+        std::cmp::Ordering::Less => {}
+        std::cmp::Ordering::Greater => *current = candidate,
+        std::cmp::Ordering::Equal => {
+            // No scheduler pop can interleave one continuation reduction.
+            // Equal keys therefore name successive appends to the same bucket,
+            // and checked addition is its exact newly filed tail occupancy.
+            let rows = current
+                .rows
+                .checked_add(candidate.rows)
+                .expect("continuation receipt row occupancy overflow");
+            let candidates = current
+                .candidates
+                .checked_add(candidate.candidates)
+                .expect("continuation receipt candidate occupancy overflow");
+            current.rows = rows;
+            current.candidates = candidates;
         }
     }
 }
@@ -5085,15 +5106,14 @@ impl ResidualStateMachine {
         })
     }
 
-    /// Removes one receipt-bounded chunk from the current canonical tail.
+    /// Removes one coalesced-receipt chunk from the current canonical tail.
     ///
     /// A global strict-deepest flag is insufficient here: another history may
     /// already occupy a deeper state, and an older cohort may already occupy
-    /// this exact state. The token limits the tail cut by one selected receipt,
-    /// preserving DFS latency without changing readiness legality or canonical
-    /// state identity. Equal-key filings may extend that tail before selection,
-    /// so the removed values need not retain receipt-level provenance. The cut
-    /// may deliberately defer the opportunity to merge with older work.
+    /// this exact state. The token limits the tail cut to all equal-key filings
+    /// coalesced by the selected transition, preserving DFS latency without
+    /// changing readiness legality or canonical state identity. The cut may
+    /// deliberately defer the opportunity to merge with older work.
     fn take_continuation(
         &mut self,
         plan: &ResidualPlan,
@@ -6096,12 +6116,12 @@ impl ResidualStateMachine {
 /// immediately prepares a geometrically wider width for later frontier work;
 /// filing any nonempty successor leaves the width unchanged. When a full
 /// Propose or Confirm action files fewer actionable atoms than that width, the
-/// receipt-bounded physical tail becomes hot and outranks cold sibling
+/// coalesced-receipt physical tail becomes hot and outranks cold sibling
 /// harvesting until it emits or dies. Planning splits and readiness pops do not
 /// activate a sprint on their own. With no hot lineage they retain ordinary
 /// batching; within a hot lineage they may continue its deliberate
 /// latency-for-reconvergence tradeoff. The token never changes canonical
-/// identity or consumes work older than the retained receipt bound. With no
+/// identity or consumes work older than the coalesced receipt bound. With no
 /// hot continuation, the deepest live bucket able to fill the width wins; if
 /// none can, the minimum-rank bucket drains through the strict readiness gate.
 /// The cap only bounds geometric width growth.
@@ -6476,7 +6496,7 @@ where
     ///
     /// The first pull uses a one-parent depth-first batch by default. Filing a
     /// nonempty successor preserves that width. When a full proposal or
-    /// confirmation action partially survives, only its receipt-bounded
+    /// confirmation action partially survives, only its coalesced-receipt
     /// physical tail becomes the next continuation; it remains ahead of cold
     /// sibling harvesting until it emits or dies. Planning splits and
     /// readiness-selected work cannot activate a sprint themselves, but may
@@ -12440,18 +12460,36 @@ mod tests {
         let base_estimates = [usize::MAX; 128];
         let expected: Vec<_> = (0..6).map(raw).collect();
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
-        let continuation = file(
+        let desc = ready_desc(1);
+        let first = file(
             &mut machine.worklist,
             &mut machine.interner,
             plan.len(),
-            ready_desc(1),
+            desc.clone(),
             StateBucket::Rows(RowBatch {
-                rows: expected.clone(),
-                row_count: expected.len(),
+                rows: expected[..2].to_vec(),
+                row_count: 2,
             }),
             &mut machine.stats,
         )
-        .expect("fixture files a live continuation cohort");
+        .expect("fixture files the first continuation receipt");
+        let second = file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            plan.len(),
+            desc,
+            StateBucket::Rows(RowBatch {
+                rows: expected[2..].to_vec(),
+                row_count: 4,
+            }),
+            &mut machine.stats,
+        )
+        .expect("fixture files the equal-key continuation receipt");
+        let mut continuation = None;
+        prefer_continuation(&mut continuation, Some(first));
+        prefer_continuation(&mut continuation, Some(second));
+        let continuation = continuation.expect("equal receipts coalesce");
+        assert_eq!(continuation.rows, expected.len());
         machine.continuation = Some(ActiveContinuation::probe_one(continuation));
 
         let mut right = machine
@@ -12719,6 +12757,323 @@ mod tests {
     }
 
     #[test]
+    fn continuation_preference_coalesces_equal_keys_across_interleaved_receipts() {
+        let first = ContinuationToken {
+            rank: 7,
+            state: StateId(3),
+            rows: 2,
+            candidates: 5,
+        };
+        let lower = ContinuationToken {
+            rank: 6,
+            state: StateId(99),
+            rows: 100,
+            candidates: 101,
+        };
+        let equal = ContinuationToken {
+            rank: 7,
+            state: StateId(3),
+            rows: 3,
+            candidates: 7,
+        };
+        let higher = ContinuationToken {
+            rank: 8,
+            state: StateId(1),
+            rows: 11,
+            candidates: 13,
+        };
+        let higher_equal = ContinuationToken {
+            rank: 8,
+            state: StateId(1),
+            rows: 17,
+            candidates: 19,
+        };
+
+        let mut selected = None;
+        for receipt in [first, lower, equal] {
+            prefer_continuation(&mut selected, Some(receipt));
+        }
+        assert_eq!(
+            selected,
+            Some(ContinuationToken {
+                rows: 5,
+                candidates: 12,
+                ..first
+            })
+        );
+
+        prefer_continuation(&mut selected, Some(higher));
+        prefer_continuation(&mut selected, Some(lower));
+        prefer_continuation(&mut selected, Some(higher_equal));
+        assert_eq!(
+            selected,
+            Some(ContinuationToken {
+                rows: 28,
+                candidates: 32,
+                ..higher
+            })
+        );
+    }
+
+    #[test]
+    fn continuation_receipt_coalescing_checks_both_occupancy_dimensions() {
+        for (rows, candidates) in [(usize::MAX, 0), (0, usize::MAX)] {
+            let result = std::panic::catch_unwind(|| {
+                let mut selected = Some(ContinuationToken {
+                    rank: 1,
+                    state: StateId(0),
+                    rows,
+                    candidates,
+                });
+                prefer_continuation(
+                    &mut selected,
+                    Some(ContinuationToken {
+                        rank: 1,
+                        state: StateId(0),
+                        rows: usize::from(rows != 0),
+                        candidates: usize::from(candidates != 0),
+                    }),
+                );
+            });
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn coalesced_zero_width_rows_preserve_affine_multiplicity() {
+        let root = ShapeLeaf(0);
+        let plan = ResidualPlan::compile(&root);
+        let desc = ready_desc(0);
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+
+        let zero_rows = |row_count| {
+            StateBucket::Rows(RowBatch {
+                rows: Vec::new(),
+                row_count,
+            })
+        };
+        let first = file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            plan.len(),
+            desc.clone(),
+            zero_rows(3),
+            &mut machine.stats,
+        );
+        let second = file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            plan.len(),
+            desc.clone(),
+            zero_rows(4),
+            &mut machine.stats,
+        );
+        let mut receipt = None;
+        prefer_continuation(&mut receipt, first);
+        prefer_continuation(&mut receipt, second);
+        let receipt = receipt.expect("virtual rows produce a physical receipt");
+        assert_eq!(receipt.rows, 7);
+
+        let task = machine.take_continuation(&plan, ActiveContinuation::cohort(receipt), 8);
+        let StateBucket::Rows(rows) = task.bucket else {
+            panic!("zero-width continuation changed payload shape")
+        };
+        assert!(rows.rows.is_empty());
+        assert_eq!(rows.row_count, 7);
+        assert_eq!(machine.stats.underfilled_continuation_pops, 1);
+        assert!(machine.worklist.is_empty());
+    }
+
+    #[test]
+    fn coalesced_candidate_page_receipts_track_candidate_and_formula_tails() {
+        let coalesce = |first, second| {
+            let mut receipt = None;
+            prefer_continuation(&mut receipt, first);
+            prefer_continuation(&mut receipt, second);
+            receipt.expect("equal candidate-page receipts coalesce")
+        };
+
+        let candidate_root = IntersectionConstraint::new(vec![
+            CapabilityLeaf {
+                variable: 0,
+                page_local: false,
+            },
+            CapabilityLeaf {
+                variable: 0,
+                page_local: true,
+            },
+        ]);
+        let candidate_plan = ResidualPlan::compile(&candidate_root);
+        let mut relevant = ChildSet::empty(candidate_plan.len());
+        relevant.insert(0);
+        relevant.insert(1);
+        let checked = ChildSet::empty(candidate_plan.len()).with_inserted(0);
+        let candidate_desc = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Candidate {
+                variable: 0,
+                relevant,
+                checked,
+            },
+        };
+        assert!(candidate_desc.uses_candidate_pages(&candidate_plan));
+        let candidate_bucket = |row_count, candidates| {
+            StateBucket::Candidates(CandidateBatch {
+                parents: RowBatch {
+                    rows: Vec::new(),
+                    row_count,
+                },
+                candidates,
+            })
+        };
+        let mut candidate_machine = ResidualStateMachine::new(
+            candidate_root.variables(),
+            candidate_plan.len(),
+            Search::Done,
+        );
+        let first = file_with_plan(
+            &mut candidate_machine.worklist,
+            &mut candidate_machine.interner,
+            &candidate_plan,
+            candidate_desc.clone(),
+            candidate_bucket(1, vec![(0, raw(10)), (0, raw(11))]),
+            &mut candidate_machine.stats,
+        );
+        let second = file_with_plan(
+            &mut candidate_machine.worklist,
+            &mut candidate_machine.interner,
+            &candidate_plan,
+            candidate_desc.clone(),
+            candidate_bucket(2, vec![(0, raw(12)), (1, raw(13)), (1, raw(14))]),
+            &mut candidate_machine.stats,
+        );
+        let candidate_receipt = coalesce(first, second);
+        assert_eq!(candidate_receipt.rows, 3);
+        assert_eq!(candidate_receipt.candidates, 5);
+
+        let task = candidate_machine.take_continuation(
+            &candidate_plan,
+            ActiveContinuation::cohort(candidate_receipt),
+            4,
+        );
+        let StateBucket::Candidates(page) = task.bucket else {
+            panic!("candidate-page receipt changed payload shape")
+        };
+        assert_eq!(page.parents.row_count, 3);
+        assert_eq!(
+            page.candidates,
+            [(0, raw(11)), (1, raw(12)), (2, raw(13)), (2, raw(14)),]
+        );
+        assert_eq!(candidate_machine.stats.underfilled_continuation_pops, 0);
+        let StateBucket::Candidates(remainder) = candidate_machine
+            .worklist
+            .get(&candidate_receipt.rank)
+            .and_then(|level| level.get(&candidate_receipt.state))
+            .expect("the bisected hot parent remains")
+        else {
+            panic!("candidate remainder changed payload shape")
+        };
+        assert_eq!(remainder.parents.row_count, 1);
+        assert_eq!(remainder.candidates, [(0, raw(10))]);
+
+        let formula_root = IntersectionConstraint::new(vec![
+            CapabilityLeaf {
+                variable: 0,
+                page_local: false,
+            },
+            CapabilityLeaf {
+                variable: 0,
+                page_local: true,
+            },
+        ]);
+        let formula_plan = ResidualPlan::compile_capabilities(
+            &formula_root,
+            ResidualCapabilities::default().root_formula(),
+        );
+        let relevant = ChildSet::empty(formula_plan.len()).with_inserted(0);
+        let start = formula_plan
+            .finite_formula
+            .start(0, 0, UnionVerb::Propose { relevant });
+        let action = formula_plan
+            .finite_formula
+            .select_child_as_action(&start, 0);
+        let completed = formula_plan.finite_formula.complete(&action);
+        let FormulaSuccessor::Formula(counter) = formula_plan.finite_formula.resume(&completed)
+        else {
+            panic!("root AND proposer did not return to its confirmation suffix")
+        };
+        let formula_desc = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Formula { counter },
+        };
+        assert!(formula_desc.uses_candidate_pages(&formula_plan));
+        let formula_bucket = |activations, row_count, current| {
+            StateBucket::Formula(FormulaBatch {
+                activations,
+                parents: RowBatch {
+                    rows: Vec::new(),
+                    row_count,
+                },
+                frames: vec![FormulaPayloadFrame::And { current }],
+            })
+        };
+        let mut formula_machine =
+            ResidualStateMachine::new(formula_root.variables(), formula_plan.len(), Search::Done);
+        let first = file_with_plan(
+            &mut formula_machine.worklist,
+            &mut formula_machine.interner,
+            &formula_plan,
+            formula_desc.clone(),
+            formula_bucket(vec![ActivationId(10)], 1, vec![(0, raw(10)), (0, raw(11))]),
+            &mut formula_machine.stats,
+        );
+        let second = file_with_plan(
+            &mut formula_machine.worklist,
+            &mut formula_machine.interner,
+            &formula_plan,
+            formula_desc,
+            formula_bucket(
+                vec![ActivationId(11), ActivationId(12)],
+                2,
+                vec![(0, raw(12)), (1, raw(13)), (1, raw(14))],
+            ),
+            &mut formula_machine.stats,
+        );
+        let formula_receipt = coalesce(first, second);
+        assert_eq!(formula_receipt.rows, 3);
+        assert_eq!(formula_receipt.candidates, 5);
+
+        let task = formula_machine.take_continuation(
+            &formula_plan,
+            ActiveContinuation::cohort(formula_receipt),
+            8,
+        );
+        let StateBucket::Formula(page) = task.bucket else {
+            panic!("formula-page receipt changed payload shape")
+        };
+        assert_eq!(
+            page.activations,
+            [ActivationId(10), ActivationId(11), ActivationId(12)]
+        );
+        assert_eq!(page.parents.row_count, 3);
+        let [FormulaPayloadFrame::And { current }] = page.frames.as_slice() else {
+            panic!("formula continuation lost its root AND frame")
+        };
+        assert_eq!(
+            current,
+            &vec![
+                (0, raw(10)),
+                (0, raw(11)),
+                (1, raw(12)),
+                (2, raw(13)),
+                (2, raw(14)),
+            ]
+        );
+        assert_eq!(formula_machine.stats.underfilled_continuation_pops, 1);
+        assert!(formula_machine.worklist.is_empty());
+    }
+
+    #[test]
     fn continuation_token_cuts_only_the_new_tail_of_a_merged_state() {
         const PARENT: VariableId = 0;
         const VARIABLE: VariableId = 1;
@@ -12846,7 +13201,7 @@ mod tests {
             }),
             &mut machine.stats,
         );
-        let hot = file(
+        let first_hot = file(
             &mut machine.worklist,
             &mut machine.interner,
             plan.len(),
@@ -12857,7 +13212,24 @@ mod tests {
             }),
             &mut machine.stats,
         )
-        .expect("hot cohort is nonempty");
+        .expect("first hot receipt is nonempty");
+        let second_hot = file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            plan.len(),
+            desc.clone(),
+            StateBucket::Rows(RowBatch {
+                rows: [44, 45, 46, 47].map(raw).into(),
+                row_count: 4,
+            }),
+            &mut machine.stats,
+        )
+        .expect("equal-key hot receipt is nonempty");
+        let mut hot = None;
+        prefer_continuation(&mut hot, Some(first_hot));
+        prefer_continuation(&mut hot, Some(second_hot));
+        let hot = hot.expect("equal-key hot receipts coalesce");
+        assert_eq!(hot.rows, 8);
         machine.continuation = Some(ActiveContinuation::probe_one(hot));
 
         let mut missed = machine.clone();
@@ -12872,7 +13244,7 @@ mod tests {
             let StateBucket::Rows(rows) = task.bucket else {
                 panic!("ready probe changed payload shape")
             };
-            assert_eq!(rows.rows, [raw(43)]);
+            assert_eq!(rows.rows, [raw(47)]);
             assert_eq!(rows.row_count, 1);
         }
 
@@ -12913,22 +13285,23 @@ mod tests {
         };
         assert_eq!(
             cold.rows,
-            [10, 11, 12, 40, 41, 42]
+            [12, 40, 41, 42, 43, 44, 45, 46]
                 .map(raw)
                 .into_iter()
                 .collect::<Vec<_>>()
         );
-        assert_eq!(cold.row_count, 6);
+        assert_eq!(cold.row_count, 8);
         assert_eq!(machine.width, 8);
         assert_eq!(missed.width, 8);
         assert_eq!(machine.stats.delta_handoff_probe_pops, 1);
         assert_eq!(missed.stats.delta_handoff_probe_pops, 1);
+        assert_eq!(machine.stats.underfilled_continuation_pops, 1);
+        assert_eq!(missed.stats.underfilled_continuation_pops, 0);
     }
 
     #[test]
     fn mixed_delta_feedback_arms_probe_without_widening() {
-        let mut machine =
-            ResidualStateMachine::new(VariableSet::new_empty(), 1, Search::Done);
+        let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 1, Search::Done);
         machine.width = 4;
         machine.cap = 64;
         let token = ContinuationToken {
