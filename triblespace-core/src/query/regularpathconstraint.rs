@@ -17,6 +17,7 @@ use crate::query::EstimateSink;
 use crate::query::Query;
 use crate::query::ResidualDeltaNode;
 use crate::query::ResidualDeltaOutput;
+use crate::query::ResidualDeltaSeed;
 use crate::query::RowsView;
 use crate::query::TriblePattern;
 use crate::query::Variable;
@@ -991,6 +992,16 @@ struct DeltaProgram {
     steps: Vec<Vec<(DeltaStep, u32)>>,
 }
 
+enum ResidualDeltaRoute<'p> {
+    BoundEndpoint {
+        source: VariableId,
+        program: &'p DeltaProgram,
+    },
+    SameVariable {
+        program: &'p DeltaProgram,
+    },
+}
+
 impl DeltaProgram {
     fn compile(expr: &PathExpr) -> Self {
         fn state(states: &mut Vec<ThompsonState>) -> u32 {
@@ -1173,18 +1184,45 @@ impl RegularPathConstraint {
         term_set.into_iter().collect()
     }
 
+    /// Exact speculative sources for an unbound `?x expr ?x` action.
+    ///
+    /// Nullable expressions admit the complete graph-term universe. A
+    /// non-nullable cycle must both leave and re-enter its source, so the
+    /// intersection of the forward and inverse FIRST seed sets is an exact
+    /// candidate superset and avoids roots that cannot possibly close.
+    fn same_variable_sources(&self) -> Vec<RawInline> {
+        if nullable(&self.expr) {
+            self.all_terms()
+        } else {
+            let firsts = first_step_seeds(&self.set, &self.expr);
+            let lasts = first_step_seeds(&self.set, &self.inverse_expr);
+            firsts.intersection(&lasts).copied().collect()
+        }
+    }
+
     /// Selects the automaton orientation for a bound-endpoint fixpoint.
     /// Finite expressions retain their WCO/ordinary path; every expression
     /// with repetition uses the same product-state program regardless of its
     /// inner Concat, Union, Optional, inverse, or negated-attribute structure.
-    fn residual_delta_program(&self, variable: VariableId) -> Option<(VariableId, &DeltaProgram)> {
+    fn residual_delta_program(&self, variable: VariableId) -> Option<ResidualDeltaRoute<'_>> {
         if self.start == self.end {
-            return None;
+            if variable != self.start {
+                return None;
+            }
+            return Some(ResidualDeltaRoute::SameVariable {
+                program: self.delta_program.as_ref()?,
+            });
         }
         if variable == self.end {
-            Some((self.start, self.delta_program.as_ref()?))
+            Some(ResidualDeltaRoute::BoundEndpoint {
+                source: self.start,
+                program: self.delta_program.as_ref()?,
+            })
         } else if variable == self.start {
-            Some((self.end, self.inverse_delta_program.as_ref()?))
+            Some(ResidualDeltaRoute::BoundEndpoint {
+                source: self.end,
+                program: self.inverse_delta_program.as_ref()?,
+            })
         } else {
             None
         }
@@ -1193,6 +1231,7 @@ impl RegularPathConstraint {
     fn expand_delta_program(
         &self,
         program: &DeltaProgram,
+        same_variable: bool,
         nodes: &[ResidualDeltaNode],
         successors: &mut Vec<(u32, ResidualDeltaOutput)>,
     ) {
@@ -1201,12 +1240,18 @@ impl RegularPathConstraint {
             let state = program.decode(node.continuation);
             for &(step, target) in &program.steps[state] {
                 let continuation = program.encode(target);
-                let accepted = program.accepting[target as usize];
                 let mut push = |value| {
+                    let accepted = program.accepting[target as usize]
+                        && (!same_variable
+                            || value
+                                == node
+                                    .source
+                                    .expect("same-variable delta activation lost its source"));
                     successors.push((
                         index,
                         ResidualDeltaOutput {
                             node: ResidualDeltaNode {
+                                source: node.source,
                                 value,
                                 continuation,
                             },
@@ -1313,13 +1358,7 @@ impl RegularPathConstraint {
             // must both LEAVE the node (FIRST step) and RE-ENTER it
             // (LAST step = FIRST of the inverse), so intersect the
             // two seed sets instead of enumerating all_terms().
-            let candidates: Vec<RawInline> = if nullable(&self.expr) {
-                self.all_terms()
-            } else {
-                let firsts = first_step_seeds(&self.set, &self.expr);
-                let lasts = first_step_seeds(&self.set, &self.inverse_expr);
-                firsts.intersection(&lasts).copied().collect()
-            };
+            let candidates = self.same_variable_sources();
             proposals.extend(
                 candidates
                     .into_iter()
@@ -1496,32 +1535,62 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
     }
 
     fn residual_delta_confirm_is_grouped(&self) -> bool {
-        self.start != self.end && has_repetition(&self.expr)
+        has_repetition(&self.expr)
     }
 
     fn residual_delta_seeds(
         &self,
         variable: VariableId,
         view: &RowsView<'_>,
-        seeds: &mut Vec<ResidualDeltaOutput>,
+        seeds: &mut Vec<ResidualDeltaSeed>,
     ) -> bool {
-        let Some((source, program)) = self.residual_delta_program(variable) else {
+        let Some(route) = self.residual_delta_program(variable) else {
             return false;
         };
-        let Some(column) = view.col(source) else {
-            return false;
-        };
-        seeds.extend(view.iter().map(|row| {
-            let value = row[column];
-            ResidualDeltaOutput {
-                node: ResidualDeltaNode {
-                    value,
-                    continuation: program.encode(program.start),
-                },
-                accepted: program.accepting[program.start as usize]
-                    && is_graph_term(&self.set, &value),
+        match route {
+            ResidualDeltaRoute::BoundEndpoint { source, program } => {
+                let Some(column) = view.col(source) else {
+                    return false;
+                };
+                seeds.extend(view.iter().enumerate().map(|(parent, row)| {
+                    let value = row[column];
+                    ResidualDeltaSeed {
+                        parent: u32::try_from(parent).expect("too many residual parent rows"),
+                        output: ResidualDeltaOutput {
+                            node: ResidualDeltaNode {
+                                source: None,
+                                value,
+                                continuation: program.encode(program.start),
+                            },
+                            accepted: program.accepting[program.start as usize]
+                                && is_graph_term(&self.set, &value),
+                        },
+                    }
+                }));
             }
-        }));
+            ResidualDeltaRoute::SameVariable { program } => {
+                if view.col(variable).is_some() {
+                    return false;
+                }
+                let sources = self.same_variable_sources();
+                for parent in 0..view.len() {
+                    let parent = u32::try_from(parent).expect("too many residual parent rows");
+                    seeds.extend(sources.iter().map(|&source| ResidualDeltaSeed {
+                        parent,
+                        output: ResidualDeltaOutput {
+                            node: ResidualDeltaNode {
+                                source: Some(source),
+                                value: source,
+                                continuation: program.encode(program.start),
+                            },
+                            // Every speculative source comes from NODES(G), so
+                            // epsilon acceptance is already graph-gated.
+                            accepted: program.accepting[program.start as usize],
+                        },
+                    }));
+                }
+            }
+        }
         true
     }
 
@@ -1531,10 +1600,14 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         nodes: &[ResidualDeltaNode],
         successors: &mut Vec<(u32, ResidualDeltaOutput)>,
     ) -> bool {
-        let Some((_, program)) = self.residual_delta_program(variable) else {
+        let Some(route) = self.residual_delta_program(variable) else {
             return false;
         };
-        self.expand_delta_program(program, nodes, successors);
+        let (program, same_variable) = match route {
+            ResidualDeltaRoute::BoundEndpoint { program, .. } => (program, false),
+            ResidualDeltaRoute::SameVariable { program } => (program, true),
+        };
+        self.expand_delta_program(program, same_variable, nodes, successors);
         true
     }
 

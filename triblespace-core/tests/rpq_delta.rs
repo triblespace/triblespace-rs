@@ -9,8 +9,8 @@ use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace_core::query::residual::ResidualCapabilities;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, ConstraintShape, EstimateSink, PathOp, Query,
-    RegularPathConstraint, ResidualDeltaNode, ResidualDeltaOutput, RowsView, Variable, VariableId,
-    VariableSet,
+    RegularPathConstraint, ResidualDeltaNode, ResidualDeltaOutput, ResidualDeltaSeed, RowsView,
+    Variable, VariableId, VariableSet,
 };
 use triblespace_core::trible::{Trible, TribleSet};
 
@@ -71,6 +71,7 @@ fn other_attribute() -> Id {
 
 struct CountingPath {
     inner: RegularPathConstraint,
+    seeded_roots: Option<Arc<AtomicUsize>>,
     expanded_nodes: Arc<AtomicUsize>,
 }
 
@@ -130,9 +131,16 @@ impl<'a> Constraint<'a> for CountingPath {
         &self,
         variable: VariableId,
         view: &RowsView<'_>,
-        seeds: &mut Vec<ResidualDeltaOutput>,
+        seeds: &mut Vec<ResidualDeltaSeed>,
     ) -> bool {
-        self.inner.residual_delta_seeds(variable, view, seeds)
+        let before = seeds.len();
+        let supported = self.inner.residual_delta_seeds(variable, view, seeds);
+        if supported {
+            if let Some(counter) = &self.seeded_roots {
+                counter.fetch_add(seeds.len() - before, Ordering::Relaxed);
+            }
+        }
+        supported
     }
 
     fn residual_delta_expand(
@@ -220,6 +228,7 @@ impl<'a> Constraint<'a> for DuplicateParents {
 struct OrderedDomain {
     variable: VariableId,
     gate: VariableId,
+    unbound_estimate: usize,
     values: Vec<RawInline>,
 }
 
@@ -240,7 +249,11 @@ impl<'a> Constraint<'a> for OrderedDomain {
         // Let the opposite endpoint bind first, then deliberately win the
         // proposer choice so the RPQ is exercised as a grouped confirmer.
         out.fill(
-            if view.col(self.gate).is_some() { 1 } else { 4 },
+            if view.col(self.gate).is_some() {
+                1
+            } else {
+                self.unbound_estimate
+            },
             view.len(),
         );
         true
@@ -308,6 +321,7 @@ fn bound_start_root(
         Box::new(start_var.is(start)) as DynConstraint,
         Box::new(CountingPath {
             inner: RegularPathConstraint::new(set, start_var, end_var, ops),
+            seeded_roots: None,
             expanded_nodes,
         }) as DynConstraint,
     ]))
@@ -325,6 +339,7 @@ fn bound_end_root(
         Box::new(end_var.is(end)) as DynConstraint,
         Box::new(CountingPath {
             inner: RegularPathConstraint::new(set, start_var, end_var, ops),
+            seeded_roots: None,
             expanded_nodes,
         }) as DynConstraint,
     ]))
@@ -351,10 +366,12 @@ fn target_confirm_root(
         Box::new(OrderedDomain {
             variable: candidate_variable,
             gate,
+            unbound_estimate: 4,
             values: candidates,
         }) as DynConstraint,
         Box::new(CountingPath {
             inner: RegularPathConstraint::new(set, start_var, end_var, ops),
+            seeded_roots: None,
             expanded_nodes,
         }) as DynConstraint,
     ]))
@@ -375,6 +392,7 @@ fn duplicate_parent_root(
         }) as DynConstraint,
         Box::new(CountingPath {
             inner: RegularPathConstraint::new(set, start_var, end_var, ops),
+            seeded_roots: None,
             expanded_nodes: Arc::new(AtomicUsize::new(0)),
         }) as DynConstraint,
     ]))
@@ -384,8 +402,46 @@ fn same_variable_root(set: TribleSet, ops: &[PathOp], expanded_nodes: Arc<Atomic
     let node = Variable::<GenId>::new(START);
     Arc::new(IntersectionConstraint::new(vec![Box::new(CountingPath {
         inner: RegularPathConstraint::new(set, node, node, ops),
+        seeded_roots: None,
         expanded_nodes,
     }) as DynConstraint]))
+}
+
+fn counted_same_variable_root(
+    set: TribleSet,
+    ops: &[PathOp],
+    seeded_roots: Arc<AtomicUsize>,
+    expanded_nodes: Arc<AtomicUsize>,
+) -> Root {
+    let node = Variable::<GenId>::new(START);
+    Arc::new(IntersectionConstraint::new(vec![Box::new(CountingPath {
+        inner: RegularPathConstraint::new(set, node, node, ops),
+        seeded_roots: Some(seeded_roots),
+        expanded_nodes,
+    }) as DynConstraint]))
+}
+
+fn same_variable_confirm_root(
+    set: TribleSet,
+    candidates: Vec<RawInline>,
+    ops: &[PathOp],
+    seeded_roots: Arc<AtomicUsize>,
+    expanded_nodes: Arc<AtomicUsize>,
+) -> Root {
+    let node = Variable::<GenId>::new(START);
+    Arc::new(IntersectionConstraint::new(vec![
+        Box::new(OrderedDomain {
+            variable: START,
+            gate: START,
+            unbound_estimate: 0,
+            values: candidates,
+        }) as DynConstraint,
+        Box::new(CountingPath {
+            inner: RegularPathConstraint::new(set, node, node, ops),
+            seeded_roots: Some(seeded_roots),
+            expanded_nodes,
+        }) as DynConstraint,
+    ]))
 }
 
 fn same_variable_outer_root(
@@ -399,10 +455,12 @@ fn same_variable_outer_root(
         Box::new(OrderedDomain {
             variable: OUTER,
             gate: OUTER,
+            unbound_estimate: 0,
             values: outer_values.to_vec(),
         }) as DynConstraint,
         Box::new(CountingPath {
             inner: RegularPathConstraint::new(set, node, node, ops),
+            seeded_roots: None,
             expanded_nodes,
         }) as DynConstraint,
     ]))
@@ -486,6 +544,7 @@ fn same_variable_plus_denotes_nonempty_cycles_not_general_reachability() {
         (3, vec![(0, 1), (1, 2)], vec![]),
         (3, vec![(0, 0), (0, 1), (1, 2)], vec![0]),
         (3, vec![(0, 1), (1, 2), (2, 0)], vec![0, 1, 2]),
+        (4, vec![(0, 2), (1, 2), (2, 1), (3, 0)], vec![1, 2]),
     ];
     for (node_count, edges, cyclic) in cases {
         let graph = Graph::new(node_count, &edges);
@@ -498,6 +557,41 @@ fn same_variable_plus_denotes_nonempty_cycles_not_general_reachability() {
                 expected,
             );
         }
+    }
+}
+
+#[test]
+fn same_variable_product_program_keeps_inverse_direction_inside_the_fixpoint() {
+    let graph = Graph::new(3, &[(0, 1), (2, 1)]);
+    let attribute = PathOp::Attr(graph.attribute.raw());
+    let cases = [
+        (
+            vec![
+                attribute.clone(),
+                attribute.clone(),
+                PathOp::Inverse,
+                PathOp::Concat,
+                PathOp::Plus,
+            ],
+            vec![graph.value(0).raw, graph.value(2).raw],
+        ),
+        (
+            vec![
+                attribute.clone(),
+                PathOp::Inverse,
+                attribute,
+                PathOp::Concat,
+                PathOp::Plus,
+            ],
+            vec![graph.value(1).raw],
+        ),
+    ];
+    for (ops, expected) in cases {
+        assert_all_schedulers(
+            || same_variable_root(graph.set.clone(), &ops, Arc::new(AtomicUsize::new(0))),
+            project_start,
+            expected,
+        );
     }
 }
 
@@ -525,6 +619,146 @@ fn same_variable_star_admits_exactly_the_graph_term_universe() {
 }
 
 #[test]
+fn same_variable_confirm_preserves_order_duplicates_and_graph_term_scope() {
+    let mut graph = Graph::new(5, &[(0, 0), (1, 2), (2, 1)]);
+    let other = other_attribute();
+    graph
+        .set
+        .insert(&Trible::new(&graph.nodes[3], &other, &graph.value(4)));
+    let absent = genid(&rngid().id).raw;
+    let original = vec![
+        (0, graph.value(3).raw),
+        (0, absent),
+        (0, graph.value(0).raw),
+        (0, graph.value(3).raw),
+        (0, graph.value(1).raw),
+        (0, absent),
+    ];
+    let node = Variable::<GenId>::new(START);
+
+    let plus = RegularPathConstraint::new(
+        graph.set.clone(),
+        node,
+        node,
+        &repeated(graph.attribute, false),
+    );
+    let mut plus_candidates = original.clone();
+    plus.confirm(
+        START,
+        &RowsView::EMPTY,
+        &mut CandidateSink::Tagged(&mut plus_candidates),
+    );
+    assert_eq!(
+        plus_candidates,
+        vec![(0, graph.value(0).raw), (0, graph.value(1).raw)]
+    );
+
+    let star = RegularPathConstraint::new(
+        graph.set.clone(),
+        node,
+        node,
+        &[PathOp::Attr(graph.attribute.raw()), PathOp::Star],
+    );
+    let mut star_candidates = original;
+    star.confirm(
+        START,
+        &RowsView::EMPTY,
+        &mut CandidateSink::Tagged(&mut star_candidates),
+    );
+    assert_eq!(
+        star_candidates,
+        vec![
+            (0, graph.value(3).raw),
+            (0, graph.value(0).raw),
+            (0, graph.value(3).raw),
+            (0, graph.value(1).raw),
+        ]
+    );
+}
+
+#[test]
+fn same_variable_grouped_delta_confirm_filters_one_immutable_sequence() {
+    let mut graph = Graph::new(5, &[(0, 0), (1, 2), (2, 1)]);
+    let other = other_attribute();
+    graph
+        .set
+        .insert(&Trible::new(&graph.nodes[3], &other, &graph.value(4)));
+    let absent = genid(&rngid().id).raw;
+    let candidates = vec![
+        graph.value(3).raw,
+        absent,
+        graph.value(0).raw,
+        graph.value(3).raw,
+        graph.value(1).raw,
+        absent,
+    ];
+    let cases = [
+        (
+            repeated(graph.attribute, false),
+            vec![graph.value(0).raw, graph.value(1).raw],
+            3,
+        ),
+        (
+            vec![PathOp::Attr(graph.attribute.raw()), PathOp::Star],
+            vec![
+                graph.value(3).raw,
+                graph.value(0).raw,
+                graph.value(3).raw,
+                graph.value(1).raw,
+            ],
+            5,
+        ),
+    ];
+    for (ops, expected, expected_roots) in cases {
+        let seeded = Arc::new(AtomicUsize::new(0));
+        let expanded = Arc::new(AtomicUsize::new(0));
+        let root = same_variable_confirm_root(
+            graph.set.clone(),
+            candidates.clone(),
+            &ops,
+            Arc::clone(&seeded),
+            Arc::clone(&expanded),
+        );
+        let actual: Vec<_> = Query::new(root, project_start)
+            .solve_residual_state_lazy_with(combined_effects())
+            .collect();
+        let mut actual_bag = actual;
+        actual_bag.sort_unstable();
+        let mut expected_bag = expected;
+        expected_bag.sort_unstable();
+        assert_eq!(actual_bag, expected_bag);
+        assert_eq!(seeded.load(Ordering::Relaxed), expected_roots);
+        assert!(expanded.load(Ordering::Relaxed) >= expected_roots);
+    }
+}
+
+#[test]
+fn same_variable_sources_do_not_share_seen_at_a_common_term() {
+    // A -> C, B -> C, C -> B is the collision: A rejects after reaching C,
+    // while B must continue through the same C and return to B. D -> A only
+    // makes A survive the exact FIRST/last-source restriction.
+    let graph = Graph::new(4, &[(0, 2), (1, 2), (2, 1), (3, 0)]);
+    let seeded = Arc::new(AtomicUsize::new(0));
+    let expanded = Arc::new(AtomicUsize::new(0));
+    let root = same_variable_confirm_root(
+        graph.set.clone(),
+        vec![graph.value(0).raw, graph.value(1).raw],
+        &repeated(graph.attribute, false),
+        Arc::clone(&seeded),
+        Arc::clone(&expanded),
+    );
+
+    assert_eq!(
+        Query::new(root, project_start)
+            .solve_residual_state_lazy_with(combined_effects())
+            .collect::<Vec<_>>(),
+        vec![graph.value(1).raw]
+    );
+    assert_eq!(seeded.load(Ordering::Relaxed), 3);
+    assert!(expanded.load(Ordering::Relaxed) > 3);
+}
+
+#[test]
 fn same_variable_fixpoint_preserves_duplicate_outer_activations() {
     let graph = Graph::new(2, &[(0, 1), (1, 0)]);
     let outer_values = [genid(&rngid().id).raw, genid(&rngid().id).raw];
@@ -546,6 +780,62 @@ fn same_variable_fixpoint_preserves_duplicate_outer_activations() {
             graph.value(1).raw,
         ],
     );
+}
+
+#[test]
+fn same_variable_delta_streams_after_one_expansion_but_seeds_the_source_universe() {
+    let graph = Graph::new(
+        8,
+        &[
+            (0, 0),
+            (1, 1),
+            (2, 2),
+            (3, 3),
+            (4, 4),
+            (5, 5),
+            (6, 6),
+            (7, 7),
+        ],
+    );
+    let seeded = Arc::new(AtomicUsize::new(0));
+    let expanded = Arc::new(AtomicUsize::new(0));
+    let root = counted_same_variable_root(
+        graph.set.clone(),
+        &repeated(graph.attribute, false),
+        Arc::clone(&seeded),
+        Arc::clone(&expanded),
+    );
+    let mut query =
+        Query::new(root, project_start).solve_residual_state_lazy_with(combined_effects());
+
+    let first = query.next().expect("every source has a self-loop");
+    assert!((0..8).any(|node| first == graph.value(node).raw));
+    assert_eq!(seeded.load(Ordering::Relaxed), 8);
+    assert_eq!(expanded.load(Ordering::Relaxed), 1);
+    drop(query);
+    assert_eq!(expanded.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn same_variable_delta_remains_opt_in() {
+    let graph = Graph::new(1, &[(0, 0)]);
+    let seeded = Arc::new(AtomicUsize::new(0));
+    let expanded = Arc::new(AtomicUsize::new(0));
+    let root = counted_same_variable_root(
+        graph.set.clone(),
+        &repeated(graph.attribute, false),
+        Arc::clone(&seeded),
+        Arc::clone(&expanded),
+    );
+
+    assert_eq!(
+        Query::new(root, project_start)
+            .solve_residual_state_lazy()
+            .collect::<Vec<_>>(),
+        vec![graph.value(0).raw]
+    );
+    assert_eq!(seeded.load(Ordering::Relaxed), 0);
+    assert_eq!(expanded.load(Ordering::Relaxed), 0);
 }
 
 #[test]
@@ -918,6 +1208,7 @@ fn bound_literal_endpoint_uses_the_inverse_delta_route() {
                 end_var,
                 &repeated(graph.attribute, false),
             ),
+            seeded_roots: None,
             expanded_nodes: Arc::clone(&expanded),
         }) as DynConstraint,
     ]));
