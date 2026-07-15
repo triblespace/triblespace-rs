@@ -1008,6 +1008,36 @@ pub trait Constraint<'a> {
     fn residual_confirm_is_page_local(&self) -> bool {
         false
     }
+
+    /// Seeds an engine-owned cyclic proposal for each parent row.
+    ///
+    /// Returning `true` opts this exact `(constraint, variable, bound schema)`
+    /// action into residual delta execution and must append exactly one node
+    /// per input row. The conservative default retains ordinary `propose`.
+    #[doc(hidden)]
+    fn residual_delta_seeds(
+        &self,
+        _variable: VariableId,
+        _view: &RowsView<'_>,
+        _seeds: &mut Vec<RawInline>,
+    ) -> bool {
+        false
+    }
+
+    /// Expands one block of engine-owned cyclic proposal nodes.
+    ///
+    /// Successors are tagged by input-node index and grouped in ascending tag
+    /// order. A constraint that returned `true` from `residual_delta_seeds`
+    /// for an action must return `true` here for the same action.
+    #[doc(hidden)]
+    fn residual_delta_expand(
+        &self,
+        _variable: VariableId,
+        _nodes: &[RawInline],
+        _successors: &mut Vec<(u32, RawInline)>,
+    ) -> bool {
+        false
+    }
 }
 
 impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
@@ -1065,6 +1095,26 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         let inner: &T = self;
         inner.residual_confirm_is_page_local()
     }
+
+    fn residual_delta_seeds(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        seeds: &mut Vec<RawInline>,
+    ) -> bool {
+        let inner: &T = self;
+        inner.residual_delta_seeds(variable, view, seeds)
+    }
+
+    fn residual_delta_expand(
+        &self,
+        variable: VariableId,
+        nodes: &[RawInline],
+        successors: &mut Vec<(u32, RawInline)>,
+    ) -> bool {
+        let inner: &T = self;
+        inner.residual_delta_expand(variable, nodes, successors)
+    }
 }
 
 impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
@@ -1121,6 +1171,26 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     fn residual_confirm_is_page_local(&self) -> bool {
         let inner: &T = self;
         inner.residual_confirm_is_page_local()
+    }
+
+    fn residual_delta_seeds(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        seeds: &mut Vec<RawInline>,
+    ) -> bool {
+        let inner: &T = self;
+        inner.residual_delta_seeds(variable, view, seeds)
+    }
+
+    fn residual_delta_expand(
+        &self,
+        variable: VariableId,
+        nodes: &[RawInline],
+        successors: &mut Vec<(u32, RawInline)>,
+    ) -> bool {
+        let inner: &T = self;
+        inner.residual_delta_expand(variable, nodes, successors)
     }
 }
 

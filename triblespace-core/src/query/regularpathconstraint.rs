@@ -947,6 +947,12 @@ pub struct RegularPathConstraint {
     set: TribleSet,
 }
 
+#[derive(Clone, Copy)]
+enum DeltaAttrRoute {
+    Forward(RawId),
+    Inverse(RawId),
+}
+
 impl RegularPathConstraint {
     /// Creates a path constraint from `start` to `end` over the given
     /// postfix-encoded path operations.
@@ -988,6 +994,67 @@ impl RegularPathConstraint {
             term_set.insert(id_into_value(&e));
         }
         term_set.into_iter().collect()
+    }
+
+    /// The deliberately narrow cyclic lowering admitted by the residual
+    /// scheduler: one repeated positive attribute hop, possibly inverted.
+    /// Proposing the start from a bound end reverses the route.
+    fn delta_attr_route(&self, variable: VariableId) -> Option<(VariableId, DeltaAttrRoute)> {
+        let PathExpr::Plus(body) = &self.expr else {
+            return None;
+        };
+        let route = match body.as_ref() {
+            PathExpr::Attr(attribute) => DeltaAttrRoute::Forward(*attribute),
+            PathExpr::InverseAttr(attribute) => DeltaAttrRoute::Inverse(*attribute),
+            _ => return None,
+        };
+        if variable == self.end && self.start != self.end {
+            Some((self.start, route))
+        } else if variable == self.start && self.start != self.end {
+            let route = match route {
+                DeltaAttrRoute::Forward(attribute) => DeltaAttrRoute::Inverse(attribute),
+                DeltaAttrRoute::Inverse(attribute) => DeltaAttrRoute::Forward(attribute),
+            };
+            Some((self.end, route))
+        } else {
+            None
+        }
+    }
+
+    fn expand_delta_attr(
+        &self,
+        route: DeltaAttrRoute,
+        nodes: &[RawInline],
+        successors: &mut Vec<(u32, RawInline)>,
+    ) {
+        for (index, node) in nodes.iter().enumerate() {
+            let index = u32::try_from(index).expect("too many residual delta nodes");
+            match route {
+                DeltaAttrRoute::Forward(attribute) => {
+                    let Some(entity) = value_as_entity(node) else {
+                        continue;
+                    };
+                    let mut prefix = [0u8; ID_LEN * 2];
+                    prefix[..ID_LEN].copy_from_slice(&entity);
+                    prefix[ID_LEN..].copy_from_slice(&attribute);
+                    self.set
+                        .eav
+                        .infixes::<{ ID_LEN * 2 }, 32, _>(&prefix, |value: &[u8; 32]| {
+                            successors.push((index, *value))
+                        });
+                }
+                DeltaAttrRoute::Inverse(attribute) => {
+                    let mut prefix = [0u8; 32 + ID_LEN];
+                    prefix[..32].copy_from_slice(node);
+                    prefix[32..].copy_from_slice(&attribute);
+                    self.set
+                        .vae
+                        .infixes::<{ 32 + ID_LEN }, ID_LEN, _>(&prefix, |entity: &[u8; ID_LEN]| {
+                            successors.push((index, id_into_value(entity)))
+                        });
+                }
+            }
+        }
     }
 }
 
@@ -1230,6 +1297,35 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
     }
 
     fn residual_confirm_is_page_local(&self) -> bool {
+        true
+    }
+
+    fn residual_delta_seeds(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        seeds: &mut Vec<RawInline>,
+    ) -> bool {
+        let Some((source, _)) = self.delta_attr_route(variable) else {
+            return false;
+        };
+        let Some(column) = view.col(source) else {
+            return false;
+        };
+        seeds.extend(view.iter().map(|row| row[column]));
+        true
+    }
+
+    fn residual_delta_expand(
+        &self,
+        variable: VariableId,
+        nodes: &[RawInline],
+        successors: &mut Vec<(u32, RawInline)>,
+    ) -> bool {
+        let Some((_, route)) = self.delta_attr_route(variable) else {
+            return false;
+        };
+        self.expand_delta_attr(route, nodes, successors);
         true
     }
 
