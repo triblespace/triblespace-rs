@@ -1125,6 +1125,9 @@ fn zero_root_cyclic_and_returns_empty_without_erasing_its_or_sibling() {
         vec![(1, 0, 0)]
     );
     assert_eq!(query.stats().delta_source_pages, 1);
+    assert_eq!(query.stats().delta_source_dead_pages, 0);
+    assert_eq!(query.stats().delta_source_negative_steps, 0);
+    assert!(query.stats().delta_handoff_probe_pops > 0);
 }
 
 #[test]
@@ -1767,6 +1770,8 @@ fn same_variable_negative_source_pages_grow_one_two_four() {
     assert_eq!(query.stats().delta_source_candidates_examined, 7);
     assert_eq!(query.stats().delta_source_roots, 6);
     assert_eq!(query.stats().delta_source_dead_pages, 3);
+    assert_eq!(query.stats().delta_source_negative_steps, 3);
+    assert_eq!(query.stats().delta_handoff_probe_pops, 0);
     assert!(expanded.load(Ordering::Relaxed) >= 6);
 }
 
@@ -1809,6 +1814,8 @@ fn same_variable_late_hit_keeps_the_geometric_negative_prefix() {
     assert_eq!(query.current_width(), 8);
     assert_eq!(query.stats().width_increases, 3);
     assert_eq!(query.stats().delta_source_dead_pages, 2);
+    assert_eq!(query.stats().delta_source_negative_steps, 2);
+    assert_eq!(query.stats().delta_handoff_probe_pops, 1);
     drop(query);
 }
 
