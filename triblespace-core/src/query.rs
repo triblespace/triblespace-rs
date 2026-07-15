@@ -785,6 +785,33 @@ pub struct ResidualDeltaSeed {
     pub output: ResidualDeltaOutput,
 }
 
+/// Borrow-free cursor for a constraint-owned residual source frontier.
+///
+/// The cursor is activation payload, never part of the canonical residual or
+/// delta state identifier. `After(value)` means that the next page must
+/// consider only source candidates strictly greater than `value` in raw-inline
+/// lexicographic order.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ResidualDeltaSourceCursor {
+    Start,
+    After(RawInline),
+}
+
+/// Result metadata for one bounded residual source page.
+///
+/// `examined` counts source candidates consumed from the ordered source
+/// frontier, including candidates rejected by an exact secondary filter. It
+/// must not exceed the requested page limit. `next == None` proves source
+/// exhaustion; otherwise the returned cursor resumes strictly after every
+/// candidate examined by this page.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidualDeltaSourcePage {
+    pub next: Option<ResidualDeltaSourceCursor>,
+    pub examined: usize,
+}
+
 /// Object-safe child access for a structural constraint shape.
 #[doc(hidden)]
 pub trait ConstraintChildren<'a> {
@@ -1074,6 +1101,42 @@ pub trait Constraint<'a> {
         false
     }
 
+    /// Whether this action owns an ordered, page-producing source frontier.
+    ///
+    /// Returning `true` replaces eager [`Self::residual_delta_seeds`] for the
+    /// exact action. The residual engine creates one affine activation per
+    /// parent row and asks [`Self::residual_delta_source_page`] for bounded
+    /// pages only as scheduler demand grows. The answer is structural for the
+    /// supplied bound schema and must remain stable for the solve.
+    #[doc(hidden)]
+    fn residual_delta_source_is_paged(&self, _variable: VariableId, _view: &RowsView<'_>) -> bool {
+        false
+    }
+
+    /// Produce at most `limit` roots from one activation's ordered source
+    /// frontier.
+    ///
+    /// `view` contains exactly one immutable parent row. During grouped
+    /// confirmation, `candidates` is the sorted, deduplicated set of values in
+    /// that parent's immutable original candidate sequence; proposal actions
+    /// pass `None`. Appended roots belong to this one activation and therefore
+    /// carry no parent tags. Returning `Some` declares support and must satisfy
+    /// `page.examined <= limit` plus `roots_added <= page.examined`.
+    /// `page.next` is suspended until every root lineage from this page has
+    /// retired. The conservative default is unsupported.
+    #[doc(hidden)]
+    fn residual_delta_source_page(
+        &self,
+        _variable: VariableId,
+        _view: &RowsView<'_>,
+        _candidates: Option<&[RawInline]>,
+        _cursor: ResidualDeltaSourceCursor,
+        _limit: usize,
+        _roots: &mut Vec<ResidualDeltaOutput>,
+    ) -> Option<ResidualDeltaSourcePage> {
+        None
+    }
+
     /// Seeds zero or more engine-owned cyclic fixpoints for each parent row.
     ///
     /// Returning `true` opts this exact `(constraint, variable, bound schema)`
@@ -1180,6 +1243,24 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.residual_delta_confirm_is_grouped()
     }
 
+    fn residual_delta_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
+        let inner: &T = self;
+        inner.residual_delta_source_is_paged(variable, view)
+    }
+
+    fn residual_delta_source_page(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: Option<&[RawInline]>,
+        cursor: ResidualDeltaSourceCursor,
+        limit: usize,
+        roots: &mut Vec<ResidualDeltaOutput>,
+    ) -> Option<ResidualDeltaSourcePage> {
+        let inner: &T = self;
+        inner.residual_delta_source_page(variable, view, candidates, cursor, limit, roots)
+    }
+
     fn residual_delta_seeds(
         &self,
         variable: VariableId,
@@ -1265,6 +1346,24 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     fn residual_delta_confirm_is_grouped(&self) -> bool {
         let inner: &T = self;
         inner.residual_delta_confirm_is_grouped()
+    }
+
+    fn residual_delta_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
+        let inner: &T = self;
+        inner.residual_delta_source_is_paged(variable, view)
+    }
+
+    fn residual_delta_source_page(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: Option<&[RawInline]>,
+        cursor: ResidualDeltaSourceCursor,
+        limit: usize,
+        roots: &mut Vec<ResidualDeltaOutput>,
+    ) -> Option<ResidualDeltaSourcePage> {
+        let inner: &T = self;
+        inner.residual_delta_source_page(variable, view, candidates, cursor, limit, roots)
     }
 
     fn residual_delta_seeds(

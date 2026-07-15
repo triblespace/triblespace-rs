@@ -14,6 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `next_infix_after` advances a strict bounded cursor without materializing
   matches or depending on cuckoo-table order. Both follow compressed trie paths
   directly and support heap and archive-backed leaves.
+- **Cyclic same-variable RPQs gain bounded ordered source frontiers.**
+  The residual scheduler now pages NODES/FIRST sources at its geometric demand
+  width, suspends each cursor until every product-state lineage from the page
+  retires, and widens on pages that file no stable effect. Source cursors remain
+  activation payload rather than canonical state identity, so equivalent work
+  still merges across parents. Grouped confirmation ranges only over the
+  distinct values in its immutable candidate sequence, then restores original
+  order and multiplicity after the complete fixpoint quiesces.
 - **WGPU Succinct confirmation can opt into exact residual-action executor
   samples.** `WgpuSuccinctArchive::observe_residual_actions()` returns a
   borrowing, non-`Deref` `ObservedWgpuSuccinctArchive` whose pattern route

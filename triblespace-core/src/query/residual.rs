@@ -55,7 +55,7 @@ use std::time::{Duration, Instant};
 use super::*;
 
 mod delta;
-use delta::{DeltaDesc, DeltaScheduler};
+use delta::{DeltaDesc, DeltaScheduler, DeltaStepOutcome};
 
 /// One deterministic route from the owned root to an opaque residual leaf.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -500,6 +500,16 @@ pub struct ResidualStateStats {
     /// Numeric increases of the lazy scheduler's desired actionable width.
     /// Saturated or growth-one attempts do not increment this counter.
     pub width_increases: usize,
+    /// Bounded source-frontier pages requested by cyclic residual lowering.
+    pub delta_source_pages: usize,
+    /// Ordered source candidates consumed across those pages, including
+    /// candidates rejected by an exact secondary source filter.
+    pub delta_source_candidates_examined: usize,
+    /// Product-state roots admitted from bounded source pages.
+    pub delta_source_roots: usize,
+    /// Source pages that retired without filing a stable acyclic effect and
+    /// therefore asked the geometric scheduler to widen.
+    pub delta_source_dead_pages: usize,
 }
 
 /// Results and measurements from [`Query::solve_residual_state_profiled`].
@@ -3756,10 +3766,28 @@ impl ResidualStateMachine {
 
         let vars: Vec<VariableId> = task.desc.bound.into_iter().collect();
         let view = rows_view(&vars, &rows.rows, rows.row_count);
+        let constraint = plan.resolve(root, proposer);
+        if constraint.residual_delta_source_is_paged(variable, &view) {
+            let SelectedResidualTask {
+                state: _,
+                desc,
+                bucket,
+            } = task;
+            let StateBucket::Rows(rows) = bucket else {
+                unreachable!("delta proposer was checked above")
+            };
+            self.stats.propose_action_pops += 1;
+            self.stats.propose_calls += 1;
+            self.stats.propose_rows += rows.row_count;
+            self.stats.max_propose_rows = self.stats.max_propose_rows.max(rows.row_count);
+            self.delta.seed_source_proposals(
+                DeltaDesc::propose(desc.bound, variable, proposer, relevant, checked),
+                rows,
+            );
+            return Ok(());
+        }
         let mut seeds = Vec::new();
-        let supported = plan
-            .resolve(root, proposer)
-            .residual_delta_seeds(variable, &view, &mut seeds);
+        let supported = constraint.residual_delta_seeds(variable, &view, &mut seeds);
         if !supported {
             assert!(
                 seeds.is_empty(),
@@ -3827,10 +3855,32 @@ impl ResidualStateMachine {
         let checked = checked.clone();
         let vars: Vec<VariableId> = task.desc.bound.into_iter().collect();
         let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
+        let constraint = plan.resolve(root, confirmer);
+        if constraint.residual_delta_source_is_paged(variable, &view) {
+            let SelectedResidualTask {
+                state: _,
+                desc,
+                bucket,
+            } = task;
+            let StateBucket::Candidates(batch) = bucket else {
+                unreachable!("delta confirmer was checked above")
+            };
+            let candidates_before = batch.candidate_count();
+            self.stats.confirm_action_pops += 1;
+            self.stats.confirm_calls += 1;
+            self.stats.confirm_rows += batch.parents.row_count;
+            self.stats.max_confirm_rows = self.stats.max_confirm_rows.max(batch.parents.row_count);
+            self.stats.candidates_confirmed += candidates_before;
+            self.stats.max_confirm_candidates =
+                self.stats.max_confirm_candidates.max(candidates_before);
+            self.delta.seed_source_confirms(
+                DeltaDesc::confirm(desc.bound, variable, confirmer, relevant, checked),
+                batch,
+            );
+            return Ok(());
+        }
         let mut seeds = Vec::new();
-        let supported = plan
-            .resolve(root, confirmer)
-            .residual_delta_seeds(variable, &view, &mut seeds);
+        let supported = constraint.residual_delta_seeds(variable, &view, &mut seeds);
         if !supported {
             assert!(
                 seeds.is_empty(),
@@ -3979,14 +4029,20 @@ impl ResidualStateMachine {
                 && !self.delta.is_empty()
                 && !self.has_full_stable(plan, width)
             {
-                self.continuation = self.delta.step(
+                match self.delta.step(
                     root,
                     plan,
                     width,
                     &mut self.worklist,
                     &mut self.interner,
                     &mut self.stats,
-                );
+                ) {
+                    DeltaStepOutcome::Progress => {}
+                    DeltaStepOutcome::Stable(continuation) => {
+                        self.continuation = Some(continuation);
+                    }
+                    DeltaStepOutcome::DeadPage => self.increase_width(),
+                }
                 continue;
             }
             match self.pop_once(root, plan, influences, base_estimates, width) {
@@ -4260,14 +4316,19 @@ impl ResidualStateMachine {
             // rather than manufacturing a second query from the seed.
             let width = self.width.max(1);
             if !self.delta.is_empty() && !self.has_full_stable(plan, width) {
-                let _ = self.delta.step(
-                    root,
-                    plan,
-                    width,
-                    &mut self.worklist,
-                    &mut self.interner,
-                    &mut self.stats,
-                );
+                if matches!(
+                    self.delta.step(
+                        root,
+                        plan,
+                        width,
+                        &mut self.worklist,
+                        &mut self.interner,
+                        &mut self.stats,
+                    ),
+                    DeltaStepOutcome::DeadPage
+                ) {
+                    self.increase_width();
+                }
                 continue;
             }
             if self.worklist.is_empty() {
