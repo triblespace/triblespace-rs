@@ -51,6 +51,40 @@ let gpu = WgpuSuccinctArchive::new(archive).expect("prepare succinct archive on 
 # }
 ```
 
+Residual-action executor samples are a second, explicit opt-in. Bind the
+borrowing adapter before constructing the pattern so the GAT-produced
+constraint can retain that borrow:
+
+```rust,ignore
+let observed_gpu = gpu.observe_residual_actions();
+let query = Query::new(
+    and!(allowed.has(value), observed_gpu.pattern(entity, attribute, value)),
+    project,
+);
+let solve = query
+    .solve_residual_state_lazy()
+    .shadow(ResidualShadowEpoch::new())
+    .collect_profiled();
+```
+
+The adapter intentionally has no `Deref` implementation: using `gpu.pattern`
+remains the direct, unobserved path and performs no residual-action TLS lookup,
+clock read, or sample work. The adapter observes only tagged whole-frontier
+Succinct `confirm` rank streams, not planning, proposals, scalar sinks, domain
+lookups, or unrelated CPU work. Outside a current observed action it executes
+normally without a sample, and an empty rank stream likewise attaches none.
+
+Each nonempty invocation records its exact probe count in `rank-probes`. A
+batch below the immutable admission threshold is labelled
+`cpu` / `wavelet-rank/threshold-fallback`; an admitted device call is labelled
+`wgpu` / `wavelet-rank/gpu-round-trip`. The route is the private per-call route
+actually executed, not an inference from aggregate statistics. Executor wall
+time covers only the CPU ranks or the synchronous WGPU
+upload/dispatch/synchronization/readback call; route selection, statistics, and
+sample attachment sit outside it. The adapter captures the action correlation
+capability before backend work and carries it explicitly across the WGPU round
+trip instead of consulting ambient TLS after dispatch.
+
 The default admission threshold is 8,192 rank probes (two probes per
 candidate), preserving the historical 4,096-candidate crossover. Smaller
 batches run against the wrapped CPU wavelet matrix. The threshold is explicit

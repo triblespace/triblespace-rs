@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **WGPU Succinct confirmation can opt into exact residual-action executor
+  samples.** `WgpuSuccinctArchive::observe_residual_actions()` returns a
+  borrowing, non-`Deref` `ObservedWgpuSuccinctArchive` whose pattern route
+  attaches only tagged whole-frontier rank streams to the current action.
+  Empty streams and calls outside an observed action attach no sample; the
+  direct wrapper remains free of correlation lookups and clocks. A private
+  per-call route seam truthfully labels threshold CPU work and admitted WGPU
+  round trips, records exact `rank-probes`, and brackets only backend work,
+  leaving route selection, counters, and sample attachment outside the wall
+  measurement.
 - **Residual action shadow observation is opt-in, unwind-safe, and
   cancellation-sound.** A closed epoch proves both affine frontier exhaustion
   and ordinary completion of every begun action; live or aborted actions fail

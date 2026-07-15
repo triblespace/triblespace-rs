@@ -1,6 +1,7 @@
 //! WGPU-resident ring columns for [`SuccinctArchive`] query confirmation.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use jerky::gpu::GpuWaveletMatrix;
 use triblespace_core::blob::encodings::succinctarchive::{
@@ -8,6 +9,9 @@ use triblespace_core::blob::encodings::succinctarchive::{
 };
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::InlineEncoding;
+use triblespace_core::query::residual::{
+    current_residual_action, ActionCorrelation, ExecutorMeasurement,
+};
 use triblespace_core::query::{Term, TriblePattern};
 
 /// Jerky's wavelet matrix resident on the default CubeCL WGPU device.
@@ -19,6 +23,37 @@ pub type WgpuWaveletMatrix = GpuWaveletMatrix<cubecl::wgpu::WgpuRuntime>;
 /// historical 4096-candidate batching threshold while making the device
 /// boundary explicit in the unit actually dispatched.
 pub const DEFAULT_MIN_RANK_BATCH: usize = 8192;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RankRoute {
+    CpuThresholdFallback,
+    WgpuRoundTrip,
+}
+
+impl RankRoute {
+    fn for_batch(probes: usize, min_rank_batch: usize) -> Self {
+        debug_assert_ne!(probes, 0);
+        if probes < min_rank_batch {
+            Self::CpuThresholdFallback
+        } else {
+            Self::WgpuRoundTrip
+        }
+    }
+
+    fn executor(self) -> &'static str {
+        match self {
+            Self::CpuThresholdFallback => "cpu",
+            Self::WgpuRoundTrip => "wgpu",
+        }
+    }
+
+    fn operation(self) -> &'static str {
+        match self {
+            Self::CpuThresholdFallback => "wavelet-rank/threshold-fallback",
+            Self::WgpuRoundTrip => "wavelet-rank/gpu-round-trip",
+        }
+    }
+}
 
 /// Observational counters for one [`WgpuSuccinctArchive`].
 ///
@@ -128,6 +163,40 @@ where
     stats: QueryStats,
 }
 
+/// Opt-in residual-action observation view over a [`WgpuSuccinctArchive`].
+///
+/// Only tagged whole-frontier Succinct `confirm` rank streams pass through
+/// this adapter. The canonical archive still performs planning, proposals,
+/// scalar confirmation, and every other CPU operation without executor
+/// samples. If the adapter is used outside an observed residual action, it
+/// executes exactly like the direct WGPU wrapper and records no sample.
+///
+/// This is a borrowing adapter and intentionally does not implement `Deref`:
+/// bind it before constructing a pattern so the pattern constraint's GAT can
+/// borrow the adapter for the full query lifetime.
+///
+/// ```ignore
+/// let observed_gpu = gpu.observe_residual_actions();
+/// let constraint = observed_gpu.pattern(entity, attribute, value);
+/// ```
+pub struct ObservedWgpuSuccinctArchive<'a, U>
+where
+    U: Universe,
+{
+    inner: &'a WgpuSuccinctArchive<U>,
+}
+
+impl<U> Clone for ObservedWgpuSuccinctArchive<'_, U>
+where
+    U: Universe,
+{
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<U> Copy for ObservedWgpuSuccinctArchive<'_, U> where U: Universe {}
+
 impl<U> WgpuSuccinctArchive<U>
 where
     U: Universe,
@@ -193,6 +262,16 @@ where
         &self.archive
     }
 
+    /// Returns an opt-in view that attaches rank-executor measurements to the
+    /// currently observed residual action.
+    ///
+    /// The direct [`WgpuSuccinctArchive`] pattern path remains unobserved. Bind
+    /// the returned adapter to a local before pattern construction; the
+    /// resulting constraint borrows it through [`TriblePattern`]'s GAT.
+    pub fn observe_residual_actions(&self) -> ObservedWgpuSuccinctArchive<'_, U> {
+        ObservedWgpuSuccinctArchive { inner: self }
+    }
+
     /// Removes the resident adapter and returns its canonical CPU archive.
     pub fn into_archive(self) -> SuccinctArchive<U> {
         self.archive
@@ -208,6 +287,60 @@ where
             SuccinctRotation::Eva => &self.eva_c,
             SuccinctRotation::Aev => &self.aev_c,
         }
+    }
+
+    fn rank_route(&self, probes: usize) -> RankRoute {
+        RankRoute::for_batch(probes, self.min_rank_batch)
+    }
+
+    /// Executes exactly the backend work named by `route`.
+    ///
+    /// Route selection, statistics, clocks, and residual observation stay
+    /// outside this seam so an observed executor wall covers only the rank
+    /// implementation (including WGPU upload/dispatch/sync/readback).
+    fn execute_rank_batch(
+        &self,
+        route: RankRoute,
+        rotation: SuccinctRotation,
+        positions: &[usize],
+        values: &[usize],
+    ) -> Vec<usize> {
+        match route {
+            RankRoute::CpuThresholdFallback => {
+                let wm = self.archive.ring_col(rotation);
+                positions
+                    .iter()
+                    .zip(values)
+                    .map(|(&position, &value)| wm.rank(position, value).unwrap())
+                    .collect()
+            }
+            RankRoute::WgpuRoundTrip => self
+                .ring_col(rotation)
+                .rank_batch(positions, values)
+                .expect("WGPU ring rank batch failed")
+                .into_iter()
+                .map(|rank| rank.expect("canonical confirm emitted an out-of-range rank position"))
+                .collect(),
+        }
+    }
+
+    fn record_rank_route(&self, route: RankRoute, probes: usize) {
+        match route {
+            RankRoute::CpuThresholdFallback => self.stats.record_cpu_fallback(probes),
+            RankRoute::WgpuRoundTrip => self.stats.record_gpu(probes),
+        }
+    }
+
+    fn rank_batch_nonempty(
+        &self,
+        rotation: SuccinctRotation,
+        positions: &[usize],
+        values: &[usize],
+    ) -> Vec<usize> {
+        let route = self.rank_route(positions.len());
+        let ranks = self.execute_rank_batch(route, rotation, positions, values);
+        self.record_rank_route(route, positions.len());
+        ranks
     }
 }
 
@@ -229,25 +362,72 @@ where
         if positions.is_empty() {
             return Vec::new();
         }
-        if positions.len() < self.min_rank_batch {
-            let wm = self.archive.ring_col(rotation);
-            let ranks = positions
-                .iter()
-                .zip(values)
-                .map(|(&position, &value)| wm.rank(position, value).unwrap())
-                .collect();
-            self.stats.record_cpu_fallback(positions.len());
-            return ranks;
+        self.rank_batch_nonempty(rotation, positions, values)
+    }
+}
+
+impl<U> RingBatchQuery for ObservedWgpuSuccinctArchive<'_, U>
+where
+    U: Universe + Send + Sync,
+{
+    fn rank_batch(
+        &self,
+        rotation: SuccinctRotation,
+        positions: &[usize],
+        values: &[usize],
+    ) -> Vec<usize> {
+        assert_eq!(
+            positions.len(),
+            values.len(),
+            "ring rank positions and values must have equal lengths"
+        );
+        // Empty streams are not executor work and must not even consult the
+        // residual-action TLS seam.
+        if positions.is_empty() {
+            return Vec::new();
         }
 
+        let Some(correlation) = current_residual_action() else {
+            return self.inner.rank_batch_nonempty(rotation, positions, values);
+        };
+        self.rank_batch_observed(correlation, rotation, positions, values)
+    }
+}
+
+impl<U> ObservedWgpuSuccinctArchive<'_, U>
+where
+    U: Universe + Send + Sync,
+{
+    fn rank_batch_observed(
+        &self,
+        correlation: ActionCorrelation,
+        rotation: SuccinctRotation,
+        positions: &[usize],
+        values: &[usize],
+    ) -> Vec<usize> {
+        let route = self.inner.rank_route(positions.len());
+        // Capture the capability before backend execution. CubeCL may execute
+        // device work asynchronously, but attribution never relies on TLS
+        // after this point; the synchronous rank API returns only after the
+        // complete GPU round trip (or panics).
+        let started = correlation.elapsed();
+        let backend_started = Instant::now();
         let ranks = self
-            .ring_col(rotation)
-            .rank_batch(positions, values)
-            .expect("WGPU ring rank batch failed")
-            .into_iter()
-            .map(|rank| rank.expect("canonical confirm emitted an out-of-range rank position"))
-            .collect();
-        self.stats.record_gpu(positions.len());
+            .inner
+            .execute_rank_batch(route, rotation, positions, values);
+        let wall = backend_started.elapsed();
+
+        // Existing stats and sample attachment are diagnostics outside the
+        // measured executor wall and cannot influence route selection.
+        self.inner.record_rank_route(route, positions.len());
+        correlation.record_executor_sample(ExecutorMeasurement {
+            executor: route.executor(),
+            operation: route.operation(),
+            work_unit: "rank-probes",
+            work_units: positions.len(),
+            started,
+            wall,
+        });
         ranks
     }
 }
@@ -268,5 +448,49 @@ where
         v: impl Into<Term<V>>,
     ) -> Self::PatternConstraint<'a> {
         SuccinctArchiveConstraint::with_ring_batch(e, a, v, &self.archive, self)
+    }
+}
+
+impl<U> TriblePattern for ObservedWgpuSuccinctArchive<'_, U>
+where
+    U: Universe + Send + Sync,
+{
+    type PatternConstraint<'a>
+        = SuccinctArchiveConstraint<'a, U>
+    where
+        Self: 'a;
+
+    fn pattern<'a, V: InlineEncoding>(
+        &'a self,
+        e: impl Into<Term<GenId>>,
+        a: impl Into<Term<GenId>>,
+        v: impl Into<Term<V>>,
+    ) -> Self::PatternConstraint<'a> {
+        SuccinctArchiveConstraint::with_ring_batch(e, a, v, self.inner.archive(), self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use triblespace_core::blob::encodings::succinctarchive::OrderedUniverse;
+
+    #[test]
+    fn rank_route_boundary_and_labels_are_exact() {
+        let cpu = RankRoute::for_batch(7, 8);
+        assert_eq!(cpu, RankRoute::CpuThresholdFallback);
+        assert_eq!(cpu.executor(), "cpu");
+        assert_eq!(cpu.operation(), "wavelet-rank/threshold-fallback");
+
+        let wgpu = RankRoute::for_batch(8, 8);
+        assert_eq!(wgpu, RankRoute::WgpuRoundTrip);
+        assert_eq!(wgpu.executor(), "wgpu");
+        assert_eq!(wgpu.operation(), "wavelet-rank/gpu-round-trip");
+    }
+
+    #[test]
+    fn observed_adapter_is_copy_send_and_sync_without_universe_copy() {
+        fn assert_copy_send_sync<T: Copy + Send + Sync>() {}
+        assert_copy_send_sync::<ObservedWgpuSuccinctArchive<'static, OrderedUniverse>>();
     }
 }

@@ -390,6 +390,27 @@ either executor, while fat batches amortize fixed dispatch/readback costs and
 use the device's rank throughput. `WgpuSuccinctArchive::stats` exposes
 dispatches, fallbacks, probe totals, and batch extrema so backend/scheduler
 economics are observable rather than hidden in a planner heuristic.
+`WgpuSuccinctArchive::observe_residual_actions()` returns a borrowing,
+non-`Deref` adapter for the additional opt-in executor bridge. Bind that adapter
+before pattern construction so the GAT-produced constraint can borrow it for
+the full query lifetime. The direct `WgpuSuccinctArchive` pattern path remains
+structurally unobserved and performs no action-correlation lookup, clock read,
+or sample work.
+
+The adapter samples only tagged whole-frontier Succinct confirmation rank
+streams. It does not reinterpret all CPU work inside the action as archive
+work, and planning, proposal, scalar confirmation, domain lookup, and
+satisfaction remain unsampled. An empty rank stream records nothing; a
+nonempty call outside a current observed action executes normally without a
+sample. Exact work is `positions.len()` in `rank-probes`. Threshold fallbacks
+are labelled `cpu` / `wavelet-rank/threshold-fallback`, while admitted device
+calls are labelled `wgpu` / `wavelet-rank/gpu-round-trip`. These labels come
+from the private per-call route that actually executes rather than from the
+racy aggregate counters. Executor wall brackets only the selected rank backend;
+route selection, aggregate-stat updates, and sample attachment are excluded.
+The adapter captures the current `ActionCorrelation` once and carries that
+capability across the synchronous WGPU round trip, so asynchronous device work
+does not depend on ambient TLS after dispatch.
 On the deterministic 1.77M-trible reconvergence probe (M4 Max, 16 Rayon
 workers), each timed run kept 371 small rank batches on CPU and sent 54 batches
 to Metal, reducing the controlled parallel-DAG median from 382 ms to 312 ms.
