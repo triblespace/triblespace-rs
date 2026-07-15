@@ -29,6 +29,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `next_infix_after` advances a strict bounded cursor without materializing
   matches or depending on cuckoo-table order. Both follow compressed trie paths
   directly and support heap and archive-backed leaves.
+- **Residual execution can explicitly probe one synthetic maximal-root
+  formula.** `ResidualCapabilities::root_formula()` keeps whole-root variable
+  selection and the commit barrier outside a canonical AND/OR program, flattens
+  only the maximal exposed root conjunction, and preserves opaque scope and
+  group-reducer boundaries. Root-AND confirmations retain candidate-occurrence
+  paging once the exact remaining suffix is page-local, including the existing
+  width-one and geometric first-result traces; formula atom observations retain
+  distinct compiled occurrence identities. Ordinary query selection and
+  default residual lowering are unchanged.
 - **WGPU Succinct confirmation can opt into exact residual-action executor
   samples.** `WgpuSuccinctArchive::observe_residual_actions()` returns a
   borrowing, non-`Deref` `ObservedWgpuSuccinctArchive` whose pattern route
