@@ -638,11 +638,10 @@ impl DeltaScheduler {
                             .collect();
                         prefer_continuation(
                             &mut continuation,
-                            file_with_span(
+                            file_with_plan(
                                 stable,
                                 stable_interner,
-                                plan.len(),
-                                plan.action_span(),
+                                plan,
                                 StateDesc {
                                     bound: desc.bound,
                                     phase: ResidualPhase::Candidate {
@@ -670,11 +669,10 @@ impl DeltaScheduler {
                         if !reduced.candidates.is_empty() {
                             prefer_continuation(
                                 &mut continuation,
-                                file_with_span(
+                                file_with_plan(
                                     stable,
                                     stable_interner,
-                                    plan.len(),
-                                    plan.action_span(),
+                                    plan,
                                     StateDesc {
                                         bound: desc.bound,
                                         phase: ResidualPhase::Candidate {

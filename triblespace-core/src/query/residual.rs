@@ -61,12 +61,6 @@ use delta::{DeltaDesc, DeltaScheduler};
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ConstraintPath(Box<[usize]>);
 
-/// Route through one or more directly nested finite unions to a terminal arm.
-/// AND nodes deliberately terminate this path in the first recursive slice;
-/// crossing a connective change needs a continuation frame, not flattening.
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct UnionArmPath(Box<[usize]>);
-
 /// One structural step below a residual leaf occurrence. Connective tags make
 /// the path self-describing and fail closed if a constraint changes shape
 /// during a solve.
@@ -81,7 +75,7 @@ struct FormulaPath(Box<[FormulaStep]>);
 
 /// Execution capabilities captured at one opaque formula occurrence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FormulaAtomCapabilities {
+struct FormulaNodeCapabilities {
     confirm_page_local: bool,
     grouped_delta_confirm: bool,
 }
@@ -94,16 +88,9 @@ struct FormulaNodeId(u32);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum FiniteFormulaNodeKind {
-    Atom {
-        path: FormulaPath,
-        capabilities: FormulaAtomCapabilities,
-    },
-    And {
-        children: Box<[FormulaNodeId]>,
-    },
-    Or {
-        children: Box<[FormulaNodeId]>,
-    },
+    Atom,
+    And { children: Box<[FormulaNodeId]> },
+    Or { children: Box<[FormulaNodeId]> },
 }
 
 /// One compiled structural formula occurrence.
@@ -115,14 +102,18 @@ enum FiniteFormulaNodeKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FiniteFormulaNode {
     kind: FiniteFormulaNodeKind,
+    /// Exact structural route from the enclosing residual leaf. Composite
+    /// nodes retain their route because an execution capability may choose to
+    /// treat that whole subtree as one opaque action boundary.
+    path: FormulaPath,
+    capabilities: FormulaNodeCapabilities,
     span: usize,
 }
 
-#[allow(dead_code)] // The first checkpoint compiles control before execution migrates.
 impl FiniteFormulaNode {
     fn children(&self) -> Option<&[FormulaNodeId]> {
         match &self.kind {
-            FiniteFormulaNodeKind::Atom { .. } => None,
+            FiniteFormulaNodeKind::Atom => None,
             FiniteFormulaNodeKind::And { children } | FiniteFormulaNodeKind::Or { children } => {
                 Some(children)
             }
@@ -140,7 +131,6 @@ struct FiniteFormulaProgram {
     roots: Vec<Option<FormulaNodeId>>,
 }
 
-#[allow(dead_code)] // The first checkpoint compiles control before execution migrates.
 impl FiniteFormulaProgram {
     fn compile<'a>(root: &dyn Constraint<'a>, leaves: &[ResidualLeaf], cyclic_rpq: bool) -> Self {
         struct Builder {
@@ -163,17 +153,19 @@ impl FiniteFormulaProgram {
                 path: &mut Vec<FormulaStep>,
             ) -> FormulaNodeId {
                 let id = self.reserve_node();
+                let node_path = FormulaPath(path.clone().into_boxed_slice());
+                let capabilities = FormulaNodeCapabilities {
+                    confirm_page_local: constraint.residual_confirm_is_page_local(),
+                    grouped_delta_confirm: self.cyclic_rpq
+                        && constraint.residual_delta_confirm_is_grouped(),
+                };
                 let kind = if let Some(children) = constraint.residual_union_children() {
                     assert!(
                         children.len() > 0,
                         "a residual finite union must expose at least one arm"
                     );
                     let mut compiled = Vec::with_capacity(children.len());
-                    for child in 0..children.len() {
-                        path.push(FormulaStep::Or(child));
-                        compiled.push(self.compile_node(children.child(child), path));
-                        path.pop();
-                    }
+                    self.compile_or_children(constraint, path, &mut compiled);
                     FiniteFormulaNodeKind::Or {
                         children: compiled.into_boxed_slice(),
                     }
@@ -190,18 +182,11 @@ impl FiniteFormulaProgram {
                                 children: compiled.into_boxed_slice(),
                             }
                         }
-                        ConstraintShape::Opaque => FiniteFormulaNodeKind::Atom {
-                            path: FormulaPath(path.clone().into_boxed_slice()),
-                            capabilities: FormulaAtomCapabilities {
-                                confirm_page_local: constraint.residual_confirm_is_page_local(),
-                                grouped_delta_confirm: self.cyclic_rpq
-                                    && constraint.residual_delta_confirm_is_grouped(),
-                            },
-                        },
+                        ConstraintShape::Opaque => FiniteFormulaNodeKind::Atom,
                     }
                 };
                 let span = match &kind {
-                    FiniteFormulaNodeKind::Atom { .. } => 2,
+                    FiniteFormulaNodeKind::Atom => 2,
                     FiniteFormulaNodeKind::And { children }
                     | FiniteFormulaNodeKind::Or { children } => children
                         .iter()
@@ -217,8 +202,42 @@ impl FiniteFormulaProgram {
                         })
                         .expect("residual formula span overflow"),
                 };
-                self.nodes[id.0 as usize] = Some(FiniteFormulaNode { kind, span });
+                self.nodes[id.0 as usize] = Some(FiniteFormulaNode {
+                    kind,
+                    path: node_path,
+                    capabilities,
+                    span,
+                });
                 id
+            }
+
+            /// Union is associative in the constraint language. Compile one
+            /// canonical flat child set across directly nested ORs, while a
+            /// connective change (notably AND) remains a terminal node in
+            /// this region. Paths retain every original structural step.
+            fn compile_or_children<'a>(
+                &mut self,
+                union: &dyn Constraint<'a>,
+                path: &mut Vec<FormulaStep>,
+                compiled: &mut Vec<FormulaNodeId>,
+            ) {
+                let children = union
+                    .residual_union_children()
+                    .expect("formula OR collection entered an opaque constraint");
+                assert!(
+                    children.len() > 0,
+                    "a residual finite union must expose at least one arm"
+                );
+                for child in 0..children.len() {
+                    path.push(FormulaStep::Or(child));
+                    let constraint = children.child(child);
+                    if constraint.residual_union_children().is_some() {
+                        self.compile_or_children(constraint, path, compiled);
+                    } else {
+                        compiled.push(self.compile_node(constraint, path));
+                    }
+                    path.pop();
+                }
             }
         }
 
@@ -244,7 +263,7 @@ impl FiniteFormulaProgram {
         };
         let mut roots = vec![None; leaves.len()];
         for (occurrence, leaf) in leaves.iter().enumerate() {
-            if !matches!(leaf.lowering, LeafLowering::FiniteUnion { .. }) {
+            if leaf.lowering != LeafLowering::FiniteFormula {
                 continue;
             }
             let constraint = resolve_leaf(root, leaf);
@@ -270,6 +289,15 @@ impl FiniteFormulaProgram {
 
     fn root(&self, occurrence: usize) -> Option<FormulaNodeId> {
         self.roots[occurrence]
+    }
+
+    fn max_root_span(&self) -> usize {
+        self.roots
+            .iter()
+            .flatten()
+            .map(|&root| self.node(root).span)
+            .max()
+            .unwrap_or(0)
     }
 
     fn child_weight(&self, child: FormulaNodeId) -> usize {
@@ -300,7 +328,7 @@ impl FiniteFormulaProgram {
 
     fn entry_focus(&self, node: FormulaNodeId, stage: FormulaStage) -> FormulaFocus {
         match &self.node(node).kind {
-            FiniteFormulaNodeKind::Atom { .. } => FormulaFocus::Atom { node, stage },
+            FiniteFormulaNodeKind::Atom => FormulaFocus::Action { node, stage },
             FiniteFormulaNodeKind::And { children } | FiniteFormulaNodeKind::Or { children } => {
                 FormulaFocus::Plan {
                     node,
@@ -335,7 +363,33 @@ impl FiniteFormulaProgram {
         }
     }
 
+    #[cfg(test)]
     fn select_child(&self, counter: &FormulaProgramCounter, child: usize) -> FormulaProgramCounter {
+        self.select_child_with(counter, child, |program, node, stage| {
+            program.entry_focus(node, stage)
+        })
+    }
+
+    /// Selects a child as one opaque protocol action even when its compiled
+    /// kind is composite. This is the first execution capability: root OR is
+    /// lowered, while an AND arm remains behind its ordinary constraint
+    /// boundary until the mixed-connective executor is enabled.
+    fn select_child_as_action(
+        &self,
+        counter: &FormulaProgramCounter,
+        child: usize,
+    ) -> FormulaProgramCounter {
+        self.select_child_with(counter, child, |_program, node, stage| {
+            FormulaFocus::Action { node, stage }
+        })
+    }
+
+    fn select_child_with(
+        &self,
+        counter: &FormulaProgramCounter,
+        child: usize,
+        focus: impl FnOnce(&Self, FormulaNodeId, FormulaStage) -> FormulaFocus,
+    ) -> FormulaProgramCounter {
         let FormulaFocus::Plan { node, stage, done } = &counter.focus else {
             panic!("only a residual formula Plan can select a child")
         };
@@ -352,7 +406,7 @@ impl FiniteFormulaProgram {
             done: done.clone(),
         });
         FormulaProgramCounter {
-            focus: self.entry_focus(children[child], *stage),
+            focus: focus(self, children[child], *stage),
             returns: returns.into_boxed_slice(),
             resume: counter.resume.clone(),
         }
@@ -383,7 +437,7 @@ impl FiniteFormulaProgram {
 
     fn complete(&self, counter: &FormulaProgramCounter) -> FormulaProgramCounter {
         let (node, stage) = match &counter.focus {
-            FormulaFocus::Atom { node, stage } => (*node, *stage),
+            FormulaFocus::Action { node, stage } => (*node, *stage),
             FormulaFocus::Plan { node, stage, done } => {
                 let children = self
                     .node(*node)
@@ -474,13 +528,7 @@ impl FiniteFormulaProgram {
         }
 
         let (focused, local_grade) = match &counter.focus {
-            FormulaFocus::Atom { node, .. } => {
-                assert!(matches!(
-                    self.node(*node).kind,
-                    FiniteFormulaNodeKind::Atom { .. }
-                ));
-                (*node, 1)
-            }
+            FormulaFocus::Action { node, .. } => (*node, 1),
             FormulaFocus::Plan { node, done, .. } => (
                 *node,
                 self.completed_weight(*node, done)
@@ -497,8 +545,7 @@ impl FiniteFormulaProgram {
 }
 
 /// Exact structural return address for one running formula child.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct FormulaReturnSite {
     parent: FormulaNodeId,
     parent_stage: FormulaStage,
@@ -510,17 +557,15 @@ struct FormulaReturnSite {
 /// because dead-child progress and action history are different facts: an AND
 /// can have a nonempty done mask and still need its one proposer, or an empty
 /// mask while already filtering as a parent confirmer.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum FormulaStage {
     Propose,
     Confirm,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum FormulaFocus {
-    Atom {
+    Action {
         node: FormulaNodeId,
         stage: FormulaStage,
     },
@@ -536,8 +581,7 @@ enum FormulaFocus {
 }
 
 /// Existing residual continuation to resume after the formula root completes.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct FormulaOuterResume {
     variable: VariableId,
     occurrence: usize,
@@ -547,8 +591,7 @@ struct FormulaOuterResume {
 /// Defunctionalized structural continuation. Candidate values are deliberately
 /// absent: equality means identical future computation, while each affine
 /// activation will carry originals, working sets, and accumulators in payload.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct FormulaProgramCounter {
     focus: FormulaFocus,
     returns: Box<[FormulaReturnSite]>,
@@ -556,7 +599,6 @@ struct FormulaProgramCounter {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 enum FormulaSuccessor {
     Formula(FormulaProgramCounter),
     Outer(FormulaOuterResume),
@@ -565,14 +607,13 @@ enum FormulaSuccessor {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LeafLowering {
     Opaque,
-    FiniteUnion { arm_count: usize },
+    FiniteFormula,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ResidualLeaf {
     path: ConstraintPath,
     lowering: LeafLowering,
-    union_arms: Box<[UnionArmPath]>,
 }
 
 #[cfg(test)]
@@ -663,45 +704,16 @@ impl ResidualPlan {
                     }
                 }
                 ConstraintShape::Opaque => {
-                    fn collect_union_arms<'a>(
-                        union: &dyn Constraint<'a>,
-                        path: &mut Vec<usize>,
-                        arms: &mut Vec<UnionArmPath>,
-                    ) {
-                        let children = union
-                            .residual_union_children()
-                            .expect("recursive union collection entered an opaque constraint");
-                        assert!(
-                            children.len() > 0,
-                            "a residual finite union must expose at least one arm"
-                        );
-                        for child in 0..children.len() {
-                            path.push(child);
-                            let constraint = children.child(child);
-                            if constraint.residual_union_children().is_some() {
-                                collect_union_arms(constraint, path, arms);
-                            } else {
-                                arms.push(UnionArmPath(path.clone().into_boxed_slice()));
-                            }
-                            path.pop();
-                        }
-                    }
-
-                    let mut union_arms = Vec::new();
                     let lowering = if mode == ResidualCompileMode::FiniteUnions
                         && constraint.residual_union_children().is_some()
                     {
-                        collect_union_arms(constraint, &mut Vec::new(), &mut union_arms);
-                        LeafLowering::FiniteUnion {
-                            arm_count: union_arms.len(),
-                        }
+                        LeafLowering::FiniteFormula
                     } else {
                         LeafLowering::Opaque
                     };
                     leaves.push(ResidualLeaf {
                         path: ConstraintPath(path.clone().into_boxed_slice()),
                         lowering,
-                        union_arms: union_arms.into_boxed_slice(),
                     });
                     page_local_confirms.push(
                         matches!(lowering, LeafLowering::Opaque)
@@ -742,29 +754,15 @@ impl ResidualPlan {
         self.leaves.len()
     }
 
-    fn max_union_arms(&self) -> usize {
-        self.leaves
-            .iter()
-            .filter_map(|leaf| match leaf.lowering {
-                LeafLowering::Opaque => None,
-                LeafLowering::FiniteUnion { arm_count } => Some(arm_count),
-            })
-            .max()
-            .unwrap_or(0)
-    }
-
     fn action_span(&self) -> usize {
-        self.max_union_arms()
-            .checked_mul(2)
-            .and_then(|span| span.checked_add(2))
-            .expect("residual union action span overflow")
+        self.finite_formula
+            .max_root_span()
+            .checked_add(2)
+            .expect("residual formula action span overflow")
     }
 
-    fn union_arm_count(&self, occurrence: usize) -> Option<usize> {
-        match self.leaves[occurrence].lowering {
-            LeafLowering::Opaque => None,
-            LeafLowering::FiniteUnion { arm_count } => Some(arm_count),
-        }
+    fn has_finite_formula(&self, occurrence: usize) -> bool {
+        self.finite_formula.root(occurrence).is_some()
     }
 
     fn resolve<'r, 'a>(
@@ -784,25 +782,27 @@ impl ResidualPlan {
         constraint
     }
 
-    fn resolve_union_arm<'r, 'a>(
+    fn resolve_formula_node<'r, 'a>(
         &self,
         root: &'r dyn Constraint<'a>,
         occurrence: usize,
-        arm: usize,
+        node: FormulaNodeId,
     ) -> &'r dyn Constraint<'a> {
-        let union = self.resolve(root, occurrence);
-        let path = &self.leaves[occurrence].union_arms[arm];
-        let mut constraint = union;
-        for &child in path.0.iter() {
-            let children = constraint
-                .residual_union_children()
-                .expect("residual nested-union shape changed during query execution");
-            constraint = children.child(child);
+        let mut constraint = self.resolve(root, occurrence);
+        for step in self.finite_formula.node(node).path.0.iter() {
+            constraint = match *step {
+                FormulaStep::Or(child) => constraint
+                    .residual_union_children()
+                    .expect("residual OR shape changed during query execution")
+                    .child(child),
+                FormulaStep::And(child) => match constraint.residual_shape() {
+                    ConstraintShape::And(children) => children.child(child),
+                    ConstraintShape::Opaque => {
+                        panic!("residual AND shape changed during query execution")
+                    }
+                },
+            };
         }
-        assert!(
-            constraint.residual_union_children().is_none(),
-            "residual nested-union terminal became another union"
-        );
         constraint
     }
 
@@ -889,8 +889,8 @@ pub struct ResidualCapabilities {
 }
 
 impl ResidualCapabilities {
-    /// Lowers finite logical unions into canonical arm-progress states while
-    /// keeping each arm itself opaque.
+    /// Lowers finite logical unions into canonical formula continuations while
+    /// keeping each direct non-Union child as one opaque protocol action.
     pub fn finite_unions(mut self) -> Self {
         self.finite_unions = true;
         self
@@ -1700,7 +1700,7 @@ impl ChildSet {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum UnionVerb {
     Propose {
         relevant: ChildSet,
@@ -1745,23 +1745,10 @@ enum ResidualPhase {
         checked: ChildSet,
         confirmer: usize,
     },
-    /// Selects one still-undone arm for every affine parent of a lowered
-    /// finite union. Accumulators remain payload, never state identity.
-    UnionPlan {
-        variable: VariableId,
-        union: usize,
-        verb: UnionVerb,
-        done: ChildSet,
-    },
-    /// Invokes one opaque arm over activations sharing the same canonical
-    /// union continuation.
-    UnionArm {
-        variable: VariableId,
-        union: usize,
-        verb: UnionVerb,
-        done: ChildSet,
-        arm: usize,
-    },
+    /// One exact finite-formula continuation. Planning and opaque protocol
+    /// actions share this identity; the focused program node distinguishes
+    /// them without a compatibility executor or historical arm index.
+    Formula { counter: FormulaProgramCounter },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1849,33 +1836,23 @@ impl StateDesc {
                     "residual confirmer is not an unchecked relevant leaf"
                 );
             }
-            ResidualPhase::UnionPlan {
-                variable,
-                union,
-                verb,
-                ..
-            }
-            | ResidualPhase::UnionArm {
-                variable,
-                union,
-                verb,
-                ..
-            } => {
-                validate_variable(*variable);
+            ResidualPhase::Formula { counter } => {
+                validate_variable(counter.resume.variable);
                 assert!(
-                    *union < leaf_count,
-                    "residual union is not a leaf occurrence"
+                    counter.resume.occurrence < leaf_count,
+                    "residual formula is not a leaf occurrence"
                 );
-                match verb {
+                match &counter.resume.verb {
                     UnionVerb::Propose { relevant } => {
                         assert!(relevant.is_valid_for(leaf_count));
-                        assert!(relevant.contains(*union));
+                        assert!(relevant.contains(counter.resume.occurrence));
                     }
                     UnionVerb::Confirm { relevant, checked } => {
                         validate_sets(relevant, checked);
                         assert!(
-                            relevant.contains(*union) && !checked.contains(*union),
-                            "residual union is not an unchecked relevant leaf"
+                            relevant.contains(counter.resume.occurrence)
+                                && !checked.contains(counter.resume.occurrence),
+                            "residual formula is not an unchecked relevant leaf"
                         );
                     }
                 }
@@ -1888,10 +1865,15 @@ impl StateDesc {
     /// popped, no unprocessed predecessor can still file into it.
     #[cfg(test)]
     fn rank(&self, leaf_count: usize) -> usize {
-        self.rank_with_span(leaf_count, 2)
+        self.rank_with_span(leaf_count, 2, None)
     }
 
-    fn rank_with_span(&self, leaf_count: usize, action_span: usize) -> usize {
+    fn rank_with_span(
+        &self,
+        leaf_count: usize,
+        action_span: usize,
+        formula: Option<&FiniteFormulaProgram>,
+    ) -> usize {
         self.validate(leaf_count);
         assert!(action_span >= 2, "residual action span is too small");
         let stride = leaf_count
@@ -1919,26 +1901,18 @@ impl StateDesc {
                 .and_then(|grade| grade.checked_add(1))
                 .and_then(|grade| base.checked_add(grade))
                 .expect("residual-state rank overflow"),
-            ResidualPhase::UnionPlan { verb, done, .. } => verb
+            ResidualPhase::Formula { counter } => counter
+                .resume
+                .verb
                 .checked_count()
                 .checked_mul(action_span)
+                .and_then(|grade| grade.checked_add(1))
                 .and_then(|grade| {
-                    done.count()
-                        .checked_mul(2)
-                        .and_then(|done| grade.checked_add(done))
+                    formula
+                        .expect("formula state rank requires its compiled program")
+                        .grade(counter)
+                        .checked_add(grade)
                 })
-                .and_then(|grade| grade.checked_add(2))
-                .and_then(|grade| base.checked_add(grade))
-                .expect("residual-state rank overflow"),
-            ResidualPhase::UnionArm { verb, done, .. } => verb
-                .checked_count()
-                .checked_mul(action_span)
-                .and_then(|grade| {
-                    done.count()
-                        .checked_mul(2)
-                        .and_then(|done| grade.checked_add(done))
-                })
-                .and_then(|grade| grade.checked_add(3))
                 .and_then(|grade| base.checked_add(grade))
                 .expect("residual-state rank overflow"),
         }
@@ -1956,8 +1930,7 @@ impl StateDesc {
             } => plan.remaining_confirms_accept_pages(relevant, checked),
             ResidualPhase::Ready
             | ResidualPhase::Propose { .. }
-            | ResidualPhase::UnionPlan { .. }
-            | ResidualPhase::UnionArm { .. } => false,
+            | ResidualPhase::Formula { .. } => false,
         }
     }
 }
@@ -2248,7 +2221,7 @@ impl CandidateBatch {
     }
 }
 
-/// Stable payload identity for one affine parent entering a lowered union.
+/// Stable payload identity for one affine parent entering a lowered formula.
 ///
 /// Tokens are machine-local and never participate in canonical state
 /// identity. They survive bucket append, planning partition, and parallel
@@ -2258,18 +2231,18 @@ impl CandidateBatch {
 struct ActivationId(u64);
 
 #[derive(Clone, Debug)]
-struct UnionBatch {
+struct FormulaBatch {
     activations: Vec<ActivationId>,
     parents: RowBatch,
     /// Immutable, sorted candidate groups fanned out independently to every
-    /// confirm arm. Empty for a proposal activation.
+    /// confirm action. Empty for a proposal activation.
     original: Candidates,
-    /// Arm outputs accumulated by parent. It is normalized only when every
-    /// arm is done, keeping intermediate values out of canonical state.
+    /// OR outputs accumulated by parent. It is normalized only when every
+    /// child is done, keeping intermediate values out of canonical state.
     accumulated: Candidates,
 }
 
-impl UnionBatch {
+impl FormulaBatch {
     fn from_proposal(parents: RowBatch, activations: Vec<ActivationId>) -> Self {
         assert_eq!(parents.row_count, activations.len());
         Self {
@@ -2292,20 +2265,20 @@ impl UnionBatch {
     }
 
     fn append(&mut self, mut other: Self) {
-        let offset = u32::try_from(self.parents.row_count).expect("too many union parents");
+        let offset = u32::try_from(self.parents.row_count).expect("too many formula parents");
         self.parents.append(other.parents);
         self.activations.append(&mut other.activations);
         self.original
             .extend(other.original.drain(..).map(|(parent, value)| {
                 (
-                    parent.checked_add(offset).expect("union parent overflow"),
+                    parent.checked_add(offset).expect("formula parent overflow"),
                     value,
                 )
             }));
         self.accumulated
             .extend(other.accumulated.drain(..).map(|(parent, value)| {
                 (
-                    parent.checked_add(offset).expect("union parent overflow"),
+                    parent.checked_add(offset).expect("formula parent overflow"),
                     value,
                 )
             }));
@@ -2337,11 +2310,11 @@ impl UnionBatch {
         fn take_tagged_tail(values: &mut Candidates, first: usize) -> Candidates {
             let cut = values.partition_point(|(parent, _)| (*parent as usize) < first);
             let mut tail = values.split_off(cut);
-            let first = u32::try_from(first).expect("too many union parents");
+            let first = u32::try_from(first).expect("too many formula parents");
             for (parent, _) in &mut tail {
                 *parent = parent
                     .checked_sub(first)
-                    .expect("union tail contained an earlier parent");
+                    .expect("formula tail contained an earlier parent");
             }
             tail
         }
@@ -2383,8 +2356,8 @@ impl UnionBatch {
                 original: Vec::new(),
                 accumulated: Vec::new(),
             });
-            remap[parent] =
-                u32::try_from(group.parents.row_count).expect("too many partitioned union parents");
+            remap[parent] = u32::try_from(group.parents.row_count)
+                .expect("too many partitioned formula parents");
             let start = parent * stride;
             group
                 .parents
@@ -2398,7 +2371,7 @@ impl UnionBatch {
             values: Candidates,
             assignment: &[K],
             remap: &[u32],
-            groups: &mut BTreeMap<K, UnionBatch>,
+            groups: &mut BTreeMap<K, FormulaBatch>,
             original: bool,
         ) where
             K: Clone + Ord,
@@ -2407,7 +2380,7 @@ impl UnionBatch {
                 let parent = parent as usize;
                 let target = groups
                     .get_mut(&assignment[parent])
-                    .expect("every union assignment created its group");
+                    .expect("every formula assignment created its group");
                 if original {
                     target.original.push((remap[parent], value));
                 } else {
@@ -2434,7 +2407,7 @@ impl UnionBatch {
 enum StateBucket {
     Rows(RowBatch),
     Candidates(CandidateBatch),
-    Union(UnionBatch),
+    Formula(FormulaBatch),
 }
 
 impl StateBucket {
@@ -2442,7 +2415,7 @@ impl StateBucket {
         match self {
             StateBucket::Rows(rows) => rows.row_count,
             StateBucket::Candidates(batch) => batch.parents.row_count,
-            StateBucket::Union(batch) => batch.parents.row_count,
+            StateBucket::Formula(batch) => batch.parents.row_count,
         }
     }
 
@@ -2460,7 +2433,7 @@ impl StateBucket {
         match (self, other) {
             (StateBucket::Rows(left), StateBucket::Rows(right)) => left.append(right),
             (StateBucket::Candidates(left), StateBucket::Candidates(right)) => left.append(right),
-            (StateBucket::Union(left), StateBucket::Union(right)) => left.append(right),
+            (StateBucket::Formula(left), StateBucket::Formula(right)) => left.append(right),
             _ => panic!("one canonical residual state received incompatible payloads"),
         }
     }
@@ -2487,11 +2460,11 @@ impl StateBucket {
                 let right_parents = batch.parents.row_count / 2;
                 Some(self.take_tail(stride, right_parents, false))
             }
-            StateBucket::Union(batch) if batch.parents.row_count >= 2 => {
+            StateBucket::Formula(batch) if batch.parents.row_count >= 2 => {
                 let right_parents = batch.parents.row_count / 2;
                 Some(self.take_tail(stride, right_parents, false))
             }
-            StateBucket::Rows(_) | StateBucket::Candidates(_) | StateBucket::Union(_) => None,
+            StateBucket::Rows(_) | StateBucket::Candidates(_) | StateBucket::Formula(_) => None,
         }
     }
 
@@ -2524,7 +2497,7 @@ impl StateBucket {
             StateBucket::Candidates(batch) => {
                 StateBucket::Candidates(batch.take_tail(stride, width))
             }
-            StateBucket::Union(batch) => StateBucket::Union(batch.take_tail(stride, width)),
+            StateBucket::Formula(batch) => StateBucket::Formula(batch.take_tail(stride, width)),
         }
     }
 }
@@ -2609,12 +2582,12 @@ impl SelectedResidualTask {
     /// materialize executor geometry on the default path.
     fn is_action_for_plan(&self, plan: &ResidualPlan) -> bool {
         match &self.desc.phase {
-            ResidualPhase::Propose { proposer, .. } => plan.union_arm_count(*proposer).is_none(),
-            ResidualPhase::Confirm { confirmer, .. } => plan.union_arm_count(*confirmer).is_none(),
-            ResidualPhase::UnionArm { .. } => true,
-            ResidualPhase::Ready
-            | ResidualPhase::Candidate { .. }
-            | ResidualPhase::UnionPlan { .. } => false,
+            ResidualPhase::Propose { proposer, .. } => !plan.has_finite_formula(*proposer),
+            ResidualPhase::Confirm { confirmer, .. } => !plan.has_finite_formula(*confirmer),
+            ResidualPhase::Formula { counter } => {
+                matches!(counter.focus, FormulaFocus::Action { .. })
+            }
+            ResidualPhase::Ready | ResidualPhase::Candidate { .. } => false,
         }
     }
 
@@ -2624,7 +2597,12 @@ impl SelectedResidualTask {
             self.desc.phase,
             ResidualPhase::Propose { .. }
                 | ResidualPhase::Confirm { .. }
-                | ResidualPhase::UnionArm { .. }
+                | ResidualPhase::Formula {
+                    counter: FormulaProgramCounter {
+                        focus: FormulaFocus::Action { .. },
+                        ..
+                    }
+                }
         )
     }
 
@@ -2637,7 +2615,7 @@ impl SelectedResidualTask {
                     variable, proposer, ..
                 },
                 StateBucket::Rows(_),
-            ) if plan.union_arm_count(*proposer).is_none() => (
+            ) if !plan.has_finite_formula(*proposer) => (
                 ResidualAction::Propose {
                     variable: *variable,
                     leaf: *proposer,
@@ -2651,60 +2629,50 @@ impl SelectedResidualTask {
                     ..
                 },
                 StateBucket::Candidates(batch),
-            ) if plan.union_arm_count(*confirmer).is_none() => (
+            ) if !plan.has_finite_formula(*confirmer) => (
                 ResidualAction::Confirm {
                     variable: *variable,
                     leaf: *confirmer,
                 },
                 batch.candidate_count(),
             ),
-            (
-                ResidualPhase::UnionArm {
-                    variable,
-                    union,
-                    verb,
-                    ..
-                },
-                StateBucket::Union(batch),
-            ) => {
-                let (action, candidates) = match verb {
-                    UnionVerb::Propose { .. } => (
+            (ResidualPhase::Formula { counter }, StateBucket::Formula(batch)) => {
+                let FormulaFocus::Action { stage, .. } = counter.focus else {
+                    return None;
+                };
+                let (action, candidates) = match stage {
+                    FormulaStage::Propose => (
                         ResidualAction::Propose {
-                            variable: *variable,
-                            leaf: *union,
+                            variable: counter.resume.variable,
+                            leaf: counter.resume.occurrence,
                         },
                         0,
                     ),
-                    UnionVerb::Confirm { .. } => (
+                    FormulaStage::Confirm => (
                         ResidualAction::Confirm {
-                            variable: *variable,
-                            leaf: *union,
+                            variable: counter.resume.variable,
+                            leaf: counter.resume.occurrence,
                         },
                         batch.original.len(),
                     ),
                 };
                 (action, candidates)
             }
-            (
-                ResidualPhase::Ready
-                | ResidualPhase::Candidate { .. }
-                | ResidualPhase::UnionPlan { .. },
-                _,
-            ) => return None,
+            (ResidualPhase::Ready | ResidualPhase::Candidate { .. }, _) => return None,
             (ResidualPhase::Propose { proposer, .. }, StateBucket::Rows(_))
-                if plan.union_arm_count(*proposer).is_some() =>
+                if plan.has_finite_formula(*proposer) =>
             {
                 return None;
             }
             (ResidualPhase::Confirm { confirmer, .. }, StateBucket::Candidates(_))
-                if plan.union_arm_count(*confirmer).is_some() =>
+                if plan.has_finite_formula(*confirmer) =>
             {
                 return None;
             }
             (
                 ResidualPhase::Propose { .. }
                 | ResidualPhase::Confirm { .. }
-                | ResidualPhase::UnionArm { .. },
+                | ResidualPhase::Formula { .. },
                 _,
             ) => {
                 panic!("canonical residual action received the wrong payload shape")
@@ -2781,6 +2749,7 @@ fn file_with_span(
     interner: &mut StateInterner,
     leaf_count: usize,
     action_span: usize,
+    formula: Option<&FiniteFormulaProgram>,
     desc: StateDesc,
     bucket: StateBucket,
     stats: &mut ResidualStateStats,
@@ -2790,10 +2759,10 @@ fn file_with_span(
         return None;
     }
     let candidates = match &bucket {
-        StateBucket::Rows(_) | StateBucket::Union(_) => 0,
+        StateBucket::Rows(_) | StateBucket::Formula(_) => 0,
         StateBucket::Candidates(batch) => batch.candidate_count(),
     };
-    let rank = desc.rank_with_span(leaf_count, action_span);
+    let rank = desc.rank_with_span(leaf_count, action_span, formula);
     let (id, known) = interner.intern_with_status(desc, stats);
     let level = worklist.entry(rank).or_default();
     if let Some(existing) = level.get_mut(&id) {
@@ -2815,6 +2784,26 @@ fn file_with_span(
     })
 }
 
+fn file_with_plan(
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    plan: &ResidualPlan,
+    desc: StateDesc,
+    bucket: StateBucket,
+    stats: &mut ResidualStateStats,
+) -> Option<ContinuationToken> {
+    file_with_span(
+        worklist,
+        interner,
+        plan.len(),
+        plan.action_span(),
+        Some(&plan.finite_formula),
+        desc,
+        bucket,
+        stats,
+    )
+}
+
 #[cfg(test)]
 fn file(
     worklist: &mut Worklist,
@@ -2824,7 +2813,7 @@ fn file(
     bucket: StateBucket,
     stats: &mut ResidualStateStats,
 ) -> Option<ContinuationToken> {
-    file_with_span(worklist, interner, leaf_count, 2, desc, bucket, stats)
+    file_with_span(worklist, interner, leaf_count, 2, None, desc, bucket, stats)
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -2863,10 +2852,10 @@ fn propose_leaf<'a>(
 }
 
 fn allocate_activations(next: &mut u64, count: usize) -> Vec<ActivationId> {
-    let count = u64::try_from(count).expect("too many union activations");
+    let count = u64::try_from(count).expect("too many formula activations");
     let end = next
         .checked_add(count)
-        .expect("residual union activation ID overflow");
+        .expect("residual formula activation ID overflow");
     let activations = (*next..end).map(ActivationId).collect();
     *next = end;
     activations
@@ -3016,11 +3005,10 @@ fn ready_plan_transition<'a>(
 
     let mut file_propose_group = |action: ProposeAction, selected: RowBatch| {
         let variable_plan = &plans[action.variable_plan];
-        file_with_span(
+        file_with_plan(
             worklist,
             interner,
-            leaf_count,
-            plan.action_span(),
+            plan,
             StateDesc {
                 bound: desc.bound,
                 phase: ResidualPhase::Propose {
@@ -3064,25 +3052,24 @@ fn propose_action_transition<'a>(
     stats: &mut ResidualStateStats,
 ) -> Option<ContinuationToken> {
     let leaf_count = plan.len();
-    if let Some(arm_count) = plan.union_arm_count(proposer) {
+    if plan.has_finite_formula(proposer) {
         let activations = allocate_activations(next_activation, rows.row_count);
-        return file_with_span(
+        let counter = plan.finite_formula.start(
+            variable,
+            proposer,
+            UnionVerb::Propose {
+                relevant: relevant.clone(),
+            },
+        );
+        return file_with_plan(
             worklist,
             interner,
-            leaf_count,
-            plan.action_span(),
+            plan,
             StateDesc {
                 bound: desc.bound,
-                phase: ResidualPhase::UnionPlan {
-                    variable,
-                    union: proposer,
-                    verb: UnionVerb::Propose {
-                        relevant: relevant.clone(),
-                    },
-                    done: ChildSet::empty(arm_count),
-                },
+                phase: ResidualPhase::Formula { counter },
             },
-            StateBucket::Union(UnionBatch::from_proposal(rows, activations)),
+            StateBucket::Formula(FormulaBatch::from_proposal(rows, activations)),
             stats,
         );
     }
@@ -3110,11 +3097,10 @@ fn propose_action_transition<'a>(
         candidates,
     };
     if let Some(candidate) = candidate.compact(vars.len()) {
-        file_with_span(
+        file_with_plan(
             worklist,
             interner,
-            leaf_count,
-            plan.action_span(),
+            plan,
             StateDesc {
                 bound: desc.bound,
                 phase: ResidualPhase::Candidate {
@@ -3132,11 +3118,10 @@ fn propose_action_transition<'a>(
 }
 
 fn commit_candidates(
+    plan: &ResidualPlan,
     desc: &StateDesc,
     variable: VariableId,
     batch: CandidateBatch,
-    leaf_count: usize,
-    action_span: usize,
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
@@ -3167,11 +3152,10 @@ fn commit_candidates(
     } else {
         next_rows.len() / next_vars.len()
     };
-    file_with_span(
+    file_with_plan(
         worklist,
         interner,
-        leaf_count,
-        action_span,
+        plan,
         StateDesc {
             bound: next_bound,
             phase: ResidualPhase::Ready,
@@ -3198,17 +3182,8 @@ fn candidate_plan_transition<'a>(
 ) -> ContinuationToken {
     let leaf_count = plan.len();
     if relevant == checked {
-        return commit_candidates(
-            desc,
-            variable,
-            batch,
-            leaf_count,
-            plan.action_span(),
-            worklist,
-            interner,
-            stats,
-        )
-        .expect("fully checked candidates committed no rows");
+        return commit_candidates(plan, desc, variable, batch, worklist, interner, stats)
+            .expect("fully checked candidates committed no rows");
     }
 
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
@@ -3256,11 +3231,10 @@ fn candidate_plan_transition<'a>(
     stats.candidate_confirmation_groups += confirmer_groups.count();
 
     let mut file_confirm_group = |confirmer: usize, selected: CandidateBatch| {
-        file_with_span(
+        file_with_plan(
             worklist,
             interner,
-            leaf_count,
-            plan.action_span(),
+            plan,
             StateDesc {
                 bound: desc.bound,
                 phase: ResidualPhase::Confirm {
@@ -3303,27 +3277,25 @@ fn confirm_action_transition<'a>(
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
 ) -> Option<ContinuationToken> {
-    let leaf_count = plan.len();
-    if let Some(arm_count) = plan.union_arm_count(confirmer) {
+    if plan.has_finite_formula(confirmer) {
         let activations = allocate_activations(next_activation, batch.parents.row_count);
-        return file_with_span(
+        let counter = plan.finite_formula.start(
+            variable,
+            confirmer,
+            UnionVerb::Confirm {
+                relevant: relevant.clone(),
+                checked: checked.clone(),
+            },
+        );
+        return file_with_plan(
             worklist,
             interner,
-            leaf_count,
-            plan.action_span(),
+            plan,
             StateDesc {
                 bound: desc.bound,
-                phase: ResidualPhase::UnionPlan {
-                    variable,
-                    union: confirmer,
-                    verb: UnionVerb::Confirm {
-                        relevant: relevant.clone(),
-                        checked: checked.clone(),
-                    },
-                    done: ChildSet::empty(arm_count),
-                },
+                phase: ResidualPhase::Formula { counter },
             },
-            StateBucket::Union(UnionBatch::from_confirmation(batch, activations)),
+            StateBucket::Formula(FormulaBatch::from_confirmation(batch, activations)),
             stats,
         );
     }
@@ -3345,11 +3317,10 @@ fn confirm_action_transition<'a>(
     stats.max_confirm_candidates = stats.max_confirm_candidates.max(candidates_before);
 
     if let Some(batch) = batch.compact(vars.len()) {
-        file_with_span(
+        file_with_plan(
             worklist,
             interner,
-            leaf_count,
-            plan.action_span(),
+            plan,
             StateDesc {
                 bound: desc.bound,
                 phase: ResidualPhase::Candidate {
@@ -3366,39 +3337,36 @@ fn confirm_action_transition<'a>(
     }
 }
 
-fn finish_union_transition(
+fn finish_formula_transition(
     plan: &ResidualPlan,
     desc: &StateDesc,
-    variable: VariableId,
-    union: usize,
-    verb: &UnionVerb,
-    batch: UnionBatch,
+    resume: &FormulaOuterResume,
+    batch: FormulaBatch,
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
 ) -> Option<ContinuationToken> {
     let leaf_count = plan.len();
-    let (relevant, checked) = match verb {
+    let (relevant, checked) = match &resume.verb {
         UnionVerb::Propose { relevant } => {
             let mut checked = ChildSet::empty(leaf_count);
-            checked.insert(union);
+            checked.insert(resume.occurrence);
             (relevant.clone(), checked)
         }
         UnionVerb::Confirm { relevant, checked } => {
-            (relevant.clone(), checked.with_inserted(union))
+            (relevant.clone(), checked.with_inserted(resume.occurrence))
         }
     };
     let stride = desc.bound.count();
     let candidate = batch.finish().compact(stride)?;
-    file_with_span(
+    file_with_plan(
         worklist,
         interner,
-        leaf_count,
-        plan.action_span(),
+        plan,
         StateDesc {
             bound: desc.bound,
             phase: ResidualPhase::Candidate {
-                variable,
+                variable: resume.variable,
                 relevant,
                 checked,
             },
@@ -3408,27 +3376,85 @@ fn finish_union_transition(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn union_plan_transition<'a>(
-    root: &dyn Constraint<'a>,
+fn continue_formula_transition(
     plan: &ResidualPlan,
     desc: &StateDesc,
-    variable: VariableId,
-    union: usize,
-    verb: &UnionVerb,
-    done: &ChildSet,
-    batch: UnionBatch,
+    counter: FormulaProgramCounter,
+    batch: FormulaBatch,
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
 ) -> Option<ContinuationToken> {
-    let leaf_count = plan.len();
-    let arm_count = plan
-        .union_arm_count(union)
-        .expect("a UnionPlan state named an opaque leaf");
+    let complete = match &counter.focus {
+        FormulaFocus::Plan { node, done, .. } => {
+            let children = plan
+                .finite_formula
+                .node(*node)
+                .children()
+                .expect("a formula Plan named an Atom");
+            done.count() == children.len()
+        }
+        FormulaFocus::Action { .. } => false,
+        FormulaFocus::Complete { .. } => {
+            panic!("a completed formula was filed as a live continuation")
+        }
+    };
+    if !complete {
+        return file_with_plan(
+            worklist,
+            interner,
+            plan,
+            StateDesc {
+                bound: desc.bound,
+                phase: ResidualPhase::Formula { counter },
+            },
+            StateBucket::Formula(batch),
+            stats,
+        );
+    }
+
+    let completed = plan.finite_formula.complete(&counter);
+    let FormulaSuccessor::Outer(resume) = plan.finite_formula.resume(&completed) else {
+        panic!("the shallow formula executor completed a nested connective")
+    };
+    finish_formula_transition(plan, desc, &resume, batch, worklist, interner, stats)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn formula_plan_transition<'a>(
+    root: &dyn Constraint<'a>,
+    plan: &ResidualPlan,
+    desc: &StateDesc,
+    counter: &FormulaProgramCounter,
+    batch: FormulaBatch,
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+) -> Option<ContinuationToken> {
+    let FormulaFocus::Plan {
+        node,
+        stage: _,
+        done,
+    } = &counter.focus
+    else {
+        panic!("formula planning received an action continuation")
+    };
     assert!(
-        done.is_valid_for(arm_count),
-        "residual union done set contains a non-arm occurrence"
+        counter.returns.is_empty(),
+        "mixed connective execution is not enabled"
+    );
+    assert_eq!(
+        plan.finite_formula.root(counter.resume.occurrence),
+        Some(*node),
+        "shallow formula planning left its root OR"
+    );
+    let FiniteFormulaNodeKind::Or { children } = &plan.finite_formula.node(*node).kind else {
+        panic!("the first formula execution slice requires a root OR")
+    };
+    let child_count = children.len();
+    assert!(
+        done.is_valid_for(child_count),
+        "residual formula progress names a non-child occurrence"
     );
 
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
@@ -3436,82 +3462,90 @@ fn union_plan_transition<'a>(
     let mut augmented = Vec::with_capacity(batch.parents.row_count);
     for parent in 0..batch.parents.row_count {
         let row = view.row_view(parent);
-        let mut next = done.clone();
-        for arm in 0..arm_count {
-            if !next.contains(arm) && !plan.resolve_union_arm(root, union, arm).satisfied(&row) {
-                next.insert(arm);
+        let mut next = counter.clone();
+        for child in 0..child_count {
+            let FormulaFocus::Plan { done, .. } = &next.focus else {
+                unreachable!("dead-child skipping preserves a formula Plan")
+            };
+            if !done.contains(child)
+                && !plan
+                    .resolve_formula_node(root, counter.resume.occurrence, children[child])
+                    .satisfied(&row)
+            {
+                next = plan.finite_formula.skip_child(&next, child);
             }
         }
         augmented.push(next);
     }
 
     let mut continuation = None;
-    for (done, batch) in batch.partition(vars.len(), &augmented) {
-        if done.count() == arm_count {
+    for (counter, batch) in batch.partition(vars.len(), &augmented) {
+        let FormulaFocus::Plan { done, .. } = &counter.focus else {
+            unreachable!("formula planning partition produced an action")
+        };
+        if done.count() == child_count {
             prefer_continuation(
                 &mut continuation,
-                finish_union_transition(
-                    plan, desc, variable, union, verb, batch, worklist, interner, stats,
-                ),
+                continue_formula_transition(plan, desc, counter, batch, worklist, interner, stats),
             );
             continue;
         }
 
         let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
-        let first_undone = (0..arm_count)
-            .find(|&arm| !done.contains(arm))
-            .expect("unfinished union has an enabled arm");
+        let first_undone = (0..child_count)
+            .find(|&child| !done.contains(child))
+            .expect("unfinished formula has an enabled child");
         let mut assignments = vec![first_undone; batch.parents.row_count];
         let mut estimates = vec![usize::MAX; batch.parents.row_count];
         let mut column = Vec::with_capacity(batch.parents.row_count);
-        for arm in 0..arm_count {
-            if done.contains(arm) {
+        for child in 0..child_count {
+            if done.contains(child) {
                 continue;
             }
             column.clear();
-            if plan.resolve_union_arm(root, union, arm).estimate(
-                variable,
-                &view,
-                &mut EstimateSink::Column(&mut column),
-            ) {
+            if plan
+                .resolve_formula_node(root, counter.resume.occurrence, children[child])
+                .estimate(
+                    counter.resume.variable,
+                    &view,
+                    &mut EstimateSink::Column(&mut column),
+                )
+            {
                 assert_eq!(
                     column.len(),
                     batch.parents.row_count,
-                    "union arm estimate must append one value per row"
+                    "formula action estimate must append one value per row"
                 );
                 for parent in 0..batch.parents.row_count {
                     if column[parent] < estimates[parent] {
                         estimates[parent] = column[parent];
-                        assignments[parent] = arm;
+                        assignments[parent] = child;
                     }
                 }
             } else {
                 assert!(
                     column.is_empty(),
-                    "irrelevant union arm estimate must leave its sink untouched"
+                    "irrelevant formula action estimate must leave its sink untouched"
                 );
             }
         }
 
-        for (arm, batch) in batch.partition(vars.len(), &assignments) {
+        let actions: Vec<_> = assignments
+            .into_iter()
+            .map(|child| plan.finite_formula.select_child_as_action(&counter, child))
+            .collect();
+        for (counter, batch) in batch.partition(vars.len(), &actions) {
             prefer_continuation(
                 &mut continuation,
-                file_with_span(
+                file_with_plan(
                     worklist,
                     interner,
-                    leaf_count,
-                    plan.action_span(),
+                    plan,
                     StateDesc {
                         bound: desc.bound,
-                        phase: ResidualPhase::UnionArm {
-                            variable,
-                            union,
-                            verb: verb.clone(),
-                            done: done.clone(),
-                            arm,
-                        },
+                        phase: ResidualPhase::Formula { counter },
                     },
-                    StateBucket::Union(batch),
+                    StateBucket::Formula(batch),
                     stats,
                 ),
             );
@@ -3521,41 +3555,37 @@ fn union_plan_transition<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn union_arm_transition<'a>(
+fn formula_action_transition<'a>(
     root: &dyn Constraint<'a>,
     plan: &ResidualPlan,
     desc: &StateDesc,
-    variable: VariableId,
-    union: usize,
-    verb: &UnionVerb,
-    done: &ChildSet,
-    arm: usize,
-    mut batch: UnionBatch,
+    counter: &FormulaProgramCounter,
+    mut batch: FormulaBatch,
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
 ) -> Option<ContinuationToken> {
-    let leaf_count = plan.len();
-    let arm_count = plan
-        .union_arm_count(union)
-        .expect("a UnionArm state named an opaque leaf");
-    assert!(arm < arm_count && !done.contains(arm));
-    assert!(done.is_valid_for(arm_count));
+    let FormulaFocus::Action { node, stage } = counter.focus else {
+        panic!("formula action received a planning continuation")
+    };
     assert_eq!(batch.activations.len(), batch.parents.row_count);
 
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
     let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
-    let constraint = plan.resolve_union_arm(root, union, arm);
+    let constraint = plan.resolve_formula_node(root, counter.resume.occurrence, node);
     debug_assert!(
         (0..batch.parents.row_count).all(|parent| constraint.satisfied(&view.row_view(parent))),
-        "a union arm became dead between planning and action"
+        "a formula action became dead between planning and execution"
     );
 
-    match verb {
-        UnionVerb::Propose { .. } => {
+    match stage {
+        FormulaStage::Propose => {
             let mut produced = Vec::new();
-            debug_assert!(produced.is_empty(), "union arm proposal sink is not empty");
-            constraint.propose(variable, &view, &mut CandidateSink::Tagged(&mut produced));
+            constraint.propose(
+                counter.resume.variable,
+                &view,
+                &mut CandidateSink::Tagged(&mut produced),
+            );
             stats.propose_calls += 1;
             stats.propose_rows += batch.parents.row_count;
             stats.max_propose_rows = stats.max_propose_rows.max(batch.parents.row_count);
@@ -3563,10 +3593,14 @@ fn union_arm_transition<'a>(
             stats.max_propose_candidates = stats.max_propose_candidates.max(produced.len());
             batch.accumulated.extend(produced);
         }
-        UnionVerb::Confirm { .. } => {
+        FormulaStage::Confirm => {
             let mut survivors = batch.original.clone();
             let candidates_before = survivors.len();
-            constraint.confirm(variable, &view, &mut CandidateSink::Tagged(&mut survivors));
+            constraint.confirm(
+                counter.resume.variable,
+                &view,
+                &mut CandidateSink::Tagged(&mut survivors),
+            );
             stats.confirm_calls += 1;
             stats.confirm_rows += batch.parents.row_count;
             stats.max_confirm_rows = stats.max_confirm_rows.max(batch.parents.row_count);
@@ -3580,34 +3614,15 @@ fn union_arm_transition<'a>(
             .accumulated
             .iter()
             .all(|(parent, _)| (*parent as usize) < batch.parents.row_count),
-        "union arm emitted an invalid candidate row tag"
+        "formula action emitted an invalid candidate row tag"
     );
     batch.accumulated.sort_unstable();
 
-    let next_done = done.with_inserted(arm);
-    if next_done.count() == arm_count {
-        finish_union_transition(
-            plan, desc, variable, union, verb, batch, worklist, interner, stats,
-        )
-    } else {
-        file_with_span(
-            worklist,
-            interner,
-            leaf_count,
-            plan.action_span(),
-            StateDesc {
-                bound: desc.bound,
-                phase: ResidualPhase::UnionPlan {
-                    variable,
-                    union,
-                    verb: verb.clone(),
-                    done: next_done,
-                },
-            },
-            StateBucket::Union(batch),
-            stats,
-        )
-    }
+    let completed = plan.finite_formula.complete(counter);
+    let FormulaSuccessor::Formula(next) = plan.finite_formula.resume(&completed) else {
+        panic!("a root OR action returned directly to its outer continuation")
+    };
+    continue_formula_transition(plan, desc, next, batch, worklist, interner, stats)
 }
 
 /// Semantic result of executing one selected residual-state chunk.
@@ -3682,7 +3697,7 @@ fn execute_task<'a>(
             },
             StateBucket::Rows(rows),
         ) => {
-            if plan.union_arm_count(*proposer).is_none() {
+            if !plan.has_finite_formula(*proposer) {
                 stats.propose_action_pops += 1;
             }
             let continuation = propose_action_transition(
@@ -3728,7 +3743,7 @@ fn execute_task<'a>(
             },
             StateBucket::Candidates(batch),
         ) => {
-            if plan.union_arm_count(*confirmer).is_none() {
+            if !plan.has_finite_formula(*confirmer) {
                 stats.confirm_action_pops += 1;
             }
             let continuation = confirm_action_transition(
@@ -3752,42 +3767,31 @@ fn execute_task<'a>(
                 StepOutcome::Dead
             }
         }
-        (
-            ResidualPhase::UnionPlan {
-                variable,
-                union,
-                verb,
-                done,
-            },
-            StateBucket::Union(batch),
-        ) => {
-            let continuation = union_plan_transition(
-                root, plan, &desc, *variable, *union, verb, done, batch, worklist, interner, stats,
-            );
-            continuation.map_or(StepOutcome::Dead, StepOutcome::Advanced)
-        }
-        (
-            ResidualPhase::UnionArm {
-                variable,
-                union,
-                verb,
-                done,
-                arm,
-            },
-            StateBucket::Union(batch),
-        ) => {
-            match verb {
-                UnionVerb::Propose { .. } => stats.propose_action_pops += 1,
-                UnionVerb::Confirm { .. } => stats.confirm_action_pops += 1,
-            }
-            let continuation = union_arm_transition(
-                root, plan, &desc, *variable, *union, verb, done, *arm, batch, worklist, interner,
-                stats,
-            );
+        (ResidualPhase::Formula { counter }, StateBucket::Formula(batch)) => {
+            let is_action = matches!(counter.focus, FormulaFocus::Action { .. });
+            let continuation = match &counter.focus {
+                FormulaFocus::Plan { .. } => formula_plan_transition(
+                    root, plan, &desc, counter, batch, worklist, interner, stats,
+                ),
+                FormulaFocus::Action { stage, .. } => {
+                    match stage {
+                        FormulaStage::Propose => stats.propose_action_pops += 1,
+                        FormulaStage::Confirm => stats.confirm_action_pops += 1,
+                    }
+                    formula_action_transition(
+                        root, plan, &desc, counter, batch, worklist, interner, stats,
+                    )
+                }
+                FormulaFocus::Complete { .. } => {
+                    panic!("a completed formula reached executor dispatch")
+                }
+            };
             if let Some(continuation) = continuation {
                 StepOutcome::Advanced(continuation)
             } else {
-                stats.dead_action_pops += 1;
+                if is_action {
+                    stats.dead_action_pops += 1;
+                }
                 StepOutcome::Dead
             }
         }
@@ -4012,6 +4016,7 @@ impl ResidualStateMachine {
                 &mut state.interner,
                 leaf_count,
                 action_span,
+                None,
                 StateDesc {
                     bound: VariableSet::new_empty(),
                     phase: ResidualPhase::Ready,
@@ -4090,7 +4095,14 @@ impl ResidualStateMachine {
         }
 
         let desc = self.interner.get(id).clone();
-        debug_assert_eq!(desc.rank_with_span(self.leaf_count, self.action_span), rank);
+        debug_assert_eq!(
+            desc.rank_with_span(
+                self.leaf_count,
+                self.action_span,
+                plan.map(|plan| &plan.finite_formula),
+            ),
+            rank
+        );
         let candidate_pages = plan.is_some_and(|plan| desc.uses_candidate_pages(plan));
         let before = bucket.occupancy(candidate_pages);
         let chunk = bucket.take_tail(desc.bound.count(), width, candidate_pages);
@@ -4147,7 +4159,11 @@ impl ResidualStateMachine {
     ) -> SelectedResidualTask {
         let desc = self.interner.get(token.state).clone();
         assert_eq!(
-            desc.rank_with_span(self.leaf_count, self.action_span),
+            desc.rank_with_span(
+                self.leaf_count,
+                self.action_span,
+                Some(&plan.finite_formula),
+            ),
             token.rank,
             "continuation token disagrees with canonical state rank"
         );
@@ -4240,8 +4256,8 @@ impl ResidualStateMachine {
 
         // Finite reducers own their proposal lifecycle. A cyclic capability
         // may replace only an ordinary opaque leaf action; RPQs nested inside
-        // a lowered Union arm deliberately remain behind that arm boundary.
-        if plan.union_arm_count(*proposer).is_some() {
+        // a lowered formula action deliberately remain behind that boundary.
+        if plan.has_finite_formula(*proposer) {
             return Err(task);
         }
 
@@ -4317,9 +4333,9 @@ impl ResidualStateMachine {
         else {
             return Err(task);
         };
-        // Lowered finite unions own their complete group reducer. Only an
+        // Lowered finite formulas own their complete group reducer. Only an
         // ordinary opaque confirmer may enter the cyclic RPQ submachine.
-        if plan.union_arm_count(*confirmer).is_some() || !plan.grouped_delta_confirms[*confirmer] {
+        if plan.has_finite_formula(*confirmer) || !plan.grouped_delta_confirms[*confirmer] {
             return Err(task);
         }
         assert!(
@@ -4711,7 +4727,7 @@ impl ResidualStateMachine {
                             batch.candidate_count() >= 2
                         }
                         StateBucket::Candidates(batch) => batch.parents.row_count >= 2,
-                        StateBucket::Union(batch) => batch.parents.row_count >= 2,
+                        StateBucket::Formula(batch) => batch.parents.row_count >= 2,
                     };
                     can_split.then_some((rank, id, candidate_pages))
                 })
@@ -4852,7 +4868,7 @@ impl ResidualStateMachine {
                             batch.candidate_count() >= 2
                         }
                         StateBucket::Candidates(batch) => batch.parents.row_count >= 2,
-                        StateBucket::Union(batch) => batch.parents.row_count >= 2,
+                        StateBucket::Formula(batch) => batch.parents.row_count >= 2,
                     };
                     can_split.then_some((rank, id, candidate_pages))
                 })
@@ -5227,11 +5243,10 @@ where
     let mut interner = StateInterner::default();
     let mut worklist = Worklist::new();
     if matches!(mode, Search::NextVariable) {
-        file_with_span(
+        file_with_plan(
             &mut worklist,
             &mut interner,
-            leaf_count,
-            plan.action_span(),
+            &plan,
             StateDesc {
                 bound: VariableSet::new_empty(),
                 phase: ResidualPhase::Ready,
@@ -5250,7 +5265,10 @@ where
             .expect("observed worklist level exists");
         for (id, bucket) in level {
             let desc = interner.get(id).clone();
-            debug_assert_eq!(desc.rank_with_span(leaf_count, plan.action_span()), rank);
+            debug_assert_eq!(
+                desc.rank_with_span(leaf_count, plan.action_span(), Some(&plan.finite_formula),),
+                rank
+            );
             let emit_bound = desc.bound;
             stats.state_pops += 1;
             stats.readiness_pops += 1;
@@ -6980,14 +6998,16 @@ mod tests {
         assert_eq!(program.node(children[0]).span, 2);
         assert_eq!(program.node(children[1]).span, 2);
         assert_eq!(program.node(root).span, 10);
+        assert_eq!(program.node(children[0]).kind, FiniteFormulaNodeKind::Atom);
         assert_eq!(
-            program.node(children[0]).kind,
-            FiniteFormulaNodeKind::Atom {
-                path: FormulaPath(vec![FormulaStep::Or(0)].into_boxed_slice()),
-                capabilities: FormulaAtomCapabilities {
-                    confirm_page_local: false,
-                    grouped_delta_confirm: false,
-                },
+            program.node(children[0]).path,
+            FormulaPath(vec![FormulaStep::Or(0)].into_boxed_slice())
+        );
+        assert_eq!(
+            program.node(children[0]).capabilities,
+            FormulaNodeCapabilities {
+                confirm_page_local: false,
+                grouped_delta_confirm: false,
             }
         );
 
@@ -7114,7 +7134,7 @@ mod tests {
         let proposer = program.select_child(&skipped_dead_child, 1);
         assert!(matches!(
             proposer.focus,
-            FormulaFocus::Atom {
+            FormulaFocus::Action {
                 stage: FormulaStage::Propose,
                 ..
             }
@@ -7224,7 +7244,9 @@ mod tests {
         loop {
             let grade = program.grade(&counter);
             let successor = match &counter.focus {
-                FormulaFocus::Atom { .. } => FormulaSuccessor::Formula(program.complete(&counter)),
+                FormulaFocus::Action { .. } => {
+                    FormulaSuccessor::Formula(program.complete(&counter))
+                }
                 FormulaFocus::Plan { node, done, .. } => {
                     let children = program.node(*node).children().unwrap();
                     if done.count() == children.len() {
@@ -7260,6 +7282,90 @@ mod tests {
         assert!(
             transitions > 10,
             "alternating formula trace was too shallow"
+        );
+    }
+
+    #[test]
+    fn finite_formula_ranks_fit_strictly_between_outer_protocol_grades() {
+        let union = UnionConstraint::new(vec![shape_leaf(0), shape_leaf(0)]);
+        let root =
+            IntersectionConstraint::new(vec![shape_leaf(0), Box::new(union) as ShapeConstraint]);
+        let plan = ResidualPlan::compile_finite_unions(&root);
+        let program = &plan.finite_formula;
+        let action_span = plan.action_span();
+        assert_eq!(action_span, 12);
+
+        let mut relevant = ChildSet::empty(plan.len());
+        relevant.insert(0);
+        relevant.insert(1);
+        let rank = |phase| {
+            StateDesc {
+                bound: VariableSet::new_empty(),
+                phase,
+            }
+            .rank_with_span(plan.len(), action_span, Some(program))
+        };
+
+        let outer_propose = rank(ResidualPhase::Propose {
+            variable: 0,
+            relevant: relevant.clone(),
+            proposer: 1,
+        });
+        let start = program.start(
+            0,
+            1,
+            UnionVerb::Propose {
+                relevant: relevant.clone(),
+            },
+        );
+        let action = program.select_child_as_action(&start, 0);
+        let child_complete = program.complete(&action);
+        let FormulaSuccessor::Formula(next_plan) = program.resume(&child_complete) else {
+            panic!("first OR child returned past its root")
+        };
+        let second_action = program.select_child_as_action(&next_plan, 1);
+        let second_complete = program.complete(&second_action);
+        let FormulaSuccessor::Formula(full_plan) = program.resume(&second_complete) else {
+            panic!("second OR child returned past its root Plan")
+        };
+        let root_complete = program.complete(&full_plan);
+
+        let formula_ranks = [
+            start,
+            action,
+            child_complete,
+            next_plan,
+            second_action,
+            second_complete,
+            full_plan,
+            root_complete,
+        ]
+        .map(|counter| rank(ResidualPhase::Formula { counter }));
+        assert!(formula_ranks[0] > outer_propose);
+        assert!(formula_ranks.windows(2).all(|pair| pair[0] < pair[1]));
+
+        let proposal_candidate = rank(ResidualPhase::Candidate {
+            variable: 0,
+            relevant: relevant.clone(),
+            checked: ChildSet::empty(plan.len()).with_inserted(1),
+        });
+        assert_eq!(proposal_candidate, action_span);
+        assert!(formula_ranks.last().unwrap() < &proposal_candidate);
+
+        let checked = ChildSet::empty(plan.len()).with_inserted(0);
+        let outer_confirm = rank(ResidualPhase::Confirm {
+            variable: 0,
+            relevant: relevant.clone(),
+            checked: checked.clone(),
+            confirmer: 1,
+        });
+        let confirm_start = program.start(0, 1, UnionVerb::Confirm { relevant, checked });
+        assert_eq!(outer_confirm, action_span + 1);
+        assert_eq!(
+            rank(ResidualPhase::Formula {
+                counter: confirm_start,
+            }),
+            action_span + 2
         );
     }
 
@@ -9120,17 +9226,41 @@ mod tests {
         let mut opaque: Vec<_> = Query::new(make(), project)
             .solve_residual_state_lazy()
             .collect();
-        let mut lowered: Vec<_> = Query::new(make(), project)
+        let epoch = ResidualShadowEpoch::new();
+        let mut lowered = Query::new(make(), project)
             .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
-            .collect();
+            .shadow(epoch)
+            .collect_profiled();
         sequential.sort_unstable();
         dag.sort_unstable();
         opaque.sort_unstable();
-        lowered.sort_unstable();
-        assert_eq!(lowered, [raw(1), raw(2), raw(3)]);
-        assert_eq!(lowered, sequential);
-        assert_eq!(lowered, dag);
-        assert_eq!(lowered, opaque);
+        lowered.results.sort_unstable();
+        assert_eq!(lowered.results, [raw(1), raw(2), raw(3)]);
+        assert_eq!(lowered.results, sequential);
+        assert_eq!(lowered.results, dag);
+        assert_eq!(lowered.results, opaque);
+
+        // Entering the lowered formula is planning, while each direct OR
+        // child remains one exact action. Observation preserves the enclosing
+        // residual occurrence as the public call site; the canonical formula
+        // counter (and unique event ID) distinguishes the two child actions.
+        assert_eq!(lowered.stats.propose_action_pops, 2);
+        assert_eq!(lowered.stats.propose_calls, 2);
+        assert_eq!(lowered.stats.confirm_action_pops, 0);
+        assert_eq!(lowered.shadow.events.len(), 2);
+        assert_eq!(
+            lowered
+                .shadow
+                .events
+                .iter()
+                .map(|event| event.event.get())
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        for event in &lowered.shadow.events {
+            assert_eq!(event.site, observation_site(ActionVerb::Propose, 0));
+            assert_eq!(event.geometry, observation_geometry(1, 0));
+        }
     }
 
     #[test]
@@ -9397,15 +9527,22 @@ mod tests {
             ])
         };
         let plan = ResidualPlan::compile_finite_unions(&make());
-        assert_eq!(plan.union_arm_count(0), Some(3));
+        let formula_root = plan.finite_formula.root(0).unwrap();
+        let FiniteFormulaNodeKind::Or { children } = &plan.finite_formula.node(formula_root).kind
+        else {
+            panic!("lowered recursive union is not an OR")
+        };
+        assert_eq!(children.len(), 3);
         assert_eq!(
-            plan.leaves[0].union_arms,
+            children
+                .iter()
+                .map(|&child| plan.finite_formula.node(child).path.clone())
+                .collect::<Vec<_>>(),
             vec![
-                UnionArmPath(vec![0, 0].into_boxed_slice()),
-                UnionArmPath(vec![0, 1].into_boxed_slice()),
-                UnionArmPath(vec![1].into_boxed_slice()),
+                FormulaPath(vec![FormulaStep::Or(0), FormulaStep::Or(0)].into_boxed_slice()),
+                FormulaPath(vec![FormulaStep::Or(0), FormulaStep::Or(1)].into_boxed_slice()),
+                FormulaPath(vec![FormulaStep::Or(1)].into_boxed_slice()),
             ]
-            .into_boxed_slice()
         );
 
         let project = |binding: &Binding| binding.get(0).copied();
@@ -9522,14 +9659,21 @@ mod tests {
         // The first recursive slice therefore stops at the AND occurrence;
         // crossing it requires an activation-private working-candidate frame.
         let plan = ResidualPlan::compile_finite_unions(&make());
-        assert_eq!(plan.union_arm_count(0), Some(2));
+        let formula_root = plan.finite_formula.root(0).unwrap();
+        let FiniteFormulaNodeKind::Or { children } = &plan.finite_formula.node(formula_root).kind
+        else {
+            panic!("lowered guarded union is not an OR")
+        };
+        assert_eq!(children.len(), 2);
         assert_eq!(
-            plan.leaves[0].union_arms,
+            children
+                .iter()
+                .map(|&child| plan.finite_formula.node(child).path.clone())
+                .collect::<Vec<_>>(),
             vec![
-                UnionArmPath(vec![0].into_boxed_slice()),
-                UnionArmPath(vec![1].into_boxed_slice()),
+                FormulaPath(vec![FormulaStep::Or(0)].into_boxed_slice()),
+                FormulaPath(vec![FormulaStep::Or(1)].into_boxed_slice()),
             ]
-            .into_boxed_slice()
         );
 
         let project = |binding: &Binding| binding.get(0).copied();
@@ -9563,8 +9707,15 @@ mod tests {
             ])
         };
         let plan = ResidualPlan::compile_finite_unions(&make());
-        assert_eq!(plan.union_arm_count(0), Some(2));
-        assert_eq!(plan.union_arm_count(1), Some(2));
+        for occurrence in 0..2 {
+            let formula_root = plan.finite_formula.root(occurrence).unwrap();
+            let FiniteFormulaNodeKind::Or { children } =
+                &plan.finite_formula.node(formula_root).kind
+            else {
+                panic!("repeated lowered union is not an OR")
+            };
+            assert_eq!(children.len(), 2);
+        }
         assert_ne!(plan.leaves[0].path, plan.leaves[1].path);
 
         let project = |binding: &Binding| binding.get(0).copied();
@@ -10301,7 +10452,7 @@ mod tests {
                 assert_eq!(batch.candidates.len(), 64);
                 assert!(batch.candidates.iter().all(|(parent, _)| *parent == 0));
             }
-            StateBucket::Rows(_) | StateBucket::Union(_) => {
+            StateBucket::Rows(_) | StateBucket::Formula(_) => {
                 panic!("confirmation returned a non-candidate payload")
             }
         }
@@ -10329,7 +10480,7 @@ mod tests {
                 assert_eq!(batch.candidates.len(), 65);
                 assert_eq!(batch.candidates.last().map(|(parent, _)| *parent), Some(1));
             }
-            StateBucket::Rows(_) | StateBucket::Union(_) => {
+            StateBucket::Rows(_) | StateBucket::Formula(_) => {
                 panic!("confirmation returned a non-candidate payload")
             }
         }
