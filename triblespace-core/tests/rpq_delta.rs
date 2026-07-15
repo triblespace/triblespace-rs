@@ -1748,6 +1748,49 @@ fn clone_and_drop_preserve_a_live_linear_formula_stream() {
 }
 
 #[test]
+fn ordinary_shape_selected_query_composes_root_formula_union_and_cyclic_rpq() {
+    let graph = Graph::new(4, &[(0, 1), (1, 2)]);
+    let ops = repeated(graph.attribute, false);
+    let start = graph.value(0);
+
+    let mut expected: Vec<_> = Query::new(
+        formula_bound_start_root(
+            graph.set.clone(),
+            start,
+            &ops,
+            None,
+            Arc::new(AtomicUsize::new(0)),
+        ),
+        project_end,
+    )
+    .sequential()
+    .collect();
+
+    let seeded = Arc::new(AtomicUsize::new(0));
+    let expanded = Arc::new(AtomicUsize::new(0));
+    let mut ordinary: Vec<_> = Query::new(
+        formula_bound_start_root(
+            graph.set,
+            start,
+            &ops,
+            Some(Arc::clone(&seeded)),
+            Arc::clone(&expanded),
+        ),
+        project_end,
+    )
+    .collect();
+
+    expected.sort_unstable();
+    ordinary.sort_unstable();
+    assert_eq!(ordinary, expected);
+    assert_eq!(seeded.load(Ordering::Relaxed), 1);
+    assert!(
+        expanded.load(Ordering::Relaxed) > 0,
+        "ordinary execution left the eligible cyclic RPQ opaque"
+    );
+}
+
+#[test]
 fn finite_or_keeps_cyclic_proposals_private_until_fixpoint_quiescence() {
     let graph = Graph::new(8, &[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)]);
     let ops = repeated(graph.attribute, false);
