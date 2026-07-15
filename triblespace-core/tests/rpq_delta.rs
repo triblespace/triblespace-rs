@@ -8,7 +8,7 @@ use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
-use triblespace_core::query::residual::ResidualCapabilities;
+use triblespace_core::query::residual::{ActionVerb, ResidualCapabilities, ResidualShadowEpoch};
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, ConstraintShape, EstimateSink, PathOp, Query,
@@ -323,6 +323,72 @@ impl<'a> Constraint<'a> for OrderedDomain {
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         view.col(self.variable)
             .is_none_or(|column| view.iter().all(|row| self.values.contains(&row[column])))
+    }
+}
+
+#[derive(Clone)]
+struct PageTraceFilter {
+    variable: VariableId,
+    estimate: usize,
+    accepted: Option<RawInline>,
+    calls: Arc<Mutex<Vec<usize>>>,
+}
+
+impl<'a> Constraint<'a> for PageTraceFilter {
+    fn variables(&self) -> VariableSet {
+        VariableSet::new_singleton(self.variable)
+    }
+
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        if variable != self.variable {
+            return false;
+        }
+        out.fill(self.estimate, view.len());
+        true
+    }
+
+    fn propose(
+        &self,
+        variable: VariableId,
+        _view: &RowsView<'_>,
+        _candidates: &mut CandidateSink<'_>,
+    ) {
+        assert_ne!(
+            variable, self.variable,
+            "the trace-only suffix unexpectedly became the proposer"
+        );
+    }
+
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        assert_eq!(variable, self.variable);
+        self.calls
+            .lock()
+            .expect("page-trace recorder poisoned")
+            .push(candidates.len());
+        if let Some(accepted) = self.accepted {
+            candidates.retain(|_, value| *value == accepted);
+        }
+    }
+
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        self.accepted.is_none_or(|accepted| {
+            view.col(self.variable)
+                .is_none_or(|column| view.iter().all(|row| row[column] == accepted))
+        })
+    }
+
+    fn residual_confirm_is_page_local(&self) -> bool {
+        true
     }
 }
 
@@ -730,6 +796,253 @@ fn assert_all_schedulers(
     ] {
         assert_eq!(run(make_root(), scheduler, project), expected);
     }
+}
+
+#[test]
+fn synthetic_root_atom_same_variable_rpq_composes_capabilities() {
+    let graph = Graph::new(4, &[(0, 0), (1, 1), (2, 2), (3, 3)]);
+    let ops = repeated(graph.attribute, false);
+    let make = |seeded_roots, source_pages| CountingPath {
+        inner: RegularPathConstraint::new(
+            graph.set.clone(),
+            Variable::<GenId>::new(START),
+            Variable::<GenId>::new(START),
+            &ops,
+        ),
+        seeded_roots: Some(seeded_roots),
+        source_pages: Some(source_pages),
+        expanded_nodes: Arc::new(AtomicUsize::new(0)),
+    };
+
+    let mut expected: Vec<_> = Query::new(
+        make(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(Mutex::new(Vec::new())),
+        ),
+        project_start,
+    )
+    .sequential()
+    .collect();
+    expected.sort_unstable();
+
+    let cases = [
+        (
+            "root-only",
+            ResidualCapabilities::default().root_formula(),
+            false,
+        ),
+        (
+            "cyclic-only",
+            ResidualCapabilities::default().cyclic_rpq(),
+            true,
+        ),
+        (
+            "root-cyclic",
+            ResidualCapabilities::default().root_formula().cyclic_rpq(),
+            true,
+        ),
+        (
+            "root-finite-cyclic",
+            ResidualCapabilities::default()
+                .root_formula()
+                .finite_unions()
+                .cyclic_rpq(),
+            true,
+        ),
+    ];
+    for (name, capabilities, should_page_sources) in cases {
+        let seeded = Arc::new(AtomicUsize::new(0));
+        let pages = Arc::new(Mutex::new(Vec::new()));
+        let mut actual: Vec<_> =
+            Query::new(make(Arc::clone(&seeded), Arc::clone(&pages)), project_start)
+                .solve_residual_state_lazy_with(capabilities)
+                .cap(4)
+                .start_width(1)
+                .collect();
+        actual.sort_unstable();
+        assert_eq!(actual, expected, "capability case {name}");
+        assert_eq!(
+            !pages
+                .lock()
+                .expect("source-page recorder poisoned")
+                .is_empty(),
+            should_page_sources,
+            "capability case {name}"
+        );
+        assert_eq!(
+            seeded.load(Ordering::Relaxed) > 0,
+            should_page_sources,
+            "capability case {name}"
+        );
+    }
+}
+
+#[test]
+fn synthetic_root_grouped_rpq_precedes_page_local_suffix_atomically() {
+    let graph = Graph::new(3, &[(0, 0)]);
+    let accepted = graph.value(0).raw;
+    let candidates = vec![accepted, graph.value(1).raw, accepted, graph.value(2).raw];
+    let source_pages = Arc::new(Mutex::new(Vec::new()));
+    let suffix_calls = Arc::new(Mutex::new(Vec::new()));
+    let seeded = Arc::new(AtomicUsize::new(0));
+    let node = Variable::<GenId>::new(START);
+    let root = Arc::new(IntersectionConstraint::new(vec![
+        Box::new(OrderedDomain {
+            variable: START,
+            gate: START,
+            unbound_estimate: 0,
+            values: candidates,
+        }) as DynConstraint,
+        Box::new(CountingPath {
+            inner: RegularPathConstraint::new(
+                graph.set.clone(),
+                node,
+                node,
+                &repeated(graph.attribute, false),
+            ),
+            seeded_roots: Some(Arc::clone(&seeded)),
+            source_pages: Some(Arc::clone(&source_pages)),
+            expanded_nodes: Arc::new(AtomicUsize::new(0)),
+        }) as DynConstraint,
+        Box::new(PageTraceFilter {
+            variable: START,
+            estimate: usize::MAX,
+            accepted: None,
+            calls: Arc::clone(&suffix_calls),
+        }) as DynConstraint,
+    ]));
+    let mut query = Query::new(root, project_start)
+        .solve_residual_state_lazy_with(ResidualCapabilities::default().root_formula().cyclic_rpq())
+        .cap(1)
+        .start_width(1);
+
+    assert_eq!(query.by_ref().collect::<Vec<_>>(), vec![accepted, accepted]);
+    let pages = source_pages
+        .lock()
+        .expect("source-page recorder poisoned")
+        .clone();
+    assert_eq!(
+        pages
+            .iter()
+            .map(|&(limit, examined, _)| (limit, examined))
+            .collect::<Vec<_>>(),
+        vec![(1, 1), (1, 1), (1, 1)]
+    );
+    assert_eq!(
+        pages.iter().map(|&(_, _, roots)| roots).sum::<usize>(),
+        1,
+        "the duplicate accepted value must remain one grouped source root"
+    );
+    assert_eq!(seeded.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        *suffix_calls.lock().expect("suffix recorder poisoned"),
+        [1, 1],
+        "candidate paging may begin only after the grouped RPQ quiesces"
+    );
+    assert_eq!(query.stats().max_confirm_candidates, 4);
+}
+
+#[test]
+fn synthetic_root_cyclic_proposer_pins_global_width_coupling() {
+    let edges: Vec<_> = (0..8).map(|node| (node, node)).collect();
+    let graph = Graph::new(8, &edges);
+    let source_pages = Arc::new(Mutex::new(Vec::new()));
+    let suffix_calls = Arc::new(Mutex::new(Vec::new()));
+    let seeded = Arc::new(AtomicUsize::new(0));
+    let node = Variable::<GenId>::new(START);
+    let accepted = graph.value(0).raw;
+    let root = Arc::new(IntersectionConstraint::new(vec![
+        Box::new(CountingPath {
+            inner: RegularPathConstraint::new(
+                graph.set.clone(),
+                node,
+                node,
+                &repeated(graph.attribute, false),
+            ),
+            seeded_roots: Some(Arc::clone(&seeded)),
+            source_pages: Some(Arc::clone(&source_pages)),
+            expanded_nodes: Arc::new(AtomicUsize::new(0)),
+        }) as DynConstraint,
+        Box::new(PageTraceFilter {
+            variable: START,
+            estimate: usize::MAX,
+            accepted: Some(accepted),
+            calls: Arc::clone(&suffix_calls),
+        }) as DynConstraint,
+    ]));
+    let mut query = Query::new(root, project_start)
+        .solve_residual_state_lazy_with(ResidualCapabilities::default().root_formula().cyclic_rpq())
+        .cap(8)
+        .start_width(1);
+
+    assert_eq!(query.next(), Some(accepted));
+    assert_eq!(
+        *source_pages.lock().expect("source-page recorder poisoned"),
+        [(1, 1, 1), (2, 2, 2), (4, 4, 4), (8, 1, 1)]
+    );
+    assert_eq!(seeded.load(Ordering::Relaxed), 8);
+    assert_eq!(
+        *suffix_calls.lock().expect("suffix recorder poisoned"),
+        [8],
+        "the page-local suffix currently inherits the source frontier's width"
+    );
+    assert_eq!(query.stats().width_increases, 3);
+    assert_eq!(query.current_width(), 8);
+}
+
+#[test]
+fn nested_repeated_root_rpqs_keep_distinct_action_occurrences() {
+    let graph = Graph::new(3, &[(0, 1), (1, 2)]);
+    let ops = repeated(graph.attribute, false);
+    let make = |left: Option<Arc<AtomicUsize>>, right: Option<Arc<AtomicUsize>>| {
+        let start = Variable::<GenId>::new(START);
+        let end = Variable::<GenId>::new(END);
+        let arm = |seeded_roots| {
+            Box::new(CountingPath {
+                inner: RegularPathConstraint::new(graph.set.clone(), start, end, &ops),
+                seeded_roots,
+                source_pages: None,
+                expanded_nodes: Arc::new(AtomicUsize::new(0)),
+            }) as DynConstraint
+        };
+        Arc::new(IntersectionConstraint::new(vec![
+            Box::new(start.is(graph.value(0))) as DynConstraint,
+            Box::new(UnionConstraint::new(vec![arm(left), arm(right)])) as DynConstraint,
+        ]))
+    };
+    let capabilities = ResidualCapabilities::default().root_formula().cyclic_rpq();
+    let left = Arc::new(AtomicUsize::new(0));
+    let right = Arc::new(AtomicUsize::new(0));
+    let mut actual: Vec<_> = Query::new(
+        make(Some(Arc::clone(&left)), Some(Arc::clone(&right))),
+        project_end,
+    )
+    .solve_residual_state_lazy_with(capabilities)
+    .collect();
+    actual.sort_unstable();
+    let mut expected = vec![graph.value(1).raw, graph.value(2).raw];
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
+    assert_eq!(left.load(Ordering::Relaxed), 1);
+    assert_eq!(right.load(Ordering::Relaxed), 1);
+
+    let observed = Query::new(make(None, None), project_end)
+        .solve_residual_state_lazy_with(capabilities)
+        .shadow(ResidualShadowEpoch::new())
+        .collect_profiled();
+    let mut observed_results = observed.results.clone();
+    observed_results.sort_unstable();
+    assert_eq!(observed_results, expected);
+    let mut occurrences: Vec<_> = observed
+        .shadow
+        .events
+        .iter()
+        .filter(|event| event.site.verb == ActionVerb::Propose && event.site.variable == END)
+        .map(|event| event.site.leaf_occurrence)
+        .collect();
+    occurrences.sort_unstable();
+    occurrences.dedup();
+    assert_eq!(occurrences.len(), 2);
 }
 
 #[test]

@@ -1889,6 +1889,9 @@ mod tests {
                 row_count: 1,
             },
             vec![super::super::ActivationId(11)],
+            &FiniteFormulaNodeKind::Or {
+                children: Box::new([]),
+            },
         );
         let mut original = ProducerRegistry::new();
         let mut started = original.start_many(
@@ -1971,6 +1974,9 @@ mod tests {
                 row_count: 1,
             },
             vec![super::super::ActivationId(11)],
+            &FiniteFormulaNodeKind::Or {
+                children: Box::new([]),
+            },
         );
         let mut original = ProducerRegistry::new();
         let (activation, generator) = original.start_source(
@@ -2063,6 +2069,9 @@ mod tests {
                     row_count: 1,
                 },
                 vec![super::super::ActivationId(index as u64)],
+                &FiniteFormulaNodeKind::Or {
+                    children: Box::new([]),
+                },
             );
             let started = scheduler.registry.start_many(
                 DeltaReducer::QuiescentProposal,
