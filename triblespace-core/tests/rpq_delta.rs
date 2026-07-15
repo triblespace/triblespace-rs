@@ -1,12 +1,15 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 use triblespace_core::id::{rngid, ExclusiveId, Id};
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace_core::query::residual::ResidualCapabilities;
+use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, ConstraintShape, EstimateSink, PathOp, Query,
     RegularPathConstraint, ResidualDeltaNode, ResidualDeltaOutput, ResidualDeltaSeed, RowsView,
@@ -174,7 +177,7 @@ impl<'a> Constraint<'a> for DuplicateParents {
         out: &mut EstimateSink<'_>,
     ) -> bool {
         match variable {
-            OUTER => out.fill(self.outer_values.len(), view.len()),
+            OUTER => out.fill(1, view.len()),
             // Force OUTER first, then create one identical START occurrence
             // for each distinct outer row. This is a bag-multiplicity oracle,
             // not a duplicate candidate-set oracle.
@@ -327,6 +330,26 @@ fn bound_start_root(
     ]))
 }
 
+fn formula_bound_start_root(
+    set: TribleSet,
+    start: Inline<GenId>,
+    ops: &[PathOp],
+    seeded_roots: Option<Arc<AtomicUsize>>,
+    expanded_nodes: Arc<AtomicUsize>,
+) -> Root {
+    let start_var = Variable::<GenId>::new(START);
+    let end_var = Variable::<GenId>::new(END);
+    let arm = Box::new(CountingPath {
+        inner: RegularPathConstraint::new(set, start_var, end_var, ops),
+        seeded_roots,
+        expanded_nodes,
+    }) as DynConstraint;
+    Arc::new(IntersectionConstraint::new(vec![
+        Box::new(start_var.is(start)) as DynConstraint,
+        Box::new(UnionConstraint::new(vec![arm])) as DynConstraint,
+    ]))
+}
+
 fn bound_end_root(
     set: TribleSet,
     end: Inline<GenId>,
@@ -374,6 +397,68 @@ fn target_confirm_root(
             seeded_roots: None,
             expanded_nodes,
         }) as DynConstraint,
+    ]))
+}
+
+fn formula_target_confirm_root(
+    set: TribleSet,
+    bound: Inline<GenId>,
+    candidates: Vec<RawInline>,
+    ops: &[PathOp],
+    seeded_roots: Option<Arc<AtomicUsize>>,
+    expanded_nodes: Arc<AtomicUsize>,
+) -> Root {
+    let start_var = Variable::<GenId>::new(START);
+    let end_var = Variable::<GenId>::new(END);
+    let arm = Box::new(CountingPath {
+        inner: RegularPathConstraint::new(set, start_var, end_var, ops),
+        seeded_roots,
+        expanded_nodes,
+    }) as DynConstraint;
+    Arc::new(IntersectionConstraint::new(vec![
+        Box::new(start_var.is(bound)) as DynConstraint,
+        Box::new(OrderedDomain {
+            variable: END,
+            gate: START,
+            unbound_estimate: 4,
+            values: candidates,
+        }) as DynConstraint,
+        Box::new(UnionConstraint::new(vec![arm])) as DynConstraint,
+    ]))
+}
+
+fn formula_and_bound_start_root(
+    set: TribleSet,
+    start: Inline<GenId>,
+    candidates: Vec<RawInline>,
+    path_estimate_wins: bool,
+    ops: &[PathOp],
+    seeded_roots: Option<Arc<AtomicUsize>>,
+    expanded_nodes: Arc<AtomicUsize>,
+) -> Root {
+    let start_var = Variable::<GenId>::new(START);
+    let end_var = Variable::<GenId>::new(END);
+    let path = Box::new(CountingPath {
+        inner: RegularPathConstraint::new(set, start_var, end_var, ops),
+        seeded_roots,
+        expanded_nodes,
+    }) as DynConstraint;
+    let domain = Box::new(OrderedDomain {
+        variable: END,
+        // END is unbound while planning this action, so this selects whether
+        // the finite AND uses the RPQ as proposer or grouped confirmer.
+        gate: END,
+        unbound_estimate: if path_estimate_wins { 100 } else { 0 },
+        values: candidates,
+    }) as DynConstraint;
+    let arm = if path_estimate_wins {
+        IntersectionConstraint::new(vec![path, domain])
+    } else {
+        IntersectionConstraint::new(vec![domain, path])
+    };
+    Arc::new(IntersectionConstraint::new(vec![
+        Box::new(start_var.is(start)) as DynConstraint,
+        Box::new(UnionConstraint::new(vec![Box::new(arm) as DynConstraint])) as DynConstraint,
     ]))
 }
 
@@ -444,6 +529,30 @@ fn same_variable_confirm_root(
     ]))
 }
 
+fn same_variable_formula_confirm_root(
+    set: TribleSet,
+    candidates: Vec<RawInline>,
+    ops: &[PathOp],
+    seeded_roots: Arc<AtomicUsize>,
+    expanded_nodes: Arc<AtomicUsize>,
+) -> Root {
+    let node = Variable::<GenId>::new(START);
+    let arm = Box::new(CountingPath {
+        inner: RegularPathConstraint::new(set, node, node, ops),
+        seeded_roots: Some(seeded_roots),
+        expanded_nodes,
+    }) as DynConstraint;
+    Arc::new(IntersectionConstraint::new(vec![
+        Box::new(OrderedDomain {
+            variable: START,
+            gate: START,
+            unbound_estimate: 0,
+            values: candidates,
+        }) as DynConstraint,
+        Box::new(UnionConstraint::new(vec![arm])) as DynConstraint,
+    ]))
+}
+
 fn same_variable_outer_root(
     set: TribleSet,
     outer_values: [RawInline; 2],
@@ -472,6 +581,10 @@ fn project_end(binding: &Binding) -> Option<RawInline> {
 
 fn project_start(binding: &Binding) -> Option<RawInline> {
     binding.get(START).copied()
+}
+
+fn project_pair(binding: &Binding) -> Option<(RawInline, RawInline)> {
+    Some((binding.get(START).copied()?, binding.get(END).copied()?))
 }
 
 fn run(
@@ -505,6 +618,481 @@ fn assert_all_schedulers(
         Scheduler::Sequential,
     ] {
         assert_eq!(run(make_root(), scheduler, project), expected);
+    }
+}
+
+#[test]
+fn cyclic_rpq_runs_as_a_direct_finite_or_proposal_action() {
+    let graph = Graph::new(4, &[(0, 1), (1, 2), (2, 3)]);
+    let ops = repeated(graph.attribute, false);
+    let seeded = Arc::new(AtomicUsize::new(0));
+    let expanded = Arc::new(AtomicUsize::new(0));
+    let root = formula_bound_start_root(
+        graph.set.clone(),
+        graph.value(0),
+        &ops,
+        Some(Arc::clone(&seeded)),
+        Arc::clone(&expanded),
+    );
+
+    let mut lowered: Vec<_> = Query::new(Arc::clone(&root), project_end)
+        .solve_residual_state_lazy_with(combined_effects())
+        .cap(1)
+        .start_width(1)
+        .collect();
+    let mut sequential: Vec<_> = Query::new(root, project_end).sequential().collect();
+    lowered.sort_unstable();
+    sequential.sort_unstable();
+    assert_eq!(lowered, sequential);
+    let mut expected: Vec<_> = (1..4).map(|node| graph.value(node).raw).collect();
+    expected.sort_unstable();
+    assert_eq!(lowered, expected);
+    assert_eq!(seeded.load(Ordering::Relaxed), 1);
+    assert!(expanded.load(Ordering::Relaxed) >= 3);
+}
+
+#[test]
+fn cyclic_rpq_runs_as_a_direct_finite_or_grouped_confirm_action() {
+    let graph = Graph::new(4, &[(0, 1), (1, 2)]);
+    let ops = repeated(graph.attribute, false);
+    let absent = genid(&rngid().id).raw;
+    let seeded = Arc::new(AtomicUsize::new(0));
+    let expanded = Arc::new(AtomicUsize::new(0));
+    let root = formula_target_confirm_root(
+        graph.set.clone(),
+        graph.value(0),
+        vec![
+            graph.value(2).raw,
+            absent,
+            graph.value(2).raw,
+            graph.value(1).raw,
+        ],
+        &ops,
+        Some(Arc::clone(&seeded)),
+        Arc::clone(&expanded),
+    );
+
+    let mut lowered: Vec<_> = Query::new(Arc::clone(&root), project_end)
+        .solve_residual_state_lazy_with(combined_effects())
+        .cap(1)
+        .start_width(1)
+        .collect();
+    let mut sequential: Vec<_> = Query::new(root, project_end).sequential().collect();
+    lowered.sort_unstable();
+    sequential.sort_unstable();
+    assert_eq!(lowered, sequential);
+    let mut expected = vec![graph.value(1).raw, graph.value(2).raw];
+    expected.sort_unstable();
+    assert_eq!(lowered, expected);
+    assert_eq!(seeded.load(Ordering::Relaxed), 1);
+    assert!(expanded.load(Ordering::Relaxed) >= 3);
+}
+
+#[test]
+fn cyclic_or_confirm_keeps_the_original_group_for_a_later_sibling() {
+    let graph = Graph::new(4, &[(0, 1), (1, 2)]);
+    let ops = repeated(graph.attribute, false);
+    let start_var = Variable::<GenId>::new(START);
+    let end_var = Variable::<GenId>::new(END);
+    let seeded = Arc::new(AtomicUsize::new(0));
+    let expanded = Arc::new(AtomicUsize::new(0));
+    let cyclic = Box::new(CountingPath {
+        inner: RegularPathConstraint::new(graph.set.clone(), start_var, end_var, &ops),
+        seeded_roots: Some(Arc::clone(&seeded)),
+        expanded_nodes: Arc::clone(&expanded),
+    }) as DynConstraint;
+    let sibling = Box::new(IntersectionConstraint::new(vec![
+        Box::new(start_var.is(graph.value(0))) as DynConstraint,
+        Box::new(OrderedDomain {
+            variable: END,
+            gate: START,
+            unbound_estimate: 10,
+            values: vec![graph.value(3).raw],
+        }) as DynConstraint,
+    ])) as DynConstraint;
+    let union = Box::new(UnionConstraint::new(vec![cyclic, sibling])) as DynConstraint;
+    let root = Arc::new(IntersectionConstraint::new(vec![
+        Box::new(start_var.is(graph.value(0))) as DynConstraint,
+        Box::new(OrderedDomain {
+            variable: END,
+            gate: START,
+            unbound_estimate: 4,
+            values: vec![graph.value(2).raw, graph.value(3).raw, graph.value(1).raw],
+        }) as DynConstraint,
+        union,
+    ]));
+
+    let mut lowered: Vec<_> = Query::new(Arc::clone(&root), project_end)
+        .solve_residual_state_lazy_with(combined_effects())
+        .cap(1)
+        .start_width(1)
+        .collect();
+    let mut sequential: Vec<_> = Query::new(root, project_end).sequential().collect();
+    lowered.sort_unstable();
+    sequential.sort_unstable();
+    assert_eq!(lowered, sequential);
+    let mut expected = vec![graph.value(1).raw, graph.value(2).raw, graph.value(3).raw];
+    expected.sort_unstable();
+    assert_eq!(lowered, expected);
+    assert_eq!(seeded.load(Ordering::Relaxed), 1);
+    assert!(expanded.load(Ordering::Relaxed) >= 3);
+}
+
+#[test]
+fn cyclic_rpq_runs_in_a_finite_and_as_proposer_and_grouped_confirmer() {
+    let graph = Graph::new(4, &[(0, 1), (1, 2)]);
+    let ops = repeated(graph.attribute, false);
+    let absent = genid(&rngid().id).raw;
+
+    for (path_estimate_wins, candidates, mut expected) in [
+        (
+            true,
+            vec![graph.value(2).raw, absent],
+            vec![graph.value(2).raw],
+        ),
+        (
+            false,
+            vec![graph.value(2).raw, absent, graph.value(1).raw],
+            vec![graph.value(1).raw, graph.value(2).raw],
+        ),
+    ] {
+        let seeded = Arc::new(AtomicUsize::new(0));
+        let expanded = Arc::new(AtomicUsize::new(0));
+        let root = formula_and_bound_start_root(
+            graph.set.clone(),
+            graph.value(0),
+            candidates,
+            path_estimate_wins,
+            &ops,
+            Some(Arc::clone(&seeded)),
+            Arc::clone(&expanded),
+        );
+        let mut lowered: Vec<_> = Query::new(Arc::clone(&root), project_end)
+            .solve_residual_state_lazy_with(combined_effects())
+            .collect();
+        let mut sequential: Vec<_> = Query::new(root, project_end).sequential().collect();
+        lowered.sort_unstable();
+        sequential.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(lowered, sequential);
+        assert_eq!(lowered, expected);
+        assert!(seeded.load(Ordering::Relaxed) > 0);
+        assert!(expanded.load(Ordering::Relaxed) > 0);
+    }
+}
+
+#[test]
+fn finite_or_keeps_cyclic_proposals_private_until_fixpoint_quiescence() {
+    let graph = Graph::new(8, &[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)]);
+    let ops = repeated(graph.attribute, false);
+    let expanded = Arc::new(AtomicUsize::new(0));
+    let root = formula_bound_start_root(
+        graph.set.clone(),
+        graph.value(0),
+        &ops,
+        None,
+        Arc::clone(&expanded),
+    );
+    let mut query = Query::new(root, project_end)
+        .solve_residual_state_lazy_with(combined_effects())
+        .cap(1)
+        .start_width(1);
+
+    assert!(query.next().is_some());
+    assert_eq!(
+        expanded.load(Ordering::Relaxed),
+        8,
+        "an OR arm must not publish a partial cyclic proposal"
+    );
+    drop(query);
+    assert_eq!(expanded.load(Ordering::Relaxed), 8);
+}
+
+#[test]
+fn clone_and_drop_preserve_a_live_formula_cyclic_remainder() {
+    let graph = Graph::new(8, &[(0, 1), (1, 2), (2, 3), (4, 5), (5, 6), (6, 7)]);
+    let ops = repeated(graph.attribute, false);
+    let start_var = Variable::<GenId>::new(START);
+    let end_var = Variable::<GenId>::new(END);
+    let expanded = Arc::new(AtomicUsize::new(0));
+    let cyclic = Box::new(CountingPath {
+        inner: RegularPathConstraint::new(graph.set.clone(), start_var, end_var, &ops),
+        seeded_roots: None,
+        expanded_nodes: Arc::clone(&expanded),
+    }) as DynConstraint;
+    let root = Arc::new(IntersectionConstraint::new(vec![
+        Box::new(OrderedDomain {
+            variable: START,
+            gate: START,
+            unbound_estimate: 0,
+            values: vec![graph.value(0).raw, graph.value(4).raw],
+        }) as DynConstraint,
+        Box::new(UnionConstraint::new(vec![cyclic])) as DynConstraint,
+    ]));
+    let mut query = Query::new(root, project_pair)
+        .solve_residual_state_lazy_with(combined_effects())
+        .cap(1)
+        .start_width(1);
+
+    let first = query.next().expect("one source activation quiesced");
+    assert_eq!(
+        expanded.load(Ordering::Relaxed),
+        4,
+        "the other source activation must remain live"
+    );
+    let exact_clone = query.clone();
+    let cancelled = query.clone();
+    drop(cancelled);
+    assert_eq!(expanded.load(Ordering::Relaxed), 4);
+
+    let mut original = vec![first];
+    original.extend(query);
+    let mut cloned = vec![first];
+    cloned.extend(exact_clone);
+    original.sort_unstable();
+    cloned.sort_unstable();
+    assert_eq!(cloned, original);
+    assert_eq!(original.len(), 6);
+    assert_eq!(expanded.load(Ordering::Relaxed), 12);
+}
+
+#[test]
+fn formula_cyclic_lowering_remains_capability_and_program_gated() {
+    let graph = Graph::new(3, &[(0, 1), (1, 2)]);
+    let plus = repeated(graph.attribute, false);
+    let expected = {
+        let mut values = vec![graph.value(1).raw, graph.value(2).raw];
+        values.sort_unstable();
+        values
+    };
+    for capabilities in [
+        ResidualCapabilities::default().finite_unions(),
+        ResidualCapabilities::default().cyclic_rpq(),
+    ] {
+        let seeded = Arc::new(AtomicUsize::new(0));
+        let expanded = Arc::new(AtomicUsize::new(0));
+        let root = formula_bound_start_root(
+            graph.set.clone(),
+            graph.value(0),
+            &plus,
+            Some(Arc::clone(&seeded)),
+            Arc::clone(&expanded),
+        );
+        let mut actual: Vec<_> = Query::new(root, project_end)
+            .solve_residual_state_lazy_with(capabilities)
+            .collect();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
+        assert_eq!(seeded.load(Ordering::Relaxed), 0);
+        assert_eq!(expanded.load(Ordering::Relaxed), 0);
+    }
+
+    let seeded = Arc::new(AtomicUsize::new(0));
+    let expanded = Arc::new(AtomicUsize::new(0));
+    let root = formula_bound_start_root(
+        graph.set.clone(),
+        graph.value(0),
+        &[PathOp::Attr(graph.attribute.raw())],
+        Some(Arc::clone(&seeded)),
+        Arc::clone(&expanded),
+    );
+    assert_eq!(
+        Query::new(root, project_end)
+            .solve_residual_state_lazy_with(combined_effects())
+            .collect::<Vec<_>>(),
+        vec![graph.value(1).raw]
+    );
+    assert_eq!(seeded.load(Ordering::Relaxed), 0);
+    assert_eq!(expanded.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn zero_root_cyclic_and_returns_empty_without_erasing_its_or_sibling() {
+    let graph = Graph::new(1, &[]);
+    let node = Variable::<GenId>::new(START);
+    let ops = repeated(graph.attribute, false);
+    let seeded = Arc::new(AtomicUsize::new(0));
+    let expanded = Arc::new(AtomicUsize::new(0));
+    let survivor = graph.value(0).raw;
+    let cyclic = Box::new(CountingPath {
+        inner: RegularPathConstraint::new(graph.set.clone(), node, node, &ops),
+        seeded_roots: Some(Arc::clone(&seeded)),
+        expanded_nodes: Arc::clone(&expanded),
+    }) as DynConstraint;
+    let dead_and = Box::new(IntersectionConstraint::new(vec![
+        cyclic,
+        Box::new(OrderedDomain {
+            variable: START,
+            gate: START,
+            unbound_estimate: 100,
+            values: vec![survivor],
+        }) as DynConstraint,
+    ])) as DynConstraint;
+    let sibling = Box::new(OrderedDomain {
+        variable: START,
+        gate: START,
+        unbound_estimate: 10,
+        values: vec![survivor],
+    }) as DynConstraint;
+    let root = Arc::new(IntersectionConstraint::new(vec![
+        Box::new(UnionConstraint::new(vec![dead_and, sibling])) as DynConstraint,
+    ]));
+
+    assert_eq!(
+        Query::new(root, project_start)
+            .solve_residual_state_lazy_with(combined_effects())
+            .collect::<Vec<_>>(),
+        vec![survivor]
+    );
+    assert_eq!(seeded.load(Ordering::Relaxed), 0);
+    assert_eq!(expanded.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn formula_cyclic_activations_preserve_duplicate_outer_parents() {
+    let graph = Graph::new(3, &[(0, 1), (1, 2)]);
+    let ops = repeated(graph.attribute, false);
+    let outer_values = [genid(&rngid().id).raw, genid(&rngid().id).raw];
+    let seeded = Arc::new(AtomicUsize::new(0));
+    let expanded = Arc::new(AtomicUsize::new(0));
+    let start_var = Variable::<GenId>::new(START);
+    let end_var = Variable::<GenId>::new(END);
+    let arm = Box::new(CountingPath {
+        inner: RegularPathConstraint::new(graph.set.clone(), start_var, end_var, &ops),
+        seeded_roots: Some(Arc::clone(&seeded)),
+        expanded_nodes: Arc::clone(&expanded),
+    }) as DynConstraint;
+    let root = Arc::new(IntersectionConstraint::new(vec![
+        Box::new(DuplicateParents {
+            outer_values,
+            start: graph.value(0).raw,
+        }) as DynConstraint,
+        Box::new(UnionConstraint::new(vec![arm])) as DynConstraint,
+    ]));
+
+    let mut lowered: Vec<_> = Query::new(Arc::clone(&root), project_end)
+        .solve_residual_state_lazy_with(combined_effects())
+        .collect();
+    let mut sequential: Vec<_> = Query::new(root, project_end).sequential().collect();
+    lowered.sort_unstable();
+    sequential.sort_unstable();
+    assert_eq!(lowered, sequential);
+    let mut expected = vec![
+        graph.value(1).raw,
+        graph.value(1).raw,
+        graph.value(2).raw,
+        graph.value(2).raw,
+    ];
+    expected.sort_unstable();
+    assert_eq!(lowered, expected);
+    assert_eq!(seeded.load(Ordering::Relaxed), 2);
+    assert!(expanded.load(Ordering::Relaxed) >= 6);
+}
+
+#[cfg(feature = "parallel")]
+#[test]
+fn formula_cyclic_parallel_split_preserves_affine_activations() {
+    let graph = Graph::new(3, &[(0, 1), (1, 2)]);
+    let ops = repeated(graph.attribute, false);
+    let outer_values = [genid(&rngid().id).raw, genid(&rngid().id).raw];
+    let make = || {
+        let start_var = Variable::<GenId>::new(START);
+        let end_var = Variable::<GenId>::new(END);
+        let arm = Box::new(CountingPath {
+            inner: RegularPathConstraint::new(graph.set.clone(), start_var, end_var, &ops),
+            seeded_roots: None,
+            expanded_nodes: Arc::new(AtomicUsize::new(0)),
+        }) as DynConstraint;
+        Arc::new(IntersectionConstraint::new(vec![
+            Box::new(DuplicateParents {
+                outer_values,
+                start: graph.value(0).raw,
+            }) as DynConstraint,
+            Box::new(UnionConstraint::new(vec![arm])) as DynConstraint,
+        ]))
+    };
+
+    let mut serial: Vec<_> = Query::new(make(), project_end)
+        .solve_residual_state_lazy_with(combined_effects())
+        .cap(2)
+        .start_width(2)
+        .collect();
+    let mut parallel: Vec<_> = Query::new(make(), project_end)
+        .solve_residual_state_lazy_with(combined_effects())
+        .cap(2)
+        .start_width(2)
+        .into_par_iter()
+        .collect();
+    serial.sort_unstable();
+    parallel.sort_unstable();
+    assert_eq!(parallel, serial);
+    assert_eq!(parallel.len(), 4);
+}
+
+#[test]
+fn formula_same_variable_sources_keep_novelty_separate_at_shared_terms() {
+    let graph = Graph::new(4, &[(0, 2), (1, 2), (2, 1), (3, 0)]);
+    let seeded = Arc::new(AtomicUsize::new(0));
+    let expanded = Arc::new(AtomicUsize::new(0));
+    let root = same_variable_formula_confirm_root(
+        graph.set.clone(),
+        vec![graph.value(0).raw, graph.value(1).raw],
+        &repeated(graph.attribute, false),
+        Arc::clone(&seeded),
+        Arc::clone(&expanded),
+    );
+
+    assert_eq!(
+        Query::new(root, project_start)
+            .solve_residual_state_lazy_with(combined_effects())
+            .collect::<Vec<_>>(),
+        vec![graph.value(1).raw]
+    );
+    assert_eq!(seeded.load(Ordering::Relaxed), 3);
+    assert!(expanded.load(Ordering::Relaxed) > 3);
+}
+
+#[test]
+fn formula_same_variable_fixpoint_keeps_inverse_program_direction() {
+    let graph = Graph::new(3, &[(0, 1), (2, 1)]);
+    let attribute = PathOp::Attr(graph.attribute.raw());
+    let cases = [
+        (
+            vec![
+                attribute.clone(),
+                attribute.clone(),
+                PathOp::Inverse,
+                PathOp::Concat,
+                PathOp::Plus,
+            ],
+            vec![graph.value(0).raw, graph.value(2).raw],
+        ),
+        (
+            vec![
+                attribute.clone(),
+                PathOp::Inverse,
+                attribute,
+                PathOp::Concat,
+                PathOp::Plus,
+            ],
+            vec![graph.value(1).raw],
+        ),
+    ];
+    for (ops, mut expected) in cases {
+        let node = Variable::<GenId>::new(START);
+        let root = Arc::new(IntersectionConstraint::new(vec![
+            Box::new(UnionConstraint::new(vec![Box::new(CountingPath {
+                inner: RegularPathConstraint::new(graph.set.clone(), node, node, &ops),
+                seeded_roots: None,
+                expanded_nodes: Arc::new(AtomicUsize::new(0)),
+            }) as DynConstraint])) as DynConstraint,
+        ]));
+        let mut lowered: Vec<_> = Query::new(root, project_start)
+            .solve_residual_state_lazy_with(combined_effects())
+            .collect();
+        lowered.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(lowered, expected);
     }
 }
 
