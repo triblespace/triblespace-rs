@@ -9,13 +9,13 @@ adapt to the values already found instead of being fixed before evaluation.
 
 The current protocol is **block-native**. Its unit of work is not necessarily
 one partial binding, but a block of partial bindings that have the same set of
-bound variables. The ordinary iterator structurally selects between a
-canonical residual-state worklist and the bound-variable-set DAG; the explicit
-[`Query::sequential`](triblespace::core::query::Query::sequential) path speaks
-the same protocol with blocks of one row. This shared interface is the
-important part of the design: a constraint has one implementation whether its
-probes are issued one at a time, fused into a CPU loop, or dispatched to a
-batch-oriented accelerator.
+bound variables. On the semantic full-switch probe, every live serial ordinary
+iterator uses the canonical residual-state worklist. The bound-variable-set
+DAG and [`Query::sequential`](triblespace::core::query::Query::sequential)
+remain explicit controls; the sequential path speaks the same protocol with
+blocks of one row. This shared interface is the important part of the design:
+a constraint has one implementation whether its probes are issued one at a
+time, fused into a CPU loop, or dispatched to a batch-oriented accelerator.
 
 ## Bindings as row blocks
 
@@ -157,14 +157,14 @@ ignore, and custom constraints remain opaque leaves unless a capability
 explicitly exposes more structure, so lowering never crosses an undeclared
 semantic boundary.
 
-When the ordinary structural selector admits a root, that root runs as one
-finite formula after variable selection. Exposed AND/OR progress then becomes
-canonical formula state, and eligible cyclic regular paths run through the
-delta submachine. Unsupported path programs and custom atoms keep using their
-ordinary opaque `Constraint` actions. The `root_formula` capability currently
-subsumes finite-union exposure on this path; the ordinary policy nevertheless
-names both capabilities explicitly so they remain separate composable controls
-for other residual entry points.
+Every live ordinary root runs as one finite formula after variable selection.
+Exposed AND/OR progress then becomes canonical formula state, and eligible
+cyclic regular paths run through the delta submachine. Unsupported path
+programs and custom atoms keep using their ordinary opaque `Constraint`
+actions. The `root_formula` capability currently subsumes finite-union exposure
+on this path; the ordinary policy nevertheless names both capabilities
+explicitly so they remain separate composable controls for other residual
+entry points.
 
 Each canonical descriptor includes the bound-variable schema and one of four
 phases:
@@ -191,21 +191,13 @@ occupancy/readiness policy harvests wider batches. This gives the state machine
 the same low-latency-to-throughput ramp as the DAG without requiring a complete
 intersection to run eagerly for one binding.
 
-The ordinary [`Query`](triblespace::core::query::Query) uses this engine only
-after exact seed settlement leaves a live search and the root exposes an AND
-with two flattened opaque leaf occurrences whose nonempty variable sets
-overlap. A shared variable is the cheap structural evidence that sibling
-proposer or confirmer work exists for residual states to canonicalize.
-Zero-variable constants are ignored by the gate; opaque roots, one-leaf ANDs,
-disjoint leaves, and seed-rejected queries retain the lazy DAG. An opaque Union
-or RPQ counts as one leaf, even when it contains its own internal state
-machine. This deliberately conservative selector follows measured evidence:
-forcing residual control states on arbitrary opaque or one-leaf roots can
-regress work and latency without opening a reconvergence opportunity.
-
-The selector and the lowering policy are independent. A root admitted by the
-selector receives root-formula, finite-union, and eligible cyclic-RPQ lowering;
-roots rejected by that same selector still use the lazy DAG.
+The ordinary [`Query`](triblespace::core::query::Query) uses this engine whenever
+exact seed settlement leaves a live search. Opaque roots, one-leaf ANDs,
+disjoint conjunctions, finite Union roots, RPQ roots, and live zero-variable
+truths therefore all exercise the same residual substrate. A seed-rejected
+query starts no worklist at all. This is a semantic coverage experiment, not a
+claim that residual control overhead pays back for every shape; the explicit
+lazy DAG remains the comparison path.
 
 [`Query::residual_state_scheduler`](triblespace::core::query::Query::residual_state_scheduler)
 forces the residual cursor for any root and remains the completeness and

@@ -1397,21 +1397,19 @@ enum QueryScheduler {
 /// A query is an iterator over the results of a query.
 /// It takes a constraint and a post-processing function as input,
 /// and returns the results of the query as a stream of values.
-/// The ordinary iterator selects canonical residual states for a live exposed
-/// conjunction only when two flattened opaque leaf occurrences share a
-/// variable. It starts with narrow, depth-first action cohorts and widens as
-/// the consumer keeps pulling, while histories with identical future
-/// computation can reconverge under one state identity. Opaque, one-leaf,
-/// disjoint, and seed-rejected roots retain the lazy DAG, where residual
-/// control-state overhead has no structural opportunity to pay back. Use
-/// [`Query::residual_state_scheduler`] or
-/// [`Query::lazy_dag_scheduler`] to override that structural default, and
-/// [`Query::sequential`] for the scalar depth-first specialization.
-/// A root admitted by the ordinary selector runs as one finite AND/OR formula
-/// and enables eligible cyclic regular paths inside that formula. Unsupported
-/// path programs remain ordinary opaque constraint actions. The explicit
-/// residual override retains conservative opaque-composite lowering so
-/// scheduler selection and structural capability remain separate controls.
+/// On this full-switch probe, every live fresh ordinary iterator uses canonical
+/// residual states. It starts with narrow, depth-first action cohorts and
+/// widens as the consumer keeps pulling, while histories with identical future
+/// computation can reconverge under one state identity. Its root runs as one
+/// finite AND/OR formula and eligible cyclic regular paths execute inside that
+/// formula; unsupported path programs remain ordinary opaque constraint
+/// actions. Seed-rejected queries start no runtime. Use
+/// [`Query::lazy_dag_scheduler`] for the bound-variable-set DAG control and
+/// [`Query::sequential`] for the scalar depth-first specialization. The
+/// explicit [`Query::residual_state_scheduler`] override retains conservative
+/// opaque-composite lowering so scheduling and structural capability remain
+/// separate experimental axes. Fully drained scheduler results are compared as
+/// multisets; their iteration order may differ.
 /// The query engine is designed to be simple and efficient, providing low, consistent,
 /// and predictable latency, skew resistance, and no required (or possible) tuning.
 /// The query engine is designed to be used in combination with the [Constraint] trait,
@@ -1774,9 +1772,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         } else {
             Search::Done
         };
-        let scheduler = if matches!(mode, Search::NextVariable)
-            && residual::useful_default_shape(&constraint)
-        {
+        let scheduler = if matches!(mode, Search::NextVariable) {
             QueryScheduler::ResidualState
         } else {
             QueryScheduler::LazyDag
