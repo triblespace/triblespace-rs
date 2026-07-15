@@ -3122,7 +3122,9 @@ fn execute_task<'a>(
             },
             StateBucket::Rows(rows),
         ) => {
-            stats.propose_action_pops += 1;
+            if plan.union_arm_count(*proposer).is_none() {
+                stats.propose_action_pops += 1;
+            }
             let continuation = propose_action_transition(
                 root,
                 plan,
@@ -3166,7 +3168,9 @@ fn execute_task<'a>(
             },
             StateBucket::Candidates(batch),
         ) => {
-            stats.confirm_action_pops += 1;
+            if plan.union_arm_count(*confirmer).is_none() {
+                stats.confirm_action_pops += 1;
+            }
             let continuation = confirm_action_transition(
                 root,
                 plan,
@@ -3212,6 +3216,10 @@ fn execute_task<'a>(
             },
             StateBucket::Union(batch),
         ) => {
+            match verb {
+                UnionVerb::Propose { .. } => stats.propose_action_pops += 1,
+                UnionVerb::Confirm { .. } => stats.confirm_action_pops += 1,
+            }
             let continuation = union_arm_transition(
                 root, plan, &desc, *variable, *union, verb, done, *arm, batch, worklist, interner,
                 stats,
