@@ -48,7 +48,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -415,7 +415,9 @@ pub struct ActionObservation {
     pub site: ActionSite,
     /// Exact input geometry.
     pub geometry: ActionGeometry,
-    /// Dispatch start offset from epoch creation.
+    /// Dispatch start offset from epoch creation. A snapshot taken in the
+    /// narrow registration-to-dispatch window reports the registration offset
+    /// until execution installs the final start offset.
     pub started: Duration,
     /// Completion, or `None` while the action is still executing.
     pub completion: Option<ActionCompletion>,
@@ -430,9 +432,12 @@ pub struct ActionObservation {
 pub enum ResidualShadowStatus {
     /// New action events may still begin.
     Open,
-    /// Normal observation completed; new actions are rejected.
+    /// The affine frontier was exhausted and every begun action completed
+    /// normally; new actions are rejected.
     Closed,
-    /// Observation was invalidated; new actions are rejected.
+    /// Observation lost its affine completion proof through unwind,
+    /// abandonment, cancellation, or explicit invalidation; new actions are
+    /// rejected.
     Invalidated,
 }
 
@@ -465,7 +470,8 @@ struct ShadowEvent {
     site: ActionSite,
     geometry: ActionGeometry,
     epoch_started: Instant,
-    started: Duration,
+    registered: Duration,
+    started: Mutex<Option<Duration>>,
     epoch: Weak<ShadowEpochInner>,
     completion: Mutex<Option<ActionCompletion>>,
     executor_samples: Mutex<Vec<ExecutorSample>>,
@@ -503,7 +509,55 @@ impl ShadowEvent {
         });
     }
 
+    fn abort(&self, wall: Duration) {
+        let Some(epoch) = self.epoch.upgrade() else {
+            let mut completion = self
+                .completion
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if completion.is_none() {
+                *completion = Some(ActionCompletion {
+                    wall,
+                    outcome: ActionOutcome::Aborted,
+                    stale: true,
+                });
+            }
+            return;
+        };
+        let _events = epoch
+            .events
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let stale = epoch.status() != ResidualShadowStatus::Open;
+        let mut completion = self
+            .completion
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if completion.is_none() {
+            *completion = Some(ActionCompletion {
+                wall,
+                outcome: ActionOutcome::Aborted,
+                stale,
+            });
+        }
+        epoch.invalidate_locked();
+    }
+
+    /// Requires the owning epoch's event lock, which serializes this read
+    /// against normal completion and abort.
+    fn completed_normally(&self) -> bool {
+        self.completion
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .is_some_and(|completion| completion.outcome != ActionOutcome::Aborted)
+    }
+
     fn snapshot(&self) -> ActionObservation {
+        let started = self
+            .started
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .unwrap_or(self.registered);
         let completion = *self
             .completion
             .lock()
@@ -518,7 +572,7 @@ impl ShadowEvent {
             event: self.event,
             site: self.site,
             geometry: self.geometry,
-            started: self.started,
+            started,
             completion,
             executor_samples,
         }
@@ -540,23 +594,55 @@ impl ShadowEpochInner {
         ResidualShadowStatus::from_raw(self.status.load(Ordering::Acquire))
     }
 
-    fn transition(&self, target: ResidualShadowStatus) -> bool {
+    fn invalidate(&self) -> bool {
         let _events = self
             .events
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        self.invalidate_locked()
+    }
+
+    /// Requires the event lock. Terminal state is monotonic: an already
+    /// Closed epoch is never upgraded to Invalidated.
+    fn invalidate_locked(&self) -> bool {
         self.status
             .compare_exchange(
                 ResidualShadowStatus::OPEN,
-                match target {
-                    ResidualShadowStatus::Closed => ResidualShadowStatus::CLOSED,
-                    ResidualShadowStatus::Invalidated => ResidualShadowStatus::INVALIDATED,
-                    ResidualShadowStatus::Open => unreachable!("epoch cannot transition to open"),
-                },
+                ResidualShadowStatus::INVALIDATED,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
             .is_ok()
+    }
+
+    /// Capability-owned normal terminal transition. Closed is proof that the
+    /// affine frontier was exhausted and every begun action completed with an
+    /// ordinary outcome. A live or aborted event makes that proof fail closed
+    /// as Invalidated.
+    fn finish_exhausted(&self) -> ResidualShadowStatus {
+        let events = self
+            .events
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        match self.status() {
+            ResidualShadowStatus::Open => {
+                let target = if events.iter().all(|event| event.completed_normally()) {
+                    ResidualShadowStatus::Closed
+                } else {
+                    ResidualShadowStatus::Invalidated
+                };
+                self.status.store(
+                    match target {
+                        ResidualShadowStatus::Closed => ResidualShadowStatus::CLOSED,
+                        ResidualShadowStatus::Invalidated => ResidualShadowStatus::INVALIDATED,
+                        ResidualShadowStatus::Open => unreachable!(),
+                    },
+                    Ordering::Release,
+                );
+                target
+            }
+            terminal => terminal,
+        }
     }
 
     fn claim(&self) {
@@ -580,9 +666,11 @@ impl ShadowEpochInner {
 
 /// Arc-backed, one-shot collector for opt-in residual action observations.
 ///
-/// Clones name the same epoch. [`close`](Self::close) and
-/// [`invalidate`](Self::invalidate) are terminal and reject later action
-/// starts; construct a new epoch for a new execution environment or run.
+/// Clones name the same epoch. Normal closure is owned by the claimed serial
+/// iterator or top-level parallel drive after proven affine exhaustion;
+/// callers may explicitly [`invalidate`](Self::invalidate) a run. Either
+/// terminal state rejects later action starts, so construct a new epoch for a
+/// new execution environment or run.
 #[derive(Clone)]
 pub struct ResidualShadowEpoch {
     inner: Arc<ShadowEpochInner>,
@@ -613,16 +701,11 @@ impl ResidualShadowEpoch {
         self.inner.status()
     }
 
-    /// Normally closes this epoch. Returns true only for the winning terminal
-    /// transition.
-    pub fn close(&self) -> bool {
-        self.inner.transition(ResidualShadowStatus::Closed)
-    }
-
-    /// Invalidates this epoch. Returns true only for the winning terminal
-    /// transition.
+    /// Invalidates this epoch. Returns true only for the winning `Open` to
+    /// `Invalidated` transition; a proven [`ResidualShadowStatus::Closed`]
+    /// epoch remains closed.
     pub fn invalidate(&self) -> bool {
-        self.inner.transition(ResidualShadowStatus::Invalidated)
+        self.inner.invalidate()
     }
 
     /// Copies all observations accumulated so far.
@@ -651,13 +734,14 @@ impl ResidualShadowEpoch {
         );
         let raw = self.inner.next_event.fetch_add(1, Ordering::Relaxed);
         assert_ne!(raw, u64::MAX, "residual shadow action event id overflow");
-        let started_at = Instant::now();
+        let registered_at = Instant::now();
         let event = Arc::new(ShadowEvent {
             event: ActionEventId(raw),
             site,
             geometry,
             epoch_started: self.inner.started,
-            started: started_at.duration_since(self.inner.started),
+            registered: registered_at.duration_since(self.inner.started),
+            started: Mutex::new(None),
             epoch: Arc::downgrade(&self.inner),
             completion: Mutex::new(None),
             executor_samples: Mutex::new(Vec::new()),
@@ -665,9 +749,13 @@ impl ResidualShadowEpoch {
         events.push(Arc::clone(&event));
         ShadowActionSpan {
             event,
-            started: started_at,
+            started: None,
             finished: false,
         }
+    }
+
+    fn finish_exhausted(&self) -> ResidualShadowStatus {
+        self.inner.finish_exhausted()
     }
 }
 
@@ -752,7 +840,7 @@ impl Drop for ShadowActionScope {
 
 struct ShadowActionSpan {
     event: Arc<ShadowEvent>,
-    started: Instant,
+    started: Option<Instant>,
     finished: bool,
 }
 
@@ -763,8 +851,29 @@ impl ShadowActionSpan {
         }
     }
 
-    fn finish(mut self, outcome: ActionOutcome) {
-        self.event.complete(self.started.elapsed(), outcome);
+    fn start(&mut self) {
+        assert!(
+            self.started.is_none(),
+            "residual shadow action timer started twice"
+        );
+        let started = Instant::now();
+        *self
+            .event
+            .started
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) =
+            Some(started.duration_since(self.event.epoch_started));
+        self.started = Some(started);
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.started
+            .expect("residual shadow action completed before its timer started")
+            .elapsed()
+    }
+
+    fn finish(mut self, wall: Duration, outcome: ActionOutcome) {
+        self.event.complete(wall, outcome);
         self.finished = true;
     }
 }
@@ -772,8 +881,10 @@ impl ShadowActionSpan {
 impl Drop for ShadowActionSpan {
     fn drop(&mut self) {
         if !self.finished {
-            self.event
-                .complete(self.started.elapsed(), ActionOutcome::Aborted);
+            let wall = self
+                .started
+                .map_or(Duration::ZERO, |started| started.elapsed());
+            self.event.abort(wall);
         }
     }
 }
@@ -2199,8 +2310,9 @@ fn execute_task_shadowed<'a>(
         );
     };
     let (site, geometry) = action.observation();
-    let span = epoch.begin(site, geometry);
+    let mut span = epoch.begin(site, geometry);
     let scope = ShadowActionScope::enter(span.correlation());
+    span.start();
     let outcome = execute_task(
         root,
         plan,
@@ -2212,6 +2324,7 @@ fn execute_task_shadowed<'a>(
         interner,
         stats,
     );
+    let wall = span.elapsed();
     let observed_outcome = match &outcome {
         StepOutcome::Advanced(continuation) => ActionOutcome::Advanced(ActionSurvival {
             parent_rows: continuation.rows,
@@ -2222,8 +2335,8 @@ fn execute_task_shadowed<'a>(
             unreachable!("only Propose and Confirm tasks enter a residual shadow action")
         }
     };
+    span.finish(wall, observed_outcome);
     drop(scope);
-    span.finish(observed_outcome);
     outcome
 }
 
@@ -3035,14 +3148,7 @@ impl ResidualStateMachine {
             }
 
             let width = self.width.max(1);
-            match self.pop_once_shadow(
-                epoch,
-                root,
-                plan,
-                influences,
-                base_estimates,
-                width,
-            ) {
+            match self.pop_once_shadow(epoch, root, plan, influences, base_estimates, width) {
                 StepOutcome::Advanced(_) => {}
                 StepOutcome::Dead => self.increase_width(),
                 StepOutcome::Emit(rows) => {
@@ -3106,7 +3212,9 @@ pub struct ResidualShadowSolve<R> {
 /// The wrapped iterator retains the same owned affine frontier. This wrapper
 /// is deliberately separate rather than an observer field on
 /// [`ResidualStateIter`], leaving ordinary execution structurally
-/// uninstrumented.
+/// uninstrumented. Every pull is unwind-guarded: a panic in planning, action
+/// execution, or result projection immediately invalidates the epoch even if
+/// the caller catches the unwind and keeps the iterator.
 #[must_use]
 pub struct ResidualShadowIter<C, P: Fn(&Binding) -> Option<R>, R> {
     inner: ResidualStateIter<C, P, R>,
@@ -3124,6 +3232,29 @@ enum ShadowIteratorLifecycle {
     Shard,
     /// Serial exhaustion already closed the epoch.
     Finished,
+}
+
+struct ShadowPullGuard {
+    epoch: ResidualShadowEpoch,
+    armed: bool,
+}
+
+impl ShadowPullGuard {
+    fn new(epoch: ResidualShadowEpoch) -> Self {
+        Self { epoch, armed: true }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ShadowPullGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.epoch.invalidate();
+        }
+    }
 }
 
 impl<C, P: Fn(&Binding) -> Option<R>, R> Drop for ResidualShadowIter<C, P, R> {
@@ -3250,7 +3381,6 @@ where
     pub fn collect_profiled(mut self) -> ResidualShadowSolve<R> {
         let mut results = Vec::new();
         results.extend(self.by_ref());
-        self.epoch.close();
         ResidualShadowSolve {
             results,
             stats: self.inner.state.stats.clone(),
@@ -3275,6 +3405,7 @@ where
             ResidualShadowStatus::Open,
             "cannot resume a residual shadow iterator after its epoch is closed or invalidated"
         );
+        let pull = ShadowPullGuard::new(self.epoch.clone());
         self.inner.iteration_started = true;
         let item = self.inner.state.pull_shadow(
             &self.epoch,
@@ -3285,9 +3416,11 @@ where
             &self.inner.base_estimates,
         );
         if item.is_none() && self.lifecycle == ShadowIteratorLifecycle::Owner {
-            self.epoch.close();
-            self.lifecycle = ShadowIteratorLifecycle::Finished;
+            if self.epoch.finish_exhausted() == ResidualShadowStatus::Closed {
+                self.lifecycle = ShadowIteratorLifecycle::Finished;
+            }
         }
+        pull.disarm();
         item
     }
 }
@@ -3656,7 +3789,10 @@ mod parallel {
     /// Shards share only the already-claimed observation epoch. Residual
     /// payload remains moved through the same splitter as
     /// [`ResidualStateParIter`], and every shard allocates globally unique
-    /// event ordinals within that epoch.
+    /// event ordinals within that epoch. Every live producer owns an armed
+    /// abandonment guard; only observing its exact `None` exhaustion disarms
+    /// it, so initial-full consumers, split-side cancellation, and unwind
+    /// invalidate the top-level drive.
     pub struct ResidualShadowParIter<C, P: Fn(&Binding) -> Option<R>, R> {
         inner: Box<ResidualShadowIter<C, P, R>>,
     }
@@ -3680,7 +3816,34 @@ mod parallel {
     struct ResidualShadowProducer<C, P: Fn(&Binding) -> Option<R>, R> {
         inner: Box<ResidualShadowIter<C, P, R>>,
         split_budget: usize,
+        guard: ShadowProducerGuard,
+    }
+
+    struct ShadowProducerGuard {
         abandoned: Arc<AtomicBool>,
+        armed: bool,
+    }
+
+    impl ShadowProducerGuard {
+        fn new(abandoned: Arc<AtomicBool>, armed: bool) -> Self {
+            Self { abandoned, armed }
+        }
+
+        fn sibling(&self) -> Self {
+            Self::new(Arc::clone(&self.abandoned), true)
+        }
+
+        fn disarm(&mut self) {
+            self.armed = false;
+        }
+    }
+
+    impl Drop for ShadowProducerGuard {
+        fn drop(&mut self) {
+            if self.armed {
+                self.abandoned.store(true, Ordering::Release);
+            }
+        }
     }
 
     impl<'a, C, P, R> UnindexedProducer for ResidualShadowProducer<C, P, R>
@@ -3730,13 +3893,13 @@ mod parallel {
             let left_budget = self.split_budget / 2;
             let right_budget = self.split_budget - left_budget;
             self.split_budget = left_budget;
-            let right_abandoned = Arc::clone(&self.abandoned);
+            let right_guard = self.guard.sibling();
             (
                 self,
                 Some(ResidualShadowProducer {
                     inner: Box::new(right),
                     split_budget: right_budget,
-                    abandoned: right_abandoned,
+                    guard: right_guard,
                 }),
             )
         }
@@ -3744,21 +3907,17 @@ mod parallel {
         fn fold_with<F: Folder<R>>(self, mut folder: F) -> F {
             let ResidualShadowProducer {
                 inner: mut iter,
-                abandoned,
+                mut guard,
                 ..
             } = self;
-            let mut exhausted = false;
             while !folder.full() {
                 match iter.next() {
                     Some(item) => folder = folder.consume(item),
                     None => {
-                        exhausted = true;
+                        guard.disarm();
                         break;
                     }
                 }
-            }
-            if !exhausted {
-                abandoned.store(true, Ordering::Release);
             }
             folder
         }
@@ -3779,7 +3938,7 @@ mod parallel {
 
         fn finish(mut self, complete: bool) {
             if complete {
-                self.epoch.close();
+                self.epoch.finish_exhausted();
             } else {
                 self.epoch.invalidate();
             }
@@ -3809,19 +3968,29 @@ mod parallel {
         {
             let mut inner = self.inner;
             let epoch = inner.epoch.clone();
-            let split_budget = if inner.inner.iteration_started {
+            let finished = inner.lifecycle == ShadowIteratorLifecycle::Finished;
+            if !finished {
+                assert_eq!(
+                    epoch.status(),
+                    ResidualShadowStatus::Open,
+                    "cannot resume a residual shadow iterator after its epoch is closed or invalidated"
+                );
+            }
+            let split_budget = if finished || inner.inner.iteration_started {
                 0
             } else {
                 rayon::current_num_threads().saturating_sub(1)
             };
-            inner.lifecycle = ShadowIteratorLifecycle::Shard;
+            if !finished {
+                inner.lifecycle = ShadowIteratorLifecycle::Shard;
+            }
             let drive = ShadowParallelDrive::new(epoch);
             let abandoned = Arc::new(AtomicBool::new(false));
             let result = bridge_unindexed(
                 ResidualShadowProducer {
                     inner,
                     split_budget,
-                    abandoned: Arc::clone(&abandoned),
+                    guard: ShadowProducerGuard::new(Arc::clone(&abandoned), !finished),
                 },
                 consumer,
             );
@@ -3966,6 +4135,70 @@ mod tests {
             _view: &RowsView<'_>,
             _candidates: &mut CandidateSink<'_>,
         ) {
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum PanicPhase {
+        Planning,
+        Propose,
+    }
+
+    #[derive(Clone)]
+    struct PanicLeaf {
+        variable: VariableId,
+        phase: PanicPhase,
+        estimate_calls: Arc<AtomicUsize>,
+    }
+
+    impl Constraint<'static> for PanicLeaf {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(self.variable)
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != self.variable {
+                return false;
+            }
+            let call = self.estimate_calls.fetch_add(1, Ordering::Relaxed);
+            if matches!(self.phase, PanicPhase::Planning) && call != 0 {
+                panic!("intentional residual planning panic");
+            }
+            out.fill(1, view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+            assert_eq!(variable, self.variable);
+            if matches!(self.phase, PanicPhase::Propose) {
+                panic!("intentional residual action panic");
+            }
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+    }
+
+    fn panic_leaf(phase: PanicPhase) -> PanicLeaf {
+        PanicLeaf {
+            variable: 0,
+            phase,
+            estimate_calls: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -5570,10 +5803,7 @@ mod tests {
         }
     }
 
-    fn observation_geometry(
-        parent_rows: usize,
-        candidate_occurrences: usize,
-    ) -> ActionGeometry {
+    fn observation_geometry(parent_rows: usize, candidate_occurrences: usize) -> ActionGeometry {
         ActionGeometry {
             parent_rows,
             candidate_occurrences,
@@ -5698,23 +5928,25 @@ mod tests {
     fn residual_shadow_nested_scopes_restore_and_own_executor_samples() {
         assert!(current_residual_action().is_none());
         let epoch = ResidualShadowEpoch::new();
-        let outer = epoch.begin(
+        let mut outer = epoch.begin(
             observation_site(ActionVerb::Propose, 0),
             observation_geometry(1, 0),
         );
         let outer_correlation = outer.correlation();
         let outer_scope = ShadowActionScope::enter(outer_correlation.clone());
+        outer.start();
         assert_eq!(
             current_residual_action().map(|action| action.event()),
             Some(outer_correlation.event())
         );
 
-        let inner = epoch.begin(
+        let mut inner = epoch.begin(
             observation_site(ActionVerb::Confirm, 1),
             observation_geometry(1, 2),
         );
         let inner_correlation = inner.correlation();
         let inner_scope = ShadowActionScope::enter(inner_correlation.clone());
+        inner.start();
         assert_eq!(
             current_residual_action().map(|action| action.event()),
             Some(inner_correlation.event())
@@ -5730,16 +5962,22 @@ mod tests {
         drop(outer_scope);
         assert!(current_residual_action().is_none());
 
-        inner.finish(ActionOutcome::Advanced(ActionSurvival {
-            parent_rows: 1,
-            candidate_occurrences: 1,
-        }));
-        outer.finish(ActionOutcome::Dead);
-        assert!(epoch.close());
+        inner.finish(
+            Duration::ZERO,
+            ActionOutcome::Advanced(ActionSurvival {
+                parent_rows: 1,
+                candidate_occurrences: 1,
+            }),
+        );
+        outer.finish(Duration::ZERO, ActionOutcome::Dead);
+        assert_eq!(epoch.finish_exhausted(), ResidualShadowStatus::Closed);
         let snapshot = epoch.snapshot();
         assert_eq!(snapshot.events.len(), 2);
         assert_eq!(snapshot.events[0].event, outer_correlation.event());
-        assert_eq!(snapshot.events[0].executor_samples[0].measurement.operation, "outer");
+        assert_eq!(
+            snapshot.events[0].executor_samples[0].measurement.operation,
+            "outer"
+        );
         assert_eq!(snapshot.events[1].event, inner_correlation.event());
         assert_eq!(
             snapshot.events[1]
@@ -5754,33 +5992,41 @@ mod tests {
     #[test]
     fn residual_shadow_late_samples_stay_with_their_terminal_epoch() {
         let old_epoch = ResidualShadowEpoch::new();
-        let old_span = old_epoch.begin(
+        let mut old_span = old_epoch.begin(
             observation_site(ActionVerb::Propose, 0),
             observation_geometry(1, 0),
         );
         let old_correlation = old_span.correlation();
-        assert!(old_epoch.close());
+        old_span.start();
+        assert!(old_epoch.invalidate());
 
         let new_epoch = ResidualShadowEpoch::new();
-        let new_span = new_epoch.begin(
+        let mut new_span = new_epoch.begin(
             observation_site(ActionVerb::Confirm, 1),
             observation_geometry(1, 1),
         );
         let new_correlation = new_span.correlation();
+        new_span.start();
         old_correlation.record_executor_sample(executor_measurement("late-old", Duration::ZERO));
         new_correlation.record_executor_sample(executor_measurement("current-new", Duration::ZERO));
-        old_span.finish(ActionOutcome::Dead);
-        new_span.finish(ActionOutcome::Dead);
-        assert!(new_epoch.close());
+        old_span.finish(Duration::ZERO, ActionOutcome::Dead);
+        new_span.finish(Duration::ZERO, ActionOutcome::Dead);
+        assert_eq!(new_epoch.finish_exhausted(), ResidualShadowStatus::Closed);
 
         let old = old_epoch.snapshot();
         let new = new_epoch.snapshot();
         assert_eq!(old.events[0].event.get(), 0);
         assert_eq!(new.events[0].event.get(), 0);
-        assert_eq!(old.events[0].executor_samples[0].measurement.operation, "late-old");
+        assert_eq!(
+            old.events[0].executor_samples[0].measurement.operation,
+            "late-old"
+        );
         assert!(old.events[0].executor_samples[0].stale);
         assert!(old.events[0].completion.unwrap().stale);
-        assert_eq!(new.events[0].executor_samples[0].measurement.operation, "current-new");
+        assert_eq!(
+            new.events[0].executor_samples[0].measurement.operation,
+            "current-new"
+        );
         assert!(!new.events[0].executor_samples[0].stale);
         assert!(!new.events[0].completion.unwrap().stale);
     }
@@ -5813,18 +6059,193 @@ mod tests {
         .collect();
         assert_eq!(drained, [raw(2)]);
         assert_eq!(drained_epoch.status(), ResidualShadowStatus::Closed);
+        assert!(!drained_epoch.invalidate());
+        assert_eq!(drained_epoch.status(), ResidualShadowStatus::Closed);
+    }
+
+    #[test]
+    fn residual_shadow_planning_unwind_invalidates_without_an_action_event() {
+        let epoch = ResidualShadowEpoch::new();
+        let mut observed = Query::new(panic_leaf(PanicPhase::Planning), |binding: &Binding| {
+            binding.get(0).copied()
+        })
+        .solve_residual_state_lazy()
+        .shadow(epoch.clone());
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observed.next()));
+        assert!(unwind.is_err());
+        assert_eq!(epoch.status(), ResidualShadowStatus::Invalidated);
+        assert!(epoch.snapshot().events.is_empty());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observed.next())).is_err()
+        );
+    }
+
+    #[test]
+    fn residual_shadow_action_unwind_records_aborted_and_never_closes() {
+        let epoch = ResidualShadowEpoch::new();
+        let mut observed = Query::new(panic_leaf(PanicPhase::Propose), |binding: &Binding| {
+            binding.get(0).copied()
+        })
+        .solve_residual_state_lazy()
+        .shadow(epoch.clone());
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observed.next()));
+        assert!(unwind.is_err());
+        let snapshot = epoch.snapshot();
+        assert_eq!(snapshot.status, ResidualShadowStatus::Invalidated);
+        assert_eq!(snapshot.events.len(), 1);
+        assert_eq!(
+            snapshot.events[0].completion.unwrap().outcome,
+            ActionOutcome::Aborted
+        );
+    }
+
+    #[test]
+    fn residual_shadow_projection_unwind_invalidates_after_normal_action_completion() {
+        let epoch = ResidualShadowEpoch::new();
+        let mut observed = Query::new(
+            FanoutLeaf {
+                variable: 0,
+                values: Arc::new(vec![raw(1)]),
+            },
+            |_binding: &Binding| -> Option<RawInline> {
+                panic!("intentional residual projection panic")
+            },
+        )
+        .solve_residual_state_lazy()
+        .shadow(epoch.clone());
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observed.next()));
+        assert!(unwind.is_err());
+        let snapshot = epoch.snapshot();
+        assert_eq!(snapshot.status, ResidualShadowStatus::Invalidated);
+        assert_eq!(snapshot.events.len(), 1);
+        assert_ne!(
+            snapshot.events[0].completion.unwrap().outcome,
+            ActionOutcome::Aborted
+        );
+    }
+
+    #[test]
+    fn residual_shadow_live_action_cannot_be_normally_closed_in_either_lock_order() {
+        let close_first = ResidualShadowEpoch::new();
+        let mut close_first_span = close_first.begin(
+            observation_site(ActionVerb::Propose, 0),
+            observation_geometry(1, 0),
+        );
+        close_first_span.start();
+        assert_eq!(
+            close_first.finish_exhausted(),
+            ResidualShadowStatus::Invalidated
+        );
+        drop(close_first_span);
+        let close_first_snapshot = close_first.snapshot();
+        assert_eq!(
+            close_first_snapshot.events[0].completion.unwrap().outcome,
+            ActionOutcome::Aborted
+        );
+        assert_eq!(
+            close_first_snapshot.status,
+            ResidualShadowStatus::Invalidated
+        );
+
+        let abort_first = ResidualShadowEpoch::new();
+        let mut abort_first_span = abort_first.begin(
+            observation_site(ActionVerb::Confirm, 1),
+            observation_geometry(1, 1),
+        );
+        abort_first_span.start();
+        drop(abort_first_span);
+        assert_eq!(
+            abort_first.finish_exhausted(),
+            ResidualShadowStatus::Invalidated
+        );
+        assert_eq!(abort_first.status(), ResidualShadowStatus::Invalidated);
+    }
+
+    #[test]
+    fn residual_shadow_completion_stores_the_exact_captured_wall_duration() {
+        let epoch = ResidualShadowEpoch::new();
+        let mut span = epoch.begin(
+            observation_site(ActionVerb::Propose, 0),
+            observation_geometry(1, 0),
+        );
+        let scope = ShadowActionScope::enter(span.correlation());
+        span.start();
+        let captured = Duration::from_nanos(123_456);
+        span.finish(captured, ActionOutcome::Dead);
+        assert!(current_residual_action().is_some());
+        drop(scope);
+        assert_eq!(epoch.finish_exhausted(), ResidualShadowStatus::Closed);
+        assert_eq!(
+            epoch.snapshot().events[0].completion.unwrap().wall,
+            captured
+        );
+    }
+
+    #[test]
+    fn residual_shadow_reports_whole_group_confirm_geometry_with_bound_schema() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let root = IntersectionConstraint::new(vec![
+            Box::new(FanoutLeaf {
+                variable: 0,
+                values: Arc::new(vec![raw(1)]),
+            }) as ShapeConstraint,
+            Box::new(FanoutLeaf {
+                variable: 1,
+                values: Arc::new(vec![raw(8), raw(9)]),
+            }) as ShapeConstraint,
+            Box::new(WholeGroupMinimumLeaf {
+                variable: 1,
+                estimate: 65,
+                calls: Arc::clone(&calls),
+            }) as ShapeConstraint,
+        ]);
+        let epoch = ResidualShadowEpoch::new();
+        let solved = Query::new(root, |binding: &Binding| {
+            Some((binding.get(0).copied()?, binding.get(1).copied()?))
+        })
+        .solve_residual_state_lazy()
+        .cap(64)
+        .start_width(64)
+        .shadow(epoch)
+        .collect_profiled();
+
+        assert_eq!(solved.results, [(raw(1), raw(8))]);
+        assert_eq!(*calls.lock().unwrap(), [2]);
+        let confirmation = solved
+            .shadow
+            .events
+            .iter()
+            .find(|event| event.site.verb == ActionVerb::Confirm && event.site.variable == 1)
+            .expect("whole-group confirmation was observed");
+        assert_eq!(confirmation.site.bound, VariableSet::new_singleton(0));
+        assert_eq!(confirmation.geometry.parent_rows, 1);
+        assert_eq!(confirmation.geometry.candidate_occurrences, 2);
+        assert_eq!(confirmation.geometry.action_atoms, 1);
     }
 
     #[test]
     fn residual_shadow_terminal_epoch_rejects_claim_under_the_transition_lock() {
         let epoch = ResidualShadowEpoch::new();
-        assert!(epoch.close());
+        let drained: Vec<_> = Query::new(
+            FanoutLeaf {
+                variable: 0,
+                values: Arc::new(vec![raw(1)]),
+            },
+            |binding: &Binding| binding.get(0).copied(),
+        )
+        .solve_residual_state_lazy()
+        .shadow(epoch.clone())
+        .collect();
+        assert_eq!(drained, [raw(1)]);
         let claim = std::panic::catch_unwind({
             let epoch = epoch.clone();
             move || epoch.inner.claim()
         });
         assert!(claim.is_err());
-        assert!(!epoch.inner.claimed.load(Ordering::Acquire));
+        assert!(epoch.inner.claimed.load(Ordering::Acquire));
         assert_eq!(epoch.status(), ResidualShadowStatus::Closed);
     }
 
@@ -5856,14 +6277,16 @@ mod tests {
         let epoch = ResidualShadowEpoch::new();
         let (first_site, first_geometry) = first.observation();
         let (second_site, second_geometry) = second.observation();
-        let first_span = epoch.begin(first_site, first_geometry);
-        let second_span = epoch.begin(second_site, second_geometry);
+        let mut first_span = epoch.begin(first_site, first_geometry);
+        let mut second_span = epoch.begin(second_site, second_geometry);
         let first_event = first_span.correlation().event();
         let second_event = second_span.correlation().event();
         assert_ne!(first_event, second_event);
-        first_span.finish(ActionOutcome::Dead);
-        second_span.finish(ActionOutcome::Dead);
-        epoch.close();
+        first_span.start();
+        second_span.start();
+        first_span.finish(Duration::ZERO, ActionOutcome::Dead);
+        second_span.finish(Duration::ZERO, ActionOutcome::Dead);
+        assert_eq!(epoch.finish_exhausted(), ResidualShadowStatus::Closed);
         let snapshot = epoch.snapshot();
         assert_eq!(snapshot.events[0].site.verb, ActionVerb::Propose);
         assert_eq!(snapshot.events[1].site.verb, ActionVerb::Confirm);
@@ -5939,7 +6362,6 @@ mod tests {
         }
     }
 
-
     #[cfg(feature = "parallel")]
     #[test]
     fn residual_shadow_parallel_short_circuit_invalidates_the_epoch() {
@@ -5960,6 +6382,94 @@ mod tests {
         });
         assert!(found.is_some());
         assert_eq!(epoch.status(), ResidualShadowStatus::Invalidated);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn residual_shadow_parallel_action_unwind_records_aborted_and_invalidates() {
+        let epoch = ResidualShadowEpoch::new();
+        let run_epoch = epoch.clone();
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            with_parallel_workers(4, move || {
+                Query::new(panic_leaf(PanicPhase::Propose), |binding: &Binding| {
+                    binding.get(0).copied()
+                })
+                .solve_residual_state_lazy()
+                .cap(128)
+                .start_width(128)
+                .shadow(run_epoch)
+                .into_par_iter()
+                .collect::<Vec<_>>()
+            })
+        }));
+        assert!(unwind.is_err());
+        let snapshot = epoch.snapshot();
+        assert_eq!(snapshot.status, ResidualShadowStatus::Invalidated);
+        assert_eq!(snapshot.events.len(), 1);
+        assert_eq!(
+            snapshot.events[0].completion.unwrap().outcome,
+            ActionOutcome::Aborted
+        );
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn residual_shadow_parallel_producer_abandonment_is_detected_before_and_after_split() {
+        for take in [0, 1] {
+            let clones = Arc::new(AtomicUsize::new(0));
+            let epoch = ResidualShadowEpoch::new();
+            let run_epoch = epoch.clone();
+            let root = CloneCountingFanout {
+                variable: 0,
+                values: Arc::new((0..128).map(raw).collect()),
+                clones: Arc::clone(&clones),
+                proposes: Arc::new(AtomicUsize::new(0)),
+            };
+            let results = with_parallel_workers(4, move || {
+                Query::new(root, |binding: &Binding| binding.get(0).copied())
+                    .solve_residual_state_lazy()
+                    .cap(128)
+                    .start_width(128)
+                    .shadow(run_epoch)
+                    .into_par_iter()
+                    .take_any(take)
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(results.len(), take);
+            assert_eq!(epoch.status(), ResidualShadowStatus::Invalidated);
+            if take == 0 {
+                assert_eq!(clones.load(Ordering::Relaxed), 0);
+                assert!(epoch.snapshot().events.is_empty());
+            } else {
+                assert!(
+                    clones.load(Ordering::Relaxed) > 0,
+                    "the frontier did not split"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn residual_shadow_finished_serial_iterator_stays_closed_in_rayon() {
+        let epoch = ResidualShadowEpoch::new();
+        let mut observed = Query::new(
+            FanoutLeaf {
+                variable: 0,
+                values: Arc::new(vec![raw(1), raw(2)]),
+            },
+            |binding: &Binding| binding.get(0).copied(),
+        )
+        .solve_residual_state_lazy()
+        .shadow(epoch.clone());
+        let serial: Vec<_> = observed.by_ref().collect();
+        assert_eq!(serial.len(), 2);
+        assert_eq!(epoch.status(), ResidualShadowStatus::Closed);
+
+        let parallel =
+            with_parallel_workers(4, move || observed.into_par_iter().collect::<Vec<_>>());
+        assert!(parallel.is_empty());
+        assert_eq!(epoch.status(), ResidualShadowStatus::Closed);
     }
 
     fn paged_filter_first_trace(

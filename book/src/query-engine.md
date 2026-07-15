@@ -337,11 +337,32 @@ field, clock read, thread-local lookup, allocation, or option branch.
 
 Action event numbers and leaf occurrences are local to one claimed epoch;
 neither exposes the machine's private interner `StateId`. Serial exhaustion
-and a fully drained Rayon drive close the epoch. Dropping an unfinished serial
-wrapper, a parallel short circuit, or a parallel unwind invalidates it. A
-snapshot is a consistent copy at its terminal/open state, while samples filed
-after a terminal transition remain attached to their original event and are
-marked stale.
+and a fully drained Rayon drive close the epoch. `Closed` is a proof state: the
+affine frontier was exhausted and every begun action has an ordinary
+completion. Normal close is therefore private to the iterator/drive that owns
+that frontier; a live or aborted action forces `Invalidated`, and the two
+terminal states never transition into one another. Dropping an unfinished
+serial wrapper, a panic anywhere in one pull (planning, action, or projection),
+a parallel short circuit, or a parallel unwind invalidates it immediately,
+even when the caller catches the unwind and retains the wrapper. A subsequent
+pull is rejected.
+
+Each Rayon producer carries its own armed abandonment guard. The guard is
+disarmed only after that producer observes exact exhaustion (`next() == None`),
+so a consumer that is already full, an abandoned split side, and cancellation
+without a fold all invalidate the top-level drive. Converting a serial wrapper
+that already proved exhaustion yields an empty Rayon iterator and preserves
+`Closed`.
+
+An event is registered first, then its thread-local correlation scope is
+installed, and only then does its execution timer begin. Successful execution
+captures and records the elapsed duration before the correlation scope is
+removed, excluding registration, scope setup/teardown, and outcome mapping
+from action wall time. A snapshot is a consistent copy at its terminal/open
+state. During the narrow registration-to-dispatch window, the non-optional
+`started` field temporarily uses the registration offset; execution replaces
+it with the actual dispatch offset. Samples filed after a terminal transition
+remain attached to their original event and are marked stale.
 
 [`current_residual_action`](triblespace::core::query::residual::current_residual_action)
 provides a stack-scoped correlation capability during a leaf call, so nested
