@@ -8392,6 +8392,64 @@ mod tests {
     }
 
     #[test]
+    fn recursive_union_does_not_flatten_across_an_and_frame() {
+        let make = || {
+            let nested = UnionConstraint::new(vec![
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(vec![raw(1)]),
+                }) as ShapeConstraint,
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(vec![raw(2)]),
+                }) as ShapeConstraint,
+            ]);
+            let guarded = IntersectionConstraint::new(vec![
+                Box::new(nested) as ShapeConstraint,
+                Box::new(PageFilterLeaf {
+                    variable: 0,
+                    estimate: 20,
+                    accepted: Some(raw(2)),
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                }) as ShapeConstraint,
+            ]);
+            UnionConstraint::new(vec![
+                Box::new(guarded) as ShapeConstraint,
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(vec![raw(4)]),
+                }) as ShapeConstraint,
+            ])
+        };
+
+        // Descending through the AND and treating its nested Union children as
+        // outer arms would drop the sibling filter and incorrectly admit 1.
+        // The first recursive slice therefore stops at the AND occurrence;
+        // crossing it requires an activation-private working-candidate frame.
+        let plan = ResidualPlan::compile_finite_unions(&make());
+        assert_eq!(plan.union_arm_count(0), Some(2));
+        assert_eq!(
+            plan.leaves[0].union_arms,
+            vec![
+                UnionArmPath(vec![0].into_boxed_slice()),
+                UnionArmPath(vec![1].into_boxed_slice()),
+            ]
+            .into_boxed_slice()
+        );
+
+        let project = |binding: &Binding| binding.get(0).copied();
+        let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
+        let mut lowered: Vec<_> = Query::new(make(), project)
+            .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+            .collect();
+        sequential.sort_unstable();
+        lowered.sort_unstable();
+        assert_eq!(lowered, [raw(2), raw(4)]);
+        assert_eq!(lowered, sequential);
+        assert!(!lowered.contains(&raw(1)));
+    }
+
+    #[test]
     fn repeated_finite_union_object_has_distinct_outer_occurrences() {
         let make = || {
             let union = Arc::new(UnionConstraint::new(vec![
