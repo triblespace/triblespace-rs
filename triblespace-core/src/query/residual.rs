@@ -45,10 +45,12 @@
 //! canonical descriptor and its stored paths a total description of the future
 //! computation while row values remain payload.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
-#[cfg(test)]
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use super::*;
 
@@ -285,6 +287,495 @@ pub struct ResidualStateSolve<R> {
     pub results: Vec<R>,
     /// Scheduler/interner measurements for the solve.
     pub stats: ResidualStateStats,
+}
+
+/// Epoch-local identity of one observed residual action.
+///
+/// The number is meaningful only within the [`ResidualShadowEpoch`] whose
+/// snapshot contains it. It is deliberately unrelated to the residual
+/// machine's private `StateId`: parallel siblings may intern later states in
+/// different orders, so a raw interner index is not a global identity.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ActionEventId(u64);
+
+impl ActionEventId {
+    /// Returns this event's ordinal within its owning epoch.
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Concrete constraint verb executed by an observed residual action.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ActionVerb {
+    /// Enumerate candidates for one selected variable.
+    Propose,
+    /// Filter one candidate frontier through one selected leaf occurrence.
+    Confirm,
+}
+
+/// Exact semantic call site of one observed action.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActionSite {
+    /// Executed protocol verb.
+    pub verb: ActionVerb,
+    /// Variable proposed or confirmed by the action.
+    pub variable: VariableId,
+    /// Deterministic preorder occurrence in this epoch's compiled plan.
+    ///
+    /// Like [`ActionEventId`], this is query/epoch-local rather than a global
+    /// constraint identity or address.
+    pub leaf_occurrence: usize,
+    /// Exact committed parent-row schema.
+    pub bound: VariableSet,
+}
+
+/// Input geometry known at the residual action dispatch boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActionGeometry {
+    /// Parent rows presented to the protocol action.
+    pub parent_rows: usize,
+    /// Candidate occurrences presented to Confirm; zero for Propose.
+    pub candidate_occurrences: usize,
+    /// Scheduler occupancy consumed by the selected action chunk.
+    pub action_atoms: usize,
+}
+
+/// Exact nonempty payload filed by a surviving action.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActionSurvival {
+    /// Parent rows retained in the immediate successor cohort.
+    pub parent_rows: usize,
+    /// Candidate occurrences retained in the immediate successor cohort.
+    pub candidate_occurrences: usize,
+}
+
+/// Semantic outcome of one observed Propose or Confirm action.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActionOutcome {
+    /// The action filed a nonempty immediate successor.
+    Advanced(ActionSurvival),
+    /// The action compacted to no successor candidates.
+    Dead,
+    /// Execution unwound before returning an ordinary outcome.
+    Aborted,
+}
+
+/// Completion recorded for an observed action.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActionCompletion {
+    /// Dispatch-to-successor wall time around the unchanged owned-task
+    /// execution. This includes protocol work and residual transition filing.
+    pub wall: Duration,
+    /// Exact action outcome and immediate survival geometry.
+    pub outcome: ActionOutcome,
+    /// True when the epoch was closed or invalidated before completion.
+    pub stale: bool,
+}
+
+/// Backend-neutral executor-local measurement nested inside one action.
+///
+/// Backends choose honest static labels and units. For example, a synchronous
+/// device API that combines upload, dispatch, synchronization, and readback
+/// should report one `gpu-round-trip` operation rather than inventing phase
+/// boundaries it cannot measure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecutorMeasurement {
+    /// Executor family, such as `cpu` or `wgpu`.
+    pub executor: &'static str,
+    /// Measured operation, such as `wavelet-rank` or `gpu-round-trip`.
+    pub operation: &'static str,
+    /// Unit name, such as `rank-probes`.
+    pub work_unit: &'static str,
+    /// Exact number of work units presented to this invocation.
+    pub work_units: usize,
+    /// Start offset from the owning epoch's creation.
+    pub started: Duration,
+    /// Executor-local wall time.
+    pub wall: Duration,
+}
+
+/// Executor measurement attached to its exact epoch-local action event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecutorSample {
+    /// Owning action event within the snapshot's epoch.
+    pub event: ActionEventId,
+    /// Executor-local measurement.
+    pub measurement: ExecutorMeasurement,
+    /// True when recorded after the epoch was closed or invalidated.
+    pub stale: bool,
+}
+
+/// One action and every executor-local sample currently attached to it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionObservation {
+    /// Epoch-local event identity.
+    pub event: ActionEventId,
+    /// Exact action site.
+    pub site: ActionSite,
+    /// Exact input geometry.
+    pub geometry: ActionGeometry,
+    /// Dispatch start offset from epoch creation.
+    pub started: Duration,
+    /// Completion, or `None` while the action is still executing.
+    pub completion: Option<ActionCompletion>,
+    /// Executor-local samples correlated through this event's capability,
+    /// ordered by start offset and then by their mutex-serialized attachment
+    /// order when offsets compare equal.
+    pub executor_samples: Vec<ExecutorSample>,
+}
+
+/// Terminal state of a one-shot observation epoch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResidualShadowStatus {
+    /// New action events may still begin.
+    Open,
+    /// Normal observation completed; new actions are rejected.
+    Closed,
+    /// Observation was invalidated; new actions are rejected.
+    Invalidated,
+}
+
+impl ResidualShadowStatus {
+    const OPEN: u8 = 0;
+    const CLOSED: u8 = 1;
+    const INVALIDATED: u8 = 2;
+
+    fn from_raw(raw: u8) -> Self {
+        match raw {
+            Self::OPEN => Self::Open,
+            Self::CLOSED => Self::Closed,
+            Self::INVALIDATED => Self::Invalidated,
+            _ => unreachable!("invalid residual shadow epoch status"),
+        }
+    }
+}
+
+/// Point-in-time copy of one shadow epoch's observations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResidualShadowSnapshot {
+    /// Epoch state when the snapshot was taken.
+    pub status: ResidualShadowStatus,
+    /// Events ordered by epoch-local [`ActionEventId`].
+    pub events: Vec<ActionObservation>,
+}
+
+struct ShadowEvent {
+    event: ActionEventId,
+    site: ActionSite,
+    geometry: ActionGeometry,
+    epoch_started: Instant,
+    started: Duration,
+    epoch: Weak<ShadowEpochInner>,
+    completion: Mutex<Option<ActionCompletion>>,
+    executor_samples: Mutex<Vec<ExecutorSample>>,
+}
+
+impl ShadowEvent {
+    fn with_epoch_staleness<T>(&self, operation: impl FnOnce(bool) -> T) -> T {
+        let Some(epoch) = self.epoch.upgrade() else {
+            return operation(true);
+        };
+        // Terminal transitions hold this same lock. A completion or sample
+        // therefore linearizes wholly before close/invalidate (fresh) or
+        // wholly after it (stale), rather than reading Open and attaching only
+        // after the terminal transition has returned.
+        let _events = epoch
+            .events
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        operation(epoch.status() != ResidualShadowStatus::Open)
+    }
+
+    fn complete(&self, wall: Duration, outcome: ActionOutcome) {
+        self.with_epoch_staleness(|stale| {
+            let mut completion = self
+                .completion
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if completion.is_none() {
+                *completion = Some(ActionCompletion {
+                    wall,
+                    outcome,
+                    stale,
+                });
+            }
+        });
+    }
+
+    fn snapshot(&self) -> ActionObservation {
+        let completion = *self
+            .completion
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut executor_samples = self
+            .executor_samples
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        executor_samples.sort_by_key(|sample| sample.measurement.started);
+        ActionObservation {
+            event: self.event,
+            site: self.site,
+            geometry: self.geometry,
+            started: self.started,
+            completion,
+            executor_samples,
+        }
+    }
+}
+
+struct ShadowEpochInner {
+    started: Instant,
+    status: AtomicU8,
+    claimed: AtomicBool,
+    next_event: AtomicU64,
+    /// Also serializes terminal transition against event creation: once close
+    /// or invalidate returns, no later event can enter this vector.
+    events: Mutex<Vec<Arc<ShadowEvent>>>,
+}
+
+impl ShadowEpochInner {
+    fn status(&self) -> ResidualShadowStatus {
+        ResidualShadowStatus::from_raw(self.status.load(Ordering::Acquire))
+    }
+
+    fn transition(&self, target: ResidualShadowStatus) -> bool {
+        let _events = self
+            .events
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        self.status
+            .compare_exchange(
+                ResidualShadowStatus::OPEN,
+                match target {
+                    ResidualShadowStatus::Closed => ResidualShadowStatus::CLOSED,
+                    ResidualShadowStatus::Invalidated => ResidualShadowStatus::INVALIDATED,
+                    ResidualShadowStatus::Open => unreachable!("epoch cannot transition to open"),
+                },
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn claim(&self) {
+        let _events = self
+            .events
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        assert_eq!(
+            self.status(),
+            ResidualShadowStatus::Open,
+            "cannot attach a closed or invalidated residual shadow epoch"
+        );
+        assert!(
+            self.claimed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "a residual shadow epoch can observe only one residual iterator"
+        );
+    }
+}
+
+/// Arc-backed, one-shot collector for opt-in residual action observations.
+///
+/// Clones name the same epoch. [`close`](Self::close) and
+/// [`invalidate`](Self::invalidate) are terminal and reject later action
+/// starts; construct a new epoch for a new execution environment or run.
+#[derive(Clone)]
+pub struct ResidualShadowEpoch {
+    inner: Arc<ShadowEpochInner>,
+}
+
+impl Default for ResidualShadowEpoch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ResidualShadowEpoch {
+    /// Creates one open, independent observation epoch.
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(ShadowEpochInner {
+                started: Instant::now(),
+                status: AtomicU8::new(ResidualShadowStatus::OPEN),
+                claimed: AtomicBool::new(false),
+                next_event: AtomicU64::new(0),
+                events: Mutex::new(Vec::new()),
+            }),
+        }
+    }
+
+    /// Returns this epoch's current terminal state.
+    pub fn status(&self) -> ResidualShadowStatus {
+        self.inner.status()
+    }
+
+    /// Normally closes this epoch. Returns true only for the winning terminal
+    /// transition.
+    pub fn close(&self) -> bool {
+        self.inner.transition(ResidualShadowStatus::Closed)
+    }
+
+    /// Invalidates this epoch. Returns true only for the winning terminal
+    /// transition.
+    pub fn invalidate(&self) -> bool {
+        self.inner.transition(ResidualShadowStatus::Invalidated)
+    }
+
+    /// Copies all observations accumulated so far.
+    pub fn snapshot(&self) -> ResidualShadowSnapshot {
+        let events = self
+            .inner
+            .events
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let status = self.status();
+        let mut events: Vec<_> = events.iter().map(|event| event.snapshot()).collect();
+        events.sort_by_key(|event| event.event);
+        ResidualShadowSnapshot { status, events }
+    }
+
+    fn begin(&self, site: ActionSite, geometry: ActionGeometry) -> ShadowActionSpan {
+        let mut events = self
+            .inner
+            .events
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        assert_eq!(
+            self.status(),
+            ResidualShadowStatus::Open,
+            "cannot begin a residual shadow action after its epoch is closed or invalidated"
+        );
+        let raw = self.inner.next_event.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(raw, u64::MAX, "residual shadow action event id overflow");
+        let started_at = Instant::now();
+        let event = Arc::new(ShadowEvent {
+            event: ActionEventId(raw),
+            site,
+            geometry,
+            epoch_started: self.inner.started,
+            started: started_at.duration_since(self.inner.started),
+            epoch: Arc::downgrade(&self.inner),
+            completion: Mutex::new(None),
+            executor_samples: Mutex::new(Vec::new()),
+        });
+        events.push(Arc::clone(&event));
+        ShadowActionSpan {
+            event,
+            started: started_at,
+            finished: false,
+        }
+    }
+}
+
+/// Capability identifying the exact currently executing shadow action.
+///
+/// It may be cloned and carried by a synchronous or asynchronous backend. The
+/// handle owns the event, so late measurements remain attached to their
+/// original epoch-local action even after the dynamic scope has ended.
+#[derive(Clone)]
+pub struct ActionCorrelation {
+    event: Arc<ShadowEvent>,
+}
+
+impl ActionCorrelation {
+    /// Returns the owning event's epoch-local identity.
+    pub fn event(&self) -> ActionEventId {
+        self.event.event
+    }
+
+    /// Returns a monotonic offset suitable for the `started` field of an
+    /// [`ExecutorMeasurement`].
+    pub fn elapsed(&self) -> Duration {
+        self.event.epoch_started.elapsed()
+    }
+
+    /// Attaches one executor-local measurement to this exact action.
+    pub fn record_executor_sample(&self, measurement: ExecutorMeasurement) {
+        self.event.with_epoch_staleness(|stale| {
+            let sample = ExecutorSample {
+                event: self.event.event,
+                measurement,
+                stale,
+            };
+            self.event
+                .executor_samples
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push(sample);
+        });
+    }
+}
+
+thread_local! {
+    static CURRENT_SHADOW_ACTION: RefCell<Vec<ActionCorrelation>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Returns the innermost observed residual action on this thread, if any.
+///
+/// The dynamic scope is stack-disciplined. Nested observed queries temporarily
+/// replace the outer action and restore it on return. Backends that transfer
+/// work to another thread must explicitly capture and carry the returned
+/// capability; ambient thread-local state is intentionally not propagated.
+pub fn current_residual_action() -> Option<ActionCorrelation> {
+    CURRENT_SHADOW_ACTION.with(|current| current.borrow().last().cloned())
+}
+
+struct ShadowActionScope(ActionEventId);
+
+impl ShadowActionScope {
+    fn enter(correlation: ActionCorrelation) -> Self {
+        let event = correlation.event();
+        CURRENT_SHADOW_ACTION.with(|current| current.borrow_mut().push(correlation));
+        Self(event)
+    }
+}
+
+impl Drop for ShadowActionScope {
+    fn drop(&mut self) {
+        CURRENT_SHADOW_ACTION.with(|current| {
+            let correlation = current
+                .borrow_mut()
+                .pop()
+                .expect("residual shadow action scope stack underflow");
+            assert_eq!(
+                correlation.event(),
+                self.0,
+                "residual shadow action scopes were dropped out of order"
+            );
+        });
+    }
+}
+
+struct ShadowActionSpan {
+    event: Arc<ShadowEvent>,
+    started: Instant,
+    finished: bool,
+}
+
+impl ShadowActionSpan {
+    fn correlation(&self) -> ActionCorrelation {
+        ActionCorrelation {
+            event: Arc::clone(&self.event),
+        }
+    }
+
+    fn finish(mut self, outcome: ActionOutcome) {
+        self.event.complete(self.started.elapsed(), outcome);
+        self.finished = true;
+    }
+}
+
+impl Drop for ShadowActionSpan {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.event
+                .complete(self.started.elapsed(), ActionOutcome::Aborted);
+        }
+    }
 }
 
 /// A dynamic bitset of flattened leaf-occurrence IDs.
@@ -907,6 +1398,31 @@ struct ResidualActionTask {
     /// the remaining confirmation suffix is page-local, then candidate
     /// occurrences.
     action_atoms: usize,
+}
+
+impl ResidualActionTask {
+    fn observation(self) -> (ActionSite, ActionGeometry) {
+        let (verb, variable, leaf_occurrence) = match self.action {
+            ResidualAction::Propose { variable, leaf } => (ActionVerb::Propose, variable, leaf),
+            ResidualAction::Confirm { variable, leaf } => (ActionVerb::Confirm, variable, leaf),
+        };
+        // `self.state` remains scheduler-private. It is exact only within one
+        // interner and is deliberately not copied into the public observation.
+        let _local_state = self.state;
+        (
+            ActionSite {
+                verb,
+                variable,
+                leaf_occurrence,
+                bound: self.bound,
+            },
+            ActionGeometry {
+                parent_rows: self.parent_rows,
+                candidate_occurrences: self.candidate_occurrences,
+                action_atoms: self.action_atoms,
+            },
+        )
+    }
 }
 
 /// One affine payload selected from the residual worklist.
@@ -1651,6 +2167,66 @@ fn execute_task<'a>(
     }
 }
 
+/// Opt-in observation wrapper around the unchanged owned-task executor.
+///
+/// The production executor above neither knows about nor branches on shadow
+/// state. Only this separate path materializes action geometry, reads clocks,
+/// and installs the executor-correlation scope.
+#[allow(clippy::too_many_arguments)]
+fn execute_task_shadowed<'a>(
+    epoch: &ResidualShadowEpoch,
+    root: &dyn Constraint<'a>,
+    plan: &ResidualPlan,
+    task: SelectedResidualTask,
+    full: VariableSet,
+    influences: &[VariableSet; 128],
+    base_estimates: &[usize; 128],
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+) -> StepOutcome {
+    let Some(action) = task.action_task(plan) else {
+        return execute_task(
+            root,
+            plan,
+            task,
+            full,
+            influences,
+            base_estimates,
+            worklist,
+            interner,
+            stats,
+        );
+    };
+    let (site, geometry) = action.observation();
+    let span = epoch.begin(site, geometry);
+    let scope = ShadowActionScope::enter(span.correlation());
+    let outcome = execute_task(
+        root,
+        plan,
+        task,
+        full,
+        influences,
+        base_estimates,
+        worklist,
+        interner,
+        stats,
+    );
+    let observed_outcome = match &outcome {
+        StepOutcome::Advanced(continuation) => ActionOutcome::Advanced(ActionSurvival {
+            parent_rows: continuation.rows,
+            candidate_occurrences: continuation.candidates,
+        }),
+        StepOutcome::Dead => ActionOutcome::Dead,
+        StepOutcome::Emit(_) => {
+            unreachable!("only Propose and Confirm tasks enter a residual shadow action")
+        }
+    };
+    drop(scope);
+    span.finish(observed_outcome);
+    outcome
+}
+
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn execute_state<'a>(
@@ -2084,6 +2660,97 @@ impl ResidualStateMachine {
             }
         }
     }
+
+    /// Opt-in counterpart of [`Self::pop_once`]. Selection, continuation, and
+    /// emission bookkeeping are intentionally identical; only concrete
+    /// Propose/Confirm execution crosses the separate shadow wrapper.
+    fn pop_once_shadow<'a>(
+        &mut self,
+        epoch: &ResidualShadowEpoch,
+        root: &dyn Constraint<'a>,
+        plan: &ResidualPlan,
+        influences: &[VariableSet; 128],
+        base_estimates: &[usize; 128],
+        width: usize,
+    ) -> StepOutcome {
+        let task = if let Some(token) = self.continuation.take() {
+            self.take_continuation(plan, token, width)
+        } else {
+            self.take_next_with_plan(plan, width)
+                .expect("pop_once_shadow requires a non-empty residual worklist")
+        };
+        self.last_was_action = task.is_action();
+        let emit_bound = task.desc.bound;
+        let outcome = execute_task_shadowed(
+            epoch,
+            root,
+            plan,
+            task,
+            self.full,
+            influences,
+            base_estimates,
+            &mut self.worklist,
+            &mut self.interner,
+            &mut self.stats,
+        );
+        if matches!(&outcome, StepOutcome::Emit(_)) {
+            self.emit_vars.clear();
+            self.emit_vars.extend(emit_bound);
+        }
+        outcome
+    }
+
+    /// Separate observed pull loop. Keeping it out of [`Self::pull`] makes the
+    /// ordinary iterator structurally free of observer fields, clock reads,
+    /// TLS access, geometry materialization, allocation, and dispatch branches.
+    fn pull_shadow<'a, P, R>(
+        &mut self,
+        epoch: &ResidualShadowEpoch,
+        root: &dyn Constraint<'a>,
+        plan: &ResidualPlan,
+        postprocessing: &P,
+        influences: &[VariableSet; 128],
+        base_estimates: &[usize; 128],
+    ) -> Option<R>
+    where
+        P: Fn(&Binding) -> Option<R>,
+    {
+        loop {
+            while self.emit_next < self.emit_count {
+                let row = self.emit_next;
+                // Match the ordinary pull loop: consume before invoking user
+                // code so a caught projection panic cannot repeat effects.
+                self.emit_next += 1;
+                let stride = self.emit_vars.len();
+                let start = row * stride;
+                for (column, &variable) in self.emit_vars.iter().enumerate() {
+                    self.binding.set(variable, &self.emit_rows[start + column]);
+                }
+                if let Some(result) = postprocessing(&self.binding) {
+                    return Some(result);
+                }
+            }
+            if self.worklist.is_empty() {
+                return None;
+            }
+
+            let width = self.width;
+            match self.pop_once_shadow(epoch, root, plan, influences, base_estimates, width) {
+                StepOutcome::Advanced(continuation) => {
+                    self.continuation = self.continuation_after_advanced(plan, width, continuation);
+                }
+                StepOutcome::Dead => {
+                    self.continuation = None;
+                    self.increase_width();
+                }
+                StepOutcome::Emit(rows) => {
+                    self.continuation = None;
+                    self.stage_emit(rows);
+                    self.increase_width();
+                }
+            }
+        }
+    }
 }
 
 #[cfg(feature = "parallel")]
@@ -2256,6 +2923,135 @@ impl ResidualStateMachine {
             }
         }
     }
+
+    /// Observed counterpart of [`Self::split_for_parallel`]. The affine split
+    /// policy is identical, but any concrete action needed to negotiate a
+    /// fresh unsplittable seed crosses the same shadow boundary as later shard
+    /// folds. This prevents parallel setup from becoming an attribution gap.
+    fn split_for_parallel_shadow<'a>(
+        &mut self,
+        epoch: &ResidualShadowEpoch,
+        root: &dyn Constraint<'a>,
+        plan: &ResidualPlan,
+        influences: &[VariableSet; 128],
+        base_estimates: &[usize; 128],
+    ) -> Option<Self> {
+        self.continuation = None;
+        loop {
+            debug_assert_eq!(
+                self.emit_next, 0,
+                "parallel residual splits before fold consumption"
+            );
+
+            if self.emit_count >= 2 {
+                let right_count = self.emit_count / 2;
+                let left_count = self.emit_count - right_count;
+                let stride = self.emit_vars.len();
+                debug_assert!(stride > 0, "a zero-variable query has one result");
+
+                let mut right = self.parallel_sibling();
+                right.emit_vars = self.emit_vars.clone();
+                right.emit_rows = self.emit_rows.split_off(left_count * stride);
+                right.emit_count = right_count;
+                self.emit_count = left_count;
+                return Some(right);
+            }
+
+            if self.emit_count == 1 && !self.worklist.is_empty() {
+                let mut right = self.parallel_sibling();
+                right.emit_vars = std::mem::take(&mut self.emit_vars);
+                right.emit_rows = std::mem::take(&mut self.emit_rows);
+                right.emit_count = 1;
+                self.emit_count = 0;
+                return Some(right);
+            }
+
+            let splittable = self.worklist.iter().rev().find_map(|(&rank, level)| {
+                level.iter().rev().find_map(|(&id, bucket)| {
+                    let desc = self.interner.get(id);
+                    let candidate_pages = desc.uses_candidate_pages(plan);
+                    let can_split = match bucket {
+                        StateBucket::Rows(batch) => batch.row_count >= 2,
+                        StateBucket::Candidates(batch) if candidate_pages => {
+                            batch.candidate_count() >= 2
+                        }
+                        StateBucket::Candidates(batch) => batch.parents.row_count >= 2,
+                    };
+                    can_split.then_some((rank, id, candidate_pages))
+                })
+            });
+            if let Some((rank, id, candidate_pages)) = splittable {
+                let desc = self.interner.get(id);
+                let stride = desc.bound.count();
+                let right_bucket = self
+                    .worklist
+                    .get_mut(&rank)
+                    .and_then(|level| level.get_mut(&id))
+                    .and_then(|bucket| bucket.split_for_parallel(stride, candidate_pages))
+                    .expect("selected residual payload is splittable");
+
+                let mut right = self.parallel_sibling();
+                assert!(
+                    right
+                        .worklist
+                        .entry(rank)
+                        .or_default()
+                        .insert(id, right_bucket)
+                        .is_none(),
+                    "fresh residual sibling unexpectedly contained work"
+                );
+                return Some(right);
+            }
+
+            let bucket_count: usize = self.worklist.values().map(BTreeMap::len).sum();
+            if bucket_count >= 2 {
+                let (&rank, level) = self
+                    .worklist
+                    .last_key_value()
+                    .expect("two buckets imply a nonempty worklist");
+                let id = *level
+                    .last_key_value()
+                    .expect("live residual rank has a bucket")
+                    .0;
+                let (bucket, remove_level) = {
+                    let level = self
+                        .worklist
+                        .get_mut(&rank)
+                        .expect("selected residual rank exists");
+                    let bucket = level.remove(&id).expect("selected residual state exists");
+                    (bucket, level.is_empty())
+                };
+                if remove_level {
+                    self.worklist.remove(&rank);
+                }
+
+                let mut right = self.parallel_sibling();
+                right.worklist.entry(rank).or_default().insert(id, bucket);
+                return Some(right);
+            }
+
+            if self.worklist.is_empty() {
+                return None;
+            }
+
+            let width = self.width.max(1);
+            match self.pop_once_shadow(
+                epoch,
+                root,
+                plan,
+                influences,
+                base_estimates,
+                width,
+            ) {
+                StepOutcome::Advanced(_) => {}
+                StepOutcome::Dead => self.increase_width(),
+                StepOutcome::Emit(rows) => {
+                    self.stage_emit(rows);
+                    self.increase_width();
+                }
+            }
+        }
+    }
 }
 
 /// Demand-driven canonical residual-state execution for any root constraint.
@@ -2293,6 +3089,73 @@ pub struct ResidualStateIter<C, P: Fn(&Binding) -> Option<R>, R> {
     iteration_started: bool,
 }
 
+/// Result of fully draining an opt-in [`ResidualShadowIter`].
+#[derive(Clone, Debug)]
+#[must_use]
+pub struct ResidualShadowSolve<R> {
+    /// Projected query results, preserving bag semantics.
+    pub results: Vec<R>,
+    /// Ordinary residual scheduler statistics from the observed execution.
+    pub stats: ResidualStateStats,
+    /// Closed point-in-time observation snapshot.
+    pub shadow: ResidualShadowSnapshot,
+}
+
+/// Serial opt-in wrapper that observes only concrete residual actions.
+///
+/// The wrapped iterator retains the same owned affine frontier. This wrapper
+/// is deliberately separate rather than an observer field on
+/// [`ResidualStateIter`], leaving ordinary execution structurally
+/// uninstrumented.
+#[must_use]
+pub struct ResidualShadowIter<C, P: Fn(&Binding) -> Option<R>, R> {
+    inner: ResidualStateIter<C, P, R>,
+    epoch: ResidualShadowEpoch,
+    lifecycle: ShadowIteratorLifecycle,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ShadowIteratorLifecycle {
+    /// This serial iterator closes on exhaustion and invalidates on drop.
+    Owner,
+    /// A Rayon producer; the top-level parallel drive owns the epoch terminal
+    /// transition, so individual shard exhaustion and drop are inert.
+    #[cfg(feature = "parallel")]
+    Shard,
+    /// Serial exhaustion already closed the epoch.
+    Finished,
+}
+
+impl<C, P: Fn(&Binding) -> Option<R>, R> Drop for ResidualShadowIter<C, P, R> {
+    fn drop(&mut self) {
+        if self.lifecycle == ShadowIteratorLifecycle::Owner {
+            self.epoch.invalidate();
+        }
+    }
+}
+
+impl<C, P: Fn(&Binding) -> Option<R>, R> ResidualShadowIter<C, P, R> {
+    /// Returns the shared one-shot observation epoch.
+    pub fn epoch(&self) -> &ResidualShadowEpoch {
+        &self.epoch
+    }
+
+    /// Width the next observed engine resumption will use.
+    pub fn current_width(&self) -> usize {
+        self.inner.current_width()
+    }
+
+    /// Ordinary residual measurements accumulated so far.
+    pub fn stats(&self) -> &ResidualStateStats {
+        self.inner.stats()
+    }
+
+    /// Copies this epoch's observations accumulated so far.
+    pub fn snapshot(&self) -> ResidualShadowSnapshot {
+        self.epoch.snapshot()
+    }
+}
+
 impl<C, P: Fn(&Binding) -> Option<R>, R> ResidualStateIter<C, P, R> {
     /// Overrides the initial chunk width, clamped to `1..=cap`.
     pub fn start_width(mut self, width: usize) -> Self {
@@ -2325,6 +3188,20 @@ impl<C, P: Fn(&Binding) -> Option<R>, R> ResidualStateIter<C, P, R> {
     /// Measurements accumulated by pulls performed so far.
     pub fn stats(&self) -> &ResidualStateStats {
         &self.state.stats
+    }
+
+    /// Wraps this exact affine remainder in a one-shot action observer.
+    ///
+    /// One epoch may claim one iterator. Parallel shards derived from that
+    /// iterator share the already-claimed epoch; a second unrelated iterator
+    /// must use a fresh epoch so leaf occurrences remain epoch-local.
+    pub fn shadow(self, epoch: ResidualShadowEpoch) -> ResidualShadowIter<C, P, R> {
+        epoch.inner.claim();
+        ResidualShadowIter {
+            inner: self,
+            epoch,
+            lifecycle: ShadowIteratorLifecycle::Owner,
+        }
     }
 }
 
@@ -2360,6 +3237,58 @@ where
             &self.influences,
             &self.base_estimates,
         )
+    }
+}
+
+impl<'a, C, P, R> ResidualShadowIter<C, P, R>
+where
+    C: Constraint<'a> + 'a,
+    P: Fn(&Binding) -> Option<R>,
+{
+    /// Fully drains the observed iterator, normally closes its epoch, and
+    /// returns results, ordinary scheduler statistics, and the final snapshot.
+    pub fn collect_profiled(mut self) -> ResidualShadowSolve<R> {
+        let mut results = Vec::new();
+        results.extend(self.by_ref());
+        self.epoch.close();
+        ResidualShadowSolve {
+            results,
+            stats: self.inner.state.stats.clone(),
+            shadow: self.epoch.snapshot(),
+        }
+    }
+}
+
+impl<'a, C, P, R> Iterator for ResidualShadowIter<C, P, R>
+where
+    C: Constraint<'a> + 'a,
+    P: Fn(&Binding) -> Option<R>,
+{
+    type Item = R;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.lifecycle == ShadowIteratorLifecycle::Finished {
+            return None;
+        }
+        assert_eq!(
+            self.epoch.status(),
+            ResidualShadowStatus::Open,
+            "cannot resume a residual shadow iterator after its epoch is closed or invalidated"
+        );
+        self.inner.iteration_started = true;
+        let item = self.inner.state.pull_shadow(
+            &self.epoch,
+            &self.inner.root,
+            &self.inner.plan,
+            &self.inner.postprocessing,
+            &self.inner.influences,
+            &self.inner.base_estimates,
+        );
+        if item.is_none() && self.lifecycle == ShadowIteratorLifecycle::Owner {
+            self.epoch.close();
+            self.lifecycle = ShadowIteratorLifecycle::Finished;
+        }
+        item
     }
 }
 
@@ -2567,7 +3496,7 @@ where
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "parallel")]
-pub use parallel::ResidualStateParIter;
+pub use parallel::{ResidualShadowParIter, ResidualStateParIter};
 
 #[cfg(feature = "parallel")]
 mod parallel {
@@ -2719,6 +3648,185 @@ mod parallel {
                 rayon::current_num_threads().saturating_sub(1)
             };
             bridge_unindexed(self, consumer)
+        }
+    }
+
+    /// Parallel iterator over one observed affine residual frontier.
+    ///
+    /// Shards share only the already-claimed observation epoch. Residual
+    /// payload remains moved through the same splitter as
+    /// [`ResidualStateParIter`], and every shard allocates globally unique
+    /// event ordinals within that epoch.
+    pub struct ResidualShadowParIter<C, P: Fn(&Binding) -> Option<R>, R> {
+        inner: Box<ResidualShadowIter<C, P, R>>,
+    }
+
+    impl<'a, C, P, R> IntoParallelIterator for ResidualShadowIter<C, P, R>
+    where
+        C: Constraint<'a> + Clone + Send + 'a,
+        P: Fn(&Binding) -> Option<R> + Clone + Send,
+        R: Send,
+    {
+        type Item = R;
+        type Iter = ResidualShadowParIter<C, P, R>;
+
+        fn into_par_iter(self) -> Self::Iter {
+            ResidualShadowParIter {
+                inner: Box::new(self),
+            }
+        }
+    }
+
+    struct ResidualShadowProducer<C, P: Fn(&Binding) -> Option<R>, R> {
+        inner: Box<ResidualShadowIter<C, P, R>>,
+        split_budget: usize,
+        abandoned: Arc<AtomicBool>,
+    }
+
+    impl<'a, C, P, R> UnindexedProducer for ResidualShadowProducer<C, P, R>
+    where
+        C: Constraint<'a> + Clone + Send + 'a,
+        P: Fn(&Binding) -> Option<R> + Clone + Send,
+        R: Send,
+    {
+        type Item = R;
+
+        fn split(mut self) -> (Self, Option<Self>) {
+            if self.inner.inner.iteration_started || self.split_budget == 0 {
+                self.split_budget = 0;
+                return (self, None);
+            }
+            self.split_budget -= 1;
+
+            let right_state = {
+                let iter = &mut self.inner.inner;
+                iter.state.split_for_parallel_shadow(
+                    &self.inner.epoch,
+                    &iter.root,
+                    &iter.plan,
+                    &iter.influences,
+                    &iter.base_estimates,
+                )
+            };
+            let Some(right_state) = right_state else {
+                self.split_budget = 0;
+                return (self, None);
+            };
+
+            let right_inner = ResidualStateIter {
+                root: self.inner.inner.root.clone(),
+                plan: self.inner.inner.plan.clone(),
+                postprocessing: self.inner.inner.postprocessing.clone(),
+                influences: self.inner.inner.influences,
+                base_estimates: self.inner.inner.base_estimates,
+                state: right_state,
+                iteration_started: false,
+            };
+            let right = ResidualShadowIter {
+                inner: right_inner,
+                epoch: self.inner.epoch.clone(),
+                lifecycle: ShadowIteratorLifecycle::Shard,
+            };
+            let left_budget = self.split_budget / 2;
+            let right_budget = self.split_budget - left_budget;
+            self.split_budget = left_budget;
+            let right_abandoned = Arc::clone(&self.abandoned);
+            (
+                self,
+                Some(ResidualShadowProducer {
+                    inner: Box::new(right),
+                    split_budget: right_budget,
+                    abandoned: right_abandoned,
+                }),
+            )
+        }
+
+        fn fold_with<F: Folder<R>>(self, mut folder: F) -> F {
+            let ResidualShadowProducer {
+                inner: mut iter,
+                abandoned,
+                ..
+            } = self;
+            let mut exhausted = false;
+            while !folder.full() {
+                match iter.next() {
+                    Some(item) => folder = folder.consume(item),
+                    None => {
+                        exhausted = true;
+                        break;
+                    }
+                }
+            }
+            if !exhausted {
+                abandoned.store(true, Ordering::Release);
+            }
+            folder
+        }
+    }
+
+    struct ShadowParallelDrive {
+        epoch: ResidualShadowEpoch,
+        finished: bool,
+    }
+
+    impl ShadowParallelDrive {
+        fn new(epoch: ResidualShadowEpoch) -> Self {
+            Self {
+                epoch,
+                finished: false,
+            }
+        }
+
+        fn finish(mut self, complete: bool) {
+            if complete {
+                self.epoch.close();
+            } else {
+                self.epoch.invalidate();
+            }
+            self.finished = true;
+        }
+    }
+
+    impl Drop for ShadowParallelDrive {
+        fn drop(&mut self) {
+            if !self.finished {
+                self.epoch.invalidate();
+            }
+        }
+    }
+
+    impl<'a, C, P, R> ParallelIterator for ResidualShadowParIter<C, P, R>
+    where
+        C: Constraint<'a> + Clone + Send + 'a,
+        P: Fn(&Binding) -> Option<R> + Clone + Send,
+        R: Send,
+    {
+        type Item = R;
+
+        fn drive_unindexed<Con>(self, consumer: Con) -> Con::Result
+        where
+            Con: UnindexedConsumer<Self::Item>,
+        {
+            let mut inner = self.inner;
+            let epoch = inner.epoch.clone();
+            let split_budget = if inner.inner.iteration_started {
+                0
+            } else {
+                rayon::current_num_threads().saturating_sub(1)
+            };
+            inner.lifecycle = ShadowIteratorLifecycle::Shard;
+            let drive = ShadowParallelDrive::new(epoch);
+            let abandoned = Arc::new(AtomicBool::new(false));
+            let result = bridge_unindexed(
+                ResidualShadowProducer {
+                    inner,
+                    split_budget,
+                    abandoned: Arc::clone(&abandoned),
+                },
+                consumer,
+            );
+            drive.finish(!abandoned.load(Ordering::Acquire));
+            result
         }
     }
 }
@@ -3165,6 +4273,102 @@ mod tests {
             if !self.accepts {
                 candidates.retain(|_, _| false);
             }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct LoggedAction {
+        verb: ActionVerb,
+        leaf_occurrence: usize,
+        parent_rows: usize,
+        candidate_occurrences: usize,
+    }
+
+    #[derive(Clone)]
+    struct LoggedLeaf {
+        variable: VariableId,
+        leaf_occurrence: usize,
+        estimate: usize,
+        proposed: Arc<Vec<RawInline>>,
+        accepted: Option<RawInline>,
+        log: Arc<Mutex<Vec<LoggedAction>>>,
+    }
+
+    impl LoggedLeaf {
+        fn record(&self, verb: ActionVerb, parent_rows: usize, candidate_occurrences: usize) {
+            self.log.lock().unwrap().push(LoggedAction {
+                verb,
+                leaf_occurrence: self.leaf_occurrence,
+                parent_rows,
+                candidate_occurrences,
+            });
+            if let Some(action) = current_residual_action() {
+                let started = action.elapsed();
+                action.record_executor_sample(ExecutorMeasurement {
+                    executor: "test-cpu",
+                    operation: match verb {
+                        ActionVerb::Propose => "logged-propose",
+                        ActionVerb::Confirm => "logged-confirm",
+                    },
+                    work_unit: "occurrences",
+                    work_units: if verb == ActionVerb::Propose {
+                        parent_rows
+                    } else {
+                        candidate_occurrences
+                    },
+                    started,
+                    wall: Duration::ZERO,
+                });
+            }
+        }
+    }
+
+    impl Constraint<'static> for LoggedLeaf {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(self.variable)
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != self.variable {
+                return false;
+            }
+            out.fill(self.estimate, view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            assert_eq!(variable, self.variable);
+            self.record(ActionVerb::Propose, view.len(), 0);
+            for row in 0..view.len() {
+                candidates.extend_row(row as u32, self.proposed.iter().copied());
+            }
+        }
+
+        fn confirm(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            assert_eq!(variable, self.variable);
+            self.record(ActionVerb::Confirm, view.len(), candidates.len());
+            if let Some(accepted) = self.accepted {
+                candidates.retain(|_, value| *value == accepted);
+            }
+        }
+
+        fn residual_confirm_is_page_local(&self) -> bool {
+            true
         }
     }
 
@@ -4302,6 +5506,460 @@ mod tests {
                 calls: second_calls,
             }) as ShapeConstraint,
         ])
+    }
+
+    fn logged_filter_fixture(
+        values: Vec<RawInline>,
+        accepted: RawInline,
+        log: Arc<Mutex<Vec<LoggedAction>>>,
+    ) -> IntersectionConstraint<ShapeConstraint> {
+        let estimate = values.len();
+        IntersectionConstraint::new(vec![
+            Box::new(LoggedLeaf {
+                variable: 0,
+                leaf_occurrence: 0,
+                estimate,
+                proposed: Arc::new(values),
+                accepted: None,
+                log: Arc::clone(&log),
+            }) as ShapeConstraint,
+            Box::new(LoggedLeaf {
+                variable: 0,
+                leaf_occurrence: 1,
+                estimate: estimate + 1,
+                proposed: Arc::new(Vec::new()),
+                accepted: Some(accepted),
+                log,
+            }) as ShapeConstraint,
+        ])
+    }
+
+    #[cfg(feature = "parallel")]
+    fn parallel_logged_filter_fixture(
+        values: Vec<RawInline>,
+        accepted: RawInline,
+        log: Arc<Mutex<Vec<LoggedAction>>>,
+    ) -> Arc<IntersectionConstraint<ParallelShapeConstraint>> {
+        let estimate = values.len();
+        Arc::new(IntersectionConstraint::new(vec![
+            parallel_shape(LoggedLeaf {
+                variable: 0,
+                leaf_occurrence: 0,
+                estimate,
+                proposed: Arc::new(values),
+                accepted: None,
+                log: Arc::clone(&log),
+            }),
+            parallel_shape(LoggedLeaf {
+                variable: 0,
+                leaf_occurrence: 1,
+                estimate: estimate + 1,
+                proposed: Arc::new(Vec::new()),
+                accepted: Some(accepted),
+                log,
+            }),
+        ]))
+    }
+
+    fn observation_site(verb: ActionVerb, leaf_occurrence: usize) -> ActionSite {
+        ActionSite {
+            verb,
+            variable: 0,
+            leaf_occurrence,
+            bound: VariableSet::new_empty(),
+        }
+    }
+
+    fn observation_geometry(
+        parent_rows: usize,
+        candidate_occurrences: usize,
+    ) -> ActionGeometry {
+        ActionGeometry {
+            parent_rows,
+            candidate_occurrences,
+            action_atoms: parent_rows.max(candidate_occurrences),
+        }
+    }
+
+    fn executor_measurement(operation: &'static str, started: Duration) -> ExecutorMeasurement {
+        ExecutorMeasurement {
+            executor: "test-executor",
+            operation,
+            work_unit: "test-items",
+            work_units: 1,
+            started,
+            wall: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn residual_shadow_preserves_bag_stats_and_action_sequence_at_every_width() {
+        let values: Vec<_> = (0..16).map(raw).collect();
+        let accepted = raw(5);
+        let mut saw_dead_confirm = false;
+        let mut saw_surviving_confirm = false;
+
+        for width in [1, 3, 16] {
+            let direct_log = Arc::new(Mutex::new(Vec::new()));
+            let direct = Query::new(
+                logged_filter_fixture(values.clone(), accepted, Arc::clone(&direct_log)),
+                |binding: &Binding| binding.get(0).copied(),
+            )
+            .solve_residual_state_lazy()
+            .cap(16)
+            .start_width(width)
+            .collect_profiled();
+
+            let shadow_log = Arc::new(Mutex::new(Vec::new()));
+            let epoch = ResidualShadowEpoch::new();
+            let shadow = Query::new(
+                logged_filter_fixture(values.clone(), accepted, Arc::clone(&shadow_log)),
+                |binding: &Binding| binding.get(0).copied(),
+            )
+            .solve_residual_state_lazy()
+            .cap(16)
+            .start_width(width)
+            .shadow(epoch.clone())
+            .collect_profiled();
+
+            let mut direct_results = direct.results;
+            let mut shadow_results = shadow.results;
+            direct_results.sort_unstable();
+            shadow_results.sort_unstable();
+            assert_eq!(shadow_results, direct_results);
+            assert_eq!(shadow_results, [accepted]);
+            assert_eq!(shadow.stats, direct.stats);
+            assert_eq!(shadow.shadow.status, ResidualShadowStatus::Closed);
+            assert_eq!(epoch.status(), ResidualShadowStatus::Closed);
+
+            let direct_calls = direct_log.lock().unwrap().clone();
+            let shadow_calls = shadow_log.lock().unwrap().clone();
+            assert_eq!(shadow_calls, direct_calls);
+            let observed_calls: Vec<_> = shadow
+                .shadow
+                .events
+                .iter()
+                .map(|event| LoggedAction {
+                    verb: event.site.verb,
+                    leaf_occurrence: event.site.leaf_occurrence,
+                    parent_rows: event.geometry.parent_rows,
+                    candidate_occurrences: event.geometry.candidate_occurrences,
+                })
+                .collect();
+            assert_eq!(observed_calls, direct_calls);
+            assert_eq!(
+                shadow.shadow.events.len(),
+                shadow.stats.propose_action_pops + shadow.stats.confirm_action_pops
+            );
+
+            for event in &shadow.shadow.events {
+                assert_eq!(event.site.variable, 0);
+                assert_eq!(event.site.bound, VariableSet::new_empty());
+                assert_eq!(event.executor_samples.len(), 1);
+                let sample = event.executor_samples[0];
+                assert_eq!(sample.event, event.event);
+                assert!(!sample.stale);
+                assert!(sample.measurement.started >= event.started);
+                assert_eq!(
+                    sample.measurement.work_units,
+                    match event.site.verb {
+                        ActionVerb::Propose => event.geometry.parent_rows,
+                        ActionVerb::Confirm => event.geometry.candidate_occurrences,
+                    }
+                );
+                assert_eq!(
+                    event.geometry.action_atoms,
+                    match event.site.verb {
+                        ActionVerb::Propose => event.geometry.parent_rows,
+                        ActionVerb::Confirm => event.geometry.candidate_occurrences,
+                    }
+                );
+                let completion = event.completion.expect("drained action completed");
+                assert!(!completion.stale);
+                if event.site.verb == ActionVerb::Confirm {
+                    match completion.outcome {
+                        ActionOutcome::Dead => saw_dead_confirm = true,
+                        ActionOutcome::Advanced(survival) => {
+                            saw_surviving_confirm = true;
+                            assert_eq!(survival.parent_rows, 1);
+                            assert_eq!(survival.candidate_occurrences, 1);
+                        }
+                        ActionOutcome::Aborted => panic!("drained confirmation aborted"),
+                    }
+                }
+            }
+        }
+
+        assert!(saw_dead_confirm);
+        assert!(saw_surviving_confirm);
+    }
+
+    #[test]
+    fn residual_shadow_nested_scopes_restore_and_own_executor_samples() {
+        assert!(current_residual_action().is_none());
+        let epoch = ResidualShadowEpoch::new();
+        let outer = epoch.begin(
+            observation_site(ActionVerb::Propose, 0),
+            observation_geometry(1, 0),
+        );
+        let outer_correlation = outer.correlation();
+        let outer_scope = ShadowActionScope::enter(outer_correlation.clone());
+        assert_eq!(
+            current_residual_action().map(|action| action.event()),
+            Some(outer_correlation.event())
+        );
+
+        let inner = epoch.begin(
+            observation_site(ActionVerb::Confirm, 1),
+            observation_geometry(1, 2),
+        );
+        let inner_correlation = inner.correlation();
+        let inner_scope = ShadowActionScope::enter(inner_correlation.clone());
+        assert_eq!(
+            current_residual_action().map(|action| action.event()),
+            Some(inner_correlation.event())
+        );
+        inner_correlation.record_executor_sample(executor_measurement("first", Duration::ZERO));
+        inner_correlation.record_executor_sample(executor_measurement("second", Duration::ZERO));
+        drop(inner_scope);
+        assert_eq!(
+            current_residual_action().map(|action| action.event()),
+            Some(outer_correlation.event())
+        );
+        outer_correlation.record_executor_sample(executor_measurement("outer", Duration::ZERO));
+        drop(outer_scope);
+        assert!(current_residual_action().is_none());
+
+        inner.finish(ActionOutcome::Advanced(ActionSurvival {
+            parent_rows: 1,
+            candidate_occurrences: 1,
+        }));
+        outer.finish(ActionOutcome::Dead);
+        assert!(epoch.close());
+        let snapshot = epoch.snapshot();
+        assert_eq!(snapshot.events.len(), 2);
+        assert_eq!(snapshot.events[0].event, outer_correlation.event());
+        assert_eq!(snapshot.events[0].executor_samples[0].measurement.operation, "outer");
+        assert_eq!(snapshot.events[1].event, inner_correlation.event());
+        assert_eq!(
+            snapshot.events[1]
+                .executor_samples
+                .iter()
+                .map(|sample| sample.measurement.operation)
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+    }
+
+    #[test]
+    fn residual_shadow_late_samples_stay_with_their_terminal_epoch() {
+        let old_epoch = ResidualShadowEpoch::new();
+        let old_span = old_epoch.begin(
+            observation_site(ActionVerb::Propose, 0),
+            observation_geometry(1, 0),
+        );
+        let old_correlation = old_span.correlation();
+        assert!(old_epoch.close());
+
+        let new_epoch = ResidualShadowEpoch::new();
+        let new_span = new_epoch.begin(
+            observation_site(ActionVerb::Confirm, 1),
+            observation_geometry(1, 1),
+        );
+        let new_correlation = new_span.correlation();
+        old_correlation.record_executor_sample(executor_measurement("late-old", Duration::ZERO));
+        new_correlation.record_executor_sample(executor_measurement("current-new", Duration::ZERO));
+        old_span.finish(ActionOutcome::Dead);
+        new_span.finish(ActionOutcome::Dead);
+        assert!(new_epoch.close());
+
+        let old = old_epoch.snapshot();
+        let new = new_epoch.snapshot();
+        assert_eq!(old.events[0].event.get(), 0);
+        assert_eq!(new.events[0].event.get(), 0);
+        assert_eq!(old.events[0].executor_samples[0].measurement.operation, "late-old");
+        assert!(old.events[0].executor_samples[0].stale);
+        assert!(old.events[0].completion.unwrap().stale);
+        assert_eq!(new.events[0].executor_samples[0].measurement.operation, "current-new");
+        assert!(!new.events[0].executor_samples[0].stale);
+        assert!(!new.events[0].completion.unwrap().stale);
+    }
+
+    #[test]
+    fn residual_shadow_serial_lifecycle_closes_or_invalidates_automatically() {
+        let dropped_epoch = ResidualShadowEpoch::new();
+        let dropped = Query::new(
+            FanoutLeaf {
+                variable: 0,
+                values: Arc::new(vec![raw(1)]),
+            },
+            |binding: &Binding| binding.get(0).copied(),
+        )
+        .solve_residual_state_lazy()
+        .shadow(dropped_epoch.clone());
+        drop(dropped);
+        assert_eq!(dropped_epoch.status(), ResidualShadowStatus::Invalidated);
+
+        let drained_epoch = ResidualShadowEpoch::new();
+        let drained: Vec<_> = Query::new(
+            FanoutLeaf {
+                variable: 0,
+                values: Arc::new(vec![raw(2)]),
+            },
+            |binding: &Binding| binding.get(0).copied(),
+        )
+        .solve_residual_state_lazy()
+        .shadow(drained_epoch.clone())
+        .collect();
+        assert_eq!(drained, [raw(2)]);
+        assert_eq!(drained_epoch.status(), ResidualShadowStatus::Closed);
+    }
+
+    #[test]
+    fn residual_shadow_terminal_epoch_rejects_claim_under_the_transition_lock() {
+        let epoch = ResidualShadowEpoch::new();
+        assert!(epoch.close());
+        let claim = std::panic::catch_unwind({
+            let epoch = epoch.clone();
+            move || epoch.inner.claim()
+        });
+        assert!(claim.is_err());
+        assert!(!epoch.inner.claimed.load(Ordering::Acquire));
+        assert_eq!(epoch.status(), ResidualShadowStatus::Closed);
+    }
+
+    #[test]
+    fn residual_shadow_event_ids_do_not_alias_colliding_private_state_ids() {
+        let state = StateId(7);
+        let first = ResidualActionTask {
+            state,
+            action: ResidualAction::Propose {
+                variable: 0,
+                leaf: 0,
+            },
+            bound: VariableSet::new_empty(),
+            parent_rows: 1,
+            candidate_occurrences: 0,
+            action_atoms: 1,
+        };
+        let second = ResidualActionTask {
+            state,
+            action: ResidualAction::Confirm {
+                variable: 0,
+                leaf: 1,
+            },
+            bound: VariableSet::new_empty(),
+            parent_rows: 1,
+            candidate_occurrences: 1,
+            action_atoms: 1,
+        };
+        let epoch = ResidualShadowEpoch::new();
+        let (first_site, first_geometry) = first.observation();
+        let (second_site, second_geometry) = second.observation();
+        let first_span = epoch.begin(first_site, first_geometry);
+        let second_span = epoch.begin(second_site, second_geometry);
+        let first_event = first_span.correlation().event();
+        let second_event = second_span.correlation().event();
+        assert_ne!(first_event, second_event);
+        first_span.finish(ActionOutcome::Dead);
+        second_span.finish(ActionOutcome::Dead);
+        epoch.close();
+        let snapshot = epoch.snapshot();
+        assert_eq!(snapshot.events[0].site.verb, ActionVerb::Propose);
+        assert_eq!(snapshot.events[1].site.verb, ActionVerb::Confirm);
+    }
+
+    #[test]
+    fn residual_shadow_handles_are_send_sync_and_selected_payload_stays_affine() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ResidualShadowEpoch>();
+        assert_send_sync::<ActionCorrelation>();
+        assert_send_sync::<ResidualShadowSnapshot>();
+
+        trait AmbiguousIfClone<Marker> {
+            fn marker() {}
+        }
+        impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+        struct CloneMarker;
+        impl<T: ?Sized + Clone> AmbiguousIfClone<CloneMarker> for T {}
+        let _ = <SelectedResidualTask as AmbiguousIfClone<_>>::marker;
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn residual_shadow_parallel_drive_shares_one_epoch_without_attribution_gaps() {
+        use std::collections::HashSet;
+
+        let values: Vec<_> = (0..128).map(raw).collect();
+        let accepted = raw(37);
+        let expected: Vec<_> = Query::new(
+            parallel_logged_filter_fixture(
+                values.clone(),
+                accepted,
+                Arc::new(Mutex::new(Vec::new())),
+            ),
+            |binding: &Binding| binding.get(0).copied(),
+        )
+        .solve_residual_state_lazy()
+        .cap(128)
+        .start_width(128)
+        .collect();
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let epoch = ResidualShadowEpoch::new();
+        let run_epoch = epoch.clone();
+        let root = parallel_logged_filter_fixture(values, accepted, Arc::clone(&log));
+        let mut observed: Vec<_> = with_parallel_workers(4, move || {
+            Query::new(root, |binding: &Binding| binding.get(0).copied())
+                .solve_residual_state_lazy()
+                .cap(128)
+                .start_width(128)
+                .shadow(run_epoch)
+                .into_par_iter()
+                .collect()
+        });
+        let mut expected = expected;
+        observed.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(observed, expected);
+        assert_eq!(observed, [accepted]);
+        assert_eq!(epoch.status(), ResidualShadowStatus::Closed);
+
+        let snapshot = epoch.snapshot();
+        assert_eq!(snapshot.status, ResidualShadowStatus::Closed);
+        assert_eq!(snapshot.events.len(), log.lock().unwrap().len());
+        assert!(snapshot.events.len() > 2);
+        let ids: HashSet<_> = snapshot.events.iter().map(|event| event.event).collect();
+        assert_eq!(ids.len(), snapshot.events.len());
+        for event in &snapshot.events {
+            assert_eq!(event.executor_samples.len(), 1);
+            assert_eq!(event.executor_samples[0].event, event.event);
+            assert!(!event.executor_samples[0].stale);
+            assert!(!event.completion.unwrap().stale);
+        }
+    }
+
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn residual_shadow_parallel_short_circuit_invalidates_the_epoch() {
+        let epoch = ResidualShadowEpoch::new();
+        let run_epoch = epoch.clone();
+        let root = Arc::new(FanoutLeaf {
+            variable: 0,
+            values: Arc::new((0..128).map(raw).collect()),
+        });
+        let found = with_parallel_workers(4, move || {
+            Query::new(root, |binding: &Binding| binding.get(0).copied())
+                .solve_residual_state_lazy()
+                .cap(128)
+                .start_width(128)
+                .shadow(run_epoch)
+                .into_par_iter()
+                .find_any(|_| true)
+        });
+        assert!(found.is_some());
+        assert_eq!(epoch.status(), ResidualShadowStatus::Invalidated);
     }
 
     fn paged_filter_first_trace(

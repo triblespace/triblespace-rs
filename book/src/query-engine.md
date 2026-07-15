@@ -322,6 +322,35 @@ cross-shard reconvergence is traded for concurrency, state is moved rather
 than duplicated, and the constraint/postprocessor pair is cloned only when a
 real sibling shard is created.
 
+### Opt-in residual action observation
+
+A configured residual iterator can be wrapped with
+[`ResidualStateIter::shadow`](triblespace::core::query::residual::ResidualStateIter::shadow)
+and a fresh
+[`ResidualShadowEpoch`](triblespace::core::query::residual::ResidualShadowEpoch). The
+wrapper observes only concrete `Propose` and `Confirm` dispatches, including
+actions performed while a parallel producer negotiates its first splittable
+frontier. It records the exact leaf occurrence, variable, bound schema, input
+geometry, wall time, immediate survival or death, and any executor-local
+samples. The ordinary residual iterator and executor contain no observer
+field, clock read, thread-local lookup, allocation, or option branch.
+
+Action event numbers and leaf occurrences are local to one claimed epoch;
+neither exposes the machine's private interner `StateId`. Serial exhaustion
+and a fully drained Rayon drive close the epoch. Dropping an unfinished serial
+wrapper, a parallel short circuit, or a parallel unwind invalidates it. A
+snapshot is a consistent copy at its terminal/open state, while samples filed
+after a terminal transition remain attached to their original event and are
+marked stale.
+
+[`current_residual_action`](triblespace::core::query::residual::current_residual_action)
+provides a stack-scoped correlation capability during a leaf call, so nested
+observed queries restore the outer action on return. An asynchronous backend
+must clone and carry that capability explicitly to another thread; ambient
+thread-local state is not propagated. Observations are diagnostics only: they
+must never feed estimates, protocol answers, state identity, action ordering,
+or scheduling decisions in the execution they observe.
+
 The optional `triblespace-gpu::WgpuSuccinctArchive` exercises that seam without
 putting a device dependency in core. It wraps the canonical archive, keeps its
 six Jerky wavelet matrices resident, and routes tagged `confirm` rank streams
