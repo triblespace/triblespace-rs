@@ -61,6 +61,12 @@ use delta::{DeltaDesc, DeltaScheduler};
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ConstraintPath(Box<[usize]>);
 
+/// Route through one or more directly nested finite unions to a terminal arm.
+/// AND nodes deliberately terminate this path in the first recursive slice;
+/// crossing a connective change needs a continuation frame, not flattening.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UnionArmPath(Box<[usize]>);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LeafLowering {
     Opaque,
@@ -71,6 +77,7 @@ enum LeafLowering {
 struct ResidualLeaf {
     path: ConstraintPath,
     lowering: LeafLowering,
+    union_arms: Box<[UnionArmPath]>,
 }
 
 #[cfg(test)]
@@ -158,25 +165,45 @@ impl ResidualPlan {
                     }
                 }
                 ConstraintShape::Opaque => {
-                    let lowering = if mode == ResidualCompileMode::FiniteUnions {
-                        constraint
+                    fn collect_union_arms<'a>(
+                        union: &dyn Constraint<'a>,
+                        path: &mut Vec<usize>,
+                        arms: &mut Vec<UnionArmPath>,
+                    ) {
+                        let children = union
                             .residual_union_children()
-                            .map(|children| {
-                                assert!(
-                                    children.len() > 0,
-                                    "a residual finite union must expose at least one arm"
-                                );
-                                LeafLowering::FiniteUnion {
-                                    arm_count: children.len(),
-                                }
-                            })
-                            .unwrap_or(LeafLowering::Opaque)
+                            .expect("recursive union collection entered an opaque constraint");
+                        assert!(
+                            children.len() > 0,
+                            "a residual finite union must expose at least one arm"
+                        );
+                        for child in 0..children.len() {
+                            path.push(child);
+                            let constraint = children.child(child);
+                            if constraint.residual_union_children().is_some() {
+                                collect_union_arms(constraint, path, arms);
+                            } else {
+                                arms.push(UnionArmPath(path.clone().into_boxed_slice()));
+                            }
+                            path.pop();
+                        }
+                    }
+
+                    let mut union_arms = Vec::new();
+                    let lowering = if mode == ResidualCompileMode::FiniteUnions
+                        && constraint.residual_union_children().is_some()
+                    {
+                        collect_union_arms(constraint, &mut Vec::new(), &mut union_arms);
+                        LeafLowering::FiniteUnion {
+                            arm_count: union_arms.len(),
+                        }
                     } else {
                         LeafLowering::Opaque
                     };
                     leaves.push(ResidualLeaf {
                         path: ConstraintPath(path.clone().into_boxed_slice()),
                         lowering,
+                        union_arms: union_arms.into_boxed_slice(),
                     });
                     page_local_confirms.push(
                         matches!(lowering, LeafLowering::Opaque)
@@ -264,15 +291,19 @@ impl ResidualPlan {
         arm: usize,
     ) -> &'r dyn Constraint<'a> {
         let union = self.resolve(root, occurrence);
-        let children = union
-            .residual_union_children()
-            .expect("residual finite-union shape changed during query execution");
-        assert_eq!(
-            Some(children.len()),
-            self.union_arm_count(occurrence),
-            "residual finite-union arm count changed during query execution"
+        let path = &self.leaves[occurrence].union_arms[arm];
+        let mut constraint = union;
+        for &child in path.0.iter() {
+            let children = constraint
+                .residual_union_children()
+                .expect("residual nested-union shape changed during query execution");
+            constraint = children.child(child);
+        }
+        assert!(
+            constraint.residual_union_children().is_none(),
+            "residual nested-union terminal became another union"
         );
-        children.child(arm)
+        constraint
     }
 
     /// True exactly when every unchecked relevant confirmer can process
@@ -8538,6 +8569,125 @@ mod tests {
         lowered.sort_unstable();
         assert_eq!(lowered, [raw(1), raw(3)]);
         assert_eq!(lowered, sequential);
+    }
+
+    #[test]
+    fn recursive_union_flattens_nested_or_and_stops_at_and_terminals() {
+        let terminal = |values: Vec<RawInline>, accepted: RawInline| {
+            Box::new(IntersectionConstraint::new(vec![
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(values),
+                }) as ShapeConstraint,
+                Box::new(PageFilterLeaf {
+                    variable: 0,
+                    estimate: 20,
+                    accepted: Some(accepted),
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                }) as ShapeConstraint,
+            ])) as ShapeConstraint
+        };
+        let make = || {
+            let inner = UnionConstraint::new(vec![
+                terminal(vec![raw(1), raw(2)], raw(1)),
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(vec![raw(3)]),
+                }) as ShapeConstraint,
+            ]);
+            UnionConstraint::new(vec![
+                Box::new(inner) as ShapeConstraint,
+                terminal(vec![raw(2), raw(4)], raw(4)),
+            ])
+        };
+        let plan = ResidualPlan::compile_finite_unions(&make());
+        assert_eq!(plan.union_arm_count(0), Some(3));
+        assert_eq!(
+            plan.leaves[0].union_arms,
+            vec![
+                UnionArmPath(vec![0, 0].into_boxed_slice()),
+                UnionArmPath(vec![0, 1].into_boxed_slice()),
+                UnionArmPath(vec![1].into_boxed_slice()),
+            ]
+            .into_boxed_slice()
+        );
+
+        let project = |binding: &Binding| binding.get(0).copied();
+        let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
+        let mut dag: Vec<_> = Query::new(make(), project).lazy_dag_scheduler().collect();
+        let mut opaque: Vec<_> = Query::new(make(), project)
+            .solve_residual_state_lazy()
+            .collect();
+        let mut lowered: Vec<_> = Query::new(make(), project)
+            .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+            .collect();
+        sequential.sort_unstable();
+        dag.sort_unstable();
+        opaque.sort_unstable();
+        lowered.sort_unstable();
+        assert_eq!(lowered, [raw(1), raw(3), raw(4)]);
+        assert_eq!(lowered, sequential);
+        assert_eq!(lowered, dag);
+        assert_eq!(lowered, opaque);
+    }
+
+    #[test]
+    fn recursive_union_confirm_preserves_each_nested_original_fanout() {
+        let zero_calls = Arc::new(Mutex::new(Vec::new()));
+        let one_calls = Arc::new(Mutex::new(Vec::new()));
+        let two_calls = Arc::new(Mutex::new(Vec::new()));
+        let make = |zero_calls: Arc<Mutex<Vec<usize>>>,
+                    one_calls: Arc<Mutex<Vec<usize>>>,
+                    two_calls: Arc<Mutex<Vec<usize>>>| {
+            let filter = |accepted, calls| {
+                Box::new(PageFilterLeaf {
+                    variable: 0,
+                    estimate: 10,
+                    accepted: Some(raw(accepted)),
+                    calls,
+                }) as ShapeConstraint
+            };
+            let nested = UnionConstraint::new(vec![filter(0, zero_calls), filter(1, one_calls)]);
+            let union = UnionConstraint::new(vec![
+                Box::new(nested) as ShapeConstraint,
+                filter(2, two_calls),
+            ]);
+            IntersectionConstraint::new(vec![
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(vec![raw(0), raw(0), raw(1), raw(2), raw(3)]),
+                }) as ShapeConstraint,
+                Box::new(union) as ShapeConstraint,
+            ])
+        };
+        let project = |binding: &Binding| binding.get(0).copied();
+        let mut sequential: Vec<_> = Query::new(
+            make(
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(Mutex::new(Vec::new())),
+            ),
+            project,
+        )
+        .sequential()
+        .collect();
+        let mut lowered: Vec<_> = Query::new(
+            make(
+                Arc::clone(&zero_calls),
+                Arc::clone(&one_calls),
+                Arc::clone(&two_calls),
+            ),
+            project,
+        )
+        .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+        .collect();
+        sequential.sort_unstable();
+        lowered.sort_unstable();
+        assert_eq!(lowered, [raw(0), raw(1), raw(2)]);
+        assert_eq!(lowered, sequential);
+        assert_eq!(*zero_calls.lock().unwrap(), [5]);
+        assert_eq!(*one_calls.lock().unwrap(), [5]);
+        assert_eq!(*two_calls.lock().unwrap(), [5]);
     }
 
     #[test]
