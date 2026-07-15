@@ -725,12 +725,13 @@ pub fn confirm_per_row(
     }
 }
 
-/// Structural shape exposed to query-engine lowering probes.
+/// Structural shape exposed to query-engine lowering.
 ///
 /// This is deliberately not part of the ordinary constraint protocol. It lets
-/// opt-in engines flatten associative conjunctions without teaching them the
-/// concrete Rust type of every constraint. Semantic wrappers and custom
-/// constraints remain opaque unless they explicitly expose a shape.
+/// shape-aware engines flatten associative conjunctions without teaching them
+/// the concrete Rust type of every constraint. Ordinary [`Query`] selection
+/// may consume an exposed shape; semantic wrappers and custom constraints
+/// remain opaque unless they explicitly opt in to exposing one.
 #[doc(hidden)]
 #[non_exhaustive]
 #[derive(Clone, Copy)]
@@ -964,7 +965,7 @@ pub trait Constraint<'a> {
         }
     }
 
-    /// Exposes associative structure to opt-in residual lowering engines.
+    /// Exposes associative structure to shape-aware residual lowering.
     ///
     /// The default keeps the constraint opaque. Implementations must expose
     /// only structure whose flattening preserves the ordinary protocol's
@@ -1399,8 +1400,8 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// runtime cursor remains behind `Query::next`, so cloning a started query
     /// snapshots its exact raw remainder. Ordinary Rayon conversion of an
     /// unstarted query still uses the established scalar splitter; use
-    /// [`Query::into_par_residual_state_iter`] to request affine residual
-    /// sharding explicitly.
+    /// `Query::into_par_residual_state_iter` (with the `parallel` feature) to
+    /// request affine residual sharding explicitly.
     ///
     /// # Panics
     ///
@@ -1423,8 +1424,8 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// resumable worklist behind `Query::next`, so cloning a started query
     /// snapshots the exact remainder. Converting an unstarted selected query
     /// through ordinary Rayon iteration still uses the established scalar
-    /// splitter; use [`Query::into_par_dag_iter`] to request affine DAG
-    /// sharding explicitly.
+    /// splitter; use `Query::into_par_dag_iter` (with the `parallel` feature)
+    /// to request affine DAG sharding explicitly.
     ///
     /// # Panics
     ///
