@@ -34,11 +34,7 @@ struct Graph {
 impl Graph {
     fn new(node_count: usize, edges: &[(usize, usize)]) -> Self {
         let nodes: Vec<_> = (0..node_count).map(|_| rngid()).collect();
-        let attribute = Id::new([
-            0xD6, 0x5F, 0xF7, 0xBC, 0x33, 0x6E, 0x47, 0x33, 0xD2, 0xEF, 0xA0, 0x9F, 0x38, 0x09,
-            0x6E, 0x31,
-        ])
-        .expect("minted nonzero attribute");
+        let attribute = path_attribute();
         let mut set = TribleSet::new();
         for &(from, to) in edges {
             set.insert(&Trible::new(
@@ -59,10 +55,81 @@ impl Graph {
     }
 }
 
+/// A fixed-ID graph family whose levels form an inclusion chain.
+///
+/// Keeping both the node universe and insertion order stable makes failures in
+/// the generated scheduler differential exactly reproducible. Every level
+/// retains a secondary-attribute cycle so negated-attribute paths remain
+/// non-vacuous, while the primary relation grows by one fact at a time.
+struct GeneratedGraph {
+    set: TribleSet,
+    nodes: [Id; 4],
+    primary: Id,
+    secondary: Id,
+}
+
+impl GeneratedGraph {
+    fn new(level: usize) -> Self {
+        assert!(level <= 4);
+        // Minted specifically for this fixture with `trible genid`.
+        let nodes = [
+            Id::from_hex("40A990B5D501DC534BDA07DB6E778241").expect("minted fixture ID"),
+            Id::from_hex("0D277C88E14918C895DEB43BFE63D17D").expect("minted fixture ID"),
+            Id::from_hex("2421654939E557C23EB17CD1ACCFE299").expect("minted fixture ID"),
+            Id::from_hex("E5DAB28D2715F85707D3DE7ADA584384").expect("minted fixture ID"),
+        ];
+        let primary = path_attribute();
+        let secondary = other_attribute();
+        let mut set = TribleSet::new();
+        let mut insert = |from: usize, attribute: &Id, to: usize| {
+            set.insert(&Trible::new(
+                ExclusiveId::force_ref(&nodes[from]),
+                attribute,
+                &genid(&nodes[to]),
+            ));
+        };
+
+        // A stable secondary cycle fixes NODES(G) and gives !primary a
+        // meaningful repeated path at every generated level.
+        for from in 0..nodes.len() {
+            insert(from, &secondary, (from + 1) % nodes.len());
+        }
+        insert(0, &primary, 1);
+        let additions = [
+            (1, primary, 0),
+            (1, primary, 2),
+            (0, secondary, 2),
+            (2, primary, 3),
+        ];
+        for &(from, attribute, to) in additions.iter().take(level) {
+            insert(from, &attribute, to);
+        }
+
+        Self {
+            set,
+            nodes,
+            primary,
+            secondary,
+        }
+    }
+
+    fn value(&self, node: usize) -> Inline<GenId> {
+        genid(&self.nodes[node])
+    }
+}
+
 fn genid(id: &Id) -> Inline<GenId> {
     let mut value = [0; 32];
     value[16..].copy_from_slice(&id[..]);
     Inline::new(value)
+}
+
+fn path_attribute() -> Id {
+    Id::new([
+        0xD6, 0x5F, 0xF7, 0xBC, 0x33, 0x6E, 0x47, 0x33, 0xD2, 0xEF, 0xA0, 0x9F, 0x38, 0x09, 0x6E,
+        0x31,
+    ])
+    .expect("minted nonzero attribute")
 }
 
 fn other_attribute() -> Id {
@@ -648,6 +715,101 @@ fn linear_formula_bound_start_filter_root(
     Arc::new(IntersectionConstraint::new(children))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GeneratedFormulaCase {
+    Atom,
+    PageLocalAnd,
+    BarrierAnd,
+    RepeatedRecursive,
+}
+
+fn generated_formula_root(
+    graph: &GeneratedGraph,
+    ops: &[PathOp],
+    case: GeneratedFormulaCase,
+) -> Root {
+    let start = Variable::<GenId>::new(START);
+    let end = Variable::<GenId>::new(END);
+    let path = Arc::new(CountingPath {
+        inner: RegularPathConstraint::new(graph.set.clone(), start, end, ops),
+        seeded_roots: None,
+        source_pages: None,
+        expanded_nodes: Arc::new(AtomicUsize::new(0)),
+    });
+    let atom = || Box::new(Arc::clone(&path)) as DynConstraint;
+    let suffix = |page_local| {
+        Box::new(PageTraceFilter {
+            variable: END,
+            estimate: usize::MAX,
+            accepted: Some(graph.value(1).raw),
+            page_local,
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }) as DynConstraint
+    };
+
+    let formula = match case {
+        GeneratedFormulaCase::Atom => atom(),
+        GeneratedFormulaCase::PageLocalAnd => {
+            Box::new(IntersectionConstraint::new(vec![atom(), suffix(true)])) as DynConstraint
+        }
+        GeneratedFormulaCase::BarrierAnd => {
+            Box::new(IntersectionConstraint::new(vec![atom(), suffix(false)])) as DynConstraint
+        }
+        GeneratedFormulaCase::RepeatedRecursive => {
+            // Both visits deliberately reference the same Arc. Compilation
+            // must still allocate two formula occurrences: object identity is
+            // reusable structure, not occurrence identity.
+            let local =
+                Box::new(IntersectionConstraint::new(vec![atom(), suffix(true)])) as DynConstraint;
+            let barrier =
+                Box::new(IntersectionConstraint::new(vec![atom(), suffix(false)])) as DynConstraint;
+            Box::new(UnionConstraint::new(vec![local, barrier])) as DynConstraint
+        }
+    };
+    Arc::new(IntersectionConstraint::new(vec![
+        Box::new(start.is(graph.value(0))) as DynConstraint,
+        formula,
+    ]))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GeneratedPathProgram {
+    Plus,
+    Star,
+    InversePlus,
+    ConcatPlus,
+    UnionInversePlus,
+    NegatedPlus,
+}
+
+impl GeneratedPathProgram {
+    fn ops(self, primary: Id, secondary: Id) -> Vec<PathOp> {
+        let primary = primary.raw();
+        let secondary = secondary.raw();
+        match self {
+            Self::Plus => vec![PathOp::Attr(primary), PathOp::Plus],
+            Self::Star => vec![PathOp::Attr(primary), PathOp::Star],
+            Self::InversePlus => {
+                vec![PathOp::Attr(primary), PathOp::Inverse, PathOp::Plus]
+            }
+            Self::ConcatPlus => vec![
+                PathOp::Attr(primary),
+                PathOp::Attr(primary),
+                PathOp::Concat,
+                PathOp::Plus,
+            ],
+            Self::UnionInversePlus => vec![
+                PathOp::Attr(primary),
+                PathOp::Attr(secondary),
+                PathOp::Inverse,
+                PathOp::Union,
+                PathOp::Plus,
+            ],
+            Self::NegatedPlus => vec![PathOp::NotAttr(primary), PathOp::Plus],
+        }
+    }
+}
+
 fn pair_end_arm(start: Inline<GenId>, values: Vec<RawInline>, estimate: usize) -> DynConstraint {
     let start_var = Variable::<GenId>::new(START);
     Box::new(IntersectionConstraint::new(vec![
@@ -876,6 +1038,20 @@ fn assert_all_schedulers(
     ] {
         assert_eq!(run(make_root(), scheduler, project), expected);
     }
+}
+
+fn sorted_bag_is_subset(subset: &[RawInline], superset: &[RawInline]) -> bool {
+    let mut candidate = 0;
+    for expected in subset {
+        while candidate < superset.len() && superset[candidate] < *expected {
+            candidate += 1;
+        }
+        if candidate == superset.len() || superset[candidate] != *expected {
+            return false;
+        }
+        candidate += 1;
+    }
+    true
 }
 
 #[test]
@@ -3053,6 +3229,141 @@ fn generated_product_programs_match_sequential_and_dag_bags() {
             );
         }
     }
+}
+
+#[test]
+fn generated_combined_formula_rpq_matrix_matches_frozen_schedulers_and_is_monotone() {
+    let programs = [
+        GeneratedPathProgram::Plus,
+        GeneratedPathProgram::Star,
+        GeneratedPathProgram::InversePlus,
+        GeneratedPathProgram::ConcatPlus,
+        GeneratedPathProgram::UnionInversePlus,
+        GeneratedPathProgram::NegatedPlus,
+    ];
+    let formulas = [
+        GeneratedFormulaCase::Atom,
+        GeneratedFormulaCase::PageLocalAnd,
+        GeneratedFormulaCase::BarrierAnd,
+        GeneratedFormulaCase::RepeatedRecursive,
+    ];
+    let capability_cases = [
+        ("opaque", ResidualCapabilities::default()),
+        ("finite", ResidualCapabilities::default().finite_unions()),
+        ("cyclic", ResidualCapabilities::default().cyclic_rpq()),
+        ("root", ResidualCapabilities::default().root_formula()),
+        (
+            "finite-cyclic",
+            ResidualCapabilities::default().finite_unions().cyclic_rpq(),
+        ),
+        (
+            "finite-root",
+            ResidualCapabilities::default()
+                .finite_unions()
+                .root_formula(),
+        ),
+        (
+            "root-cyclic",
+            ResidualCapabilities::default().root_formula().cyclic_rpq(),
+        ),
+        (
+            "all",
+            ResidualCapabilities::default()
+                .finite_unions()
+                .root_formula()
+                .cyclic_rpq(),
+        ),
+    ];
+    let mut saw_root_cyclic_probe_one = false;
+
+    for program in programs {
+        let mut bags_by_formula = Vec::new();
+        for formula in formulas {
+            let mut bags_by_level = Vec::new();
+            for level in 0..=4 {
+                let graph = GeneratedGraph::new(level);
+                let ops = program.ops(graph.primary, graph.secondary);
+                let make_root = || generated_formula_root(&graph, &ops, formula);
+                let expected = run(make_root(), Scheduler::Sequential, project_end);
+
+                assert_eq!(
+                    run(make_root(), Scheduler::Ordinary, project_end),
+                    expected,
+                    "level={level} program={program:?} formula={formula:?} ordinary"
+                );
+                assert_eq!(
+                    run(make_root(), Scheduler::Dag, project_end),
+                    expected,
+                    "level={level} program={program:?} formula={formula:?} LazyDag"
+                );
+
+                for &(capability, capabilities) in &capability_cases {
+                    let mut query = Query::new(make_root(), project_end)
+                        .solve_residual_state_lazy_with(capabilities)
+                        .cap(1)
+                        .start_width(1);
+                    let mut actual: Vec<_> = query.by_ref().collect();
+                    actual.sort_unstable();
+                    assert_eq!(
+                        actual, expected,
+                        "level={level} program={program:?} formula={formula:?} capability={capability}"
+                    );
+                    if capability == "root-cyclic"
+                        && program == GeneratedPathProgram::Plus
+                        && formula == GeneratedFormulaCase::PageLocalAnd
+                        && query.stats().delta_handoff_probe_pops > 0
+                    {
+                        saw_root_cyclic_probe_one = true;
+                    }
+                }
+                bags_by_level.push(expected);
+            }
+
+            for (level, pair) in bags_by_level.windows(2).enumerate() {
+                assert!(
+                    sorted_bag_is_subset(&pair[0], &pair[1]),
+                    "adding graph facts retracted results: level={level}->{} program={program:?} formula={formula:?} before={:?} after={:?}",
+                    level + 1,
+                    pair[0],
+                    pair[1]
+                );
+            }
+            bags_by_formula.push(bags_by_level);
+        }
+
+        assert_eq!(
+            bags_by_formula[1], bags_by_formula[2],
+            "page-locality changed semantics for program={program:?}"
+        );
+    }
+
+    assert!(
+        saw_root_cyclic_probe_one,
+        "the generated width-one root+cyclic lane never exercised a streamed handoff probe"
+    );
+
+    // The recursive bag cannot reveal accidental occurrence collapse because
+    // its two arms denote the same relation. Pin the structural invariant once
+    // through the diagnostic-only shadow surface.
+    let graph = GeneratedGraph::new(4);
+    let ops = GeneratedPathProgram::Plus.ops(graph.primary, graph.secondary);
+    let observed = Query::new(
+        generated_formula_root(&graph, &ops, GeneratedFormulaCase::RepeatedRecursive),
+        project_end,
+    )
+    .solve_residual_state_lazy_with(ResidualCapabilities::default().root_formula().cyclic_rpq())
+    .shadow(ResidualShadowEpoch::new())
+    .collect_profiled();
+    let mut occurrences: Vec<_> = observed
+        .shadow
+        .events
+        .iter()
+        .filter(|event| event.site.verb == ActionVerb::Propose && event.site.variable == END)
+        .map(|event| event.site.leaf_occurrence)
+        .collect();
+    occurrences.sort_unstable();
+    occurrences.dedup();
+    assert_eq!(occurrences.len(), 2);
 }
 
 #[test]
