@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Cyclic RPQ actions now execute inside lowered finite formulas.** Direct
+  path atoms under OR and OR-to-AND arms share the residual delta fixpoint for
+  both proposal and grouped confirmation while retaining an exact affine
+  formula continuation per parent. Formula proposals remain private until
+  quiescence, empty root sets resume as empty branch results, and structural
+  delta buckets may merge expansion work across distinct formula return masks.
 - **WGPU Succinct confirmation can opt into exact residual-action executor
   samples.** `WgpuSuccinctArchive::observe_residual_actions()` returns a
   borrowing, non-`Deref` `ObservedWgpuSuccinctArchive` whose pattern route

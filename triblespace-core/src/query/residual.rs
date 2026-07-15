@@ -2330,6 +2330,42 @@ impl FormulaBatch {
         }
     }
 
+    /// Applies one complete Atom action result to the focused reducer frame.
+    /// Ordinary protocol execution and quiescent cyclic execution share this
+    /// exact boundary so AND replaces its working stream while OR accumulates
+    /// one independently evaluated arm.
+    fn apply_action_result(&mut self, stage: FormulaStage, mut result: Candidates) {
+        result.sort_unstable();
+        match (self.frames.last_mut().unwrap(), stage) {
+            (FormulaPayloadFrame::Or { output, .. }, _) => {
+                output.extend(result);
+                output.sort_unstable();
+            }
+            (FormulaPayloadFrame::And { current }, FormulaStage::Propose) => {
+                assert!(current.is_empty(), "an AND ran two proposers");
+                *current = result;
+            }
+            (FormulaPayloadFrame::And { current }, FormulaStage::Confirm) => {
+                *current = result;
+            }
+        }
+    }
+
+    fn validate_tags(&self) {
+        assert!(
+            self.frames.iter().all(|frame| match frame {
+                FormulaPayloadFrame::Or { source, output } => source
+                    .iter()
+                    .chain(output.iter())
+                    .all(|(parent, _)| (*parent as usize) < self.parents.row_count),
+                FormulaPayloadFrame::And { current } => current
+                    .iter()
+                    .all(|(parent, _)| (*parent as usize) < self.parents.row_count),
+            }),
+            "formula action emitted an invalid candidate row tag"
+        );
+    }
+
     fn enter(&mut self, kind: &FiniteFormulaNodeKind, stage: FormulaStage) {
         let input = match stage {
             FormulaStage::Propose => Vec::new(),
@@ -2566,6 +2602,17 @@ impl FormulaBatch {
             }
         }
         groups
+    }
+
+    /// Moves every affine parent, including its complete reducer-frame stack,
+    /// into a one-parent payload suitable for activation-local cyclic work.
+    /// Candidate tags are normalized to zero by the ordinary partition path.
+    fn into_singletons(self, stride: usize) -> Vec<Self> {
+        let parent_count = self.parents.row_count;
+        let assignment: Vec<_> = (0..parent_count).collect();
+        let groups = self.partition(stride, &assignment);
+        assert_eq!(groups.len(), parent_count);
+        groups.into_values().collect()
     }
 
     fn finish(mut self) -> CandidateBatch {
@@ -3907,12 +3954,42 @@ fn formula_and_plan_transition<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn finish_formula_action_result(
+    plan: &ResidualPlan,
+    bound: VariableSet,
+    counter: &FormulaProgramCounter,
+    mut batch: FormulaBatch,
+    result: Candidates,
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+) -> Option<ContinuationToken> {
+    let FormulaFocus::Action { stage, .. } = counter.focus else {
+        panic!("formula result received a planning continuation")
+    };
+    batch.apply_action_result(stage, result);
+    batch.validate_tags();
+
+    let completed = plan.finite_formula.complete(counter);
+    let FormulaSuccessor::Formula(next) = plan.finite_formula.resume(&completed) else {
+        panic!("an Atom action returned directly past the formula root")
+    };
+    let desc = StateDesc {
+        bound,
+        phase: ResidualPhase::Formula {
+            counter: counter.clone(),
+        },
+    };
+    continue_formula_transition(plan, &desc, next, batch, worklist, interner, stats)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn formula_action_transition<'a>(
     root: &dyn Constraint<'a>,
     plan: &ResidualPlan,
     desc: &StateDesc,
     counter: &FormulaProgramCounter,
-    mut batch: FormulaBatch,
+    batch: FormulaBatch,
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
@@ -3930,53 +4007,29 @@ fn formula_action_transition<'a>(
         "a formula action became dead between planning and execution"
     );
 
-    match (batch.frames.last_mut().unwrap(), stage) {
-        (FormulaPayloadFrame::Or { output, .. }, FormulaStage::Propose) => {
-            let mut produced = Vec::new();
+    let mut result = match stage {
+        FormulaStage::Propose => Vec::new(),
+        FormulaStage::Confirm => batch.input().clone(),
+    };
+    let candidates_before = result.len();
+    match stage {
+        FormulaStage::Propose => {
             constraint.propose(
                 counter.resume.variable,
                 &view,
-                &mut CandidateSink::Tagged(&mut produced),
+                &mut CandidateSink::Tagged(&mut result),
             );
-            stats.candidates_proposed += produced.len();
-            stats.max_propose_candidates = stats.max_propose_candidates.max(produced.len());
-            output.extend(produced);
-            output.sort_unstable();
+            stats.candidates_proposed += result.len();
+            stats.max_propose_candidates = stats.max_propose_candidates.max(result.len());
         }
-        (FormulaPayloadFrame::Or { source, output }, FormulaStage::Confirm) => {
-            let mut survivors = source.clone();
-            let candidates_before = survivors.len();
+        FormulaStage::Confirm => {
             constraint.confirm(
                 counter.resume.variable,
                 &view,
-                &mut CandidateSink::Tagged(&mut survivors),
+                &mut CandidateSink::Tagged(&mut result),
             );
             stats.candidates_confirmed += candidates_before;
             stats.max_confirm_candidates = stats.max_confirm_candidates.max(candidates_before);
-            output.extend(survivors);
-            output.sort_unstable();
-        }
-        (FormulaPayloadFrame::And { current }, FormulaStage::Propose) => {
-            assert!(current.is_empty(), "an AND ran two proposers");
-            constraint.propose(
-                counter.resume.variable,
-                &view,
-                &mut CandidateSink::Tagged(current),
-            );
-            stats.candidates_proposed += current.len();
-            stats.max_propose_candidates = stats.max_propose_candidates.max(current.len());
-            current.sort_unstable();
-        }
-        (FormulaPayloadFrame::And { current }, FormulaStage::Confirm) => {
-            let candidates_before = current.len();
-            constraint.confirm(
-                counter.resume.variable,
-                &view,
-                &mut CandidateSink::Tagged(current),
-            );
-            stats.candidates_confirmed += candidates_before;
-            stats.max_confirm_candidates = stats.max_confirm_candidates.max(candidates_before);
-            current.sort_unstable();
         }
     }
     match stage {
@@ -3991,24 +4044,9 @@ fn formula_action_transition<'a>(
             stats.max_confirm_rows = stats.max_confirm_rows.max(batch.parents.row_count);
         }
     }
-    assert!(
-        batch.frames.iter().all(|frame| match frame {
-            FormulaPayloadFrame::Or { source, output } => source
-                .iter()
-                .chain(output.iter())
-                .all(|(parent, _)| (*parent as usize) < batch.parents.row_count),
-            FormulaPayloadFrame::And { current } => current
-                .iter()
-                .all(|(parent, _)| (*parent as usize) < batch.parents.row_count),
-        }),
-        "formula action emitted an invalid candidate row tag"
-    );
-
-    let completed = plan.finite_formula.complete(counter);
-    let FormulaSuccessor::Formula(next) = plan.finite_formula.resume(&completed) else {
-        panic!("an Atom action returned directly past the formula root")
-    };
-    continue_formula_transition(plan, desc, next, batch, worklist, interner, stats)
+    finish_formula_action_result(
+        plan, desc.bound, counter, batch, result, worklist, interner, stats,
+    )
 }
 
 /// Semantic result of executing one selected residual-state chunk.
@@ -4028,7 +4066,9 @@ enum StepOutcome {
 #[derive(Debug)]
 enum MachineStep {
     Stable(StepOutcome),
-    DeltaSeeded,
+    /// Cyclic work was seeded. Parents with an empty root set may already
+    /// have resumed their stable formula continuation.
+    DeltaSeeded(Option<ContinuationToken>),
 }
 
 /// Executes one canonical control state after the scheduler has selected its
@@ -4640,9 +4680,8 @@ impl ResidualStateMachine {
             return Err(task);
         };
 
-        // Finite reducers own their proposal lifecycle. A cyclic capability
-        // may replace only an ordinary opaque leaf action; RPQs nested inside
-        // a lowered formula action deliberately remain behind that boundary.
+        // Formula actions enter the same cyclic stratum through their own
+        // suspension path below; this hook owns ordinary opaque leaf actions.
         if plan.has_finite_formula(*proposer) {
             return Err(task);
         }
@@ -4681,11 +4720,16 @@ impl ResidualStateMachine {
         self.stats.propose_calls += 1;
         self.stats.propose_rows += rows.row_count;
         self.stats.max_propose_rows = self.stats.max_propose_rows.max(rows.row_count);
-        self.delta.seed_proposals(
-            DeltaDesc::propose(desc.bound, variable, proposer, relevant, checked),
-            rows,
-            seeds,
-        );
+        let successor = StateDesc {
+            bound: desc.bound,
+            phase: ResidualPhase::Candidate {
+                variable,
+                relevant,
+                checked,
+            },
+        };
+        self.delta
+            .seed_proposals(DeltaDesc::leaf(variable, proposer), successor, rows, seeds);
         Ok(())
     }
 
@@ -4756,12 +4800,108 @@ impl ResidualStateMachine {
         self.stats.candidates_confirmed += candidates_before;
         self.stats.max_confirm_candidates =
             self.stats.max_confirm_candidates.max(candidates_before);
+        let successor = StateDesc {
+            bound: desc.bound,
+            phase: ResidualPhase::Candidate {
+                variable,
+                relevant,
+                checked: checked.with_inserted(confirmer),
+            },
+        };
         self.delta.seed_confirms(
-            DeltaDesc::confirm(desc.bound, variable, confirmer, relevant, checked),
+            DeltaDesc::leaf(variable, confirmer),
+            successor,
             batch,
             seeds,
         );
         Ok(())
+    }
+
+    /// Suspends a currently focused formula Atom behind one cyclic reducer
+    /// activation per affine parent. The complete Action PC and every payload
+    /// frame remain activation data; [`DeltaDesc`] names only the common
+    /// structural expansion kernel.
+    fn seed_delta_formula<'a>(
+        &mut self,
+        root: &dyn Constraint<'a>,
+        plan: &ResidualPlan,
+        task: SelectedResidualTask,
+    ) -> Result<Option<ContinuationToken>, SelectedResidualTask> {
+        if !plan.cyclic_rpq {
+            return Err(task);
+        }
+        let (ResidualPhase::Formula { counter }, StateBucket::Formula(batch)) =
+            (&task.desc.phase, &task.bucket)
+        else {
+            return Err(task);
+        };
+        let counter = counter.clone();
+        let (node, stage) = match &counter.focus {
+            FormulaFocus::Action { node, stage } => (*node, *stage),
+            _ => return Err(task),
+        };
+        let formula_node = plan.finite_formula.node(node);
+        if !matches!(formula_node.kind, FiniteFormulaNodeKind::Atom)
+            || (stage == FormulaStage::Confirm && !formula_node.capabilities.grouped_delta_confirm)
+        {
+            return Err(task);
+        }
+
+        let variable = counter.resume.variable;
+        let occurrence = counter.resume.occurrence;
+        let vars: Vec<VariableId> = task.desc.bound.into_iter().collect();
+        let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
+        let mut seeds = Vec::new();
+        let supported = plan
+            .resolve_formula_node(root, occurrence, node)
+            .residual_delta_seeds(variable, &view, &mut seeds);
+        if !supported {
+            assert!(
+                seeds.is_empty(),
+                "unsupported formula delta seed hook mutated its output"
+            );
+            return Err(task);
+        }
+
+        let SelectedResidualTask {
+            state: _,
+            desc,
+            bucket,
+        } = task;
+        let StateBucket::Formula(batch) = bucket else {
+            unreachable!("formula delta action was checked above")
+        };
+        match stage {
+            FormulaStage::Propose => {
+                self.stats.propose_action_pops += 1;
+                self.stats.propose_calls += 1;
+                self.stats.propose_rows += batch.parents.row_count;
+                self.stats.max_propose_rows =
+                    self.stats.max_propose_rows.max(batch.parents.row_count);
+            }
+            FormulaStage::Confirm => {
+                let candidates_before = batch.action_candidate_count(stage);
+                self.stats.confirm_action_pops += 1;
+                self.stats.confirm_calls += 1;
+                self.stats.confirm_rows += batch.parents.row_count;
+                self.stats.max_confirm_rows =
+                    self.stats.max_confirm_rows.max(batch.parents.row_count);
+                self.stats.candidates_confirmed += candidates_before;
+                self.stats.max_confirm_candidates =
+                    self.stats.max_confirm_candidates.max(candidates_before);
+            }
+        }
+        Ok(self.delta.seed_formula(
+            DeltaDesc::formula(variable, occurrence, node),
+            desc.bound,
+            counter,
+            batch,
+            seeds,
+            plan,
+            &mut self.worklist,
+            &mut self.interner,
+            &mut self.stats,
+        ))
     }
 
     fn pop_once<'a>(
@@ -4780,11 +4920,15 @@ impl ResidualStateMachine {
         };
         self.last_was_action = task.is_action_for_plan(plan);
         let task = match self.seed_delta_proposal(root, plan, task) {
-            Ok(()) => return MachineStep::DeltaSeeded,
+            Ok(()) => return MachineStep::DeltaSeeded(None),
             Err(task) => task,
         };
         let task = match self.seed_delta_confirm(root, plan, task) {
-            Ok(()) => return MachineStep::DeltaSeeded,
+            Ok(()) => return MachineStep::DeltaSeeded(None),
+            Err(task) => task,
+        };
+        let task = match self.seed_delta_formula(root, plan, task) {
+            Ok(continuation) => return MachineStep::DeltaSeeded(continuation),
             Err(task) => task,
         };
         let emit_bound = task.desc.bound;
@@ -4904,8 +5048,10 @@ impl ResidualStateMachine {
                     self.stage_emit(rows);
                     self.increase_width();
                 }
-                MachineStep::DeltaSeeded => {
-                    self.continuation = None;
+                MachineStep::DeltaSeeded(continuation) => {
+                    self.continuation = continuation.and_then(|continuation| {
+                        self.continuation_after_advanced(plan, width, continuation)
+                    });
                 }
             }
         }
@@ -5180,7 +5326,7 @@ impl ResidualStateMachine {
                 // every successor normally and deliberately does not arm the
                 // first-result continuation sprint before the frontier has
                 // been partitioned.
-                MachineStep::Stable(StepOutcome::Advanced(_)) | MachineStep::DeltaSeeded => {}
+                MachineStep::Stable(StepOutcome::Advanced(_)) | MachineStep::DeltaSeeded(_) => {}
                 MachineStep::Stable(StepOutcome::Dead) => self.increase_width(),
                 MachineStep::Stable(StepOutcome::Emit(rows)) => {
                     self.stage_emit(rows);
