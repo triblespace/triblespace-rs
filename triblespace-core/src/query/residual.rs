@@ -58,6 +58,31 @@ use super::*;
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ConstraintPath(Box<[usize]>);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LeafLowering {
+    Opaque,
+    FiniteUnion { arm_count: usize },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResidualLeaf {
+    path: ConstraintPath,
+    lowering: LeafLowering,
+}
+
+#[cfg(test)]
+impl PartialEq<ConstraintPath> for ResidualLeaf {
+    fn eq(&self, other: &ConstraintPath) -> bool {
+        self.path == *other
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResidualCompileMode {
+    OpaqueUnions,
+    FiniteUnions,
+}
+
 /// Borrow-free lowering plan safe to store beside its owned root.
 ///
 /// Occurrence identity is the path's preorder position, not the address or
@@ -65,7 +90,7 @@ struct ConstraintPath(Box<[usize]>);
 /// twice in an AND produces two independent residual occurrences.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ResidualPlan {
-    leaves: Vec<ConstraintPath>,
+    leaves: Vec<ResidualLeaf>,
     /// Whether each opaque leaf's confirmation is homomorphic over ordered
     /// pages of one parent's candidate sequence.
     page_local_confirms: Vec<bool>,
@@ -73,30 +98,73 @@ struct ResidualPlan {
 
 impl ResidualPlan {
     fn compile<'a>(root: &dyn Constraint<'a>) -> Self {
+        Self::compile_mode(root, ResidualCompileMode::OpaqueUnions)
+    }
+
+    fn compile_finite_unions<'a>(root: &dyn Constraint<'a>) -> Self {
+        Self::compile_mode(root, ResidualCompileMode::FiniteUnions)
+    }
+
+    fn compile_mode<'a>(root: &dyn Constraint<'a>, mode: ResidualCompileMode) -> Self {
         fn visit<'a>(
             constraint: &dyn Constraint<'a>,
+            mode: ResidualCompileMode,
             path: &mut Vec<usize>,
-            leaves: &mut Vec<ConstraintPath>,
+            leaves: &mut Vec<ResidualLeaf>,
             page_local_confirms: &mut Vec<bool>,
         ) {
             match constraint.residual_shape() {
                 ConstraintShape::And(children) => {
                     for child in 0..children.len() {
                         path.push(child);
-                        visit(children.child(child), path, leaves, page_local_confirms);
+                        visit(
+                            children.child(child),
+                            mode,
+                            path,
+                            leaves,
+                            page_local_confirms,
+                        );
                         path.pop();
                     }
                 }
                 ConstraintShape::Opaque => {
-                    leaves.push(ConstraintPath(path.clone().into_boxed_slice()));
-                    page_local_confirms.push(constraint.residual_confirm_is_page_local());
+                    let lowering = if mode == ResidualCompileMode::FiniteUnions {
+                        constraint
+                            .residual_union_children()
+                            .map(|children| {
+                                assert!(
+                                    children.len() > 0,
+                                    "a residual finite union must expose at least one arm"
+                                );
+                                LeafLowering::FiniteUnion {
+                                    arm_count: children.len(),
+                                }
+                            })
+                            .unwrap_or(LeafLowering::Opaque)
+                    } else {
+                        LeafLowering::Opaque
+                    };
+                    leaves.push(ResidualLeaf {
+                        path: ConstraintPath(path.clone().into_boxed_slice()),
+                        lowering,
+                    });
+                    page_local_confirms.push(
+                        matches!(lowering, LeafLowering::Opaque)
+                            && constraint.residual_confirm_is_page_local(),
+                    );
                 }
             }
         }
 
         let mut leaves = Vec::new();
         let mut page_local_confirms = Vec::new();
-        visit(root, &mut Vec::new(), &mut leaves, &mut page_local_confirms);
+        visit(
+            root,
+            mode,
+            &mut Vec::new(),
+            &mut leaves,
+            &mut page_local_confirms,
+        );
         Self {
             leaves,
             page_local_confirms,
@@ -107,13 +175,38 @@ impl ResidualPlan {
         self.leaves.len()
     }
 
+    fn max_union_arms(&self) -> usize {
+        self.leaves
+            .iter()
+            .filter_map(|leaf| match leaf.lowering {
+                LeafLowering::Opaque => None,
+                LeafLowering::FiniteUnion { arm_count } => Some(arm_count),
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn action_span(&self) -> usize {
+        self.max_union_arms()
+            .checked_mul(2)
+            .and_then(|span| span.checked_add(2))
+            .expect("residual union action span overflow")
+    }
+
+    fn union_arm_count(&self, occurrence: usize) -> Option<usize> {
+        match self.leaves[occurrence].lowering {
+            LeafLowering::Opaque => None,
+            LeafLowering::FiniteUnion { arm_count } => Some(arm_count),
+        }
+    }
+
     fn resolve<'r, 'a>(
         &self,
         root: &'r dyn Constraint<'a>,
         occurrence: usize,
     ) -> &'r dyn Constraint<'a> {
         let mut constraint = root;
-        for &child in self.leaves[occurrence].0.iter() {
+        for &child in self.leaves[occurrence].path.0.iter() {
             constraint = match constraint.residual_shape() {
                 ConstraintShape::And(children) => children.child(child),
                 ConstraintShape::Opaque => {
@@ -122,6 +215,24 @@ impl ResidualPlan {
             };
         }
         constraint
+    }
+
+    fn resolve_union_arm<'r, 'a>(
+        &self,
+        root: &'r dyn Constraint<'a>,
+        occurrence: usize,
+        arm: usize,
+    ) -> &'r dyn Constraint<'a> {
+        let union = self.resolve(root, occurrence);
+        let children = union
+            .residual_union_children()
+            .expect("residual finite-union shape changed during query execution");
+        assert_eq!(
+            Some(children.len()),
+            self.union_arm_count(occurrence),
+            "residual finite-union arm count changed during query execution"
+        );
+        children.child(arm)
     }
 
     /// True exactly when every unchecked relevant confirmer can process
@@ -179,6 +290,27 @@ pub(super) fn useful_default_shape<'a>(root: &dyn Constraint<'a>) -> bool {
         }
     }
     false
+}
+
+/// Explicit structural capabilities enabled for one residual solve.
+///
+/// The default preserves every composite boundary except exposed associative
+/// conjunctions. This probe surface is intentionally one composable switch
+/// rather than a family of solver methods, so later finite submachines can
+/// share the same execution substrate.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[must_use]
+pub struct ResidualCapabilities {
+    finite_unions: bool,
+}
+
+impl ResidualCapabilities {
+    /// Lowers finite logical unions into canonical arm-progress states while
+    /// keeping each arm itself opaque.
+    pub fn finite_unions(mut self) -> Self {
+        self.finite_unions = true;
+        self
+    }
 }
 
 /// Measurements from one residual-state solve.
@@ -934,7 +1066,7 @@ impl Drop for ShadowActionSpan {
 /// AND region, not its Rust type, address, or variable set. A dynamic
 /// representation avoids aliasing conjunctions with more leaves than the query
 /// language's independent 128-variable cap.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct ChildSet(Vec<u64>);
 
 impl ChildSet {
@@ -977,6 +1109,26 @@ impl ChildSet {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum UnionVerb {
+    Propose {
+        relevant: ChildSet,
+    },
+    Confirm {
+        relevant: ChildSet,
+        checked: ChildSet,
+    },
+}
+
+impl UnionVerb {
+    fn checked_count(&self) -> usize {
+        match self {
+            UnionVerb::Propose { .. } => 0,
+            UnionVerb::Confirm { checked, .. } => checked.count(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum ResidualPhase {
     /// Plan one joint `(variable, proposing child)` action per row.
     Ready,
@@ -1000,6 +1152,23 @@ enum ResidualPhase {
         relevant: ChildSet,
         checked: ChildSet,
         confirmer: usize,
+    },
+    /// Selects one still-undone arm for every affine parent of a lowered
+    /// finite union. Accumulators remain payload, never state identity.
+    UnionPlan {
+        variable: VariableId,
+        union: usize,
+        verb: UnionVerb,
+        done: ChildSet,
+    },
+    /// Invokes one opaque arm over activations sharing the same canonical
+    /// union continuation.
+    UnionArm {
+        variable: VariableId,
+        union: usize,
+        verb: UnionVerb,
+        done: ChildSet,
+        arm: usize,
     },
 }
 
@@ -1088,17 +1257,54 @@ impl StateDesc {
                     "residual confirmer is not an unchecked relevant leaf"
                 );
             }
+            ResidualPhase::UnionPlan {
+                variable,
+                union,
+                verb,
+                ..
+            }
+            | ResidualPhase::UnionArm {
+                variable,
+                union,
+                verb,
+                ..
+            } => {
+                validate_variable(*variable);
+                assert!(
+                    *union < leaf_count,
+                    "residual union is not a leaf occurrence"
+                );
+                match verb {
+                    UnionVerb::Propose { relevant } => {
+                        assert!(relevant.is_valid_for(leaf_count));
+                        assert!(relevant.contains(*union));
+                    }
+                    UnionVerb::Confirm { relevant, checked } => {
+                        validate_sets(relevant, checked);
+                        assert!(
+                            relevant.contains(*union) && !checked.contains(*union),
+                            "residual union is not an unchecked relevant leaf"
+                        );
+                    }
+                }
+            }
         }
     }
 
     /// History-independent grade. Every transition strictly raises it, so
     /// draining the minimum grade is an exact readiness gate: once a state is
     /// popped, no unprocessed predecessor can still file into it.
+    #[cfg(test)]
     fn rank(&self, leaf_count: usize) -> usize {
+        self.rank_with_span(leaf_count, 2)
+    }
+
+    fn rank_with_span(&self, leaf_count: usize, action_span: usize) -> usize {
         self.validate(leaf_count);
+        assert!(action_span >= 2, "residual action span is too small");
         let stride = leaf_count
             .checked_add(1)
-            .and_then(|value| value.checked_mul(2))
+            .and_then(|value| value.checked_mul(action_span))
             .expect("residual-state rank stride overflow");
         let base = self
             .bound
@@ -1112,13 +1318,35 @@ impl StateDesc {
             }
             ResidualPhase::Candidate { checked, .. } => checked
                 .count()
-                .checked_mul(2)
+                .checked_mul(action_span)
                 .and_then(|grade| base.checked_add(grade))
                 .expect("residual-state rank overflow"),
             ResidualPhase::Confirm { checked, .. } => checked
                 .count()
-                .checked_mul(2)
+                .checked_mul(action_span)
                 .and_then(|grade| grade.checked_add(1))
+                .and_then(|grade| base.checked_add(grade))
+                .expect("residual-state rank overflow"),
+            ResidualPhase::UnionPlan { verb, done, .. } => verb
+                .checked_count()
+                .checked_mul(action_span)
+                .and_then(|grade| {
+                    done.count()
+                        .checked_mul(2)
+                        .and_then(|done| grade.checked_add(done))
+                })
+                .and_then(|grade| grade.checked_add(2))
+                .and_then(|grade| base.checked_add(grade))
+                .expect("residual-state rank overflow"),
+            ResidualPhase::UnionArm { verb, done, .. } => verb
+                .checked_count()
+                .checked_mul(action_span)
+                .and_then(|grade| {
+                    done.count()
+                        .checked_mul(2)
+                        .and_then(|done| grade.checked_add(done))
+                })
+                .and_then(|grade| grade.checked_add(3))
                 .and_then(|grade| base.checked_add(grade))
                 .expect("residual-state rank overflow"),
         }
@@ -1134,7 +1362,10 @@ impl StateDesc {
             ResidualPhase::Confirm {
                 relevant, checked, ..
             } => plan.remaining_confirms_are_page_local(relevant, checked),
-            ResidualPhase::Ready | ResidualPhase::Propose { .. } => false,
+            ResidualPhase::Ready
+            | ResidualPhase::Propose { .. }
+            | ResidualPhase::UnionPlan { .. }
+            | ResidualPhase::UnionArm { .. } => false,
         }
     }
 }
@@ -1335,14 +1566,17 @@ impl CandidateBatch {
 
     /// Stable-partitions parents and their ragged candidate groups in one
     /// pass according to a per-parent leaf-occurrence assignment.
-    fn partition(self, stride: usize, assignment: &[usize]) -> BTreeMap<usize, Self> {
+    fn partition<K>(self, stride: usize, assignment: &[K]) -> BTreeMap<K, Self>
+    where
+        K: Clone + Ord,
+    {
         let RowBatch { rows, row_count } = self.parents;
         assert_eq!(assignment.len(), row_count);
         let mut remap = vec![u32::MAX; row_count];
-        let mut groups: BTreeMap<usize, Self> = BTreeMap::new();
+        let mut groups: BTreeMap<K, Self> = BTreeMap::new();
 
-        for (parent, &child) in assignment.iter().enumerate() {
-            let group = groups.entry(child).or_insert_with(|| Self {
+        for (parent, child) in assignment.iter().enumerate() {
+            let group = groups.entry(child.clone()).or_insert_with(|| Self {
                 parents: RowBatch {
                     rows: Vec::new(),
                     row_count: 0,
@@ -1422,10 +1656,193 @@ impl CandidateBatch {
     }
 }
 
+/// Stable payload identity for one affine parent entering a lowered union.
+///
+/// Tokens are machine-local and never participate in canonical state
+/// identity. They survive bucket append, planning partition, and parallel
+/// split so each accumulator remains attached to exactly one parent even when
+/// duplicate parent bindings are byte-identical.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct ActivationId(u64);
+
+#[derive(Clone, Debug)]
+struct UnionBatch {
+    activations: Vec<ActivationId>,
+    parents: RowBatch,
+    /// Immutable, sorted candidate groups fanned out independently to every
+    /// confirm arm. Empty for a proposal activation.
+    original: Candidates,
+    /// Arm outputs accumulated by parent. It is normalized only when every
+    /// arm is done, keeping intermediate values out of canonical state.
+    accumulated: Candidates,
+}
+
+impl UnionBatch {
+    fn from_proposal(parents: RowBatch, activations: Vec<ActivationId>) -> Self {
+        assert_eq!(parents.row_count, activations.len());
+        Self {
+            activations,
+            parents,
+            original: Vec::new(),
+            accumulated: Vec::new(),
+        }
+    }
+
+    fn from_confirmation(mut batch: CandidateBatch, activations: Vec<ActivationId>) -> Self {
+        assert_eq!(batch.parents.row_count, activations.len());
+        batch.candidates.sort_unstable();
+        Self {
+            activations,
+            parents: batch.parents,
+            original: batch.candidates,
+            accumulated: Vec::new(),
+        }
+    }
+
+    fn append(&mut self, mut other: Self) {
+        let offset = u32::try_from(self.parents.row_count).expect("too many union parents");
+        self.parents.append(other.parents);
+        self.activations.append(&mut other.activations);
+        self.original
+            .extend(other.original.drain(..).map(|(parent, value)| {
+                (
+                    parent.checked_add(offset).expect("union parent overflow"),
+                    value,
+                )
+            }));
+        self.accumulated
+            .extend(other.accumulated.drain(..).map(|(parent, value)| {
+                (
+                    parent.checked_add(offset).expect("union parent overflow"),
+                    value,
+                )
+            }));
+    }
+
+    fn take_tail(&mut self, stride: usize, width: usize) -> Self {
+        let take = self.parents.row_count.min(width.max(1));
+        debug_assert!(take > 0);
+        if take == self.parents.row_count {
+            return Self {
+                activations: std::mem::take(&mut self.activations),
+                parents: std::mem::replace(
+                    &mut self.parents,
+                    RowBatch {
+                        rows: Vec::new(),
+                        row_count: 0,
+                    },
+                ),
+                original: std::mem::take(&mut self.original),
+                accumulated: std::mem::take(&mut self.accumulated),
+            };
+        }
+
+        let first = self.parents.row_count - take;
+        let rows = self.parents.rows.split_off(first * stride);
+        self.parents.row_count = first;
+        let activations = self.activations.split_off(first);
+
+        fn take_tagged_tail(values: &mut Candidates, first: usize) -> Candidates {
+            let cut = values.partition_point(|(parent, _)| (*parent as usize) < first);
+            let mut tail = values.split_off(cut);
+            let first = u32::try_from(first).expect("too many union parents");
+            for (parent, _) in &mut tail {
+                *parent = parent
+                    .checked_sub(first)
+                    .expect("union tail contained an earlier parent");
+            }
+            tail
+        }
+
+        let original = take_tagged_tail(&mut self.original, first);
+        let accumulated = take_tagged_tail(&mut self.accumulated, first);
+        Self {
+            activations,
+            parents: RowBatch {
+                rows,
+                row_count: take,
+            },
+            original,
+            accumulated,
+        }
+    }
+
+    fn partition<K>(self, stride: usize, assignment: &[K]) -> BTreeMap<K, Self>
+    where
+        K: Clone + Ord,
+    {
+        let RowBatch { rows, row_count } = self.parents;
+        assert_eq!(assignment.len(), row_count);
+        assert_eq!(self.activations.len(), row_count);
+        let mut remap = vec![u32::MAX; row_count];
+        let mut groups: BTreeMap<K, Self> = BTreeMap::new();
+
+        for (parent, (child, activation)) in assignment
+            .iter()
+            .zip(self.activations.into_iter())
+            .enumerate()
+        {
+            let group = groups.entry(child.clone()).or_insert_with(|| Self {
+                activations: Vec::new(),
+                parents: RowBatch {
+                    rows: Vec::new(),
+                    row_count: 0,
+                },
+                original: Vec::new(),
+                accumulated: Vec::new(),
+            });
+            remap[parent] =
+                u32::try_from(group.parents.row_count).expect("too many partitioned union parents");
+            let start = parent * stride;
+            group
+                .parents
+                .rows
+                .extend_from_slice(&rows[start..start + stride]);
+            group.parents.row_count += 1;
+            group.activations.push(activation);
+        }
+
+        fn partition_values<K>(
+            values: Candidates,
+            assignment: &[K],
+            remap: &[u32],
+            groups: &mut BTreeMap<K, UnionBatch>,
+            original: bool,
+        ) where
+            K: Clone + Ord,
+        {
+            for (parent, value) in values {
+                let parent = parent as usize;
+                let target = groups
+                    .get_mut(&assignment[parent])
+                    .expect("every union assignment created its group");
+                if original {
+                    target.original.push((remap[parent], value));
+                } else {
+                    target.accumulated.push((remap[parent], value));
+                }
+            }
+        }
+        partition_values(self.original, assignment, &remap, &mut groups, true);
+        partition_values(self.accumulated, assignment, &remap, &mut groups, false);
+        groups
+    }
+
+    fn finish(mut self) -> CandidateBatch {
+        self.accumulated.sort_unstable();
+        self.accumulated.dedup();
+        CandidateBatch {
+            parents: self.parents,
+            candidates: self.accumulated,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 enum StateBucket {
     Rows(RowBatch),
     Candidates(CandidateBatch),
+    Union(UnionBatch),
 }
 
 impl StateBucket {
@@ -1433,6 +1850,7 @@ impl StateBucket {
         match self {
             StateBucket::Rows(rows) => rows.row_count,
             StateBucket::Candidates(batch) => batch.parents.row_count,
+            StateBucket::Union(batch) => batch.parents.row_count,
         }
     }
 
@@ -1450,6 +1868,7 @@ impl StateBucket {
         match (self, other) {
             (StateBucket::Rows(left), StateBucket::Rows(right)) => left.append(right),
             (StateBucket::Candidates(left), StateBucket::Candidates(right)) => left.append(right),
+            (StateBucket::Union(left), StateBucket::Union(right)) => left.append(right),
             _ => panic!("one canonical residual state received incompatible payloads"),
         }
     }
@@ -1476,7 +1895,11 @@ impl StateBucket {
                 let right_parents = batch.parents.row_count / 2;
                 Some(self.take_tail(stride, right_parents, false))
             }
-            StateBucket::Rows(_) | StateBucket::Candidates(_) => None,
+            StateBucket::Union(batch) if batch.parents.row_count >= 2 => {
+                let right_parents = batch.parents.row_count / 2;
+                Some(self.take_tail(stride, right_parents, false))
+            }
+            StateBucket::Rows(_) | StateBucket::Candidates(_) | StateBucket::Union(_) => None,
         }
     }
 
@@ -1509,6 +1932,7 @@ impl StateBucket {
             StateBucket::Candidates(batch) => {
                 StateBucket::Candidates(batch.take_tail(stride, width))
             }
+            StateBucket::Union(batch) => StateBucket::Union(batch.take_tail(stride, width)),
         }
     }
 }
@@ -1591,10 +2015,24 @@ struct SelectedResidualTask {
 impl SelectedResidualTask {
     /// Cheap phase classification used by the latency scheduler. It must not
     /// materialize executor geometry on the default path.
+    fn is_action_for_plan(&self, plan: &ResidualPlan) -> bool {
+        match &self.desc.phase {
+            ResidualPhase::Propose { proposer, .. } => plan.union_arm_count(*proposer).is_none(),
+            ResidualPhase::Confirm { confirmer, .. } => plan.union_arm_count(*confirmer).is_none(),
+            ResidualPhase::UnionArm { .. } => true,
+            ResidualPhase::Ready
+            | ResidualPhase::Candidate { .. }
+            | ResidualPhase::UnionPlan { .. } => false,
+        }
+    }
+
+    #[cfg(test)]
     fn is_action(&self) -> bool {
         matches!(
-            &self.desc.phase,
-            ResidualPhase::Propose { .. } | ResidualPhase::Confirm { .. }
+            self.desc.phase,
+            ResidualPhase::Propose { .. }
+                | ResidualPhase::Confirm { .. }
+                | ResidualPhase::UnionArm { .. }
         )
     }
 
@@ -1607,7 +2045,7 @@ impl SelectedResidualTask {
                     variable, proposer, ..
                 },
                 StateBucket::Rows(_),
-            ) => (
+            ) if plan.union_arm_count(*proposer).is_none() => (
                 ResidualAction::Propose {
                     variable: *variable,
                     leaf: *proposer,
@@ -1621,15 +2059,62 @@ impl SelectedResidualTask {
                     ..
                 },
                 StateBucket::Candidates(batch),
-            ) => (
+            ) if plan.union_arm_count(*confirmer).is_none() => (
                 ResidualAction::Confirm {
                     variable: *variable,
                     leaf: *confirmer,
                 },
                 batch.candidate_count(),
             ),
-            (ResidualPhase::Ready | ResidualPhase::Candidate { .. }, _) => return None,
-            (ResidualPhase::Propose { .. } | ResidualPhase::Confirm { .. }, _) => {
+            (
+                ResidualPhase::UnionArm {
+                    variable,
+                    union,
+                    verb,
+                    ..
+                },
+                StateBucket::Union(batch),
+            ) => {
+                let (action, candidates) = match verb {
+                    UnionVerb::Propose { .. } => (
+                        ResidualAction::Propose {
+                            variable: *variable,
+                            leaf: *union,
+                        },
+                        0,
+                    ),
+                    UnionVerb::Confirm { .. } => (
+                        ResidualAction::Confirm {
+                            variable: *variable,
+                            leaf: *union,
+                        },
+                        batch.original.len(),
+                    ),
+                };
+                (action, candidates)
+            }
+            (
+                ResidualPhase::Ready
+                | ResidualPhase::Candidate { .. }
+                | ResidualPhase::UnionPlan { .. },
+                _,
+            ) => return None,
+            (ResidualPhase::Propose { proposer, .. }, StateBucket::Rows(_))
+                if plan.union_arm_count(*proposer).is_some() =>
+            {
+                return None;
+            }
+            (ResidualPhase::Confirm { confirmer, .. }, StateBucket::Candidates(_))
+                if plan.union_arm_count(*confirmer).is_some() =>
+            {
+                return None;
+            }
+            (
+                ResidualPhase::Propose { .. }
+                | ResidualPhase::Confirm { .. }
+                | ResidualPhase::UnionArm { .. },
+                _,
+            ) => {
                 panic!("canonical residual action received the wrong payload shape")
             }
         };
@@ -1699,10 +2184,11 @@ fn rows_view<'v>(vars: &'v [VariableId], rows: &'v [RawInline], row_count: usize
     RowsView::new_with_row_count(vars, rows, row_count)
 }
 
-fn file(
+fn file_with_span(
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     leaf_count: usize,
+    action_span: usize,
     desc: StateDesc,
     bucket: StateBucket,
     stats: &mut ResidualStateStats,
@@ -1712,10 +2198,10 @@ fn file(
         return None;
     }
     let candidates = match &bucket {
-        StateBucket::Rows(_) => 0,
+        StateBucket::Rows(_) | StateBucket::Union(_) => 0,
         StateBucket::Candidates(batch) => batch.candidate_count(),
     };
-    let rank = desc.rank(leaf_count);
+    let rank = desc.rank_with_span(leaf_count, action_span);
     let (id, known) = interner.intern_with_status(desc, stats);
     let level = worklist.entry(rank).or_default();
     if let Some(existing) = level.get_mut(&id) {
@@ -1735,6 +2221,18 @@ fn file(
         rows,
         candidates,
     })
+}
+
+#[cfg(test)]
+fn file(
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    leaf_count: usize,
+    desc: StateDesc,
+    bucket: StateBucket,
+    stats: &mut ResidualStateStats,
+) -> Option<ContinuationToken> {
+    file_with_span(worklist, interner, leaf_count, 2, desc, bucket, stats)
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1770,6 +2268,16 @@ fn propose_leaf<'a>(
     candidates: &mut CandidateSink<'_>,
 ) {
     plan.resolve(root, leaf).propose(variable, view, candidates);
+}
+
+fn allocate_activations(next: &mut u64, count: usize) -> Vec<ActivationId> {
+    let count = u64::try_from(count).expect("too many union activations");
+    let end = next
+        .checked_add(count)
+        .expect("residual union activation ID overflow");
+    let activations = (*next..end).map(ActivationId).collect();
+    *next = end;
+    activations
 }
 
 fn confirm_leaf<'a>(
@@ -1916,10 +2424,11 @@ fn ready_plan_transition<'a>(
 
     let mut file_propose_group = |action: ProposeAction, selected: RowBatch| {
         let variable_plan = &plans[action.variable_plan];
-        file(
+        file_with_span(
             worklist,
             interner,
             leaf_count,
+            plan.action_span(),
             StateDesc {
                 bound: desc.bound,
                 phase: ResidualPhase::Propose {
@@ -1957,11 +2466,34 @@ fn propose_action_transition<'a>(
     relevant: &ChildSet,
     proposer: usize,
     rows: RowBatch,
+    next_activation: &mut u64,
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
 ) -> Option<ContinuationToken> {
     let leaf_count = plan.len();
+    if let Some(arm_count) = plan.union_arm_count(proposer) {
+        let activations = allocate_activations(next_activation, rows.row_count);
+        return file_with_span(
+            worklist,
+            interner,
+            leaf_count,
+            plan.action_span(),
+            StateDesc {
+                bound: desc.bound,
+                phase: ResidualPhase::UnionPlan {
+                    variable,
+                    union: proposer,
+                    verb: UnionVerb::Propose {
+                        relevant: relevant.clone(),
+                    },
+                    done: ChildSet::empty(arm_count),
+                },
+            },
+            StateBucket::Union(UnionBatch::from_proposal(rows, activations)),
+            stats,
+        );
+    }
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
     let view = rows_view(&vars, &rows.rows, rows.row_count);
     let mut candidates = Vec::new();
@@ -1986,10 +2518,11 @@ fn propose_action_transition<'a>(
         candidates,
     };
     if let Some(candidate) = candidate.compact(vars.len()) {
-        file(
+        file_with_span(
             worklist,
             interner,
             leaf_count,
+            plan.action_span(),
             StateDesc {
                 bound: desc.bound,
                 phase: ResidualPhase::Candidate {
@@ -2011,6 +2544,7 @@ fn commit_candidates(
     variable: VariableId,
     batch: CandidateBatch,
     leaf_count: usize,
+    action_span: usize,
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
@@ -2041,10 +2575,11 @@ fn commit_candidates(
     } else {
         next_rows.len() / next_vars.len()
     };
-    file(
+    file_with_span(
         worklist,
         interner,
         leaf_count,
+        action_span,
         StateDesc {
             bound: next_bound,
             phase: ResidualPhase::Ready,
@@ -2071,8 +2606,17 @@ fn candidate_plan_transition<'a>(
 ) -> ContinuationToken {
     let leaf_count = plan.len();
     if relevant == checked {
-        return commit_candidates(desc, variable, batch, leaf_count, worklist, interner, stats)
-            .expect("fully checked candidates committed no rows");
+        return commit_candidates(
+            desc,
+            variable,
+            batch,
+            leaf_count,
+            plan.action_span(),
+            worklist,
+            interner,
+            stats,
+        )
+        .expect("fully checked candidates committed no rows");
     }
 
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
@@ -2120,10 +2664,11 @@ fn candidate_plan_transition<'a>(
     stats.candidate_confirmation_groups += confirmer_groups.count();
 
     let mut file_confirm_group = |confirmer: usize, selected: CandidateBatch| {
-        file(
+        file_with_span(
             worklist,
             interner,
             leaf_count,
+            plan.action_span(),
             StateDesc {
                 bound: desc.bound,
                 phase: ResidualPhase::Confirm {
@@ -2161,11 +2706,35 @@ fn confirm_action_transition<'a>(
     checked: &ChildSet,
     confirmer: usize,
     mut batch: CandidateBatch,
+    next_activation: &mut u64,
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
 ) -> Option<ContinuationToken> {
     let leaf_count = plan.len();
+    if let Some(arm_count) = plan.union_arm_count(confirmer) {
+        let activations = allocate_activations(next_activation, batch.parents.row_count);
+        return file_with_span(
+            worklist,
+            interner,
+            leaf_count,
+            plan.action_span(),
+            StateDesc {
+                bound: desc.bound,
+                phase: ResidualPhase::UnionPlan {
+                    variable,
+                    union: confirmer,
+                    verb: UnionVerb::Confirm {
+                        relevant: relevant.clone(),
+                        checked: checked.clone(),
+                    },
+                    done: ChildSet::empty(arm_count),
+                },
+            },
+            StateBucket::Union(UnionBatch::from_confirmation(batch, activations)),
+            stats,
+        );
+    }
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
     let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
     let candidates_before = batch.candidates.len();
@@ -2184,10 +2753,11 @@ fn confirm_action_transition<'a>(
     stats.max_confirm_candidates = stats.max_confirm_candidates.max(candidates_before);
 
     if let Some(batch) = batch.compact(vars.len()) {
-        file(
+        file_with_span(
             worklist,
             interner,
             leaf_count,
+            plan.action_span(),
             StateDesc {
                 bound: desc.bound,
                 phase: ResidualPhase::Candidate {
@@ -2201,6 +2771,250 @@ fn confirm_action_transition<'a>(
         )
     } else {
         None
+    }
+}
+
+fn finish_union_transition(
+    plan: &ResidualPlan,
+    desc: &StateDesc,
+    variable: VariableId,
+    union: usize,
+    verb: &UnionVerb,
+    batch: UnionBatch,
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+) -> Option<ContinuationToken> {
+    let leaf_count = plan.len();
+    let (relevant, checked) = match verb {
+        UnionVerb::Propose { relevant } => {
+            let mut checked = ChildSet::empty(leaf_count);
+            checked.insert(union);
+            (relevant.clone(), checked)
+        }
+        UnionVerb::Confirm { relevant, checked } => {
+            (relevant.clone(), checked.with_inserted(union))
+        }
+    };
+    let stride = desc.bound.count();
+    let candidate = batch.finish().compact(stride)?;
+    file_with_span(
+        worklist,
+        interner,
+        leaf_count,
+        plan.action_span(),
+        StateDesc {
+            bound: desc.bound,
+            phase: ResidualPhase::Candidate {
+                variable,
+                relevant,
+                checked,
+            },
+        },
+        StateBucket::Candidates(candidate),
+        stats,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn union_plan_transition<'a>(
+    root: &dyn Constraint<'a>,
+    plan: &ResidualPlan,
+    desc: &StateDesc,
+    variable: VariableId,
+    union: usize,
+    verb: &UnionVerb,
+    done: &ChildSet,
+    batch: UnionBatch,
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+) -> Option<ContinuationToken> {
+    let leaf_count = plan.len();
+    let arm_count = plan
+        .union_arm_count(union)
+        .expect("a UnionPlan state named an opaque leaf");
+    assert!(
+        done.is_valid_for(arm_count),
+        "residual union done set contains a non-arm occurrence"
+    );
+
+    let vars: Vec<VariableId> = desc.bound.into_iter().collect();
+    let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
+    let mut augmented = Vec::with_capacity(batch.parents.row_count);
+    for parent in 0..batch.parents.row_count {
+        let row = view.row_view(parent);
+        let mut next = done.clone();
+        for arm in 0..arm_count {
+            if !next.contains(arm) && !plan.resolve_union_arm(root, union, arm).satisfied(&row) {
+                next.insert(arm);
+            }
+        }
+        augmented.push(next);
+    }
+
+    let mut continuation = None;
+    for (done, batch) in batch.partition(vars.len(), &augmented) {
+        if done.count() == arm_count {
+            prefer_continuation(
+                &mut continuation,
+                finish_union_transition(
+                    plan, desc, variable, union, verb, batch, worklist, interner, stats,
+                ),
+            );
+            continue;
+        }
+
+        let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
+        let first_undone = (0..arm_count)
+            .find(|&arm| !done.contains(arm))
+            .expect("unfinished union has an enabled arm");
+        let mut assignments = vec![first_undone; batch.parents.row_count];
+        let mut estimates = vec![usize::MAX; batch.parents.row_count];
+        let mut column = Vec::with_capacity(batch.parents.row_count);
+        for arm in 0..arm_count {
+            if done.contains(arm) {
+                continue;
+            }
+            column.clear();
+            if plan.resolve_union_arm(root, union, arm).estimate(
+                variable,
+                &view,
+                &mut EstimateSink::Column(&mut column),
+            ) {
+                assert_eq!(
+                    column.len(),
+                    batch.parents.row_count,
+                    "union arm estimate must append one value per row"
+                );
+                for parent in 0..batch.parents.row_count {
+                    if column[parent] < estimates[parent] {
+                        estimates[parent] = column[parent];
+                        assignments[parent] = arm;
+                    }
+                }
+            } else {
+                assert!(
+                    column.is_empty(),
+                    "irrelevant union arm estimate must leave its sink untouched"
+                );
+            }
+        }
+
+        for (arm, batch) in batch.partition(vars.len(), &assignments) {
+            prefer_continuation(
+                &mut continuation,
+                file_with_span(
+                    worklist,
+                    interner,
+                    leaf_count,
+                    plan.action_span(),
+                    StateDesc {
+                        bound: desc.bound,
+                        phase: ResidualPhase::UnionArm {
+                            variable,
+                            union,
+                            verb: verb.clone(),
+                            done: done.clone(),
+                            arm,
+                        },
+                    },
+                    StateBucket::Union(batch),
+                    stats,
+                ),
+            );
+        }
+    }
+    continuation
+}
+
+#[allow(clippy::too_many_arguments)]
+fn union_arm_transition<'a>(
+    root: &dyn Constraint<'a>,
+    plan: &ResidualPlan,
+    desc: &StateDesc,
+    variable: VariableId,
+    union: usize,
+    verb: &UnionVerb,
+    done: &ChildSet,
+    arm: usize,
+    mut batch: UnionBatch,
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+) -> Option<ContinuationToken> {
+    let leaf_count = plan.len();
+    let arm_count = plan
+        .union_arm_count(union)
+        .expect("a UnionArm state named an opaque leaf");
+    assert!(arm < arm_count && !done.contains(arm));
+    assert!(done.is_valid_for(arm_count));
+    assert_eq!(batch.activations.len(), batch.parents.row_count);
+
+    let vars: Vec<VariableId> = desc.bound.into_iter().collect();
+    let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
+    let constraint = plan.resolve_union_arm(root, union, arm);
+    debug_assert!(
+        (0..batch.parents.row_count).all(|parent| constraint.satisfied(&view.row_view(parent))),
+        "a union arm became dead between planning and action"
+    );
+
+    match verb {
+        UnionVerb::Propose { .. } => {
+            let mut produced = Vec::new();
+            debug_assert!(produced.is_empty(), "union arm proposal sink is not empty");
+            constraint.propose(variable, &view, &mut CandidateSink::Tagged(&mut produced));
+            stats.propose_calls += 1;
+            stats.propose_rows += batch.parents.row_count;
+            stats.max_propose_rows = stats.max_propose_rows.max(batch.parents.row_count);
+            stats.candidates_proposed += produced.len();
+            stats.max_propose_candidates = stats.max_propose_candidates.max(produced.len());
+            batch.accumulated.extend(produced);
+        }
+        UnionVerb::Confirm { .. } => {
+            let mut survivors = batch.original.clone();
+            let candidates_before = survivors.len();
+            constraint.confirm(variable, &view, &mut CandidateSink::Tagged(&mut survivors));
+            stats.confirm_calls += 1;
+            stats.confirm_rows += batch.parents.row_count;
+            stats.max_confirm_rows = stats.max_confirm_rows.max(batch.parents.row_count);
+            stats.candidates_confirmed += candidates_before;
+            stats.max_confirm_candidates = stats.max_confirm_candidates.max(candidates_before);
+            batch.accumulated.extend(survivors);
+        }
+    }
+    assert!(
+        batch
+            .accumulated
+            .iter()
+            .all(|(parent, _)| (*parent as usize) < batch.parents.row_count),
+        "union arm emitted an invalid candidate row tag"
+    );
+    batch.accumulated.sort_unstable();
+
+    let next_done = done.with_inserted(arm);
+    if next_done.count() == arm_count {
+        finish_union_transition(
+            plan, desc, variable, union, verb, batch, worklist, interner, stats,
+        )
+    } else {
+        file_with_span(
+            worklist,
+            interner,
+            leaf_count,
+            plan.action_span(),
+            StateDesc {
+                bound: desc.bound,
+                phase: ResidualPhase::UnionPlan {
+                    variable,
+                    union,
+                    verb: verb.clone(),
+                    done: next_done,
+                },
+            },
+            StateBucket::Union(batch),
+            stats,
+        )
     }
 }
 
@@ -2232,6 +3046,7 @@ fn execute_task<'a>(
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
+    next_activation: &mut u64,
 ) -> StepOutcome {
     let SelectedResidualTask {
         state: _,
@@ -2269,7 +3084,17 @@ fn execute_task<'a>(
         ) => {
             stats.propose_action_pops += 1;
             let continuation = propose_action_transition(
-                root, plan, &desc, *variable, relevant, *proposer, rows, worklist, interner, stats,
+                root,
+                plan,
+                &desc,
+                *variable,
+                relevant,
+                *proposer,
+                rows,
+                next_activation,
+                worklist,
+                interner,
+                stats,
             );
             if let Some(continuation) = continuation {
                 StepOutcome::Advanced(continuation)
@@ -2303,8 +3128,53 @@ fn execute_task<'a>(
         ) => {
             stats.confirm_action_pops += 1;
             let continuation = confirm_action_transition(
-                root, plan, &desc, *variable, relevant, checked, *confirmer, batch, worklist,
-                interner, stats,
+                root,
+                plan,
+                &desc,
+                *variable,
+                relevant,
+                checked,
+                *confirmer,
+                batch,
+                next_activation,
+                worklist,
+                interner,
+                stats,
+            );
+            if let Some(continuation) = continuation {
+                StepOutcome::Advanced(continuation)
+            } else {
+                stats.dead_action_pops += 1;
+                StepOutcome::Dead
+            }
+        }
+        (
+            ResidualPhase::UnionPlan {
+                variable,
+                union,
+                verb,
+                done,
+            },
+            StateBucket::Union(batch),
+        ) => {
+            let continuation = union_plan_transition(
+                root, plan, &desc, *variable, *union, verb, done, batch, worklist, interner, stats,
+            );
+            continuation.map_or(StepOutcome::Dead, StepOutcome::Advanced)
+        }
+        (
+            ResidualPhase::UnionArm {
+                variable,
+                union,
+                verb,
+                done,
+                arm,
+            },
+            StateBucket::Union(batch),
+        ) => {
+            let continuation = union_arm_transition(
+                root, plan, &desc, *variable, *union, verb, done, *arm, batch, worklist, interner,
+                stats,
             );
             if let Some(continuation) = continuation {
                 StepOutcome::Advanced(continuation)
@@ -2334,6 +3204,7 @@ fn execute_task_shadowed<'a>(
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
+    next_activation: &mut u64,
 ) -> StepOutcome {
     let Some(action) = task.action_task(plan) else {
         return execute_task(
@@ -2346,6 +3217,7 @@ fn execute_task_shadowed<'a>(
             worklist,
             interner,
             stats,
+            next_activation,
         );
     };
     let (site, geometry) = action.observation();
@@ -2365,6 +3237,7 @@ fn execute_task_shadowed<'a>(
         worklist,
         interner,
         stats,
+        next_activation,
     );
     let wall = span.elapsed();
     let observed_outcome = match &outcome {
@@ -2396,6 +3269,7 @@ fn execute_state<'a>(
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
 ) -> StepOutcome {
+    let mut next_activation = 0;
     execute_task(
         root,
         plan,
@@ -2413,6 +3287,7 @@ fn execute_state<'a>(
         worklist,
         interner,
         stats,
+        &mut next_activation,
     )
 }
 
@@ -2425,6 +3300,8 @@ fn execute_state<'a>(
 struct ResidualStateMachine {
     full: VariableSet,
     leaf_count: usize,
+    action_span: usize,
+    next_activation: u64,
     interner: StateInterner,
     worklist: Worklist,
     stats: ResidualStateStats,
@@ -2481,10 +3358,25 @@ impl ResidualQueryState {
 
 impl ResidualStateMachine {
     fn new(full: VariableSet, leaf_count: usize, mode: Search) -> Self {
+        Self::new_with_span(full, leaf_count, 2, mode)
+    }
+
+    fn new_for_plan(full: VariableSet, plan: &ResidualPlan, mode: Search) -> Self {
+        Self::new_with_span(full, plan.len(), plan.action_span(), mode)
+    }
+
+    fn new_with_span(
+        full: VariableSet,
+        leaf_count: usize,
+        action_span: usize,
+        mode: Search,
+    ) -> Self {
         let cap = block_row_cap();
         let mut state = Self {
             full,
             leaf_count,
+            action_span,
+            next_activation: 0,
             interner: StateInterner::default(),
             worklist: Worklist::new(),
             stats: ResidualStateStats::default(),
@@ -2503,10 +3395,11 @@ impl ResidualStateMachine {
             cap,
         };
         if matches!(mode, Search::NextVariable) {
-            file(
+            file_with_span(
                 &mut state.worklist,
                 &mut state.interner,
                 leaf_count,
+                action_span,
                 StateDesc {
                     bound: VariableSet::new_empty(),
                     phase: ResidualPhase::Ready,
@@ -2585,7 +3478,7 @@ impl ResidualStateMachine {
         }
 
         let desc = self.interner.get(id).clone();
-        debug_assert_eq!(desc.rank(self.leaf_count), rank);
+        debug_assert_eq!(desc.rank_with_span(self.leaf_count, self.action_span), rank);
         let candidate_pages = plan.is_some_and(|plan| desc.uses_candidate_pages(plan));
         let before = bucket.occupancy(candidate_pages);
         let chunk = bucket.take_tail(desc.bound.count(), width, candidate_pages);
@@ -2642,7 +3535,7 @@ impl ResidualStateMachine {
     ) -> SelectedResidualTask {
         let desc = self.interner.get(token.state).clone();
         assert_eq!(
-            desc.rank(self.leaf_count),
+            desc.rank_with_span(self.leaf_count, self.action_span),
             token.rank,
             "continuation token disagrees with canonical state rank"
         );
@@ -2712,7 +3605,7 @@ impl ResidualStateMachine {
             self.take_next_with_plan(plan, width)
                 .expect("pop_once requires a non-empty residual worklist")
         };
-        self.last_was_action = task.is_action();
+        self.last_was_action = task.is_action_for_plan(plan);
         let emit_bound = task.desc.bound;
         let outcome = execute_task(
             root,
@@ -2724,6 +3617,7 @@ impl ResidualStateMachine {
             &mut self.worklist,
             &mut self.interner,
             &mut self.stats,
+            &mut self.next_activation,
         );
         if matches!(&outcome, StepOutcome::Emit(_)) {
             self.emit_vars.clear();
@@ -2834,7 +3728,7 @@ impl ResidualStateMachine {
             self.take_next_with_plan(plan, width)
                 .expect("pop_once_shadow requires a non-empty residual worklist")
         };
-        self.last_was_action = task.is_action();
+        self.last_was_action = task.is_action_for_plan(plan);
         let emit_bound = task.desc.bound;
         let outcome = execute_task_shadowed(
             epoch,
@@ -2847,6 +3741,7 @@ impl ResidualStateMachine {
             &mut self.worklist,
             &mut self.interner,
             &mut self.stats,
+            &mut self.next_activation,
         );
         if matches!(&outcome, StepOutcome::Emit(_)) {
             self.emit_vars.clear();
@@ -2918,6 +3813,8 @@ impl ResidualStateMachine {
         Self {
             full: self.full,
             leaf_count: self.leaf_count,
+            action_span: self.action_span,
+            next_activation: self.next_activation,
             interner: self.interner.clone(),
             worklist: Worklist::new(),
             stats: ResidualStateStats::default(),
@@ -3002,6 +3899,7 @@ impl ResidualStateMachine {
                             batch.candidate_count() >= 2
                         }
                         StateBucket::Candidates(batch) => batch.parents.row_count >= 2,
+                        StateBucket::Union(batch) => batch.parents.row_count >= 2,
                     };
                     can_split.then_some((rank, id, candidate_pages))
                 })
@@ -3132,6 +4030,7 @@ impl ResidualStateMachine {
                             batch.candidate_count() >= 2
                         }
                         StateBucket::Candidates(batch) => batch.parents.row_count >= 2,
+                        StateBucket::Union(batch) => batch.parents.row_count >= 2,
                     };
                     can_split.then_some((rank, id, candidate_pages))
                 })
@@ -3486,10 +4385,11 @@ where
     let mut interner = StateInterner::default();
     let mut worklist = Worklist::new();
     if matches!(mode, Search::NextVariable) {
-        file(
+        file_with_span(
             &mut worklist,
             &mut interner,
             leaf_count,
+            plan.action_span(),
             StateDesc {
                 bound: VariableSet::new_empty(),
                 phase: ResidualPhase::Ready,
@@ -3501,13 +4401,14 @@ where
 
     let mut results = Vec::new();
     let mut binding = Binding::default();
+    let mut next_activation = 0;
     while let Some((&rank, _)) = worklist.first_key_value() {
         let level = worklist
             .remove(&rank)
             .expect("observed worklist level exists");
         for (id, bucket) in level {
             let desc = interner.get(id).clone();
-            debug_assert_eq!(desc.rank(leaf_count), rank);
+            debug_assert_eq!(desc.rank_with_span(leaf_count, plan.action_span()), rank);
             let emit_bound = desc.bound;
             stats.state_pops += 1;
             stats.readiness_pops += 1;
@@ -3525,6 +4426,7 @@ where
                 &mut worklist,
                 &mut interner,
                 &mut stats,
+                &mut next_activation,
             ) {
                 StepOutcome::Advanced(_) | StepOutcome::Dead => {}
                 StepOutcome::Emit(rows) => {
@@ -3581,6 +4483,23 @@ where
     ///
     /// Panics if iteration has already started on this query.
     pub fn solve_residual_state_lazy(self) -> ResidualStateIter<C, P, R> {
+        self.solve_residual_state_lazy_with(ResidualCapabilities::default())
+    }
+
+    /// Lazily executes through residual states with explicit finite
+    /// submachine capabilities.
+    ///
+    /// Capabilities are opt-in and composable. In particular, finite-union
+    /// lowering changes only scheduling granularity; passing the default
+    /// capability set is identical to [`solve_residual_state_lazy`](Self::solve_residual_state_lazy).
+    ///
+    /// # Panics
+    ///
+    /// Panics if iteration has already started on this query.
+    pub fn solve_residual_state_lazy_with(
+        self,
+        capabilities: ResidualCapabilities,
+    ) -> ResidualStateIter<C, P, R> {
         assert_fresh(&self);
         let Query {
             constraint,
@@ -3591,15 +4510,19 @@ where
             ..
         } = self;
         let full = constraint.variables();
-        let plan = ResidualPlan::compile(&constraint);
-        let leaf_count = plan.len();
+        let plan = if capabilities.finite_unions {
+            ResidualPlan::compile_finite_unions(&constraint)
+        } else {
+            ResidualPlan::compile(&constraint)
+        };
+        let state = ResidualStateMachine::new_for_plan(full, &plan, mode);
         ResidualStateIter {
             root: constraint,
             plan,
             postprocessing,
             influences,
             base_estimates,
-            state: ResidualStateMachine::new(full, leaf_count, mode),
+            state,
             iteration_started: false,
         }
     }
@@ -4798,6 +5721,99 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct MaskedUnionArm {
+        parent: VariableId,
+        variable: VariableId,
+        live_parity: u8,
+        value: RawInline,
+        proposal_rows: Arc<AtomicUsize>,
+    }
+
+    impl Constraint<'static> for MaskedUnionArm {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(self.parent).union(VariableSet::new_singleton(self.variable))
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable == self.parent {
+                out.fill(100, view.len());
+                return true;
+            }
+            if variable != self.variable {
+                return false;
+            }
+            if let Some(parent) = view.col(self.parent) {
+                out.extend(view.iter().map(|row| {
+                    if row[parent][0] & 1 == self.live_parity {
+                        1
+                    } else {
+                        100
+                    }
+                }));
+            } else {
+                out.fill(1, view.len());
+            }
+            true
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            assert_eq!(variable, self.variable);
+            assert!(
+                candidates.is_empty(),
+                "every union arm needs an empty proposal sink"
+            );
+            self.proposal_rows.fetch_add(view.len(), Ordering::Relaxed);
+            for row in 0..view.len() {
+                candidates.push(row as u32, self.value);
+            }
+        }
+
+        fn confirm(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            if variable == self.variable {
+                let value = self.value;
+                candidates.retain(|_, candidate| *candidate == value);
+            } else {
+                assert_eq!(variable, self.parent);
+                if let Some(value_column) = view.col(self.variable) {
+                    let live_parity = self.live_parity;
+                    let accepted_value = self.value;
+                    confirm_per_row(view, candidates, |row, values| {
+                        values.retain(|parent| {
+                            parent[0] & 1 == live_parity && row[value_column] == accepted_value
+                        });
+                    });
+                }
+            }
+        }
+
+        fn satisfied(&self, view: &RowsView<'_>) -> bool {
+            let Some(parent) = view.col(self.parent) else {
+                return true;
+            };
+            let variable = view.col(self.variable);
+            view.iter().all(|row| {
+                row[parent][0] & 1 == self.live_parity
+                    && variable.is_none_or(|variable| row[variable] == self.value)
+            })
+        }
+    }
+
     type ShapeConstraint = Box<dyn Constraint<'static> + Send + Sync>;
 
     #[cfg(feature = "parallel")]
@@ -5060,7 +6076,11 @@ mod tests {
             shape_leaf(4),
         ]);
         let plan = ResidualPlan::compile(&root);
-        let paths: Vec<Vec<usize>> = plan.leaves.iter().map(|path| path.0.to_vec()).collect();
+        let paths: Vec<Vec<usize>> = plan
+            .leaves
+            .iter()
+            .map(|leaf| leaf.path.0.to_vec())
+            .collect();
         assert_eq!(
             paths,
             [vec![0], vec![1, 0], vec![1, 1, 0], vec![1, 1, 1], vec![2]]
@@ -5082,7 +6102,7 @@ mod tests {
         let right_paths: Vec<Vec<usize>> = ResidualPlan::compile(&right)
             .leaves
             .iter()
-            .map(|path| path.0.to_vec())
+            .map(|leaf| leaf.path.0.to_vec())
             .collect();
         assert_eq!(
             right_paths,
@@ -6946,6 +7966,347 @@ mod tests {
         assert_eq!(*suffix_calls.lock().unwrap(), [1, 1, 2]);
     }
 
+    #[test]
+    fn finite_union_proposal_matches_sequential_dag_and_opaque_residual() {
+        let make = || {
+            UnionConstraint::new(vec![
+                FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(vec![raw(3), raw(1), raw(1)]),
+                },
+                FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(vec![raw(2), raw(3)]),
+                },
+            ])
+        };
+        let project = |binding: &Binding| binding.get(0).copied();
+        let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
+        let mut dag: Vec<_> = Query::new(make(), project).lazy_dag_scheduler().collect();
+        let mut opaque: Vec<_> = Query::new(make(), project)
+            .solve_residual_state_lazy()
+            .collect();
+        let mut lowered: Vec<_> = Query::new(make(), project)
+            .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+            .collect();
+        sequential.sort_unstable();
+        dag.sort_unstable();
+        opaque.sort_unstable();
+        lowered.sort_unstable();
+        assert_eq!(lowered, [raw(1), raw(2), raw(3)]);
+        assert_eq!(lowered, sequential);
+        assert_eq!(lowered, dag);
+        assert_eq!(lowered, opaque);
+    }
+
+    #[test]
+    fn finite_union_confirmation_fans_out_the_immutable_original_group() {
+        let make = |left_calls: Arc<Mutex<Vec<usize>>>, right_calls: Arc<Mutex<Vec<usize>>>| {
+            let union = UnionConstraint::new(vec![
+                PageFilterLeaf {
+                    variable: 0,
+                    estimate: 10,
+                    accepted: Some(raw(0)),
+                    calls: left_calls,
+                },
+                PageFilterLeaf {
+                    variable: 0,
+                    estimate: 11,
+                    accepted: Some(raw(1)),
+                    calls: right_calls,
+                },
+            ]);
+            IntersectionConstraint::new(vec![
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(vec![raw(0), raw(0), raw(1), raw(1), raw(2)]),
+                }) as ShapeConstraint,
+                Box::new(union) as ShapeConstraint,
+            ])
+        };
+        let project = |binding: &Binding| binding.get(0).copied();
+        let fresh = || Arc::new(Mutex::new(Vec::new()));
+        let mut sequential: Vec<_> = Query::new(make(fresh(), fresh()), project)
+            .sequential()
+            .collect();
+        let mut dag: Vec<_> = Query::new(make(fresh(), fresh()), project)
+            .lazy_dag_scheduler()
+            .collect();
+        let mut opaque: Vec<_> = Query::new(make(fresh(), fresh()), project)
+            .solve_residual_state_lazy()
+            .collect();
+        let left_calls = fresh();
+        let right_calls = fresh();
+        let mut lowered: Vec<_> = Query::new(
+            make(Arc::clone(&left_calls), Arc::clone(&right_calls)),
+            project,
+        )
+        .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+        .collect();
+        sequential.sort_unstable();
+        dag.sort_unstable();
+        opaque.sort_unstable();
+        lowered.sort_unstable();
+        assert_eq!(lowered, [raw(0), raw(1)]);
+        assert_eq!(lowered, sequential);
+        assert_eq!(lowered, dag);
+        assert_eq!(lowered, opaque);
+        assert_eq!(*left_calls.lock().unwrap(), [5]);
+        assert_eq!(*right_calls.lock().unwrap(), [5]);
+    }
+
+    #[test]
+    fn finite_union_dead_arm_masks_split_then_remerge_by_done_set() {
+        let left_rows = Arc::new(AtomicUsize::new(0));
+        let right_rows = Arc::new(AtomicUsize::new(0));
+        let make = |left_rows: Arc<AtomicUsize>, right_rows: Arc<AtomicUsize>| {
+            let union = UnionConstraint::new(vec![
+                MaskedUnionArm {
+                    parent: 0,
+                    variable: 1,
+                    live_parity: 0,
+                    value: raw(10),
+                    proposal_rows: left_rows,
+                },
+                MaskedUnionArm {
+                    parent: 0,
+                    variable: 1,
+                    live_parity: 1,
+                    value: raw(20),
+                    proposal_rows: right_rows,
+                },
+            ]);
+            IntersectionConstraint::new(vec![
+                Box::new(LoggedLeaf {
+                    variable: 0,
+                    leaf_occurrence: 99,
+                    estimate: 1,
+                    proposed: Arc::new(vec![raw(0), raw(1)]),
+                    accepted: None,
+                    log: Arc::new(Mutex::new(Vec::new())),
+                }) as ShapeConstraint,
+                Box::new(union) as ShapeConstraint,
+            ])
+        };
+        let project =
+            |binding: &Binding| Some((binding.get(0).copied()?, binding.get(1).copied()?));
+        let mut sequential: Vec<_> = Query::new(
+            make(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))),
+            project,
+        )
+        .sequential()
+        .collect();
+        let mut lowered = Query::new(
+            make(Arc::clone(&left_rows), Arc::clone(&right_rows)),
+            project,
+        )
+        .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+        .cap(2)
+        .start_width(2)
+        .growth(1)
+        .collect_profiled();
+        sequential.sort_unstable();
+        lowered.results.sort_unstable();
+        assert_eq!(lowered.results, [(raw(0), raw(10)), (raw(1), raw(20))]);
+        assert_eq!(lowered.results, sequential);
+        assert_eq!(left_rows.load(Ordering::Relaxed), 1);
+        assert_eq!(right_rows.load(Ordering::Relaxed), 1);
+        assert!(
+            lowered.stats.bucket_merges > 0,
+            "opposite done-arm histories never reconverged"
+        );
+    }
+
+    #[test]
+    fn finite_union_keeps_duplicate_outer_parents_affine() {
+        let make = || {
+            let arm = |estimate| VerbLeaf {
+                variable: 1,
+                estimate,
+                accepts: true,
+                proposes: Arc::new(AtomicUsize::new(0)),
+                confirms: Arc::new(AtomicUsize::new(0)),
+            };
+            IntersectionConstraint::new(vec![
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(vec![raw(7), raw(7)]),
+                }) as ShapeConstraint,
+                Box::new(UnionConstraint::new(vec![arm(100), arm(101)])) as ShapeConstraint,
+            ])
+        };
+        let project =
+            |binding: &Binding| Some((binding.get(0).copied()?, binding.get(1).copied()?));
+        let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
+        let mut lowered: Vec<_> = Query::new(make(), project)
+            .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+            .collect();
+        sequential.sort_unstable();
+        lowered.sort_unstable();
+        assert_eq!(lowered, [(raw(7), raw(1)), (raw(7), raw(1))]);
+        assert_eq!(lowered, sequential);
+    }
+
+    #[test]
+    fn finite_union_lazy_first_result_only_runs_one_parent_cohort() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let make_arm = |leaf_occurrence, proposed| LoggedLeaf {
+            variable: 1,
+            leaf_occurrence,
+            estimate: 100,
+            proposed: Arc::new(vec![proposed]),
+            accepted: None,
+            log: Arc::clone(&log),
+        };
+        let root = IntersectionConstraint::new(vec![
+            Box::new(FanoutLeaf {
+                variable: 0,
+                values: Arc::new((0..32).map(raw).collect()),
+            }) as ShapeConstraint,
+            Box::new(UnionConstraint::new(vec![
+                make_arm(0, raw(10)),
+                make_arm(1, raw(20)),
+            ])) as ShapeConstraint,
+        ]);
+        let mut lowered = Query::new(root, |binding: &Binding| {
+            Some((binding.get(0).copied()?, binding.get(1).copied()?))
+        })
+        .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+        .cap(32)
+        .start_width(1)
+        .growth(2);
+        assert!(lowered.next().is_some());
+        let calls = log.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|call| call.parent_rows == 1));
+    }
+
+    #[test]
+    fn finite_one_arm_union_is_a_valid_submachine() {
+        let make = || {
+            UnionConstraint::new(vec![FanoutLeaf {
+                variable: 0,
+                values: Arc::new(vec![raw(4), raw(4), raw(5)]),
+            }])
+        };
+        let project = |binding: &Binding| binding.get(0).copied();
+        let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
+        let mut lowered: Vec<_> = Query::new(make(), project)
+            .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+            .collect();
+        sequential.sort_unstable();
+        lowered.sort_unstable();
+        assert_eq!(lowered, [raw(4), raw(5)]);
+        assert_eq!(lowered, sequential);
+    }
+
+    #[test]
+    fn finite_union_keeps_nested_and_arms_opaque() {
+        let make_arm = |values: Vec<RawInline>, accepted: RawInline| {
+            IntersectionConstraint::new(vec![
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(values),
+                }) as ShapeConstraint,
+                Box::new(PageFilterLeaf {
+                    variable: 0,
+                    estimate: 20,
+                    accepted: Some(accepted),
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                }) as ShapeConstraint,
+            ])
+        };
+        let make = || {
+            UnionConstraint::new(vec![
+                make_arm(vec![raw(1), raw(2)], raw(1)),
+                make_arm(vec![raw(2), raw(3)], raw(3)),
+            ])
+        };
+        let project = |binding: &Binding| binding.get(0).copied();
+        let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
+        let mut lowered: Vec<_> = Query::new(make(), project)
+            .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+            .collect();
+        sequential.sort_unstable();
+        lowered.sort_unstable();
+        assert_eq!(lowered, [raw(1), raw(3)]);
+        assert_eq!(lowered, sequential);
+    }
+
+    #[test]
+    fn repeated_finite_union_object_has_distinct_outer_occurrences() {
+        let make = || {
+            let union = Arc::new(UnionConstraint::new(vec![
+                FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(vec![raw(1), raw(2)]),
+                },
+                FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(vec![raw(2), raw(3)]),
+                },
+            ]));
+            IntersectionConstraint::new(vec![
+                Box::new(Arc::clone(&union)) as ShapeConstraint,
+                Box::new(union) as ShapeConstraint,
+            ])
+        };
+        let plan = ResidualPlan::compile_finite_unions(&make());
+        assert_eq!(plan.union_arm_count(0), Some(2));
+        assert_eq!(plan.union_arm_count(1), Some(2));
+        assert_ne!(plan.leaves[0].path, plan.leaves[1].path);
+
+        let project = |binding: &Binding| binding.get(0).copied();
+        let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
+        let mut lowered: Vec<_> = Query::new(make(), project)
+            .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+            .collect();
+        sequential.sort_unstable();
+        lowered.sort_unstable();
+        assert_eq!(lowered, [raw(1), raw(2), raw(3)]);
+        assert_eq!(lowered, sequential);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn finite_union_parallel_split_preserves_affine_activations() {
+        let make = || {
+            let arm = |estimate| VerbLeaf {
+                variable: 1,
+                estimate,
+                accepts: true,
+                proposes: Arc::new(AtomicUsize::new(0)),
+                confirms: Arc::new(AtomicUsize::new(0)),
+            };
+            Arc::new(IntersectionConstraint::new(vec![
+                parallel_shape(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new((0..128).map(raw).collect()),
+                }),
+                parallel_shape(UnionConstraint::new(vec![arm(200), arm(201)])),
+            ]))
+        };
+        let project =
+            |binding: &Binding| Some((binding.get(0).copied()?, binding.get(1).copied()?));
+        let mut expected: Vec<_> = Query::new(make(), project)
+            .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+            .cap(128)
+            .start_width(128)
+            .collect();
+        let mut parallel: Vec<_> = with_parallel_workers(4, || {
+            Query::new(make(), project)
+                .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+                .cap(128)
+                .start_width(128)
+                .into_par_iter()
+                .collect()
+        });
+        expected.sort_unstable();
+        parallel.sort_unstable();
+        assert_eq!(parallel, expected);
+        assert_eq!(parallel.len(), 128);
+    }
+
     #[cfg(feature = "parallel")]
     #[test]
     fn parallel_page_local_sharding_bisects_one_parent_duplicate_run() {
@@ -7629,7 +8990,9 @@ mod tests {
                 assert_eq!(batch.candidates.len(), 64);
                 assert!(batch.candidates.iter().all(|(parent, _)| *parent == 0));
             }
-            StateBucket::Rows(_) => panic!("confirmation returned a row payload"),
+            StateBucket::Rows(_) | StateBucket::Union(_) => {
+                panic!("confirmation returned a non-candidate payload")
+            }
         }
 
         let mut full = ResidualStateMachine::new(VariableSet::new_empty(), 2, Search::Done);
@@ -7655,7 +9018,9 @@ mod tests {
                 assert_eq!(batch.candidates.len(), 65);
                 assert_eq!(batch.candidates.last().map(|(parent, _)| *parent), Some(1));
             }
-            StateBucket::Rows(_) => panic!("confirmation returned a row payload"),
+            StateBucket::Rows(_) | StateBucket::Union(_) => {
+                panic!("confirmation returned a non-candidate payload")
+            }
         }
     }
 
