@@ -380,6 +380,34 @@ fn duplicate_parent_root(
     ]))
 }
 
+fn same_variable_root(set: TribleSet, ops: &[PathOp], expanded_nodes: Arc<AtomicUsize>) -> Root {
+    let node = Variable::<GenId>::new(START);
+    Arc::new(IntersectionConstraint::new(vec![Box::new(CountingPath {
+        inner: RegularPathConstraint::new(set, node, node, ops),
+        expanded_nodes,
+    }) as DynConstraint]))
+}
+
+fn same_variable_outer_root(
+    set: TribleSet,
+    outer_values: [RawInline; 2],
+    ops: &[PathOp],
+    expanded_nodes: Arc<AtomicUsize>,
+) -> Root {
+    let node = Variable::<GenId>::new(START);
+    Arc::new(IntersectionConstraint::new(vec![
+        Box::new(OrderedDomain {
+            variable: OUTER,
+            gate: OUTER,
+            values: outer_values.to_vec(),
+        }) as DynConstraint,
+        Box::new(CountingPath {
+            inner: RegularPathConstraint::new(set, node, node, ops),
+            expanded_nodes,
+        }) as DynConstraint,
+    ]))
+}
+
 fn project_end(binding: &Binding) -> Option<RawInline> {
     binding.get(END).copied()
 }
@@ -450,6 +478,74 @@ fn plus_attr_handles_chain_diamond_self_loop_and_long_cycle() {
             expected,
         );
     }
+}
+
+#[test]
+fn same_variable_plus_denotes_nonempty_cycles_not_general_reachability() {
+    let cases = [
+        (3, vec![(0, 1), (1, 2)], vec![]),
+        (3, vec![(0, 0), (0, 1), (1, 2)], vec![0]),
+        (3, vec![(0, 1), (1, 2), (2, 0)], vec![0, 1, 2]),
+    ];
+    for (node_count, edges, cyclic) in cases {
+        let graph = Graph::new(node_count, &edges);
+        for inverse in [false, true] {
+            let ops = repeated(graph.attribute, inverse);
+            let expected = cyclic.iter().map(|&node| graph.value(node).raw).collect();
+            assert_all_schedulers(
+                || same_variable_root(graph.set.clone(), &ops, Arc::new(AtomicUsize::new(0))),
+                project_start,
+                expected,
+            );
+        }
+    }
+}
+
+#[test]
+fn same_variable_star_admits_exactly_the_graph_term_universe() {
+    let mut graph = Graph::new(4, &[(0, 1), (1, 2)]);
+    let other = other_attribute();
+    graph
+        .set
+        .insert(&Trible::new(&graph.nodes[3], &other, &graph.value(3)));
+    let expected: Vec<_> = (0..4).map(|node| graph.value(node).raw).collect();
+    for inverse in [false, true] {
+        let mut ops = if inverse {
+            vec![PathOp::Attr(graph.attribute.raw()), PathOp::Inverse]
+        } else {
+            vec![PathOp::Attr(graph.attribute.raw())]
+        };
+        ops.push(PathOp::Star);
+        assert_all_schedulers(
+            || same_variable_root(graph.set.clone(), &ops, Arc::new(AtomicUsize::new(0))),
+            project_start,
+            expected.clone(),
+        );
+    }
+}
+
+#[test]
+fn same_variable_fixpoint_preserves_duplicate_outer_activations() {
+    let graph = Graph::new(2, &[(0, 1), (1, 0)]);
+    let outer_values = [genid(&rngid().id).raw, genid(&rngid().id).raw];
+    let ops = repeated(graph.attribute, false);
+    assert_all_schedulers(
+        || {
+            same_variable_outer_root(
+                graph.set.clone(),
+                outer_values,
+                &ops,
+                Arc::new(AtomicUsize::new(0)),
+            )
+        },
+        project_start,
+        vec![
+            graph.value(0).raw,
+            graph.value(0).raw,
+            graph.value(1).raw,
+            graph.value(1).raw,
+        ],
+    );
 }
 
 #[test]
