@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **PATCH gains ordered infix lower-bound and successor descent.**
+  `first_infix_range` returns the first distinct infix in an inclusive range,
+  and `next_infix_after` advances a strict bounded cursor without materializing
+  matches or depending on cuckoo-table order. Both follow compressed trie paths
+  directly and support heap and archive-backed leaves.
 - **WGPU Succinct confirmation can opt into exact residual-action executor
   samples.** `WgpuSuccinctArchive::observe_residual_actions()` returns a
   borrowing, non-`Deref` `ObservedWgpuSuccinctArchive` whose pattern route

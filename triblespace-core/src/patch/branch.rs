@@ -826,6 +826,97 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         }
     }
 
+    /// Return the lexicographically first infix in the inclusive range.
+    ///
+    /// Child slots are cuckoo-ordered rather than lexicographically ordered,
+    /// so lower-bound descent probes child byte values in order and follows
+    /// only the first subtree that can contain a match. This keeps the cursor
+    /// independent of the branch's physical table layout.
+    pub fn first_infix_range<const PREFIX_LEN: usize, const INFIX_LEN: usize>(
+        &self,
+        prefix: &[u8; PREFIX_LEN],
+        at_depth: usize,
+        min_infix: &[u8; INFIX_LEN],
+        max_infix: &[u8; INFIX_LEN],
+    ) -> Option<[u8; INFIX_LEN]> {
+        let node_end_depth = self.end_depth as usize;
+        let limit = std::cmp::min(PREFIX_LEN, node_end_depth);
+        if !super::leaf::key_ops::has_prefix::<KEY_LEN, O>(
+            self.childleaf_key(),
+            at_depth,
+            &prefix[..limit],
+        ) {
+            return None;
+        }
+
+        // The complete infix lies on this compressed path, so every
+        // descendant represents the same infix value.
+        if PREFIX_LEN + INFIX_LEN <= node_end_depth {
+            let infix: [u8; INFIX_LEN] =
+                core::array::from_fn(|i| self.childleaf_key()[O::TREE_TO_KEY[PREFIX_LEN + i]]);
+            return (&infix >= min_infix && &infix <= max_infix).then_some(infix);
+        }
+
+        // The prefix fixes the one child that can contain a result.
+        if PREFIX_LEN > node_end_depth {
+            return self
+                .child_table
+                .table_get(prefix[node_end_depth])
+                .and_then(|child| {
+                    child.first_infix_range(prefix, node_end_depth, min_infix, max_infix)
+                });
+        }
+
+        // The fixed part of this compressed path must be compatible with the
+        // range. Track whether the next branching byte is still constrained
+        // by either boundary.
+        let infix_byte_idx = node_end_depth - PREFIX_LEN;
+        let mut min_tight = true;
+        let mut max_tight = true;
+        for i in 0..infix_byte_idx {
+            let path_byte = self.childleaf_key()[O::TREE_TO_KEY[PREFIX_LEN + i]];
+            if min_tight {
+                if path_byte < min_infix[i] {
+                    return None;
+                }
+                if path_byte > min_infix[i] {
+                    min_tight = false;
+                }
+            }
+            if max_tight {
+                if path_byte > max_infix[i] {
+                    return None;
+                }
+                if path_byte < max_infix[i] {
+                    max_tight = false;
+                }
+            }
+        }
+
+        let lower = if min_tight {
+            min_infix[infix_byte_idx]
+        } else {
+            u8::MIN
+        };
+        let upper = if max_tight {
+            max_infix[infix_byte_idx]
+        } else {
+            u8::MAX
+        };
+
+        for child_byte in lower..=upper {
+            let Some(child) = self.child_table.table_get(child_byte) else {
+                continue;
+            };
+            if let Some(infix) =
+                child.first_infix_range(prefix, node_end_depth, min_infix, max_infix)
+            {
+                return Some(infix);
+            }
+        }
+        None
+    }
+
     /// Count leaves whose infix falls within [min_infix, max_infix].
     ///
     /// Counts **distinct first-segment values** under this branch whose

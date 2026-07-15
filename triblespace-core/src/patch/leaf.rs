@@ -120,6 +120,22 @@ impl<const KEY_LEN: usize, V> Leaf<KEY_LEN, V> {
         )
     }
 
+    pub fn first_infix_range<
+        const PREFIX_LEN: usize,
+        const INFIX_LEN: usize,
+        O: KeySchema<KEY_LEN>,
+    >(
+        &self,
+        prefix: &[u8; PREFIX_LEN],
+        at_depth: usize,
+        min_infix: &[u8; INFIX_LEN],
+        max_infix: &[u8; INFIX_LEN],
+    ) -> Option<[u8; INFIX_LEN]> {
+        key_ops::first_infix_range::<KEY_LEN, PREFIX_LEN, INFIX_LEN, O>(
+            &self.key, prefix, at_depth, min_infix, max_infix,
+        )
+    }
+
     pub fn count_range<const PREFIX_LEN: usize, const INFIX_LEN: usize, O: KeySchema<KEY_LEN>>(
         &self,
         prefix: &[u8; PREFIX_LEN],
@@ -240,6 +256,26 @@ pub(crate) mod key_ops {
         if &infix >= min_infix && &infix <= max_infix {
             f(&infix);
         }
+    }
+
+    #[inline]
+    pub fn first_infix_range<
+        const KEY_LEN: usize,
+        const PREFIX_LEN: usize,
+        const INFIX_LEN: usize,
+        O: KeySchema<KEY_LEN>,
+    >(
+        key: &[u8; KEY_LEN],
+        prefix: &[u8; PREFIX_LEN],
+        at_depth: usize,
+        min_infix: &[u8; INFIX_LEN],
+        max_infix: &[u8; INFIX_LEN],
+    ) -> Option<[u8; INFIX_LEN]> {
+        if !has_prefix::<KEY_LEN, O>(key, at_depth, prefix) {
+            return None;
+        }
+        let infix: [u8; INFIX_LEN] = core::array::from_fn(|i| key[O::TREE_TO_KEY[PREFIX_LEN + i]]);
+        (&infix >= min_infix && &infix <= max_infix).then_some(infix)
     }
 
     #[inline]
