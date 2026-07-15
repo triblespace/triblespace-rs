@@ -509,6 +509,31 @@ impl ShadowEvent {
         });
     }
 
+    /// Publishes the dispatch offset through the epoch's snapshot gate.
+    ///
+    /// An action admitted while the epoch was open may reach dispatch after
+    /// explicit invalidation. Publication remains diagnostic-only in that
+    /// case: it must not cancel or otherwise perturb the observed query.
+    fn publish_started(&self) {
+        let Some(epoch) = self.epoch.upgrade() else {
+            *self
+                .started
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) =
+                Some(Instant::now().duration_since(self.epoch_started));
+            return;
+        };
+        let _events = epoch
+            .events
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *self
+            .started
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) =
+            Some(Instant::now().duration_since(self.epoch_started));
+    }
+
     fn abort(&self, wall: Duration) {
         let Some(epoch) = self.epoch.upgrade() else {
             let mut completion = self
@@ -669,8 +694,10 @@ impl ShadowEpochInner {
 /// Clones name the same epoch. Normal closure is owned by the claimed serial
 /// iterator or top-level parallel drive after proven affine exhaustion;
 /// callers may explicitly [`invalidate`](Self::invalidate) a run. Either
-/// terminal state rejects later action starts, so construct a new epoch for a
-/// new execution environment or run.
+/// terminal state rejects new event registration. An action admitted while
+/// the epoch was open may still dispatch and complete after invalidation; its
+/// late completion is retained as stale rather than changing query execution.
+/// Construct a new epoch for a new execution environment or run.
 #[derive(Clone)]
 pub struct ResidualShadowEpoch {
     inner: Arc<ShadowEpochInner>,
@@ -749,7 +776,7 @@ impl ResidualShadowEpoch {
         events.push(Arc::clone(&event));
         ShadowActionSpan {
             event,
-            started: None,
+            execution_started: None,
             finished: false,
         }
     }
@@ -840,7 +867,7 @@ impl Drop for ShadowActionScope {
 
 struct ShadowActionSpan {
     event: Arc<ShadowEvent>,
-    started: Option<Instant>,
+    execution_started: Option<Instant>,
     finished: bool,
 }
 
@@ -852,22 +879,23 @@ impl ShadowActionSpan {
     }
 
     fn start(&mut self) {
+        self.start_with(Instant::now);
+    }
+
+    fn start_with(&mut self, execution_clock: impl FnOnce() -> Instant) {
         assert!(
-            self.started.is_none(),
+            self.execution_started.is_none(),
             "residual shadow action timer started twice"
         );
-        let started = Instant::now();
-        *self
-            .event
-            .started
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner()) =
-            Some(started.duration_since(self.event.epoch_started));
-        self.started = Some(started);
+        self.event.publish_started();
+        // This private clock is deliberately captured only after publication
+        // released every observer lock. No snapshot contention or diagnostic
+        // metadata write may enter the executor wall measurement.
+        self.execution_started = Some(execution_clock());
     }
 
     fn elapsed(&self) -> Duration {
-        self.started
+        self.execution_started
             .expect("residual shadow action completed before its timer started")
             .elapsed()
     }
@@ -882,7 +910,7 @@ impl Drop for ShadowActionSpan {
     fn drop(&mut self) {
         if !self.finished {
             let wall = self
-                .started
+                .execution_started
                 .map_or(Duration::ZERO, |started| started.elapsed());
             self.event.abort(wall);
         }
@@ -3198,12 +3226,13 @@ pub struct ResidualStateIter<C, P: Fn(&Binding) -> Option<R>, R> {
 /// Result of fully draining an opt-in [`ResidualShadowIter`].
 #[derive(Clone, Debug)]
 #[must_use]
+#[non_exhaustive]
 pub struct ResidualShadowSolve<R> {
     /// Projected query results, preserving bag semantics.
     pub results: Vec<R>,
     /// Ordinary residual scheduler statistics from the observed execution.
     pub stats: ResidualStateStats,
-    /// Closed point-in-time observation snapshot.
+    /// Final point-in-time observation snapshot.
     pub shadow: ResidualShadowSnapshot,
 }
 
@@ -6172,7 +6201,22 @@ mod tests {
             observation_geometry(1, 0),
         );
         let scope = ShadowActionScope::enter(span.correlation());
-        span.start();
+        let epoch_inner = Arc::clone(&epoch.inner);
+        let event = Arc::clone(&span.event);
+        span.start_with(|| {
+            let events = epoch_inner
+                .events
+                .try_lock()
+                .expect("execution clock captured while the snapshot gate was held");
+            let started = event
+                .started
+                .try_lock()
+                .expect("execution clock captured while start publication was held");
+            assert!(started.is_some(), "dispatch offset was not published first");
+            drop(started);
+            drop(events);
+            Instant::now()
+        });
         let captured = Duration::from_nanos(123_456);
         span.finish(captured, ActionOutcome::Dead);
         assert!(current_residual_action().is_some());
@@ -6182,6 +6226,30 @@ mod tests {
             epoch.snapshot().events[0].completion.unwrap().wall,
             captured
         );
+    }
+
+    #[test]
+    fn residual_shadow_admitted_action_may_start_after_explicit_invalidation() {
+        let epoch = ResidualShadowEpoch::new();
+        let mut span = epoch.begin(
+            observation_site(ActionVerb::Confirm, 0),
+            observation_geometry(1, 1),
+        );
+        let registered = epoch.snapshot().events[0].started;
+        assert!(epoch.invalidate());
+
+        // Observation is diagnostic-only: invalidation rejects new events but
+        // never cancels an action that the open epoch already admitted.
+        span.start();
+        let published = epoch.snapshot();
+        assert_eq!(published.status, ResidualShadowStatus::Invalidated);
+        assert!(published.events[0].started >= registered);
+        assert!(published.events[0].completion.is_none());
+
+        span.finish(Duration::ZERO, ActionOutcome::Dead);
+        let completed = epoch.snapshot();
+        assert_eq!(completed.status, ResidualShadowStatus::Invalidated);
+        assert!(completed.events[0].completion.unwrap().stale);
     }
 
     #[test]

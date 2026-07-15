@@ -333,7 +333,8 @@ actions performed while a parallel producer negotiates its first splittable
 frontier. It records the exact leaf occurrence, variable, bound schema, input
 geometry, wall time, immediate survival or death, and any executor-local
 samples. The ordinary residual iterator and executor contain no observer
-field, clock read, thread-local lookup, allocation, or option branch.
+field, clock read, thread-local lookup, observer allocation, or observer
+option branch.
 
 Action event numbers and leaf occurrences are local to one claimed epoch;
 neither exposes the machine's private interner `StateId`. Serial exhaustion
@@ -355,14 +356,19 @@ that already proved exhaustion yields an empty Rayon iterator and preserves
 `Closed`.
 
 An event is registered first, then its thread-local correlation scope is
-installed, and only then does its execution timer begin. Successful execution
-captures and records the elapsed duration before the correlation scope is
-removed, excluding registration, scope setup/teardown, and outcome mapping
-from action wall time. A snapshot is a consistent copy at its terminal/open
-state. During the narrow registration-to-dispatch window, the non-optional
-`started` field temporarily uses the registration offset; execution replaces
-it with the actual dispatch offset. Samples filed after a terminal transition
-remain attached to their original event and are marked stale.
+installed. Its public dispatch offset is published through the epoch's
+snapshot gate; after that gate and every observer lock are released, a
+separate private execution timer begins immediately before the unchanged task
+executor. Successful execution captures and records that duration before the
+correlation scope is removed, excluding registration, snapshot contention,
+scope setup/teardown, and outcome mapping from action wall time. A snapshot is
+a consistent copy at its terminal/open state. During the narrow
+registration-to-dispatch window, the non-optional `started` field temporarily
+uses the registration offset; dispatch replaces it with the actual offset.
+An event admitted while the epoch was open may still publish and complete
+after explicit invalidation: observation never cancels engine work, and its
+completion is retained as stale. Samples filed after a terminal transition
+likewise remain attached to their original event and are marked stale.
 
 [`current_residual_action`](triblespace::core::query::residual::current_residual_action)
 provides a stack-scoped correlation capability during a leaf call, so nested

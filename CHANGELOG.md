@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Residual action shadow observation is opt-in, unwind-safe, and
+  cancellation-sound.** A closed epoch proves both affine frontier exhaustion
+  and ordinary completion of every begun action; live or aborted actions fail
+  closed as invalidated, and normal closure is owned privately by the draining
+  iterator or top-level Rayon drive. A whole-pull guard covers planning,
+  action, and projection unwinds, while per-producer guards detect initial-full
+  consumers, abandoned split sides, and short-circuit cancellation. Dispatch
+  metadata is snapshot-linearized before a separate execution-only wall timer
+  begins. `ActionOutcome::Aborted` records action unwinds, and a serially
+  exhausted wrapper remains closed when later converted to Rayon.
 - **Ordinary `Query` owns selectable residual-state and lazy-DAG cursors.**
   `residual_state_scheduler` forces the arbitrary-root residual machine, while
   `lazy_dag_scheduler` forces the bound-set DAG for behavioral and performance
@@ -148,17 +158,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Residual action shadow epochs are unwind- and cancellation-sound.** A
-  closed epoch now proves both affine frontier exhaustion and ordinary
-  completion of every begun action; live or aborted actions fail closed as
-  invalidated, and normal closure is owned privately by the draining iterator
-  or top-level Rayon drive. A whole-pull guard covers planning, action, and
-  projection unwinds, while per-producer guards detect initial-full consumers,
-  abandoned split sides, and short-circuit cancellation. Successful action
-  timing begins after correlation scope installation and is captured before
-  outcome bookkeeping and scope teardown. `ActionOutcome::Aborted` records
-  action unwinds, and a serially exhausted wrapper remains closed when later
-  converted to Rayon.
 - **Residual action dispatch now preserves an affine executor task.** Eager and
   lazy residual execution both carry the selected interner state, canonical
   descriptor, and owned row/candidate payload through one internal dispatch
