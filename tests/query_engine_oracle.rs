@@ -13,6 +13,9 @@ use proptest::prelude::*;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
+use triblespace::core::query::residual::{
+    ActionVerb, ResidualCapabilities, ResidualShadowEpoch, ResidualShadowStatus,
+};
 use triblespace::core::query::{Binding, Constraint, Query};
 use triblespace::prelude::inlineencodings::GenId;
 use triblespace::prelude::*;
@@ -423,6 +426,185 @@ proptest! {
             union_query!(&archive)
         );
     }
+}
+
+/// The synthetic formula PC and its candidate paging are independent of the
+/// storage representation used by each Atom.
+///
+/// Both source entities produce the same middle values, so projecting only
+/// `middle` makes every accepted value occur twice. The nested Union is a
+/// whole-group reducer; after it completes, the final pattern is a page-local
+/// confirmation suffix. A width-one residual run must therefore retain both
+/// affine source activations while descending through partial candidate tails.
+#[test]
+fn root_formula_candidate_paging_is_storage_polymorphic() {
+    let sources = [fixture_id(81), fixture_id(82)];
+    let middles: [Id; 12] = std::array::from_fn(|i| fixture_id(91 + i as u8));
+    let marker_distractors: [Id; 12] = std::array::from_fn(|i| fixture_id(121 + i as u8));
+    let target = fixture_id(111);
+    let marker = fixture_id(112);
+    let mut kb = TribleSet::new();
+
+    for source in &sources {
+        for middle in &middles {
+            insert_edge(&mut kb, source, &oracle::p, middle);
+        }
+    }
+    for middle in &middles[..8] {
+        insert_edge(&mut kb, middle, &oracle::q, &target);
+    }
+    for middle in &middles[4..11] {
+        insert_edge(&mut kb, middle, &oracle::r, &target);
+    }
+    for middle in &middles[2..10] {
+        insert_edge(&mut kb, middle, &oracle::kind, &marker);
+    }
+    // Keep the final membership pattern less selective globally than the
+    // source-local p frontier. These unrelated entities cannot join through
+    // p, but they make p the formula proposer and leave kind as the
+    // page-local suffix after the nested Union has reduced the whole group.
+    for distractor in &marker_distractors {
+        insert_edge(&mut kb, distractor, &oracle::kind, &marker);
+    }
+
+    let archive: SuccinctArchive<OrderedUniverse> = (&kb).into();
+    let expected = multiset(middles[2..10].iter().flat_map(|middle| {
+        let middle: Inline<GenId> = middle.to_inline();
+        [middle, middle]
+    }));
+    assert!(
+        expected.values().all(|&count| count == sources.len()),
+        "fixture must expose projected bag multiplicity"
+    );
+
+    macro_rules! query {
+        ($store:expr) => {
+            find!(
+                middle: Inline<GenId>,
+                temp!((source),
+                    and!(
+                        pattern!($store, [{ ?source @ oracle::p: ?middle }]),
+                        or!(
+                            pattern!($store, [{ ?middle @ oracle::q: (&target) }]),
+                            pattern!($store, [{ ?middle @ oracle::r: (&target) }]),
+                        ),
+                        pattern!($store, [{ ?middle @ oracle::kind: (&marker) }]),
+                    )
+                )
+            )
+        };
+    }
+
+    macro_rules! assert_backend {
+        ($label:literal, $store:expr) => {{
+            assert_eq!(
+                multiset(query!($store).sequential()),
+                expected,
+                concat!($label, ": sequential")
+            );
+            assert_eq!(
+                multiset(query!($store)),
+                expected,
+                concat!($label, ": ordinary")
+            );
+            assert_eq!(
+                multiset(query!($store).solve_dag_lazy()),
+                expected,
+                concat!($label, ": LazyDag")
+            );
+
+            for (geometry, cap, growth) in [("width one", 1, 1), ("geometric", 64, 2)] {
+                assert_eq!(
+                    multiset(
+                        query!($store)
+                            .solve_residual_state_lazy()
+                            .cap(cap)
+                            .start_width(1)
+                            .growth(growth)
+                    ),
+                    expected,
+                    "{}: conservative residual ({geometry})",
+                    $label
+                );
+
+                for (capability, capabilities) in [
+                    (
+                        "root formula",
+                        ResidualCapabilities::default().root_formula(),
+                    ),
+                    (
+                        "root formula + finite Union",
+                        ResidualCapabilities::default()
+                            .root_formula()
+                            .finite_unions(),
+                    ),
+                ] {
+                    assert_eq!(
+                        multiset(
+                            query!($store)
+                                .solve_residual_state_lazy_with(capabilities)
+                                .cap(cap)
+                                .start_width(1)
+                                .growth(growth)
+                        ),
+                        expected,
+                        "{}: {capability} ({geometry})",
+                        $label
+                    );
+                }
+            }
+        }};
+    }
+
+    assert_backend!("TribleSetConstraint", &kb);
+    assert_backend!("SuccinctArchiveConstraint", &archive);
+
+    let lowered = query!(&archive)
+        .solve_residual_state_lazy_with(
+            ResidualCapabilities::default()
+                .root_formula()
+                .finite_unions(),
+        )
+        .cap(1)
+        .start_width(1)
+        .growth(1)
+        .shadow(ResidualShadowEpoch::new())
+        .collect_profiled();
+    assert_eq!(multiset(lowered.results), expected);
+    assert_eq!(lowered.shadow.status, ResidualShadowStatus::Closed);
+    assert!(lowered.stats.partial_pops > 0);
+    assert!(lowered.stats.max_propose_candidates > 1);
+    assert!(lowered.stats.max_confirm_candidates > 1);
+
+    let formula_confirms: Vec<_> = lowered
+        .shadow
+        .events
+        .iter()
+        .filter(|event| event.site.verb == ActionVerb::Confirm)
+        .collect();
+    // Every Atom in this concrete query is constructed from `&archive`, so
+    // a non-outer leaf occurrence is direct evidence that a
+    // SuccinctArchiveConstraint action ran inside the synthetic formula PC.
+    assert!(
+        lowered
+            .shadow
+            .events
+            .iter()
+            .all(|event| event.site.leaf_occurrence > 0),
+        "synthetic formula actions must not collapse to the opaque outer occurrence"
+    );
+    assert!(
+        formula_confirms
+            .iter()
+            .any(|event| event.geometry.candidate_occurrences == 1),
+        "page-local formula suffix never consumed a width-one candidate tail"
+    );
+    assert!(
+        formula_confirms
+            .iter()
+            .any(|event| event.geometry.candidate_occurrences > 1),
+        "nested Union unexpectedly lost its whole-group action boundary"
+    );
 }
 
 proptest! {
