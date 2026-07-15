@@ -29,7 +29,7 @@ use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::patch::{Entry, IdentitySchema, PATCH};
 use triblespace_core::prelude::*;
 use triblespace_core::query::regularpathconstraint::{PathOp, RegularPathConstraint};
-use triblespace_core::query::residual::ResidualCapabilities;
+use triblespace_core::query::residual::{ResidualCapabilities, ResidualShadowEpoch};
 use triblespace_core::query::sortedsliceconstraint::SortedSlice;
 use triblespace_core::query::{
     Constraint, ContainsConstraint, RowsView, TriblePattern, Variable, VariableContext,
@@ -126,61 +126,125 @@ fn pattern_changes_monotone_growth_keeps_results() {
     let full2 = full1.clone() + growth.clone();
     let delta2 = delta1.clone() + growth;
 
-    let query = |full: &TribleSet, delta: &TribleSet| -> HashSet<[u8; 32]> {
-        find!(
+    let baseline_query =
+        |full: &TribleSet, delta: &TribleSet, sequential: bool| -> HashSet<[u8; 32]> {
+            let query = find!(
             e: Inline<GenId>,
             pattern_changes!(full, delta, [
                 { ?e @ test_ns::rel_r: _?rv, test_ns::rel_s: _?sv }
             ])
-        )
-        .solve_dag_lazy()
-        .agglomerative_partition()
-        .map(|e: Inline<GenId>| e.raw)
-        .collect()
-    };
+            );
+            if sequential {
+                query.sequential().map(|e: Inline<GenId>| e.raw).collect()
+            } else {
+                query.map(|e: Inline<GenId>| e.raw).collect()
+            }
+        };
 
-    let finite_union_query = |full: &TribleSet, delta: &TribleSet| -> HashSet<[u8; 32]> {
-        find!(
-            e: Inline<GenId>,
-            pattern_changes!(full, delta, [
-                { ?e @ test_ns::rel_r: _?rv, test_ns::rel_s: _?sv }
-            ])
-        )
-        .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
-        .map(|e: Inline<GenId>| e.raw)
-        .collect()
-    };
+    let residual_query =
+        |full: &TribleSet, delta: &TribleSet, capabilities: ResidualCapabilities| {
+            find!(
+                e: Inline<GenId>,
+                pattern_changes!(full, delta, [
+                    { ?e @ test_ns::rel_r: _?rv, test_ns::rel_s: _?sv }
+                ])
+            )
+            .solve_residual_state_lazy_with(capabilities)
+            .shadow(ResidualShadowEpoch::new())
+            .collect_profiled()
+        };
 
-    let before = query(&full1, &delta1);
-    let after = query(&full2, &delta2);
-    let finite_before = finite_union_query(&full1, &delta1);
-    let finite_after = finite_union_query(&full2, &delta2);
-
+    let ordinary_before = baseline_query(&full1, &delta1, false);
+    let ordinary_after = baseline_query(&full2, &delta2, false);
     assert_eq!(
-        finite_before, before,
-        "finite-union residual lowering must match the ordinary scheduler before growth"
+        baseline_query(&full1, &delta1, true),
+        ordinary_before,
+        "the ordinary and sequential schedulers must agree before growth"
     );
     assert_eq!(
-        finite_after, after,
-        "finite-union residual lowering must match the ordinary scheduler after growth"
+        baseline_query(&full2, &delta2, true),
+        ordinary_after,
+        "the ordinary and sequential schedulers must agree after growth"
+    );
+
+    // `cyclic_rpq` cannot affect this RPQ-free fixture. These are the four
+    // meaningful capability combinations: opaque control, inner finite-Union
+    // lowering, synthetic whole-root lowering, and both switches together.
+    let cases = [
+        ("opaque", ResidualCapabilities::default(), false),
+        (
+            "finite-union",
+            ResidualCapabilities::default().finite_unions(),
+            false,
+        ),
+        (
+            "root-formula",
+            ResidualCapabilities::default().root_formula(),
+            true,
+        ),
+        (
+            "root-formula+finite-union",
+            ResidualCapabilities::default()
+                .root_formula()
+                .finite_unions(),
+            true,
+        ),
+    ];
+
+    let raw_set = |results: &[Inline<GenId>]| -> HashSet<[u8; 32]> {
+        results.iter().map(|value| value.raw).collect()
+    };
+    let mut action_counts = Vec::new();
+    for (name, capabilities, synthetic_root) in cases {
+        let before = residual_query(&full1, &delta1, capabilities);
+        let after = residual_query(&full2, &delta2, capabilities);
+        let before_set = raw_set(&before.results);
+        let after_set = raw_set(&after.results);
+
+        assert_eq!(
+            before_set, ordinary_before,
+            "residual capability case {name} must match ordinary execution before growth"
+        );
+        assert_eq!(
+            after_set, ordinary_after,
+            "residual capability case {name} must match ordinary execution after growth"
+        );
+        assert!(
+            before_set.is_subset(&after_set),
+            "residual capability case {name} must preserve monotone pattern_changes! growth"
+        );
+
+        action_counts.push(after.shadow.events.len());
+        if synthetic_root {
+            let occurrences: HashSet<_> = after
+                .shadow
+                .events
+                .iter()
+                .map(|event| event.site.leaf_occurrence)
+                .collect();
+            assert!(
+                occurrences.len() >= 2 && occurrences.iter().all(|&occurrence| occurrence > 0),
+                "synthetic-root lowering must execute multiple compiled formula occurrences"
+            );
+        }
+    }
+    assert!(
+        action_counts[1] > action_counts[0],
+        "finite-Union lowering must execute its child actions, not the opaque Union fallback"
     );
 
     let a_val: Inline<GenId> = (&a).to_inline();
     assert!(
-        before.contains(&a_val.raw),
+        ordinary_before.contains(&a_val.raw),
         "sanity: `a` joins R (delta) with S (full) in the initial state"
     );
     assert!(
-        after.contains(&a_val.raw),
+        ordinary_after.contains(&a_val.raw),
         "monotonicity: growing full+delta must not remove `a` from the result"
     );
     assert!(
-        before.is_subset(&after),
+        ordinary_before.is_subset(&ordinary_after),
         "monotonicity: Q(A) ⊆ Q(A ∪ B) for pattern_changes!"
-    );
-    assert!(
-        finite_before.is_subset(&finite_after),
-        "finite-union residual lowering must preserve monotone pattern_changes! growth"
     );
 }
 
