@@ -67,6 +67,501 @@ struct ConstraintPath(Box<[usize]>);
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct UnionArmPath(Box<[usize]>);
 
+/// One structural step below a residual leaf occurrence. Connective tags make
+/// the path self-describing and fail closed if a constraint changes shape
+/// during a solve.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum FormulaStep {
+    And(usize),
+    Or(usize),
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct FormulaPath(Box<[FormulaStep]>);
+
+/// Execution capabilities captured at one opaque formula occurrence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FormulaAtomCapabilities {
+    confirm_page_local: bool,
+    grouped_delta_confirm: bool,
+}
+
+/// Plan-local identity of one formula-tree occurrence. Compilation allocates a
+/// fresh ID for every visit, so repeated references to one `Arc` remain
+/// distinct occurrences without relying on object addresses.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct FormulaNodeId(u32);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FiniteFormulaNodeKind {
+    Atom {
+        path: FormulaPath,
+        capabilities: FormulaAtomCapabilities,
+    },
+    And {
+        children: Box<[FormulaNodeId]>,
+    },
+    Or {
+        children: Box<[FormulaNodeId]>,
+    },
+}
+
+/// One compiled structural formula occurrence.
+///
+/// `span` is a compiler-derived topological measure, not a scheduler tuning
+/// constant. Atoms have span two. A composite reserves `child.span + 2` for
+/// each child and two grades for its own plan/completion boundary. This is the
+/// local mixed-radix layout used by [`FormulaProgramCounter::grade`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FiniteFormulaNode {
+    kind: FiniteFormulaNodeKind,
+    span: usize,
+}
+
+#[allow(dead_code)] // The first checkpoint compiles control before execution migrates.
+impl FiniteFormulaNode {
+    fn children(&self) -> Option<&[FormulaNodeId]> {
+        match &self.kind {
+            FiniteFormulaNodeKind::Atom { .. } => None,
+            FiniteFormulaNodeKind::And { children } | FiniteFormulaNodeKind::Or { children } => {
+                Some(children)
+            }
+        }
+    }
+}
+
+/// Structural finite-formula program compiled only below currently lowered
+/// residual Union leaves. Root AND planning remains the existing WCO layer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FiniteFormulaProgram {
+    nodes: Vec<FiniteFormulaNode>,
+    /// Formula root per flattened residual leaf occurrence. Opaque leaves have
+    /// no root; a lowered Union occurrence always points at an `Or` node.
+    roots: Vec<Option<FormulaNodeId>>,
+}
+
+#[allow(dead_code)] // The first checkpoint compiles control before execution migrates.
+impl FiniteFormulaProgram {
+    fn compile<'a>(root: &dyn Constraint<'a>, leaves: &[ResidualLeaf], cyclic_rpq: bool) -> Self {
+        struct Builder {
+            nodes: Vec<Option<FiniteFormulaNode>>,
+            cyclic_rpq: bool,
+        }
+
+        impl Builder {
+            fn reserve_node(&mut self) -> FormulaNodeId {
+                let id = FormulaNodeId(
+                    u32::try_from(self.nodes.len()).expect("too many residual formula nodes"),
+                );
+                self.nodes.push(None);
+                id
+            }
+
+            fn compile_node<'a>(
+                &mut self,
+                constraint: &dyn Constraint<'a>,
+                path: &mut Vec<FormulaStep>,
+            ) -> FormulaNodeId {
+                let id = self.reserve_node();
+                let kind = if let Some(children) = constraint.residual_union_children() {
+                    assert!(
+                        children.len() > 0,
+                        "a residual finite union must expose at least one arm"
+                    );
+                    let mut compiled = Vec::with_capacity(children.len());
+                    for child in 0..children.len() {
+                        path.push(FormulaStep::Or(child));
+                        compiled.push(self.compile_node(children.child(child), path));
+                        path.pop();
+                    }
+                    FiniteFormulaNodeKind::Or {
+                        children: compiled.into_boxed_slice(),
+                    }
+                } else {
+                    match constraint.residual_shape() {
+                        ConstraintShape::And(children) => {
+                            let mut compiled = Vec::with_capacity(children.len());
+                            for child in 0..children.len() {
+                                path.push(FormulaStep::And(child));
+                                compiled.push(self.compile_node(children.child(child), path));
+                                path.pop();
+                            }
+                            FiniteFormulaNodeKind::And {
+                                children: compiled.into_boxed_slice(),
+                            }
+                        }
+                        ConstraintShape::Opaque => FiniteFormulaNodeKind::Atom {
+                            path: FormulaPath(path.clone().into_boxed_slice()),
+                            capabilities: FormulaAtomCapabilities {
+                                confirm_page_local: constraint.residual_confirm_is_page_local(),
+                                grouped_delta_confirm: self.cyclic_rpq
+                                    && constraint.residual_delta_confirm_is_grouped(),
+                            },
+                        },
+                    }
+                };
+                let span = match &kind {
+                    FiniteFormulaNodeKind::Atom { .. } => 2,
+                    FiniteFormulaNodeKind::And { children }
+                    | FiniteFormulaNodeKind::Or { children } => children
+                        .iter()
+                        .try_fold(2usize, |span, &child| {
+                            span.checked_add(
+                                self.nodes[child.0 as usize]
+                                    .as_ref()
+                                    .expect("formula child was not compiled")
+                                    .span
+                                    .checked_add(2)
+                                    .expect("residual formula child weight overflow"),
+                            )
+                        })
+                        .expect("residual formula span overflow"),
+                };
+                self.nodes[id.0 as usize] = Some(FiniteFormulaNode { kind, span });
+                id
+            }
+        }
+
+        fn resolve_leaf<'r, 'a>(
+            root: &'r dyn Constraint<'a>,
+            leaf: &ResidualLeaf,
+        ) -> &'r dyn Constraint<'a> {
+            let mut constraint = root;
+            for &child in leaf.path.0.iter() {
+                constraint = match constraint.residual_shape() {
+                    ConstraintShape::And(children) => children.child(child),
+                    ConstraintShape::Opaque => {
+                        panic!("residual AND shape changed during formula compilation")
+                    }
+                };
+            }
+            constraint
+        }
+
+        let mut builder = Builder {
+            nodes: Vec::new(),
+            cyclic_rpq,
+        };
+        let mut roots = vec![None; leaves.len()];
+        for (occurrence, leaf) in leaves.iter().enumerate() {
+            if !matches!(leaf.lowering, LeafLowering::FiniteUnion { .. }) {
+                continue;
+            }
+            let constraint = resolve_leaf(root, leaf);
+            assert!(
+                constraint.residual_union_children().is_some(),
+                "a finite-formula root stopped being a Union"
+            );
+            roots[occurrence] = Some(builder.compile_node(constraint, &mut Vec::new()));
+        }
+        Self {
+            nodes: builder
+                .nodes
+                .into_iter()
+                .map(|node| node.expect("reserved residual formula node was not compiled"))
+                .collect(),
+            roots,
+        }
+    }
+
+    fn node(&self, id: FormulaNodeId) -> &FiniteFormulaNode {
+        &self.nodes[id.0 as usize]
+    }
+
+    fn root(&self, occurrence: usize) -> Option<FormulaNodeId> {
+        self.roots[occurrence]
+    }
+
+    fn child_weight(&self, child: FormulaNodeId) -> usize {
+        self.node(child)
+            .span
+            .checked_add(2)
+            .expect("residual formula child weight overflow")
+    }
+
+    fn completed_weight(&self, node: FormulaNodeId, done: &ChildSet) -> usize {
+        let children = self
+            .node(node)
+            .children()
+            .expect("an Atom cannot have finite child progress");
+        assert!(
+            done.is_valid_for(children.len()),
+            "residual formula progress names a non-child occurrence"
+        );
+        children
+            .iter()
+            .enumerate()
+            .filter(|(child, _)| done.contains(*child))
+            .try_fold(0usize, |grade, (_, &child)| {
+                grade.checked_add(self.child_weight(child))
+            })
+            .expect("residual formula grade overflow")
+    }
+
+    fn entry_focus(&self, node: FormulaNodeId, stage: FormulaStage) -> FormulaFocus {
+        match &self.node(node).kind {
+            FiniteFormulaNodeKind::Atom { .. } => FormulaFocus::Atom { node, stage },
+            FiniteFormulaNodeKind::And { children } | FiniteFormulaNodeKind::Or { children } => {
+                FormulaFocus::Plan {
+                    node,
+                    stage,
+                    done: ChildSet::empty(children.len()),
+                }
+            }
+        }
+    }
+
+    fn start(
+        &self,
+        variable: VariableId,
+        occurrence: usize,
+        verb: UnionVerb,
+    ) -> FormulaProgramCounter {
+        let root = self
+            .root(occurrence)
+            .expect("an opaque residual leaf has no finite formula program");
+        let stage = match &verb {
+            UnionVerb::Propose { .. } => FormulaStage::Propose,
+            UnionVerb::Confirm { .. } => FormulaStage::Confirm,
+        };
+        FormulaProgramCounter {
+            focus: self.entry_focus(root, stage),
+            returns: Box::new([]),
+            resume: FormulaOuterResume {
+                variable,
+                occurrence,
+                verb,
+            },
+        }
+    }
+
+    fn select_child(&self, counter: &FormulaProgramCounter, child: usize) -> FormulaProgramCounter {
+        let FormulaFocus::Plan { node, stage, done } = &counter.focus else {
+            panic!("only a residual formula Plan can select a child")
+        };
+        let children = self
+            .node(*node)
+            .children()
+            .expect("a residual formula Plan named an Atom");
+        assert!(child < children.len() && !done.contains(child));
+        let mut returns = counter.returns.to_vec();
+        returns.push(FormulaReturnSite {
+            parent: *node,
+            parent_stage: *stage,
+            child,
+            done: done.clone(),
+        });
+        FormulaProgramCounter {
+            focus: self.entry_focus(children[child], *stage),
+            returns: returns.into_boxed_slice(),
+            resume: counter.resume.clone(),
+        }
+    }
+
+    /// Marks one structurally dead or irrelevant child complete without
+    /// claiming that an AND proposer ran. Stage is canonical control state,
+    /// not something inferred from whether the done mask happens to be empty.
+    fn skip_child(&self, counter: &FormulaProgramCounter, child: usize) -> FormulaProgramCounter {
+        let FormulaFocus::Plan { node, stage, done } = &counter.focus else {
+            panic!("only a residual formula Plan can skip a child")
+        };
+        let children = self
+            .node(*node)
+            .children()
+            .expect("a residual formula Plan named an Atom");
+        assert!(child < children.len() && !done.contains(child));
+        FormulaProgramCounter {
+            focus: FormulaFocus::Plan {
+                node: *node,
+                stage: *stage,
+                done: done.with_inserted(child),
+            },
+            returns: counter.returns.clone(),
+            resume: counter.resume.clone(),
+        }
+    }
+
+    fn complete(&self, counter: &FormulaProgramCounter) -> FormulaProgramCounter {
+        let (node, stage) = match &counter.focus {
+            FormulaFocus::Atom { node, stage } => (*node, *stage),
+            FormulaFocus::Plan { node, stage, done } => {
+                let children = self
+                    .node(*node)
+                    .children()
+                    .expect("a residual formula Plan named an Atom");
+                assert_eq!(
+                    done.count(),
+                    children.len(),
+                    "a residual formula completed with live children"
+                );
+                (*node, *stage)
+            }
+            FormulaFocus::Complete { .. } => {
+                panic!("a completed residual formula was completed twice")
+            }
+        };
+        FormulaProgramCounter {
+            focus: FormulaFocus::Complete { node, stage },
+            returns: counter.returns.clone(),
+            resume: counter.resume.clone(),
+        }
+    }
+
+    fn resume(&self, counter: &FormulaProgramCounter) -> FormulaSuccessor {
+        let FormulaFocus::Complete {
+            node: completed,
+            stage: completed_stage,
+        } = counter.focus
+        else {
+            panic!("only a completed residual formula can return")
+        };
+        let Some((site, outer)) = counter.returns.split_last() else {
+            assert_eq!(self.root(counter.resume.occurrence), Some(completed));
+            assert_eq!(
+                completed_stage,
+                match &counter.resume.verb {
+                    UnionVerb::Propose { .. } => FormulaStage::Propose,
+                    UnionVerb::Confirm { .. } => FormulaStage::Confirm,
+                }
+            );
+            return FormulaSuccessor::Outer(counter.resume.clone());
+        };
+        let children = self
+            .node(site.parent)
+            .children()
+            .expect("a residual formula return site named an Atom parent");
+        assert_eq!(children[site.child], completed);
+        let done = site.done.with_inserted(site.child);
+        let stage = match (&self.node(site.parent).kind, site.parent_stage) {
+            (FiniteFormulaNodeKind::And { .. }, FormulaStage::Propose) => FormulaStage::Confirm,
+            _ => site.parent_stage,
+        };
+        FormulaSuccessor::Formula(FormulaProgramCounter {
+            focus: FormulaFocus::Plan {
+                node: site.parent,
+                stage,
+                done,
+            },
+            returns: outer.to_vec().into_boxed_slice(),
+            resume: counter.resume.clone(),
+        })
+    }
+
+    /// Compiler-derived, history-independent topological grade for one exact
+    /// structural continuation. Every control transition above strictly
+    /// increases this value, including adaptive child orders.
+    fn grade(&self, counter: &FormulaProgramCounter) -> usize {
+        let root = self
+            .root(counter.resume.occurrence)
+            .expect("a formula counter resumed an opaque residual leaf");
+        let mut expected = root;
+        let mut outer_grade = 0usize;
+        for site in counter.returns.iter() {
+            assert_eq!(site.parent, expected);
+            let children = self
+                .node(site.parent)
+                .children()
+                .expect("a formula return site named an Atom parent");
+            assert!(site.child < children.len() && !site.done.contains(site.child));
+            outer_grade = outer_grade
+                .checked_add(2)
+                .and_then(|grade| {
+                    self.completed_weight(site.parent, &site.done)
+                        .checked_add(grade)
+                })
+                .expect("residual formula grade overflow");
+            expected = children[site.child];
+        }
+
+        let (focused, local_grade) = match &counter.focus {
+            FormulaFocus::Atom { node, .. } => {
+                assert!(matches!(
+                    self.node(*node).kind,
+                    FiniteFormulaNodeKind::Atom { .. }
+                ));
+                (*node, 1)
+            }
+            FormulaFocus::Plan { node, done, .. } => (
+                *node,
+                self.completed_weight(*node, done)
+                    .checked_add(1)
+                    .expect("residual formula grade overflow"),
+            ),
+            FormulaFocus::Complete { node, .. } => (*node, self.node(*node).span),
+        };
+        assert_eq!(focused, expected);
+        outer_grade
+            .checked_add(local_grade)
+            .expect("residual formula grade overflow")
+    }
+}
+
+/// Exact structural return address for one running formula child.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[allow(dead_code)]
+struct FormulaReturnSite {
+    parent: FormulaNodeId,
+    parent_stage: FormulaStage,
+    child: usize,
+    done: ChildSet,
+}
+
+/// Effective protocol role at the focused formula node. It is explicit
+/// because dead-child progress and action history are different facts: an AND
+/// can have a nonempty done mask and still need its one proposer, or an empty
+/// mask while already filtering as a parent confirmer.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[allow(dead_code)]
+enum FormulaStage {
+    Propose,
+    Confirm,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[allow(dead_code)]
+enum FormulaFocus {
+    Atom {
+        node: FormulaNodeId,
+        stage: FormulaStage,
+    },
+    Plan {
+        node: FormulaNodeId,
+        stage: FormulaStage,
+        done: ChildSet,
+    },
+    Complete {
+        node: FormulaNodeId,
+        stage: FormulaStage,
+    },
+}
+
+/// Existing residual continuation to resume after the formula root completes.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[allow(dead_code)]
+struct FormulaOuterResume {
+    variable: VariableId,
+    occurrence: usize,
+    verb: UnionVerb,
+}
+
+/// Defunctionalized structural continuation. Candidate values are deliberately
+/// absent: equality means identical future computation, while each affine
+/// activation will carry originals, working sets, and accumulators in payload.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[allow(dead_code)]
+struct FormulaProgramCounter {
+    focus: FormulaFocus,
+    returns: Box<[FormulaReturnSite]>,
+    resume: FormulaOuterResume,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+enum FormulaSuccessor {
+    Formula(FormulaProgramCounter),
+    Outer(FormulaOuterResume),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LeafLowering {
     Opaque,
@@ -101,6 +596,9 @@ enum ResidualCompileMode {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ResidualPlan {
     leaves: Vec<ResidualLeaf>,
+    /// Structural finite-formula program below lowered Union occurrences.
+    /// Runtime migration is intentionally separate from compilation.
+    finite_formula: FiniteFormulaProgram,
     /// Whether each opaque leaf's confirmation is homomorphic over ordered
     /// pages of one parent's candidate sequence.
     page_local_confirms: Vec<bool>,
@@ -230,8 +728,10 @@ impl ResidualPlan {
             &mut page_local_confirms,
             &mut grouped_delta_confirms,
         );
+        let finite_formula = FiniteFormulaProgram::compile(root, &leaves, cyclic_rpq);
         Self {
             leaves,
+            finite_formula,
             page_local_confirms,
             cyclic_rpq,
             grouped_delta_confirms,
@@ -6464,6 +6964,302 @@ mod tests {
         assert_eq!(
             plan.resolve(&root, 0).variables(),
             VariableSet::new_singleton(9)
+        );
+    }
+
+    #[test]
+    fn finite_formula_compiles_a_direct_or_and_canonical_arm_progress() {
+        let root = UnionConstraint::new(vec![shape_leaf(0), shape_leaf(0)]);
+        let plan = ResidualPlan::compile_finite_unions(&root);
+        let program = &plan.finite_formula;
+        let root = program.root(0).expect("lowered Union has a formula root");
+        let FiniteFormulaNodeKind::Or { children } = &program.node(root).kind else {
+            panic!("a lowered Union did not compile to Or")
+        };
+        assert_eq!(children.len(), 2);
+        assert_eq!(program.node(children[0]).span, 2);
+        assert_eq!(program.node(children[1]).span, 2);
+        assert_eq!(program.node(root).span, 10);
+        assert_eq!(
+            program.node(children[0]).kind,
+            FiniteFormulaNodeKind::Atom {
+                path: FormulaPath(vec![FormulaStep::Or(0)].into_boxed_slice()),
+                capabilities: FormulaAtomCapabilities {
+                    confirm_page_local: false,
+                    grouped_delta_confirm: false,
+                },
+            }
+        );
+
+        let mut relevant = ChildSet::empty(plan.len());
+        relevant.insert(0);
+        let start = program.start(0, 0, UnionVerb::Propose { relevant });
+        let run_arm = |counter: FormulaProgramCounter, arm| {
+            let action = program.select_child(&counter, arm);
+            let complete = program.complete(&action);
+            match program.resume(&complete) {
+                FormulaSuccessor::Formula(counter) => counter,
+                FormulaSuccessor::Outer(_) => panic!("one Or arm completed the root"),
+            }
+        };
+        let left_then_right = run_arm(run_arm(start.clone(), 0), 1);
+        let right_then_left = run_arm(run_arm(start, 1), 0);
+        assert_eq!(
+            left_then_right, right_then_left,
+            "exact done masks must erase historical arm order"
+        );
+    }
+
+    #[test]
+    fn finite_formula_compiles_and_to_or_as_structural_return_sites() {
+        let nested = UnionConstraint::new(vec![shape_leaf(0), shape_leaf(0)]);
+        let guarded = IntersectionConstraint::new(vec![
+            shape_leaf(0),
+            Box::new(nested) as ShapeConstraint,
+            shape_leaf(0),
+        ]);
+        let root = UnionConstraint::new(vec![Box::new(guarded) as ShapeConstraint, shape_leaf(0)]);
+        let plan = ResidualPlan::compile_finite_unions(&root);
+        let program = &plan.finite_formula;
+        let outer = program.root(0).unwrap();
+        let FiniteFormulaNodeKind::Or {
+            children: outer_children,
+        } = &program.node(outer).kind
+        else {
+            panic!("formula root is not Or")
+        };
+        let guarded = outer_children[0];
+        let FiniteFormulaNodeKind::And {
+            children: and_children,
+        } = &program.node(guarded).kind
+        else {
+            panic!("outer arm is not And")
+        };
+        let nested = and_children[1];
+        let FiniteFormulaNodeKind::Or {
+            children: nested_children,
+        } = &program.node(nested).kind
+        else {
+            panic!("And child is not nested Or")
+        };
+        assert_eq!(nested_children.len(), 2);
+        assert_eq!(program.node(nested).span, 10);
+        assert_eq!(program.node(guarded).span, 22);
+        assert_eq!(program.node(outer).span, 30);
+
+        let mut relevant = ChildSet::empty(plan.len());
+        relevant.insert(0);
+        let root_plan = program.start(0, 0, UnionVerb::Propose { relevant });
+        let and_plan = program.select_child(&root_plan, 0);
+        let nested_plan = program.select_child(&and_plan, 1);
+        assert_eq!(nested_plan.returns.len(), 2);
+        assert_eq!(
+            nested_plan.returns[0],
+            FormulaReturnSite {
+                parent: outer,
+                parent_stage: FormulaStage::Propose,
+                child: 0,
+                done: ChildSet::empty(outer_children.len()),
+            }
+        );
+        assert_eq!(
+            nested_plan.returns[1],
+            FormulaReturnSite {
+                parent: guarded,
+                parent_stage: FormulaStage::Propose,
+                child: 1,
+                done: ChildSet::empty(and_children.len()),
+            }
+        );
+        assert_eq!(
+            nested_plan.focus,
+            FormulaFocus::Plan {
+                node: nested,
+                stage: FormulaStage::Propose,
+                done: ChildSet::empty(nested_children.len()),
+            }
+        );
+    }
+
+    #[test]
+    fn finite_formula_and_stage_is_not_inferred_from_its_done_mask() {
+        let guarded =
+            IntersectionConstraint::new(vec![shape_leaf(0), shape_leaf(0), shape_leaf(0)]);
+        let union = UnionConstraint::new(vec![Box::new(guarded) as ShapeConstraint, shape_leaf(0)]);
+        let root =
+            IntersectionConstraint::new(vec![shape_leaf(0), Box::new(union) as ShapeConstraint]);
+        let plan = ResidualPlan::compile_finite_unions(&root);
+        let program = &plan.finite_formula;
+
+        let mut propose_relevant = ChildSet::empty(plan.len());
+        propose_relevant.insert(1);
+        let outer_propose = program.start(
+            0,
+            1,
+            UnionVerb::Propose {
+                relevant: propose_relevant,
+            },
+        );
+        let and_needs_proposer = program.select_child(&outer_propose, 0);
+        let skipped_dead_child = program.skip_child(&and_needs_proposer, 0);
+        let FormulaFocus::Plan { stage, done, .. } = &skipped_dead_child.focus else {
+            panic!("guarded arm did not enter an AND plan")
+        };
+        assert_eq!(*stage, FormulaStage::Propose);
+        assert_eq!(done.count(), 1);
+        assert!(program.grade(&skipped_dead_child) > program.grade(&and_needs_proposer));
+
+        // Only returning from an actually selected proposer changes the AND
+        // into its confirmation suffix. Dead/irrelevant progress does not.
+        let proposer = program.select_child(&skipped_dead_child, 1);
+        assert!(matches!(
+            proposer.focus,
+            FormulaFocus::Atom {
+                stage: FormulaStage::Propose,
+                ..
+            }
+        ));
+        let proposer_done = program.complete(&proposer);
+        let FormulaSuccessor::Formula(filtering_suffix) = program.resume(&proposer_done) else {
+            panic!("AND proposer returned past its parent")
+        };
+        let FormulaFocus::Plan { stage, done, .. } = filtering_suffix.focus else {
+            panic!("AND proposer did not resume its parent plan")
+        };
+        assert_eq!(stage, FormulaStage::Confirm);
+        assert_eq!(done.count(), 2);
+
+        // The identical AND occurrence entered as a parent confirmer starts
+        // in Confirm even though no child has yet been checked.
+        let mut confirm_relevant = ChildSet::empty(plan.len());
+        confirm_relevant.insert(0);
+        confirm_relevant.insert(1);
+        let mut checked = ChildSet::empty(plan.len());
+        checked.insert(0);
+        let outer_confirm = program.start(
+            0,
+            1,
+            UnionVerb::Confirm {
+                relevant: confirm_relevant,
+                checked,
+            },
+        );
+        let and_is_confirmer = program.select_child(&outer_confirm, 0);
+        let FormulaFocus::Plan { stage, done, .. } = &and_is_confirmer.focus else {
+            panic!("confirming guarded arm did not enter an AND plan")
+        };
+        assert_eq!(*stage, FormulaStage::Confirm);
+        assert_eq!(done.count(), 0);
+        assert_ne!(and_needs_proposer, and_is_confirmer);
+    }
+
+    #[test]
+    fn finite_formula_repeated_arcs_keep_distinct_node_and_resume_identity() {
+        let union = Arc::new(UnionConstraint::new(vec![ShapeLeaf(0), ShapeLeaf(0)]));
+        let root = IntersectionConstraint::new(vec![
+            Box::new(Arc::clone(&union)) as ShapeConstraint,
+            Box::new(union) as ShapeConstraint,
+        ]);
+        let plan = ResidualPlan::compile_finite_unions(&root);
+        let program = &plan.finite_formula;
+        let left = program.root(0).unwrap();
+        let right = program.root(1).unwrap();
+        assert_ne!(left, right);
+        assert_eq!(program.nodes.len(), 6);
+        let FiniteFormulaNodeKind::Or {
+            children: left_children,
+        } = &program.node(left).kind
+        else {
+            panic!("left repeated occurrence is not Or")
+        };
+        let FiniteFormulaNodeKind::Or {
+            children: right_children,
+        } = &program.node(right).kind
+        else {
+            panic!("right repeated occurrence is not Or")
+        };
+        assert_eq!(left_children.len(), right_children.len());
+        assert!(left_children
+            .iter()
+            .all(|child| !right_children.contains(child)));
+        assert_eq!(program.node(left).span, program.node(right).span);
+
+        let mut left_relevant = ChildSet::empty(plan.len());
+        left_relevant.insert(0);
+        let mut right_relevant = ChildSet::empty(plan.len());
+        right_relevant.insert(1);
+        let left_counter = program.start(
+            0,
+            0,
+            UnionVerb::Propose {
+                relevant: left_relevant,
+            },
+        );
+        let right_counter = program.start(
+            0,
+            1,
+            UnionVerb::Propose {
+                relevant: right_relevant,
+            },
+        );
+        assert_ne!(left_counter, right_counter);
+    }
+
+    #[test]
+    fn finite_formula_compiler_grades_every_adaptive_transition_strictly() {
+        let nested = UnionConstraint::new(vec![shape_leaf(0), shape_leaf(0)]);
+        let guarded = IntersectionConstraint::new(vec![
+            shape_leaf(0),
+            Box::new(nested) as ShapeConstraint,
+            shape_leaf(0),
+        ]);
+        let root = UnionConstraint::new(vec![Box::new(guarded) as ShapeConstraint, shape_leaf(0)]);
+        let plan = ResidualPlan::compile_finite_unions(&root);
+        let program = &plan.finite_formula;
+        let mut relevant = ChildSet::empty(plan.len());
+        relevant.insert(0);
+        let mut counter = program.start(0, 0, UnionVerb::Propose { relevant });
+        let mut transitions = 0usize;
+
+        loop {
+            let grade = program.grade(&counter);
+            let successor = match &counter.focus {
+                FormulaFocus::Atom { .. } => FormulaSuccessor::Formula(program.complete(&counter)),
+                FormulaFocus::Plan { node, done, .. } => {
+                    let children = program.node(*node).children().unwrap();
+                    if done.count() == children.len() {
+                        FormulaSuccessor::Formula(program.complete(&counter))
+                    } else {
+                        let child = (0..children.len())
+                            .rev()
+                            .find(|&child| !done.contains(child))
+                            .unwrap();
+                        FormulaSuccessor::Formula(program.select_child(&counter, child))
+                    }
+                }
+                FormulaFocus::Complete { .. } => program.resume(&counter),
+            };
+            transitions += 1;
+            assert!(transitions < 64, "finite formula control did not terminate");
+            match successor {
+                FormulaSuccessor::Formula(next) => {
+                    let next_grade = program.grade(&next);
+                    assert!(
+                        next_grade > grade,
+                        "formula grade regressed from {grade} to {next_grade}: {counter:?} -> {next:?}"
+                    );
+                    counter = next;
+                }
+                FormulaSuccessor::Outer(resume) => {
+                    assert_eq!(resume, counter.resume);
+                    assert!(matches!(counter.focus, FormulaFocus::Complete { .. }));
+                    break;
+                }
+            }
+        }
+        assert!(
+            transitions > 10,
+            "alternating formula trace was too shallow"
         );
     }
 
