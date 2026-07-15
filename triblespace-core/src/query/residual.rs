@@ -1,12 +1,11 @@
-//! Experimental canonical residual-state execution.
+//! Canonical residual-state execution.
 //!
-//! This is the smallest executable slice of a scheduler where a bucket is
-//! identified by its remaining computation rather than its history. It
-//! lowers any root [`Constraint`]. An exposed associative AND region becomes
-//! deterministic preorder leaf occurrences; an opaque root is one leaf at the
-//! empty path. Union, ignore, and regular-path constraints therefore remain
-//! ordinary indivisible leaves, as do custom constraints unless they explicitly
-//! expose an associative AND shape.
+//! A bucket is identified by its remaining computation rather than its
+//! history. The engine can lower any root [`Constraint`]. An exposed
+//! associative AND region becomes deterministic preorder leaf occurrences; an
+//! opaque root is one leaf at the empty path. Union, ignore, and regular-path
+//! constraints therefore remain ordinary indivisible leaves, as do custom
+//! constraints unless they explicitly expose an associative AND shape.
 //!
 //! Ready and Candidate descriptors are pure planning states: they estimate,
 //! partition rows by a uniform semantic action, and file explicit Propose or
@@ -131,6 +130,53 @@ impl ResidualPlan {
             !relevant.contains(leaf) || checked.contains(leaf) || self.page_local_confirms[leaf]
         })
     }
+}
+
+/// Whether ordinary iteration should lower this root into canonical residual
+/// states by default.
+///
+/// The first production selector is deliberately structural and conservative:
+/// an exposed associative conjunction must contain at least two flattened
+/// opaque leaf occurrences whose nonempty variable sets overlap. Fully bound
+/// constant leaves have no future protocol action, while disjoint leaves have
+/// no sibling proposer/confirm work for the residual state to canonicalize.
+/// Opaque roots and conjunctions without a shared variable retain the lazy DAG,
+/// because residual control-state overhead has no structural opportunity to
+/// pay back there and measured regressions are possible. Explicit residual
+/// entry points stay complete for every root.
+pub(super) fn useful_default_shape<'a>(root: &dyn Constraint<'a>) -> bool {
+    fn overlaps_seen_leaf<'a>(constraint: &dyn Constraint<'a>, seen: &mut VariableSet) -> bool {
+        match constraint.residual_shape() {
+            ConstraintShape::Opaque => {
+                let variables = constraint.variables();
+                if variables.is_empty() {
+                    return false;
+                }
+                let overlaps = !variables.intersect(*seen).is_empty();
+                *seen = seen.union(variables);
+                overlaps
+            }
+            ConstraintShape::And(children) => {
+                for child in 0..children.len() {
+                    if overlaps_seen_leaf(children.child(child), seen) {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    let ConstraintShape::And(children) = root.residual_shape() else {
+        return false;
+    };
+    let mut seen = VariableSet::new_empty();
+    for child in 0..children.len() {
+        if overlaps_seen_leaf(children.child(child), &mut seen) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Measurements from one residual-state solve.
@@ -2809,11 +2855,9 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "parallel")]
     #[derive(Clone, Copy)]
     struct ZeroVariableTruth(bool);
 
-    #[cfg(feature = "parallel")]
     impl Constraint<'static> for ZeroVariableTruth {
         fn variables(&self) -> VariableSet {
             VariableSet::new_empty()
@@ -3428,6 +3472,166 @@ mod tests {
     }
 
     #[test]
+    fn default_selector_requires_overlapping_actionable_exposed_leaves() {
+        assert!(!useful_default_shape(&ShapeLeaf(0)));
+        assert!(!useful_default_shape(&IntersectionConstraint::new(Vec::<
+            ShapeConstraint,
+        >::new(
+        ))));
+        assert!(!useful_default_shape(&IntersectionConstraint::new(vec![
+            shape_leaf(0)
+        ])));
+
+        for truth in [true, false] {
+            let constant = Box::new(ZeroVariableTruth(truth)) as ShapeConstraint;
+            let one_actionable = IntersectionConstraint::new(vec![constant, shape_leaf(0)]);
+            assert!(
+                !useful_default_shape(&one_actionable),
+                "a {truth} constant leaf must not make one actionable leaf residual-worthy"
+            );
+        }
+
+        assert!(
+            !useful_default_shape(&IntersectionConstraint::new(vec![
+                shape_leaf(0),
+                shape_leaf(1),
+            ])),
+            "disjoint leaves have no shared-variable residual action"
+        );
+        assert!(useful_default_shape(&IntersectionConstraint::new(vec![
+            shape_leaf(0),
+            shape_leaf(0),
+        ])));
+        assert!(useful_default_shape(&IntersectionConstraint::new(vec![
+            Box::new(ZeroVariableTruth(true)) as ShapeConstraint,
+            shape_leaf(0),
+            shape_and(vec![shape_leaf(1), shape_and(vec![shape_leaf(0)])]),
+        ])));
+        assert!(
+            !useful_default_shape(&IntersectionConstraint::new(vec![
+                shape_leaf(0),
+                shape_and(vec![shape_leaf(1), shape_and(vec![shape_leaf(2)])]),
+            ])),
+            "nested ANDs flatten, but disjoint variable sets remain a DAG case"
+        );
+        let boxed_and: Box<dyn Constraint<'static> + Send + Sync> =
+            Box::new(IntersectionConstraint::new(vec![
+                shape_leaf(3),
+                shape_leaf(3),
+            ]));
+        assert!(useful_default_shape(boxed_and.as_ref()));
+        let arc_and: Arc<dyn Constraint<'static> + Send + Sync> =
+            Arc::new(IntersectionConstraint::new(vec![
+                ShapeLeaf(4),
+                ShapeLeaf(4),
+            ]));
+        assert!(useful_default_shape(arc_and.as_ref()));
+
+        // Union stays one opaque leaf: equal variables inside its variants do
+        // not look like two residual occurrences. A separate sibling that
+        // shares the variable does create an overlap at the opaque boundary.
+        let opaque_union = UnionConstraint::new(vec![shape_leaf(0), shape_leaf(0)]);
+        assert!(!useful_default_shape(&opaque_union));
+        assert!(!useful_default_shape(&IntersectionConstraint::new(vec![
+            Box::new(opaque_union) as ShapeConstraint,
+            shape_leaf(1),
+        ])));
+        let opaque_union = UnionConstraint::new(vec![shape_leaf(0), shape_leaf(0)]);
+        assert!(useful_default_shape(&IntersectionConstraint::new(vec![
+            Box::new(opaque_union) as ShapeConstraint,
+            shape_leaf(0),
+        ])));
+
+        // An RPQ is likewise one opaque two-variable leaf. Its internal state
+        // machine is never flattened; only overlap with another AND sibling
+        // is visible to the selector.
+        use crate::inline::encodings::genid::GenId;
+        use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
+        use crate::trible::TribleSet;
+        let mut context = VariableContext::new();
+        let start = context.next_variable::<GenId>();
+        let end = context.next_variable::<GenId>();
+        let rpq = RegularPathConstraint::new(
+            TribleSet::new(),
+            start,
+            end,
+            &[PathOp::Attr([0; crate::id::ID_LEN])],
+        );
+        assert!(!useful_default_shape(&rpq));
+        assert!(!useful_default_shape(&IntersectionConstraint::new(vec![
+            Box::new(rpq) as ShapeConstraint,
+            shape_leaf(2),
+        ])));
+        let rpq = RegularPathConstraint::new(
+            TribleSet::new(),
+            start,
+            end,
+            &[PathOp::Attr([0; crate::id::ID_LEN])],
+        );
+        assert!(useful_default_shape(&IntersectionConstraint::new(vec![
+            Box::new(rpq) as ShapeConstraint,
+            shape_leaf(end.index),
+        ])));
+    }
+
+    #[test]
+    fn ordinary_default_keeps_constant_edges_exact_on_lazy_dag() {
+        let false_root =
+            IntersectionConstraint::new(
+                vec![Box::new(ZeroVariableTruth(false)) as ShapeConstraint],
+            );
+        let mut false_query = Query::new(false_root, |_| Some(()));
+        assert_eq!(false_query.scheduler, QueryScheduler::LazyDag);
+        assert_eq!(false_query.next(), None);
+        assert!(false_query.residual.is_none());
+        assert!(false_query.dag.is_none());
+
+        let values = Arc::new(vec![raw(3), raw(7), raw(11)]);
+        let make_true_and_one_real = || {
+            IntersectionConstraint::new(vec![
+                Box::new(ZeroVariableTruth(true)) as ShapeConstraint,
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::clone(&values),
+                }) as ShapeConstraint,
+            ])
+        };
+        let project = |binding: &Binding| binding.get(0).copied();
+        let mut ordinary = Query::new(make_true_and_one_real(), project);
+        assert_eq!(ordinary.scheduler, QueryScheduler::LazyDag);
+        let mut ordinary_bag: Vec<_> = ordinary.by_ref().collect();
+        let mut explicit_dag_bag: Vec<_> = Query::new(make_true_and_one_real(), project)
+            .lazy_dag_scheduler()
+            .collect();
+        let mut expected_bag = values.as_ref().clone();
+        ordinary_bag.sort_unstable();
+        explicit_dag_bag.sort_unstable();
+        expected_bag.sort_unstable();
+        assert_eq!(ordinary_bag, expected_bag);
+        assert_eq!(ordinary_bag, explicit_dag_bag);
+
+        // A false constant must suppress residual admission even when the
+        // remaining exposed shape has an overlapping-variable pair.
+        let false_overlapping = IntersectionConstraint::new(vec![
+            Box::new(ZeroVariableTruth(false)) as ShapeConstraint,
+            Box::new(FanoutLeaf {
+                variable: 0,
+                values: Arc::clone(&values),
+            }) as ShapeConstraint,
+            shape_leaf(0),
+        ]);
+        assert!(useful_default_shape(&false_overlapping));
+        let mut false_overlapping = Query::new(false_overlapping, |_| Some(()));
+        assert_eq!(false_overlapping.scheduler, QueryScheduler::LazyDag);
+        assert_eq!(false_overlapping.next(), None);
+        assert!(false_overlapping.residual.is_none());
+        assert!(false_overlapping.dag.is_none());
+        let debug = format!("{false_overlapping:?}");
+        assert!(debug.contains("scheduler: LazyDag"), "{debug}");
+        assert!(debug.contains("residual_started: false"), "{debug}");
+    }
+
+    #[test]
     fn repeated_objects_keep_distinct_occurrence_paths() {
         let shared: Arc<dyn Constraint<'static> + Send + Sync> = Arc::new(ShapeLeaf(7));
         let root = IntersectionConstraint::new(vec![Arc::clone(&shared), Arc::clone(&shared)]);
@@ -3874,8 +4078,7 @@ mod tests {
                 calls: Arc::new(Mutex::new(Vec::new())),
             }) as ShapeConstraint,
         ]));
-        let mut query = Query::new(root, |binding: &Binding| binding.get(0).copied())
-            .residual_state_scheduler();
+        let mut query = Query::new(root, |binding: &Binding| binding.get(0).copied());
 
         assert_eq!(query.next(), Some(raw(63)));
         let runtime = query.residual.as_deref().expect("residual cursor started");

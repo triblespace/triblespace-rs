@@ -522,20 +522,22 @@ the block-native protocol can participate in `find!`. The six core methods are:
 
 The explicit `Query::sequential()` scheduler calls these methods with a one-row
 [`RowsView`](triblespace::core::query::RowsView) and scalar/plain-value sinks;
-the ordinary DAG-backed iterator calls the same methods with row blocks and
-tagged candidate frontiers. Implementations without a specialized batch
-operation can loop over the rows, use `CandidateSink::extend_row`, and use the
-`confirm_per_row` adapter.
+the ordinary iterator shape-selects between canonical residual states for an
+exposed conjunction with shared-variable leaf work and a lazy-DAG fallback for
+opaque, one-leaf, or disjoint roots. Both blocked engines call the same methods
+with row blocks and tagged candidate frontiers. Implementations without a
+specialized batch operation can loop over the rows, use
+`CandidateSink::extend_row`, and use the `confirm_per_row` adapter.
 
 The four row-taking operations must also be row-homomorphic: evaluating
 non-empty consecutive sub-blocks independently and concatenating their
-row-remapped outputs must equal evaluating the original block. The DAG
-scheduler, including the explicit `Query::into_par_dag_iter()`
-frontier-sharding path, is free to change block boundaries; block-global top-k
-or first-row semantics would therefore be incorrect. Diagnostics may observe
-call boundaries, but must not feed those observations back into protocol
-answers. Ordinary `into_par_iter()` retains the scalar DFS splitter for
-CPU-oriented workloads.
+row-remapped outputs must equal evaluating the original block. The blocked
+schedulers, including the explicit `Query::into_par_dag_iter()` and
+`Query::into_par_residual_state_iter()` frontier-sharding paths, are free to
+change block boundaries; block-global top-k or first-row semantics would
+therefore be incorrect. Diagnostics may observe call boundaries, but must not
+feed those observations back into protocol answers. Ordinary `into_par_iter()`
+retains the scalar DFS splitter for CPU-oriented workloads.
 
 `propose` owns the empty sink it receives, whereas `confirm` may only remove
 entries from an existing sink. `satisfied` may conservatively return `true`
@@ -544,7 +546,7 @@ all of the constraint's variables are present in the view. That exactness is
 required for sound composition with `or!` and for constant, zero-variable
 checks; it is not merely an optional early-pruning optimization. Zero-variable
 roots are settled once during construction. The [Query Engine](query-engine.md#the-constraint-protocol)
-chapter explains the protocol and both schedulers in detail.
+chapter explains the protocol and its schedulers in detail.
 
 ## Regular path queries
 

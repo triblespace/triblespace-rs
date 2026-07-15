@@ -86,6 +86,12 @@ macro_rules! assert_all_engines_match {
             $label
         );
         prop_assert_eq!(
+            multiset($query),
+            expected.clone(),
+            "{}: ordinary shape-selected Query",
+            $label
+        );
+        prop_assert_eq!(
             multiset(($query).solve_blocked()),
             expected.clone(),
             "{}: blocked",
@@ -136,7 +142,7 @@ macro_rules! assert_all_engines_match {
         prop_assert_eq!(
             multiset(($query).residual_state_scheduler()),
             expected.clone(),
-            "{}: ordinary Query residual state",
+            "{}: explicit ordinary Query residual state",
             $label
         );
         #[cfg(feature = "parallel")]
@@ -170,6 +176,12 @@ macro_rules! assert_residual_engines_match {
             multiset(($query).sequential()),
             expected.clone(),
             "{}: scalar DFS reference",
+            $label
+        );
+        prop_assert_eq!(
+            multiset($query),
+            expected.clone(),
+            "{}: ordinary shape-selected Query",
             $label
         );
         prop_assert_eq!(

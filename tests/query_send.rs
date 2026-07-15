@@ -23,9 +23,9 @@ fn ordinary_query_with_non_send_output_is_send() {
 
     assert_send(query);
 
-    // Starting the default DAG scheduler must not change the query type's
-    // auto traits: projected values are postprocessed on demand, never stored
-    // in the worklist.
+    // Starting the shape-selected default scheduler must not change the query
+    // type's auto traits: projected values are postprocessed on demand, never
+    // stored in either worklist.
     let mut context = VariableContext::new();
     let variable = context.next_variable::<U256BE>();
     let constraint = variable.is(U256BE::inline_from(1u64));
@@ -33,8 +33,16 @@ fn ordinary_query_with_non_send_output_is_send() {
     assert!(started.next().is_some());
     assert_send(started);
 
-    // The owned residual runtime likewise stores only raw rows and planning
-    // state, never a projected `R`.
+    // The explicit lazy-DAG fallback likewise stores only raw rows and
+    // planning state, never a projected `R`.
+    let mut context = VariableContext::new();
+    let variable = context.next_variable::<U256BE>();
+    let constraint = variable.is(U256BE::inline_from(1u64));
+    let mut dag = Query::new(constraint, |_| Some(Rc::new(()))).lazy_dag_scheduler();
+    assert!(dag.next().is_some());
+    assert_send(dag);
+
+    // The residual runtime also stores only raw rows and planning state.
     let mut context = VariableContext::new();
     let variable = context.next_variable::<U256BE>();
     let constraint = variable.is(U256BE::inline_from(1u64));
@@ -44,7 +52,40 @@ fn ordinary_query_with_non_send_output_is_send() {
 }
 
 #[test]
-fn ordinary_query_uses_lazy_dag_by_default() {
+fn ordinary_query_uses_residual_for_exposed_overlapping_and() {
+    let mut context = VariableContext::new();
+    let variable = context.next_variable::<U256BE>();
+    let one = U256BE::inline_from(1u64);
+    let constraint = and!(variable.is(one), variable.is(one));
+    let mut query = Query::new(constraint, |_| Some(()));
+
+    assert_eq!(query.next(), Some(()));
+    let state = format!("{query:?}");
+    assert!(state.contains("scheduler: ResidualState"), "{state}");
+    assert!(state.contains("residual_started: true"), "{state}");
+    assert!(state.contains("dag_started: false"), "{state}");
+}
+
+#[test]
+fn ordinary_query_keeps_lazy_dag_for_disjoint_and_leaves() {
+    let mut context = VariableContext::new();
+    let left = context.next_variable::<U256BE>();
+    let right = context.next_variable::<U256BE>();
+    let constraint = and!(
+        left.is(U256BE::inline_from(1u64)),
+        right.is(U256BE::inline_from(2u64))
+    );
+    let mut query = Query::new(constraint, |_| Some(()));
+
+    assert_eq!(query.next(), Some(()));
+    let state = format!("{query:?}");
+    assert!(state.contains("scheduler: LazyDag"), "{state}");
+    assert!(state.contains("residual_started: false"), "{state}");
+    assert!(state.contains("dag_started: true"), "{state}");
+}
+
+#[test]
+fn ordinary_query_keeps_lazy_dag_for_opaque_root() {
     let _stats_guard = DAG_STATS_TEST_LOCK.lock().unwrap();
     let mut context = VariableContext::new();
     let variable = context.next_variable::<U256BE>();
@@ -61,6 +102,43 @@ fn ordinary_query_uses_lazy_dag_by_default() {
         pops > 0,
         "ordinary Query iteration did not run the DAG worklist"
     );
+}
+
+#[test]
+fn ordinary_query_keeps_lazy_dag_for_exposed_one_leaf_and() {
+    let _stats_guard = DAG_STATS_TEST_LOCK.lock().unwrap();
+    let mut context = VariableContext::new();
+    let variable = context.next_variable::<U256BE>();
+    let constraint = and!(variable.is(U256BE::inline_from(1u64)));
+
+    dag_stats::reset();
+    dag_stats::set_enabled(true);
+    let rows = Query::new(constraint, |_| Some(())).count();
+    let pops = dag_stats::pops();
+    dag_stats::set_enabled(false);
+
+    assert_eq!(rows, 1);
+    assert!(pops > 0, "one-leaf AND did not retain the lazy DAG");
+}
+
+#[test]
+fn explicit_lazy_dag_override_bypasses_overlapping_residual_default() {
+    let _stats_guard = DAG_STATS_TEST_LOCK.lock().unwrap();
+    let mut context = VariableContext::new();
+    let variable = context.next_variable::<U256BE>();
+    let one = U256BE::inline_from(1u64);
+    let constraint = and!(variable.is(one), variable.is(one));
+
+    dag_stats::reset();
+    dag_stats::set_enabled(true);
+    let rows = Query::new(constraint, |_| Some(()))
+        .lazy_dag_scheduler()
+        .count();
+    let pops = dag_stats::pops();
+    dag_stats::set_enabled(false);
+
+    assert_eq!(rows, 1);
+    assert!(pops > 0, "explicit lazy-DAG override was ignored");
 }
 
 /// Cloning the ordinary lazy-DAG iterator after a pull snapshots its raw
@@ -286,6 +364,10 @@ fn pulled_query_rejects_every_seed_restarting_selector() {
         })),
         std::panic::catch_unwind(std::panic::AssertUnwindSafe({
             let query = query.clone();
+            move || drop(query.lazy_dag_scheduler())
+        })),
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let query = query.clone();
             move || drop(query.solve_dag_lazy())
         })),
         std::panic::catch_unwind(std::panic::AssertUnwindSafe({
@@ -324,19 +406,26 @@ fn fresh_query_into_par_iter_matches_scalar_scheduler() {
     assert_eq!(actual, expected);
 
     // Ordinary Rayon conversion remains the scalar splitter even when the
-    // unstarted query had selected residual execution.
+    // automatic shape selector chose residual execution.
     let mut context = VariableContext::new();
     let variable = context.next_variable::<U256BE>();
-    let constraint = or!(
-        variable.is(values[0]),
-        variable.is(values[1]),
-        variable.is(values[2]),
-        variable.is(values[3])
+    let constraint = and!(
+        or!(
+            variable.is(values[0]),
+            variable.is(values[1]),
+            variable.is(values[2]),
+            variable.is(values[3])
+        ),
+        or!(
+            variable.is(values[0]),
+            variable.is(values[1]),
+            variable.is(values[2]),
+            variable.is(values[3])
+        )
     );
     let mut selected = Query::new(constraint, move |binding| {
         binding.get(variable.index).copied()
     })
-    .residual_state_scheduler()
     .into_par_iter()
     .collect::<Vec<_>>();
     selected.sort_unstable();

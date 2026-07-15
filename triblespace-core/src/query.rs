@@ -1133,10 +1133,15 @@ enum QueryScheduler {
 /// A query is an iterator over the results of a query.
 /// It takes a constraint and a post-processing function as input,
 /// and returns the results of the query as a stream of values.
-/// The ordinary iterator uses a lazy DAG worklist that starts with narrow,
-/// depth-first chunks and widens as the consumer keeps pulling. Split blocks
-/// may agglomerate compatible exact-choice groups into fewer batches using
-/// estimate magnitudes and the query's influence topology. Use
+/// The ordinary iterator selects canonical residual states for a live exposed
+/// conjunction only when two flattened opaque leaf occurrences share a
+/// variable. It starts with narrow, depth-first action cohorts and widens as
+/// the consumer keeps pulling, while histories with identical future
+/// computation can reconverge under one state identity. Opaque, one-leaf,
+/// disjoint, and seed-rejected roots retain the lazy DAG, where residual
+/// control-state overhead has no structural opportunity to pay back. Use
+/// [`Query::residual_state_scheduler`] or
+/// [`Query::lazy_dag_scheduler`] to override that structural default, and
 /// [`Query::sequential`] for the scalar depth-first specialization.
 /// The query engine is designed to be simple and efficient, providing low, consistent,
 /// and predictable latency, skew resistance, and no required (or possible) tuning.
@@ -1191,9 +1196,9 @@ pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
     /// Emit-only scratch: filled from the cursor when a full row is
     /// postprocessed. The only place a [`Binding`] still exists.
     binding: Binding,
-    /// Lazily initialized default-scheduler state. Keeping the worklist in a
-    /// box avoids growing the already-large sequential cursor copied by
-    /// rayon's DFS splitter.
+    /// Lazily initialized lazy-DAG state for the structural fallback or an
+    /// explicit override. Keeping the worklist in a box avoids growing the
+    /// already-large sequential cursor copied by rayon's DFS splitter.
     dag: Option<Box<DagState>>,
     /// Lazily initialized canonical residual-state cursor. The box owns only
     /// a borrow-free lowering plan plus raw machine state; `constraint` and
@@ -1365,10 +1370,11 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
 
     /// Use the scalar depth-first scheduler for this query.
     ///
-    /// The ordinary iterator defaults to the lazy DAG worklist. The scalar
-    /// scheduler remains useful for tiny queries, strict frontier-memory
-    /// bounds, and as the block-of-one specialization of the same
-    /// block-native constraint protocol.
+    /// The ordinary iterator structurally selects residual states for a live
+    /// exposed conjunction with overlapping leaf variable sets, and the lazy
+    /// DAG otherwise. The scalar scheduler remains useful for tiny queries,
+    /// strict frontier-memory bounds, and as the block-of-one specialization
+    /// of the same block-native constraint protocol.
     ///
     /// # Panics
     ///
@@ -1383,17 +1389,18 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         self
     }
 
-    /// Use the experimental canonical residual-state scheduler through the
-    /// ordinary resumable [`Query`] iterator.
+    /// Force canonical residual-state execution through the ordinary
+    /// resumable [`Query`] iterator.
     ///
-    /// Unlike [`Query::solve_residual_state_lazy`], this keeps the runtime
-    /// cursor behind `Query::next`, so cloning a started query snapshots its
-    /// exact raw remainder and ordinary parallel conversion can drain that
-    /// remainder without restarting from the seed. Converting an unstarted
-    /// selected query through ordinary Rayon iteration still uses the stable
-    /// scalar splitter; it does not initialize a residual cursor implicitly.
-    /// The ordinary default remains the lazy DAG scheduler while this API is
-    /// evaluated.
+    /// Ordinary iteration already selects residual states for live exposed
+    /// conjunctions with shared-variable leaf work. This override preserves
+    /// arbitrary-root completeness for opaque, one-leaf, disjoint, and
+    /// seed-rejected constraints, and is useful for scheduler comparison. The
+    /// runtime cursor remains behind `Query::next`, so cloning a started query
+    /// snapshots its exact raw remainder. Ordinary Rayon conversion of an
+    /// unstarted query still uses the established scalar splitter; use
+    /// [`Query::into_par_residual_state_iter`] to request affine residual
+    /// sharding explicitly.
     ///
     /// # Panics
     ///
@@ -1405,6 +1412,30 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             "cannot select the residual-state query scheduler after iteration has started"
         );
         self.scheduler = QueryScheduler::ResidualState;
+        self
+    }
+
+    /// Use the lazy bound-variable-set DAG through the ordinary resumable
+    /// [`Query`] iterator.
+    ///
+    /// This is a diagnostic and behavioral control for comparing the DAG
+    /// worklist with the shape-selected ordinary scheduler. It keeps its raw
+    /// resumable worklist behind `Query::next`, so cloning a started query
+    /// snapshots the exact remainder. Converting an unstarted selected query
+    /// through ordinary Rayon iteration still uses the established scalar
+    /// splitter; use [`Query::into_par_dag_iter`] to request affine DAG
+    /// sharding explicitly.
+    ///
+    /// # Panics
+    ///
+    /// Panics if iteration has already started. Scheduler selection must be
+    /// made before the first call to [`Iterator::next`].
+    pub fn lazy_dag_scheduler(mut self) -> Self {
+        assert!(
+            !self.iteration_started && self.dag.is_none() && self.residual.is_none(),
+            "cannot select the lazy-DAG query scheduler after iteration has started"
+        );
+        self.scheduler = QueryScheduler::LazyDag;
         self
     }
 
@@ -1464,11 +1495,18 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         } else {
             Search::Done
         };
+        let scheduler = if matches!(mode, Search::NextVariable)
+            && residual::useful_default_shape(&constraint)
+        {
+            QueryScheduler::ResidualState
+        } else {
+            QueryScheduler::LazyDag
+        };
 
         Query {
             constraint,
             postprocessing,
-            scheduler: QueryScheduler::LazyDag,
+            scheduler,
             mode,
             iteration_started: false,
             influences,
@@ -3275,10 +3313,11 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
             );
         }
 
-        // The ordinary iterator defaults to the lazy DAG. Rayon partitions a
-        // fresh query by advancing the scalar cursor before its leaves call
-        // `next`; those partial cursors deliberately stay on the sequential
-        // path instead of restarting from the seed worklist.
+        // The lazy DAG handles the structural opaque/one-leaf fallback as well
+        // as explicit diagnostic selection. Rayon partitions a fresh ordinary
+        // query by advancing the scalar cursor before its leaves call `next`;
+        // those partial cursors deliberately stay on the sequential path
+        // instead of restarting from a worklist.
         if self.scheduler == QueryScheduler::LazyDag
             && fresh
             && matches!(self.mode, Search::NextVariable)
@@ -3391,9 +3430,9 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> fmt::Debug for Quer
 // block-native alternative: seed negotiation runs until a bucket contains
 // multiple rows, then Rayon bisects those affine rows into independent
 // worklists. Each DAG fold leaf therefore keeps batching, per-row variable
-// selection, and local route reconvergence. A partially consumed ordinary DAG
-// or explicitly selected residual query remains one exact-remainder leaf when
-// converted through the ordinary `IntoParallelIterator` path.
+// selection, and local route reconvergence. A partially consumed ordinary
+// residual or lazy-DAG query remains one exact-remainder leaf when converted
+// through the ordinary `IntoParallelIterator` path.
 //
 // `fold_with` is the terminal leaf: it drives the ordinary `Iterator::next()`
 // on whichever scheduler state the producer owns. No duplicated execution

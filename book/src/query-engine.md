@@ -9,11 +9,12 @@ adapt to the values already found instead of being fixed before evaluation.
 
 The current protocol is **block-native**. Its unit of work is not necessarily
 one partial binding, but a block of partial bindings that have the same set of
-bound variables. The ordinary iterator uses a demand-adaptive DAG worklist;
-the explicit [`Query::sequential`](triblespace::core::query::Query::sequential)
-path speaks the same protocol with blocks of one row. This shared interface is
-the important part of the design: a constraint has one implementation whether
-its probes are issued one at a time, fused into a CPU loop, or dispatched to a
+bound variables. The ordinary iterator structurally selects between a
+canonical residual-state worklist and the bound-variable-set DAG; the explicit
+[`Query::sequential`](triblespace::core::query::Query::sequential) path speaks
+the same protocol with blocks of one row. This shared interface is the
+important part of the design: a constraint has one implementation whether its
+probes are issued one at a time, fused into a CPU loop, or dispatched to a
 batch-oriented accelerator.
 
 ## Bindings as row blocks
@@ -104,7 +105,7 @@ shared existential witness.
 Constraints are otherwise stateless. Each method receives the current
 `RowsView`; the engine does not notify constraints when it backtracks, chunks a
 frontier, or processes work in a different order. This is what allows the same
-constraint tree to run under both schedulers.
+constraint tree to run under every scheduler.
 
 ## One expansion step
 
@@ -119,10 +120,12 @@ An expansion still performs the familiar Atreides negotiation:
    into the compatible active target that yields the least total candidate
    estimate, then partition by the retained scheduled variable with a stable
    counting sort. Variables preferred by no row are not opened as new hubs.
-4. For each group, ask the root constraint to propose that variable. An
-   intersection chooses its tightest child per row to propose and runs the
-   remaining children as whole-frontier confirmation passes. A union evaluates
-   its still-satisfied alternatives independently and merges their candidates.
+4. For each group, propose that variable. The DAG asks the root constraint; an
+   intersection chooses its tightest child per row and runs the remaining
+   children as whole-frontier confirmation passes. The residual engine makes
+   the same proposer and confirmer choices explicit worklist actions. A union
+   remains an opaque leaf that evaluates its still-satisfied alternatives
+   independently and merges their candidates.
 5. Extend the parent rows with the surviving `(row, value)` pairs. Rows without
    candidates disappear.
 
@@ -143,6 +146,60 @@ Thus the sequential path does not emulate batching by allocating tagged rows:
 it is the zero-overhead scalar representation of the same protocol. It remains
 valuable for low first-result latency, tiny candidate sets, and workloads where
 there is no useful frontier to fuse.
+
+## Canonical residual-state engine
+
+The residual engine keys a bucket by its **remaining computation**, not merely
+by the bindings or the route that produced it. It recursively flattens the
+maximal associative AND region exposed at the root into deterministic preorder
+leaf occurrences. Union, regular-path, ignore, and custom constraints remain
+opaque leaves unless they explicitly expose associative AND structure, so
+flattening never crosses a semantic boundary.
+
+Each canonical descriptor includes the bound-variable schema and one of four
+phases:
+
+- `Ready` jointly chooses a row's next variable and exact proposing leaf.
+- `Propose` invokes one uniform proposer over an assembled parent-row bucket.
+- `Candidate` chooses the next unchecked relevant confirmer.
+- `Confirm` invokes one uniform confirmer over complete parent candidate
+  groups, or over candidate pages once every remaining confirmer declares that
+  operation page-local.
+
+Planning phases only estimate, partition, and file work; protocol calls happen
+in the explicit action phases. The checked-leaf set is canonical, so histories
+that applied the same constraints in different orders can append to the same
+future state before its remaining work runs. Row and candidate payloads still
+carry every occurrence, preserving bag semantics even when control states
+collapse.
+
+Lazy residual execution begins with actionable width one. A surviving action
+keeps its newly filed continuation hot, allowing a successful path to descend
+and emit before cold siblings are evaluated. Dead actions and terminal rows
+grow the desired width geometrically; once no hot continuation can run, an
+occupancy/readiness policy harvests wider batches. This gives the state machine
+the same low-latency-to-throughput ramp as the DAG without requiring a complete
+intersection to run eagerly for one binding.
+
+The ordinary [`Query`](triblespace::core::query::Query) uses this engine only
+after exact seed settlement leaves a live search and the root exposes an AND
+with two flattened opaque leaf occurrences whose nonempty variable sets
+overlap. A shared variable is the cheap structural evidence that sibling
+proposer or confirmer work exists for residual states to canonicalize.
+Zero-variable constants are ignored by the gate; opaque roots, one-leaf ANDs,
+disjoint leaves, and seed-rejected queries retain the lazy DAG. An opaque Union
+or RPQ counts as one leaf, even when it contains its own internal state
+machine. This deliberately conservative selector follows measured evidence:
+forcing residual control states on arbitrary opaque or one-leaf roots can
+regress work and latency without opening a reconvergence opportunity.
+
+[`Query::residual_state_scheduler`](triblespace::core::query::Query::residual_state_scheduler)
+forces the residual cursor for any root and remains the completeness and
+comparison control. `solve_residual_state_lazy` exposes its width policy;
+`solve_residual_state` is the eager saturated form, and
+`solve_residual_state_profiled` reports state, merge, action, and batch
+measurements. Fully drained variants preserve the result multiset, but may
+change result order.
 
 ## DAG worklist engine
 
@@ -181,10 +238,12 @@ after its first parent filed into it. The tradeoff is explicit: highly
 reconvergent queries can retain a broader frontier and use more memory in
 exchange for larger batches.
 
-The ordinary [`Query`](triblespace::core::query::Query) iterator combines this
-worklist with demand-adaptive chunking. Its width starts at one row and grows
-geometrically whenever the consumer asks the engine to resume. Before the width
-cap is reached, scheduling is strict deepest-first, preserving
+The ordinary [`Query`](triblespace::core::query::Query) uses this worklist as
+its structural fallback, and
+[`Query::lazy_dag_scheduler`](triblespace::core::query::Query::lazy_dag_scheduler)
+forces it for comparison. Demand-adaptive chunk width starts at one row and
+grows geometrically whenever the consumer asks the engine to resume. Before
+the width cap is reached, scheduling is strict deepest-first, preserving
 sequential-class first-result behavior; after saturation, the readiness gate
 turns on and the remaining computation enters the batch-harvesting regime. An
 `exists!` or `take(1)` consumer can therefore discard the worklist after the
@@ -217,17 +276,16 @@ grouping; agglomeration adds `O(R + V²)` scratch beyond it. It builds the
 row/group compatibility table once, then rescans the active directed edges for
 at most `V - 1` absorptions.
 
-Fully-bound rows remain in raw inline form until the consumer pulls them. The
-worklist never stores projected result values, so a query's `Send`/`Sync`
-properties do not depend on its output type and cloning a partially consumed
-query snapshots its exact remaining raw state without requiring the result type
-to implement `Clone`.
+Both block-native engines keep fully-bound rows in raw inline form until the
+consumer pulls them. Neither worklist stores projected result values, so a
+query's `Send`/`Sync` properties do not depend on its output type and cloning a
+partially consumed query snapshots its exact remaining raw state without
+requiring the result type to implement `Clone`.
 
 [`Query::solve_dag_lazy`](triblespace::core::query::Query::solve_dag_lazy)
 exposes the same scheduler as a configurable iterator with explicit starting
 width, growth, cap, and partition-policy controls. The eager/grouped probe
-solvers pin grouping explicitly so they remain stable controls for the
-agglomerative ordinary iterator.
+solvers pin grouping explicitly so they remain stable DAG controls.
 
 [`Query::solve_dag`](triblespace::core::query::Query::solve_dag) is the eager,
 saturated-width form. Fully drained schedulers produce the same result
@@ -238,7 +296,8 @@ saturated-width form. Fully drained schedulers produce the same result
 With the `parallel` feature, ordinary `IntoParallelIterator` consumption keeps
 the established scalar DFS proposal splitter. This remains the CPU-oriented
 default: inexpensive one-row probes can outperform the bookkeeping and wider
-batches of a DAG worklist.
+batches of either worklist. An unstarted ordinary query uses this scalar path
+even when its serial shape selector would choose residual states.
 
 [`Query::into_par_dag_iter`](triblespace::core::query::Query::into_par_dag_iter)
 is the explicit block-native alternative. It partitions a fresh query's affine
@@ -251,6 +310,17 @@ DAG starts at the configured row cap because full parallel enumeration is an
 explicit throughput request. This path preserves batches for block-oriented
 and accelerator-backed constraints even when scalar DFS is faster on CPU-only
 workloads.
+
+[`Query::into_par_residual_state_iter`](triblespace::core::query::Query::into_par_residual_state_iter)
+is the corresponding explicit residual path. It advances one exact state
+machine until an affine frontier can be divided and creates at most one shard
+per worker. Rows, complete candidate-parent groups, and candidates whose entire
+remaining confirmation suffix is page-local are valid shard atoms; a
+whole-group confirmer keeps each parent's ragged candidate sequence intact.
+Every shard retains canonical state merging locally. As with the DAG splitter,
+cross-shard reconvergence is traded for concurrency, state is moved rather
+than duplicated, and the constraint/postprocessor pair is cloned only when a
+real sibling shard is created.
 
 The optional `triblespace-gpu::WgpuSuccinctArchive` exercises that seam without
 putting a device dependency in core. It wraps the canonical archive, keeps its
@@ -271,13 +341,14 @@ Forcing all 425 non-empty rank batches emitted by the shards to WGPU instead
 took 775 ms, demonstrating that the admission boundary is part of the
 algorithm rather than a backend detail.
 
-A partially consumed ordinary DAG query converted through `into_par_iter()` is
-drained as one parallel leaf so its exact remaining state cannot be restarted.
-The explicit DAG entry point requires a fresh query. With one Rayon worker it
-has a zero split budget; with `N` workers it permits at most `N - 1` splits. In
-every case the result guarantee is multiset equality, not iteration order.
+A partially consumed ordinary residual or DAG query converted through
+`into_par_iter()` is drained as one parallel leaf so its exact remaining state
+cannot be restarted. Both explicit block-native entry points require a fresh
+query. With one Rayon worker each has a zero split budget; with `N` workers each
+permits at most `N - 1` splits. In every case the result guarantee is multiset
+equality, not iteration order.
 
-Both parallel paths clone the constraint tree and result postprocessor per
+The parallel paths clone the constraint tree and result postprocessor per
 shard. Code that needs aggregate observations across clones should use shared
 synchronization such as `Arc<AtomicU64>`; clone-local interior state is not a
 global invocation counter. The row-homomorphism law above is what permits the
@@ -309,11 +380,13 @@ The query engine uses the Atreides family of worst-case optimal join
 algorithms. These algorithms leverage the same cardinality estimates surfaced
 through `Constraint::estimate` to guide variable choice over partial bindings,
 providing skew-resistant and predictable performance. The sequential scheduler
-explores those choices depth-first; the DAG scheduler begins from the same
-per-row choices, may softly coalesce compatible complete preference groups, and
-files the results through its worklist. Because both refresh estimates during
-evaluation, binding order adapts whenever a constraint updates its influence
-set—there is no separate planning artifact to maintain.
+explores those choices depth-first; the DAG begins from the same per-row
+choices, may softly coalesce compatible complete preference groups, and files
+the results by bound-variable set. The residual engine also chooses the exact
+proposer occurrence and represents the remaining confirmer set in its
+canonical state. Because every path refreshes estimates during evaluation,
+binding order adapts whenever a constraint updates its influence set—there is
+no separate planning artifact to maintain.
 For a detailed discussion, see the [Atreides Join](atreides-join.md) chapter.
 
 ## Query Languages

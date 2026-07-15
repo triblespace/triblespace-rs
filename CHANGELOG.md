@@ -9,12 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Ordinary `Query` can explicitly own a residual-state cursor.** The
-  temporary `residual_state_scheduler` selector keeps the default lazy-DAG and
-  scalar controls unchanged while placing a borrow-free plan-and-machine box
-  behind `Query::next`. Mid-iteration clones snapshot candidate remainders and
-  staged raw rows without requiring `R: Clone`; a partially consumed residual
-  query converts to Rayon as one exact unsplittable remainder leaf.
+- **Ordinary `Query` owns selectable residual-state and lazy-DAG cursors.**
+  `residual_state_scheduler` forces the arbitrary-root residual machine, while
+  `lazy_dag_scheduler` forces the bound-set DAG for behavioral and performance
+  comparisons. Both keep borrow-free raw state behind `Query::next`.
+  Mid-iteration clones snapshot candidate remainders and staged raw rows
+  without requiring `R: Clone`; a partially consumed residual or DAG query
+  converts to Rayon as one exact unsplittable remainder leaf. Fresh ordinary
+  Rayon conversion remains the scalar DFS splitter. The explicit
+  `into_par_residual_state_iter` path instead divides one affine residual
+  frontier into at most one shard per worker, keeping candidate groups
+  parent-atomic until every remaining confirmer is page-local.
 - **Constraints gain an opt-in canonical residual-state solver.** Any root
   `Constraint` can use the residual APIs: roots that expose associative AND
   structure are recursively flattened, while an opaque root is represented by
@@ -219,15 +224,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `satisfied` is exact whenever all relevant variables are bound. The latter
   includes constant, zero-variable constraints and lets unions reject dead arms
   while negotiating variables owned by another arm.
-- **The ordinary `Query` iterator now uses the lazy DAG scheduler.** It
-  evaluates a worklist of row buckets keyed by bound-variable set, partitions
-  each block by its per-row preferred next variable, and merges routes that
-  reconverge on the same set. Demand-adaptive chunk width starts with
-  depth-first, first-result-oriented execution and grows into readiness-gated
-  batch harvesting. Whenever a block's exact per-row choices split, those
-  complete groups become the leaves of an agglomerative merge hierarchy. A
-  source group may move to active target `v` only when every row's binary
-  estimate-magnitude regret fits the bit length of
+- **The ordinary `Query` iterator now selects a block-native scheduler from
+  exposed query shape.** A live root-level associative AND uses canonical
+  residual states only when two flattened opaque leaf occurrences share at
+  least one variable. Nested ANDs flatten; zero-variable constants do not
+  count; and opaque roots, one-leaf conjunctions, disjoint conjunctions, and
+  queries rejected by exact seed settlement retain the lazy DAG. Union,
+  regular-path, ignore, and custom opaque wrappers remain single leaf
+  boundaries. This conservative selector avoids residual control-state cost
+  where there is no sibling proposer/confirm work to canonicalize, while
+  `residual_state_scheduler`, `lazy_dag_scheduler`, and `sequential` remain
+  explicit controls.
+  The DAG fallback evaluates row buckets keyed by bound-variable set,
+  partitions each block by its per-row preferred next variable, and merges
+  routes that reconverge on the same set. Demand-adaptive chunk width starts
+  with depth-first, first-result-oriented execution and grows into
+  readiness-gated batch harvesting. Whenever a block's exact per-row choices
+  split, those complete groups become the leaves of an agglomerative merge
+  hierarchy. A source group may move to active target `v` only when every
+  row's binary estimate-magnitude regret fits the bit length of
   `{v} ∪ (influence(v) ∩ unbound)`; zero-estimate rows require zero work. At
   each hierarchy level the compatible absorption with the least resulting
   candidate estimate wins. Merging continues to the coarsest admissible level,
@@ -245,8 +260,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead partitions the lazy DAG's affine row frontier into at most one
   saturated worklist shard per worker, retaining block-native probes, adaptive
   grouping, and local reconvergence for accelerator-oriented backends. A
-  partially consumed ordinary DAG query still drains its exact remainder as
-  one rayon leaf. The constraint protocol now states the required
+  partially consumed ordinary residual or DAG query still drains its exact
+  remainder as one rayon leaf. The constraint protocol now states the required
   row-homomorphism law that makes chunking and sharding semantics-neutral.
   Fully-bound rows stay raw until the consumer pulls them: the worklist never
   stores projected `R`s, preserving `Query` auto traits and allowing exact
