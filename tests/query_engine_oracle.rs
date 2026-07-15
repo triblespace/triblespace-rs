@@ -428,8 +428,8 @@ proptest! {
 proptest! {
     #![proptest_config(rpq_proptest_config())]
 
-    /// Generated RPQ oracle covering the opaque-root completeness path and
-    /// the shape-selected residual composition path.
+    /// Generated RPQ oracle covering both opaque-root and heterogeneous
+    /// residual composition paths under the full-switch default.
     ///
     /// The random part is a pair of labelled relations on four nodes. The
     /// expression closes the alternation `p | ^r`, so the independent oracle
@@ -542,7 +542,7 @@ proptest! {
         assert_rpq_engines(
             "opaque-rpq/tribleset",
             &expected,
-            "LazyDag",
+            "ResidualState",
             || {
                 find!(
                     (src: Inline<GenId>, dst: Inline<GenId>),
@@ -553,7 +553,7 @@ proptest! {
         assert_rpq_engines(
             "opaque-rpq/archive-roundtrip-graph",
             &expected,
-            "LazyDag",
+            "ResidualState",
             || {
                 find!(
                     (src: Inline<GenId>, dst: Inline<GenId>),
@@ -565,11 +565,11 @@ proptest! {
             },
         );
 
-        // Here the RPQ leaf and the native pattern leaf share `dst`, so the
-        // exposed AND must choose ResidualState by default. The archive case
-        // is the real heterogeneous composition gate: RPQ traversal uses the
-        // roundtripped TribleSet graph while its sibling's estimate/propose/
-        // confirm verbs run natively against SuccinctArchive.
+        // The full-switch default also routes the exposed RPQ/pattern AND
+        // through ResidualState. The archive case is the real heterogeneous
+        // composition gate: RPQ traversal uses the roundtripped TribleSet graph
+        // while its sibling's estimate/propose/confirm verbs run natively
+        // against SuccinctArchive.
         assert_rpq_engines(
             "rpq-and-pattern/tribleset",
             &expected_marked,

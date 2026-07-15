@@ -707,7 +707,7 @@ mod tests {
     }
 
     #[test]
-    fn ns_local_ids_bad_estimates_panics() {
+    fn ns_local_ids_bad_estimates_remain_complete() {
         let mut kb = TribleSet::new();
 
         {
@@ -744,7 +744,10 @@ mod tests {
         let q: Query<_, _, _> = Query::new(wrapper, |binding| {
             Some(name.extract(binding).try_from_inline::<String>().unwrap())
         });
-        let r: Vec<_> = q.collect();
+        // Query scheduling may change result order; this regression is about
+        // completeness under deliberately misleading estimates.
+        let mut r: Vec<_> = q.collect();
+        r.sort();
         assert_eq!(r, vec!["Isaac", "Jules"]);
     }
 }

@@ -1159,18 +1159,13 @@ impl ResidualPlan {
     }
 }
 
-/// Whether ordinary iteration should lower this root into canonical residual
-/// states by default.
+/// The conservative structural selector that preceded the full-switch probe.
 ///
-/// The first production selector is deliberately structural and conservative:
-/// an exposed associative conjunction must contain at least two flattened
-/// opaque leaf occurrences whose nonempty variable sets overlap. Fully bound
-/// constant leaves have no future protocol action, while disjoint leaves have
-/// no sibling proposer/confirm work for the residual state to canonicalize.
-/// Opaque roots and conjunctions without a shared variable retain the lazy DAG,
-/// because residual control-state overhead has no structural opportunity to
-/// pay back there and measured regressions are possible. Explicit residual
-/// entry points stay complete for every root.
+/// It remains test-only so coverage widened by the probe can be named exactly:
+/// the old policy admitted only exposed AND roots with two flattened,
+/// nonempty, overlapping leaf-variable sets. Production ordinary iteration no
+/// longer consults it on this branch.
+#[cfg(test)]
 pub(super) fn useful_default_shape<'a>(root: &dyn Constraint<'a>) -> bool {
     fn overlaps_seen_leaf<'a>(constraint: &dyn Constraint<'a>, seen: &mut VariableSet) -> bool {
         match constraint.residual_shape() {
@@ -1232,9 +1227,9 @@ impl ResidualCapabilities {
     /// Lowers the maximal exposed query root as one synthetic formula
     /// occurrence after variable selection. The outer Ready/commit protocol
     /// remains intact; AND/OR child progress becomes canonical formula state.
-    /// This capability does not affect scheduler selection. Ordinary queries
-    /// admitted by the independent structural selector enable it, while the
-    /// explicit residual controls retain `ResidualCapabilities::default()`.
+    /// This capability does not affect scheduler selection. Every live
+    /// ordinary query enables it on the full-switch probe, while the explicit
+    /// residual controls retain `ResidualCapabilities::default()`.
     pub fn root_formula(mut self) -> Self {
         self.root_formula = true;
         self
@@ -9040,7 +9035,7 @@ mod tests {
     }
 
     #[test]
-    fn default_selector_requires_overlapping_actionable_exposed_leaves() {
+    fn legacy_selector_requires_overlapping_actionable_exposed_leaves() {
         assert!(!useful_default_shape(&ShapeLeaf(0)));
         assert!(!useful_default_shape(&IntersectionConstraint::new(Vec::<
             ShapeConstraint,
@@ -9143,7 +9138,53 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_default_keeps_constant_edges_exact_on_lazy_dag() {
+    fn full_switch_routes_every_live_legacy_fallback_shape_to_residual() {
+        fn assert_residual<C>(root: C)
+        where
+            C: Constraint<'static> + 'static,
+        {
+            let mut query = Query::new(root, |_| Some(()));
+            assert_eq!(query.scheduler, QueryScheduler::ResidualState);
+            let _ = query.next();
+            assert!(query.residual.is_some());
+            assert!(query.dag.is_none());
+        }
+
+        assert_residual(ShapeLeaf(0));
+        assert_residual(IntersectionConstraint::new(vec![shape_leaf(0)]));
+        assert_residual(IntersectionConstraint::new(vec![
+            shape_leaf(0),
+            shape_leaf(1),
+        ]));
+        assert_residual(UnionConstraint::new(vec![ShapeLeaf(0), ShapeLeaf(0)]));
+
+        use crate::inline::encodings::genid::GenId;
+        use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
+        use crate::trible::TribleSet;
+        let mut context = VariableContext::new();
+        let start = context.next_variable::<GenId>();
+        let end = context.next_variable::<GenId>();
+        assert_residual(RegularPathConstraint::new(
+            TribleSet::new(),
+            start,
+            end,
+            &[PathOp::Attr(crate::id::rngid().raw()), PathOp::Plus],
+        ));
+
+        let mut true_constant = Query::new(ZeroVariableTruth(true), |_| Some(()));
+        assert_eq!(true_constant.scheduler, QueryScheduler::ResidualState);
+        assert_eq!(true_constant.next(), Some(()));
+        assert!(true_constant.residual.is_some());
+
+        let mut false_constant = Query::new(ZeroVariableTruth(false), |_| Some(()));
+        assert_eq!(false_constant.scheduler, QueryScheduler::LazyDag);
+        assert_eq!(false_constant.next(), None);
+        assert!(false_constant.residual.is_none());
+        assert!(false_constant.dag.is_none());
+    }
+
+    #[test]
+    fn full_switch_keeps_constant_edges_exact() {
         let false_root =
             IntersectionConstraint::new(
                 vec![Box::new(ZeroVariableTruth(false)) as ShapeConstraint],
@@ -9166,11 +9207,13 @@ mod tests {
         };
         let project = |binding: &Binding| binding.get(0).copied();
         let mut ordinary = Query::new(make_true_and_one_real(), project);
-        assert_eq!(ordinary.scheduler, QueryScheduler::LazyDag);
+        assert_eq!(ordinary.scheduler, QueryScheduler::ResidualState);
         let mut ordinary_bag: Vec<_> = ordinary.by_ref().collect();
-        let mut explicit_dag_bag: Vec<_> = Query::new(make_true_and_one_real(), project)
-            .lazy_dag_scheduler()
-            .collect();
+        assert!(ordinary.residual.is_some());
+        let mut explicit_dag = Query::new(make_true_and_one_real(), project).lazy_dag_scheduler();
+        assert_eq!(explicit_dag.scheduler, QueryScheduler::LazyDag);
+        let mut explicit_dag_bag: Vec<_> = explicit_dag.by_ref().collect();
+        assert!(explicit_dag.dag.is_some());
         let mut expected_bag = values.as_ref().clone();
         ordinary_bag.sort_unstable();
         explicit_dag_bag.sort_unstable();
