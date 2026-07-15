@@ -744,12 +744,19 @@ pub enum ConstraintShape<'s, 'a> {
 
 /// One engine-owned node in a cyclic residual fixpoint.
 ///
-/// `value` is the data-plane term and `continuation` is a constraint-defined
-/// canonical program point. Novelty is over the pair: the same term reached
-/// under different residual programs may have different future computation.
+/// `value` is the current data-plane term, `source` is an optional speculative
+/// root carried through the traversal, and `continuation` is a
+/// constraint-defined program point. Novelty is over the complete node: the
+/// same current term reached from different roots or under different residual
+/// programs may have different future computation.
+///
+/// None of these fields participates in the scheduler's canonical structural
+/// state identifier. Nodes are activation-private payload batched under the
+/// structural transition operator selected by that identifier.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ResidualDeltaNode {
+    pub source: Option<RawInline>,
     pub value: RawInline,
     pub continuation: u32,
 }
@@ -763,6 +770,19 @@ pub struct ResidualDeltaNode {
 pub struct ResidualDeltaOutput {
     pub node: ResidualDeltaNode,
     pub accepted: bool,
+}
+
+/// One affine producer root seeded from a parent row.
+///
+/// Several seeds may name the same parent. They become distinct affine root
+/// credits inside one parent-scoped activation, sharing that activation's
+/// novelty and reducer. `parent` selects the immutable outer row copied into
+/// the activation. Seeds must be grouped by ascending parent tag.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidualDeltaSeed {
+    pub parent: u32,
+    pub output: ResidualDeltaOutput,
 }
 
 /// Object-safe child access for a structural constraint shape.
@@ -1054,19 +1074,26 @@ pub trait Constraint<'a> {
         false
     }
 
-    /// Seeds one engine-owned cyclic fixpoint for each parent row.
+    /// Seeds zero or more engine-owned cyclic fixpoints for each parent row.
     ///
     /// Returning `true` opts this exact `(constraint, variable, bound schema)`
-    /// proposal or grouped-confirm action into residual delta execution and
-    /// must append exactly one output per input row. A nullable program may
-    /// mark its seed accepted without adding it to work novelty. The
-    /// conservative default retains the ordinary constraint protocol.
+    /// proposal or grouped-confirm action into residual delta execution. Every
+    /// appended seed carries an in-range parent-row tag and tags are grouped in
+    /// ascending order. Proposal actions may append zero or more seeds per
+    /// parent; repeated tags denote distinct affine producer roots inside one
+    /// parent activation. That activation streams proposal effects but does
+    /// not reduce a grouped confirmation until every root lineage quiesces, so
+    /// the one immutable candidate sequence supplies exact order and
+    /// multiplicity. A nullable program may mark its seed accepted without
+    /// adding it to work novelty. Returning `true` with no seeds for a parent
+    /// is an exact empty result for that parent. The conservative default
+    /// retains the ordinary constraint protocol.
     #[doc(hidden)]
     fn residual_delta_seeds(
         &self,
         _variable: VariableId,
         _view: &RowsView<'_>,
-        _seeds: &mut Vec<ResidualDeltaOutput>,
+        _seeds: &mut Vec<ResidualDeltaSeed>,
     ) -> bool {
         false
     }
@@ -1157,7 +1184,7 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         &self,
         variable: VariableId,
         view: &RowsView<'_>,
-        seeds: &mut Vec<ResidualDeltaOutput>,
+        seeds: &mut Vec<ResidualDeltaSeed>,
     ) -> bool {
         let inner: &T = self;
         inner.residual_delta_seeds(variable, view, seeds)
@@ -1244,7 +1271,7 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
         &self,
         variable: VariableId,
         view: &RowsView<'_>,
-        seeds: &mut Vec<ResidualDeltaOutput>,
+        seeds: &mut Vec<ResidualDeltaSeed>,
     ) -> bool {
         let inner: &T = self;
         inner.residual_delta_seeds(variable, view, seeds)

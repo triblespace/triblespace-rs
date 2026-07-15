@@ -3767,12 +3767,6 @@ impl ResidualStateMachine {
             );
             return Err(task);
         }
-        assert_eq!(
-            seeds.len(),
-            rows.row_count,
-            "supported delta seed hook must emit one node per parent"
-        );
-
         let SelectedResidualTask {
             state: _,
             desc,
@@ -3844,12 +3838,6 @@ impl ResidualStateMachine {
             );
             return Err(task);
         }
-        assert_eq!(
-            seeds.len(),
-            batch.parents.row_count,
-            "supported delta seed hook must emit one node per parent"
-        );
-
         let SelectedResidualTask {
             state: _,
             desc,

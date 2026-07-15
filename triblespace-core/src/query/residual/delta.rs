@@ -149,6 +149,9 @@ enum DeltaReducer {
     Confirm { original: Box<[RawInline]> },
 }
 
+/// One affine parent reducer scope. Several speculative source roots may own
+/// live credits inside it; they share novelty and Accepted, while source stays
+/// in each node so their product states cannot suppress one another.
 #[derive(Clone)]
 struct Activation {
     parent: Box<[RawInline]>,
@@ -204,28 +207,42 @@ impl ProducerRegistry {
         }
     }
 
-    fn start(
+    /// Starts one parent-scoped activation with one affine credit per root.
+    fn start_many(
         &mut self,
         parent: Box<[RawInline]>,
         reducer: DeltaReducer,
-        seed: ResidualDeltaOutput,
-    ) -> (ActivationId, ProducerCredit) {
+        seeds: impl IntoIterator<Item = ResidualDeltaOutput>,
+    ) -> Option<(ActivationId, Vec<(ResidualDeltaNode, ProducerCredit)>)> {
+        let mut seeds = seeds.into_iter().peekable();
+        if seeds.peek().is_none() {
+            return None;
+        }
         let activation = ActivationId(take_monotonic(
             &mut self.state.next_activation,
             "activation",
         ));
-        let nonce = CreditNonce(take_monotonic(&mut self.state.next_credit, "credit"));
-        assert!(
-            self.state.credit_owner.insert(nonce, activation).is_none(),
-            "delta credit nonce was reused"
-        );
         let mut live = BTreeSet::new();
-        assert!(live.insert(nonce));
         let mut accepted = HashSet::new();
         let mut pending_accepted = Vec::new();
-        if seed.accepted {
-            assert!(accepted.insert(seed.node.value));
-            pending_accepted.push(seed.node.value);
+        let mut roots = Vec::with_capacity(seeds.size_hint().0);
+        for seed in seeds {
+            let nonce = CreditNonce(take_monotonic(&mut self.state.next_credit, "credit"));
+            assert!(
+                self.state.credit_owner.insert(nonce, activation).is_none(),
+                "delta credit nonce was reused"
+            );
+            assert!(live.insert(nonce));
+            if seed.accepted && accepted.insert(seed.node.value) {
+                pending_accepted.push(seed.node.value);
+            }
+            roots.push((
+                seed.node,
+                ProducerCredit {
+                    brand: self.brand,
+                    key: CreditKey { activation, nonce },
+                },
+            ));
         }
         assert!(
             self.state
@@ -246,13 +263,7 @@ impl ProducerRegistry {
                 .is_none(),
             "delta activation identifier was reused"
         );
-        (
-            activation,
-            ProducerCredit {
-                brand: self.brand,
-                key: CreditKey { activation, nonce },
-            },
-        )
+        Some((activation, roots))
     }
 
     fn replace(
@@ -414,6 +425,40 @@ fn take_monotonic(counter: &mut u64, kind: &str) -> u64 {
     current
 }
 
+fn validate_seed_tags(seeds: &[ResidualDeltaSeed], parent_count: usize) {
+    let mut previous = 0u32;
+    for (index, seed) in seeds.iter().enumerate() {
+        assert!(
+            (seed.parent as usize) < parent_count,
+            "delta seed parent tag out of range"
+        );
+        assert!(
+            index == 0 || seed.parent >= previous,
+            "delta seed parent tags are not grouped in ascending order"
+        );
+        previous = seed.parent;
+    }
+}
+
+fn seed_ranges(seeds: &[ResidualDeltaSeed], parent_count: usize) -> Vec<std::ops::Range<usize>> {
+    validate_seed_tags(seeds, parent_count);
+    let mut ranges = Vec::with_capacity(parent_count);
+    let mut cursor = 0usize;
+    for parent in 0..parent_count {
+        let begin = cursor;
+        while cursor < seeds.len() && seeds[cursor].parent as usize == parent {
+            cursor += 1;
+        }
+        ranges.push(begin..cursor);
+    }
+    assert_eq!(
+        cursor,
+        seeds.len(),
+        "delta seed parent tags skipped a range"
+    );
+    ranges
+}
+
 #[derive(Debug)]
 struct DeltaTask {
     activation: ActivationId,
@@ -457,27 +502,29 @@ impl DeltaScheduler {
         &mut self,
         desc: DeltaDesc,
         parents: RowBatch,
-        seeds: Vec<ResidualDeltaOutput>,
+        seeds: Vec<ResidualDeltaSeed>,
     ) {
         assert_eq!(desc.verb, DeltaVerb::Propose);
-        assert_eq!(
-            seeds.len(),
-            parents.row_count,
-            "delta seed hook must emit one node per parent"
-        );
+        let ranges = seed_ranges(&seeds, parents.row_count);
         let stride = desc.bound.count();
-        let mut tasks = Vec::with_capacity(parents.row_count);
-        for (row, seed) in seeds.into_iter().enumerate() {
+        let mut tasks = Vec::with_capacity(seeds.len());
+        for (row, range) in ranges.into_iter().enumerate() {
             let start = row * stride;
             let parent = parents.rows[start..start + stride]
                 .to_vec()
                 .into_boxed_slice();
-            let (activation, credit) = self.registry.start(parent, DeltaReducer::Propose, seed);
-            tasks.push(DeltaTask {
+            let Some((activation, roots)) = self.registry.start_many(
+                parent,
+                DeltaReducer::Propose,
+                seeds[range].iter().map(|seed| seed.output),
+            ) else {
+                continue;
+            };
+            tasks.extend(roots.into_iter().map(|(node, credit)| DeltaTask {
                 activation,
                 credit,
-                node: seed.node,
-            });
+                node,
+            }));
         }
         self.file(desc, tasks);
     }
@@ -486,22 +533,14 @@ impl DeltaScheduler {
         &mut self,
         desc: DeltaDesc,
         batch: CandidateBatch,
-        seeds: Vec<ResidualDeltaOutput>,
+        seeds: Vec<ResidualDeltaSeed>,
     ) {
         assert_eq!(desc.verb, DeltaVerb::Confirm);
-        assert_eq!(
-            seeds.len(),
-            batch.parents.row_count,
-            "delta seed hook must emit one node per parent"
-        );
+        let seed_ranges = seed_ranges(&seeds, batch.parents.row_count);
         let stride = desc.bound.count();
-        let mut tasks = Vec::with_capacity(batch.parents.row_count);
+        let mut candidate_ranges = Vec::with_capacity(batch.parents.row_count);
         let mut cursor = 0usize;
-        for (row, seed) in seeds.into_iter().enumerate() {
-            let start = row * stride;
-            let parent = batch.parents.rows[start..start + stride]
-                .to_vec()
-                .into_boxed_slice();
+        for row in 0..batch.parents.row_count {
             let begin = cursor;
             while cursor < batch.candidates.len() && batch.candidates[cursor].0 as usize == row {
                 cursor += 1;
@@ -510,25 +549,38 @@ impl DeltaScheduler {
                 begin < cursor,
                 "compacted delta confirmation parent has no candidates"
             );
-            let original = batch.candidates[begin..cursor]
-                .iter()
-                .map(|(_, value)| *value)
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
-            let (activation, credit) =
-                self.registry
-                    .start(parent, DeltaReducer::Confirm { original }, seed);
-            tasks.push(DeltaTask {
-                activation,
-                credit,
-                node: seed.node,
-            });
+            candidate_ranges.push(begin..cursor);
         }
         assert_eq!(
             cursor,
             batch.candidates.len(),
             "delta confirmation candidate tags are invalid or ungrouped"
         );
+
+        let mut tasks = Vec::with_capacity(seeds.len());
+        for (row, seed_range) in seed_ranges.into_iter().enumerate() {
+            let start = row * stride;
+            let parent = batch.parents.rows[start..start + stride]
+                .to_vec()
+                .into_boxed_slice();
+            let original = batch.candidates[candidate_ranges[row].clone()]
+                .iter()
+                .map(|(_, value)| *value)
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            let Some((activation, roots)) = self.registry.start_many(
+                parent,
+                DeltaReducer::Confirm { original },
+                seeds[seed_range].iter().map(|seed| seed.output),
+            ) else {
+                continue;
+            };
+            tasks.extend(roots.into_iter().map(|(node, credit)| DeltaTask {
+                activation,
+                credit,
+                node,
+            }));
+        }
         self.file(desc, tasks);
     }
 
@@ -749,6 +801,7 @@ mod tests {
     fn output(byte: u8, continuation: u32, accepted: bool) -> ResidualDeltaOutput {
         ResidualDeltaOutput {
             node: ResidualDeltaNode {
+                source: None,
                 value: value(byte),
                 continuation,
             },
@@ -756,26 +809,119 @@ mod tests {
         }
     }
 
+    fn sourced_output(
+        source: u8,
+        current: u8,
+        continuation: u32,
+        accepted: bool,
+    ) -> ResidualDeltaOutput {
+        ResidualDeltaOutput {
+            node: ResidualDeltaNode {
+                source: Some(value(source)),
+                value: value(current),
+                continuation,
+            },
+            accepted,
+        }
+    }
+
     #[test]
-    fn confirm_reducer_filters_the_immutable_sequence_after_quiescence() {
+    fn source_is_part_of_activation_local_novelty() {
+        let mut registry = ProducerRegistry::new();
+        let (activation, roots) = registry
+            .start_many(
+                Vec::new().into_boxed_slice(),
+                DeltaReducer::Propose,
+                [
+                    sourced_output(1, 1, 0, false),
+                    sourced_output(2, 2, 0, false),
+                ],
+            )
+            .expect("two sources create one parent activation");
+
+        let mut children = Vec::new();
+        for ((_, root), successor) in roots.into_iter().zip([
+            sourced_output(1, 3, 1, false),
+            sourced_output(2, 3, 1, false),
+        ]) {
+            children.extend(registry.replace(root, [successor]).children);
+        }
+        assert_eq!(
+            children.len(),
+            2,
+            "one source suppressed the other's C state"
+        );
+        assert_eq!(
+            registry
+                .state
+                .activations
+                .get(&activation)
+                .expect("live activation")
+                .seen
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn duplicate_accepted_roots_filter_one_original_confirm_sequence() {
+        let candidate = value(7);
+        let mut registry = ProducerRegistry::new();
+        let (activation, roots) = registry
+            .start_many(
+                Vec::new().into_boxed_slice(),
+                DeltaReducer::Confirm {
+                    original: vec![candidate, candidate].into_boxed_slice(),
+                },
+                [output(7, 0, true), output(7, 0, true)],
+            )
+            .expect("duplicate roots still share one reducer activation");
+        let mut proof = None;
+        for (_, root) in roots {
+            let outcome = registry.replace(root, []);
+            if outcome.quiescence.is_some() {
+                assert!(proof.replace(outcome.quiescence.unwrap()).is_none());
+            }
+        }
+
+        let proof = proof.expect("all root credits quiesced");
+        assert_eq!(proof.activation, activation);
+        assert_eq!(
+            registry.reduce_confirm(proof).candidates,
+            vec![(0, candidate), (0, candidate)]
+        );
+    }
+
+    #[test]
+    fn confirm_reducer_joins_multiple_roots_before_filtering_the_sequence() {
         let seed = value(1);
         let first = value(2);
         let second = value(3);
         let rejected = value(4);
         let mut registry = ProducerRegistry::new();
-        let (activation, root) = registry.start(
-            vec![value(9)].into_boxed_slice(),
-            DeltaReducer::Confirm {
-                original: vec![second, seed, first, rejected, second].into_boxed_slice(),
-            },
-            output(1, 0, false),
-        );
+        let (activation, roots) = registry
+            .start_many(
+                vec![value(9)].into_boxed_slice(),
+                DeltaReducer::Confirm {
+                    original: vec![second, seed, first, rejected, second].into_boxed_slice(),
+                },
+                [output(1, 0, false), output(5, 0, false)],
+            )
+            .expect("two roots create one activation");
+        assert_eq!(roots.len(), 2);
 
-        let root_outcome = registry.replace(root, [output(2, 1, true), output(3, 1, true)]);
-        assert_eq!(root_outcome.accepted, vec![first, second]);
-        assert!(root_outcome.quiescence.is_none());
+        let mut children = Vec::new();
+        for ((_, root), successor) in roots
+            .into_iter()
+            .zip([output(2, 1, true), output(3, 1, true)])
+        {
+            assert_eq!(root.key.activation, activation);
+            let outcome = registry.replace(root, [successor]);
+            assert!(outcome.quiescence.is_none());
+            children.extend(outcome.children);
+        }
         let mut proof = None;
-        for (_, child) in root_outcome.children {
+        for (_, child) in children {
             let outcome = registry.replace(child, []);
             assert!(outcome.accepted.is_empty());
             if outcome.quiescence.is_some() {
