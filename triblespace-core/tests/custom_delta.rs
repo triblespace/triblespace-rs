@@ -337,8 +337,13 @@ fn custom_cyclic_delta_composes_with_recursive_root_formula() {
     let ordinary_evidence = Arc::new(DeltaEvidence::default());
     let ordinary =
         sorted(Query::new(fixture(Arc::clone(&ordinary_evidence)), project_end).collect());
-    assert_eq!(ordinary_evidence.seeded_roots.load(Ordering::Relaxed), 0);
-    assert_eq!(ordinary_evidence.expanded_nodes.load(Ordering::Relaxed), 0);
+    assert!(ordinary_evidence.seeded_roots.load(Ordering::Relaxed) > 0);
+    assert!(ordinary_evidence.expanded_nodes.load(Ordering::Relaxed) > 0);
+    assert_eq!(
+        ordinary_evidence.continuation_mask.load(Ordering::Relaxed) & 0b11,
+        0b11,
+        "the full-switch ordinary path must run both custom continuation states"
+    );
 
     let residual_evidence = Arc::new(DeltaEvidence::default());
     let residual = Query::new(fixture(Arc::clone(&residual_evidence)), project_end)
