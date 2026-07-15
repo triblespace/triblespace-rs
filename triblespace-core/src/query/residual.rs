@@ -88,6 +88,29 @@ struct FormulaNodeCapabilities {
     grouped_delta_confirm: bool,
 }
 
+/// Conservative proof result for publishing cyclic proposal endpoints before
+/// their producer activation reaches fixpoint quiescence.
+///
+/// This is intentionally narrower than the set of formula contexts that might
+/// admit a specialized online reducer. The probe accepts only continuations
+/// whose remaining work is an empty-preserving composition of page-local AND
+/// confirmations followed by the ordinary outer commit path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FormulaProposalStreamability {
+    Linear,
+    Barrier(FormulaProposalStreamBarrier),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FormulaProposalStreamBarrier {
+    NotSyntheticRoot,
+    NotProposalAction,
+    OrFrame,
+    NonPageLocalConfirm,
+    GroupedConfirm,
+    OuterContinuation,
+}
+
 /// Plan-local identity of one formula-tree occurrence. Compilation allocates a
 /// fresh ID for every visit, so repeated references to one `Arc` remain
 /// distinct occurrences without relying on object addresses.
@@ -692,6 +715,97 @@ impl FiniteFormulaProgram {
                     && !node.capabilities.grouped_delta_confirm
             })
     }
+
+    /// Proves that one focused proposal can be distributed over accepted
+    /// endpoint chunks without changing the formula continuation's bag
+    /// semantics. Every ancestor must be AND, and every sibling that remains
+    /// after the focused child must itself be an AND-only tree of page-local,
+    /// non-grouped confirmers.
+    fn proposal_streamability(
+        &self,
+        counter: &FormulaProgramCounter,
+    ) -> FormulaProposalStreamability {
+        fn confirm_subtree(
+            program: &FiniteFormulaProgram,
+            node: FormulaNodeId,
+        ) -> FormulaProposalStreamability {
+            let node = program.node(node);
+            match &node.kind {
+                FiniteFormulaNodeKind::Atom => {
+                    if node.capabilities.grouped_delta_confirm {
+                        FormulaProposalStreamability::Barrier(
+                            FormulaProposalStreamBarrier::GroupedConfirm,
+                        )
+                    } else if !node.capabilities.confirm_page_local {
+                        FormulaProposalStreamability::Barrier(
+                            FormulaProposalStreamBarrier::NonPageLocalConfirm,
+                        )
+                    } else {
+                        FormulaProposalStreamability::Linear
+                    }
+                }
+                FiniteFormulaNodeKind::And { children } => children
+                    .iter()
+                    .find_map(|&child| match confirm_subtree(program, child) {
+                        FormulaProposalStreamability::Linear => None,
+                        barrier => Some(barrier),
+                    })
+                    .unwrap_or(FormulaProposalStreamability::Linear),
+                FiniteFormulaNodeKind::Or { .. } => {
+                    FormulaProposalStreamability::Barrier(FormulaProposalStreamBarrier::OrFrame)
+                }
+            }
+        }
+
+        let focused = match counter.focus {
+            FormulaFocus::Action {
+                node,
+                stage: FormulaStage::Propose,
+            } => node,
+            _ => {
+                return FormulaProposalStreamability::Barrier(
+                    FormulaProposalStreamBarrier::NotProposalAction,
+                )
+            }
+        };
+        if !matches!(self.node(focused).kind, FiniteFormulaNodeKind::Atom) {
+            return FormulaProposalStreamability::Barrier(
+                FormulaProposalStreamBarrier::NotProposalAction,
+            );
+        }
+
+        let mut completed = focused;
+        for site in counter.returns.iter().rev() {
+            if site.parent_stage != FormulaStage::Propose {
+                return FormulaProposalStreamability::Barrier(
+                    FormulaProposalStreamBarrier::NotProposalAction,
+                );
+            }
+            let parent = self.node(site.parent);
+            let FiniteFormulaNodeKind::And { children } = &parent.kind else {
+                return FormulaProposalStreamability::Barrier(
+                    FormulaProposalStreamBarrier::OrFrame,
+                );
+            };
+            assert_eq!(children[site.child], completed);
+            for (child, &node) in children.iter().enumerate() {
+                if child == site.child || site.done.contains(child) {
+                    continue;
+                }
+                let streamability = confirm_subtree(self, node);
+                if streamability != FormulaProposalStreamability::Linear {
+                    return streamability;
+                }
+            }
+            completed = site.parent;
+        }
+        assert_eq!(
+            self.root(counter.resume.occurrence),
+            Some(completed),
+            "formula proposal return stack did not reach its root"
+        );
+        FormulaProposalStreamability::Linear
+    }
 }
 
 /// Exact structural return address for one running formula child.
@@ -954,6 +1068,34 @@ impl ResidualPlan {
                 .root_confirm_suffix_accepts_pages(counter)
     }
 
+    fn formula_proposal_streamability(
+        &self,
+        counter: &FormulaProgramCounter,
+    ) -> FormulaProposalStreamability {
+        if !self.synthetic_root_formula {
+            return FormulaProposalStreamability::Barrier(
+                FormulaProposalStreamBarrier::NotSyntheticRoot,
+            );
+        }
+        let streamability = self.finite_formula.proposal_streamability(counter);
+        if streamability != FormulaProposalStreamability::Linear {
+            return streamability;
+        }
+
+        let UnionVerb::Propose { relevant } = &counter.resume.verb else {
+            return FormulaProposalStreamability::Barrier(
+                FormulaProposalStreamBarrier::NotProposalAction,
+            );
+        };
+        let checked = ChildSet::empty(self.len()).with_inserted(counter.resume.occurrence);
+        if !self.remaining_confirms_accept_pages(relevant, &checked) {
+            return FormulaProposalStreamability::Barrier(
+                FormulaProposalStreamBarrier::OuterContinuation,
+            );
+        }
+        FormulaProposalStreamability::Linear
+    }
+
     fn resolve<'r, 'a>(
         &self,
         root: &'r dyn Constraint<'a>,
@@ -1099,7 +1241,11 @@ impl ResidualCapabilities {
 
     /// Executes eligible proposer-side and grouped confirmer-side `+` regular
     /// paths through the cyclic delta submachine. Unsupported RPQ shapes stay
-    /// on the ordinary opaque constraint protocol.
+    /// on the ordinary opaque constraint protocol. A certified synthetic-root
+    /// Atom/AND proposal may publish accepted endpoints in delta discovery
+    /// order, matching ordinary outer cyclic proposals; it does not reproduce
+    /// the sorted order of a quiescent formula batch. Residual iteration
+    /// therefore preserves the result bag, not a particular result order.
     pub fn cyclic_rpq(mut self) -> Self {
         self.cyclic_rpq = true;
         self
@@ -5225,6 +5371,18 @@ impl ResidualStateMachine {
         {
             return Err(task);
         }
+        let stream_proposal = stage == FormulaStage::Propose
+            && plan.formula_proposal_streamability(&counter)
+                == FormulaProposalStreamability::Linear;
+        if stream_proposal {
+            assert!(
+                batch
+                    .frames
+                    .iter()
+                    .all(|frame| matches!(frame, FormulaPayloadFrame::And { .. })),
+                "a certified linear formula proposal carried a non-AND payload frame"
+            );
+        }
 
         let variable = counter.resume.variable;
         let occurrence = counter.resume.occurrence;
@@ -5278,6 +5436,7 @@ impl ResidualStateMachine {
                 desc.bound,
                 counter,
                 batch,
+                stream_proposal,
             );
             return Ok(None);
         }
@@ -5287,6 +5446,7 @@ impl ResidualStateMachine {
             counter,
             batch,
             seeds,
+            stream_proposal,
             plan,
             &mut self.worklist,
             &mut self.interner,
@@ -6837,6 +6997,50 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct GroupedCapabilityLeaf(CapabilityLeaf);
+
+    impl Constraint<'static> for GroupedCapabilityLeaf {
+        fn variables(&self) -> VariableSet {
+            self.0.variables()
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            self.0.estimate(variable, view, out)
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            self.0.propose(variable, view, candidates);
+        }
+
+        fn confirm(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            self.0.confirm(variable, view, candidates);
+        }
+
+        fn residual_confirm_is_page_local(&self) -> bool {
+            self.0.page_local
+        }
+
+        fn residual_delta_confirm_is_grouped(&self) -> bool {
+            true
+        }
+    }
+
     #[derive(Clone)]
     struct FanoutLeaf {
         variable: VariableId,
@@ -8094,6 +8298,137 @@ mod tests {
         assert_ne!(
             program.node(children[0]).path,
             program.node(children[1]).path
+        );
+    }
+
+    #[test]
+    fn formula_proposal_streamability_accepts_only_linear_synthetic_roots() {
+        fn start(plan: &ResidualPlan) -> FormulaProgramCounter {
+            plan.finite_formula.start(
+                0,
+                0,
+                UnionVerb::Propose {
+                    relevant: ChildSet::empty(plan.len()).with_inserted(0),
+                },
+            )
+        }
+
+        let capabilities = ResidualCapabilities::default().root_formula().cyclic_rpq();
+
+        let atom = CapabilityLeaf {
+            variable: 0,
+            page_local: false,
+        };
+        let atom_plan = ResidualPlan::compile_capabilities(&atom, capabilities);
+        assert_eq!(
+            atom_plan.formula_proposal_streamability(&start(&atom_plan)),
+            FormulaProposalStreamability::Linear,
+            "the focused proposer itself need not be a page-local confirmer"
+        );
+
+        let linear_root = IntersectionConstraint::new(vec![
+            Box::new(CapabilityLeaf {
+                variable: 0,
+                page_local: false,
+            }) as ShapeConstraint,
+            shape_and(vec![
+                Box::new(CapabilityLeaf {
+                    variable: 0,
+                    page_local: true,
+                }),
+                Box::new(CapabilityLeaf {
+                    variable: 0,
+                    page_local: true,
+                }),
+            ]),
+        ]);
+        let linear_plan = ResidualPlan::compile_capabilities(&linear_root, capabilities);
+        let linear_start = start(&linear_plan);
+        let FiniteFormulaNodeKind::And { children } = &linear_plan
+            .finite_formula
+            .node(linear_plan.finite_formula.root(0).unwrap())
+            .kind
+        else {
+            panic!("synthetic conjunction did not compile as AND")
+        };
+        assert_eq!(children.len(), 3, "nested root AND should be flattened");
+        let linear_action = linear_plan
+            .finite_formula
+            .select_child_as_action(&linear_start, 0);
+        assert_eq!(
+            linear_plan.formula_proposal_streamability(&linear_action),
+            FormulaProposalStreamability::Linear
+        );
+
+        let non_local_root = IntersectionConstraint::new(vec![
+            Box::new(CapabilityLeaf {
+                variable: 0,
+                page_local: false,
+            }) as ShapeConstraint,
+            Box::new(CapabilityLeaf {
+                variable: 0,
+                page_local: false,
+            }),
+        ]);
+        let non_local_plan = ResidualPlan::compile_capabilities(&non_local_root, capabilities);
+        let non_local_action = non_local_plan
+            .finite_formula
+            .select_child_as_action(&start(&non_local_plan), 0);
+        assert_eq!(
+            non_local_plan.formula_proposal_streamability(&non_local_action),
+            FormulaProposalStreamability::Barrier(
+                FormulaProposalStreamBarrier::NonPageLocalConfirm
+            )
+        );
+
+        let grouped_root = IntersectionConstraint::new(vec![
+            Box::new(CapabilityLeaf {
+                variable: 0,
+                page_local: false,
+            }) as ShapeConstraint,
+            Box::new(GroupedCapabilityLeaf(CapabilityLeaf {
+                variable: 0,
+                page_local: true,
+            })),
+        ]);
+        let grouped_plan = ResidualPlan::compile_capabilities(&grouped_root, capabilities);
+        let grouped_action = grouped_plan
+            .finite_formula
+            .select_child_as_action(&start(&grouped_plan), 0);
+        assert_eq!(
+            grouped_plan.formula_proposal_streamability(&grouped_action),
+            FormulaProposalStreamability::Barrier(FormulaProposalStreamBarrier::GroupedConfirm)
+        );
+
+        let union = UnionConstraint::new(vec![
+            Box::new(CapabilityLeaf {
+                variable: 0,
+                page_local: true,
+            }) as ShapeConstraint,
+            Box::new(CapabilityLeaf {
+                variable: 0,
+                page_local: true,
+            }),
+        ]);
+        let union_plan = ResidualPlan::compile_capabilities(&union, capabilities);
+        let union_action = union_plan
+            .finite_formula
+            .select_child_as_action(&start(&union_plan), 0);
+        assert_eq!(
+            union_plan.formula_proposal_streamability(&union_action),
+            FormulaProposalStreamability::Barrier(FormulaProposalStreamBarrier::OrFrame)
+        );
+
+        let old_formula_plan = ResidualPlan::compile_capabilities(
+            &union,
+            ResidualCapabilities::default().finite_unions().cyclic_rpq(),
+        );
+        let old_formula_action = old_formula_plan
+            .finite_formula
+            .select_child_as_action(&start(&old_formula_plan), 0);
+        assert_eq!(
+            old_formula_plan.formula_proposal_streamability(&old_formula_action),
+            FormulaProposalStreamability::Barrier(FormulaProposalStreamBarrier::NotSyntheticRoot)
         );
     }
 
