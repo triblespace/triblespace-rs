@@ -6,6 +6,10 @@
 //! opaque root is one leaf at the empty path. Union, ignore, and regular-path
 //! constraints therefore remain ordinary indivisible leaves, as do custom
 //! constraints unless they explicitly expose an associative AND shape.
+//! When finite-formula lowering is enabled, a residual Union executes its
+//! direct AND arms through the same canonical formula PC and an affine payload
+//! frame stack. AND children remain opaque actions in this slice; deeper
+//! connectives therefore retain their existing constraint semantics.
 //!
 //! Ready and Candidate descriptors are pure planning states: they estimate,
 //! partition rows by a uniform semantic action, and file explicit Propose or
@@ -363,7 +367,6 @@ impl FiniteFormulaProgram {
         }
     }
 
-    #[cfg(test)]
     fn select_child(&self, counter: &FormulaProgramCounter, child: usize) -> FormulaProgramCounter {
         self.select_child_with(counter, child, |program, node, stage| {
             program.entry_focus(node, stage)
@@ -371,9 +374,9 @@ impl FiniteFormulaProgram {
     }
 
     /// Selects a child as one opaque protocol action even when its compiled
-    /// kind is composite. This is the first execution capability: root OR is
-    /// lowered, while an AND arm remains behind its ordinary constraint
-    /// boundary until the mixed-connective executor is enabled.
+    /// kind is composite. The mixed executor uses this for every direct child
+    /// of an active AND frame; deeper connectives keep their ordinary
+    /// constraint behavior until that structural boundary is enabled too.
     fn select_child_as_action(
         &self,
         counter: &FormulaProgramCounter,
@@ -2231,15 +2234,55 @@ impl CandidateBatch {
 struct ActivationId(u64);
 
 #[derive(Clone, Debug)]
+enum FormulaPayloadFrame {
+    /// Every OR child reads the same immutable source and appends its result
+    /// to one activation-private union accumulator.
+    Or {
+        source: Candidates,
+        output: Candidates,
+    },
+    /// AND threads one private candidate stream through its selected proposer
+    /// and remaining confirmers. Empty current streams annihilate this branch
+    /// without erasing the enclosing OR activation.
+    And { current: Candidates },
+}
+
+impl FormulaPayloadFrame {
+    fn empty_like(&self) -> Self {
+        match self {
+            Self::Or { .. } => Self::Or {
+                source: Vec::new(),
+                output: Vec::new(),
+            },
+            Self::And { .. } => Self::And {
+                current: Vec::new(),
+            },
+        }
+    }
+
+    fn result(self) -> Candidates {
+        match self {
+            Self::Or { mut output, .. } => {
+                // OR is a set-valued reducer. Normalize at this frame's own
+                // completion boundary so an enclosing AND never observes
+                // duplicate candidates produced by sibling histories.
+                output.sort_unstable();
+                output.dedup();
+                output
+            }
+            Self::And { current } => current,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 struct FormulaBatch {
     activations: Vec<ActivationId>,
     parents: RowBatch,
-    /// Immutable, sorted candidate groups fanned out independently to every
-    /// confirm action. Empty for a proposal activation.
-    original: Candidates,
-    /// OR outputs accumulated by parent. It is normalized only when every
-    /// child is done, keeping intermediate values out of canonical state.
-    accumulated: Candidates,
+    /// One activation-private reducer frame per live composite on the formula
+    /// path. Frame shape follows the structural PC and therefore remains
+    /// payload rather than canonical state identity.
+    frames: Vec<FormulaPayloadFrame>,
 }
 
 impl FormulaBatch {
@@ -2248,8 +2291,10 @@ impl FormulaBatch {
         Self {
             activations,
             parents,
-            original: Vec::new(),
-            accumulated: Vec::new(),
+            frames: vec![FormulaPayloadFrame::Or {
+                source: Vec::new(),
+                output: Vec::new(),
+            }],
         }
     }
 
@@ -2259,29 +2304,124 @@ impl FormulaBatch {
         Self {
             activations,
             parents: batch.parents,
-            original: batch.candidates,
-            accumulated: Vec::new(),
+            frames: vec![FormulaPayloadFrame::Or {
+                source: batch.candidates,
+                output: Vec::new(),
+            }],
         }
+    }
+
+    fn input(&self) -> &Candidates {
+        match self
+            .frames
+            .last()
+            .expect("formula payload has no root frame")
+        {
+            FormulaPayloadFrame::Or { source, .. } => source,
+            FormulaPayloadFrame::And { current } => current,
+        }
+    }
+
+    fn action_candidate_count(&self, stage: FormulaStage) -> usize {
+        match stage {
+            FormulaStage::Propose => 0,
+            FormulaStage::Confirm => self.input().len(),
+        }
+    }
+
+    fn enter(&mut self, kind: &FiniteFormulaNodeKind, stage: FormulaStage) {
+        let input = match stage {
+            FormulaStage::Propose => Vec::new(),
+            FormulaStage::Confirm => self.input().clone(),
+        };
+        self.frames.push(match kind {
+            FiniteFormulaNodeKind::And { .. } => FormulaPayloadFrame::And { current: input },
+            FiniteFormulaNodeKind::Or { .. } => FormulaPayloadFrame::Or {
+                source: input,
+                output: Vec::new(),
+            },
+            FiniteFormulaNodeKind::Atom => panic!("an Atom cannot own a formula payload frame"),
+        });
+    }
+
+    fn return_frame(&mut self) {
+        assert!(
+            self.frames.len() >= 2,
+            "the root formula frame cannot return"
+        );
+        let result = self
+            .frames
+            .pop()
+            .expect("a returning formula node has a payload frame")
+            .result();
+        match self
+            .frames
+            .last_mut()
+            .expect("a returning formula node has a parent frame")
+        {
+            FormulaPayloadFrame::Or { output, .. } => {
+                output.extend(result);
+                output.sort_unstable();
+            }
+            FormulaPayloadFrame::And { current } => *current = result,
+        }
+    }
+
+    fn current_is_live(&self) -> Vec<bool> {
+        let FormulaPayloadFrame::And { current } = self
+            .frames
+            .last()
+            .expect("formula payload has no current frame")
+        else {
+            panic!("only an AND frame has annihilating current streams")
+        };
+        let mut live = vec![false; self.parents.row_count];
+        for &(parent, _) in current {
+            live[parent as usize] = true;
+        }
+        live
     }
 
     fn append(&mut self, mut other: Self) {
         let offset = u32::try_from(self.parents.row_count).expect("too many formula parents");
         self.parents.append(other.parents);
         self.activations.append(&mut other.activations);
-        self.original
-            .extend(other.original.drain(..).map(|(parent, value)| {
+        assert_eq!(self.frames.len(), other.frames.len());
+
+        fn append_values(left: &mut Candidates, right: Candidates, offset: u32) {
+            left.extend(right.into_iter().map(|(parent, value)| {
                 (
                     parent.checked_add(offset).expect("formula parent overflow"),
                     value,
                 )
             }));
-        self.accumulated
-            .extend(other.accumulated.drain(..).map(|(parent, value)| {
+        }
+        for (left, right) in self.frames.iter_mut().zip(other.frames) {
+            match (left, right) {
                 (
-                    parent.checked_add(offset).expect("formula parent overflow"),
-                    value,
-                )
-            }));
+                    FormulaPayloadFrame::Or {
+                        source: left_source,
+                        output: left_output,
+                    },
+                    FormulaPayloadFrame::Or {
+                        source: right_source,
+                        output: right_output,
+                    },
+                ) => {
+                    append_values(left_source, right_source, offset);
+                    append_values(left_output, right_output, offset);
+                }
+                (
+                    FormulaPayloadFrame::And {
+                        current: left_current,
+                    },
+                    FormulaPayloadFrame::And {
+                        current: right_current,
+                    },
+                ) => append_values(left_current, right_current, offset),
+                _ => panic!("one formula state received incompatible payload-frame shapes"),
+            }
+        }
     }
 
     fn take_tail(&mut self, stride: usize, width: usize) -> Self {
@@ -2297,8 +2437,11 @@ impl FormulaBatch {
                         row_count: 0,
                     },
                 ),
-                original: std::mem::take(&mut self.original),
-                accumulated: std::mem::take(&mut self.accumulated),
+                frames: self
+                    .frames
+                    .iter_mut()
+                    .map(|frame| std::mem::replace(frame, frame.empty_like()))
+                    .collect(),
             };
         }
 
@@ -2319,16 +2462,26 @@ impl FormulaBatch {
             tail
         }
 
-        let original = take_tagged_tail(&mut self.original, first);
-        let accumulated = take_tagged_tail(&mut self.accumulated, first);
+        let frames = self
+            .frames
+            .iter_mut()
+            .map(|frame| match frame {
+                FormulaPayloadFrame::Or { source, output } => FormulaPayloadFrame::Or {
+                    source: take_tagged_tail(source, first),
+                    output: take_tagged_tail(output, first),
+                },
+                FormulaPayloadFrame::And { current } => FormulaPayloadFrame::And {
+                    current: take_tagged_tail(current, first),
+                },
+            })
+            .collect();
         Self {
             activations,
             parents: RowBatch {
                 rows,
                 row_count: take,
             },
-            original,
-            accumulated,
+            frames,
         }
     }
 
@@ -2341,6 +2494,11 @@ impl FormulaBatch {
         assert_eq!(self.activations.len(), row_count);
         let mut remap = vec![u32::MAX; row_count];
         let mut groups: BTreeMap<K, Self> = BTreeMap::new();
+        let empty_frames: Vec<_> = self
+            .frames
+            .iter()
+            .map(FormulaPayloadFrame::empty_like)
+            .collect();
 
         for (parent, (child, activation)) in assignment
             .iter()
@@ -2353,8 +2511,7 @@ impl FormulaBatch {
                     rows: Vec::new(),
                     row_count: 0,
                 },
-                original: Vec::new(),
-                accumulated: Vec::new(),
+                frames: empty_frames.clone(),
             });
             remap[parent] = u32::try_from(group.parents.row_count)
                 .expect("too many partitioned formula parents");
@@ -2372,7 +2529,8 @@ impl FormulaBatch {
             assignment: &[K],
             remap: &[u32],
             groups: &mut BTreeMap<K, FormulaBatch>,
-            original: bool,
+            frame: usize,
+            field: usize,
         ) where
             K: Clone + Ord,
         {
@@ -2381,24 +2539,44 @@ impl FormulaBatch {
                 let target = groups
                     .get_mut(&assignment[parent])
                     .expect("every formula assignment created its group");
-                if original {
-                    target.original.push((remap[parent], value));
-                } else {
-                    target.accumulated.push((remap[parent], value));
+                match (&mut target.frames[frame], field) {
+                    (FormulaPayloadFrame::Or { source, .. }, 0) => {
+                        source.push((remap[parent], value))
+                    }
+                    (FormulaPayloadFrame::Or { output, .. }, 1) => {
+                        output.push((remap[parent], value))
+                    }
+                    (FormulaPayloadFrame::And { current }, 0) => {
+                        current.push((remap[parent], value))
+                    }
+                    _ => panic!("formula frame field disagrees with its structural shape"),
                 }
             }
         }
-        partition_values(self.original, assignment, &remap, &mut groups, true);
-        partition_values(self.accumulated, assignment, &remap, &mut groups, false);
+        for (frame, payload) in self.frames.into_iter().enumerate() {
+            match payload {
+                FormulaPayloadFrame::Or { source, output } => {
+                    partition_values(source, assignment, &remap, &mut groups, frame, 0);
+                    partition_values(output, assignment, &remap, &mut groups, frame, 1);
+                }
+                FormulaPayloadFrame::And { current } => {
+                    partition_values(current, assignment, &remap, &mut groups, frame, 0);
+                }
+            }
+        }
         groups
     }
 
     fn finish(mut self) -> CandidateBatch {
-        self.accumulated.sort_unstable();
-        self.accumulated.dedup();
+        assert_eq!(self.frames.len(), 1);
+        let root = self.frames.pop().unwrap();
+        assert!(
+            matches!(&root, FormulaPayloadFrame::Or { .. }),
+            "a finite-formula root must be OR"
+        );
         CandidateBatch {
             parents: self.parents,
-            candidates: self.accumulated,
+            candidates: root.result(),
         }
     }
 }
@@ -2653,7 +2831,7 @@ impl SelectedResidualTask {
                             variable: counter.resume.variable,
                             leaf: counter.resume.occurrence,
                         },
-                        batch.original.len(),
+                        batch.action_candidate_count(stage),
                     ),
                 };
                 (action, candidates)
@@ -3379,12 +3557,62 @@ fn finish_formula_transition(
 fn continue_formula_transition(
     plan: &ResidualPlan,
     desc: &StateDesc,
-    counter: FormulaProgramCounter,
+    mut counter: FormulaProgramCounter,
     batch: FormulaBatch,
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
 ) -> Option<ContinuationToken> {
+    if let FormulaFocus::Plan {
+        node,
+        stage: FormulaStage::Confirm,
+        ..
+    } = &counter.focus
+    {
+        if matches!(
+            plan.finite_formula.node(*node).kind,
+            FiniteFormulaNodeKind::And { .. }
+        ) {
+            let live = batch.current_is_live();
+            let first = live[0];
+            if live.iter().any(|&is_live| is_live != first) {
+                let mut continuation = None;
+                for (_, batch) in batch.partition(desc.bound.count(), &live) {
+                    prefer_continuation(
+                        &mut continuation,
+                        continue_formula_transition(
+                            plan,
+                            desc,
+                            counter.clone(),
+                            batch,
+                            worklist,
+                            interner,
+                            stats,
+                        ),
+                    );
+                }
+                return continuation;
+            }
+            if !first {
+                loop {
+                    let FormulaFocus::Plan { node, done, .. } = &counter.focus else {
+                        unreachable!("annihilation preserves an AND Plan")
+                    };
+                    let children = plan
+                        .finite_formula
+                        .node(*node)
+                        .children()
+                        .expect("an AND Plan has children");
+                    let Some(child) = (0..children.len()).find(|&child| !done.contains(child))
+                    else {
+                        break;
+                    };
+                    counter = plan.finite_formula.skip_child(&counter, child);
+                }
+            }
+        }
+    }
+
     let complete = match &counter.focus {
         FormulaFocus::Plan { node, done, .. } => {
             let children = plan
@@ -3414,10 +3642,16 @@ fn continue_formula_transition(
     }
 
     let completed = plan.finite_formula.complete(&counter);
-    let FormulaSuccessor::Outer(resume) = plan.finite_formula.resume(&completed) else {
-        panic!("the shallow formula executor completed a nested connective")
-    };
-    finish_formula_transition(plan, desc, &resume, batch, worklist, interner, stats)
+    match plan.finite_formula.resume(&completed) {
+        FormulaSuccessor::Formula(next) => {
+            let mut batch = batch;
+            batch.return_frame();
+            continue_formula_transition(plan, desc, next, batch, worklist, interner, stats)
+        }
+        FormulaSuccessor::Outer(resume) => {
+            finish_formula_transition(plan, desc, &resume, batch, worklist, interner, stats)
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3431,26 +3665,40 @@ fn formula_plan_transition<'a>(
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
 ) -> Option<ContinuationToken> {
-    let FormulaFocus::Plan {
-        node,
-        stage: _,
-        done,
-    } = &counter.focus
-    else {
+    let FormulaFocus::Plan { node, .. } = &counter.focus else {
         panic!("formula planning received an action continuation")
     };
-    assert!(
-        counter.returns.is_empty(),
-        "mixed connective execution is not enabled"
-    );
+    match &plan.finite_formula.node(*node).kind {
+        FiniteFormulaNodeKind::Or { children } => formula_or_plan_transition(
+            root, plan, desc, counter, children, batch, worklist, interner, stats,
+        ),
+        FiniteFormulaNodeKind::And { children } => formula_and_plan_transition(
+            root, plan, desc, counter, children, batch, worklist, interner, stats,
+        ),
+        FiniteFormulaNodeKind::Atom => panic!("a formula Plan named an Atom"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn formula_or_plan_transition<'a>(
+    root: &dyn Constraint<'a>,
+    plan: &ResidualPlan,
+    desc: &StateDesc,
+    counter: &FormulaProgramCounter,
+    children: &[FormulaNodeId],
+    batch: FormulaBatch,
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+) -> Option<ContinuationToken> {
+    let FormulaFocus::Plan { node, done, .. } = &counter.focus else {
+        unreachable!("OR planning received an action continuation")
+    };
     assert_eq!(
         plan.finite_formula.root(counter.resume.occurrence),
         Some(*node),
-        "shallow formula planning left its root OR"
+        "this execution slice only plans the root OR"
     );
-    let FiniteFormulaNodeKind::Or { children } = &plan.finite_formula.node(*node).kind else {
-        panic!("the first formula execution slice requires a root OR")
-    };
     let child_count = children.len();
     assert!(
         done.is_valid_for(child_count),
@@ -3530,26 +3778,116 @@ fn formula_plan_transition<'a>(
             }
         }
 
-        let actions: Vec<_> = assignments
+        let successors: Vec<_> = assignments
             .into_iter()
-            .map(|child| plan.finite_formula.select_child_as_action(&counter, child))
+            .map(|child| {
+                if matches!(
+                    plan.finite_formula.node(children[child]).kind,
+                    FiniteFormulaNodeKind::And { .. }
+                ) {
+                    plan.finite_formula.select_child(&counter, child)
+                } else {
+                    plan.finite_formula.select_child_as_action(&counter, child)
+                }
+            })
             .collect();
-        for (counter, batch) in batch.partition(vars.len(), &actions) {
+        for (counter, mut batch) in batch.partition(vars.len(), &successors) {
+            if let FormulaFocus::Plan { node, stage, .. } = &counter.focus {
+                batch.enter(&plan.finite_formula.node(*node).kind, *stage);
+            }
             prefer_continuation(
                 &mut continuation,
-                file_with_plan(
-                    worklist,
-                    interner,
-                    plan,
-                    StateDesc {
-                        bound: desc.bound,
-                        phase: ResidualPhase::Formula { counter },
-                    },
-                    StateBucket::Formula(batch),
-                    stats,
-                ),
+                continue_formula_transition(plan, desc, counter, batch, worklist, interner, stats),
             );
         }
+    }
+    continuation
+}
+
+#[allow(clippy::too_many_arguments)]
+fn formula_and_plan_transition<'a>(
+    root: &dyn Constraint<'a>,
+    plan: &ResidualPlan,
+    desc: &StateDesc,
+    counter: &FormulaProgramCounter,
+    children: &[FormulaNodeId],
+    batch: FormulaBatch,
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+) -> Option<ContinuationToken> {
+    let FormulaFocus::Plan { done, .. } = &counter.focus else {
+        unreachable!("AND planning received an action continuation")
+    };
+    assert!(matches!(
+        batch.frames.last(),
+        Some(FormulaPayloadFrame::And { .. })
+    ));
+    assert!(done.is_valid_for(children.len()));
+
+    let vars: Vec<VariableId> = desc.bound.into_iter().collect();
+    let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
+    let mut next = counter.clone();
+    let mut estimates_by_child = Vec::new();
+    for child in 0..children.len() {
+        if done.contains(child) {
+            continue;
+        }
+        let mut column = Vec::with_capacity(batch.parents.row_count);
+        if plan
+            .resolve_formula_node(root, counter.resume.occurrence, children[child])
+            .estimate(
+                counter.resume.variable,
+                &view,
+                &mut EstimateSink::Column(&mut column),
+            )
+        {
+            assert_eq!(
+                column.len(),
+                batch.parents.row_count,
+                "AND child estimate must append one value per row"
+            );
+            estimates_by_child.push((child, column));
+        } else {
+            assert!(
+                column.is_empty(),
+                "irrelevant AND child estimate must leave its sink untouched"
+            );
+            next = plan.finite_formula.skip_child(&next, child);
+        }
+    }
+
+    let FormulaFocus::Plan { done, .. } = &next.focus else {
+        unreachable!("AND relevance planning preserves a Plan")
+    };
+    if done.count() == children.len() {
+        return continue_formula_transition(plan, desc, next, batch, worklist, interner, stats);
+    }
+    let first = estimates_by_child
+        .first()
+        .expect("an unfinished AND has a relevant child")
+        .0;
+    let mut assignments = vec![first; batch.parents.row_count];
+    let mut best = vec![usize::MAX; batch.parents.row_count];
+    for (child, column) in estimates_by_child {
+        for parent in 0..batch.parents.row_count {
+            if column[parent] < best[parent] {
+                best[parent] = column[parent];
+                assignments[parent] = child;
+            }
+        }
+    }
+
+    let actions: Vec<_> = assignments
+        .into_iter()
+        .map(|child| plan.finite_formula.select_child_as_action(&next, child))
+        .collect();
+    let mut continuation = None;
+    for (counter, batch) in batch.partition(vars.len(), &actions) {
+        prefer_continuation(
+            &mut continuation,
+            continue_formula_transition(plan, desc, counter, batch, worklist, interner, stats),
+        );
     }
     continuation
 }
@@ -3578,45 +3916,79 @@ fn formula_action_transition<'a>(
         "a formula action became dead between planning and execution"
     );
 
-    match stage {
-        FormulaStage::Propose => {
+    match (batch.frames.last_mut().unwrap(), stage) {
+        (FormulaPayloadFrame::Or { output, .. }, FormulaStage::Propose) => {
             let mut produced = Vec::new();
             constraint.propose(
                 counter.resume.variable,
                 &view,
                 &mut CandidateSink::Tagged(&mut produced),
             );
-            stats.propose_calls += 1;
-            stats.propose_rows += batch.parents.row_count;
-            stats.max_propose_rows = stats.max_propose_rows.max(batch.parents.row_count);
             stats.candidates_proposed += produced.len();
             stats.max_propose_candidates = stats.max_propose_candidates.max(produced.len());
-            batch.accumulated.extend(produced);
+            output.extend(produced);
+            output.sort_unstable();
         }
-        FormulaStage::Confirm => {
-            let mut survivors = batch.original.clone();
+        (FormulaPayloadFrame::Or { source, output }, FormulaStage::Confirm) => {
+            let mut survivors = source.clone();
             let candidates_before = survivors.len();
             constraint.confirm(
                 counter.resume.variable,
                 &view,
                 &mut CandidateSink::Tagged(&mut survivors),
             );
+            stats.candidates_confirmed += candidates_before;
+            stats.max_confirm_candidates = stats.max_confirm_candidates.max(candidates_before);
+            output.extend(survivors);
+            output.sort_unstable();
+        }
+        (FormulaPayloadFrame::And { current }, FormulaStage::Propose) => {
+            assert!(current.is_empty(), "an AND ran two proposers");
+            constraint.propose(
+                counter.resume.variable,
+                &view,
+                &mut CandidateSink::Tagged(current),
+            );
+            stats.candidates_proposed += current.len();
+            stats.max_propose_candidates = stats.max_propose_candidates.max(current.len());
+            current.sort_unstable();
+        }
+        (FormulaPayloadFrame::And { current }, FormulaStage::Confirm) => {
+            let candidates_before = current.len();
+            constraint.confirm(
+                counter.resume.variable,
+                &view,
+                &mut CandidateSink::Tagged(current),
+            );
+            stats.candidates_confirmed += candidates_before;
+            stats.max_confirm_candidates = stats.max_confirm_candidates.max(candidates_before);
+            current.sort_unstable();
+        }
+    }
+    match stage {
+        FormulaStage::Propose => {
+            stats.propose_calls += 1;
+            stats.propose_rows += batch.parents.row_count;
+            stats.max_propose_rows = stats.max_propose_rows.max(batch.parents.row_count);
+        }
+        FormulaStage::Confirm => {
             stats.confirm_calls += 1;
             stats.confirm_rows += batch.parents.row_count;
             stats.max_confirm_rows = stats.max_confirm_rows.max(batch.parents.row_count);
-            stats.candidates_confirmed += candidates_before;
-            stats.max_confirm_candidates = stats.max_confirm_candidates.max(candidates_before);
-            batch.accumulated.extend(survivors);
         }
     }
     assert!(
-        batch
-            .accumulated
-            .iter()
-            .all(|(parent, _)| (*parent as usize) < batch.parents.row_count),
+        batch.frames.iter().all(|frame| match frame {
+            FormulaPayloadFrame::Or { source, output } => source
+                .iter()
+                .chain(output.iter())
+                .all(|(parent, _)| (*parent as usize) < batch.parents.row_count),
+            FormulaPayloadFrame::And { current } => current
+                .iter()
+                .all(|(parent, _)| (*parent as usize) < batch.parents.row_count),
+        }),
         "formula action emitted an invalid candidate row tag"
     );
-    batch.accumulated.sort_unstable();
 
     let completed = plan.finite_formula.complete(counter);
     let FormulaSuccessor::Formula(next) = plan.finite_formula.resume(&completed) else {
@@ -6578,6 +6950,70 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct RowAdaptiveLeaf {
+        parent: VariableId,
+        variable: VariableId,
+        estimates: [usize; 2],
+        value: RawInline,
+        proposed_parents: Arc<Mutex<Vec<Vec<RawInline>>>>,
+    }
+
+    impl Constraint<'static> for RowAdaptiveLeaf {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(self.parent).union(VariableSet::new_singleton(self.variable))
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != self.variable {
+                return false;
+            }
+            if let Some(parent) = view.col(self.parent) {
+                out.extend(
+                    view.iter()
+                        .map(|row| self.estimates[(row[parent][0] & 1) as usize]),
+                );
+            } else {
+                out.fill(100, view.len());
+            }
+            true
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            assert_eq!(variable, self.variable);
+            let parent = view
+                .col(self.parent)
+                .expect("row-adaptive proposal requires its parent binding");
+            self.proposed_parents
+                .lock()
+                .unwrap()
+                .push(view.iter().map(|row| row[parent]).collect());
+            for row in 0..view.len() {
+                candidates.push(row as u32, self.value);
+            }
+        }
+
+        fn confirm(
+            &self,
+            variable: VariableId,
+            _view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            assert_eq!(variable, self.variable);
+            candidates.retain(|_, value| *value == self.value);
+        }
+    }
+
+    #[derive(Clone)]
     struct MaskedUnionArm {
         parent: VariableId,
         variable: VariableId,
@@ -7102,6 +7538,33 @@ mod tests {
     }
 
     #[test]
+    fn formula_payload_normalizes_a_local_or_before_returning_to_and() {
+        let mut batch = FormulaBatch {
+            activations: vec![ActivationId(0)],
+            parents: RowBatch {
+                rows: Vec::new(),
+                row_count: 1,
+            },
+            frames: vec![
+                FormulaPayloadFrame::And {
+                    current: Vec::new(),
+                },
+                FormulaPayloadFrame::Or {
+                    source: vec![(0, raw(9))],
+                    output: vec![(0, raw(2)), (0, raw(1)), (0, raw(2))],
+                },
+            ],
+        };
+
+        batch.return_frame();
+        assert_eq!(batch.frames.len(), 1);
+        let FormulaPayloadFrame::And { current } = &batch.frames[0] else {
+            panic!("local OR returned into the wrong parent-frame shape")
+        };
+        assert_eq!(current, &vec![(0, raw(1)), (0, raw(2))]);
+    }
+
+    #[test]
     fn finite_formula_and_stage_is_not_inferred_from_its_done_mask() {
         let guarded =
             IntersectionConstraint::new(vec![shape_leaf(0), shape_leaf(0), shape_leaf(0)]);
@@ -7171,6 +7634,42 @@ mod tests {
         assert_eq!(*stage, FormulaStage::Confirm);
         assert_eq!(done.count(), 0);
         assert_ne!(and_needs_proposer, and_is_confirmer);
+    }
+
+    #[test]
+    fn finite_formula_and_child_orders_return_to_one_exact_parent_counter() {
+        let guarded = IntersectionConstraint::new(vec![shape_leaf(0), shape_leaf(0)]);
+        let root = UnionConstraint::new(vec![Box::new(guarded) as ShapeConstraint]);
+        let plan = ResidualPlan::compile_finite_unions(&root);
+        let program = &plan.finite_formula;
+        let mut relevant = ChildSet::empty(plan.len());
+        relevant.insert(0);
+        let outer = program.start(0, 0, UnionVerb::Propose { relevant });
+        let and_plan = program.select_child(&outer, 0);
+
+        let run = |first, second| {
+            let first_action = program.select_child_as_action(&and_plan, first);
+            let first_complete = program.complete(&first_action);
+            let FormulaSuccessor::Formula(and_confirm) = program.resume(&first_complete) else {
+                panic!("AND proposer returned past its own frame")
+            };
+            let second_action = program.select_child_as_action(&and_confirm, second);
+            let second_complete = program.complete(&second_action);
+            let FormulaSuccessor::Formula(and_done) = program.resume(&second_complete) else {
+                panic!("AND confirmer returned past its own frame")
+            };
+            let and_complete = program.complete(&and_done);
+            let FormulaSuccessor::Formula(outer_done) = program.resume(&and_complete) else {
+                panic!("AND frame returned past its enclosing OR")
+            };
+            outer_done
+        };
+
+        assert_eq!(
+            run(0, 1),
+            run(1, 0),
+            "the done set and parent return site must erase AND child history"
+        );
     }
 
     #[test]
@@ -9384,12 +9883,18 @@ mod tests {
     #[test]
     fn finite_union_keeps_duplicate_outer_parents_affine() {
         let make = || {
-            let arm = |estimate| VerbLeaf {
+            let leaf = |estimate| VerbLeaf {
                 variable: 1,
                 estimate,
                 accepts: true,
                 proposes: Arc::new(AtomicUsize::new(0)),
                 confirms: Arc::new(AtomicUsize::new(0)),
+            };
+            let arm = |estimate| {
+                IntersectionConstraint::new(vec![
+                    Box::new(leaf(estimate)) as ShapeConstraint,
+                    Box::new(leaf(estimate + 100)) as ShapeConstraint,
+                ])
             };
             IntersectionConstraint::new(vec![
                 Box::new(FanoutLeaf {
@@ -9465,7 +9970,7 @@ mod tests {
     }
 
     #[test]
-    fn finite_union_keeps_nested_and_arms_opaque() {
+    fn finite_union_executes_direct_and_arm_children() {
         let make_arm = |values: Vec<RawInline>, accepted: RawInline| {
             IntersectionConstraint::new(vec![
                 Box::new(FanoutLeaf {
@@ -9488,13 +9993,215 @@ mod tests {
         };
         let project = |binding: &Binding| binding.get(0).copied();
         let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
-        let mut lowered: Vec<_> = Query::new(make(), project)
+        let mut lowered = Query::new(make(), project)
             .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
-            .collect();
+            .collect_profiled();
+        sequential.sort_unstable();
+        lowered.results.sort_unstable();
+        assert_eq!(lowered.results, [raw(1), raw(3)]);
+        assert_eq!(lowered.results, sequential);
+        assert_eq!(lowered.stats.propose_calls, 2);
+        assert_eq!(lowered.stats.confirm_calls, 2);
+    }
+
+    #[test]
+    fn finite_union_and_confirmation_threads_current_but_preserves_sibling_input() {
+        let first_calls = Arc::new(Mutex::new(Vec::new()));
+        let second_calls = Arc::new(Mutex::new(Vec::new()));
+        let sibling_calls = Arc::new(Mutex::new(Vec::new()));
+        let make = |first_calls: Arc<Mutex<Vec<usize>>>,
+                    second_calls: Arc<Mutex<Vec<usize>>>,
+                    sibling_calls: Arc<Mutex<Vec<usize>>>| {
+            let and_arm = IntersectionConstraint::new(vec![
+                Box::new(PageFilterLeaf {
+                    variable: 0,
+                    estimate: 10,
+                    accepted: Some(raw(0)),
+                    calls: first_calls,
+                }) as ShapeConstraint,
+                Box::new(PageFilterLeaf {
+                    variable: 0,
+                    estimate: 11,
+                    accepted: Some(raw(0)),
+                    calls: second_calls,
+                }) as ShapeConstraint,
+            ]);
+            let union = UnionConstraint::new(vec![
+                Box::new(and_arm) as ShapeConstraint,
+                Box::new(PageFilterLeaf {
+                    variable: 0,
+                    estimate: 12,
+                    accepted: Some(raw(2)),
+                    calls: sibling_calls,
+                }) as ShapeConstraint,
+            ]);
+            IntersectionConstraint::new(vec![
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(vec![raw(0), raw(1), raw(2), raw(3)]),
+                }) as ShapeConstraint,
+                Box::new(union) as ShapeConstraint,
+            ])
+        };
+        let project = |binding: &Binding| binding.get(0).copied();
+        let mut sequential: Vec<_> = Query::new(
+            make(
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(Mutex::new(Vec::new())),
+            ),
+            project,
+        )
+        .sequential()
+        .collect();
+        let mut lowered: Vec<_> = Query::new(
+            make(
+                Arc::clone(&first_calls),
+                Arc::clone(&second_calls),
+                Arc::clone(&sibling_calls),
+            ),
+            project,
+        )
+        .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+        .collect();
         sequential.sort_unstable();
         lowered.sort_unstable();
-        assert_eq!(lowered, [raw(1), raw(3)]);
+        assert_eq!(lowered, [raw(0), raw(2)]);
         assert_eq!(lowered, sequential);
+        assert_eq!(*first_calls.lock().unwrap(), [4]);
+        assert_eq!(*second_calls.lock().unwrap(), [1]);
+        assert_eq!(*sibling_calls.lock().unwrap(), [4]);
+    }
+
+    #[test]
+    fn finite_union_empty_and_child_annihilates_only_its_private_branch() {
+        let rejecting_calls = Arc::new(Mutex::new(Vec::new()));
+        let skipped_calls = Arc::new(Mutex::new(Vec::new()));
+        let sibling_calls = Arc::new(Mutex::new(Vec::new()));
+        let make = |rejecting_calls: Arc<Mutex<Vec<usize>>>,
+                    skipped_calls: Arc<Mutex<Vec<usize>>>,
+                    sibling_calls: Arc<Mutex<Vec<usize>>>| {
+            let and_arm = IntersectionConstraint::new(vec![
+                Box::new(PageFilterLeaf {
+                    variable: 0,
+                    estimate: 10,
+                    accepted: Some(raw(99)),
+                    calls: rejecting_calls,
+                }) as ShapeConstraint,
+                Box::new(PageFilterLeaf {
+                    variable: 0,
+                    estimate: 11,
+                    accepted: None,
+                    calls: skipped_calls,
+                }) as ShapeConstraint,
+            ]);
+            let union = UnionConstraint::new(vec![
+                Box::new(and_arm) as ShapeConstraint,
+                Box::new(PageFilterLeaf {
+                    variable: 0,
+                    estimate: 12,
+                    accepted: Some(raw(2)),
+                    calls: sibling_calls,
+                }) as ShapeConstraint,
+            ]);
+            IntersectionConstraint::new(vec![
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(vec![raw(0), raw(1), raw(2), raw(3)]),
+                }) as ShapeConstraint,
+                Box::new(union) as ShapeConstraint,
+            ])
+        };
+        let project = |binding: &Binding| binding.get(0).copied();
+        let mut sequential: Vec<_> = Query::new(
+            make(
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(Mutex::new(Vec::new())),
+            ),
+            project,
+        )
+        .sequential()
+        .collect();
+        let mut lowered: Vec<_> = Query::new(
+            make(
+                Arc::clone(&rejecting_calls),
+                Arc::clone(&skipped_calls),
+                Arc::clone(&sibling_calls),
+            ),
+            project,
+        )
+        .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+        .collect();
+        sequential.sort_unstable();
+        lowered.sort_unstable();
+        assert_eq!(lowered, [raw(2)]);
+        assert_eq!(lowered, sequential);
+        assert_eq!(*rejecting_calls.lock().unwrap(), [4]);
+        assert!(skipped_calls.lock().unwrap().is_empty());
+        assert_eq!(*sibling_calls.lock().unwrap(), [4]);
+    }
+
+    #[test]
+    fn finite_union_and_selects_proposers_per_row_then_remerges_canonically() {
+        let left_proposals = Arc::new(Mutex::new(Vec::new()));
+        let right_proposals = Arc::new(Mutex::new(Vec::new()));
+        let make = |left_proposals: Arc<Mutex<Vec<Vec<RawInline>>>>,
+                    right_proposals: Arc<Mutex<Vec<Vec<RawInline>>>>| {
+            let and_arm = IntersectionConstraint::new(vec![
+                Box::new(RowAdaptiveLeaf {
+                    parent: 0,
+                    variable: 1,
+                    estimates: [1, 10],
+                    value: raw(7),
+                    proposed_parents: left_proposals,
+                }) as ShapeConstraint,
+                Box::new(RowAdaptiveLeaf {
+                    parent: 0,
+                    variable: 1,
+                    estimates: [10, 1],
+                    value: raw(7),
+                    proposed_parents: right_proposals,
+                }) as ShapeConstraint,
+            ]);
+            IntersectionConstraint::new(vec![
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(vec![raw(0), raw(1)]),
+                }) as ShapeConstraint,
+                Box::new(UnionConstraint::new(vec![and_arm])) as ShapeConstraint,
+            ])
+        };
+        let project =
+            |binding: &Binding| Some((binding.get(0).copied()?, binding.get(1).copied()?));
+        let mut sequential: Vec<_> = Query::new(
+            make(
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(Mutex::new(Vec::new())),
+            ),
+            project,
+        )
+        .sequential()
+        .collect();
+        let mut lowered = Query::new(
+            make(Arc::clone(&left_proposals), Arc::clone(&right_proposals)),
+            project,
+        )
+        .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+        .cap(2)
+        .start_width(2)
+        .growth(1)
+        .collect_profiled();
+        sequential.sort_unstable();
+        lowered.results.sort_unstable();
+        assert_eq!(lowered.results, [(raw(0), raw(7)), (raw(1), raw(7))]);
+        assert_eq!(lowered.results, sequential);
+        assert_eq!(*left_proposals.lock().unwrap(), [vec![raw(0)]]);
+        assert_eq!(*right_proposals.lock().unwrap(), [vec![raw(1)]]);
+        assert!(
+            lowered.stats.bucket_merges > 0,
+            "opposite AND child histories did not reconverge at one canonical PC"
+        );
     }
 
     #[test]
@@ -9656,8 +10363,9 @@ mod tests {
 
         // Descending through the AND and treating its nested Union children as
         // outer arms would drop the sibling filter and incorrectly admit 1.
-        // The first recursive slice therefore stops at the AND occurrence;
-        // crossing it requires an activation-private working-candidate frame.
+        // OR flattening therefore stops at the AND occurrence. Execution may
+        // cross that boundary using an activation-private current frame, but
+        // the nested OR remains one opaque AND-child action in this slice.
         let plan = ResidualPlan::compile_finite_unions(&make());
         let formula_root = plan.finite_formula.root(0).unwrap();
         let FiniteFormulaNodeKind::Or { children } = &plan.finite_formula.node(formula_root).kind
@@ -9731,14 +10439,20 @@ mod tests {
 
     #[cfg(feature = "parallel")]
     #[test]
-    fn finite_union_parallel_split_preserves_affine_activations() {
+    fn finite_union_mixed_and_parallel_split_preserves_affine_frames() {
         let make = || {
-            let arm = |estimate| VerbLeaf {
+            let leaf = |estimate| VerbLeaf {
                 variable: 1,
                 estimate,
                 accepts: true,
                 proposes: Arc::new(AtomicUsize::new(0)),
                 confirms: Arc::new(AtomicUsize::new(0)),
+            };
+            let arm = |estimate| {
+                parallel_shape(IntersectionConstraint::new(vec![
+                    parallel_shape(leaf(estimate)),
+                    parallel_shape(leaf(estimate + 100)),
+                ]))
             };
             Arc::new(IntersectionConstraint::new(vec![
                 parallel_shape(FanoutLeaf {
