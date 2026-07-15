@@ -9,7 +9,11 @@
 //! When finite-formula lowering is enabled, a residual Union executes an
 //! arbitrary finite tree of AND/OR frames through the same canonical formula
 //! PC and an affine payload-frame stack. Only Atom nodes invoke the opaque
-//! constraint protocol; connective nesting remains explicit control.
+//! constraint protocol; connective nesting remains explicit control. The
+//! explicit root-formula capability instead makes the maximal exposed root one
+//! synthetic formula occurrence after outer variable selection. It flattens
+//! only the maximal root AND region and retains candidate-occurrence paging
+//! once that AND's exact remaining confirmation suffix is page-local.
 //!
 //! Ready and Candidate descriptors are pure planning states: they estimate,
 //! partition rows by a uniform semantic action, and file explicit Propose or
@@ -125,8 +129,9 @@ impl FiniteFormulaNode {
     }
 }
 
-/// Structural finite-formula program compiled only below currently lowered
-/// residual Union leaves. Root AND planning remains the existing WCO layer.
+/// Structural finite-formula program compiled below lowered residual Union
+/// leaves or, for the explicit root-formula probe, across one synthetic whole
+/// root. Variable selection remains the outer WCO layer in either mode.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FiniteFormulaProgram {
     nodes: Vec<FiniteFormulaNode>,
@@ -136,7 +141,12 @@ struct FiniteFormulaProgram {
 }
 
 impl FiniteFormulaProgram {
-    fn compile<'a>(root: &dyn Constraint<'a>, leaves: &[ResidualLeaf], cyclic_rpq: bool) -> Self {
+    fn compile<'a>(
+        root: &dyn Constraint<'a>,
+        leaves: &[ResidualLeaf],
+        cyclic_rpq: bool,
+        synthetic_root: bool,
+    ) -> Self {
         struct Builder {
             nodes: Vec<Option<FiniteFormulaNode>>,
             cyclic_rpq: bool,
@@ -215,6 +225,80 @@ impl FiniteFormulaProgram {
                 id
             }
 
+            /// Compiles one synthetic whole-query root. Only the maximal
+            /// exposed AND region at the root is flattened: an AND below an
+            /// OR remains inside that arm, preserving the union's private
+            /// candidate reducer boundary.
+            fn compile_root<'a>(&mut self, root: &dyn Constraint<'a>) -> FormulaNodeId {
+                if root.residual_union_children().is_some() {
+                    return self.compile_node(root, &mut Vec::new());
+                }
+                let ConstraintShape::And(_) = root.residual_shape() else {
+                    return self.compile_node(root, &mut Vec::new());
+                };
+
+                let id = self.reserve_node();
+                let capabilities = FormulaNodeCapabilities {
+                    confirm_page_local: root.residual_confirm_is_page_local(),
+                    grouped_delta_confirm: self.cyclic_rpq
+                        && root.residual_delta_confirm_is_grouped(),
+                };
+                let mut children = Vec::new();
+                self.compile_root_and_children(root, &mut Vec::new(), &mut children);
+                let kind = FiniteFormulaNodeKind::And {
+                    children: children.into_boxed_slice(),
+                };
+                let FiniteFormulaNodeKind::And {
+                    children: compiled_children,
+                } = &kind
+                else {
+                    unreachable!("synthetic root kind is AND")
+                };
+                let span = compiled_children
+                    .iter()
+                    .try_fold(2usize, |span, &child| {
+                        span.checked_add(
+                            self.nodes[child.0 as usize]
+                                .as_ref()
+                                .expect("formula child was not compiled")
+                                .span
+                                .checked_add(2)
+                                .expect("residual formula child weight overflow"),
+                        )
+                    })
+                    .expect("residual formula span overflow");
+                self.nodes[id.0 as usize] = Some(FiniteFormulaNode {
+                    kind,
+                    path: FormulaPath(Box::new([])),
+                    capabilities,
+                    span,
+                });
+                id
+            }
+
+            fn compile_root_and_children<'a>(
+                &mut self,
+                conjunction: &dyn Constraint<'a>,
+                path: &mut Vec<FormulaStep>,
+                compiled: &mut Vec<FormulaNodeId>,
+            ) {
+                let ConstraintShape::And(children) = conjunction.residual_shape() else {
+                    panic!("synthetic root AND collection entered an opaque constraint")
+                };
+                for child in 0..children.len() {
+                    path.push(FormulaStep::And(child));
+                    let constraint = children.child(child);
+                    if constraint.residual_union_children().is_none()
+                        && matches!(constraint.residual_shape(), ConstraintShape::And(_))
+                    {
+                        self.compile_root_and_children(constraint, path, compiled);
+                    } else {
+                        compiled.push(self.compile_node(constraint, path));
+                    }
+                    path.pop();
+                }
+            }
+
             /// Union is associative in the constraint language. Compile one
             /// canonical flat child set across directly nested ORs, while a
             /// connective change (notably AND) remains a terminal node in
@@ -265,6 +349,22 @@ impl FiniteFormulaProgram {
             nodes: Vec::new(),
             cyclic_rpq,
         };
+        if synthetic_root {
+            assert_eq!(
+                leaves.len(),
+                1,
+                "a synthetic residual formula has one outer occurrence"
+            );
+            let root = builder.compile_root(root);
+            return Self {
+                nodes: builder
+                    .nodes
+                    .into_iter()
+                    .map(|node| node.expect("reserved residual formula node was not compiled"))
+                    .collect(),
+                roots: vec![Some(root)],
+            };
+        }
         let mut roots = vec![None; leaves.len()];
         for (occurrence, leaf) in leaves.iter().enumerate() {
             if leaf.lowering != LeafLowering::FiniteFormula {
@@ -474,13 +574,14 @@ impl FiniteFormulaProgram {
         };
         let Some((site, outer)) = counter.returns.split_last() else {
             assert_eq!(self.root(counter.resume.occurrence), Some(completed));
-            assert_eq!(
-                completed_stage,
-                match &counter.resume.verb {
-                    UnionVerb::Propose { .. } => FormulaStage::Propose,
-                    UnionVerb::Confirm { .. } => FormulaStage::Confirm,
+            let root_stage = match (&self.node(completed).kind, &counter.resume.verb) {
+                (FiniteFormulaNodeKind::And { .. }, UnionVerb::Propose { .. }) => {
+                    FormulaStage::Confirm
                 }
-            );
+                (_, UnionVerb::Propose { .. }) => FormulaStage::Propose,
+                (_, UnionVerb::Confirm { .. }) => FormulaStage::Confirm,
+            };
+            assert_eq!(completed_stage, root_stage);
             return FormulaSuccessor::Outer(counter.resume.clone());
         };
         let children = self
@@ -544,6 +645,52 @@ impl FiniteFormulaProgram {
         outer_grade
             .checked_add(local_grade)
             .expect("residual formula grade overflow")
+    }
+
+    /// Whether the active synthetic-root continuation is the exact analogue
+    /// of an outer Candidate state whose entire remaining confirmation suffix
+    /// is page-local. Only a maximal root AND may expose candidate pages. OR
+    /// reducers and nested formula frames retain complete parent groups.
+    fn root_confirm_suffix_accepts_pages(&self, counter: &FormulaProgramCounter) -> bool {
+        let root = self
+            .root(counter.resume.occurrence)
+            .expect("a formula counter resumed an opaque residual leaf");
+        let FiniteFormulaNodeKind::And { children } = &self.node(root).kind else {
+            return false;
+        };
+
+        let done = match &counter.focus {
+            FormulaFocus::Plan {
+                node,
+                stage: FormulaStage::Confirm,
+                done,
+            } if *node == root && counter.returns.is_empty() => done,
+            FormulaFocus::Action {
+                node,
+                stage: FormulaStage::Confirm,
+            } if counter.returns.len() == 1 => {
+                let site = &counter.returns[0];
+                if site.parent != root
+                    || site.parent_stage != FormulaStage::Confirm
+                    || children[site.child] != *node
+                {
+                    return false;
+                }
+                &site.done
+            }
+            _ => return false,
+        };
+
+        children
+            .iter()
+            .enumerate()
+            .filter(|(child, _)| !done.contains(*child))
+            .all(|(_, &child)| {
+                let node = self.node(child);
+                matches!(node.kind, FiniteFormulaNodeKind::Atom)
+                    && node.capabilities.confirm_page_local
+                    && !node.capabilities.grouped_delta_confirm
+            })
     }
 }
 
@@ -652,16 +799,19 @@ struct ResidualPlan {
     /// Whether a lowered cyclic confirmation needs the immutable complete
     /// candidate sequence for each parent until traversal quiescence.
     grouped_delta_confirms: Vec<bool>,
+    /// The whole exposed root is one formula occurrence. This is an explicit
+    /// probe capability; ordinary lowering retains flattened outer leaves.
+    synthetic_root_formula: bool,
 }
 
 impl ResidualPlan {
     fn compile<'a>(root: &dyn Constraint<'a>) -> Self {
-        Self::compile_mode(root, ResidualCompileMode::OpaqueUnions, false)
+        Self::compile_mode(root, ResidualCompileMode::OpaqueUnions, false, false)
     }
 
     #[cfg(test)]
     fn compile_finite_unions<'a>(root: &dyn Constraint<'a>) -> Self {
-        Self::compile_mode(root, ResidualCompileMode::FiniteUnions, false)
+        Self::compile_mode(root, ResidualCompileMode::FiniteUnions, false, false)
     }
 
     fn compile_capabilities<'a>(
@@ -673,13 +823,19 @@ impl ResidualPlan {
         } else {
             ResidualCompileMode::OpaqueUnions
         };
-        Self::compile_mode(root, mode, capabilities.cyclic_rpq)
+        Self::compile_mode(
+            root,
+            mode,
+            capabilities.cyclic_rpq,
+            capabilities.root_formula,
+        )
     }
 
     fn compile_mode<'a>(
         root: &dyn Constraint<'a>,
         mode: ResidualCompileMode,
         cyclic_rpq: bool,
+        synthetic_root_formula: bool,
     ) -> Self {
         fn visit<'a>(
             constraint: &dyn Constraint<'a>,
@@ -731,25 +887,38 @@ impl ResidualPlan {
             }
         }
 
-        let mut leaves = Vec::new();
-        let mut page_local_confirms = Vec::new();
-        let mut grouped_delta_confirms = Vec::new();
-        visit(
-            root,
-            mode,
-            cyclic_rpq,
-            &mut Vec::new(),
-            &mut leaves,
-            &mut page_local_confirms,
-            &mut grouped_delta_confirms,
-        );
-        let finite_formula = FiniteFormulaProgram::compile(root, &leaves, cyclic_rpq);
+        let (mut leaves, mut page_local_confirms, mut grouped_delta_confirms) =
+            (Vec::new(), Vec::new(), Vec::new());
+        if synthetic_root_formula {
+            leaves.push(ResidualLeaf {
+                path: ConstraintPath(Box::new([])),
+                lowering: LeafLowering::FiniteFormula,
+            });
+            // Formula control owns the exact inner action boundary. The
+            // singleton outer occurrence itself is never an ordinary
+            // page-local or grouped confirmer.
+            page_local_confirms.push(false);
+            grouped_delta_confirms.push(false);
+        } else {
+            visit(
+                root,
+                mode,
+                cyclic_rpq,
+                &mut Vec::new(),
+                &mut leaves,
+                &mut page_local_confirms,
+                &mut grouped_delta_confirms,
+            );
+        }
+        let finite_formula =
+            FiniteFormulaProgram::compile(root, &leaves, cyclic_rpq, synthetic_root_formula);
         Self {
             leaves,
             finite_formula,
             page_local_confirms,
             cyclic_rpq,
             grouped_delta_confirms,
+            synthetic_root_formula,
         }
     }
 
@@ -766,6 +935,23 @@ impl ResidualPlan {
 
     fn has_finite_formula(&self, occurrence: usize) -> bool {
         self.finite_formula.root(occurrence).is_some()
+    }
+
+    fn formula_action_occurrence(&self, outer: usize, node: FormulaNodeId) -> usize {
+        if self.synthetic_root_formula {
+            self.len()
+                .checked_add(node.0 as usize)
+                .expect("formula action occurrence overflow")
+        } else {
+            outer
+        }
+    }
+
+    fn formula_uses_candidate_pages(&self, counter: &FormulaProgramCounter) -> bool {
+        self.synthetic_root_formula
+            && self
+                .finite_formula
+                .root_confirm_suffix_accepts_pages(counter)
     }
 
     fn resolve<'r, 'a>(
@@ -889,6 +1075,7 @@ pub(super) fn useful_default_shape<'a>(root: &dyn Constraint<'a>) -> bool {
 pub struct ResidualCapabilities {
     finite_unions: bool,
     cyclic_rpq: bool,
+    root_formula: bool,
 }
 
 impl ResidualCapabilities {
@@ -897,6 +1084,16 @@ impl ResidualCapabilities {
     /// the ordinary opaque constraint protocol.
     pub fn finite_unions(mut self) -> Self {
         self.finite_unions = true;
+        self
+    }
+
+    /// Lowers the maximal exposed query root as one synthetic formula
+    /// occurrence after variable selection. The outer Ready/commit protocol
+    /// remains intact; AND/OR child progress becomes canonical formula state.
+    /// This is an explicit probe capability and does not affect ordinary
+    /// query selection.
+    pub fn root_formula(mut self) -> Self {
+        self.root_formula = true;
         self
     }
 
@@ -1932,9 +2129,8 @@ impl StateDesc {
             ResidualPhase::Confirm {
                 relevant, checked, ..
             } => plan.remaining_confirms_accept_pages(relevant, checked),
-            ResidualPhase::Ready
-            | ResidualPhase::Propose { .. }
-            | ResidualPhase::Formula { .. } => false,
+            ResidualPhase::Formula { counter } => plan.formula_uses_candidate_pages(counter),
+            ResidualPhase::Ready | ResidualPhase::Propose { .. } => false,
         }
     }
 }
@@ -2287,28 +2483,52 @@ struct FormulaBatch {
 }
 
 impl FormulaBatch {
-    fn from_proposal(parents: RowBatch, activations: Vec<ActivationId>) -> Self {
+    fn root_frame(kind: &FiniteFormulaNodeKind, source: Candidates) -> FormulaPayloadFrame {
+        match kind {
+            FiniteFormulaNodeKind::Or { .. } => FormulaPayloadFrame::Or {
+                source,
+                output: Vec::new(),
+            },
+            // A root Atom uses the same single-stream payload as a one-child
+            // conjunction. Nested atoms continue to operate directly on
+            // their enclosing connective frame.
+            FiniteFormulaNodeKind::And { .. } | FiniteFormulaNodeKind::Atom => {
+                FormulaPayloadFrame::And { current: source }
+            }
+        }
+    }
+
+    fn from_proposal(
+        parents: RowBatch,
+        activations: Vec<ActivationId>,
+        root_kind: &FiniteFormulaNodeKind,
+    ) -> Self {
         assert_eq!(parents.row_count, activations.len());
         Self {
             activations,
             parents,
-            frames: vec![FormulaPayloadFrame::Or {
-                source: Vec::new(),
-                output: Vec::new(),
-            }],
+            frames: vec![Self::root_frame(root_kind, Vec::new())],
         }
     }
 
-    fn from_confirmation(mut batch: CandidateBatch, activations: Vec<ActivationId>) -> Self {
+    fn from_confirmation(
+        mut batch: CandidateBatch,
+        activations: Vec<ActivationId>,
+        root_kind: &FiniteFormulaNodeKind,
+    ) -> Self {
         assert_eq!(batch.parents.row_count, activations.len());
         batch.candidates.sort_unstable();
         Self {
             activations,
             parents: batch.parents,
-            frames: vec![FormulaPayloadFrame::Or {
-                source: batch.candidates,
-                output: Vec::new(),
-            }],
+            frames: vec![Self::root_frame(root_kind, batch.candidates)],
+        }
+    }
+
+    fn page_candidate_count(&self) -> usize {
+        match self.frames.as_slice() {
+            [FormulaPayloadFrame::And { current }] => current.len(),
+            _ => 0,
         }
     }
 
@@ -2486,6 +2706,75 @@ impl FormulaBatch {
         }
     }
 
+    /// Takes a disjoint tail of candidate occurrences from a synthetic root
+    /// AND. The active PC proves that every remaining confirmer is page-local
+    /// before the scheduler calls this. A bisected parent is copied into both
+    /// pages, while each speculative candidate remains affine to one page.
+    fn take_candidate_tail(&mut self, stride: usize, width: usize) -> Self {
+        assert_eq!(
+            self.frames.len(),
+            1,
+            "only a synthetic root AND may expose candidate pages"
+        );
+        let FormulaPayloadFrame::And { current } = &mut self.frames[0] else {
+            panic!("only a synthetic root AND may expose candidate pages")
+        };
+        let take = current.len().min(width.max(1));
+        debug_assert!(take > 0);
+        if take == current.len() {
+            return Self {
+                activations: std::mem::take(&mut self.activations),
+                parents: std::mem::replace(
+                    &mut self.parents,
+                    RowBatch {
+                        rows: Vec::new(),
+                        row_count: 0,
+                    },
+                ),
+                frames: vec![FormulaPayloadFrame::And {
+                    current: std::mem::take(current),
+                }],
+            };
+        }
+
+        let cut = current.len() - take;
+        let mut tail_candidates = current.split_off(cut);
+        let first_tail_parent = tail_candidates[0].0 as usize;
+        let prefix_parent_count = current.last().unwrap().0 as usize + 1;
+        assert!(
+            first_tail_parent < self.parents.row_count,
+            "constraint emitted an invalid candidate row tag"
+        );
+        assert!(
+            prefix_parent_count <= first_tail_parent + 1,
+            "candidate tags must remain grouped by ascending parent"
+        );
+
+        let tail_rows = self.parents.rows[first_tail_parent * stride..].to_vec();
+        let tail_parent_count = self.parents.row_count - first_tail_parent;
+        let tail_activations = self.activations[first_tail_parent..].to_vec();
+        let first_tail_parent = u32::try_from(first_tail_parent).expect("too many parents");
+        for (parent, _) in &mut tail_candidates {
+            *parent = parent
+                .checked_sub(first_tail_parent)
+                .expect("candidate tail contained an earlier parent");
+        }
+        self.parents.rows.truncate(prefix_parent_count * stride);
+        self.parents.row_count = prefix_parent_count;
+        self.activations.truncate(prefix_parent_count);
+
+        Self {
+            activations: tail_activations,
+            parents: RowBatch {
+                rows: tail_rows,
+                row_count: tail_parent_count,
+            },
+            frames: vec![FormulaPayloadFrame::And {
+                current: tail_candidates,
+            }],
+        }
+    }
+
     fn partition<K>(self, stride: usize, assignment: &[K]) -> BTreeMap<K, Self>
     where
         K: Clone + Ord,
@@ -2571,10 +2860,6 @@ impl FormulaBatch {
     fn finish(mut self) -> CandidateBatch {
         assert_eq!(self.frames.len(), 1);
         let root = self.frames.pop().unwrap();
-        assert!(
-            matches!(&root, FormulaPayloadFrame::Or { .. }),
-            "a finite-formula root must be OR"
-        );
         CandidateBatch {
             parents: self.parents,
             candidates: root.result(),
@@ -2604,6 +2889,7 @@ impl StateBucket {
     fn occupancy(&self, candidate_pages: bool) -> usize {
         match self {
             StateBucket::Candidates(batch) if candidate_pages => batch.candidate_count(),
+            StateBucket::Formula(batch) if candidate_pages => batch.page_candidate_count(),
             _ => self.row_count(),
         }
     }
@@ -2638,6 +2924,10 @@ impl StateBucket {
             StateBucket::Candidates(batch) if !candidate_pages && batch.parents.row_count >= 2 => {
                 let right_parents = batch.parents.row_count / 2;
                 Some(self.take_tail(stride, right_parents, false))
+            }
+            StateBucket::Formula(batch) if candidate_pages && batch.page_candidate_count() >= 2 => {
+                let right_candidates = batch.page_candidate_count() / 2;
+                Some(self.take_tail(stride, right_candidates, true))
             }
             StateBucket::Formula(batch) if batch.parents.row_count >= 2 => {
                 let right_parents = batch.parents.row_count / 2;
@@ -2676,6 +2966,9 @@ impl StateBucket {
             StateBucket::Candidates(batch) => {
                 StateBucket::Candidates(batch.take_tail(stride, width))
             }
+            StateBucket::Formula(batch) if candidate_pages => {
+                StateBucket::Formula(batch.take_candidate_tail(stride, width))
+            }
             StateBucket::Formula(batch) => StateBucket::Formula(batch.take_tail(stride, width)),
         }
     }
@@ -2683,9 +2976,11 @@ impl StateBucket {
 
 /// Exact protocol verb selected by one concrete residual action state.
 ///
-/// The leaf is an occurrence in the compiled residual plan, not a constraint
-/// address. Together with [`ResidualActionTask::state`], it identifies both
-/// the concrete call and the complete canonical continuation that owns it.
+/// The leaf is a compiled action occurrence, not a constraint address. Outer
+/// opaque actions use their residual-plan occurrence; synthetic-root formula
+/// atoms use their fresh formula-node occurrence. Together with
+/// [`ResidualActionTask::state`], it identifies both the concrete call and the
+/// complete canonical continuation that owns it.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum ResidualAction {
     Propose { variable: VariableId, leaf: usize },
@@ -2816,21 +3111,22 @@ impl SelectedResidualTask {
                 batch.candidate_count(),
             ),
             (ResidualPhase::Formula { counter }, StateBucket::Formula(batch)) => {
-                let FormulaFocus::Action { stage, .. } = counter.focus else {
+                let FormulaFocus::Action { node, stage } = counter.focus else {
                     return None;
                 };
+                let occurrence = plan.formula_action_occurrence(counter.resume.occurrence, node);
                 let (action, candidates) = match stage {
                     FormulaStage::Propose => (
                         ResidualAction::Propose {
                             variable: counter.resume.variable,
-                            leaf: counter.resume.occurrence,
+                            leaf: occurrence,
                         },
                         0,
                     ),
                     FormulaStage::Confirm => (
                         ResidualAction::Confirm {
                             variable: counter.resume.variable,
-                            leaf: counter.resume.occurrence,
+                            leaf: occurrence,
                         },
                         batch.action_candidate_count(stage),
                     ),
@@ -2938,8 +3234,9 @@ fn file_with_span(
         return None;
     }
     let candidates = match &bucket {
-        StateBucket::Rows(_) | StateBucket::Formula(_) => 0,
+        StateBucket::Rows(_) => 0,
         StateBucket::Candidates(batch) => batch.candidate_count(),
+        StateBucket::Formula(batch) => batch.page_candidate_count(),
     };
     let rank = desc.rank_with_span(leaf_count, action_span, formula);
     let (id, known) = interner.intern_with_status(desc, stats);
@@ -3233,6 +3530,10 @@ fn propose_action_transition<'a>(
     let leaf_count = plan.len();
     if plan.has_finite_formula(proposer) {
         let activations = allocate_activations(next_activation, rows.row_count);
+        let formula_root = plan
+            .finite_formula
+            .root(proposer)
+            .expect("a lowered formula has a root");
         let counter = plan.finite_formula.start(
             variable,
             proposer,
@@ -3248,7 +3549,11 @@ fn propose_action_transition<'a>(
                 bound: desc.bound,
                 phase: ResidualPhase::Formula { counter },
             },
-            StateBucket::Formula(FormulaBatch::from_proposal(rows, activations)),
+            StateBucket::Formula(FormulaBatch::from_proposal(
+                rows,
+                activations,
+                &plan.finite_formula.node(formula_root).kind,
+            )),
             stats,
         );
     }
@@ -3458,6 +3763,10 @@ fn confirm_action_transition<'a>(
 ) -> Option<ContinuationToken> {
     if plan.has_finite_formula(confirmer) {
         let activations = allocate_activations(next_activation, batch.parents.row_count);
+        let formula_root = plan
+            .finite_formula
+            .root(confirmer)
+            .expect("a lowered formula has a root");
         let counter = plan.finite_formula.start(
             variable,
             confirmer,
@@ -3474,7 +3783,11 @@ fn confirm_action_transition<'a>(
                 bound: desc.bound,
                 phase: ResidualPhase::Formula { counter },
             },
-            StateBucket::Formula(FormulaBatch::from_confirmation(batch, activations)),
+            StateBucket::Formula(FormulaBatch::from_confirmation(
+                batch,
+                activations,
+                &plan.finite_formula.node(formula_root).kind,
+            )),
             stats,
         );
     }
@@ -4005,10 +4318,14 @@ fn formula_action_transition<'a>(
     );
 
     let completed = plan.finite_formula.complete(counter);
-    let FormulaSuccessor::Formula(next) = plan.finite_formula.resume(&completed) else {
-        panic!("an Atom action returned directly past the formula root")
-    };
-    continue_formula_transition(plan, desc, next, batch, worklist, interner, stats)
+    match plan.finite_formula.resume(&completed) {
+        FormulaSuccessor::Formula(next) => {
+            continue_formula_transition(plan, desc, next, batch, worklist, interner, stats)
+        }
+        FormulaSuccessor::Outer(resume) => {
+            finish_formula_transition(plan, desc, &resume, batch, worklist, interner, stats)
+        }
+    }
 }
 
 /// Semantic result of executing one selected residual-state chunk.
@@ -7333,6 +7650,71 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_root_formula_keeps_outer_per_row_variable_choice() {
+        const PARENT: VariableId = 0;
+        const LEFT: VariableId = 1;
+        const RIGHT: VariableId = 2;
+        let root = IntersectionConstraint::new(vec![
+            RowEstimateLeaf {
+                parent: PARENT,
+                variable: LEFT,
+                estimates: [1, 64],
+            },
+            RowEstimateLeaf {
+                parent: PARENT,
+                variable: RIGHT,
+                estimates: [64, 1],
+            },
+        ]);
+        let plan = ResidualPlan::compile_capabilities(
+            &root,
+            ResidualCapabilities::default().root_formula(),
+        );
+        let desc = StateDesc {
+            bound: VariableSet::new_singleton(PARENT),
+            phase: ResidualPhase::Ready,
+        };
+        let rows = RowBatch {
+            rows: vec![raw(0), raw(1)],
+            row_count: 2,
+        };
+        let influences = [VariableSet::new_empty(); 128];
+        let base_estimates = [1; 128];
+        let mut worklist = Worklist::new();
+        let mut interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let _ = ready_plan_transition(
+            &root,
+            &plan,
+            &desc,
+            rows,
+            root.variables(),
+            &influences,
+            &base_estimates,
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+        );
+
+        let mut actions = Vec::new();
+        for level in worklist.values() {
+            for (&id, bucket) in level {
+                let ResidualPhase::Propose {
+                    variable, proposer, ..
+                } = interner.get(id).phase
+                else {
+                    panic!("Ready planning filed a non-proposal state")
+                };
+                actions.push((variable, proposer, bucket.row_count()));
+            }
+        }
+        actions.sort_unstable();
+        assert_eq!(actions, [(LEFT, 0, 1), (RIGHT, 0, 1)]);
+        assert_eq!(stats.ready_preferred_variable_groups, 2);
+        assert_eq!(stats.ready_scheduled_variable_groups, 2);
+    }
+
+    #[test]
     fn box_and_arc_forward_object_safe_residual_shapes() {
         let boxed: Box<dyn Constraint<'static> + Send + Sync> =
             Box::new(IntersectionConstraint::new(vec![ShapeLeaf(0)]));
@@ -7420,6 +7802,68 @@ mod tests {
         assert_eq!(
             plan.resolve(&root, 0).variables(),
             VariableSet::new_singleton(9)
+        );
+    }
+
+    #[test]
+    fn synthetic_formula_flattens_only_the_maximal_root_and() {
+        let arm = || shape_and(vec![shape_leaf(0), shape_leaf(0)]);
+        let union = UnionConstraint::new(vec![arm(), arm()]);
+        let root = IntersectionConstraint::new(vec![
+            shape_and(vec![shape_leaf(0), shape_leaf(0)]),
+            Box::new(union) as ShapeConstraint,
+        ]);
+        let plan = ResidualPlan::compile_capabilities(
+            &root,
+            ResidualCapabilities::default().root_formula(),
+        );
+        assert_eq!(plan.len(), 1);
+        assert!(plan.synthetic_root_formula);
+        let program = &plan.finite_formula;
+        let root = program.root(0).expect("synthetic formula has a root");
+        let FiniteFormulaNodeKind::And { children } = &program.node(root).kind else {
+            panic!("exposed root AND did not compile as AND")
+        };
+        assert_eq!(children.len(), 3, "direct nested AND was not flattened");
+        assert_eq!(program.node(children[0]).kind, FiniteFormulaNodeKind::Atom);
+        assert_eq!(program.node(children[1]).kind, FiniteFormulaNodeKind::Atom);
+
+        let FiniteFormulaNodeKind::Or {
+            children: union_arms,
+        } = &program.node(children[2]).kind
+        else {
+            panic!("the OR boundary disappeared")
+        };
+        assert_eq!(union_arms.len(), 2);
+        assert!(union_arms
+            .iter()
+            .all(|&arm| matches!(program.node(arm).kind, FiniteFormulaNodeKind::And { .. })));
+    }
+
+    #[test]
+    fn synthetic_formula_repeated_occurrences_have_distinct_action_sites() {
+        let shared = Arc::new(CapabilityLeaf {
+            variable: 0,
+            page_local: true,
+        });
+        let root = IntersectionConstraint::new(vec![shared.clone(), shared]);
+        let plan = ResidualPlan::compile_capabilities(
+            &root,
+            ResidualCapabilities::default().root_formula(),
+        );
+        let program = &plan.finite_formula;
+        let root = program.root(0).unwrap();
+        let FiniteFormulaNodeKind::And { children } = &program.node(root).kind else {
+            panic!("synthetic root is not AND")
+        };
+        assert_ne!(children[0], children[1]);
+        assert_ne!(
+            plan.formula_action_occurrence(0, children[0]),
+            plan.formula_action_occurrence(0, children[1])
+        );
+        assert_ne!(
+            program.node(children[0]).path,
+            program.node(children[1]).path
         );
     }
 
@@ -9430,6 +9874,188 @@ mod tests {
         )
     }
 
+    fn root_formula_paged_filter_first_trace(
+        accepted: RawInline,
+    ) -> (
+        Option<RawInline>,
+        Vec<usize>,
+        Vec<usize>,
+        ResidualStateStats,
+        usize,
+    ) {
+        let first_calls = Arc::new(Mutex::new(Vec::new()));
+        let second_calls = Arc::new(Mutex::new(Vec::new()));
+        let root = paged_filter_fixture(
+            (0..64).map(raw).collect(),
+            accepted,
+            Arc::clone(&first_calls),
+            Arc::clone(&second_calls),
+        );
+        let mut lazy = Query::new(root, |binding: &Binding| binding.get(0).copied())
+            .solve_residual_state_lazy_with(ResidualCapabilities::default().root_formula())
+            .cap(64);
+        let result = lazy.next();
+        let first = first_calls.lock().unwrap().clone();
+        let second = second_calls.lock().unwrap().clone();
+        (
+            result,
+            first,
+            second,
+            lazy.stats().clone(),
+            lazy.current_width(),
+        )
+    }
+
+    #[test]
+    fn synthetic_root_formula_width_one_preserves_candidate_descent() {
+        let (result, first_calls, second_calls, stats, width) =
+            root_formula_paged_filter_first_trace(raw(63));
+        assert_eq!(result, Some(raw(63)));
+        assert_eq!(first_calls, [1]);
+        assert_eq!(second_calls, [1]);
+        assert_eq!(stats.candidates_proposed, 64);
+        assert_eq!(stats.candidates_confirmed, 2);
+        assert_eq!(stats.max_confirm_candidates, 1);
+        assert_eq!(stats.partial_pops, 1);
+        assert_eq!(width, 2);
+    }
+
+    #[test]
+    fn synthetic_root_formula_grows_page_local_misses_geometrically() {
+        for (accepted, expected) in [(raw(0), Some(raw(0))), (raw(255), None)] {
+            let (result, first_calls, second_calls, stats, width) =
+                root_formula_paged_filter_first_trace(accepted);
+            assert_eq!(result, expected);
+            assert_eq!(first_calls, [1, 2, 4, 8, 16, 32, 1]);
+            assert_eq!(second_calls, [1, 2, 4, 8, 16, 32, 1]);
+            assert_eq!(stats.candidates_proposed, 64);
+            assert_eq!(stats.candidates_confirmed, 128);
+            assert_eq!(stats.max_confirm_candidates, 32);
+            assert_eq!(stats.width_increases, 6);
+            assert_eq!(width, 64);
+        }
+    }
+
+    #[test]
+    fn synthetic_root_formula_matches_atom_or_and_alternation_oracles() {
+        let project = |binding: &Binding| binding.get(0).copied();
+
+        let atom = || FanoutLeaf {
+            variable: 0,
+            values: Arc::new(vec![raw(1), raw(2), raw(2)]),
+        };
+        let mut atom_expected: Vec<_> = Query::new(atom(), project).sequential().collect();
+        let mut atom_actual: Vec<_> = Query::new(atom(), project)
+            .solve_residual_state_lazy_with(ResidualCapabilities::default().root_formula())
+            .collect();
+        atom_expected.sort_unstable();
+        atom_actual.sort_unstable();
+        assert_eq!(atom_actual, atom_expected);
+
+        let union = || {
+            UnionConstraint::new(vec![
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(vec![raw(1), raw(2)]),
+                }) as ShapeConstraint,
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(vec![raw(2), raw(3)]),
+                }) as ShapeConstraint,
+            ])
+        };
+        let mut union_expected: Vec<_> = Query::new(union(), project).sequential().collect();
+        let mut union_actual: Vec<_> = Query::new(union(), project)
+            .solve_residual_state_lazy_with(ResidualCapabilities::default().root_formula())
+            .collect();
+        union_expected.sort_unstable();
+        union_actual.sort_unstable();
+        assert_eq!(union_actual, union_expected);
+        assert_eq!(union_actual, [raw(1), raw(2), raw(3)]);
+
+        let alternating = || {
+            let arm = |values: Vec<RawInline>, accepted: RawInline| {
+                Box::new(IntersectionConstraint::new(vec![
+                    Box::new(FanoutLeaf {
+                        variable: 0,
+                        values: Arc::new(values),
+                    }) as ShapeConstraint,
+                    Box::new(PageFilterLeaf {
+                        variable: 0,
+                        estimate: 10,
+                        accepted: Some(accepted),
+                        calls: Arc::new(Mutex::new(Vec::new())),
+                    }) as ShapeConstraint,
+                ])) as ShapeConstraint
+            };
+            IntersectionConstraint::new(vec![
+                Box::new(UnionConstraint::new(vec![
+                    arm(vec![raw(1), raw(2)], raw(1)),
+                    arm(vec![raw(2), raw(3)], raw(3)),
+                ])) as ShapeConstraint,
+                Box::new(PageFilterLeaf {
+                    variable: 0,
+                    estimate: 20,
+                    accepted: Some(raw(3)),
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                }) as ShapeConstraint,
+            ])
+        };
+        let mut alternating_expected: Vec<_> =
+            Query::new(alternating(), project).sequential().collect();
+        let mut alternating_actual: Vec<_> = Query::new(alternating(), project)
+            .solve_residual_state_lazy_with(ResidualCapabilities::default().root_formula())
+            .collect();
+        alternating_expected.sort_unstable();
+        alternating_actual.sort_unstable();
+        assert_eq!(alternating_actual, alternating_expected);
+        assert_eq!(alternating_actual, [raw(3)]);
+    }
+
+    #[test]
+    fn synthetic_root_formula_preserves_ignore_and_zero_variable_boundaries() {
+        let make_ignored = || {
+            let inner = IntersectionConstraint::new(vec![
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(vec![raw(4), raw(5)]),
+                }) as ShapeConstraint,
+                Box::new(FanoutLeaf {
+                    variable: 1,
+                    values: Arc::new(vec![raw(9)]),
+                }) as ShapeConstraint,
+            ]);
+            IgnoreConstraint::new(VariableSet::new_singleton(1), Box::new(inner))
+        };
+        let plan = ResidualPlan::compile_capabilities(
+            &make_ignored(),
+            ResidualCapabilities::default().root_formula(),
+        );
+        let root = plan.finite_formula.root(0).unwrap();
+        assert_eq!(
+            plan.finite_formula.node(root).kind,
+            FiniteFormulaNodeKind::Atom,
+            "Ignore must remain an opaque scope boundary"
+        );
+
+        let project = |binding: &Binding| binding.get(0).copied();
+        let mut expected: Vec<_> = Query::new(make_ignored(), project).sequential().collect();
+        let mut actual: Vec<_> = Query::new(make_ignored(), project)
+            .solve_residual_state_lazy_with(ResidualCapabilities::default().root_formula())
+            .collect();
+        expected.sort_unstable();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
+
+        for truth in [false, true] {
+            let expected = if truth { vec![()] } else { Vec::new() };
+            let actual = Query::new(ZeroVariableTruth(truth), |_| Some(()))
+                .solve_residual_state_lazy_with(ResidualCapabilities::default().root_formula())
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+        }
+    }
+
     #[test]
     fn width_one_confirms_one_candidate_then_descends() {
         let first_calls = Arc::new(Mutex::new(Vec::new()));
@@ -9724,6 +10350,34 @@ mod tests {
         assert_eq!(residual, sequential);
         assert_eq!(*whole_calls.lock().unwrap(), [4, 4]);
         assert_eq!(*page_calls.lock().unwrap(), [1, 1, 2]);
+
+        let synthetic_whole_calls = Arc::new(Mutex::new(Vec::new()));
+        let synthetic_page_calls = Arc::new(Mutex::new(Vec::new()));
+        let synthetic_root = IntersectionConstraint::new(vec![
+            Box::new(FanoutLeaf {
+                variable: 0,
+                values: Arc::new(vec![raw(3), raw(1), raw(1), raw(2)]),
+            }) as ShapeConstraint,
+            Box::new(WholeGroupMinimumLeaf {
+                variable: 0,
+                estimate: 5,
+                calls: Arc::clone(&synthetic_whole_calls),
+            }) as ShapeConstraint,
+            Box::new(PageFilterLeaf {
+                variable: 0,
+                estimate: 6,
+                accepted: None,
+                calls: Arc::clone(&synthetic_page_calls),
+            }) as ShapeConstraint,
+        ]);
+        let mut synthetic: Vec<_> = Query::new(synthetic_root, project)
+            .solve_residual_state_lazy_with(ResidualCapabilities::default().root_formula())
+            .cap(1)
+            .collect();
+        synthetic.sort_unstable();
+        assert_eq!(synthetic, residual);
+        assert_eq!(*synthetic_whole_calls.lock().unwrap(), [4]);
+        assert_eq!(*synthetic_page_calls.lock().unwrap(), [1, 1]);
     }
 
     #[test]
@@ -10271,6 +10925,29 @@ mod tests {
         assert!(
             lowered.stats.bucket_merges > 0,
             "opposite AND child histories did not reconverge at one canonical PC"
+        );
+
+        let root_left_proposals = Arc::new(Mutex::new(Vec::new()));
+        let root_right_proposals = Arc::new(Mutex::new(Vec::new()));
+        let mut synthetic = Query::new(
+            make(
+                Arc::clone(&root_left_proposals),
+                Arc::clone(&root_right_proposals),
+            ),
+            project,
+        )
+        .solve_residual_state_lazy_with(ResidualCapabilities::default().root_formula())
+        .cap(2)
+        .start_width(2)
+        .growth(1)
+        .collect_profiled();
+        synthetic.results.sort_unstable();
+        assert_eq!(synthetic.results, sequential);
+        assert_eq!(*root_left_proposals.lock().unwrap(), [vec![raw(0)]]);
+        assert_eq!(*root_right_proposals.lock().unwrap(), [vec![raw(1)]]);
+        assert!(
+            synthetic.stats.bucket_merges > 0,
+            "synthetic root histories did not remerge at one canonical PC"
         );
     }
 
