@@ -1430,19 +1430,22 @@ pub struct ActionGeometry {
     pub action_atoms: usize,
 }
 
-/// Exact nonempty payload filed by a surviving action.
+/// Exact nonempty payload filed by a surviving action, or transferred into
+/// its native cyclic continuation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ActionSurvival {
-    /// Parent rows retained in the immediate successor cohort.
+    /// Parent rows retained in the immediate stable successor cohort, or
+    /// transferred into the cyclic scheduler when expansion is deferred.
     pub parent_rows: usize,
-    /// Candidate occurrences retained in the immediate successor cohort.
+    /// Candidate occurrences retained by that stable or cyclic continuation.
     pub candidate_occurrences: usize,
 }
 
 /// Semantic outcome of one observed Propose or Confirm action.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ActionOutcome {
-    /// The action filed a nonempty immediate successor.
+    /// The action filed a nonempty stable successor or transferred affine work
+    /// into its native cyclic continuation.
     Advanced(ActionSurvival),
     /// The action compacted to no successor candidates.
     Dead,
@@ -1454,7 +1457,9 @@ pub enum ActionOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ActionCompletion {
     /// Dispatch-to-successor wall time around the unchanged owned-task
-    /// execution. This includes protocol work and residual transition filing.
+    /// execution. This includes protocol work and residual transition filing;
+    /// for cyclic lowering it ends after native seeding, before later shared
+    /// expansion cohorts that may combine several action sites.
     pub wall: Duration,
     /// Exact action outcome and immediate survival geometry.
     pub outcome: ActionOutcome,
@@ -4584,7 +4589,12 @@ enum MachineStep {
     Stable(StepOutcome),
     /// Cyclic work was seeded. Parents with an empty root set may already
     /// have resumed their stable formula continuation.
-    DeltaSeeded(Option<ContinuationToken>),
+    DeltaSeeded {
+        continuation: Option<ContinuationToken>,
+        /// At least one affine input is suspended in the cyclic scheduler.
+        /// This is dispatch-outcome metadata, not canonical state identity.
+        deferred: bool,
+    },
 }
 
 /// Executes one canonical control state after the scheduler has selected its
@@ -4741,72 +4751,89 @@ fn execute_task<'a>(
     }
 }
 
-/// Opt-in observation wrapper around the unchanged owned-task executor.
-///
-/// The production executor above neither knows about nor branches on shadow
-/// state. Only this separate path materializes action geometry, reads clocks,
-/// and installs the executor-correlation scope.
-#[allow(clippy::too_many_arguments)]
-fn execute_task_shadowed<'a>(
-    epoch: &ResidualShadowEpoch,
-    root: &dyn Constraint<'a>,
-    plan: &ResidualPlan,
-    task: SelectedResidualTask,
-    full: VariableSet,
-    influences: &[VariableSet; 128],
-    base_estimates: &[usize; 128],
-    worklist: &mut Worklist,
-    interner: &mut StateInterner,
-    stats: &mut ResidualStateStats,
-    next_activation: &mut u64,
-) -> StepOutcome {
-    let Some(action) = task.action_task(plan) else {
-        return execute_task(
-            root,
-            plan,
-            task,
-            full,
-            influences,
-            base_estimates,
-            worklist,
-            interner,
-            stats,
-            next_activation,
-        );
-    };
-    let (site, geometry) = action.observation();
-    let pending = epoch.begin(site, geometry);
-    let scope = ShadowActionScope::enter(pending.correlation());
-    // The timed span is deliberately bound after the TLS scope. Reverse drop
-    // order then captures aborted wall time before observer scope teardown.
-    let mut span = pending;
-    span.start();
-    let outcome = execute_task(
-        root,
-        plan,
-        task,
-        full,
-        influences,
-        base_estimates,
-        worklist,
-        interner,
-        stats,
-        next_activation,
-    );
-    let wall = span.elapsed();
-    let observed_outcome = match &outcome {
-        StepOutcome::Advanced(continuation) => ActionOutcome::Advanced(ActionSurvival {
-            parent_rows: continuation.rows,
-            candidate_occurrences: continuation.candidates,
-        }),
-        StepOutcome::Dead => ActionOutcome::Dead,
-        StepOutcome::Emit(_) => {
-            unreachable!("only Propose and Confirm tasks enter a residual shadow action")
-        }
-    };
-    span.finish(wall, observed_outcome);
-    drop(scope);
-    outcome
+/// Compile-time action-dispatch seam shared by the ordinary and shadowed
+/// mixed stable/delta control loop. The direct implementation is a zero-sized
+/// passthrough and never materializes action geometry. Only the shadow
+/// implementation reads clocks, touches TLS, or allocates observer records.
+trait ResidualActionDispatch {
+    fn run(
+        &self,
+        task: SelectedResidualTask,
+        plan: &ResidualPlan,
+        execute: impl FnOnce(SelectedResidualTask) -> MachineStep,
+    ) -> MachineStep;
+}
+
+#[derive(Clone, Copy)]
+struct DirectActionDispatch;
+
+impl ResidualActionDispatch for DirectActionDispatch {
+    #[inline]
+    fn run(
+        &self,
+        task: SelectedResidualTask,
+        _plan: &ResidualPlan,
+        execute: impl FnOnce(SelectedResidualTask) -> MachineStep,
+    ) -> MachineStep {
+        execute(task)
+    }
+}
+
+struct ShadowActionDispatch<'e> {
+    epoch: &'e ResidualShadowEpoch,
+}
+
+impl ResidualActionDispatch for ShadowActionDispatch<'_> {
+    fn run(
+        &self,
+        task: SelectedResidualTask,
+        plan: &ResidualPlan,
+        execute: impl FnOnce(SelectedResidualTask) -> MachineStep,
+    ) -> MachineStep {
+        let Some(action) = task.action_task(plan) else {
+            return execute(task);
+        };
+        let (site, geometry) = action.observation();
+        let pending = self.epoch.begin(site, geometry);
+        let scope = ShadowActionScope::enter(pending.correlation());
+        // The timed span is deliberately bound after the TLS scope. Reverse
+        // drop order captures aborted wall time before scope teardown.
+        let mut span = pending;
+        span.start();
+        let outcome = execute(task);
+        let wall = span.elapsed();
+        let observed_outcome = match &outcome {
+            MachineStep::Stable(StepOutcome::Advanced(continuation))
+            | MachineStep::DeltaSeeded {
+                continuation: Some(continuation),
+                deferred: false,
+            } => ActionOutcome::Advanced(ActionSurvival {
+                parent_rows: continuation.rows,
+                candidate_occurrences: continuation.candidates,
+            }),
+            MachineStep::DeltaSeeded { deferred: true, .. } => {
+                // Native cyclic lowering transfers the selected affine input
+                // into a reopenable delta frontier. Expansion is deliberately
+                // not attributed to one event: one canonical expansion cohort
+                // may batch activations from several action sites.
+                ActionOutcome::Advanced(ActionSurvival {
+                    parent_rows: action.parent_rows,
+                    candidate_occurrences: action.candidate_occurrences,
+                })
+            }
+            MachineStep::Stable(StepOutcome::Dead)
+            | MachineStep::DeltaSeeded {
+                continuation: None,
+                deferred: false,
+            } => ActionOutcome::Dead,
+            MachineStep::Stable(StepOutcome::Emit(_)) => {
+                unreachable!("only Propose and Confirm tasks enter a residual shadow action")
+            }
+        };
+        span.finish(wall, observed_outcome);
+        drop(scope);
+        outcome
+    }
 }
 
 #[cfg(test)]
@@ -5188,7 +5215,7 @@ impl ResidualStateMachine {
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
         task: SelectedResidualTask,
-    ) -> Result<(), SelectedResidualTask> {
+    ) -> Result<bool, SelectedResidualTask> {
         if !plan.cyclic_rpq {
             return Err(task);
         }
@@ -5245,7 +5272,7 @@ impl ResidualStateMachine {
             };
             self.delta
                 .seed_source_proposals(DeltaDesc::leaf(variable, proposer), successor, rows);
-            return Ok(());
+            return Ok(true);
         }
         let mut seeds = Vec::new();
         let supported = constraint.residual_delta_seeds(variable, &view, &mut seeds);
@@ -5276,9 +5303,10 @@ impl ResidualStateMachine {
                 checked,
             },
         };
+        let deferred = !seeds.is_empty();
         self.delta
             .seed_proposals(DeltaDesc::leaf(variable, proposer), successor, rows, seeds);
-        Ok(())
+        Ok(deferred)
     }
 
     /// Converts one eligible confirmer into one cyclic activation per parent
@@ -5289,7 +5317,7 @@ impl ResidualStateMachine {
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
         task: SelectedResidualTask,
-    ) -> Result<(), SelectedResidualTask> {
+    ) -> Result<bool, SelectedResidualTask> {
         if !plan.cyclic_rpq {
             return Err(task);
         }
@@ -5349,7 +5377,7 @@ impl ResidualStateMachine {
             };
             self.delta
                 .seed_source_confirms(DeltaDesc::leaf(variable, confirmer), successor, batch);
-            return Ok(());
+            return Ok(true);
         }
         let mut seeds = Vec::new();
         let supported = constraint.residual_delta_seeds(variable, &view, &mut seeds);
@@ -5384,13 +5412,14 @@ impl ResidualStateMachine {
                 checked: checked.with_inserted(confirmer),
             },
         };
+        let deferred = !seeds.is_empty();
         self.delta.seed_confirms(
             DeltaDesc::leaf(variable, confirmer),
             successor,
             batch,
             seeds,
         );
-        Ok(())
+        Ok(deferred)
     }
 
     /// Suspends a currently focused formula Atom behind one cyclic reducer
@@ -5402,7 +5431,7 @@ impl ResidualStateMachine {
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
         task: SelectedResidualTask,
-    ) -> Result<Option<ContinuationToken>, SelectedResidualTask> {
+    ) -> Result<(Option<ContinuationToken>, bool), SelectedResidualTask> {
         if !plan.cyclic_rpq {
             return Err(task);
         }
@@ -5489,47 +5518,59 @@ impl ResidualStateMachine {
                 batch,
                 stream_proposal,
             );
-            return Ok(None);
+            return Ok((None, true));
         }
-        Ok(self.delta.seed_formula(
-            DeltaDesc::formula(variable, occurrence, node),
-            desc.bound,
-            counter,
-            batch,
-            seeds,
-            stream_proposal,
-            plan,
-            &mut self.worklist,
-            &mut self.interner,
-            &mut self.stats,
+        let deferred = !seeds.is_empty();
+        Ok((
+            self.delta.seed_formula(
+                DeltaDesc::formula(variable, occurrence, node),
+                desc.bound,
+                counter,
+                batch,
+                seeds,
+                stream_proposal,
+                plan,
+                &mut self.worklist,
+                &mut self.interner,
+                &mut self.stats,
+            ),
+            deferred,
         ))
     }
 
-    fn pop_once<'a>(
+    fn execute_selected_task<'a>(
         &mut self,
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
+        task: SelectedResidualTask,
         influences: &[VariableSet; 128],
         base_estimates: &[usize; 128],
-        width: usize,
     ) -> MachineStep {
-        let task = if let Some(token) = self.continuation.take() {
-            self.take_continuation(plan, token, width)
-        } else {
-            self.take_next_with_plan(plan, width)
-                .expect("pop_once requires a non-empty residual worklist")
-        };
-        self.last_was_action = task.is_action_for_plan(plan);
         let task = match self.seed_delta_proposal(root, plan, task) {
-            Ok(()) => return MachineStep::DeltaSeeded(None),
+            Ok(deferred) => {
+                return MachineStep::DeltaSeeded {
+                    continuation: None,
+                    deferred,
+                }
+            }
             Err(task) => task,
         };
         let task = match self.seed_delta_confirm(root, plan, task) {
-            Ok(()) => return MachineStep::DeltaSeeded(None),
+            Ok(deferred) => {
+                return MachineStep::DeltaSeeded {
+                    continuation: None,
+                    deferred,
+                }
+            }
             Err(task) => task,
         };
         let task = match self.seed_delta_formula(root, plan, task) {
-            Ok(continuation) => return MachineStep::DeltaSeeded(continuation),
+            Ok((continuation, deferred)) => {
+                return MachineStep::DeltaSeeded {
+                    continuation,
+                    deferred,
+                }
+            }
             Err(task) => task,
         };
         let emit_bound = task.desc.bound;
@@ -5550,6 +5591,46 @@ impl ResidualStateMachine {
             self.emit_vars.extend(emit_bound);
         }
         MachineStep::Stable(outcome)
+    }
+
+    fn pop_once_with_dispatch<'a>(
+        &mut self,
+        dispatch: &impl ResidualActionDispatch,
+        root: &dyn Constraint<'a>,
+        plan: &ResidualPlan,
+        influences: &[VariableSet; 128],
+        base_estimates: &[usize; 128],
+        width: usize,
+    ) -> MachineStep {
+        let task = if let Some(token) = self.continuation.take() {
+            self.take_continuation(plan, token, width)
+        } else {
+            self.take_next_with_plan(plan, width)
+                .expect("pop_once requires a non-empty residual worklist")
+        };
+        self.last_was_action = task.is_action_for_plan(plan);
+        dispatch.run(task, plan, |task| {
+            self.execute_selected_task(root, plan, task, influences, base_estimates)
+        })
+    }
+
+    #[cfg(test)]
+    fn pop_once<'a>(
+        &mut self,
+        root: &dyn Constraint<'a>,
+        plan: &ResidualPlan,
+        influences: &[VariableSet; 128],
+        base_estimates: &[usize; 128],
+        width: usize,
+    ) -> MachineStep {
+        self.pop_once_with_dispatch(
+            &DirectActionDispatch,
+            root,
+            plan,
+            influences,
+            base_estimates,
+            width,
+        )
     }
 
     fn increase_width(&mut self) {
@@ -5611,8 +5692,9 @@ impl ResidualStateMachine {
         self.emit_count = rows.row_count;
     }
 
-    fn pull<'a, P, R>(
+    fn pull_with_dispatch<'a, P, R>(
         &mut self,
+        dispatch: &impl ResidualActionDispatch,
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
         postprocessing: &P,
@@ -5660,7 +5742,14 @@ impl ResidualStateMachine {
                 self.accept_delta_step(outcome);
                 continue;
             }
-            match self.pop_once(root, plan, influences, base_estimates, width) {
+            match self.pop_once_with_dispatch(
+                dispatch,
+                root,
+                plan,
+                influences,
+                base_estimates,
+                width,
+            ) {
                 MachineStep::Stable(StepOutcome::Advanced(continuation)) => {
                     self.continuation = self.continuation_after_advanced(plan, width, continuation);
                 }
@@ -5673,57 +5762,40 @@ impl ResidualStateMachine {
                     self.stage_emit(rows);
                     self.increase_width();
                 }
-                MachineStep::DeltaSeeded(continuation) => {
+                MachineStep::DeltaSeeded {
+                    continuation,
+                    deferred: _,
+                } => {
                     self.continuation = continuation.map(ActiveContinuation::probe_one);
                 }
             }
         }
     }
 
-    /// Opt-in counterpart of [`Self::pop_once`]. Selection, continuation, and
-    /// emission bookkeeping are intentionally identical; only concrete
-    /// Propose/Confirm execution crosses the separate shadow wrapper.
-    fn pop_once_shadow<'a>(
+    fn pull<'a, P, R>(
         &mut self,
-        epoch: &ResidualShadowEpoch,
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
+        postprocessing: &P,
         influences: &[VariableSet; 128],
         base_estimates: &[usize; 128],
-        width: usize,
-    ) -> StepOutcome {
-        let task = if let Some(token) = self.continuation.take() {
-            self.take_continuation(plan, token, width)
-        } else {
-            self.take_next_with_plan(plan, width)
-                .expect("pop_once_shadow requires a non-empty residual worklist")
-        };
-        self.last_was_action = task.is_action_for_plan(plan);
-        let emit_bound = task.desc.bound;
-        let outcome = execute_task_shadowed(
-            epoch,
+    ) -> Option<R>
+    where
+        P: Fn(&Binding) -> Option<R>,
+    {
+        self.pull_with_dispatch(
+            &DirectActionDispatch,
             root,
             plan,
-            task,
-            self.full,
+            postprocessing,
             influences,
             base_estimates,
-            &mut self.worklist,
-            &mut self.interner,
-            &mut self.stats,
-            &mut self.next_activation,
-        );
-        if matches!(&outcome, StepOutcome::Emit(_)) {
-            self.emit_vars.clear();
-            self.emit_vars.extend(emit_bound);
-        }
-        outcome
+        )
     }
 
-    /// Separate observed pull loop. Keeping it out of [`Self::pull`] makes the
-    /// ordinary iterator structurally free of observer fields, clock reads,
-    /// TLS access, geometry materialization, observer allocation, and observer
-    /// dispatch branches.
+    /// Observed counterpart of [`Self::pull`]. Both wrappers instantiate the
+    /// same mixed stable/delta control loop; static dispatch keeps the ordinary
+    /// monomorphization free of observer fields, clocks, TLS, and allocation.
     fn pull_shadow<'a, P, R>(
         &mut self,
         epoch: &ResidualShadowEpoch,
@@ -5736,41 +5808,14 @@ impl ResidualStateMachine {
     where
         P: Fn(&Binding) -> Option<R>,
     {
-        loop {
-            while self.emit_next < self.emit_count {
-                let row = self.emit_next;
-                // Match the ordinary pull loop: consume before invoking user
-                // code so a caught projection panic cannot repeat effects.
-                self.emit_next += 1;
-                let stride = self.emit_vars.len();
-                let start = row * stride;
-                for (column, &variable) in self.emit_vars.iter().enumerate() {
-                    self.binding.set(variable, &self.emit_rows[start + column]);
-                }
-                if let Some(result) = postprocessing(&self.binding) {
-                    return Some(result);
-                }
-            }
-            if self.worklist.is_empty() {
-                return None;
-            }
-
-            let width = self.width;
-            match self.pop_once_shadow(epoch, root, plan, influences, base_estimates, width) {
-                StepOutcome::Advanced(continuation) => {
-                    self.continuation = self.continuation_after_advanced(plan, width, continuation);
-                }
-                StepOutcome::Dead => {
-                    self.continuation = None;
-                    self.increase_width();
-                }
-                StepOutcome::Emit(rows) => {
-                    self.continuation = None;
-                    self.stage_emit(rows);
-                    self.increase_width();
-                }
-            }
-        }
+        self.pull_with_dispatch(
+            &ShadowActionDispatch { epoch },
+            root,
+            plan,
+            postprocessing,
+            influences,
+            base_estimates,
+        )
     }
 }
 
@@ -5815,8 +5860,9 @@ impl ResidualStateMachine {
     /// page-local. If two unsplittable buckets already exist, one whole bucket
     /// moves to the sibling. Cross-shard reconvergence is deliberately traded
     /// for parallelism, just as in the affine DAG splitter.
-    fn split_for_parallel<'a>(
+    fn split_for_parallel_with_dispatch<'a>(
         &mut self,
+        dispatch: &impl ResidualActionDispatch,
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
         influences: &[VariableSet; 128],
@@ -5948,12 +5994,20 @@ impl ResidualStateMachine {
             if self.worklist.is_empty() {
                 return None;
             }
-            match self.pop_once(root, plan, influences, base_estimates, width) {
+            match self.pop_once_with_dispatch(
+                dispatch,
+                root,
+                plan,
+                influences,
+                base_estimates,
+                width,
+            ) {
                 // Split negotiation is a saturated throughput path. It files
                 // every successor normally and deliberately does not arm the
                 // first-result continuation sprint before the frontier has
                 // been partitioned.
-                MachineStep::Stable(StepOutcome::Advanced(_)) | MachineStep::DeltaSeeded(_) => {}
+                MachineStep::Stable(StepOutcome::Advanced(_)) | MachineStep::DeltaSeeded { .. } => {
+                }
                 MachineStep::Stable(StepOutcome::Dead) => self.increase_width(),
                 MachineStep::Stable(StepOutcome::Emit(rows)) => {
                     self.stage_emit(rows);
@@ -5961,6 +6015,22 @@ impl ResidualStateMachine {
                 }
             }
         }
+    }
+
+    fn split_for_parallel<'a>(
+        &mut self,
+        root: &dyn Constraint<'a>,
+        plan: &ResidualPlan,
+        influences: &[VariableSet; 128],
+        base_estimates: &[usize; 128],
+    ) -> Option<Self> {
+        self.split_for_parallel_with_dispatch(
+            &DirectActionDispatch,
+            root,
+            plan,
+            influences,
+            base_estimates,
+        )
     }
 
     /// Observed counterpart of [`Self::split_for_parallel`]. The affine split
@@ -5975,115 +6045,13 @@ impl ResidualStateMachine {
         influences: &[VariableSet; 128],
         base_estimates: &[usize; 128],
     ) -> Option<Self> {
-        self.continuation = None;
-        loop {
-            debug_assert_eq!(
-                self.emit_next, 0,
-                "parallel residual splits before fold consumption"
-            );
-
-            if self.emit_count >= 2 {
-                let right_count = self.emit_count / 2;
-                let left_count = self.emit_count - right_count;
-                let stride = self.emit_vars.len();
-                debug_assert!(stride > 0, "a zero-variable query has one result");
-
-                let mut right = self.parallel_sibling();
-                right.emit_vars = self.emit_vars.clone();
-                right.emit_rows = self.emit_rows.split_off(left_count * stride);
-                right.emit_count = right_count;
-                self.emit_count = left_count;
-                return Some(right);
-            }
-
-            if self.emit_count == 1 && !self.worklist.is_empty() {
-                let mut right = self.parallel_sibling();
-                right.emit_vars = std::mem::take(&mut self.emit_vars);
-                right.emit_rows = std::mem::take(&mut self.emit_rows);
-                right.emit_count = 1;
-                self.emit_count = 0;
-                return Some(right);
-            }
-
-            let splittable = self.worklist.iter().rev().find_map(|(&rank, level)| {
-                level.iter().rev().find_map(|(&id, bucket)| {
-                    let desc = self.interner.get(id);
-                    let candidate_pages = desc.uses_candidate_pages(plan);
-                    let can_split = match bucket {
-                        StateBucket::Rows(batch) => batch.row_count >= 2,
-                        StateBucket::Candidates(batch) if candidate_pages => {
-                            batch.candidate_count() >= 2
-                        }
-                        StateBucket::Candidates(batch) => batch.parents.row_count >= 2,
-                        StateBucket::Formula(batch) => batch.parents.row_count >= 2,
-                    };
-                    can_split.then_some((rank, id, candidate_pages))
-                })
-            });
-            if let Some((rank, id, candidate_pages)) = splittable {
-                let desc = self.interner.get(id);
-                let stride = desc.bound.count();
-                let right_bucket = self
-                    .worklist
-                    .get_mut(&rank)
-                    .and_then(|level| level.get_mut(&id))
-                    .and_then(|bucket| bucket.split_for_parallel(stride, candidate_pages))
-                    .expect("selected residual payload is splittable");
-
-                let mut right = self.parallel_sibling();
-                assert!(
-                    right
-                        .worklist
-                        .entry(rank)
-                        .or_default()
-                        .insert(id, right_bucket)
-                        .is_none(),
-                    "fresh residual sibling unexpectedly contained work"
-                );
-                return Some(right);
-            }
-
-            let bucket_count: usize = self.worklist.values().map(BTreeMap::len).sum();
-            if bucket_count >= 2 {
-                let (&rank, level) = self
-                    .worklist
-                    .last_key_value()
-                    .expect("two buckets imply a nonempty worklist");
-                let id = *level
-                    .last_key_value()
-                    .expect("live residual rank has a bucket")
-                    .0;
-                let (bucket, remove_level) = {
-                    let level = self
-                        .worklist
-                        .get_mut(&rank)
-                        .expect("selected residual rank exists");
-                    let bucket = level.remove(&id).expect("selected residual state exists");
-                    (bucket, level.is_empty())
-                };
-                if remove_level {
-                    self.worklist.remove(&rank);
-                }
-
-                let mut right = self.parallel_sibling();
-                right.worklist.entry(rank).or_default().insert(id, bucket);
-                return Some(right);
-            }
-
-            if self.worklist.is_empty() {
-                return None;
-            }
-
-            let width = self.width.max(1);
-            match self.pop_once_shadow(epoch, root, plan, influences, base_estimates, width) {
-                StepOutcome::Advanced(_) => {}
-                StepOutcome::Dead => self.increase_width(),
-                StepOutcome::Emit(rows) => {
-                    self.stage_emit(rows);
-                    self.increase_width();
-                }
-            }
-        }
+        self.split_for_parallel_with_dispatch(
+            &ShadowActionDispatch { epoch },
+            root,
+            plan,
+            influences,
+            base_estimates,
+        )
     }
 }
 

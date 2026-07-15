@@ -1123,12 +1123,13 @@ fn nested_repeated_root_rpqs_keep_distinct_action_occurrences() {
     let capabilities = ResidualCapabilities::default().root_formula().cyclic_rpq();
     let left = Arc::new(AtomicUsize::new(0));
     let right = Arc::new(AtomicUsize::new(0));
-    let mut actual: Vec<_> = Query::new(
+    let direct = Query::new(
         make(Some(Arc::clone(&left)), Some(Arc::clone(&right))),
         project_end,
     )
     .solve_residual_state_lazy_with(capabilities)
-    .collect();
+    .collect_profiled();
+    let mut actual = direct.results;
     actual.sort_unstable();
     let mut expected = vec![graph.value(1).raw, graph.value(2).raw];
     expected.sort_unstable();
@@ -1136,10 +1137,18 @@ fn nested_repeated_root_rpqs_keep_distinct_action_occurrences() {
     assert_eq!(left.load(Ordering::Relaxed), 1);
     assert_eq!(right.load(Ordering::Relaxed), 1);
 
-    let observed = Query::new(make(None, None), project_end)
-        .solve_residual_state_lazy_with(capabilities)
-        .shadow(ResidualShadowEpoch::new())
-        .collect_profiled();
+    let observed_left = Arc::new(AtomicUsize::new(0));
+    let observed_right = Arc::new(AtomicUsize::new(0));
+    let observed = Query::new(
+        make(
+            Some(Arc::clone(&observed_left)),
+            Some(Arc::clone(&observed_right)),
+        ),
+        project_end,
+    )
+    .solve_residual_state_lazy_with(capabilities)
+    .shadow(ResidualShadowEpoch::new())
+    .collect_profiled();
     let mut observed_results = observed.results.clone();
     observed_results.sort_unstable();
     assert_eq!(observed_results, expected);
@@ -1153,6 +1162,9 @@ fn nested_repeated_root_rpqs_keep_distinct_action_occurrences() {
     occurrences.sort_unstable();
     occurrences.dedup();
     assert_eq!(occurrences.len(), 2);
+    assert_eq!(observed.stats, direct.stats);
+    assert_eq!(observed_left.load(Ordering::Relaxed), 1);
+    assert_eq!(observed_right.load(Ordering::Relaxed), 1);
 }
 
 #[test]

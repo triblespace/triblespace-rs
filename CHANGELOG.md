@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Residual shadow observation preserves native cyclic execution.** Direct
+  and observed iterators now instantiate one statically dispatched mixed
+  stable/delta pull and Rayon split loop, so source paging, fixpoint
+  quiescence, geometric handoffs, continuations, statistics, and exact affine
+  remainders cannot diverge behind the observer. Delta actions are observed
+  once at their native seed boundary; later canonical expansion cohorts remain
+  unattributed because they may combine activations from several action sites.
 - **Cyclic RPQ actions now execute inside lowered finite formulas.** Direct
   path atoms under OR and OR-to-AND arms share the residual delta fixpoint for
   both proposal and grouped confirmation while retaining an exact affine

@@ -7,7 +7,9 @@ use rayon::prelude::*;
 use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
-use triblespace_core::query::residual::ResidualCapabilities;
+use triblespace_core::query::residual::{
+    ResidualCapabilities, ResidualShadowEpoch, ResidualShadowStatus,
+};
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, EstimateSink, Query, ResidualDeltaNode,
@@ -376,5 +378,84 @@ fn custom_cyclic_delta_composes_with_recursive_root_formula() {
         assert_eq!(parallel, sequential);
         assert!(parallel_evidence.seeded_roots.load(Ordering::Relaxed) > 0);
         assert!(parallel_evidence.expanded_nodes.load(Ordering::Relaxed) > 0);
+    }
+}
+
+#[test]
+fn custom_cyclic_delta_shadow_preserves_native_execution() {
+    let capabilities = ResidualCapabilities::default().root_formula().cyclic_rpq();
+
+    let direct_evidence = Arc::new(DeltaEvidence::default());
+    let direct = Query::new(fixture(Arc::clone(&direct_evidence)), project_end)
+        .solve_residual_state_lazy_with(capabilities)
+        .cap(2)
+        .start_width(1)
+        .collect_profiled();
+    assert!(direct_evidence.seeded_roots.load(Ordering::Relaxed) > 0);
+    assert!(direct_evidence.expanded_nodes.load(Ordering::Relaxed) > 0);
+    assert_eq!(
+        direct_evidence.continuation_mask.load(Ordering::Relaxed) & 0b11,
+        0b11,
+        "the direct run must execute both constraint-defined continuation states"
+    );
+
+    let shadow_evidence = Arc::new(DeltaEvidence::default());
+    let epoch = ResidualShadowEpoch::new();
+    let shadow = Query::new(fixture(Arc::clone(&shadow_evidence)), project_end)
+        .solve_residual_state_lazy_with(capabilities)
+        .cap(2)
+        .start_width(1)
+        .shadow(epoch.clone())
+        .collect_profiled();
+
+    assert_eq!(shadow.results, direct.results);
+    assert_eq!(shadow.stats, direct.stats);
+    assert!(shadow_evidence.seeded_roots.load(Ordering::Relaxed) > 0);
+    assert!(shadow_evidence.expanded_nodes.load(Ordering::Relaxed) > 0);
+    assert_eq!(
+        shadow_evidence.continuation_mask.load(Ordering::Relaxed) & 0b11,
+        0b11,
+        "shadowing must not replace native delta execution with ordinary formula actions"
+    );
+    assert_eq!(shadow.shadow.status, ResidualShadowStatus::Closed);
+    assert_eq!(epoch.status(), ResidualShadowStatus::Closed);
+    assert_eq!(
+        shadow.shadow.events.len(),
+        shadow.stats.propose_action_pops + shadow.stats.confirm_action_pops,
+        "each selected native action site must be observed exactly once"
+    );
+
+    #[cfg(feature = "parallel")]
+    {
+        let parallel_evidence = Arc::new(DeltaEvidence::default());
+        let parallel_epoch = ResidualShadowEpoch::new();
+        let mut parallel: Vec<_> = Query::new(fixture(Arc::clone(&parallel_evidence)), project_end)
+            .solve_residual_state_lazy_with(capabilities)
+            .cap(4)
+            .start_width(4)
+            .shadow(parallel_epoch.clone())
+            .into_par_iter()
+            .collect();
+        let mut expected = direct.results;
+        parallel.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(parallel, expected);
+        assert!(parallel_evidence.seeded_roots.load(Ordering::Relaxed) > 0);
+        assert!(parallel_evidence.expanded_nodes.load(Ordering::Relaxed) > 0);
+        assert_eq!(
+            parallel_evidence.continuation_mask.load(Ordering::Relaxed) & 0b11,
+            0b11,
+            "parallel shadow shards must retain both native continuation states"
+        );
+        assert_eq!(parallel_epoch.status(), ResidualShadowStatus::Closed);
+        let snapshot = parallel_epoch.snapshot();
+        assert!(!snapshot.events.is_empty());
+        assert!(
+            snapshot
+                .events
+                .iter()
+                .all(|event| event.completion.is_some()),
+            "a normally drained parallel epoch left an action event live"
+        );
     }
 }
