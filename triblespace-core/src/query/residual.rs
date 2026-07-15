@@ -872,6 +872,113 @@ impl StateBucket {
     }
 }
 
+/// Exact protocol verb selected by one concrete residual action state.
+///
+/// The leaf is an occurrence in the compiled residual plan, not a constraint
+/// address. Together with [`ResidualActionTask::state`], it identifies both
+/// the concrete call and the complete canonical continuation that owns it.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum ResidualAction {
+    Propose { variable: VariableId, leaf: usize },
+    Confirm { variable: VariableId, leaf: usize },
+}
+
+/// Executor-facing description of one concrete proposal or confirmation.
+///
+/// This is deliberately scheduler-owned and hardware-neutral. It records the
+/// exact interned state/action identity plus the geometry already known at the
+/// dispatch boundary. It does not quote cost, read a clock, or extend the
+/// constraint protocol. Planning-only Ready and Candidate states never
+/// produce this description.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResidualActionTask {
+    state: StateId,
+    action: ResidualAction,
+    /// Exact committed row schema. Its cardinality is the physical column
+    /// count, while the variable IDs prevent unlike schemas with equal width
+    /// from becoming one executor cohort.
+    bound: VariableSet,
+    /// Number of parent rows presented to the protocol call.
+    parent_rows: usize,
+    /// Number of candidate occurrences presented to Confirm; zero for
+    /// Propose because its output sink is initially empty.
+    candidate_occurrences: usize,
+    /// Scheduler occupancy consumed by this action. This is parent rows until
+    /// the remaining confirmation suffix is page-local, then candidate
+    /// occurrences.
+    action_atoms: usize,
+}
+
+/// One affine payload selected from the residual worklist.
+///
+/// Selection used to return only `(StateDesc, StateBucket)`, discarding the
+/// interner identity before dispatch. Keeping all three pieces together gives
+/// an executor a stable ownership boundary without changing state identity,
+/// worklist order, or protocol semantics.
+#[derive(Debug)]
+struct SelectedResidualTask {
+    state: StateId,
+    desc: StateDesc,
+    bucket: StateBucket,
+}
+
+impl SelectedResidualTask {
+    /// Cheap phase classification used by the latency scheduler. It must not
+    /// materialize executor geometry on the default path.
+    fn is_action(&self) -> bool {
+        matches!(
+            &self.desc.phase,
+            ResidualPhase::Propose { .. } | ResidualPhase::Confirm { .. }
+        )
+    }
+
+    /// Returns executor geometry only for a concrete protocol action.
+    #[allow(dead_code)]
+    fn action_task(&self, plan: &ResidualPlan) -> Option<ResidualActionTask> {
+        let (action, candidate_occurrences) = match (&self.desc.phase, &self.bucket) {
+            (
+                ResidualPhase::Propose {
+                    variable, proposer, ..
+                },
+                StateBucket::Rows(_),
+            ) => (
+                ResidualAction::Propose {
+                    variable: *variable,
+                    leaf: *proposer,
+                },
+                0,
+            ),
+            (
+                ResidualPhase::Confirm {
+                    variable,
+                    confirmer,
+                    ..
+                },
+                StateBucket::Candidates(batch),
+            ) => (
+                ResidualAction::Confirm {
+                    variable: *variable,
+                    leaf: *confirmer,
+                },
+                batch.candidate_count(),
+            ),
+            (ResidualPhase::Ready | ResidualPhase::Candidate { .. }, _) => return None,
+            (ResidualPhase::Propose { .. } | ResidualPhase::Confirm { .. }, _) => {
+                panic!("canonical residual action received the wrong payload shape")
+            }
+        };
+        let candidate_pages = self.desc.uses_candidate_pages(plan);
+        Some(ResidualActionTask {
+            state: self.state,
+            action,
+            bound: self.desc.bound,
+            parent_rows: self.bucket.row_count(),
+            candidate_occurrences,
+            action_atoms: self.bucket.occupancy(candidate_pages),
+        })
+    }
+}
+
 type Worklist = BTreeMap<usize, BTreeMap<StateId, StateBucket>>;
 
 /// Exact physical tail appended by one transition to a canonical state.
@@ -1444,14 +1551,15 @@ enum StepOutcome {
 }
 
 /// Executes one canonical control state after the scheduler has selected its
-/// affine payload chunk. The explicit outcome lets eager and lazy callers
-/// distinguish semantic progress, branch death, and terminal projection
-/// without inferring any of them from worklist size.
-fn execute_state<'a>(
+/// affine payload chunk. The explicit owned task is the common eager/lazy
+/// dispatch boundary; its action-only view is where a future executor can
+/// attach a local cost quote without widening [`Constraint`]. The outcome lets
+/// callers distinguish semantic progress, branch death, and terminal
+/// projection without inferring any of them from worklist size.
+fn execute_task<'a>(
     root: &dyn Constraint<'a>,
     plan: &ResidualPlan,
-    desc: &StateDesc,
-    bucket: StateBucket,
+    task: SelectedResidualTask,
     full: VariableSet,
     influences: &[VariableSet; 128],
     base_estimates: &[usize; 128],
@@ -1459,6 +1567,11 @@ fn execute_state<'a>(
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
 ) -> StepOutcome {
+    let SelectedResidualTask {
+        state: _,
+        desc,
+        bucket,
+    } = task;
     match (&desc.phase, bucket) {
         (ResidualPhase::Ready, StateBucket::Rows(rows)) if desc.bound == full => {
             stats.emit_pops += 1;
@@ -1469,7 +1582,7 @@ fn execute_state<'a>(
             let continuation = ready_plan_transition(
                 root,
                 plan,
-                desc,
+                &desc,
                 rows,
                 full,
                 influences,
@@ -1490,7 +1603,7 @@ fn execute_state<'a>(
         ) => {
             stats.propose_action_pops += 1;
             let continuation = propose_action_transition(
-                root, plan, desc, *variable, relevant, *proposer, rows, worklist, interner, stats,
+                root, plan, &desc, *variable, relevant, *proposer, rows, worklist, interner, stats,
             );
             if let Some(continuation) = continuation {
                 StepOutcome::Advanced(continuation)
@@ -1509,7 +1622,7 @@ fn execute_state<'a>(
         ) => {
             stats.candidate_plan_pops += 1;
             let continuation = candidate_plan_transition(
-                root, plan, desc, *variable, relevant, checked, batch, worklist, interner, stats,
+                root, plan, &desc, *variable, relevant, checked, batch, worklist, interner, stats,
             );
             StepOutcome::Advanced(continuation)
         }
@@ -1524,7 +1637,7 @@ fn execute_state<'a>(
         ) => {
             stats.confirm_action_pops += 1;
             let continuation = confirm_action_transition(
-                root, plan, desc, *variable, relevant, checked, *confirmer, batch, worklist,
+                root, plan, &desc, *variable, relevant, checked, *confirmer, batch, worklist,
                 interner, stats,
             );
             if let Some(continuation) = continuation {
@@ -1536,6 +1649,40 @@ fn execute_state<'a>(
         }
         _ => panic!("canonical residual state received the wrong payload shape"),
     }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn execute_state<'a>(
+    root: &dyn Constraint<'a>,
+    plan: &ResidualPlan,
+    desc: &StateDesc,
+    bucket: StateBucket,
+    full: VariableSet,
+    influences: &[VariableSet; 128],
+    base_estimates: &[usize; 128],
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+) -> StepOutcome {
+    execute_task(
+        root,
+        plan,
+        SelectedResidualTask {
+            // Direct transition tests do not select through the interner. The
+            // executor does not consult this synthetic identity; production
+            // eager and lazy paths always carry the exact selected StateId.
+            state: StateId(u32::MAX),
+            desc: desc.clone(),
+            bucket,
+        },
+        full,
+        influences,
+        base_estimates,
+        worklist,
+        interner,
+        stats,
+    )
 }
 
 /// Resumable execution state for [`ResidualStateIter`].
@@ -1654,13 +1801,14 @@ impl ResidualStateMachine {
     #[cfg(test)]
     fn take_next(&mut self, width: usize) -> Option<(StateDesc, StateBucket)> {
         self.take_next_inner(None, width)
+            .map(|task| (task.desc, task.bucket))
     }
 
     fn take_next_with_plan(
         &mut self,
         plan: &ResidualPlan,
         width: usize,
-    ) -> Option<(StateDesc, StateBucket)> {
+    ) -> Option<SelectedResidualTask> {
         self.take_next_inner(Some(plan), width)
     }
 
@@ -1668,7 +1816,7 @@ impl ResidualStateMachine {
         &mut self,
         plan: Option<&ResidualPlan>,
         width: usize,
-    ) -> Option<(StateDesc, StateBucket)> {
+    ) -> Option<SelectedResidualTask> {
         let width = width.max(1);
         let full_state = self.worklist.iter().rev().find_map(|(&rank, level)| {
             level.iter().rev().find_map(|(&id, bucket)| {
@@ -1739,7 +1887,11 @@ impl ResidualStateMachine {
             self.stats.readiness_pops += 1;
             self.last_selection = SelectionKind::Readiness;
         }
-        Some((desc, chunk))
+        Some(SelectedResidualTask {
+            state: id,
+            desc,
+            bucket: chunk,
+        })
     }
 
     /// Removes one chunk exclusively from the tail appended by the preceding
@@ -1756,7 +1908,7 @@ impl ResidualStateMachine {
         plan: &ResidualPlan,
         token: ContinuationToken,
         width: usize,
-    ) -> (StateDesc, StateBucket) {
+    ) -> SelectedResidualTask {
         let desc = self.interner.get(token.state).clone();
         assert_eq!(
             desc.rank(self.leaf_count),
@@ -1808,7 +1960,11 @@ impl ResidualStateMachine {
         if cohort_occupancy < width.max(1) {
             self.stats.underfilled_continuation_pops += 1;
         }
-        (desc, chunk)
+        SelectedResidualTask {
+            state: token.state,
+            desc,
+            bucket: chunk,
+        }
     }
 
     fn pop_once<'a>(
@@ -1819,21 +1975,18 @@ impl ResidualStateMachine {
         base_estimates: &[usize; 128],
         width: usize,
     ) -> StepOutcome {
-        let (desc, bucket) = if let Some(token) = self.continuation.take() {
+        let task = if let Some(token) = self.continuation.take() {
             self.take_continuation(plan, token, width)
         } else {
             self.take_next_with_plan(plan, width)
                 .expect("pop_once requires a non-empty residual worklist")
         };
-        self.last_was_action = matches!(
-            desc.phase,
-            ResidualPhase::Propose { .. } | ResidualPhase::Confirm { .. }
-        );
-        let outcome = execute_state(
+        self.last_was_action = task.is_action();
+        let emit_bound = task.desc.bound;
+        let outcome = execute_task(
             root,
             plan,
-            &desc,
-            bucket,
+            task,
             self.full,
             influences,
             base_estimates,
@@ -1843,7 +1996,7 @@ impl ResidualStateMachine {
         );
         if matches!(&outcome, StepOutcome::Emit(_)) {
             self.emit_vars.clear();
-            self.emit_vars.extend(desc.bound);
+            self.emit_vars.extend(emit_bound);
         }
         outcome
     }
@@ -2249,13 +2402,17 @@ where
         for (id, bucket) in level {
             let desc = interner.get(id).clone();
             debug_assert_eq!(desc.rank(leaf_count), rank);
+            let emit_bound = desc.bound;
             stats.state_pops += 1;
             stats.readiness_pops += 1;
-            match execute_state(
+            match execute_task(
                 root,
                 &plan,
-                &desc,
-                bucket,
+                SelectedResidualTask {
+                    state: id,
+                    desc,
+                    bucket,
+                },
                 full,
                 &influences,
                 &base_estimates,
@@ -2265,7 +2422,7 @@ where
             ) {
                 StepOutcome::Advanced(_) | StepOutcome::Dead => {}
                 StepOutcome::Emit(rows) => {
-                    let vars: Vec<VariableId> = desc.bound.into_iter().collect();
+                    let vars: Vec<VariableId> = emit_bound.into_iter().collect();
                     let view = rows_view(&vars, &rows.rows, rows.row_count);
                     for row in 0..rows.row_count {
                         let row_view = view.row_view(row);
@@ -3943,7 +4100,7 @@ mod tests {
         assert!(desc.uses_candidate_pages(&plan));
 
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
-        file(
+        let token = file(
             &mut machine.worklist,
             &mut machine.interner,
             plan.len(),
@@ -3953,13 +4110,15 @@ mod tests {
                 candidates: (0..8).map(|value| (0, raw(value))).collect(),
             }),
             &mut machine.stats,
-        );
+        )
+        .expect("fixture files one candidate state");
 
-        let (selected, page) = machine
+        let task = machine
             .take_next_with_plan(&plan, 2)
             .expect("page-local candidates are live");
-        assert_eq!(selected, desc);
-        let StateBucket::Candidates(page) = page else {
+        assert_eq!(task.state, token.state);
+        assert_eq!(task.desc, desc);
+        let StateBucket::Candidates(page) = task.bucket else {
             panic!("candidate state returned row payload")
         };
         assert_eq!(page.parents.row_count, 1);
@@ -3973,6 +4132,149 @@ mod tests {
         assert_eq!(machine.interner.get(id), &desc);
         assert_eq!(remainder.occupancy(true), 6);
         assert_eq!(machine.stats.partial_pops, 1);
+    }
+
+    #[test]
+    fn selected_task_exposes_exact_action_identity_and_batch_geometry_only_for_verbs() {
+        const PARENT: VariableId = 0;
+        const VARIABLE: VariableId = 1;
+        let root = IntersectionConstraint::new(vec![
+            CapabilityLeaf {
+                variable: VARIABLE,
+                page_local: false,
+            },
+            CapabilityLeaf {
+                variable: VARIABLE,
+                page_local: true,
+            },
+        ]);
+        let plan = ResidualPlan::compile(&root);
+        let bound = VariableSet::new_singleton(PARENT);
+        let mut relevant = ChildSet::empty(plan.len());
+        relevant.insert(0);
+        relevant.insert(1);
+        let mut checked = ChildSet::empty(plan.len());
+        checked.insert(0);
+
+        let propose = SelectedResidualTask {
+            state: StateId(41),
+            desc: StateDesc {
+                bound,
+                phase: ResidualPhase::Propose {
+                    variable: VARIABLE,
+                    relevant: relevant.clone(),
+                    proposer: 0,
+                },
+            },
+            bucket: StateBucket::Rows(RowBatch {
+                rows: vec![raw(10), raw(11), raw(12)],
+                row_count: 3,
+            }),
+        };
+        assert_eq!(
+            propose.action_task(&plan),
+            Some(ResidualActionTask {
+                state: StateId(41),
+                action: ResidualAction::Propose {
+                    variable: VARIABLE,
+                    leaf: 0,
+                },
+                bound,
+                parent_rows: 3,
+                candidate_occurrences: 0,
+                action_atoms: 3,
+            })
+        );
+
+        let candidate_batch = || CandidateBatch {
+            parents: RowBatch {
+                rows: vec![raw(20), raw(21)],
+                row_count: 2,
+            },
+            candidates: vec![
+                (0, raw(1)),
+                (0, raw(2)),
+                (0, raw(3)),
+                (1, raw(4)),
+                (1, raw(5)),
+            ],
+        };
+        let candidate = SelectedResidualTask {
+            state: StateId(42),
+            desc: StateDesc {
+                bound,
+                phase: ResidualPhase::Candidate {
+                    variable: VARIABLE,
+                    relevant: relevant.clone(),
+                    checked: checked.clone(),
+                },
+            },
+            bucket: StateBucket::Candidates(candidate_batch()),
+        };
+        assert!(!candidate.is_action());
+        assert_eq!(candidate.action_task(&plan), None);
+
+        let confirm = SelectedResidualTask {
+            state: StateId(43),
+            desc: StateDesc {
+                bound,
+                phase: ResidualPhase::Confirm {
+                    variable: VARIABLE,
+                    relevant,
+                    checked,
+                    confirmer: 1,
+                },
+            },
+            bucket: StateBucket::Candidates(candidate_batch()),
+        };
+        assert!(confirm.is_action());
+        assert_eq!(
+            confirm.action_task(&plan),
+            Some(ResidualActionTask {
+                state: StateId(43),
+                action: ResidualAction::Confirm {
+                    variable: VARIABLE,
+                    leaf: 1,
+                },
+                bound,
+                parent_rows: 2,
+                candidate_occurrences: 5,
+                action_atoms: 5,
+            })
+        );
+
+        let atomic_plan = ResidualPlan::compile(&IntersectionConstraint::new(vec![
+            CapabilityLeaf {
+                variable: VARIABLE,
+                page_local: false,
+            },
+            CapabilityLeaf {
+                variable: VARIABLE,
+                page_local: false,
+            },
+        ]));
+        assert_eq!(
+            confirm
+                .action_task(&atomic_plan)
+                .expect("the same concrete confirmation remains actionable")
+                .action_atoms,
+            2,
+            "whole-parent confirmations quote parent rows, not occurrences"
+        );
+
+        let ready = SelectedResidualTask {
+            state: StateId(44),
+            desc: StateDesc {
+                bound,
+                phase: ResidualPhase::Ready,
+            },
+            bucket: StateBucket::Rows(RowBatch {
+                rows: vec![raw(30)],
+                row_count: 1,
+            }),
+        };
+        assert!(!ready.is_action());
+        assert_eq!(ready.action_task(&plan), None);
     }
 
     fn paged_filter_fixture(
@@ -4835,9 +5137,10 @@ mod tests {
             &mut machine.stats,
         );
 
-        let (selected, chunk) = machine.take_continuation(&plan, hot, 8);
-        assert_eq!(selected, desc);
-        let StateBucket::Candidates(chunk) = chunk else {
+        let task = machine.take_continuation(&plan, hot, 8);
+        assert_eq!(task.state, hot.state);
+        assert_eq!(task.desc, desc);
+        let StateBucket::Candidates(chunk) = task.bucket else {
             panic!("continuation returned a row payload")
         };
         assert_eq!(chunk.parents.rows, [raw(99)]);
@@ -4845,7 +5148,7 @@ mod tests {
         assert_eq!(machine.stats.continuation_pops, 1);
         assert_eq!(machine.stats.underfilled_continuation_pops, 1);
 
-        let rank = selected.rank(plan.len());
+        let rank = desc.rank(plan.len());
         let level = machine
             .worklist
             .get(&rank)
@@ -4900,11 +5203,11 @@ mod tests {
             "a width-filling successor must remain globally schedulable"
         );
 
-        let (selected, chunk) = machine
+        let task = machine
             .take_next_with_plan(&plan, 2)
             .expect("global work remains live");
-        assert_eq!(selected, ready_desc(2));
-        assert_eq!(chunk.row_count(), 2);
+        assert_eq!(task.desc, ready_desc(2));
+        assert_eq!(task.bucket.row_count(), 2);
         assert_eq!(machine.stats.continuation_pops, 0);
     }
 

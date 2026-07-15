@@ -155,6 +155,13 @@ prioritized for efficient zero-copy access.
 - Add a FAQ chapter to the book summarising common questions.
 
 ## Discovered Issues
+- Add an executor-local shadow observer at the residual action-task boundary.
+  It should quote critical-path and total service cost for the exact
+  `(action, bound schema, batch geometry)` without giving planning-only Ready
+  or Candidate states a fabricated backend quote. Keep observation opt-in
+  until its clock/counter cost is measured, then compare an unsplit parent
+  task with concrete child tasks using confidence and reconvergence loss
+  rather than a global hardware cutoff.
 - Publish the checked Rank9 sidecar seam as a new Jerky crate version, then
   replace the exact git-revision pins in `triblespace-core` and
   `triblespace-search` before the next crates.io release. The git pin is an

@@ -148,6 +148,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Residual action dispatch now preserves an affine executor task.** Eager and
+  lazy residual execution both carry the selected interner state, canonical
+  descriptor, and owned row/candidate payload through one internal dispatch
+  boundary. Concrete Propose and Confirm states expose a hardware-neutral
+  action view with the exact state, leaf occurrence, variable, bound-row
+  schema, parent count, candidate count, and scheduler action units; Ready and
+  Candidate planning states expose no backend action. The ordinary path still
+  performs no timing or quote lookup, and scheduling, multiplicity, and the
+  public `Constraint` protocol are unchanged.
 - **Piles use one authoritative PATCH replay path.** The unpublished alternate
   locator-sidecar API, overlays, and CLI were removed before release. Refresh
   retains the useful one-observed-length optimization: each pass decodes one
