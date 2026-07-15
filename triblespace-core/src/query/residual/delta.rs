@@ -1716,10 +1716,36 @@ mod tests {
         }
     }
 
+    fn streaming_formula_return(plan: &ResidualPlan) -> DeltaReturn {
+        let relevant = ChildSet::empty(plan.len()).with_inserted(0);
+        let counter = plan
+            .finite_formula
+            .start(0, 0, UnionVerb::Propose { relevant });
+        let root = plan
+            .finite_formula
+            .root(0)
+            .expect("the synthetic root has a formula program");
+        DeltaReturn::Formula {
+            bound: VariableSet::new_empty(),
+            counter,
+            batch: FormulaBatch::from_proposal(
+                RowBatch {
+                    rows: Vec::new(),
+                    row_count: 1,
+                },
+                vec![super::super::ActivationId(11)],
+                &plan.finite_formula.node(root).kind,
+            ),
+        }
+    }
+
     #[test]
-    fn batched_delta_step_reports_dead_page_and_stable_handoff_independently() {
+    fn batched_delta_step_keeps_dead_page_and_streamed_formula_handoff_independent() {
         let root = MixedExpansion;
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_capabilities(
+            &root,
+            ResidualCapabilities::default().root_formula().cyclic_rpq(),
+        );
         let desc = DeltaDesc::leaf(0, 0);
         let mut scheduler = DeltaScheduler::new();
 
@@ -1735,17 +1761,17 @@ mod tests {
         );
         let (dead_node, dead_credit) = dead_page.roots.into_iter().next().unwrap();
 
-        let (live_activation, live_generator) = scheduler.registry.start_source(
-            DeltaReducer::StreamProposal,
-            candidate_return(Vec::new()),
-            None,
+        // This accepted seed publishes and proves quiescence in the same
+        // scheduler step. StreamFormulaProposal must file its affine return
+        // exactly once; cleanup must not replay the activation-local template.
+        let mut live = scheduler.registry.start_many(
+            DeltaReducer::StreamFormulaProposal,
+            streaming_formula_return(&plan),
+            [output(3, 0, true)],
         );
-        let live_page = scheduler.registry.replace_source(
-            live_generator,
-            [output(2, 0, false)],
-            None,
-        );
-        let (live_node, live_credit) = live_page.roots.into_iter().next().unwrap();
+        let live_activation = live.activation;
+        let (live_node, live_credit) = live.roots.pop().expect("one live formula root");
+        assert!(live.quiescence.is_none());
 
         scheduler.file(
             desc,
@@ -1778,8 +1804,49 @@ mod tests {
         assert_eq!(outcome.dead_pages, 1);
         assert!(outcome.continuation.is_some());
         assert_eq!(stats.delta_source_dead_pages, 1);
-        assert_eq!(stable.values().map(BTreeMap::len).sum::<usize>(), 1);
-        assert_eq!(scheduler.source_worklist.values().next().unwrap().tasks.len(), 1);
+        assert_eq!(stats.candidates_proposed, 1);
+        let mut stable_buckets = stable.values().flat_map(BTreeMap::values);
+        let StateBucket::Candidates(batch) = stable_buckets.next().expect("one stable handoff")
+        else {
+            panic!("streamed formula handoff changed payload shape")
+        };
+        assert!(stable_buckets.next().is_none());
+        assert_eq!(batch.parents.row_count, 1);
+        assert!(batch.parents.rows.is_empty());
+        assert_eq!(batch.candidates, [(0, value(3))]);
+        assert!(
+            !scheduler
+                .registry
+                .state
+                .activations
+                .contains_key(&live_activation),
+            "formula quiescence must retire the streamed activation"
+        );
+        assert!(scheduler.worklist.is_empty());
+        assert_eq!(
+            scheduler
+                .source_worklist
+                .values()
+                .next()
+                .unwrap()
+                .tasks
+                .len(),
+            1
+        );
+
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        machine.width = 4;
+        machine.cap = 64;
+        machine.accept_delta_step(outcome);
+        assert_eq!(machine.width, 4, "a mixed positive step must not widen");
+        assert_eq!(machine.stats.delta_source_negative_steps, 0);
+        assert!(matches!(
+            machine.continuation,
+            Some(ActiveContinuation {
+                mode: ContinuationMode::ProbeOne,
+                ..
+            })
+        ));
     }
 
     #[test]

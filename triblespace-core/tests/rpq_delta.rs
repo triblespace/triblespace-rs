@@ -331,6 +331,7 @@ struct PageTraceFilter {
     variable: VariableId,
     estimate: usize,
     accepted: Option<RawInline>,
+    page_local: bool,
     calls: Arc<Mutex<Vec<usize>>>,
 }
 
@@ -388,7 +389,7 @@ impl<'a> Constraint<'a> for PageTraceFilter {
     }
 
     fn residual_confirm_is_page_local(&self) -> bool {
-        true
+        self.page_local
     }
 }
 
@@ -987,6 +988,7 @@ fn synthetic_root_grouped_rpq_precedes_page_local_suffix_atomically() {
             variable: START,
             estimate: usize::MAX,
             accepted: None,
+            page_local: true,
             calls: Arc::clone(&suffix_calls),
         }) as DynConstraint,
     ]));
@@ -1022,51 +1024,80 @@ fn synthetic_root_grouped_rpq_precedes_page_local_suffix_atomically() {
 }
 
 #[test]
-fn synthetic_root_cyclic_proposer_pins_global_width_coupling() {
-    let edges: Vec<_> = (0..8).map(|node| (node, node)).collect();
-    let graph = Graph::new(8, &edges);
-    let source_pages = Arc::new(Mutex::new(Vec::new()));
-    let suffix_calls = Arc::new(Mutex::new(Vec::new()));
-    let seeded = Arc::new(AtomicUsize::new(0));
-    let node = Variable::<GenId>::new(START);
-    let accepted = graph.value(0).raw;
-    let root = Arc::new(IntersectionConstraint::new(vec![
-        Box::new(CountingPath {
-            inner: RegularPathConstraint::new(
-                graph.set.clone(),
-                node,
-                node,
-                &repeated(graph.attribute, false),
-            ),
-            seeded_roots: Some(Arc::clone(&seeded)),
-            source_pages: Some(Arc::clone(&source_pages)),
-            expanded_nodes: Arc::new(AtomicUsize::new(0)),
-        }) as DynConstraint,
-        Box::new(PageTraceFilter {
-            variable: START,
-            estimate: usize::MAX,
-            accepted: Some(accepted),
-            calls: Arc::clone(&suffix_calls),
-        }) as DynConstraint,
-    ]));
-    let mut query = Query::new(root, project_start)
-        .solve_residual_state_lazy_with(ResidualCapabilities::default().root_formula().cyclic_rpq())
-        .cap(8)
-        .start_width(1);
+fn synthetic_root_cyclic_proposer_respects_the_streamability_latency_boundary() {
+    for page_local in [true, false] {
+        let edges: Vec<_> = (0..8).map(|node| (node, node)).collect();
+        let graph = Graph::new(8, &edges);
+        let source_pages = Arc::new(Mutex::new(Vec::new()));
+        let suffix_calls = Arc::new(Mutex::new(Vec::new()));
+        let seeded = Arc::new(AtomicUsize::new(0));
+        let node = Variable::<GenId>::new(START);
+        let accepted = (0..8)
+            .map(|node| graph.value(node).raw)
+            .max()
+            .expect("nonempty source frontier");
+        let root = Arc::new(IntersectionConstraint::new(vec![
+            Box::new(CountingPath {
+                inner: RegularPathConstraint::new(
+                    graph.set.clone(),
+                    node,
+                    node,
+                    &repeated(graph.attribute, false),
+                ),
+                seeded_roots: Some(Arc::clone(&seeded)),
+                source_pages: Some(Arc::clone(&source_pages)),
+                expanded_nodes: Arc::new(AtomicUsize::new(0)),
+            }) as DynConstraint,
+            Box::new(PageTraceFilter {
+                variable: START,
+                estimate: usize::MAX,
+                accepted: Some(accepted),
+                page_local,
+                calls: Arc::clone(&suffix_calls),
+            }) as DynConstraint,
+        ]));
+        let mut query = Query::new(root, project_start)
+            .solve_residual_state_lazy_with(
+                ResidualCapabilities::default().root_formula().cyclic_rpq(),
+            )
+            .cap(8)
+            .start_width(1);
 
-    assert_eq!(query.next(), Some(accepted));
-    assert_eq!(
-        *source_pages.lock().expect("source-page recorder poisoned"),
-        [(1, 1, 1), (2, 2, 2), (4, 4, 4), (8, 1, 1)]
-    );
-    assert_eq!(seeded.load(Ordering::Relaxed), 8);
-    assert_eq!(
-        *suffix_calls.lock().expect("suffix recorder poisoned"),
-        [8],
-        "the page-local suffix currently inherits the source frontier's width"
-    );
-    assert_eq!(query.stats().width_increases, 3);
-    assert_eq!(query.current_width(), 8);
+        assert_eq!(query.next(), Some(accepted));
+        if page_local {
+            assert_eq!(
+                *source_pages.lock().expect("source-page recorder poisoned"),
+                [(1, 1, 1), (2, 2, 2), (4, 4, 4), (8, 1, 1)]
+            );
+            assert_eq!(seeded.load(Ordering::Relaxed), 8);
+            assert_eq!(
+                *suffix_calls.lock().expect("suffix recorder poisoned"),
+                [1, 1, 1, 1],
+                "each ProbeOne handoff must isolate one streamed atom"
+            );
+            assert_eq!(query.stats().delta_handoff_probe_pops, 4);
+            assert_eq!(query.stats().delta_source_dead_pages, 0);
+            assert_eq!(query.stats().delta_source_negative_steps, 0);
+            assert_eq!(query.stats().width_increases, 3);
+            assert_eq!(query.current_width(), 8);
+        } else {
+            assert_eq!(
+                *source_pages.lock().expect("source-page recorder poisoned"),
+                [(1, 1, 1), (2, 2, 2), (4, 4, 4), (8, 1, 1)]
+            );
+            assert_eq!(seeded.load(Ordering::Relaxed), 8);
+            assert_eq!(
+                *suffix_calls.lock().expect("suffix recorder poisoned"),
+                [8],
+                "an ineligible suffix must retain the frozen global-width trace"
+            );
+            assert_eq!(query.stats().delta_handoff_probe_pops, 1);
+            assert_eq!(query.stats().delta_source_dead_pages, 3);
+            assert_eq!(query.stats().delta_source_negative_steps, 3);
+            assert_eq!(query.stats().width_increases, 3);
+            assert_eq!(query.current_width(), 8);
+        }
+    }
 }
 
 #[test]
@@ -1370,6 +1401,7 @@ fn synthetic_root_atom_streams_a_cycle_before_fixpoint_cleanup() {
 
     assert_eq!(query.next(), Some(graph.value(0).raw));
     assert_eq!(expanded.load(Ordering::Relaxed), 1);
+    assert_eq!(query.stats().delta_handoff_probe_pops, 1);
     assert_eq!(query.next(), None);
     assert_eq!(expanded.load(Ordering::Relaxed), 2);
 }
@@ -1399,6 +1431,11 @@ fn synthetic_root_and_streams_early_and_late_page_local_survivors() {
             expanded.load(Ordering::Relaxed),
             expected_before_emit,
             "accepted_node={accepted_node}, nested_and={nested_and}"
+        );
+        assert_eq!(
+            query.stats().delta_handoff_probe_pops,
+            expected_before_emit,
+            "every streamed AND handoff must be probed exactly once"
         );
         assert_eq!(query.next(), None);
         assert_eq!(expanded.load(Ordering::Relaxed), 5);
@@ -1515,6 +1552,7 @@ fn clone_and_drop_preserve_a_live_linear_formula_stream() {
     let first = query.next().expect("the first endpoint streamed");
     assert_eq!(first, graph.value(1).raw);
     assert_eq!(expanded.load(Ordering::Relaxed), 1);
+    assert_eq!(query.stats().delta_handoff_probe_pops, 1);
     let exact_clone = query.clone();
     let cancelled = query.clone();
     drop(cancelled);

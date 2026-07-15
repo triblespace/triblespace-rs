@@ -1311,7 +1311,7 @@ pub struct ResidualStateStats {
     /// partially survived. These pops deliberately bypass global occupancy
     /// harvesting without changing canonical state identity.
     pub continuation_pops: usize,
-    /// Continuation-cohort pops whose exact newly filed payload was smaller
+    /// Continuation-cohort pops whose retained receipt occupancy was smaller
     /// than the current desired width.
     pub underfilled_continuation_pops: usize,
     /// Pops that left unprocessed parent rows or candidate occurrences live
@@ -3378,14 +3378,15 @@ impl SelectedResidualTask {
 
 type Worklist = BTreeMap<usize, BTreeMap<StateId, StateBucket>>;
 
-/// Exact physical tail appended by one transition to a canonical state.
+/// Physical tail receipt from one transition into a canonical state.
 ///
 /// This token is deliberately absent from [`StateDesc`] and the interner: two
 /// histories with identical future computation retain one semantic state even
 /// while the lazy scheduler temporarily keeps the newly advanced cohort hot.
-/// Single-threaded filing appends the cohort at the payload tail, so its exact
-/// row/candidate occupancy can be removed without consuming an older cohort
-/// that already occupied the same state.
+/// Single-threaded filing appends at the payload tail, so the receipt bounds a
+/// tail removal without consuming older work. If several receipts target the
+/// same canonical key before selection, the retained receipt may name an
+/// equivalent final tail rather than the literal rows from its own filing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ContinuationToken {
     rank: usize,
@@ -5084,15 +5085,15 @@ impl ResidualStateMachine {
         })
     }
 
-    /// Removes one chunk exclusively from the tail appended by the preceding
-    /// advancing transition.
+    /// Removes one receipt-bounded chunk from the current canonical tail.
     ///
     /// A global strict-deepest flag is insufficient here: another history may
     /// already occupy a deeper state, and an older cohort may already occupy
-    /// this exact state. The token limits the tail cut to the newly filed
-    /// cohort, preserving DFS latency without changing readiness legality or
-    /// canonical state identity. It may deliberately defer the opportunity to
-    /// merge this cohort with older work.
+    /// this exact state. The token limits the tail cut by one selected receipt,
+    /// preserving DFS latency without changing readiness legality or canonical
+    /// state identity. Equal-key filings may extend that tail before selection,
+    /// so the removed values need not retain receipt-level provenance. The cut
+    /// may deliberately defer the opportunity to merge with older work.
     fn take_continuation(
         &mut self,
         plan: &ResidualPlan,
@@ -6095,12 +6096,12 @@ impl ResidualStateMachine {
 /// immediately prepares a geometrically wider width for later frontier work;
 /// filing any nonempty successor leaves the width unchanged. When a full
 /// Propose or Confirm action files fewer actionable atoms than that width, the
-/// exact newly appended physical cohort becomes hot and outranks cold sibling
+/// receipt-bounded physical tail becomes hot and outranks cold sibling
 /// harvesting until it emits or dies. Planning splits and readiness pops do not
 /// activate a sprint on their own. With no hot lineage they retain ordinary
 /// batching; within a hot lineage they may continue its deliberate
 /// latency-for-reconvergence tradeoff. The token never changes canonical
-/// identity or consumes an older cohort merged under the same state. With no
+/// identity or consumes work older than the retained receipt bound. With no
 /// hot continuation, the deepest live bucket able to fill the width wins; if
 /// none can, the minimum-rank bucket drains through the strict readiness gate.
 /// The cap only bounds geometric width growth.
@@ -6475,8 +6476,8 @@ where
     ///
     /// The first pull uses a one-parent depth-first batch by default. Filing a
     /// nonempty successor preserves that width. When a full proposal or
-    /// confirmation action partially survives, only its exact newly appended
-    /// physical cohort becomes the next continuation; it remains ahead of cold
+    /// confirmation action partially survives, only its receipt-bounded
+    /// physical tail becomes the next continuation; it remains ahead of cold
     /// sibling harvesting until it emits or dies. Planning splits and
     /// readiness-selected work cannot activate a sprint themselves, but may
     /// carry an already-hot lineage forward. Death or raw terminal output grows
@@ -12883,15 +12884,25 @@ mod tests {
             plan.len(),
             desc,
             StateBucket::Rows(RowBatch {
-                rows: vec![raw(50)],
-                row_count: 1,
+                rows: [50, 51, 52].map(raw).into(),
+                row_count: 3,
             }),
             &mut machine.stats,
         )
         .unwrap();
+        let resumed = machine
+            .continuation_after_advanced(&plan, machine.width, successor)
+            .expect("the probe hit has an ordered successor");
+        assert_eq!(resumed, ActiveContinuation::cohort(successor));
+        let resumed = machine.take_continuation(&plan, resumed, machine.width);
+        let StateBucket::Rows(resumed) = resumed.bucket else {
+            panic!("probe successor changed payload shape")
+        };
+        assert_eq!(resumed.rows, [50, 51, 52].map(raw));
+        assert_eq!(resumed.row_count, 3);
         assert_eq!(
-            machine.continuation_after_advanced(&plan, machine.width, successor),
-            Some(ActiveContinuation::cohort(successor))
+            machine.stats.delta_handoff_probe_pops, 1,
+            "the ordered successor cohort must not be probed again"
         );
 
         // A miss leaves the unprobed hot prefix merged with older work. The
