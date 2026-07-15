@@ -1209,8 +1209,16 @@ pub struct ResidualStateStats {
     /// Product-state roots admitted from bounded source pages.
     pub delta_source_roots: usize,
     /// Source pages that retired without filing a stable acyclic effect and
-    /// therefore asked the geometric scheduler to widen.
+    /// without resuming a stable/formula continuation. This counts pages
+    /// exactly even when another activation files a stable continuation in
+    /// the same batched delta step.
     pub delta_source_dead_pages: usize,
+    /// Delta steps that contained at least one dead source page and no stable
+    /// continuation, and therefore widened the global cold-harvest demand.
+    pub delta_source_negative_steps: usize,
+    /// One-atom continuation pops used to probe a delta-to-stable handoff
+    /// before returning the rest of that cohort to global cold harvesting.
+    pub delta_handoff_probe_pops: usize,
 }
 
 /// Results and measurements from [`Query::solve_residual_state_profiled`].
@@ -3240,6 +3248,40 @@ struct ContinuationToken {
     candidates: usize,
 }
 
+/// Physical scheduling policy for one exact continuation receipt.
+///
+/// `Cohort` preserves the ordinary action sprint. `ProbeOne` is reserved for
+/// delta-to-stable handoffs: it selects one promising atom, then hands that
+/// atom's ordered fanout back to `Cohort`, without resetting the query-wide
+/// cold-harvest width or making width part of canonical state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContinuationMode {
+    Cohort,
+    ProbeOne,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ActiveContinuation {
+    token: ContinuationToken,
+    mode: ContinuationMode,
+}
+
+impl ActiveContinuation {
+    fn cohort(token: ContinuationToken) -> Self {
+        Self {
+            token,
+            mode: ContinuationMode::Cohort,
+        }
+    }
+
+    fn probe_one(token: ContinuationToken) -> Self {
+        Self {
+            token,
+            mode: ContinuationMode::ProbeOne,
+        }
+    }
+}
+
 impl ContinuationToken {
     fn occupancy(self, desc: &StateDesc, plan: &ResidualPlan) -> usize {
         if desc.uses_candidate_pages(plan) {
@@ -3269,7 +3311,7 @@ fn prefer_continuation(
 enum SelectionKind {
     Full,
     Readiness,
-    Continuation,
+    Continuation(ContinuationMode),
 }
 
 fn rows_view<'v>(vars: &'v [VariableId], rows: &'v [RawInline], row_count: usize) -> RowsView<'v> {
@@ -4678,9 +4720,10 @@ struct ResidualStateMachine {
     emit_rows: Vec<RawInline>,
     emit_next: usize,
     emit_count: usize,
-    /// Exact physical cohort activated by a partially surviving full action.
-    /// Its lineage is consumed before returning to global batch harvesting.
-    continuation: Option<ContinuationToken>,
+    /// Exact physical cohort activated by a partially surviving full action
+    /// or a delta-to-stable handoff. Its physical scheduling mode remains
+    /// outside canonical state identity.
+    continuation: Option<ActiveContinuation>,
     #[cfg(test)]
     continuation_sprint_enabled: bool,
     last_selection: SelectionKind,
@@ -4907,9 +4950,10 @@ impl ResidualStateMachine {
     fn take_continuation(
         &mut self,
         plan: &ResidualPlan,
-        token: ContinuationToken,
+        active: ActiveContinuation,
         width: usize,
     ) -> SelectedResidualTask {
+        let ActiveContinuation { token, mode } = active;
         let desc = self.interner.get(token.state).clone();
         assert_eq!(
             desc.rank_with_span(
@@ -4923,7 +4967,10 @@ impl ResidualStateMachine {
         let candidate_pages = desc.uses_candidate_pages(plan);
         let cohort_occupancy = token.occupancy(&desc, plan);
         assert!(cohort_occupancy > 0, "continuation cohort is empty");
-        let take = cohort_occupancy.min(width.max(1));
+        let take = match mode {
+            ContinuationMode::Cohort => cohort_occupancy.min(width.max(1)),
+            ContinuationMode::ProbeOne => 1,
+        };
 
         let (mut bucket, remove_level) = {
             let level = self
@@ -4961,7 +5008,10 @@ impl ResidualStateMachine {
 
         self.stats.state_pops += 1;
         self.stats.continuation_pops += 1;
-        self.last_selection = SelectionKind::Continuation;
+        self.last_selection = SelectionKind::Continuation(mode);
+        if mode == ContinuationMode::ProbeOne {
+            self.stats.delta_handoff_probe_pops += 1;
+        }
         if cohort_occupancy < width.max(1) {
             self.stats.underfilled_continuation_pops += 1;
         }
@@ -5349,12 +5399,27 @@ impl ResidualStateMachine {
         self.width = next;
     }
 
+    /// Applies geometric feedback from one delta scheduler step without
+    /// confusing exact dead-page telemetry with a globally negative step.
+    fn account_delta_feedback(&mut self, outcome: &DeltaStepOutcome) {
+        if outcome.dead_pages > 0 && outcome.continuation.is_none() {
+            self.stats.delta_source_negative_steps += 1;
+            self.increase_width();
+        }
+    }
+
+    /// Accepts a delta-to-stable handoff into the one-atom latency probe.
+    fn accept_delta_step(&mut self, outcome: DeltaStepOutcome) {
+        self.account_delta_feedback(&outcome);
+        self.continuation = outcome.continuation.map(ActiveContinuation::probe_one);
+    }
+
     fn continuation_after_advanced(
         &self,
         plan: &ResidualPlan,
         width: usize,
         continuation: ContinuationToken,
-    ) -> Option<ContinuationToken> {
+    ) -> Option<ActiveContinuation> {
         #[cfg(test)]
         if !self.continuation_sprint_enabled {
             return None;
@@ -5362,9 +5427,17 @@ impl ResidualStateMachine {
         let desc = self.interner.get(continuation.state);
         let successor_is_underfilled = continuation.occupancy(desc, plan) < width.max(1);
         match self.last_selection {
-            SelectionKind::Continuation => Some(continuation),
+            // ProbeOne governs exactly the delta-filed handoff atom. Once it
+            // advances, its ordered fanout is an ordinary semantic cohort;
+            // probing that tail again could reverse observable result order.
+            SelectionKind::Continuation(ContinuationMode::ProbeOne) => {
+                Some(ActiveContinuation::cohort(continuation))
+            }
+            SelectionKind::Continuation(ContinuationMode::Cohort) => {
+                Some(ActiveContinuation::cohort(continuation))
+            }
             SelectionKind::Full if self.last_was_action && successor_is_underfilled => {
-                Some(continuation)
+                Some(ActiveContinuation::cohort(continuation))
             }
             SelectionKind::Full | SelectionKind::Readiness => None,
         }
@@ -5415,20 +5488,15 @@ impl ResidualStateMachine {
                 && !self.delta.is_empty()
                 && !self.has_full_stable(plan, width)
             {
-                match self.delta.step(
+                let outcome = self.delta.step(
                     root,
                     plan,
                     width,
                     &mut self.worklist,
                     &mut self.interner,
                     &mut self.stats,
-                ) {
-                    DeltaStepOutcome::Progress => {}
-                    DeltaStepOutcome::Stable(continuation) => {
-                        self.continuation = Some(continuation);
-                    }
-                    DeltaStepOutcome::DeadPage => self.increase_width(),
-                }
+                );
+                self.accept_delta_step(outcome);
                 continue;
             }
             match self.pop_once(root, plan, influences, base_estimates, width) {
@@ -5445,9 +5513,7 @@ impl ResidualStateMachine {
                     self.increase_width();
                 }
                 MachineStep::DeltaSeeded(continuation) => {
-                    self.continuation = continuation.and_then(|continuation| {
-                        self.continuation_after_advanced(plan, width, continuation)
-                    });
+                    self.continuation = continuation.map(ActiveContinuation::probe_one);
                 }
             }
         }
@@ -5704,19 +5770,18 @@ impl ResidualStateMachine {
             // rather than manufacturing a second query from the seed.
             let width = self.width.max(1);
             if !self.delta.is_empty() && !self.has_full_stable(plan, width) {
-                if matches!(
-                    self.delta.step(
-                        root,
-                        plan,
-                        width,
-                        &mut self.worklist,
-                        &mut self.interner,
-                        &mut self.stats,
-                    ),
-                    DeltaStepOutcome::DeadPage
-                ) {
-                    self.increase_width();
-                }
+                let outcome = self.delta.step(
+                    root,
+                    plan,
+                    width,
+                    &mut self.worklist,
+                    &mut self.interner,
+                    &mut self.stats,
+                );
+                // Split negotiation deliberately leaves every stable result
+                // in the cold worklist; it only consumes the same geometric
+                // feedback as the serial scheduler.
+                self.account_delta_feedback(&outcome);
                 continue;
             }
             if self.worklist.is_empty() {
@@ -10379,6 +10444,7 @@ mod tests {
         assert_eq!(stats.candidates_confirmed, 6);
         assert_eq!(stats.max_confirm_candidates, 2);
         assert_eq!(stats.underfilled_continuation_pops, 2);
+        assert_eq!(stats.delta_handoff_probe_pops, 0);
         assert_eq!(
             stats.state_pops,
             stats.full_pops + stats.readiness_pops + stats.continuation_pops,
@@ -10407,6 +10473,7 @@ mod tests {
         assert_eq!(stats.candidates_confirmed, 126);
         assert_eq!(stats.max_confirm_candidates, 32);
         assert_eq!(stats.underfilled_continuation_pops, 2);
+        assert_eq!(stats.delta_handoff_probe_pops, 0);
         assert_eq!(stats.width_increases, 6);
         assert_eq!(width, 64);
 
@@ -12049,7 +12116,7 @@ mod tests {
             &mut machine.stats,
         )
         .expect("fixture files a live continuation cohort");
-        machine.continuation = Some(continuation);
+        machine.continuation = Some(ActiveContinuation::probe_one(continuation));
 
         let mut right = machine
             .split_for_parallel(&root, &plan, &influences, &base_estimates)
@@ -12391,7 +12458,7 @@ mod tests {
             &mut machine.stats,
         );
 
-        let task = machine.take_continuation(&plan, hot, 8);
+        let task = machine.take_continuation(&plan, ActiveContinuation::cohort(hot), 8);
         assert_eq!(task.state, hot.state);
         assert_eq!(task.desc, desc);
         let StateBucket::Candidates(chunk) = task.bucket else {
@@ -12421,6 +12488,128 @@ mod tests {
             .values()
             .flat_map(|level| level.keys())
             .any(|&id| machine.interner.get(id) == &ready_desc(3)));
+    }
+
+    #[test]
+    fn probe_one_preserves_old_cold_tail_across_hit_miss_and_clone() {
+        let root = ShapeLeaf(0);
+        let plan = ResidualPlan::compile(&root);
+        let desc = ready_desc(1);
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        machine.width = 8;
+        machine.cap = 64;
+
+        file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            plan.len(),
+            desc.clone(),
+            StateBucket::Rows(RowBatch {
+                rows: [10, 11, 12].map(raw).into(),
+                row_count: 3,
+            }),
+            &mut machine.stats,
+        );
+        let hot = file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            plan.len(),
+            desc.clone(),
+            StateBucket::Rows(RowBatch {
+                rows: [40, 41, 42, 43].map(raw).into(),
+                row_count: 4,
+            }),
+            &mut machine.stats,
+        )
+        .expect("hot cohort is nonempty");
+        machine.continuation = Some(ActiveContinuation::probe_one(hot));
+
+        let mut missed = machine.clone();
+        assert_eq!(missed.continuation, machine.continuation);
+        let hit = machine.continuation.take().unwrap();
+        let hit_width = machine.width;
+        let hit_task = machine.take_continuation(&plan, hit, hit_width);
+        let miss = missed.continuation.take().unwrap();
+        let miss_width = missed.width;
+        let miss_task = missed.take_continuation(&plan, miss, miss_width);
+        for task in [hit_task, miss_task] {
+            let StateBucket::Rows(rows) = task.bucket else {
+                panic!("ready probe changed payload shape")
+            };
+            assert_eq!(rows.rows, [raw(43)]);
+            assert_eq!(rows.row_count, 1);
+        }
+
+        // A hit returns the selected atom's ordered fanout to ordinary cohort
+        // continuation. Only the original delta handoff is probed one-at-a-time.
+        let successor = file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            plan.len(),
+            desc,
+            StateBucket::Rows(RowBatch {
+                rows: vec![raw(50)],
+                row_count: 1,
+            }),
+            &mut machine.stats,
+        )
+        .unwrap();
+        assert_eq!(
+            machine.continuation_after_advanced(&plan, machine.width, successor),
+            Some(ActiveContinuation::cohort(successor))
+        );
+
+        // A miss leaves the unprobed hot prefix merged with older work. The
+        // next selection is ordinary global cold harvesting at width eight.
+        let cold = missed.take_next_with_plan(&plan, missed.width).unwrap();
+        let StateBucket::Rows(cold) = cold.bucket else {
+            panic!("cold ready cohort changed payload shape")
+        };
+        assert_eq!(
+            cold.rows,
+            [10, 11, 12, 40, 41, 42]
+                .map(raw)
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(cold.row_count, 6);
+        assert_eq!(machine.width, 8);
+        assert_eq!(missed.width, 8);
+        assert_eq!(machine.stats.delta_handoff_probe_pops, 1);
+        assert_eq!(missed.stats.delta_handoff_probe_pops, 1);
+    }
+
+    #[test]
+    fn mixed_delta_feedback_arms_probe_without_widening() {
+        let mut machine =
+            ResidualStateMachine::new(VariableSet::new_empty(), 1, Search::Done);
+        machine.width = 4;
+        machine.cap = 64;
+        let token = ContinuationToken {
+            rank: 7,
+            state: StateId(3),
+            rows: 2,
+            candidates: 0,
+        };
+
+        machine.accept_delta_step(DeltaStepOutcome {
+            continuation: Some(token),
+            dead_pages: 2,
+        });
+        assert_eq!(machine.width, 4);
+        assert_eq!(machine.stats.delta_source_negative_steps, 0);
+        assert_eq!(
+            machine.continuation,
+            Some(ActiveContinuation::probe_one(token))
+        );
+
+        machine.accept_delta_step(DeltaStepOutcome {
+            continuation: None,
+            dead_pages: 2,
+        });
+        assert_eq!(machine.width, 8);
+        assert_eq!(machine.stats.delta_source_negative_steps, 1);
+        assert!(machine.continuation.is_none());
     }
 
     #[test]

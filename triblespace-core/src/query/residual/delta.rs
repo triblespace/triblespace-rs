@@ -801,15 +801,13 @@ struct SourceBucket {
 }
 
 /// One delta scheduler step as observed by the outer geometric policy.
-pub(super) enum DeltaStepOutcome {
-    /// Cyclic work advanced without a stable acyclic effect and without
-    /// retiring a scheduler-negative source page.
-    Progress,
-    /// A stable continuation was filed and may be consumed immediately.
-    Stable(ContinuationToken),
-    /// At least one bounded source page retired without filing a stable
-    /// effect. The outer scheduler must grow its width geometrically.
-    DeadPage,
+///
+/// Stable progress and dead pages are deliberately independent: one batched
+/// expansion can retire an ineffective page for one activation while another
+/// activation files a stable continuation.
+pub(super) struct DeltaStepOutcome {
+    pub(super) continuation: Option<ContinuationToken>,
+    pub(super) dead_pages: usize,
 }
 
 impl DeltaBucket {
@@ -1309,7 +1307,7 @@ impl DeltaScheduler {
         let mut next_tasks = Vec::new();
         let mut resumed_sources = Vec::new();
         let mut continuation = None;
-        let mut dead_page = false;
+        let mut dead_pages = 0usize;
         let mut cursor = 0usize;
         for (task_index, task) in tasks.into_iter().enumerate() {
             assert_eq!(task.activation, task.credit.key.activation);
@@ -1321,6 +1319,8 @@ impl DeltaScheduler {
                 task.credit,
                 successors[begin..cursor].iter().map(|(_, value)| *value),
             );
+            let retired_source_page = outcome.retired_source_page;
+            let mut task_continuation = None;
             for (node, credit) in outcome.children {
                 next_tasks.push(DeltaTask {
                     activation: task.activation,
@@ -1335,12 +1335,6 @@ impl DeltaScheduler {
                     cursor: source_cursor,
                 });
             }
-            if outcome
-                .retired_source_page
-                .is_some_and(|page| !page.had_stable_effect)
-            {
-                dead_page = true;
-            }
             if !outcome.accepted.is_empty() {
                 if let Some((return_desc, parent)) = self.registry.streaming_return(task.activation)
                 {
@@ -1353,7 +1347,7 @@ impl DeltaScheduler {
                         .map(|value| (0, value))
                         .collect();
                     prefer_continuation(
-                        &mut continuation,
+                        &mut task_continuation,
                         file_with_plan(
                             stable,
                             stable_interner,
@@ -1375,21 +1369,24 @@ impl DeltaScheduler {
                 assert_eq!(proof.activation, task.activation);
                 let completed = self.registry.finish(proof);
                 prefer_continuation(
-                    &mut continuation,
+                    &mut task_continuation,
                     Self::release_completion(completed, plan, stable, stable_interner, stats),
                 );
             }
+            if retired_source_page.is_some_and(|page| !page.had_stable_effect)
+                && task_continuation.is_none()
+            {
+                dead_pages += 1;
+            }
+            prefer_continuation(&mut continuation, task_continuation);
         }
         assert_eq!(cursor, successors.len());
         self.file(desc.clone(), next_tasks);
         self.file_source(desc, resumed_sources);
-        if let Some(continuation) = continuation {
-            DeltaStepOutcome::Stable(continuation)
-        } else if dead_page {
-            stats.delta_source_dead_pages += 1;
-            DeltaStepOutcome::DeadPage
-        } else {
-            DeltaStepOutcome::Progress
+        stats.delta_source_dead_pages += dead_pages;
+        DeltaStepOutcome {
+            continuation,
+            dead_pages,
         }
     }
 
@@ -1495,16 +1492,16 @@ impl DeltaScheduler {
             );
         }
 
-        if let Some(continuation) = continuation {
-            DeltaStepOutcome::Stable(continuation)
-        } else if outcome
-            .retired_source_page
-            .is_some_and(|page| !page.had_stable_effect)
-        {
-            stats.delta_source_dead_pages += 1;
-            DeltaStepOutcome::DeadPage
-        } else {
-            DeltaStepOutcome::Progress
+        let dead_pages = usize::from(
+            outcome
+                .retired_source_page
+                .is_some_and(|page| !page.had_stable_effect)
+                && continuation.is_none(),
+        );
+        stats.delta_source_dead_pages += dead_pages;
+        DeltaStepOutcome {
+            continuation,
+            dead_pages,
         }
     }
 
@@ -1563,6 +1560,61 @@ impl Clone for DeltaScheduler {
 mod tests {
     use super::*;
 
+    #[derive(Clone, Copy)]
+    struct MixedExpansion;
+
+    impl Constraint<'static> for MixedExpansion {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(0)
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != 0 {
+                return false;
+            }
+            out.fill(1, view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn residual_delta_expand(
+            &self,
+            _variable: VariableId,
+            nodes: &[ResidualDeltaNode],
+            successors: &mut Vec<(u32, ResidualDeltaOutput)>,
+        ) -> bool {
+            for (tag, node) in nodes.iter().enumerate() {
+                if node.value == value(2) {
+                    successors.push((
+                        u32::try_from(tag).unwrap(),
+                        output(3, node.continuation + 1, true),
+                    ));
+                }
+            }
+            true
+        }
+    }
+
     fn value(byte: u8) -> RawInline {
         [byte; 32]
     }
@@ -1602,6 +1654,87 @@ mod tests {
             },
             parent: parent.into_boxed_slice(),
         }
+    }
+
+    fn candidate_return(parent: Vec<RawInline>) -> DeltaReturn {
+        let relevant = ChildSet::empty(1).with_inserted(0);
+        DeltaReturn::Stable {
+            desc: StateDesc {
+                bound: VariableSet::new_empty(),
+                phase: ResidualPhase::Candidate {
+                    variable: 0,
+                    relevant: relevant.clone(),
+                    checked: relevant,
+                },
+            },
+            parent: parent.into_boxed_slice(),
+        }
+    }
+
+    #[test]
+    fn batched_delta_step_reports_dead_page_and_stable_handoff_independently() {
+        let root = MixedExpansion;
+        let plan = ResidualPlan::compile(&root);
+        let desc = DeltaDesc::leaf(0, 0);
+        let mut scheduler = DeltaScheduler::new();
+
+        let (dead_activation, dead_generator) = scheduler.registry.start_source(
+            DeltaReducer::StreamProposal,
+            candidate_return(Vec::new()),
+            None,
+        );
+        let dead_page = scheduler.registry.replace_source(
+            dead_generator,
+            [output(1, 0, false)],
+            Some(ResidualDeltaSourceCursor::After(value(1))),
+        );
+        let (dead_node, dead_credit) = dead_page.roots.into_iter().next().unwrap();
+
+        let (live_activation, live_generator) = scheduler.registry.start_source(
+            DeltaReducer::StreamProposal,
+            candidate_return(Vec::new()),
+            None,
+        );
+        let live_page = scheduler.registry.replace_source(
+            live_generator,
+            [output(2, 0, false)],
+            None,
+        );
+        let (live_node, live_credit) = live_page.roots.into_iter().next().unwrap();
+
+        scheduler.file(
+            desc,
+            vec![
+                DeltaTask {
+                    activation: dead_activation,
+                    credit: dead_credit,
+                    node: dead_node,
+                },
+                DeltaTask {
+                    activation: live_activation,
+                    credit: live_credit,
+                    node: live_node,
+                },
+            ],
+        );
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+
+        let outcome = scheduler.step(
+            &root,
+            &plan,
+            2,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+
+        assert_eq!(outcome.dead_pages, 1);
+        assert!(outcome.continuation.is_some());
+        assert_eq!(stats.delta_source_dead_pages, 1);
+        assert_eq!(stable.values().map(BTreeMap::len).sum::<usize>(), 1);
+        assert_eq!(scheduler.source_worklist.values().next().unwrap().tasks.len(), 1);
     }
 
     #[test]
