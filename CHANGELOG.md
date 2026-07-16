@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Standalone PATCH constraints can page ordered proposal sources.**
+  Full-width value and ID membership constraints now drive residual proposals
+  through strict lexical PATCH cursors, so width-one demand can yield and
+  cancel without eagerly materializing the remaining set. Direct pages retain
+  set deduplication while separate affine parent activations preserve query bag
+  multiplicity; bound and confirmation actions keep their eager paths.
 - **TribleSet proposals can page ordered direct candidates.** Residual
   execution now drives every distinct-position E/A/V binding shape through
   strict PATCH segment cursors, preserving affine parent multiplicity while
