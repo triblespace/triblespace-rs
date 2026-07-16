@@ -2,8 +2,8 @@
 //!
 //! TribleSet is the executable reference for same-variable equality. These
 //! tests exercise SuccinctArchive through the complete constraint protocol and
-//! through every public scheduler, including the ordinary eager fallback used
-//! when repeated-position sources deliberately decline direct paging.
+//! through every public scheduler and the bounded filtered source used for
+//! repeated-position proposals.
 
 use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use triblespace_core::id::Id;
@@ -112,8 +112,8 @@ fn assert_protocol_equal<'a, L, R>(
         "{name}: SuccinctArchive disagreed with TribleSet",
     );
     assert!(
-        !right.residual_proposal_source_is_paged(variable, view),
-        "{name}: repeated-position equality must stay on the eager fallback",
+        right.residual_proposal_source_is_paged(variable, view),
+        "{name}: repeated-position equality must expose bounded source paging",
     );
 }
 
