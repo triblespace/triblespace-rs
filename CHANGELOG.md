@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The reconvergence probe now isolates ordinary iterator latency.**
+  Its unchanged 24-route query first passes a fixture-derived exact sorted
+  oracle on TribleSet and SuccinctArchive, then reports construction,
+  pull-to-first, geometric output prefixes, and full-drain throughput for the
+  ordinary `Query` before the existing scheduler matrix. Builds may embed an
+  exact `ENGINE_REVISION` for source-identical cross-revision comparisons.
 - **A source-identical benchmark compares query-engine generations.**
   `query_engine_generation_bench` runs finite unions, recursive AND/OR,
   cyclic regular paths, and mixed formula/path queries against independent

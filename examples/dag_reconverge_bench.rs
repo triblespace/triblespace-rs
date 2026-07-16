@@ -14,6 +14,11 @@
 //! unbound. Merged buckets re-fatten the final batch 24×; the lineage
 //! control (`solve_dag_unmerged`) and the recursive solvers keep 24 thin
 //! batches.
+//! In canonical column order, `x1 -> x2` reaches `{e,x1,x2}` by inserting
+//! at column 2 while `x2 -> x1` reaches the same Ready state by inserting at
+//! column 1. The four-variable convergence exercises insertion positions
+//! 1 through 4, then measures shared work after a fixed five-column bound
+//! prefix. `n_per_pop` controls cohort width and `z_fan` controls that work.
 //!
 //! Usage:
 //!     cargo run --release --example dag_reconverge_bench -- \
@@ -34,6 +39,11 @@
 //! and prints per mode: min/median/max wall time, parity signature, and for the
 //! frontier engines the group/batch structure, materialized rows, peak live
 //! row-store cells, and the DAG's bucket/merge census.
+//! Before those historical modes, an isolated ordinary-`Query` section checks
+//! the complete sorted relation against a fixture-derived oracle and measures
+//! construction, pull-to-first, geometric output prefixes, and full drain.
+//! The source embeds `ENGINE_REVISION` when supplied at build time so binaries
+//! transplanted across engine revisions remain attributable.
 //! With `--features gpu`, an additional controlled comparison interleaves the
 //! canonical CPU archive, the WGPU wrapper forced to its CPU rank path, forced
 //! WGPU rank dispatch, and the default gated hybrid. Each case is equally
@@ -42,7 +52,7 @@
 //! parallel schedulers directly; sequential/parallel ratios are end-to-end
 //! query-plus-consumer throughput rather than isolated engine scaling.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -53,6 +63,20 @@ use triblespace::core::trible::TribleSet;
 #[cfg(feature = "gpu")]
 use triblespace::gpu::{WgpuQueryStats, WgpuSuccinctArchive, DEFAULT_MIN_RANK_BATCH};
 use triblespace::prelude::*;
+
+const ENGINE_REVISION: &str = match option_env!("ENGINE_REVISION") {
+    Some(revision) => revision,
+    None => "unknown",
+};
+
+type QueryRow = (
+    Inline<inlineencodings::GenId>,
+    Inline<inlineencodings::GenId>,
+    Inline<inlineencodings::GenId>,
+    Inline<inlineencodings::GenId>,
+    Inline<inlineencodings::GenId>,
+    Inline<inlineencodings::GenId>,
+);
 
 mod world {
     use triblespace::prelude::*;
@@ -69,6 +93,25 @@ mod world {
         "0EFC41641FCD73A30E2414AE78DEC219" as rs: inlineencodings::GenId;
         "BCB248E3850EA6ACF22E7B175B574E12" as rtz: inlineencodings::GenId;
     }
+}
+
+/// Keep the relation under test literally identical across the historical
+/// scheduler matrix, the ordinary latency ladder, and the exact oracle gate.
+macro_rules! reconvergence_query {
+    ($kb:expr, $markers:expr) => {{
+        let (k1, k2, k3, k4, kz) = $markers;
+        find!(
+            (e: Inline<_>, x1: Inline<_>, x2: Inline<_>, x3: Inline<_>, x4: Inline<_>, z: Inline<_>),
+            pattern!($kb, [
+                { ?e @ world::rp1: ?x1, world::rp2: ?x2, world::rp3: ?x3, world::rp4: ?x4, world::rs: ?z },
+                { ?x1 @ world::rt1: k1 },
+                { ?x2 @ world::rt2: k2 },
+                { ?x3 @ world::rt3: k3 },
+                { ?x4 @ world::rt4: k4 },
+                { ?z @ world::rtz: kz }
+            ])
+        )
+    }};
 }
 
 /// (count, order-independent multiset hash) — parity signature.
@@ -143,7 +186,7 @@ impl FixtureIds {
     }
 }
 
-fn build_world(n_per_pop: usize, z_fan: usize) -> (TribleSet, (Id, Id, Id, Id, Id), usize) {
+fn build_world(n_per_pop: usize, z_fan: usize) -> (TribleSet, (Id, Id, Id, Id, Id), Vec<QueryRow>) {
     assert!(
         z_fan > 8,
         "z must be chosen after every x (fans go up to 8)"
@@ -153,6 +196,7 @@ fn build_world(n_per_pop: usize, z_fan: usize) -> (TribleSet, (Id, Id, Id, Id, I
     let markers: Vec<_> = (0..4).map(|_| ids.mint()).collect();
     let z_marker = ids.mint();
     let fans = [1usize, 2, 4, 8];
+    let mut expected_rows = Vec::with_capacity(24 * n_per_pop);
 
     let mut perms: Vec<[usize; 4]> = Vec::new();
     for a in 0..4 {
@@ -174,6 +218,7 @@ fn build_world(n_per_pop: usize, z_fan: usize) -> (TribleSet, (Id, Id, Id, Id, I
     for sigma in &perms {
         for _ in 0..n_per_pop {
             let e = ids.mint();
+            let mut real_by_attribute = [None; 4];
             for (k, &attr_idx) in sigma.iter().enumerate() {
                 let values: Vec<_> = (0..fans[k]).map(|_| ids.mint()).collect();
                 for v in &values {
@@ -185,6 +230,7 @@ fn build_world(n_per_pop: usize, z_fan: usize) -> (TribleSet, (Id, Id, Id, Id, I
                     };
                 }
                 let real = &values[0];
+                real_by_attribute[attr_idx] = Some(real.id);
                 let marker = &markers[attr_idx];
                 kb += match attr_idx {
                     0 => entity! { real @ world::rt1: marker },
@@ -198,9 +244,25 @@ fn build_world(n_per_pop: usize, z_fan: usize) -> (TribleSet, (Id, Id, Id, Id, I
                 kb += entity! { &e @ world::rs: v };
             }
             kb += entity! { &z_values[0] @ world::rtz: &z_marker };
+            expected_rows.push((
+                e.id.to_inline(),
+                real_by_attribute[0]
+                    .expect("every entity has rp1")
+                    .to_inline(),
+                real_by_attribute[1]
+                    .expect("every entity has rp2")
+                    .to_inline(),
+                real_by_attribute[2]
+                    .expect("every entity has rp3")
+                    .to_inline(),
+                real_by_attribute[3]
+                    .expect("every entity has rp4")
+                    .to_inline(),
+                z_values[0].id.to_inline(),
+            ));
         }
     }
-    let expected = 24 * n_per_pop;
+    expected_rows.sort_unstable();
     (
         kb,
         (
@@ -210,7 +272,7 @@ fn build_world(n_per_pop: usize, z_fan: usize) -> (TribleSet, (Id, Id, Id, Id, I
             *markers[3],
             *z_marker,
         ),
-        expected,
+        expected_rows,
     )
 }
 
@@ -233,18 +295,7 @@ enum Mode {
 }
 
 fn run_query<S: TriblePattern>(kb: &S, markers: (Id, Id, Id, Id, Id), mode: Mode) -> (usize, u64) {
-    let (k1, k2, k3, k4, kz) = markers;
-    let q = find!(
-        (e: Inline<_>, x1: Inline<_>, x2: Inline<_>, x3: Inline<_>, x4: Inline<_>, z: Inline<_>),
-        pattern!(kb, [
-            { ?e @ world::rp1: ?x1, world::rp2: ?x2, world::rp3: ?x3, world::rp4: ?x4, world::rs: ?z },
-            { ?x1 @ world::rt1: k1 },
-            { ?x2 @ world::rt2: k2 },
-            { ?x3 @ world::rt3: k3 },
-            { ?x4 @ world::rt4: k4 },
-            { ?z @ world::rtz: kz }
-        ])
-    );
+    let q = reconvergence_query!(kb, markers);
     match mode {
         Mode::Seq => tally(q.sequential()),
         #[cfg(feature = "parallel")]
@@ -272,19 +323,7 @@ fn run_residual_profiled<S: TriblePattern>(
     kb: &S,
     markers: (Id, Id, Id, Id, Id),
 ) -> ((usize, u64), ResidualStateStats) {
-    let (k1, k2, k3, k4, kz) = markers;
-    let solve = find!(
-        (e: Inline<_>, x1: Inline<_>, x2: Inline<_>, x3: Inline<_>, x4: Inline<_>, z: Inline<_>),
-        pattern!(kb, [
-            { ?e @ world::rp1: ?x1, world::rp2: ?x2, world::rp3: ?x3, world::rp4: ?x4, world::rs: ?z },
-            { ?x1 @ world::rt1: k1 },
-            { ?x2 @ world::rt2: k2 },
-            { ?x3 @ world::rt3: k3 },
-            { ?x4 @ world::rt4: k4 },
-            { ?z @ world::rtz: kz }
-        ])
-    )
-    .solve_residual_state_profiled();
+    let solve = reconvergence_query!(kb, markers).solve_residual_state_profiled();
     (tally(solve.results), solve.stats)
 }
 
@@ -292,20 +331,9 @@ fn run_lazy_residual_profiled<S: TriblePattern>(
     kb: &S,
     markers: (Id, Id, Id, Id, Id),
 ) -> ((usize, u64), ResidualStateStats) {
-    let (k1, k2, k3, k4, kz) = markers;
-    let solve = find!(
-        (e: Inline<_>, x1: Inline<_>, x2: Inline<_>, x3: Inline<_>, x4: Inline<_>, z: Inline<_>),
-        pattern!(kb, [
-            { ?e @ world::rp1: ?x1, world::rp2: ?x2, world::rp3: ?x3, world::rp4: ?x4, world::rs: ?z },
-            { ?x1 @ world::rt1: k1 },
-            { ?x2 @ world::rt2: k2 },
-            { ?x3 @ world::rt3: k3 },
-            { ?x4 @ world::rt4: k4 },
-            { ?z @ world::rtz: kz }
-        ])
-    )
-    .solve_residual_state_lazy()
-    .collect_profiled();
+    let solve = reconvergence_query!(kb, markers)
+        .solve_residual_state_lazy()
+        .collect_profiled();
     (tally(solve.results), solve.stats)
 }
 
@@ -322,13 +350,151 @@ fn timing_summary(v: &[f64]) -> (f64, f64, f64) {
     (s[0], median, s[s.len() - 1])
 }
 
+fn ordinary_collect<S: TriblePattern>(kb: &S, markers: (Id, Id, Id, Id, Id)) -> Vec<QueryRow> {
+    reconvergence_query!(kb, markers).collect()
+}
+
+fn check_ordinary_oracle<S: TriblePattern>(
+    label: &str,
+    kb: &S,
+    markers: (Id, Id, Id, Id, Id),
+    expected: &[QueryRow],
+) {
+    let mut actual = ordinary_collect(kb, markers);
+    actual.sort_unstable();
+    assert_eq!(actual, expected, "{label}: exact ordinary oracle mismatch");
+    println!(
+        "  ordinary exact oracle: {} sorted rows match",
+        expected.len()
+    );
+}
+
+fn ordinary_construct<S: TriblePattern>(kb: &S, markers: (Id, Id, Id, Id, Id)) {
+    drop(std::hint::black_box(reconvergence_query!(kb, markers)));
+}
+
+/// Construct outside the timer so this isolates the iterator's first pull.
+fn ordinary_pull<S: TriblePattern>(kb: &S, markers: (Id, Id, Id, Id, Id)) -> (Duration, bool) {
+    let mut query = reconvergence_query!(kb, markers);
+    let start = Instant::now();
+    let found = std::hint::black_box(query.next()).is_some();
+    (start.elapsed(), found)
+}
+
+/// End-to-end prefix: construction is deliberately included.
+fn ordinary_prefix<S: TriblePattern>(
+    kb: &S,
+    markers: (Id, Id, Id, Id, Id),
+    limit: usize,
+) -> (usize, u64) {
+    tally(reconvergence_query!(kb, markers).take(limit))
+}
+
+fn bench_ordinary<S: TriblePattern>(
+    kb: &S,
+    markers: (Id, Id, Id, Id, Id),
+    expected: &[QueryRow],
+    reps: usize,
+) {
+    let expected_rows = expected.len();
+    assert!(expected_rows > 0, "ordinary benchmark needs one result");
+
+    ordinary_construct(kb, markers);
+    assert!(ordinary_pull(kb, markers).1);
+    for limit in [1, 10, 100, usize::MAX] {
+        std::hint::black_box(ordinary_prefix(kb, markers, limit));
+    }
+
+    let mut construct_samples = Vec::with_capacity(reps);
+    let mut pull_samples = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        let start = Instant::now();
+        ordinary_construct(kb, markers);
+        construct_samples.push(start.elapsed().as_secs_f64() * 1e6);
+
+        let (elapsed, found) = ordinary_pull(kb, markers);
+        assert!(found, "ordinary first result disappeared");
+        pull_samples.push(elapsed.as_secs_f64() * 1e6);
+    }
+
+    let mut points: Vec<usize> = [1, 10, 100]
+        .into_iter()
+        .map(|point| point.min(expected_rows))
+        .collect();
+    points.sort_unstable();
+    points.dedup();
+    points.push(usize::MAX);
+
+    let mut point_samples = vec![Vec::with_capacity(reps); points.len()];
+    let mut signatures = vec![(0usize, 0u64); points.len()];
+    for repetition in 0..reps {
+        for offset in 0..points.len() {
+            let point_index = (repetition + offset) % points.len();
+            let start = Instant::now();
+            signatures[point_index] =
+                std::hint::black_box(ordinary_prefix(kb, markers, points[point_index]));
+            point_samples[point_index].push(start.elapsed().as_secs_f64());
+        }
+    }
+
+    let (construct_min, construct_median, construct_max) = timing_summary(&construct_samples);
+    let (pull_min, pull_median, pull_max) = timing_summary(&pull_samples);
+    println!("  ordinary Query latency ladder (canonical bound-prefix width 5):");
+    println!(
+        "    construct+drop  {:>10.3} us  [{construct_min:.3}..{construct_max:.3}]",
+        construct_median,
+    );
+    println!(
+        "    pull->first     {:>10.3} us  [{pull_min:.3}..{pull_max:.3}]",
+        pull_median,
+    );
+
+    let expected_signature = tally(expected.iter());
+    for (point_index, &point) in points.iter().enumerate() {
+        let expected_at_point = if point == usize::MAX {
+            expected_rows
+        } else {
+            point
+        };
+        assert_eq!(
+            signatures[point_index].0, expected_at_point,
+            "ordinary prefix count mismatch"
+        );
+        let (min, median, max) = timing_summary(&point_samples[point_index]);
+        if point == usize::MAX {
+            assert_eq!(
+                signatures[point_index], expected_signature,
+                "ordinary full-drain signature disagrees with exact oracle"
+            );
+            println!(
+                "    full drain      {:>10.3} ms  [{:.3}..{:.3}]  {:>12.0} rows/s",
+                median * 1e3,
+                min * 1e3,
+                max * 1e3,
+                expected_rows as f64 / median,
+            );
+        } else {
+            println!(
+                "    e2e take {point:<3}   {:>10.3} us  [{:.3}..{:.3}]",
+                median * 1e6,
+                min * 1e6,
+                max * 1e6,
+            );
+        }
+    }
+}
+
 fn bench_backend<S: TriblePattern>(
     label: &str,
     kb: &S,
     markers: (Id, Id, Id, Id, Id),
-    expected: usize,
+    expected_rows: &[QueryRow],
     reps: usize,
 ) {
+    check_ordinary_oracle(label, kb, markers, expected_rows);
+    bench_ordinary(kb, markers, expected_rows, reps);
+    let expected = expected_rows.len();
+
     let mut modes = vec![("seq", Mode::Seq)];
     #[cfg(feature = "parallel")]
     modes.extend([
@@ -459,16 +625,6 @@ fn format_batch_range(stats: WgpuQueryStats) -> String {
     }
 }
 
-#[cfg(feature = "gpu")]
-type QueryRow = (
-    Inline<inlineencodings::GenId>,
-    Inline<inlineencodings::GenId>,
-    Inline<inlineencodings::GenId>,
-    Inline<inlineencodings::GenId>,
-    Inline<inlineencodings::GenId>,
-    Inline<inlineencodings::GenId>,
-);
-
 /// Collects a full result multiset for the global DAG, saturated serial
 /// residual, and two affine Rayon scheduler shapes used by the controlled GPU
 /// comparison. Callers sort the result before comparison, because Rayon
@@ -479,18 +635,7 @@ fn collect_query<S: TriblePattern>(
     markers: (Id, Id, Id, Id, Id),
     mode: Mode,
 ) -> Vec<QueryRow> {
-    let (k1, k2, k3, k4, kz) = markers;
-    let q = find!(
-        (e: Inline<_>, x1: Inline<_>, x2: Inline<_>, x3: Inline<_>, x4: Inline<_>, z: Inline<_>),
-        pattern!(kb, [
-            { ?e @ world::rp1: ?x1, world::rp2: ?x2, world::rp3: ?x3, world::rp4: ?x4, world::rs: ?z },
-            { ?x1 @ world::rt1: k1 },
-            { ?x2 @ world::rt2: k2 },
-            { ?x3 @ world::rt3: k3 },
-            { ?x4 @ world::rt4: k4 },
-            { ?z @ world::rtz: kz }
-        ])
-    );
+    let q = reconvergence_query!(kb, markers);
     match mode {
         Mode::Dag => q.solve_dag(),
         Mode::Residual => q.solve_residual_state(),
@@ -794,14 +939,15 @@ fn main() {
     let controlled_gpu_only = false;
 
     eprintln!(
-        "block row cap: {}",
+        "revision: {ENGINE_REVISION}; block row cap: {}",
         triblespace::core::query::block_row_cap()
     );
     #[cfg(feature = "parallel")]
     eprintln!("Rayon worker threads: {}", rayon::current_num_threads());
 
     let t0 = Instant::now();
-    let (kb, markers, expected) = build_world(n_per_pop, z_fan);
+    let (kb, markers, expected_rows) = build_world(n_per_pop, z_fan);
+    let expected = expected_rows.len();
     eprintln!(
         "reconvergence world: {} entities (24 pops x {n_per_pop}), z_fan {z_fan}, {} tribles, built in {:?}",
         expected,
@@ -811,7 +957,7 @@ fn main() {
 
     if !controlled_gpu_only {
         println!("\n== TribleSet backend (default blocked delegation) ==");
-        bench_backend("reconverge 24-route", &kb, markers, expected, reps);
+        bench_backend("reconverge 24-route", &kb, markers, &expected_rows, reps);
     }
 
     let t0 = Instant::now();
@@ -820,7 +966,13 @@ fn main() {
 
     if !controlled_gpu_only {
         println!("\n== SuccinctArchive backend (batched blocked overrides) ==");
-        bench_backend("reconverge 24-route", &archive, markers, expected, reps);
+        bench_backend(
+            "reconverge 24-route",
+            &archive,
+            markers,
+            &expected_rows,
+            reps,
+        );
     }
 
     #[cfg(feature = "gpu")]
