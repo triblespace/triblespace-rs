@@ -1334,6 +1334,9 @@ impl RegularPathConstraint {
         let after = match cursor {
             ResidualDeltaSourceCursor::Start => None,
             ResidualDeltaSourceCursor::After(value) => Some(value),
+            ResidualDeltaSourceCursor::Offset(_) => {
+                panic!("regular-path source received an ordinal cursor")
+            }
         };
         let mut first = Vec::new();
         let mut last = Vec::new();
@@ -1432,6 +1435,9 @@ impl RegularPathConstraint {
         let after = match cursor {
             ResidualDeltaSourceCursor::Start => None,
             ResidualDeltaSourceCursor::After(value) => Some(value),
+            ResidualDeltaSourceCursor::Offset(_) => {
+                panic!("regular-path source received an ordinal cursor")
+            }
         };
 
         let source_steps: &[FirstStep] = if nullable {

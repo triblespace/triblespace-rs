@@ -1525,7 +1525,9 @@ pub struct ResidualStateStats {
     pub state_reentries: usize,
     /// Parent rows carried by [`state_reentries`](Self::state_reentries).
     pub rows_reentered: usize,
-    /// Flattened-leaf proposal calls.
+    /// Logical flattened-leaf proposal actions. A paged source activation
+    /// counts once even though it bypasses the eager `Constraint::propose`
+    /// verb.
     pub propose_calls: usize,
     /// Flattened-leaf Boolean-support calls.
     pub support_calls: usize,
@@ -1533,10 +1535,11 @@ pub struct ResidualStateStats {
     pub confirm_calls: usize,
     /// Parent rows passed to proposal calls.
     pub propose_rows: usize,
-    /// Candidate occurrences materialized by proposal calls. Proposal remains
-    /// eager per selected parent block; candidate paging begins afterwards.
+    /// Candidate occurrences produced by proposal actions, including direct
+    /// source-page effects that bypass an eager protocol call.
     pub candidates_proposed: usize,
-    /// Largest candidate frontier materialized by one proposal call.
+    /// Largest candidate frontier produced by one eager call or direct source
+    /// handoff.
     pub max_propose_candidates: usize,
     /// Parent rows passed to confirmation calls.
     pub confirm_rows: usize,
@@ -1556,13 +1559,16 @@ pub struct ResidualStateStats {
     /// Numeric increases of the lazy scheduler's desired actionable width.
     /// Saturated or growth-one attempts do not increment this counter.
     pub width_increases: usize,
-    /// Bounded source-frontier pages requested by cyclic residual lowering.
+    /// Bounded pages requested from constraint-owned source frontiers.
     pub delta_source_pages: usize,
     /// Ordered source candidates consumed across those pages, including
     /// candidates rejected by an exact secondary source filter.
     pub delta_source_candidates_examined: usize,
     /// Product-state roots admitted from bounded source pages.
     pub delta_source_roots: usize,
+    /// Direct proposal candidates admitted from bounded source pages without
+    /// creating product-state traversal roots.
+    pub delta_source_direct_candidates: usize,
     /// Source pages that retired without filing a stable acyclic effect and
     /// without resuming a stable/formula continuation. This counts pages
     /// exactly even when another activation files a stable continuation in
