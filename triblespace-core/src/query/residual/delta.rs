@@ -151,6 +151,12 @@ enum DeltaReducer {
     /// Accepted values remain private until the enclosing formula action has
     /// proved quiescence.
     QuiescentProposal,
+    /// Accepted endpoints are Boolean witnesses, not candidate values. The
+    /// first witness releases `true` exactly once; only producer quiescence can
+    /// release `false`.
+    Support {
+        published: bool,
+    },
     Confirm {
         original: Box<[RawInline]>,
     },
@@ -259,9 +265,28 @@ struct StartOutcome {
 
 struct CompletedActivation {
     return_to: DeltaReturn,
-    /// Complete quiescent action result. Streaming proposals have already
-    /// released every accepted value and therefore finish with cleanup only.
-    result: Option<Candidates>,
+    effect: DeltaCompletion,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum DeltaCompletion {
+    /// Every semantic effect was released before quiescence.
+    Cleanup,
+    /// Complete quiescent candidate action result.
+    Candidates(Candidates),
+    /// Boolean support proved only at the reducer boundary.
+    Support(bool),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeltaStreamingEffect {
+    Candidates,
+    Support,
+}
+
+struct DeltaStreamingReturn {
+    return_to: DeltaReturn,
+    effect: DeltaStreamingEffect,
 }
 
 impl ProducerRegistry {
@@ -667,24 +692,37 @@ impl ProducerRegistry {
         )
     }
 
-    fn streaming_return(&self, activation: ActivationId) -> Option<DeltaReturn> {
+    /// Takes one activation-local early effect. Support mutates its reducer at
+    /// this exact boundary so duplicate witnesses and later expansion cohorts
+    /// cannot replay `true`.
+    fn take_streaming_return(&mut self, activation: ActivationId) -> Option<DeltaStreamingReturn> {
         let activation = self
             .state
             .activations
-            .get(&activation)
+            .get_mut(&activation)
             .expect("unknown delta activation");
-        if !activation.reducer.streams() {
-            return None;
-        }
-        assert!(matches!(
-            (&activation.reducer, &activation.return_to),
-            (DeltaReducer::StreamProposal, DeltaReturn::Stable { .. })
-                | (
-                    DeltaReducer::StreamFormulaProposal,
-                    DeltaReturn::Formula { .. }
-                )
-        ));
-        Some(activation.return_to.clone())
+        let effect = match &mut activation.reducer {
+            DeltaReducer::StreamProposal => {
+                assert!(matches!(&activation.return_to, DeltaReturn::Stable { .. }));
+                DeltaStreamingEffect::Candidates
+            }
+            DeltaReducer::StreamFormulaProposal => {
+                assert!(matches!(&activation.return_to, DeltaReturn::Formula { .. }));
+                DeltaStreamingEffect::Candidates
+            }
+            DeltaReducer::Support { published } if !*published => {
+                assert!(matches!(&activation.return_to, DeltaReturn::Formula { .. }));
+                *published = true;
+                DeltaStreamingEffect::Support
+            }
+            DeltaReducer::Support { .. }
+            | DeltaReducer::QuiescentProposal
+            | DeltaReducer::Confirm { .. } => return None,
+        };
+        Some(DeltaStreamingReturn {
+            return_to: activation.return_to.clone(),
+            effect,
+        })
     }
 
     /// Consumes the unique quiescence proof and releases the exact affine
@@ -708,8 +746,10 @@ impl ProducerRegistry {
             );
         }
 
-        let result = match activation.reducer {
-            DeltaReducer::StreamProposal | DeltaReducer::StreamFormulaProposal => None,
+        let effect = match activation.reducer {
+            DeltaReducer::StreamProposal | DeltaReducer::StreamFormulaProposal => {
+                DeltaCompletion::Cleanup
+            }
             DeltaReducer::QuiescentProposal => {
                 let mut result: Candidates = activation
                     .accepted
@@ -717,9 +757,17 @@ impl ProducerRegistry {
                     .map(|value| (0, value))
                     .collect();
                 result.sort_unstable();
-                Some(result)
+                DeltaCompletion::Candidates(result)
             }
-            DeltaReducer::Confirm { original } => Some(
+            DeltaReducer::Support { published: true } => DeltaCompletion::Cleanup,
+            DeltaReducer::Support { published: false } => {
+                assert!(
+                    activation.accepted.is_empty(),
+                    "an unpublished support reducer quiesced with a witness"
+                );
+                DeltaCompletion::Support(false)
+            }
+            DeltaReducer::Confirm { original } => DeltaCompletion::Candidates(
                 original
                     .iter()
                     .filter(|candidate| activation.accepted.contains(*candidate))
@@ -730,7 +778,7 @@ impl ProducerRegistry {
         };
         CompletedActivation {
             return_to: activation.return_to,
-            result,
+            effect,
         }
     }
 
@@ -886,7 +934,7 @@ impl DeltaScheduler {
             }));
             if let Some(proof) = started.quiescence {
                 let completed = self.registry.finish(proof);
-                assert!(completed.result.is_none());
+                assert_eq!(completed.effect, DeltaCompletion::Cleanup);
                 assert!(matches!(completed.return_to, DeltaReturn::Stable { .. }));
             }
         }
@@ -977,7 +1025,7 @@ impl DeltaScheduler {
             }));
             if let Some(proof) = started.quiescence {
                 let completed = self.registry.finish(proof);
-                assert!(completed.result.as_ref().is_some_and(Vec::is_empty));
+                assert_eq!(completed.effect, DeltaCompletion::Candidates(Vec::new()));
                 assert!(matches!(completed.return_to, DeltaReturn::Stable { .. }));
             }
         }
@@ -1070,9 +1118,7 @@ impl DeltaScheduler {
         let mut completed = Vec::new();
         for (batch, range) in singletons.into_iter().zip(ranges) {
             let reducer = match stage {
-                FormulaStage::Support => {
-                    unreachable!("support has no delta reducer")
-                }
+                FormulaStage::Support => DeltaReducer::Support { published: false },
                 FormulaStage::Propose if stream_proposal => DeltaReducer::StreamFormulaProposal,
                 FormulaStage::Propose => DeltaReducer::QuiescentProposal,
                 FormulaStage::Confirm => DeltaReducer::Confirm {
@@ -1181,12 +1227,25 @@ impl DeltaScheduler {
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
     ) -> Option<ContinuationToken> {
-        let Some(result) = completed.result else {
-            // A streaming activation has already resumed one affine copy of
-            // its continuation per accepted endpoint chunk. Quiescence only
-            // retires producer credits; replaying the template here would
-            // duplicate publication (and make an empty chunk observable).
-            return None;
+        let result = match completed.effect {
+            DeltaCompletion::Cleanup => {
+                // A streaming activation has already resumed one affine copy
+                // of its continuation per semantic effect. Quiescence only
+                // retires producer credits; replaying the template here would
+                // duplicate publication.
+                return None;
+            }
+            DeltaCompletion::Support(truth) => {
+                return Self::release_support(
+                    completed.return_to,
+                    truth,
+                    plan,
+                    stable,
+                    stable_interner,
+                    stats,
+                );
+            }
+            DeltaCompletion::Candidates(result) => result,
         };
         match completed.return_to {
             DeltaReturn::Stable { desc, parent } => {
@@ -1239,7 +1298,7 @@ impl DeltaScheduler {
 
     #[allow(clippy::too_many_arguments)]
     fn release_streaming(
-        return_to: DeltaReturn,
+        streamed: DeltaStreamingReturn,
         accepted: Vec<RawInline>,
         plan: &ResidualPlan,
         stable: &mut Worklist,
@@ -1247,10 +1306,20 @@ impl DeltaScheduler {
         stats: &mut ResidualStateStats,
     ) -> Option<ContinuationToken> {
         debug_assert!(!accepted.is_empty());
+        if streamed.effect == DeltaStreamingEffect::Support {
+            return Self::release_support(
+                streamed.return_to,
+                true,
+                plan,
+                stable,
+                stable_interner,
+                stats,
+            );
+        }
         stats.candidates_proposed += accepted.len();
         stats.max_propose_candidates = stats.max_propose_candidates.max(accepted.len());
         let candidates = accepted.into_iter().map(|value| (0, value)).collect();
-        match return_to {
+        match streamed.return_to {
             DeltaReturn::Stable { desc, parent } => file_with_plan(
                 stable,
                 stable_interner,
@@ -1280,6 +1349,47 @@ impl DeltaScheduler {
                 stats,
             ),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn release_support(
+        return_to: DeltaReturn,
+        truth: bool,
+        plan: &ResidualPlan,
+        stable: &mut Worklist,
+        stable_interner: &mut StateInterner,
+        stats: &mut ResidualStateStats,
+    ) -> Option<ContinuationToken> {
+        let DeltaReturn::Formula {
+            bound,
+            counter,
+            batch,
+        } = return_to
+        else {
+            panic!("delta support returned to a candidate continuation")
+        };
+        assert!(matches!(
+            &counter.focus,
+            FormulaFocus::Action {
+                stage: FormulaStage::Support,
+                ..
+            }
+        ));
+        let completed = plan.finite_formula.complete(&counter);
+        let desc = StateDesc {
+            bound,
+            phase: ResidualPhase::Formula { counter },
+        };
+        propagate_formula_support(
+            plan,
+            &desc,
+            completed,
+            truth,
+            batch,
+            stable,
+            stable_interner,
+            stats,
+        )
     }
 
     fn file(&mut self, desc: DeltaDesc, mut tasks: Vec<DeltaTask>) {
@@ -1416,11 +1526,11 @@ impl DeltaScheduler {
                 });
             }
             if !outcome.accepted.is_empty() {
-                if let Some(return_to) = self.registry.streaming_return(task.activation) {
+                if let Some(streamed) = self.registry.take_streaming_return(task.activation) {
                     prefer_continuation(
                         &mut task_continuation,
                         Self::release_streaming(
-                            return_to,
+                            streamed,
                             outcome.accepted,
                             plan,
                             stable,
@@ -1523,9 +1633,9 @@ impl DeltaScheduler {
 
         let mut continuation = None;
         if !outcome.accepted.is_empty() {
-            if let Some(return_to) = self.registry.streaming_return(task.activation) {
+            if let Some(streamed) = self.registry.take_streaming_return(task.activation) {
                 continuation = Self::release_streaming(
-                    return_to,
+                    streamed,
                     outcome.accepted,
                     plan,
                     stable,
@@ -1745,6 +1855,126 @@ mod tests {
         }
     }
 
+    fn support_formula_return() -> DeltaReturn {
+        let relevant = ChildSet::empty(1).with_inserted(0);
+        DeltaReturn::Formula {
+            bound: VariableSet::new_empty(),
+            counter: FormulaProgramCounter {
+                focus: FormulaFocus::Action {
+                    node: FormulaNodeId(7),
+                    stage: FormulaStage::Support,
+                },
+                returns: Vec::new().into_boxed_slice(),
+                resume: FormulaOuterResume {
+                    variable: 0,
+                    occurrence: 0,
+                    verb: UnionVerb::Propose { relevant },
+                },
+            },
+            batch: FormulaBatch::from_proposal(
+                RowBatch {
+                    rows: Vec::new(),
+                    row_count: 1,
+                },
+                vec![super::super::ActivationId(11)],
+                &FiniteFormulaNodeKind::Or {
+                    children: Box::new([]),
+                },
+            ),
+        }
+    }
+
+    #[test]
+    fn empty_support_roots_prove_false_only_at_quiescence() {
+        let mut registry = ProducerRegistry::new();
+        let started = registry.start_many(
+            DeltaReducer::Support { published: false },
+            support_formula_return(),
+            [],
+        );
+
+        let completed = registry.finish(
+            started
+                .quiescence
+                .expect("an empty support frontier is immediately quiescent"),
+        );
+        assert_eq!(completed.effect, DeltaCompletion::Support(false));
+        assert!(matches!(completed.return_to, DeltaReturn::Formula { .. }));
+    }
+
+    #[test]
+    fn support_reducer_publishes_only_the_first_distinct_witness() {
+        let mut registry = ProducerRegistry::new();
+        let started = registry.start_many(
+            DeltaReducer::Support { published: false },
+            support_formula_return(),
+            [output(1, 0, false), output(2, 0, false)],
+        );
+        let activation = started.activation;
+        let mut roots = started.roots.into_iter();
+        let (_, first_root) = roots.next().unwrap();
+        let (_, second_root) = roots.next().unwrap();
+
+        let first = registry.replace_traversal(first_root, [output(7, 1, true)]);
+        assert_eq!(first.accepted, [value(7)]);
+        let streamed = registry
+            .take_streaming_return(activation)
+            .expect("the first witness publishes support");
+        assert_eq!(streamed.effect, DeltaStreamingEffect::Support);
+        assert!(matches!(streamed.return_to, DeltaReturn::Formula { .. }));
+
+        let second =
+            registry.replace_traversal(second_root, [output(7, 2, true), output(8, 2, true)]);
+        assert_eq!(second.accepted, [value(8)]);
+        assert!(registry.take_streaming_return(activation).is_none());
+
+        let mut proof = None;
+        for (_, child) in first.children.into_iter().chain(second.children) {
+            let retired = registry.replace_traversal(child, []);
+            if let Some(quiescence) = retired.quiescence {
+                assert!(proof.replace(quiescence).is_none());
+            }
+        }
+        let completed = registry.finish(proof.expect("the last witness lineage quiesces"));
+        assert_eq!(completed.effect, DeltaCompletion::Cleanup);
+    }
+
+    #[test]
+    fn support_publication_state_is_preserved_across_deep_clone() {
+        let mut original = ProducerRegistry::new();
+        let started = original.start_many(
+            DeltaReducer::Support { published: false },
+            support_formula_return(),
+            [output(1, 0, false), output(2, 0, false)],
+        );
+        let activation = started.activation;
+        let mut roots = started.roots.into_iter();
+        let (_, witness_root) = roots.next().unwrap();
+        let (_, remaining_root) = roots.next().unwrap();
+        let remaining_key = remaining_root.key;
+
+        let first = original.replace_traversal(witness_root, [output(7, 1, true)]);
+        assert_eq!(first.accepted, [value(7)]);
+        assert_eq!(
+            original
+                .take_streaming_return(activation)
+                .expect("the original publishes its witness")
+                .effect,
+            DeltaStreamingEffect::Support
+        );
+
+        let (mut cloned, mut remap) = original.deep_clone();
+        let cloned_remaining = remap
+            .remove(&remaining_key)
+            .expect("the clone remapped the still-live root");
+        let original_second = original.replace_traversal(remaining_root, [output(8, 2, true)]);
+        let cloned_second = cloned.replace_traversal(cloned_remaining, [output(8, 2, true)]);
+        assert_eq!(original_second.accepted, [value(8)]);
+        assert_eq!(cloned_second.accepted, [value(8)]);
+        assert!(original.take_streaming_return(activation).is_none());
+        assert!(cloned.take_streaming_return(activation).is_none());
+    }
+
     #[test]
     fn batched_delta_step_keeps_dead_page_and_streamed_formula_handoff_independent() {
         let root = MixedExpansion;
@@ -1916,7 +2146,10 @@ mod tests {
         let proof = proof.expect("all root credits quiesced");
         assert_eq!(proof.activation, activation);
         let completed = registry.finish(proof);
-        assert_eq!(completed.result, Some(vec![(0, candidate), (0, candidate)]));
+        assert_eq!(
+            completed.effect,
+            DeltaCompletion::Candidates(vec![(0, candidate), (0, candidate)])
+        );
     }
 
     #[test]
@@ -1965,8 +2198,8 @@ mod tests {
         };
         assert_eq!(parent.as_ref(), &[value(9)]);
         assert_eq!(
-            completed.result,
-            Some(vec![(0, second), (0, first), (0, second)])
+            completed.effect,
+            DeltaCompletion::Candidates(vec![(0, second), (0, first), (0, second)])
         );
     }
 
@@ -2068,8 +2301,8 @@ mod tests {
             .expect("the terminal page proves reducer quiescence");
         assert_eq!(proof.activation, activation);
         assert_eq!(
-            registry.finish(proof).result,
-            Some(vec![(0, second), (0, first), (0, first)])
+            registry.finish(proof).effect,
+            DeltaCompletion::Candidates(vec![(0, second), (0, first), (0, first)])
         );
     }
 
@@ -2170,7 +2403,10 @@ mod tests {
             .quiescence
             .expect("clone quiesced independently");
         for completed in [original.finish(original_proof), cloned.finish(cloned_proof)] {
-            assert_eq!(completed.result, Some(vec![(0, value(7))]));
+            assert_eq!(
+                completed.effect,
+                DeltaCompletion::Candidates(vec![(0, value(7))])
+            );
             let DeltaReturn::Formula {
                 bound: returned_bound,
                 counter: returned_counter,
@@ -2266,7 +2502,10 @@ mod tests {
             complete(&mut original, original_credit),
             complete(&mut cloned, cloned_credit),
         ] {
-            assert_eq!(completed.result, Some(vec![(0, value(7))]));
+            assert_eq!(
+                completed.effect,
+                DeltaCompletion::Candidates(vec![(0, value(7))])
+            );
             let DeltaReturn::Formula {
                 bound: returned_bound,
                 counter: returned_counter,
