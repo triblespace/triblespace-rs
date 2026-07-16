@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **TribleSet proposals can page ordered direct candidates.** Residual
+  execution now drives every distinct-position E/A/V binding shape through
+  strict PATCH segment cursors, preserving affine parent multiplicity while
+  geometric width-one demand can yield and cancel before the remaining
+  proposal domain is materialized. Repeated-position equality shapes retain
+  the eager fallback.
 - **Formula Support gains composed affine parity receipts.** End-to-end RPQ
   tests now pin duplicate-parent bag multiplicity, nested AND/OR arm-order
   invariance, monotone graph growth, live clone and Rayon worker parity, and
