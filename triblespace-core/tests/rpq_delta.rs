@@ -262,6 +262,95 @@ impl<'a> Constraint<'a> for CountingPath {
     }
 }
 
+/// Distinguishes the legacy fully-bound `satisfied` traversal from native
+/// transition-backed formula Support. Partial bindings are intentionally not
+/// counted: regular paths answer those optimistically without graph work.
+struct SupportCountingPath {
+    inner: RegularPathConstraint,
+    fully_bound_satisfied_calls: Arc<AtomicUsize>,
+    support_seeded_roots: Arc<AtomicUsize>,
+    expanded_nodes: Arc<AtomicUsize>,
+}
+
+impl<'a> Constraint<'a> for SupportCountingPath {
+    fn variables(&self) -> VariableSet {
+        self.inner.variables()
+    }
+
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        self.inner.estimate(variable, view, out)
+    }
+
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.inner.propose(variable, view, candidates)
+    }
+
+    fn confirm(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.inner.confirm(variable, view, candidates)
+    }
+
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        if view.col(START).is_some() && view.col(END).is_some() {
+            self.fully_bound_satisfied_calls
+                .fetch_add(view.len(), Ordering::Relaxed);
+        }
+        self.inner.satisfied(view)
+    }
+
+    fn influence(&self, variable: VariableId) -> VariableSet {
+        self.inner.influence(variable)
+    }
+
+    fn residual_confirm_is_page_local(&self) -> bool {
+        self.inner.residual_confirm_is_page_local()
+    }
+
+    fn residual_delta_confirm_is_grouped(&self) -> bool {
+        self.inner.residual_delta_confirm_is_grouped()
+    }
+
+    fn residual_delta_support_seeds(
+        &self,
+        view: &RowsView<'_>,
+        seeds: &mut Vec<ResidualDeltaSeed>,
+    ) -> Option<VariableId> {
+        let before = seeds.len();
+        let route = self.inner.residual_delta_support_seeds(view, seeds);
+        if route.is_some() {
+            self.support_seeded_roots
+                .fetch_add(seeds.len() - before, Ordering::Relaxed);
+        }
+        route
+    }
+
+    fn residual_delta_expand(
+        &self,
+        variable: VariableId,
+        nodes: &[ResidualDeltaNode],
+        successors: &mut Vec<(u32, ResidualDeltaOutput)>,
+    ) -> bool {
+        self.expanded_nodes
+            .fetch_add(nodes.len(), Ordering::Relaxed);
+        self.inner
+            .residual_delta_expand(variable, nodes, successors)
+    }
+}
+
 #[derive(Clone)]
 struct DuplicateParents {
     outer_values: [RawInline; 2],
@@ -891,6 +980,54 @@ fn pair_end_arm(start: Inline<GenId>, values: Vec<RawInline>, estimate: usize) -
     ]))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn fully_bound_support_root(
+    set: TribleSet,
+    source: Inline<GenId>,
+    target: Inline<GenId>,
+    ops: &[PathOp],
+    guarded_value: RawInline,
+    sibling_value: RawInline,
+    guarded_estimate: usize,
+    sibling_estimate: usize,
+    fully_bound_satisfied_calls: Arc<AtomicUsize>,
+    support_seeded_roots: Arc<AtomicUsize>,
+    expanded_nodes: Arc<AtomicUsize>,
+) -> Root {
+    let start = Variable::<GenId>::new(START);
+    let end = Variable::<GenId>::new(END);
+    let guarded = Box::new(IntersectionConstraint::new(vec![
+        Box::new(SupportCountingPath {
+            inner: RegularPathConstraint::new(set, start, end, ops),
+            fully_bound_satisfied_calls,
+            support_seeded_roots,
+            expanded_nodes,
+        }) as DynConstraint,
+        Box::new(OrderedDomain {
+            variable: OUTER,
+            gate: OUTER,
+            unbound_estimate: guarded_estimate,
+            values: vec![guarded_value],
+        }) as DynConstraint,
+    ])) as DynConstraint;
+    let sibling = Box::new(IntersectionConstraint::new(vec![
+        Box::new(start.is(source)) as DynConstraint,
+        Box::new(end.is(target)) as DynConstraint,
+        Box::new(OrderedDomain {
+            variable: OUTER,
+            gate: OUTER,
+            unbound_estimate: sibling_estimate,
+            values: vec![sibling_value],
+        }) as DynConstraint,
+    ])) as DynConstraint;
+
+    Arc::new(IntersectionConstraint::new(vec![
+        Box::new(start.is(source)) as DynConstraint,
+        Box::new(end.is(target)) as DynConstraint,
+        Box::new(UnionConstraint::new(vec![guarded, sibling])) as DynConstraint,
+    ]))
+}
+
 fn duplicate_parent_root(
     set: TribleSet,
     start: RawInline,
@@ -1072,6 +1209,10 @@ fn project_start(binding: &Binding) -> Option<RawInline> {
 
 fn project_pair(binding: &Binding) -> Option<(RawInline, RawInline)> {
     Some((binding.get(START).copied()?, binding.get(END).copied()?))
+}
+
+fn project_outer(binding: &Binding) -> Option<RawInline> {
+    binding.get(OUTER).copied()
 }
 
 fn run(
@@ -2969,6 +3110,86 @@ fn fully_bound_nullable_support_gates_epsilon_by_nodes_without_source_paging() {
     assert_eq!(seeds.len(), 2);
     assert!(seeds[0].output.accepted);
     assert!(!seeds[1].output.accepted);
+}
+
+#[test]
+fn fully_bound_formula_guard_uses_native_support_instead_of_legacy_reachability() {
+    let graph = Graph::new(4, &[(0, 1), (1, 2)]);
+    let guarded_value = genid(&rngid().id).raw;
+    let sibling_value = genid(&rngid().id).raw;
+    let fully_bound_satisfied_calls = Arc::new(AtomicUsize::new(0));
+    let support_seeded_roots = Arc::new(AtomicUsize::new(0));
+    let expanded_nodes = Arc::new(AtomicUsize::new(0));
+    let root = fully_bound_support_root(
+        graph.set.clone(),
+        graph.value(0),
+        graph.value(3),
+        &repeated(graph.attribute, false),
+        guarded_value,
+        sibling_value,
+        1,
+        8,
+        Arc::clone(&fully_bound_satisfied_calls),
+        Arc::clone(&support_seeded_roots),
+        Arc::clone(&expanded_nodes),
+    );
+
+    let actual: Vec<_> = Query::new(root, project_outer)
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .cap(1)
+        .start_width(1)
+        .collect();
+
+    assert_eq!(actual, vec![sibling_value]);
+    assert_eq!(fully_bound_satisfied_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(support_seeded_roots.load(Ordering::Relaxed), 1);
+    assert!(
+        expanded_nodes.load(Ordering::Relaxed) > 0,
+        "an unreachable fully-bound guard must prove false by native quiescence"
+    );
+}
+
+#[test]
+fn first_support_witness_resumes_formula_before_irrelevant_path_work_drains() {
+    let graph = Graph::new(8, &[(0, 1), (0, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)]);
+    let guarded_value = genid(&rngid().id).raw;
+    let sibling_value = genid(&rngid().id).raw;
+    let fully_bound_satisfied_calls = Arc::new(AtomicUsize::new(0));
+    let support_seeded_roots = Arc::new(AtomicUsize::new(0));
+    let expanded_nodes = Arc::new(AtomicUsize::new(0));
+    let root = fully_bound_support_root(
+        graph.set.clone(),
+        graph.value(0),
+        graph.value(1),
+        &repeated(graph.attribute, false),
+        guarded_value,
+        sibling_value,
+        1,
+        8,
+        Arc::clone(&fully_bound_satisfied_calls),
+        Arc::clone(&support_seeded_roots),
+        Arc::clone(&expanded_nodes),
+    );
+    let mut query = Query::new(root, project_outer)
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .cap(1)
+        .start_width(1);
+
+    let first = query.next().expect("one guarded Union result");
+    assert!(first == guarded_value || first == sibling_value);
+    assert_eq!(fully_bound_satisfied_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(support_seeded_roots.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        expanded_nodes.load(Ordering::Relaxed),
+        1,
+        "the source expansion already contains a witness; its long sibling must remain live"
+    );
+    drop(query);
+    assert_eq!(
+        expanded_nodes.load(Ordering::Relaxed),
+        1,
+        "dropping the consumer must cancel the irrelevant live traversal"
+    );
 }
 
 #[test]
