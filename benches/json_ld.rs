@@ -1,7 +1,5 @@
 use anybytes::Bytes;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use oxigraph::io::{JsonLdProfileSet, RdfFormat, RdfParser, RdfSerializer};
-use oxigraph::model::Dataset;
 use serde_json::Value as JsonValue;
 use std::fmt::Write as FmtWrite;
 use std::path::PathBuf;
@@ -51,74 +49,11 @@ fn normalize_for_import(payload: &str) -> String {
     }
 }
 
-fn bench_oxigraph(c: &mut Criterion, payload: &str) {
-    let bytes = payload.len() as u64;
-    let mut group = c.benchmark_group("json_ld/oxigraph");
-    group.throughput(Throughput::Bytes(bytes));
-
-    group.bench_function(BenchmarkId::new("parse", FIXTURE_NAME), |b| {
-        b.iter(|| {
-            let mut dataset = Dataset::new();
-            let parser = RdfParser::from_format(RdfFormat::JsonLd {
-                profile: JsonLdProfileSet::default(),
-            });
-            for quad in parser.for_reader(payload.as_bytes()) {
-                dataset.insert(&quad.expect("quad"));
-            }
-            hint::black_box(dataset.len());
-        });
-    });
-
-    group.bench_function(BenchmarkId::new("parse_nquads", FIXTURE_NAME), |b| {
-        b.iter(|| {
-            let mut dataset = Dataset::new();
-            let parser = RdfParser::from_format(RdfFormat::JsonLd {
-                profile: JsonLdProfileSet::default(),
-            });
-            for quad in parser.for_reader(payload.as_bytes()) {
-                dataset.insert(&quad.expect("quad"));
-            }
-
-            let mut serializer =
-                RdfSerializer::from_format(RdfFormat::NQuads).for_writer(Vec::new());
-            for quad in dataset.iter() {
-                serializer.serialize_quad(quad).expect("serialize quad");
-            }
-            let out = serializer.finish().expect("finish serialization");
-            hint::black_box(out.len());
-        });
-    });
-
-    group.bench_function(BenchmarkId::new("jsonld_roundtrip", FIXTURE_NAME), |b| {
-        b.iter(|| {
-            let mut dataset = Dataset::new();
-            let parser = RdfParser::from_format(RdfFormat::JsonLd {
-                profile: JsonLdProfileSet::default(),
-            });
-            for quad in parser.for_reader(payload.as_bytes()) {
-                dataset.insert(&quad.expect("quad"));
-            }
-
-            let mut serializer = RdfSerializer::from_format(RdfFormat::JsonLd {
-                profile: JsonLdProfileSet::default(),
-            })
-            .for_writer(Vec::new());
-            for quad in dataset.iter() {
-                serializer.serialize_quad(quad).expect("serialize quad");
-            }
-            let out = serializer.finish().expect("finish serialization");
-            hint::black_box(out.len());
-        });
-    });
-
-    group.finish();
-}
-
 fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
     let import_payload = normalize_for_import(payload);
     let bytes = import_payload.len() as u64;
     let import_blob: Blob<LongString> = Blob::new(Bytes::from(import_payload.clone().into_bytes()));
-    let mut group = c.benchmark_group("json_ld/tribles");
+    let mut group = c.benchmark_group("json_ld");
     group.throughput(Throughput::Bytes(bytes));
 
     struct ExportFixture {
@@ -259,7 +194,6 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
 
 fn json_ld_benchmarks(c: &mut Criterion) {
     let payload = load_payload();
-    bench_oxigraph(c, &payload);
     bench_tribles_roundtrip(c, &payload);
 }
 
