@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Built-in constraints gain an executable residual capability matrix.**
+  Constants, equality, inclusive ranges, sorted slices, hash-set and hash-map
+  membership, finite unions, ignored scopes, diagnostic wrappers, and repeated
+  projected variables now have exact bag receipts across the scalar oracle,
+  eager DAG, conservative and full residual lowering, fixed width one,
+  geometric growth, and a cloned live remainder. Static capability assertions
+  and runtime counters distinguish native paging/formula execution from the
+  semantically exact opaque fallback.
 - **Succinct shard unions page one globally normalized source.** `UnionArchive`
   now merges one ordered head per shard behind a single activation-local
   `After(value)` cursor, preserving cross-shard deduplication without
