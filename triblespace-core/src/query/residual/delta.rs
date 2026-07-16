@@ -122,12 +122,6 @@ enum CreditKind {
     Traversal,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct CreditOwner {
-    activation: ActivationId,
-    kind: CreditKind,
-}
-
 /// Affine authority to replace one cyclic producer with its novel successors.
 #[derive(Debug)]
 pub(super) struct ProducerCredit {
@@ -216,8 +210,10 @@ struct Activation {
     /// quiescent formula reducer. Streaming reducers file these immediately;
     /// transition acceptance continues to use the distinct `accepted` set.
     direct_candidates: Vec<RawInline>,
-    live: AHashSet<CreditNonce>,
-    retired: AHashSet<CreditNonce>,
+    /// The complete affine producer ledger for this activation. Presence
+    /// proves that the nonce is live; the value distinguishes generator and
+    /// traversal replacement authority without a second global owner map.
+    live: AHashMap<CreditNonce, CreditKind>,
     status: ActivationStatus,
 }
 
@@ -225,7 +221,6 @@ struct Activation {
 struct RegistryState {
     next_activation: u64,
     next_credit: u64,
-    credit_owner: AHashMap<CreditNonce, CreditOwner>,
     activations: AHashMap<ActivationId, Activation>,
 }
 
@@ -306,7 +301,6 @@ impl ProducerRegistry {
             state: RegistryState {
                 next_activation: 0,
                 next_credit: 0,
-                credit_owner: AHashMap::new(),
                 activations: AHashMap::new(),
             },
         }
@@ -324,26 +318,13 @@ impl ProducerRegistry {
             &mut self.state.next_activation,
             "activation",
         ));
-        let mut live = AHashSet::new();
+        let mut live = AHashMap::new();
         let mut accepted = AHashSet::new();
         let mut initial_accepted = Vec::new();
         let mut roots = Vec::with_capacity(seeds.size_hint().0);
         for seed in seeds {
             let nonce = CreditNonce(take_monotonic(&mut self.state.next_credit, "credit"));
-            assert!(
-                self.state
-                    .credit_owner
-                    .insert(
-                        nonce,
-                        CreditOwner {
-                            activation,
-                            kind: CreditKind::Traversal,
-                        },
-                    )
-                    .is_none(),
-                "delta credit nonce was reused"
-            );
-            assert!(live.insert(nonce));
+            assert!(live.insert(nonce, CreditKind::Traversal).is_none());
             if seed.accepted && accepted.insert(seed.node.value) {
                 initial_accepted.push(seed.node.value);
             }
@@ -374,7 +355,6 @@ impl ProducerRegistry {
                         accepted,
                         direct_candidates: Vec::new(),
                         live,
-                        retired: AHashSet::new(),
                         status,
                     },
                 )
@@ -416,8 +396,7 @@ impl ProducerRegistry {
                         seen: AHashMap::new(),
                         accepted: AHashSet::new(),
                         direct_candidates: Vec::new(),
-                        live: AHashSet::new(),
-                        retired: AHashSet::new(),
+                        live: AHashMap::new(),
                         status: ActivationStatus::Open,
                     },
                 )
@@ -432,18 +411,14 @@ impl ProducerRegistry {
         let nonce = CreditNonce(take_monotonic(&mut self.state.next_credit, "credit"));
         assert!(
             self.state
-                .credit_owner
-                .insert(nonce, CreditOwner { activation, kind })
+                .activations
+                .get_mut(&activation)
+                .expect("unknown delta activation")
+                .live
+                .insert(nonce, kind)
                 .is_none(),
             "delta credit nonce was reused"
         );
-        assert!(self
-            .state
-            .activations
-            .get_mut(&activation)
-            .expect("unknown delta activation")
-            .live
-            .insert(nonce));
         ProducerCredit {
             brand: self.brand,
             key: CreditKey { activation, nonce },
@@ -466,27 +441,16 @@ impl ProducerRegistry {
         next: Option<ResidualDeltaExpandCursor>,
     ) -> ReplaceOutcome {
         assert_eq!(parent.brand, self.brand, "delta credit crossed registries");
-        let owner = self
-            .state
-            .credit_owner
-            .get(&parent.key.nonce)
-            .copied()
-            .expect("unknown delta credit");
-        assert_eq!(
-            owner.activation, parent.key.activation,
-            "delta credit changed activation"
-        );
-        assert_eq!(owner.kind, CreditKind::Traversal);
-
         let activation = self
             .state
             .activations
             .get_mut(&parent.key.activation)
             .expect("unknown delta activation");
         assert_eq!(activation.status, ActivationStatus::Open);
-        assert!(
-            activation.live.contains(&parent.key.nonce),
-            "delta credit was replayed"
+        assert_eq!(
+            activation.live.get(&parent.key.nonce),
+            Some(&CreditKind::Traversal),
+            "unknown, replayed, or wrong-kind delta traversal credit"
         );
 
         let mut novel = Vec::new();
@@ -530,8 +494,10 @@ impl ProducerRegistry {
             .activations
             .get_mut(&parent.key.activation)
             .expect("unknown delta activation");
-        assert!(activation.live.remove(&parent.key.nonce));
-        assert!(activation.retired.insert(parent.key.nonce));
+        assert_eq!(
+            activation.live.remove(&parent.key.nonce),
+            Some(CreditKind::Traversal)
+        );
         if !accepted.is_empty() && activation.reducer.streams() {
             if let Some(page) = &mut activation.suspended_source_page {
                 page.had_stable_effect = true;
@@ -564,14 +530,17 @@ impl ProducerRegistry {
             generator.brand, self.brand,
             "delta credit crossed registries"
         );
-        let owner = self
+        let activation = self
             .state
-            .credit_owner
-            .get(&generator.key.nonce)
-            .copied()
-            .expect("unknown delta credit");
-        assert_eq!(owner.activation, generator.key.activation);
-        assert_eq!(owner.kind, CreditKind::Generator);
+            .activations
+            .get(&generator.key.activation)
+            .expect("unknown delta activation");
+        assert_eq!(activation.status, ActivationStatus::Open);
+        assert_eq!(
+            activation.live.get(&generator.key.nonce),
+            Some(&CreditKind::Generator),
+            "unknown, replayed, or wrong-kind delta generator credit"
+        );
 
         let roots: Vec<_> = roots.into_iter().collect();
         let direct: Vec<_> = direct.into_iter().collect();
@@ -598,7 +567,10 @@ impl ProducerRegistry {
                 .expect("unknown delta activation");
             assert_eq!(activation.status, ActivationStatus::Open);
             assert_eq!(activation.live.len(), 1);
-            assert!(activation.live.contains(&generator.key.nonce));
+            assert_eq!(
+                activation.live.get(&generator.key.nonce),
+                Some(&CreditKind::Generator)
+            );
             assert!(activation.suspended_source_page.is_none());
             match &activation.reducer {
                 DeltaReducer::QuiescentProposal => activation
@@ -639,8 +611,10 @@ impl ProducerRegistry {
                 .activations
                 .get_mut(&generator.key.activation)
                 .expect("unknown delta activation");
-            assert!(activation.live.remove(&generator.key.nonce));
-            assert!(activation.retired.insert(generator.key.nonce));
+            assert_eq!(
+                activation.live.remove(&generator.key.nonce),
+                Some(CreditKind::Generator)
+            );
             activation.live.is_empty()
         };
         let (resumed_source, retired_source_page, quiescence) = if page_finished {
@@ -806,16 +780,6 @@ impl ProducerRegistry {
             .expect("unknown delta activation");
         assert_eq!(activation.status, ActivationStatus::Quiescent);
         assert!(activation.live.is_empty());
-        for nonce in &activation.retired {
-            assert_eq!(
-                self.state
-                    .credit_owner
-                    .remove(nonce)
-                    .map(|owner| owner.activation),
-                Some(proof.activation),
-                "retired delta credit lost its owner"
-            );
-        }
 
         let effect = match activation.reducer {
             DeltaReducer::StreamProposal | DeltaReducer::StreamFormulaProposal => {
@@ -872,7 +836,7 @@ impl ProducerRegistry {
         let brand = RegistryBrand::fresh();
         let mut remap = BTreeMap::new();
         for (&activation, state) in &state.activations {
-            for &nonce in &state.live {
+            for &nonce in state.live.keys() {
                 let key = CreditKey { activation, nonce };
                 assert!(
                     remap.insert(key, ProducerCredit { brand, key }).is_none(),
@@ -3136,13 +3100,8 @@ mod tests {
         assert!(state.suspended_source_page.is_none());
         assert_eq!(state.live.len(), 1);
         assert_eq!(
-            registry
-                .state
-                .credit_owner
-                .get(&credit.key.nonce)
-                .expect("resumed credit owner")
-                .kind,
-            CreditKind::Generator
+            state.live.get(&credit.key.nonce),
+            Some(&CreditKind::Generator)
         );
     }
 

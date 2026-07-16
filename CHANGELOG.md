@@ -354,6 +354,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   iteration order is semantically invisible, while cohort selection retains
   its canonical ordering. Complete positive-transition batches reserve their
   cached fanout before the bulk PATCH expansion kernel.
+- **Each delta activation owns one authoritative live-credit ledger.**
+  Activation-local `nonce -> kind` entries now prove traversal or generator
+  authority, replay safety, and quiescence directly. The redundant global
+  owner table and accumulated retired-nonce set are gone; retiring a producer
+  removes its sole live entry, so bookkeeping memory follows the active
+  frontier rather than every transition visited before fixpoint completion.
+  Registry brands and globally monotone nonces still seal credits across
+  registries, and deep clones rebuild exact affine handles from the live map.
 - **Residual RPQ scheduling separates fixpoint depth from parent breadth.**
   Transition work that can publish endpoints immediately still batches across
   activations. Quiescent formula, support, and grouped-confirm reducers instead
