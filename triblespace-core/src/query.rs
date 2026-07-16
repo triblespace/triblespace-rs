@@ -1053,10 +1053,11 @@ pub trait Constraint<'a> {
 
     /// Exposes the finite arms of an otherwise opaque logical union.
     ///
-    /// Ordinary residual lowering deliberately ignores this capability, so a
-    /// union retains its existing indivisible [`Constraint`] semantics unless
-    /// the caller explicitly selects finite-union lowering. The child count
-    /// and order are structural facts and must remain stable for the solve.
+    /// [`residual::FormulaScope::OpaqueLeaves`] deliberately ignores this
+    /// capability, so a union retains its existing indivisible [`Constraint`]
+    /// semantics. `UnionLeaves` and `WholeRoot` expose it to canonical formula
+    /// control. The child count and order are structural facts and must remain
+    /// stable for the solve.
     #[doc(hidden)]
     fn residual_union_children(&self) -> Option<&dyn ConstraintChildren<'a>> {
         None
@@ -1408,10 +1409,10 @@ enum QueryScheduler {
 /// constraint actions. Seed-rejected queries start no runtime. Use
 /// [`Query::lazy_dag_scheduler`] for the bound-variable-set DAG control and
 /// [`Query::sequential`] for the scalar depth-first specialization. The
-/// explicit [`Query::residual_state_scheduler`] override retains conservative
-/// opaque-composite lowering so scheduling and structural capability remain
-/// separate experimental axes. Fully drained scheduler results are compared as
-/// multisets; their iteration order may differ.
+/// Scheduler selection and structural lowering are independent controls; use
+/// [`Query::residual_lowering`] to select a conservative or intermediate
+/// lowering without changing the scheduler. Fully drained scheduler results
+/// are compared as multisets; their iteration order may differ.
 /// The query engine is designed to be simple and efficient, providing low, consistent,
 /// and predictable latency, skew resistance, and no required (or possible) tuning.
 /// The query engine is designed to be used in combination with the [Constraint] trait,
@@ -1426,11 +1427,8 @@ pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
     constraint: C,
     postprocessing: P,
     scheduler: QueryScheduler,
-    /// Structural lowering selected together with the ordinary residual
-    /// scheduler. Explicit scheduler overrides retain the conservative
-    /// capability set so scheduler choice and lowering capability remain two
-    /// independently testable axes.
-    residual_capabilities: residual::ResidualCapabilities,
+    /// Structural lowering selected independently from the physical scheduler.
+    residual_lowering: residual::ResidualLowering,
     mode: Search,
     /// Whether [`Iterator::next`] has ever been called on this query.
     ///
@@ -1496,7 +1494,7 @@ where
             constraint: self.constraint.clone(),
             postprocessing: self.postprocessing.clone(),
             scheduler: self.scheduler,
-            residual_capabilities: self.residual_capabilities,
+            residual_lowering: self.residual_lowering,
             mode: self.mode,
             iteration_started: self.iteration_started,
             influences: self.influences,
@@ -1671,9 +1669,9 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// conjunctions with shared-variable leaf work. This override preserves
     /// arbitrary-root completeness for opaque, one-leaf, disjoint, and
     /// seed-rejected constraints, and is useful for scheduler comparison. The
-    /// override uses conservative opaque-composite lowering; it does not
-    /// inherit the richer formula and path-program capabilities of an ordinary
-    /// shape-selected residual query. The runtime cursor remains behind
+    /// override preserves the query's structural lowering. Use
+    /// [`Query::residual_lowering`] before this method to choose another of the
+    /// six canonical lowering forms. The runtime cursor remains behind
     /// `Query::next`, so cloning a started query
     /// snapshots its exact raw remainder. Ordinary Rayon conversion of an
     /// unstarted query still uses the established scalar splitter; use
@@ -1690,7 +1688,26 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             "cannot select the residual-state query scheduler after iteration has started"
         );
         self.scheduler = QueryScheduler::ResidualState;
-        self.residual_capabilities = residual::ResidualCapabilities::default();
+        self
+    }
+
+    /// Select structural lowering independently from the physical scheduler.
+    ///
+    /// Ordinary live queries start with [`residual::ResidualLowering::FULL`].
+    /// Explicit scheduler comparisons can request
+    /// [`residual::ResidualLowering::CONSERVATIVE`] or any intermediate form
+    /// without changing their scheduler.
+    ///
+    /// # Panics
+    ///
+    /// Panics if iteration has already started. Lowering must be selected
+    /// before the first call to [`Iterator::next`].
+    pub fn residual_lowering(mut self, lowering: residual::ResidualLowering) -> Self {
+        assert!(
+            !self.iteration_started && self.dag.is_none() && self.residual.is_none(),
+            "cannot select residual lowering after iteration has started"
+        );
+        self.residual_lowering = lowering;
         self
     }
 
@@ -1779,26 +1796,11 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         } else {
             QueryScheduler::LazyDag
         };
-        let residual_capabilities = if scheduler == QueryScheduler::ResidualState {
-            // `root_formula` currently exposes finite ORs throughout this
-            // selected root, so `finite_unions` is operationally redundant in
-            // this exact combination. Keep the complete policy named here:
-            // the capabilities remain independently meaningful on explicit
-            // residual solves, and a future lowering split must not silently
-            // narrow the ordinary default.
-            residual::ResidualCapabilities::default()
-                .root_formula()
-                .finite_unions()
-                .cyclic_rpq()
-        } else {
-            residual::ResidualCapabilities::default()
-        };
-
         Query {
             constraint,
             postprocessing,
             scheduler,
-            residual_capabilities,
+            residual_lowering: residual::ResidualLowering::FULL,
             mode,
             iteration_started: false,
             influences,
@@ -3596,7 +3598,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
                 .insert(Box::new(residual::ResidualQueryState::new(
                     &self.constraint,
                     self.mode,
-                    self.residual_capabilities,
+                    self.residual_lowering,
                 )));
             return state.pull(
                 &self.constraint,
@@ -4206,6 +4208,38 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+
+    #[test]
+    fn scheduler_and_residual_lowering_are_orthogonal_controls() {
+        let mut context = VariableContext::new();
+        let variable = context.next_variable::<U256BE>();
+        let ordinary = Query::new(variable.is(U256BE::inline_from(1u64)), |_| Some(()));
+        assert_eq!(ordinary.scheduler, QueryScheduler::ResidualState);
+        assert_eq!(ordinary.residual_lowering, residual::ResidualLowering::FULL);
+
+        let conservative = ordinary
+            .residual_lowering(residual::ResidualLowering::CONSERVATIVE)
+            .residual_state_scheduler();
+        assert_eq!(conservative.scheduler, QueryScheduler::ResidualState);
+        assert_eq!(
+            conservative.residual_lowering,
+            residual::ResidualLowering::CONSERVATIVE,
+            "selecting a scheduler must not rewrite structural lowering"
+        );
+
+        let mut context = VariableContext::new();
+        let variable = context.next_variable::<U256BE>();
+        let intermediate =
+            residual::ResidualLowering::new(residual::FormulaScope::UnionLeaves, true);
+        let dag = Query::new(variable.is(U256BE::inline_from(1u64)), |_| Some(()))
+            .lazy_dag_scheduler()
+            .residual_lowering(intermediate);
+        assert_eq!(dag.scheduler, QueryScheduler::LazyDag);
+        assert_eq!(
+            dag.residual_lowering, intermediate,
+            "selecting lowering must not rewrite the physical scheduler"
+        );
+    }
 
     #[test]
     fn rows_view_preserves_explicit_zero_width_row_multiplicity() {

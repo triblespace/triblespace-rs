@@ -6,14 +6,15 @@
 //! opaque root is one leaf at the empty path. Union, ignore, and regular-path
 //! constraints therefore remain ordinary indivisible leaves, as do custom
 //! constraints unless they explicitly expose an associative AND shape.
-//! When finite-formula lowering is enabled, a residual Union executes an
-//! arbitrary finite tree of AND/OR frames through the same canonical formula
-//! PC and an affine payload-frame stack. Only Atom nodes invoke the opaque
-//! constraint protocol; connective nesting remains explicit control. The
-//! explicit root-formula capability instead makes the maximal exposed root one
-//! synthetic formula occurrence after outer variable selection. It flattens
-//! only the maximal root AND region and retains candidate-occurrence paging
-//! once that AND's exact remaining confirmation suffix is page-local.
+//! [`FormulaScope`] selects a chain of formula boundaries. `UnionLeaves`
+//! executes exposed Unions as arbitrary finite AND/OR trees through a canonical
+//! program counter and affine payload-frame stack; only Atom nodes invoke the
+//! opaque constraint protocol. `WholeRoot` absorbs that scope and instead makes
+//! the maximal exposed root one synthetic formula occurrence after outer
+//! variable selection. It flattens only the maximal root AND region and retains
+//! candidate-occurrence paging once that AND's exact remaining confirmation
+//! suffix is page-local. The independent transition-program axis admits both
+//! terminating finite automata and repeated least-fixpoint programs.
 //!
 //! Ready and Candidate descriptors are pure planning states: they estimate,
 //! partition rows by a uniform semantic action, and file explicit Propose or
@@ -167,12 +168,12 @@ impl FiniteFormulaProgram {
     fn compile<'a>(
         root: &dyn Constraint<'a>,
         leaves: &[ResidualLeaf],
-        cyclic_rpq: bool,
+        transition_programs: bool,
         synthetic_root: bool,
     ) -> Self {
         struct Builder {
             nodes: Vec<Option<FiniteFormulaNode>>,
-            cyclic_rpq: bool,
+            transition_programs: bool,
         }
 
         impl Builder {
@@ -193,7 +194,7 @@ impl FiniteFormulaProgram {
                 let node_path = FormulaPath(path.clone().into_boxed_slice());
                 let capabilities = FormulaNodeCapabilities {
                     confirm_page_local: constraint.residual_confirm_is_page_local(),
-                    grouped_delta_confirm: self.cyclic_rpq
+                    grouped_delta_confirm: self.transition_programs
                         && constraint.residual_delta_confirm_is_grouped(),
                 };
                 let kind = if let Some(children) = constraint.residual_union_children() {
@@ -263,7 +264,7 @@ impl FiniteFormulaProgram {
                 let id = self.reserve_node();
                 let capabilities = FormulaNodeCapabilities {
                     confirm_page_local: root.residual_confirm_is_page_local(),
-                    grouped_delta_confirm: self.cyclic_rpq
+                    grouped_delta_confirm: self.transition_programs
                         && root.residual_delta_confirm_is_grouped(),
                 };
                 let mut children = Vec::new();
@@ -370,7 +371,7 @@ impl FiniteFormulaProgram {
 
         let mut builder = Builder {
             nodes: Vec::new(),
-            cyclic_rpq,
+            transition_programs,
         };
         if synthetic_root {
             assert_eq!(
@@ -887,12 +888,6 @@ impl PartialEq<ConstraintPath> for ResidualLeaf {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ResidualCompileMode {
-    OpaqueUnions,
-    FiniteUnions,
-}
-
 /// Borrow-free lowering plan safe to store beside its owned root.
 ///
 /// Occurrence identity is the path's preorder position, not the address or
@@ -907,9 +902,10 @@ struct ResidualPlan {
     /// Whether each opaque leaf's confirmation is homomorphic over ordered
     /// pages of one parent's candidate sequence.
     page_local_confirms: Vec<bool>,
-    /// Whether eligible opaque RPQ proposal leaves may enter the cyclic delta
-    /// submachine for this exact solve.
-    cyclic_rpq: bool,
+    /// Whether eligible opaque proposal leaves may enter the residual
+    /// transition submachine for this exact solve. Finite programs terminate;
+    /// repeated programs compute their least fixpoint on the same substrate.
+    transition_programs: bool,
     /// Whether a lowered cyclic confirmation needs the immutable complete
     /// candidate sequence for each parent until traversal quiescence.
     grouped_delta_confirms: Vec<bool>,
@@ -920,41 +916,31 @@ struct ResidualPlan {
 
 impl ResidualPlan {
     fn compile<'a>(root: &dyn Constraint<'a>) -> Self {
-        Self::compile_mode(root, ResidualCompileMode::OpaqueUnions, false, false)
+        Self::compile_mode(root, FormulaScope::OpaqueLeaves, false)
     }
 
     #[cfg(test)]
     fn compile_finite_unions<'a>(root: &dyn Constraint<'a>) -> Self {
-        Self::compile_mode(root, ResidualCompileMode::FiniteUnions, false, false)
+        Self::compile_mode(root, FormulaScope::UnionLeaves, false)
     }
 
-    fn compile_capabilities<'a>(
-        root: &dyn Constraint<'a>,
-        capabilities: ResidualCapabilities,
-    ) -> Self {
-        let mode = if capabilities.finite_unions {
-            ResidualCompileMode::FiniteUnions
-        } else {
-            ResidualCompileMode::OpaqueUnions
-        };
+    fn compile_lowering<'a>(root: &dyn Constraint<'a>, lowering: ResidualLowering) -> Self {
         Self::compile_mode(
             root,
-            mode,
-            capabilities.cyclic_rpq,
-            capabilities.root_formula,
+            lowering.formula_scope(),
+            lowering.transition_programs(),
         )
     }
 
     fn compile_mode<'a>(
         root: &dyn Constraint<'a>,
-        mode: ResidualCompileMode,
-        cyclic_rpq: bool,
-        synthetic_root_formula: bool,
+        formula_scope: FormulaScope,
+        transition_programs: bool,
     ) -> Self {
         fn visit<'a>(
             constraint: &dyn Constraint<'a>,
-            mode: ResidualCompileMode,
-            cyclic_rpq: bool,
+            formula_scope: FormulaScope,
+            transition_programs: bool,
             path: &mut Vec<usize>,
             leaves: &mut Vec<ResidualLeaf>,
             page_local_confirms: &mut Vec<bool>,
@@ -966,8 +952,8 @@ impl ResidualPlan {
                         path.push(child);
                         visit(
                             children.child(child),
-                            mode,
-                            cyclic_rpq,
+                            formula_scope,
+                            transition_programs,
                             path,
                             leaves,
                             page_local_confirms,
@@ -977,7 +963,7 @@ impl ResidualPlan {
                     }
                 }
                 ConstraintShape::Opaque => {
-                    let lowering = if mode == ResidualCompileMode::FiniteUnions
+                    let lowering = if formula_scope == FormulaScope::UnionLeaves
                         && constraint.residual_union_children().is_some()
                     {
                         LeafLowering::FiniteFormula
@@ -993,7 +979,7 @@ impl ResidualPlan {
                             && constraint.residual_confirm_is_page_local(),
                     );
                     grouped_delta_confirms.push(
-                        cyclic_rpq
+                        transition_programs
                             && matches!(lowering, LeafLowering::Opaque)
                             && constraint.residual_delta_confirm_is_grouped(),
                     );
@@ -1001,6 +987,7 @@ impl ResidualPlan {
             }
         }
 
+        let synthetic_root_formula = formula_scope == FormulaScope::WholeRoot;
         let (mut leaves, mut page_local_confirms, mut grouped_delta_confirms) =
             (Vec::new(), Vec::new(), Vec::new());
         if synthetic_root_formula {
@@ -1016,21 +1003,25 @@ impl ResidualPlan {
         } else {
             visit(
                 root,
-                mode,
-                cyclic_rpq,
+                formula_scope,
+                transition_programs,
                 &mut Vec::new(),
                 &mut leaves,
                 &mut page_local_confirms,
                 &mut grouped_delta_confirms,
             );
         }
-        let finite_formula =
-            FiniteFormulaProgram::compile(root, &leaves, cyclic_rpq, synthetic_root_formula);
+        let finite_formula = FiniteFormulaProgram::compile(
+            root,
+            &leaves,
+            transition_programs,
+            synthetic_root_formula,
+        );
         Self {
             leaves,
             finite_formula,
             page_local_confirms,
-            cyclic_rpq,
+            transition_programs,
             grouped_delta_confirms,
             synthetic_root_formula,
         }
@@ -1201,52 +1192,56 @@ pub(super) fn useful_default_shape<'a>(root: &dyn Constraint<'a>) -> bool {
     false
 }
 
-/// Explicit structural capabilities enabled for one residual solve.
+/// Formula boundary exposed to the canonical residual machine.
 ///
-/// The default preserves every composite boundary except exposed associative
-/// conjunctions. This probe surface is intentionally one composable switch
-/// rather than a family of solver methods, so later finite submachines can
-/// share the same execution substrate.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// These variants form a chain, not independent feature bits: lowering the
+/// whole root necessarily absorbs union-leaf lowering below it.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 #[must_use]
-pub struct ResidualCapabilities {
-    finite_unions: bool,
-    cyclic_rpq: bool,
-    root_formula: bool,
+pub enum FormulaScope {
+    /// Preserve every composite boundary except exposed associative ANDs.
+    #[default]
+    OpaqueLeaves,
+    /// Lower exposed Union leaves and their recursive AND/OR descendants.
+    UnionLeaves,
+    /// Lower the maximal exposed root as one synthetic formula occurrence.
+    WholeRoot,
 }
 
-impl ResidualCapabilities {
-    /// Lowers finite logical unions and their recursively exposed AND/OR
-    /// descendants into canonical formula continuations. Atom nodes retain
-    /// the ordinary opaque constraint protocol.
-    pub fn finite_unions(mut self) -> Self {
-        self.finite_unions = true;
-        self
+/// Orthogonal structural lowering selected for one residual solve.
+///
+/// Formula scope is a three-element chain. Transition programs form the one
+/// independent capability axis, giving exactly six canonical lowering forms.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[must_use]
+pub struct ResidualLowering {
+    formula_scope: FormulaScope,
+    transition_programs: bool,
+}
+
+impl ResidualLowering {
+    /// Conservative residual lowering used by explicit probe solvers.
+    pub const CONSERVATIVE: Self = Self::new(FormulaScope::OpaqueLeaves, false);
+    /// Full formula and transition-program lowering used by ordinary queries.
+    pub const FULL: Self = Self::new(FormulaScope::WholeRoot, true);
+
+    /// Constructs one of the six canonical lowering forms.
+    pub const fn new(formula_scope: FormulaScope, transition_programs: bool) -> Self {
+        Self {
+            formula_scope,
+            transition_programs,
+        }
     }
 
-    /// Lowers the maximal exposed query root as one synthetic formula
-    /// occurrence after variable selection. The outer Ready/commit protocol
-    /// remains intact; AND/OR child progress becomes canonical formula state.
-    /// This capability does not affect scheduler selection. Every live
-    /// ordinary query enables it on the full-switch probe, while the explicit
-    /// residual controls retain `ResidualCapabilities::default()`.
-    pub fn root_formula(mut self) -> Self {
-        self.root_formula = true;
-        self
+    /// Returns the formula boundary exposed to the residual machine.
+    pub const fn formula_scope(self) -> FormulaScope {
+        self.formula_scope
     }
 
-    /// Executes eligible regular-path transition programs through the residual
-    /// delta submachine. Finite paths use terminating automata and may confirm
-    /// disjoint candidate pages; repeated paths use the same substrate as a
-    /// least fixpoint and retain grouped confirmation. Unsupported custom
-    /// transition shapes stay on the ordinary opaque constraint protocol. A
-    /// certified synthetic-root Atom/AND proposal may publish accepted
-    /// endpoints in transition discovery order; it does not reproduce the
-    /// sorted order of a quiescent formula batch. Residual iteration therefore
-    /// preserves the result bag, not a particular result order.
-    pub fn cyclic_rpq(mut self) -> Self {
-        self.cyclic_rpq = true;
-        self
+    /// Whether eligible finite and repeated transition programs execute in
+    /// the residual submachine.
+    pub const fn transition_programs(self) -> bool {
+        self.transition_programs
     }
 }
 
@@ -4942,9 +4937,9 @@ impl ResidualQueryState {
     pub(super) fn new<'a>(
         root: &dyn Constraint<'a>,
         mode: Search,
-        capabilities: ResidualCapabilities,
+        lowering: ResidualLowering,
     ) -> Self {
-        let plan = ResidualPlan::compile_capabilities(root, capabilities);
+        let plan = ResidualPlan::compile_lowering(root, lowering);
         let machine = ResidualStateMachine::new_for_plan(root.variables(), &plan, mode);
         Self { plan, machine }
     }
@@ -5239,7 +5234,7 @@ impl ResidualStateMachine {
         plan: &ResidualPlan,
         task: SelectedResidualTask,
     ) -> Result<bool, SelectedResidualTask> {
-        if !plan.cyclic_rpq {
+        if !plan.transition_programs {
             return Err(task);
         }
         let (
@@ -5343,7 +5338,7 @@ impl ResidualStateMachine {
         plan: &ResidualPlan,
         task: SelectedResidualTask,
     ) -> Result<bool, SelectedResidualTask> {
-        if !plan.cyclic_rpq {
+        if !plan.transition_programs {
             return Err(task);
         }
         let (
@@ -5462,7 +5457,7 @@ impl ResidualStateMachine {
         plan: &ResidualPlan,
         task: SelectedResidualTask,
     ) -> Result<(Option<ContinuationToken>, bool), SelectedResidualTask> {
-        if !plan.cyclic_rpq {
+        if !plan.transition_programs {
             return Err(task);
         }
         let (ResidualPhase::Formula { counter }, StateBucket::Formula(batch)) =
@@ -6486,22 +6481,22 @@ where
     ///
     /// Panics if iteration has already started on this query.
     pub fn solve_residual_state_lazy(self) -> ResidualStateIter<C, P, R> {
-        self.solve_residual_state_lazy_with(ResidualCapabilities::default())
+        self.solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
     }
 
-    /// Lazily executes through residual states with explicit finite
-    /// submachine capabilities.
+    /// Lazily executes through residual states with explicit structural
+    /// lowering.
     ///
-    /// Capabilities are opt-in and composable. In particular, finite-union
-    /// lowering changes only scheduling granularity; passing the default
-    /// capability set is identical to [`solve_residual_state_lazy`](Self::solve_residual_state_lazy).
+    /// Lowering is independent of scheduler selection. Passing
+    /// [`ResidualLowering::CONSERVATIVE`] is identical to
+    /// [`solve_residual_state_lazy`](Self::solve_residual_state_lazy).
     ///
     /// # Panics
     ///
     /// Panics if iteration has already started on this query.
     pub fn solve_residual_state_lazy_with(
         self,
-        capabilities: ResidualCapabilities,
+        lowering: ResidualLowering,
     ) -> ResidualStateIter<C, P, R> {
         assert_fresh(&self);
         let Query {
@@ -6513,7 +6508,7 @@ where
             ..
         } = self;
         let full = constraint.variables();
-        let plan = ResidualPlan::compile_capabilities(&constraint, capabilities);
+        let plan = ResidualPlan::compile_lowering(&constraint, lowering);
         let state = ResidualStateMachine::new_for_plan(full, &plan, mode);
         ResidualStateIter {
             root: constraint,
@@ -6975,6 +6970,29 @@ mod tests {
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
+
+    #[test]
+    fn residual_lowering_has_exactly_six_canonical_forms() {
+        let forms: std::collections::HashSet<_> = [
+            FormulaScope::OpaqueLeaves,
+            FormulaScope::UnionLeaves,
+            FormulaScope::WholeRoot,
+        ]
+        .into_iter()
+        .flat_map(|scope| {
+            [false, true]
+                .into_iter()
+                .map(move |transitions| ResidualLowering::new(scope, transitions))
+        })
+        .collect();
+
+        assert_eq!(forms.len(), 6);
+        assert_eq!(ResidualLowering::default(), ResidualLowering::CONSERVATIVE);
+        assert_eq!(
+            ResidualLowering::FULL,
+            ResidualLowering::new(FormulaScope::WholeRoot, true)
+        );
+    }
 
     #[derive(Clone, Copy)]
     struct ShapeLeaf(VariableId);
@@ -8162,9 +8180,9 @@ mod tests {
                 estimates: [64, 1],
             },
         ]);
-        let plan = ResidualPlan::compile_capabilities(
+        let plan = ResidualPlan::compile_lowering(
             &root,
-            ResidualCapabilities::default().root_formula(),
+            ResidualLowering::new(FormulaScope::WholeRoot, false),
         );
         let desc = StateDesc {
             bound: VariableSet::new_singleton(PARENT),
@@ -8309,9 +8327,9 @@ mod tests {
             shape_and(vec![shape_leaf(0), shape_leaf(0)]),
             Box::new(union) as ShapeConstraint,
         ]);
-        let plan = ResidualPlan::compile_capabilities(
+        let plan = ResidualPlan::compile_lowering(
             &root,
-            ResidualCapabilities::default().root_formula(),
+            ResidualLowering::new(FormulaScope::WholeRoot, false),
         );
         assert_eq!(plan.len(), 1);
         assert!(plan.synthetic_root_formula);
@@ -8337,15 +8355,44 @@ mod tests {
     }
 
     #[test]
+    fn whole_root_scope_absorbs_union_leaf_lowering() {
+        let union = UnionConstraint::new(vec![shape_leaf(0), shape_leaf(0)]);
+        let root =
+            IntersectionConstraint::new(vec![shape_leaf(0), Box::new(union) as ShapeConstraint]);
+
+        let union_leaves = ResidualPlan::compile_lowering(
+            &root,
+            ResidualLowering::new(FormulaScope::UnionLeaves, false),
+        );
+        assert!(!union_leaves.synthetic_root_formula);
+        assert_eq!(union_leaves.len(), 2);
+        assert!(union_leaves.finite_formula.root(0).is_none());
+        assert!(union_leaves.finite_formula.root(1).is_some());
+
+        let whole_root = ResidualPlan::compile_lowering(
+            &root,
+            ResidualLowering::new(FormulaScope::WholeRoot, false),
+        );
+        assert!(whole_root.synthetic_root_formula);
+        assert_eq!(whole_root.len(), 1);
+        assert!(whole_root.finite_formula.root(0).is_some());
+        assert!(whole_root
+            .finite_formula
+            .nodes
+            .iter()
+            .any(|node| matches!(&node.kind, FiniteFormulaNodeKind::Or { .. })));
+    }
+
+    #[test]
     fn synthetic_formula_repeated_occurrences_have_distinct_action_sites() {
         let shared = Arc::new(CapabilityLeaf {
             variable: 0,
             page_local: true,
         });
         let root = IntersectionConstraint::new(vec![shared.clone(), shared]);
-        let plan = ResidualPlan::compile_capabilities(
+        let plan = ResidualPlan::compile_lowering(
             &root,
-            ResidualCapabilities::default().root_formula(),
+            ResidualLowering::new(FormulaScope::WholeRoot, false),
         );
         let program = &plan.finite_formula;
         let root = program.root(0).unwrap();
@@ -8375,13 +8422,13 @@ mod tests {
             )
         }
 
-        let capabilities = ResidualCapabilities::default().root_formula().cyclic_rpq();
+        let lowering = ResidualLowering::FULL;
 
         let atom = CapabilityLeaf {
             variable: 0,
             page_local: false,
         };
-        let atom_plan = ResidualPlan::compile_capabilities(&atom, capabilities);
+        let atom_plan = ResidualPlan::compile_lowering(&atom, lowering);
         assert_eq!(
             atom_plan.formula_proposal_streamability(&start(&atom_plan)),
             FormulaProposalStreamability::Linear,
@@ -8404,7 +8451,7 @@ mod tests {
                 }),
             ]),
         ]);
-        let linear_plan = ResidualPlan::compile_capabilities(&linear_root, capabilities);
+        let linear_plan = ResidualPlan::compile_lowering(&linear_root, lowering);
         let linear_start = start(&linear_plan);
         let FiniteFormulaNodeKind::And { children } = &linear_plan
             .finite_formula
@@ -8432,7 +8479,7 @@ mod tests {
                 page_local: false,
             }),
         ]);
-        let non_local_plan = ResidualPlan::compile_capabilities(&non_local_root, capabilities);
+        let non_local_plan = ResidualPlan::compile_lowering(&non_local_root, lowering);
         let non_local_action = non_local_plan
             .finite_formula
             .select_child_as_action(&start(&non_local_plan), 0);
@@ -8453,7 +8500,7 @@ mod tests {
                 page_local: true,
             })),
         ]);
-        let grouped_plan = ResidualPlan::compile_capabilities(&grouped_root, capabilities);
+        let grouped_plan = ResidualPlan::compile_lowering(&grouped_root, lowering);
         let grouped_action = grouped_plan
             .finite_formula
             .select_child_as_action(&start(&grouped_plan), 0);
@@ -8472,7 +8519,7 @@ mod tests {
                 page_local: true,
             }),
         ]);
-        let union_plan = ResidualPlan::compile_capabilities(&union, capabilities);
+        let union_plan = ResidualPlan::compile_lowering(&union, lowering);
         let union_action = union_plan
             .finite_formula
             .select_child_as_action(&start(&union_plan), 0);
@@ -8481,9 +8528,9 @@ mod tests {
             FormulaProposalStreamability::Barrier(FormulaProposalStreamBarrier::OrFrame)
         );
 
-        let old_formula_plan = ResidualPlan::compile_capabilities(
+        let old_formula_plan = ResidualPlan::compile_lowering(
             &union,
-            ResidualCapabilities::default().finite_unions().cyclic_rpq(),
+            ResidualLowering::new(FormulaScope::UnionLeaves, true),
         );
         let old_formula_action = old_formula_plan
             .finite_formula
@@ -10567,7 +10614,7 @@ mod tests {
             Arc::clone(&second_calls),
         );
         let mut lazy = Query::new(root, |binding: &Binding| binding.get(0).copied())
-            .solve_residual_state_lazy_with(ResidualCapabilities::default().root_formula())
+            .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::WholeRoot, false))
             .cap(64);
         let result = lazy.next();
         let first = first_calls.lock().unwrap().clone();
@@ -10621,7 +10668,7 @@ mod tests {
         };
         let mut atom_expected: Vec<_> = Query::new(atom(), project).sequential().collect();
         let mut atom_actual: Vec<_> = Query::new(atom(), project)
-            .solve_residual_state_lazy_with(ResidualCapabilities::default().root_formula())
+            .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::WholeRoot, false))
             .collect();
         atom_expected.sort_unstable();
         atom_actual.sort_unstable();
@@ -10641,7 +10688,7 @@ mod tests {
         };
         let mut union_expected: Vec<_> = Query::new(union(), project).sequential().collect();
         let mut union_actual: Vec<_> = Query::new(union(), project)
-            .solve_residual_state_lazy_with(ResidualCapabilities::default().root_formula())
+            .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::WholeRoot, false))
             .collect();
         union_expected.sort_unstable();
         union_actual.sort_unstable();
@@ -10679,7 +10726,7 @@ mod tests {
         let mut alternating_expected: Vec<_> =
             Query::new(alternating(), project).sequential().collect();
         let mut alternating_actual: Vec<_> = Query::new(alternating(), project)
-            .solve_residual_state_lazy_with(ResidualCapabilities::default().root_formula())
+            .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::WholeRoot, false))
             .collect();
         alternating_expected.sort_unstable();
         alternating_actual.sort_unstable();
@@ -10702,9 +10749,9 @@ mod tests {
             ]);
             IgnoreConstraint::new(VariableSet::new_singleton(1), Box::new(inner))
         };
-        let plan = ResidualPlan::compile_capabilities(
+        let plan = ResidualPlan::compile_lowering(
             &make_ignored(),
-            ResidualCapabilities::default().root_formula(),
+            ResidualLowering::new(FormulaScope::WholeRoot, false),
         );
         let root = plan.finite_formula.root(0).unwrap();
         assert_eq!(
@@ -10716,7 +10763,7 @@ mod tests {
         let project = |binding: &Binding| binding.get(0).copied();
         let mut expected: Vec<_> = Query::new(make_ignored(), project).sequential().collect();
         let mut actual: Vec<_> = Query::new(make_ignored(), project)
-            .solve_residual_state_lazy_with(ResidualCapabilities::default().root_formula())
+            .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::WholeRoot, false))
             .collect();
         expected.sort_unstable();
         actual.sort_unstable();
@@ -10725,7 +10772,10 @@ mod tests {
         for truth in [false, true] {
             let expected = if truth { vec![()] } else { Vec::new() };
             let actual = Query::new(ZeroVariableTruth(truth), |_| Some(()))
-                .solve_residual_state_lazy_with(ResidualCapabilities::default().root_formula())
+                .solve_residual_state_lazy_with(ResidualLowering::new(
+                    FormulaScope::WholeRoot,
+                    false,
+                ))
                 .collect::<Vec<_>>();
             assert_eq!(actual, expected);
         }
@@ -10759,7 +10809,7 @@ mod tests {
 
     #[cfg(feature = "parallel")]
     #[test]
-    fn ordinary_query_clone_snapshots_parked_candidate_remainder() {
+    fn conservative_query_clone_snapshots_parked_candidate_remainder() {
         let values: Vec<_> = (0..64).map(raw).collect();
         let root = Arc::new(IntersectionConstraint::new(vec![
             Box::new(FanoutLeaf {
@@ -10774,6 +10824,7 @@ mod tests {
             }) as ShapeConstraint,
         ]));
         let mut query = Query::new(root, |binding: &Binding| binding.get(0).copied())
+            .residual_lowering(ResidualLowering::CONSERVATIVE)
             .residual_state_scheduler();
 
         assert_eq!(query.next(), Some(raw(63)));
@@ -11093,7 +11144,7 @@ mod tests {
             }) as ShapeConstraint,
         ]);
         let mut synthetic: Vec<_> = Query::new(synthetic_root, project)
-            .solve_residual_state_lazy_with(ResidualCapabilities::default().root_formula())
+            .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::WholeRoot, false))
             .cap(1)
             .collect();
         synthetic.sort_unstable();
@@ -11173,7 +11224,7 @@ mod tests {
             .collect();
         let epoch = ResidualShadowEpoch::new();
         let mut lowered = Query::new(make(), project)
-            .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+            .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::UnionLeaves, false))
             .shadow(epoch)
             .collect_profiled();
         sequential.sort_unstable();
@@ -11250,7 +11301,7 @@ mod tests {
             make(Arc::clone(&left_calls), Arc::clone(&right_calls)),
             project,
         )
-        .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+        .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::UnionLeaves, false))
         .collect();
         sequential.sort_unstable();
         dag.sort_unstable();
@@ -11309,7 +11360,7 @@ mod tests {
             make(Arc::clone(&left_rows), Arc::clone(&right_rows)),
             project,
         )
-        .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+        .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::UnionLeaves, false))
         .cap(2)
         .start_width(2)
         .growth(1)
@@ -11354,7 +11405,7 @@ mod tests {
             |binding: &Binding| Some((binding.get(0).copied()?, binding.get(1).copied()?));
         let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
         let mut lowered: Vec<_> = Query::new(make(), project)
-            .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+            .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::UnionLeaves, false))
             .collect();
         sequential.sort_unstable();
         lowered.sort_unstable();
@@ -11386,7 +11437,7 @@ mod tests {
         let mut lowered = Query::new(root, |binding: &Binding| {
             Some((binding.get(0).copied()?, binding.get(1).copied()?))
         })
-        .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+        .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::UnionLeaves, false))
         .cap(32)
         .start_width(1)
         .growth(2);
@@ -11407,7 +11458,7 @@ mod tests {
         let project = |binding: &Binding| binding.get(0).copied();
         let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
         let mut lowered: Vec<_> = Query::new(make(), project)
-            .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+            .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::UnionLeaves, false))
             .collect();
         sequential.sort_unstable();
         lowered.sort_unstable();
@@ -11440,7 +11491,7 @@ mod tests {
         let project = |binding: &Binding| binding.get(0).copied();
         let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
         let mut lowered = Query::new(make(), project)
-            .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+            .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::UnionLeaves, false))
             .collect_profiled();
         sequential.sort_unstable();
         lowered.results.sort_unstable();
@@ -11508,7 +11559,7 @@ mod tests {
             ),
             project,
         )
-        .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+        .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::UnionLeaves, false))
         .collect();
         sequential.sort_unstable();
         lowered.sort_unstable();
@@ -11577,7 +11628,7 @@ mod tests {
             ),
             project,
         )
-        .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+        .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::UnionLeaves, false))
         .collect();
         sequential.sort_unstable();
         lowered.sort_unstable();
@@ -11633,7 +11684,7 @@ mod tests {
             make(Arc::clone(&left_proposals), Arc::clone(&right_proposals)),
             project,
         )
-        .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+        .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::UnionLeaves, false))
         .cap(2)
         .start_width(2)
         .growth(1)
@@ -11658,7 +11709,7 @@ mod tests {
             ),
             project,
         )
-        .solve_residual_state_lazy_with(ResidualCapabilities::default().root_formula())
+        .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::WholeRoot, false))
         .cap(2)
         .start_width(2)
         .growth(1)
@@ -11732,7 +11783,7 @@ mod tests {
             ),
             project,
         )
-        .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+        .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::UnionLeaves, false))
         .cap(4)
         .start_width(4)
         .growth(1)
@@ -11822,7 +11873,7 @@ mod tests {
             .solve_residual_state_lazy()
             .collect();
         let mut lowered: Vec<_> = Query::new(make(), project)
-            .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+            .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::UnionLeaves, false))
             .collect();
         sequential.sort_unstable();
         dag.sort_unstable();
@@ -11882,7 +11933,7 @@ mod tests {
             ),
             project,
         )
-        .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+        .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::UnionLeaves, false))
         .collect();
         sequential.sort_unstable();
         lowered.sort_unstable();
@@ -11963,7 +12014,7 @@ mod tests {
             .solve_residual_state_lazy()
             .collect_profiled();
         let mut lowered = Query::new(make(), project)
-            .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+            .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::UnionLeaves, false))
             .collect_profiled();
         sequential.sort_unstable();
         opaque.results.sort_unstable();
@@ -12045,7 +12096,7 @@ mod tests {
             ),
             project,
         )
-        .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+        .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::UnionLeaves, false))
         .collect();
         sequential.sort_unstable();
         opaque.sort_unstable();
@@ -12092,7 +12143,7 @@ mod tests {
             .solve_residual_state_lazy()
             .collect();
         let mut lowered: Vec<_> = Query::new(make(Arc::clone(&sibling_calls)), project)
-            .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+            .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::UnionLeaves, false))
             .collect();
         sequential.sort_unstable();
         opaque.sort_unstable();
@@ -12152,7 +12203,7 @@ mod tests {
             .solve_residual_state_lazy()
             .collect();
         let mut lowered: Vec<_> = Query::new(make(), project)
-            .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+            .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::UnionLeaves, false))
             .collect();
         sequential.sort_unstable();
         opaque.sort_unstable();
@@ -12201,7 +12252,7 @@ mod tests {
             .solve_residual_state_lazy()
             .collect();
         let mut lowered: Vec<_> = Query::new(make(Arc::clone(&skipped_calls)), project)
-            .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+            .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::UnionLeaves, false))
             .collect();
         sequential.sort_unstable();
         opaque.sort_unstable();
@@ -12269,7 +12320,10 @@ mod tests {
         .collect();
         let mut lowered: Vec<_> =
             Query::new(make(Arc::clone(&even_rows), Arc::clone(&odd_rows)), project)
-                .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+                .solve_residual_state_lazy_with(ResidualLowering::new(
+                    FormulaScope::UnionLeaves,
+                    false,
+                ))
                 .collect();
         sequential.sort_unstable();
         opaque.sort_unstable();
@@ -12324,7 +12378,7 @@ mod tests {
             .solve_residual_state_lazy()
             .collect();
         let mut lowered: Vec<_> = Query::new(make(), project)
-            .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+            .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::UnionLeaves, false))
             .collect();
         sequential.sort_unstable();
         opaque.sort_unstable();
@@ -12367,7 +12421,7 @@ mod tests {
         let project = |binding: &Binding| binding.get(0).copied();
         let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
         let mut lowered: Vec<_> = Query::new(make(), project)
-            .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+            .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::UnionLeaves, false))
             .collect();
         sequential.sort_unstable();
         lowered.sort_unstable();
@@ -12411,13 +12465,16 @@ mod tests {
         let project =
             |binding: &Binding| Some((binding.get(0).copied()?, binding.get(1).copied()?));
         let mut expected: Vec<_> = Query::new(make(), project)
-            .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+            .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::UnionLeaves, false))
             .cap(128)
             .start_width(128)
             .collect();
         let mut parallel: Vec<_> = with_parallel_workers(4, || {
             Query::new(make(), project)
-                .solve_residual_state_lazy_with(ResidualCapabilities::default().finite_unions())
+                .solve_residual_state_lazy_with(ResidualLowering::new(
+                    FormulaScope::UnionLeaves,
+                    false,
+                ))
                 .cap(128)
                 .start_width(128)
                 .into_par_iter()
@@ -13055,9 +13112,9 @@ mod tests {
                 page_local: true,
             },
         ]);
-        let formula_plan = ResidualPlan::compile_capabilities(
+        let formula_plan = ResidualPlan::compile_lowering(
             &formula_root,
-            ResidualCapabilities::default().root_formula(),
+            ResidualLowering::new(FormulaScope::WholeRoot, false),
         );
         let relevant = ChildSet::empty(formula_plan.len()).with_inserted(0);
         let start = formula_plan

@@ -8,7 +8,7 @@ use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace_core::query::residual::{
-    ResidualCapabilities, ResidualShadowEpoch, ResidualShadowStatus,
+    ResidualLowering, ResidualShadowEpoch, ResidualShadowStatus,
 };
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
@@ -349,7 +349,7 @@ fn custom_cyclic_delta_composes_with_recursive_root_formula() {
 
     let residual_evidence = Arc::new(DeltaEvidence::default());
     let residual = Query::new(fixture(Arc::clone(&residual_evidence)), project_end)
-        .solve_residual_state_lazy_with(ResidualCapabilities::default().root_formula().cyclic_rpq())
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
         .cap(2)
         .start_width(1)
         .collect_profiled();
@@ -372,9 +372,7 @@ fn custom_cyclic_delta_composes_with_recursive_root_formula() {
         let parallel_evidence = Arc::new(DeltaEvidence::default());
         let parallel = sorted(
             Query::new(fixture(Arc::clone(&parallel_evidence)), project_end)
-                .solve_residual_state_lazy_with(
-                    ResidualCapabilities::default().root_formula().cyclic_rpq(),
-                )
+                .solve_residual_state_lazy_with(ResidualLowering::FULL)
                 .cap(4)
                 .start_width(4)
                 .into_par_iter()
@@ -388,11 +386,11 @@ fn custom_cyclic_delta_composes_with_recursive_root_formula() {
 
 #[test]
 fn custom_cyclic_delta_shadow_preserves_native_execution() {
-    let capabilities = ResidualCapabilities::default().root_formula().cyclic_rpq();
+    let lowering = ResidualLowering::FULL;
 
     let direct_evidence = Arc::new(DeltaEvidence::default());
     let direct = Query::new(fixture(Arc::clone(&direct_evidence)), project_end)
-        .solve_residual_state_lazy_with(capabilities)
+        .solve_residual_state_lazy_with(lowering)
         .cap(2)
         .start_width(1)
         .collect_profiled();
@@ -407,7 +405,7 @@ fn custom_cyclic_delta_shadow_preserves_native_execution() {
     let shadow_evidence = Arc::new(DeltaEvidence::default());
     let epoch = ResidualShadowEpoch::new();
     let shadow = Query::new(fixture(Arc::clone(&shadow_evidence)), project_end)
-        .solve_residual_state_lazy_with(capabilities)
+        .solve_residual_state_lazy_with(lowering)
         .cap(2)
         .start_width(1)
         .shadow(epoch.clone())
@@ -435,7 +433,7 @@ fn custom_cyclic_delta_shadow_preserves_native_execution() {
         let parallel_evidence = Arc::new(DeltaEvidence::default());
         let parallel_epoch = ResidualShadowEpoch::new();
         let mut parallel: Vec<_> = Query::new(fixture(Arc::clone(&parallel_evidence)), project_end)
-            .solve_residual_state_lazy_with(capabilities)
+            .solve_residual_state_lazy_with(lowering)
             .cap(4)
             .start_width(4)
             .shadow(parallel_epoch.clone())

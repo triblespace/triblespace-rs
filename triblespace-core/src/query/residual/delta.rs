@@ -1742,10 +1742,7 @@ mod tests {
     #[test]
     fn batched_delta_step_keeps_dead_page_and_streamed_formula_handoff_independent() {
         let root = MixedExpansion;
-        let plan = ResidualPlan::compile_capabilities(
-            &root,
-            ResidualCapabilities::default().root_formula().cyclic_rpq(),
-        );
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
         let desc = DeltaDesc::leaf(0, 0);
         let mut scheduler = DeltaScheduler::new();
 

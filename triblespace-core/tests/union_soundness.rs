@@ -29,7 +29,7 @@ use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::patch::{Entry, IdentitySchema, PATCH};
 use triblespace_core::prelude::*;
 use triblespace_core::query::regularpathconstraint::{PathOp, RegularPathConstraint};
-use triblespace_core::query::residual::{ResidualCapabilities, ResidualShadowEpoch};
+use triblespace_core::query::residual::{FormulaScope, ResidualLowering, ResidualShadowEpoch};
 use triblespace_core::query::sortedsliceconstraint::SortedSlice;
 use triblespace_core::query::{
     Constraint, ContainsConstraint, RowsView, TriblePattern, Variable, VariableContext,
@@ -141,18 +141,17 @@ fn pattern_changes_monotone_growth_keeps_results() {
             }
         };
 
-    let residual_query =
-        |full: &TribleSet, delta: &TribleSet, capabilities: ResidualCapabilities| {
-            find!(
-                e: Inline<GenId>,
-                pattern_changes!(full, delta, [
-                    { ?e @ test_ns::rel_r: _?rv, test_ns::rel_s: _?sv }
-                ])
-            )
-            .solve_residual_state_lazy_with(capabilities)
-            .shadow(ResidualShadowEpoch::new())
-            .collect_profiled()
-        };
+    let residual_query = |full: &TribleSet, delta: &TribleSet, lowering: ResidualLowering| {
+        find!(
+            e: Inline<GenId>,
+            pattern_changes!(full, delta, [
+                { ?e @ test_ns::rel_r: _?rv, test_ns::rel_s: _?sv }
+            ])
+        )
+        .solve_residual_state_lazy_with(lowering)
+        .shadow(ResidualShadowEpoch::new())
+        .collect_profiled()
+    };
 
     let ordinary_before = baseline_query(&full1, &delta1, false);
     let ordinary_after = baseline_query(&full2, &delta2, false);
@@ -167,26 +166,18 @@ fn pattern_changes_monotone_growth_keeps_results() {
         "the ordinary and sequential schedulers must agree after growth"
     );
 
-    // `cyclic_rpq` cannot affect this RPQ-free fixture. These are the four
-    // meaningful capability combinations: opaque control, inner finite-Union
-    // lowering, synthetic whole-root lowering, and both switches together.
+    // Transition programs cannot affect this RPQ-free fixture. Formula scope
+    // is a chain: WholeRoot absorbs UnionLeaves, so there are three forms.
     let cases = [
-        ("opaque", ResidualCapabilities::default(), false),
+        ("opaque", ResidualLowering::CONSERVATIVE, false),
         (
-            "finite-union",
-            ResidualCapabilities::default().finite_unions(),
+            "union-leaves",
+            ResidualLowering::new(FormulaScope::UnionLeaves, false),
             false,
         ),
         (
-            "root-formula",
-            ResidualCapabilities::default().root_formula(),
-            true,
-        ),
-        (
-            "root-formula+finite-union",
-            ResidualCapabilities::default()
-                .root_formula()
-                .finite_unions(),
+            "whole-root",
+            ResidualLowering::new(FormulaScope::WholeRoot, false),
             true,
         ),
     ];
@@ -195,9 +186,9 @@ fn pattern_changes_monotone_growth_keeps_results() {
         results.iter().map(|value| value.raw).collect()
     };
     let mut action_counts = Vec::new();
-    for (name, capabilities, synthetic_root) in cases {
-        let before = residual_query(&full1, &delta1, capabilities);
-        let after = residual_query(&full2, &delta2, capabilities);
+    for (name, lowering, synthetic_root) in cases {
+        let before = residual_query(&full1, &delta1, lowering);
+        let after = residual_query(&full2, &delta2, lowering);
         let before_set = raw_set(&before.results);
         let after_set = raw_set(&after.results);
 

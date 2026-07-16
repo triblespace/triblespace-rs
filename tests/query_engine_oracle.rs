@@ -14,7 +14,7 @@ use proptest::prelude::*;
 use rayon::prelude::*;
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use triblespace::core::query::residual::{
-    ActionVerb, ResidualCapabilities, ResidualShadowEpoch, ResidualShadowStatus,
+    ActionVerb, FormulaScope, ResidualLowering, ResidualShadowEpoch, ResidualShadowStatus,
 };
 use triblespace::core::query::{Binding, Constraint, Query};
 use triblespace::prelude::inlineencodings::GenId;
@@ -55,6 +55,20 @@ fn multiset<T: Eq + Hash>(items: impl IntoIterator<Item = T>) -> HashMap<T, usiz
         *counts.entry(item).or_default() += 1;
     }
     counts
+}
+
+/// Keep the extra policy-builder move out of the already large generated
+/// oracle frame. Debug builds otherwise reserve another full `Query` temporary
+/// at every macro expansion and can cross the test thread's stack budget.
+#[inline(never)]
+fn conservative_residual_cursor<'a, C, P, R>(query: Query<C, P, R>) -> Query<C, P, R>
+where
+    C: Constraint<'a>,
+    P: Fn(&Binding) -> Option<R>,
+{
+    query
+        .residual_lowering(ResidualLowering::CONSERVATIVE)
+        .residual_state_scheduler()
 }
 
 #[cfg(feature = "parallel")]
@@ -134,7 +148,7 @@ fn assert_rpq_engines<'a, C, P, R, F>(
             }
             RpqEngine::LazyDag => make_query().solve_dag_lazy().collect::<Vec<_>>(),
             RpqEngine::ResidualCursor => {
-                make_query().residual_state_scheduler().collect::<Vec<_>>()
+                conservative_residual_cursor(make_query()).collect::<Vec<_>>()
             }
             RpqEngine::ResidualEager => make_query().solve_residual_state(),
             RpqEngine::ResidualLazy => make_query().solve_residual_state_lazy().collect::<Vec<_>>(),
@@ -230,9 +244,9 @@ macro_rules! assert_all_engines_match {
             $label
         );
         prop_assert_eq!(
-            multiset(($query).residual_state_scheduler()),
+            multiset(conservative_residual_cursor($query)),
             expected.clone(),
-            "{}: explicit ordinary Query residual state",
+            "{}: explicit conservative Query residual state",
             $label
         );
         #[cfg(feature = "parallel")]
@@ -527,31 +541,21 @@ fn root_formula_candidate_paging_is_storage_polymorphic() {
                     $label
                 );
 
-                for (capability, capabilities) in [
-                    (
-                        "root formula",
-                        ResidualCapabilities::default().root_formula(),
+                assert_eq!(
+                    multiset(
+                        query!($store)
+                            .solve_residual_state_lazy_with(ResidualLowering::new(
+                                FormulaScope::WholeRoot,
+                                false,
+                            ))
+                            .cap(cap)
+                            .start_width(1)
+                            .growth(growth)
                     ),
-                    (
-                        "root formula + finite Union",
-                        ResidualCapabilities::default()
-                            .root_formula()
-                            .finite_unions(),
-                    ),
-                ] {
-                    assert_eq!(
-                        multiset(
-                            query!($store)
-                                .solve_residual_state_lazy_with(capabilities)
-                                .cap(cap)
-                                .start_width(1)
-                                .growth(growth)
-                        ),
-                        expected,
-                        "{}: {capability} ({geometry})",
-                        $label
-                    );
-                }
+                    expected,
+                    "{}: whole-root formula ({geometry})",
+                    $label
+                );
             }
         }};
     }
@@ -560,11 +564,7 @@ fn root_formula_candidate_paging_is_storage_polymorphic() {
     assert_backend!("SuccinctArchiveConstraint", &archive);
 
     let lowered = query!(&archive)
-        .solve_residual_state_lazy_with(
-            ResidualCapabilities::default()
-                .root_formula()
-                .finite_unions(),
-        )
+        .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::WholeRoot, false))
         .cap(1)
         .start_width(1)
         .growth(1)

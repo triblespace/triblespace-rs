@@ -8,7 +8,9 @@ use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
-use triblespace_core::query::residual::{ActionVerb, ResidualCapabilities, ResidualShadowEpoch};
+use triblespace_core::query::residual::{
+    ActionVerb, FormulaScope, ResidualLowering, ResidualShadowEpoch,
+};
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, ConstraintShape, EstimateSink, PathOp, Query,
@@ -512,17 +514,17 @@ enum Scheduler {
     Sequential,
 }
 
-fn combined_effects() -> ResidualCapabilities {
-    ResidualCapabilities::default().finite_unions().cyclic_rpq()
+fn combined_effects() -> ResidualLowering {
+    ResidualLowering::new(FormulaScope::UnionLeaves, true)
 }
 
-fn root_formula_effects() -> ResidualCapabilities {
-    ResidualCapabilities::default().root_formula().cyclic_rpq()
+fn root_formula_effects() -> ResidualLowering {
+    ResidualLowering::FULL
 }
 
 #[cfg(feature = "parallel")]
-fn all_formula_effects() -> ResidualCapabilities {
-    root_formula_effects().finite_unions()
+fn all_formula_effects() -> ResidualLowering {
+    ResidualLowering::FULL
 }
 
 fn repeated(attribute: Id, inverse: bool) -> Vec<PathOp> {
@@ -1150,34 +1152,22 @@ fn synthetic_root_atom_same_variable_rpq_composes_capabilities() {
     let cases = [
         (
             "root-only",
-            ResidualCapabilities::default().root_formula(),
+            ResidualLowering::new(FormulaScope::WholeRoot, false),
             false,
         ),
         (
             "cyclic-only",
-            ResidualCapabilities::default().cyclic_rpq(),
+            ResidualLowering::new(FormulaScope::OpaqueLeaves, true),
             true,
         ),
-        (
-            "root-cyclic",
-            ResidualCapabilities::default().root_formula().cyclic_rpq(),
-            true,
-        ),
-        (
-            "root-finite-cyclic",
-            ResidualCapabilities::default()
-                .root_formula()
-                .finite_unions()
-                .cyclic_rpq(),
-            true,
-        ),
+        ("whole-root-transitions", ResidualLowering::FULL, true),
     ];
-    for (name, capabilities, should_page_sources) in cases {
+    for (name, lowering, should_page_sources) in cases {
         let seeded = Arc::new(AtomicUsize::new(0));
         let pages = Arc::new(Mutex::new(Vec::new()));
         let mut actual: Vec<_> =
             Query::new(make(Arc::clone(&seeded), Arc::clone(&pages)), project_start)
-                .solve_residual_state_lazy_with(capabilities)
+                .solve_residual_state_lazy_with(lowering)
                 .cap(4)
                 .start_width(1)
                 .collect();
@@ -1235,7 +1225,7 @@ fn synthetic_root_grouped_rpq_precedes_page_local_suffix_atomically() {
         }) as DynConstraint,
     ]));
     let mut query = Query::new(root, project_start)
-        .solve_residual_state_lazy_with(ResidualCapabilities::default().root_formula().cyclic_rpq())
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
         .cap(1)
         .start_width(1);
 
@@ -1299,9 +1289,7 @@ fn synthetic_root_cyclic_proposer_respects_the_streamability_latency_boundary() 
             }) as DynConstraint,
         ]));
         let mut query = Query::new(root, project_start)
-            .solve_residual_state_lazy_with(
-                ResidualCapabilities::default().root_formula().cyclic_rpq(),
-            )
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
             .cap(8)
             .start_width(1);
 
@@ -1362,14 +1350,14 @@ fn nested_repeated_root_rpqs_keep_distinct_action_occurrences() {
             Box::new(UnionConstraint::new(vec![arm(left), arm(right)])) as DynConstraint,
         ]))
     };
-    let capabilities = ResidualCapabilities::default().root_formula().cyclic_rpq();
+    let lowering = ResidualLowering::FULL;
     let left = Arc::new(AtomicUsize::new(0));
     let right = Arc::new(AtomicUsize::new(0));
     let direct = Query::new(
         make(Some(Arc::clone(&left)), Some(Arc::clone(&right))),
         project_end,
     )
-    .solve_residual_state_lazy_with(capabilities)
+    .solve_residual_state_lazy_with(lowering)
     .collect_profiled();
     let mut actual = direct.results;
     actual.sort_unstable();
@@ -1388,7 +1376,7 @@ fn nested_repeated_root_rpqs_keep_distinct_action_occurrences() {
         ),
         project_end,
     )
-    .solve_residual_state_lazy_with(capabilities)
+    .solve_residual_state_lazy_with(lowering)
     .shadow(ResidualShadowEpoch::new())
     .collect_profiled();
     let mut observed_results = observed.results.clone();
@@ -1953,9 +1941,9 @@ fn formula_transition_lowering_remains_capability_and_shape_gated() {
         values.sort_unstable();
         values
     };
-    for capabilities in [
-        ResidualCapabilities::default().finite_unions(),
-        ResidualCapabilities::default().cyclic_rpq(),
+    for lowering in [
+        ResidualLowering::new(FormulaScope::UnionLeaves, false),
+        ResidualLowering::new(FormulaScope::OpaqueLeaves, true),
     ] {
         let seeded = Arc::new(AtomicUsize::new(0));
         let expanded = Arc::new(AtomicUsize::new(0));
@@ -1967,7 +1955,7 @@ fn formula_transition_lowering_remains_capability_and_shape_gated() {
             Arc::clone(&expanded),
         );
         let mut actual: Vec<_> = Query::new(root, project_end)
-            .solve_residual_state_lazy_with(capabilities)
+            .solve_residual_state_lazy_with(lowering)
             .collect();
         actual.sort_unstable();
         assert_eq!(actual, expected);
@@ -3221,7 +3209,7 @@ fn duplicate_outer_parents_preserve_endpoint_bag_multiplicity() {
 }
 
 #[test]
-fn default_residual_capabilities_keep_plus_opaque() {
+fn conservative_residual_lowering_keeps_plus_opaque() {
     let graph = Graph::new(3, &[(0, 1), (1, 2)]);
     let proposed = Arc::new(AtomicUsize::new(0));
     let root = bound_start_root(
@@ -3437,32 +3425,25 @@ fn generated_combined_formula_rpq_matrix_matches_frozen_schedulers_and_is_monoto
         GeneratedFormulaCase::BarrierAnd,
         GeneratedFormulaCase::RepeatedRecursive,
     ];
-    let capability_cases = [
-        ("opaque", ResidualCapabilities::default()),
-        ("finite", ResidualCapabilities::default().finite_unions()),
-        ("cyclic", ResidualCapabilities::default().cyclic_rpq()),
-        ("root", ResidualCapabilities::default().root_formula()),
+    let lowering_cases = [
+        ("opaque", ResidualLowering::CONSERVATIVE),
         (
-            "finite-cyclic",
-            ResidualCapabilities::default().finite_unions().cyclic_rpq(),
+            "union-leaves",
+            ResidualLowering::new(FormulaScope::UnionLeaves, false),
         ),
         (
-            "finite-root",
-            ResidualCapabilities::default()
-                .finite_unions()
-                .root_formula(),
+            "whole-root",
+            ResidualLowering::new(FormulaScope::WholeRoot, false),
         ),
         (
-            "root-cyclic",
-            ResidualCapabilities::default().root_formula().cyclic_rpq(),
+            "opaque-transitions",
+            ResidualLowering::new(FormulaScope::OpaqueLeaves, true),
         ),
         (
-            "all",
-            ResidualCapabilities::default()
-                .finite_unions()
-                .root_formula()
-                .cyclic_rpq(),
+            "union-leaves-transitions",
+            ResidualLowering::new(FormulaScope::UnionLeaves, true),
         ),
+        ("whole-root-transitions", ResidualLowering::FULL),
     ];
     let mut saw_root_cyclic_probe_one = false;
 
@@ -3487,9 +3468,9 @@ fn generated_combined_formula_rpq_matrix_matches_frozen_schedulers_and_is_monoto
                     "level={level} program={program:?} formula={formula:?} LazyDag"
                 );
 
-                for &(capability, capabilities) in &capability_cases {
+                for &(capability, lowering) in &lowering_cases {
                     let mut query = Query::new(make_root(), project_end)
-                        .solve_residual_state_lazy_with(capabilities)
+                        .solve_residual_state_lazy_with(lowering)
                         .cap(1)
                         .start_width(1);
                     let mut actual: Vec<_> = query.by_ref().collect();
@@ -3498,7 +3479,7 @@ fn generated_combined_formula_rpq_matrix_matches_frozen_schedulers_and_is_monoto
                         actual, expected,
                         "level={level} program={program:?} formula={formula:?} capability={capability}"
                     );
-                    if capability == "root-cyclic"
+                    if capability == "whole-root-transitions"
                         && program == GeneratedPathProgram::Plus
                         && formula == GeneratedFormulaCase::PageLocalAnd
                         && query.stats().delta_handoff_probe_pops > 0
@@ -3541,7 +3522,7 @@ fn generated_combined_formula_rpq_matrix_matches_frozen_schedulers_and_is_monoto
         generated_formula_root(&graph, &ops, GeneratedFormulaCase::RepeatedRecursive),
         project_end,
     )
-    .solve_residual_state_lazy_with(ResidualCapabilities::default().root_formula().cyclic_rpq())
+    .solve_residual_state_lazy_with(ResidualLowering::FULL)
     .shadow(ResidualShadowEpoch::new())
     .collect_profiled();
     let mut occurrences: Vec<_> = observed
