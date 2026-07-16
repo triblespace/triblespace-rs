@@ -10,10 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Ignored wildcard scopes keep outward proposal sources paged.** The opaque
-  `IgnoreConstraint` boundary now forwards exact direct candidate pages and
-  page-local confirmation only for variables that remain visible. Hidden
-  variables never become schedulable source actions, while TribleSet and other
-  paged children retain geometric first-result latency through `ignore!`.
+  `IgnoreConstraint` boundary now forwards exact direct candidate pages,
+  native source cohorts, and page-local confirmation only for variables that
+  remain visible. Hidden variables never become schedulable source actions,
+  while TribleSet and other paged children retain geometric first-result
+  latency through `ignore!`.
 - **Residual source pages dispatch as compatible affine cohorts.** Canonical
   delta identity remains structural while the scheduler physically partitions
   source activations by bound-row schema, candidate mode, and cursor family.

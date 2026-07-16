@@ -107,6 +107,30 @@ impl<'a> Constraint<'a> for IgnoreConstraint<'a> {
             .residual_delta_source_page(variable, view, candidates, cursor, limit, roots, accepted)
     }
 
+    fn residual_delta_source_pages(
+        &self,
+        variable: VariableId,
+        batch: ResidualDeltaSourceBatch<'_>,
+        pages: &mut Vec<ResidualDeltaSourcePage>,
+        roots: &mut Vec<(u32, ResidualDeltaOutput)>,
+        accepted: &mut Vec<(u32, RawInline)>,
+    ) -> bool {
+        // Preserve a child's native block hook at the same outward-only
+        // boundary as the scalar page hook. Candidate-bearing reducers and
+        // hidden variables remain sealed by Ignore's opaque scope.
+        if self.ignored.is_set(variable)
+            || !self.variables().is_set(variable)
+            || batch
+                .candidate_sets
+                .iter()
+                .any(|candidates| candidates.is_some())
+        {
+            return false;
+        }
+        self.constraint
+            .residual_delta_source_pages(variable, batch, pages, roots, accepted)
+    }
+
     /// Replays the historical wildcard filter once every outward variable is
     /// bound.
     ///

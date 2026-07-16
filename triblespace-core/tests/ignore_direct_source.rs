@@ -10,8 +10,8 @@ use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace_core::query::residual::ResidualLowering;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, EstimateSink, IgnoreConstraint, Query, ResidualDeltaOutput,
-    ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, TriblePattern, Variable,
-    VariableId, VariableSet,
+    ResidualDeltaSourceBatch, ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView,
+    TriblePattern, Variable, VariableId, VariableSet,
 };
 use triblespace_core::trible::{Trible, TribleSet};
 
@@ -241,6 +241,7 @@ fn ignored_direct_source_preserves_duplicate_affine_parents() {
 #[derive(Clone, Default)]
 struct SourceCounters {
     propose_calls: Arc<AtomicUsize>,
+    batch_calls: Arc<AtomicUsize>,
     page_calls: Arc<AtomicUsize>,
     examined: Arc<AtomicUsize>,
 }
@@ -320,10 +321,35 @@ impl<'a, C: Constraint<'a>> Constraint<'a> for CountedSource<C> {
         }
         page
     }
+
+    fn residual_delta_source_pages(
+        &self,
+        variable: VariableId,
+        batch: ResidualDeltaSourceBatch<'_>,
+        pages: &mut Vec<ResidualDeltaSourcePage>,
+        roots: &mut Vec<(u32, ResidualDeltaOutput)>,
+        accepted: &mut Vec<(u32, RawInline)>,
+    ) -> bool {
+        let page_base = pages.len();
+        let supported = self
+            .inner
+            .residual_delta_source_pages(variable, batch, pages, roots, accepted);
+        if supported {
+            self.counters.batch_calls.fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .page_calls
+                .fetch_add(pages.len() - page_base, Ordering::Relaxed);
+            self.counters.examined.fetch_add(
+                pages[page_base..].iter().map(|page| page.examined).sum(),
+                Ordering::Relaxed,
+            );
+        }
+        supported
+    }
 }
 
 #[test]
-fn width_one_yields_after_one_ignored_entry_and_drop_cancels_the_frontier() {
+fn width_one_forwards_native_batch_and_drop_cancels_the_frontier() {
     let attribute = id(0xf2);
     let set = relation(attribute, 1..=64);
     let entity = Variable::<GenId>::new(ENTITY);
@@ -343,12 +369,14 @@ fn width_one_yields_after_one_ignored_entry_and_drop_cancels_the_frontier() {
 
     assert!(query.next().is_some());
     assert_eq!(counters.propose_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(counters.batch_calls.load(Ordering::Relaxed), 1);
     assert_eq!(counters.page_calls.load(Ordering::Relaxed), 1);
     assert_eq!(counters.examined.load(Ordering::Relaxed), 1);
     assert_eq!(query.stats().delta_source_pages, 1);
     assert_eq!(query.stats().delta_source_candidates_examined, 1);
     assert_eq!(query.stats().delta_source_direct_candidates, 1);
     drop(query);
+    assert_eq!(counters.batch_calls.load(Ordering::Relaxed), 1);
     assert_eq!(counters.page_calls.load(Ordering::Relaxed), 1);
     assert_eq!(counters.examined.load(Ordering::Relaxed), 1);
 }
