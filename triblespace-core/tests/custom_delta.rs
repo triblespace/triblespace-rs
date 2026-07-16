@@ -424,7 +424,9 @@ fn custom_cyclic_delta_shadow_preserves_native_execution() {
     assert_eq!(epoch.status(), ResidualShadowStatus::Closed);
     assert_eq!(
         shadow.shadow.events.len(),
-        shadow.stats.propose_action_pops + shadow.stats.confirm_action_pops,
+        shadow.stats.support_action_pops
+            + shadow.stats.propose_action_pops
+            + shadow.stats.confirm_action_pops,
         "each selected native action site must be observed exactly once"
     );
 
