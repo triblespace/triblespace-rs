@@ -398,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn quiescent_union_keeps_direct_occurrences_private_until_normalization() {
+    fn quiescent_union_eager_proposals_keep_occurrences_private_until_normalization() {
         let left = [value(1), value(1), value(2)];
         let right = [value(2), value(3)];
         let left = SortedSlice::new(&left).unwrap();
@@ -421,10 +421,12 @@ mod tests {
         actual.sort_unstable();
         assert_eq!(actual, expected);
         assert_eq!(actual, [value(1).raw, value(2).raw, value(3).raw]);
-        assert_eq!(query.stats().delta_source_direct_candidates, 5);
+        assert_eq!(query.stats().delta_source_direct_candidates, 0);
         assert_eq!(query.stats().delta_source_roots, 0);
-        // Each source page stays private to its Union arm; normalization emits
-        // the three distinct values only after both arms reach quiescence.
+        assert_eq!(query.stats().delta_source_pages, 0);
+        // Each eager proposal stays private to its Union arm; normalization
+        // emits the three distinct values only after both arms reach
+        // quiescence.
         assert_eq!(query.stats().max_propose_candidates, 3);
     }
 }

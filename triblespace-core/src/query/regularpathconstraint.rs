@@ -2159,6 +2159,14 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         )
     }
 
+    fn residual_proposal_source_has_transition_roots(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+    ) -> bool {
+        self.residual_proposal_source_is_paged(variable, view)
+    }
+
     fn residual_delta_source_page(
         &self,
         variable: VariableId,

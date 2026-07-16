@@ -1397,6 +1397,55 @@ impl ResidualPlan {
         constraint
     }
 
+    /// Whether any concrete leaf in this plan owns a true transition source
+    /// for the current variable and bound-row schema. Proposal-only paging can
+    /// be materialized eagerly behind a quiescent formula barrier when the
+    /// whole frontier is finite. A heterogeneous transition sibling keeps the
+    /// direct source on the same bounded substrate so the scheduler can
+    /// interleave their work.
+    fn has_paged_transition_source<'a>(
+        &self,
+        root: &dyn Constraint<'a>,
+        variable: VariableId,
+        view: &RowsView<'_>,
+    ) -> bool {
+        fn formula_has_source<'a>(
+            plan: &ResidualPlan,
+            root: &dyn Constraint<'a>,
+            occurrence: usize,
+            node: FormulaNodeId,
+            variable: VariableId,
+            view: &RowsView<'_>,
+        ) -> bool {
+            match &plan.finite_formula.node(node).kind {
+                FiniteFormulaNodeKind::Atom => {
+                    let constraint = plan.resolve_formula_node(root, occurrence, node);
+                    constraint.residual_delta_source_is_paged(variable, view)
+                        || constraint
+                            .residual_proposal_source_has_transition_roots(variable, view)
+                }
+                FiniteFormulaNodeKind::And { children }
+                | FiniteFormulaNodeKind::Or { children } => children.iter().any(|&child| {
+                    formula_has_source(plan, root, occurrence, child, variable, view)
+                }),
+            }
+        }
+
+        (0..self.len()).any(|occurrence| {
+            self.finite_formula.root(occurrence).map_or_else(
+                || {
+                    let constraint = self.resolve(root, occurrence);
+                    constraint.residual_delta_source_is_paged(variable, view)
+                        || constraint
+                            .residual_proposal_source_has_transition_roots(variable, view)
+                },
+                |formula_root| {
+                    formula_has_source(self, root, occurrence, formula_root, variable, view)
+                },
+            )
+        })
+    }
+
     /// True exactly when every unchecked relevant confirmer can process
     /// ordered candidate pages independently. Whole-group confirmers may run
     /// first; paging begins only once the remaining continuation is local.
@@ -3302,9 +3351,14 @@ impl FormulaBatch {
     where
         K: Clone + Ord,
     {
+        assert_eq!(assignment.len(), self.parents.row_count);
+        assert_eq!(self.activations.len(), self.parents.row_count);
+        if let Some(first) = assignment.first() {
+            if assignment.iter().all(|key| key == first) {
+                return BTreeMap::from([(first.clone(), self)]);
+            }
+        }
         let RowBatch { rows, row_count } = self.parents;
-        assert_eq!(assignment.len(), row_count);
-        assert_eq!(self.activations.len(), row_count);
         let mut remap = vec![u32::MAX; row_count];
         let mut groups: BTreeMap<K, Self> = BTreeMap::new();
         let empty_frames: Vec<_> = self
@@ -4835,12 +4889,9 @@ fn formula_or_plan_transition<'a>(
         }
     }
 
-    let successors: Vec<_> = assignments
-        .into_iter()
-        .map(|child| plan.finite_formula.guard_child(counter, child))
-        .collect();
     let mut continuation = None;
-    for (counter, batch) in batch.partition(vars.len(), &successors) {
+    for (child, batch) in batch.partition(vars.len(), &assignments) {
+        let counter = plan.finite_formula.guard_child(counter, child);
         prefer_continuation(
             &mut continuation,
             continue_formula_transition(plan, desc, counter, batch, worklist, interner, stats),
@@ -4923,12 +4974,9 @@ fn formula_and_plan_transition<'a>(
         }
     }
 
-    let successors: Vec<_> = assignments
-        .into_iter()
-        .map(|child| select_formula_child(&plan.finite_formula, &next, children, child))
-        .collect();
     let mut continuation = None;
-    for (counter, mut batch) in batch.partition(vars.len(), &successors) {
+    for (child, mut batch) in batch.partition(vars.len(), &assignments) {
+        let counter = select_formula_child(&plan.finite_formula, &next, children, child);
         enter_selected_formula_frame(&plan.finite_formula, &counter, &mut batch);
         prefer_continuation(
             &mut continuation,
@@ -6131,9 +6179,26 @@ impl ResidualStateMachine {
             (route, false)
         } else {
             let variable = counter.resume.variable;
-            let paged = constraint.residual_delta_source_is_paged(variable, &view)
-                || (stage == FormulaStage::Propose
-                    && constraint.residual_proposal_source_is_paged(variable, &view));
+            let transition_paged = constraint.residual_delta_source_is_paged(variable, &view);
+            let proposal_paged = stage == FormulaStage::Propose
+                && constraint.residual_proposal_source_is_paged(variable, &view);
+            let proposal_has_transition_roots = proposal_paged
+                && constraint.residual_proposal_source_has_transition_roots(variable, &view);
+            if proposal_paged
+                && !transition_paged
+                && !proposal_has_transition_roots
+                && !stream_proposal
+                && !plan.has_paged_transition_source(root, variable, &view)
+            {
+                // A quiescent formula reducer cannot publish direct proposal
+                // pages before the finite frontier settles. Eager proposal
+                // materializes the same row-local bag without affine source
+                // machinery. When any sibling owns a true transition source,
+                // keep the heterogeneous frontier uniformly pageable so its
+                // work can still be interleaved.
+                return Err(task);
+            }
+            let paged = transition_paged || proposal_paged;
             if !paged {
                 let supported = constraint.residual_delta_seeds(variable, &view, &mut seeds);
                 if !supported {
@@ -7860,6 +7925,112 @@ mod tests {
             _view: &RowsView<'_>,
             _candidates: &mut CandidateSink<'_>,
         ) {
+        }
+    }
+
+    #[derive(Clone)]
+    struct PagedProposalLeaf {
+        variable: VariableId,
+        values: Arc<Vec<RawInline>>,
+        transition_source: bool,
+        proposes: Arc<AtomicUsize>,
+        pages: Arc<AtomicUsize>,
+    }
+
+    impl Constraint<'static> for PagedProposalLeaf {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(self.variable)
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != self.variable {
+                return false;
+            }
+            out.fill(self.values.len(), view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            assert_eq!(variable, self.variable);
+            self.proposes.fetch_add(1, Ordering::Relaxed);
+            for row in 0..view.len() {
+                candidates.extend_row(row as u32, self.values.iter().copied());
+            }
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn residual_delta_source_is_paged(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+        ) -> bool {
+            false
+        }
+
+        fn residual_proposal_source_is_paged(
+            &self,
+            variable: VariableId,
+            _view: &RowsView<'_>,
+        ) -> bool {
+            variable == self.variable
+        }
+
+        fn residual_proposal_source_has_transition_roots(
+            &self,
+            variable: VariableId,
+            _view: &RowsView<'_>,
+        ) -> bool {
+            variable == self.variable && self.transition_source
+        }
+
+        fn residual_delta_source_page(
+            &self,
+            variable: VariableId,
+            _view: &RowsView<'_>,
+            candidates: Option<&[RawInline]>,
+            cursor: ResidualDeltaSourceCursor,
+            limit: usize,
+            roots: &mut Vec<ResidualDeltaOutput>,
+            accepted: &mut Vec<RawInline>,
+        ) -> Option<ResidualDeltaSourcePage> {
+            assert_eq!(variable, self.variable);
+            assert!(candidates.is_none());
+            assert!(roots.is_empty());
+            self.pages.fetch_add(1, Ordering::Relaxed);
+            let offset = match cursor {
+                ResidualDeltaSourceCursor::Start => 0,
+                ResidualDeltaSourceCursor::Offset(offset) => {
+                    usize::try_from(offset).expect("test proposal cursor exceeds usize")
+                }
+                ResidualDeltaSourceCursor::After(_) => {
+                    panic!("test proposal source uses ordinal cursors")
+                }
+            };
+            let end = offset.saturating_add(limit).min(self.values.len());
+            accepted.extend_from_slice(&self.values[offset..end]);
+            Some(ResidualDeltaSourcePage {
+                next: (end < self.values.len()).then_some(ResidualDeltaSourceCursor::Offset(
+                    u64::try_from(end).expect("test proposal cursor exceeds u64"),
+                )),
+                examined: end - offset,
+            })
         }
     }
 
@@ -9699,6 +9870,60 @@ mod tests {
             panic!("local OR returned into the wrong parent-frame shape")
         };
         assert_eq!(current, &vec![(0, raw(1)), (0, raw(2))]);
+    }
+
+    #[test]
+    fn formula_uniform_partition_reuses_the_complete_payload() {
+        let batch = FormulaBatch {
+            activations: vec![ActivationId(10), ActivationId(11), ActivationId(12)],
+            parents: RowBatch {
+                rows: [1, 2, 3, 4, 5, 6].map(raw).into_iter().collect(),
+                row_count: 3,
+            },
+            frames: vec![
+                FormulaPayloadFrame::Or {
+                    source: vec![(0, raw(20)), (2, raw(21))],
+                    output: vec![(1, raw(22))],
+                },
+                FormulaPayloadFrame::And {
+                    current: vec![(0, raw(30)), (1, raw(31)), (2, raw(32))],
+                },
+            ],
+        };
+        let mut groups = batch.partition(2, &[7u8, 7, 7]);
+        assert_eq!(groups.len(), 1);
+        let group = groups.remove(&7).expect("uniform assignment has one key");
+        assert_eq!(
+            group.activations,
+            [ActivationId(10), ActivationId(11), ActivationId(12)]
+        );
+        assert_eq!(group.parents.rows, [1, 2, 3, 4, 5, 6].map(raw));
+        assert_eq!(group.parents.row_count, 3);
+        let [
+            FormulaPayloadFrame::Or { source, output },
+            FormulaPayloadFrame::And { current },
+        ] = group.frames.as_slice()
+        else {
+            panic!("uniform partition changed formula frame shapes")
+        };
+        assert_eq!(source, &vec![(0, raw(20)), (2, raw(21))]);
+        assert_eq!(output, &vec![(1, raw(22))]);
+        assert_eq!(
+            current,
+            &vec![(0, raw(30)), (1, raw(31)), (2, raw(32))]
+        );
+
+        let empty = FormulaBatch {
+            activations: Vec::new(),
+            parents: RowBatch {
+                rows: Vec::new(),
+                row_count: 0,
+            },
+            frames: vec![FormulaPayloadFrame::And {
+                current: Vec::new(),
+            }],
+        };
+        assert!(empty.partition::<u8>(0, &[]).is_empty());
     }
 
     #[test]
@@ -12572,6 +12797,73 @@ mod tests {
         lowered.sort_unstable();
         assert_eq!(lowered, [raw(4), raw(5)]);
         assert_eq!(lowered, sequential);
+    }
+
+    #[test]
+    fn quiescent_formula_eagerly_materializes_only_proposal_paging() {
+        let run = |transition_source| {
+            let proposes = Arc::new(AtomicUsize::new(0));
+            let pages = Arc::new(AtomicUsize::new(0));
+            let leaf = |values| PagedProposalLeaf {
+                variable: 0,
+                values: Arc::new(values),
+                transition_source,
+                proposes: Arc::clone(&proposes),
+                pages: Arc::clone(&pages),
+            };
+            let root = UnionConstraint::new(vec![
+                leaf(vec![raw(1), raw(2), raw(2)]),
+                leaf(vec![raw(2), raw(3)]),
+            ]);
+            let mut solve = Query::new(root, |binding: &Binding| binding.get(0).copied())
+                .solve_residual_state_lazy_with(ResidualLowering::FULL)
+                .collect_profiled();
+            solve.results.sort_unstable();
+            (solve, proposes, pages)
+        };
+
+        let (proposal_only, proposes, pages) = run(false);
+        assert_eq!(proposal_only.results, [raw(1), raw(2), raw(3)]);
+        assert_eq!(proposes.load(Ordering::Relaxed), 2);
+        assert_eq!(pages.load(Ordering::Relaxed), 0);
+        assert_eq!(proposal_only.stats.delta_source_pages, 0);
+
+        let (transition, proposes, pages) = run(true);
+        assert_eq!(transition.results, proposal_only.results);
+        assert_eq!(proposes.load(Ordering::Relaxed), 0);
+        assert!(pages.load(Ordering::Relaxed) > 0);
+        assert!(transition.stats.delta_source_pages > 0);
+
+        let finite_proposes = Arc::new(AtomicUsize::new(0));
+        let finite_pages = Arc::new(AtomicUsize::new(0));
+        let transition_proposes = Arc::new(AtomicUsize::new(0));
+        let transition_pages = Arc::new(AtomicUsize::new(0));
+        let root = UnionConstraint::new(vec![
+            PagedProposalLeaf {
+                variable: 0,
+                values: Arc::new(vec![raw(1), raw(2)]),
+                transition_source: false,
+                proposes: Arc::clone(&finite_proposes),
+                pages: Arc::clone(&finite_pages),
+            },
+            PagedProposalLeaf {
+                variable: 0,
+                values: Arc::new(vec![raw(2), raw(3)]),
+                transition_source: true,
+                proposes: Arc::clone(&transition_proposes),
+                pages: Arc::clone(&transition_pages),
+            },
+        ]);
+        let mut heterogeneous: Vec<_> =
+            Query::new(root, |binding: &Binding| binding.get(0).copied())
+                .solve_residual_state_lazy_with(ResidualLowering::FULL)
+                .collect();
+        heterogeneous.sort_unstable();
+        assert_eq!(heterogeneous, [raw(1), raw(2), raw(3)]);
+        assert_eq!(finite_proposes.load(Ordering::Relaxed), 0);
+        assert!(finite_pages.load(Ordering::Relaxed) > 0);
+        assert_eq!(transition_proposes.load(Ordering::Relaxed), 0);
+        assert!(transition_pages.load(Ordering::Relaxed) > 0);
     }
 
     #[test]

@@ -338,6 +338,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Finite residual formulas avoid materializing administrative row copies.**
+  Uniform child selections now retain their complete affine batch, and mixed
+  selections partition on compact child ordinals before constructing canonical
+  continuation states. Quiescent formulas eagerly consume finite direct
+  proposal sources instead of registering paged affine activations; a distinct
+  structural capability keeps product-state root sources and heterogeneous
+  formula/path frontiers on the bounded transition substrate. Exact arm-local
+  bags and the normalization barrier remain unchanged.
 - **Residual RPQ scheduling separates fixpoint depth from parent breadth.**
   Transition work that can publish endpoints immediately still batches across
   activations. Quiescent formula, support, and grouped-confirm reducers instead

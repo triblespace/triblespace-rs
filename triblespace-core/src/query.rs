@@ -1203,6 +1203,23 @@ pub trait Constraint<'a> {
         false
     }
 
+    /// Whether a paged proposal source emits product-state roots rather than
+    /// only finished direct candidates.
+    ///
+    /// Direct candidate pages may be materialized eagerly when a surrounding
+    /// finite-formula reducer is quiescent. A root-producing page must retain
+    /// the transition substrate: its source page is merely the beginning of a
+    /// resumable automaton traversal. This answer is structural for the
+    /// supplied bound schema and must remain stable for the solve.
+    #[doc(hidden)]
+    fn residual_proposal_source_has_transition_roots(
+        &self,
+        _variable: VariableId,
+        _view: &RowsView<'_>,
+    ) -> bool {
+        false
+    }
+
     /// Consume at most `limit` entries from one activation's ordered source
     /// frontier.
     ///
@@ -1502,6 +1519,15 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.residual_proposal_source_is_paged(variable, view)
     }
 
+    fn residual_proposal_source_has_transition_roots(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+    ) -> bool {
+        let inner: &T = self;
+        inner.residual_proposal_source_has_transition_roots(variable, view)
+    }
+
     fn residual_delta_source_page(
         &self,
         variable: VariableId,
@@ -1655,6 +1681,15 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
         let inner: &T = self;
         inner.residual_proposal_source_is_paged(variable, view)
+    }
+
+    fn residual_proposal_source_has_transition_roots(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+    ) -> bool {
+        let inner: &T = self;
+        inner.residual_proposal_source_has_transition_roots(variable, view)
     }
 
     fn residual_delta_source_page(
