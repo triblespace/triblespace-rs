@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A source-identical benchmark compares query-engine generations.**
+  `query_engine_generation_bench` runs finite unions, recursive AND/OR,
+  cyclic regular paths, and mixed formula/path queries against independent
+  relational oracles on both TribleSet and SuccinctArchive. Compile-time
+  terminal adapters select the historical Binding/Vec DFS, today's scalar
+  block-of-one DFS, or the residual state scheduler while keeping fixtures
+  and query expressions byte-identical; the probe reports construction,
+  pull-to-first, geometric prefix, and full-drain throughput separately.
 - **Finite RPQ helper joins enter private seeded residual frames.** Closure-free
   forward, existential, and same-variable fallback joins now import captured
   endpoint values as a canonical one-row seed instead of starting a nested
