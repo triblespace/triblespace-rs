@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -13,7 +13,8 @@ use triblespace_core::query::residual::{
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, EstimateSink, Query, ResidualDeltaNode,
-    ResidualDeltaOutput, ResidualDeltaSeed, RowsView, Variable, VariableId, VariableSet,
+    ResidualDeltaOutput, ResidualDeltaSeed, ResidualDeltaSourceCursor, ResidualDeltaSourcePage,
+    RowsView, Variable, VariableId, VariableSet,
 };
 
 const START: VariableId = 0;
@@ -372,6 +373,168 @@ impl<'a> Constraint<'a> for PageLocalDomain {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DirectPageTrace {
+    parent: RawInline,
+    cursor: ResidualDeltaSourceCursor,
+    limit: usize,
+    accepted: Vec<RawInline>,
+    next: Option<ResidualDeltaSourceCursor>,
+}
+
+#[derive(Default)]
+struct DirectSourceEvidence {
+    pages: Mutex<Vec<DirectPageTrace>>,
+    expanded_nodes: AtomicUsize,
+}
+
+/// A deliberately non-RPQ ordered domain. Sequential execution sees an
+/// ordinary finite proposer; residual execution may consume its exact same
+/// values as rootless direct source effects, one bounded page at a time.
+struct PagedDirectDomain {
+    variable: VariableId,
+    values: Arc<Vec<RawInline>>,
+    evidence: Arc<DirectSourceEvidence>,
+}
+
+impl<'a> Constraint<'a> for PagedDirectDomain {
+    fn variables(&self) -> VariableSet {
+        VariableSet::new_singleton(self.variable)
+    }
+
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        if variable != self.variable {
+            return false;
+        }
+        // Keep the hidden affine parent ahead of this source in the plan.
+        out.fill(self.values.len() + 32, view.len());
+        true
+    }
+
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        if variable == self.variable {
+            for parent in 0..view.len() {
+                candidates.extend_row(parent as u32, self.values.iter().copied());
+            }
+        }
+    }
+
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        if variable == self.variable {
+            candidates.retain(|_, candidate| self.values.contains(candidate));
+        }
+    }
+
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        view.col(self.variable)
+            .is_none_or(|column| view.iter().all(|row| self.values.contains(&row[column])))
+    }
+
+    fn residual_confirm_is_page_local(&self) -> bool {
+        true
+    }
+
+    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
+        variable == self.variable && view.col(PARENT).is_some()
+    }
+
+    fn residual_delta_source_page(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: Option<&[RawInline]>,
+        cursor: ResidualDeltaSourceCursor,
+        limit: usize,
+        roots: &mut Vec<ResidualDeltaOutput>,
+        accepted: &mut Vec<RawInline>,
+    ) -> Option<ResidualDeltaSourcePage> {
+        if !self.residual_proposal_source_is_paged(variable, view) {
+            return None;
+        }
+        assert!(
+            candidates.is_none(),
+            "a proposal source has no parent candidates"
+        );
+        assert_eq!(view.len(), 1, "each source activation owns one affine row");
+        assert!(
+            roots.is_empty(),
+            "direct pages must not inherit traversal roots"
+        );
+        assert!(limit > 0);
+
+        let begin = match cursor {
+            ResidualDeltaSourceCursor::Start => 0,
+            ResidualDeltaSourceCursor::After(previous) => {
+                self.values.partition_point(|value| *value <= previous)
+            }
+        };
+        let end = begin.saturating_add(limit).min(self.values.len());
+        let page_values = self.values[begin..end].to_vec();
+        accepted.extend(page_values.iter().copied());
+        let next = (end < self.values.len())
+            .then(|| ResidualDeltaSourceCursor::After(self.values[end - 1]));
+        let parent = view.row(0)[view.col(PARENT).expect("paged source parent")];
+        self.evidence
+            .pages
+            .lock()
+            .expect("direct source trace poisoned")
+            .push(DirectPageTrace {
+                parent,
+                cursor,
+                limit,
+                accepted: page_values,
+                next,
+            });
+        Some(ResidualDeltaSourcePage {
+            next,
+            examined: end - begin,
+        })
+    }
+
+    fn residual_delta_expand(
+        &self,
+        _variable: VariableId,
+        nodes: &[ResidualDeltaNode],
+        _successors: &mut Vec<(u32, ResidualDeltaOutput)>,
+    ) -> bool {
+        self.evidence
+            .expanded_nodes
+            .fetch_add(nodes.len(), Ordering::Relaxed);
+        false
+    }
+}
+
+fn direct_source_fixture(values: Vec<RawInline>, evidence: Arc<DirectSourceEvidence>) -> Root {
+    assert!(values.windows(2).all(|pair| pair[0] <= pair[1]));
+    Arc::new(IntersectionConstraint::new(vec![
+        Box::new(PageLocalDomain {
+            variable: PARENT,
+            estimate: 2,
+            values: Arc::new(vec![raw(8), raw(9)]),
+        }) as DynConstraint,
+        Box::new(PagedDirectDomain {
+            variable: START,
+            values: Arc::new(values),
+            evidence,
+        }) as DynConstraint,
+    ]))
+}
+
 fn fixture(evidence: Arc<DeltaEvidence>) -> Root {
     let machine = alternating_closure(evidence);
     let arm = Box::new(IntersectionConstraint::new(vec![
@@ -451,6 +614,10 @@ fn recursive_support_fixture(
 
 fn project_end(binding: &Binding) -> Option<RawInline> {
     binding.get(END).copied()
+}
+
+fn project_start(binding: &Binding) -> Option<RawInline> {
+    binding.get(START).copied()
 }
 
 fn project_outer(binding: &Binding) -> Option<RawInline> {
@@ -587,6 +754,159 @@ fn custom_support_recursive_formula_is_affine_and_monotone() {
         extension_only.remove(position);
     }
     assert_eq!(extension_only, vec![raw(10), raw(10)]);
+}
+
+#[test]
+fn custom_direct_source_first_pull_is_rootless_and_drop_cancels_the_frontier() {
+    let evidence = Arc::new(DirectSourceEvidence::default());
+    let mut query = Query::new(
+        direct_source_fixture(vec![raw(1), raw(2), raw(3), raw(4)], Arc::clone(&evidence)),
+        project_start,
+    )
+    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .cap(1)
+    .start_width(1);
+
+    assert_eq!(query.next(), Some(raw(1)));
+    let pages = evidence
+        .pages
+        .lock()
+        .expect("direct source trace poisoned")
+        .clone();
+    assert_eq!(pages.len(), 1);
+    assert!(matches!(pages[0].parent, value if value == raw(8) || value == raw(9)));
+    assert_eq!(pages[0].cursor, ResidualDeltaSourceCursor::Start);
+    assert_eq!(pages[0].limit, 1);
+    assert_eq!(pages[0].accepted, [raw(1)]);
+    assert_eq!(
+        pages[0].next,
+        Some(ResidualDeltaSourceCursor::After(raw(1)))
+    );
+    assert_eq!(query.stats().delta_source_pages, 1);
+    assert_eq!(query.stats().delta_source_candidates_examined, 1);
+    assert_eq!(query.stats().delta_source_roots, 0);
+    assert_eq!(
+        evidence.expanded_nodes.load(Ordering::Relaxed),
+        0,
+        "a rootless direct page must resume without traversal lineage"
+    );
+
+    drop(query);
+    assert_eq!(
+        evidence
+            .pages
+            .lock()
+            .expect("direct source trace poisoned")
+            .as_slice(),
+        pages,
+        "dropping the query must leave the ordered source frontier untouched"
+    );
+    assert_eq!(evidence.expanded_nodes.load(Ordering::Relaxed), 0);
+}
+
+fn assert_direct_source_case(values: Vec<RawInline>, expected: Vec<RawInline>) -> Vec<RawInline> {
+    let oracle_evidence = Arc::new(DirectSourceEvidence::default());
+    let oracle = sorted(
+        Query::new(
+            direct_source_fixture(values.clone(), Arc::clone(&oracle_evidence)),
+            project_start,
+        )
+        .sequential()
+        .collect(),
+    );
+    assert_eq!(oracle, expected);
+    assert!(
+        oracle_evidence
+            .pages
+            .lock()
+            .expect("direct source trace poisoned")
+            .is_empty(),
+        "the sequential oracle must use the ordinary proposer"
+    );
+
+    let residual_evidence = Arc::new(DirectSourceEvidence::default());
+    let residual = Query::new(
+        direct_source_fixture(values, Arc::clone(&residual_evidence)),
+        project_start,
+    )
+    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .cap(1)
+    .start_width(1)
+    .collect_profiled();
+    let actual = sorted(residual.results);
+    assert_eq!(actual, oracle);
+    assert_eq!(actual, expected);
+    assert_eq!(residual.stats.delta_source_roots, 0);
+    assert_eq!(residual_evidence.expanded_nodes.load(Ordering::Relaxed), 0);
+
+    let pages = residual_evidence
+        .pages
+        .lock()
+        .expect("direct source trace poisoned");
+    assert!(pages.iter().all(|page| page.accepted.len() <= page.limit));
+    let affine_values: Vec<_> = actual.chunks_exact(2).map(|pair| pair[0]).collect();
+    for parent in [raw(8), raw(9)] {
+        let parent_values: Vec<_> = pages
+            .iter()
+            .filter(|page| page.parent == parent)
+            .flat_map(|page| page.accepted.iter().copied())
+            .collect();
+        assert_eq!(parent_values, affine_values);
+    }
+    actual
+}
+
+#[test]
+fn custom_direct_source_preserves_affine_bag_and_monotone_growth() {
+    let inherited =
+        assert_direct_source_case(vec![raw(1), raw(3)], vec![raw(1), raw(1), raw(3), raw(3)]);
+    let mut extension = assert_direct_source_case(
+        vec![raw(1), raw(2), raw(3)],
+        vec![raw(1), raw(1), raw(2), raw(2), raw(3), raw(3)],
+    );
+    for value in inherited {
+        let position = extension
+            .iter()
+            .position(|candidate| *candidate == value)
+            .expect("monotone source growth must preserve every affine occurrence");
+        extension.remove(position);
+    }
+    assert_eq!(extension, [raw(2), raw(2)]);
+}
+
+#[test]
+fn custom_direct_source_preserves_duplicate_occurrences_within_one_page() {
+    // Both equal occurrences fit in one page. A failure therefore isolates
+    // occurrence handling after the hook from value-cursor resumption.
+    let values = vec![raw(1), raw(1)];
+    let oracle = sorted(
+        Query::new(
+            direct_source_fixture(values.clone(), Arc::default()),
+            project_start,
+        )
+        .sequential()
+        .collect(),
+    );
+    assert_eq!(oracle, [raw(1), raw(1), raw(1), raw(1)]);
+
+    let evidence = Arc::new(DirectSourceEvidence::default());
+    let residual = Query::new(
+        direct_source_fixture(values, Arc::clone(&evidence)),
+        project_start,
+    )
+    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .cap(2)
+    .start_width(2)
+    .collect_profiled();
+    let actual = sorted(residual.results);
+    let pages = evidence.pages.lock().expect("direct source trace poisoned");
+    assert_eq!(pages.len(), 2, "each affine parent owns one source page");
+    assert!(
+        pages.iter().all(|page| page.accepted == [raw(1), raw(1)]),
+        "each affine activation must hand both duplicate occurrences to the registry"
+    );
+    drop(pages);
+    assert_eq!(actual, oracle);
 }
 
 #[test]
