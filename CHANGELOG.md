@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Ignored wildcard scopes keep outward proposal sources paged.** The opaque
+  `IgnoreConstraint` boundary now forwards exact direct candidate pages and
+  page-local confirmation only for variables that remain visible. Hidden
+  variables never become schedulable source actions, while TribleSet and other
+  paged children retain geometric first-result latency through `ignore!`.
 - **Ordered proposal sources can page direct candidate occurrences.** The
   residual source cursor now distinguishes raw-value and native-ordinal
   frontiers while preserving proposal order and multiplicity. Sorted slices

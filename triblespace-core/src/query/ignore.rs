@@ -69,6 +69,44 @@ impl<'a> Constraint<'a> for IgnoreConstraint<'a> {
         self.constraint.confirm(variable, view, candidates)
     }
 
+    fn residual_confirm_is_page_local(&self) -> bool {
+        self.constraint.residual_confirm_is_page_local()
+    }
+
+    /// Hiding variables changes the outward schema, but not the proposal
+    /// sequence for a variable that remains visible. Keep that exact child
+    /// frontier available without making the wrapper structurally transparent.
+    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
+        !self.ignored.is_set(variable)
+            && self.variables().is_set(variable)
+            && self
+                .constraint
+                .residual_proposal_source_is_paged(variable, view)
+    }
+
+    fn residual_delta_source_page(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: Option<&[RawInline]>,
+        cursor: ResidualDeltaSourceCursor,
+        limit: usize,
+        roots: &mut Vec<ResidualDeltaOutput>,
+        accepted: &mut Vec<RawInline>,
+    ) -> Option<ResidualDeltaSourcePage> {
+        // Ignore is paging-transparent only for direct outward proposals.
+        // Hidden variables and candidate reducers remain behind the scope
+        // boundary, matching the wrapper's deliberately opaque shape.
+        if self.ignored.is_set(variable)
+            || !self.variables().is_set(variable)
+            || candidates.is_some()
+        {
+            return None;
+        }
+        self.constraint
+            .residual_delta_source_page(variable, view, candidates, cursor, limit, roots, accepted)
+    }
+
     /// Replays the historical wildcard filter once every outward variable is
     /// bound.
     ///
