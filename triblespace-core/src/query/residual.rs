@@ -4105,6 +4105,87 @@ fn confirm_leaf<'a>(
     plan.resolve(root, leaf).confirm(variable, view, candidates);
 }
 
+#[allow(clippy::too_many_arguments)]
+fn ready_plan_scalar_transition<'a>(
+    root: &dyn Constraint<'a>,
+    plan: &ResidualPlan,
+    desc: &StateDesc,
+    rows: RowBatch,
+    full: VariableSet,
+    influences: &[VariableSet; 128],
+    base_estimates: &[usize; 128],
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+) -> ContinuationToken {
+    debug_assert_eq!(rows.row_count, 1);
+    let leaf_count = plan.len();
+    let vars: SmallVec<[VariableId; 16]> = desc.bound.into_iter().collect();
+    let view = rows_view(&vars, &rows.rows, 1);
+    let mut selected: Option<(VariableId, ChildSet, usize, (u64, u64, u64))> = None;
+
+    for variable in full.subtract(desc.bound) {
+        let mut relevant = ChildSet::empty(leaf_count);
+        let mut proposer = usize::MAX;
+        let mut variable_estimate = usize::MAX;
+        for leaf in 0..leaf_count {
+            let mut estimate = usize::MAX;
+            if estimate_leaf(
+                root,
+                plan,
+                leaf,
+                variable,
+                &view,
+                &mut EstimateSink::Scalar(&mut estimate),
+            ) {
+                relevant.insert(leaf);
+                if proposer == usize::MAX || estimate < variable_estimate {
+                    proposer = leaf;
+                    variable_estimate = estimate;
+                }
+            }
+        }
+        assert_ne!(
+            proposer,
+            usize::MAX,
+            "unconstrained variable in residual-state query"
+        );
+        let key = variable_order_key(
+            variable_estimate,
+            base_estimates[variable],
+            influences[variable].count(),
+        );
+        if selected
+            .as_ref()
+            .is_none_or(|(_, _, _, best_key)| key > *best_key)
+        {
+            selected = Some((variable, relevant, proposer, key));
+        }
+    }
+
+    let (variable, relevant, proposer, _) =
+        selected.expect("a non-full ready state has an enabled proposal");
+    stats.ready_preferred_variable_groups += 1;
+    stats.ready_scheduled_variable_groups += 1;
+    stats.ready_proposal_groups += 1;
+    file_with_plan(
+        worklist,
+        interner,
+        plan,
+        StateDesc {
+            bound: desc.bound,
+            phase: ResidualPhase::Propose {
+                variable,
+                relevant,
+                proposer,
+            },
+        },
+        StateBucket::Rows(rows),
+        stats,
+    )
+    .expect("Ready planning filed an empty action")
+}
+
 fn ready_plan_transition<'a>(
     root: &dyn Constraint<'a>,
     plan: &ResidualPlan,
@@ -4117,6 +4198,21 @@ fn ready_plan_transition<'a>(
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
 ) -> ContinuationToken {
+    if rows.row_count == 1 {
+        return ready_plan_scalar_transition(
+            root,
+            plan,
+            desc,
+            rows,
+            full,
+            influences,
+            base_estimates,
+            worklist,
+            interner,
+            stats,
+        );
+    }
+
     let leaf_count = plan.len();
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
     let view = rows_view(&vars, &rows.rows, rows.row_count);
@@ -4953,6 +5049,36 @@ fn formula_or_plan_transition<'a>(
         "residual formula progress names a non-child occurrence"
     );
 
+    if batch.parents.row_count == 1 {
+        assert_eq!(batch.activations.len(), 1);
+        let vars: SmallVec<[VariableId; 16]> = desc.bound.into_iter().collect();
+        let view = rows_view(&vars, &batch.parents.rows, 1);
+        let mut selected = (0..child_count)
+            .find(|&child| !done.contains(child))
+            .expect("unfinished formula has an enabled child");
+        let mut best = usize::MAX;
+        for child in 0..child_count {
+            if done.contains(child) {
+                continue;
+            }
+            let mut estimate = usize::MAX;
+            if plan
+                .resolve_formula_node(root, counter.resume.occurrence, children[child])
+                .estimate(
+                    counter.resume.variable,
+                    &view,
+                    &mut EstimateSink::Scalar(&mut estimate),
+                )
+                && estimate < best
+            {
+                best = estimate;
+                selected = child;
+            }
+        }
+        let counter = plan.finite_formula.guard_child(counter, selected);
+        return continue_formula_transition(plan, desc, counter, batch, worklist, interner, stats);
+    }
+
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
     let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
     let first_undone = (0..child_count)
@@ -5024,6 +5150,48 @@ fn formula_and_plan_transition<'a>(
         Some(FormulaPayloadFrame::And { .. })
     ));
     assert!(done.is_valid_for(children.len()));
+
+    if batch.parents.row_count == 1 {
+        assert_eq!(batch.activations.len(), 1);
+        let vars: SmallVec<[VariableId; 16]> = desc.bound.into_iter().collect();
+        let view = rows_view(&vars, &batch.parents.rows, 1);
+        let mut next = counter.clone();
+        let mut selected = None;
+        let mut best = usize::MAX;
+        for child in 0..children.len() {
+            if done.contains(child) {
+                continue;
+            }
+            let mut estimate = usize::MAX;
+            if plan
+                .resolve_formula_node(root, counter.resume.occurrence, children[child])
+                .estimate(
+                    counter.resume.variable,
+                    &view,
+                    &mut EstimateSink::Scalar(&mut estimate),
+                )
+            {
+                if selected.is_none() || estimate < best {
+                    selected = Some(child);
+                    best = estimate;
+                }
+            } else {
+                next = plan.finite_formula.skip_child(&next, child);
+            }
+        }
+
+        let FormulaFocus::Plan { done, .. } = &next.focus else {
+            unreachable!("AND relevance planning preserves a Plan")
+        };
+        if done.count() == children.len() {
+            return continue_formula_transition(plan, desc, next, batch, worklist, interner, stats);
+        }
+        let child = selected.expect("an unfinished AND has a relevant child");
+        let counter = select_formula_child(&plan.finite_formula, &next, children, child);
+        let mut batch = batch;
+        enter_selected_formula_frame(&plan.finite_formula, &counter, &mut batch);
+        return continue_formula_transition(plan, desc, counter, batch, worklist, interner, stats);
+    }
 
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
     let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
@@ -5142,6 +5310,21 @@ fn formula_action_transition<'a>(
         panic!("formula action received a planning continuation")
     };
     assert_eq!(batch.activations.len(), batch.parents.row_count);
+
+    if stage == FormulaStage::Support && batch.parents.row_count == 1 {
+        let vars: SmallVec<[VariableId; 16]> = desc.bound.into_iter().collect();
+        let view = rows_view(&vars, &batch.parents.rows, 1);
+        let truth = plan
+            .resolve_formula_node(root, counter.resume.occurrence, node)
+            .satisfied(&view.row_view(0));
+        stats.support_calls += 1;
+        stats.support_rows += 1;
+        stats.max_support_rows = stats.max_support_rows.max(1);
+        let completed = plan.finite_formula.complete(counter);
+        return propagate_formula_support(
+            plan, desc, completed, truth, batch, worklist, interner, stats,
+        );
+    }
 
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
     let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
@@ -9062,6 +9245,88 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct SinkShapeCounts {
+        scalar_estimates: AtomicUsize,
+        column_estimates: AtomicUsize,
+        satisfied_calls: AtomicUsize,
+    }
+
+    #[derive(Clone)]
+    struct SinkShapeLeaf {
+        variable: VariableId,
+        estimate: usize,
+        truth: bool,
+        counts: Arc<SinkShapeCounts>,
+    }
+
+    impl Constraint<'static> for SinkShapeLeaf {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(self.variable)
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            match out {
+                EstimateSink::Scalar(_) => {
+                    self.counts.scalar_estimates.fetch_add(1, Ordering::Relaxed);
+                }
+                EstimateSink::Column(_) => {
+                    self.counts.column_estimates.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            if variable != self.variable {
+                return false;
+            }
+            out.fill(self.estimate, view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            assert_eq!(variable, self.variable);
+            for row in 0..view.len() {
+                candidates.push(row as u32, raw(self.estimate as u8));
+            }
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn satisfied(&self, view: &RowsView<'_>) -> bool {
+            assert_eq!(view.len(), 1);
+            self.counts.satisfied_calls.fetch_add(1, Ordering::Relaxed);
+            self.truth
+        }
+    }
+
+    fn sink_shape_leaf(
+        variable: VariableId,
+        estimate: usize,
+        truth: bool,
+        counts: &Arc<SinkShapeCounts>,
+    ) -> SinkShapeLeaf {
+        SinkShapeLeaf {
+            variable,
+            estimate,
+            truth,
+            counts: Arc::clone(counts),
+        }
+    }
+
     #[derive(Clone)]
     struct RowAdaptiveLeaf {
         parent: VariableId,
@@ -9314,6 +9579,23 @@ mod tests {
         machine
     }
 
+    fn only_filed_state<'a>(
+        worklist: &'a Worklist,
+        interner: &'a StateInterner,
+    ) -> (&'a StateDesc, &'a StateBucket) {
+        assert_eq!(
+            worklist.values().map(BTreeMap::len).sum::<usize>(),
+            1,
+            "expected exactly one filed residual state"
+        );
+        let (&id, bucket) = worklist
+            .values()
+            .next()
+            .and_then(|level| level.first_key_value())
+            .expect("one residual state was filed");
+        (interner.get(id), bucket)
+    }
+
     fn ready_action_fixture(
         leaves: Vec<RowEstimateLeaf>,
     ) -> (Vec<(VariableId, usize, usize)>, ResidualStateStats) {
@@ -9361,6 +9643,306 @@ mod tests {
         }
         actions.sort_unstable();
         (actions, stats)
+    }
+
+    #[test]
+    fn one_parent_ready_planning_uses_scalar_estimates_and_exact_ties() {
+        const LEFT: VariableId = 1;
+        const RIGHT: VariableId = 2;
+        let counts = Arc::new(SinkShapeCounts::default());
+        let root = IntersectionConstraint::new(vec![
+            sink_shape_leaf(LEFT, 8, true, &counts),
+            sink_shape_leaf(LEFT, 2, true, &counts),
+            sink_shape_leaf(RIGHT, 2, true, &counts),
+        ]);
+        let plan = ResidualPlan::compile(&root);
+        let desc = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Ready,
+        };
+        let influences = [VariableSet::new_empty(); 128];
+        let base_estimates = [1; 128];
+        let mut worklist = Worklist::new();
+        let mut interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+
+        ready_plan_transition(
+            &root,
+            &plan,
+            &desc,
+            RowBatch::seed(),
+            root.variables(),
+            &influences,
+            &base_estimates,
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+        );
+
+        assert_eq!(counts.scalar_estimates.load(Ordering::Relaxed), 6);
+        assert_eq!(counts.column_estimates.load(Ordering::Relaxed), 0);
+        let (filed, bucket) = only_filed_state(&worklist, &interner);
+        let ResidualPhase::Propose {
+            variable,
+            relevant,
+            proposer,
+        } = &filed.phase
+        else {
+            panic!("scalar Ready planning filed a non-proposal state")
+        };
+        assert_eq!(*variable, LEFT, "equal variable keys keep ascending order");
+        assert_eq!(*proposer, 1, "the tightest relevant leaf must propose");
+        assert!(relevant.contains(0));
+        assert!(relevant.contains(1));
+        assert!(!relevant.contains(2));
+        assert_eq!(bucket.row_count(), 1);
+        assert_eq!(stats.ready_preferred_variable_groups, 1);
+        assert_eq!(stats.ready_scheduled_variable_groups, 1);
+        assert_eq!(stats.ready_proposal_groups, 1);
+        assert_eq!(stats.agglomerated_ready_pops, 0);
+    }
+
+    #[test]
+    fn one_parent_formula_or_planning_uses_scalar_estimates_and_exact_ties() {
+        let counts = Arc::new(SinkShapeCounts::default());
+        let root = UnionConstraint::new(vec![
+            Box::new(sink_shape_leaf(0, 8, true, &counts)) as ShapeConstraint,
+            Box::new(sink_shape_leaf(0, 2, true, &counts)) as ShapeConstraint,
+            Box::new(sink_shape_leaf(0, 2, true, &counts)) as ShapeConstraint,
+        ]);
+        let plan = ResidualPlan::compile_finite_unions(&root);
+        let formula_root = plan
+            .finite_formula
+            .root(0)
+            .expect("Union has a formula root");
+        let FiniteFormulaNodeKind::Or { children } = &plan.finite_formula.node(formula_root).kind
+        else {
+            panic!("Union did not compile to an OR")
+        };
+        let children = children.clone();
+        let mut relevant = ChildSet::empty(plan.len());
+        relevant.insert(0);
+        let counter = plan
+            .finite_formula
+            .start(0, 0, UnionVerb::Propose { relevant });
+        let desc = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Formula {
+                counter: counter.clone(),
+            },
+        };
+        let batch = FormulaBatch::from_proposal(
+            RowBatch::seed(),
+            vec![ActivationId(0)],
+            &plan.finite_formula.node(formula_root).kind,
+        );
+        let mut worklist = Worklist::new();
+        let mut interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+
+        formula_or_plan_transition(
+            &root,
+            &plan,
+            &desc,
+            &counter,
+            &children,
+            batch,
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+        );
+
+        assert_eq!(counts.scalar_estimates.load(Ordering::Relaxed), 3);
+        assert_eq!(counts.column_estimates.load(Ordering::Relaxed), 0);
+        let (filed, bucket) = only_filed_state(&worklist, &interner);
+        let ResidualPhase::Formula { counter } = &filed.phase else {
+            panic!("scalar OR planning filed a non-formula state")
+        };
+        assert!(matches!(
+            &counter.focus,
+            FormulaFocus::Action {
+                node,
+                stage: FormulaStage::Support,
+            } if *node == children[1]
+        ));
+        let site = counter
+            .returns
+            .last()
+            .expect("the selected OR guard has a return site");
+        assert_eq!(site.kind, FormulaReturnKind::Guard);
+        assert_eq!(site.child, 1, "equal child estimates keep preorder");
+        assert_eq!(bucket.row_count(), 1);
+    }
+
+    #[test]
+    fn one_parent_formula_and_planning_skips_irrelevant_children_and_keeps_ties() {
+        let counts = Arc::new(SinkShapeCounts::default());
+        let root = IntersectionConstraint::new(vec![
+            sink_shape_leaf(1, 1, true, &counts),
+            sink_shape_leaf(0, 2, true, &counts),
+            sink_shape_leaf(0, 2, true, &counts),
+        ]);
+        let plan = ResidualPlan::compile_lowering(
+            &root,
+            ResidualLowering::new(FormulaScope::WholeRoot, false),
+        );
+        let formula_root = plan
+            .finite_formula
+            .root(0)
+            .expect("synthetic AND has a formula root");
+        let FiniteFormulaNodeKind::And { children } = &plan.finite_formula.node(formula_root).kind
+        else {
+            panic!("Intersection did not compile to an AND")
+        };
+        let children = children.clone();
+        let mut relevant = ChildSet::empty(plan.len());
+        relevant.insert(0);
+        let counter = plan
+            .finite_formula
+            .start(0, 0, UnionVerb::Propose { relevant });
+        let desc = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Formula {
+                counter: counter.clone(),
+            },
+        };
+        let batch = FormulaBatch::from_proposal(
+            RowBatch::seed(),
+            vec![ActivationId(0)],
+            &plan.finite_formula.node(formula_root).kind,
+        );
+        let mut worklist = Worklist::new();
+        let mut interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+
+        formula_and_plan_transition(
+            &root,
+            &plan,
+            &desc,
+            &counter,
+            &children,
+            batch,
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+        );
+
+        assert_eq!(counts.scalar_estimates.load(Ordering::Relaxed), 3);
+        assert_eq!(counts.column_estimates.load(Ordering::Relaxed), 0);
+        let (filed, bucket) = only_filed_state(&worklist, &interner);
+        let ResidualPhase::Formula { counter } = &filed.phase else {
+            panic!("scalar AND planning filed a non-formula state")
+        };
+        assert!(matches!(
+            &counter.focus,
+            FormulaFocus::Action {
+                node,
+                stage: FormulaStage::Propose,
+            } if *node == children[1]
+        ));
+        let site = counter
+            .returns
+            .last()
+            .expect("the selected AND child has a return site");
+        assert_eq!(site.kind, FormulaReturnKind::Child);
+        assert_eq!(site.child, 1, "equal child estimates keep preorder");
+        assert!(site.done.contains(0), "irrelevant children are skipped");
+        assert!(!site.done.contains(1));
+        assert!(!site.done.contains(2));
+        assert_eq!(bucket.row_count(), 1);
+    }
+
+    #[test]
+    fn one_parent_formula_support_propagates_truth_without_partitioning() {
+        for truth in [false, true] {
+            let counts = Arc::new(SinkShapeCounts::default());
+            let root = UnionConstraint::new(vec![
+                Box::new(sink_shape_leaf(0, 1, truth, &counts)) as ShapeConstraint,
+                Box::new(sink_shape_leaf(0, 2, true, &counts)) as ShapeConstraint,
+            ]);
+            let plan = ResidualPlan::compile_finite_unions(&root);
+            let formula_root = plan
+                .finite_formula
+                .root(0)
+                .expect("Union has a formula root");
+            let FiniteFormulaNodeKind::Or { children } =
+                &plan.finite_formula.node(formula_root).kind
+            else {
+                panic!("Union did not compile to an OR")
+            };
+            let children = children.clone();
+            let mut relevant = ChildSet::empty(plan.len());
+            relevant.insert(0);
+            let parent = plan
+                .finite_formula
+                .start(0, 0, UnionVerb::Propose { relevant });
+            let counter = plan.finite_formula.guard_child(&parent, 0);
+            let desc = StateDesc {
+                bound: VariableSet::new_empty(),
+                phase: ResidualPhase::Formula {
+                    counter: counter.clone(),
+                },
+            };
+            let batch = FormulaBatch::from_proposal(
+                RowBatch::seed(),
+                vec![ActivationId(0)],
+                &plan.finite_formula.node(formula_root).kind,
+            );
+            let mut worklist = Worklist::new();
+            let mut interner = StateInterner::default();
+            let mut stats = ResidualStateStats::default();
+
+            formula_action_transition(
+                &root,
+                &plan,
+                &desc,
+                &counter,
+                batch,
+                &mut worklist,
+                &mut interner,
+                &mut stats,
+            );
+
+            assert_eq!(counts.satisfied_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(counts.scalar_estimates.load(Ordering::Relaxed), 0);
+            assert_eq!(counts.column_estimates.load(Ordering::Relaxed), 0);
+            assert_eq!(stats.support_calls, 1);
+            assert_eq!(stats.support_rows, 1);
+            assert_eq!(stats.max_support_rows, 1);
+            let (filed, bucket) = only_filed_state(&worklist, &interner);
+            let ResidualPhase::Formula { counter } = &filed.phase else {
+                panic!("scalar support filed a non-formula state")
+            };
+            if truth {
+                assert!(matches!(
+                    &counter.focus,
+                    FormulaFocus::Action {
+                        node,
+                        stage: FormulaStage::Propose,
+                    } if *node == children[0]
+                ));
+                let site = counter
+                    .returns
+                    .last()
+                    .expect("supported OR child has a return site");
+                assert_eq!(site.kind, FormulaReturnKind::Child);
+                assert_eq!(site.child, 0);
+            } else {
+                let FormulaFocus::Plan {
+                    node,
+                    stage: FormulaStage::Propose,
+                    done,
+                } = &counter.focus
+                else {
+                    panic!("false support did not resume OR planning")
+                };
+                assert_eq!(*node, formula_root);
+                assert!(done.contains(0));
+                assert!(!done.contains(1));
+                assert!(counter.returns.is_empty());
+            }
+            assert_eq!(bucket.row_count(), 1);
+        }
     }
 
     #[test]
