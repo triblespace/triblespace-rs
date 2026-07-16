@@ -96,6 +96,26 @@ fn term_src(term: &RawTerm, view: &RowsView<'_>) -> Option<Src> {
 
 /// Strict successor in one id-sized PATCH segment, expressed in the raw
 /// inline value space used by residual source cursors.
+pub(super) fn next_id_source_in_range<const PREFIX_LEN: usize, O>(
+    index: &PATCH<TRIBLE_LEN, O, ()>,
+    prefix: &[u8; PREFIX_LEN],
+    min: &RawId,
+    max: &RawId,
+    after: Option<&RawInline>,
+) -> Option<RawInline>
+where
+    O: KeySchema<TRIBLE_LEN>,
+{
+    let id = match after {
+        None => index.first_infix_range(prefix, min, max),
+        Some(value) => {
+            let id = id_from_value(value)?;
+            index.next_infix_after(prefix, &id, max)
+        }
+    }?;
+    Some(id_into_value(&id))
+}
+
 fn next_id_source<const PREFIX_LEN: usize, O>(
     index: &PATCH<TRIBLE_LEN, O, ()>,
     prefix: &[u8; PREFIX_LEN],
@@ -104,17 +124,26 @@ fn next_id_source<const PREFIX_LEN: usize, O>(
 where
     O: KeySchema<TRIBLE_LEN>,
 {
-    let id = match after {
-        None => index.first_infix_range(prefix, &[u8::MIN; ID_LEN], &[u8::MAX; ID_LEN]),
-        Some(value) => {
-            let id = id_from_value(value)?;
-            index.next_infix_after(prefix, &id, &[u8::MAX; ID_LEN])
-        }
-    }?;
-    Some(id_into_value(&id))
+    next_id_source_in_range(index, prefix, &[u8::MIN; ID_LEN], &[u8::MAX; ID_LEN], after)
 }
 
 /// Strict successor in one inline-sized PATCH segment.
+pub(super) fn next_inline_source_in_range<const PREFIX_LEN: usize, O>(
+    index: &PATCH<TRIBLE_LEN, O, ()>,
+    prefix: &[u8; PREFIX_LEN],
+    min: &RawInline,
+    max: &RawInline,
+    after: Option<&RawInline>,
+) -> Option<RawInline>
+where
+    O: KeySchema<TRIBLE_LEN>,
+{
+    match after {
+        None => index.first_infix_range(prefix, min, max),
+        Some(value) => index.next_infix_after(prefix, value, max),
+    }
+}
+
 fn next_inline_source<const PREFIX_LEN: usize, O>(
     index: &PATCH<TRIBLE_LEN, O, ()>,
     prefix: &[u8; PREFIX_LEN],
@@ -123,17 +152,20 @@ fn next_inline_source<const PREFIX_LEN: usize, O>(
 where
     O: KeySchema<TRIBLE_LEN>,
 {
-    match after {
-        None => index.first_infix_range(prefix, &[u8::MIN; INLINE_LEN], &[u8::MAX; INLINE_LEN]),
-        Some(value) => index.next_infix_after(prefix, value, &[u8::MAX; INLINE_LEN]),
-    }
+    next_inline_source_in_range(
+        index,
+        prefix,
+        &[u8::MIN; INLINE_LEN],
+        &[u8::MAX; INLINE_LEN],
+        after,
+    )
 }
 
 /// Consume a bounded page from a strict raw-inline successor function.
 ///
 /// The one-entry lookahead only decides whether a cursor remains; it is not a
 /// consumed source candidate and therefore does not contribute to `examined`.
-fn direct_source_page(
+pub(super) fn direct_source_page(
     cursor: ResidualDeltaSourceCursor,
     limit: usize,
     accepted: &mut Vec<RawInline>,
