@@ -1070,6 +1070,9 @@ impl DeltaScheduler {
         let mut completed = Vec::new();
         for (batch, range) in singletons.into_iter().zip(ranges) {
             let reducer = match stage {
+                FormulaStage::Support => {
+                    unreachable!("support has no delta reducer")
+                }
                 FormulaStage::Propose if stream_proposal => DeltaReducer::StreamFormulaProposal,
                 FormulaStage::Propose => DeltaReducer::QuiescentProposal,
                 FormulaStage::Confirm => DeltaReducer::Confirm {
@@ -1130,6 +1133,9 @@ impl DeltaScheduler {
         let mut tasks = Vec::with_capacity(singletons.len());
         for batch in singletons {
             let (reducer, source_candidates) = match stage {
+                FormulaStage::Support => {
+                    unreachable!("support has no delta source reducer")
+                }
                 FormulaStage::Propose if stream_proposal => {
                     (DeltaReducer::StreamFormulaProposal, None)
                 }
@@ -2295,6 +2301,7 @@ mod tests {
         let second = FormulaProgramCounter {
             focus: first.focus.clone(),
             returns: vec![FormulaReturnSite {
+                kind: FormulaReturnKind::Child,
                 parent: FormulaNodeId(5),
                 parent_stage: FormulaStage::Propose,
                 child: 1,
