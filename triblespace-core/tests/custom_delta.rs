@@ -913,6 +913,76 @@ fn custom_direct_source_preserves_duplicate_occurrences_within_one_page() {
 }
 
 #[test]
+fn live_custom_direct_source_clones_exactly_and_matches_rayon_workers() {
+    let values = vec![raw(1), raw(2), raw(3), raw(4)];
+    let mut expected: Vec<_> = values
+        .iter()
+        .flat_map(|value| [*value, *value])
+        .collect();
+    expected.sort_unstable();
+
+    let evidence = Arc::new(DirectSourceEvidence::default());
+    let mut query = Query::new(
+        direct_source_fixture(values.clone(), Arc::clone(&evidence)),
+        project_start,
+    )
+    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .cap(1)
+    .start_width(1);
+    let first = query
+        .next()
+        .expect("the direct source has eight affine occurrences");
+    assert_eq!(
+        query.stats().delta_source_candidates_examined,
+        1,
+        "the clone point must retain a genuinely suspended source frontier"
+    );
+    let clone = query.clone();
+    let remainder: Vec<_> = query.collect();
+    let cloned_remainder: Vec<_> = clone.collect();
+    assert_eq!(
+        cloned_remainder, remainder,
+        "a live direct-source clone changed the exact affine remainder"
+    );
+    let mut reconstructed: Vec<_> = std::iter::once(first).chain(remainder).collect();
+    reconstructed.sort_unstable();
+    assert_eq!(reconstructed, expected);
+    assert_eq!(evidence.expanded_nodes.load(Ordering::Relaxed), 0);
+
+    #[cfg(feature = "parallel")]
+    for workers in [1, 4] {
+        let evidence = Arc::new(DirectSourceEvidence::default());
+        let query = Query::new(
+            direct_source_fixture(values.clone(), Arc::clone(&evidence)),
+            project_start,
+        )
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .cap(1)
+        .start_width(1);
+        let mut actual = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()
+            .unwrap()
+            .install(|| query.into_par_iter().collect::<Vec<_>>());
+        actual.sort_unstable();
+        assert_eq!(actual, expected, "workers={workers}");
+        assert!(
+            !evidence
+                .pages
+                .lock()
+                .expect("direct source trace poisoned")
+                .is_empty(),
+            "workers={workers}"
+        );
+        assert_eq!(
+            evidence.expanded_nodes.load(Ordering::Relaxed),
+            0,
+            "workers={workers}"
+        );
+    }
+}
+
+#[test]
 fn custom_cyclic_delta_composes_with_recursive_root_formula() {
     let sequential_evidence = Arc::new(DeltaEvidence::default());
     let sequential = sorted(
