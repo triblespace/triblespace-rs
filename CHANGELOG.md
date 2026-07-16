@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reducers execute it synchronously—distinct projection drains the frame while
   existence may short-circuit and drop its private remainder—keeping local
   residual states out of the caller's ordering domain.
+- **A test-only frame scheduler model pins the asynchronous cohosting laws.**
+  Focused executable receipts cover affine queued/in-flight credits,
+  activation-local reducers and cancellation, plan-local readiness, global
+  width sharing, and the ordering boundary between hot, full, frame, and cold
+  underfilled outer work without wiring dynamic frame calls into production.
 - **Estimate-only wrappers preserve native residual execution.**
   `EstimateOverrideConstraint` remains a structural opaque leaf so its planner
   cardinality overrides cannot be bypassed, while forwarding exact page-local
