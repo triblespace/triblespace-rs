@@ -352,6 +352,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   grouping instead of value-sorting every leaf result. OR accumulators still
   sort after combining sibling arms, so their completion boundary can
   deduplicate exactly without sorting the already-normalized output again.
+- **One-parent residual planning stays scalar.** Ready and finite-formula
+  planning now use stack estimate slots and direct continuation selection for
+  one parent, while Boolean support propagates its single truth value without
+  allocating and partitioning a batch. Multi-parent planning is unchanged.
 - **Canonical residual child sets keep one bitset word inline.** State
   descriptor cloning and interning avoid heap allocation for the common
   at-most-64-leaf formula while wider formulas transparently spill, preserving
