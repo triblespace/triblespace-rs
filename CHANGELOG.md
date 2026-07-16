@@ -347,6 +347,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Residual formula payloads retain only their required ordering.** Candidate
+  actions and confirmation handoffs now trust the protocol's ascending-parent
+  grouping instead of value-sorting every leaf result. OR accumulators still
+  sort after combining sibling arms, so their completion boundary can
+  deduplicate exactly without sorting the already-normalized output again.
 - **Canonical residual child sets keep one bitset word inline.** State
   descriptor cloning and interning avoid heap allocation for the common
   at-most-64-leaf formula while wider formulas transparently spill, preserving

@@ -3058,17 +3058,27 @@ impl CandidateBatch {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct ActivationId(u64);
 
+#[inline]
+fn debug_assert_candidates_grouped(candidates: &Candidates) {
+    debug_assert!(
+        candidates.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+        "candidate tags must remain grouped by ascending parent"
+    );
+}
+
 #[derive(Clone, Debug)]
 enum FormulaPayloadFrame {
     /// Every OR child reads the same immutable source and appends its result
-    /// to one activation-private union accumulator.
+    /// to one activation-private union accumulator. `source` follows the
+    /// protocol's ascending-parent grouping; `output` is fully sorted after
+    /// every child accumulation so frame completion can deduplicate in place.
     Or {
         source: Candidates,
         output: Candidates,
     },
-    /// AND threads one private candidate stream through its selected proposer
-    /// and remaining confirmers. Empty current streams annihilate this branch
-    /// without erasing the enclosing OR activation.
+    /// AND threads one ascending-parent-grouped candidate stream through its
+    /// selected proposer and remaining confirmers. Empty current streams
+    /// annihilate this branch without erasing the enclosing OR activation.
     And { current: Candidates },
 }
 
@@ -3090,8 +3100,9 @@ impl FormulaPayloadFrame {
             Self::Or { mut output, .. } => {
                 // OR is a set-valued reducer. Normalize at this frame's own
                 // completion boundary so an enclosing AND never observes
-                // duplicate candidates produced by sibling histories.
-                output.sort_unstable();
+                // duplicate candidates produced by sibling histories. Every
+                // accumulation already sorted the complete output.
+                debug_assert!(output.is_sorted());
                 output.dedup();
                 output
             }
@@ -3140,12 +3151,14 @@ impl FormulaBatch {
     }
 
     fn from_confirmation(
-        mut batch: CandidateBatch,
+        batch: CandidateBatch,
         activations: Vec<ActivationId>,
         root_kind: &FiniteFormulaNodeKind,
     ) -> Self {
         assert_eq!(batch.parents.row_count, activations.len());
-        batch.candidates.sort_unstable();
+        // CandidateBatch inherits the protocol's ascending-parent grouping;
+        // formula traversal and splitting require no stronger value order.
+        debug_assert_candidates_grouped(&batch.candidates);
         Self {
             activations,
             parents: batch.parents,
@@ -3182,13 +3195,15 @@ impl FormulaBatch {
     /// Ordinary protocol execution and quiescent cyclic execution share this
     /// exact boundary so AND replaces its working stream while OR accumulates
     /// one independently evaluated arm.
-    fn apply_action_result(&mut self, stage: FormulaStage, mut result: Candidates) {
+    fn apply_action_result(&mut self, stage: FormulaStage, result: Candidates) {
         assert_ne!(
             stage,
             FormulaStage::Support,
             "Boolean support never enters a candidate reducer frame"
         );
-        result.sort_unstable();
+        // Both protocol verbs preserve ascending parent groups. AND needs
+        // only that grouping; OR sorts once after combining sibling arms.
+        debug_assert_candidates_grouped(&result);
         match (self.frames.last_mut().unwrap(), stage) {
             (
                 FormulaPayloadFrame::Or { output, .. },
@@ -10199,17 +10214,43 @@ mod tests {
                 },
                 FormulaPayloadFrame::Or {
                     source: vec![(0, raw(9))],
-                    output: vec![(0, raw(2)), (0, raw(1)), (0, raw(2))],
+                    output: Vec::new(),
                 },
             ],
         };
 
+        batch.apply_action_result(
+            FormulaStage::Propose,
+            vec![(0, raw(2)), (0, raw(1)), (0, raw(2))],
+        );
         batch.return_frame();
         assert_eq!(batch.frames.len(), 1);
         let FormulaPayloadFrame::And { current } = &batch.frames[0] else {
             panic!("local OR returned into the wrong parent-frame shape")
         };
         assert_eq!(current, &vec![(0, raw(1)), (0, raw(2))]);
+    }
+
+    #[test]
+    fn formula_and_payload_requires_only_parent_grouping() {
+        let initial = vec![(0, raw(9)), (0, raw(1)), (1, raw(8)), (1, raw(2))];
+        let mut batch = FormulaBatch::from_confirmation(
+            CandidateBatch {
+                parents: RowBatch {
+                    rows: vec![raw(20), raw(21)],
+                    row_count: 2,
+                },
+                candidates: initial.clone(),
+            },
+            vec![ActivationId(0), ActivationId(1)],
+            &FiniteFormulaNodeKind::Atom,
+        );
+
+        assert_eq!(batch.input(), initial.as_slice());
+
+        let confirmed = vec![(0, raw(7)), (0, raw(3)), (1, raw(6)), (1, raw(4))];
+        batch.apply_action_result(FormulaStage::Confirm, confirmed.clone());
+        assert_eq!(batch.input(), confirmed.as_slice());
     }
 
     #[test]
