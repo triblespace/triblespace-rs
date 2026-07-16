@@ -1288,7 +1288,11 @@ pub trait Constraint<'a> {
     /// finite confirmation owns only its disjoint candidate page; a grouped
     /// confirmation owns the complete parent sequence. In both cases the
     /// immutable sequence supplies exact order and multiplicity. A nullable
-    /// program may mark its seed accepted without adding it to work novelty.
+    /// program may mark its seed accepted without adding it to work novelty;
+    /// the scheduler records that endpoint at activation creation and may
+    /// publish a streaming proposal or Support witness before expanding the
+    /// seed's independent transition credit. Seed acceptance consumes no
+    /// transition-page demand.
     /// Returning `true` with no seeds for a parent is an exact empty result for
     /// that parent. The conservative default retains the ordinary constraint
     /// protocol.

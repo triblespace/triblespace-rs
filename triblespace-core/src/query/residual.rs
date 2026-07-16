@@ -5019,8 +5019,9 @@ enum StepOutcome {
     Emit(RowBatch),
 }
 
-/// One pull of the mixed stable/delta machine. Delta seeding is progress but
-/// has no strict-rank continuation until an expansion accepts an endpoint.
+/// One pull of the mixed stable/delta machine. Delta seeding may immediately
+/// file an accepting seed effect while retaining its independent cyclic
+/// traversal frontier.
 #[derive(Debug)]
 enum MachineStep {
     Stable(StepOutcome),
@@ -5657,7 +5658,7 @@ impl ResidualStateMachine {
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
         task: SelectedResidualTask,
-    ) -> Result<bool, SelectedResidualTask> {
+    ) -> Result<(Option<ContinuationToken>, bool), SelectedResidualTask> {
         if !plan.transition_programs {
             return Err(task);
         }
@@ -5716,7 +5717,7 @@ impl ResidualStateMachine {
             };
             self.delta
                 .seed_source_proposals(DeltaDesc::leaf(variable, proposer), successor, rows);
-            return Ok(true);
+            return Ok((None, true));
         }
         let mut seeds = Vec::new();
         let supported = constraint.residual_delta_seeds(variable, &view, &mut seeds);
@@ -5748,9 +5749,17 @@ impl ResidualStateMachine {
             },
         };
         let deferred = !seeds.is_empty();
-        self.delta
-            .seed_proposals(DeltaDesc::leaf(variable, proposer), successor, rows, seeds);
-        Ok(deferred)
+        let continuation = self.delta.seed_proposals(
+            DeltaDesc::leaf(variable, proposer),
+            successor,
+            rows,
+            seeds,
+            plan,
+            &mut self.worklist,
+            &mut self.interner,
+            &mut self.stats,
+        );
+        Ok((continuation, deferred))
     }
 
     /// Converts one eligible confirmer into one transition activation per
@@ -6016,9 +6025,9 @@ impl ResidualStateMachine {
         base_estimates: &[usize; 128],
     ) -> MachineStep {
         let task = match self.seed_delta_proposal(root, plan, task) {
-            Ok(deferred) => {
+            Ok((continuation, deferred)) => {
                 return MachineStep::DeltaSeeded {
-                    continuation: None,
+                    continuation,
                     deferred,
                 }
             }
