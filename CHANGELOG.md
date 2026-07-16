@@ -160,6 +160,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `next_infix_after` advances a strict bounded cursor without materializing
   matches or depending on cuckoo-table order. Both follow compressed trie paths
   directly and support heap and archive-backed leaves.
+- **PATCH can retain one cardinality-bounded infix traversal.**
+  `bounded_infixes` locates a prefix once and returns an opaque borrowed view
+  only when the cached distinct-segment count fits the caller's limit. The view
+  exposes its exact count for reservation and enumerates from that same trie
+  head in ordinary `infixes` order; missing prefixes are successful empty
+  views, while over-limit prefixes expose no partial traversal. RPQ transition
+  cohorts use these retained views to prove every fresh positive branch fits
+  the geometric page budget before emitting, eliminating the former count
+  descent followed by a second enumeration descent.
 - **Residual lowering has six canonical, scheduler-independent forms.**
   `ResidualLowering` crosses the `FormulaScope` chain (`OpaqueLeaves`,
   `UnionLeaves`, `WholeRoot`) with one independent `transition_programs` axis;

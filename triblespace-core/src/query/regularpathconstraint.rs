@@ -7,6 +7,7 @@ use crate::id::ID_LEN;
 use crate::inline::encodings::genid::GenId;
 use crate::inline::IntoInline;
 use crate::inline::RawInline;
+use crate::patch::PATCHBoundedInfixes;
 use crate::query::confirm_per_row;
 use crate::query::intersectionconstraint::IntersectionConstraint;
 use crate::query::residual::FrameSeedRow;
@@ -29,7 +30,10 @@ use crate::query::Variable;
 use crate::query::VariableContext;
 use crate::query::VariableId;
 use crate::query::VariableSet;
+use crate::trible::EAVOrder;
 use crate::trible::TribleSet;
+use crate::trible::VAEOrder;
+use crate::trible::TRIBLE_LEN;
 
 // ── Path expression types ────────────────────────────────────────────────
 
@@ -1168,6 +1172,36 @@ enum DeltaStep {
     InverseNotAttr(RawId),
 }
 
+enum PositiveDeltaInfixes<'a> {
+    Empty,
+    Attr(PATCHBoundedInfixes<'a, TRIBLE_LEN, { ID_LEN * 2 }, 32, EAVOrder, ()>),
+    InverseAttr(PATCHBoundedInfixes<'a, TRIBLE_LEN, { 32 + ID_LEN }, ID_LEN, VAEOrder, ()>),
+}
+
+impl PositiveDeltaInfixes<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Attr(infixes) => {
+                usize::try_from(infixes.len()).expect("bounded PATCH count must fit usize")
+            }
+            Self::InverseAttr(infixes) => {
+                usize::try_from(infixes.len()).expect("bounded PATCH count must fit usize")
+            }
+        }
+    }
+
+    fn for_each(self, mut for_each: impl FnMut(RawInline)) {
+        match self {
+            Self::Empty => {}
+            Self::Attr(infixes) => infixes.for_each(|value: &[u8; 32]| for_each(*value)),
+            Self::InverseAttr(infixes) => {
+                infixes.for_each(|entity: &[u8; ID_LEN]| for_each(id_into_value(entity)))
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct ThompsonState {
     epsilon: Vec<u32>,
@@ -1774,25 +1808,42 @@ impl RegularPathConstraint {
         }
     }
 
-    /// Returns the complete positive-branch fanout from a fresh node cursor.
-    /// Negated branches return `None`: their destination predicate makes raw
-    /// frontier size a separate concern and they retain ordinary paging.
-    fn positive_delta_fanout(&self, step: DeltaStep, source: &RawInline) -> Option<usize> {
+    /// Locate a complete positive transition branch only when it fits in
+    /// `limit`. Negated branches return `None`: their destination predicate
+    /// makes raw frontier size a separate concern and they retain ordinary
+    /// paging.
+    ///
+    /// PATCH locates the fixed prefix once, checks the cached distinct-segment
+    /// count, and returns a borrowed view of that same subtree. The cohort can
+    /// therefore finish planning and reserve exactly before any enumeration.
+    fn bounded_positive_delta_infixes<'a>(
+        &'a self,
+        step: DeltaStep,
+        source: &RawInline,
+        limit: usize,
+    ) -> Option<PositiveDeltaInfixes<'a>> {
+        let limit = u64::try_from(limit).unwrap_or(u64::MAX);
         match step {
             DeltaStep::Attr(attribute) => {
                 let Some(entity) = value_as_entity(source) else {
-                    return Some(0);
+                    return Some(PositiveDeltaInfixes::Empty);
                 };
                 let mut prefix = [0u8; ID_LEN * 2];
                 prefix[..ID_LEN].copy_from_slice(&entity);
                 prefix[ID_LEN..].copy_from_slice(&attribute);
-                Some(usize::try_from(self.set.eav.segmented_len(&prefix)).unwrap_or(usize::MAX))
+                self.set
+                    .eav
+                    .bounded_infixes(&prefix, limit)
+                    .map(PositiveDeltaInfixes::Attr)
             }
             DeltaStep::InverseAttr(attribute) => {
                 let mut prefix = [0u8; 32 + ID_LEN];
                 prefix[..32].copy_from_slice(source);
                 prefix[32..].copy_from_slice(&attribute);
-                Some(usize::try_from(self.set.vae.segmented_len(&prefix)).unwrap_or(usize::MAX))
+                self.set
+                    .vae
+                    .bounded_infixes(&prefix, limit)
+                    .map(PositiveDeltaInfixes::InverseAttr)
             }
             DeltaStep::NotAttr(_) | DeltaStep::InverseNotAttr(_) => None,
         }
@@ -2311,37 +2362,69 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         };
 
         // A cohort of fresh positive frontiers whose complete fanouts fit can
-        // reuse the existing bulk transition kernel. Cached segment counts
-        // prove every page terminal before PATCH's native traversal, avoiding
-        // per-successor lower-bound descent, terminal lookahead, and one
-        // temporary successor allocation per row.
+        // use PATCH's native bulk traversal. Each branch locates its prefix
+        // once, proves the page terminal from the cached segment count, and
+        // retains that subtree until the complete cohort has proved eligible.
+        // This avoids duplicate prefix descent and per-successor lower-bound
+        // work while preserving exact preallocation and atomic fallback.
+        let mut plans = Vec::new();
         let mut fanouts = Vec::with_capacity(batch.nodes.len());
-        let all_fit = batch.nodes.iter().zip(batch.cursors).zip(batch.limits).all(
-            |((&node, &cursor), &limit)| {
-                if cursor != ResidualDeltaExpandCursor::Start {
-                    return false;
-                }
-                let state = program.decode(node.continuation);
-                if program.steps[state].is_empty() {
-                    return false;
-                }
-                let mut fanout = 0usize;
-                for &(step, _) in &program.steps[state] {
-                    let Some(branch_fanout) = self.positive_delta_fanout(step, &node.value) else {
-                        return false;
-                    };
-                    fanout = fanout.saturating_add(branch_fanout);
-                    if fanout > limit {
-                        return false;
-                    }
-                }
-                fanouts.push(fanout);
-                true
-            },
-        );
+        let mut all_fit = true;
+        'rows: for (row, ((&node, &cursor), &limit)) in batch
+            .nodes
+            .iter()
+            .zip(batch.cursors)
+            .zip(batch.limits)
+            .enumerate()
+        {
+            if cursor != ResidualDeltaExpandCursor::Start {
+                all_fit = false;
+                break;
+            }
+            let state = program.decode(node.continuation);
+            if program.steps[state].is_empty() {
+                all_fit = false;
+                break;
+            }
+            let row = u32::try_from(row).expect("too many RPQ transition pages in one cohort");
+            let mut fanout = 0usize;
+            for &(step, target) in &program.steps[state] {
+                debug_assert!(
+                    fanout <= limit,
+                    "each accepted transition branch must fit the remaining page budget"
+                );
+                let Some(infixes) =
+                    self.bounded_positive_delta_infixes(step, &node.value, limit - fanout)
+                else {
+                    all_fit = false;
+                    break 'rows;
+                };
+                let branch_fanout = infixes.len();
+                fanout += branch_fanout;
+                plans.push((row, node, target, infixes));
+            }
+            fanouts.push(fanout);
+        }
         if all_fit {
             successors.reserve(fanouts.iter().sum());
-            self.expand_delta_program(program, batch.nodes, successors);
+            for (row, node, target, infixes) in plans {
+                let continuation = program.encode(target);
+                infixes.for_each(|value| {
+                    let accepted = program.accepting[target as usize]
+                        && node.source.is_none_or(|anchor| value == anchor);
+                    successors.push((
+                        row,
+                        ResidualDeltaOutput {
+                            node: ResidualDeltaNode {
+                                source: node.source,
+                                value,
+                                continuation,
+                            },
+                            accepted,
+                        },
+                    ));
+                });
+            }
             pages.extend(fanouts.into_iter().map(|examined| {
                 Some(ResidualDeltaExpandPage {
                     next: None,

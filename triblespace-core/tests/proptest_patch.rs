@@ -219,6 +219,52 @@ proptest! {
         );
     }
 
+    #[test]
+    fn bounded_segment_infixes_are_atomic_and_match_the_existing_traversal(
+        stored_prefix in prop::array::uniform4(any::<u8>()),
+        alternate_prefix in prop::array::uniform4(any::<u8>()),
+        query_stored_prefix in any::<bool>(),
+        entries in vec(
+            (
+                prop::array::uniform4(any::<u8>()),
+                prop::array::uniform4(any::<u8>()),
+            ),
+            0..80,
+        ),
+        limit in 0u64..80,
+    ) {
+        let mut patch = SegmentedPatch::new();
+        for (infix, suffix) in entries {
+            let mut key = [0u8; 12];
+            key[..4].copy_from_slice(&stored_prefix);
+            key[4..8].copy_from_slice(&infix);
+            key[8..].copy_from_slice(&suffix);
+            patch.insert(&Entry::new(&key));
+        }
+        let prefix = if query_stored_prefix {
+            stored_prefix
+        } else {
+            alternate_prefix
+        };
+
+        let expected_count = patch.segmented_len(&prefix);
+        let mut expected = Vec::new();
+        patch.infixes(&prefix, |infix: &[u8; 4]| expected.push(*infix));
+        let mut actual = Vec::new();
+        let bounded = patch.bounded_infixes::<4, 4>(&prefix, limit);
+
+        if expected_count <= limit {
+            let bounded = bounded.expect("the independently counted segment fits");
+            prop_assert_eq!(bounded.len(), expected_count);
+            bounded.for_each(|infix: &[u8; 4]| actual.push(*infix));
+            // Preserve the existing PATCH callback order, not just the bag.
+            prop_assert_eq!(actual, expected);
+        } else {
+            prop_assert!(bounded.is_none());
+            prop_assert!(actual.is_empty(), "an over-limit view must not be visitable");
+        }
+    }
+
     // ── Equality ─────────────────────────────────────────────────────
 
     #[test]
