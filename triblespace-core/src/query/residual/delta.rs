@@ -3547,7 +3547,7 @@ mod tests {
         assert!(outcome.continuation.is_none());
         assert_eq!(stats.delta_source_dead_pages, 1);
         assert_eq!(stats.candidates_proposed, 1);
-        let mut stable_buckets = stable.values().flat_map(BTreeMap::values);
+        let mut stable_buckets = stable.values();
         let StateBucket::Candidates(batch) = stable_buckets.next().expect("one stable handoff")
         else {
             panic!("streamed formula handoff changed payload shape")

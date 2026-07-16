@@ -3866,7 +3866,27 @@ impl SelectedResidualTask {
     }
 }
 
-type Worklist = BTreeMap<usize, BTreeMap<StateId, StateBucket>>;
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct WorklistKey {
+    rank: usize,
+    state: StateId,
+}
+
+impl WorklistKey {
+    const fn new(rank: usize, state: StateId) -> Self {
+        Self { rank, state }
+    }
+
+    const fn rank_start(rank: usize) -> Self {
+        Self::new(rank, StateId(0))
+    }
+
+    const fn rank_end(rank: usize) -> Self {
+        Self::new(rank, StateId(u32::MAX))
+    }
+}
+
+type Worklist = BTreeMap<WorklistKey, StateBucket>;
 
 /// Physical tail receipt from one transition into a canonical state.
 ///
@@ -3928,8 +3948,8 @@ impl ContinuationToken {
         }
     }
 
-    fn scheduling_key(self) -> (usize, StateId) {
-        (self.rank, self.state)
+    fn scheduling_key(self) -> WorklistKey {
+        WorklistKey::new(self.rank, self.state)
     }
 }
 
@@ -3997,8 +4017,8 @@ fn file_with_span(
     };
     let rank = desc.rank_with_span(leaf_count, action_span, formula);
     let (id, known) = interner.intern_with_status(desc, stats);
-    let level = worklist.entry(rank).or_default();
-    if let Some(existing) = level.get_mut(&id) {
+    let key = WorklistKey::new(rank, id);
+    if let Some(existing) = worklist.get_mut(&key) {
         stats.bucket_merges += 1;
         stats.rows_merged += rows;
         existing.append(bucket);
@@ -4007,7 +4027,7 @@ fn file_with_span(
             stats.state_reentries += 1;
             stats.rows_reentered += rows;
         }
-        level.insert(id, bucket);
+        worklist.insert(key, bucket);
     }
     Some(ContinuationToken {
         rank,
@@ -5833,49 +5853,42 @@ impl ResidualStateMachine {
         width: usize,
     ) -> Option<SelectedResidualTask> {
         let width = width.max(1);
-        let full_state = self.worklist.iter().rev().find_map(|(&rank, level)| {
-            level.iter().rev().find_map(|(&id, bucket)| {
-                let desc = self.interner.get(id);
-                let candidate_pages = plan.is_some_and(|plan| desc.uses_candidate_pages(plan));
-                (bucket.occupancy(candidate_pages) >= width).then_some((rank, id))
-            })
+        let full_state = self.worklist.iter().rev().find_map(|(&key, bucket)| {
+            let desc = self.interner.get(key.state);
+            let candidate_pages = plan.is_some_and(|plan| desc.uses_candidate_pages(plan));
+            (bucket.occupancy(candidate_pages) >= width).then_some(key)
         });
-        let (rank, id, is_full) = if let Some((rank, id)) = full_state {
-            (rank, id, true)
+        let (key, is_full) = if let Some(key) = full_state {
+            (key, true)
         } else {
-            let (&rank, level) = self.worklist.first_key_value()?;
-            let (&id, bucket) = level
-                .last_key_value()
+            let (&first, _) = self.worklist.first_key_value()?;
+            let (&key, bucket) = self
+                .worklist
+                .range(WorklistKey::rank_start(first.rank)..=WorklistKey::rank_end(first.rank))
+                .next_back()
                 .expect("residual rank has a live state");
-            let desc = self.interner.get(id);
+            let desc = self.interner.get(key.state);
             let candidate_pages = plan.is_some_and(|plan| desc.uses_candidate_pages(plan));
             assert!(
                 bucket.occupancy(candidate_pages) < width,
                 "readiness selected while a full residual bucket existed"
             );
-            (rank, id, false)
+            (key, false)
         };
 
-        let (mut bucket, remove_level) = {
-            let level = self
-                .worklist
-                .get_mut(&rank)
-                .expect("selected residual rank exists");
-            let bucket = level.remove(&id).expect("selected residual state exists");
-            (bucket, level.is_empty())
-        };
-        if remove_level {
-            self.worklist.remove(&rank);
-        }
+        let mut bucket = self
+            .worklist
+            .remove(&key)
+            .expect("selected residual state exists");
 
-        let desc = self.interner.get(id).clone();
+        let desc = self.interner.get(key.state).clone();
         debug_assert_eq!(
             desc.rank_with_span(
                 self.leaf_count,
                 self.action_span,
                 plan.map(|plan| &plan.finite_formula),
             ),
-            rank
+            key.rank
         );
         let candidate_pages = plan.is_some_and(|plan| desc.uses_candidate_pages(plan));
         let before = bucket.occupancy(candidate_pages);
@@ -5885,11 +5898,7 @@ impl ResidualStateMachine {
             assert!(is_full, "only a full pop may leave a remainder");
             self.stats.partial_pops += 1;
             assert!(
-                self.worklist
-                    .entry(rank)
-                    .or_default()
-                    .insert(id, bucket)
-                    .is_none(),
+                self.worklist.insert(key, bucket).is_none(),
                 "a residual-state remainder collided with another live bucket"
             );
         }
@@ -5910,7 +5919,7 @@ impl ResidualStateMachine {
             self.last_selection = SelectionKind::Readiness;
         }
         Some(SelectedResidualTask {
-            state: id,
+            state: key.state,
             desc,
             bucket: chunk,
         })
@@ -5949,19 +5958,11 @@ impl ResidualStateMachine {
             ContinuationMode::ProbeOne => 1,
         };
 
-        let (mut bucket, remove_level) = {
-            let level = self
-                .worklist
-                .get_mut(&token.rank)
-                .expect("continuation rank remains live");
-            let bucket = level
-                .remove(&token.state)
-                .expect("continuation state remains live");
-            (bucket, level.is_empty())
-        };
-        if remove_level {
-            self.worklist.remove(&token.rank);
-        }
+        let key = token.scheduling_key();
+        let mut bucket = self
+            .worklist
+            .remove(&key)
+            .expect("continuation state remains live");
 
         let before = bucket.occupancy(candidate_pages);
         assert!(
@@ -5973,11 +5974,7 @@ impl ResidualStateMachine {
         if remainder != 0 {
             self.stats.partial_pops += 1;
             assert!(
-                self.worklist
-                    .entry(token.rank)
-                    .or_default()
-                    .insert(token.state, bucket)
-                    .is_none(),
+                self.worklist.insert(key, bucket).is_none(),
                 "a continuation remainder collided with another live bucket"
             );
         }
@@ -6003,11 +6000,9 @@ impl ResidualStateMachine {
     /// without invoking the minimum-rank readiness lemma.
     fn has_full_stable(&self, plan: &ResidualPlan, width: usize) -> bool {
         let width = width.max(1);
-        self.worklist.values().any(|level| {
-            level.iter().any(|(&id, bucket)| {
-                let desc = self.interner.get(id);
-                bucket.occupancy(desc.uses_candidate_pages(plan)) >= width
-            })
+        self.worklist.iter().any(|(&key, bucket)| {
+            let desc = self.interner.get(key.state);
+            bucket.occupancy(desc.uses_candidate_pages(plan)) >= width
         })
     }
 
@@ -6904,39 +6899,31 @@ impl ResidualStateMachine {
 
             // Prefer splitting inside one exact state so both workers retain
             // similarly shaped block-native continuations.
-            let splittable = self.worklist.iter().rev().find_map(|(&rank, level)| {
-                level.iter().rev().find_map(|(&id, bucket)| {
-                    let desc = self.interner.get(id);
-                    let candidate_pages = desc.uses_candidate_pages(plan);
-                    let can_split = match bucket {
-                        StateBucket::Rows(batch) => batch.row_count >= 2,
-                        StateBucket::Candidates(batch) if candidate_pages => {
-                            batch.candidate_count() >= 2
-                        }
-                        StateBucket::Candidates(batch) => batch.parents.row_count >= 2,
-                        StateBucket::Formula(batch) => batch.parents.row_count >= 2,
-                    };
-                    can_split.then_some((rank, id, candidate_pages))
-                })
+            let splittable = self.worklist.iter().rev().find_map(|(&key, bucket)| {
+                let desc = self.interner.get(key.state);
+                let candidate_pages = desc.uses_candidate_pages(plan);
+                let can_split = match bucket {
+                    StateBucket::Rows(batch) => batch.row_count >= 2,
+                    StateBucket::Candidates(batch) if candidate_pages => {
+                        batch.candidate_count() >= 2
+                    }
+                    StateBucket::Candidates(batch) => batch.parents.row_count >= 2,
+                    StateBucket::Formula(batch) => batch.parents.row_count >= 2,
+                };
+                can_split.then_some((key, candidate_pages))
             });
-            if let Some((rank, id, candidate_pages)) = splittable {
-                let desc = self.interner.get(id);
+            if let Some((key, candidate_pages)) = splittable {
+                let desc = self.interner.get(key.state);
                 let stride = desc.bound.count();
                 let right_bucket = self
                     .worklist
-                    .get_mut(&rank)
-                    .and_then(|level| level.get_mut(&id))
+                    .get_mut(&key)
                     .and_then(|bucket| bucket.split_for_parallel(stride, candidate_pages))
                     .expect("selected residual payload is splittable");
 
                 let mut right = self.parallel_sibling();
                 assert!(
-                    right
-                        .worklist
-                        .entry(rank)
-                        .or_default()
-                        .insert(id, right_bucket)
-                        .is_none(),
+                    right.worklist.insert(key, right_bucket).is_none(),
                     "fresh residual sibling unexpectedly contained work"
                 );
                 return Some(right);
@@ -6944,30 +6931,18 @@ impl ResidualStateMachine {
 
             // Distinct state buckets are disjoint affine components even when
             // neither currently contains two scheduling atoms.
-            let bucket_count: usize = self.worklist.values().map(BTreeMap::len).sum();
-            if bucket_count >= 2 {
-                let (&rank, level) = self
+            if self.worklist.len() >= 2 {
+                let (&key, _) = self
                     .worklist
                     .last_key_value()
                     .expect("two buckets imply a nonempty worklist");
-                let id = *level
-                    .last_key_value()
-                    .expect("live residual rank has a bucket")
-                    .0;
-                let (bucket, remove_level) = {
-                    let level = self
-                        .worklist
-                        .get_mut(&rank)
-                        .expect("selected residual rank exists");
-                    let bucket = level.remove(&id).expect("selected residual state exists");
-                    (bucket, level.is_empty())
-                };
-                if remove_level {
-                    self.worklist.remove(&rank);
-                }
+                let bucket = self
+                    .worklist
+                    .remove(&key)
+                    .expect("selected residual state exists");
 
                 let mut right = self.parallel_sibling();
-                right.worklist.entry(rank).or_default().insert(id, bucket);
+                right.worklist.insert(key, bucket);
                 return Some(right);
             }
 
@@ -7376,12 +7351,16 @@ where
     let mut results = Vec::new();
     let mut binding = Binding::default();
     let mut next_activation = 0;
-    while let Some((&rank, _)) = worklist.first_key_value() {
-        let level = worklist
-            .remove(&rank)
-            .expect("observed worklist level exists");
-        for (id, bucket) in level {
-            let desc = interner.get(id).clone();
+    while let Some((&first, _)) = worklist.first_key_value() {
+        let rank = first.rank;
+        let level = if let Some(next_rank) = rank.checked_add(1) {
+            let later = worklist.split_off(&WorklistKey::rank_start(next_rank));
+            std::mem::replace(&mut worklist, later)
+        } else {
+            std::mem::take(&mut worklist)
+        };
+        for (key, bucket) in level {
+            let desc = interner.get(key.state).clone();
             debug_assert_eq!(
                 desc.rank_with_span(leaf_count, plan.action_span(), Some(&plan.finite_formula),),
                 rank
@@ -7393,7 +7372,7 @@ where
                 root,
                 &plan,
                 SelectedResidualTask {
-                    state: id,
+                    state: key.state,
                     desc,
                     bucket,
                 },
@@ -8623,17 +8602,16 @@ mod tests {
             ResidualLowering::FULL,
         );
 
-        let (&rank, level) = frame
+        let (&key, _) = frame
             .machine
             .worklist
             .first_key_value()
             .expect("the live seed is filed");
-        let (&state, _) = level.first_key_value().expect("one seed state");
-        let desc = frame.machine.interner.get(state);
+        let desc = frame.machine.interner.get(key.state);
         assert_eq!(desc.bound, VariableSet::new_singleton(0));
         assert!(matches!(desc.phase, ResidualPhase::Ready));
         assert_eq!(
-            rank,
+            key.rank,
             desc.rank_with_span(
                 frame.plan.len(),
                 frame.plan.action_span(),
@@ -9348,16 +9326,14 @@ mod tests {
         );
 
         let mut actions = Vec::new();
-        for level in worklist.values() {
-            for (&id, bucket) in level {
-                let ResidualPhase::Propose {
-                    variable, proposer, ..
-                } = interner.get(id).phase
-                else {
-                    panic!("Ready planning filed a non-proposal state")
-                };
-                actions.push((variable, proposer, bucket.row_count()));
-            }
+        for (&key, bucket) in &worklist {
+            let ResidualPhase::Propose {
+                variable, proposer, ..
+            } = interner.get(key.state).phase
+            else {
+                panic!("Ready planning filed a non-proposal state")
+            };
+            actions.push((variable, proposer, bucket.row_count()));
         }
         actions.sort_unstable();
         (actions, stats)
@@ -9491,16 +9467,14 @@ mod tests {
         );
 
         let mut actions = Vec::new();
-        for level in worklist.values() {
-            for (&id, bucket) in level {
-                let ResidualPhase::Propose {
-                    variable, proposer, ..
-                } = interner.get(id).phase
-                else {
-                    panic!("Ready planning filed a non-proposal state")
-                };
-                actions.push((variable, proposer, bucket.row_count()));
-            }
+        for (&key, bucket) in &worklist {
+            let ResidualPhase::Propose {
+                variable, proposer, ..
+            } = interner.get(key.state).phase
+            else {
+                panic!("Ready planning filed a non-proposal state")
+            };
+            actions.push((variable, proposer, bucket.row_count()));
         }
         actions.sort_unstable();
         assert_eq!(actions, [(LEFT, 0, 1), (RIGHT, 0, 1)]);
@@ -11194,12 +11168,11 @@ mod tests {
         assert_eq!(page.parents.row_count, 1);
         assert_eq!(page.candidates, [(0, raw(6)), (0, raw(7))]);
 
-        let (_, level) = machine
+        let (&key, remainder) = machine
             .worklist
             .first_key_value()
             .expect("candidate remainder stays under the same rank");
-        let (&id, remainder) = level.first_key_value().unwrap();
-        assert_eq!(machine.interner.get(id), &desc);
+        assert_eq!(machine.interner.get(key.state), &desc);
         assert_eq!(remainder.occupancy(true), 6);
         assert_eq!(machine.stats.partial_pops, 1);
     }
@@ -12495,11 +12468,11 @@ mod tests {
 
         assert_eq!(query.next(), Some(raw(63)));
         let runtime = query.residual.as_deref().expect("residual cursor started");
-        assert!(runtime.machine.worklist.values().any(|level| {
-            level
-                .values()
-                .any(|bucket| matches!(bucket, StateBucket::Candidates(_)))
-        }));
+        assert!(runtime
+            .machine
+            .worklist
+            .values()
+            .any(|bucket| matches!(bucket, StateBucket::Candidates(_))));
         assert!(runtime.machine.stats.partial_pops > 0);
 
         let cloned = query.clone();
@@ -12526,11 +12499,11 @@ mod tests {
 
         let first = query.next().expect("the formula frontier is nonempty");
         let runtime = query.residual.as_deref().expect("residual cursor started");
-        assert!(runtime.machine.worklist.values().any(|level| {
-            level
-                .values()
-                .any(|bucket| matches!(bucket, StateBucket::Formula(_)))
-        }));
+        assert!(runtime
+            .machine
+            .worklist
+            .values()
+            .any(|bucket| matches!(bucket, StateBucket::Formula(_))));
         assert!(runtime.machine.stats.partial_pops > 0);
 
         let cloned = query.clone();
@@ -15030,8 +15003,7 @@ mod tests {
         assert_eq!(candidate_machine.stats.underfilled_continuation_pops, 0);
         let StateBucket::Candidates(remainder) = candidate_machine
             .worklist
-            .get(&candidate_receipt.rank)
-            .and_then(|level| level.get(&candidate_receipt.state))
+            .get(&candidate_receipt.scheduling_key())
             .expect("the bisected hot parent remains")
         else {
             panic!("candidate remainder changed payload shape")
@@ -15224,14 +15196,10 @@ mod tests {
         assert_eq!(machine.stats.underfilled_continuation_pops, 1);
 
         let rank = desc.rank(plan.len());
-        let level = machine
+        let old = machine
             .worklist
-            .get(&rank)
+            .get(&WorklistKey::new(rank, hot.state))
             .expect("old cohort remains live");
-        let old = level
-            .values()
-            .next()
-            .expect("merged state retained its old payload");
         let StateBucket::Candidates(old) = old else {
             panic!("old cohort changed payload shape")
         };
@@ -15239,9 +15207,8 @@ mod tests {
         assert_eq!(old.candidates, [(0, raw(1)), (0, raw(2)), (0, raw(3))]);
         assert!(machine
             .worklist
-            .values()
-            .flat_map(|level| level.keys())
-            .any(|&id| machine.interner.get(id) == &ready_desc(3)));
+            .keys()
+            .any(|key| machine.interner.get(key.state) == &ready_desc(3)));
     }
 
     #[test]
@@ -15875,9 +15842,14 @@ mod tests {
         assert_eq!(stats.rows_merged, 1);
         assert_eq!(stats.dead_action_pops, 0);
         assert_eq!(proposes.load(Ordering::Relaxed), 1);
-        let (_, level) = worklist.first_key_value().expect("candidate remains live");
-        assert_eq!(level.len(), 1);
-        assert_eq!(level.first_key_value().unwrap().1.row_count(), 2);
+        let (&key, bucket) = worklist.first_key_value().expect("candidate remains live");
+        assert_eq!(
+            worklist
+                .range(WorklistKey::rank_start(key.rank)..=WorklistKey::rank_end(key.rank))
+                .count(),
+            1
+        );
+        assert_eq!(bucket.row_count(), 2);
     }
 
     #[test]
@@ -15922,8 +15894,7 @@ mod tests {
         assert!(matches!(outcome, StepOutcome::Advanced(_)));
         assert_eq!(stats.dead_action_pops, 0);
         assert_eq!((stats.propose_rows, stats.max_propose_rows), (2, 2));
-        let (_, level) = worklist.first_key_value().expect("one parent survived");
-        let bucket = level.first_key_value().unwrap().1;
+        let (_, bucket) = worklist.first_key_value().expect("one parent survived");
         assert_eq!(bucket.row_count(), 1);
         let StateBucket::Candidates(batch) = bucket else {
             panic!("partial proposal did not file candidates")
@@ -16014,13 +15985,11 @@ mod tests {
         assert_eq!(stats.confirm_calls, 0);
         assert_eq!(confirms.load(Ordering::Relaxed), 0);
 
-        let (&rank, _) = worklist
+        let (key, bucket) = worklist.pop_first().expect("confirm action was filed");
+        assert!(worklist
             .first_key_value()
-            .expect("confirm action was filed");
-        let mut level = worklist.remove(&rank).unwrap();
-        let (id, bucket) = level.pop_first().unwrap();
-        assert!(level.is_empty());
-        let action_desc = interner.get(id).clone();
+            .is_none_or(|(next, _)| next.rank != key.rank));
+        let action_desc = interner.get(key.state).clone();
         assert!(matches!(
             execute_state(
                 &root,
@@ -16094,10 +16063,9 @@ mod tests {
         assert_eq!(proposes.load(Ordering::Relaxed), 0);
         assert_eq!(confirms.load(Ordering::Relaxed), 0);
 
-        let (_, level) = worklist.first_key_value().expect("Ready state was filed");
-        let (&id, payload) = level.first_key_value().unwrap();
+        let (&key, payload) = worklist.first_key_value().expect("Ready state was filed");
         assert_eq!(
-            interner.get(id),
+            interner.get(key.state),
             &StateDesc {
                 bound: VariableSet::new_singleton(0),
                 phase: ResidualPhase::Ready,
@@ -16168,12 +16136,8 @@ mod tests {
             ),
             StepOutcome::Advanced(_)
         ));
-        let (&rank, _) = worklist
-            .first_key_value()
-            .expect("confirm action was filed");
-        let mut level = worklist.remove(&rank).unwrap();
-        let (id, bucket) = level.pop_first().unwrap();
-        let action_desc = interner.get(id).clone();
+        let (key, bucket) = worklist.pop_first().expect("confirm action was filed");
+        let action_desc = interner.get(key.state).clone();
         assert!(matches!(
             execute_state(
                 &root,
@@ -16284,16 +16248,22 @@ mod tests {
         assert_eq!(even_calls.load(Ordering::Relaxed), 0);
         assert_eq!(odd_calls.load(Ordering::Relaxed), 0);
 
-        let (&rank, level) = worklist
+        let (&first, _) = worklist
             .first_key_value()
             .expect("striped Confirm actions were filed");
-        assert_eq!(level.len(), 2);
-        assert!(level.values().all(|bucket| bucket.row_count() == 2));
+        let keys: Vec<_> = worklist
+            .range(WorklistKey::rank_start(first.rank)..=WorklistKey::rank_end(first.rank))
+            .map(|(&key, bucket)| {
+                assert_eq!(bucket.row_count(), 2);
+                key
+            })
+            .collect();
+        assert_eq!(keys.len(), 2);
         assert_eq!((stats.bucket_merges, stats.rows_merged), (2, 2));
 
-        let level = worklist.remove(&rank).unwrap();
-        for (id, bucket) in level {
-            let action_desc = interner.get(id).clone();
+        for key in keys {
+            let bucket = worklist.remove(&key).unwrap();
+            let action_desc = interner.get(key.state).clone();
             assert!(matches!(
                 execute_state(
                     &root,
