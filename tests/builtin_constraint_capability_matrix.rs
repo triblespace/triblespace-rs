@@ -474,9 +474,16 @@ fn finite_union_ignore_and_wrappers_have_explicit_execution_receipts() {
             .delta_source_pages,
         0
     );
+    assert!(
+        ignore_pattern_profiles.full_geometric.delta_source_pages > 0,
+        "the pattern macro's internal AND must expose its visible source at candidate stage"
+    );
     assert_eq!(
-        ignore_pattern_profiles.full_geometric.delta_source_pages, 0,
-        "the pattern macro's internal intersection remains behind the opaque Ignore scope"
+        ignore_pattern_profiles
+            .full_geometric
+            .delta_source_direct_candidates,
+        2,
+        "scoped-AND paging must retain the two distinct visible entities"
     );
 
     let sorted_values = [a, a, b];
