@@ -817,6 +817,32 @@ pub struct ResidualDeltaSourcePage {
     pub examined: usize,
 }
 
+/// Borrow-free cursor for one node's ordered transition frontier.
+///
+/// `branch` identifies one constraint-defined outgoing transition from the
+/// node's current program point. `After` resumes strictly after `value` within
+/// that branch. Branches are visited in increasing order, so the pair
+/// `(branch, value)` advances monotonically even when two branches produce the
+/// same value or lead to different program points.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ResidualDeltaExpandCursor {
+    Start,
+    After { branch: u32, value: RawInline },
+}
+
+/// Result metadata for one bounded transition-expansion page.
+///
+/// `examined` counts constraint-owned transition candidates consumed from the
+/// node frontier and must not exceed the requested limit. `next == None`
+/// proves that this node has no remaining outgoing transition work.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidualDeltaExpandPage {
+    pub next: Option<ResidualDeltaExpandCursor>,
+    pub examined: usize,
+}
+
 /// Object-safe child access for a structural constraint shape.
 #[doc(hidden)]
 pub trait ConstraintChildren<'a> {
@@ -1212,6 +1238,29 @@ pub trait Constraint<'a> {
         None
     }
 
+    /// Expands at most `limit` entries from one transition node's ordered
+    /// outgoing frontier.
+    ///
+    /// Returning `Some` opts this exact node into affine transition paging.
+    /// Appended outputs belong to the supplied node and therefore carry no
+    /// input tags. Their count must not exceed `page.examined`, which in turn
+    /// must not exceed `limit`. A nonterminal page resumes strictly after its
+    /// previous cursor in the same `(branch, value)` order. Returning `None`
+    /// from `Start` retains block-native [`Self::residual_delta_expand`]; a
+    /// node that has returned a nonterminal page must continue to support every
+    /// cursor it produced.
+    #[doc(hidden)]
+    fn residual_delta_expand_page(
+        &self,
+        _variable: VariableId,
+        _node: ResidualDeltaNode,
+        _cursor: ResidualDeltaExpandCursor,
+        _limit: usize,
+        _successors: &mut Vec<ResidualDeltaOutput>,
+    ) -> Option<ResidualDeltaExpandPage> {
+        None
+    }
+
     /// Expands one block of engine-owned transition-program nodes.
     ///
     /// Successors are tagged by input-node index and grouped in ascending tag
@@ -1337,6 +1386,18 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.residual_delta_support_seeds(view, seeds)
     }
 
+    fn residual_delta_expand_page(
+        &self,
+        variable: VariableId,
+        node: ResidualDeltaNode,
+        cursor: ResidualDeltaExpandCursor,
+        limit: usize,
+        successors: &mut Vec<ResidualDeltaOutput>,
+    ) -> Option<ResidualDeltaExpandPage> {
+        let inner: &T = self;
+        inner.residual_delta_expand_page(variable, node, cursor, limit, successors)
+    }
+
     fn residual_delta_expand(
         &self,
         variable: VariableId,
@@ -1455,6 +1516,18 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     ) -> Option<VariableId> {
         let inner: &T = self;
         inner.residual_delta_support_seeds(view, seeds)
+    }
+
+    fn residual_delta_expand_page(
+        &self,
+        variable: VariableId,
+        node: ResidualDeltaNode,
+        cursor: ResidualDeltaExpandCursor,
+        limit: usize,
+        successors: &mut Vec<ResidualDeltaOutput>,
+    ) -> Option<ResidualDeltaExpandPage> {
+        let inner: &T = self;
+        inner.residual_delta_expand_page(variable, node, cursor, limit, successors)
     }
 
     fn residual_delta_expand(

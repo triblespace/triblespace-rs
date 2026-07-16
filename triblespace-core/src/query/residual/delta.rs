@@ -242,6 +242,7 @@ struct QuiescenceProof {
 struct ReplaceOutcome {
     children: Vec<(ResidualDeltaNode, ProducerCredit)>,
     accepted: Vec<RawInline>,
+    resumed_traversal: Option<(ResidualDeltaExpandCursor, ProducerCredit)>,
     resumed_source: Option<(ResidualDeltaSourceCursor, ProducerCredit)>,
     retired_source_page: Option<RetiredSourcePage>,
     quiescence: Option<QuiescenceProof>,
@@ -445,10 +446,20 @@ impl ProducerRegistry {
         }
     }
 
+    #[cfg(test)]
     fn replace_traversal(
         &mut self,
         parent: ProducerCredit,
         successors: impl IntoIterator<Item = ResidualDeltaOutput>,
+    ) -> ReplaceOutcome {
+        self.replace_traversal_page(parent, successors, None)
+    }
+
+    fn replace_traversal_page(
+        &mut self,
+        parent: ProducerCredit,
+        successors: impl IntoIterator<Item = ResidualDeltaOutput>,
+        next: Option<ResidualDeltaExpandCursor>,
     ) -> ReplaceOutcome {
         assert_eq!(parent.brand, self.brand, "delta credit crossed registries");
         let owner = self
@@ -503,6 +514,12 @@ impl ProducerRegistry {
                 self.issue_credit(parent.key.activation, CreditKind::Traversal),
             ));
         }
+        let resumed_traversal = next.map(|cursor| {
+            (
+                cursor,
+                self.issue_credit(parent.key.activation, CreditKind::Traversal),
+            )
+        });
 
         let activation = self
             .state
@@ -525,6 +542,7 @@ impl ProducerRegistry {
         ReplaceOutcome {
             children,
             accepted,
+            resumed_traversal,
             resumed_source,
             retired_source_page,
             quiescence,
@@ -887,6 +905,7 @@ struct DeltaTask {
     activation: ActivationId,
     credit: ProducerCredit,
     node: ResidualDeltaNode,
+    cursor: ResidualDeltaExpandCursor,
 }
 
 #[derive(Debug)]
@@ -972,6 +991,7 @@ impl DeltaScheduler {
                 activation: started.activation,
                 credit,
                 node,
+                cursor: ResidualDeltaExpandCursor::Start,
             }));
             if let Some(proof) = started.quiescence {
                 let completed = self.registry.finish(proof);
@@ -1063,6 +1083,7 @@ impl DeltaScheduler {
                 activation: started.activation,
                 credit,
                 node,
+                cursor: ResidualDeltaExpandCursor::Start,
             }));
             if let Some(proof) = started.quiescence {
                 let completed = self.registry.finish(proof);
@@ -1184,6 +1205,7 @@ impl DeltaScheduler {
                 activation: started.activation,
                 credit,
                 node,
+                cursor: ResidualDeltaExpandCursor::Start,
             }));
             if let Some(proof) = started.quiescence {
                 completed.push(self.registry.finish(proof));
@@ -1518,45 +1540,111 @@ impl DeltaScheduler {
         }
 
         let (desc, tasks) = self.pop(width);
-        let nodes: Vec<_> = tasks.iter().map(|task| task.node).collect();
-        let mut successors = Vec::new();
-        assert!(
-            desc.resolve(root, plan)
-                .residual_delta_expand(desc.variable, &nodes, &mut successors),
-            "delta expansion became unsupported after seeding"
-        );
-        let mut previous = 0u32;
-        for (index, &(tag, _)) in successors.iter().enumerate() {
-            assert!(tag < tasks.len() as u32, "delta successor tag out of range");
-            assert!(
-                index == 0 || tag >= previous,
-                "delta successor tags are not grouped in ascending order"
+        let constraint = desc.resolve(root, plan);
+        let task_count = tasks.len();
+        let page_budget = width.max(1);
+        let page_base = page_budget / task_count;
+        let page_remainder = page_budget % task_count;
+        debug_assert!(page_base > 0);
+        let mut successors = vec![Vec::new(); task_count];
+        let mut next_cursors = vec![None; task_count];
+        let mut legacy_indices = Vec::new();
+        let mut legacy_nodes = Vec::new();
+        for (index, task) in tasks.iter().enumerate() {
+            let limit = page_base + usize::from(index < page_remainder);
+            let page = constraint.residual_delta_expand_page(
+                desc.variable,
+                task.node,
+                task.cursor,
+                limit,
+                &mut successors[index],
             );
-            previous = tag;
+            let Some(page) = page else {
+                assert_eq!(
+                    task.cursor,
+                    ResidualDeltaExpandCursor::Start,
+                    "paged delta expansion became unsupported after suspension"
+                );
+                assert!(
+                    successors[index].is_empty(),
+                    "unsupported delta expansion page mutated its output"
+                );
+                legacy_indices.push(index);
+                legacy_nodes.push(task.node);
+                continue;
+            };
+            assert!(page.examined <= limit);
+            assert!(successors[index].len() <= page.examined);
+            if let Some(next) = page.next {
+                assert!(
+                    page.examined > 0,
+                    "a delta expansion cursor made no progress"
+                );
+                match (task.cursor, next) {
+                    (ResidualDeltaExpandCursor::Start, ResidualDeltaExpandCursor::After { .. }) => {
+                    }
+                    (
+                        ResidualDeltaExpandCursor::After { .. },
+                        ResidualDeltaExpandCursor::After { .. },
+                    ) => assert!(next > task.cursor, "delta expansion cursor did not advance"),
+                    (_, ResidualDeltaExpandCursor::Start) => {
+                        panic!("delta expansion page restarted its cursor")
+                    }
+                }
+            }
+            stats.delta_transition_pages += 1;
+            stats.delta_transition_candidates_examined += page.examined;
+            next_cursors[index] = page.next;
+        }
+
+        if !legacy_nodes.is_empty() {
+            let mut tagged = Vec::new();
+            assert!(
+                constraint.residual_delta_expand(desc.variable, &legacy_nodes, &mut tagged),
+                "delta expansion became unsupported after seeding"
+            );
+            let mut previous = 0u32;
+            for (position, (tag, output)) in tagged.into_iter().enumerate() {
+                assert!(
+                    (tag as usize) < legacy_nodes.len(),
+                    "delta successor tag out of range"
+                );
+                assert!(
+                    position == 0 || tag >= previous,
+                    "delta successor tags are not grouped in ascending order"
+                );
+                previous = tag;
+                successors[legacy_indices[tag as usize]].push(output);
+            }
         }
 
         let mut next_tasks = Vec::new();
         let mut resumed_sources = Vec::new();
         let mut continuation = None;
         let mut dead_pages = 0usize;
-        let mut cursor = 0usize;
         for (task_index, task) in tasks.into_iter().enumerate() {
             assert_eq!(task.activation, task.credit.key.activation);
-            let begin = cursor;
-            while cursor < successors.len() && successors[cursor].0 as usize == task_index {
-                cursor += 1;
-            }
-            let outcome = self.registry.replace_traversal(
+            let outcome = self.registry.replace_traversal_page(
                 task.credit,
-                successors[begin..cursor].iter().map(|(_, value)| *value),
+                successors[task_index].iter().copied(),
+                next_cursors[task_index],
             );
             let retired_source_page = outcome.retired_source_page;
             let mut task_continuation = None;
+            if let Some((cursor, credit)) = outcome.resumed_traversal {
+                next_tasks.push(DeltaTask {
+                    activation: task.activation,
+                    credit,
+                    node: task.node,
+                    cursor,
+                });
+            }
             for (node, credit) in outcome.children {
                 next_tasks.push(DeltaTask {
                     activation: task.activation,
                     credit,
                     node,
+                    cursor: ResidualDeltaExpandCursor::Start,
                 });
             }
             if let Some((source_cursor, credit)) = outcome.resumed_source {
@@ -1596,7 +1684,6 @@ impl DeltaScheduler {
             }
             prefer_continuation(&mut continuation, task_continuation);
         }
-        assert_eq!(cursor, successors.len());
         self.file(desc.clone(), next_tasks);
         self.file_source(desc, resumed_sources);
         stats.delta_source_dead_pages += dead_pages;
@@ -1671,6 +1758,7 @@ impl DeltaScheduler {
                 activation: task.activation,
                 credit,
                 node,
+                cursor: ResidualDeltaExpandCursor::Start,
             });
         }
         self.file(desc.clone(), traversal);
@@ -1733,6 +1821,7 @@ impl DeltaScheduler {
                     activation: task.activation,
                     credit,
                     node: task.node,
+                    cursor: task.cursor,
                 });
             }
             worklist.insert(id, DeltaBucket { tasks });
@@ -2068,11 +2157,13 @@ mod tests {
                     activation: dead_activation,
                     credit: dead_credit,
                     node: dead_node,
+                    cursor: ResidualDeltaExpandCursor::Start,
                 },
                 DeltaTask {
                     activation: live_activation,
                     credit: live_credit,
                     node: live_node,
+                    cursor: ResidualDeltaExpandCursor::Start,
                 },
             ],
         );
@@ -2699,6 +2790,7 @@ mod tests {
                     activation: started.activation,
                     credit,
                     node,
+                    cursor: ResidualDeltaExpandCursor::Start,
                 })
                 .collect();
             scheduler.file(desc.clone(), tasks);

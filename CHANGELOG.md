@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **RPQ product-state transitions gain bounded affine pages.** Positive and
+  inverse attribute branches now advance by a branch-qualified lexical cursor,
+  so one high-degree automaton node consumes at most the residual scheduler's
+  current geometric demand before its continuation is refiled. Cursor state is
+  activation payload rather than canonical state identity; clones retain the
+  exact remainder, duplicate outer parents remain distinct bags, and accepted
+  endpoints keep their existing per-activation set semantics. Negated-property
+  transitions retain the eager expansion path until their two-level
+  attribute/value frontier has an equally exact cursor.
 - **Ordered proposal sources can page direct candidate occurrences.** The
   residual source cursor now distinguishes raw-value and native-ordinal
   frontiers while preserving proposal order and multiplicity. Sorted slices

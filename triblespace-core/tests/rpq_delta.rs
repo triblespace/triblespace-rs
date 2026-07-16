@@ -14,9 +14,9 @@ use triblespace_core::query::residual::{
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, ConstraintShape, EstimateSink, PathOp, Query,
-    RegularPathConstraint, ResidualDeltaNode, ResidualDeltaOutput, ResidualDeltaSeed,
-    ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, Variable, VariableId,
-    VariableSet,
+    RegularPathConstraint, ResidualDeltaExpandCursor, ResidualDeltaNode, ResidualDeltaOutput,
+    ResidualDeltaSeed, ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, Variable,
+    VariableId, VariableSet,
 };
 use triblespace_core::trible::{Trible, TribleSet};
 
@@ -720,6 +720,15 @@ fn bound_start_root(
     counted_bound_start_root(set, start, ops, None, expanded_nodes)
 }
 
+fn native_bound_start_root(set: TribleSet, start: Inline<GenId>, ops: &[PathOp]) -> Root {
+    let start_var = Variable::<GenId>::new(START);
+    let end_var = Variable::<GenId>::new(END);
+    Arc::new(IntersectionConstraint::new(vec![
+        Box::new(start_var.is(start)) as DynConstraint,
+        Box::new(RegularPathConstraint::new(set, start_var, end_var, ops)) as DynConstraint,
+    ]))
+}
+
 fn counted_bound_start_root(
     set: TribleSet,
     start: Inline<GenId>,
@@ -1279,6 +1288,23 @@ fn duplicate_parent_root(
             source_pages: None,
             expanded_nodes: Arc::new(AtomicUsize::new(0)),
         }) as DynConstraint,
+    ]))
+}
+
+fn native_duplicate_parent_root(
+    set: TribleSet,
+    start: RawInline,
+    outer_values: [RawInline; 2],
+    ops: &[PathOp],
+) -> Root {
+    let start_var = Variable::<GenId>::new(START);
+    let end_var = Variable::<GenId>::new(END);
+    Arc::new(IntersectionConstraint::new(vec![
+        Box::new(DuplicateParents {
+            outer_values,
+            start,
+        }) as DynConstraint,
+        Box::new(RegularPathConstraint::new(set, start_var, end_var, ops)) as DynConstraint,
     ]))
 }
 
@@ -4807,4 +4833,201 @@ fn finite_same_variable_optional_pages_preserve_epsilon_scope_and_multiplicity()
         assert!(expanded.load(Ordering::Relaxed) > 0, "{name}");
         assert_eq!(query.stats().max_confirm_candidates, 1, "{name}");
     }
+}
+
+#[test]
+fn positive_transition_frontiers_page_by_automaton_branch_and_value() {
+    let mut graph = Graph::new(6, &[(0, 1), (0, 2), (0, 3), (0, 4), (0, 5)]);
+    let start = Variable::<GenId>::new(START);
+    let end = Variable::<GenId>::new(END);
+    let path = RegularPathConstraint::new(
+        graph.set.clone(),
+        start,
+        end,
+        &[PathOp::Attr(graph.attribute.raw())],
+    );
+    let vars = [START];
+    let rows = [graph.value(0).raw];
+    let mut seeds = Vec::new();
+    assert!(path.residual_delta_seeds(END, &RowsView::new(&vars, &rows), &mut seeds));
+    assert_eq!(seeds.len(), 1);
+    let node = seeds[0].output.node;
+
+    let mut cursor = ResidualDeltaExpandCursor::Start;
+    let mut outputs = Vec::new();
+    let mut page_sizes = Vec::new();
+    loop {
+        let before = outputs.len();
+        let page = path
+            .residual_delta_expand_page(END, node, cursor, 2, &mut outputs)
+            .expect("a positive attribute frontier is pageable");
+        page_sizes.push((page.examined, outputs.len() - before));
+        match page.next {
+            Some(next) => {
+                assert!(next > cursor);
+                cursor = next;
+            }
+            None => break,
+        }
+    }
+    assert_eq!(page_sizes, vec![(2, 2), (2, 2), (1, 1)]);
+    let mut actual: Vec<_> = outputs.iter().map(|output| output.node.value).collect();
+    let mut expected: Vec<_> = (1..6).map(|index| graph.value(index).raw).collect();
+    actual.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
+    assert!(outputs.iter().all(|output| output.accepted));
+
+    let inverse_attribute = other_attribute();
+    graph.set.insert(&Trible::new(
+        &graph.nodes[5],
+        &inverse_attribute,
+        &graph.value(0),
+    ));
+    let union = RegularPathConstraint::new(
+        graph.set.clone(),
+        start,
+        end,
+        &[
+            PathOp::Attr(graph.attribute.raw()),
+            PathOp::Attr(inverse_attribute.raw()),
+            PathOp::Inverse,
+            PathOp::Union,
+        ],
+    );
+    let mut seeds = Vec::new();
+    assert!(union.residual_delta_seeds(END, &RowsView::new(&vars, &rows), &mut seeds));
+    let mut first = Vec::new();
+    let page = union
+        .residual_delta_expand_page(
+            END,
+            seeds[0].output.node,
+            ResidualDeltaExpandCursor::Start,
+            1,
+            &mut first,
+        )
+        .expect("a positive union frontier is pageable");
+    let next = page.next.expect("the inverse branch remains live");
+    assert!(matches!(
+        next,
+        ResidualDeltaExpandCursor::After { branch: 0, .. }
+    ));
+    let mut remainder = Vec::new();
+    let page = union
+        .residual_delta_expand_page(END, seeds[0].output.node, next, 16, &mut remainder)
+        .expect("the branch-qualified cursor resumes");
+    assert_eq!(page.next, None);
+    let mut actual: Vec<_> = first
+        .iter()
+        .chain(&remainder)
+        .map(|output| output.node.value)
+        .collect();
+    let mut expected: Vec<_> = (1..6).map(|index| graph.value(index).raw).collect();
+    expected.push(graph.value(5).raw);
+    actual.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn first_fanout_result_scans_one_transition_and_clone_keeps_the_exact_cursor() {
+    let edges: Vec<_> = (1..17).map(|target| (0, target)).collect();
+    let graph = Graph::new(17, &edges);
+    let ops = [PathOp::Attr(graph.attribute.raw())];
+    let make = || native_bound_start_root(graph.set.clone(), graph.value(0), &ops);
+    let mut query = Query::new(make(), project_end)
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .start_width(1)
+        .cap(16);
+
+    let first = query.next().expect("one fanout endpoint");
+    assert_eq!(query.stats().delta_transition_pages, 1);
+    assert_eq!(query.stats().delta_transition_candidates_examined, 1);
+    let cloned = query.clone();
+
+    let mut original = vec![first];
+    original.extend(query);
+    let mut clone_results = vec![first];
+    clone_results.extend(cloned);
+    original.sort_unstable();
+    clone_results.sort_unstable();
+    let mut expected: Vec<_> = (1..17).map(|target| graph.value(target).raw).collect();
+    expected.sort_unstable();
+    assert_eq!(original, expected);
+    assert_eq!(clone_results, expected);
+}
+
+#[test]
+fn paged_transitions_preserve_affine_parent_bags_and_storage_monotonicity() {
+    let graph = Graph::new(5, &[(0, 1), (0, 2), (0, 3), (0, 4)]);
+    let ops = [PathOp::Attr(graph.attribute.raw())];
+    let outer_values = [genid(&rngid().id).raw, genid(&rngid().id).raw];
+    let make =
+        || native_duplicate_parent_root(graph.set.clone(), graph.value(0).raw, outer_values, &ops);
+    let mut expected: Vec<_> = Query::new(make(), project_end).sequential().collect();
+    let mut dag: Vec<_> = Query::new(make(), project_end)
+        .lazy_dag_scheduler()
+        .collect();
+    let mut residual = Query::new(make(), project_end)
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .start_width(1)
+        .cap(2);
+    let mut actual: Vec<_> = residual.by_ref().collect();
+    expected.sort_unstable();
+    dag.sort_unstable();
+    actual.sort_unstable();
+    assert_eq!(actual, expected);
+    assert_eq!(dag, expected);
+    for target in 1..5 {
+        assert_eq!(
+            actual
+                .iter()
+                .filter(|&&value| value == graph.value(target).raw)
+                .count(),
+            2
+        );
+    }
+    assert!(residual.stats().delta_transition_pages > 0);
+
+    let mut previous = Vec::new();
+    for level in 0..=4 {
+        let graph = GeneratedGraph::new(level);
+        let ops = [PathOp::Attr(graph.primary.raw()), PathOp::Star];
+        let mut query = Query::new(
+            native_bound_start_root(graph.set.clone(), graph.value(0), &ops),
+            project_end,
+        )
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .start_width(1)
+        .cap(2);
+        let mut current: Vec<_> = query.by_ref().collect();
+        current.sort_unstable();
+        current.dedup();
+        assert!(
+            previous.iter().all(|value| current.contains(value)),
+            "adding graph facts removed a nullable/cyclic endpoint at level {level}"
+        );
+        assert!(query.stats().delta_transition_pages > 0);
+        previous = current;
+    }
+}
+
+#[test]
+fn negated_transition_steps_keep_the_honest_eager_boundary() {
+    let mut graph = Graph::new(3, &[(0, 1)]);
+    let other = other_attribute();
+    graph
+        .set
+        .insert(&Trible::new(&graph.nodes[0], &other, &graph.value(2)));
+    let ops = [PathOp::NotAttr(graph.attribute.raw())];
+    let make = || native_bound_start_root(graph.set.clone(), graph.value(0), &ops);
+    let expected: Vec<_> = Query::new(make(), project_end).sequential().collect();
+    let mut residual = Query::new(make(), project_end)
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .start_width(1)
+        .cap(1);
+    let actual: Vec<_> = residual.by_ref().collect();
+    assert_eq!(actual, expected);
+    assert_eq!(actual, vec![graph.value(2).raw]);
+    assert_eq!(residual.stats().delta_transition_pages, 0);
 }
