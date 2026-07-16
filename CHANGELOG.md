@@ -90,7 +90,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   value ranges through PATCH cursors. SuccinctArchive patterns page the same
   twelve schemas by ordered-universe, distinct-pair, and fixed-pair wavelet
   cursors, while Succinct value ranges seek directly into their bounded V-axis
-  domain. Repeated target-position equality shapes retain eager fallback.
+  domain. TribleSet patterns with one variable repeated across E/V, E/A, A/V,
+  or all three positions now page a strict ordered driver under the same
+  examined-candidate budget and apply the remaining equality as an exact
+  secondary filter; SuccinctArchive and shard-union repeated shapes retain
+  their eager fallback.
 - **Formula Support gains composed affine parity receipts.** End-to-end RPQ
   tests now pin duplicate-parent bag multiplicity, nested AND/OR arm-order
   invariance, monotone graph growth, live clone and Rayon worker parity, and
