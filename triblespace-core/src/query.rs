@@ -817,6 +817,23 @@ pub struct ResidualDeltaSourcePage {
     pub examined: usize,
 }
 
+/// One physically compatible cohort of affine residual source activations.
+///
+/// The rows share one bound-variable schema. `candidate_sets`, `cursors`, and
+/// `limits` are row-aligned; candidate sets are either present for every row
+/// or absent for every row, and every cursor belongs to the same family. The
+/// per-row limits are positive and their sum is bounded by the scheduler's
+/// current global geometric width. None of these physical dispatch details is
+/// part of canonical residual or delta state identity.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct ResidualDeltaSourceBatch<'v> {
+    pub view: RowsView<'v>,
+    pub candidate_sets: &'v [Option<&'v [RawInline]>],
+    pub cursors: &'v [ResidualDeltaSourceCursor],
+    pub limits: &'v [usize],
+}
+
 /// Object-safe child access for a structural constraint shape.
 #[doc(hidden)]
 pub trait ConstraintChildren<'a> {
@@ -1163,6 +1180,56 @@ pub trait Constraint<'a> {
         None
     }
 
+    /// Consume one physically compatible cohort of affine source pages.
+    ///
+    /// `pages` receives exactly one row-aligned page descriptor. Roots and
+    /// direct accepted occurrences carry ascending input-row tags, just like
+    /// [`Self::residual_delta_expand`] successors. An implementation may
+    /// override this hook with a native batched kernel. The default preserves
+    /// compatibility by invoking [`Self::residual_delta_source_page`] once per
+    /// row and rolling back every output if any row reports unsupported.
+    #[doc(hidden)]
+    fn residual_delta_source_pages(
+        &self,
+        variable: VariableId,
+        batch: ResidualDeltaSourceBatch<'_>,
+        pages: &mut Vec<ResidualDeltaSourcePage>,
+        roots: &mut Vec<(u32, ResidualDeltaOutput)>,
+        accepted: &mut Vec<(u32, RawInline)>,
+    ) -> bool {
+        let row_count = batch.view.len();
+        assert_eq!(batch.candidate_sets.len(), row_count);
+        assert_eq!(batch.cursors.len(), row_count);
+        assert_eq!(batch.limits.len(), row_count);
+
+        let page_base = pages.len();
+        let root_base = roots.len();
+        let accepted_base = accepted.len();
+        for row in 0..row_count {
+            let mut row_roots = Vec::new();
+            let mut row_accepted = Vec::new();
+            let Some(page) = self.residual_delta_source_page(
+                variable,
+                &batch.view.row_view(row),
+                batch.candidate_sets[row],
+                batch.cursors[row],
+                batch.limits[row],
+                &mut row_roots,
+                &mut row_accepted,
+            ) else {
+                pages.truncate(page_base);
+                roots.truncate(root_base);
+                accepted.truncate(accepted_base);
+                return false;
+            };
+            let tag = u32::try_from(row).expect("residual source cohort exceeds u32 tags");
+            pages.push(page);
+            roots.extend(row_roots.into_iter().map(|root| (tag, root)));
+            accepted.extend(row_accepted.into_iter().map(|value| (tag, value)));
+        }
+        true
+    }
+
     /// Seeds zero or more engine-owned transition programs for each parent row.
     ///
     /// Returning `true` opts this exact `(constraint, variable, bound schema)`
@@ -1318,6 +1385,18 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.residual_delta_source_page(variable, view, candidates, cursor, limit, roots, accepted)
     }
 
+    fn residual_delta_source_pages(
+        &self,
+        variable: VariableId,
+        batch: ResidualDeltaSourceBatch<'_>,
+        pages: &mut Vec<ResidualDeltaSourcePage>,
+        roots: &mut Vec<(u32, ResidualDeltaOutput)>,
+        accepted: &mut Vec<(u32, RawInline)>,
+    ) -> bool {
+        let inner: &T = self;
+        inner.residual_delta_source_pages(variable, batch, pages, roots, accepted)
+    }
+
     fn residual_delta_seeds(
         &self,
         variable: VariableId,
@@ -1436,6 +1515,18 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     ) -> Option<ResidualDeltaSourcePage> {
         let inner: &T = self;
         inner.residual_delta_source_page(variable, view, candidates, cursor, limit, roots, accepted)
+    }
+
+    fn residual_delta_source_pages(
+        &self,
+        variable: VariableId,
+        batch: ResidualDeltaSourceBatch<'_>,
+        pages: &mut Vec<ResidualDeltaSourcePage>,
+        roots: &mut Vec<(u32, ResidualDeltaOutput)>,
+        accepted: &mut Vec<(u32, RawInline)>,
+    ) -> bool {
+        let inner: &T = self;
+        inner.residual_delta_source_pages(variable, batch, pages, roots, accepted)
     }
 
     fn residual_delta_seeds(

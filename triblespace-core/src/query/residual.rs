@@ -46,6 +46,13 @@
 //! dies. Width grows geometrically after an action dies or raw rows reach
 //! projection, so a negative prefix can widen within a single pull.
 //!
+//! Ordered cyclic sources retain an affine cursor per activation while a
+//! separate physical layer cohorts activations with the same row schema,
+//! candidate mode, and cursor family. One same-schema block-native hook gets
+//! ragged per-parent limits whose sum is the current global width, so batching
+//! does not multiply the geometric work budget or refine canonical state
+//! identity.
+//!
 //! As with the other batched engines, flattened leaves must obey the
 //! [`Constraint::estimate`] protocol: relevance is a structural answer,
 //! uniform across every row with the same bound-variable schema. Constraint
@@ -1561,6 +1568,12 @@ pub struct ResidualStateStats {
     pub width_increases: usize,
     /// Bounded pages requested from constraint-owned source frontiers.
     pub delta_source_pages: usize,
+    /// Physical calls that consumed one compatible cohort of affine source
+    /// pages. This is deliberately distinct from canonical delta states.
+    pub delta_source_cohorts: usize,
+    /// Largest number of compatible affine source activations dispatched by
+    /// one physical cohort call.
+    pub max_delta_source_cohort: usize,
     /// Ordered source candidates consumed across those pages, including
     /// candidates rejected by an exact secondary source filter.
     pub delta_source_candidates_examined: usize,

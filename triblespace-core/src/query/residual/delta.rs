@@ -719,6 +719,19 @@ impl ProducerRegistry {
         )
     }
 
+    fn source_dispatch_shape(&self, activation: ActivationId) -> (VariableSet, bool) {
+        let activation = self
+            .state
+            .activations
+            .get(&activation)
+            .expect("unknown delta activation");
+        let bound = match &activation.return_to {
+            DeltaReturn::Stable { desc, .. } => desc.bound,
+            DeltaReturn::Formula { bound, .. } => *bound,
+        };
+        (bound, activation.source_candidates.is_some())
+    }
+
     /// Takes one activation-local early effect. Support mutates its reducer at
     /// this exact boundary so duplicate witnesses and later expansion cohorts
     /// cannot replay `true`.
@@ -882,6 +895,28 @@ fn seed_ranges(seeds: &[ResidualDeltaSeed], parent_count: usize) -> Vec<std::ops
     ranges
 }
 
+fn tagged_ranges<T>(
+    values: &[(u32, T)],
+    parent_count: usize,
+    kind: &str,
+) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::with_capacity(parent_count);
+    let mut cursor = 0usize;
+    for parent in 0..parent_count {
+        let begin = cursor;
+        while cursor < values.len() && values[cursor].0 as usize == parent {
+            cursor += 1;
+        }
+        ranges.push(begin..cursor);
+    }
+    assert_eq!(
+        cursor,
+        values.len(),
+        "residual source {kind} tags are out of range or not grouped in ascending order"
+    );
+    ranges
+}
+
 #[derive(Debug)]
 struct DeltaTask {
     activation: ActivationId,
@@ -894,6 +929,68 @@ struct SourceTask {
     activation: ActivationId,
     credit: ProducerCredit,
     cursor: ResidualDeltaSourceCursor,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceCursorFamily {
+    Start,
+    After,
+    Offset,
+}
+
+impl SourceCursorFamily {
+    fn of(cursor: ResidualDeltaSourceCursor) -> Self {
+        match cursor {
+            ResidualDeltaSourceCursor::Start => Self::Start,
+            ResidualDeltaSourceCursor::After(_) => Self::After,
+            ResidualDeltaSourceCursor::Offset(_) => Self::Offset,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceDispatchKey {
+    bound: VariableSet,
+    has_candidates: bool,
+    cursor_family: SourceCursorFamily,
+}
+
+impl SourceDispatchKey {
+    fn of(registry: &ProducerRegistry, task: &SourceTask) -> Self {
+        let (bound, has_candidates) = registry.source_dispatch_shape(task.activation);
+        Self {
+            bound,
+            has_candidates,
+            cursor_family: SourceCursorFamily::of(task.cursor),
+        }
+    }
+}
+
+fn validate_source_cursor(
+    current: ResidualDeltaSourceCursor,
+    next: Option<ResidualDeltaSourceCursor>,
+) {
+    let Some(next) = next else {
+        return;
+    };
+    match (current, next) {
+        (
+            ResidualDeltaSourceCursor::Start,
+            ResidualDeltaSourceCursor::After(_) | ResidualDeltaSourceCursor::Offset(1..),
+        ) => {}
+        (
+            ResidualDeltaSourceCursor::After(previous),
+            ResidualDeltaSourceCursor::After(next),
+        ) => assert!(next > previous, "residual source cursor did not advance"),
+        (
+            ResidualDeltaSourceCursor::Offset(previous),
+            ResidualDeltaSourceCursor::Offset(next),
+        ) => assert!(next > previous, "residual source cursor did not advance"),
+        (_, ResidualDeltaSourceCursor::Start) => {
+            panic!("residual source page restarted its cursor")
+        }
+        _ => panic!("residual source page changed cursor families"),
+    }
 }
 
 #[derive(Default)]
@@ -1481,24 +1578,40 @@ impl DeltaScheduler {
         (self.interner.get(id).clone(), tasks)
     }
 
-    fn pop_source(&mut self) -> (DeltaDesc, SourceTask) {
+    fn pop_source(&mut self, width: usize) -> (DeltaDesc, Vec<SourceTask>) {
+        let width = width.max(1);
         let id = *self
             .source_worklist
             .last_key_value()
             .expect("source pop requires live work")
             .0;
-        let (task, empty) = {
+        let (tasks, empty) = {
+            let registry = &self.registry;
             let bucket = self
                 .source_worklist
                 .get_mut(&id)
                 .expect("selected source state");
-            let task = bucket.tasks.pop().expect("live source bucket is nonempty");
-            (task, bucket.tasks.is_empty())
+            let key = SourceDispatchKey::of(
+                registry,
+                bucket.tasks.last().expect("live source bucket is nonempty"),
+            );
+            let mut selected = Vec::with_capacity(width.min(bucket.tasks.len()));
+            let mut retained = Vec::with_capacity(bucket.tasks.len());
+            for task in std::mem::take(&mut bucket.tasks).into_iter().rev() {
+                if selected.len() < width && SourceDispatchKey::of(registry, &task) == key {
+                    selected.push(task);
+                } else {
+                    retained.push(task);
+                }
+            }
+            retained.reverse();
+            bucket.tasks = retained;
+            (selected, bucket.tasks.is_empty())
         };
         if empty {
             self.source_worklist.remove(&id);
         }
-        (self.interner.get(id).clone(), task)
+        (self.interner.get(id).clone(), tasks)
     }
 
     /// Executes one structural product-state cohort and files accepted
@@ -1616,103 +1729,144 @@ impl DeltaScheduler {
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
     ) -> DeltaStepOutcome {
-        let (desc, task) = self.pop_source();
-        assert_eq!(task.activation, task.credit.key.activation);
-        let (bound, parent, candidates) = self.registry.source_context(task.activation);
-        let vars: Vec<VariableId> = bound.into_iter().collect();
-        let view = rows_view(&vars, &parent, 1);
+        let budget = width.max(1);
+        let (desc, tasks) = self.pop_source(budget);
+        assert!(!tasks.is_empty());
+        assert!(tasks.len() <= budget);
+        let dispatch_key = SourceDispatchKey::of(&self.registry, &tasks[0]);
+        assert!(
+            tasks
+                .iter()
+                .all(|task| SourceDispatchKey::of(&self.registry, task) == dispatch_key),
+            "one residual source cohort mixed incompatible physical dispatch shapes"
+        );
+
+        let row_count = tasks.len();
+        let quotient = budget / row_count;
+        let remainder = budget % row_count;
+        let limits: Vec<_> = (0..row_count)
+            .map(|row| quotient + usize::from(row < remainder))
+            .collect();
+        assert!(limits.iter().all(|&limit| limit > 0));
+        assert_eq!(limits.iter().sum::<usize>(), budget);
+
+        let mut parents = Vec::new();
+        let mut candidate_storage = Vec::with_capacity(row_count);
+        for task in &tasks {
+            assert_eq!(task.activation, task.credit.key.activation);
+            let (bound, parent, candidates) = self.registry.source_context(task.activation);
+            assert_eq!(bound, dispatch_key.bound);
+            assert_eq!(candidates.is_some(), dispatch_key.has_candidates);
+            parents.extend(parent);
+            candidate_storage.push(candidates);
+        }
+        let vars: Vec<VariableId> = dispatch_key.bound.into_iter().collect();
+        let view = rows_view(&vars, &parents, row_count);
+        let candidate_sets: Vec<Option<&[RawInline]>> = candidate_storage
+            .iter()
+            .map(|candidates| candidates.as_deref())
+            .collect();
+        let cursors: Vec<_> = tasks.iter().map(|task| task.cursor).collect();
+        let batch = ResidualDeltaSourceBatch {
+            view,
+            candidate_sets: &candidate_sets,
+            cursors: &cursors,
+            limits: &limits,
+        };
+        let mut pages = Vec::with_capacity(row_count);
         let mut roots = Vec::new();
         let mut direct = Vec::new();
-        let page = desc
-            .resolve(root, plan)
-            .residual_delta_source_page(
+        assert!(
+            desc.resolve(root, plan).residual_delta_source_pages(
                 desc.variable,
-                &view,
-                candidates.as_deref(),
-                task.cursor,
-                width.max(1),
+                batch,
+                &mut pages,
                 &mut roots,
                 &mut direct,
-            )
-            .expect("paged delta source became unsupported after seeding");
-        assert!(page.examined <= width.max(1));
-        assert!(roots.len() + direct.len() <= page.examined);
-        if let Some(next) = page.next {
-            match (task.cursor, next) {
-                (
-                    ResidualDeltaSourceCursor::Start,
-                    ResidualDeltaSourceCursor::After(_) | ResidualDeltaSourceCursor::Offset(1..),
-                ) => {}
-                (
-                    ResidualDeltaSourceCursor::After(previous),
-                    ResidualDeltaSourceCursor::After(next),
-                ) => assert!(next > previous, "residual source cursor did not advance"),
-                (
-                    ResidualDeltaSourceCursor::Offset(previous),
-                    ResidualDeltaSourceCursor::Offset(next),
-                ) => assert!(next > previous, "residual source cursor did not advance"),
-                (_, ResidualDeltaSourceCursor::Start) => {
-                    panic!("residual source page restarted its cursor")
-                }
-                _ => panic!("residual source page changed cursor families"),
-            }
-        }
-        stats.delta_source_pages += 1;
-        stats.delta_source_candidates_examined += page.examined;
-        stats.delta_source_roots += roots.len();
-        stats.delta_source_direct_candidates += direct.len();
+            ),
+            "paged delta source became unsupported after seeding"
+        );
+        assert_eq!(pages.len(), row_count);
+        let root_ranges = tagged_ranges(&roots, row_count, "root");
+        let direct_ranges = tagged_ranges(&direct, row_count, "direct candidate");
 
-        let outcome = self
-            .registry
-            .replace_source(task.credit, roots, direct, page.next);
-        let mut traversal = Vec::with_capacity(outcome.roots.len());
-        for (node, credit) in outcome.roots {
-            traversal.push(DeltaTask {
-                activation: task.activation,
-                credit,
-                node,
-            });
-        }
-        self.file(desc.clone(), traversal);
-        if let Some((cursor, credit)) = outcome.resumed_source {
-            self.file_source(
-                desc.clone(),
-                vec![SourceTask {
+        stats.delta_source_cohorts += 1;
+        stats.max_delta_source_cohort = stats.max_delta_source_cohort.max(row_count);
+        stats.delta_source_pages += row_count;
+        let mut continuation = None;
+        let mut traversal = Vec::new();
+        let mut resumed_sources = Vec::new();
+        let mut dead_pages = 0usize;
+        for (row, (((task, page), root_range), direct_range)) in tasks
+            .into_iter()
+            .zip(pages)
+            .zip(root_ranges)
+            .zip(direct_ranges)
+            .enumerate()
+        {
+            let row_roots = &roots[root_range];
+            let row_direct = &direct[direct_range];
+            assert!(page.examined <= limits[row]);
+            assert!(row_roots.len() + row_direct.len() <= page.examined);
+            validate_source_cursor(task.cursor, page.next);
+            stats.delta_source_candidates_examined += page.examined;
+            stats.delta_source_roots += row_roots.len();
+            stats.delta_source_direct_candidates += row_direct.len();
+
+            let outcome = self.registry.replace_source(
+                task.credit,
+                row_roots.iter().map(|(_, output)| *output),
+                row_direct.iter().map(|(_, value)| *value),
+                page.next,
+            );
+            for (node, credit) in outcome.roots {
+                traversal.push(DeltaTask {
+                    activation: task.activation,
+                    credit,
+                    node,
+                });
+            }
+            if let Some((cursor, credit)) = outcome.resumed_source {
+                resumed_sources.push(SourceTask {
                     activation: task.activation,
                     credit,
                     cursor,
-                }],
-            );
-        }
-
-        let mut continuation = None;
-        if !outcome.accepted.is_empty() {
-            if let Some(streamed) = self.registry.take_streaming_return(task.activation) {
-                continuation = Self::release_streaming(
-                    streamed,
-                    outcome.accepted,
-                    plan,
-                    stable,
-                    stable_interner,
-                    stats,
+                });
+            }
+            let retired_source_page = outcome.retired_source_page;
+            let mut task_continuation = None;
+            if !outcome.accepted.is_empty() {
+                if let Some(streamed) = self.registry.take_streaming_return(task.activation) {
+                    prefer_continuation(
+                        &mut task_continuation,
+                        Self::release_streaming(
+                            streamed,
+                            outcome.accepted,
+                            plan,
+                            stable,
+                            stable_interner,
+                            stats,
+                        ),
+                    );
+                }
+            }
+            if let Some(proof) = outcome.quiescence {
+                assert_eq!(proof.activation, task.activation);
+                let completed = self.registry.finish(proof);
+                prefer_continuation(
+                    &mut task_continuation,
+                    Self::release_completion(completed, plan, stable, stable_interner, stats),
                 );
             }
+            if retired_source_page.is_some_and(|page| !page.had_stable_effect)
+                && task_continuation.is_none()
+            {
+                dead_pages += 1;
+            }
+            prefer_continuation(&mut continuation, task_continuation);
         }
-        if let Some(proof) = outcome.quiescence {
-            assert_eq!(proof.activation, task.activation);
-            let completed = self.registry.finish(proof);
-            prefer_continuation(
-                &mut continuation,
-                Self::release_completion(completed, plan, stable, stable_interner, stats),
-            );
-        }
-
-        let dead_pages = usize::from(
-            outcome
-                .retired_source_page
-                .is_some_and(|page| !page.had_stable_effect)
-                && continuation.is_none(),
-        );
+        self.file(desc.clone(), traversal);
+        self.file_source(desc, resumed_sources);
         stats.delta_source_dead_pages += dead_pages;
         DeltaStepOutcome {
             continuation,
@@ -2467,6 +2621,100 @@ mod tests {
         assert_ne!(tasks[0].activation, tasks[1].activation);
         assert_eq!(tasks[0].cursor, ResidualDeltaSourceCursor::Start);
         assert_eq!(tasks[1].cursor, ResidualDeltaSourceCursor::After(value(7)));
+    }
+
+    #[test]
+    fn source_pop_cohorts_by_physical_shape_without_refining_delta_identity() {
+        fn return_with_bound(bound: VariableSet, parent: RawInline) -> DeltaReturn {
+            DeltaReturn::Stable {
+                desc: StateDesc {
+                    bound,
+                    phase: ResidualPhase::Ready,
+                },
+                parent: vec![parent].into_boxed_slice(),
+            }
+        }
+
+        let mut scheduler = DeltaScheduler::new();
+        let desc = DeltaDesc::leaf(0, 0);
+        let schema_a = VariableSet::new_singleton(0);
+        let schema_b = VariableSet::new_singleton(1);
+        let mut source_task = |
+            bound: VariableSet,
+            candidates: Option<Box<[RawInline]>>,
+            cursor: ResidualDeltaSourceCursor,
+            parent: RawInline,
+        | {
+            let reducer = if candidates.is_some() {
+                DeltaReducer::Confirm {
+                    original: Box::new([]),
+                }
+            } else {
+                DeltaReducer::StreamProposal
+            };
+            let (activation, credit) = scheduler.registry.start_source(
+                reducer,
+                return_with_bound(bound, parent),
+                candidates,
+            );
+            SourceTask {
+                activation,
+                credit,
+                cursor,
+            }
+        };
+
+        // All five activations retain one canonical DeltaDesc bucket. The two
+        // final tasks alone share schema, candidate mode, and cursor family.
+        let tasks = vec![
+            source_task(schema_b, None, ResidualDeltaSourceCursor::Start, value(1)),
+            source_task(
+                schema_a,
+                Some(vec![value(9)].into_boxed_slice()),
+                ResidualDeltaSourceCursor::Start,
+                value(2),
+            ),
+            source_task(
+                schema_a,
+                None,
+                ResidualDeltaSourceCursor::After(value(3)),
+                value(3),
+            ),
+            source_task(schema_a, None, ResidualDeltaSourceCursor::Start, value(4)),
+            source_task(schema_a, None, ResidualDeltaSourceCursor::Start, value(5)),
+        ];
+        scheduler.file_source(desc.clone(), tasks);
+        assert_eq!(scheduler.interner.descs, [desc]);
+        assert_eq!(scheduler.source_worklist.len(), 1);
+
+        let (_, compatible) = scheduler.pop_source(8);
+        assert_eq!(compatible.len(), 2);
+        assert!(compatible.iter().all(|task| {
+            SourceDispatchKey::of(&scheduler.registry, task)
+                == SourceDispatchKey {
+                    bound: schema_a,
+                    has_candidates: false,
+                    cursor_family: SourceCursorFamily::Start,
+                }
+        }));
+
+        let (_, after) = scheduler.pop_source(8);
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            SourceDispatchKey::of(&scheduler.registry, &after[0]).cursor_family,
+            SourceCursorFamily::After
+        );
+        let (_, candidate) = scheduler.pop_source(8);
+        assert_eq!(candidate.len(), 1);
+        assert!(SourceDispatchKey::of(&scheduler.registry, &candidate[0]).has_candidates);
+        let (_, other_schema) = scheduler.pop_source(8);
+        assert_eq!(other_schema.len(), 1);
+        assert_eq!(
+            SourceDispatchKey::of(&scheduler.registry, &other_schema[0]).bound,
+            schema_b
+        );
+        assert!(scheduler.source_worklist.is_empty());
+        assert_eq!(scheduler.interner.descs.len(), 1);
     }
 
     #[test]
