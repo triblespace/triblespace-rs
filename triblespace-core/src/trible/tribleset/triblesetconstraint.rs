@@ -140,13 +140,13 @@ fn direct_source_page(
     mut next: impl FnMut(Option<&RawInline>) -> Option<RawInline>,
 ) -> ResidualDeltaSourcePage {
     assert!(limit > 0, "residual source pages require positive demand");
-    // This frontier exclusively emits value cursors. Other source families
-    // may add cursor representations without making them valid here.
-    #[allow(unreachable_patterns)]
+    // This frontier exclusively emits value cursors.
     let mut current = match cursor {
         ResidualDeltaSourceCursor::Start => None,
         ResidualDeltaSourceCursor::After(value) => Some(value),
-        _ => panic!("non-value cursor crossed into a TribleSet source frontier"),
+        ResidualDeltaSourceCursor::Offset(_) => {
+            panic!("ordinal cursor crossed into a TribleSet source frontier")
+        }
     };
     let mut examined = 0usize;
     while examined < limit {
@@ -1088,7 +1088,6 @@ mod tests {
             let Some(next) = page.next else {
                 break;
             };
-            #[allow(unreachable_patterns)]
             match (cursor, next) {
                 (ResidualDeltaSourceCursor::Start, ResidualDeltaSourceCursor::After(_)) => {}
                 (
@@ -1096,7 +1095,12 @@ mod tests {
                     ResidualDeltaSourceCursor::After(next),
                 ) => assert!(next > previous),
                 (_, ResidualDeltaSourceCursor::Start) => unreachable!("source cursor restarted"),
-                _ => unreachable!("non-value cursor crossed the TribleSet test frontier"),
+                (_, ResidualDeltaSourceCursor::Offset(_)) => {
+                    unreachable!("ordinal cursor crossed the TribleSet test frontier")
+                }
+                (ResidualDeltaSourceCursor::Offset(_), _) => {
+                    unreachable!("ordinal cursor resumed the TribleSet test frontier")
+                }
             }
             cursor = next;
         }
@@ -1589,6 +1593,7 @@ mod tests {
         assert_eq!(counters.examined.load(Ordering::Relaxed), 1);
         assert_eq!(query.stats().delta_source_pages, 1);
         assert_eq!(query.stats().delta_source_candidates_examined, 1);
+        assert_eq!(query.stats().delta_source_direct_candidates, 1);
         assert_eq!(query.stats().delta_source_roots, 0);
         drop(query);
         assert_eq!(counters.page_calls.load(Ordering::Relaxed), 1);
