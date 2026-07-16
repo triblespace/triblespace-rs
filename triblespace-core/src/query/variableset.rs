@@ -10,6 +10,15 @@ pub struct VariableSet {
 }
 
 impl VariableSet {
+    /// The canonical bit representation used by query-local internal caches.
+    ///
+    /// Kept crate-private so the public abstraction remains a set rather than
+    /// committing callers to its current storage representation.
+    #[must_use]
+    pub(crate) const fn bits(self) -> u128 {
+        self.bits
+    }
+
     /// Create a new empty set.
     #[must_use]
     pub const fn new_empty() -> Self {

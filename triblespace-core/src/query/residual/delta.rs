@@ -1883,6 +1883,7 @@ impl DeltaScheduler {
         width: usize,
         stable: &mut Worklist,
         stable_interner: &mut StateInterner,
+        layouts: &mut BoundLayouts,
         stats: &mut ResidualStateStats,
     ) -> ActiveDeltaStepOutcome {
         let has_source = self.has_active_source(active);
@@ -1906,6 +1907,7 @@ impl DeltaScheduler {
                 width.max(1),
                 stable,
                 stable_interner,
+                layouts,
                 stats,
             )
         } else {
@@ -1941,10 +1943,11 @@ impl DeltaScheduler {
         width: usize,
         stable: &mut Worklist,
         stable_interner: &mut StateInterner,
+        layouts: &mut BoundLayouts,
         stats: &mut ResidualStateStats,
     ) -> DeltaStepOutcome {
         if self.worklist.is_empty() {
-            return self.step_source(root, plan, width, stable, stable_interner, stats);
+            return self.step_source(root, plan, width, stable, stable_interner, layouts, stats);
         }
 
         let (desc, tasks) = self.pop(width);
@@ -2193,6 +2196,7 @@ impl DeltaScheduler {
         width: usize,
         stable: &mut Worklist,
         stable_interner: &mut StateInterner,
+        layouts: &mut BoundLayouts,
         stats: &mut ResidualStateStats,
     ) -> DeltaStepOutcome {
         let budget = width.max(1);
@@ -2205,6 +2209,7 @@ impl DeltaScheduler {
             budget,
             stable,
             stable_interner,
+            layouts,
             stats,
         )
     }
@@ -2219,6 +2224,7 @@ impl DeltaScheduler {
         budget: usize,
         stable: &mut Worklist,
         stable_interner: &mut StateInterner,
+        layouts: &mut BoundLayouts,
         stats: &mut ResidualStateStats,
     ) -> DeltaStepOutcome {
         assert!(!tasks.is_empty());
@@ -2250,8 +2256,8 @@ impl DeltaScheduler {
             parents.extend(parent);
             candidate_storage.push(candidates);
         }
-        let vars: Vec<VariableId> = dispatch_key.bound.into_iter().collect();
-        let view = rows_view(&vars, &parents, row_count);
+        let layout = layouts.get_or_insert(dispatch_key.bound);
+        let view = layout.view(&parents, row_count);
         let candidate_sets: Vec<Option<&[RawInline]>> = candidate_storage
             .iter()
             .map(|candidates| candidates.as_deref())
@@ -3209,6 +3215,7 @@ mod tests {
                     1,
                     &mut clone_stable,
                     &mut clone_interner,
+                    &mut BoundLayouts::default(),
                     &mut clone_stats,
                 )
                 .status,
@@ -3243,6 +3250,7 @@ mod tests {
             1,
             &mut stable,
             &mut stable_interner,
+            &mut BoundLayouts::default(),
             &mut stats,
         );
         assert_eq!(source.status, ActiveDeltaStatus::Pending);
@@ -3256,6 +3264,7 @@ mod tests {
             1,
             &mut stable,
             &mut stable_interner,
+            &mut BoundLayouts::default(),
             &mut stats,
         );
         assert_eq!(transition.status, ActiveDeltaStatus::Pending);
@@ -3268,6 +3277,7 @@ mod tests {
             1,
             &mut stable,
             &mut stable_interner,
+            &mut BoundLayouts::default(),
             &mut stats,
         );
         assert_eq!(terminal_source.status, ActiveDeltaStatus::Quiescent);
@@ -3316,6 +3326,7 @@ mod tests {
             1,
             &mut stable,
             &mut stable_interner,
+            &mut BoundLayouts::default(),
             &mut stats,
         );
         assert_eq!(yielded.status, ActiveDeltaStatus::Yielded);
@@ -3366,6 +3377,7 @@ mod tests {
             3,
             &mut stable,
             &mut stable_interner,
+            &mut BoundLayouts::default(),
             &mut stats,
         );
 
@@ -3495,6 +3507,7 @@ mod tests {
             2,
             &mut stable,
             &mut stable_interner,
+            &mut BoundLayouts::default(),
             &mut stats,
         );
 
@@ -3896,6 +3909,7 @@ mod tests {
             2,
             &mut stable,
             &mut stable_interner,
+            &mut BoundLayouts::default(),
             &mut stats,
         );
 

@@ -378,9 +378,9 @@ pub struct RowsView<'v> {
     /// Optional O(1) variable→column index: `cols[v]` is the column of
     /// variable `v`, [`COL_UNBOUND`] when unbound. The sequential engine
     /// maintains one incrementally (its cursor changes one variable at a
-    /// time); the blocked engines pass `None` — they amortize the
-    /// [`col`](Self::col) scan over whole blocks, while the block-of-1
-    /// caller pays it per verb call without the index.
+    /// time), while blocked engines attach the canonical index for their row
+    /// layout. Public ad-hoc views may omit it and let [`col`](Self::col)
+    /// scan the usually small schema.
     cols: Option<&'v [u8; 128]>,
     /// Row count, computed once at construction. Kept as a field so
     /// [`len`](Self::len) — called on every verb of every constraint —
@@ -459,6 +459,27 @@ impl<'v> RowsView<'v> {
             cols: Some(cols),
             n_rows,
         }
+    }
+
+    /// Creates an engine-internal indexed view with an explicit row count.
+    ///
+    /// This combines [`new_with_row_count`](Self::new_with_row_count)'s
+    /// zero-width row multiplicity with [`new_indexed`](Self::new_indexed)'s
+    /// constant-time variable lookup. Blocked engines use it when their
+    /// canonical row layout already owns a variable-to-column index.
+    pub(crate) fn new_indexed_with_row_count(
+        vars: &'v [VariableId],
+        rows: &'v [RawInline],
+        cols: &'v [u8; 128],
+        n_rows: usize,
+    ) -> Self {
+        debug_assert!(vars
+            .iter()
+            .enumerate()
+            .all(|(column, &variable)| cols[variable] as usize == column));
+        let mut view = Self::new_with_row_count(vars, rows, n_rows);
+        view.cols = Some(cols);
+        view
     }
 
     /// Number of values per row (= number of bound variables).
