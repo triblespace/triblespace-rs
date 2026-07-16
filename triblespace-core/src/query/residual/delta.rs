@@ -185,10 +185,12 @@ impl DeltaReducer {
 enum DeltaReturn {
     Stable {
         desc: StateDesc,
+        layout: BoundLayoutId,
         parent: Box<[RawInline]>,
     },
     Formula {
         bound: VariableSet,
+        layout: BoundLayoutId,
         counter: FormulaProgramCounter,
         batch: FormulaBatch,
     },
@@ -716,21 +718,21 @@ impl ProducerRegistry {
     fn source_context(
         &self,
         activation: ActivationId,
-    ) -> (VariableSet, Vec<RawInline>, Option<Vec<RawInline>>) {
+    ) -> (BoundLayoutId, Vec<RawInline>, Option<Vec<RawInline>>) {
         let activation = self
             .state
             .activations
             .get(&activation)
             .expect("unknown delta activation");
-        let (bound, parent) = match &activation.return_to {
-            DeltaReturn::Stable { desc, parent } => (desc.bound, parent.to_vec()),
-            DeltaReturn::Formula { bound, batch, .. } => {
+        let (layout, parent) = match &activation.return_to {
+            DeltaReturn::Stable { layout, parent, .. } => (*layout, parent.to_vec()),
+            DeltaReturn::Formula { layout, batch, .. } => {
                 assert_eq!(batch.parents.row_count, 1);
-                (*bound, batch.parents.rows.clone())
+                (*layout, batch.parents.rows.clone())
             }
         };
         (
-            bound,
+            layout,
             parent,
             activation
                 .source_candidates
@@ -739,17 +741,16 @@ impl ProducerRegistry {
         )
     }
 
-    fn source_dispatch_shape(&self, activation: ActivationId) -> (VariableSet, bool) {
+    fn source_dispatch_shape(&self, activation: ActivationId) -> (BoundLayoutId, bool) {
         let activation = self
             .state
             .activations
             .get(&activation)
             .expect("unknown delta activation");
-        let bound = match &activation.return_to {
-            DeltaReturn::Stable { desc, .. } => desc.bound,
-            DeltaReturn::Formula { bound, .. } => *bound,
+        let layout = match &activation.return_to {
+            DeltaReturn::Stable { layout, .. } | DeltaReturn::Formula { layout, .. } => *layout,
         };
-        (bound, activation.source_candidates.is_some())
+        (layout, activation.source_candidates.is_some())
     }
 
     fn activation_streams(&self, activation: ActivationId) -> bool {
@@ -986,16 +987,16 @@ impl SourceCursorFamily {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SourceDispatchKey {
-    bound: VariableSet,
+    layout: BoundLayoutId,
     has_candidates: bool,
     cursor_family: SourceCursorFamily,
 }
 
 impl SourceDispatchKey {
     fn of(registry: &ProducerRegistry, task: &SourceTask) -> Self {
-        let (bound, has_candidates) = registry.source_dispatch_shape(task.activation);
+        let (layout, has_candidates) = registry.source_dispatch_shape(task.activation);
         Self {
-            bound,
+            layout,
             has_candidates,
             cursor_family: SourceCursorFamily::of(task.cursor),
         }
@@ -1215,6 +1216,7 @@ impl DeltaScheduler {
         &mut self,
         desc: DeltaDesc,
         successor: StateDesc,
+        layout: BoundLayoutId,
         parents: RowBatch,
         seeds: Vec<ResidualDeltaSeed>,
         plan: &ResidualPlan,
@@ -1235,6 +1237,7 @@ impl DeltaScheduler {
                 DeltaReducer::StreamProposal,
                 DeltaReturn::Stable {
                     desc: successor.clone(),
+                    layout,
                     parent,
                 },
                 seeds[range].iter().map(|seed| seed.output),
@@ -1279,6 +1282,7 @@ impl DeltaScheduler {
         &mut self,
         desc: DeltaDesc,
         successor: StateDesc,
+        layout: BoundLayoutId,
         parents: RowBatch,
     ) -> Option<ActiveDeltaContinuation> {
         let stride = successor.bound.count();
@@ -1292,6 +1296,7 @@ impl DeltaScheduler {
                 DeltaReducer::StreamProposal,
                 DeltaReturn::Stable {
                     desc: successor.clone(),
+                    layout,
                     parent,
                 },
                 None,
@@ -1309,6 +1314,7 @@ impl DeltaScheduler {
         &mut self,
         desc: DeltaDesc,
         successor: StateDesc,
+        layout: BoundLayoutId,
         batch: CandidateBatch,
         seeds: Vec<ResidualDeltaSeed>,
     ) -> Option<ActiveDeltaContinuation> {
@@ -1329,6 +1335,7 @@ impl DeltaScheduler {
                 DeltaReducer::Confirm { original },
                 DeltaReturn::Stable {
                     desc: successor.clone(),
+                    layout,
                     parent,
                 },
                 seeds[seed_range].iter().map(|seed| seed.output),
@@ -1352,6 +1359,7 @@ impl DeltaScheduler {
         &mut self,
         desc: DeltaDesc,
         successor: StateDesc,
+        layout: BoundLayoutId,
         batch: CandidateBatch,
     ) -> Option<ActiveDeltaContinuation> {
         let stride = successor.bound.count();
@@ -1372,6 +1380,7 @@ impl DeltaScheduler {
                 DeltaReducer::Confirm { original },
                 DeltaReturn::Stable {
                     desc: successor.clone(),
+                    layout,
                     parent,
                 },
                 Some(source_candidates.into_boxed_slice()),
@@ -1393,6 +1402,7 @@ impl DeltaScheduler {
         &mut self,
         desc: DeltaDesc,
         bound: VariableSet,
+        layout: BoundLayoutId,
         counter: FormulaProgramCounter,
         batch: FormulaBatch,
         seeds: Vec<ResidualDeltaSeed>,
@@ -1430,6 +1440,7 @@ impl DeltaScheduler {
                 reducer,
                 DeltaReturn::Formula {
                     bound,
+                    layout,
                     counter: counter.clone(),
                     batch,
                 },
@@ -1481,6 +1492,7 @@ impl DeltaScheduler {
         &mut self,
         desc: DeltaDesc,
         bound: VariableSet,
+        layout: BoundLayoutId,
         counter: FormulaProgramCounter,
         batch: FormulaBatch,
         stream_proposal: bool,
@@ -1519,6 +1531,7 @@ impl DeltaScheduler {
                 reducer,
                 DeltaReturn::Formula {
                     bound,
+                    layout,
                     counter: counter.clone(),
                     batch,
                 },
@@ -1561,7 +1574,11 @@ impl DeltaScheduler {
             DeltaCompletion::Candidates(result) => result,
         };
         match completed.return_to {
-            DeltaReturn::Stable { desc, parent } => {
+            DeltaReturn::Stable {
+                desc,
+                layout,
+                parent,
+            } => {
                 if result.is_empty() {
                     return None;
                 }
@@ -1570,6 +1587,7 @@ impl DeltaScheduler {
                     stable_interner,
                     plan,
                     desc,
+                    layout,
                     StateBucket::Candidates(CandidateBatch {
                         parents: RowBatch {
                             rows: parent.into_vec(),
@@ -1582,6 +1600,7 @@ impl DeltaScheduler {
             }
             DeltaReturn::Formula {
                 bound,
+                layout,
                 counter,
                 batch,
             } => {
@@ -1598,6 +1617,7 @@ impl DeltaScheduler {
                 finish_formula_action_result(
                     plan,
                     bound,
+                    layout,
                     &counter,
                     batch,
                     CandidatePayload::Values(result),
@@ -1633,11 +1653,16 @@ impl DeltaScheduler {
         stats.max_propose_candidates = stats.max_propose_candidates.max(accepted.len());
         let candidates = CandidatePayload::Values(accepted);
         match streamed.return_to {
-            DeltaReturn::Stable { desc, parent } => file_with_plan(
+            DeltaReturn::Stable {
+                desc,
+                layout,
+                parent,
+            } => file_with_plan(
                 stable,
                 stable_interner,
                 plan,
                 desc,
+                layout,
                 StateBucket::Candidates(CandidateBatch {
                     parents: RowBatch {
                         rows: parent.into_vec(),
@@ -1649,11 +1674,13 @@ impl DeltaScheduler {
             ),
             DeltaReturn::Formula {
                 bound,
+                layout,
                 counter,
                 batch,
             } => finish_formula_action_result(
                 plan,
                 bound,
+                layout,
                 &counter,
                 batch,
                 candidates,
@@ -1675,6 +1702,7 @@ impl DeltaScheduler {
     ) -> Option<ContinuationToken> {
         let DeltaReturn::Formula {
             bound,
+            layout,
             counter,
             batch,
         } = return_to
@@ -1696,6 +1724,7 @@ impl DeltaScheduler {
         propagate_formula_support(
             plan,
             &desc,
+            layout,
             completed,
             truth,
             batch,
@@ -2250,13 +2279,13 @@ impl DeltaScheduler {
         let mut candidate_storage = Vec::with_capacity(row_count);
         for task in &tasks {
             assert_eq!(task.activation, task.credit.key.activation);
-            let (bound, parent, candidates) = self.registry.source_context(task.activation);
-            assert_eq!(bound, dispatch_key.bound);
+            let (layout, parent, candidates) = self.registry.source_context(task.activation);
+            assert_eq!(layout, dispatch_key.layout);
             assert_eq!(candidates.is_some(), dispatch_key.has_candidates);
             parents.extend(parent);
             candidate_storage.push(candidates);
         }
-        let layout = layouts.get_or_insert(dispatch_key.bound);
+        let layout = layouts.get(dispatch_key.layout);
         let view = layout.view(&parents, row_count);
         let candidate_sets: Vec<Option<&[RawInline]>> = candidate_storage
             .iter()
@@ -2767,6 +2796,12 @@ mod tests {
         [byte; 32]
     }
 
+    fn empty_layouts() -> BoundLayouts {
+        let mut layouts = BoundLayouts::default();
+        assert_eq!(layouts.intern(VariableSet::new_empty()), BoundLayoutId(0));
+        layouts
+    }
+
     fn output(byte: u8, continuation: u32, accepted: bool) -> ResidualDeltaOutput {
         ResidualDeltaOutput {
             node: ResidualDeltaNode {
@@ -2800,6 +2835,7 @@ mod tests {
                 bound: VariableSet::new_empty(),
                 phase: ResidualPhase::Ready,
             },
+            layout: BoundLayoutId(0),
             parent: parent.into_boxed_slice(),
         }
     }
@@ -2815,6 +2851,7 @@ mod tests {
                     checked: relevant,
                 },
             },
+            layout: BoundLayoutId(0),
             parent: parent.into_boxed_slice(),
         }
     }
@@ -2831,6 +2868,7 @@ mod tests {
             .expect("the synthetic root has a formula program");
         DeltaReturn::Formula {
             bound: VariableSet::new_empty(),
+            layout: BoundLayoutId(0),
             counter,
             batch: FormulaBatch::from_proposal(
                 RowBatch {
@@ -2847,6 +2885,7 @@ mod tests {
         let relevant = ChildSet::empty(1).with_inserted(0);
         DeltaReturn::Formula {
             bound: VariableSet::new_empty(),
+            layout: BoundLayoutId(0),
             counter: FormulaProgramCounter {
                 focus: FormulaFocus::Action {
                     node: FormulaNodeId(7),
@@ -3143,6 +3182,7 @@ mod tests {
         let seeded = scheduler.seed_proposals(
             DeltaDesc::leaf(0, 0),
             successor.clone(),
+            BoundLayoutId(0),
             RowBatch {
                 rows: Vec::new(),
                 row_count: 2,
@@ -3168,6 +3208,7 @@ mod tests {
         let empty = scheduler.seed_proposals(
             DeltaDesc::leaf(0, 0),
             successor,
+            BoundLayoutId(0),
             RowBatch {
                 rows: Vec::new(),
                 row_count: 1,
@@ -3195,6 +3236,7 @@ mod tests {
                     bound: VariableSet::new_empty(),
                     phase: ResidualPhase::Ready,
                 },
+                BoundLayoutId(0),
                 RowBatch {
                     rows: Vec::new(),
                     row_count: 1,
@@ -3215,7 +3257,7 @@ mod tests {
                     1,
                     &mut clone_stable,
                     &mut clone_interner,
-                    &mut BoundLayouts::default(),
+                    &mut empty_layouts(),
                     &mut clone_stats,
                 )
                 .status,
@@ -3250,7 +3292,7 @@ mod tests {
             1,
             &mut stable,
             &mut stable_interner,
-            &mut BoundLayouts::default(),
+            &mut empty_layouts(),
             &mut stats,
         );
         assert_eq!(source.status, ActiveDeltaStatus::Pending);
@@ -3264,7 +3306,7 @@ mod tests {
             1,
             &mut stable,
             &mut stable_interner,
-            &mut BoundLayouts::default(),
+            &mut empty_layouts(),
             &mut stats,
         );
         assert_eq!(transition.status, ActiveDeltaStatus::Pending);
@@ -3277,7 +3319,7 @@ mod tests {
             1,
             &mut stable,
             &mut stable_interner,
-            &mut BoundLayouts::default(),
+            &mut empty_layouts(),
             &mut stats,
         );
         assert_eq!(terminal_source.status, ActiveDeltaStatus::Quiescent);
@@ -3326,7 +3368,7 @@ mod tests {
             1,
             &mut stable,
             &mut stable_interner,
-            &mut BoundLayouts::default(),
+            &mut empty_layouts(),
             &mut stats,
         );
         assert_eq!(yielded.status, ActiveDeltaStatus::Yielded);
@@ -3377,7 +3419,7 @@ mod tests {
             3,
             &mut stable,
             &mut stable_interner,
-            &mut BoundLayouts::default(),
+            &mut empty_layouts(),
             &mut stats,
         );
 
@@ -3507,7 +3549,7 @@ mod tests {
             2,
             &mut stable,
             &mut stable_interner,
-            &mut BoundLayouts::default(),
+            &mut empty_layouts(),
             &mut stats,
         );
 
@@ -3894,6 +3936,7 @@ mod tests {
                 bound: VariableSet::new_empty(),
                 phase: ResidualPhase::Ready,
             },
+            BoundLayoutId(0),
             RowBatch {
                 rows: Vec::new(),
                 row_count: 2,
@@ -3909,7 +3952,7 @@ mod tests {
             2,
             &mut stable,
             &mut stable_interner,
-            &mut BoundLayouts::default(),
+            &mut empty_layouts(),
             &mut stats,
         );
 
@@ -3938,12 +3981,17 @@ mod tests {
 
     #[test]
     fn source_pop_cohorts_by_physical_shape_without_refining_delta_identity() {
-        fn return_with_bound(bound: VariableSet, parent: RawInline) -> DeltaReturn {
+        fn return_with_bound(
+            bound: VariableSet,
+            layout: BoundLayoutId,
+            parent: RawInline,
+        ) -> DeltaReturn {
             DeltaReturn::Stable {
                 desc: StateDesc {
                     bound,
                     phase: ResidualPhase::Ready,
                 },
+                layout,
                 parent: vec![parent].into_boxed_slice(),
             }
         }
@@ -3952,7 +4000,10 @@ mod tests {
         let desc = DeltaDesc::leaf(0, 0);
         let schema_a = VariableSet::new_singleton(0);
         let schema_b = VariableSet::new_singleton(1);
+        let layout_a = BoundLayoutId(11);
+        let layout_b = BoundLayoutId(12);
         let mut source_task = |bound: VariableSet,
+                               layout: BoundLayoutId,
                                candidates: Option<Box<[RawInline]>>,
                                cursor: ResidualDeltaSourceCursor,
                                parent: RawInline| {
@@ -3965,7 +4016,7 @@ mod tests {
             };
             let (activation, credit) = scheduler.registry.start_source(
                 reducer,
-                return_with_bound(bound, parent),
+                return_with_bound(bound, layout, parent),
                 candidates,
             );
             SourceTask {
@@ -3978,21 +4029,41 @@ mod tests {
         // All five activations retain one canonical DeltaDesc bucket. The two
         // final tasks alone share schema, candidate mode, and cursor family.
         let tasks = vec![
-            source_task(schema_b, None, ResidualDeltaSourceCursor::Start, value(1)),
+            source_task(
+                schema_b,
+                layout_b,
+                None,
+                ResidualDeltaSourceCursor::Start,
+                value(1),
+            ),
             source_task(
                 schema_a,
+                layout_a,
                 Some(vec![value(9)].into_boxed_slice()),
                 ResidualDeltaSourceCursor::Start,
                 value(2),
             ),
             source_task(
                 schema_a,
+                layout_a,
                 None,
                 ResidualDeltaSourceCursor::After(value(3)),
                 value(3),
             ),
-            source_task(schema_a, None, ResidualDeltaSourceCursor::Start, value(4)),
-            source_task(schema_a, None, ResidualDeltaSourceCursor::Start, value(5)),
+            source_task(
+                schema_a,
+                layout_a,
+                None,
+                ResidualDeltaSourceCursor::Start,
+                value(4),
+            ),
+            source_task(
+                schema_a,
+                layout_a,
+                None,
+                ResidualDeltaSourceCursor::Start,
+                value(5),
+            ),
         ];
         let _ = scheduler.file_source(desc.clone(), tasks);
         assert_eq!(scheduler.interner.descs, [desc]);
@@ -4003,7 +4074,7 @@ mod tests {
         assert!(compatible.iter().all(|task| {
             SourceDispatchKey::of(&scheduler.registry, task)
                 == SourceDispatchKey {
-                    bound: schema_a,
+                    layout: layout_a,
                     has_candidates: false,
                     cursor_family: SourceCursorFamily::Start,
                 }
@@ -4021,8 +4092,8 @@ mod tests {
         let (_, other_schema) = scheduler.pop_source(8);
         assert_eq!(other_schema.len(), 1);
         assert_eq!(
-            SourceDispatchKey::of(&scheduler.registry, &other_schema[0]).bound,
-            schema_b
+            SourceDispatchKey::of(&scheduler.registry, &other_schema[0]).layout,
+            layout_b
         );
         assert!(scheduler.source_worklist.is_empty());
         assert_eq!(scheduler.interner.descs.len(), 1);
@@ -4059,6 +4130,7 @@ mod tests {
             DeltaReducer::QuiescentProposal,
             DeltaReturn::Formula {
                 bound,
+                layout: BoundLayoutId(0),
                 counter: counter.clone(),
                 batch,
             },
@@ -4088,6 +4160,7 @@ mod tests {
                 bound: returned_bound,
                 counter: returned_counter,
                 batch: returned_batch,
+                ..
             } = completed.return_to
             else {
                 panic!("formula activation returned to a stable continuation")
@@ -4147,6 +4220,7 @@ mod tests {
             DeltaReducer::QuiescentProposal,
             DeltaReturn::Formula {
                 bound,
+                layout: BoundLayoutId(0),
                 counter: counter.clone(),
                 batch,
             },
@@ -4188,6 +4262,7 @@ mod tests {
                 bound: returned_bound,
                 counter: returned_counter,
                 batch: returned_batch,
+                ..
             } = completed.return_to
             else {
                 panic!("formula source returned to a stable continuation")
@@ -4246,6 +4321,7 @@ mod tests {
                 DeltaReducer::QuiescentProposal,
                 DeltaReturn::Formula {
                     bound: VariableSet::new_singleton(0),
+                    layout: BoundLayoutId(0),
                     counter,
                     batch,
                 },

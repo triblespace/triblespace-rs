@@ -2760,6 +2760,14 @@ impl StateDesc {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct StateId(u32);
 
+/// Query-local arena handle for one canonical physical row layout.
+///
+/// This is deliberately absent from [`StateDesc`]: semantic state identity
+/// remains the exact bound set plus future computation. The state interner
+/// associates each descriptor with the arena handle as derived physical data.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct BoundLayoutId(u32);
+
 /// Canonical physical row layout for one bound-variable set.
 ///
 /// Residual state identity already carries the exact `u128` [`VariableSet`],
@@ -2769,6 +2777,7 @@ struct StateId(u32);
 /// column at which an unbound variable enters the successor schema.
 #[derive(Clone, Debug)]
 struct BoundLayout {
+    bound: VariableSet,
     vars: Box<[VariableId]>,
     cols: [u8; 128],
     insertions: [u8; 128],
@@ -2791,6 +2800,7 @@ impl BoundLayout {
         }
         debug_assert_eq!(column, bound.count());
         Self {
+            bound,
             vars: vars.into_boxed_slice(),
             cols,
             insertions,
@@ -2819,31 +2829,50 @@ impl BoundLayout {
     }
 }
 
-/// Query-local interner for physical row layouts, keyed by the canonical
-/// `u128` representation already carried by [`VariableSet`].
+/// Query-local arena for physical row layouts.
+///
+/// The canonical map is consulted only when a bound set first enters the
+/// arena. Stable states carry [`BoundLayoutId`] beside their exact descriptor,
+/// while same-bound transitions inherit that ID. Only a transition that adds
+/// a variable asks the arena to intern its successor bound set.
 #[derive(Clone, Default)]
 struct BoundLayouts {
-    layouts: HashMap<u128, Arc<BoundLayout>, ahash::RandomState>,
+    by_bound: HashMap<u128, BoundLayoutId, ahash::RandomState>,
+    layouts: Vec<Arc<BoundLayout>>,
     #[cfg(test)]
-    lookups: usize,
+    hash_lookups: usize,
     #[cfg(test)]
     builds: usize,
 }
 
 impl BoundLayouts {
     #[inline]
-    fn get_or_insert(&mut self, bound: VariableSet) -> &BoundLayout {
+    fn intern(&mut self, bound: VariableSet) -> BoundLayoutId {
         let key = bound.bits();
         #[cfg(test)]
         {
-            self.lookups += 1;
-            self.builds += usize::from(!self.layouts.contains_key(&key));
+            self.hash_lookups += 1;
         }
-        let layout = self
-            .layouts
-            .entry(key)
-            .or_insert_with(|| Arc::new(BoundLayout::new(bound)));
-        layout
+        if let Some(&id) = self.by_bound.get(&key) {
+            return id;
+        }
+        let id = BoundLayoutId(
+            u32::try_from(self.layouts.len()).expect("too many residual bound layouts"),
+        );
+        self.layouts.push(Arc::new(BoundLayout::new(bound)));
+        self.by_bound.insert(key, id);
+        #[cfg(test)]
+        {
+            self.builds += 1;
+        }
+        id
+    }
+
+    #[inline]
+    fn get(&self, id: BoundLayoutId) -> &BoundLayout {
+        self.layouts
+            .get(id.0 as usize)
+            .expect("interned residual bound layout exists")
     }
 }
 
@@ -2851,6 +2880,8 @@ impl BoundLayouts {
 struct StateInterner {
     // The insertion index is the stable StateId; hashing never determines IDs.
     descs: IndexSet<StateDesc, ahash::RandomState>,
+    /// Physical row layout derived from the descriptor at the same index.
+    layouts: Vec<BoundLayoutId>,
 }
 
 impl StateInterner {
@@ -2858,12 +2889,17 @@ impl StateInterner {
     fn intern_with_status(
         &mut self,
         desc: StateDesc,
+        layout: BoundLayoutId,
         stats: &mut ResidualStateStats,
     ) -> (StateId, bool) {
         // Preserve successful lookups after the representable StateId space is
         // full, while rejecting a genuinely new state before mutating the set.
         if self.descs.len() > u32::MAX as usize {
             if let Some(raw) = self.descs.get_index_of(&desc) {
+                assert_eq!(
+                    self.layouts[raw], layout,
+                    "one residual state was associated with different bound layouts"
+                );
                 stats.interner_hits += 1;
                 return (StateId(raw as u32), true);
             }
@@ -2872,9 +2908,19 @@ impl StateInterner {
         let (raw, inserted) = self.descs.insert_full(desc);
         let id = StateId(u32::try_from(raw).expect("too many residual states"));
         if inserted {
+            assert_eq!(
+                raw,
+                self.layouts.len(),
+                "residual state/layout arenas lost insertion alignment"
+            );
+            self.layouts.push(layout);
             stats.states_interned += 1;
             (id, false)
         } else {
+            assert_eq!(
+                self.layouts[raw], layout,
+                "one residual state was associated with different bound layouts"
+            );
             stats.interner_hits += 1;
             (id, true)
         }
@@ -2884,6 +2930,13 @@ impl StateInterner {
         self.descs
             .get_index(id.0 as usize)
             .expect("interned residual state exists")
+    }
+
+    fn layout(&self, id: StateId) -> BoundLayoutId {
+        *self
+            .layouts
+            .get(id.0 as usize)
+            .expect("interned residual state has a bound layout")
     }
 }
 
@@ -4245,6 +4298,7 @@ impl ResidualActionTask {
 #[derive(Debug)]
 struct SelectedResidualTask {
     state: StateId,
+    layout: BoundLayoutId,
     desc: StateDesc,
     bucket: StateBucket,
 }
@@ -4483,6 +4537,7 @@ fn file_with_span(
     action_span: usize,
     formula: Option<&FiniteFormulaProgram>,
     desc: StateDesc,
+    layout: BoundLayoutId,
     bucket: StateBucket,
     stats: &mut ResidualStateStats,
 ) -> Option<ContinuationToken> {
@@ -4496,7 +4551,7 @@ fn file_with_span(
         StateBucket::Formula(batch) => batch.page_candidate_count(),
     };
     let rank = desc.rank_with_span(leaf_count, action_span, formula);
-    let (id, known) = interner.intern_with_status(desc, stats);
+    let (id, known) = interner.intern_with_status(desc, layout, stats);
     let level = worklist.entry(rank).or_default();
     if let Some(existing) = level.get_mut(&id) {
         stats.bucket_merges += 1;
@@ -4522,6 +4577,7 @@ fn file_with_plan(
     interner: &mut StateInterner,
     plan: &ResidualPlan,
     desc: StateDesc,
+    layout: BoundLayoutId,
     bucket: StateBucket,
     stats: &mut ResidualStateStats,
 ) -> Option<ContinuationToken> {
@@ -4532,6 +4588,7 @@ fn file_with_plan(
         plan.action_span(),
         Some(&plan.finite_formula),
         desc,
+        layout,
         bucket,
         stats,
     )
@@ -4543,10 +4600,13 @@ fn file(
     interner: &mut StateInterner,
     leaf_count: usize,
     desc: StateDesc,
+    layout: BoundLayoutId,
     bucket: StateBucket,
     stats: &mut ResidualStateStats,
 ) -> Option<ContinuationToken> {
-    file_with_span(worklist, interner, leaf_count, 2, None, desc, bucket, stats)
+    file_with_span(
+        worklist, interner, leaf_count, 2, None, desc, layout, bucket, stats,
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -4609,6 +4669,7 @@ fn ready_plan_transition<'a>(
     root: &dyn Constraint<'a>,
     plan: &ResidualPlan,
     desc: &StateDesc,
+    layout_id: BoundLayoutId,
     layout: &BoundLayout,
     rows: RowBatch,
     full: VariableSet,
@@ -4750,6 +4811,7 @@ fn ready_plan_transition<'a>(
                     proposer: action.leaf,
                 },
             },
+            layout_id,
             StateBucket::Rows(selected),
             stats,
         )
@@ -4775,6 +4837,7 @@ fn propose_action_transition<'a>(
     root: &dyn Constraint<'a>,
     plan: &ResidualPlan,
     desc: &StateDesc,
+    layout_id: BoundLayoutId,
     layout: &BoundLayout,
     variable: VariableId,
     relevant: &ChildSet,
@@ -4807,6 +4870,7 @@ fn propose_action_transition<'a>(
                 bound: desc.bound,
                 phase: ResidualPhase::Formula { counter },
             },
+            layout_id,
             StateBucket::Formula(FormulaBatch::from_proposal(
                 rows,
                 activations,
@@ -4850,6 +4914,7 @@ fn propose_action_transition<'a>(
                     checked,
                 },
             },
+            layout_id,
             StateBucket::Candidates(candidate),
             stats,
         )
@@ -4861,13 +4926,15 @@ fn propose_action_transition<'a>(
 fn commit_candidates(
     plan: &ResidualPlan,
     desc: &StateDesc,
-    layout: &BoundLayout,
+    layout_id: BoundLayoutId,
+    layouts: &mut BoundLayouts,
     variable: VariableId,
     batch: CandidateBatch,
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
 ) -> Option<ContinuationToken> {
+    let layout = layouts.get(layout_id);
     let mut next_bound = desc.bound;
     next_bound.set(variable);
     let parent_stride = layout.stride();
@@ -4897,6 +4964,7 @@ fn commit_candidates(
     }
 
     let row_count = next_rows.len() / next_stride;
+    let next_layout = layouts.intern(next_bound);
     file_with_plan(
         worklist,
         interner,
@@ -4905,6 +4973,7 @@ fn commit_candidates(
             bound: next_bound,
             phase: ResidualPhase::Ready,
         },
+        next_layout,
         StateBucket::Rows(RowBatch {
             rows: next_rows,
             row_count,
@@ -4917,7 +4986,8 @@ fn candidate_plan_transition<'a>(
     root: &dyn Constraint<'a>,
     plan: &ResidualPlan,
     desc: &StateDesc,
-    layout: &BoundLayout,
+    layout_id: BoundLayoutId,
+    layouts: &mut BoundLayouts,
     variable: VariableId,
     relevant: &ChildSet,
     checked: &ChildSet,
@@ -4929,11 +4999,12 @@ fn candidate_plan_transition<'a>(
     let leaf_count = plan.len();
     if relevant == checked {
         return commit_candidates(
-            plan, desc, layout, variable, batch, worklist, interner, stats,
+            plan, desc, layout_id, layouts, variable, batch, worklist, interner, stats,
         )
         .expect("fully checked candidates committed no rows");
     }
 
+    let layout = layouts.get(layout_id);
     let view = layout.view(&batch.parents.rows, batch.parents.row_count);
     let mut confirmers = vec![usize::MAX; batch.parents.row_count];
     let mut estimates = vec![usize::MAX; batch.parents.row_count];
@@ -4991,6 +5062,7 @@ fn candidate_plan_transition<'a>(
                     confirmer,
                 },
             },
+            layout_id,
             StateBucket::Candidates(selected),
             stats,
         )
@@ -5014,6 +5086,7 @@ fn confirm_action_transition<'a>(
     root: &dyn Constraint<'a>,
     plan: &ResidualPlan,
     desc: &StateDesc,
+    layout_id: BoundLayoutId,
     layout: &BoundLayout,
     variable: VariableId,
     relevant: &ChildSet,
@@ -5047,6 +5120,7 @@ fn confirm_action_transition<'a>(
                 bound: desc.bound,
                 phase: ResidualPhase::Formula { counter },
             },
+            layout_id,
             StateBucket::Formula(FormulaBatch::from_confirmation(
                 batch,
                 activations,
@@ -5084,6 +5158,7 @@ fn confirm_action_transition<'a>(
                     checked: checked.with_inserted(confirmer),
                 },
             },
+            layout_id,
             StateBucket::Candidates(batch),
             stats,
         )
@@ -5095,6 +5170,7 @@ fn confirm_action_transition<'a>(
 fn finish_formula_transition(
     plan: &ResidualPlan,
     desc: &StateDesc,
+    layout_id: BoundLayoutId,
     resume: &FormulaOuterResume,
     batch: FormulaBatch,
     worklist: &mut Worklist,
@@ -5126,6 +5202,7 @@ fn finish_formula_transition(
                 checked,
             },
         },
+        layout_id,
         StateBucket::Candidates(candidate),
         stats,
     )
@@ -5138,6 +5215,7 @@ fn finish_formula_transition(
 fn propagate_formula_support(
     plan: &ResidualPlan,
     desc: &StateDesc,
+    layout_id: BoundLayoutId,
     completed: FormulaProgramCounter,
     truth: bool,
     batch: FormulaBatch,
@@ -5175,7 +5253,7 @@ fn propagate_formula_support(
                     .finite_formula
                     .complete_support_short_circuit(&parent, truth);
                 return propagate_formula_support(
-                    plan, desc, completed, truth, batch, worklist, interner, stats,
+                    plan, desc, layout_id, completed, truth, batch, worklist, interner, stats,
                 );
             }
             if done.count()
@@ -5186,7 +5264,7 @@ fn propagate_formula_support(
             {
                 let completed = plan.finite_formula.complete(&parent);
                 return propagate_formula_support(
-                    plan, desc, completed, identity, batch, worklist, interner, stats,
+                    plan, desc, layout_id, completed, identity, batch, worklist, interner, stats,
                 );
             }
             file_with_plan(
@@ -5197,6 +5275,7 @@ fn propagate_formula_support(
                     bound: desc.bound,
                     phase: ResidualPhase::Formula { counter: parent },
                 },
+                layout_id,
                 StateBucket::Formula(batch),
                 stats,
             )
@@ -5211,7 +5290,9 @@ fn propagate_formula_support(
             if truth {
                 enter_selected_formula_frame(&plan.finite_formula, &next, &mut batch);
             }
-            continue_formula_transition(plan, desc, next, batch, worklist, interner, stats)
+            continue_formula_transition(
+                plan, desc, layout_id, next, batch, worklist, interner, stats,
+            )
         }
         FormulaSuccessor::Outer(_) => {
             unreachable!("support traversal escaped without an OR guard")
@@ -5222,6 +5303,7 @@ fn propagate_formula_support(
 fn continue_formula_transition(
     plan: &ResidualPlan,
     desc: &StateDesc,
+    layout_id: BoundLayoutId,
     mut counter: FormulaProgramCounter,
     batch: FormulaBatch,
     worklist: &mut Worklist,
@@ -5242,7 +5324,7 @@ fn continue_formula_transition(
             let truth = matches!(formula_node.kind, FiniteFormulaNodeKind::And { .. });
             let completed = plan.finite_formula.complete(&counter);
             return propagate_formula_support(
-                plan, desc, completed, truth, batch, worklist, interner, stats,
+                plan, desc, layout_id, completed, truth, batch, worklist, interner, stats,
             );
         }
     }
@@ -5267,6 +5349,7 @@ fn continue_formula_transition(
                         continue_formula_transition(
                             plan,
                             desc,
+                            layout_id,
                             counter.clone(),
                             batch,
                             worklist,
@@ -5320,6 +5403,7 @@ fn continue_formula_transition(
                 bound: desc.bound,
                 phase: ResidualPhase::Formula { counter },
             },
+            layout_id,
             StateBucket::Formula(batch),
             stats,
         );
@@ -5330,14 +5414,16 @@ fn continue_formula_transition(
         FormulaSuccessor::Formula(next) => {
             let mut batch = batch;
             batch.return_frame();
-            continue_formula_transition(plan, desc, next, batch, worklist, interner, stats)
+            continue_formula_transition(
+                plan, desc, layout_id, next, batch, worklist, interner, stats,
+            )
         }
         FormulaSuccessor::Guard { .. } => {
             unreachable!("ordinary formula completion returned through a support guard")
         }
-        FormulaSuccessor::Outer(resume) => {
-            finish_formula_transition(plan, desc, &resume, batch, worklist, interner, stats)
-        }
+        FormulaSuccessor::Outer(resume) => finish_formula_transition(
+            plan, desc, layout_id, &resume, batch, worklist, interner, stats,
+        ),
     }
 }
 
@@ -5346,6 +5432,7 @@ fn formula_plan_transition<'a>(
     root: &dyn Constraint<'a>,
     plan: &ResidualPlan,
     desc: &StateDesc,
+    layout_id: BoundLayoutId,
     layout: &BoundLayout,
     counter: &FormulaProgramCounter,
     batch: FormulaBatch,
@@ -5358,15 +5445,17 @@ fn formula_plan_transition<'a>(
     };
     if *stage == FormulaStage::Support {
         return formula_support_plan_transition(
-            plan, desc, counter, batch, worklist, interner, stats,
+            plan, desc, layout_id, counter, batch, worklist, interner, stats,
         );
     }
     match &plan.finite_formula.node(*node).kind {
         FiniteFormulaNodeKind::Or { children } => formula_or_plan_transition(
-            root, plan, desc, layout, counter, children, batch, worklist, interner, stats,
+            root, plan, desc, layout_id, layout, counter, children, batch, worklist, interner,
+            stats,
         ),
         FiniteFormulaNodeKind::And { children } => formula_and_plan_transition(
-            root, plan, desc, layout, counter, children, batch, worklist, interner, stats,
+            root, plan, desc, layout_id, layout, counter, children, batch, worklist, interner,
+            stats,
         ),
         FiniteFormulaNodeKind::Atom => panic!("a formula Plan named an Atom"),
     }
@@ -5376,6 +5465,7 @@ fn formula_plan_transition<'a>(
 fn formula_support_plan_transition(
     plan: &ResidualPlan,
     desc: &StateDesc,
+    layout_id: BoundLayoutId,
     counter: &FormulaProgramCounter,
     batch: FormulaBatch,
     worklist: &mut Worklist,
@@ -5400,6 +5490,7 @@ fn formula_support_plan_transition(
         return continue_formula_transition(
             plan,
             desc,
+            layout_id,
             counter.clone(),
             batch,
             worklist,
@@ -5408,7 +5499,9 @@ fn formula_support_plan_transition(
         );
     };
     let next = select_formula_child(&plan.finite_formula, counter, children, child);
-    continue_formula_transition(plan, desc, next, batch, worklist, interner, stats)
+    continue_formula_transition(
+        plan, desc, layout_id, next, batch, worklist, interner, stats,
+    )
 }
 
 fn select_formula_child(
@@ -5440,6 +5533,7 @@ fn formula_or_plan_transition<'a>(
     root: &dyn Constraint<'a>,
     plan: &ResidualPlan,
     desc: &StateDesc,
+    layout_id: BoundLayoutId,
     layout: &BoundLayout,
     counter: &FormulaProgramCounter,
     children: &[FormulaNodeId],
@@ -5505,7 +5599,9 @@ fn formula_or_plan_transition<'a>(
         let counter = plan.finite_formula.guard_child(counter, child);
         prefer_continuation(
             &mut continuation,
-            continue_formula_transition(plan, desc, counter, batch, worklist, interner, stats),
+            continue_formula_transition(
+                plan, desc, layout_id, counter, batch, worklist, interner, stats,
+            ),
         );
     }
     continuation
@@ -5516,6 +5612,7 @@ fn formula_and_plan_transition<'a>(
     root: &dyn Constraint<'a>,
     plan: &ResidualPlan,
     desc: &StateDesc,
+    layout_id: BoundLayoutId,
     layout: &BoundLayout,
     counter: &FormulaProgramCounter,
     children: &[FormulaNodeId],
@@ -5568,7 +5665,9 @@ fn formula_and_plan_transition<'a>(
         unreachable!("AND relevance planning preserves a Plan")
     };
     if done.count() == children.len() {
-        return continue_formula_transition(plan, desc, next, batch, worklist, interner, stats);
+        return continue_formula_transition(
+            plan, desc, layout_id, next, batch, worklist, interner, stats,
+        );
     }
     let first = estimates_by_child
         .first()
@@ -5591,7 +5690,9 @@ fn formula_and_plan_transition<'a>(
         enter_selected_formula_frame(&plan.finite_formula, &counter, &mut batch);
         prefer_continuation(
             &mut continuation,
-            continue_formula_transition(plan, desc, counter, batch, worklist, interner, stats),
+            continue_formula_transition(
+                plan, desc, layout_id, counter, batch, worklist, interner, stats,
+            ),
         );
     }
     continuation
@@ -5601,6 +5702,7 @@ fn formula_and_plan_transition<'a>(
 fn finish_formula_action_result(
     plan: &ResidualPlan,
     bound: VariableSet,
+    layout_id: BoundLayoutId,
     counter: &FormulaProgramCounter,
     mut batch: FormulaBatch,
     result: CandidatePayload,
@@ -5622,15 +5724,15 @@ fn finish_formula_action_result(
         },
     };
     match plan.finite_formula.resume(&completed) {
-        FormulaSuccessor::Formula(next) => {
-            continue_formula_transition(plan, &desc, next, batch, worklist, interner, stats)
-        }
+        FormulaSuccessor::Formula(next) => continue_formula_transition(
+            plan, &desc, layout_id, next, batch, worklist, interner, stats,
+        ),
         FormulaSuccessor::Guard { .. } => {
             unreachable!("candidate action returned through a support guard")
         }
-        FormulaSuccessor::Outer(resume) => {
-            finish_formula_transition(plan, &desc, &resume, batch, worklist, interner, stats)
-        }
+        FormulaSuccessor::Outer(resume) => finish_formula_transition(
+            plan, &desc, layout_id, &resume, batch, worklist, interner, stats,
+        ),
     }
 }
 
@@ -5639,6 +5741,7 @@ fn formula_action_transition<'a>(
     root: &dyn Constraint<'a>,
     plan: &ResidualPlan,
     desc: &StateDesc,
+    layout_id: BoundLayoutId,
     layout: &BoundLayout,
     counter: &FormulaProgramCounter,
     batch: FormulaBatch,
@@ -5668,6 +5771,7 @@ fn formula_action_transition<'a>(
                 propagate_formula_support(
                     plan,
                     desc,
+                    layout_id,
                     completed.clone(),
                     truth,
                     batch,
@@ -5721,7 +5825,7 @@ fn formula_action_transition<'a>(
         }
     }
     finish_formula_action_result(
-        plan, desc.bound, counter, batch, result, worklist, interner, stats,
+        plan, desc.bound, layout_id, counter, batch, result, worklist, interner, stats,
     )
 }
 
@@ -5779,10 +5883,15 @@ fn execute_task<'a>(
 ) -> StepOutcome {
     let SelectedResidualTask {
         state: _,
+        layout: layout_id,
         desc,
         bucket,
     } = task;
-    let layout = layouts.get_or_insert(desc.bound);
+    assert_eq!(
+        layouts.get(layout_id).bound,
+        desc.bound,
+        "interned residual state/layout association changed row schema"
+    );
     match (&desc.phase, bucket) {
         (ResidualPhase::Ready, StateBucket::Rows(rows)) if desc.bound == full => {
             stats.emit_pops += 1;
@@ -5790,10 +5899,12 @@ fn execute_task<'a>(
         }
         (ResidualPhase::Ready, StateBucket::Rows(rows)) => {
             stats.ready_plan_pops += 1;
+            let layout = layouts.get(layout_id);
             let continuation = ready_plan_transition(
                 root,
                 plan,
                 &desc,
+                layout_id,
                 layout,
                 rows,
                 full,
@@ -5816,10 +5927,12 @@ fn execute_task<'a>(
             if !plan.has_finite_formula(*proposer) {
                 stats.propose_action_pops += 1;
             }
+            let layout = layouts.get(layout_id);
             let continuation = propose_action_transition(
                 root,
                 plan,
                 &desc,
+                layout_id,
                 layout,
                 *variable,
                 relevant,
@@ -5847,8 +5960,8 @@ fn execute_task<'a>(
         ) => {
             stats.candidate_plan_pops += 1;
             let continuation = candidate_plan_transition(
-                root, plan, &desc, layout, *variable, relevant, checked, batch, worklist, interner,
-                stats,
+                root, plan, &desc, layout_id, layouts, *variable, relevant, checked, batch,
+                worklist, interner, stats,
             );
             StepOutcome::Advanced(continuation)
         }
@@ -5864,10 +5977,12 @@ fn execute_task<'a>(
             if !plan.has_finite_formula(*confirmer) {
                 stats.confirm_action_pops += 1;
             }
+            let layout = layouts.get(layout_id);
             let continuation = confirm_action_transition(
                 root,
                 plan,
                 &desc,
+                layout_id,
                 layout,
                 *variable,
                 relevant,
@@ -5888,9 +6003,10 @@ fn execute_task<'a>(
         }
         (ResidualPhase::Formula { counter }, StateBucket::Formula(batch)) => {
             let is_action = matches!(counter.focus, FormulaFocus::Action { .. });
+            let layout = layouts.get(layout_id);
             let continuation = match &counter.focus {
                 FormulaFocus::Plan { .. } => formula_plan_transition(
-                    root, plan, &desc, layout, counter, batch, worklist, interner, stats,
+                    root, plan, &desc, layout_id, layout, counter, batch, worklist, interner, stats,
                 ),
                 FormulaFocus::Action { stage, .. } => {
                     match stage {
@@ -5899,7 +6015,8 @@ fn execute_task<'a>(
                         FormulaStage::Confirm => stats.confirm_action_pops += 1,
                     }
                     formula_action_transition(
-                        root, plan, &desc, layout, counter, batch, worklist, interner, stats,
+                        root, plan, &desc, layout_id, layout, counter, batch, worklist, interner,
+                        stats,
                     )
                 }
                 FormulaFocus::Complete { .. } => {
@@ -6024,6 +6141,7 @@ fn execute_state<'a>(
 ) -> StepOutcome {
     let mut next_activation = 0;
     let mut layouts = BoundLayouts::default();
+    let layout = layouts.intern(desc.bound);
     execute_task(
         root,
         plan,
@@ -6032,6 +6150,7 @@ fn execute_state<'a>(
             // executor does not consult this synthetic identity; production
             // eager and lazy paths always carry the exact selected StateId.
             state: StateId(u32::MAX),
+            layout,
             desc: desc.clone(),
             bucket,
         },
@@ -6067,7 +6186,7 @@ struct ResidualStateMachine {
     delta: DeltaScheduler,
     stats: ResidualStateStats,
     binding: Binding,
-    emit_bound: VariableSet,
+    emit_layout: Option<BoundLayoutId>,
     emit_rows: Vec<RawInline>,
     emit_next: usize,
     emit_count: usize,
@@ -6286,7 +6405,7 @@ impl ResidualStateMachine {
             delta: DeltaScheduler::new(),
             stats: ResidualStateStats::default(),
             binding: Binding::default(),
-            emit_bound: VariableSet::new_empty(),
+            emit_layout: None,
             emit_rows: Vec::new(),
             emit_next: 0,
             emit_count: 0,
@@ -6301,6 +6420,7 @@ impl ResidualStateMachine {
             cap,
         };
         if matches!(mode, Search::NextVariable) {
+            let seed_layout = state.layouts.intern(seed.bound);
             file_with_span(
                 &mut state.worklist,
                 &mut state.interner,
@@ -6311,6 +6431,7 @@ impl ResidualStateMachine {
                     bound: seed.bound,
                     phase: ResidualPhase::Ready,
                 },
+                seed_layout,
                 StateBucket::Rows(RowBatch {
                     rows: seed.values,
                     row_count: 1,
@@ -6430,6 +6551,7 @@ impl ResidualStateMachine {
         }
         Some(SelectedResidualTask {
             state: id,
+            layout: self.interner.layout(id),
             desc,
             bucket: chunk,
         })
@@ -6513,6 +6635,7 @@ impl ResidualStateMachine {
         }
         SelectedResidualTask {
             state: token.state,
+            layout: self.interner.layout(token.state),
             desc,
             bucket: chunk,
         }
@@ -6568,7 +6691,7 @@ impl ResidualStateMachine {
         let proposer = *proposer;
         let relevant = relevant.clone();
 
-        let layout = self.layouts.get_or_insert(task.desc.bound);
+        let layout = self.layouts.get(task.layout);
         let view = layout.view(&rows.rows, rows.row_count);
         let constraint = plan.resolve(root, proposer);
         if constraint.residual_delta_source_is_paged(variable, &view)
@@ -6576,6 +6699,7 @@ impl ResidualStateMachine {
         {
             let SelectedResidualTask {
                 state: _,
+                layout,
                 desc,
                 bucket,
             } = task;
@@ -6597,6 +6721,7 @@ impl ResidualStateMachine {
             let active = self.delta.seed_source_proposals(
                 DeltaDesc::leaf(variable, proposer),
                 successor,
+                layout,
                 rows,
             );
             return Ok(DeltaSeedOutcome {
@@ -6615,6 +6740,7 @@ impl ResidualStateMachine {
         }
         let SelectedResidualTask {
             state: _,
+            layout,
             desc,
             bucket,
         } = task;
@@ -6636,6 +6762,7 @@ impl ResidualStateMachine {
         let outcome = self.delta.seed_proposals(
             DeltaDesc::leaf(variable, proposer),
             successor,
+            layout,
             rows,
             seeds,
             plan,
@@ -6693,12 +6820,13 @@ impl ResidualStateMachine {
         let confirmer = *confirmer;
         let relevant = relevant.clone();
         let checked = checked.clone();
-        let layout = self.layouts.get_or_insert(task.desc.bound);
-        let view = layout.view(&batch.parents.rows, batch.parents.row_count);
+        let layout_view = self.layouts.get(task.layout);
+        let view = layout_view.view(&batch.parents.rows, batch.parents.row_count);
         let constraint = plan.resolve(root, confirmer);
         if constraint.residual_delta_source_is_paged(variable, &view) {
             let SelectedResidualTask {
                 state: _,
+                layout,
                 desc,
                 bucket,
             } = task;
@@ -6724,6 +6852,7 @@ impl ResidualStateMachine {
             let active = self.delta.seed_source_confirms(
                 DeltaDesc::leaf(variable, confirmer),
                 successor,
+                layout,
                 batch,
             );
             return Ok(DeltaSeedOutcome {
@@ -6742,6 +6871,7 @@ impl ResidualStateMachine {
         }
         let SelectedResidualTask {
             state: _,
+            layout,
             desc,
             bucket,
         } = task;
@@ -6767,6 +6897,7 @@ impl ResidualStateMachine {
         let active = self.delta.seed_confirms(
             DeltaDesc::leaf(variable, confirmer),
             successor,
+            layout,
             batch,
             seeds,
         );
@@ -6818,8 +6949,8 @@ impl ResidualStateMachine {
             );
         }
         let occurrence = counter.resume.occurrence;
-        let layout = self.layouts.get_or_insert(task.desc.bound);
-        let view = layout.view(&batch.parents.rows, batch.parents.row_count);
+        let layout_view = self.layouts.get(task.layout);
+        let view = layout_view.view(&batch.parents.rows, batch.parents.row_count);
         let constraint = plan.resolve_formula_node(root, occurrence, node);
         let mut seeds = Vec::new();
         let (variable, paged) = if stage == FormulaStage::Support {
@@ -6868,6 +6999,7 @@ impl ResidualStateMachine {
 
         let SelectedResidualTask {
             state: _,
+            layout,
             desc,
             bucket,
         } = task;
@@ -6905,6 +7037,7 @@ impl ResidualStateMachine {
             let active = self.delta.seed_source_formula(
                 DeltaDesc::formula(variable, occurrence, node),
                 desc.bound,
+                layout,
                 counter,
                 batch,
                 stream_proposal,
@@ -6917,6 +7050,7 @@ impl ResidualStateMachine {
         Ok(self.delta.seed_formula(
             DeltaDesc::formula(variable, occurrence, node),
             desc.bound,
+            layout,
             counter,
             batch,
             seeds,
@@ -6976,7 +7110,7 @@ impl ResidualStateMachine {
             }
             Err(task) => task,
         };
-        let emit_bound = task.desc.bound;
+        let emit_layout = task.layout;
         let outcome = execute_task(
             root,
             plan,
@@ -6991,7 +7125,7 @@ impl ResidualStateMachine {
             &mut self.next_activation,
         );
         if matches!(&outcome, StepOutcome::Emit(_)) {
-            self.emit_bound = emit_bound;
+            self.emit_layout = Some(emit_layout);
         }
         MachineStep::Stable(outcome)
     }
@@ -7193,7 +7327,10 @@ impl ResidualStateMachine {
                 // Consume before invoking user code. If it panics and the
                 // unwind is caught, a later pull must not repeat its effects.
                 self.emit_next += 1;
-                let layout = self.layouts.get_or_insert(self.emit_bound);
+                let layout = self.layouts.get(
+                    self.emit_layout
+                        .expect("staged residual rows have a layout"),
+                );
                 let stride = layout.stride();
                 let start = row * stride;
                 for (column, &variable) in layout.vars().iter().enumerate() {
@@ -7354,7 +7491,7 @@ impl ResidualStateMachine {
             delta: DeltaScheduler::new(),
             stats: ResidualStateStats::default(),
             binding: Binding::default(),
-            emit_bound: VariableSet::new_empty(),
+            emit_layout: None,
             emit_rows: Vec::new(),
             emit_next: 0,
             emit_count: 0,
@@ -7403,11 +7540,17 @@ impl ResidualStateMachine {
             if self.emit_count >= 2 {
                 let right_count = self.emit_count / 2;
                 let left_count = self.emit_count - right_count;
-                let stride = self.layouts.get_or_insert(self.emit_bound).stride();
+                let stride = self
+                    .layouts
+                    .get(
+                        self.emit_layout
+                            .expect("staged residual rows have a layout"),
+                    )
+                    .stride();
                 debug_assert!(stride > 0, "a zero-variable query has one result");
 
                 let mut right = self.parallel_sibling();
-                right.emit_bound = self.emit_bound;
+                right.emit_layout = self.emit_layout;
                 right.emit_rows = self.emit_rows.split_off(left_count * stride);
                 right.emit_count = right_count;
                 self.emit_count = left_count;
@@ -7418,7 +7561,7 @@ impl ResidualStateMachine {
             // it intact while the other shard owns the remaining worklist.
             if self.emit_count == 1 && (!self.worklist.is_empty() || !self.delta.is_empty()) {
                 let mut right = self.parallel_sibling();
-                right.emit_bound = self.emit_bound;
+                right.emit_layout = self.emit_layout;
                 right.emit_rows = std::mem::take(&mut self.emit_rows);
                 right.emit_count = 1;
                 self.emit_count = 0;
@@ -7885,6 +8028,7 @@ where
     let mut layouts = BoundLayouts::default();
     let mut worklist = Worklist::new();
     if matches!(mode, Search::NextVariable) {
+        let seed_layout = layouts.intern(VariableSet::new_empty());
         file_with_plan(
             &mut worklist,
             &mut interner,
@@ -7893,6 +8037,7 @@ where
                 bound: VariableSet::new_empty(),
                 phase: ResidualPhase::Ready,
             },
+            seed_layout,
             StateBucket::Rows(RowBatch::seed()),
             &mut stats,
         );
@@ -7907,6 +8052,7 @@ where
             .expect("observed worklist level exists");
         for (id, bucket) in level {
             let desc = interner.get(id).clone();
+            let layout_id = interner.layout(id);
             debug_assert_eq!(
                 desc.rank_with_span(leaf_count, plan.action_span(), Some(&plan.finite_formula),),
                 rank
@@ -7919,6 +8065,7 @@ where
                 &plan,
                 SelectedResidualTask {
                     state: id,
+                    layout: layout_id,
                     desc,
                     bucket,
                 },
@@ -7933,7 +8080,8 @@ where
             ) {
                 StepOutcome::Advanced(_) | StepOutcome::Dead => {}
                 StepOutcome::Emit(rows) => {
-                    let layout = layouts.get_or_insert(emit_bound);
+                    let layout = layouts.get(layout_id);
+                    assert_eq!(layout.bound, emit_bound);
                     let view = layout.view(&rows.rows, rows.row_count);
                     for row in 0..rows.row_count {
                         let row_view = view.row_view(row);
@@ -8486,17 +8634,14 @@ mod tests {
         }
 
         let mut layouts = BoundLayouts::default();
-        let first = layouts.get_or_insert(bound) as *const BoundLayout;
+        let first = layouts.intern(bound);
         assert_eq!(layouts.layouts.len(), 1);
-        let second = layouts.get_or_insert(bound) as *const BoundLayout;
+        let second = layouts.intern(bound);
         assert_eq!(first, second);
         assert_eq!(layouts.layouts.len(), 1);
-        assert_eq!(layouts.lookups, 2);
+        assert_eq!(layouts.hash_lookups, 2);
         assert_eq!(layouts.builds, 1);
-        let layout = layouts
-            .layouts
-            .get(&bound.bits())
-            .expect("interned bound layout is present");
+        let layout = layouts.get(first);
         assert_eq!(layout.vars(), [0, 5, 127]);
         assert_eq!(layout.stride(), 3);
         assert_eq!(layout.insertion(1), 1);
@@ -8509,6 +8654,54 @@ mod tests {
         assert_eq!(view.col(5), Some(1));
         assert_eq!(view.col(127), Some(2));
         assert_eq!(view.col(6), None);
+
+        let mut successor_bound = bound;
+        successor_bound.set(6);
+        let successor = layouts.intern(successor_bound);
+        assert_eq!(layouts.hash_lookups, 3);
+        assert_eq!(layouts.builds, 2);
+        assert!(layouts.get(successor).bound.is_set(6));
+    }
+
+    #[test]
+    fn bound_layout_ids_are_machine_local_across_clone_divergence() {
+        let mut layouts = BoundLayouts::default();
+        let empty = layouts.intern(VariableSet::new_empty());
+        let mut interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let ready = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Ready,
+        };
+        let (ready_id, _) = interner.intern_with_status(ready, empty, &mut stats);
+        assert_eq!(interner.layout(ready_id), empty);
+
+        // Rayon siblings clone both aligned arenas before affine payload is
+        // divided. Once they diverge, their compact IDs are intentionally
+        // machine-local, just like StateId; no task crosses between them.
+        let mut right_layouts = layouts.clone();
+        let mut right_interner = interner.clone();
+        let left = layouts.intern(VariableSet::new_singleton(1));
+        let right = right_layouts.intern(VariableSet::new_singleton(2));
+        assert_eq!(left, right, "numeric IDs may be reused after divergence");
+        assert_eq!(layouts.get(left).bound, VariableSet::new_singleton(1));
+        assert_eq!(
+            right_layouts.get(right).bound,
+            VariableSet::new_singleton(2)
+        );
+
+        let left_desc = StateDesc {
+            bound: VariableSet::new_singleton(1),
+            phase: ResidualPhase::Ready,
+        };
+        let right_desc = StateDesc {
+            bound: VariableSet::new_singleton(2),
+            phase: ResidualPhase::Ready,
+        };
+        let (left_state, _) = interner.intern_with_status(left_desc, left, &mut stats);
+        let (right_state, _) = right_interner.intern_with_status(right_desc, right, &mut stats);
+        assert_eq!(interner.layout(left_state), left);
+        assert_eq!(right_interner.layout(right_state), right);
     }
 
     #[test]
@@ -8780,6 +8973,32 @@ mod tests {
             _candidates: &mut CandidateSink<'_>,
         ) {
         }
+    }
+
+    #[test]
+    fn layout_hashing_tracks_bound_changes_not_hot_actions_or_rows() {
+        let values: Vec<_> = (0..64).map(|byte| [byte; 32]).collect();
+        let mut frame = SeededResidualFrame::new(
+            FanoutLeaf {
+                variable: 0,
+                values: Arc::new(values),
+            },
+            FrameSeedRow::empty(),
+            ResidualLowering::FULL,
+        );
+
+        let mut emitted = 0;
+        while frame.next_binding().is_some() {
+            emitted += 1;
+        }
+
+        assert_eq!(emitted, 64);
+        assert!(frame.machine.stats.state_pops > 2);
+        assert_eq!(
+            frame.machine.layouts.hash_lookups, 2,
+            "only the empty seed and its one-variable successor need hashing"
+        );
+        assert_eq!(frame.machine.layouts.builds, 2);
     }
 
     #[derive(Clone)]
@@ -9940,11 +10159,14 @@ mod tests {
     fn scheduler_fixture(entries: &[(usize, usize, u8)]) -> ResidualStateMachine {
         let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 1, Search::Done);
         for &(bound_count, row_count, marker) in entries {
+            let desc = ready_desc(bound_count);
+            let layout = machine.layouts.intern(desc.bound);
             file(
                 &mut machine.worklist,
                 &mut machine.interner,
                 machine.leaf_count,
-                ready_desc(bound_count),
+                desc,
+                layout,
                 ready_bucket(bound_count, row_count, marker),
                 &mut machine.stats,
             );
@@ -9972,11 +10194,13 @@ mod tests {
         let mut interner = StateInterner::default();
         let mut stats = ResidualStateStats::default();
         let layout = BoundLayout::new(desc.bound);
+        let layout_id = BoundLayoutId(0);
 
         let _continuation = ready_plan_transition(
             &root,
             &plan,
             &desc,
+            layout_id,
             &layout,
             rows,
             root.variables(),
@@ -10118,10 +10342,12 @@ mod tests {
         let mut interner = StateInterner::default();
         let mut stats = ResidualStateStats::default();
         let layout = BoundLayout::new(desc.bound);
+        let layout_id = BoundLayoutId(0);
         let _ = ready_plan_transition(
             &root,
             &plan,
             &desc,
+            layout_id,
             &layout,
             rows,
             root.variables(),
@@ -10708,8 +10934,11 @@ mod tests {
             .start(0, 0, UnionVerb::Propose { relevant });
         let support = plan.finite_formula.guard_child(&parent, 0);
         let root_node = plan.finite_formula.root(0).unwrap();
+        let mut machine = ResidualStateMachine::new_for_plan(root.variables(), &plan, Search::Done);
+        let layout = machine.layouts.intern(VariableSet::new_empty());
         let task = SelectedResidualTask {
             state: StateId(0),
+            layout,
             desc: StateDesc {
                 bound: VariableSet::new_empty(),
                 phase: ResidualPhase::Formula {
@@ -10722,7 +10951,6 @@ mod tests {
                 &plan.finite_formula.node(root_node).kind,
             )),
         };
-        let mut machine = ResidualStateMachine::new_for_plan(root.variables(), &plan, Search::Done);
         let returned = machine
             .seed_delta_formula(&root, &plan, task)
             .expect_err("an unsupported support hook must retain synchronous execution");
@@ -11948,11 +12176,13 @@ mod tests {
         assert!(desc.uses_candidate_pages(&plan));
 
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        let layout = machine.layouts.intern(desc.bound);
         let token = file(
             &mut machine.worklist,
             &mut machine.interner,
             plan.len(),
             desc.clone(),
+            layout,
             StateBucket::Candidates(CandidateBatch {
                 parents: RowBatch::seed(),
                 candidates: CandidatePayload::Values((0..8).map(raw).collect()),
@@ -12007,6 +12237,7 @@ mod tests {
 
         let propose = SelectedResidualTask {
             state: StateId(41),
+            layout: BoundLayoutId(0),
             desc: StateDesc {
                 bound,
                 phase: ResidualPhase::Propose {
@@ -12053,6 +12284,7 @@ mod tests {
         };
         let candidate = SelectedResidualTask {
             state: StateId(42),
+            layout: BoundLayoutId(0),
             desc: StateDesc {
                 bound,
                 phase: ResidualPhase::Candidate {
@@ -12068,6 +12300,7 @@ mod tests {
 
         let confirm = SelectedResidualTask {
             state: StateId(43),
+            layout: BoundLayoutId(0),
             desc: StateDesc {
                 bound,
                 phase: ResidualPhase::Confirm {
@@ -12116,6 +12349,7 @@ mod tests {
 
         let ready = SelectedResidualTask {
             state: StateId(44),
+            layout: BoundLayoutId(0),
             desc: StateDesc {
                 bound,
                 phase: ResidualPhase::Ready,
@@ -15232,7 +15466,7 @@ mod tests {
         };
         let plan = ResidualPlan::compile(&root);
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
-        machine.emit_bound = VariableSet::new_singleton(0);
+        machine.emit_layout = Some(machine.layouts.intern(VariableSet::new_singleton(0)));
         machine.emit_rows = (0..7).map(raw).collect();
         machine.emit_count = 7;
 
@@ -15261,11 +15495,13 @@ mod tests {
         let influences = [VariableSet::new_empty(); 128];
         let base_estimates = [usize::MAX; 128];
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        let layout = machine.layouts.intern(ready_desc(1).bound);
         file(
             &mut machine.worklist,
             &mut machine.interner,
             plan.len(),
             ready_desc(1),
+            layout,
             StateBucket::Rows(RowBatch {
                 rows: vec![raw(1), raw(2)],
                 row_count: 2,
@@ -15280,6 +15516,7 @@ mod tests {
                     bound: VariableSet::new_empty(),
                     phase: ResidualPhase::Ready,
                 },
+                machine.layouts.intern(VariableSet::new_empty()),
                 RowBatch::seed(),
             )
             .expect("one physical delta preference was filed");
@@ -15306,11 +15543,13 @@ mod tests {
         let expected: Vec<_> = (0..6).map(raw).collect();
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
         let desc = ready_desc(1);
+        let layout = machine.layouts.intern(desc.bound);
         let first = file(
             &mut machine.worklist,
             &mut machine.interner,
             plan.len(),
             desc.clone(),
+            layout,
             StateBucket::Rows(RowBatch {
                 rows: expected[..2].to_vec(),
                 row_count: 2,
@@ -15323,6 +15562,7 @@ mod tests {
             &mut machine.interner,
             plan.len(),
             desc,
+            layout,
             StateBucket::Rows(RowBatch {
                 rows: expected[2..].to_vec(),
                 row_count: 4,
@@ -15690,6 +15930,7 @@ mod tests {
         let plan = ResidualPlan::compile(&root);
         let desc = ready_desc(0);
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        let layout = machine.layouts.intern(desc.bound);
 
         let zero_rows = |row_count| {
             StateBucket::Rows(RowBatch {
@@ -15702,6 +15943,7 @@ mod tests {
             &mut machine.interner,
             plan.len(),
             desc.clone(),
+            layout,
             zero_rows(3),
             &mut machine.stats,
         );
@@ -15710,6 +15952,7 @@ mod tests {
             &mut machine.interner,
             plan.len(),
             desc.clone(),
+            layout,
             zero_rows(4),
             &mut machine.stats,
         );
@@ -15776,11 +16019,13 @@ mod tests {
             candidate_plan.len(),
             Search::Done,
         );
+        let candidate_layout = candidate_machine.layouts.intern(candidate_desc.bound);
         let first = file_with_plan(
             &mut candidate_machine.worklist,
             &mut candidate_machine.interner,
             &candidate_plan,
             candidate_desc.clone(),
+            candidate_layout,
             candidate_bucket(1, vec![(0, raw(10)), (0, raw(11))]),
             &mut candidate_machine.stats,
         );
@@ -15789,6 +16034,7 @@ mod tests {
             &mut candidate_machine.interner,
             &candidate_plan,
             candidate_desc.clone(),
+            candidate_layout,
             candidate_bucket(2, vec![(0, raw(12)), (1, raw(13)), (1, raw(14))]),
             &mut candidate_machine.stats,
         );
@@ -15866,11 +16112,13 @@ mod tests {
         };
         let mut formula_machine =
             ResidualStateMachine::new(formula_root.variables(), formula_plan.len(), Search::Done);
+        let formula_layout = formula_machine.layouts.intern(formula_desc.bound);
         let first = file_with_plan(
             &mut formula_machine.worklist,
             &mut formula_machine.interner,
             &formula_plan,
             formula_desc.clone(),
+            formula_layout,
             formula_bucket(vec![ActivationId(10)], 1, vec![(0, raw(10)), (0, raw(11))]),
             &mut formula_machine.stats,
         );
@@ -15879,6 +16127,7 @@ mod tests {
             &mut formula_machine.interner,
             &formula_plan,
             formula_desc,
+            formula_layout,
             formula_bucket(
                 vec![ActivationId(11), ActivationId(12)],
                 2,
@@ -15953,6 +16202,7 @@ mod tests {
         assert!(desc.uses_candidate_pages(&plan));
 
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        let layout = machine.layouts.intern(desc.bound);
         let old = StateBucket::Candidates(CandidateBatch {
             parents: RowBatch {
                 rows: vec![raw(10)],
@@ -15965,6 +16215,7 @@ mod tests {
             &mut machine.interner,
             plan.len(),
             desc.clone(),
+            layout,
             old,
             &mut machine.stats,
         )
@@ -15974,6 +16225,7 @@ mod tests {
             &mut machine.interner,
             plan.len(),
             desc.clone(),
+            layout,
             StateBucket::Candidates(CandidateBatch {
                 parents: RowBatch {
                     rows: vec![raw(99)],
@@ -15987,11 +16239,14 @@ mod tests {
 
         // A deeper unrelated state is also live. A global "strict deepest"
         // flag would be free to steal it; the physical token is exact.
+        let deeper_desc = ready_desc(3);
+        let deeper_layout = machine.layouts.intern(deeper_desc.bound);
         file(
             &mut machine.worklist,
             &mut machine.interner,
             plan.len(),
-            ready_desc(3),
+            deeper_desc,
+            deeper_layout,
             ready_bucket(3, 1, 77),
             &mut machine.stats,
         );
@@ -16036,12 +16291,14 @@ mod tests {
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
         machine.width = 8;
         machine.cap = 64;
+        let layout = machine.layouts.intern(desc.bound);
 
         file(
             &mut machine.worklist,
             &mut machine.interner,
             plan.len(),
             desc.clone(),
+            layout,
             StateBucket::Rows(RowBatch {
                 rows: [10, 11, 12].map(raw).into(),
                 row_count: 3,
@@ -16053,6 +16310,7 @@ mod tests {
             &mut machine.interner,
             plan.len(),
             desc.clone(),
+            layout,
             StateBucket::Rows(RowBatch {
                 rows: [40, 41, 42, 43].map(raw).into(),
                 row_count: 4,
@@ -16065,6 +16323,7 @@ mod tests {
             &mut machine.interner,
             plan.len(),
             desc.clone(),
+            layout,
             StateBucket::Rows(RowBatch {
                 rows: [44, 45, 46, 47].map(raw).into(),
                 row_count: 4,
@@ -16102,6 +16361,7 @@ mod tests {
             &mut machine.interner,
             plan.len(),
             desc,
+            layout,
             StateBucket::Rows(RowBatch {
                 rows: [50, 51, 52].map(raw).into(),
                 row_count: 3,
@@ -16153,6 +16413,7 @@ mod tests {
         machine.cap = 64;
         let mut relevant = ChildSet::empty(1);
         relevant.insert(0);
+        let empty_layout = machine.layouts.intern(VariableSet::new_empty());
         let (state, _) = machine.interner.intern_with_status(
             StateDesc {
                 bound: VariableSet::new_empty(),
@@ -16162,6 +16423,7 @@ mod tests {
                     checked: ChildSet::empty(1),
                 },
             },
+            empty_layout,
             &mut machine.stats,
         );
         let token = ContinuationToken {
@@ -16208,6 +16470,7 @@ mod tests {
                     checked: relevant,
                 },
             },
+            empty_layout,
             &mut machine.stats,
         );
         let terminal = ContinuationToken {
@@ -16262,6 +16525,7 @@ mod tests {
         };
         let plan = ResidualPlan::compile(&root);
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        let empty_layout = machine.layouts.intern(VariableSet::new_empty());
         let active = machine
             .delta
             .seed_source_proposals(
@@ -16270,6 +16534,7 @@ mod tests {
                     bound: VariableSet::new_empty(),
                     phase: ResidualPhase::Ready,
                 },
+                empty_layout,
                 RowBatch::seed(),
             )
             .expect("one cyclic source activation was filed");
@@ -16301,6 +16566,7 @@ mod tests {
             &mut machine.interner,
             plan.len(),
             ready_desc(0),
+            empty_layout,
             StateBucket::Rows(RowBatch::seed()),
             &mut machine.stats,
         )
@@ -16331,20 +16597,26 @@ mod tests {
         };
         let plan = ResidualPlan::compile(&root);
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        let first_desc = ready_desc(1);
+        let first_layout = machine.layouts.intern(first_desc.bound);
         let successor = file(
             &mut machine.worklist,
             &mut machine.interner,
             plan.len(),
-            ready_desc(1),
+            first_desc,
+            first_layout,
             ready_bucket(1, 2, 11),
             &mut machine.stats,
         )
         .unwrap();
+        let second_desc = ready_desc(2);
+        let second_layout = machine.layouts.intern(second_desc.bound);
         file(
             &mut machine.worklist,
             &mut machine.interner,
             plan.len(),
-            ready_desc(2),
+            second_desc,
+            second_layout,
             ready_bucket(2, 2, 22),
             &mut machine.stats,
         );
@@ -16404,11 +16676,13 @@ mod tests {
                 proposer: 0,
             },
         };
+        let layout = machine.layouts.intern(propose.bound);
         file(
             &mut machine.worklist,
             &mut machine.interner,
             machine.leaf_count,
             propose.clone(),
+            layout,
             ready_bucket(1, 1, 2),
             &mut machine.stats,
         );
@@ -16442,11 +16716,13 @@ mod tests {
             phase: ResidualPhase::Ready,
         };
         for (desc, marker) in [(first, 1), (second.clone(), 2)] {
+            let layout = machine.layouts.intern(desc.bound);
             file(
                 &mut machine.worklist,
                 &mut machine.interner,
                 machine.leaf_count,
                 desc,
+                layout,
                 ready_bucket(1, 1, marker),
                 &mut machine.stats,
             );
@@ -16497,11 +16773,13 @@ mod tests {
             (ready_desc(1), ready_bucket(1, 2, 1)),
             (confirm_desc(), candidate_bucket(1)),
         ] {
+            let layout = underfilled.layouts.intern(desc.bound);
             file(
                 &mut underfilled.worklist,
                 &mut underfilled.interner,
                 underfilled.leaf_count,
                 desc,
+                layout,
                 bucket,
                 &mut underfilled.stats,
             );
@@ -16531,11 +16809,13 @@ mod tests {
             (ready_desc(1), ready_bucket(1, 2, 1)),
             (confirm_desc(), candidate_bucket(2)),
         ] {
+            let layout = full.layouts.intern(desc.bound);
             file(
                 &mut full.worklist,
                 &mut full.interner,
                 full.leaf_count,
                 desc,
+                layout,
                 bucket,
                 &mut full.stats,
             );
@@ -16628,11 +16908,13 @@ mod tests {
         let mut worklist = Worklist::new();
         let mut interner = StateInterner::default();
         let mut stats = ResidualStateStats::default();
+        let layout = BoundLayoutId(0);
         assert!(file(
             &mut worklist,
             &mut interner,
             plan.len(),
             candidate_desc,
+            layout,
             StateBucket::Candidates(CandidateBatch {
                 parents: RowBatch::seed(),
                 candidates: CandidatePayload::Values(vec![raw(7)]),
@@ -17150,11 +17432,12 @@ mod tests {
         };
         let mut stats = ResidualStateStats::default();
         let mut interner = StateInterner::default();
+        let layout = BoundLayoutId(0);
         let left = interner
-            .intern_with_status(desc(left_checked), &mut stats)
+            .intern_with_status(desc(left_checked), layout, &mut stats)
             .0;
         let right = interner
-            .intern_with_status(desc(right_checked), &mut stats)
+            .intern_with_status(desc(right_checked), layout, &mut stats)
             .0;
         assert_eq!(left, right);
         assert_eq!(stats.states_interned, 1);
@@ -17168,17 +17451,20 @@ mod tests {
         let third = ready_desc(2);
         let mut stats = ResidualStateStats::default();
         let mut interner = StateInterner::default();
+        let first_layout = BoundLayoutId(0);
+        let second_layout = BoundLayoutId(1);
+        let third_layout = BoundLayoutId(2);
 
         assert_eq!(
-            interner.intern_with_status(first.clone(), &mut stats),
+            interner.intern_with_status(first.clone(), first_layout, &mut stats),
             (StateId(0), false)
         );
         assert_eq!(
-            interner.intern_with_status(second.clone(), &mut stats),
+            interner.intern_with_status(second.clone(), second_layout, &mut stats),
             (StateId(1), false)
         );
         assert_eq!(
-            interner.intern_with_status(first.clone(), &mut stats),
+            interner.intern_with_status(first.clone(), first_layout, &mut stats),
             (StateId(0), true)
         );
         assert_eq!(interner.get(StateId(0)), &first);
@@ -17189,11 +17475,11 @@ mod tests {
         assert_eq!(cloned.get(StateId(0)), &first);
         assert_eq!(cloned.get(StateId(1)), &second);
         assert_eq!(
-            interner.intern_with_status(third.clone(), &mut stats),
+            interner.intern_with_status(third.clone(), third_layout, &mut stats),
             (StateId(2), false)
         );
         assert_eq!(
-            cloned.intern_with_status(third.clone(), &mut cloned_stats),
+            cloned.intern_with_status(third.clone(), third_layout, &mut cloned_stats),
             (StateId(2), false)
         );
 
@@ -17201,15 +17487,15 @@ mod tests {
         let mut fresh = StateInterner::default();
         let mut fresh_stats = ResidualStateStats::default();
         assert_eq!(
-            fresh.intern_with_status(first, &mut fresh_stats),
+            fresh.intern_with_status(first, first_layout, &mut fresh_stats),
             (StateId(0), false)
         );
         assert_eq!(
-            fresh.intern_with_status(second, &mut fresh_stats),
+            fresh.intern_with_status(second, second_layout, &mut fresh_stats),
             (StateId(1), false)
         );
         assert_eq!(
-            fresh.intern_with_status(third, &mut fresh_stats),
+            fresh.intern_with_status(third, third_layout, &mut fresh_stats),
             (StateId(2), false)
         );
         assert_eq!(stats.states_interned, 3);
@@ -17325,9 +17611,13 @@ mod tests {
 
         let mut stats = ResidualStateStats::default();
         let mut interner = StateInterner::default();
-        let original = interner.intern_with_status(candidate, &mut stats).0;
+        let layout = BoundLayoutId(0);
+        let original = interner.intern_with_status(candidate, layout, &mut stats).0;
         for variant in variants {
-            assert_ne!(original, interner.intern_with_status(variant, &mut stats).0);
+            assert_ne!(
+                original,
+                interner.intern_with_status(variant, layout, &mut stats).0
+            );
         }
         assert_eq!(stats.states_interned, 12);
         assert_eq!(stats.interner_hits, 0);

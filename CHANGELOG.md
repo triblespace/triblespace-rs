@@ -356,10 +356,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Residual bound-row layouts are canonical query-local values.** Each
   `VariableSet` now derives its ascending columns, variable-to-column index,
-  and successor insertion positions once per query. Stable, formula, cyclic
-  source, eager, delayed-emission, and Rayon paths reuse indexed `RowsView`s
-  instead of rebuilding schema vectors and linearly scanning columns at every
-  protocol action; row order, multiplicity, and scheduler state are unchanged.
+  and successor insertion positions once per query. Interned states carry a
+  compact machine-local `BoundLayoutId` beside their unchanged exact
+  descriptors: same-bound formula, cyclic-source, delayed-emission, eager, and
+  Rayon paths resolve layouts by direct arena indexing, while only transitions
+  that add a bound variable consult the canonical map. This avoids rebuilding
+  schemas, linearly scanning columns, or hashing the bound set at every hot
+  protocol action and emitted row; row order, multiplicity, and scheduler state
+  are unchanged.
 - **One-parent residual candidate payloads stay tagless.** Ordinary and lowered
   formula actions now receive the scalar `Values` candidate sink whenever one
   affine parent is live, while reconverged multi-parent work promotes to the
