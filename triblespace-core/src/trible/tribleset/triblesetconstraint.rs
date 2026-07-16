@@ -8,15 +8,21 @@ use crate::inline::encodings::genid::GenId;
 use crate::inline::InlineEncoding;
 use crate::inline::RawInline;
 use crate::inline::INLINE_LEN;
+use crate::patch::KeySchema;
+use crate::patch::PATCH;
 use crate::query::CandidateSink;
 use crate::query::Constraint;
 use crate::query::EstimateSink;
 use crate::query::RawTerm;
+use crate::query::ResidualDeltaOutput;
+use crate::query::ResidualDeltaSourceCursor;
+use crate::query::ResidualDeltaSourcePage;
 use crate::query::RowsView;
 use crate::query::Term;
 use crate::query::VariableId;
 use crate::query::VariableSet;
 use crate::trible::TribleSet;
+use crate::trible::TRIBLE_LEN;
 
 /// A triple-pattern lookup against a [`TribleSet`].
 ///
@@ -85,6 +91,79 @@ fn term_src(term: &RawTerm, view: &RowsView<'_>) -> Option<Src> {
     match term {
         RawTerm::Var(v) => view.col(*v).map(Src::Col),
         RawTerm::Const(c) => Some(Src::Const(*c)),
+    }
+}
+
+/// Strict successor in one id-sized PATCH segment, expressed in the raw
+/// inline value space used by residual source cursors.
+fn next_id_source<const PREFIX_LEN: usize, O>(
+    index: &PATCH<TRIBLE_LEN, O, ()>,
+    prefix: &[u8; PREFIX_LEN],
+    after: Option<&RawInline>,
+) -> Option<RawInline>
+where
+    O: KeySchema<TRIBLE_LEN>,
+{
+    let id = match after {
+        None => index.first_infix_range(prefix, &[u8::MIN; ID_LEN], &[u8::MAX; ID_LEN]),
+        Some(value) => {
+            let id = id_from_value(value)?;
+            index.next_infix_after(prefix, &id, &[u8::MAX; ID_LEN])
+        }
+    }?;
+    Some(id_into_value(&id))
+}
+
+/// Strict successor in one inline-sized PATCH segment.
+fn next_inline_source<const PREFIX_LEN: usize, O>(
+    index: &PATCH<TRIBLE_LEN, O, ()>,
+    prefix: &[u8; PREFIX_LEN],
+    after: Option<&RawInline>,
+) -> Option<RawInline>
+where
+    O: KeySchema<TRIBLE_LEN>,
+{
+    match after {
+        None => index.first_infix_range(prefix, &[u8::MIN; INLINE_LEN], &[u8::MAX; INLINE_LEN]),
+        Some(value) => index.next_infix_after(prefix, value, &[u8::MAX; INLINE_LEN]),
+    }
+}
+
+/// Consume a bounded page from a strict raw-inline successor function.
+///
+/// The one-entry lookahead only decides whether a cursor remains; it is not a
+/// consumed source candidate and therefore does not contribute to `examined`.
+fn direct_source_page(
+    cursor: ResidualDeltaSourceCursor,
+    limit: usize,
+    accepted: &mut Vec<RawInline>,
+    mut next: impl FnMut(Option<&RawInline>) -> Option<RawInline>,
+) -> ResidualDeltaSourcePage {
+    assert!(limit > 0, "residual source pages require positive demand");
+    // This frontier exclusively emits value cursors. Other source families
+    // may add cursor representations without making them valid here.
+    #[allow(unreachable_patterns)]
+    let mut current = match cursor {
+        ResidualDeltaSourceCursor::Start => None,
+        ResidualDeltaSourceCursor::After(value) => Some(value),
+        _ => panic!("non-value cursor crossed into a TribleSet source frontier"),
+    };
+    let mut examined = 0usize;
+    while examined < limit {
+        let Some(value) = next(current.as_ref()) else {
+            return ResidualDeltaSourcePage {
+                next: None,
+                examined,
+            };
+        };
+        current = Some(value);
+        accepted.push(value);
+        examined += 1;
+    }
+    let last_examined = current.expect("a full positive page examined a source");
+    ResidualDeltaSourcePage {
+        next: next(Some(&last_examined)).map(|_| ResidualDeltaSourceCursor::After(last_examined)),
+        examined,
     }
 }
 
@@ -754,6 +833,143 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
         true
     }
 
+    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
+        if view.col(variable).is_some() {
+            return false;
+        }
+        // A variable repeated across trible positions needs an equality
+        // filter over the driving segment. Keep those shapes on the ordinary
+        // eager path until that filtered frontier has its own exact contract.
+        [
+            self.term_e.is_var(variable),
+            self.term_a.is_var(variable),
+            self.term_v.is_var(variable),
+        ]
+        .into_iter()
+        .filter(|is_position| *is_position)
+        .count()
+            == 1
+    }
+
+    fn residual_delta_source_page(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: Option<&[RawInline]>,
+        cursor: ResidualDeltaSourceCursor,
+        limit: usize,
+        _roots: &mut Vec<ResidualDeltaOutput>,
+        accepted: &mut Vec<RawInline>,
+    ) -> Option<ResidualDeltaSourcePage> {
+        if candidates.is_some()
+            || view.len() != 1
+            || !self.residual_proposal_source_is_paged(variable, view)
+        {
+            return None;
+        }
+        let p = self.positions(variable, view);
+        let row = view.row(0);
+        let e_bound = match p.e(row) {
+            Some(value) => match id_from_value(value) {
+                Some(id) => Some(id),
+                None => {
+                    return Some(ResidualDeltaSourcePage {
+                        next: None,
+                        examined: 0,
+                    });
+                }
+            },
+            None => None,
+        };
+        let a_bound = match p.a(row) {
+            Some(value) => match id_from_value(value) {
+                Some(id) => Some(id),
+                None => {
+                    return Some(ResidualDeltaSourcePage {
+                        next: None,
+                        examined: 0,
+                    });
+                }
+            },
+            None => None,
+        };
+        let v_bound = p.v(row);
+
+        let page = match (e_bound, a_bound, v_bound, p.e_var, p.a_var, p.v_var) {
+            (None, None, None, true, false, false) => {
+                direct_source_page(cursor, limit, accepted, |after| {
+                    next_id_source(&self.set.eav, &[], after)
+                })
+            }
+            (None, None, None, false, true, false) => {
+                direct_source_page(cursor, limit, accepted, |after| {
+                    next_id_source(&self.set.aev, &[], after)
+                })
+            }
+            (None, None, None, false, false, true) => {
+                direct_source_page(cursor, limit, accepted, |after| {
+                    next_inline_source(&self.set.vea, &[], after)
+                })
+            }
+            (Some(e), None, None, false, true, false) => {
+                direct_source_page(cursor, limit, accepted, |after| {
+                    next_id_source(&self.set.eav, &e, after)
+                })
+            }
+            (Some(e), None, None, false, false, true) => {
+                direct_source_page(cursor, limit, accepted, |after| {
+                    next_inline_source(&self.set.eva, &e, after)
+                })
+            }
+            (None, Some(a), None, true, false, false) => {
+                direct_source_page(cursor, limit, accepted, |after| {
+                    next_id_source(&self.set.aev, &a, after)
+                })
+            }
+            (None, Some(a), None, false, false, true) => {
+                direct_source_page(cursor, limit, accepted, |after| {
+                    next_inline_source(&self.set.ave, &a, after)
+                })
+            }
+            (None, None, Some(v), true, false, false) => {
+                direct_source_page(cursor, limit, accepted, |after| {
+                    next_id_source(&self.set.vea, v, after)
+                })
+            }
+            (None, None, Some(v), false, true, false) => {
+                direct_source_page(cursor, limit, accepted, |after| {
+                    next_id_source(&self.set.vae, v, after)
+                })
+            }
+            (None, Some(a), Some(v), true, false, false) => {
+                let mut prefix = [0u8; ID_LEN + INLINE_LEN];
+                prefix[..ID_LEN].copy_from_slice(&a);
+                prefix[ID_LEN..].copy_from_slice(v);
+                direct_source_page(cursor, limit, accepted, |after| {
+                    next_id_source(&self.set.ave, &prefix, after)
+                })
+            }
+            (Some(e), None, Some(v), false, true, false) => {
+                let mut prefix = [0u8; ID_LEN + INLINE_LEN];
+                prefix[..ID_LEN].copy_from_slice(&e);
+                prefix[ID_LEN..].copy_from_slice(v);
+                direct_source_page(cursor, limit, accepted, |after| {
+                    next_id_source(&self.set.eva, &prefix, after)
+                })
+            }
+            (Some(e), Some(a), None, false, false, true) => {
+                let mut prefix = [0u8; ID_LEN + ID_LEN];
+                prefix[..ID_LEN].copy_from_slice(&e);
+                prefix[ID_LEN..].copy_from_slice(&a);
+                direct_source_page(cursor, limit, accepted, |after| {
+                    next_inline_source(&self.set.eav, &prefix, after)
+                })
+            }
+            _ => unreachable!("a distinct-position proposal has one of twelve bound schemas"),
+        };
+        Some(page)
+    }
+
     /// When all three positions have values (bound or constant), checks
     /// whether each row's triple exists in the EAV index. Returns `true`
     /// optimistically when any position is still unbound.
@@ -783,14 +999,257 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
     use crate::find;
     use crate::id::rngid;
+    use crate::inline::encodings::genid::GenId;
     use crate::inline::encodings::UnknownInline;
     use crate::inline::Inline;
+    use crate::query::intersectionconstraint::IntersectionConstraint;
+    use crate::query::residual::ResidualLowering;
+    use crate::query::Binding;
+    use crate::query::Query;
     use crate::query::TriblePattern;
     use crate::query::Variable;
     use crate::trible::Trible;
     use crate::trible::TribleSet;
+
+    fn direct_fixture() -> (
+        TribleSet,
+        [RawInline; 3],
+        [RawInline; 2],
+        [Inline<UnknownInline>; 2],
+    ) {
+        let entities = [rngid(), rngid(), rngid()];
+        let attributes = [rngid(), rngid()];
+        let values = [
+            Inline::<UnknownInline>::new([0x31; INLINE_LEN]),
+            Inline::<UnknownInline>::new([0x72; INLINE_LEN]),
+        ];
+        let mut set = TribleSet::new();
+        for (entity, attribute, value) in [
+            (&entities[0], &attributes[0], &values[0]),
+            (&entities[0], &attributes[1], &values[1]),
+            (&entities[1], &attributes[0], &values[0]),
+            (&entities[1], &attributes[1], &values[0]),
+            (&entities[2], &attributes[0], &values[1]),
+        ] {
+            set.insert(&Trible::new(entity, attribute, value));
+        }
+        (
+            set,
+            entities.each_ref().map(|entity| id_into_value(entity)),
+            attributes
+                .each_ref()
+                .map(|attribute| id_into_value(attribute)),
+            values,
+        )
+    }
+
+    fn eager_proposal(
+        constraint: &TribleSetConstraint,
+        variable: VariableId,
+        view: &RowsView<'_>,
+    ) -> Vec<RawInline> {
+        let mut values = Vec::new();
+        constraint.propose(variable, view, &mut CandidateSink::Values(&mut values));
+        values.sort_unstable();
+        values
+    }
+
+    fn paged_proposal(
+        constraint: &TribleSetConstraint,
+        variable: VariableId,
+        view: &RowsView<'_>,
+    ) -> Vec<RawInline> {
+        assert!(constraint.residual_proposal_source_is_paged(variable, view));
+        let mut cursor = ResidualDeltaSourceCursor::Start;
+        let mut values = Vec::new();
+        loop {
+            let mut roots = Vec::new();
+            let before = values.len();
+            let page = constraint
+                .residual_delta_source_page(
+                    variable,
+                    view,
+                    None,
+                    cursor,
+                    1,
+                    &mut roots,
+                    &mut values,
+                )
+                .expect("declared direct proposal source remains supported");
+            assert!(roots.is_empty());
+            assert_eq!(values.len() - before, page.examined);
+            assert!(page.examined <= 1);
+            let Some(next) = page.next else {
+                break;
+            };
+            #[allow(unreachable_patterns)]
+            match (cursor, next) {
+                (ResidualDeltaSourceCursor::Start, ResidualDeltaSourceCursor::After(_)) => {}
+                (
+                    ResidualDeltaSourceCursor::After(previous),
+                    ResidualDeltaSourceCursor::After(next),
+                ) => assert!(next > previous),
+                (_, ResidualDeltaSourceCursor::Start) => unreachable!("source cursor restarted"),
+                _ => unreachable!("non-value cursor crossed the TribleSet test frontier"),
+            }
+            cursor = next;
+        }
+        values.sort_unstable();
+        values
+    }
+
+    #[derive(Clone, Default)]
+    struct SourceCounters {
+        propose_calls: Arc<AtomicUsize>,
+        page_calls: Arc<AtomicUsize>,
+        examined: Arc<AtomicUsize>,
+    }
+
+    struct CountedSource<C> {
+        inner: C,
+        counters: SourceCounters,
+    }
+
+    #[derive(Clone, Copy)]
+    struct DuplicateDomain {
+        variable: VariableId,
+        value: RawInline,
+    }
+
+    impl<'a> Constraint<'a> for DuplicateDomain {
+        fn variables(&self) -> VariableSet {
+            let mut variables = VariableSet::new_empty();
+            variables.set(self.variable);
+            variables
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != self.variable {
+                return false;
+            }
+            out.extend(std::iter::repeat_n(2, view.len()));
+            true
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            if variable == self.variable {
+                for row in 0..view.len() {
+                    candidates.extend_row(row as u32, [self.value, self.value]);
+                }
+            }
+        }
+
+        fn confirm(
+            &self,
+            variable: VariableId,
+            _view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            if variable == self.variable {
+                candidates.retain(|_, value| *value == self.value);
+            }
+        }
+
+        fn satisfied(&self, view: &RowsView<'_>) -> bool {
+            view.col(self.variable)
+                .is_none_or(|column| view.iter().all(|row| row[column] == self.value))
+        }
+    }
+
+    impl<'a, C> Constraint<'a> for CountedSource<C>
+    where
+        C: Constraint<'a>,
+    {
+        fn variables(&self) -> VariableSet {
+            self.inner.variables()
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            self.inner.estimate(variable, view, out)
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            self.counters.propose_calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.propose(variable, view, candidates);
+        }
+
+        fn confirm(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            self.inner.confirm(variable, view, candidates);
+        }
+
+        fn satisfied(&self, view: &RowsView<'_>) -> bool {
+            self.inner.satisfied(view)
+        }
+
+        fn influence(&self, variable: VariableId) -> VariableSet {
+            self.inner.influence(variable)
+        }
+
+        fn residual_confirm_is_page_local(&self) -> bool {
+            self.inner.residual_confirm_is_page_local()
+        }
+
+        fn residual_proposal_source_is_paged(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+        ) -> bool {
+            self.inner.residual_proposal_source_is_paged(variable, view)
+        }
+
+        fn residual_delta_source_page(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: Option<&[RawInline]>,
+            cursor: ResidualDeltaSourceCursor,
+            limit: usize,
+            roots: &mut Vec<ResidualDeltaOutput>,
+            accepted: &mut Vec<RawInline>,
+        ) -> Option<ResidualDeltaSourcePage> {
+            let page = self.inner.residual_delta_source_page(
+                variable, view, candidates, cursor, limit, roots, accepted,
+            );
+            if let Some(page) = page {
+                self.counters.page_calls.fetch_add(1, Ordering::Relaxed);
+                self.counters
+                    .examined
+                    .fetch_add(page.examined, Ordering::Relaxed);
+            }
+            page
+        }
+    }
 
     #[test]
     fn constant() {
@@ -978,5 +1437,161 @@ mod tests {
             "expected 2 self-self-self triples, got {}",
             r.len()
         );
+    }
+
+    #[test]
+    fn direct_pages_match_eager_proposals_for_all_distinct_position_schemas() {
+        const E: VariableId = 0;
+        const A: VariableId = 1;
+        const V: VariableId = 2;
+
+        let (set, entities, attributes, values) = direct_fixture();
+        let e = Variable::<GenId>::new(E);
+        let a = Variable::<GenId>::new(A);
+        let v = Variable::<UnknownInline>::new(V);
+        let constraint = TribleSetConstraint::new(e, a, v, set);
+        let schemas = [
+            ("E|___", E, vec![], vec![]),
+            ("E|A__", E, vec![A], vec![attributes[0]]),
+            ("E|__V", E, vec![V], vec![values[0].raw]),
+            ("E|A_V", E, vec![A, V], vec![attributes[0], values[0].raw]),
+            ("A|___", A, vec![], vec![]),
+            ("A|E__", A, vec![E], vec![entities[0]]),
+            ("A|__V", A, vec![V], vec![values[0].raw]),
+            ("A|E_V", A, vec![E, V], vec![entities[0], values[0].raw]),
+            ("V|___", V, vec![], vec![]),
+            ("V|E__", V, vec![E], vec![entities[0]]),
+            ("V|A__", V, vec![A], vec![attributes[0]]),
+            ("V|EA_", V, vec![E, A], vec![entities[0], attributes[0]]),
+        ];
+
+        for (name, variable, vars, row) in schemas {
+            let view = RowsView::new(&vars, &row);
+            assert_eq!(
+                paged_proposal(&constraint, variable, &view),
+                eager_proposal(&constraint, variable, &view),
+                "schema {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_position_variables_keep_the_eager_fallback() {
+        let (set, _, _, _) = direct_fixture();
+        let x = Variable::<GenId>::new(0);
+        let a = Variable::<GenId>::new(1);
+        let two_positions = TribleSetConstraint::new(x, a, x, set.clone());
+        assert!(!two_positions.residual_proposal_source_is_paged(0, &RowsView::EMPTY));
+
+        let all_positions = TribleSetConstraint::new(x, x, x, set);
+        assert!(!all_positions.residual_proposal_source_is_paged(0, &RowsView::EMPTY));
+    }
+
+    fn project_triple(binding: &Binding) -> Option<(RawInline, RawInline, RawInline)> {
+        Some((*binding.get(0)?, *binding.get(1)?, *binding.get(2)?))
+    }
+
+    #[test]
+    fn ordinary_and_residual_direct_sources_match_the_sequential_bag() {
+        let (set, _, _, _) = direct_fixture();
+        let e = Variable::<GenId>::new(0);
+        let a = Variable::<GenId>::new(1);
+        let v = Variable::<UnknownInline>::new(2);
+        let make = || TribleSetConstraint::new(e, a, v, set.clone());
+
+        let mut sequential: Vec<_> = Query::new(make(), project_triple).sequential().collect();
+        let mut ordinary: Vec<_> = Query::new(make(), project_triple).collect();
+        let mut residual: Vec<_> = Query::new(make(), project_triple)
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .cap(1)
+            .start_width(1)
+            .collect();
+        sequential.sort_unstable();
+        ordinary.sort_unstable();
+        residual.sort_unstable();
+
+        assert_eq!(sequential.len(), set.len());
+        assert_eq!(ordinary, sequential);
+        assert_eq!(residual, sequential);
+    }
+
+    #[test]
+    fn direct_source_activations_preserve_duplicate_affine_parents() {
+        const PARENT: VariableId = 0;
+        const ENTITY: VariableId = 1;
+
+        let attribute = rngid();
+        let attribute_inline = Inline::<GenId>::new(id_into_value(&attribute));
+        let value = Inline::<UnknownInline>::new([0xa6; INLINE_LEN]);
+        let parent_value = [0x44; INLINE_LEN];
+        let mut set = TribleSet::new();
+        for _ in 0..4 {
+            set.insert(&Trible::new(&rngid(), &attribute, &value));
+        }
+        let parent = Variable::<UnknownInline>::new(PARENT);
+        let entity = Variable::<GenId>::new(ENTITY);
+        let make = || {
+            IntersectionConstraint::new(vec![
+                Box::new(DuplicateDomain {
+                    variable: parent.index,
+                    value: parent_value,
+                }) as Box<dyn Constraint<'static>>,
+                Box::new(TribleSetConstraint::new(
+                    entity,
+                    attribute_inline,
+                    value,
+                    set.clone(),
+                )) as Box<dyn Constraint<'static>>,
+            ])
+        };
+        let project = |binding: &Binding| Some((*binding.get(PARENT)?, *binding.get(ENTITY)?));
+
+        let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
+        let mut ordinary: Vec<_> = Query::new(make(), project).collect();
+        let mut residual: Vec<_> = Query::new(make(), project)
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .cap(1)
+            .start_width(1)
+            .collect();
+        sequential.sort_unstable();
+        ordinary.sort_unstable();
+        residual.sort_unstable();
+
+        assert_eq!(sequential.len(), 8);
+        assert!(sequential.iter().all(|(parent, _)| *parent == parent_value));
+        assert_eq!(ordinary, sequential);
+        assert_eq!(residual, sequential);
+    }
+
+    #[test]
+    fn width_one_yields_after_one_direct_candidate_and_drop_cancels_the_frontier() {
+        let attribute = rngid();
+        let attribute_inline = Inline::<GenId>::new(id_into_value(&attribute));
+        let value = Inline::<UnknownInline>::new([0x5a; INLINE_LEN]);
+        let mut set = TribleSet::new();
+        for _ in 0..64 {
+            set.insert(&Trible::new(&rngid(), &attribute, &value));
+        }
+        let entity = Variable::<GenId>::new(0);
+        let counters = SourceCounters::default();
+        let counted = CountedSource {
+            inner: TribleSetConstraint::new(entity, attribute_inline, value, set),
+            counters: counters.clone(),
+        };
+        let mut query = Query::new(counted, |binding: &Binding| binding.get(0).copied())
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .cap(1)
+            .start_width(1);
+
+        assert!(query.next().is_some());
+        assert_eq!(counters.propose_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.page_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.examined.load(Ordering::Relaxed), 1);
+        assert_eq!(query.stats().delta_source_pages, 1);
+        assert_eq!(query.stats().delta_source_candidates_examined, 1);
+        assert_eq!(query.stats().delta_source_roots, 0);
+        drop(query);
+        assert_eq!(counters.page_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.examined.load(Ordering::Relaxed), 1);
     }
 }
