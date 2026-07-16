@@ -354,6 +354,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Private finite-formula control tails bypass scheduler round trips.** Exact
+  canonical filing receipts distinguish a sole fresh or reopened affine tail
+  from live reconvergence, partitions, and later appends. Planning-only formula
+  successors may therefore continue locally while semantic actions, RPQ/delta
+  boundaries, and every ambiguous merge return through normal scheduling;
+  canonical state identity, tail-local row order, and bag semantics remain
+  unchanged.
 - **One-parent residual candidate payloads stay tagless.** Ordinary and lowered
   formula actions now receive the scalar `Values` candidate sink whenever one
   affine parent is live, while reconverged multi-parent work promotes to the

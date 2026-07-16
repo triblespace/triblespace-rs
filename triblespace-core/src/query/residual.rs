@@ -1668,10 +1668,15 @@ pub struct ResidualStateStats {
     pub bucket_merges: usize,
     /// Parent rows appended by those merge filings.
     pub rows_merged: usize,
-    /// Number of canonical bucket chunks processed. Every pop is selected by
-    /// exactly one physical policy, so this equals `full_pops +
-    /// readiness_pops + continuation_pops`.
+    /// Number of canonical bucket chunks selected by the physical scheduler.
+    /// Every pop is selected by exactly one physical policy, so this equals
+    /// `full_pops + readiness_pops + continuation_pops`. Formula epsilon
+    /// transitions consumed through an exact private filing receipt are counted
+    /// separately by [`formula_epsilon_transitions`](Self::formula_epsilon_transitions).
     pub state_pops: usize,
+    /// Planning-only formula states consumed locally through an exact private
+    /// filing receipt instead of returning through the physical scheduler.
+    pub formula_epsilon_transitions: usize,
     /// Ready-state chunks that planned row-local proposal actions without
     /// invoking the constraint protocol.
     pub ready_plan_pops: usize,
@@ -4168,6 +4173,19 @@ struct SelectedResidualTask {
 }
 
 impl SelectedResidualTask {
+    /// Whether this task is a planning-only finite-formula control state.
+    fn is_formula_plan(&self) -> bool {
+        matches!(
+            &self.desc.phase,
+            ResidualPhase::Formula {
+                counter: FormulaProgramCounter {
+                    focus: FormulaFocus::Plan { .. },
+                    ..
+                }
+            }
+        )
+    }
+
     /// Cheap phase classification used by the latency scheduler. It must not
     /// materialize executor geometry on the default path.
     fn is_action_for_plan(&self, plan: &ResidualPlan) -> bool {
@@ -4305,6 +4323,15 @@ struct ContinuationToken {
     state: StateId,
     rows: usize,
     candidates: usize,
+    /// The filing appended behind work that was already live under this exact
+    /// canonical key. Such a tail remains identifiable, but is deliberately
+    /// not eligible for local formula normalization: the live bucket is the
+    /// observable reconvergence barrier.
+    merged_with_existing: bool,
+    /// This receipt is the only nonempty successor selected by its transition.
+    /// Partitioned or otherwise competing successors clear this bit even when
+    /// the chosen physical tail itself remains exact.
+    sole_successor: bool,
 }
 
 /// Physical scheduling policy for one exact continuation receipt.
@@ -4353,19 +4380,28 @@ impl ContinuationToken {
     fn scheduling_key(self) -> (usize, StateId) {
         (self.rank, self.state)
     }
+
+    fn is_private(self) -> bool {
+        self.sole_successor && !self.merged_with_existing
+    }
 }
 
 fn prefer_continuation(
     selected: &mut Option<ContinuationToken>,
     candidate: Option<ContinuationToken>,
 ) {
-    let Some(candidate) = candidate else {
+    let Some(mut candidate) = candidate else {
         return;
     };
     let Some(current) = selected else {
         *selected = Some(candidate);
         return;
     };
+    // Seeing two live receipts proves that this transition did not preserve a
+    // single affine successor, even when both receipts canonicalize to the same
+    // key and their adjacent physical tails can be coalesced exactly.
+    current.sole_successor = false;
+    candidate.sole_successor = false;
     match candidate.scheduling_key().cmp(&current.scheduling_key()) {
         std::cmp::Ordering::Less => {}
         std::cmp::Ordering::Greater => *current = candidate,
@@ -4383,6 +4419,7 @@ fn prefer_continuation(
                 .expect("continuation receipt candidate occupancy overflow");
             current.rows = rows;
             current.candidates = candidates;
+            current.merged_with_existing |= candidate.merged_with_existing;
         }
     }
 }
@@ -4398,6 +4435,16 @@ fn rows_view<'v>(vars: &'v [VariableId], rows: &'v [RawInline], row_count: usize
     RowsView::new_with_row_count(vars, rows, row_count)
 }
 
+fn continuation_geometry(bucket: &StateBucket) -> (usize, usize) {
+    let rows = bucket.row_count();
+    let candidates = match bucket {
+        StateBucket::Rows(_) => 0,
+        StateBucket::Candidates(batch) => batch.candidate_count(),
+        StateBucket::Formula(batch) => batch.page_candidate_count(),
+    };
+    (rows, candidates)
+}
+
 fn file_with_span(
     worklist: &mut Worklist,
     interner: &mut StateInterner,
@@ -4408,34 +4455,33 @@ fn file_with_span(
     bucket: StateBucket,
     stats: &mut ResidualStateStats,
 ) -> Option<ContinuationToken> {
-    let rows = bucket.row_count();
+    let (rows, candidates) = continuation_geometry(&bucket);
     if rows == 0 {
         return None;
     }
-    let candidates = match &bucket {
-        StateBucket::Rows(_) => 0,
-        StateBucket::Candidates(batch) => batch.candidate_count(),
-        StateBucket::Formula(batch) => batch.page_candidate_count(),
-    };
     let rank = desc.rank_with_span(leaf_count, action_span, formula);
     let (id, known) = interner.intern_with_status(desc, stats);
     let level = worklist.entry(rank).or_default();
-    if let Some(existing) = level.get_mut(&id) {
+    let merged_with_existing = if let Some(existing) = level.get_mut(&id) {
         stats.bucket_merges += 1;
         stats.rows_merged += rows;
         existing.append(bucket);
+        true
     } else {
         if known {
             stats.state_reentries += 1;
             stats.rows_reentered += rows;
         }
         level.insert(id, bucket);
-    }
+        false
+    };
     Some(ContinuationToken {
         rank,
         state: id,
         rows,
         candidates,
+        merged_with_existing,
+        sole_successor: true,
     })
 }
 
@@ -4457,6 +4503,70 @@ fn file_with_plan(
         bucket,
         stats,
     )
+}
+
+/// Removes the exact tail named by a private formula-Plan filing receipt.
+///
+/// Filing always happens first, so canonical interning, reentry accounting,
+/// and any live reconvergence remain authoritative. A receipt is consumable
+/// only when its transition had one nonempty successor and the canonical key
+/// was not already live. In the single-threaded reducer no later append can
+/// interleave between filing and this check; the bucket must therefore equal
+/// the receipt's complete appended occupancy rather than merely end with it.
+fn take_private_formula_plan_tail(
+    worklist: &mut Worklist,
+    interner: &StateInterner,
+    receipt: ContinuationToken,
+) -> Option<SelectedResidualTask> {
+    if !receipt.is_private() {
+        return None;
+    }
+    let desc = interner.get(receipt.state);
+    if !matches!(
+        &desc.phase,
+        ResidualPhase::Formula {
+            counter: FormulaProgramCounter {
+                focus: FormulaFocus::Plan { .. },
+                ..
+            }
+        }
+    ) {
+        return None;
+    }
+    let desc = desc.clone();
+    let live_geometry = worklist
+        .get(&receipt.rank)
+        .and_then(|level| level.get(&receipt.state))
+        .map(continuation_geometry);
+    let expected = (receipt.rows, receipt.candidates);
+    if live_geometry != Some(expected) {
+        // The receipt was exact when issued, but another append has since
+        // extended its canonical bucket. Preserve that merge barrier rather
+        // than cutting a formerly-private suffix out of the joined work.
+        return None;
+    }
+    let (bucket, remove_level) = {
+        let level = worklist
+            .get_mut(&receipt.rank)
+            .expect("private formula receipt rank remains live");
+        let bucket = level
+            .remove(&receipt.state)
+            .expect("private formula receipt state remains live");
+        (bucket, level.is_empty())
+    };
+    if remove_level {
+        worklist.remove(&receipt.rank);
+    }
+    assert_eq!(
+        continuation_geometry(&bucket),
+        expected,
+        "private formula receipt no longer names the complete canonical bucket"
+    );
+    Some(SelectedResidualTask {
+        state: receipt.state,
+        desc,
+        bucket,
+    })
 }
 
 #[cfg(test)]
@@ -5841,6 +5951,67 @@ fn execute_task<'a>(
     }
 }
 
+/// Executes one scheduler-selected task and collapses only its private chain of
+/// planning-only formula successors.
+///
+/// Semantic actions, ordinary Ready/Candidate plans, formula partitions,
+/// already-live merge keys, and every cyclic action boundary return normally
+/// through the scheduler. Each local step still files and interns its successor
+/// before the exact receipt is inspected, so this changes no canonical state
+/// identity and consumes no work outside the newly appended affine tail.
+#[allow(clippy::too_many_arguments)]
+fn execute_task_with_formula_epsilon<'a>(
+    root: &dyn Constraint<'a>,
+    plan: &ResidualPlan,
+    mut task: SelectedResidualTask,
+    full: VariableSet,
+    influences: &[VariableSet; 128],
+    base_estimates: &[usize; 128],
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+    next_activation: &mut u64,
+) -> StepOutcome {
+    if !task.is_formula_plan() {
+        return execute_task(
+            root,
+            plan,
+            task,
+            full,
+            influences,
+            base_estimates,
+            worklist,
+            interner,
+            stats,
+            next_activation,
+        );
+    }
+
+    loop {
+        debug_assert!(task.is_formula_plan());
+        let outcome = execute_task(
+            root,
+            plan,
+            task,
+            full,
+            influences,
+            base_estimates,
+            worklist,
+            interner,
+            stats,
+            next_activation,
+        );
+        let StepOutcome::Advanced(receipt) = outcome else {
+            return outcome;
+        };
+        let Some(next) = take_private_formula_plan_tail(worklist, interner, receipt) else {
+            return StepOutcome::Advanced(receipt);
+        };
+        stats.formula_epsilon_transitions += 1;
+        task = next;
+    }
+}
+
 /// Compile-time action-dispatch seam shared by the ordinary and shadowed
 /// mixed stable/delta control loop. The direct implementation is a zero-sized
 /// passthrough and never materializes action geometry. Only the shadow
@@ -6893,7 +7064,7 @@ impl ResidualStateMachine {
             Err(task) => task,
         };
         let emit_bound = task.desc.bound;
-        let outcome = execute_task(
+        let outcome = execute_task_with_formula_epsilon(
             root,
             plan,
             task,
@@ -7824,7 +7995,7 @@ where
             let emit_bound = desc.bound;
             stats.state_pops += 1;
             stats.readiness_pops += 1;
-            match execute_task(
+            match execute_task_with_formula_epsilon(
                 root,
                 &plan,
                 SelectedResidualTask {
@@ -9773,6 +9944,21 @@ mod tests {
 
     fn candidate_payload(parent_count: usize, candidates: Candidates) -> CandidatePayload {
         CandidatePayload::from_tagged(candidates, parent_count)
+    }
+
+    /// Scheduler-only Formula entry/Plan dispatches left after semantic plans,
+    /// actions, and terminal emission are accounted for.
+    fn formula_control_pops(stats: &ResidualStateStats) -> usize {
+        let semantic = stats.ready_plan_pops
+            + stats.candidate_plan_pops
+            + stats.propose_action_pops
+            + stats.support_action_pops
+            + stats.confirm_action_pops
+            + stats.emit_pops;
+        stats
+            .state_pops
+            .checked_sub(semantic)
+            .expect("semantic pop counters exceeded scheduler pops")
     }
 
     fn ready_desc(bound_count: usize) -> StateDesc {
@@ -14223,6 +14409,12 @@ mod tests {
             lowered.stats.bucket_merges > 0,
             "opposite AND child histories did not reconverge at one canonical PC"
         );
+        assert_eq!(lowered.stats.formula_epsilon_transitions, 1);
+        assert_eq!(
+            formula_control_pops(&lowered.stats),
+            6,
+            "the private formula descent retained a scheduler-only round trip"
+        );
 
         let root_left_proposals = Arc::new(Mutex::new(Vec::new()));
         let root_right_proposals = Arc::new(Mutex::new(Vec::new()));
@@ -14339,6 +14531,12 @@ mod tests {
             lowered.stats.bucket_merges >= 3,
             "recursive opposite-order histories did not remerge at multiple zipper depths: {:?}",
             lowered.stats
+        );
+        assert_eq!(lowered.stats.formula_epsilon_transitions, 3);
+        assert_eq!(
+            formula_control_pops(&lowered.stats),
+            11,
+            "recursive private descents retained scheduler-only round trips"
         );
     }
 
@@ -15456,30 +15654,40 @@ mod tests {
             state: StateId(3),
             rows: 2,
             candidates: 5,
+            merged_with_existing: false,
+            sole_successor: true,
         };
         let lower = ContinuationToken {
             rank: 6,
             state: StateId(99),
             rows: 100,
             candidates: 101,
+            merged_with_existing: false,
+            sole_successor: true,
         };
         let equal = ContinuationToken {
             rank: 7,
             state: StateId(3),
             rows: 3,
             candidates: 7,
+            merged_with_existing: true,
+            sole_successor: true,
         };
         let higher = ContinuationToken {
             rank: 8,
             state: StateId(1),
             rows: 11,
             candidates: 13,
+            merged_with_existing: false,
+            sole_successor: true,
         };
         let higher_equal = ContinuationToken {
             rank: 8,
             state: StateId(1),
             rows: 17,
             candidates: 19,
+            merged_with_existing: true,
+            sole_successor: true,
         };
 
         let mut selected = None;
@@ -15491,6 +15699,8 @@ mod tests {
             Some(ContinuationToken {
                 rows: 5,
                 candidates: 12,
+                merged_with_existing: true,
+                sole_successor: false,
                 ..first
             })
         );
@@ -15503,9 +15713,123 @@ mod tests {
             Some(ContinuationToken {
                 rows: 28,
                 candidates: 32,
+                merged_with_existing: true,
+                sole_successor: false,
                 ..higher
             })
         );
+    }
+
+    #[test]
+    fn private_formula_receipts_distinguish_fresh_reopen_and_live_merge_zero_width_tails() {
+        let root = UnionConstraint::new(vec![
+            FanoutLeaf {
+                variable: 0,
+                values: Arc::new(vec![raw(1)]),
+            },
+            FanoutLeaf {
+                variable: 0,
+                values: Arc::new(vec![raw(2)]),
+            },
+        ]);
+        let plan = ResidualPlan::compile_lowering(
+            &root,
+            ResidualLowering::new(FormulaScope::UnionLeaves, false),
+        );
+        let formula_root = plan
+            .finite_formula
+            .root(0)
+            .expect("the union compiles to a formula root");
+        let mut relevant = ChildSet::empty(plan.len());
+        relevant.insert(0);
+        let counter = plan
+            .finite_formula
+            .start(0, 0, UnionVerb::Propose { relevant });
+        assert!(matches!(counter.focus, FormulaFocus::Plan { .. }));
+        let desc = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Formula { counter },
+        };
+        let bucket = |activation| {
+            StateBucket::Formula(FormulaBatch::from_proposal(
+                RowBatch::seed(),
+                vec![ActivationId(activation)],
+                &plan.finite_formula.node(formula_root).kind,
+            ))
+        };
+        let mut worklist = Worklist::new();
+        let mut interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+
+        let fresh = file_with_plan(
+            &mut worklist,
+            &mut interner,
+            &plan,
+            desc.clone(),
+            bucket(0),
+            &mut stats,
+        )
+        .expect("the virtual seed row files work");
+        assert!(fresh.is_private());
+        let fresh_task = take_private_formula_plan_tail(&mut worklist, &interner, fresh)
+            .expect("a fresh exact formula tail is private");
+        assert_eq!(fresh_task.bucket.row_count(), 1);
+        assert!(worklist.is_empty());
+
+        let reopened = file_with_plan(
+            &mut worklist,
+            &mut interner,
+            &plan,
+            desc.clone(),
+            bucket(1),
+            &mut stats,
+        )
+        .expect("an empty known key reopens");
+        assert!(reopened.is_private());
+        assert_eq!(stats.state_reentries, 1);
+        assert!(
+            take_private_formula_plan_tail(&mut worklist, &interner, reopened).is_some(),
+            "reopening an empty canonical key does not create a merge barrier"
+        );
+
+        let first = file_with_plan(
+            &mut worklist,
+            &mut interner,
+            &plan,
+            desc.clone(),
+            bucket(2),
+            &mut stats,
+        )
+        .expect("the first live tail files");
+        let merged = file_with_plan(
+            &mut worklist,
+            &mut interner,
+            &plan,
+            desc,
+            bucket(3),
+            &mut stats,
+        )
+        .expect("the second live tail merges");
+        assert!(!first.merged_with_existing);
+        assert!(merged.merged_with_existing);
+        assert!(
+            take_private_formula_plan_tail(&mut worklist, &interner, merged).is_none(),
+            "a receipt that appended to live work must stop at reconvergence"
+        );
+        assert!(
+            take_private_formula_plan_tail(&mut worklist, &interner, first).is_none(),
+            "a later append invalidates an earlier receipt's private occupancy"
+        );
+        let live = worklist
+            .values()
+            .flat_map(|level| level.values())
+            .next()
+            .expect("the merged formula bucket remains scheduled");
+        assert_eq!(live.row_count(), 2);
+        let StateBucket::Formula(batch) = live else {
+            panic!("formula receipt changed payload shape")
+        };
+        assert!(batch.parents.rows.is_empty());
     }
 
     #[test]
@@ -15517,6 +15841,8 @@ mod tests {
                     state: StateId(0),
                     rows,
                     candidates,
+                    merged_with_existing: false,
+                    sole_successor: true,
                 });
                 prefer_continuation(
                     &mut selected,
@@ -15525,6 +15851,8 @@ mod tests {
                         state: StateId(0),
                         rows: usize::from(rows != 0),
                         candidates: usize::from(candidates != 0),
+                        merged_with_existing: true,
+                        sole_successor: true,
                     }),
                 );
             });
@@ -16017,6 +16345,8 @@ mod tests {
             state,
             rows: 2,
             candidates: 0,
+            merged_with_existing: false,
+            sole_successor: true,
         };
 
         machine.accept_delta_step(DeltaStepOutcome {

@@ -2100,11 +2100,11 @@ fn cyclic_rpq_resumes_through_recursive_or_and_or_frames() {
         constraints.push(outer_or);
         let root = Arc::new(IntersectionConstraint::new(constraints));
 
-        let mut lowered: Vec<_> = Query::new(Arc::clone(&root), project_end)
+        let mut lowered_query = Query::new(Arc::clone(&root), project_end)
             .solve_residual_state_lazy_with(combined_effects())
             .cap(1)
-            .start_width(1)
-            .collect();
+            .start_width(1);
+        let mut lowered: Vec<_> = lowered_query.by_ref().collect();
         let mut sequential: Vec<_> = Query::new(root, project_end).sequential().collect();
         let mut expected = vec![graph.value(0).raw, graph.value(2).raw, graph.value(3).raw];
         lowered.sort_unstable();
@@ -2118,6 +2118,14 @@ fn cyclic_rpq_resumes_through_recursive_or_and_or_frames() {
             "outer_confirmation={outer_confirmation}"
         );
         assert!(expanded.load(Ordering::Relaxed) >= 3);
+        assert!(
+            lowered_query.stats().formula_epsilon_transitions > 0,
+            "recursive finite control never exercised a private epsilon receipt"
+        );
+        assert!(
+            lowered_query.stats().delta_activations_completed > 0,
+            "the RPQ action boundary never completed a delta activation"
+        );
     }
 }
 
