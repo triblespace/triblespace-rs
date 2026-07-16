@@ -2862,6 +2862,116 @@ fn star_and_optional_epsilon_acceptance_obey_the_graph_term_gate() {
 }
 
 #[test]
+fn fully_bound_support_seeds_anchor_each_target_in_the_forward_program() {
+    let graph = Graph::new(4, &[(0, 1), (0, 2)]);
+    let start = Variable::<GenId>::new(START);
+    let end = Variable::<GenId>::new(END);
+    let path: Box<dyn Constraint<'static>> = Box::new(RegularPathConstraint::new(
+        graph.set.clone(),
+        start,
+        end,
+        &[PathOp::Attr(graph.attribute.raw())],
+    ));
+    let source = graph.value(0).raw;
+    let reachable = graph.value(1).raw;
+    let absent = graph.value(3).raw;
+    let vars = [START, END];
+    let rows = [source, reachable, source, absent];
+    let view = RowsView::new(&vars, &rows);
+    let mut seeds = Vec::new();
+
+    let route = path
+        .residual_delta_support_seeds(&view, &mut seeds)
+        .expect("a fully-bound path exposes its forward transition route");
+    assert_eq!(route, END);
+    assert_eq!(seeds.len(), 2);
+    assert_eq!(seeds[0].parent, 0);
+    assert_eq!(seeds[0].output.node.source, Some(reachable));
+    assert_eq!(seeds[0].output.node.value, source);
+    assert!(!seeds[0].output.accepted);
+    assert_eq!(seeds[1].parent, 1);
+    assert_eq!(seeds[1].output.node.source, Some(absent));
+    assert_eq!(seeds[1].output.node.value, source);
+    assert!(!seeds[1].output.accepted);
+
+    let nodes: Vec<_> = seeds.iter().map(|seed| seed.output.node).collect();
+    let mut successors = Vec::new();
+    assert!(path.residual_delta_expand(route, &nodes, &mut successors));
+    assert!(successors
+        .iter()
+        .all(|(parent, output)| output.node.source == seeds[*parent as usize].output.node.source));
+    assert_eq!(
+        successors
+            .iter()
+            .filter(|(_, output)| output.accepted)
+            .map(|(parent, output)| (*parent, output.node.value))
+            .collect::<Vec<_>>(),
+        vec![(0, reachable)]
+    );
+
+    let partial_vars = [START];
+    let partial_rows = [source];
+    let partial = RowsView::new(&partial_vars, &partial_rows);
+    let mut unsupported = Vec::new();
+    assert_eq!(
+        path.residual_delta_support_seeds(&partial, &mut unsupported),
+        None
+    );
+    assert!(unsupported.is_empty());
+}
+
+#[test]
+fn fully_bound_nullable_support_gates_epsilon_by_nodes_without_source_paging() {
+    let graph = Graph::new(3, &[(0, 1)]);
+    let graph_term = graph.value(0).raw;
+    let other_term = graph.value(1).raw;
+    let absent = graph.value(2).raw;
+    let vars = [START, END];
+    let rows = [
+        graph_term, graph_term, graph_term, other_term, absent, absent,
+    ];
+
+    for suffix in [PathOp::Star, PathOp::Optional] {
+        let path = RegularPathConstraint::new(
+            graph.set.clone(),
+            Variable::<GenId>::new(START),
+            Variable::<GenId>::new(END),
+            &[PathOp::Attr(graph.attribute.raw()), suffix],
+        );
+        let mut seeds = Vec::new();
+        assert_eq!(
+            path.residual_delta_support_seeds(&RowsView::new(&vars, &rows), &mut seeds),
+            Some(END)
+        );
+        assert_eq!(seeds.len(), 3);
+        assert!(seeds[0].output.accepted);
+        assert!(!seeds[1].output.accepted);
+        assert!(!seeds[2].output.accepted);
+    }
+
+    let node = Variable::<GenId>::new(START);
+    let same_variable: Arc<dyn Constraint<'static> + Send + Sync> =
+        Arc::new(RegularPathConstraint::new(
+            graph.set,
+            node,
+            node,
+            &[PathOp::Attr(graph.attribute.raw()), PathOp::Star],
+        ));
+    let same_rows = [graph_term, absent];
+    let same_vars = [START];
+    let same_view = RowsView::new(&same_vars, &same_rows);
+    assert!(!same_variable.residual_delta_source_is_paged(START, &same_view));
+    let mut seeds = Vec::new();
+    assert_eq!(
+        same_variable.residual_delta_support_seeds(&same_view, &mut seeds),
+        Some(START)
+    );
+    assert_eq!(seeds.len(), 2);
+    assert!(seeds[0].output.accepted);
+    assert!(!seeds[1].output.accepted);
+}
+
+#[test]
 fn one_term_at_two_program_counters_keeps_both_futures() {
     let graph = Graph::new(2, &[(0, 1)]);
     // ((p / p) | (p / ^p))+. Both arms reach node 1 after their first

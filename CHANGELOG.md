@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Fully-bound constraints can expose transition-backed support seeds.** The
+  hidden constraint protocol now exposes one structural expansion route for a
+  block of fully-bound boolean checks.
+  Regular paths reuse their forward Thompson program with the bound target as
+  an activation-private acceptance anchor, including exact NODES(G) scope for
+  nullable epsilon witnesses, without enumerating the graph-term universe.
 - **Residual shadow observation preserves native cyclic execution.** Direct
   and observed iterators now instantiate one statically dispatched mixed
   stable/delta pull and Rayon split loop, so source paging, fixpoint
