@@ -348,12 +348,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Ready-row expansion stays segmented across insertion histories.** A
-  canonical Ready bucket retains materialized seeds and committed candidate
-  overlays as an inline-first segment sequence with constant-time logical
-  occupancy. Reconvergent cohorts append without retagging or flattening even
-  when their insertion positions differ; tail selection moves whole suffix
-  segments, splits at most one boundary cohort, and materializes only the
-  selected rows before planning or protocol code can observe them.
+  singleton materialized row block or committed candidate overlay stays in its
+  direct payload shape; only the first actual Ready-state merge allocates a
+  segment vector with constant-time logical occupancy. Reconvergent cohorts
+  append without retagging or flattening even when their insertion positions
+  differ; tail selection moves whole suffix segments, splits at most one
+  boundary cohort, canonicalizes either side back to a singleton when possible,
+  and materializes only selected rows before planning or protocol code can
+  observe them.
 - **One-parent residual candidate payloads stay tagless.** Ordinary and lowered
   formula actions now receive the scalar `Values` candidate sink whenever one
   affine parent is live, while reconverged multi-parent work promotes to the
