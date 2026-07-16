@@ -2888,7 +2888,7 @@ mod tests {
                     node: FormulaNodeId(7),
                     stage: FormulaStage::Support,
                 },
-                returns: Vec::new().into_boxed_slice(),
+                returns: FormulaReturnStack::default(),
                 resume: FormulaOuterResume {
                     variable: 0,
                     occurrence: 0,
@@ -4072,7 +4072,7 @@ mod tests {
                 node: FormulaNodeId(7),
                 stage: FormulaStage::Propose,
             },
-            returns: Vec::new().into_boxed_slice(),
+            returns: FormulaReturnStack::default(),
             resume: FormulaOuterResume {
                 variable: 0,
                 occurrence: 0,
@@ -4160,7 +4160,7 @@ mod tests {
                 node: FormulaNodeId(7),
                 stage: FormulaStage::Propose,
             },
-            returns: Vec::new().into_boxed_slice(),
+            returns: FormulaReturnStack::default(),
             resume: FormulaOuterResume {
                 variable: 0,
                 occurrence: 0,
@@ -4248,19 +4248,20 @@ mod tests {
                 node: FormulaNodeId(7),
                 stage: FormulaStage::Propose,
             },
-            returns: Vec::new().into_boxed_slice(),
+            returns: FormulaReturnStack::default(),
             resume: resume.clone(),
         };
         let second = FormulaProgramCounter {
             focus: first.focus.clone(),
-            returns: vec![FormulaReturnSite {
+            returns: [FormulaReturnSite {
                 kind: FormulaReturnKind::Child,
                 parent: FormulaNodeId(5),
                 parent_stage: FormulaStage::Propose,
                 child: 1,
                 done: ChildSet::empty(2).with_inserted(0),
             }]
-            .into_boxed_slice(),
+            .into_iter()
+            .collect(),
             resume,
         };
         assert_ne!(first, second);

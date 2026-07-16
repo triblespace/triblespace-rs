@@ -628,7 +628,7 @@ impl FiniteFormulaProgram {
         };
         FormulaProgramCounter {
             focus: self.entry_focus(root, stage),
-            returns: Box::new([]),
+            returns: FormulaReturnStack::default(),
             resume: FormulaOuterResume {
                 variable,
                 occurrence,
@@ -729,8 +729,7 @@ impl FiniteFormulaProgram {
             .children()
             .expect("a residual formula Plan named an Atom");
         assert!(child < children.len() && !done.contains(child));
-        let mut returns = counter.returns.to_vec();
-        returns.push(FormulaReturnSite {
+        let returns = counter.returns.push(FormulaReturnSite {
             kind,
             parent: *node,
             parent_stage: *stage,
@@ -739,7 +738,7 @@ impl FiniteFormulaProgram {
         });
         FormulaProgramCounter {
             focus: focus(self, children[child], child_stage),
-            returns: returns.into_boxed_slice(),
+            returns,
             resume: counter.resume.clone(),
         }
     }
@@ -867,7 +866,7 @@ impl FiniteFormulaProgram {
                         stage: site.parent_stage,
                         done: site.done.clone(),
                     },
-                    returns: outer.to_vec().into_boxed_slice(),
+                    returns: outer.clone(),
                     resume: counter.resume.clone(),
                 },
                 child: site.child,
@@ -884,7 +883,7 @@ impl FiniteFormulaProgram {
                 stage,
                 done,
             },
-            returns: outer.to_vec().into_boxed_slice(),
+            returns: outer.clone(),
             resume: counter.resume.clone(),
         })
     }
@@ -898,7 +897,7 @@ impl FiniteFormulaProgram {
             .expect("a formula counter resumed an opaque residual leaf");
         let mut expected = root;
         let mut outer_grade = 0usize;
-        for site in counter.returns.iter() {
+        counter.returns.for_each_root(|site| {
             assert_eq!(site.parent, expected);
             let children = self
                 .node(site.parent)
@@ -937,7 +936,7 @@ impl FiniteFormulaProgram {
                 })
                 .expect("residual formula grade overflow");
             expected = child;
-        }
+        });
 
         let (focused, local_grade) = match &counter.focus {
             FormulaFocus::Action { node, .. } => (*node, 1),
@@ -983,7 +982,7 @@ impl FiniteFormulaProgram {
                 node,
                 stage: FormulaStage::Confirm,
             } if counter.returns.len() == 1 => {
-                let site = &counter.returns[0];
+                let site = counter.returns.get(0).unwrap();
                 if site.kind != FormulaReturnKind::Child
                     || site.parent != root
                     || site.parent_stage != FormulaStage::Confirm
@@ -1074,7 +1073,7 @@ impl FiniteFormulaProgram {
         }
 
         let mut completed = focused;
-        for site in counter.returns.iter().rev() {
+        for site in counter.returns.top_iter() {
             if site.kind != FormulaReturnKind::Child || site.parent_stage != FormulaStage::Propose {
                 return FormulaProposalStreamability::Barrier(
                     FormulaProposalStreamBarrier::NotProposalAction,
@@ -1126,6 +1125,106 @@ struct FormulaReturnSite {
     done: ChildSet,
 }
 
+/// Persistent formula return spine. Every descent allocates one immutable
+/// frame; clones and returns share the unchanged outer prefix.
+#[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct FormulaReturnStack {
+    top: Option<Arc<FormulaReturnFrame>>,
+}
+
+#[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct FormulaReturnFrame {
+    outer: FormulaReturnStack,
+    site: FormulaReturnSite,
+}
+
+impl FormulaReturnStack {
+    fn push(&self, site: FormulaReturnSite) -> Self {
+        Self {
+            top: Some(Arc::new(FormulaReturnFrame {
+                outer: self.clone(),
+                site,
+            })),
+        }
+    }
+
+    fn split_last(&self) -> Option<(&FormulaReturnSite, &Self)> {
+        self.top.as_deref().map(|frame| (&frame.site, &frame.outer))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.top.is_none()
+    }
+
+    fn len(&self) -> usize {
+        self.top_iter().count()
+    }
+
+    fn get(&self, index: usize) -> Option<&FormulaReturnSite> {
+        let len = self.len();
+        if index >= len {
+            return None;
+        }
+        let mut frame = self.top.as_deref().unwrap();
+        for _ in 0..len - index - 1 {
+            frame = frame.outer.top.as_deref().unwrap();
+        }
+        Some(&frame.site)
+    }
+
+    fn for_each_root(&self, mut visit: impl FnMut(&FormulaReturnSite)) {
+        fn walk(stack: &FormulaReturnStack, visit: &mut impl FnMut(&FormulaReturnSite)) {
+            if let Some(frame) = stack.top.as_deref() {
+                walk(&frame.outer, visit);
+                visit(&frame.site);
+            }
+        }
+
+        walk(self, &mut visit);
+    }
+
+    /// Focus-to-root order for continuation proofs that walk back upward.
+    fn top_iter(&self) -> FormulaReturnTopIter<'_> {
+        FormulaReturnTopIter {
+            next: self.top.as_deref(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl FromIterator<FormulaReturnSite> for FormulaReturnStack {
+    fn from_iter<T: IntoIterator<Item = FormulaReturnSite>>(iter: T) -> Self {
+        iter.into_iter()
+            .fold(Self::default(), |stack, site| stack.push(site))
+    }
+}
+
+impl Drop for FormulaReturnStack {
+    fn drop(&mut self) {
+        let mut top = self.top.take();
+        while let Some(frame) = top {
+            let Ok(mut frame) = Arc::try_unwrap(frame) else {
+                break;
+            };
+            top = frame.outer.top.take();
+        }
+    }
+}
+
+struct FormulaReturnTopIter<'a> {
+    next: Option<&'a FormulaReturnFrame>,
+}
+
+impl<'a> Iterator for FormulaReturnTopIter<'a> {
+    type Item = &'a FormulaReturnSite;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let frame = self.next?;
+        self.next = frame.outer.top.as_deref();
+        Some(&frame.site)
+    }
+}
+
 /// Effective protocol role at the focused formula node. It is explicit
 /// because dead-child progress and action history are different facts: an AND
 /// can have a nonempty done mask and still need its one proposer, or an empty
@@ -1170,7 +1269,7 @@ struct FormulaOuterResume {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct FormulaProgramCounter {
     focus: FormulaFocus,
-    returns: Box<[FormulaReturnSite]>,
+    returns: FormulaReturnStack,
     resume: FormulaOuterResume,
 }
 
@@ -10156,7 +10255,7 @@ mod tests {
         let nested_plan = program.select_child(&and_plan, 1);
         assert_eq!(nested_plan.returns.len(), 2);
         assert_eq!(
-            nested_plan.returns[0],
+            *nested_plan.returns.get(0).unwrap(),
             FormulaReturnSite {
                 kind: FormulaReturnKind::Child,
                 parent: outer,
@@ -10166,7 +10265,7 @@ mod tests {
             }
         );
         assert_eq!(
-            nested_plan.returns[1],
+            *nested_plan.returns.get(1).unwrap(),
             FormulaReturnSite {
                 kind: FormulaReturnKind::Child,
                 parent: guarded,
@@ -12387,7 +12486,7 @@ mod tests {
         );
         let support_start = FormulaProgramCounter {
             focus: plan.finite_formula.entry_focus(root, FormulaStage::Support),
-            returns: Box::new([]),
+            returns: FormulaReturnStack::default(),
             resume: candidate_start.resume.clone(),
         };
         let support_complete = plan.finite_formula.complete(&support_start);
@@ -16331,6 +16430,79 @@ mod tests {
         assert!(set.contains(0));
         assert!(set.contains(128));
         assert_eq!(set.count(), 2);
+    }
+
+    #[test]
+    fn formula_return_stack_shares_deep_structural_identity() {
+        use std::collections::hash_map::DefaultHasher;
+
+        let sites = (0..64)
+            .map(|child| {
+                let mut done = ChildSet::empty(64);
+                if child != 0 {
+                    done.insert(child - 1);
+                }
+                FormulaReturnSite {
+                    kind: if child % 2 == 0 {
+                        FormulaReturnKind::Child
+                    } else {
+                        FormulaReturnKind::Guard
+                    },
+                    parent: FormulaNodeId(child as u32),
+                    parent_stage: FormulaStage::Confirm,
+                    child,
+                    done,
+                }
+            })
+            .collect::<Vec<_>>();
+        let stack: FormulaReturnStack = sites.clone().into_iter().collect();
+        assert_eq!(stack.len(), sites.len());
+        for (index, site) in sites.iter().enumerate() {
+            assert_eq!(stack.get(index), Some(site));
+        }
+
+        let shared = stack.clone();
+        assert!(Arc::ptr_eq(
+            stack.top.as_ref().unwrap(),
+            shared.top.as_ref().unwrap()
+        ));
+        let (top, outer) = shared.split_last().unwrap();
+        assert_eq!(top, sites.last().unwrap());
+        assert_eq!(outer.len(), sites.len() - 1);
+        assert_eq!(
+            stack.len(),
+            sites.len(),
+            "splitting mutated the shared spine"
+        );
+
+        let independent: FormulaReturnStack = sites.clone().into_iter().collect();
+        assert_eq!(stack, independent);
+        assert_eq!(stack.cmp(&independent), std::cmp::Ordering::Equal);
+        let hash = |stack: &FormulaReturnStack| {
+            let mut hasher = DefaultHasher::new();
+            stack.hash(&mut hasher);
+            hasher.finish()
+        };
+        assert_eq!(hash(&stack), hash(&independent));
+
+        let mut changed_sites = sites.clone();
+        changed_sites[0].parent = FormulaNodeId(u32::MAX);
+        let changed: FormulaReturnStack = changed_sites.clone().into_iter().collect();
+        assert_ne!(stack, changed);
+        assert_eq!(
+            stack.cmp(&changed),
+            sites.iter().cmp(changed_sites.iter()),
+            "ordering must preserve the exact root-to-focus structure"
+        );
+
+        let mut split = stack;
+        for site in sites.iter().rev() {
+            let (top, outer) = split.split_last().unwrap();
+            assert_eq!(top, site);
+            let outer = outer.clone();
+            split = outer;
+        }
+        assert!(split.is_empty());
     }
 
     #[test]

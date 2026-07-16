@@ -351,6 +351,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   descriptor cloning and interning avoid heap allocation for the common
   at-most-64-leaf formula while wider formulas transparently spill, preserving
   exact identity, hashing, canonical remerging, and geometric scheduling.
+- **Formula continuations share immutable return prefixes.** Selecting a child
+  allocates one persistent return frame, while descriptor clones, completion,
+  and parent resumption retain an `Arc` handle instead of copying the complete
+  structural stack. Equality, hashing, ordering, adaptive grades, and canonical
+  remerging still inspect the exact return-site sequence at arbitrary depth.
 - **Singleton continuation-selected cyclic seeds retain physical focus.** The
   residual scheduler follows the activation-local source/transition lineage it
   just seeded until its first stable effect or quiescence; canonical delta
