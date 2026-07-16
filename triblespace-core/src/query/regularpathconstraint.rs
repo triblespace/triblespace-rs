@@ -5,16 +5,16 @@ use crate::id::id_into_value;
 use crate::id::RawId;
 use crate::id::ID_LEN;
 use crate::inline::encodings::genid::GenId;
-use crate::inline::Inline;
 use crate::inline::IntoInline;
 use crate::inline::RawInline;
 use crate::query::confirm_per_row;
 use crate::query::intersectionconstraint::IntersectionConstraint;
-use crate::query::Binding;
+use crate::query::residual::FrameSeedRow;
+use crate::query::residual::ResidualLowering;
+use crate::query::residual::SeededResidualFrame;
 use crate::query::CandidateSink;
 use crate::query::Constraint;
 use crate::query::EstimateSink;
-use crate::query::Query;
 use crate::query::ResidualDeltaExpandBatch;
 use crate::query::ResidualDeltaExpandCursor;
 use crate::query::ResidualDeltaExpandPage;
@@ -263,22 +263,121 @@ fn distribute_concat(l: PathExpr, r: PathExpr) -> PathExpr {
     }
 }
 
-/// Build the WCO join constraint for a non-closure expression with a bound start,
-/// returning the constraint and the destination variable index.
-fn build_join(
+/// Build a closure-free WCO frame in a fresh local variable namespace.
+///
+/// The start remains an ordinary local variable and is supplied through the
+/// frame's seed row. Unlike the historical nested-query helper, this does not
+/// manufacture a `ConstantConstraint` merely to import the caller value.
+fn build_chain_frame(
     set: &TribleSet,
     expr: &PathExpr,
-    start: &RawInline,
+    close_loop: bool,
 ) -> (
     IntersectionConstraint<Box<dyn Constraint<'static>>>,
+    VariableId,
     VariableId,
 ) {
     let mut ctx = VariableContext::new();
     let start_var = ctx.next_variable::<GenId>();
     let mut constraints: Vec<Box<dyn Constraint<'static> + 'static>> = Vec::new();
-    constraints.push(Box::new(start_var.is(Inline::new(*start))));
     let dest_var = expr.build_constraint(set, &mut ctx, start_var, &mut constraints);
-    (IntersectionConstraint::new(constraints), dest_var.index)
+    if close_loop {
+        constraints.push(Box::new(
+            crate::query::equalityconstraint::EqualityConstraint::new(
+                start_var.index,
+                dest_var.index,
+            ),
+        ));
+    }
+    (
+        IntersectionConstraint::new(constraints),
+        start_var.index,
+        dest_var.index,
+    )
+}
+
+trait ChainFrameReducer {
+    type Output;
+
+    /// Returns whether the private frame should keep searching.
+    fn observe(&mut self, binding: &crate::query::Binding) -> bool;
+    fn finish(self) -> Self::Output;
+}
+
+struct DistinctProject {
+    variable: VariableId,
+    output: HashSet<RawInline>,
+}
+
+impl DistinctProject {
+    fn new(variable: VariableId) -> Self {
+        Self {
+            variable,
+            output: HashSet::new(),
+        }
+    }
+}
+
+impl ChainFrameReducer for DistinctProject {
+    type Output = HashSet<RawInline>;
+
+    fn observe(&mut self, binding: &crate::query::Binding) -> bool {
+        self.output.insert(
+            *binding
+                .get(self.variable)
+                .expect("residual frame omitted its projected variable"),
+        );
+        true
+    }
+
+    fn finish(self) -> Self::Output {
+        self.output
+    }
+}
+
+struct ExistsEq {
+    variable: VariableId,
+    target: RawInline,
+    found: bool,
+}
+
+impl ExistsEq {
+    fn new(variable: VariableId, target: RawInline) -> Self {
+        Self {
+            variable,
+            target,
+            found: false,
+        }
+    }
+}
+
+impl ChainFrameReducer for ExistsEq {
+    type Output = bool;
+
+    fn observe(&mut self, binding: &crate::query::Binding) -> bool {
+        self.found = binding
+            .get(self.variable)
+            .is_some_and(|value| *value == self.target);
+        !self.found
+    }
+
+    fn finish(self) -> Self::Output {
+        self.found
+    }
+}
+
+fn run_chain_frame<C, R>(root: C, seed: FrameSeedRow, mut reducer: R) -> R::Output
+where
+    C: Constraint<'static> + 'static,
+    R: ChainFrameReducer,
+{
+    let mut frame = SeededResidualFrame::new(root, seed, ResidualLowering::FULL);
+    while let Some(binding) = frame.next_binding() {
+        if !reducer.observe(&binding) {
+            break;
+        }
+    }
+    reducer.finish()
 }
 
 // ── Recursive path evaluator ─────────────────────────────────────────────
@@ -474,11 +573,12 @@ fn eval_from(set: &TribleSet, expr: &PathExpr, start: &RawInline) -> HashSet<Raw
                 }
                 return results;
             }
-            let (constraint, dest_idx) = build_join(set, expr, start);
-            Query::new(constraint, move |binding: &Binding| {
-                binding.get(dest_idx).copied()
-            })
-            .collect()
+            let (constraint, start_idx, dest_idx) = build_chain_frame(set, expr, false);
+            run_chain_frame(
+                constraint,
+                FrameSeedRow::one(start_idx, *start),
+                DistinctProject::new(dest_idx),
+            )
         }
         PathExpr::Union(lhs, rhs) => {
             let mut results = eval_from(set, lhs, start);
@@ -533,11 +633,12 @@ fn has_path(set: &TribleSet, expr: &PathExpr, from: &RawInline, to: &RawInline) 
             false
         }
         PathExpr::Concat(_, _) => {
-            let (constraint, dest_idx) = build_join(set, expr, from);
-            Query::new(constraint, move |binding: &Binding| {
-                binding.get(dest_idx).copied()
-            })
-            .any(|dest| dest == *to)
+            let (constraint, start_idx, dest_idx) = build_chain_frame(set, expr, false);
+            run_chain_frame(
+                constraint,
+                FrameSeedRow::one(start_idx, *from),
+                ExistsEq::new(dest_idx, *to),
+            )
         }
         PathExpr::Union(lhs, rhs) => has_path(set, lhs, from, to) || has_path(set, rhs, from, to),
         PathExpr::Plus(body) => {
@@ -689,13 +790,12 @@ fn estimate_from(set: &TribleSet, expr: &PathExpr, start: &RawInline) -> usize {
             bounded_eval_from(set, body, start, RPQ_ESTIMATE_DEPTH).len()
         }
         _ => {
-            let (constraint, dest_idx) = build_join(set, body, start);
-            let vars = [0usize];
+            let (constraint, start_idx, dest_idx) = build_chain_frame(set, body, false);
             let row = [*start];
             let mut out = 0usize;
             if constraint.estimate(
                 dest_idx,
-                &RowsView::new(&vars, &row),
+                &RowsView::new(&[start_idx], &row),
                 &mut EstimateSink::Scalar(&mut out),
             ) {
                 out
@@ -976,22 +1076,12 @@ fn eval_selfloop_join(set: &TribleSet, expr: &PathExpr) -> HashSet<RawInline> {
             out
         }
         chain => {
-            let mut ctx = VariableContext::new();
-            let start_var = ctx.next_variable::<GenId>();
-            let mut constraints: Vec<Box<dyn Constraint<'static> + 'static>> = Vec::new();
-            let dest_var = chain.build_constraint(set, &mut ctx, start_var, &mut constraints);
-            constraints.push(Box::new(
-                crate::query::equalityconstraint::EqualityConstraint::new(
-                    start_var.index,
-                    dest_var.index,
-                ),
-            ));
-            let constraint = IntersectionConstraint::new(constraints);
-            let idx = start_var.index;
-            Query::new(constraint, move |binding: &Binding| {
-                binding.get(idx).copied()
-            })
-            .collect()
+            let (constraint, start_idx, _) = build_chain_frame(set, chain, true);
+            run_chain_frame(
+                constraint,
+                FrameSeedRow::empty(),
+                DistinctProject::new(start_idx),
+            )
         }
     }
 }
@@ -2241,6 +2331,223 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
                 .iter()
                 .all(|row| has_path_gated(&self.set, &self.expr, &row[cs], &row[ce])),
             _ => true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod seeded_frame_tests {
+    use super::*;
+    use crate::id::rngid;
+    use crate::id::ExclusiveId;
+    use crate::inline::Inline;
+    use crate::query::Binding;
+    use crate::query::Query;
+    use crate::trible::Trible;
+
+    struct GraphFixture {
+        set: TribleSet,
+        nodes: Vec<RawInline>,
+        primary: RawId,
+        secondary: RawId,
+    }
+
+    impl GraphFixture {
+        fn new() -> Self {
+            let primary_id = rngid();
+            let secondary_id = rngid();
+            let primary = primary_id.id.raw();
+            let secondary = secondary_id.id.raw();
+            let node_ids: Vec<_> = (0..8).map(|_| rngid()).collect();
+            let nodes: Vec<_> = node_ids
+                .iter()
+                .map(|id| id_into_value(&id.id.raw()))
+                .collect();
+            let mut set = TribleSet::new();
+
+            let primary_edges = [
+                (0, 1),
+                (0, 3),
+                (1, 2),
+                (3, 2),
+                (2, 0),
+                (4, 1),
+                (5, 3),
+                (6, 7),
+            ];
+            let secondary_edges = [(1, 2), (3, 2), (1, 0), (3, 0), (5, 1), (4, 3), (2, 2)];
+            for &(from, to) in &primary_edges {
+                insert_edge(&mut set, &node_ids[from], &primary_id, nodes[to]);
+            }
+            for &(from, to) in &secondary_edges {
+                insert_edge(&mut set, &node_ids[from], &secondary_id, nodes[to]);
+            }
+
+            Self {
+                set,
+                nodes,
+                primary,
+                secondary,
+            }
+        }
+    }
+
+    fn insert_edge(
+        set: &mut TribleSet,
+        from: &ExclusiveId,
+        attribute: &ExclusiveId,
+        to: RawInline,
+    ) {
+        set.insert(&Trible::new(from, attribute, &Inline::<GenId>::new(to)));
+    }
+
+    /// The historical import boundary: capture the outer value by adding a
+    /// constant leaf, then start a fresh scalar `Query` from the empty row.
+    /// Keeping this test-only supplies an independent scheduler oracle for the
+    /// private seeded residual frame without retaining nested queries in the
+    /// production RPQ evaluator.
+    fn scalar_nested_eval_oracle(
+        set: &TribleSet,
+        expr: &PathExpr,
+        start: RawInline,
+    ) -> HashSet<RawInline> {
+        let mut ctx = VariableContext::new();
+        let start_var = ctx.next_variable::<GenId>();
+        let mut constraints: Vec<Box<dyn Constraint<'static> + 'static>> = Vec::new();
+        constraints.push(Box::new(start_var.is(Inline::new(start))));
+        let dest = expr.build_constraint(set, &mut ctx, start_var, &mut constraints);
+        Query::new(
+            IntersectionConstraint::new(constraints),
+            move |binding: &Binding| binding.get(dest.index).copied(),
+        )
+        .sequential()
+        .collect()
+    }
+
+    fn scalar_nested_exists_oracle(
+        set: &TribleSet,
+        expr: &PathExpr,
+        start: RawInline,
+        target: RawInline,
+    ) -> bool {
+        let mut ctx = VariableContext::new();
+        let start_var = ctx.next_variable::<GenId>();
+        let mut constraints: Vec<Box<dyn Constraint<'static> + 'static>> = Vec::new();
+        constraints.push(Box::new(start_var.is(Inline::new(start))));
+        let dest = expr.build_constraint(set, &mut ctx, start_var, &mut constraints);
+        Query::new(
+            IntersectionConstraint::new(constraints),
+            move |binding: &Binding| binding.get(dest.index).copied(),
+        )
+        .sequential()
+        .any(|value| value == target)
+    }
+
+    fn scalar_nested_selfloop_oracle(set: &TribleSet, expr: &PathExpr) -> HashSet<RawInline> {
+        let mut ctx = VariableContext::new();
+        let start = ctx.next_variable::<GenId>();
+        let mut constraints: Vec<Box<dyn Constraint<'static> + 'static>> = Vec::new();
+        let dest = expr.build_constraint(set, &mut ctx, start, &mut constraints);
+        constraints.push(Box::new(
+            crate::query::equalityconstraint::EqualityConstraint::new(start.index, dest.index),
+        ));
+        Query::new(
+            IntersectionConstraint::new(constraints),
+            move |binding: &Binding| binding.get(start.index).copied(),
+        )
+        .sequential()
+        .collect()
+    }
+
+    fn concat(left: PathExpr, right: PathExpr) -> PathExpr {
+        PathExpr::Concat(Box::new(left), Box::new(right))
+    }
+
+    #[test]
+    fn seeded_chain_frame_matches_nested_scalar_query() {
+        let graph = GraphFixture::new();
+        let chains = [
+            concat(
+                PathExpr::Attr(graph.primary),
+                PathExpr::Attr(graph.secondary),
+            ),
+            concat(
+                PathExpr::Attr(graph.primary),
+                PathExpr::InverseAttr(graph.secondary),
+            ),
+            concat(
+                concat(PathExpr::Attr(graph.primary), PathExpr::Attr(graph.primary)),
+                PathExpr::Attr(graph.primary),
+            ),
+        ];
+
+        for chain in &chains {
+            for &start in &graph.nodes {
+                assert_eq!(
+                    eval_from(&graph.set, chain, &start),
+                    scalar_nested_eval_oracle(&graph.set, chain, start),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn seeded_exists_frame_matches_nested_scalar_query() {
+        let graph = GraphFixture::new();
+        let chain = concat(
+            PathExpr::Attr(graph.primary),
+            PathExpr::Attr(graph.secondary),
+        );
+
+        for &start in &graph.nodes {
+            for &target in &graph.nodes {
+                assert_eq!(
+                    has_path(&graph.set, &chain, &start, &target),
+                    scalar_nested_exists_oracle(&graph.set, &chain, start, target),
+                );
+            }
+        }
+        let absent = id_into_value(&rngid().id.raw());
+        assert!(!has_path(&graph.set, &chain, &graph.nodes[0], &absent));
+    }
+
+    #[test]
+    fn seeded_selfloop_frame_matches_nested_scalar_query() {
+        let graph = GraphFixture::new();
+        let chains = [
+            concat(
+                PathExpr::Attr(graph.primary),
+                PathExpr::Attr(graph.secondary),
+            ),
+            concat(
+                concat(PathExpr::Attr(graph.primary), PathExpr::Attr(graph.primary)),
+                PathExpr::Attr(graph.primary),
+            ),
+            concat(
+                PathExpr::Attr(graph.primary),
+                PathExpr::InverseAttr(graph.secondary),
+            ),
+        ];
+
+        for chain in &chains {
+            assert_eq!(
+                eval_selfloop_join(&graph.set, chain),
+                scalar_nested_selfloop_oracle(&graph.set, chain),
+            );
+        }
+    }
+
+    #[test]
+    fn each_seeded_chain_invocation_owns_a_fresh_local_namespace() {
+        let graph = GraphFixture::new();
+        let chain = concat(
+            PathExpr::Attr(graph.primary),
+            PathExpr::InverseAttr(graph.secondary),
+        );
+        let expected = scalar_nested_eval_oracle(&graph.set, &chain, graph.nodes[0]);
+
+        for _ in 0..26 {
+            assert_eq!(eval_from(&graph.set, &chain, &graph.nodes[0]), expected);
         }
     }
 }

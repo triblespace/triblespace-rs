@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Finite RPQ helper joins enter private seeded residual frames.** Closure-free
+  forward, existential, and same-variable fallback joins now import captured
+  endpoint values as a canonical one-row seed instead of starting a nested
+  `Query` with synthetic constant constraints. Each frame owns its local plan,
+  interner, ranks, and worklist; typed distinct-projection and existence
+  reducers execute it synchronously—distinct projection drains the frame while
+  existence may short-circuit and drop its private remainder—keeping local
+  residual states out of the caller's ordering domain.
 - **Estimate-only wrappers preserve native residual execution.**
   `EstimateOverrideConstraint` remains a structural opaque leaf so its planner
   cardinality overrides cannot be bypassed, while forwarding exact page-local
