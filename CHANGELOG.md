@@ -347,13 +347,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Ready-row expansion is deferred while insertion histories agree.** A
-  canonical Ready bucket retains its parent bindings and committed candidate
-  occurrences as a private overlay, splits and receipts that overlay by logical
-  row, and expands only the selected tail before planning or protocol code can
-  observe it. Equal insertion histories stay deferred; heterogeneous histories
-  materialize when they promote to flat rows, preserving exact append order,
-  canonical state identity, and bag semantics.
+- **Ready-row expansion stays segmented across insertion histories.** A
+  canonical Ready bucket retains materialized seeds and committed candidate
+  overlays as an inline-first segment sequence with constant-time logical
+  occupancy. Reconvergent cohorts append without retagging or flattening even
+  when their insertion positions differ; tail selection moves whole suffix
+  segments, splits at most one boundary cohort, and materializes only the
+  selected rows before planning or protocol code can observe them.
 - **One-parent residual candidate payloads stay tagless.** Ordinary and lowered
   formula actions now receive the scalar `Values` candidate sink whenever one
   affine parent is live, while reconverged multi-parent work promotes to the

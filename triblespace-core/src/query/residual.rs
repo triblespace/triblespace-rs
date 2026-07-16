@@ -3456,21 +3456,22 @@ impl CandidateBatch {
     }
 }
 
-/// Fully confirmed row extensions waiting in a canonical `Ready` bucket.
+/// One fully confirmed row-extension cohort waiting in a canonical `Ready`
+/// bucket.
 ///
 /// The speculative values are already committed logically, but retaining the
 /// parent/candidate overlay postpones the `O(rows * columns)` canonical-row
 /// copy until a scheduler pull actually selects those occurrences. Physical
 /// shape is deliberately absent from [`StateDesc`].
 #[derive(Clone, Debug)]
-struct DeferredRows {
+struct DeferredSegment {
     /// Canonical child-column position occupied by the committed candidate.
     insert_at: usize,
     /// Parent bindings plus one disjoint occurrence for every committed row.
     source: CandidateBatch,
 }
 
-impl DeferredRows {
+impl DeferredSegment {
     fn row_count(&self) -> usize {
         self.source.candidate_count()
     }
@@ -3503,15 +3504,17 @@ impl DeferredRows {
         }
     }
 
-    fn into_rows(self) -> RowBatch {
+    fn append_into_rows(self, child_stride: usize, rows: &mut Vec<RawInline>) {
         let parent_stride = self.parent_stride();
+        assert_eq!(
+            child_stride,
+            parent_stride + 1,
+            "deferred row schema disagrees with its canonical state"
+        );
         assert!(
             self.insert_at <= parent_stride,
             "deferred insertion lies outside the child row"
         );
-        let row_count = self.row_count();
-        let child_stride = parent_stride + 1;
-        let mut rows = Vec::with_capacity(row_count.saturating_mul(child_stride));
         let parents = self.source.parents.rows;
 
         let mut append = |parent: usize, candidate: RawInline| {
@@ -3536,8 +3539,212 @@ impl DeferredRows {
                 }
             }
         }
-        debug_assert_eq!(rows.len(), row_count * child_stride);
-        RowBatch { rows, row_count }
+    }
+}
+
+/// One physical cohort in a canonical `Ready` bucket.
+///
+/// Materialized seed/delta rows and deferred extensions share the same segment
+/// sequence so reconvergent histories can append in `O(number of segments)`
+/// without flattening an older fanout or retagging another cohort's candidate
+/// coordinates.
+#[derive(Clone, Debug)]
+enum ReadySegment {
+    Rows(RowBatch),
+    Deferred(DeferredSegment),
+}
+
+impl ReadySegment {
+    fn row_count(&self) -> usize {
+        match self {
+            Self::Rows(rows) => rows.row_count,
+            Self::Deferred(rows) => rows.row_count(),
+        }
+    }
+
+    /// Removes a strict logical tail from this segment. Whole segments are
+    /// moved by [`ReadyRows::take_tail`] without entering this path.
+    fn take_tail(&mut self, child_stride: usize, width: usize) -> Self {
+        assert!(width > 0 && width < self.row_count());
+        match self {
+            Self::Rows(batch) => {
+                assert_eq!(
+                    batch.rows.len(),
+                    batch.row_count.saturating_mul(child_stride),
+                    "ready rows are not rectangular"
+                );
+                let first = batch.row_count - width;
+                let rows = batch.rows.split_off(first * child_stride);
+                batch.row_count = first;
+                Self::Rows(RowBatch {
+                    rows,
+                    row_count: width,
+                })
+            }
+            Self::Deferred(batch) => Self::Deferred(batch.take_tail(child_stride, width)),
+        }
+    }
+
+    fn append_into_rows(self, child_stride: usize, rows: &mut Vec<RawInline>) {
+        match self {
+            Self::Rows(batch) => {
+                assert_eq!(
+                    batch.rows.len(),
+                    batch.row_count.saturating_mul(child_stride),
+                    "ready rows are not rectangular"
+                );
+                rows.extend(batch.rows);
+            }
+            Self::Deferred(batch) => batch.append_into_rows(child_stride, rows),
+        }
+    }
+}
+
+/// Physical payload of one canonical `Ready` state.
+///
+/// The common case stays inline. Reconvergent histories merely append a
+/// segment, retaining strict bag order and leaving every cohort's local parent
+/// coordinates untouched. `row_count` is cached because scheduler occupancy
+/// and continuation receipts must remain constant-time regardless of segment
+/// count.
+#[derive(Clone, Debug)]
+struct ReadyRows {
+    row_count: usize,
+    segments: SmallVec<[ReadySegment; 1]>,
+}
+
+impl ReadyRows {
+    fn from_rows(rows: RowBatch) -> Self {
+        let row_count = rows.row_count;
+        let mut segments = SmallVec::new();
+        if row_count != 0 {
+            segments.push(ReadySegment::Rows(rows));
+        }
+        Self {
+            row_count,
+            segments,
+        }
+    }
+
+    fn from_deferred(insert_at: usize, source: CandidateBatch) -> Self {
+        let row_count = source.candidate_count();
+        let mut segments = SmallVec::new();
+        if row_count != 0 {
+            segments.push(ReadySegment::Deferred(DeferredSegment {
+                insert_at,
+                source,
+            }));
+        }
+        Self {
+            row_count,
+            segments,
+        }
+    }
+
+    fn row_count(&self) -> usize {
+        self.row_count
+    }
+
+    fn append(&mut self, other: Self) {
+        self.row_count = self
+            .row_count
+            .checked_add(other.row_count)
+            .expect("ready row occupancy overflow");
+        self.segments.extend(other.segments);
+        debug_assert_eq!(
+            self.row_count,
+            self.segments
+                .iter()
+                .map(ReadySegment::row_count)
+                .sum::<usize>()
+        );
+    }
+
+    /// Removes the newest logical row occurrences. Whole suffix segments move
+    /// without inspecting their fanout; at most one boundary segment is split.
+    fn take_tail(&mut self, child_stride: usize, width: usize) -> Self {
+        let take = self.row_count.min(width.max(1));
+        debug_assert!(take > 0);
+        let mut remaining = take;
+        let mut reverse_tail = SmallVec::<[ReadySegment; 1]>::new();
+        while remaining != 0 {
+            let last_count = self
+                .segments
+                .last()
+                .expect("nonempty ready rows have a segment")
+                .row_count();
+            if last_count <= remaining {
+                reverse_tail.push(self.segments.pop().unwrap());
+                remaining -= last_count;
+            } else {
+                reverse_tail.push(
+                    self.segments
+                        .last_mut()
+                        .unwrap()
+                        .take_tail(child_stride, remaining),
+                );
+                remaining = 0;
+            }
+        }
+        reverse_tail.reverse();
+        self.row_count = self
+            .row_count
+            .checked_sub(take)
+            .expect("ready tail exceeded its occupancy");
+        let tail = Self {
+            row_count: take,
+            segments: reverse_tail,
+        };
+        debug_assert_eq!(
+            self.row_count,
+            self.segments
+                .iter()
+                .map(ReadySegment::row_count)
+                .sum::<usize>()
+        );
+        debug_assert_eq!(
+            tail.row_count,
+            tail.segments
+                .iter()
+                .map(ReadySegment::row_count)
+                .sum::<usize>()
+        );
+        tail
+    }
+
+    fn into_rows(mut self, child_stride: usize) -> RowBatch {
+        debug_assert_eq!(
+            self.row_count,
+            self.segments
+                .iter()
+                .map(ReadySegment::row_count)
+                .sum::<usize>()
+        );
+        if matches!(self.segments.as_slice(), [ReadySegment::Rows(_)]) {
+            let ReadySegment::Rows(rows) = self.segments.pop().unwrap() else {
+                unreachable!()
+            };
+            assert_eq!(rows.row_count, self.row_count);
+            assert_eq!(
+                rows.rows.len(),
+                rows.row_count.saturating_mul(child_stride),
+                "ready rows are not rectangular"
+            );
+            return rows;
+        }
+        let capacity = self
+            .row_count
+            .checked_mul(child_stride)
+            .expect("ready row allocation overflow");
+        let mut rows = Vec::with_capacity(capacity);
+        for segment in self.segments {
+            segment.append_into_rows(child_stride, &mut rows);
+        }
+        assert_eq!(rows.len(), capacity, "ready row materialization was ragged");
+        RowBatch {
+            rows,
+            row_count: self.row_count,
+        }
     }
 }
 
@@ -4069,7 +4276,7 @@ impl FormulaBatch {
 #[derive(Clone, Debug)]
 enum StateBucket {
     Rows(RowBatch),
-    DeferredRows(DeferredRows),
+    ReadyRows(ReadyRows),
     Candidates(CandidateBatch),
     Formula(FormulaBatch),
 }
@@ -4078,7 +4285,7 @@ impl StateBucket {
     fn row_count(&self) -> usize {
         match self {
             StateBucket::Rows(rows) => rows.row_count,
-            StateBucket::DeferredRows(rows) => rows.row_count(),
+            StateBucket::ReadyRows(rows) => rows.row_count(),
             StateBucket::Candidates(batch) => batch.parents.row_count,
             StateBucket::Formula(batch) => batch.parents.row_count,
         }
@@ -4097,62 +4304,29 @@ impl StateBucket {
 
     fn append(&mut self, other: Self) {
         match other {
-            StateBucket::DeferredRows(right) => match self {
-                StateBucket::DeferredRows(left) if left.insert_at == right.insert_at => {
-                    left.source.append(right.source);
-                }
-                StateBucket::DeferredRows(_) => {
-                    let left = match std::mem::replace(
-                        self,
-                        StateBucket::Rows(RowBatch {
-                            rows: Vec::new(),
-                            row_count: 0,
-                        }),
-                    ) {
-                        StateBucket::DeferredRows(left) => left,
-                        _ => unreachable!(),
-                    };
-                    let mut rows = left.into_rows();
-                    rows.append(right.into_rows());
-                    *self = StateBucket::Rows(rows);
-                }
-                StateBucket::Rows(left) => left.append(right.into_rows()),
-                StateBucket::Candidates(_) | StateBucket::Formula(_) => {
+            StateBucket::ReadyRows(right) => match self {
+                StateBucket::ReadyRows(left) => left.append(right),
+                StateBucket::Rows(_) | StateBucket::Candidates(_) | StateBucket::Formula(_) => {
                     panic!("one canonical residual state received incompatible payloads")
                 }
             },
             StateBucket::Rows(right) => match self {
                 StateBucket::Rows(left) => left.append(right),
-                StateBucket::DeferredRows(_) => {
-                    let left = match std::mem::replace(
-                        self,
-                        StateBucket::Rows(RowBatch {
-                            rows: Vec::new(),
-                            row_count: 0,
-                        }),
-                    ) {
-                        StateBucket::DeferredRows(left) => left,
-                        _ => unreachable!(),
-                    };
-                    let mut rows = left.into_rows();
-                    rows.append(right);
-                    *self = StateBucket::Rows(rows);
-                }
-                StateBucket::Candidates(_) | StateBucket::Formula(_) => {
+                StateBucket::ReadyRows(_)
+                | StateBucket::Candidates(_)
+                | StateBucket::Formula(_) => {
                     panic!("one canonical residual state received incompatible payloads")
                 }
             },
             StateBucket::Candidates(right) => match self {
                 StateBucket::Candidates(left) => left.append(right),
-                StateBucket::Rows(_) | StateBucket::DeferredRows(_) | StateBucket::Formula(_) => {
+                StateBucket::Rows(_) | StateBucket::ReadyRows(_) | StateBucket::Formula(_) => {
                     panic!("one canonical residual state received incompatible payloads")
                 }
             },
             StateBucket::Formula(right) => match self {
                 StateBucket::Formula(left) => left.append(right),
-                StateBucket::Rows(_)
-                | StateBucket::DeferredRows(_)
-                | StateBucket::Candidates(_) => {
+                StateBucket::Rows(_) | StateBucket::ReadyRows(_) | StateBucket::Candidates(_) => {
                     panic!("one canonical residual state received incompatible payloads")
                 }
             },
@@ -4163,11 +4337,11 @@ impl StateBucket {
     /// before any selected task can cross into planning or protocol code.
     fn materialize_selected(self, desc: &StateDesc) -> Self {
         match (self, &desc.phase) {
-            (StateBucket::DeferredRows(rows), ResidualPhase::Ready) => {
-                StateBucket::Rows(rows.into_rows())
+            (StateBucket::ReadyRows(rows), ResidualPhase::Ready) => {
+                StateBucket::Rows(rows.into_rows(desc.bound.count()))
             }
-            (StateBucket::DeferredRows(_), _) => {
-                panic!("deferred rows escaped their canonical Ready state")
+            (StateBucket::ReadyRows(_), _) => {
+                panic!("segmented rows escaped their canonical Ready state")
             }
             (bucket, _) => bucket,
         }
@@ -4187,7 +4361,7 @@ impl StateBucket {
                 let right_rows = batch.row_count / 2;
                 Some(self.take_tail(stride, right_rows, false))
             }
-            StateBucket::DeferredRows(batch) if batch.row_count() >= 2 => {
+            StateBucket::ReadyRows(batch) if batch.row_count() >= 2 => {
                 let right_rows = batch.row_count() / 2;
                 Some(self.take_tail(stride, right_rows, false))
             }
@@ -4208,7 +4382,7 @@ impl StateBucket {
                 Some(self.take_tail(stride, right_parents, false))
             }
             StateBucket::Rows(_)
-            | StateBucket::DeferredRows(_)
+            | StateBucket::ReadyRows(_)
             | StateBucket::Candidates(_)
             | StateBucket::Formula(_) => None,
         }
@@ -4237,9 +4411,7 @@ impl StateBucket {
                     row_count: take,
                 })
             }
-            StateBucket::DeferredRows(batch) => {
-                StateBucket::DeferredRows(batch.take_tail(stride, width))
-            }
+            StateBucket::ReadyRows(batch) => StateBucket::ReadyRows(batch.take_tail(stride, width)),
             StateBucket::Candidates(batch) if candidate_pages => {
                 StateBucket::Candidates(batch.take_candidate_tail(stride, width))
             }
@@ -4583,12 +4755,17 @@ fn file_with_span(
     bucket: StateBucket,
     stats: &mut ResidualStateStats,
 ) -> Option<ContinuationToken> {
+    assert_eq!(
+        matches!(&desc.phase, ResidualPhase::Ready),
+        matches!(&bucket, StateBucket::ReadyRows(_)),
+        "canonical Ready states alone carry segmented rows"
+    );
     let rows = bucket.row_count();
     if rows == 0 {
         return None;
     }
     let candidates = match &bucket {
-        StateBucket::Rows(_) | StateBucket::DeferredRows(_) => 0,
+        StateBucket::Rows(_) | StateBucket::ReadyRows(_) => 0,
         StateBucket::Candidates(batch) => batch.candidate_count(),
         StateBucket::Formula(batch) => batch.page_candidate_count(),
     };
@@ -4983,10 +5160,7 @@ fn commit_candidates(
             bound: next_bound,
             phase: ResidualPhase::Ready,
         },
-        StateBucket::DeferredRows(DeferredRows {
-            insert_at,
-            source: batch,
-        }),
+        StateBucket::ReadyRows(ReadyRows::from_deferred(insert_at, batch)),
         stats,
     )
 }
@@ -6374,10 +6548,10 @@ impl ResidualStateMachine {
                     bound: seed.bound,
                     phase: ResidualPhase::Ready,
                 },
-                StateBucket::Rows(RowBatch {
+                StateBucket::ReadyRows(ReadyRows::from_rows(RowBatch {
                     rows: seed.values,
                     row_count: 1,
-                }),
+                })),
                 &mut state.stats,
             );
         }
@@ -7484,7 +7658,7 @@ impl ResidualStateMachine {
                     let candidate_pages = desc.uses_candidate_pages(plan);
                     let can_split = match bucket {
                         StateBucket::Rows(batch) => batch.row_count >= 2,
-                        StateBucket::DeferredRows(batch) => batch.row_count() >= 2,
+                        StateBucket::ReadyRows(batch) => batch.row_count() >= 2,
                         StateBucket::Candidates(batch) if candidate_pages => {
                             batch.candidate_count() >= 2
                         }
@@ -7943,7 +8117,7 @@ where
                 bound: VariableSet::new_empty(),
                 phase: ResidualPhase::Ready,
             },
-            StateBucket::Rows(RowBatch::seed()),
+            StateBucket::ReadyRows(ReadyRows::from_rows(RowBatch::seed())),
             &mut stats,
         );
     }
@@ -9911,13 +10085,13 @@ mod tests {
         CandidatePayload::from_tagged(candidates, parent_count)
     }
 
-    fn deferred_rows(
+    fn deferred_segment(
         insert_at: usize,
         parent_rows: Vec<RawInline>,
         parent_count: usize,
         candidates: Candidates,
-    ) -> DeferredRows {
-        DeferredRows {
+    ) -> DeferredSegment {
+        DeferredSegment {
             insert_at,
             source: CandidateBatch {
                 parents: RowBatch {
@@ -9929,7 +10103,23 @@ mod tests {
         }
     }
 
-    fn eagerly_expand_deferred(deferred: &DeferredRows) -> RowBatch {
+    fn deferred_rows(
+        insert_at: usize,
+        parent_rows: Vec<RawInline>,
+        parent_count: usize,
+        candidates: Candidates,
+    ) -> ReadyRows {
+        let segment = deferred_segment(insert_at, parent_rows, parent_count, candidates);
+        let row_count = segment.row_count();
+        let mut segments = SmallVec::new();
+        segments.push(ReadySegment::Deferred(segment));
+        ReadyRows {
+            row_count,
+            segments,
+        }
+    }
+
+    fn eagerly_expand_deferred(deferred: &DeferredSegment) -> RowBatch {
         let parent_count = deferred.source.parents.row_count;
         assert!(parent_count > 0);
         let parent_stride = deferred.source.parents.rows.len() / parent_count;
@@ -9959,10 +10149,10 @@ mod tests {
     }
 
     fn ready_bucket(bound_count: usize, row_count: usize, marker: u8) -> StateBucket {
-        StateBucket::Rows(RowBatch {
+        StateBucket::ReadyRows(ReadyRows::from_rows(RowBatch {
             rows: vec![raw(marker); bound_count * row_count],
             row_count,
-        })
+        }))
     }
 
     fn scheduler_fixture(entries: &[(usize, usize, u8)]) -> ResidualStateMachine {
@@ -11970,7 +12160,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_rows_match_eager_expansion_across_randomized_insertions() {
+    fn deferred_segments_match_eager_expansion_across_randomized_insertions() {
         fn next(seed: &mut u64) -> usize {
             *seed = seed
                 .wrapping_mul(6_364_136_223_846_793_005)
@@ -12002,9 +12192,16 @@ mod tests {
                         }
                     }
 
-                    let deferred = deferred_rows(insert_at, parents, parent_count, candidates);
+                    let deferred = deferred_segment(insert_at, parents, parent_count, candidates);
                     let expected = eagerly_expand_deferred(&deferred);
-                    let actual = deferred.into_rows();
+                    let row_count = deferred.row_count();
+                    let mut segments = SmallVec::new();
+                    segments.push(ReadySegment::Deferred(deferred));
+                    let actual = ReadyRows {
+                        row_count,
+                        segments,
+                    }
+                    .into_rows(parent_stride + 1);
                     assert_eq!(actual.row_count, expected.row_count);
                     assert_eq!(
                         actual.rows, expected.rows,
@@ -12016,74 +12213,75 @@ mod tests {
     }
 
     #[test]
-    fn deferred_append_is_homomorphic_and_promotes_only_on_shape_mismatch() {
-        let left = deferred_rows(1, vec![raw(10), raw(11)], 1, vec![(0, raw(1)), (0, raw(1))]);
-        let right = deferred_rows(1, vec![raw(20), raw(21)], 1, vec![(0, raw(2))]);
-        let mut expected = eagerly_expand_deferred(&left);
-        expected.append(eagerly_expand_deferred(&right));
-        let mut same = StateBucket::DeferredRows(left);
-        same.append(StateBucket::DeferredRows(right));
-        let StateBucket::DeferredRows(same_overlay) = &same else {
-            panic!("equal insertion overlays materialized eagerly")
+    fn segmented_ready_append_is_a_strict_bag_homomorphism() {
+        let first = deferred_segment(1, vec![raw(10), raw(11)], 1, vec![(0, raw(1)), (0, raw(1))]);
+        let second = deferred_segment(0, vec![raw(20), raw(21)], 1, vec![(0, raw(2))]);
+        let third = deferred_segment(1, vec![raw(30), raw(31)], 1, vec![(0, raw(3))]);
+        let mut expected = eagerly_expand_deferred(&first);
+        expected.append(eagerly_expand_deferred(&second));
+        expected.append(eagerly_expand_deferred(&third));
+
+        let mut bucket = StateBucket::ReadyRows(deferred_rows(
+            1,
+            vec![raw(10), raw(11)],
+            1,
+            vec![(0, raw(1)), (0, raw(1))],
+        ));
+        bucket.append(StateBucket::ReadyRows(deferred_rows(
+            0,
+            vec![raw(20), raw(21)],
+            1,
+            vec![(0, raw(2))],
+        )));
+        bucket.append(StateBucket::ReadyRows(deferred_rows(
+            1,
+            vec![raw(30), raw(31)],
+            1,
+            vec![(0, raw(3))],
+        )));
+        let StateBucket::ReadyRows(segmented) = &bucket else {
+            panic!("heterogeneous insertions materialized eagerly")
         };
-        assert_eq!(same_overlay.row_count(), 3);
-        let StateBucket::Rows(actual) = same.materialize_selected(&ready_desc(3)) else {
+        assert_eq!(segmented.row_count(), 4);
+        assert_eq!(segmented.segments.len(), 3);
+        assert!(segmented.segments.iter().all(|segment| {
+            matches!(
+                segment,
+                ReadySegment::Deferred(DeferredSegment {
+                    source: CandidateBatch {
+                        candidates: CandidatePayload::Values(_),
+                        ..
+                    },
+                    ..
+                })
+            )
+        }));
+
+        let StateBucket::Rows(actual) = bucket.materialize_selected(&ready_desc(3)) else {
             unreachable!()
         };
         assert_eq!(actual.rows, expected.rows);
         assert_eq!(actual.row_count, expected.row_count);
 
-        // Two histories bind different last variables into the same canonical
-        // two-column Ready state. Their insertion positions differ, so the
-        // exact left-then-right sequence promotes without a heuristic cutoff.
-        let first = deferred_rows(0, vec![raw(30)], 1, vec![(0, raw(3))]);
-        let second = deferred_rows(1, vec![raw(40)], 1, vec![(0, raw(4)), (0, raw(4))]);
-        let mut promoted = StateBucket::DeferredRows(first);
-        promoted.append(StateBucket::DeferredRows(second));
-        let StateBucket::Rows(rows) = &promoted else {
-            panic!("different insertion histories did not promote")
-        };
-        assert_eq!(
-            rows.rows,
-            [raw(3), raw(30), raw(40), raw(4), raw(40), raw(4)]
-        );
-        assert_eq!(rows.row_count, 3);
-
-        // Promotion is permanent for the bucket: later deferred tails are
-        // materialized once and appended after every older occurrence.
-        promoted.append(StateBucket::DeferredRows(deferred_rows(
+        // Materialized seed/delta cohorts use the same structural append path
+        // inside ReadyRows; neither side is flattened until selection.
+        let mut mixed = ReadyRows::from_rows(RowBatch {
+            rows: vec![raw(40), raw(41), raw(42)],
+            row_count: 1,
+        });
+        mixed.append(deferred_rows(
             0,
-            vec![raw(50)],
+            vec![raw(50), raw(51)],
             1,
             vec![(0, raw(5))],
-        )));
-        let StateBucket::Rows(rows) = &promoted else {
-            unreachable!()
-        };
+        ));
+        assert_eq!(mixed.segments.len(), 2);
+        assert!(matches!(mixed.segments[0], ReadySegment::Rows(_)));
+        assert!(matches!(mixed.segments[1], ReadySegment::Deferred(_)));
         assert_eq!(
-            rows.rows,
-            [
-                raw(3),
-                raw(30),
-                raw(40),
-                raw(4),
-                raw(40),
-                raw(4),
-                raw(5),
-                raw(50),
-            ]
+            mixed.into_rows(3).rows,
+            [raw(40), raw(41), raw(42), raw(5), raw(50), raw(51)]
         );
-
-        let deferred = deferred_rows(0, vec![raw(60)], 1, vec![(0, raw(6))]);
-        let mut deferred_then_rows = StateBucket::DeferredRows(deferred);
-        deferred_then_rows.append(StateBucket::Rows(RowBatch {
-            rows: vec![raw(70), raw(7)],
-            row_count: 1,
-        }));
-        let StateBucket::Rows(rows) = deferred_then_rows else {
-            unreachable!()
-        };
-        assert_eq!(rows.rows, [raw(6), raw(60), raw(70), raw(7)]);
     }
 
     #[test]
@@ -12095,7 +12293,7 @@ mod tests {
             &mut machine.interner,
             machine.leaf_count,
             desc.clone(),
-            StateBucket::DeferredRows(deferred_rows(
+            StateBucket::ReadyRows(deferred_rows(
                 0,
                 Vec::new(),
                 1,
@@ -12118,10 +12316,13 @@ mod tests {
             .flat_map(|level| level.values())
             .next()
             .expect("two duplicate occurrences remain deferred");
-        let StateBucket::DeferredRows(remainder) = remainder else {
+        let StateBucket::ReadyRows(remainder) = remainder else {
             panic!("unselected deferred prefix was materialized")
         };
         assert_eq!(remainder.row_count(), 2);
+        let [ReadySegment::Deferred(remainder)] = remainder.segments.as_slice() else {
+            panic!("one unsplit cohort changed physical shape")
+        };
         assert_eq!(remainder.source.parents.rows, Vec::<RawInline>::new());
         assert_eq!(remainder.source.candidates, [(0, raw(1)), (0, raw(1))]);
     }
@@ -12137,7 +12338,7 @@ mod tests {
             &mut machine.interner,
             &plan,
             desc.clone(),
-            StateBucket::DeferredRows(deferred_rows(
+            StateBucket::ReadyRows(deferred_rows(
                 1,
                 vec![raw(10)],
                 1,
@@ -12150,7 +12351,7 @@ mod tests {
             &mut machine.interner,
             &plan,
             desc.clone(),
-            StateBucket::DeferredRows(deferred_rows(
+            StateBucket::ReadyRows(deferred_rows(
                 1,
                 vec![raw(99)],
                 1,
@@ -12175,10 +12376,10 @@ mod tests {
             .get(&hot.rank)
             .and_then(|level| level.get(&hot.state))
             .expect("old prefix and one hot occurrence remain");
-        let StateBucket::DeferredRows(remainder) = remainder else {
+        let StateBucket::ReadyRows(remainder) = remainder else {
             panic!("unselected same-insert prefix was materialized")
         };
-        let remainder = remainder.clone().into_rows();
+        let remainder = remainder.clone().into_rows(2);
         assert_eq!(
             remainder.rows,
             [raw(10), raw(1), raw(10), raw(2), raw(99), raw(40)]
@@ -12187,7 +12388,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_insert_promotion_keeps_new_tail_receipts_exact() {
+    fn coalesced_heterogeneous_receipt_cuts_an_exact_ordered_segment_tail() {
         let root = ShapeLeaf(7);
         let plan = ResidualPlan::compile(&root);
         let desc = ready_desc(2);
@@ -12197,68 +12398,136 @@ mod tests {
             &mut machine.interner,
             &plan,
             desc.clone(),
-            StateBucket::DeferredRows(deferred_rows(
+            StateBucket::ReadyRows(deferred_rows(
                 0,
-                vec![raw(10)],
+                vec![raw(9)],
                 1,
                 vec![(0, raw(1)), (0, raw(2))],
             )),
             &mut machine.stats,
         );
-        let promoted_hot = file_with_plan(
-            &mut machine.worklist,
-            &mut machine.interner,
-            &plan,
-            desc.clone(),
-            StateBucket::DeferredRows(deferred_rows(
-                1,
-                vec![raw(20)],
-                1,
-                vec![(0, raw(3)), (0, raw(4))],
-            )),
-            &mut machine.stats,
-        )
-        .unwrap();
-        assert_eq!(promoted_hot.rows, 2);
-        let task =
-            machine.take_continuation(&plan, ActiveContinuation::cohort(promoted_hot), usize::MAX);
-        let StateBucket::Rows(rows) = task.bucket else {
-            unreachable!()
-        };
-        assert_eq!(rows.rows, [raw(20), raw(3), raw(20), raw(4)]);
+        let filings = [
+            deferred_rows(0, vec![raw(10)], 1, vec![(0, raw(30))]),
+            deferred_rows(1, vec![raw(20)], 1, vec![(0, raw(40)), (0, raw(41))]),
+            deferred_rows(0, vec![raw(30)], 1, vec![(0, raw(50)), (0, raw(51))]),
+        ];
+        let mut hot = None;
+        for rows in filings {
+            prefer_continuation(
+                &mut hot,
+                file_with_plan(
+                    &mut machine.worklist,
+                    &mut machine.interner,
+                    &plan,
+                    desc.clone(),
+                    StateBucket::ReadyRows(rows),
+                    &mut machine.stats,
+                ),
+            );
+        }
+        let hot = hot.expect("equal-state receipts coalesce");
+        assert_eq!(hot.rows, 5);
 
-        let later_hot = file_with_plan(
-            &mut machine.worklist,
-            &mut machine.interner,
-            &plan,
-            desc,
-            StateBucket::DeferredRows(deferred_rows(
-                0,
-                vec![raw(30)],
-                1,
-                vec![(0, raw(5)), (0, raw(6))],
-            )),
-            &mut machine.stats,
-        )
-        .unwrap();
-        let task =
-            machine.take_continuation(&plan, ActiveContinuation::cohort(later_hot), usize::MAX);
+        // The newest three occurrences cross the B/C segment boundary. Their
+        // denotation is B-tail followed by all of C, never reverse pop order.
+        let task = machine.take_continuation(&plan, ActiveContinuation::cohort(hot), 3);
         let StateBucket::Rows(rows) = task.bucket else {
             unreachable!()
         };
-        assert_eq!(rows.rows, [raw(5), raw(30), raw(6), raw(30)]);
+        assert_eq!(
+            rows.rows,
+            [raw(20), raw(41), raw(50), raw(30), raw(51), raw(30)]
+        );
 
         let cold = machine.take_next_with_plan(&plan, usize::MAX).unwrap();
         let StateBucket::Rows(rows) = cold.bucket else {
             unreachable!()
         };
-        assert_eq!(rows.rows, [raw(1), raw(10), raw(2), raw(10)]);
+        assert_eq!(
+            rows.rows,
+            [
+                raw(1),
+                raw(9),
+                raw(2),
+                raw(9),
+                raw(30),
+                raw(10),
+                raw(20),
+                raw(40),
+            ]
+        );
+    }
+
+    #[test]
+    fn randomized_segment_tails_equal_flat_bag_suffixes() {
+        fn next(seed: &mut u64) -> usize {
+            *seed = seed
+                .wrapping_mul(2_862_933_555_777_941_757)
+                .wrapping_add(3_037_000_493);
+            (*seed >> 29) as usize
+        }
+
+        let mut seed = 0x5E6D_3A11_5EED_0001u64;
+        for child_stride in 1..=5 {
+            let parent_stride = child_stride - 1;
+            for case in 0..96usize {
+                let segment_count = 1 + next(&mut seed) % 7;
+                let mut segmented = ReadyRows {
+                    row_count: 0,
+                    segments: SmallVec::new(),
+                };
+                let mut expected = RowBatch {
+                    rows: Vec::new(),
+                    row_count: 0,
+                };
+                for segment_index in 0..segment_count {
+                    let insert_at = next(&mut seed) % child_stride;
+                    let parent_count = 1 + next(&mut seed) % 4;
+                    let mut parents = Vec::with_capacity(parent_count * parent_stride);
+                    let mut candidates = Vec::new();
+                    for parent in 0..parent_count {
+                        for column in 0..parent_stride {
+                            let mut value = raw(80 + parent as u8);
+                            value[1] = column as u8;
+                            value[2] = segment_index as u8;
+                            parents.push(value);
+                        }
+                        let occurrences = 1 + next(&mut seed) % 4;
+                        for occurrence in 0..occurrences {
+                            let mut value = raw((next(&mut seed) % 12) as u8);
+                            value[1] = (occurrence / 2) as u8;
+                            value[2] = case as u8;
+                            candidates.push((parent as u32, value));
+                        }
+                    }
+                    let segment = deferred_segment(insert_at, parents, parent_count, candidates);
+                    expected.append(eagerly_expand_deferred(&segment));
+                    let row_count = segment.row_count();
+                    let mut segments = SmallVec::new();
+                    segments.push(ReadySegment::Deferred(segment));
+                    segmented.append(ReadyRows {
+                        row_count,
+                        segments,
+                    });
+                }
+
+                let take = 1 + next(&mut seed) % segmented.row_count();
+                let mut prefix = segmented;
+                let tail = prefix.take_tail(child_stride, take);
+                let prefix = prefix.into_rows(child_stride);
+                let tail = tail.into_rows(child_stride);
+                let cut = (expected.row_count - take) * child_stride;
+                assert_eq!(prefix.rows, expected.rows[..cut]);
+                assert_eq!(tail.rows, expected.rows[cut..]);
+                assert_eq!(prefix.row_count + tail.row_count, expected.row_count);
+            }
+        }
     }
 
     #[cfg(feature = "parallel")]
     #[test]
-    fn parallel_split_bisects_committed_duplicate_fanout_without_loss() {
-        let original = deferred_rows(
+    fn parallel_split_bisects_segmented_duplicate_fanout_without_loss() {
+        let mut original = deferred_rows(
             0,
             Vec::new(),
             1,
@@ -12271,8 +12540,14 @@ mod tests {
                 (0, raw(3)),
             ],
         );
-        let expected = original.clone().into_rows().rows;
-        let mut left = StateBucket::DeferredRows(original);
+        original.append(deferred_rows(
+            0,
+            Vec::new(),
+            1,
+            vec![(0, raw(4)), (0, raw(4)), (0, raw(5))],
+        ));
+        let expected = original.clone().into_rows(1).rows;
+        let mut left = StateBucket::ReadyRows(original);
         let right = left
             .split_for_parallel(1, false)
             .expect("one committed fanout is splittable by occurrence");
@@ -12283,8 +12558,8 @@ mod tests {
         let StateBucket::Rows(right) = right.materialize_selected(&ready_desc(1)) else {
             unreachable!()
         };
-        assert_eq!(left.row_count, 3);
-        assert_eq!(right.row_count, 3);
+        assert_eq!(left.row_count, 5);
+        assert_eq!(right.row_count, 4);
         let mut actual = left.rows;
         actual.extend(right.rows);
         assert_eq!(actual, expected);
@@ -15681,10 +15956,10 @@ mod tests {
             &mut machine.interner,
             plan.len(),
             ready_desc(1),
-            StateBucket::Rows(RowBatch {
+            StateBucket::ReadyRows(ReadyRows::from_rows(RowBatch {
                 rows: vec![raw(1), raw(2)],
                 row_count: 2,
-            }),
+            })),
             &mut machine.stats,
         );
         let active = machine
@@ -15726,10 +16001,10 @@ mod tests {
             &mut machine.interner,
             plan.len(),
             desc.clone(),
-            StateBucket::Rows(RowBatch {
+            StateBucket::ReadyRows(ReadyRows::from_rows(RowBatch {
                 rows: expected[..2].to_vec(),
                 row_count: 2,
-            }),
+            })),
             &mut machine.stats,
         )
         .expect("fixture files the first continuation receipt");
@@ -15738,10 +16013,10 @@ mod tests {
             &mut machine.interner,
             plan.len(),
             desc,
-            StateBucket::Rows(RowBatch {
+            StateBucket::ReadyRows(ReadyRows::from_rows(RowBatch {
                 rows: expected[2..].to_vec(),
                 row_count: 4,
-            }),
+            })),
             &mut machine.stats,
         )
         .expect("fixture files the equal-key continuation receipt");
@@ -16107,10 +16382,10 @@ mod tests {
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
 
         let zero_rows = |row_count| {
-            StateBucket::Rows(RowBatch {
+            StateBucket::ReadyRows(ReadyRows::from_rows(RowBatch {
                 rows: Vec::new(),
                 row_count,
-            })
+            }))
         };
         let first = file(
             &mut machine.worklist,
@@ -16457,10 +16732,10 @@ mod tests {
             &mut machine.interner,
             plan.len(),
             desc.clone(),
-            StateBucket::Rows(RowBatch {
+            StateBucket::ReadyRows(ReadyRows::from_rows(RowBatch {
                 rows: [10, 11, 12].map(raw).into(),
                 row_count: 3,
-            }),
+            })),
             &mut machine.stats,
         );
         let first_hot = file(
@@ -16468,10 +16743,10 @@ mod tests {
             &mut machine.interner,
             plan.len(),
             desc.clone(),
-            StateBucket::Rows(RowBatch {
+            StateBucket::ReadyRows(ReadyRows::from_rows(RowBatch {
                 rows: [40, 41, 42, 43].map(raw).into(),
                 row_count: 4,
-            }),
+            })),
             &mut machine.stats,
         )
         .expect("first hot receipt is nonempty");
@@ -16480,10 +16755,10 @@ mod tests {
             &mut machine.interner,
             plan.len(),
             desc.clone(),
-            StateBucket::Rows(RowBatch {
+            StateBucket::ReadyRows(ReadyRows::from_rows(RowBatch {
                 rows: [44, 45, 46, 47].map(raw).into(),
                 row_count: 4,
-            }),
+            })),
             &mut machine.stats,
         )
         .expect("equal-key hot receipt is nonempty");
@@ -16517,10 +16792,10 @@ mod tests {
             &mut machine.interner,
             plan.len(),
             desc,
-            StateBucket::Rows(RowBatch {
+            StateBucket::ReadyRows(ReadyRows::from_rows(RowBatch {
                 rows: [50, 51, 52].map(raw).into(),
                 row_count: 3,
-            }),
+            })),
             &mut machine.stats,
         )
         .unwrap();
@@ -16716,7 +16991,7 @@ mod tests {
             &mut machine.interner,
             plan.len(),
             ready_desc(0),
-            StateBucket::Rows(RowBatch::seed()),
+            StateBucket::ReadyRows(ReadyRows::from_rows(RowBatch::seed())),
             &mut machine.stats,
         )
         .expect("one stable seed effect was filed");
@@ -16824,7 +17099,10 @@ mod tests {
             &mut machine.interner,
             machine.leaf_count,
             propose.clone(),
-            ready_bucket(1, 1, 2),
+            StateBucket::Rows(RowBatch {
+                rows: vec![raw(2)],
+                row_count: 1,
+            }),
             &mut machine.stats,
         );
 
@@ -16936,7 +17214,7 @@ mod tests {
                 assert!(batch.candidates.is_values());
                 assert!(batch.candidates.iter().all(|(parent, _)| parent == 0));
             }
-            StateBucket::Rows(_) | StateBucket::DeferredRows(_) | StateBucket::Formula(_) => {
+            StateBucket::Rows(_) | StateBucket::ReadyRows(_) | StateBucket::Formula(_) => {
                 panic!("confirmation returned a non-candidate payload")
             }
         }
@@ -16971,7 +17249,7 @@ mod tests {
                     Some(1)
                 );
             }
-            StateBucket::Rows(_) | StateBucket::DeferredRows(_) | StateBucket::Formula(_) => {
+            StateBucket::Rows(_) | StateBucket::ReadyRows(_) | StateBucket::Formula(_) => {
                 panic!("confirmation returned a non-candidate payload")
             }
         }
@@ -17310,11 +17588,14 @@ mod tests {
                 phase: ResidualPhase::Ready,
             }
         );
-        let StateBucket::DeferredRows(rows) = payload else {
+        let StateBucket::ReadyRows(rows) = payload else {
             panic!("committed candidate was expanded before Ready selection")
         };
-        assert_eq!(rows.insert_at, 0);
         assert_eq!(rows.row_count(), 1);
+        let [ReadySegment::Deferred(rows)] = rows.segments.as_slice() else {
+            panic!("one committed cohort was not retained inline")
+        };
+        assert_eq!(rows.insert_at, 0);
         assert_eq!(rows.source.candidates, [(0, raw(7))]);
 
         let selected = SelectedResidualTask::new(id, interner.get(id).clone(), payload.clone());
