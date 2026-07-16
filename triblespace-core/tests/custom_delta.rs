@@ -479,18 +479,21 @@ impl<'a> Constraint<'a> for PagedDirectDomain {
 
         let begin = match cursor {
             ResidualDeltaSourceCursor::Start => 0,
-            ResidualDeltaSourceCursor::After(previous) => {
-                self.values.partition_point(|value| *value <= previous)
-            }
-            ResidualDeltaSourceCursor::Offset(_) => {
-                panic!("raw-ordered custom source received an ordinal cursor")
+            ResidualDeltaSourceCursor::Offset(offset) => usize::try_from(offset)
+                .expect("custom source cursor does not fit this address space"),
+            ResidualDeltaSourceCursor::After(_) => {
+                panic!("occurrence-bearing custom source received a value cursor")
             }
         };
+        assert!(begin <= self.values.len(), "custom source cursor out of range");
         let end = begin.saturating_add(limit).min(self.values.len());
         let page_values = self.values[begin..end].to_vec();
         accepted.extend(page_values.iter().copied());
-        let next = (end < self.values.len())
-            .then(|| ResidualDeltaSourceCursor::After(self.values[end - 1]));
+        let next = (end < self.values.len()).then(|| {
+            ResidualDeltaSourceCursor::Offset(
+                u64::try_from(end).expect("custom source cursor exceeds u64"),
+            )
+        });
         let parent = view.row(0)[view.col(PARENT).expect("paged source parent")];
         self.evidence
             .pages
@@ -783,7 +786,7 @@ fn custom_direct_source_first_pull_is_rootless_and_drop_cancels_the_frontier() {
     assert_eq!(pages[0].accepted, [raw(1)]);
     assert_eq!(
         pages[0].next,
-        Some(ResidualDeltaSourceCursor::After(raw(1)))
+        Some(ResidualDeltaSourceCursor::Offset(1))
     );
     assert_eq!(query.stats().delta_source_pages, 1);
     assert_eq!(query.stats().delta_source_candidates_examined, 1);
@@ -878,9 +881,9 @@ fn custom_direct_source_preserves_affine_bag_and_monotone_growth() {
 }
 
 #[test]
-fn custom_direct_source_preserves_duplicate_occurrences_within_one_page() {
-    // Both equal occurrences fit in one page. A failure therefore isolates
-    // occurrence handling after the hook from value-cursor resumption.
+fn custom_direct_source_preserves_duplicate_occurrences_at_width_one() {
+    // Equal occurrences straddle pages deliberately. The ordinal cursor is
+    // what makes their two positions representable despite equal values.
     let values = vec![raw(1), raw(1)];
     let oracle = sorted(
         Query::new(
@@ -898,18 +901,21 @@ fn custom_direct_source_preserves_duplicate_occurrences_within_one_page() {
         project_start,
     )
     .solve_residual_state_lazy_with(ResidualLowering::FULL)
-    .cap(2)
-    .start_width(2)
+    .cap(1)
+    .start_width(1)
     .collect_profiled();
     let actual = sorted(residual.results);
-    let pages = evidence.pages.lock().expect("direct source trace poisoned");
-    assert_eq!(pages.len(), 2, "each affine parent owns one source page");
-    assert!(
-        pages.iter().all(|page| page.accepted == [raw(1), raw(1)]),
-        "each affine activation must hand both duplicate occurrences to the registry"
-    );
-    drop(pages);
     assert_eq!(actual, oracle);
+    let pages = evidence.pages.lock().expect("direct source trace poisoned");
+    assert_eq!(pages.len(), 4, "each affine parent owns two source pages");
+    for parent in [raw(8), raw(9)] {
+        let accepted: Vec<_> = pages
+            .iter()
+            .filter(|page| page.parent == parent)
+            .flat_map(|page| page.accepted.iter().copied())
+            .collect();
+        assert_eq!(accepted, [raw(1), raw(1)]);
+    }
 }
 
 #[test]
