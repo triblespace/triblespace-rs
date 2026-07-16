@@ -1579,6 +1579,10 @@ pub struct ResidualStateStats {
     pub delta_source_candidates_examined: usize,
     /// Product-state roots admitted from bounded source pages.
     pub delta_source_roots: usize,
+    /// Bounded pages requested from live product-state transition nodes.
+    pub delta_transition_pages: usize,
+    /// Ordered outgoing transition candidates consumed across those pages.
+    pub delta_transition_candidates_examined: usize,
     /// Direct proposal candidates admitted from bounded source pages without
     /// creating product-state traversal roots.
     pub delta_source_direct_candidates: usize,

@@ -15,6 +15,8 @@ use crate::query::CandidateSink;
 use crate::query::Constraint;
 use crate::query::EstimateSink;
 use crate::query::Query;
+use crate::query::ResidualDeltaExpandCursor;
+use crate::query::ResidualDeltaExpandPage;
 use crate::query::ResidualDeltaNode;
 use crate::query::ResidualDeltaOutput;
 use crate::query::ResidualDeltaSeed;
@@ -1558,6 +1560,137 @@ impl RegularPathConstraint {
             }
         }
     }
+
+    fn next_pageable_delta_value(
+        &self,
+        step: DeltaStep,
+        source: &RawInline,
+        after: Option<&RawInline>,
+    ) -> Option<RawInline> {
+        match step {
+            DeltaStep::Attr(attribute) => {
+                let entity = value_as_entity(source)?;
+                let mut prefix = [0u8; ID_LEN * 2];
+                prefix[..ID_LEN].copy_from_slice(&entity);
+                prefix[ID_LEN..].copy_from_slice(&attribute);
+                match after {
+                    None => self
+                        .set
+                        .eav
+                        .first_infix_range(&prefix, &[u8::MIN; 32], &[u8::MAX; 32]),
+                    Some(value) => self
+                        .set
+                        .eav
+                        .next_infix_after(&prefix, value, &[u8::MAX; 32]),
+                }
+            }
+            DeltaStep::InverseAttr(attribute) => {
+                let mut prefix = [0u8; 32 + ID_LEN];
+                prefix[..32].copy_from_slice(source);
+                prefix[32..].copy_from_slice(&attribute);
+                let entity = match after {
+                    None => self.set.vae.first_infix_range(
+                        &prefix,
+                        &[u8::MIN; ID_LEN],
+                        &[u8::MAX; ID_LEN],
+                    ),
+                    Some(value) => {
+                        let entity = value_as_entity(value)?;
+                        self.set
+                            .vae
+                            .next_infix_after(&prefix, &entity, &[u8::MAX; ID_LEN])
+                    }
+                }?;
+                Some(id_into_value(&entity))
+            }
+            DeltaStep::NotAttr(_) | DeltaStep::InverseNotAttr(_) => None,
+        }
+    }
+
+    fn next_pageable_delta_successor(
+        &self,
+        program: &DeltaProgram,
+        node: ResidualDeltaNode,
+        cursor: ResidualDeltaExpandCursor,
+    ) -> Option<(u32, RawInline, u32)> {
+        let state = program.decode(node.continuation);
+        let steps = &program.steps[state];
+        let (start_branch, after) = match cursor {
+            ResidualDeltaExpandCursor::Start => (0usize, None),
+            ResidualDeltaExpandCursor::After { branch, value } => {
+                let branch = usize::try_from(branch).expect("RPQ branch index does not fit usize");
+                assert!(branch < steps.len(), "invalid RPQ transition-page cursor");
+                (branch, Some(value))
+            }
+        };
+        for (branch, &(step, target)) in steps.iter().enumerate().skip(start_branch) {
+            let branch_after = (branch == start_branch).then_some(after).flatten();
+            if let Some(value) =
+                self.next_pageable_delta_value(step, &node.value, branch_after.as_ref())
+            {
+                return Some((
+                    u32::try_from(branch).expect("too many RPQ transition branches"),
+                    value,
+                    target,
+                ));
+            }
+        }
+        None
+    }
+
+    fn expand_delta_program_page(
+        &self,
+        program: &DeltaProgram,
+        node: ResidualDeltaNode,
+        cursor: ResidualDeltaExpandCursor,
+        limit: usize,
+        successors: &mut Vec<ResidualDeltaOutput>,
+    ) -> Option<ResidualDeltaExpandPage> {
+        assert!(
+            limit > 0,
+            "residual transition pages require positive demand"
+        );
+        let state = program.decode(node.continuation);
+        if program.steps[state].is_empty()
+            || program.steps[state].iter().any(|(step, _)| {
+                matches!(step, DeltaStep::NotAttr(_) | DeltaStep::InverseNotAttr(_))
+            })
+        {
+            assert_eq!(
+                cursor,
+                ResidualDeltaExpandCursor::Start,
+                "an RPQ transition page became unsupported after suspension"
+            );
+            return None;
+        }
+
+        let begin = successors.len();
+        let mut resume = cursor;
+        while successors.len() - begin < limit {
+            let Some((branch, value, target)) =
+                self.next_pageable_delta_successor(program, node, resume)
+            else {
+                break;
+            };
+            successors.push(ResidualDeltaOutput {
+                node: ResidualDeltaNode {
+                    source: node.source,
+                    value,
+                    continuation: program.encode(target),
+                },
+                accepted: program.accepting[target as usize]
+                    && node.source.is_none_or(|anchor| value == anchor),
+            });
+            resume = ResidualDeltaExpandCursor::After { branch, value };
+        }
+        let examined = successors.len() - begin;
+        let next = (examined == limit
+            && self
+                .next_pageable_delta_successor(program, node, resume)
+                .is_some())
+        .then_some(resume);
+        Some(ResidualDeltaExpandPage { next, examined })
+    }
 }
 
 impl RegularPathConstraint {
@@ -1913,6 +2046,28 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
             }
         }));
         Some(self.end)
+    }
+
+    fn residual_delta_expand_page(
+        &self,
+        variable: VariableId,
+        node: ResidualDeltaNode,
+        cursor: ResidualDeltaExpandCursor,
+        limit: usize,
+        successors: &mut Vec<ResidualDeltaOutput>,
+    ) -> Option<ResidualDeltaExpandPage> {
+        let route = self.residual_delta_program(variable)?;
+        let program = match route {
+            ResidualDeltaRoute::BoundEndpoint { program, .. } => program,
+            ResidualDeltaRoute::SameVariable { program } => {
+                assert!(
+                    node.source.is_some(),
+                    "same-variable delta activation lost its source anchor"
+                );
+                program
+            }
+        };
+        self.expand_delta_program_page(program, node, cursor, limit, successors)
     }
 
     fn residual_delta_expand(

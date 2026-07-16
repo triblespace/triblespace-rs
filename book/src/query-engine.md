@@ -191,6 +191,19 @@ occupancy/readiness policy harvests wider batches. This gives the state machine
 the same low-latency-to-throughput ramp as the DAG without requiring a complete
 intersection to run eagerly for one binding.
 
+Regular-path product states apply that demand inside a node as well as across
+nodes. Positive and inverse attribute transitions expose an ordered frontier
+whose cursor is `(automaton branch, last value)`. A width-one pull can therefore
+inspect one edge of a high-degree node, file both its affine expansion
+continuation and any novel child, and descend toward a result without first
+materializing the complete adjacency. Branch-qualified cursors keep distinct
+NFA futures separate even when they produce the same graph value. Negated
+property transitions still use their eager two-level attribute/value scan;
+their exact pageable representation remains an explicit capability boundary.
+An initial nullable endpoint is already recorded by the activation, but becomes
+visible when that root performs its first expansion page; publishing this
+epsilon effect before any transition lookup is a remaining latency refinement.
+
 The ordinary [`Query`](triblespace::core::query::Query) uses this engine whenever
 exact seed settlement leaves a live search. Opaque roots, one-leaf ANDs,
 disjoint conjunctions, finite Union roots, RPQ roots, and live zero-variable
