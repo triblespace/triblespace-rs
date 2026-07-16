@@ -10369,10 +10369,7 @@ mod tests {
         const PARENT: VariableId = 0;
         const LEFT: VariableId = 1;
         const RIGHT: VariableId = 2;
-        let expected = vec![
-            (raw(0), raw(11), raw(22)),
-            (raw(1), raw(11), raw(22)),
-        ];
+        let expected = vec![(raw(0), raw(11), raw(22)), (raw(1), raw(11), raw(22))];
         let make_query = || {
             let root = Arc::new(IntersectionConstraint::new(vec![
                 Arc::new(FanoutLeaf {
