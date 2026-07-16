@@ -187,6 +187,175 @@ impl Positions {
     }
 }
 
+/// Finds the first position whose decoded value is strictly greater than
+/// `after`. The indexed sequence must be nondecreasing in raw-inline order.
+/// SuccinctArchive's Ring rotations give us exactly that order for every
+/// fixed proposal schema, so the residual cursor can remain value based
+/// instead of exposing archive-local codes or positions.
+fn upper_bound_indexed(
+    mut lo: usize,
+    mut hi: usize,
+    after: &RawInline,
+    at: &impl Fn(usize) -> RawInline,
+) -> usize {
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if at(mid) <= *after {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+/// Pages one nondecreasing indexed sequence as distinct direct candidates.
+///
+/// The ordinary two-bound proposal arms defensively call `unique()`. Keeping
+/// that semantic here makes the source exact even if an archive implementation
+/// later exposes repeated adjacent codes inside a fixed-pair range. Seeking and
+/// duplicate skipping are binary searches over the immutable wavelet/range
+/// view; no prefix of candidates is materialized or replayed.
+fn page_indexed_distinct(
+    len: usize,
+    at: impl Fn(usize) -> RawInline,
+    cursor: ResidualDeltaSourceCursor,
+    limit: usize,
+    accepted: &mut Vec<RawInline>,
+) -> ResidualDeltaSourcePage {
+    assert!(limit > 0, "residual source pages require positive demand");
+    let mut index = match cursor {
+        ResidualDeltaSourceCursor::Start => 0,
+        ResidualDeltaSourceCursor::After(after) => upper_bound_indexed(0, len, &after, &at),
+    };
+    let mut examined = 0usize;
+    let mut last = None;
+    while index < len && examined < limit {
+        let value = at(index);
+        debug_assert!(last.is_none_or(|previous| previous < value));
+        accepted.push(value);
+        examined += 1;
+        last = Some(value);
+        index = upper_bound_indexed(index + 1, len, &value, &at);
+    }
+    ResidualDeltaSourcePage {
+        next: (index < len).then(|| {
+            ResidualDeltaSourceCursor::After(
+                last.expect("a nonterminal positive page examined a candidate"),
+            )
+        }),
+        examined,
+    }
+}
+
+/// Pages the distinct values that occur on one top-level archive axis.
+/// `Universe::search_upper` translates the public raw-value cursor into the
+/// first possible archive-local code, and `enumerate_domain_in_range` skips
+/// absent code groups with the prefix bitvector's select stride.
+pub(super) fn page_domain<U>(
+    archive: &SuccinctArchive<U>,
+    prefix: &BitVector<Rank9SelIndex>,
+    mut code_range: Range<usize>,
+    cursor: ResidualDeltaSourceCursor,
+    limit: usize,
+    accepted: &mut Vec<RawInline>,
+) -> ResidualDeltaSourcePage
+where
+    U: Universe,
+{
+    assert!(limit > 0, "residual source pages require positive demand");
+    if let ResidualDeltaSourceCursor::After(after) = cursor {
+        code_range.start = code_range.start.max(archive.domain.search_upper(&after));
+    }
+    code_range.end = code_range.end.min(archive.domain.len());
+    code_range.start = code_range.start.min(code_range.end);
+
+    let mut values = archive
+        .enumerate_domain_in_range(prefix, code_range)
+        .peekable();
+    let mut examined = 0usize;
+    let mut last = None;
+    while examined < limit {
+        let Some(value) = values.next() else {
+            break;
+        };
+        debug_assert!(last.is_none_or(|previous| previous < value));
+        accepted.push(value);
+        examined += 1;
+        last = Some(value);
+    }
+    ResidualDeltaSourcePage {
+        next: values.peek().map(|_| {
+            ResidualDeltaSourceCursor::After(
+                last.expect("a nonterminal positive page examined a candidate"),
+            )
+        }),
+        examined,
+    }
+}
+
+/// Pages the middle component of a fixed-first Ring range. `changed_pair`
+/// indexes one occurrence per distinct `(first, middle)` pair; the Ring hop
+/// maps that occurrence to the middle code in the adjacent rotation.
+#[allow(clippy::too_many_arguments)]
+fn page_middle<U>(
+    archive: &SuccinctArchive<U>,
+    changed_pair: &BitVector<Rank9SelIndex>,
+    range: Range<usize>,
+    last_column: &WaveletMatrix<Rank9SelIndex>,
+    last_prefix: &BitVector<Rank9SelIndex>,
+    middle_column: &WaveletMatrix<Rank9SelIndex>,
+    cursor: ResidualDeltaSourceCursor,
+    limit: usize,
+    accepted: &mut Vec<RawInline>,
+) -> ResidualDeltaSourcePage
+where
+    U: Universe,
+{
+    let first_rank = changed_pair.rank1(range.start).unwrap();
+    let len = changed_pair.rank1(range.end).unwrap() - first_rank;
+    page_indexed_distinct(
+        len,
+        |offset| {
+            let position = changed_pair.select1(first_rank + offset).unwrap();
+            let last = last_column.access(position).unwrap();
+            let rotated = last_prefix.select1(last).unwrap() - last
+                + last_column.rank(position, last).unwrap();
+            archive
+                .domain
+                .access(middle_column.access(rotated).unwrap())
+        },
+        cursor,
+        limit,
+        accepted,
+    )
+}
+
+/// Pages the final component of one fixed `(first, middle)` Ring range.
+fn page_last<U>(
+    archive: &SuccinctArchive<U>,
+    range: Range<usize>,
+    last_column: &WaveletMatrix<Rank9SelIndex>,
+    cursor: ResidualDeltaSourceCursor,
+    limit: usize,
+    accepted: &mut Vec<RawInline>,
+) -> ResidualDeltaSourcePage
+where
+    U: Universe,
+{
+    page_indexed_distinct(
+        range.len(),
+        |offset| {
+            archive
+                .domain
+                .access(last_column.access(range.start + offset).unwrap())
+        },
+        cursor,
+        limit,
+        accepted,
+    )
+}
+
 impl<'a, U> SuccinctArchiveConstraint<'a, U>
 where
     U: Universe,
@@ -401,6 +570,174 @@ where
                 .for_each(|v| push(self.archive.domain.access(v)))
             }
             _ => unreachable!(),
+        }
+    }
+
+    /// Bounded counterpart of [`Self::propose_row`]. Every supported arm
+    /// follows the same sorted Ring rotation as the ordinary proposal and
+    /// appends exact terminal candidates, never transition roots.
+    fn proposal_source_page_row(
+        &self,
+        p: &Positions,
+        row: &[RawInline],
+        cursor: ResidualDeltaSourceCursor,
+        limit: usize,
+        accepted: &mut Vec<RawInline>,
+    ) -> ResidualDeltaSourcePage {
+        let Positions {
+            e_var,
+            a_var,
+            v_var,
+            ..
+        } = *p;
+        let e_bound = p.e(row);
+        let a_bound = p.a(row);
+        let v_bound = p.v(row);
+        let all_codes = 0..self.archive.domain.len();
+
+        match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
+            (None, None, None, true, false, false) => page_domain(
+                self.archive,
+                &self.archive.e_a,
+                all_codes,
+                cursor,
+                limit,
+                accepted,
+            ),
+            (None, None, None, false, true, false) => page_domain(
+                self.archive,
+                &self.archive.a_a,
+                all_codes,
+                cursor,
+                limit,
+                accepted,
+            ),
+            (None, None, None, false, false, true) => page_domain(
+                self.archive,
+                &self.archive.v_a,
+                all_codes,
+                cursor,
+                limit,
+                accepted,
+            ),
+            (Some(e), None, None, false, true, false) => page_middle(
+                self.archive,
+                &self.archive.changed_e_a,
+                base_range(&self.archive.domain, &self.archive.e_a, e),
+                &self.archive.eav_c,
+                &self.archive.v_a,
+                &self.archive.vea_c,
+                cursor,
+                limit,
+                accepted,
+            ),
+            (Some(e), None, None, false, false, true) => page_middle(
+                self.archive,
+                &self.archive.changed_e_v,
+                base_range(&self.archive.domain, &self.archive.e_a, e),
+                &self.archive.eva_c,
+                &self.archive.a_a,
+                &self.archive.aev_c,
+                cursor,
+                limit,
+                accepted,
+            ),
+            (None, Some(a), None, true, false, false) => page_middle(
+                self.archive,
+                &self.archive.changed_a_e,
+                base_range(&self.archive.domain, &self.archive.a_a, a),
+                &self.archive.aev_c,
+                &self.archive.v_a,
+                &self.archive.vae_c,
+                cursor,
+                limit,
+                accepted,
+            ),
+            (None, Some(a), None, false, false, true) => page_middle(
+                self.archive,
+                &self.archive.changed_a_v,
+                base_range(&self.archive.domain, &self.archive.a_a, a),
+                &self.archive.ave_c,
+                &self.archive.e_a,
+                &self.archive.eav_c,
+                cursor,
+                limit,
+                accepted,
+            ),
+            (None, None, Some(v), true, false, false) => page_middle(
+                self.archive,
+                &self.archive.changed_v_e,
+                base_range(&self.archive.domain, &self.archive.v_a, v),
+                &self.archive.vea_c,
+                &self.archive.a_a,
+                &self.archive.ave_c,
+                cursor,
+                limit,
+                accepted,
+            ),
+            (None, None, Some(v), false, true, false) => page_middle(
+                self.archive,
+                &self.archive.changed_v_a,
+                base_range(&self.archive.domain, &self.archive.v_a, v),
+                &self.archive.vae_c,
+                &self.archive.e_a,
+                &self.archive.eva_c,
+                cursor,
+                limit,
+                accepted,
+            ),
+            (None, Some(a), Some(v), true, false, false) => {
+                let range = base_range(&self.archive.domain, &self.archive.a_a, a);
+                page_last(
+                    self.archive,
+                    restrict_range(
+                        &self.archive.domain,
+                        &self.archive.v_a,
+                        &self.archive.aev_c,
+                        v,
+                        &range,
+                    ),
+                    &self.archive.vae_c,
+                    cursor,
+                    limit,
+                    accepted,
+                )
+            }
+            (Some(e), None, Some(v), false, true, false) => {
+                let range = base_range(&self.archive.domain, &self.archive.e_a, e);
+                page_last(
+                    self.archive,
+                    restrict_range(
+                        &self.archive.domain,
+                        &self.archive.v_a,
+                        &self.archive.eav_c,
+                        v,
+                        &range,
+                    ),
+                    &self.archive.vea_c,
+                    cursor,
+                    limit,
+                    accepted,
+                )
+            }
+            (Some(e), Some(a), None, false, false, true) => {
+                let range = base_range(&self.archive.domain, &self.archive.e_a, e);
+                page_last(
+                    self.archive,
+                    restrict_range(
+                        &self.archive.domain,
+                        &self.archive.a_a,
+                        &self.archive.eva_c,
+                        a,
+                        &range,
+                    ),
+                    &self.archive.aev_c,
+                    cursor,
+                    limit,
+                    accepted,
+                )
+            }
+            _ => unreachable!("invalid succinct proposal source state"),
         }
     }
 }
@@ -667,6 +1004,36 @@ where
 
     fn residual_confirm_is_page_local(&self) -> bool {
         true
+    }
+
+    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
+        if view.col(variable).is_some() {
+            return false;
+        }
+        usize::from(self.term_e.is_var(variable))
+            + usize::from(self.term_a.is_var(variable))
+            + usize::from(self.term_v.is_var(variable))
+            == 1
+    }
+
+    fn residual_delta_source_page(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: Option<&[RawInline]>,
+        cursor: ResidualDeltaSourceCursor,
+        limit: usize,
+        _roots: &mut Vec<ResidualDeltaOutput>,
+        accepted: &mut Vec<RawInline>,
+    ) -> Option<ResidualDeltaSourcePage> {
+        if candidates.is_some()
+            || view.len() != 1
+            || !self.residual_proposal_source_is_paged(variable, view)
+        {
+            return None;
+        }
+        let p = self.positions(variable, view);
+        Some(self.proposal_source_page_row(&p, view.row(0), cursor, limit, accepted))
     }
 
     /// Exact when entity, attribute, and value all have values (bound or
