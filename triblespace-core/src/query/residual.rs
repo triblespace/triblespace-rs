@@ -1175,6 +1175,15 @@ struct FormulaProgramCounter {
     resume: FormulaOuterResume,
 }
 
+/// Query-local canonical name for one immutable formula continuation.
+///
+/// The structural counter itself lives exactly once in [`FormulaPcInterner`].
+/// Keeping only this compact name in [`StateDesc`] prevents state hashing,
+/// cloning, and destruction from repeatedly walking or owning the boxed
+/// return-frame spine.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct FormulaPcId(u32);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum FormulaSuccessor {
     Formula(FormulaProgramCounter),
@@ -2565,7 +2574,7 @@ enum ResidualPhase {
     /// One exact finite-formula continuation. Planning and opaque protocol
     /// actions share this identity; the focused program node distinguishes
     /// them without a compatibility executor or historical arm index.
-    Formula { counter: FormulaProgramCounter },
+    Formula { counter: FormulaPcId },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2588,7 +2597,7 @@ impl Hash for StateDesc {
 }
 
 impl StateDesc {
-    fn validate(&self, leaf_count: usize) {
+    fn validate(&self, leaf_count: usize, formula_pcs: &FormulaPcInterner) {
         let validate_variable = |variable: VariableId| {
             assert!(
                 !self.bound.is_set(variable),
@@ -2654,6 +2663,7 @@ impl StateDesc {
                 );
             }
             ResidualPhase::Formula { counter } => {
+                let counter = formula_pcs.get(*counter);
                 validate_variable(counter.resume.variable);
                 assert!(
                     counter.resume.occurrence < leaf_count,
@@ -2682,7 +2692,7 @@ impl StateDesc {
     /// popped, no unprocessed predecessor can still file into it.
     #[cfg(test)]
     fn rank(&self, leaf_count: usize) -> usize {
-        self.rank_with_span(leaf_count, 2, None)
+        self.rank_with_span(leaf_count, 2, None, &FormulaPcInterner::default())
     }
 
     fn rank_with_span(
@@ -2690,8 +2700,9 @@ impl StateDesc {
         leaf_count: usize,
         action_span: usize,
         formula: Option<&FiniteFormulaProgram>,
+        formula_pcs: &FormulaPcInterner,
     ) -> usize {
-        self.validate(leaf_count);
+        self.validate(leaf_count, formula_pcs);
         assert!(action_span >= 2, "residual action span is too small");
         let stride = leaf_count
             .checked_add(1)
@@ -2718,17 +2729,16 @@ impl StateDesc {
                 .and_then(|grade| grade.checked_add(1))
                 .and_then(|grade| base.checked_add(grade))
                 .expect("residual-state rank overflow"),
-            ResidualPhase::Formula { counter } => counter
+            ResidualPhase::Formula { counter } => formula_pcs
+                .get(*counter)
                 .resume
                 .verb
                 .checked_count()
                 .checked_mul(action_span)
                 .and_then(|grade| grade.checked_add(1))
                 .and_then(|grade| {
-                    formula
-                        .expect("formula state rank requires its compiled program")
-                        .grade(counter)
-                        .checked_add(grade)
+                    formula.expect("formula state rank requires its compiled program");
+                    formula_pcs.grade(*counter).checked_add(grade)
                 })
                 .and_then(|grade| base.checked_add(grade))
                 .expect("residual-state rank overflow"),
@@ -2737,7 +2747,7 @@ impl StateDesc {
 
     /// Candidate occurrences become independent scheduling atoms only after
     /// every confirmer still named by the continuation is page-local.
-    fn uses_candidate_pages(&self, plan: &ResidualPlan) -> bool {
+    fn uses_candidate_pages(&self, plan: &ResidualPlan, formula_pcs: &FormulaPcInterner) -> bool {
         match &self.phase {
             ResidualPhase::Candidate {
                 variable,
@@ -2755,7 +2765,7 @@ impl StateDesc {
                 ..
             } => plan.remaining_confirms_accept_pages(relevant, checked, *variable, self.bound),
             ResidualPhase::Formula { counter } => {
-                plan.formula_uses_candidate_pages(counter, self.bound)
+                plan.formula_uses_candidate_pages(formula_pcs.get(*counter), self.bound)
             }
             ResidualPhase::Ready | ResidualPhase::Propose { .. } => false,
         }
@@ -2766,12 +2776,104 @@ impl StateDesc {
 struct StateId(u32);
 
 #[derive(Clone, Default)]
+struct FormulaPcInterner {
+    // Insertion order, rather than a hash, determines stable query-local IDs.
+    counters: IndexSet<FormulaProgramCounter, ahash::RandomState>,
+    // Compiler-derived grade is immutable with the structural counter and
+    // removes return-frame walks from every later state filing.
+    grades: Vec<Option<usize>>,
+}
+
+impl FormulaPcInterner {
+    fn intern(
+        &mut self,
+        program: &FiniteFormulaProgram,
+        counter: FormulaProgramCounter,
+    ) -> FormulaPcId {
+        self.intern_inner(counter, Some(program))
+    }
+
+    fn intern_inner(
+        &mut self,
+        counter: FormulaProgramCounter,
+        program: Option<&FiniteFormulaProgram>,
+    ) -> FormulaPcId {
+        if self.counters.len() > u32::MAX as usize {
+            if let Some(raw) = self.counters.get_index_of(&counter) {
+                return FormulaPcId(raw as u32);
+            }
+            panic!("too many residual formula program counters");
+        }
+        let (raw, inserted) = self.counters.insert_full(counter);
+        if inserted {
+            let grade = program.map(|program| {
+                program.grade(
+                    self.counters
+                        .get_index(raw)
+                        .expect("newly interned residual formula counter exists"),
+                )
+            });
+            self.grades.push(grade);
+        } else if self.grades[raw].is_none() {
+            if let Some(program) = program {
+                self.grades[raw] = Some(
+                    program.grade(
+                        self.counters
+                            .get_index(raw)
+                            .expect("interned residual formula counter exists"),
+                    ),
+                );
+            }
+        }
+        FormulaPcId(u32::try_from(raw).expect("too many residual formula program counters"))
+    }
+
+    #[cfg(test)]
+    fn intern_ungraded(&mut self, counter: FormulaProgramCounter) -> FormulaPcId {
+        self.intern_inner(counter, None)
+    }
+
+    fn get(&self, id: FormulaPcId) -> &FormulaProgramCounter {
+        self.counters
+            .get_index(id.0 as usize)
+            .expect("interned residual formula program counter exists")
+    }
+
+    fn grade(&self, id: FormulaPcId) -> usize {
+        self.grades
+            .get(id.0 as usize)
+            .copied()
+            .flatten()
+            .expect("ranked residual formula program counter has a compiled grade")
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.counters.len()
+    }
+}
+
+#[derive(Clone, Default)]
 struct StateInterner {
     // The insertion index is the stable StateId; hashing never determines IDs.
     descs: IndexSet<StateDesc, ahash::RandomState>,
+    // FormulaPcId is meaningful only inside this exact state-interner clone.
+    formula_pcs: FormulaPcInterner,
 }
 
 impl StateInterner {
+    fn intern_formula(
+        &mut self,
+        program: &FiniteFormulaProgram,
+        counter: FormulaProgramCounter,
+    ) -> FormulaPcId {
+        self.formula_pcs.intern(program, counter)
+    }
+
+    fn formula(&self, id: FormulaPcId) -> &FormulaProgramCounter {
+        self.formula_pcs.get(id)
+    }
+
     /// Returns the exact ID and whether the descriptor was already interned.
     fn intern_with_status(
         &mut self,
@@ -4170,35 +4272,39 @@ struct SelectedResidualTask {
 impl SelectedResidualTask {
     /// Cheap phase classification used by the latency scheduler. It must not
     /// materialize executor geometry on the default path.
-    fn is_action_for_plan(&self, plan: &ResidualPlan) -> bool {
+    fn is_action_for_plan(&self, plan: &ResidualPlan, interner: &StateInterner) -> bool {
         match &self.desc.phase {
             ResidualPhase::Propose { proposer, .. } => !plan.has_finite_formula(*proposer),
             ResidualPhase::Confirm { confirmer, .. } => !plan.has_finite_formula(*confirmer),
             ResidualPhase::Formula { counter } => {
-                matches!(counter.focus, FormulaFocus::Action { .. })
+                matches!(
+                    &interner.formula(*counter).focus,
+                    FormulaFocus::Action { .. }
+                )
             }
             ResidualPhase::Ready | ResidualPhase::Candidate { .. } => false,
         }
     }
 
     #[cfg(test)]
-    fn is_action(&self) -> bool {
-        matches!(
-            self.desc.phase,
-            ResidualPhase::Propose { .. }
-                | ResidualPhase::Confirm { .. }
-                | ResidualPhase::Formula {
-                    counter: FormulaProgramCounter {
-                        focus: FormulaFocus::Action { .. },
-                        ..
-                    }
-                }
-        )
+    fn is_action(&self, interner: &StateInterner) -> bool {
+        match &self.desc.phase {
+            ResidualPhase::Propose { .. } | ResidualPhase::Confirm { .. } => true,
+            ResidualPhase::Formula { counter } => matches!(
+                &interner.formula(*counter).focus,
+                FormulaFocus::Action { .. }
+            ),
+            ResidualPhase::Ready | ResidualPhase::Candidate { .. } => false,
+        }
     }
 
     /// Returns executor geometry only for a concrete protocol action.
     #[allow(dead_code)]
-    fn action_task(&self, plan: &ResidualPlan) -> Option<ResidualActionTask> {
+    fn action_task(
+        &self,
+        plan: &ResidualPlan,
+        interner: &StateInterner,
+    ) -> Option<ResidualActionTask> {
         let (action, candidate_occurrences) = match (&self.desc.phase, &self.bucket) {
             (
                 ResidualPhase::Propose {
@@ -4227,10 +4333,11 @@ impl SelectedResidualTask {
                 batch.candidate_count(),
             ),
             (ResidualPhase::Formula { counter }, StateBucket::Formula(batch)) => {
-                let FormulaFocus::Action { node, stage } = counter.focus else {
+                let counter = interner.formula(*counter);
+                let FormulaFocus::Action { node, stage } = &counter.focus else {
                     return None;
                 };
-                let occurrence = plan.formula_action_occurrence(counter.resume.occurrence, node);
+                let occurrence = plan.formula_action_occurrence(counter.resume.occurrence, *node);
                 let (action, candidates) = match stage {
                     FormulaStage::Support => (
                         ResidualAction::Support {
@@ -4251,7 +4358,7 @@ impl SelectedResidualTask {
                             variable: counter.resume.variable,
                             leaf: occurrence,
                         },
-                        batch.action_candidate_count(stage),
+                        batch.action_candidate_count(*stage),
                     ),
                 };
                 (action, candidates)
@@ -4276,7 +4383,7 @@ impl SelectedResidualTask {
                 panic!("canonical residual action received the wrong payload shape")
             }
         };
-        let candidate_pages = self.desc.uses_candidate_pages(plan);
+        let candidate_pages = self.desc.uses_candidate_pages(plan, &interner.formula_pcs);
         Some(ResidualActionTask {
             state: self.state,
             action,
@@ -4342,8 +4449,13 @@ impl ActiveContinuation {
 }
 
 impl ContinuationToken {
-    fn occupancy(self, desc: &StateDesc, plan: &ResidualPlan) -> usize {
-        if desc.uses_candidate_pages(plan) {
+    fn occupancy(
+        self,
+        desc: &StateDesc,
+        plan: &ResidualPlan,
+        formula_pcs: &FormulaPcInterner,
+    ) -> usize {
+        if desc.uses_candidate_pages(plan, formula_pcs) {
             self.candidates
         } else {
             self.rows
@@ -4417,7 +4529,7 @@ fn file_with_span(
         StateBucket::Candidates(batch) => batch.candidate_count(),
         StateBucket::Formula(batch) => batch.page_candidate_count(),
     };
-    let rank = desc.rank_with_span(leaf_count, action_span, formula);
+    let rank = desc.rank_with_span(leaf_count, action_span, formula, &interner.formula_pcs);
     let (id, known) = interner.intern_with_status(desc, stats);
     let level = worklist.entry(rank).or_default();
     if let Some(existing) = level.get_mut(&id) {
@@ -4720,6 +4832,7 @@ fn propose_action_transition<'a>(
                 relevant: relevant.clone(),
             },
         );
+        let counter = interner.intern_formula(&plan.finite_formula, counter);
         return file_with_plan(
             worklist,
             interner,
@@ -4967,6 +5080,7 @@ fn confirm_action_transition<'a>(
                 checked: checked.clone(),
             },
         );
+        let counter = interner.intern_formula(&plan.finite_formula, counter);
         return file_with_plan(
             worklist,
             interner,
@@ -5067,21 +5181,23 @@ fn finish_formula_transition(
 fn propagate_formula_support(
     plan: &ResidualPlan,
     desc: &StateDesc,
-    completed: FormulaProgramCounter,
+    completed: FormulaPcId,
     truth: bool,
     batch: FormulaBatch,
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
 ) -> Option<ContinuationToken> {
+    let completed_counter = interner.formula(completed);
     assert!(matches!(
-        completed.focus,
+        completed_counter.focus,
         FormulaFocus::Complete {
             stage: FormulaStage::Support,
             ..
         }
     ));
-    match plan.finite_formula.resume(&completed) {
+    let successor = plan.finite_formula.resume(completed_counter);
+    match successor {
         FormulaSuccessor::Formula(parent) => {
             let FormulaFocus::Plan {
                 node,
@@ -5103,6 +5219,7 @@ fn propagate_formula_support(
                 let completed = plan
                     .finite_formula
                     .complete_support_short_circuit(&parent, truth);
+                let completed = interner.intern_formula(&plan.finite_formula, completed);
                 return propagate_formula_support(
                     plan, desc, completed, truth, batch, worklist, interner, stats,
                 );
@@ -5114,10 +5231,12 @@ fn propagate_formula_support(
                     .len()
             {
                 let completed = plan.finite_formula.complete(&parent);
+                let completed = interner.intern_formula(&plan.finite_formula, completed);
                 return propagate_formula_support(
                     plan, desc, completed, identity, batch, worklist, interner, stats,
                 );
             }
+            let parent = interner.intern_formula(&plan.finite_formula, parent);
             file_with_plan(
                 worklist,
                 interner,
@@ -5140,6 +5259,7 @@ fn propagate_formula_support(
             if truth {
                 enter_selected_formula_frame(&plan.finite_formula, &next, &mut batch);
             }
+            let next = interner.intern_formula(&plan.finite_formula, next);
             continue_formula_transition(plan, desc, next, batch, worklist, interner, stats)
         }
         FormulaSuccessor::Outer(_) => {
@@ -5151,39 +5271,46 @@ fn propagate_formula_support(
 fn continue_formula_transition(
     plan: &ResidualPlan,
     desc: &StateDesc,
-    mut counter: FormulaProgramCounter,
+    mut counter: FormulaPcId,
     batch: FormulaBatch,
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
 ) -> Option<ContinuationToken> {
-    if let FormulaFocus::Plan {
-        node,
-        stage: FormulaStage::Support,
-        done,
-    } = &counter.focus
-    {
-        let formula_node = plan.finite_formula.node(*node);
+    let support_complete = match &interner.formula(counter).focus {
+        FormulaFocus::Plan {
+            node,
+            stage: FormulaStage::Support,
+            done,
+        } => Some((*node, done.count())),
+        _ => None,
+    };
+    if let Some((node, done_count)) = support_complete {
+        let formula_node = plan.finite_formula.node(node);
         let children = formula_node
             .children()
             .expect("a support Plan named an Atom");
-        if done.count() == children.len() {
+        if done_count == children.len() {
             let truth = matches!(formula_node.kind, FiniteFormulaNodeKind::And { .. });
-            let completed = plan.finite_formula.complete(&counter);
+            let completed = plan.finite_formula.complete(interner.formula(counter));
+            let completed = interner.intern_formula(&plan.finite_formula, completed);
             return propagate_formula_support(
                 plan, desc, completed, truth, batch, worklist, interner, stats,
             );
         }
     }
 
-    if let FormulaFocus::Plan {
-        node,
-        stage: FormulaStage::Confirm,
-        ..
-    } = &counter.focus
-    {
+    let confirm_node = match interner.formula(counter).focus {
+        FormulaFocus::Plan {
+            node,
+            stage: FormulaStage::Confirm,
+            ..
+        } => Some(node),
+        _ => None,
+    };
+    if let Some(node) = confirm_node {
         if matches!(
-            plan.finite_formula.node(*node).kind,
+            plan.finite_formula.node(node).kind,
             FiniteFormulaNodeKind::And { .. }
         ) {
             let live = batch.current_is_live();
@@ -5194,13 +5321,7 @@ fn continue_formula_transition(
                     prefer_continuation(
                         &mut continuation,
                         continue_formula_transition(
-                            plan,
-                            desc,
-                            counter.clone(),
-                            batch,
-                            worklist,
-                            interner,
-                            stats,
+                            plan, desc, counter, batch, worklist, interner, stats,
                         ),
                     );
                 }
@@ -5208,25 +5329,32 @@ fn continue_formula_transition(
             }
             if !first {
                 loop {
-                    let FormulaFocus::Plan { node, done, .. } = &counter.focus else {
-                        unreachable!("annihilation preserves an AND Plan")
+                    let child = {
+                        let FormulaFocus::Plan { node, done, .. } =
+                            &interner.formula(counter).focus
+                        else {
+                            unreachable!("annihilation preserves an AND Plan")
+                        };
+                        let children = plan
+                            .finite_formula
+                            .node(*node)
+                            .children()
+                            .expect("an AND Plan has children");
+                        (0..children.len()).find(|&child| !done.contains(child))
                     };
-                    let children = plan
-                        .finite_formula
-                        .node(*node)
-                        .children()
-                        .expect("an AND Plan has children");
-                    let Some(child) = (0..children.len()).find(|&child| !done.contains(child))
-                    else {
+                    let Some(child) = child else {
                         break;
                     };
-                    counter = plan.finite_formula.skip_child(&counter, child);
+                    let next = plan
+                        .finite_formula
+                        .skip_child(interner.formula(counter), child);
+                    counter = interner.intern_formula(&plan.finite_formula, next);
                 }
             }
         }
     }
 
-    let complete = match &counter.focus {
+    let complete = match &interner.formula(counter).focus {
         FormulaFocus::Plan { node, done, .. } => {
             let children = plan
                 .finite_formula
@@ -5254,11 +5382,12 @@ fn continue_formula_transition(
         );
     }
 
-    let completed = plan.finite_formula.complete(&counter);
+    let completed = plan.finite_formula.complete(interner.formula(counter));
     match plan.finite_formula.resume(&completed) {
         FormulaSuccessor::Formula(next) => {
             let mut batch = batch;
             batch.return_frame();
+            let next = interner.intern_formula(&plan.finite_formula, next);
             continue_formula_transition(plan, desc, next, batch, worklist, interner, stats)
         }
         FormulaSuccessor::Guard { .. } => {
@@ -5275,21 +5404,22 @@ fn formula_plan_transition<'a>(
     root: &dyn Constraint<'a>,
     plan: &ResidualPlan,
     desc: &StateDesc,
-    counter: &FormulaProgramCounter,
+    counter: FormulaPcId,
     batch: FormulaBatch,
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
 ) -> Option<ContinuationToken> {
-    let FormulaFocus::Plan { node, stage, .. } = &counter.focus else {
-        panic!("formula planning received an action continuation")
+    let (node, stage) = match &interner.formula(counter).focus {
+        FormulaFocus::Plan { node, stage, .. } => (*node, *stage),
+        _ => panic!("formula planning received an action continuation"),
     };
-    if *stage == FormulaStage::Support {
+    if stage == FormulaStage::Support {
         return formula_support_plan_transition(
             plan, desc, counter, batch, worklist, interner, stats,
         );
     }
-    match &plan.finite_formula.node(*node).kind {
+    match &plan.finite_formula.node(node).kind {
         FiniteFormulaNodeKind::Or { children } => formula_or_plan_transition(
             root, plan, desc, counter, children, batch, worklist, interner, stats,
         ),
@@ -5304,38 +5434,36 @@ fn formula_plan_transition<'a>(
 fn formula_support_plan_transition(
     plan: &ResidualPlan,
     desc: &StateDesc,
-    counter: &FormulaProgramCounter,
+    counter: FormulaPcId,
     batch: FormulaBatch,
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
 ) -> Option<ContinuationToken> {
-    let FormulaFocus::Plan {
-        node,
-        stage: FormulaStage::Support,
-        done,
-    } = &counter.focus
-    else {
-        unreachable!("support planning received a non-support continuation")
+    let (node, done) = match &interner.formula(counter).focus {
+        FormulaFocus::Plan {
+            node,
+            stage: FormulaStage::Support,
+            done,
+        } => (*node, done.clone()),
+        _ => unreachable!("support planning received a non-support continuation"),
     };
     let children = plan
         .finite_formula
-        .node(*node)
+        .node(node)
         .children()
         .expect("a support Plan named an Atom");
     assert!(done.is_valid_for(children.len()));
     let Some(child) = (0..children.len()).find(|&child| !done.contains(child)) else {
-        return continue_formula_transition(
-            plan,
-            desc,
-            counter.clone(),
-            batch,
-            worklist,
-            interner,
-            stats,
-        );
+        return continue_formula_transition(plan, desc, counter, batch, worklist, interner, stats);
     };
-    let next = select_formula_child(&plan.finite_formula, counter, children, child);
+    let next = select_formula_child(
+        &plan.finite_formula,
+        interner.formula(counter),
+        children,
+        child,
+    );
+    let next = interner.intern_formula(&plan.finite_formula, next);
     continue_formula_transition(plan, desc, next, batch, worklist, interner, stats)
 }
 
@@ -5368,15 +5496,20 @@ fn formula_or_plan_transition<'a>(
     root: &dyn Constraint<'a>,
     plan: &ResidualPlan,
     desc: &StateDesc,
-    counter: &FormulaProgramCounter,
+    counter: FormulaPcId,
     children: &[FormulaNodeId],
     batch: FormulaBatch,
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
 ) -> Option<ContinuationToken> {
-    let FormulaFocus::Plan { done, .. } = &counter.focus else {
-        unreachable!("OR planning received an action continuation")
+    let (done, occurrence, variable) = match &interner.formula(counter).focus {
+        FormulaFocus::Plan { done, .. } => (
+            done.clone(),
+            interner.formula(counter).resume.occurrence,
+            interner.formula(counter).resume.variable,
+        ),
+        _ => unreachable!("OR planning received an action continuation"),
     };
     assert!(matches!(
         batch.frames.last(),
@@ -5402,12 +5535,8 @@ fn formula_or_plan_transition<'a>(
         }
         column.clear();
         if plan
-            .resolve_formula_node(root, counter.resume.occurrence, children[child])
-            .estimate(
-                counter.resume.variable,
-                &view,
-                &mut EstimateSink::Column(&mut column),
-            )
+            .resolve_formula_node(root, occurrence, children[child])
+            .estimate(variable, &view, &mut EstimateSink::Column(&mut column))
         {
             assert_eq!(
                 column.len(),
@@ -5430,10 +5559,13 @@ fn formula_or_plan_transition<'a>(
 
     let mut continuation = None;
     for (child, batch) in batch.partition(vars.len(), &assignments) {
-        let counter = plan.finite_formula.guard_child(counter, child);
+        let next = plan
+            .finite_formula
+            .guard_child(interner.formula(counter), child);
+        let next = interner.intern_formula(&plan.finite_formula, next);
         prefer_continuation(
             &mut continuation,
-            continue_formula_transition(plan, desc, counter, batch, worklist, interner, stats),
+            continue_formula_transition(plan, desc, next, batch, worklist, interner, stats),
         );
     }
     continuation
@@ -5444,15 +5576,20 @@ fn formula_and_plan_transition<'a>(
     root: &dyn Constraint<'a>,
     plan: &ResidualPlan,
     desc: &StateDesc,
-    counter: &FormulaProgramCounter,
+    counter: FormulaPcId,
     children: &[FormulaNodeId],
     batch: FormulaBatch,
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
 ) -> Option<ContinuationToken> {
-    let FormulaFocus::Plan { done, .. } = &counter.focus else {
-        unreachable!("AND planning received an action continuation")
+    let (done, occurrence, variable) = match &interner.formula(counter).focus {
+        FormulaFocus::Plan { done, .. } => (
+            done.clone(),
+            interner.formula(counter).resume.occurrence,
+            interner.formula(counter).resume.variable,
+        ),
+        _ => unreachable!("AND planning received an action continuation"),
     };
     assert!(matches!(
         batch.frames.last(),
@@ -5462,7 +5599,7 @@ fn formula_and_plan_transition<'a>(
 
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
     let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
-    let mut next = counter.clone();
+    let mut next = counter;
     let mut estimates_by_child = Vec::new();
     for child in 0..children.len() {
         if done.contains(child) {
@@ -5470,12 +5607,8 @@ fn formula_and_plan_transition<'a>(
         }
         let mut column = Vec::with_capacity(batch.parents.row_count);
         if plan
-            .resolve_formula_node(root, counter.resume.occurrence, children[child])
-            .estimate(
-                counter.resume.variable,
-                &view,
-                &mut EstimateSink::Column(&mut column),
-            )
+            .resolve_formula_node(root, occurrence, children[child])
+            .estimate(variable, &view, &mut EstimateSink::Column(&mut column))
         {
             assert_eq!(
                 column.len(),
@@ -5488,14 +5621,18 @@ fn formula_and_plan_transition<'a>(
                 column.is_empty(),
                 "irrelevant AND child estimate must leave its sink untouched"
             );
-            next = plan.finite_formula.skip_child(&next, child);
+            let skipped = plan
+                .finite_formula
+                .skip_child(interner.formula(next), child);
+            next = interner.intern_formula(&plan.finite_formula, skipped);
         }
     }
 
-    let FormulaFocus::Plan { done, .. } = &next.focus else {
-        unreachable!("AND relevance planning preserves a Plan")
+    let done_count = match &interner.formula(next).focus {
+        FormulaFocus::Plan { done, .. } => done.count(),
+        _ => unreachable!("AND relevance planning preserves a Plan"),
     };
-    if done.count() == children.len() {
+    if done_count == children.len() {
         return continue_formula_transition(plan, desc, next, batch, worklist, interner, stats);
     }
     let first = estimates_by_child
@@ -5515,11 +5652,17 @@ fn formula_and_plan_transition<'a>(
 
     let mut continuation = None;
     for (child, mut batch) in batch.partition(vars.len(), &assignments) {
-        let counter = select_formula_child(&plan.finite_formula, &next, children, child);
-        enter_selected_formula_frame(&plan.finite_formula, &counter, &mut batch);
+        let selected = select_formula_child(
+            &plan.finite_formula,
+            interner.formula(next),
+            children,
+            child,
+        );
+        enter_selected_formula_frame(&plan.finite_formula, &selected, &mut batch);
+        let selected = interner.intern_formula(&plan.finite_formula, selected);
         prefer_continuation(
             &mut continuation,
-            continue_formula_transition(plan, desc, counter, batch, worklist, interner, stats),
+            continue_formula_transition(plan, desc, selected, batch, worklist, interner, stats),
         );
     }
     continuation
@@ -5529,28 +5672,28 @@ fn formula_and_plan_transition<'a>(
 fn finish_formula_action_result(
     plan: &ResidualPlan,
     bound: VariableSet,
-    counter: &FormulaProgramCounter,
+    counter: FormulaPcId,
     mut batch: FormulaBatch,
     result: CandidatePayload,
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
 ) -> Option<ContinuationToken> {
-    let FormulaFocus::Action { stage, .. } = counter.focus else {
-        panic!("formula result received a planning continuation")
+    let stage = match &interner.formula(counter).focus {
+        FormulaFocus::Action { stage, .. } => *stage,
+        _ => panic!("formula result received a planning continuation"),
     };
     batch.apply_action_result(stage, result);
     batch.validate_tags();
 
-    let completed = plan.finite_formula.complete(counter);
+    let completed = plan.finite_formula.complete(interner.formula(counter));
     let desc = StateDesc {
         bound,
-        phase: ResidualPhase::Formula {
-            counter: counter.clone(),
-        },
+        phase: ResidualPhase::Formula { counter },
     };
     match plan.finite_formula.resume(&completed) {
         FormulaSuccessor::Formula(next) => {
+            let next = interner.intern_formula(&plan.finite_formula, next);
             continue_formula_transition(plan, &desc, next, batch, worklist, interner, stats)
         }
         FormulaSuccessor::Guard { .. } => {
@@ -5567,20 +5710,26 @@ fn formula_action_transition<'a>(
     root: &dyn Constraint<'a>,
     plan: &ResidualPlan,
     desc: &StateDesc,
-    counter: &FormulaProgramCounter,
+    counter: FormulaPcId,
     batch: FormulaBatch,
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
 ) -> Option<ContinuationToken> {
-    let FormulaFocus::Action { node, stage } = counter.focus else {
-        panic!("formula action received a planning continuation")
+    let (node, stage, occurrence, variable) = match &interner.formula(counter).focus {
+        FormulaFocus::Action { node, stage } => (
+            *node,
+            *stage,
+            interner.formula(counter).resume.occurrence,
+            interner.formula(counter).resume.variable,
+        ),
+        _ => panic!("formula action received a planning continuation"),
     };
     assert_eq!(batch.activations.len(), batch.parents.row_count);
 
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
     let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
-    let constraint = plan.resolve_formula_node(root, counter.resume.occurrence, node);
+    let constraint = plan.resolve_formula_node(root, occurrence, node);
     if stage == FormulaStage::Support {
         let support: Vec<bool> = (0..batch.parents.row_count)
             .map(|parent| constraint.satisfied(&view.row_view(parent)))
@@ -5588,20 +5737,14 @@ fn formula_action_transition<'a>(
         stats.support_calls += 1;
         stats.support_rows += batch.parents.row_count;
         stats.max_support_rows = stats.max_support_rows.max(batch.parents.row_count);
-        let completed = plan.finite_formula.complete(counter);
+        let completed = plan.finite_formula.complete(interner.formula(counter));
+        let completed = interner.intern_formula(&plan.finite_formula, completed);
         let mut continuation = None;
         for (truth, batch) in batch.partition(vars.len(), &support) {
             prefer_continuation(
                 &mut continuation,
                 propagate_formula_support(
-                    plan,
-                    desc,
-                    completed.clone(),
-                    truth,
-                    batch,
-                    worklist,
-                    interner,
-                    stats,
+                    plan, desc, completed, truth, batch, worklist, interner, stats,
                 ),
             );
         }
@@ -5617,20 +5760,12 @@ fn formula_action_transition<'a>(
     match stage {
         FormulaStage::Support => unreachable!("support returned above"),
         FormulaStage::Propose => {
-            constraint.propose(
-                counter.resume.variable,
-                &view,
-                &mut result.sink(batch.parents.row_count),
-            );
+            constraint.propose(variable, &view, &mut result.sink(batch.parents.row_count));
             stats.candidates_proposed += result.len();
             stats.max_propose_candidates = stats.max_propose_candidates.max(result.len());
         }
         FormulaStage::Confirm => {
-            constraint.confirm(
-                counter.resume.variable,
-                &view,
-                &mut result.sink(batch.parents.row_count),
-            );
+            constraint.confirm(variable, &view, &mut result.sink(batch.parents.row_count));
             stats.candidates_confirmed += candidates_before;
             stats.max_confirm_candidates = stats.max_confirm_candidates.max(candidates_before);
         }
@@ -5809,12 +5944,20 @@ fn execute_task<'a>(
             }
         }
         (ResidualPhase::Formula { counter }, StateBucket::Formula(batch)) => {
-            let is_action = matches!(counter.focus, FormulaFocus::Action { .. });
-            let continuation = match &counter.focus {
-                FormulaFocus::Plan { .. } => formula_plan_transition(
+            let counter = *counter;
+            let action_stage = match &interner.formula(counter).focus {
+                FormulaFocus::Plan { .. } => None,
+                FormulaFocus::Action { stage, .. } => Some(*stage),
+                FormulaFocus::Complete { .. } => {
+                    panic!("a completed formula reached executor dispatch")
+                }
+            };
+            let is_action = action_stage.is_some();
+            let continuation = match action_stage {
+                None => formula_plan_transition(
                     root, plan, &desc, counter, batch, worklist, interner, stats,
                 ),
-                FormulaFocus::Action { stage, .. } => {
+                Some(stage) => {
                     match stage {
                         FormulaStage::Support => stats.support_action_pops += 1,
                         FormulaStage::Propose => stats.propose_action_pops += 1,
@@ -5823,9 +5966,6 @@ fn execute_task<'a>(
                     formula_action_transition(
                         root, plan, &desc, counter, batch, worklist, interner, stats,
                     )
-                }
-                FormulaFocus::Complete { .. } => {
-                    panic!("a completed formula reached executor dispatch")
                 }
             };
             if let Some(continuation) = continuation {
@@ -5846,10 +5986,12 @@ fn execute_task<'a>(
 /// passthrough and never materializes action geometry. Only the shadow
 /// implementation reads clocks, touches TLS, or allocates observer records.
 trait ResidualActionDispatch {
+    fn observes_actions(&self) -> bool;
+
     fn run(
         &self,
         task: SelectedResidualTask,
-        plan: &ResidualPlan,
+        action: Option<ResidualActionTask>,
         execute: impl FnOnce(SelectedResidualTask) -> MachineStep,
     ) -> MachineStep;
 }
@@ -5859,10 +6001,15 @@ struct DirectActionDispatch;
 
 impl ResidualActionDispatch for DirectActionDispatch {
     #[inline]
+    fn observes_actions(&self) -> bool {
+        false
+    }
+
+    #[inline]
     fn run(
         &self,
         task: SelectedResidualTask,
-        _plan: &ResidualPlan,
+        _action: Option<ResidualActionTask>,
         execute: impl FnOnce(SelectedResidualTask) -> MachineStep,
     ) -> MachineStep {
         execute(task)
@@ -5874,13 +6021,17 @@ struct ShadowActionDispatch<'e> {
 }
 
 impl ResidualActionDispatch for ShadowActionDispatch<'_> {
+    fn observes_actions(&self) -> bool {
+        true
+    }
+
     fn run(
         &self,
         task: SelectedResidualTask,
-        plan: &ResidualPlan,
+        action: Option<ResidualActionTask>,
         execute: impl FnOnce(SelectedResidualTask) -> MachineStep,
     ) -> MachineStep {
-        let Some(action) = task.action_task(plan) else {
+        let Some(action) = action else {
             return execute(task);
         };
         let (site, geometry) = action.observation();
@@ -6271,7 +6422,9 @@ impl ResidualStateMachine {
         let full_state = self.worklist.iter().rev().find_map(|(&rank, level)| {
             level.iter().rev().find_map(|(&id, bucket)| {
                 let desc = self.interner.get(id);
-                let candidate_pages = plan.is_some_and(|plan| desc.uses_candidate_pages(plan));
+                let candidate_pages = plan.is_some_and(|plan| {
+                    desc.uses_candidate_pages(plan, &self.interner.formula_pcs)
+                });
                 (bucket.occupancy(candidate_pages) >= width).then_some((rank, id))
             })
         });
@@ -6283,7 +6436,8 @@ impl ResidualStateMachine {
                 .last_key_value()
                 .expect("residual rank has a live state");
             let desc = self.interner.get(id);
-            let candidate_pages = plan.is_some_and(|plan| desc.uses_candidate_pages(plan));
+            let candidate_pages = plan
+                .is_some_and(|plan| desc.uses_candidate_pages(plan, &self.interner.formula_pcs));
             assert!(
                 bucket.occupancy(candidate_pages) < width,
                 "readiness selected while a full residual bucket existed"
@@ -6309,10 +6463,12 @@ impl ResidualStateMachine {
                 self.leaf_count,
                 self.action_span,
                 plan.map(|plan| &plan.finite_formula),
+                &self.interner.formula_pcs,
             ),
             rank
         );
-        let candidate_pages = plan.is_some_and(|plan| desc.uses_candidate_pages(plan));
+        let candidate_pages =
+            plan.is_some_and(|plan| desc.uses_candidate_pages(plan, &self.interner.formula_pcs));
         let before = bucket.occupancy(candidate_pages);
         let chunk = bucket.take_tail(desc.bound.count(), width, candidate_pages);
         let remainder = bucket.occupancy(candidate_pages);
@@ -6372,12 +6528,13 @@ impl ResidualStateMachine {
                 self.leaf_count,
                 self.action_span,
                 Some(&plan.finite_formula),
+                &self.interner.formula_pcs,
             ),
             token.rank,
             "continuation token disagrees with canonical state rank"
         );
-        let candidate_pages = desc.uses_candidate_pages(plan);
-        let cohort_occupancy = token.occupancy(&desc, plan);
+        let candidate_pages = desc.uses_candidate_pages(plan, &self.interner.formula_pcs);
+        let cohort_occupancy = token.occupancy(&desc, plan, &self.interner.formula_pcs);
         assert!(cohort_occupancy > 0, "continuation cohort is empty");
         let take = match mode {
             ContinuationMode::Cohort => cohort_occupancy.min(width.max(1)),
@@ -6441,7 +6598,8 @@ impl ResidualStateMachine {
         self.worklist.values().any(|level| {
             level.iter().any(|(&id, bucket)| {
                 let desc = self.interner.get(id);
-                bucket.occupancy(desc.uses_candidate_pages(plan)) >= width
+                bucket.occupancy(desc.uses_candidate_pages(plan, &self.interner.formula_pcs))
+                    >= width
             })
         })
     }
@@ -6600,7 +6758,9 @@ impl ResidualStateMachine {
             task.desc.bound,
         ) {
             assert!(
-                !task.desc.uses_candidate_pages(plan),
+                !task
+                    .desc
+                    .uses_candidate_pages(plan, &self.interner.formula_pcs),
                 "grouped delta confirmation was split into candidate pages"
             );
         }
@@ -6712,17 +6872,25 @@ impl ResidualStateMachine {
         else {
             return Err(task);
         };
-        let counter = counter.clone();
-        let (node, stage) = match &counter.focus {
-            FormulaFocus::Action { node, stage } => (*node, *stage),
-            _ => return Err(task),
+        let counter = *counter;
+        let (node, stage, occurrence, outer_variable) = {
+            let counter = self.interner.formula(counter);
+            match &counter.focus {
+                FormulaFocus::Action { node, stage } => (
+                    *node,
+                    *stage,
+                    counter.resume.occurrence,
+                    counter.resume.variable,
+                ),
+                _ => return Err(task),
+            }
         };
         let formula_node = plan.finite_formula.node(node);
         if !matches!(formula_node.kind, FiniteFormulaNodeKind::Atom) {
             return Err(task);
         }
         let stream_proposal = stage == FormulaStage::Propose
-            && plan.formula_proposal_streamability(&counter, task.desc.bound)
+            && plan.formula_proposal_streamability(self.interner.formula(counter), task.desc.bound)
                 == FormulaProposalStreamability::Linear;
         if stream_proposal {
             assert!(
@@ -6733,7 +6901,6 @@ impl ResidualStateMachine {
                 "a certified linear formula proposal carried a non-AND payload frame"
             );
         }
-        let occurrence = counter.resume.occurrence;
         let vars: Vec<VariableId> = task.desc.bound.into_iter().collect();
         let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
         let constraint = plan.resolve_formula_node(root, occurrence, node);
@@ -6748,7 +6915,7 @@ impl ResidualStateMachine {
             };
             (route, false)
         } else {
-            let variable = counter.resume.variable;
+            let variable = outer_variable;
             let transition_paged = constraint.residual_delta_source_is_paged(variable, &view);
             let proposal_paged = stage == FormulaStage::Propose
                 && constraint.residual_proposal_source_is_paged(variable, &view);
@@ -6822,6 +6989,7 @@ impl ResidualStateMachine {
                 DeltaDesc::formula(variable, occurrence, node),
                 desc.bound,
                 counter,
+                stage,
                 batch,
                 stream_proposal,
             );
@@ -6834,6 +7002,7 @@ impl ResidualStateMachine {
             DeltaDesc::formula(variable, occurrence, node),
             desc.bound,
             counter,
+            stage,
             batch,
             seeds,
             stream_proposal,
@@ -6927,8 +7096,12 @@ impl ResidualStateMachine {
             self.take_next_with_plan(plan, width)
                 .expect("pop_once requires a non-empty residual worklist")
         };
-        self.last_was_action = task.is_action_for_plan(plan);
-        dispatch.run(task, plan, |task| {
+        self.last_was_action = task.is_action_for_plan(plan, &self.interner);
+        let action = dispatch
+            .observes_actions()
+            .then(|| task.action_task(plan, &self.interner))
+            .flatten();
+        dispatch.run(task, action, |task| {
             self.execute_selected_task(root, plan, task, influences, base_estimates)
         })
     }
@@ -7027,7 +7200,8 @@ impl ResidualStateMachine {
             return None;
         }
         let desc = self.interner.get(continuation.state);
-        let successor_is_underfilled = continuation.occupancy(desc, plan) < width.max(1);
+        let successor_is_underfilled =
+            continuation.occupancy(desc, plan, &self.interner.formula_pcs) < width.max(1);
         match self.last_selection {
             // ProbeOne governs exactly the delta-filed handoff atom. Once it
             // advances, its ordered fanout is an ordinary semantic cohort;
@@ -7342,7 +7516,8 @@ impl ResidualStateMachine {
             let splittable = self.worklist.iter().rev().find_map(|(&rank, level)| {
                 level.iter().rev().find_map(|(&id, bucket)| {
                     let desc = self.interner.get(id);
-                    let candidate_pages = desc.uses_candidate_pages(plan);
+                    let candidate_pages =
+                        desc.uses_candidate_pages(plan, &self.interner.formula_pcs);
                     let can_split = match bucket {
                         StateBucket::Rows(batch) => batch.row_count >= 2,
                         StateBucket::Candidates(batch) if candidate_pages => {
@@ -7818,7 +7993,12 @@ where
         for (id, bucket) in level {
             let desc = interner.get(id).clone();
             debug_assert_eq!(
-                desc.rank_with_span(leaf_count, plan.action_span(), Some(&plan.finite_formula),),
+                desc.rank_with_span(
+                    leaf_count,
+                    plan.action_span(),
+                    Some(&plan.finite_formula),
+                    &interner.formula_pcs,
+                ),
                 rank
             );
             let emit_bound = desc.bound;
@@ -9073,6 +9253,7 @@ mod tests {
                 frame.plan.len(),
                 frame.plan.action_span(),
                 Some(&frame.plan.finite_formula),
+                &frame.machine.interner.formula_pcs,
             )
         );
 
@@ -9769,6 +9950,89 @@ mod tests {
         let mut value = [0; 32];
         value[0] = byte;
         value
+    }
+
+    #[test]
+    fn formula_pc_arena_is_exact_compact_and_query_local() {
+        #[allow(dead_code)]
+        enum LegacyResidualPhaseLayout {
+            Ready,
+            Propose {
+                variable: VariableId,
+                relevant: ChildSet,
+                proposer: usize,
+            },
+            Candidate {
+                variable: VariableId,
+                relevant: ChildSet,
+                checked: ChildSet,
+            },
+            Confirm {
+                variable: VariableId,
+                relevant: ChildSet,
+                checked: ChildSet,
+                confirmer: usize,
+            },
+            Formula {
+                counter: FormulaProgramCounter,
+            },
+        }
+
+        #[allow(dead_code)]
+        struct LegacyStateDescLayout {
+            bound: VariableSet,
+            phase: LegacyResidualPhaseLayout,
+        }
+
+        let relevant = ChildSet::empty(2).with_inserted(0);
+        let first = FormulaProgramCounter {
+            focus: FormulaFocus::Plan {
+                node: FormulaNodeId(7),
+                stage: FormulaStage::Confirm,
+                done: ChildSet::empty(2).with_inserted(0),
+            },
+            returns: vec![FormulaReturnSite {
+                kind: FormulaReturnKind::Child,
+                parent: FormulaNodeId(5),
+                parent_stage: FormulaStage::Confirm,
+                child: 1,
+                done: ChildSet::empty(2),
+            }]
+            .into_boxed_slice(),
+            resume: FormulaOuterResume {
+                variable: 0,
+                occurrence: 0,
+                verb: UnionVerb::Propose { relevant },
+            },
+        };
+        let mut second = first.clone();
+        let FormulaFocus::Plan { done, .. } = &mut second.focus else {
+            unreachable!("the fixture starts at a Plan")
+        };
+        done.insert(1);
+
+        let mut arena = FormulaPcInterner::default();
+        let first_id = arena.intern_ungraded(first.clone());
+        assert_eq!(arena.intern_ungraded(first.clone()), first_id);
+        let second_id = arena.intern_ungraded(second.clone());
+        assert_ne!(first_id, second_id);
+        assert_eq!(arena.len(), 2);
+        assert_eq!(arena.get(first_id), &first);
+        assert_eq!(arena.get(second_id), &second);
+        assert_eq!(arena.clone().get(first_id), &first);
+
+        assert_eq!(std::mem::size_of::<FormulaPcId>(), 4);
+        assert!(
+            std::mem::size_of::<StateDesc>() < std::mem::size_of::<LegacyStateDescLayout>(),
+            "a compact PC ID should reduce the owning descriptor layout"
+        );
+        eprintln!(
+            "formula_pc={} formula_pc_id={} state_desc={} legacy_state_desc={}",
+            std::mem::size_of::<FormulaProgramCounter>(),
+            std::mem::size_of::<FormulaPcId>(),
+            std::mem::size_of::<StateDesc>(),
+            std::mem::size_of::<LegacyStateDescLayout>(),
+        );
     }
 
     fn candidate_payload(parent_count: usize, candidates: Candidates) -> CandidatePayload {
@@ -10559,14 +10823,16 @@ mod tests {
             .finite_formula
             .start(0, 0, UnionVerb::Propose { relevant });
         let support = plan.finite_formula.guard_child(&parent, 0);
+        let mut machine = ResidualStateMachine::new_for_plan(root.variables(), &plan, Search::Done);
+        let support = machine
+            .interner
+            .intern_formula(&plan.finite_formula, support);
         let root_node = plan.finite_formula.root(0).unwrap();
         let task = SelectedResidualTask {
             state: StateId(0),
             desc: StateDesc {
                 bound: VariableSet::new_empty(),
-                phase: ResidualPhase::Formula {
-                    counter: support.clone(),
-                },
+                phase: ResidualPhase::Formula { counter: support },
             },
             bucket: StateBucket::Formula(FormulaBatch::from_proposal(
                 RowBatch::seed(),
@@ -10574,7 +10840,6 @@ mod tests {
                 &plan.finite_formula.node(root_node).kind,
             )),
         };
-        let mut machine = ResidualStateMachine::new_for_plan(root.variables(), &plan, Search::Done);
         let returned = machine
             .seed_delta_formula(&root, &plan, task)
             .expect_err("an unsupported support hook must retain synchronous execution");
@@ -11134,19 +11399,24 @@ mod tests {
         let mut relevant = ChildSet::empty(plan.len());
         relevant.insert(0);
         relevant.insert(1);
-        let rank = |phase| {
+        let rank = |formula_pcs: &FormulaPcInterner, phase| {
             StateDesc {
                 bound: VariableSet::new_empty(),
                 phase,
             }
-            .rank_with_span(plan.len(), action_span, Some(program))
+            .rank_with_span(plan.len(), action_span, Some(program), formula_pcs)
         };
 
-        let outer_propose = rank(ResidualPhase::Propose {
-            variable: 0,
-            relevant: relevant.clone(),
-            proposer: 1,
-        });
+        let mut formula_pcs = FormulaPcInterner::default();
+
+        let outer_propose = rank(
+            &formula_pcs,
+            ResidualPhase::Propose {
+                variable: 0,
+                relevant: relevant.clone(),
+                proposer: 1,
+            },
+        );
         let start = program.start(
             0,
             1,
@@ -11176,31 +11446,44 @@ mod tests {
             full_plan,
             root_complete,
         ]
-        .map(|counter| rank(ResidualPhase::Formula { counter }));
+        .map(|counter| {
+            let counter = formula_pcs.intern(program, counter);
+            rank(&formula_pcs, ResidualPhase::Formula { counter })
+        });
         assert!(formula_ranks[0] > outer_propose);
         assert!(formula_ranks.windows(2).all(|pair| pair[0] < pair[1]));
 
-        let proposal_candidate = rank(ResidualPhase::Candidate {
-            variable: 0,
-            relevant: relevant.clone(),
-            checked: ChildSet::empty(plan.len()).with_inserted(1),
-        });
+        let proposal_candidate = rank(
+            &formula_pcs,
+            ResidualPhase::Candidate {
+                variable: 0,
+                relevant: relevant.clone(),
+                checked: ChildSet::empty(plan.len()).with_inserted(1),
+            },
+        );
         assert_eq!(proposal_candidate, action_span);
         assert!(formula_ranks.last().unwrap() < &proposal_candidate);
 
         let checked = ChildSet::empty(plan.len()).with_inserted(0);
-        let outer_confirm = rank(ResidualPhase::Confirm {
-            variable: 0,
-            relevant: relevant.clone(),
-            checked: checked.clone(),
-            confirmer: 1,
-        });
+        let outer_confirm = rank(
+            &formula_pcs,
+            ResidualPhase::Confirm {
+                variable: 0,
+                relevant: relevant.clone(),
+                checked: checked.clone(),
+                confirmer: 1,
+            },
+        );
         let confirm_start = program.start(0, 1, UnionVerb::Confirm { relevant, checked });
+        let confirm_start = formula_pcs.intern(program, confirm_start);
         assert_eq!(outer_confirm, action_span + 1);
         assert_eq!(
-            rank(ResidualPhase::Formula {
-                counter: confirm_start,
-            }),
+            rank(
+                &formula_pcs,
+                ResidualPhase::Formula {
+                    counter: confirm_start,
+                }
+            ),
             action_span + 2
         );
     }
@@ -11740,6 +12023,7 @@ mod tests {
             },
         ]);
         let plan = ResidualPlan::compile(&root);
+        let formula_pcs = FormulaPcInterner::default();
         let mut relevant = ChildSet::empty(plan.len());
         relevant.insert(0);
         relevant.insert(1);
@@ -11754,7 +12038,7 @@ mod tests {
                 checked: proposer_checked.clone(),
             },
         };
-        assert!(!before_atomic.uses_candidate_pages(&plan));
+        assert!(!before_atomic.uses_candidate_pages(&plan, &formula_pcs));
 
         let after_atomic = StateDesc {
             bound: VariableSet::new_empty(),
@@ -11764,7 +12048,7 @@ mod tests {
                 checked: proposer_checked.with_inserted(1),
             },
         };
-        assert!(after_atomic.uses_candidate_pages(&plan));
+        assert!(after_atomic.uses_candidate_pages(&plan, &formula_pcs));
     }
 
     #[test]
@@ -11780,6 +12064,7 @@ mod tests {
             },
         ]);
         let plan = ResidualPlan::compile(&root);
+        let formula_pcs = FormulaPcInterner::default();
         let mut relevant = ChildSet::empty(plan.len());
         relevant.insert(0);
         relevant.insert(1);
@@ -11793,7 +12078,7 @@ mod tests {
                 checked,
             },
         };
-        assert!(desc.uses_candidate_pages(&plan));
+        assert!(desc.uses_candidate_pages(&plan, &formula_pcs));
 
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
         let token = file(
@@ -11846,6 +12131,7 @@ mod tests {
             },
         ]);
         let plan = ResidualPlan::compile(&root);
+        let interner = StateInterner::default();
         let bound = VariableSet::new_singleton(PARENT);
         let mut relevant = ChildSet::empty(plan.len());
         relevant.insert(0);
@@ -11869,7 +12155,7 @@ mod tests {
             }),
         };
         assert_eq!(
-            propose.action_task(&plan),
+            propose.action_task(&plan, &interner),
             Some(ResidualActionTask {
                 state: StateId(41),
                 action: ResidualAction::Propose {
@@ -11911,8 +12197,8 @@ mod tests {
             },
             bucket: StateBucket::Candidates(candidate_batch()),
         };
-        assert!(!candidate.is_action());
-        assert_eq!(candidate.action_task(&plan), None);
+        assert!(!candidate.is_action(&interner));
+        assert_eq!(candidate.action_task(&plan, &interner), None);
 
         let confirm = SelectedResidualTask {
             state: StateId(43),
@@ -11927,9 +12213,9 @@ mod tests {
             },
             bucket: StateBucket::Candidates(candidate_batch()),
         };
-        assert!(confirm.is_action());
+        assert!(confirm.is_action(&interner));
         assert_eq!(
-            confirm.action_task(&plan),
+            confirm.action_task(&plan, &interner),
             Some(ResidualActionTask {
                 state: StateId(43),
                 action: ResidualAction::Confirm {
@@ -11955,7 +12241,7 @@ mod tests {
         ]));
         assert_eq!(
             confirm
-                .action_task(&atomic_plan)
+                .action_task(&atomic_plan, &interner)
                 .expect("the same concrete confirmation remains actionable")
                 .action_atoms,
             2,
@@ -11973,8 +12259,8 @@ mod tests {
                 row_count: 1,
             }),
         };
-        assert!(!ready.is_action());
-        assert_eq!(ready.action_task(&plan), None);
+        assert!(!ready.is_action(&interner));
+        assert_eq!(ready.action_task(&plan, &interner), None);
     }
 
     fn paged_filter_fixture(
@@ -15597,6 +15883,7 @@ mod tests {
             },
         ]);
         let candidate_plan = ResidualPlan::compile(&candidate_root);
+        let candidate_formula_pcs = FormulaPcInterner::default();
         let mut relevant = ChildSet::empty(candidate_plan.len());
         relevant.insert(0);
         relevant.insert(1);
@@ -15609,7 +15896,7 @@ mod tests {
                 checked,
             },
         };
-        assert!(candidate_desc.uses_candidate_pages(&candidate_plan));
+        assert!(candidate_desc.uses_candidate_pages(&candidate_plan, &candidate_formula_pcs));
         let candidate_bucket = |row_count, candidates| {
             StateBucket::Candidates(CandidateBatch {
                 parents: RowBatch {
@@ -15695,11 +15982,18 @@ mod tests {
         else {
             panic!("root AND proposer did not return to its confirmation suffix")
         };
+        let mut formula_machine =
+            ResidualStateMachine::new(formula_root.variables(), formula_plan.len(), Search::Done);
+        let counter = formula_machine
+            .interner
+            .intern_formula(&formula_plan.finite_formula, counter);
         let formula_desc = StateDesc {
             bound: VariableSet::new_empty(),
             phase: ResidualPhase::Formula { counter },
         };
-        assert!(formula_desc.uses_candidate_pages(&formula_plan));
+        assert!(
+            formula_desc.uses_candidate_pages(&formula_plan, &formula_machine.interner.formula_pcs)
+        );
         let formula_bucket = |activations, row_count, current| {
             StateBucket::Formula(FormulaBatch {
                 activations,
@@ -15712,8 +16006,6 @@ mod tests {
                 }],
             })
         };
-        let mut formula_machine =
-            ResidualStateMachine::new(formula_root.variables(), formula_plan.len(), Search::Done);
         let first = file_with_plan(
             &mut formula_machine.worklist,
             &mut formula_machine.interner,
@@ -15783,6 +16075,7 @@ mod tests {
             },
         ]);
         let plan = ResidualPlan::compile(&root);
+        let formula_pcs = FormulaPcInterner::default();
         let mut relevant = ChildSet::empty(plan.len());
         relevant.insert(0);
         relevant.insert(1);
@@ -15798,7 +16091,7 @@ mod tests {
                 checked,
             },
         };
-        assert!(desc.uses_candidate_pages(&plan));
+        assert!(desc.uses_candidate_pages(&plan, &formula_pcs));
 
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
         let old = StateBucket::Candidates(CandidateBatch {
