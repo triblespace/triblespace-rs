@@ -354,6 +354,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Residual formula continuations use compact persistent arena records.**
+  Canonical state descriptors now carry a four-byte query-local program-counter
+  ID. Each arena record names its exact parent return edge and outer WCO resume
+  by interned ID, so child selection, completion, resume, state hashing, and
+  rank lookup no longer clone or walk a boxed return stack. Compiler-derived
+  grades remain exact under adaptive child order, OR guard reconvergence,
+  delta suspension, query cloning, and independent Rayon shard execution.
 - **One-parent residual candidate payloads stay tagless.** Ordinary and lowered
   formula actions now receive the scalar `Values` candidate sink whenever one
   affine parent is live, while reconverged multi-parent work promotes to the
