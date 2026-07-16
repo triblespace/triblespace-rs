@@ -290,7 +290,7 @@ enum DeltaCompletion {
     /// Every semantic effect was released before quiescence.
     Cleanup,
     /// Complete quiescent candidate action result.
-    Candidates(Candidates),
+    Candidates(Vec<RawInline>),
     /// Boolean support proved only at the reducer boundary.
     Support(bool),
 }
@@ -325,6 +325,12 @@ impl ProducerRegistry {
         return_to: DeltaReturn,
         seeds: impl IntoIterator<Item = ResidualDeltaOutput>,
     ) -> StartOutcome {
+        debug_assert!(
+            matches!(
+                &return_to,
+                DeltaReturn::Formula { batch, .. } if batch.parents.row_count == 1
+            ) || !matches!(&return_to, DeltaReturn::Formula { .. })
+        );
         let seeds = seeds.into_iter();
         let activation = ActivationId(take_monotonic(
             &mut self.state.next_activation,
@@ -391,6 +397,12 @@ impl ProducerRegistry {
         return_to: DeltaReturn,
         source_candidates: Option<Box<[RawInline]>>,
     ) -> (ActivationId, ProducerCredit) {
+        debug_assert!(
+            matches!(
+                &return_to,
+                DeltaReturn::Formula { batch, .. } if batch.parents.row_count == 1
+            ) || !matches!(&return_to, DeltaReturn::Formula { .. })
+        );
         let activation = ActivationId(take_monotonic(
             &mut self.state.next_activation,
             "activation",
@@ -803,17 +815,8 @@ impl ProducerRegistry {
                 DeltaCompletion::Cleanup
             }
             DeltaReducer::QuiescentProposal => {
-                let mut result: Candidates = activation
-                    .accepted
-                    .into_iter()
-                    .map(|value| (0, value))
-                    .collect();
-                result.extend(
-                    activation
-                        .direct_candidates
-                        .into_iter()
-                        .map(|value| (0, value)),
-                );
+                let mut result = activation.accepted.into_iter().collect::<Vec<_>>();
+                result.extend(activation.direct_candidates);
                 result.sort_unstable();
                 DeltaCompletion::Candidates(result)
             }
@@ -836,7 +839,6 @@ impl ProducerRegistry {
                         .iter()
                         .filter(|candidate| activation.accepted.contains(*candidate))
                         .copied()
-                        .map(|candidate| (0, candidate))
                         .collect(),
                 )
             }
@@ -1012,14 +1014,12 @@ fn validate_source_cursor(
             ResidualDeltaSourceCursor::Start,
             ResidualDeltaSourceCursor::After(_) | ResidualDeltaSourceCursor::Offset(1..),
         ) => {}
-        (
-            ResidualDeltaSourceCursor::After(previous),
-            ResidualDeltaSourceCursor::After(next),
-        ) => assert!(next > previous, "residual source cursor did not advance"),
-        (
-            ResidualDeltaSourceCursor::Offset(previous),
-            ResidualDeltaSourceCursor::Offset(next),
-        ) => assert!(next > previous, "residual source cursor did not advance"),
+        (ResidualDeltaSourceCursor::After(previous), ResidualDeltaSourceCursor::After(next)) => {
+            assert!(next > previous, "residual source cursor did not advance")
+        }
+        (ResidualDeltaSourceCursor::Offset(previous), ResidualDeltaSourceCursor::Offset(next)) => {
+            assert!(next > previous, "residual source cursor did not advance")
+        }
         (_, ResidualDeltaSourceCursor::Start) => {
             panic!("residual source page restarted its cursor")
         }
@@ -1314,36 +1314,17 @@ impl DeltaScheduler {
     ) -> Option<ActiveDeltaContinuation> {
         let seed_ranges = seed_ranges(&seeds, batch.parents.row_count);
         let stride = successor.bound.count();
-        let mut candidate_ranges = Vec::with_capacity(batch.parents.row_count);
-        let mut cursor = 0usize;
-        for row in 0..batch.parents.row_count {
-            let begin = cursor;
-            while cursor < batch.candidates.len() && batch.candidates[cursor].0 as usize == row {
-                cursor += 1;
-            }
-            assert!(
-                begin < cursor,
-                "compacted delta confirmation parent has no candidates"
-            );
-            candidate_ranges.push(begin..cursor);
-        }
-        assert_eq!(
-            cursor,
-            batch.candidates.len(),
-            "delta confirmation candidate tags are invalid or ungrouped"
-        );
+        let (parents, candidate_groups) = batch.into_parent_candidates();
 
         let mut tasks = Vec::with_capacity(seeds.len());
-        for (row, seed_range) in seed_ranges.into_iter().enumerate() {
+        for ((row, seed_range), original) in
+            seed_ranges.into_iter().enumerate().zip(candidate_groups)
+        {
             let start = row * stride;
-            let parent = batch.parents.rows[start..start + stride]
+            let parent = parents.rows[start..start + stride]
                 .to_vec()
                 .into_boxed_slice();
-            let original = batch.candidates[candidate_ranges[row].clone()]
-                .iter()
-                .map(|(_, value)| *value)
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
+            let original = original.into_boxed_slice();
             let started = self.registry.start_many(
                 DeltaReducer::Confirm { original },
                 DeltaReturn::Stable {
@@ -1374,36 +1355,16 @@ impl DeltaScheduler {
         batch: CandidateBatch,
     ) -> Option<ActiveDeltaContinuation> {
         let stride = successor.bound.count();
-        let mut candidate_ranges = Vec::with_capacity(batch.parents.row_count);
-        let mut cursor = 0usize;
-        for row in 0..batch.parents.row_count {
-            let begin = cursor;
-            while cursor < batch.candidates.len() && batch.candidates[cursor].0 as usize == row {
-                cursor += 1;
-            }
-            assert!(
-                begin < cursor,
-                "compacted delta confirmation parent has no candidates"
-            );
-            candidate_ranges.push(begin..cursor);
-        }
-        assert_eq!(
-            cursor,
-            batch.candidates.len(),
-            "delta confirmation candidate tags are invalid or ungrouped"
-        );
+        let parent_count = batch.parents.row_count;
+        let (parents, candidate_groups) = batch.into_parent_candidates();
 
-        let mut tasks = Vec::with_capacity(batch.parents.row_count);
-        for (row, candidate_range) in candidate_ranges.into_iter().enumerate() {
+        let mut tasks = Vec::with_capacity(parent_count);
+        for (row, original) in candidate_groups.into_iter().enumerate() {
             let start = row * stride;
-            let parent = batch.parents.rows[start..start + stride]
+            let parent = parents.rows[start..start + stride]
                 .to_vec()
                 .into_boxed_slice();
-            let original = batch.candidates[candidate_range]
-                .iter()
-                .map(|(_, value)| *value)
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
+            let original = original.into_boxed_slice();
             let mut source_candidates = original.to_vec();
             source_candidates.sort_unstable();
             source_candidates.dedup();
@@ -1460,9 +1421,8 @@ impl DeltaScheduler {
                 FormulaStage::Confirm => DeltaReducer::Confirm {
                     original: batch
                         .input()
-                        .iter()
-                        .map(|(_, value)| *value)
-                        .collect::<Vec<_>>()
+                        .one_parent_values()
+                        .to_vec()
                         .into_boxed_slice(),
                 },
             };
@@ -1543,9 +1503,8 @@ impl DeltaScheduler {
                 FormulaStage::Confirm => {
                     let original = batch
                         .input()
-                        .iter()
-                        .map(|(_, value)| *value)
-                        .collect::<Vec<_>>()
+                        .one_parent_values()
+                        .to_vec()
                         .into_boxed_slice();
                     let mut source_candidates = original.to_vec();
                     source_candidates.sort_unstable();
@@ -1616,7 +1575,7 @@ impl DeltaScheduler {
                             rows: parent.into_vec(),
                             row_count: 1,
                         },
-                        candidates: result,
+                        candidates: CandidatePayload::Values(result),
                     }),
                     stats,
                 )
@@ -1641,7 +1600,7 @@ impl DeltaScheduler {
                     bound,
                     &counter,
                     batch,
-                    result,
+                    CandidatePayload::Values(result),
                     stable,
                     stable_interner,
                     stats,
@@ -1672,7 +1631,7 @@ impl DeltaScheduler {
         }
         stats.candidates_proposed += accepted.len();
         stats.max_propose_candidates = stats.max_propose_candidates.max(accepted.len());
-        let candidates = accepted.into_iter().map(|value| (0, value)).collect();
+        let candidates = CandidatePayload::Values(accepted);
         match streamed.return_to {
             DeltaReturn::Stable { desc, parent } => file_with_plan(
                 stable,
@@ -2698,18 +2657,17 @@ mod tests {
             assert!(pages.is_empty());
             assert!(roots.is_empty());
             assert!(accepted.is_empty());
-            *self.trace.lock().expect("zero-column trace poisoned") =
-                Some(ZeroColumnBatchTrace {
-                    row_count: batch.view.len(),
-                    vars: batch.view.vars.to_vec(),
-                    candidate_modes: batch
-                        .candidate_sets
-                        .iter()
-                        .map(|candidates| candidates.is_some())
-                        .collect(),
-                    cursors: batch.cursors.to_vec(),
-                    limits: batch.limits.to_vec(),
-                });
+            *self.trace.lock().expect("zero-column trace poisoned") = Some(ZeroColumnBatchTrace {
+                row_count: batch.view.len(),
+                vars: batch.view.vars.to_vec(),
+                candidate_modes: batch
+                    .candidate_sets
+                    .iter()
+                    .map(|candidates| candidates.is_some())
+                    .collect(),
+                cursors: batch.cursors.to_vec(),
+                limits: batch.limits.to_vec(),
+            });
             pages.extend((0..batch.view.len()).map(|_| ResidualDeltaSourcePage {
                 next: None,
                 examined: 0,
@@ -3464,10 +3422,7 @@ mod tests {
             .finite_formula
             .root(0)
             .expect("the union root has a formula program");
-        let FiniteFormulaNodeKind::Or { children } = &plan
-            .finite_formula
-            .node(formula_root)
-            .kind
+        let FiniteFormulaNodeKind::Or { children } = &plan.finite_formula.node(formula_root).kind
         else {
             panic!("the union root did not compile as OR")
         };
@@ -3555,7 +3510,8 @@ mod tests {
         assert!(stable_buckets.next().is_none());
         assert_eq!(batch.parents.row_count, 1);
         assert!(batch.parents.rows.is_empty());
-        assert_eq!(batch.candidates, [(0, value(3))]);
+        assert!(batch.candidates.is_values());
+        assert_eq!(batch.candidates.one_parent_values(), [value(3)]);
         assert!(
             !scheduler
                 .registry
@@ -3654,7 +3610,7 @@ mod tests {
         let completed = registry.finish(proof);
         assert_eq!(
             completed.effect,
-            DeltaCompletion::Candidates(vec![(0, candidate), (0, candidate)])
+            DeltaCompletion::Candidates(vec![candidate, candidate])
         );
     }
 
@@ -3705,7 +3661,7 @@ mod tests {
         assert_eq!(parent.as_ref(), &[value(9)]);
         assert_eq!(
             completed.effect,
-            DeltaCompletion::Candidates(vec![(0, second), (0, first), (0, second)])
+            DeltaCompletion::Candidates(vec![second, first, second])
         );
     }
 
@@ -3851,12 +3807,8 @@ mod tests {
             .resumed_source
             .expect("second page cursor resumed");
 
-        let second_page = registry.replace_source(
-            generator,
-            [sourced_output(2, 2, 0, true)],
-            [],
-            None,
-        );
+        let second_page =
+            registry.replace_source(generator, [sourced_output(2, 2, 0, true)], [], None);
         assert!(second_page.quiescence.is_none());
         let (_, second_root) = second_page.roots.into_iter().next().expect("second root");
         let second_retired = registry.replace_traversal(second_root, []);
@@ -3866,7 +3818,7 @@ mod tests {
         assert_eq!(proof.activation, activation);
         assert_eq!(
             registry.finish(proof).effect,
-            DeltaCompletion::Candidates(vec![(0, second), (0, first), (0, first)])
+            DeltaCompletion::Candidates(vec![second, first, first])
         );
     }
 
@@ -3986,12 +3938,10 @@ mod tests {
         let desc = DeltaDesc::leaf(0, 0);
         let schema_a = VariableSet::new_singleton(0);
         let schema_b = VariableSet::new_singleton(1);
-        let mut source_task = |
-            bound: VariableSet,
-            candidates: Option<Box<[RawInline]>>,
-            cursor: ResidualDeltaSourceCursor,
-            parent: RawInline,
-        | {
+        let mut source_task = |bound: VariableSet,
+                               candidates: Option<Box<[RawInline]>>,
+                               cursor: ResidualDeltaSourceCursor,
+                               parent: RawInline| {
             let reducer = if candidates.is_some() {
                 DeltaReducer::Confirm {
                     original: Box::new([]),
@@ -4118,7 +4068,7 @@ mod tests {
         for completed in [original.finish(original_proof), cloned.finish(cloned_proof)] {
             assert_eq!(
                 completed.effect,
-                DeltaCompletion::Candidates(vec![(0, value(7))])
+                DeltaCompletion::Candidates(vec![value(7)])
             );
             let DeltaReturn::Formula {
                 bound: returned_bound,
@@ -4218,7 +4168,7 @@ mod tests {
         ] {
             assert_eq!(
                 completed.effect,
-                DeltaCompletion::Candidates(vec![(0, value(3)), (0, value(3)), (0, value(7))])
+                DeltaCompletion::Candidates(vec![value(3), value(3), value(7)])
             );
             let DeltaReturn::Formula {
                 bound: returned_bound,
