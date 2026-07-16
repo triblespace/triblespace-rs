@@ -215,19 +215,23 @@ fn upper_bound_indexed(
     lo
 }
 
-/// Pages one nondecreasing indexed sequence as distinct direct candidates.
+/// Pages one nondecreasing indexed driver through an exact secondary filter.
 ///
 /// The ordinary two-bound proposal arms defensively call `unique()`. Keeping
 /// that semantic here makes the source exact even if an archive implementation
 /// later exposes repeated adjacent codes inside a fixed-pair range. Seeking and
 /// duplicate skipping are binary searches over the immutable wavelet/range
-/// view; no prefix of candidates is materialized or replayed.
-fn page_indexed_distinct(
+/// view; no prefix of candidates is materialized or replayed. Every distinct
+/// driver value consumes demand even when `accept` rejects it, and continuation
+/// resumes strictly after the last value examined rather than the last emitted
+/// candidate.
+fn page_indexed_distinct_filtered(
     len: usize,
     at: impl Fn(usize) -> RawInline,
     cursor: ResidualDeltaSourceCursor,
     limit: usize,
     accepted: &mut Vec<RawInline>,
+    mut accept: impl FnMut(&RawInline) -> bool,
 ) -> ResidualDeltaSourcePage {
     assert!(limit > 0, "residual source pages require positive demand");
     let mut index = match cursor {
@@ -242,9 +246,11 @@ fn page_indexed_distinct(
     while index < len && examined < limit {
         let value = at(index);
         debug_assert!(last.is_none_or(|previous| previous < value));
-        accepted.push(value);
         examined += 1;
         last = Some(value);
+        if accept(&value) {
+            accepted.push(value);
+        }
         index = upper_bound_indexed(index + 1, len, &value, &at);
     }
     ResidualDeltaSourcePage {
@@ -257,17 +263,31 @@ fn page_indexed_distinct(
     }
 }
 
+fn page_indexed_distinct(
+    len: usize,
+    at: impl Fn(usize) -> RawInline,
+    cursor: ResidualDeltaSourceCursor,
+    limit: usize,
+    accepted: &mut Vec<RawInline>,
+) -> ResidualDeltaSourcePage {
+    page_indexed_distinct_filtered(len, at, cursor, limit, accepted, |_| true)
+}
+
 /// Pages the distinct values that occur on one top-level archive axis.
 /// `Universe::search_upper` translates the public raw-value cursor into the
 /// first possible archive-local code, and `enumerate_domain_in_range` skips
 /// absent code groups with the prefix bitvector's select stride.
-pub(super) fn page_domain<U>(
+/// Filtered counterpart of [`page_domain`]. Prefix navigation stays identical;
+/// only the orthogonal admission predicate may make `accepted.len()` smaller
+/// than `examined`.
+fn page_domain_filtered<U>(
     archive: &SuccinctArchive<U>,
     prefix: &BitVector<Rank9SelIndex>,
     mut code_range: Range<usize>,
     cursor: ResidualDeltaSourceCursor,
     limit: usize,
     accepted: &mut Vec<RawInline>,
+    mut accept: impl FnMut(&RawInline) -> bool,
 ) -> ResidualDeltaSourcePage
 where
     U: Universe,
@@ -295,9 +315,11 @@ where
             break;
         };
         debug_assert!(last.is_none_or(|previous| previous < value));
-        accepted.push(value);
         examined += 1;
         last = Some(value);
+        if accept(&value) {
+            accepted.push(value);
+        }
     }
     ResidualDeltaSourcePage {
         next: values.peek().map(|_| {
@@ -307,6 +329,22 @@ where
         }),
         examined,
     }
+}
+
+pub(super) fn page_domain<U>(
+    archive: &SuccinctArchive<U>,
+    prefix: &BitVector<Rank9SelIndex>,
+    code_range: Range<usize>,
+    cursor: ResidualDeltaSourceCursor,
+    limit: usize,
+    accepted: &mut Vec<RawInline>,
+) -> ResidualDeltaSourcePage
+where
+    U: Universe,
+{
+    page_domain_filtered(archive, prefix, code_range, cursor, limit, accepted, |_| {
+        true
+    })
 }
 
 /// Pages the middle component of a fixed-first Ring range. `changed_pair`
@@ -327,9 +365,40 @@ fn page_middle<U>(
 where
     U: Universe,
 {
+    page_middle_filtered(
+        archive,
+        changed_pair,
+        range,
+        last_column,
+        last_prefix,
+        middle_column,
+        cursor,
+        limit,
+        accepted,
+        |_| true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Filtered counterpart of [`page_middle`], sharing its exact Ring navigation.
+fn page_middle_filtered<U>(
+    archive: &SuccinctArchive<U>,
+    changed_pair: &BitVector<Rank9SelIndex>,
+    range: Range<usize>,
+    last_column: &WaveletMatrix<Rank9SelIndex>,
+    last_prefix: &BitVector<Rank9SelIndex>,
+    middle_column: &WaveletMatrix<Rank9SelIndex>,
+    cursor: ResidualDeltaSourceCursor,
+    limit: usize,
+    accepted: &mut Vec<RawInline>,
+    accept: impl FnMut(&RawInline) -> bool,
+) -> ResidualDeltaSourcePage
+where
+    U: Universe,
+{
     let first_rank = changed_pair.rank1(range.start).unwrap();
     let len = changed_pair.rank1(range.end).unwrap() - first_rank;
-    page_indexed_distinct(
+    page_indexed_distinct_filtered(
         len,
         |offset| {
             let position = changed_pair.select1(first_rank + offset).unwrap();
@@ -343,6 +412,7 @@ where
         cursor,
         limit,
         accepted,
+        accept,
     )
 }
 
@@ -725,6 +795,85 @@ where
         let a_bound = p.a(row);
         let v_bound = p.v(row);
         let all_codes = 0..self.archive.domain.len();
+
+        if p.target_count() > 1 {
+            let accept = |value: &RawInline| self.repeated_value_matches(p, row, value);
+            return match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
+                (_, Some(a), _, true, false, true) => page_middle_filtered(
+                    self.archive,
+                    &self.archive.changed_a_e,
+                    base_range(&self.archive.domain, &self.archive.a_a, a),
+                    &self.archive.aev_c,
+                    &self.archive.v_a,
+                    &self.archive.vae_c,
+                    cursor,
+                    limit,
+                    accepted,
+                    accept,
+                ),
+                (_, None, _, true, false, true) => page_domain_filtered(
+                    self.archive,
+                    &self.archive.e_a,
+                    all_codes,
+                    cursor,
+                    limit,
+                    accepted,
+                    accept,
+                ),
+                (_, _, Some(v), true, true, false) => page_middle_filtered(
+                    self.archive,
+                    &self.archive.changed_v_a,
+                    base_range(&self.archive.domain, &self.archive.v_a, v),
+                    &self.archive.vae_c,
+                    &self.archive.e_a,
+                    &self.archive.eva_c,
+                    cursor,
+                    limit,
+                    accepted,
+                    accept,
+                ),
+                (_, _, None, true, true, false) => page_domain_filtered(
+                    self.archive,
+                    &self.archive.e_a,
+                    all_codes,
+                    cursor,
+                    limit,
+                    accepted,
+                    accept,
+                ),
+                (Some(e), _, _, false, true, true) => page_middle_filtered(
+                    self.archive,
+                    &self.archive.changed_e_a,
+                    base_range(&self.archive.domain, &self.archive.e_a, e),
+                    &self.archive.eav_c,
+                    &self.archive.v_a,
+                    &self.archive.vea_c,
+                    cursor,
+                    limit,
+                    accepted,
+                    accept,
+                ),
+                (None, _, _, false, true, true) => page_domain_filtered(
+                    self.archive,
+                    &self.archive.a_a,
+                    all_codes,
+                    cursor,
+                    limit,
+                    accepted,
+                    accept,
+                ),
+                (_, _, _, true, true, true) => page_domain_filtered(
+                    self.archive,
+                    &self.archive.e_a,
+                    all_codes,
+                    cursor,
+                    limit,
+                    accepted,
+                    accept,
+                ),
+                _ => unreachable!("invalid repeated-position proposal source state"),
+            };
+        }
 
         match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
             (None, None, None, true, false, false) => page_domain(
@@ -1150,7 +1299,7 @@ where
         usize::from(self.term_e.is_var(variable))
             + usize::from(self.term_a.is_var(variable))
             + usize::from(self.term_v.is_var(variable))
-            == 1
+            >= 1
     }
 
     fn residual_delta_source_page(

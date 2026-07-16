@@ -220,7 +220,7 @@ fn interleaved_shards_page_global_order_and_cross_shard_duplicates_once() {
 
 #[test]
 fn generic_union_and_repeated_target_shapes_remain_nonpaged() {
-    let (set, entities, attributes, values) = fixture(2, 2, 2);
+    let (set, entities, attributes, _) = fixture(2, 2, 2);
     let archives: Vec<SuccinctArchive<OrderedUniverse>> = vec![(&set).into(), (&set).into()];
     let value_var = Variable::<UnknownInline>::new(0);
     let generic = UnionConstraint::new(
@@ -248,20 +248,32 @@ fn generic_union_and_repeated_target_shapes_remain_nonpaged() {
     );
 
     let union = UnionArchive::new(&archives);
-    let repeated = Variable::<GenId>::new(1);
-    let repeated = union.pattern(repeated, repeated, values[0]);
-    assert!(!repeated.residual_proposal_source_is_paged(1, &RowsView::EMPTY));
-    assert!(repeated
-        .residual_delta_source_page(
-            1,
-            &RowsView::EMPTY,
-            None,
-            ResidualDeltaSourceCursor::Start,
-            1,
-            &mut Vec::new(),
-            &mut Vec::new(),
-        )
-        .is_none());
+    let x = Variable::<GenId>::new(1);
+    for (name, repeated) in [
+        ("E=V", union.pattern(x, attributes[0], x)),
+        ("E=A", union.pattern(x, x, entities[0])),
+        ("A=V", union.pattern(entities[0], x, x)),
+        ("E=A=V", union.pattern(x, x, x)),
+    ] {
+        assert!(
+            !repeated.residual_proposal_source_is_paged(x.index, &RowsView::EMPTY),
+            "{name}: filtered shard heads are not rejection-free",
+        );
+        assert!(
+            repeated
+                .residual_delta_source_page(
+                    x.index,
+                    &RowsView::EMPTY,
+                    None,
+                    ResidualDeltaSourceCursor::Start,
+                    1,
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                )
+                .is_none(),
+            "{name}: UnionArchive auto-admitted a filtered source",
+        );
+    }
 }
 
 #[test]

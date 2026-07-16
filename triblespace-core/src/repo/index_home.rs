@@ -28,7 +28,7 @@ use crate::metadata;
 use crate::prelude::{attributes, entity, pattern};
 use crate::query::unionconstraint::UnionConstraint;
 use crate::query::{
-    CandidateSink, Constraint, ConstraintChildren, EstimateSink, ResidualDeltaOutput,
+    CandidateSink, Constraint, ConstraintChildren, EstimateSink, RawTerm, ResidualDeltaOutput,
     ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, Term, TriblePattern, VariableId,
     VariableSet,
 };
@@ -1288,15 +1288,22 @@ where
     U: Universe,
 {
     union: UnionConstraint<SuccinctArchiveConstraint<'a, U>>,
+    terms: [RawTerm; 3],
 }
 
 impl<'a, U> UnionArchiveConstraint<'a, U>
 where
     U: Universe,
 {
-    fn new(constraints: Vec<SuccinctArchiveConstraint<'a, U>>) -> Self {
+    fn new(
+        constraints: Vec<SuccinctArchiveConstraint<'a, U>>,
+        term_e: RawTerm,
+        term_a: RawTerm,
+        term_v: RawTerm,
+    ) -> Self {
         Self {
             union: UnionConstraint::new(constraints),
+            terms: [term_e, term_a, term_v],
         }
     }
 }
@@ -1346,6 +1353,15 @@ where
 
     fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
         view.col(variable).is_none()
+            // The shard merge consumes one emitted head per examined value.
+            // Repeated-position Succinct sources may reject driver values, so
+            // they need a different bounded per-shard head-discovery proof.
+            && self
+                .terms
+                .iter()
+                .filter(|term| term.is_var(variable))
+                .count()
+                == 1
             && (0..self.union.len()).all(|shard| {
                 self.union
                     .child(shard)
@@ -1465,6 +1481,9 @@ where
                 .iter()
                 .map(|segment| segment.pattern(e, a, v))
                 .collect(),
+            e.erase(),
+            a.erase(),
+            v.erase(),
         )
     }
 }
