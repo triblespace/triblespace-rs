@@ -347,6 +347,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Grouped transition confirmation is a predicate of canonical bound state.**
+  The former solve-wide Boolean capability is replaced by per-variable bound
+  prerequisites compiled into the residual plan. Candidate pages remain
+  independent while those prerequisites are absent and become parent-atomic
+  exactly when the state binds them. Repeated distinct-endpoint RPQs therefore
+  use page-local first-step confirmation while the opposite endpoint is free,
+  then retain their complete ordered candidate group when that endpoint is
+  bound and a real transition reducer can run; repeated same-endpoint paths
+  remain grouped unconditionally. This restores geometric descent through a
+  mixed finite-formula/path query without weakening quiescent fixpoint filters.
 - **Finite residual formulas avoid materializing administrative row copies.**
   Uniform child selections now retain their complete affine batch, and mixed
   selections partition on compact child ordinals before constructing canonical

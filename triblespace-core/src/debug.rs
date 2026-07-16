@@ -166,8 +166,12 @@ pub mod query {
             self.constraint.residual_confirm_is_page_local()
         }
 
-        fn residual_delta_confirm_is_grouped(&self) -> bool {
-            self.constraint.residual_delta_confirm_is_grouped()
+        fn residual_delta_confirm_grouping_requirements(
+            &self,
+            variable: VariableId,
+        ) -> Option<VariableSet> {
+            self.constraint
+                .residual_delta_confirm_grouping_requirements(variable)
         }
 
         fn residual_delta_source_is_paged(

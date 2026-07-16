@@ -2188,8 +2188,25 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         true
     }
 
-    fn residual_delta_confirm_is_grouped(&self) -> bool {
-        has_repetition(&self.expr)
+    fn residual_delta_confirm_grouping_requirements(
+        &self,
+        variable: VariableId,
+    ) -> Option<VariableSet> {
+        if !has_repetition(&self.expr) || (variable != self.start && variable != self.end) {
+            return None;
+        }
+
+        // A repeated path confirmation only enters the quiescent transition
+        // reducer when its opposite endpoint is already bound. With neither
+        // endpoint bound, confirm_row merely filters direct first-step
+        // candidates and is homomorphic over candidate pages.
+        if self.start == self.end {
+            Some(VariableSet::new_empty())
+        } else if variable == self.start {
+            Some(VariableSet::new_singleton(self.end))
+        } else {
+            Some(VariableSet::new_singleton(self.start))
+        }
     }
 
     fn residual_delta_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
@@ -2503,6 +2520,47 @@ mod seeded_frame_tests {
     use crate::query::Binding;
     use crate::query::Query;
     use crate::trible::Trible;
+
+    #[test]
+    fn repeated_path_grouping_requires_the_opposite_endpoint() {
+        let mut variables = VariableContext::new();
+        let start = variables.next_variable::<GenId>();
+        let end = variables.next_variable::<GenId>();
+        let attribute = rngid().id.raw();
+        let repeated = RegularPathConstraint::new(
+            TribleSet::new(),
+            start,
+            end,
+            &[PathOp::Attr(attribute), PathOp::Plus],
+        );
+
+        assert_eq!(
+            repeated.residual_delta_confirm_grouping_requirements(start.index),
+            Some(VariableSet::new_singleton(end.index))
+        );
+        assert_eq!(
+            repeated.residual_delta_confirm_grouping_requirements(end.index),
+            Some(VariableSet::new_singleton(start.index))
+        );
+
+        let direct =
+            RegularPathConstraint::new(TribleSet::new(), start, end, &[PathOp::Attr(attribute)]);
+        assert_eq!(
+            direct.residual_delta_confirm_grouping_requirements(start.index),
+            None
+        );
+
+        let same_endpoint = RegularPathConstraint::new(
+            TribleSet::new(),
+            start,
+            start,
+            &[PathOp::Attr(attribute), PathOp::Star],
+        );
+        assert_eq!(
+            same_endpoint.residual_delta_confirm_grouping_requirements(start.index),
+            Some(VariableSet::new_empty())
+        );
+    }
 
     struct GraphFixture {
         set: TribleSet,

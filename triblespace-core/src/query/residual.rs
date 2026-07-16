@@ -94,10 +94,46 @@ enum FormulaStep {
 struct FormulaPath(Box<[FormulaStep]>);
 
 /// Execution capabilities captured at one opaque formula occurrence.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct FormulaNodeCapabilities {
     confirm_page_local: bool,
-    grouped_delta_confirm: bool,
+    grouped_delta_confirm_requirements: Box<[(VariableId, VariableSet)]>,
+}
+
+impl FormulaNodeCapabilities {
+    fn grouped_delta_confirm(&self, variable: VariableId, bound: VariableSet) -> bool {
+        grouped_delta_confirm_is_active(&self.grouped_delta_confirm_requirements, variable, bound)
+    }
+}
+
+fn compile_grouped_delta_confirm_requirements<'a>(
+    constraint: &dyn Constraint<'a>,
+    transition_programs: bool,
+) -> Box<[(VariableId, VariableSet)]> {
+    if !transition_programs {
+        return Box::new([]);
+    }
+    constraint
+        .variables()
+        .into_iter()
+        .filter_map(|variable| {
+            constraint
+                .residual_delta_confirm_grouping_requirements(variable)
+                .map(|required| (variable, required))
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
+fn grouped_delta_confirm_is_active(
+    requirements: &[(VariableId, VariableSet)],
+    variable: VariableId,
+    bound: VariableSet,
+) -> bool {
+    requirements
+        .iter()
+        .find_map(|&(candidate, required)| (candidate == variable).then_some(required))
+        .is_some_and(|required| required.is_subset_of(&bound))
 }
 
 /// Conservative proof result for publishing cyclic proposal endpoints before
@@ -266,8 +302,10 @@ impl FiniteFormulaProgram {
                 let node_path = FormulaPath(path.clone().into_boxed_slice());
                 let capabilities = FormulaNodeCapabilities {
                     confirm_page_local: constraint.residual_confirm_is_page_local(),
-                    grouped_delta_confirm: self.transition_programs
-                        && constraint.residual_delta_confirm_is_grouped(),
+                    grouped_delta_confirm_requirements: compile_grouped_delta_confirm_requirements(
+                        constraint,
+                        self.transition_programs,
+                    ),
                 };
                 let (kind, support_atomic) =
                     if let Some(children) = constraint.residual_union_children() {
@@ -343,8 +381,10 @@ impl FiniteFormulaProgram {
                 let id = self.reserve_node();
                 let capabilities = FormulaNodeCapabilities {
                     confirm_page_local: root.residual_confirm_is_page_local(),
-                    grouped_delta_confirm: self.transition_programs
-                        && root.residual_delta_confirm_is_grouped(),
+                    grouped_delta_confirm_requirements: compile_grouped_delta_confirm_requirements(
+                        root,
+                        self.transition_programs,
+                    ),
                 };
                 let mut children = Vec::new();
                 self.compile_root_and_children(root, &mut Vec::new(), &mut children);
@@ -916,7 +956,11 @@ impl FiniteFormulaProgram {
     /// of an outer Candidate state whose entire remaining confirmation suffix
     /// is page-local. Only a maximal root AND may expose candidate pages. OR
     /// reducers and nested formula frames retain complete parent groups.
-    fn root_confirm_suffix_accepts_pages(&self, counter: &FormulaProgramCounter) -> bool {
+    fn root_confirm_suffix_accepts_pages(
+        &self,
+        counter: &FormulaProgramCounter,
+        bound: VariableSet,
+    ) -> bool {
         let root = self
             .root(counter.resume.occurrence)
             .expect("a formula counter resumed an opaque residual leaf");
@@ -955,7 +999,9 @@ impl FiniteFormulaProgram {
                 let node = self.node(child);
                 matches!(node.kind, FiniteFormulaNodeKind::Atom)
                     && node.capabilities.confirm_page_local
-                    && !node.capabilities.grouped_delta_confirm
+                    && !node
+                        .capabilities
+                        .grouped_delta_confirm(counter.resume.variable, bound)
             })
     }
 
@@ -967,15 +1013,18 @@ impl FiniteFormulaProgram {
     fn proposal_streamability(
         &self,
         counter: &FormulaProgramCounter,
+        bound: VariableSet,
     ) -> FormulaProposalStreamability {
         fn confirm_subtree(
             program: &FiniteFormulaProgram,
             node: FormulaNodeId,
+            variable: VariableId,
+            bound: VariableSet,
         ) -> FormulaProposalStreamability {
             let node = program.node(node);
             match &node.kind {
                 FiniteFormulaNodeKind::Atom => {
-                    if node.capabilities.grouped_delta_confirm {
+                    if node.capabilities.grouped_delta_confirm(variable, bound) {
                         FormulaProposalStreamability::Barrier(
                             FormulaProposalStreamBarrier::GroupedConfirm,
                         )
@@ -989,10 +1038,12 @@ impl FiniteFormulaProgram {
                 }
                 FiniteFormulaNodeKind::And { children } => children
                     .iter()
-                    .find_map(|&child| match confirm_subtree(program, child) {
-                        FormulaProposalStreamability::Linear => None,
-                        barrier => Some(barrier),
-                    })
+                    .find_map(
+                        |&child| match confirm_subtree(program, child, variable, bound) {
+                            FormulaProposalStreamability::Linear => None,
+                            barrier => Some(barrier),
+                        },
+                    )
                     .unwrap_or(FormulaProposalStreamability::Linear),
                 FiniteFormulaNodeKind::Or { .. } => {
                     FormulaProposalStreamability::Barrier(FormulaProposalStreamBarrier::OrFrame)
@@ -1035,7 +1086,7 @@ impl FiniteFormulaProgram {
                 if child == site.child || site.done.contains(child) {
                     continue;
                 }
-                let streamability = confirm_subtree(self, node);
+                let streamability = confirm_subtree(self, node, counter.resume.variable, bound);
                 if streamability != FormulaProposalStreamability::Linear {
                     return streamability;
                 }
@@ -1167,9 +1218,10 @@ struct ResidualPlan {
     /// transition submachine for this exact solve. Finite programs terminate;
     /// repeated programs compute their least fixpoint on the same substrate.
     transition_programs: bool,
-    /// Whether a lowered cyclic confirmation needs the immutable complete
-    /// candidate sequence for each parent until traversal quiescence.
-    grouped_delta_confirms: Vec<bool>,
+    /// Per-variable bound-schema prerequisites under which a lowered cyclic
+    /// confirmation needs the immutable complete candidate sequence for each
+    /// parent until traversal quiescence.
+    grouped_delta_confirm_requirements: Vec<Box<[(VariableId, VariableSet)]>>,
     /// The whole exposed root is one formula occurrence. This is an explicit
     /// probe capability; ordinary lowering retains flattened outer leaves.
     synthetic_root_formula: bool,
@@ -1205,7 +1257,7 @@ impl ResidualPlan {
             path: &mut Vec<usize>,
             leaves: &mut Vec<ResidualLeaf>,
             page_local_confirms: &mut Vec<bool>,
-            grouped_delta_confirms: &mut Vec<bool>,
+            grouped_delta_confirm_requirements: &mut Vec<Box<[(VariableId, VariableSet)]>>,
         ) {
             match constraint.residual_shape() {
                 ConstraintShape::And(children) | ConstraintShape::ScopedAnd(children) => {
@@ -1218,7 +1270,7 @@ impl ResidualPlan {
                             path,
                             leaves,
                             page_local_confirms,
-                            grouped_delta_confirms,
+                            grouped_delta_confirm_requirements,
                         );
                         path.pop();
                     }
@@ -1239,18 +1291,25 @@ impl ResidualPlan {
                         matches!(lowering, LeafLowering::Opaque)
                             && constraint.residual_confirm_is_page_local(),
                     );
-                    grouped_delta_confirms.push(
-                        transition_programs
-                            && matches!(lowering, LeafLowering::Opaque)
-                            && constraint.residual_delta_confirm_is_grouped(),
+                    grouped_delta_confirm_requirements.push(
+                        if matches!(lowering, LeafLowering::Opaque) {
+                            compile_grouped_delta_confirm_requirements(
+                                constraint,
+                                transition_programs,
+                            )
+                        } else {
+                            Box::new([])
+                        },
                     );
                 }
             }
         }
 
         let synthetic_root_formula = formula_scope == FormulaScope::WholeRoot;
-        let (mut leaves, mut page_local_confirms, mut grouped_delta_confirms) =
-            (Vec::new(), Vec::new(), Vec::new());
+        let mut leaves = Vec::new();
+        let mut page_local_confirms = Vec::new();
+        let mut grouped_delta_confirm_requirements: Vec<Box<[(VariableId, VariableSet)]>> =
+            Vec::new();
         if synthetic_root_formula {
             leaves.push(ResidualLeaf {
                 path: ConstraintPath(Box::new([])),
@@ -1260,7 +1319,7 @@ impl ResidualPlan {
             // singleton outer occurrence itself is never an ordinary
             // page-local or grouped confirmer.
             page_local_confirms.push(false);
-            grouped_delta_confirms.push(false);
+            grouped_delta_confirm_requirements.push(Box::new([]));
         } else {
             visit(
                 root,
@@ -1269,7 +1328,7 @@ impl ResidualPlan {
                 &mut Vec::new(),
                 &mut leaves,
                 &mut page_local_confirms,
-                &mut grouped_delta_confirms,
+                &mut grouped_delta_confirm_requirements,
             );
         }
         let finite_formula = FiniteFormulaProgram::compile(
@@ -1283,7 +1342,7 @@ impl ResidualPlan {
             finite_formula,
             page_local_confirms,
             transition_programs,
-            grouped_delta_confirms,
+            grouped_delta_confirm_requirements,
             synthetic_root_formula,
         }
     }
@@ -1313,23 +1372,28 @@ impl ResidualPlan {
         }
     }
 
-    fn formula_uses_candidate_pages(&self, counter: &FormulaProgramCounter) -> bool {
+    fn formula_uses_candidate_pages(
+        &self,
+        counter: &FormulaProgramCounter,
+        bound: VariableSet,
+    ) -> bool {
         self.synthetic_root_formula
             && self
                 .finite_formula
-                .root_confirm_suffix_accepts_pages(counter)
+                .root_confirm_suffix_accepts_pages(counter, bound)
     }
 
     fn formula_proposal_streamability(
         &self,
         counter: &FormulaProgramCounter,
+        bound: VariableSet,
     ) -> FormulaProposalStreamability {
         if !self.synthetic_root_formula {
             return FormulaProposalStreamability::Barrier(
                 FormulaProposalStreamBarrier::NotSyntheticRoot,
             );
         }
-        let streamability = self.finite_formula.proposal_streamability(counter);
+        let streamability = self.finite_formula.proposal_streamability(counter, bound);
         if streamability != FormulaProposalStreamability::Linear {
             return streamability;
         }
@@ -1340,7 +1404,8 @@ impl ResidualPlan {
             );
         };
         let checked = ChildSet::empty(self.len()).with_inserted(counter.resume.occurrence);
-        if !self.remaining_confirms_accept_pages(relevant, &checked) {
+        if !self.remaining_confirms_accept_pages(relevant, &checked, counter.resume.variable, bound)
+        {
             return FormulaProposalStreamability::Barrier(
                 FormulaProposalStreamBarrier::OuterContinuation,
             );
@@ -1458,12 +1523,22 @@ impl ResidualPlan {
     /// Whether candidate occurrences may be consumed as independent pages.
     /// A grouped delta reducer is deliberately parent-atomic even when its
     /// ordinary protocol confirmation is elementwise.
-    fn remaining_confirms_accept_pages(&self, relevant: &ChildSet, checked: &ChildSet) -> bool {
+    fn remaining_confirms_accept_pages(
+        &self,
+        relevant: &ChildSet,
+        checked: &ChildSet,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> bool {
         self.remaining_confirms_are_page_local(relevant, checked)
             && (0..self.len()).all(|leaf| {
                 !relevant.contains(leaf)
                     || checked.contains(leaf)
-                    || !self.grouped_delta_confirms[leaf]
+                    || !grouped_delta_confirm_is_active(
+                        &self.grouped_delta_confirm_requirements[leaf],
+                        variable,
+                        bound,
+                    )
             })
     }
 }
@@ -2648,12 +2723,23 @@ impl StateDesc {
     fn uses_candidate_pages(&self, plan: &ResidualPlan) -> bool {
         match &self.phase {
             ResidualPhase::Candidate {
-                relevant, checked, ..
-            } => relevant != checked && plan.remaining_confirms_accept_pages(relevant, checked),
+                variable,
+                relevant,
+                checked,
+            } => {
+                relevant != checked
+                    && plan
+                        .remaining_confirms_accept_pages(relevant, checked, *variable, self.bound)
+            }
             ResidualPhase::Confirm {
-                relevant, checked, ..
-            } => plan.remaining_confirms_accept_pages(relevant, checked),
-            ResidualPhase::Formula { counter } => plan.formula_uses_candidate_pages(counter),
+                variable,
+                relevant,
+                checked,
+                ..
+            } => plan.remaining_confirms_accept_pages(relevant, checked, *variable, self.bound),
+            ResidualPhase::Formula { counter } => {
+                plan.formula_uses_candidate_pages(counter, self.bound)
+            }
             ResidualPhase::Ready | ResidualPhase::Propose { .. } => false,
         }
     }
@@ -5924,7 +6010,7 @@ impl ResidualStateMachine {
 
         let mut checked = ChildSet::empty(plan.len());
         checked.insert(*proposer);
-        if !plan.remaining_confirms_accept_pages(relevant, &checked) {
+        if !plan.remaining_confirms_accept_pages(relevant, &checked, *variable, task.desc.bound) {
             return Err(task);
         }
         let variable = *variable;
@@ -6036,7 +6122,11 @@ impl ResidualStateMachine {
         if plan.has_finite_formula(*confirmer) {
             return Err(task);
         }
-        if plan.grouped_delta_confirms[*confirmer] {
+        if grouped_delta_confirm_is_active(
+            &plan.grouped_delta_confirm_requirements[*confirmer],
+            *variable,
+            task.desc.bound,
+        ) {
             assert!(
                 !task.desc.uses_candidate_pages(plan),
                 "grouped delta confirmation was split into candidate pages"
@@ -6152,7 +6242,7 @@ impl ResidualStateMachine {
             return Err(task);
         }
         let stream_proposal = stage == FormulaStage::Propose
-            && plan.formula_proposal_streamability(&counter)
+            && plan.formula_proposal_streamability(&counter, task.desc.bound)
                 == FormulaProposalStreamability::Linear;
         if stream_proposal {
             assert!(
@@ -7878,8 +7968,64 @@ mod tests {
             self.0.page_local
         }
 
-        fn residual_delta_confirm_is_grouped(&self) -> bool {
+        fn residual_delta_confirm_grouping_requirements(
+            &self,
+            variable: VariableId,
+        ) -> Option<VariableSet> {
+            (variable == self.0.variable).then_some(VariableSet::new_empty())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct ConditionalGroupedCapabilityLeaf {
+        variable: VariableId,
+        required: VariableId,
+    }
+
+    impl Constraint<'static> for ConditionalGroupedCapabilityLeaf {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(self.variable)
+                .union(VariableSet::new_singleton(self.required))
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != self.variable {
+                return false;
+            }
+            out.fill(1, view.len());
             true
+        }
+
+        fn propose(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn residual_confirm_is_page_local(&self) -> bool {
+            true
+        }
+
+        fn residual_delta_confirm_grouping_requirements(
+            &self,
+            variable: VariableId,
+        ) -> Option<VariableSet> {
+            (variable == self.variable).then_some(VariableSet::new_singleton(self.required))
         }
     }
 
@@ -9439,7 +9585,10 @@ mod tests {
         };
         let atom_plan = ResidualPlan::compile_lowering(&atom, lowering);
         assert_eq!(
-            atom_plan.formula_proposal_streamability(&start(&atom_plan)),
+            atom_plan.formula_proposal_streamability(
+                &start(&atom_plan),
+                VariableSet::new_empty(),
+            ),
             FormulaProposalStreamability::Linear,
             "the focused proposer itself need not be a page-local confirmer"
         );
@@ -9474,7 +9623,10 @@ mod tests {
             .finite_formula
             .select_child_as_action(&linear_start, 0);
         assert_eq!(
-            linear_plan.formula_proposal_streamability(&linear_action),
+            linear_plan.formula_proposal_streamability(
+                &linear_action,
+                VariableSet::new_empty(),
+            ),
             FormulaProposalStreamability::Linear
         );
 
@@ -9493,7 +9645,10 @@ mod tests {
             .finite_formula
             .select_child_as_action(&start(&non_local_plan), 0);
         assert_eq!(
-            non_local_plan.formula_proposal_streamability(&non_local_action),
+            non_local_plan.formula_proposal_streamability(
+                &non_local_action,
+                VariableSet::new_empty(),
+            ),
             FormulaProposalStreamability::Barrier(
                 FormulaProposalStreamBarrier::NonPageLocalConfirm
             )
@@ -9514,7 +9669,10 @@ mod tests {
             .finite_formula
             .select_child_as_action(&start(&grouped_plan), 0);
         assert_eq!(
-            grouped_plan.formula_proposal_streamability(&grouped_action),
+            grouped_plan.formula_proposal_streamability(
+                &grouped_action,
+                VariableSet::new_empty(),
+            ),
             FormulaProposalStreamability::Barrier(FormulaProposalStreamBarrier::GroupedConfirm)
         );
 
@@ -9533,7 +9691,10 @@ mod tests {
             .finite_formula
             .select_child_as_action(&start(&union_plan), 0);
         assert_eq!(
-            union_plan.formula_proposal_streamability(&union_action),
+            union_plan.formula_proposal_streamability(
+                &union_action,
+                VariableSet::new_empty(),
+            ),
             FormulaProposalStreamability::Barrier(FormulaProposalStreamBarrier::OrFrame)
         );
 
@@ -9545,8 +9706,45 @@ mod tests {
             .finite_formula
             .select_child_as_action(&start(&old_formula_plan), 0);
         assert_eq!(
-            old_formula_plan.formula_proposal_streamability(&old_formula_action),
+            old_formula_plan.formula_proposal_streamability(
+                &old_formula_action,
+                VariableSet::new_empty(),
+            ),
             FormulaProposalStreamability::Barrier(FormulaProposalStreamBarrier::NotSyntheticRoot)
+        );
+    }
+
+    #[test]
+    fn formula_grouped_confirm_capability_depends_on_bound_schema() {
+        let root = IntersectionConstraint::new(vec![
+            Box::new(CapabilityLeaf {
+                variable: 0,
+                page_local: false,
+            }) as ShapeConstraint,
+            Box::new(ConditionalGroupedCapabilityLeaf {
+                variable: 0,
+                required: 1,
+            }),
+        ]);
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let start = plan.finite_formula.start(
+            0,
+            0,
+            UnionVerb::Propose {
+                relevant: ChildSet::empty(plan.len()).with_inserted(0),
+            },
+        );
+        let action = plan.finite_formula.select_child_as_action(&start, 0);
+
+        assert_eq!(
+            plan.formula_proposal_streamability(&action, VariableSet::new_empty()),
+            FormulaProposalStreamability::Linear,
+            "an unmet grouping prerequisite leaves the continuation pageable"
+        );
+        assert_eq!(
+            plan.formula_proposal_streamability(&action, VariableSet::new_singleton(1)),
+            FormulaProposalStreamability::Barrier(FormulaProposalStreamBarrier::GroupedConfirm),
+            "binding the prerequisite restores the parent-atomic barrier"
         );
     }
 
@@ -9575,7 +9773,7 @@ mod tests {
             program.node(children[0]).capabilities,
             FormulaNodeCapabilities {
                 confirm_page_local: false,
-                grouped_delta_confirm: false,
+                grouped_delta_confirm_requirements: Box::new([]),
             }
         );
 
@@ -9617,7 +9815,10 @@ mod tests {
             }
         ));
         assert!(program.grade(&guard) > program.grade(&start));
-        assert!(!plan.formula_uses_candidate_pages(&guard));
+        assert!(!plan.formula_uses_candidate_pages(
+            &guard,
+            VariableSet::new_empty(),
+        ));
 
         let guard_complete = program.complete(&guard);
         assert!(program.grade(&guard_complete) > program.grade(&guard));

@@ -210,8 +210,12 @@ impl<'a> Constraint<'a> for CountingPath {
         self.inner.residual_confirm_is_page_local()
     }
 
-    fn residual_delta_confirm_is_grouped(&self) -> bool {
-        self.inner.residual_delta_confirm_is_grouped()
+    fn residual_delta_confirm_grouping_requirements(
+        &self,
+        variable: VariableId,
+    ) -> Option<VariableSet> {
+        self.inner
+            .residual_delta_confirm_grouping_requirements(variable)
     }
 
     fn residual_delta_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
@@ -355,8 +359,12 @@ impl<'a> Constraint<'a> for SupportCountingPath {
         self.inner.residual_confirm_is_page_local()
     }
 
-    fn residual_delta_confirm_is_grouped(&self) -> bool {
-        self.inner.residual_delta_confirm_is_grouped()
+    fn residual_delta_confirm_grouping_requirements(
+        &self,
+        variable: VariableId,
+    ) -> Option<VariableSet> {
+        self.inner
+            .residual_delta_confirm_grouping_requirements(variable)
     }
 
     fn residual_delta_support_seeds(

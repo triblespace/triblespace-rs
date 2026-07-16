@@ -616,8 +616,16 @@ impl Constraint<'static> for PathWithHidden {
         self.path.residual_confirm_is_page_local()
     }
 
-    fn residual_delta_confirm_is_grouped(&self) -> bool {
-        self.path.residual_delta_confirm_is_grouped()
+    fn residual_delta_confirm_grouping_requirements(
+        &self,
+        variable: VariableId,
+    ) -> Option<VariableSet> {
+        (variable != HIDDEN_PATH_STATE)
+            .then(|| {
+                self.path
+                    .residual_delta_confirm_grouping_requirements(variable)
+            })
+            .flatten()
     }
 
     fn residual_delta_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
@@ -761,7 +769,10 @@ fn ignored_same_variable_path_keeps_paged_roots_grouping_and_expansion() {
 
     let source = make();
     assert_eq!(source.variables(), VariableSet::new_singleton(START));
-    assert!(source.residual_delta_confirm_is_grouped());
+    assert_eq!(
+        source.residual_delta_confirm_grouping_requirements(START),
+        Some(VariableSet::new_empty())
+    );
     assert!(source.residual_delta_source_is_paged(START, &RowsView::EMPTY));
     let mut roots = Vec::new();
     let page = source

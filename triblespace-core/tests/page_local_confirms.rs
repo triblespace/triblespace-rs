@@ -18,6 +18,7 @@ use triblespace_core::query::regularpathconstraint::{PathOp, RegularPathConstrai
 use triblespace_core::query::sortedsliceconstraint::SortedSlice;
 use triblespace_core::query::{
     CandidateSink, Candidates, Constraint, ContainsConstraint, RowsView, TriblePattern, Variable,
+    VariableSet,
 };
 use triblespace_core::trible::Trible;
 
@@ -322,8 +323,9 @@ fn whole_group_reducers_remain_explicitly_atomic() {
         repeated_path.residual_confirm_is_page_local(),
         "ordinary RPQ confirmation is pointwise"
     );
-    assert!(
-        repeated_path.residual_delta_confirm_is_grouped(),
-        "the cyclic RPQ reducer must retain the complete parent group"
+    assert_eq!(
+        repeated_path.residual_delta_confirm_grouping_requirements(start.index),
+        Some(VariableSet::new_singleton(end.index)),
+        "the cyclic RPQ reducer becomes grouped once its opposite endpoint is bound"
     );
 }

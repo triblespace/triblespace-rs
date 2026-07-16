@@ -1165,15 +1165,26 @@ pub trait Constraint<'a> {
         false
     }
 
-    /// Whether a supported transition confirmation must retain each parent's
-    /// complete ordered candidate group until its reducer quiesces.
+    /// Bound-variable prerequisites for a grouped transition confirmation.
+    ///
+    /// `Some(required)` means that confirming `variable` through a supported
+    /// residual transition program needs the complete ordered candidate group
+    /// exactly when every variable in `required` is already bound. `None`
+    /// means that this confirmation never needs a grouped reducer. When the
+    /// prerequisites are not met, the constraint must either decline residual
+    /// transition seeds or provide a page-local transition confirmation.
     ///
     /// This is separate from `residual_confirm_is_page_local`: the ordinary
     /// confirmation may be elementwise while the lowered implementation
     /// intentionally traverses once and filters the immutable original group.
+    /// The conservative default declines grouped transition lowering. The
+    /// answer is structural and must remain stable for the solve.
     #[doc(hidden)]
-    fn residual_delta_confirm_is_grouped(&self) -> bool {
-        false
+    fn residual_delta_confirm_grouping_requirements(
+        &self,
+        _variable: VariableId,
+    ) -> Option<VariableSet> {
+        None
     }
 
     /// Whether this action owns an ordered, page-producing source frontier.
@@ -1504,9 +1515,12 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.residual_confirm_is_page_local()
     }
 
-    fn residual_delta_confirm_is_grouped(&self) -> bool {
+    fn residual_delta_confirm_grouping_requirements(
+        &self,
+        variable: VariableId,
+    ) -> Option<VariableSet> {
         let inner: &T = self;
-        inner.residual_delta_confirm_is_grouped()
+        inner.residual_delta_confirm_grouping_requirements(variable)
     }
 
     fn residual_delta_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
@@ -1668,9 +1682,12 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
         inner.residual_confirm_is_page_local()
     }
 
-    fn residual_delta_confirm_is_grouped(&self) -> bool {
+    fn residual_delta_confirm_grouping_requirements(
+        &self,
+        variable: VariableId,
+    ) -> Option<VariableSet> {
         let inner: &T = self;
-        inner.residual_delta_confirm_is_grouped()
+        inner.residual_delta_confirm_grouping_requirements(variable)
     }
 
     fn residual_delta_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
