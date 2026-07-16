@@ -178,9 +178,9 @@ impl DeltaReducer {
 
 /// Exact affine continuation owned by one reducer activation.
 ///
-/// Stable formula PCs intentionally live here rather than in [`DeltaDesc`]:
+/// Stable formula PC IDs intentionally live here rather than in [`DeltaDesc`]:
 /// two activations may expand the same RPQ product kernel while returning to
-/// different ancestor done masks and payload-frame stacks.
+/// different arena-interned ancestor states and payload-frame stacks.
 #[derive(Clone)]
 enum DeltaReturn {
     Stable {
@@ -1682,10 +1682,9 @@ impl DeltaScheduler {
                 ..
             }
         ));
-        let completed = plan
-            .finite_formula
-            .complete(stable_interner.formula(counter));
-        let completed = stable_interner.intern_formula(&plan.finite_formula, completed);
+        let completed = stable_interner
+            .formula_pcs
+            .complete(&plan.finite_formula, counter);
         let desc = StateDesc {
             bound,
             phase: ResidualPhase::Formula { counter },
@@ -2815,11 +2814,16 @@ mod tests {
         stable_interner: &mut StateInterner,
     ) -> DeltaReturn {
         let relevant = ChildSet::empty(plan.len()).with_inserted(0);
-        let counter = plan
-            .finite_formula
-            .start(0, 0, UnionVerb::Propose { relevant });
-        let counter = plan.finite_formula.select_child_as_action(&counter, 0);
-        let counter = stable_interner.intern_formula(&plan.finite_formula, counter);
+        let counter = stable_interner.start_formula(
+            &plan.finite_formula,
+            0,
+            0,
+            UnionVerb::Propose { relevant },
+        );
+        let counter =
+            stable_interner
+                .formula_pcs
+                .select_child_as_action(&plan.finite_formula, counter, 0);
         let root = plan
             .finite_formula
             .root(0)
@@ -4158,29 +4162,45 @@ mod tests {
             occurrence: 3,
             verb: UnionVerb::Propose { relevant },
         };
-        let first_counter = FormulaProgramCounter {
-            focus: FormulaFocus::Action {
-                node: FormulaNodeId(7),
-                stage: FormulaStage::Propose,
-            },
-            returns: Vec::new().into_boxed_slice(),
-            resume: resume.clone(),
-        };
-        let second_counter = FormulaProgramCounter {
-            focus: first_counter.focus.clone(),
-            returns: vec![FormulaReturnSite {
-                kind: FormulaReturnKind::Child,
-                parent: FormulaNodeId(5),
-                parent_stage: FormulaStage::Propose,
-                child: 1,
-                done: ChildSet::empty(2).with_inserted(0),
-            }]
-            .into_boxed_slice(),
-            resume,
-        };
         let mut formula_pcs = FormulaPcInterner::default();
-        let first = formula_pcs.intern_ungraded(first_counter);
-        let second = formula_pcs.intern_ungraded(second_counter);
+        let resume = formula_pcs.intern_resume(resume);
+        let focus = FormulaFocus::Action {
+            node: FormulaNodeId(7),
+            stage: FormulaStage::Propose,
+        };
+        let first = formula_pcs.intern_record(
+            FormulaPcRecord {
+                focus: focus.clone(),
+                return_to: None,
+                resume,
+            },
+            1,
+        );
+        let parent = formula_pcs.intern_record(
+            FormulaPcRecord {
+                focus: FormulaFocus::Plan {
+                    node: FormulaNodeId(5),
+                    stage: FormulaStage::Propose,
+                    done: ChildSet::empty(2).with_inserted(0),
+                },
+                return_to: None,
+                resume,
+            },
+            1,
+        );
+        let return_to = formula_pcs.intern_return(FormulaReturnRecord {
+            kind: FormulaReturnKind::Child,
+            parent,
+            child: 1,
+        });
+        let second = formula_pcs.intern_record(
+            FormulaPcRecord {
+                focus,
+                return_to: Some(return_to),
+                resume,
+            },
+            3,
+        );
         assert_ne!(first, second);
 
         let mut scheduler = DeltaScheduler::new();
