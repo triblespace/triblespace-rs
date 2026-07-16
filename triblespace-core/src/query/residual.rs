@@ -71,6 +71,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use smallvec::SmallVec;
+
 use super::*;
 
 mod delta;
@@ -2475,11 +2477,11 @@ impl Drop for ShadowActionSpan {
 /// representation avoids aliasing conjunctions with more leaves than the query
 /// language's independent 128-variable cap.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-struct ChildSet(Vec<u64>);
+struct ChildSet(SmallVec<[u64; 1]>);
 
 impl ChildSet {
     fn empty(leaf_count: usize) -> Self {
-        Self(vec![0; leaf_count.div_ceil(64)])
+        Self(SmallVec::from_elem(0, leaf_count.div_ceil(64)))
     }
 
     fn contains(&self, child: usize) -> bool {

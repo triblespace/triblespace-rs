@@ -347,6 +347,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Canonical residual child sets keep one bitset word inline.** State
+  descriptor cloning and interning avoid heap allocation for the common
+  at-most-64-leaf formula while wider formulas transparently spill, preserving
+  exact identity, hashing, canonical remerging, and geometric scheduling.
 - **Singleton continuation-selected cyclic seeds retain physical focus.** The
   residual scheduler follows the activation-local source/transition lineage it
   just seeded until its first stable effect or quiescence; canonical delta
