@@ -208,9 +208,21 @@ the activation-private cursor or relying on fixpoint deduplication. A
 transition page that produces no novel child, accepted endpoint, or stable
 continuation contributes negative feedback, so a rejected prefix grows from
 one to two to four destinations instead of remaining a width-one serial scan.
-An initial nullable endpoint is already recorded by the activation, but becomes
-visible when that root performs its first expansion page; publishing this
-epsilon effect before any transition lookup is a remaining latency refinement.
+An accepting initial product root is settled one step earlier. Activation
+creation records its endpoint in the same distinct accepted set used by later
+transition witnesses and returns a one-shot seed-effect receipt to the delta
+scheduler. A streaming proposal or fully-bound Boolean Support reducer files
+that receipt into the stable machine immediately, while the root's affine
+traversal credit remains live for non-epsilon paths. Grouped confirmation and
+non-linear formula proposal retain their existing quiescence barriers: seed
+acceptance is private reducer state there, not an illegally streamed result.
+This mechanism is generic to `ResidualDeltaOutput::accepted`, not an RPQ
+branch in the scheduler. It preserves NODES(G) gating, same-variable paths,
+duplicate outer parent bags, and clone/drop remainders. Seed publication
+consumes neither transition width nor a transition-page statistic, and the
+first later expansion cannot replay it. Conversely, an independently dead
+source or transition page still supplies geometric negative feedback even if
+the activation published an earlier seed effect.
 
 Paged product nodes under the same structural transition operator cross one
 block-native cohort seam. The batch carries row-aligned nodes, affine cursors,

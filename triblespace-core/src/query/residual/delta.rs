@@ -214,7 +214,6 @@ struct Activation {
     /// quiescent formula reducer. Streaming reducers file these immediately;
     /// transition acceptance continues to use the distinct `accepted` set.
     direct_candidates: Vec<RawInline>,
-    pending_accepted: Vec<RawInline>,
     live: BTreeSet<CreditNonce>,
     retired: BTreeSet<CreditNonce>,
     status: ActivationStatus,
@@ -265,6 +264,10 @@ struct SourcePageOutcome {
 struct StartOutcome {
     activation: ActivationId,
     roots: Vec<(ResidualDeltaNode, ProducerCredit)>,
+    /// Distinct accepting seed endpoints in constraint order. The registry
+    /// records them before issuing this receipt, so reducers that cannot
+    /// stream may simply retain them until quiescence.
+    initial_accepted: Vec<RawInline>,
     quiescence: Option<QuiescenceProof>,
 }
 
@@ -321,7 +324,7 @@ impl ProducerRegistry {
         ));
         let mut live = BTreeSet::new();
         let mut accepted = HashSet::new();
-        let mut pending_accepted = Vec::new();
+        let mut initial_accepted = Vec::new();
         let mut roots = Vec::with_capacity(seeds.size_hint().0);
         for seed in seeds {
             let nonce = CreditNonce(take_monotonic(&mut self.state.next_credit, "credit"));
@@ -340,7 +343,7 @@ impl ProducerRegistry {
             );
             assert!(live.insert(nonce));
             if seed.accepted && accepted.insert(seed.node.value) {
-                pending_accepted.push(seed.node.value);
+                initial_accepted.push(seed.node.value);
             }
             roots.push((
                 seed.node,
@@ -368,7 +371,6 @@ impl ProducerRegistry {
                         seen: HashMap::new(),
                         accepted,
                         direct_candidates: Vec::new(),
-                        pending_accepted,
                         live,
                         retired: BTreeSet::new(),
                         status,
@@ -380,6 +382,7 @@ impl ProducerRegistry {
         StartOutcome {
             activation,
             roots,
+            initial_accepted,
             quiescence: (status == ActivationStatus::Quiescent)
                 .then_some(QuiescenceProof { activation }),
         }
@@ -411,7 +414,6 @@ impl ProducerRegistry {
                         seen: HashMap::new(),
                         accepted: HashSet::new(),
                         direct_candidates: Vec::new(),
-                        pending_accepted: Vec::new(),
                         live: BTreeSet::new(),
                         retired: BTreeSet::new(),
                         status: ActivationStatus::Open,
@@ -486,7 +488,7 @@ impl ProducerRegistry {
         );
 
         let mut novel = Vec::new();
-        let mut accepted = std::mem::take(&mut activation.pending_accepted);
+        let mut accepted = Vec::new();
         for successor in successors {
             if let Some(&previous) = activation.seen.get(&successor.node) {
                 assert_eq!(
@@ -1069,10 +1071,15 @@ impl DeltaScheduler {
         successor: StateDesc,
         parents: RowBatch,
         seeds: Vec<ResidualDeltaSeed>,
-    ) {
+        plan: &ResidualPlan,
+        stable: &mut Worklist,
+        stable_interner: &mut StateInterner,
+        stats: &mut ResidualStateStats,
+    ) -> Option<ContinuationToken> {
         let ranges = seed_ranges(&seeds, parents.row_count);
         let stride = successor.bound.count();
         let mut tasks = Vec::with_capacity(seeds.len());
+        let mut continuation = None;
         for (row, range) in ranges.into_iter().enumerate() {
             let start = row * stride;
             let parent = parents.rows[start..start + stride]
@@ -1086,6 +1093,23 @@ impl DeltaScheduler {
                 },
                 seeds[range].iter().map(|seed| seed.output),
             );
+            if !started.initial_accepted.is_empty() {
+                let streamed = self
+                    .registry
+                    .take_streaming_return(started.activation)
+                    .expect("a streaming proposal rejected its accepting seed receipt");
+                prefer_continuation(
+                    &mut continuation,
+                    Self::release_streaming(
+                        streamed,
+                        started.initial_accepted,
+                        plan,
+                        stable,
+                        stable_interner,
+                        stats,
+                    ),
+                );
+            }
             tasks.extend(started.roots.into_iter().map(|(node, credit)| DeltaTask {
                 activation: started.activation,
                 credit,
@@ -1099,6 +1123,7 @@ impl DeltaScheduler {
             }
         }
         self.file(desc, tasks);
+        continuation
     }
 
     pub(super) fn seed_source_proposals(
@@ -1277,6 +1302,7 @@ impl DeltaScheduler {
 
         let mut tasks = Vec::with_capacity(seeds.len());
         let mut completed = Vec::new();
+        let mut continuation = None;
         for (batch, range) in singletons.into_iter().zip(ranges) {
             let reducer = match stage {
                 FormulaStage::Support => DeltaReducer::Support { published: false },
@@ -1300,6 +1326,21 @@ impl DeltaScheduler {
                 },
                 seeds[range].iter().map(|seed| seed.output),
             );
+            if !started.initial_accepted.is_empty() {
+                if let Some(streamed) = self.registry.take_streaming_return(started.activation) {
+                    prefer_continuation(
+                        &mut continuation,
+                        Self::release_streaming(
+                            streamed,
+                            started.initial_accepted,
+                            plan,
+                            stable,
+                            stable_interner,
+                            stats,
+                        ),
+                    );
+                }
+            }
             tasks.extend(started.roots.into_iter().map(|(node, credit)| DeltaTask {
                 activation: started.activation,
                 credit,
@@ -1312,7 +1353,6 @@ impl DeltaScheduler {
         }
         self.file(desc, tasks);
 
-        let mut continuation = None;
         for completed in completed {
             prefer_continuation(
                 &mut continuation,
@@ -2440,6 +2480,33 @@ mod tests {
     }
 
     #[test]
+    fn accepting_seed_is_an_immediate_effect_receipt_not_an_expansion_side_effect() {
+        let mut registry = ProducerRegistry::new();
+        let started = registry.start_many(
+            DeltaReducer::StreamProposal,
+            stable_return(Vec::new()),
+            [output(7, 0, true)],
+        );
+        assert_eq!(started.initial_accepted, [value(7)]);
+        assert_eq!(
+            registry
+                .take_streaming_return(started.activation)
+                .expect("the accepting seed has a streaming return")
+                .effect,
+            DeltaStreamingEffect::Candidates
+        );
+        let (_, root) = started.roots.into_iter().next().expect("one seed root");
+
+        let expanded = registry.replace_traversal(root, []);
+        assert!(
+            expanded.accepted.is_empty(),
+            "the first adjacency expansion replayed seed acceptance"
+        );
+        let completed = registry.finish(expanded.quiescence.expect("the root quiesces"));
+        assert_eq!(completed.effect, DeltaCompletion::Cleanup);
+    }
+
+    #[test]
     fn support_reducer_publishes_only_the_first_distinct_witness() {
         let mut registry = ProducerRegistry::new();
         let started = registry.start_many(
@@ -2601,7 +2668,7 @@ mod tests {
     }
 
     #[test]
-    fn batched_delta_step_keeps_dead_page_and_streamed_formula_handoff_independent() {
+    fn batched_delta_step_keeps_dead_page_and_seeded_formula_handoff_independent() {
         let root = MixedExpansion;
         let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
         let desc = DeltaDesc::leaf(0, 0);
@@ -2620,9 +2687,9 @@ mod tests {
         );
         let (dead_node, dead_credit) = dead_page.roots.into_iter().next().unwrap();
 
-        // This accepted seed publishes and proves quiescence in the same
-        // scheduler step. StreamFormulaProposal must file its affine return
-        // exactly once; cleanup must not replay the activation-local template.
+        // The accepting seed publishes before this scheduler step, while its
+        // independent traversal credit proves quiescence during the step.
+        // Cleanup must not replay the activation-local return template.
         let mut live = scheduler.registry.start_many(
             DeltaReducer::StreamFormulaProposal,
             streaming_formula_return(&plan),
@@ -2631,6 +2698,23 @@ mod tests {
         let live_activation = live.activation;
         let (live_node, live_credit) = live.roots.pop().expect("one live formula root");
         assert!(live.quiescence.is_none());
+
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let streamed = scheduler
+            .registry
+            .take_streaming_return(live_activation)
+            .expect("an accepting formula seed has a streaming return");
+        let seed_continuation = DeltaScheduler::release_streaming(
+            streamed,
+            live.initial_accepted,
+            &plan,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert!(seed_continuation.is_some());
 
         scheduler.file(
             desc,
@@ -2649,9 +2733,6 @@ mod tests {
                 },
             ],
         );
-        let mut stable = Worklist::new();
-        let mut stable_interner = StateInterner::default();
-        let mut stats = ResidualStateStats::default();
 
         let outcome = scheduler.step(
             &root,
@@ -2663,7 +2744,7 @@ mod tests {
         );
 
         assert_eq!(outcome.dead_pages, 1);
-        assert!(outcome.continuation.is_some());
+        assert!(outcome.continuation.is_none());
         assert_eq!(stats.delta_source_dead_pages, 1);
         assert_eq!(stats.candidates_proposed, 1);
         let mut stable_buckets = stable.values().flat_map(BTreeMap::values);
@@ -2699,15 +2780,12 @@ mod tests {
         machine.width = 4;
         machine.cap = 64;
         machine.accept_delta_step(outcome);
-        assert_eq!(machine.width, 4, "a mixed positive step must not widen");
-        assert_eq!(machine.stats.delta_source_negative_steps, 0);
-        assert!(matches!(
-            machine.continuation,
-            Some(ActiveContinuation {
-                mode: ContinuationMode::ProbeOne,
-                ..
-            })
-        ));
+        assert_eq!(
+            machine.width, 8,
+            "the earlier seed receipt must not hide a later dead source page"
+        );
+        assert_eq!(machine.stats.delta_source_negative_steps, 1);
+        assert!(machine.continuation.is_none());
     }
 
     #[test]

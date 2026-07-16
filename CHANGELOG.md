@@ -47,6 +47,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   successor, so mixed positive/negated nodes obey one global width; pages with
   no novel effect feed the same geometric negative-width ramp as dead source
   pages.
+- **Accepting transition seeds publish without probing adjacency.** A delta
+  activation now returns its distinct accepting seed endpoints as an immediate
+  scheduler-owned effect receipt while retaining independent traversal
+  credits. Streaming proposals and fully-bound Boolean Support can therefore
+  yield nullable epsilon results before any transition page; grouped confirms
+  and non-linear formula proposals keep the same quiescent reducer barriers.
+  Seed effects consume no transition demand, preserve affine parent bags and
+  NODES(G) scope, and cannot replay during the first later expansion.
 - **Ordered proposal sources can page direct candidate occurrences.** The
   residual source cursor now distinguishes raw-value and native-ordinal
   frontiers while preserving proposal order and multiplicity. Sorted slices

@@ -1281,6 +1281,40 @@ fn fully_bound_support_root(
     ]))
 }
 
+fn fully_bound_same_variable_support_root(
+    set: TribleSet,
+    source: Inline<GenId>,
+    ops: &[PathOp],
+    guarded_value: RawInline,
+    sibling_value: RawInline,
+    counters: &SupportProbeCounters,
+) -> Root {
+    let node = Variable::<GenId>::new(START);
+    let guarded = Box::new(IntersectionConstraint::new(vec![
+        support_probe_path(&set, node, node, ops, counters, None),
+        Box::new(OrderedDomain {
+            variable: OUTER,
+            gate: OUTER,
+            unbound_estimate: 1,
+            values: vec![guarded_value],
+        }) as DynConstraint,
+    ])) as DynConstraint;
+    let sibling = Box::new(IntersectionConstraint::new(vec![
+        Box::new(node.is(source)) as DynConstraint,
+        Box::new(OrderedDomain {
+            variable: OUTER,
+            gate: OUTER,
+            unbound_estimate: 8,
+            values: vec![sibling_value],
+        }) as DynConstraint,
+    ])) as DynConstraint;
+
+    Arc::new(IntersectionConstraint::new(vec![
+        Box::new(node.is(source)) as DynConstraint,
+        Box::new(UnionConstraint::new(vec![guarded, sibling])) as DynConstraint,
+    ]))
+}
+
 fn duplicate_parent_root(
     set: TribleSet,
     start: RawInline,
@@ -3422,6 +3456,135 @@ fn fully_bound_nullable_support_gates_epsilon_by_nodes_without_source_paging() {
 }
 
 #[test]
+fn nullable_support_seed_publishes_before_distinct_or_same_variable_expansion() {
+    let graph = Graph::new(6, &[(0, 1), (1, 2), (2, 3), (3, 4)]);
+    let ops = [PathOp::Attr(graph.attribute.raw()), PathOp::Star];
+    let guarded_value = genid(&rngid().id).raw;
+    let sibling_value = genid(&rngid().id).raw;
+    let fully_bound_satisfied_calls = Arc::new(AtomicUsize::new(0));
+    let support_seeded_roots = Arc::new(AtomicUsize::new(0));
+    let expanded_nodes = Arc::new(AtomicUsize::new(0));
+    let make = || {
+        fully_bound_support_root(
+            graph.set.clone(),
+            graph.value(0),
+            graph.value(0),
+            &ops,
+            guarded_value,
+            sibling_value,
+            1,
+            8,
+            Arc::clone(&fully_bound_satisfied_calls),
+            Arc::clone(&support_seeded_roots),
+            Arc::clone(&expanded_nodes),
+        )
+    };
+    let mut query = Query::new(make(), project_outer)
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .start_width(1)
+        .cap(1);
+
+    let first = query.next().expect("one nullable Support result");
+    assert!(first == guarded_value || first == sibling_value);
+    assert_eq!(fully_bound_satisfied_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(support_seeded_roots.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        expanded_nodes.load(Ordering::Relaxed),
+        0,
+        "epsilon Support crossed an adjacency expansion before publication"
+    );
+    assert_eq!(query.stats().delta_transition_pages, 0);
+    assert_eq!(query.stats().delta_transition_candidates_examined, 0);
+    let mut cloned = query.clone();
+    let remainder = if first == guarded_value {
+        sibling_value
+    } else {
+        guarded_value
+    };
+    assert_eq!(query.next(), Some(remainder));
+    assert_eq!(cloned.next(), Some(remainder));
+    assert_eq!(
+        expanded_nodes.load(Ordering::Relaxed),
+        0,
+        "publishing the nullable Support branch performed transition work"
+    );
+    drop(query);
+    drop(cloned);
+
+    let counters = SupportProbeCounters::new();
+    let mut same_variable = Query::new(
+        fully_bound_same_variable_support_root(
+            graph.set.clone(),
+            graph.value(0),
+            &ops,
+            guarded_value,
+            sibling_value,
+            &counters,
+        ),
+        project_outer,
+    )
+    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .start_width(1)
+    .cap(1);
+    let same_first = same_variable
+        .next()
+        .expect("one same-variable nullable Support result");
+    assert!(same_first == guarded_value || same_first == sibling_value);
+    assert_eq!(
+        counters.expanded_nodes.load(Ordering::Relaxed),
+        0,
+        "same-variable epsilon Support crossed an adjacency expansion"
+    );
+    assert_eq!(
+        counters.fully_bound_satisfied_calls.load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(counters.support_seeded_roots.load(Ordering::Relaxed), 1);
+    let same_remainder = if same_first == guarded_value {
+        sibling_value
+    } else {
+        guarded_value
+    };
+    assert_eq!(same_variable.next(), Some(same_remainder));
+    assert_eq!(
+        counters.expanded_nodes.load(Ordering::Relaxed),
+        0,
+        "publishing same-variable nullable Support performed transition work"
+    );
+    drop(same_variable);
+
+    let absent_guard = genid(&rngid().id).raw;
+    let absent_sibling = genid(&rngid().id).raw;
+    let absent_expanded = Arc::new(AtomicUsize::new(0));
+    let absent = fully_bound_support_root(
+        graph.set.clone(),
+        graph.value(5),
+        graph.value(5),
+        &ops,
+        absent_guard,
+        absent_sibling,
+        1,
+        8,
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::clone(&absent_expanded),
+    );
+    assert_eq!(
+        Query::new(absent, project_outer)
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .start_width(1)
+            .cap(1)
+            .collect::<Vec<_>>(),
+        vec![absent_sibling],
+        "nullable acceptance escaped the NODES(G) gate"
+    );
+    assert!(
+        absent_expanded.load(Ordering::Relaxed) > 0,
+        "an absent term was accepted without proving non-epsilon failure"
+    );
+}
+
+#[test]
 fn fully_bound_formula_guard_uses_native_support_instead_of_legacy_reachability() {
     let graph = Graph::new(4, &[(0, 1), (1, 2)]);
     let guarded_value = genid(&rngid().id).raw;
@@ -4321,6 +4484,71 @@ fn first_result_requires_one_expansion_and_drop_cancels_the_remainder() {
     assert_eq!(expanded.load(Ordering::Relaxed), 1);
     drop(query);
     assert_eq!(expanded.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn nullable_seed_is_first_result_without_transition_work_and_keeps_affine_bags() {
+    let graph = Graph::new(5, &[(0, 1), (1, 2), (2, 3), (3, 4)]);
+    let ops = [PathOp::Attr(graph.attribute.raw()), PathOp::Star];
+    let outer_values = [genid(&rngid().id).raw, genid(&rngid().id).raw];
+    let make =
+        || native_duplicate_parent_root(graph.set.clone(), graph.value(0).raw, outer_values, &ops);
+    let mut expected: Vec<_> = Query::new(make(), project_end).sequential().collect();
+    expected.sort_unstable();
+    let mut query = Query::new(make(), project_end)
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .start_width(1)
+        .cap(1);
+
+    let first = query.next().expect("nullable seed endpoint");
+    assert_eq!(first, graph.value(0).raw);
+    assert_eq!(query.stats().delta_transition_pages, 0);
+    assert_eq!(query.stats().delta_transition_cohorts, 0);
+    assert_eq!(query.stats().delta_transition_candidates_examined, 0);
+    assert_eq!(query.current_width(), 1);
+    assert_eq!(query.stats().width_increases, 0);
+
+    let cloned = query.clone();
+    let mut original = vec![first];
+    original.extend(query);
+    let mut clone_results = vec![first];
+    clone_results.extend(cloned);
+    original.sort_unstable();
+    clone_results.sort_unstable();
+    assert_eq!(original, expected);
+    assert_eq!(clone_results, expected);
+    for node in 0..5 {
+        assert_eq!(
+            original
+                .iter()
+                .filter(|&&value| value == graph.value(node).raw)
+                .count(),
+            2,
+            "one affine parent copy was lost for node {node}"
+        );
+    }
+
+    let mut dropped = Query::new(make(), project_end)
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .start_width(1)
+        .cap(1);
+    assert_eq!(dropped.next(), Some(graph.value(0).raw));
+    assert_eq!(dropped.stats().delta_transition_pages, 0);
+    drop(dropped);
+
+    let absent = genid(&rngid().id);
+    assert!(
+        Query::new(
+            native_bound_start_root(graph.set.clone(), absent, &ops),
+            project_end,
+        )
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .start_width(1)
+        .cap(1)
+        .next()
+        .is_none(),
+        "nullable seed publication admitted a non-graph term"
+    );
 }
 
 #[test]
