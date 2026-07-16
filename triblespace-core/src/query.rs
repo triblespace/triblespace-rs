@@ -742,7 +742,7 @@ pub enum ConstraintShape<'s, 'a> {
     And(&'s dyn ConstraintChildren<'a>),
 }
 
-/// One engine-owned node in a cyclic residual fixpoint.
+/// One engine-owned node in a residual transition program.
 ///
 /// `value` is the current data-plane term, `source` is an optional speculative
 /// root carried through the traversal, and `continuation` is a
@@ -761,7 +761,7 @@ pub struct ResidualDeltaNode {
     pub continuation: u32,
 }
 
-/// One cyclic work item plus its endpoint effect.
+/// One transition work item plus its endpoint effect.
 ///
 /// `accepted` is not part of work identity. A well-formed constraint must
 /// report it consistently for every occurrence of the same node.
@@ -1090,8 +1090,8 @@ pub trait Constraint<'a> {
         false
     }
 
-    /// Whether a supported delta confirmation must retain each parent's
-    /// complete ordered candidate group until its cyclic reducer quiesces.
+    /// Whether a supported transition confirmation must retain each parent's
+    /// complete ordered candidate group until its reducer quiesces.
     ///
     /// This is separate from `residual_confirm_is_page_local`: the ordinary
     /// confirmation may be elementwise while the lowered implementation
@@ -1137,20 +1137,22 @@ pub trait Constraint<'a> {
         None
     }
 
-    /// Seeds zero or more engine-owned cyclic fixpoints for each parent row.
+    /// Seeds zero or more engine-owned transition programs for each parent row.
     ///
     /// Returning `true` opts this exact `(constraint, variable, bound schema)`
-    /// proposal or grouped-confirm action into residual delta execution. Every
+    /// proposal or confirm action into residual delta execution. Every
     /// appended seed carries an in-range parent-row tag and tags are grouped in
     /// ascending order. Proposal actions may append zero or more seeds per
     /// parent; repeated tags denote distinct affine producer roots inside one
-    /// parent activation. That activation streams proposal effects but does
-    /// not reduce a grouped confirmation until every root lineage quiesces, so
-    /// the one immutable candidate sequence supplies exact order and
-    /// multiplicity. A nullable program may mark its seed accepted without
-    /// adding it to work novelty. Returning `true` with no seeds for a parent
-    /// is an exact empty result for that parent. The conservative default
-    /// retains the ordinary constraint protocol.
+    /// parent activation. That activation streams proposal effects but does not
+    /// reduce a confirmation until every root lineage quiesces. A page-local
+    /// finite confirmation owns only its disjoint candidate page; a grouped
+    /// confirmation owns the complete parent sequence. In both cases the
+    /// immutable sequence supplies exact order and multiplicity. A nullable
+    /// program may mark its seed accepted without adding it to work novelty.
+    /// Returning `true` with no seeds for a parent is an exact empty result for
+    /// that parent. The conservative default retains the ordinary constraint
+    /// protocol.
     #[doc(hidden)]
     fn residual_delta_seeds(
         &self,
@@ -1161,7 +1163,7 @@ pub trait Constraint<'a> {
         false
     }
 
-    /// Expands one block of engine-owned cyclic fixpoint nodes.
+    /// Expands one block of engine-owned transition-program nodes.
     ///
     /// Successors are tagged by input-node index and grouped in ascending tag
     /// order. A constraint that returned `true` from `residual_delta_seeds`
@@ -1401,9 +1403,9 @@ enum QueryScheduler {
 /// residual states. It starts with narrow, depth-first action cohorts and
 /// widens as the consumer keeps pulling, while histories with identical future
 /// computation can reconverge under one state identity. Its root runs as one
-/// finite AND/OR formula and eligible cyclic regular paths execute inside that
-/// formula; unsupported path programs remain ordinary opaque constraint
-/// actions. Seed-rejected queries start no runtime. Use
+/// finite AND/OR formula and eligible regular-path transition programs execute
+/// inside that formula; unsupported custom programs remain ordinary opaque
+/// constraint actions. Seed-rejected queries start no runtime. Use
 /// [`Query::lazy_dag_scheduler`] for the bound-variable-set DAG control and
 /// [`Query::sequential`] for the scalar depth-first specialization. The
 /// explicit [`Query::residual_state_scheduler`] override retains conservative
@@ -1670,7 +1672,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// arbitrary-root completeness for opaque, one-leaf, disjoint, and
     /// seed-rejected constraints, and is useful for scheduler comparison. The
     /// override uses conservative opaque-composite lowering; it does not
-    /// inherit the richer formula and cyclic-path capabilities of an ordinary
+    /// inherit the richer formula and path-program capabilities of an ordinary
     /// shape-selected residual query. The runtime cursor remains behind
     /// `Query::next`, so cloning a started query
     /// snapshots its exact raw remainder. Ordinary Rayon conversion of an

@@ -1235,13 +1235,15 @@ impl ResidualCapabilities {
         self
     }
 
-    /// Executes eligible proposer-side and grouped confirmer-side `+` regular
-    /// paths through the cyclic delta submachine. Unsupported RPQ shapes stay
-    /// on the ordinary opaque constraint protocol. A certified synthetic-root
-    /// Atom/AND proposal may publish accepted endpoints in delta discovery
-    /// order, matching ordinary outer cyclic proposals; it does not reproduce
-    /// the sorted order of a quiescent formula batch. Residual iteration
-    /// therefore preserves the result bag, not a particular result order.
+    /// Executes eligible regular-path transition programs through the residual
+    /// delta submachine. Finite paths use terminating automata and may confirm
+    /// disjoint candidate pages; repeated paths use the same substrate as a
+    /// least fixpoint and retain grouped confirmation. Unsupported custom
+    /// transition shapes stay on the ordinary opaque constraint protocol. A
+    /// certified synthetic-root Atom/AND proposal may publish accepted
+    /// endpoints in transition discovery order; it does not reproduce the
+    /// sorted order of a quiescent formula batch. Residual iteration therefore
+    /// preserves the result bag, not a particular result order.
     pub fn cyclic_rpq(mut self) -> Self {
         self.cyclic_rpq = true;
         self
@@ -5330,9 +5332,11 @@ impl ResidualStateMachine {
         Ok(deferred)
     }
 
-    /// Converts one eligible confirmer into one cyclic activation per parent
-    /// candidate group. The reducer retains the immutable original candidate
-    /// sequence and filters it only after reachability quiesces.
+    /// Converts one eligible confirmer into one transition activation per
+    /// parent candidate batch. The reducer retains the immutable original
+    /// candidate sequence and filters it only after traversal quiesces. Finite
+    /// page-local confirmations may receive one disjoint page; repeated paths
+    /// remain parent-grouped by their plan capability.
     fn seed_delta_confirm<'a>(
         &mut self,
         root: &dyn Constraint<'a>,
@@ -5354,15 +5358,18 @@ impl ResidualStateMachine {
         else {
             return Err(task);
         };
-        // Lowered finite formulas own their complete group reducer. Only an
-        // ordinary opaque confirmer may enter the cyclic RPQ submachine.
-        if plan.has_finite_formula(*confirmer) || !plan.grouped_delta_confirms[*confirmer] {
+        // Lowered finite formulas own their own action reducer. Any ordinary
+        // opaque confirmer may offer a transition program; unsupported hooks
+        // fall back to the ordinary protocol below.
+        if plan.has_finite_formula(*confirmer) {
             return Err(task);
         }
-        assert!(
-            !task.desc.uses_candidate_pages(plan),
-            "grouped delta confirmation was split into candidate pages"
-        );
+        if plan.grouped_delta_confirms[*confirmer] {
+            assert!(
+                !task.desc.uses_candidate_pages(plan),
+                "grouped delta confirmation was split into candidate pages"
+            );
+        }
 
         let variable = *variable;
         let confirmer = *confirmer;
@@ -5443,10 +5450,12 @@ impl ResidualStateMachine {
         Ok(deferred)
     }
 
-    /// Suspends a currently focused formula Atom behind one cyclic reducer
+    /// Suspends a currently focused formula Atom behind one transition reducer
     /// activation per affine parent. The complete Action PC and every payload
     /// frame remain activation data; [`DeltaDesc`] names only the common
-    /// structural expansion kernel.
+    /// structural expansion kernel. Page-local finite confirmations retain the
+    /// formula's geometric candidate split; grouped repeated confirmations keep
+    /// their complete parent candidate sequence.
     fn seed_delta_formula<'a>(
         &mut self,
         root: &dyn Constraint<'a>,
@@ -5467,9 +5476,7 @@ impl ResidualStateMachine {
             _ => return Err(task),
         };
         let formula_node = plan.finite_formula.node(node);
-        if !matches!(formula_node.kind, FiniteFormulaNodeKind::Atom)
-            || (stage == FormulaStage::Confirm && !formula_node.capabilities.grouped_delta_confirm)
-        {
+        if !matches!(formula_node.kind, FiniteFormulaNodeKind::Atom) {
             return Err(task);
         }
         let stream_proposal = stage == FormulaStage::Propose

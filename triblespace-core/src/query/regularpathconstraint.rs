@@ -1056,11 +1056,14 @@ pub struct RegularPathConstraint {
     /// one-time clone-and-invert at construction pays for
     /// itself.
     inverse_expr: PathExpr,
-    /// Thompson-style programs for the forward and inverse expressions.
-    /// Epsilon closure is compiled into each state's accepting bit and labeled
-    /// frontier, so runtime delta nodes need only `(term, program counter)`.
-    delta_program: Option<DeltaProgram>,
-    inverse_delta_program: Option<DeltaProgram>,
+    /// Thompson-style transition programs for the forward and inverse
+    /// expressions. Epsilon closure is compiled into each state's accepting bit
+    /// and labeled frontier, so runtime residual nodes need only
+    /// `(term, program counter)`. Finite programs terminate after their acyclic
+    /// frontier drains; repeated programs use the same representation as a
+    /// least fixpoint.
+    delta_program: DeltaProgram,
+    inverse_delta_program: DeltaProgram,
     set: TribleSet,
 }
 
@@ -1247,9 +1250,8 @@ impl RegularPathConstraint {
     ) -> Self {
         let expr = PathExpr::from_postfix(ops);
         let inverse_expr = invert(expr.clone());
-        let delta_program = has_repetition(&expr).then(|| DeltaProgram::compile(&expr));
-        let inverse_delta_program =
-            has_repetition(&inverse_expr).then(|| DeltaProgram::compile(&inverse_expr));
+        let delta_program = DeltaProgram::compile(&expr);
+        let inverse_delta_program = DeltaProgram::compile(&inverse_expr);
         RegularPathConstraint {
             start: start.index,
             end: end.index,
@@ -1397,28 +1399,28 @@ impl RegularPathConstraint {
         }
     }
 
-    /// Selects the automaton orientation for a bound-endpoint fixpoint.
-    /// Finite expressions retain their WCO/ordinary path; every expression
-    /// with repetition uses the same product-state program regardless of its
-    /// inner Concat, Union, Optional, inverse, or negated-attribute structure.
+    /// Selects the transition-program orientation for a bound endpoint or a
+    /// same-variable source frontier. Finite and repeated expressions share the
+    /// same product-state representation; the latter are the cyclic special
+    /// case whose novelty set computes a least fixpoint.
     fn residual_delta_program(&self, variable: VariableId) -> Option<ResidualDeltaRoute<'_>> {
         if self.start == self.end {
             if variable != self.start {
                 return None;
             }
             return Some(ResidualDeltaRoute::SameVariable {
-                program: self.delta_program.as_ref()?,
+                program: &self.delta_program,
             });
         }
         if variable == self.end {
             Some(ResidualDeltaRoute::BoundEndpoint {
                 source: self.start,
-                program: self.delta_program.as_ref()?,
+                program: &self.delta_program,
             })
         } else if variable == self.start {
             Some(ResidualDeltaRoute::BoundEndpoint {
                 source: self.end,
-                program: self.inverse_delta_program.as_ref()?,
+                program: &self.inverse_delta_program,
             })
         } else {
             None
