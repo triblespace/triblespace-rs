@@ -10,9 +10,10 @@ use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace_core::query::residual::ResidualLowering;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, EstimateSink, IgnoreConstraint, PathOp, Query,
-    RegularPathConstraint, ResidualDeltaExpandCursor, ResidualDeltaExpandPage, ResidualDeltaNode,
-    ResidualDeltaOutput, ResidualDeltaSeed, ResidualDeltaSourceBatch, ResidualDeltaSourceCursor,
-    ResidualDeltaSourcePage, RowsView, TriblePattern, Variable, VariableId, VariableSet,
+    RegularPathConstraint, ResidualDeltaExpandBatch, ResidualDeltaExpandCursor,
+    ResidualDeltaExpandPage, ResidualDeltaNode, ResidualDeltaOutput, ResidualDeltaSeed,
+    ResidualDeltaSourceBatch, ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView,
+    TriblePattern, Variable, VariableId, VariableSet,
 };
 use triblespace_core::trible::{Trible, TribleSet};
 
@@ -601,6 +602,21 @@ impl Constraint<'static> for PathWithHidden {
             .residual_delta_expand_page(variable, node, cursor, limit, successors)
     }
 
+    fn residual_delta_expand_pages(
+        &self,
+        variable: VariableId,
+        batch: ResidualDeltaExpandBatch<'_>,
+        pages: &mut Vec<Option<ResidualDeltaExpandPage>>,
+        successors: &mut Vec<(u32, ResidualDeltaOutput)>,
+    ) {
+        if variable == HIDDEN_PATH_STATE {
+            pages.resize(pages.len() + batch.nodes.len(), None);
+            return;
+        }
+        self.path
+            .residual_delta_expand_pages(variable, batch, pages, successors);
+    }
+
     fn residual_delta_expand(
         &self,
         variable: VariableId,
@@ -714,6 +730,7 @@ fn ignored_same_variable_path_keeps_paged_roots_grouping_and_expansion() {
     assert!(full_query.stats().delta_source_pages > 0);
     assert!(full_query.stats().delta_source_roots > 0);
     assert!(full_query.stats().delta_transition_pages > 0);
+    assert!(full_query.stats().delta_transition_cohorts > 0);
     assert_eq!(full_query.stats().delta_source_direct_candidates, 0);
 }
 

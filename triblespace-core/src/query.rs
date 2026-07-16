@@ -860,6 +860,21 @@ pub struct ResidualDeltaExpandPage {
     pub examined: usize,
 }
 
+/// One physical cohort of affine transition-node pages.
+///
+/// Every node belongs to the same structural transition operator. `nodes`,
+/// `cursors`, and `limits` are row-aligned, every limit is positive, and their
+/// sum is bounded by the scheduler's current global geometric width. Nodes and
+/// cursors remain activation payload; the batch is a dispatch shape, never a
+/// canonical state identity.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct ResidualDeltaExpandBatch<'v> {
+    pub nodes: &'v [ResidualDeltaNode],
+    pub cursors: &'v [ResidualDeltaExpandCursor],
+    pub limits: &'v [usize],
+}
+
 /// Object-safe child access for a structural constraint shape.
 #[doc(hidden)]
 pub trait ConstraintChildren<'a> {
@@ -1333,6 +1348,53 @@ pub trait Constraint<'a> {
         None
     }
 
+    /// Expands one physical cohort of bounded transition-node pages.
+    ///
+    /// `pages` receives one row-aligned entry per input node. `Some(page)`
+    /// follows [`Self::residual_delta_expand_page`]; `None` leaves that row for
+    /// the block-native eager fallback and is valid only from `Start`.
+    /// Successors from supported pages are tagged by input-node index and
+    /// grouped in ascending tag order. The default preserves scalar page
+    /// implementations while giving block-native constraints one stable seam
+    /// for fused CPU or accelerator execution.
+    #[doc(hidden)]
+    fn residual_delta_expand_pages(
+        &self,
+        variable: VariableId,
+        batch: ResidualDeltaExpandBatch<'_>,
+        pages: &mut Vec<Option<ResidualDeltaExpandPage>>,
+        successors: &mut Vec<(u32, ResidualDeltaOutput)>,
+    ) {
+        assert_eq!(batch.nodes.len(), batch.cursors.len());
+        assert_eq!(batch.nodes.len(), batch.limits.len());
+        for (row, ((&node, &cursor), &limit)) in batch
+            .nodes
+            .iter()
+            .zip(batch.cursors)
+            .zip(batch.limits)
+            .enumerate()
+        {
+            let mut row_successors = Vec::new();
+            let page =
+                self.residual_delta_expand_page(variable, node, cursor, limit, &mut row_successors);
+            if page.is_none() {
+                assert_eq!(
+                    cursor,
+                    ResidualDeltaExpandCursor::Start,
+                    "paged delta expansion became unsupported after suspension"
+                );
+                assert!(
+                    row_successors.is_empty(),
+                    "unsupported delta expansion page mutated its output"
+                );
+            } else {
+                let row = u32::try_from(row).expect("too many transition pages in one cohort");
+                successors.extend(row_successors.into_iter().map(|output| (row, output)));
+            }
+            pages.push(page);
+        }
+    }
+
     /// Expands one block of engine-owned transition-program nodes.
     ///
     /// Successors are tagged by input-node index and grouped in ascending tag
@@ -1482,6 +1544,17 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.residual_delta_expand_page(variable, node, cursor, limit, successors)
     }
 
+    fn residual_delta_expand_pages(
+        &self,
+        variable: VariableId,
+        batch: ResidualDeltaExpandBatch<'_>,
+        pages: &mut Vec<Option<ResidualDeltaExpandPage>>,
+        successors: &mut Vec<(u32, ResidualDeltaOutput)>,
+    ) {
+        let inner: &T = self;
+        inner.residual_delta_expand_pages(variable, batch, pages, successors)
+    }
+
     fn residual_delta_expand(
         &self,
         variable: VariableId,
@@ -1624,6 +1697,17 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     ) -> Option<ResidualDeltaExpandPage> {
         let inner: &T = self;
         inner.residual_delta_expand_page(variable, node, cursor, limit, successors)
+    }
+
+    fn residual_delta_expand_pages(
+        &self,
+        variable: VariableId,
+        batch: ResidualDeltaExpandBatch<'_>,
+        pages: &mut Vec<Option<ResidualDeltaExpandPage>>,
+        successors: &mut Vec<(u32, ResidualDeltaOutput)>,
+    ) {
+        let inner: &T = self;
+        inner.residual_delta_expand_pages(variable, batch, pages, successors)
     }
 
     fn residual_delta_expand(
