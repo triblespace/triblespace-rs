@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Succinct shard unions page one globally normalized source.** `UnionArchive`
+  now merges one ordered head per shard behind a single activation-local
+  `After(value)` cursor, preserving cross-shard deduplication without
+  materializing complete union arms. Generic `UnionConstraint` remains
+  unchanged, and schemas not admitted by every shard remain non-paged.
 - **Ignored wildcard scopes preserve outward action capabilities.** The opaque
   `IgnoreConstraint` boundary now forwards direct candidate pages, native
   source cohorts, grouped reducers, transition seeds, and bounded expansion
