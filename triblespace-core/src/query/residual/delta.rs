@@ -2187,6 +2187,8 @@ impl Clone for DeltaScheduler {
 mod tests {
     use std::sync::atomic::AtomicUsize;
 
+    use crate::query::unionconstraint::UnionConstraint;
+
     use super::*;
 
     #[derive(Clone, Copy)]
@@ -2495,6 +2497,7 @@ mod tests {
         let counter = plan
             .finite_formula
             .start(0, 0, UnionVerb::Propose { relevant });
+        let counter = plan.finite_formula.select_child_as_action(&counter, 0);
         let root = plan
             .finite_formula
             .root(0)
@@ -2813,9 +2816,22 @@ mod tests {
 
     #[test]
     fn batched_delta_step_keeps_dead_page_and_seeded_formula_handoff_independent() {
-        let root = MixedExpansion;
+        // Keep a real formula boundary in this white-box fixture. A lone
+        // opaque root is deliberately normalized to the flat action plan.
+        let root = UnionConstraint::new(vec![MixedExpansion]);
         let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
-        let desc = DeltaDesc::leaf(0, 0);
+        let formula_root = plan
+            .finite_formula
+            .root(0)
+            .expect("the union root has a formula program");
+        let FiniteFormulaNodeKind::Or { children } = &plan
+            .finite_formula
+            .node(formula_root)
+            .kind
+        else {
+            panic!("the union root did not compile as OR")
+        };
+        let desc = DeltaDesc::formula(0, 0, children[0]);
         let mut scheduler = DeltaScheduler::new();
 
         let (dead_activation, dead_generator) = scheduler.registry.start_source(

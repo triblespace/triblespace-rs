@@ -347,6 +347,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Whole-root lowering erases formula identity shells.** An opaque non-union
+  atom, including one wrapped only in unary exposed AND nodes, now enters the
+  flat residual action plan even when `FormulaScope::WholeRoot` is selected.
+  Multi-child conjunctions, unions, and scoped atomic boundaries retain the
+  finite formula machine. Native transition programs therefore publish
+  directly for a pure regular-path query instead of routing every accepted
+  page through an administrative formula payload and program counter.
 - **RPQ transition programs quotient equivalent residual kernels.** After
   epsilon elimination, deterministic forward-bisimulation refinement merges
   program counters with the same accepting bit and ordered labeled future.

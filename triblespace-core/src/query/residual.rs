@@ -1222,8 +1222,8 @@ struct ResidualPlan {
     /// confirmation needs the immutable complete candidate sequence for each
     /// parent until traversal quiescence.
     grouped_delta_confirm_requirements: Vec<Box<[(VariableId, VariableSet)]>>,
-    /// The whole exposed root is one formula occurrence. This is an explicit
-    /// probe capability; ordinary lowering retains flattened outer leaves.
+    /// The nontrivial exposed root is one formula occurrence. Whole-root
+    /// identity shells around one opaque atom normalize to the flat plan.
     synthetic_root_formula: bool,
 }
 
@@ -1250,6 +1250,18 @@ impl ResidualPlan {
         formula_scope: FormulaScope,
         transition_programs: bool,
     ) -> Self {
+        /// Whether whole-root formula interpretation would add only Boolean
+        /// identity control around one opaque non-union action.
+        fn is_formula_identity<'a>(constraint: &dyn Constraint<'a>) -> bool {
+            match constraint.residual_shape() {
+                ConstraintShape::And(children) if children.len() == 1 => {
+                    is_formula_identity(children.child(0))
+                }
+                ConstraintShape::Opaque => constraint.residual_union_children().is_none(),
+                ConstraintShape::And(_) | ConstraintShape::ScopedAnd(_) => false,
+            }
+        }
+
         fn visit<'a>(
             constraint: &dyn Constraint<'a>,
             formula_scope: FormulaScope,
@@ -1305,7 +1317,8 @@ impl ResidualPlan {
             }
         }
 
-        let synthetic_root_formula = formula_scope == FormulaScope::WholeRoot;
+        let synthetic_root_formula = formula_scope == FormulaScope::WholeRoot
+            && !is_formula_identity(root);
         let mut leaves = Vec::new();
         let mut page_local_confirms = Vec::new();
         let mut grouped_delta_confirm_requirements: Vec<Box<[(VariableId, VariableSet)]>> =
@@ -9475,6 +9488,29 @@ mod tests {
     }
 
     #[test]
+    fn whole_root_scope_normalizes_formula_identity_shells() {
+        let opaque = ShapeLeaf(9);
+        let opaque_plan = ResidualPlan::compile_lowering(
+            &opaque,
+            ResidualLowering::new(FormulaScope::WholeRoot, true),
+        );
+        assert!(!opaque_plan.synthetic_root_formula);
+        assert_eq!(opaque_plan.len(), 1);
+        assert!(opaque_plan.finite_formula.root(0).is_none());
+        assert!(opaque_plan.leaves[0].path.0.is_empty());
+
+        let nested = shape_and(vec![shape_and(vec![shape_leaf(9)])]);
+        let nested_plan = ResidualPlan::compile_lowering(
+            nested.as_ref(),
+            ResidualLowering::new(FormulaScope::WholeRoot, true),
+        );
+        assert!(!nested_plan.synthetic_root_formula);
+        assert_eq!(nested_plan.len(), 1);
+        assert!(nested_plan.finite_formula.root(0).is_none());
+        assert_eq!(nested_plan.leaves[0].path.0.as_ref(), [0, 0]);
+    }
+
+    #[test]
     fn synthetic_formula_flattens_only_the_maximal_root_and() {
         let arm = || shape_and(vec![shape_leaf(0), shape_leaf(0)]);
         let union = UnionConstraint::new(vec![arm(), arm()]);
@@ -9579,20 +9615,6 @@ mod tests {
 
         let lowering = ResidualLowering::FULL;
 
-        let atom = CapabilityLeaf {
-            variable: 0,
-            page_local: false,
-        };
-        let atom_plan = ResidualPlan::compile_lowering(&atom, lowering);
-        assert_eq!(
-            atom_plan.formula_proposal_streamability(
-                &start(&atom_plan),
-                VariableSet::new_empty(),
-            ),
-            FormulaProposalStreamability::Linear,
-            "the focused proposer itself need not be a page-local confirmer"
-        );
-
         let linear_root = IntersectionConstraint::new(vec![
             Box::new(CapabilityLeaf {
                 variable: 0,
@@ -9627,7 +9649,8 @@ mod tests {
                 &linear_action,
                 VariableSet::new_empty(),
             ),
-            FormulaProposalStreamability::Linear
+            FormulaProposalStreamability::Linear,
+            "the focused proposer itself need not be a page-local confirmer"
         );
 
         let non_local_root = IntersectionConstraint::new(vec![
