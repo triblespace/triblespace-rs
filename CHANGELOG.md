@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The reconvergence probe can isolate the ordinary query path.** Setting
+  `TRIBLES_ORDINARY_ONLY=1` keeps the exact sorted oracle and ordinary
+  construction, first-pull, prefix, and full-drain latency ladder on both
+  TribleSet and SuccinctArchive, then skips the historical scheduler matrices.
+  The probe prints a unique mode marker while preserving its embedded engine
+  revision attribution.
 - **The reconvergence probe now isolates ordinary iterator latency.**
   Its unchanged 24-route query first passes a fixture-derived exact sorted
   oracle on TribleSet and SuccinctArchive, then reports construction,
