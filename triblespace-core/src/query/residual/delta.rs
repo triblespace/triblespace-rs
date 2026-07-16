@@ -189,7 +189,7 @@ enum DeltaReturn {
     },
     Formula {
         bound: VariableSet,
-        counter: FormulaProgramCounter,
+        counter: FormulaPcId,
         batch: FormulaBatch,
     },
 }
@@ -1393,7 +1393,8 @@ impl DeltaScheduler {
         &mut self,
         desc: DeltaDesc,
         bound: VariableSet,
-        counter: FormulaProgramCounter,
+        counter: FormulaPcId,
+        stage: FormulaStage,
         batch: FormulaBatch,
         seeds: Vec<ResidualDeltaSeed>,
         stream_proposal: bool,
@@ -1403,10 +1404,6 @@ impl DeltaScheduler {
         stats: &mut ResidualStateStats,
     ) -> DeltaSeedOutcome {
         let ranges = seed_ranges(&seeds, batch.parents.row_count);
-        let stage = match counter.focus {
-            FormulaFocus::Action { stage, .. } => stage,
-            _ => panic!("delta formula seeding requires an Action PC"),
-        };
         let singletons = batch.into_singletons(bound.count());
         assert_eq!(singletons.len(), ranges.len());
 
@@ -1430,7 +1427,7 @@ impl DeltaScheduler {
                 reducer,
                 DeltaReturn::Formula {
                     bound,
-                    counter: counter.clone(),
+                    counter,
                     batch,
                 },
                 seeds[range].iter().map(|seed| seed.output),
@@ -1481,14 +1478,11 @@ impl DeltaScheduler {
         &mut self,
         desc: DeltaDesc,
         bound: VariableSet,
-        counter: FormulaProgramCounter,
+        counter: FormulaPcId,
+        stage: FormulaStage,
         batch: FormulaBatch,
         stream_proposal: bool,
     ) -> Option<ActiveDeltaContinuation> {
-        let stage = match counter.focus {
-            FormulaFocus::Action { stage, .. } => stage,
-            _ => panic!("delta formula seeding requires an Action PC"),
-        };
         let singletons = batch.into_singletons(bound.count());
         let mut tasks = Vec::with_capacity(singletons.len());
         for batch in singletons {
@@ -1519,7 +1513,7 @@ impl DeltaScheduler {
                 reducer,
                 DeltaReturn::Formula {
                     bound,
-                    counter: counter.clone(),
+                    counter,
                     batch,
                 },
                 source_candidates,
@@ -1586,7 +1580,7 @@ impl DeltaScheduler {
                 batch,
             } => {
                 if matches!(
-                    counter.focus,
+                    &stable_interner.formula(counter).focus,
                     FormulaFocus::Action {
                         stage: FormulaStage::Propose,
                         ..
@@ -1598,7 +1592,7 @@ impl DeltaScheduler {
                 finish_formula_action_result(
                     plan,
                     bound,
-                    &counter,
+                    counter,
                     batch,
                     CandidatePayload::Values(result),
                     stable,
@@ -1654,7 +1648,7 @@ impl DeltaScheduler {
             } => finish_formula_action_result(
                 plan,
                 bound,
-                &counter,
+                counter,
                 batch,
                 candidates,
                 stable,
@@ -1682,13 +1676,16 @@ impl DeltaScheduler {
             panic!("delta support returned to a candidate continuation")
         };
         assert!(matches!(
-            &counter.focus,
+            &stable_interner.formula(counter).focus,
             FormulaFocus::Action {
                 stage: FormulaStage::Support,
                 ..
             }
         ));
-        let completed = plan.finite_formula.complete(&counter);
+        let completed = plan
+            .finite_formula
+            .complete(stable_interner.formula(counter));
+        let completed = stable_interner.intern_formula(&plan.finite_formula, completed);
         let desc = StateDesc {
             bound,
             phase: ResidualPhase::Formula { counter },
@@ -2813,12 +2810,16 @@ mod tests {
         }
     }
 
-    fn streaming_formula_return(plan: &ResidualPlan) -> DeltaReturn {
+    fn streaming_formula_return(
+        plan: &ResidualPlan,
+        stable_interner: &mut StateInterner,
+    ) -> DeltaReturn {
         let relevant = ChildSet::empty(plan.len()).with_inserted(0);
         let counter = plan
             .finite_formula
             .start(0, 0, UnionVerb::Propose { relevant });
         let counter = plan.finite_formula.select_child_as_action(&counter, 0);
+        let counter = stable_interner.intern_formula(&plan.finite_formula, counter);
         let root = plan
             .finite_formula
             .root(0)
@@ -2838,21 +2839,9 @@ mod tests {
     }
 
     fn support_formula_return() -> DeltaReturn {
-        let relevant = ChildSet::empty(1).with_inserted(0);
         DeltaReturn::Formula {
             bound: VariableSet::new_empty(),
-            counter: FormulaProgramCounter {
-                focus: FormulaFocus::Action {
-                    node: FormulaNodeId(7),
-                    stage: FormulaStage::Support,
-                },
-                returns: Vec::new().into_boxed_slice(),
-                resume: FormulaOuterResume {
-                    variable: 0,
-                    occurrence: 0,
-                    verb: UnionVerb::Propose { relevant },
-                },
-            },
+            counter: FormulaPcId(7),
             batch: FormulaBatch::from_proposal(
                 RowBatch {
                     rows: Vec::new(),
@@ -3445,17 +3434,17 @@ mod tests {
         // The accepting seed publishes before this scheduler step, while its
         // independent traversal credit proves quiescence during the step.
         // Cleanup must not replay the activation-local return template.
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
         let mut live = scheduler.registry.start_many(
             DeltaReducer::StreamFormulaProposal,
-            streaming_formula_return(&plan),
+            streaming_formula_return(&plan, &mut stable_interner),
             [output(3, 0, true)],
         );
         let live_activation = live.activation;
         let (live_node, live_credit) = live.roots.pop().expect("one live formula root");
         assert!(live.quiescence.is_none());
 
-        let mut stable = Worklist::new();
-        let mut stable_interner = StateInterner::default();
         let mut stats = ResidualStateStats::default();
         let streamed = scheduler
             .registry
@@ -4016,19 +4005,7 @@ mod tests {
 
     #[test]
     fn cloning_live_formula_activation_remaps_credit_and_preserves_return_payload() {
-        let relevant = ChildSet::empty(1).with_inserted(0);
-        let counter = FormulaProgramCounter {
-            focus: FormulaFocus::Action {
-                node: FormulaNodeId(7),
-                stage: FormulaStage::Propose,
-            },
-            returns: Vec::new().into_boxed_slice(),
-            resume: FormulaOuterResume {
-                variable: 0,
-                occurrence: 0,
-                verb: UnionVerb::Propose { relevant },
-            },
-        };
+        let counter = FormulaPcId(7);
         let bound = VariableSet::new_singleton(0);
         let batch = FormulaBatch::from_proposal(
             RowBatch {
@@ -4045,7 +4022,7 @@ mod tests {
             DeltaReducer::QuiescentProposal,
             DeltaReturn::Formula {
                 bound,
-                counter: counter.clone(),
+                counter,
                 batch,
             },
             [output(7, 0, true)],
@@ -4104,19 +4081,7 @@ mod tests {
             registry.finish(proof)
         }
 
-        let relevant = ChildSet::empty(1).with_inserted(0);
-        let counter = FormulaProgramCounter {
-            focus: FormulaFocus::Action {
-                node: FormulaNodeId(7),
-                stage: FormulaStage::Propose,
-            },
-            returns: Vec::new().into_boxed_slice(),
-            resume: FormulaOuterResume {
-                variable: 0,
-                occurrence: 0,
-                verb: UnionVerb::Propose { relevant },
-            },
-        };
+        let counter = FormulaPcId(7);
         let bound = VariableSet::new_singleton(0);
         let batch = FormulaBatch::from_proposal(
             RowBatch {
@@ -4133,7 +4098,7 @@ mod tests {
             DeltaReducer::QuiescentProposal,
             DeltaReturn::Formula {
                 bound,
-                counter: counter.clone(),
+                counter,
                 batch,
             },
             None,
@@ -4193,7 +4158,7 @@ mod tests {
             occurrence: 3,
             verb: UnionVerb::Propose { relevant },
         };
-        let first = FormulaProgramCounter {
+        let first_counter = FormulaProgramCounter {
             focus: FormulaFocus::Action {
                 node: FormulaNodeId(7),
                 stage: FormulaStage::Propose,
@@ -4201,8 +4166,8 @@ mod tests {
             returns: Vec::new().into_boxed_slice(),
             resume: resume.clone(),
         };
-        let second = FormulaProgramCounter {
-            focus: first.focus.clone(),
+        let second_counter = FormulaProgramCounter {
+            focus: first_counter.focus.clone(),
             returns: vec![FormulaReturnSite {
                 kind: FormulaReturnKind::Child,
                 parent: FormulaNodeId(5),
@@ -4213,11 +4178,14 @@ mod tests {
             .into_boxed_slice(),
             resume,
         };
+        let mut formula_pcs = FormulaPcInterner::default();
+        let first = formula_pcs.intern_ungraded(first_counter);
+        let second = formula_pcs.intern_ungraded(second_counter);
         assert_ne!(first, second);
 
         let mut scheduler = DeltaScheduler::new();
         let desc = DeltaDesc::formula(0, 3, FormulaNodeId(7));
-        for (index, counter) in [first.clone(), second.clone()].into_iter().enumerate() {
+        for (index, counter) in [first, second].into_iter().enumerate() {
             let batch = FormulaBatch::from_proposal(
                 RowBatch {
                     rows: vec![value(index as u8)],
@@ -4266,7 +4234,7 @@ mod tests {
                 let DeltaReturn::Formula { counter, .. } = &activation.return_to else {
                     panic!("formula task lost its formula continuation")
                 };
-                counter.clone()
+                *counter
             })
             .collect();
         assert_eq!(counters, [first, second]);
