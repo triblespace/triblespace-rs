@@ -9,7 +9,8 @@
 use std::sync::{Arc, Mutex};
 
 use triblespace_core::blob::encodings::succinctarchive::{
-    OrderedUniverse, RingBatchQuery, SuccinctArchive, SuccinctArchiveConstraint, SuccinctRotation,
+    CompressedUniverse, OrderedUniverse, RingBatchQuery, SuccinctArchive,
+    SuccinctArchiveConstraint, SuccinctRotation,
 };
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::{genid::GenId, UnknownInline};
@@ -221,6 +222,70 @@ fn all_twelve_pattern_bound_schemas_page_exactly_on_cpu_and_ring_backend() {
             );
         }
     }
+}
+
+#[test]
+fn compressed_universe_preserves_zero_one_two_bound_and_range_sources() {
+    let (set, entities, attributes, values) = fixture(3, 3, 3);
+    let archive: SuccinctArchive<CompressedUniverse> = (&set).into();
+    let entity = Variable::<GenId>::new(0);
+    let attribute = Variable::<GenId>::new(1);
+    let value = Variable::<UnknownInline>::new(2);
+    let constraint = SuccinctArchiveConstraint::new(entity, attribute, value, &archive);
+
+    assert_pages_equal_eager(
+        "compressed/zero-v",
+        &constraint,
+        value.index,
+        &RowsView::EMPTY,
+    );
+    let attribute_vars = [attribute.index];
+    let attribute_row = [attributes[0].raw];
+    let attribute_view = RowsView::new(&attribute_vars, &attribute_row);
+    assert_pages_equal_eager("compressed/a-v", &constraint, value.index, &attribute_view);
+    let entity_attribute_vars = [entity.index, attribute.index];
+    let entity_attribute_row = [entities[0].raw, attributes[0].raw];
+    let entity_attribute_view = RowsView::new(&entity_attribute_vars, &entity_attribute_row);
+    assert_pages_equal_eager(
+        "compressed/ea-v",
+        &constraint,
+        value.index,
+        &entity_attribute_view,
+    );
+    let range = archive.value_in_range(value, values[0], values[1]);
+    assert_pages_equal_eager(
+        "compressed/value-range",
+        &range,
+        value.index,
+        &RowsView::EMPTY,
+    );
+}
+
+#[test]
+fn absent_bound_values_and_empty_ranges_exhaust_without_candidates() {
+    let (set, _, attributes, values) = fixture(2, 2, 2);
+    let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+    let entity = Variable::<GenId>::new(0);
+    let attribute = Variable::<GenId>::new(1);
+    let value = Variable::<UnknownInline>::new(2);
+    let constraint = SuccinctArchiveConstraint::new(entity, attribute, value, &archive);
+    let absent_entity: Inline<GenId> = id(90).to_inline();
+    let absent_vars = [entity.index];
+    let absent_row = [absent_entity.raw];
+    let absent_view = RowsView::new(&absent_vars, &absent_row);
+    assert_pages_equal_eager("absent-e/a", &constraint, attribute.index, &absent_view);
+    let absent_pair_vars = [entity.index, attribute.index];
+    let absent_pair_row = [absent_entity.raw, attributes[0].raw];
+    let absent_pair_view = RowsView::new(&absent_pair_vars, &absent_pair_row);
+    assert_pages_equal_eager("absent-ea/v", &constraint, value.index, &absent_pair_view);
+
+    let empty_range = archive.value_in_range(value, values[1], values[0]);
+    assert_pages_equal_eager(
+        "inverted-value-range",
+        &empty_range,
+        value.index,
+        &RowsView::EMPTY,
+    );
 }
 
 fn project_pattern(axes: [VariableId; 3]) -> impl Fn(&Binding) -> Option<[RawInline; 3]> {

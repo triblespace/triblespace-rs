@@ -2405,12 +2405,8 @@ mod tests {
             .resumed_source
             .expect("second page cursor resumed");
 
-        let second_page = registry.replace_source(
-            generator,
-            [sourced_output(2, 2, 0, true)],
-            [],
-            None,
-        );
+        let second_page =
+            registry.replace_source(generator, [sourced_output(2, 2, 0, true)], [], None);
         assert!(second_page.quiescence.is_none());
         let (_, second_root) = second_page.roots.into_iter().next().expect("second root");
         let second_retired = registry.replace_traversal(second_root, []);

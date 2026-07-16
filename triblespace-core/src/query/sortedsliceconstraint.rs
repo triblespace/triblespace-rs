@@ -310,12 +310,9 @@ mod tests {
         assert_eq!(second.examined, 2);
         assert_eq!(second.next, Some(ResidualDeltaSourceCursor::Offset(3)));
 
-        let mut expected: Vec<_> = Query::new(
-            SortedSliceConstraint::new(variable, slice),
-            project,
-        )
-        .sequential()
-        .collect();
+        let mut expected: Vec<_> = Query::new(SortedSliceConstraint::new(variable, slice), project)
+            .sequential()
+            .collect();
         let mut query = Query::new(SortedSliceConstraint::new(variable, slice), project)
             .solve_residual_state_lazy_with(ResidualLowering::FULL)
             .cap(1)
@@ -324,7 +321,10 @@ mod tests {
         expected.sort_unstable();
         actual.sort_unstable();
         assert_eq!(actual, expected);
-        assert_eq!(actual, [value(1).raw, value(1).raw, value(2).raw, value(3).raw]);
+        assert_eq!(
+            actual,
+            [value(1).raw, value(1).raw, value(2).raw, value(3).raw]
+        );
         assert_eq!(query.stats().propose_calls, 1);
         assert_eq!(query.stats().delta_source_pages, values.len());
         assert_eq!(query.stats().delta_source_candidates_examined, values.len());
@@ -381,10 +381,9 @@ mod tests {
             .collect();
         assert!(encoded.windows(2).all(|pair| pair[0] > pair[1]));
 
-        let mut expected: Vec<_> =
-            Query::new(SortedSliceConstraint::new(variable, slice), project)
-                .sequential()
-                .collect();
+        let mut expected: Vec<_> = Query::new(SortedSliceConstraint::new(variable, slice), project)
+            .sequential()
+            .collect();
         let mut query = Query::new(SortedSliceConstraint::new(variable, slice), project)
             .solve_residual_state_lazy_with(ResidualLowering::FULL)
             .cap(1)

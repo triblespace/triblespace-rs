@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Ordered proposal sources can page direct candidate occurrences.** The
+  residual source cursor now distinguishes raw-value and native-ordinal
+  frontiers while preserving proposal order and multiplicity. Sorted slices
+  page their immutable native sequence by offset; SuccinctArchive triple
+  patterns page every zero-, one-, and two-bound Ring schema by ordered
+  universe, distinct-pair, and fixed-pair wavelet cursors, and value-range
+  constraints seek directly into their bounded V-axis code range.
 - **Formula Support gains composed affine parity receipts.** End-to-end RPQ
   tests now pin duplicate-parent bag multiplicity, nested AND/OR arm-order
   invariance, monotone graph growth, live clone and Rayon worker parity, and
