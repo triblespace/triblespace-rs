@@ -69,8 +69,22 @@ fn fully_hidden_present_and_absent_are_both_omitted() {
 
     assert_eq!(present!().collect::<Vec<_>>(), vec![()]);
     assert_eq!(present!().solve_dag(), vec![()]);
+    assert_eq!(present!().solve_residual_state(), vec![()]);
+    assert_eq!(
+        present!()
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .collect::<Vec<_>>(),
+        vec![()]
+    );
     assert_eq!(absent!().collect::<Vec<_>>(), vec![()]);
     assert_eq!(absent!().solve_dag(), vec![()]);
+    assert_eq!(absent!().solve_residual_state(), vec![()]);
+    assert_eq!(
+        absent!()
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .collect::<Vec<_>>(),
+        vec![()]
+    );
 }
 
 /// A hidden-only false clause cannot act as an exists-filter. Adding a
@@ -105,12 +119,28 @@ fn hidden_only_clause_cannot_filter_a_conjunction() {
     let expected = sorted(people.iter().map(|id| id.to_inline()).collect());
     let before_seq = sorted(query!(&before).collect());
     let before_dag = sorted(query!(&before).solve_dag());
+    let before_residual = sorted(query!(&before).solve_residual_state());
+    let before_full = sorted(
+        query!(&before)
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .collect(),
+    );
     let after_seq = sorted(query!(&after).collect());
     let after_dag = sorted(query!(&after).solve_dag());
+    let after_residual = sorted(query!(&after).solve_residual_state());
+    let after_full = sorted(
+        query!(&after)
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .collect(),
+    );
     assert_eq!(before_seq, expected);
     assert_eq!(before_dag, expected);
+    assert_eq!(before_residual, expected);
+    assert_eq!(before_full, expected);
     assert_eq!(after_seq, expected);
     assert_eq!(after_dag, expected);
+    assert_eq!(after_residual, expected);
+    assert_eq!(after_full, expected);
 }
 
 /// Reusing the spelling `h` does not turn an ignored wildcard into a hidden
@@ -154,6 +184,15 @@ fn repeated_ignored_name_does_not_join_across_clauses() {
     let expected = sorted(vec![matching.to_inline(), mismatching.to_inline()]);
     assert_eq!(sorted(query!().collect()), expected);
     assert_eq!(sorted(query!().solve_dag()), expected);
+    assert_eq!(sorted(query!().solve_residual_state()), expected);
+    assert_eq!(
+        sorted(
+            query!()
+                .solve_residual_state_lazy_with(ResidualLowering::FULL)
+                .collect()
+        ),
+        expected
+    );
 }
 
 /// A wildcard-scoped conjunction must prove every already-bound visible
@@ -210,6 +249,91 @@ fn partially_bound_ignored_union_arm_cannot_leak_a_hybrid_row() {
             .collect::<Vec<_>>(),
         expected
     );
+}
+
+/// A semantic OR below the wildcard scope remains guarded by that OR, while
+/// Support for the enclosing ignored conjunction remains one atomic replay.
+/// The dead outer arm must not borrow a pinned `x`; either live inner arm may
+/// independently activate the primary arm without exposing its hidden value.
+#[test]
+fn nested_union_inside_ignore_keeps_scope_support_atomic() {
+    let p_x = ufoid();
+    let r_x = ufoid();
+    let dead_x = ufoid();
+    let p_hidden = ufoid();
+    let r_hidden = ufoid();
+    let target = ufoid();
+    let primary_y: Vec<_> = (0..2).map(|_| ufoid()).collect();
+    let fallback_y = ufoid();
+    let mut kb = TribleSet::new();
+    kb += entity! { &p_x @ world::p: &p_hidden };
+    kb += entity! { &r_x @ world::r: &r_hidden };
+    for y in &primary_y {
+        kb += entity! { y @ world::q: &target };
+    }
+    let p_x = *p_x;
+    let r_x = *r_x;
+    let dead_x = *dead_x;
+    let target = *target;
+    let fallback_y = *fallback_y;
+
+    macro_rules! query {
+        ($pin:expr) => {
+            find!(
+                (x: Inline<GenId>, y: Inline<GenId>),
+                and!(
+                    x.is($pin),
+                    or!(
+                        ignore!(
+                            (h),
+                            and!(
+                                or!(
+                                    pattern!(&kb, [{ ?x @ world::p: ?h }]),
+                                    pattern!(&kb, [{ ?x @ world::r: ?h }])
+                                ),
+                                pattern!(&kb, [{ ?y @ world::q: &target }])
+                            )
+                        ),
+                        and!(
+                            x.is(dead_x.to_inline()),
+                            y.is(fallback_y.to_inline())
+                        )
+                    )
+                )
+            )
+        };
+    }
+
+    let assert_all = |pin: Inline<GenId>, expected: Vec<(Inline<GenId>, Inline<GenId>)>| {
+        assert_eq!(sorted(query!(pin).sequential().collect()), expected);
+        assert_eq!(sorted(query!(pin).collect()), expected);
+        assert_eq!(sorted(query!(pin).solve_dag()), expected);
+        assert_eq!(sorted(query!(pin).solve_residual_state()), expected);
+        assert_eq!(
+            sorted(
+                query!(pin)
+                    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+                    .collect()
+            ),
+            expected
+        );
+    };
+
+    assert_all(
+        dead_x.to_inline(),
+        vec![(dead_x.to_inline(), fallback_y.to_inline())],
+    );
+    for live_x in [p_x, r_x] {
+        assert_all(
+            live_x.to_inline(),
+            sorted(
+                primary_y
+                    .iter()
+                    .map(|y| (live_x.to_inline(), y.to_inline()))
+                    .collect(),
+            ),
+        );
+    }
 }
 
 /// An atomic pattern with a surviving `x` is not inert merely because its

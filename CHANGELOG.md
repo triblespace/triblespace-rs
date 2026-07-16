@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   confirmation, bounded proposal sources, transition programs, and Boolean
   Support to its inner constraint. `DebugConstraint` remains deliberately
   opaque because native proposal execution would bypass its observation log.
+- **Ignored conjunctions expose candidate work without exposing wildcard
+  Support.** `ConstraintShape::ScopedAnd` lets the residual engine descend
+  through `IgnoreConstraint` for estimate, proposal, and confirmation while
+  retaining `IgnoreConstraint::satisfied` as one atomic formula action. Inner
+  TribleSet sources consequently keep direct geometric paging through an
+  ignored AND; hidden-only children remain inert, repeated hidden names remain
+  non-joining wildcards, and nested unions keep their own semantic guards.
 - **Built-in constraints gain an executable residual capability matrix.**
   Constants, equality, inclusive ranges, sorted slices, hash-set and hash-map
   membership, finite unions, ignored scopes, diagnostic wrappers, and repeated
@@ -180,11 +187,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   history-independent rank gate lets variable-order, proposal, confirmation,
   and independently planned action histories reconverge before shared work
   runs, while row payloads retain multiplicity. The maximal nested AND region
-  is flattened into deterministic preorder leaf occurrences; unions and
-  ignore/path wrappers remain opaque semantic boundaries; custom constraints
-  do too unless they explicitly expose an associative AND shape. A profiled
-  entry point reports planning/action pops, interner and bucket merges, and
-  leaf-call batch measurements.
+  is flattened into deterministic preorder leaf occurrences; unions and path
+  wrappers remain opaque semantic boundaries, while ignored conjunctions may
+  expose candidate children behind an atomic Support boundary. Custom
+  constraints remain opaque unless they explicitly expose a safe shape. A
+  profiled entry point reports planning/action pops, interner and bucket merges,
+  and leaf-call batch measurements.
 - **Canonical residual states gain a demand-driven batch-fill iterator.**
   `solve_residual_state_lazy` starts with a narrow desired parent-atom width so
   descendants can yield before sibling rows are evaluated. Filing a nonempty
@@ -392,9 +400,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   least one variable. Nested ANDs flatten; zero-variable constants do not
   count; and opaque roots, one-leaf conjunctions, disjoint conjunctions, and
   queries rejected by exact seed settlement retain the lazy DAG. Union,
-  regular-path, ignore, and custom opaque wrappers remain single leaf
-  boundaries. This conservative selector avoids residual control-state cost
-  where there is no sibling proposer/confirm work to canonicalize, while
+  regular-path, scoped-ignore, and custom opaque wrappers remain single
+  selector boundaries. This conservative selector avoids residual
+  control-state cost where there is no sibling proposer/confirm work to
+  canonicalize, while
   `residual_state_scheduler`, `lazy_dag_scheduler`, and `sequential` remain
   explicit controls.
   The DAG fallback evaluates row buckets keyed by bound-variable set,

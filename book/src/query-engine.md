@@ -154,10 +154,14 @@ there is no useful frontier to fuse.
 The residual engine keys a bucket by its **remaining computation**, not merely
 by the bindings or the route that produced it. Its conservative explicit
 controls recursively flatten the maximal associative AND region exposed at the
-root into deterministic preorder leaf occurrences. Union, regular-path,
-ignore, and custom constraints remain opaque leaves unless a capability
-explicitly exposes more structure, so lowering never crosses an undeclared
-semantic boundary.
+root into deterministic preorder leaf occurrences. Union, regular-path, and
+custom constraints remain opaque leaves unless a capability explicitly exposes
+more structure, so lowering never crosses an undeclared semantic boundary. An
+`ignore!` around an exposed conjunction uses a scoped-AND capability: estimate,
+propose, and confirm may descend into the conjunction because those verbs
+distribute over the wildcard wrapper, but Support still invokes the owning
+`IgnoreConstraint` as one action. Its partial replay therefore remains the gate
+seen by an enclosing union, and hidden names never become state keys.
 
 Every live ordinary root runs as one finite formula after variable selection.
 Exposed AND/OR progress then becomes canonical formula state, and eligible

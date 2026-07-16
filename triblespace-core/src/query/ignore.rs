@@ -73,6 +73,21 @@ impl<'a> Constraint<'a> for IgnoreConstraint<'a> {
         self.constraint.confirm(variable, view, candidates)
     }
 
+    /// Exposes an inner conjunction only for candidate-stage lowering.
+    ///
+    /// `Ignore` delegates estimate, proposal, and confirmation with hidden
+    /// columns absent from the row, so those verbs distribute exactly over an
+    /// inner AND. Its `satisfied` replay and Support capability are properties
+    /// of the whole scope boundary, however, and must remain atomic.
+    fn residual_shape(&self) -> ConstraintShape<'_, 'a> {
+        match self.constraint.residual_shape() {
+            ConstraintShape::And(children) | ConstraintShape::ScopedAnd(children) => {
+                ConstraintShape::ScopedAnd(children)
+            }
+            ConstraintShape::Opaque => ConstraintShape::Opaque,
+        }
+    }
+
     fn residual_confirm_is_page_local(&self) -> bool {
         self.constraint.residual_confirm_is_page_local()
     }
