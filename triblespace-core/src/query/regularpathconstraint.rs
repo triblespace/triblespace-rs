@@ -1430,7 +1430,6 @@ impl RegularPathConstraint {
     fn expand_delta_program(
         &self,
         program: &DeltaProgram,
-        same_variable: bool,
         nodes: &[ResidualDeltaNode],
         successors: &mut Vec<(u32, ResidualDeltaOutput)>,
     ) {
@@ -1441,11 +1440,7 @@ impl RegularPathConstraint {
                 let continuation = program.encode(target);
                 let mut push = |value| {
                     let accepted = program.accepting[target as usize]
-                        && (!same_variable
-                            || value
-                                == node
-                                    .source
-                                    .expect("same-variable delta activation lost its source"));
+                        && node.source.is_none_or(|anchor| value == anchor);
                     successors.push((
                         index,
                         ResidualDeltaOutput {
@@ -1805,6 +1800,38 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         true
     }
 
+    fn residual_delta_support_seeds(
+        &self,
+        view: &RowsView<'_>,
+        seeds: &mut Vec<ResidualDeltaSeed>,
+    ) -> Option<VariableId> {
+        let start = view.col(self.start)?;
+        let end = view.col(self.end)?;
+        let program = &self.delta_program;
+        seeds.extend(view.iter().enumerate().map(|(parent, row)| {
+            let source = row[start];
+            let target = row[end];
+            ResidualDeltaSeed {
+                parent: u32::try_from(parent).expect("too many residual parent rows"),
+                output: ResidualDeltaOutput {
+                    node: ResidualDeltaNode {
+                        source: Some(target),
+                        value: source,
+                        continuation: program.encode(program.start),
+                    },
+                    // SPARQL zero-length paths range over NODES(G), not every
+                    // representable inline value. Non-epsilon witnesses cross
+                    // a real edge and therefore establish graph membership by
+                    // construction during expansion.
+                    accepted: program.accepting[program.start as usize]
+                        && source == target
+                        && is_graph_term(&self.set, &source),
+                },
+            }
+        }));
+        Some(self.end)
+    }
+
     fn residual_delta_expand(
         &self,
         variable: VariableId,
@@ -1814,11 +1841,17 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         let Some(route) = self.residual_delta_program(variable) else {
             return false;
         };
-        let (program, same_variable) = match route {
-            ResidualDeltaRoute::BoundEndpoint { program, .. } => (program, false),
-            ResidualDeltaRoute::SameVariable { program } => (program, true),
+        let program = match route {
+            ResidualDeltaRoute::BoundEndpoint { program, .. } => program,
+            ResidualDeltaRoute::SameVariable { program } => {
+                assert!(
+                    nodes.iter().all(|node| node.source.is_some()),
+                    "same-variable delta activation lost its source anchor"
+                );
+                program
+            }
         };
-        self.expand_delta_program(program, same_variable, nodes, successors);
+        self.expand_delta_program(program, nodes, successors);
         true
     }
 

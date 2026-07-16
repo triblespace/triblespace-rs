@@ -744,11 +744,13 @@ pub enum ConstraintShape<'s, 'a> {
 
 /// One engine-owned node in a residual transition program.
 ///
-/// `value` is the current data-plane term, `source` is an optional speculative
-/// root carried through the traversal, and `continuation` is a
-/// constraint-defined program point. Novelty is over the complete node: the
-/// same current term reached from different roots or under different residual
-/// programs may have different future computation.
+/// `value` is the current data-plane term, `source` is an optional fixed
+/// acceptance anchor carried through the traversal, and `continuation` is a
+/// constraint-defined program point. A same-variable traversal anchors its
+/// speculative root; a fully-bound support traversal may instead anchor its
+/// required target. Novelty is over the complete node: the same current term
+/// reached with different anchors or under different residual programs may
+/// have different future computation.
 ///
 /// None of these fields participates in the scheduler's canonical structural
 /// state identifier. Nodes are activation-private payload batched under the
@@ -1164,6 +1166,29 @@ pub trait Constraint<'a> {
         false
     }
 
+    /// Seeds a transition-backed boolean test for fully-bound parent rows.
+    ///
+    /// Returning `Some(variable)` declares support and selects the structural
+    /// route subsequently passed to [`Self::residual_delta_expand`]. Every
+    /// constraint variable must already be present in `view`. Appended seeds
+    /// follow the same ascending parent-tag law as
+    /// [`Self::residual_delta_seeds`], but accepted outputs are boolean
+    /// witnesses rather than proposed values. Returning `Some` with no seed
+    /// for a parent is an exact false result for that parent. Returning `None`
+    /// must leave `seeds` untouched.
+    ///
+    /// The route must depend only on the constraint and bound schema, never on
+    /// row values, so every seeded node remains valid under one canonical
+    /// structural transition operator.
+    #[doc(hidden)]
+    fn residual_delta_support_seeds(
+        &self,
+        _view: &RowsView<'_>,
+        _seeds: &mut Vec<ResidualDeltaSeed>,
+    ) -> Option<VariableId> {
+        None
+    }
+
     /// Expands one block of engine-owned transition-program nodes.
     ///
     /// Successors are tagged by input-node index and grouped in ascending tag
@@ -1274,6 +1299,15 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.residual_delta_seeds(variable, view, seeds)
     }
 
+    fn residual_delta_support_seeds(
+        &self,
+        view: &RowsView<'_>,
+        seeds: &mut Vec<ResidualDeltaSeed>,
+    ) -> Option<VariableId> {
+        let inner: &T = self;
+        inner.residual_delta_support_seeds(view, seeds)
+    }
+
     fn residual_delta_expand(
         &self,
         variable: VariableId,
@@ -1377,6 +1411,15 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     ) -> bool {
         let inner: &T = self;
         inner.residual_delta_seeds(variable, view, seeds)
+    }
+
+    fn residual_delta_support_seeds(
+        &self,
+        view: &RowsView<'_>,
+        seeds: &mut Vec<ResidualDeltaSeed>,
+    ) -> Option<VariableId> {
+        let inner: &T = self;
+        inner.residual_delta_support_seeds(view, seeds)
     }
 
     fn residual_delta_expand(
