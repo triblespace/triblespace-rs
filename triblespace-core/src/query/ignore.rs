@@ -165,6 +165,21 @@ impl<'a> Constraint<'a> for IgnoreConstraint<'a> {
             .residual_delta_expand_page(variable, node, cursor, limit, successors)
     }
 
+    fn residual_delta_expand_pages(
+        &self,
+        variable: VariableId,
+        batch: ResidualDeltaExpandBatch<'_>,
+        pages: &mut Vec<Option<ResidualDeltaExpandPage>>,
+        successors: &mut Vec<(u32, ResidualDeltaOutput)>,
+    ) {
+        if !self.exposes(variable) {
+            pages.resize(pages.len() + batch.nodes.len(), None);
+            return;
+        }
+        self.constraint
+            .residual_delta_expand_pages(variable, batch, pages, successors)
+    }
+
     fn residual_delta_expand(
         &self,
         variable: VariableId,

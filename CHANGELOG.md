@@ -24,6 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   limits and tagged outputs; its scalar default preserves existing constraints.
   Page limits share the current global geometric budget instead of multiplying
   it by cohort size.
+- **Residual transition pages expose one block-native cohort seam.** Live
+  product nodes under the same structural transition operator now pass their
+  activation-private nodes, cursors, and ragged page limits through one tagged
+  batch call. Mixed pageable and eager nodes retain exact fallback, while the
+  sum of page limits remains the scheduler's single geometric width.
 - **RPQ product-state transitions gain bounded affine pages.** Positive and
   inverse attribute branches now advance by a branch-qualified lexical cursor,
   so one high-degree automaton node consumes at most the residual scheduler's

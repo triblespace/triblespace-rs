@@ -15,6 +15,7 @@ use crate::query::CandidateSink;
 use crate::query::Constraint;
 use crate::query::EstimateSink;
 use crate::query::Query;
+use crate::query::ResidualDeltaExpandBatch;
 use crate::query::ResidualDeltaExpandCursor;
 use crate::query::ResidualDeltaExpandPage;
 use crate::query::ResidualDeltaNode;
@@ -2068,6 +2069,50 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
             }
         };
         self.expand_delta_program_page(program, node, cursor, limit, successors)
+    }
+
+    fn residual_delta_expand_pages(
+        &self,
+        variable: VariableId,
+        batch: ResidualDeltaExpandBatch<'_>,
+        pages: &mut Vec<Option<ResidualDeltaExpandPage>>,
+        successors: &mut Vec<(u32, ResidualDeltaOutput)>,
+    ) {
+        assert_eq!(batch.nodes.len(), batch.cursors.len());
+        assert_eq!(batch.nodes.len(), batch.limits.len());
+        let Some(route) = self.residual_delta_program(variable) else {
+            pages.resize(pages.len() + batch.nodes.len(), None);
+            return;
+        };
+        let program = match route {
+            ResidualDeltaRoute::BoundEndpoint { program, .. } => program,
+            ResidualDeltaRoute::SameVariable { program } => {
+                assert!(
+                    batch.nodes.iter().all(|node| node.source.is_some()),
+                    "same-variable delta activation lost its source anchor"
+                );
+                program
+            }
+        };
+        for (row, ((&node, &cursor), &limit)) in batch
+            .nodes
+            .iter()
+            .zip(batch.cursors)
+            .zip(batch.limits)
+            .enumerate()
+        {
+            let mut row_successors = Vec::new();
+            let page =
+                self.expand_delta_program_page(program, node, cursor, limit, &mut row_successors);
+            if page.is_none() {
+                assert_eq!(cursor, ResidualDeltaExpandCursor::Start);
+                assert!(row_successors.is_empty());
+            } else {
+                let row = u32::try_from(row).expect("too many RPQ transition pages in one cohort");
+                successors.extend(row_successors.into_iter().map(|output| (row, output)));
+            }
+            pages.push(page);
+        }
     }
 
     fn residual_delta_expand(

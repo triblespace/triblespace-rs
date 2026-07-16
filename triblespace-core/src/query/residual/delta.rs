@@ -930,7 +930,7 @@ fn tagged_ranges<T>(
     assert_eq!(
         cursor,
         values.len(),
-        "residual source {kind} tags are out of range or not grouped in ascending order"
+        "residual {kind} tags are out of range or not grouped in ascending order"
     );
     ranges
 }
@@ -1659,19 +1659,45 @@ impl DeltaScheduler {
         let page_base = page_budget / task_count;
         let page_remainder = page_budget % task_count;
         debug_assert!(page_base > 0);
+        let nodes: Vec<_> = tasks.iter().map(|task| task.node).collect();
+        let cursors: Vec<_> = tasks.iter().map(|task| task.cursor).collect();
+        let limits: Vec<_> = (0..task_count)
+            .map(|index| page_base + usize::from(index < page_remainder))
+            .collect();
+        debug_assert_eq!(limits.iter().sum::<usize>(), page_budget);
+        let batch = ResidualDeltaExpandBatch {
+            nodes: &nodes,
+            cursors: &cursors,
+            limits: &limits,
+        };
+        let mut pages = Vec::with_capacity(task_count);
+        let mut tagged_successors = Vec::new();
+        constraint.residual_delta_expand_pages(
+            desc.variable,
+            batch,
+            &mut pages,
+            &mut tagged_successors,
+        );
+        assert_eq!(
+            pages.len(),
+            task_count,
+            "delta transition cohort returned the wrong page count"
+        );
+        let successor_ranges =
+            tagged_ranges(&tagged_successors, task_count, "transition successor");
         let mut successors = vec![Vec::new(); task_count];
         let mut next_cursors = vec![None; task_count];
         let mut legacy_indices = Vec::new();
         let mut legacy_nodes = Vec::new();
-        for (index, task) in tasks.iter().enumerate() {
-            let limit = page_base + usize::from(index < page_remainder);
-            let page = constraint.residual_delta_expand_page(
-                desc.variable,
-                task.node,
-                task.cursor,
-                limit,
-                &mut successors[index],
-            );
+        let mut paged_count = 0usize;
+        for (index, (((task, page), range), &limit)) in tasks
+            .iter()
+            .zip(pages)
+            .zip(successor_ranges)
+            .zip(&limits)
+            .enumerate()
+        {
+            successors[index].extend(tagged_successors[range].iter().map(|(_, output)| *output));
             let Some(page) = page else {
                 assert_eq!(
                     task.cursor,
@@ -1686,6 +1712,7 @@ impl DeltaScheduler {
                 legacy_nodes.push(task.node);
                 continue;
             };
+            paged_count += 1;
             assert!(page.examined <= limit);
             assert!(successors[index].len() <= page.examined);
             if let Some(next) = page.next {
@@ -1708,6 +1735,10 @@ impl DeltaScheduler {
             stats.delta_transition_pages += 1;
             stats.delta_transition_candidates_examined += page.examined;
             next_cursors[index] = page.next;
+        }
+        if paged_count > 0 {
+            stats.delta_transition_cohorts += 1;
+            stats.max_delta_transition_cohort = stats.max_delta_transition_cohort.max(paged_count);
         }
 
         if !legacy_nodes.is_empty() {
@@ -2016,6 +2047,8 @@ impl Clone for DeltaScheduler {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use super::*;
 
     #[derive(Clone, Copy)]
@@ -2068,6 +2101,117 @@ mod tests {
                         output(3, node.continuation + 1, true),
                     ));
                 }
+            }
+            true
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct TransitionBatchTrace {
+        nodes: Vec<ResidualDeltaNode>,
+        cursors: Vec<ResidualDeltaExpandCursor>,
+        limits: Vec<usize>,
+    }
+
+    struct BatchedPagedExpansion {
+        trace: Arc<Mutex<Option<TransitionBatchTrace>>>,
+        scalar_page_calls: Arc<AtomicUsize>,
+        eager_nodes: Arc<AtomicUsize>,
+    }
+
+    impl Constraint<'static> for BatchedPagedExpansion {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(0)
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != 0 {
+                return false;
+            }
+            out.fill(1, view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn residual_delta_expand_page(
+            &self,
+            _variable: VariableId,
+            _node: ResidualDeltaNode,
+            _cursor: ResidualDeltaExpandCursor,
+            _limit: usize,
+            _successors: &mut Vec<ResidualDeltaOutput>,
+        ) -> Option<ResidualDeltaExpandPage> {
+            self.scalar_page_calls.fetch_add(1, Ordering::Relaxed);
+            panic!("native transition cohort was scalarized")
+        }
+
+        fn residual_delta_expand_pages(
+            &self,
+            variable: VariableId,
+            batch: ResidualDeltaExpandBatch<'_>,
+            pages: &mut Vec<Option<ResidualDeltaExpandPage>>,
+            successors: &mut Vec<(u32, ResidualDeltaOutput)>,
+        ) {
+            assert_eq!(variable, 0);
+            assert!(pages.is_empty());
+            assert!(successors.is_empty());
+            *self.trace.lock().expect("transition batch trace poisoned") =
+                Some(TransitionBatchTrace {
+                    nodes: batch.nodes.to_vec(),
+                    cursors: batch.cursors.to_vec(),
+                    limits: batch.limits.to_vec(),
+                });
+            for (row, node) in batch.nodes.iter().enumerate() {
+                if node.value == value(2) {
+                    pages.push(None);
+                    continue;
+                }
+                assert_eq!(batch.cursors[row], ResidualDeltaExpandCursor::Start);
+                assert_eq!(batch.limits[row], 1);
+                pages.push(Some(ResidualDeltaExpandPage {
+                    next: None,
+                    examined: 1,
+                }));
+                successors.push((
+                    u32::try_from(row).expect("too many native transition rows"),
+                    output(node.value[0] + 10, node.continuation + 1, false),
+                ));
+            }
+        }
+
+        fn residual_delta_expand(
+            &self,
+            _variable: VariableId,
+            nodes: &[ResidualDeltaNode],
+            successors: &mut Vec<(u32, ResidualDeltaOutput)>,
+        ) -> bool {
+            self.eager_nodes.fetch_add(nodes.len(), Ordering::Relaxed);
+            for (tag, node) in nodes.iter().enumerate() {
+                assert_eq!(node.value, value(2));
+                successors.push((
+                    u32::try_from(tag).expect("too many eager transition rows"),
+                    output(12, node.continuation + 1, false),
+                ));
             }
             true
         }
@@ -2349,6 +2493,94 @@ mod tests {
         assert_eq!(cloned_second.accepted, [value(8)]);
         assert!(original.take_streaming_return(activation).is_none());
         assert!(cloned.take_streaming_return(activation).is_none());
+    }
+
+    #[test]
+    fn transition_pages_dispatch_as_one_affine_cohort_with_mixed_eager_fallback() {
+        let trace = Arc::new(Mutex::new(None));
+        let scalar_page_calls = Arc::new(AtomicUsize::new(0));
+        let eager_nodes = Arc::new(AtomicUsize::new(0));
+        let root = BatchedPagedExpansion {
+            trace: Arc::clone(&trace),
+            scalar_page_calls: Arc::clone(&scalar_page_calls),
+            eager_nodes: Arc::clone(&eager_nodes),
+        };
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let desc = DeltaDesc::leaf(0, 0);
+        let mut scheduler = DeltaScheduler::new();
+        let mut tasks = Vec::new();
+        let mut activations = Vec::new();
+        for byte in [1, 3, 2] {
+            let mut started = scheduler.registry.start_many(
+                DeltaReducer::StreamProposal,
+                candidate_return(Vec::new()),
+                [output(byte, 0, false)],
+            );
+            activations.push(started.activation);
+            let (node, credit) = started.roots.pop().expect("one transition root");
+            assert!(started.quiescence.is_none());
+            tasks.push(DeltaTask {
+                activation: started.activation,
+                credit,
+                node,
+                cursor: ResidualDeltaExpandCursor::Start,
+            });
+        }
+        scheduler.file(desc.clone(), tasks);
+
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let outcome = scheduler.step(
+            &root,
+            &plan,
+            3,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+
+        assert!(outcome.continuation.is_none());
+        assert_eq!(outcome.dead_pages, 0);
+        assert!(stable.is_empty());
+        assert_eq!(scalar_page_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(eager_nodes.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.delta_transition_pages, 2);
+        assert_eq!(stats.delta_transition_cohorts, 1);
+        assert_eq!(stats.max_delta_transition_cohort, 2);
+        assert_eq!(stats.delta_transition_candidates_examined, 2);
+        assert_eq!(
+            *trace.lock().expect("transition batch trace poisoned"),
+            Some(TransitionBatchTrace {
+                nodes: vec![
+                    output(1, 0, false).node,
+                    output(3, 0, false).node,
+                    output(2, 0, false).node
+                ],
+                cursors: vec![ResidualDeltaExpandCursor::Start; 3],
+                limits: vec![1; 3],
+            })
+        );
+
+        let bucket = scheduler
+            .worklist
+            .values()
+            .next()
+            .expect("transition children were refiled");
+        let actual: Vec<_> = bucket
+            .tasks
+            .iter()
+            .map(|task| (task.activation, task.node.value, task.node.continuation))
+            .collect();
+        assert_eq!(
+            actual,
+            vec![
+                (activations[0], value(11), 1),
+                (activations[1], value(13), 1),
+                (activations[2], value(12), 1),
+            ],
+            "tagged native and eager successors crossed affine activations"
+        );
     }
 
     #[test]

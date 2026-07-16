@@ -1581,6 +1581,12 @@ pub struct ResidualStateStats {
     pub delta_source_roots: usize,
     /// Bounded pages requested from live product-state transition nodes.
     pub delta_transition_pages: usize,
+    /// Physical calls that consumed one or more affine transition pages under
+    /// the same structural transition operator.
+    pub delta_transition_cohorts: usize,
+    /// Largest number of affine transition pages consumed by one physical
+    /// cohort call. Eager fallback rows are not included.
+    pub max_delta_transition_cohort: usize,
     /// Ordered outgoing transition candidates consumed across those pages.
     pub delta_transition_candidates_examined: usize,
     /// Direct proposal candidates admitted from bounded source pages without

@@ -204,6 +204,15 @@ An initial nullable endpoint is already recorded by the activation, but becomes
 visible when that root performs its first expansion page; publishing this
 epsilon effect before any transition lookup is a remaining latency refinement.
 
+Paged product nodes under the same structural transition operator cross one
+block-native cohort seam. The batch carries row-aligned nodes, affine cursors,
+and ragged limits whose sum is the current global width; successors return with
+input-node tags. A constraint may page some rows while leaving other `Start`
+rows to the existing eager block expansion, so one negated fallback does not
+erase bounded positive work. The default lowers the cohort to scalar page
+calls, while storage or accelerator constraints can fuse it without changing
+canonical state or producer-credit semantics.
+
 The ordinary [`Query`](triblespace::core::query::Query) uses this engine whenever
 exact seed settlement leaves a live search. Opaque roots, one-leaf ANDs,
 disjoint conjunctions, finite Union roots, RPQ roots, and live zero-variable

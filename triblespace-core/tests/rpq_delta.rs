@@ -4942,6 +4942,8 @@ fn first_fanout_result_scans_one_transition_and_clone_keeps_the_exact_cursor() {
 
     let first = query.next().expect("one fanout endpoint");
     assert_eq!(query.stats().delta_transition_pages, 1);
+    assert_eq!(query.stats().delta_transition_cohorts, 1);
+    assert_eq!(query.stats().max_delta_transition_cohort, 1);
     assert_eq!(query.stats().delta_transition_candidates_examined, 1);
     let cloned = query.clone();
 
