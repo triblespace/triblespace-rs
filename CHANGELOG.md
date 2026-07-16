@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Built-in constraints gain an executable residual capability matrix.**
+  Constants, equality, inclusive ranges, sorted slices, hash-set and hash-map
+  membership, finite unions, ignored scopes, diagnostic wrappers, and repeated
+  projected variables now have exact bag receipts across the scalar oracle,
+  eager DAG, conservative and full residual lowering, fixed width one,
+  geometric growth, and a cloned live remainder. Static capability assertions
+  and runtime counters distinguish native paging/formula execution from the
+  semantically exact opaque fallback.
 - **SuccinctArchive preserves equality for repeated pattern variables.**
   Triple patterns that reuse one unbound variable across E/V, E/A, A/V, or
   all three positions now estimate, propose, and confirm through exact Ring
