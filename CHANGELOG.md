@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **External database comparisons no longer burden benchmark builds.**
+  Removed the Oxigraph and OxRDF development dependencies and comparison paths;
+  the retained JSON roundtrip and insertion benchmarks now measure TribleSpace
+  directly without pulling in RocksDB.
+
 ### Added
 
 - **The reconvergence probe now isolates ordinary iterator latency.**
