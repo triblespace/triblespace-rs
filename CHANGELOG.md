@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Formula Support gains composed affine parity receipts.** End-to-end RPQ
+  tests now pin duplicate-parent bag multiplicity, nested AND/OR arm-order
+  invariance, monotone graph growth, live clone and Rayon worker parity, and
+  the parent-atomic barrier before page-local candidate confirmation.
 - **Fully-bound constraints can expose transition-backed support seeds.** The
   hidden constraint protocol now exposes one structural expansion route for a
   block of fully-bound boolean checks.

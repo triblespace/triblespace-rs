@@ -23,6 +23,7 @@ use triblespace_core::trible::{Trible, TribleSet};
 const START: VariableId = 0;
 const END: VariableId = 1;
 const OUTER: VariableId = 2;
+const PARENT: VariableId = 3;
 
 type DynConstraint = Box<dyn Constraint<'static> + Send + Sync>;
 type Root = Arc<IntersectionConstraint<DynConstraint>>;
@@ -265,11 +266,18 @@ impl<'a> Constraint<'a> for CountingPath {
 /// Distinguishes the legacy fully-bound `satisfied` traversal from native
 /// transition-backed formula Support. Partial bindings are intentionally not
 /// counted: regular paths answer those optimistically without graph work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SupportTraceEvent {
+    Expand { label: u8, witness: bool },
+    CandidatePage(usize),
+}
+
 struct SupportCountingPath {
     inner: RegularPathConstraint,
     fully_bound_satisfied_calls: Arc<AtomicUsize>,
     support_seeded_roots: Arc<AtomicUsize>,
     expanded_nodes: Arc<AtomicUsize>,
+    trace: Option<(u8, Arc<Mutex<Vec<SupportTraceEvent>>>)>,
 }
 
 impl<'a> Constraint<'a> for SupportCountingPath {
@@ -346,8 +354,24 @@ impl<'a> Constraint<'a> for SupportCountingPath {
     ) -> bool {
         self.expanded_nodes
             .fetch_add(nodes.len(), Ordering::Relaxed);
-        self.inner
-            .residual_delta_expand(variable, nodes, successors)
+        let before = successors.len();
+        let supported = self
+            .inner
+            .residual_delta_expand(variable, nodes, successors);
+        if supported {
+            if let Some((label, trace)) = &self.trace {
+                trace
+                    .lock()
+                    .expect("support trace poisoned")
+                    .push(SupportTraceEvent::Expand {
+                        label: *label,
+                        witness: successors[before..]
+                            .iter()
+                            .any(|(_, output)| output.accepted),
+                    });
+            }
+        }
+        supported
     }
 }
 
@@ -548,6 +572,63 @@ impl<'a> Constraint<'a> for PageTraceFilter {
 
     fn residual_confirm_is_page_local(&self) -> bool {
         self.page_local
+    }
+}
+
+#[derive(Clone)]
+struct SupportPageTraceFilter {
+    trace: Arc<Mutex<Vec<SupportTraceEvent>>>,
+}
+
+impl<'a> Constraint<'a> for SupportPageTraceFilter {
+    fn variables(&self) -> VariableSet {
+        VariableSet::new_singleton(OUTER)
+    }
+
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        if variable != OUTER {
+            return false;
+        }
+        out.fill(usize::MAX, view.len());
+        true
+    }
+
+    fn propose(
+        &self,
+        variable: VariableId,
+        _view: &RowsView<'_>,
+        _candidates: &mut CandidateSink<'_>,
+    ) {
+        assert_ne!(
+            variable, OUTER,
+            "the trace-only Support suffix unexpectedly became the proposer"
+        );
+    }
+
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        assert_eq!(variable, OUTER);
+        self.trace
+            .lock()
+            .expect("support trace poisoned")
+            .push(SupportTraceEvent::CandidatePage(candidates.len()));
+    }
+
+    fn satisfied(&self, _view: &RowsView<'_>) -> bool {
+        true
+    }
+
+    fn residual_confirm_is_page_local(&self) -> bool {
+        true
     }
 }
 
@@ -980,6 +1061,133 @@ fn pair_end_arm(start: Inline<GenId>, values: Vec<RawInline>, estimate: usize) -
     ]))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SupportArmOrder {
+    FalseFirst,
+    TrueFirst,
+}
+
+#[derive(Clone)]
+struct SupportProbeCounters {
+    fully_bound_satisfied_calls: Arc<AtomicUsize>,
+    support_seeded_roots: Arc<AtomicUsize>,
+    expanded_nodes: Arc<AtomicUsize>,
+}
+
+impl SupportProbeCounters {
+    fn new() -> Self {
+        Self {
+            fully_bound_satisfied_calls: Arc::new(AtomicUsize::new(0)),
+            support_seeded_roots: Arc::new(AtomicUsize::new(0)),
+            expanded_nodes: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+fn support_probe_path(
+    set: &TribleSet,
+    start: Variable<GenId>,
+    end: Variable<GenId>,
+    ops: &[PathOp],
+    counters: &SupportProbeCounters,
+    trace: Option<(u8, &Arc<Mutex<Vec<SupportTraceEvent>>>)>,
+) -> DynConstraint {
+    Box::new(SupportCountingPath {
+        inner: RegularPathConstraint::new(set.clone(), start, end, ops),
+        fully_bound_satisfied_calls: Arc::clone(&counters.fully_bound_satisfied_calls),
+        support_seeded_roots: Arc::clone(&counters.support_seeded_roots),
+        expanded_nodes: Arc::clone(&counters.expanded_nodes),
+        trace: trace.map(|(label, trace)| (label, Arc::clone(trace))),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn nested_affine_support_root(
+    set: TribleSet,
+    source: Inline<GenId>,
+    target: Inline<GenId>,
+    primary: Id,
+    secondary: Id,
+    parent_values: Vec<RawInline>,
+    guarded_values: Vec<RawInline>,
+    sibling_value: RawInline,
+    arm_order: SupportArmOrder,
+    trace: Option<Arc<Mutex<Vec<SupportTraceEvent>>>>,
+) -> (Root, SupportProbeCounters) {
+    let start = Variable::<GenId>::new(START);
+    let end = Variable::<GenId>::new(END);
+    let counters = SupportProbeCounters::new();
+    let false_path = support_probe_path(
+        &set,
+        start,
+        end,
+        &[PathOp::Attr(secondary.raw())],
+        &counters,
+        trace.as_ref().map(|trace| (0, trace)),
+    );
+    let true_path = Box::new(IntersectionConstraint::new(vec![
+        support_probe_path(
+            &set,
+            start,
+            end,
+            &repeated(primary, false),
+            &counters,
+            trace.as_ref().map(|trace| (1, trace)),
+        ),
+        support_probe_path(
+            &set,
+            start,
+            end,
+            &[PathOp::Attr(primary.raw()), PathOp::Star],
+            &counters,
+            trace.as_ref().map(|trace| (2, trace)),
+        ),
+    ])) as DynConstraint;
+    let guard_arms = match arm_order {
+        SupportArmOrder::FalseFirst => vec![false_path, true_path],
+        SupportArmOrder::TrueFirst => vec![true_path, false_path],
+    };
+    let guarded_children = vec![
+        Box::new(UnionConstraint::new(guard_arms)) as DynConstraint,
+        Box::new(OrderedDomain {
+            variable: OUTER,
+            gate: OUTER,
+            unbound_estimate: 8,
+            values: guarded_values,
+        }) as DynConstraint,
+    ];
+    let guarded = Box::new(IntersectionConstraint::new(guarded_children)) as DynConstraint;
+    let sibling = Box::new(IntersectionConstraint::new(vec![
+        Box::new(start.is(source)) as DynConstraint,
+        Box::new(end.is(target)) as DynConstraint,
+        Box::new(OrderedDomain {
+            variable: OUTER,
+            gate: OUTER,
+            unbound_estimate: 9,
+            values: vec![sibling_value],
+        }) as DynConstraint,
+    ])) as DynConstraint;
+
+    let mut root_children = vec![
+        Box::new(OrderedDomain {
+            variable: PARENT,
+            gate: PARENT,
+            unbound_estimate: 0,
+            values: parent_values,
+        }) as DynConstraint,
+        Box::new(start.is(source)) as DynConstraint,
+        Box::new(end.is(target)) as DynConstraint,
+        Box::new(UnionConstraint::new(vec![guarded, sibling])) as DynConstraint,
+    ];
+    if let Some(trace) = &trace {
+        root_children.push(Box::new(SupportPageTraceFilter {
+            trace: Arc::clone(trace),
+        }) as DynConstraint);
+    }
+    let root = Arc::new(IntersectionConstraint::new(root_children));
+    (root, counters)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn fully_bound_support_root(
     set: TribleSet,
@@ -1002,6 +1210,7 @@ fn fully_bound_support_root(
             fully_bound_satisfied_calls,
             support_seeded_roots,
             expanded_nodes,
+            trace: None,
         }) as DynConstraint,
         Box::new(OrderedDomain {
             variable: OUTER,
@@ -3189,6 +3398,271 @@ fn first_support_witness_resumes_formula_before_irrelevant_path_work_drains() {
         expanded_nodes.load(Ordering::Relaxed),
         1,
         "dropping the consumer must cancel the irrelevant live traversal"
+    );
+}
+
+#[test]
+fn affine_nested_support_is_permutation_invariant_and_monotone() {
+    let parent_values = vec![genid(&rngid().id).raw, genid(&rngid().id).raw];
+    let guarded_value = genid(&rngid().id).raw;
+    let sibling_value = genid(&rngid().id).raw;
+    let mut permutation_bags = Vec::new();
+
+    for arm_order in [SupportArmOrder::FalseFirst, SupportArmOrder::TrueFirst] {
+        let mut previous = Vec::new();
+        let mut level_bags = Vec::new();
+        for level in 0..=4 {
+            let graph = GeneratedGraph::new(level);
+            let (root, counters) = nested_affine_support_root(
+                graph.set.clone(),
+                graph.value(0),
+                graph.value(2),
+                graph.primary,
+                graph.secondary,
+                parent_values.clone(),
+                vec![guarded_value],
+                sibling_value,
+                arm_order,
+                None,
+            );
+            let mut actual: Vec<_> = Query::new(root, project_outer)
+                .solve_residual_state_lazy_with(ResidualLowering::FULL)
+                .cap(1)
+                .start_width(1)
+                .collect();
+            actual.sort_unstable();
+
+            let mut expected = vec![sibling_value, sibling_value];
+            if level >= 2 {
+                expected.extend([guarded_value, guarded_value]);
+            }
+            expected.sort_unstable();
+            assert_eq!(actual, expected, "level={level}, order={arm_order:?}");
+            assert!(
+                sorted_bag_is_subset(&previous, &actual),
+                "graph growth retracted an affine Support result at level={level}, order={arm_order:?}"
+            );
+            assert_eq!(
+                counters
+                    .fully_bound_satisfied_calls
+                    .load(Ordering::Relaxed),
+                0,
+                "nested Support fell back to legacy reachability at level={level}, order={arm_order:?}"
+            );
+            assert!(
+                counters.support_seeded_roots.load(Ordering::Relaxed) > 0,
+                "nested Support never entered the transition substrate at level={level}, order={arm_order:?}"
+            );
+            assert!(
+                counters.expanded_nodes.load(Ordering::Relaxed) > 0,
+                "the discriminating non-nullable guard performed no transition work"
+            );
+            previous = actual.clone();
+            level_bags.push(actual);
+        }
+        permutation_bags.push(level_bags);
+    }
+
+    assert_eq!(
+        permutation_bags[0], permutation_bags[1],
+        "reordering the false arm and nested true AND changed Boolean Support semantics"
+    );
+}
+
+#[test]
+fn live_affine_support_clones_exactly_and_matches_rayon_worker_counts() {
+    let graph = Graph::new(8, &[(0, 1), (0, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)]);
+    let parent_values = vec![genid(&rngid().id).raw, genid(&rngid().id).raw];
+    let guarded_value = genid(&rngid().id).raw;
+    let sibling_value = genid(&rngid().id).raw;
+    let make = || {
+        nested_affine_support_root(
+            graph.set.clone(),
+            graph.value(0),
+            graph.value(1),
+            graph.attribute,
+            other_attribute(),
+            parent_values.clone(),
+            vec![guarded_value],
+            sibling_value,
+            SupportArmOrder::FalseFirst,
+            None,
+        )
+    };
+    let mut expected = vec![guarded_value, guarded_value, sibling_value, sibling_value];
+    expected.sort_unstable();
+
+    let (root, counters) = make();
+    let mut query = Query::new(root, project_outer)
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .cap(1)
+        .start_width(1);
+    let first = query.next().expect("the affine formula has four results");
+    let expansions_at_first = counters.expanded_nodes.load(Ordering::Relaxed);
+    assert!(expansions_at_first > 0);
+    assert!(
+        expansions_at_first < 8,
+        "the first result drained the deliberately irrelevant path tail"
+    );
+    assert!(counters.support_seeded_roots.load(Ordering::Relaxed) > 0);
+    assert_eq!(
+        counters.fully_bound_satisfied_calls.load(Ordering::Relaxed),
+        0
+    );
+
+    let clone = query.clone();
+    let remainder: Vec<_> = query.collect();
+    let cloned_remainder: Vec<_> = clone.collect();
+    assert_eq!(
+        cloned_remainder, remainder,
+        "a live Support clone changed the exact affine remainder"
+    );
+    let mut reconstructed: Vec<_> = std::iter::once(first).chain(remainder).collect();
+    reconstructed.sort_unstable();
+    assert_eq!(reconstructed, expected);
+
+    #[cfg(feature = "parallel")]
+    for workers in [1, 4] {
+        let (root, counters) = make();
+        let query = Query::new(root, project_outer)
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .cap(1)
+            .start_width(1);
+        let mut actual = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()
+            .unwrap()
+            .install(|| query.into_par_iter().collect::<Vec<_>>());
+        actual.sort_unstable();
+        assert_eq!(actual, expected, "workers={workers}");
+        assert!(
+            counters.support_seeded_roots.load(Ordering::Relaxed) > 0,
+            "workers={workers}"
+        );
+        assert!(
+            counters.expanded_nodes.load(Ordering::Relaxed) > 0,
+            "workers={workers}"
+        );
+        assert_eq!(
+            counters.fully_bound_satisfied_calls.load(Ordering::Relaxed),
+            0,
+            "workers={workers}"
+        );
+    }
+}
+
+#[test]
+fn support_is_parent_atomic_before_candidate_pages() {
+    let parent = genid(&rngid().id).raw;
+    let guarded_values: Vec<_> = (0..4).map(|_| genid(&rngid().id).raw).collect();
+    let sibling_value = genid(&rngid().id).raw;
+    let reachable = Graph::new(8, &[(0, 1), (0, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)]);
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let (root, counters) = nested_affine_support_root(
+        reachable.set.clone(),
+        reachable.value(0),
+        reachable.value(1),
+        reachable.attribute,
+        other_attribute(),
+        vec![parent],
+        guarded_values.clone(),
+        sibling_value,
+        SupportArmOrder::FalseFirst,
+        Some(Arc::clone(&trace)),
+    );
+    let mut actual: Vec<_> = Query::new(root, project_outer)
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .cap(1)
+        .start_width(1)
+        .collect();
+    actual.sort_unstable();
+    let mut expected = guarded_values.clone();
+    expected.push(sibling_value);
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
+    assert_eq!(
+        counters.fully_bound_satisfied_calls.load(Ordering::Relaxed),
+        0
+    );
+
+    let trace = trace.lock().expect("support trace poisoned").clone();
+    let first_page = trace
+        .iter()
+        .position(|event| matches!(event, SupportTraceEvent::CandidatePage(_)))
+        .expect("the page-local suffix must see the guarded candidates");
+    for (label, description) in [
+        (0, "false arm quiescence"),
+        (1, "Plus witness"),
+        (2, "Star witness"),
+    ] {
+        let completion = trace
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    SupportTraceEvent::Expand {
+                        label: event_label,
+                        witness
+                    } if *event_label == label && (label == 0 || *witness)
+                )
+            })
+            .unwrap_or_else(|| panic!("missing {description}: {trace:?}"));
+        assert!(
+            completion < first_page,
+            "candidate paging crossed the {description} barrier: {trace:?}"
+        );
+    }
+    assert_eq!(
+        trace
+            .iter()
+            .filter_map(|event| match event {
+                SupportTraceEvent::CandidatePage(len) => Some(*len),
+                SupportTraceEvent::Expand { .. } => None,
+            })
+            .collect::<Vec<_>>(),
+        vec![1, 1, 1, 1, 1]
+    );
+
+    let unreachable = Graph::new(8, &[(0, 1), (0, 2), (2, 3), (3, 4), (4, 5), (5, 6), (7, 7)]);
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let (root, counters) = nested_affine_support_root(
+        unreachable.set.clone(),
+        unreachable.value(0),
+        unreachable.value(7),
+        unreachable.attribute,
+        other_attribute(),
+        vec![parent],
+        guarded_values,
+        sibling_value,
+        SupportArmOrder::FalseFirst,
+        Some(Arc::clone(&trace)),
+    );
+    assert_eq!(
+        Query::new(root, project_outer)
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .cap(1)
+            .start_width(1)
+            .collect::<Vec<_>>(),
+        vec![sibling_value]
+    );
+    assert_eq!(
+        trace
+            .lock()
+            .expect("support trace poisoned")
+            .iter()
+            .filter_map(|event| match event {
+                SupportTraceEvent::CandidatePage(len) => Some(*len),
+                SupportTraceEvent::Expand { .. } => None,
+            })
+            .collect::<Vec<_>>(),
+        vec![1],
+        "a false Support guard leaked its four guarded candidates into paging"
+    );
+    assert!(counters.support_seeded_roots.load(Ordering::Relaxed) > 0);
+    assert!(counters.expanded_nodes.load(Ordering::Relaxed) > 0);
+    assert_eq!(
+        counters.fully_bound_satisfied_calls.load(Ordering::Relaxed),
+        0
     );
 }
 
