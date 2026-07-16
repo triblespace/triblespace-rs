@@ -296,10 +296,19 @@ fn built_in_capability_receipts_distinguish_native_paths_from_opaque_fallbacks()
         CapabilityReceipt {
             opaque_shape: true,
             finite_union_arms: None,
-            page_local_confirm: false,
-            direct_proposal_source: false,
+            page_local_confirm: true,
+            direct_proposal_source: true,
         },
-        "EstimateOverrideConstraint currently masks optional residual capabilities"
+        "EstimateOverrideConstraint keeps shape opaque but forwards exact execution capabilities"
+    );
+    let wrapped_and = EstimateOverrideConstraint::new(and!(x.is(a), y.is(b)));
+    assert!(matches!(
+        wrapped_and.residual_shape(),
+        ConstraintShape::Opaque
+    ));
+    assert!(
+        wrapped_and.residual_union_children().is_none(),
+        "opening an estimate wrapper's composite child would bypass its planning override"
     );
 }
 
@@ -501,8 +510,87 @@ fn finite_union_ignore_and_wrappers_have_explicit_execution_receipts() {
         0
     );
     assert_eq!(
-        estimate_profiles.full_geometric.delta_source_pages, 0,
-        "EstimateOverrideConstraint currently remains an honest opaque fallback"
+        estimate_profiles
+            .full_geometric
+            .delta_source_direct_candidates,
+        sorted_values.len(),
+        "EstimateOverrideConstraint must preserve the inner bounded proposal source"
+    );
+    assert!(estimate_profiles.full_geometric.delta_source_pages > 0);
+
+    let parent_a = value(21);
+    let parent_b = value(22);
+    let parents = [parent_a, parent_a, parent_b];
+    let parents = SortedSlice::new(&parents).unwrap();
+    let wrapped_values = [a, a, b];
+    let wrapped_values = SortedSlice::new(&wrapped_values).unwrap();
+    let affine_profiles = assert_scheduler_matrix(
+        "estimate wrapper preserves direct occurrences for every affine parent",
+        vec![
+            (parent_a, a),
+            (parent_a, a),
+            (parent_a, a),
+            (parent_a, a),
+            (parent_a, b),
+            (parent_a, b),
+            (parent_b, a),
+            (parent_b, a),
+            (parent_b, b),
+        ],
+        || {
+            find!(
+                (parent: Inline<UnknownInline>, x: Inline<UnknownInline>),
+                and!(
+                    parents.has(parent),
+                    Arc::new({
+                        let mut values = EstimateOverrideConstraint::new(wrapped_values.has(x));
+                        values.set_estimate(x.index, 4);
+                        values
+                    }),
+                )
+            )
+        },
+    );
+    assert_eq!(affine_profiles.conservative_geometric.delta_source_pages, 0);
+    assert!(affine_profiles.full_geometric.delta_source_pages > 0);
+}
+
+#[test]
+fn estimate_override_forwards_transition_programs_without_opening_its_shape() {
+    let start = fixture_id(51);
+    let middle = fixture_id(52);
+    let end = fixture_id(53);
+    let start_value: Inline<GenId> = (&start).to_inline();
+    let middle_value: Inline<GenId> = (&middle).to_inline();
+    let end_value: Inline<GenId> = (&end).to_inline();
+    let mut graph = TribleSet::new();
+    insert_tag(&mut graph, &start, &middle);
+    insert_tag(&mut graph, &middle, &end);
+
+    let profiles = assert_scheduler_matrix(
+        "estimate override around a repeated transition program",
+        vec![(start_value, middle_value), (start_value, end_value)],
+        || {
+            find!(
+                (source: Inline<GenId>, target: Inline<GenId>),
+                and!(
+                    source.is(start_value),
+                    Arc::new({
+                        let mut path = EstimateOverrideConstraint::new(path!(
+                            graph.clone(),
+                            source triblespace::core::metadata::tag+ target
+                        ));
+                        path.set_estimate(target.index, 128);
+                        path
+                    }),
+                )
+            )
+        },
+    );
+    assert_eq!(profiles.conservative_geometric.delta_transition_pages, 0);
+    assert!(
+        profiles.full_geometric.delta_transition_pages > 0,
+        "FULL lowering must reach the wrapped path's native transition frontier"
     );
 }
 

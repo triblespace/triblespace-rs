@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Estimate-only wrappers preserve native residual execution.**
+  `EstimateOverrideConstraint` remains a structural opaque leaf so its planner
+  cardinality overrides cannot be bypassed, while forwarding exact page-local
+  confirmation, bounded proposal sources, transition programs, and Boolean
+  Support to its inner constraint. `DebugConstraint` remains deliberately
+  opaque because native proposal execution would bypass its observation log.
 - **Built-in constraints gain an executable residual capability matrix.**
   Constants, equality, inclusive ranges, sorted slices, hash-set and hash-map
   membership, finite unions, ignored scopes, diagnostic wrappers, and repeated
