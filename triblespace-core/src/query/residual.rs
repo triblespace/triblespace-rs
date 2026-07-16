@@ -5858,11 +5858,6 @@ impl ResidualStateMachine {
             FormulaFocus::Action { node, stage } => (*node, *stage),
             _ => return Err(task),
         };
-        // Support is a synchronous control-only traversal. Until a dedicated
-        // Boolean delta reducer exists, never expose it to cyclic seed hooks.
-        if stage == FormulaStage::Support {
-            return Err(task);
-        }
         let formula_node = plan.finite_formula.node(node);
         if !matches!(formula_node.kind, FiniteFormulaNodeKind::Atom) {
             return Err(task);
@@ -5879,24 +5874,35 @@ impl ResidualStateMachine {
                 "a certified linear formula proposal carried a non-AND payload frame"
             );
         }
-
-        let variable = counter.resume.variable;
         let occurrence = counter.resume.occurrence;
         let vars: Vec<VariableId> = task.desc.bound.into_iter().collect();
         let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
         let constraint = plan.resolve_formula_node(root, occurrence, node);
-        let paged = constraint.residual_delta_source_is_paged(variable, &view);
         let mut seeds = Vec::new();
-        if !paged {
-            let supported = constraint.residual_delta_seeds(variable, &view, &mut seeds);
-            if !supported {
+        let (variable, paged) = if stage == FormulaStage::Support {
+            let Some(route) = constraint.residual_delta_support_seeds(&view, &mut seeds) else {
                 assert!(
                     seeds.is_empty(),
-                    "unsupported formula delta seed hook mutated its output"
+                    "unsupported formula support seed hook mutated its output"
                 );
                 return Err(task);
+            };
+            (route, false)
+        } else {
+            let variable = counter.resume.variable;
+            let paged = constraint.residual_delta_source_is_paged(variable, &view);
+            if !paged {
+                let supported = constraint.residual_delta_seeds(variable, &view, &mut seeds);
+                if !supported {
+                    assert!(
+                        seeds.is_empty(),
+                        "unsupported formula delta seed hook mutated its output"
+                    );
+                    return Err(task);
+                }
             }
-        }
+            (variable, paged)
+        };
 
         let SelectedResidualTask {
             state: _,
@@ -5907,7 +5913,13 @@ impl ResidualStateMachine {
             unreachable!("formula delta action was checked above")
         };
         match stage {
-            FormulaStage::Support => unreachable!("support was declined above"),
+            FormulaStage::Support => {
+                self.stats.support_action_pops += 1;
+                self.stats.support_calls += 1;
+                self.stats.support_rows += batch.parents.row_count;
+                self.stats.max_support_rows =
+                    self.stats.max_support_rows.max(batch.parents.row_count);
+            }
             FormulaStage::Propose => {
                 self.stats.propose_action_pops += 1;
                 self.stats.propose_calls += 1;
@@ -9161,7 +9173,7 @@ mod tests {
     }
 
     #[test]
-    fn finite_formula_support_declines_delta_seeding_without_calling_the_hook() {
+    fn finite_formula_support_falls_back_when_support_hook_is_unsupported() {
         let delta_calls = Arc::new(AtomicUsize::new(0));
         let root = UnionConstraint::new(vec![DeltaSeedTrap {
             variable: 0,
@@ -9195,7 +9207,7 @@ mod tests {
         let mut machine = ResidualStateMachine::new_for_plan(root.variables(), &plan, Search::Done);
         let returned = machine
             .seed_delta_formula(&root, &plan, task)
-            .expect_err("support must remain in the synchronous control machine");
+            .expect_err("an unsupported support hook must retain synchronous execution");
         assert_eq!(
             returned.desc.phase,
             ResidualPhase::Formula { counter: support }
