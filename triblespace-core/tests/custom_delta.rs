@@ -13,8 +13,8 @@ use triblespace_core::query::residual::{
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, EstimateSink, Query, ResidualDeltaNode,
-    ResidualDeltaOutput, ResidualDeltaSeed, ResidualDeltaSourceCursor, ResidualDeltaSourcePage,
-    RowsView, Variable, VariableId, VariableSet,
+    ResidualDeltaOutput, ResidualDeltaSeed, ResidualDeltaSourceBatch, ResidualDeltaSourceCursor,
+    ResidualDeltaSourcePage, RowsView, Variable, VariableId, VariableSet,
 };
 
 const START: VariableId = 0;
@@ -382,9 +382,19 @@ struct DirectPageTrace {
     next: Option<ResidualDeltaSourceCursor>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DirectCohortTrace {
+    vars: Vec<VariableId>,
+    parents: Vec<RawInline>,
+    candidate_mode: bool,
+    cursors: Vec<ResidualDeltaSourceCursor>,
+    limits: Vec<usize>,
+}
+
 #[derive(Default)]
 struct DirectSourceEvidence {
     pages: Mutex<Vec<DirectPageTrace>>,
+    cohorts: Mutex<Vec<DirectCohortTrace>>,
     expanded_nodes: AtomicUsize,
 }
 
@@ -395,6 +405,67 @@ struct PagedDirectDomain {
     variable: VariableId,
     values: Arc<Vec<RawInline>>,
     evidence: Arc<DirectSourceEvidence>,
+}
+
+impl PagedDirectDomain {
+    fn source_page(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: Option<&[RawInline]>,
+        cursor: ResidualDeltaSourceCursor,
+        limit: usize,
+        roots: &mut Vec<ResidualDeltaOutput>,
+        accepted: &mut Vec<RawInline>,
+    ) -> Option<ResidualDeltaSourcePage> {
+        if !(variable == self.variable && view.col(PARENT).is_some()) {
+            return None;
+        }
+        assert!(
+            candidates.is_none(),
+            "a proposal source has no parent candidates"
+        );
+        assert_eq!(view.len(), 1, "each source activation owns one affine row");
+        assert!(
+            roots.is_empty(),
+            "direct pages must not inherit traversal roots"
+        );
+        assert!(limit > 0);
+
+        let begin = match cursor {
+            ResidualDeltaSourceCursor::Start => 0,
+            ResidualDeltaSourceCursor::Offset(offset) => usize::try_from(offset)
+                .expect("custom source cursor does not fit this address space"),
+            ResidualDeltaSourceCursor::After(_) => {
+                panic!("occurrence-bearing custom source received a value cursor")
+            }
+        };
+        assert!(begin <= self.values.len(), "custom source cursor out of range");
+        let end = begin.saturating_add(limit).min(self.values.len());
+        let page_values = self.values[begin..end].to_vec();
+        accepted.extend(page_values.iter().copied());
+        let next = (end < self.values.len()).then(|| {
+            ResidualDeltaSourceCursor::Offset(
+                u64::try_from(end).expect("custom source cursor exceeds u64"),
+            )
+        });
+        let parent = view.row(0)[view.col(PARENT).expect("paged source parent")];
+        self.evidence
+            .pages
+            .lock()
+            .expect("direct source trace poisoned")
+            .push(DirectPageTrace {
+                parent,
+                cursor,
+                limit,
+                accepted: page_values,
+                next,
+            });
+        Some(ResidualDeltaSourcePage {
+            next,
+            examined: end - begin,
+        })
+    }
 }
 
 impl<'a> Constraint<'a> for PagedDirectDomain {
@@ -463,53 +534,62 @@ impl<'a> Constraint<'a> for PagedDirectDomain {
         roots: &mut Vec<ResidualDeltaOutput>,
         accepted: &mut Vec<RawInline>,
     ) -> Option<ResidualDeltaSourcePage> {
-        if !self.residual_proposal_source_is_paged(variable, view) {
-            return None;
-        }
-        assert!(
-            candidates.is_none(),
-            "a proposal source has no parent candidates"
-        );
-        assert_eq!(view.len(), 1, "each source activation owns one affine row");
-        assert!(
-            roots.is_empty(),
-            "direct pages must not inherit traversal roots"
-        );
-        assert!(limit > 0);
+        self.source_page(variable, view, candidates, cursor, limit, roots, accepted)
+    }
 
-        let begin = match cursor {
-            ResidualDeltaSourceCursor::Start => 0,
-            ResidualDeltaSourceCursor::Offset(offset) => usize::try_from(offset)
-                .expect("custom source cursor does not fit this address space"),
-            ResidualDeltaSourceCursor::After(_) => {
-                panic!("occurrence-bearing custom source received a value cursor")
-            }
-        };
-        assert!(begin <= self.values.len(), "custom source cursor out of range");
-        let end = begin.saturating_add(limit).min(self.values.len());
-        let page_values = self.values[begin..end].to_vec();
-        accepted.extend(page_values.iter().copied());
-        let next = (end < self.values.len()).then(|| {
-            ResidualDeltaSourceCursor::Offset(
-                u64::try_from(end).expect("custom source cursor exceeds u64"),
-            )
-        });
-        let parent = view.row(0)[view.col(PARENT).expect("paged source parent")];
+    fn residual_delta_source_pages(
+        &self,
+        variable: VariableId,
+        batch: ResidualDeltaSourceBatch<'_>,
+        pages: &mut Vec<ResidualDeltaSourcePage>,
+        roots: &mut Vec<(u32, ResidualDeltaOutput)>,
+        accepted: &mut Vec<(u32, RawInline)>,
+    ) -> bool {
+        let parent_column = batch.view.col(PARENT).expect("paged source parent");
+        let candidate_mode = batch
+            .candidate_sets
+            .first()
+            .is_some_and(|candidates| candidates.is_some());
+        assert!(batch
+            .candidate_sets
+            .iter()
+            .all(|candidates| candidates.is_some() == candidate_mode));
         self.evidence
-            .pages
+            .cohorts
             .lock()
-            .expect("direct source trace poisoned")
-            .push(DirectPageTrace {
-                parent,
-                cursor,
-                limit,
-                accepted: page_values,
-                next,
+            .expect("direct source cohort trace poisoned")
+            .push(DirectCohortTrace {
+                vars: batch.view.vars.to_vec(),
+                parents: batch
+                    .view
+                    .iter()
+                    .map(|row| row[parent_column])
+                    .collect(),
+                candidate_mode,
+                cursors: batch.cursors.to_vec(),
+                limits: batch.limits.to_vec(),
             });
-        Some(ResidualDeltaSourcePage {
-            next,
-            examined: end - begin,
-        })
+
+        for row in 0..batch.view.len() {
+            let mut row_roots = Vec::new();
+            let mut row_accepted = Vec::new();
+            let Some(page) = self.source_page(
+                variable,
+                &batch.view.row_view(row),
+                batch.candidate_sets[row],
+                batch.cursors[row],
+                batch.limits[row],
+                &mut row_roots,
+                &mut row_accepted,
+            ) else {
+                return false;
+            };
+            let tag = u32::try_from(row).expect("custom source cohort exceeds u32 tags");
+            pages.push(page);
+            roots.extend(row_roots.into_iter().map(|root| (tag, root)));
+            accepted.extend(row_accepted.into_iter().map(|value| (tag, value)));
+        }
+        true
     }
 
     fn residual_delta_expand(
@@ -915,6 +995,74 @@ fn custom_direct_source_preserves_duplicate_occurrences_at_width_one() {
             .flat_map(|page| page.accepted.iter().copied())
             .collect();
         assert_eq!(accepted, [raw(1), raw(1)]);
+    }
+}
+
+#[test]
+fn custom_direct_source_batches_compatible_parents_with_one_global_budget() {
+    let values = vec![raw(1), raw(2), raw(3)];
+    let oracle = sorted(
+        Query::new(
+            direct_source_fixture(values.clone(), Arc::default()),
+            project_start,
+        )
+        .sequential()
+        .collect(),
+    );
+    let conservative = sorted(
+        Query::new(
+            direct_source_fixture(values.clone(), Arc::default()),
+            project_start,
+        )
+        .solve_residual_state_lazy()
+        .collect(),
+    );
+    assert_eq!(conservative, oracle);
+    let evidence = Arc::new(DirectSourceEvidence::default());
+    let residual = Query::new(
+        direct_source_fixture(values, Arc::clone(&evidence)),
+        project_start,
+    )
+    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .cap(3)
+    .start_width(3)
+    .collect_profiled();
+
+    assert_eq!(sorted(residual.results), oracle);
+    assert_eq!(residual.stats.max_delta_source_cohort, 2);
+    assert_eq!(residual.stats.delta_source_cohorts, 2);
+    assert_eq!(residual.stats.delta_source_pages, 4);
+    let cohorts = evidence
+        .cohorts
+        .lock()
+        .expect("direct source cohort trace poisoned");
+    assert_eq!(cohorts.len(), 2);
+    for (page, cohort) in cohorts.iter().enumerate() {
+        assert_eq!(cohort.vars, [PARENT]);
+        assert_eq!(cohort.parents.len(), 2);
+        assert!(!cohort.candidate_mode);
+        assert_eq!(cohort.limits, [2, 1]);
+        assert_eq!(cohort.limits.iter().sum::<usize>(), 3);
+        match page {
+            0 => assert!(cohort
+                .cursors
+                .iter()
+                .all(|cursor| *cursor == ResidualDeltaSourceCursor::Start)),
+            1 => {
+                for (&parent, &cursor) in cohort.parents.iter().zip(&cohort.cursors) {
+                    let initial = cohorts[0]
+                        .parents
+                        .iter()
+                        .position(|candidate| *candidate == parent)
+                        .expect("affine parent disappeared between source cohorts");
+                    assert_eq!(
+                        cursor,
+                        ResidualDeltaSourceCursor::Offset(cohorts[0].limits[initial] as u64)
+                    );
+                }
+            }
+            _ => unreachable!(),
+        }
     }
 }
 

@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   page-local confirmation only for variables that remain visible. Hidden
   variables never become schedulable source actions, while TribleSet and other
   paged children retain geometric first-result latency through `ignore!`.
+- **Residual source pages dispatch as compatible affine cohorts.** Canonical
+  delta identity remains structural while the scheduler physically partitions
+  source activations by bound-row schema, candidate mode, and cursor family.
+  One block-native hook receives a same-schema row batch with ragged per-parent
+  limits and tagged outputs; its scalar default preserves existing constraints.
+  Page limits share the current global geometric budget instead of multiplying
+  it by cohort size.
 - **Ordered proposal sources can page direct candidate occurrences.** The
   residual source cursor now distinguishes raw-value and native-ordinal
   frontiers while preserving proposal order and multiplicity. Sorted slices
