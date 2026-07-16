@@ -19,6 +19,7 @@ use triblespace_core::query::{
 const START: VariableId = 0;
 const END: VariableId = 1;
 const OUTER: VariableId = 2;
+const PARENT: VariableId = 3;
 
 type DynConstraint = Box<dyn Constraint<'static> + Send + Sync>;
 type Root = Arc<IntersectionConstraint<DynConstraint>>;
@@ -32,6 +33,10 @@ struct DeltaEvidence {
     seeded_roots: AtomicUsize,
     expanded_nodes: AtomicUsize,
     continuation_mask: AtomicUsize,
+    fully_bound_satisfied_calls: AtomicUsize,
+    support_seeded_roots: AtomicUsize,
+    support_expanded_nodes: AtomicUsize,
+    support_witnesses: AtomicUsize,
 }
 
 /// A deliberately non-RPQ relation: `(red, blue)+` over two in-memory edge
@@ -129,6 +134,11 @@ impl<'a> Constraint<'a> for AlternatingClosure {
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         let start = view.col(START);
         let end = view.col(END);
+        if start.is_some() && end.is_some() {
+            self.evidence
+                .fully_bound_satisfied_calls
+                .fetch_add(view.len(), Ordering::Relaxed);
+        }
         view.iter().all(|row| match (start, end) {
             (Some(start), Some(end)) => self.relation.contains(&(row[start], row[end])),
             (Some(start), None) => !self.candidates(END, Some(row[start])).is_empty(),
@@ -174,6 +184,37 @@ impl<'a> Constraint<'a> for AlternatingClosure {
         true
     }
 
+    fn residual_delta_support_seeds(
+        &self,
+        view: &RowsView<'_>,
+        seeds: &mut Vec<ResidualDeltaSeed>,
+    ) -> Option<VariableId> {
+        let start = view.col(START)?;
+        let end = view.col(END)?;
+        let before = seeds.len();
+        seeds.extend(view.iter().enumerate().map(|(parent, row)| {
+            ResidualDeltaSeed {
+                parent: u32::try_from(parent).expect("too many custom-support parents"),
+                output: ResidualDeltaOutput {
+                    node: ResidualDeltaNode {
+                        // Support reuses the node's optional anchor as the
+                        // fixed target and reserves continuations 2/3 for its
+                        // Boolean traversal. Proposal keeps using 0/1.
+                        source: Some(row[end]),
+                        value: row[start],
+                        continuation: 2,
+                    },
+                    // `(red, blue)+` has no nullable witness.
+                    accepted: false,
+                },
+            }
+        }));
+        self.evidence
+            .support_seeded_roots
+            .fetch_add(seeds.len() - before, Ordering::Relaxed);
+        Some(END)
+    }
+
     fn residual_delta_expand(
         &self,
         variable: VariableId,
@@ -186,10 +227,19 @@ impl<'a> Constraint<'a> for AlternatingClosure {
         self.evidence
             .expanded_nodes
             .fetch_add(nodes.len(), Ordering::Relaxed);
+        self.evidence.support_expanded_nodes.fetch_add(
+            nodes
+                .iter()
+                .filter(|node| matches!(node.continuation, 2 | 3))
+                .count(),
+            Ordering::Relaxed,
+        );
         for (tag, node) in nodes.iter().enumerate() {
-            let (edges, next) = match node.continuation {
-                0 => (&self.red, 1),
-                1 => (&self.blue, 0),
+            let (edges, next, support) = match node.continuation {
+                0 => (&self.red, 1, false),
+                1 => (&self.blue, 0, false),
+                2 => (&self.red, 3, true),
+                3 => (&self.blue, 2, true),
                 _ => panic!("invalid custom-delta continuation"),
             };
             self.evidence
@@ -200,6 +250,16 @@ impl<'a> Constraint<'a> for AlternatingClosure {
                     .iter()
                     .filter(|&&(source, _)| source == node.value)
                     .map(|&(_, target)| {
+                        let accepted = if support {
+                            node.continuation == 3 && node.source == Some(target)
+                        } else {
+                            node.continuation == 1
+                        };
+                        if support && accepted {
+                            self.evidence
+                                .support_witnesses
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                         (
                             u32::try_from(tag).expect("too many custom-delta nodes"),
                             ResidualDeltaOutput {
@@ -208,13 +268,48 @@ impl<'a> Constraint<'a> for AlternatingClosure {
                                     value: target,
                                     continuation: next,
                                 },
-                                accepted: node.continuation == 1,
+                                accepted,
                             },
                         )
                     }),
             );
         }
         true
+    }
+}
+
+fn alternating_closure(evidence: Arc<DeltaEvidence>) -> AlternatingClosure {
+    alternating_closure_with_terminal(evidence, false)
+}
+
+fn alternating_closure_with_terminal(
+    evidence: Arc<DeltaEvidence>,
+    include_terminal: bool,
+) -> AlternatingClosure {
+    // The 4 -> 1 edge closes a real product-state cycle back to (1, blue).
+    let mut relation: Vec<_> = [raw(0), raw(2), raw(4)]
+        .into_iter()
+        .flat_map(|start| [raw(2), raw(4), raw(6)].map(|end| (start, end)))
+        .collect();
+    let mut blue = vec![(raw(1), raw(2)), (raw(3), raw(4)), (raw(5), raw(6))];
+    if include_terminal {
+        relation.extend(
+            [raw(0), raw(2), raw(4)]
+                .into_iter()
+                .map(|start| (start, raw(7))),
+        );
+        blue.push((raw(5), raw(7)));
+    }
+    AlternatingClosure {
+        relation,
+        red: vec![
+            (raw(0), raw(1)),
+            (raw(2), raw(3)),
+            (raw(2), raw(5)),
+            (raw(4), raw(1)),
+        ],
+        blue,
+        evidence,
     }
 }
 
@@ -278,21 +373,7 @@ impl<'a> Constraint<'a> for PageLocalDomain {
 }
 
 fn fixture(evidence: Arc<DeltaEvidence>) -> Root {
-    // The 4 -> 1 edge closes a real product-state cycle back to (1, blue).
-    let machine = AlternatingClosure {
-        relation: [raw(0), raw(2), raw(4)]
-            .into_iter()
-            .flat_map(|start| [raw(2), raw(4), raw(6)].map(|end| (start, end)))
-            .collect(),
-        red: vec![
-            (raw(0), raw(1)),
-            (raw(2), raw(3)),
-            (raw(2), raw(5)),
-            (raw(4), raw(1)),
-        ],
-        blue: vec![(raw(1), raw(2)), (raw(3), raw(4)), (raw(5), raw(6))],
-        evidence,
-    };
+    let machine = alternating_closure(evidence);
     let arm = Box::new(IntersectionConstraint::new(vec![
         Box::new(machine) as DynConstraint,
         Box::new(PageLocalDomain {
@@ -313,13 +394,199 @@ fn fixture(evidence: Arc<DeltaEvidence>) -> Root {
     ]))
 }
 
+/// Places the custom transition machine under both recursive Boolean
+/// connectives. The inner OR has a deliberately impossible finite arm; the
+/// guarded outer arm is an AND, and its sibling keeps the outer OR live when
+/// transition Support proves false. PARENT is deliberately projected away so
+/// its two affine rows become observable bag multiplicity.
+fn recursive_support_fixture(
+    evidence: Arc<DeltaEvidence>,
+    include_terminal: bool,
+    guarded_value: RawInline,
+    sibling_value: RawInline,
+) -> Root {
+    let target = raw(7);
+    let start = Variable::<UnknownInline>::new(START);
+    let end = Variable::<UnknownInline>::new(END);
+    let impossible = Box::new(IntersectionConstraint::new(vec![
+        Box::new(start.is(Inline::<UnknownInline>::new(raw(250)))) as DynConstraint,
+        Box::new(end.is(Inline::<UnknownInline>::new(raw(251)))) as DynConstraint,
+    ])) as DynConstraint;
+    let inner_or = Box::new(UnionConstraint::new(vec![
+        Box::new(alternating_closure_with_terminal(
+            evidence,
+            include_terminal,
+        )) as DynConstraint,
+        impossible,
+    ])) as DynConstraint;
+    let guarded = Box::new(IntersectionConstraint::new(vec![
+        inner_or,
+        Box::new(PageLocalDomain {
+            variable: OUTER,
+            estimate: 32,
+            values: Arc::new(vec![guarded_value]),
+        }) as DynConstraint,
+    ])) as DynConstraint;
+    let sibling = Box::new(IntersectionConstraint::new(vec![
+        Box::new(start.is(Inline::<UnknownInline>::new(raw(0)))) as DynConstraint,
+        Box::new(end.is(Inline::<UnknownInline>::new(target))) as DynConstraint,
+        Box::new(PageLocalDomain {
+            variable: OUTER,
+            estimate: 64,
+            values: Arc::new(vec![sibling_value]),
+        }) as DynConstraint,
+    ])) as DynConstraint;
+
+    Arc::new(IntersectionConstraint::new(vec![
+        Box::new(start.is(Inline::<UnknownInline>::new(raw(0)))) as DynConstraint,
+        Box::new(end.is(Inline::<UnknownInline>::new(target))) as DynConstraint,
+        Box::new(PageLocalDomain {
+            variable: PARENT,
+            estimate: 2,
+            values: Arc::new(vec![raw(8), raw(9)]),
+        }) as DynConstraint,
+        Box::new(UnionConstraint::new(vec![guarded, sibling])) as DynConstraint,
+    ]))
+}
+
 fn project_end(binding: &Binding) -> Option<RawInline> {
     binding.get(END).copied()
+}
+
+fn project_outer(binding: &Binding) -> Option<RawInline> {
+    binding.get(OUTER).copied()
 }
 
 fn sorted(mut values: Vec<RawInline>) -> Vec<RawInline> {
     values.sort_unstable();
     values
+}
+
+fn assert_recursive_support_case(include_terminal: bool) -> Vec<RawInline> {
+    let reachable = include_terminal;
+    let guarded_value = raw(10);
+    let sibling_value = raw(11);
+    let expected = if reachable {
+        sorted(vec![
+            guarded_value,
+            guarded_value,
+            sibling_value,
+            sibling_value,
+        ])
+    } else {
+        sorted(vec![sibling_value, sibling_value])
+    };
+
+    let oracle_evidence = Arc::new(DeltaEvidence::default());
+    let oracle = sorted(
+        Query::new(
+            recursive_support_fixture(
+                Arc::clone(&oracle_evidence),
+                include_terminal,
+                guarded_value,
+                sibling_value,
+            ),
+            project_outer,
+        )
+        .sequential()
+        .collect(),
+    );
+    assert_eq!(oracle, expected);
+    assert!(
+        oracle_evidence
+            .fully_bound_satisfied_calls
+            .load(Ordering::Relaxed)
+            > 0,
+        "the finite oracle must exercise the ordinary fully-bound relation"
+    );
+    assert_eq!(
+        oracle_evidence.support_seeded_roots.load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        oracle_evidence
+            .support_expanded_nodes
+            .load(Ordering::Relaxed),
+        0
+    );
+
+    let residual_evidence = Arc::new(DeltaEvidence::default());
+    let residual = Query::new(
+        recursive_support_fixture(
+            Arc::clone(&residual_evidence),
+            include_terminal,
+            guarded_value,
+            sibling_value,
+        ),
+        project_outer,
+    )
+    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .cap(1)
+    .start_width(1)
+    .collect_profiled();
+    let residual_results = sorted(residual.results);
+
+    assert_eq!(residual_results, oracle);
+    assert_eq!(residual_results, expected);
+    assert_eq!(
+        residual_evidence
+            .fully_bound_satisfied_calls
+            .load(Ordering::Relaxed),
+        0,
+        "native Support must replace the synchronous fully-bound oracle"
+    );
+    assert_eq!(
+        residual_evidence
+            .support_seeded_roots
+            .load(Ordering::Relaxed),
+        2,
+        "each projected-away PARENT row owns one affine Support activation"
+    );
+    assert!(
+        residual_evidence
+            .support_expanded_nodes
+            .load(Ordering::Relaxed)
+            > 0,
+        "the Boolean guard must execute the custom transition machine"
+    );
+    assert_eq!(
+        residual_evidence.continuation_mask.load(Ordering::Relaxed) & 0b1100,
+        0b1100,
+        "both custom Support continuation states must execute"
+    );
+    assert!(
+        residual.stats.support_action_pops > 0,
+        "the recursive finite formula must expose a Support action"
+    );
+    if reachable {
+        assert_eq!(
+            residual_evidence.support_witnesses.load(Ordering::Relaxed),
+            2,
+            "each affine parent must publish its own witness"
+        );
+    } else {
+        assert_eq!(
+            residual_evidence.support_witnesses.load(Ordering::Relaxed),
+            0,
+            "an unreachable guard may become false only after quiescence"
+        );
+    }
+    residual_results
+}
+
+#[test]
+fn custom_support_recursive_formula_is_affine_and_monotone() {
+    let unreachable = assert_recursive_support_case(false);
+    let reachable_extension = assert_recursive_support_case(true);
+    let mut extension_only = reachable_extension;
+    for inherited in unreachable {
+        let position = extension_only
+            .iter()
+            .position(|value| *value == inherited)
+            .expect("adding one edge must not remove an inherited bag occurrence");
+        extension_only.remove(position);
+    }
+    assert_eq!(extension_only, vec![raw(10), raw(10)]);
 }
 
 #[test]
