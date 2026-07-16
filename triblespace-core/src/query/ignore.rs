@@ -31,6 +31,10 @@ impl<'a> IgnoreConstraint<'a> {
             constraint,
         }
     }
+
+    fn exposes(&self, variable: VariableId) -> bool {
+        !self.ignored.is_set(variable) && self.constraint.variables().is_set(variable)
+    }
 }
 
 impl<'a> Constraint<'a> for IgnoreConstraint<'a> {
@@ -73,12 +77,22 @@ impl<'a> Constraint<'a> for IgnoreConstraint<'a> {
         self.constraint.residual_confirm_is_page_local()
     }
 
+    fn residual_delta_confirm_is_grouped(&self) -> bool {
+        self.constraint.residual_delta_confirm_is_grouped()
+    }
+
+    fn residual_delta_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
+        self.exposes(variable)
+            && self
+                .constraint
+                .residual_delta_source_is_paged(variable, view)
+    }
+
     /// Hiding variables changes the outward schema, but not the proposal
     /// sequence for a variable that remains visible. Keep that exact child
     /// frontier available without making the wrapper structurally transparent.
     fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
-        !self.ignored.is_set(variable)
-            && self.variables().is_set(variable)
+        self.exposes(variable)
             && self
                 .constraint
                 .residual_proposal_source_is_paged(variable, view)
@@ -94,13 +108,7 @@ impl<'a> Constraint<'a> for IgnoreConstraint<'a> {
         roots: &mut Vec<ResidualDeltaOutput>,
         accepted: &mut Vec<RawInline>,
     ) -> Option<ResidualDeltaSourcePage> {
-        // Ignore is paging-transparent only for direct outward proposals.
-        // Hidden variables and candidate reducers remain behind the scope
-        // boundary, matching the wrapper's deliberately opaque shape.
-        if self.ignored.is_set(variable)
-            || !self.variables().is_set(variable)
-            || candidates.is_some()
-        {
+        if !self.exposes(variable) {
             return None;
         }
         self.constraint
@@ -115,20 +123,58 @@ impl<'a> Constraint<'a> for IgnoreConstraint<'a> {
         roots: &mut Vec<(u32, ResidualDeltaOutput)>,
         accepted: &mut Vec<(u32, RawInline)>,
     ) -> bool {
-        // Preserve a child's native block hook at the same outward-only
-        // boundary as the scalar page hook. Candidate-bearing reducers and
-        // hidden variables remain sealed by Ignore's opaque scope.
-        if self.ignored.is_set(variable)
-            || !self.variables().is_set(variable)
-            || batch
-                .candidate_sets
-                .iter()
-                .any(|candidates| candidates.is_some())
-        {
+        if !self.exposes(variable) {
             return false;
         }
         self.constraint
             .residual_delta_source_pages(variable, batch, pages, roots, accepted)
+    }
+
+    fn residual_delta_seeds(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        seeds: &mut Vec<ResidualDeltaSeed>,
+    ) -> bool {
+        self.exposes(variable) && self.constraint.residual_delta_seeds(variable, view, seeds)
+    }
+
+    fn residual_delta_support_seeds(
+        &self,
+        _view: &RowsView<'_>,
+        _seeds: &mut Vec<ResidualDeltaSeed>,
+    ) -> Option<VariableId> {
+        // Ignore is fully bound once its outward variables are present, while
+        // the child still declares every hidden variable. Delegating Support
+        // would therefore ask the child to prove a different proposition.
+        None
+    }
+
+    fn residual_delta_expand_page(
+        &self,
+        variable: VariableId,
+        node: ResidualDeltaNode,
+        cursor: ResidualDeltaExpandCursor,
+        limit: usize,
+        successors: &mut Vec<ResidualDeltaOutput>,
+    ) -> Option<ResidualDeltaExpandPage> {
+        if !self.exposes(variable) {
+            return None;
+        }
+        self.constraint
+            .residual_delta_expand_page(variable, node, cursor, limit, successors)
+    }
+
+    fn residual_delta_expand(
+        &self,
+        variable: VariableId,
+        nodes: &[ResidualDeltaNode],
+        successors: &mut Vec<(u32, ResidualDeltaOutput)>,
+    ) -> bool {
+        self.exposes(variable)
+            && self
+                .constraint
+                .residual_delta_expand(variable, nodes, successors)
     }
 
     /// Replays the historical wildcard filter once every outward variable is
