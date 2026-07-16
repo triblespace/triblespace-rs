@@ -752,6 +752,15 @@ impl ProducerRegistry {
         (bound, activation.source_candidates.is_some())
     }
 
+    fn activation_streams(&self, activation: ActivationId) -> bool {
+        self.state
+            .activations
+            .get(&activation)
+            .expect("unknown delta activation")
+            .reducer
+            .streams()
+    }
+
     /// Takes one activation-local early effect. Support mutates its reducer at
     /// this exact boundary so duplicate witnesses and later expansion cohorts
     /// cannot replay `true`.
@@ -945,6 +954,28 @@ struct DeltaTask {
     cursor: ResidualDeltaExpandCursor,
 }
 
+/// Physical transition cohort compatible with one publication boundary.
+///
+/// Streaming activations may share a block because every accepted endpoint is
+/// immediately visible to the stable machine. A quiescent reducer must finish
+/// its own fixpoint before it can publish, so mixing independent activations
+/// would turn geometric width into breadth and postpone every first result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransitionDispatchKey {
+    Streaming,
+    Quiescent(ActivationId),
+}
+
+impl TransitionDispatchKey {
+    fn of(registry: &ProducerRegistry, task: &DeltaTask) -> Self {
+        if registry.activation_streams(task.activation) {
+            Self::Streaming
+        } else {
+            Self::Quiescent(task.activation)
+        }
+    }
+}
+
 #[derive(Debug)]
 struct SourceTask {
     activation: ActivationId,
@@ -1034,12 +1065,50 @@ pub(super) struct DeltaStepOutcome {
     pub(super) dead_pages: usize,
     pub(super) source_dead_pages: usize,
     pub(super) transition_dead_pages: usize,
+    pub(super) completed_activations: usize,
 }
 
 impl DeltaBucket {
-    fn take_tail(&mut self, width: usize) -> Vec<DeltaTask> {
-        let first = self.tasks.len().saturating_sub(width.max(1));
-        self.tasks.split_off(first)
+    fn take_tail(
+        &mut self,
+        registry: &ProducerRegistry,
+        width: usize,
+        activation_width: usize,
+    ) -> Vec<DeltaTask> {
+        let width = width.max(1);
+        let activation_width = activation_width.max(1);
+        let key = TransitionDispatchKey::of(
+            registry,
+            self.tasks.last().expect("live delta bucket is nonempty"),
+        );
+        let mut activations = BTreeSet::new();
+        let mut selected = Vec::with_capacity(width.min(self.tasks.len()));
+        let mut retained = Vec::with_capacity(self.tasks.len());
+        for task in std::mem::take(&mut self.tasks).into_iter().rev() {
+            let compatible = match (key, TransitionDispatchKey::of(registry, &task)) {
+                (TransitionDispatchKey::Streaming, TransitionDispatchKey::Streaming) => true,
+                (
+                    TransitionDispatchKey::Quiescent(_),
+                    TransitionDispatchKey::Quiescent(activation),
+                ) => {
+                    activations.contains(&activation)
+                        || (activations.len() < activation_width && {
+                            activations.insert(activation);
+                            true
+                        })
+                }
+                _ => false,
+            };
+            if selected.len() < width && compatible {
+                selected.push(task);
+            } else {
+                retained.push(task);
+            }
+        }
+        selected.reverse();
+        retained.reverse();
+        self.tasks = retained;
+        selected
     }
 }
 
@@ -1049,6 +1118,10 @@ pub(super) struct DeltaScheduler {
     interner: DeltaInterner,
     worklist: BTreeMap<DeltaStateId, DeltaBucket>,
     source_worklist: BTreeMap<DeltaStateId, SourceBucket>,
+    /// Number of independent quiescent activations that may share one
+    /// transition cohort. This grows only when activations complete; `width`
+    /// remains the separate intra-activation page/work budget.
+    activation_width: usize,
 }
 
 impl DeltaScheduler {
@@ -1058,7 +1131,23 @@ impl DeltaScheduler {
             interner: DeltaInterner::default(),
             worklist: BTreeMap::new(),
             source_worklist: BTreeMap::new(),
+            activation_width: 1,
         }
+    }
+
+    pub(super) fn grow_activation_width(&mut self, growth: usize, cap: usize) -> bool {
+        let next = self
+            .activation_width
+            .saturating_mul(growth.max(1))
+            .clamp(1, cap.max(1));
+        let grew = next > self.activation_width;
+        self.activation_width = next;
+        grew
+    }
+
+    #[cfg(test)]
+    pub(super) fn activation_width(&self) -> usize {
+        self.activation_width
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -1632,8 +1721,9 @@ impl DeltaScheduler {
                 .0
         });
         let (tasks, empty) = {
+            let registry = &self.registry;
             let bucket = self.worklist.get_mut(&id).expect("selected delta state");
-            let tasks = bucket.take_tail(width);
+            let tasks = bucket.take_tail(registry, width, self.activation_width);
             (tasks, bucket.tasks.is_empty())
         };
         if empty {
@@ -1812,6 +1902,7 @@ impl DeltaScheduler {
         let mut dead_pages = 0usize;
         let mut source_dead_pages = 0usize;
         let mut transition_dead_pages = 0usize;
+        let mut completed_activations = 0usize;
         for (task_index, task) in tasks.into_iter().enumerate() {
             assert_eq!(task.activation, task.credit.key.activation);
             let outcome = self.registry.replace_traversal_page(
@@ -1863,6 +1954,7 @@ impl DeltaScheduler {
             }
             if let Some(proof) = outcome.quiescence {
                 assert_eq!(proof.activation, task.activation);
+                completed_activations += 1;
                 let completed = self.registry.finish(proof);
                 prefer_continuation(
                     &mut task_continuation,
@@ -1889,6 +1981,7 @@ impl DeltaScheduler {
             dead_pages,
             source_dead_pages,
             transition_dead_pages,
+            completed_activations,
         }
     }
 
@@ -1970,6 +2063,7 @@ impl DeltaScheduler {
         let mut traversal = Vec::new();
         let mut resumed_sources = Vec::new();
         let mut dead_pages = 0usize;
+        let mut completed_activations = 0usize;
         for (row, (((task, page), root_range), direct_range)) in tasks
             .into_iter()
             .zip(pages)
@@ -2026,6 +2120,7 @@ impl DeltaScheduler {
             }
             if let Some(proof) = outcome.quiescence {
                 assert_eq!(proof.activation, task.activation);
+                completed_activations += 1;
                 let completed = self.registry.finish(proof);
                 prefer_continuation(
                     &mut task_continuation,
@@ -2047,6 +2142,7 @@ impl DeltaScheduler {
             dead_pages,
             source_dead_pages: dead_pages,
             transition_dead_pages: 0,
+            completed_activations,
         }
     }
 
@@ -2092,6 +2188,7 @@ impl DeltaScheduler {
             interner: self.interner.clone(),
             worklist,
             source_worklist,
+            activation_width: self.activation_width,
         }
     }
 }
@@ -2577,6 +2674,69 @@ mod tests {
         assert_eq!(cloned_second.accepted, [value(8)]);
         assert!(original.take_streaming_return(activation).is_none());
         assert!(cloned.take_streaming_return(activation).is_none());
+    }
+
+    #[test]
+    fn transition_pop_keeps_quiescent_activations_coherent() {
+        let mut scheduler = DeltaScheduler::new();
+        let desc = DeltaDesc::leaf(0, 0);
+
+        let mut first = scheduler.registry.start_many(
+            DeltaReducer::QuiescentProposal,
+            candidate_return(Vec::new()),
+            [output(1, 0, false), output(2, 0, false)],
+        );
+        let first_activation = first.activation;
+        let (first_node, first_credit) = first.roots.remove(0);
+        let (last_node, last_credit) = first.roots.remove(0);
+
+        let mut second = scheduler.registry.start_many(
+            DeltaReducer::QuiescentProposal,
+            candidate_return(Vec::new()),
+            [output(3, 0, false)],
+        );
+        let second_activation = second.activation;
+        let (second_node, second_credit) = second.roots.remove(0);
+
+        scheduler.file(
+            desc,
+            vec![
+                DeltaTask {
+                    activation: first_activation,
+                    credit: first_credit,
+                    node: first_node,
+                    cursor: ResidualDeltaExpandCursor::Start,
+                },
+                DeltaTask {
+                    activation: second_activation,
+                    credit: second_credit,
+                    node: second_node,
+                    cursor: ResidualDeltaExpandCursor::Start,
+                },
+                DeltaTask {
+                    activation: first_activation,
+                    credit: last_credit,
+                    node: last_node,
+                    cursor: ResidualDeltaExpandCursor::Start,
+                },
+            ],
+        );
+
+        let (_, selected) = scheduler.pop(usize::MAX);
+        assert_eq!(selected.len(), 2);
+        assert!(
+            selected
+                .iter()
+                .all(|task| task.activation == first_activation),
+            "one quiescent fixpoint must consume width internally"
+        );
+        let retained = scheduler
+            .worklist
+            .values()
+            .next()
+            .expect("the independent activation remains queued");
+        assert_eq!(retained.tasks.len(), 1);
+        assert_eq!(retained.tasks[0].activation, second_activation);
     }
 
     #[test]

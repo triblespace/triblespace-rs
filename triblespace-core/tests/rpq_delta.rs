@@ -14,9 +14,9 @@ use triblespace_core::query::residual::{
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, ConstraintShape, EstimateSink, PathOp, Query,
-    RegularPathConstraint, ResidualDeltaExpandCursor, ResidualDeltaNode, ResidualDeltaOutput,
-    ResidualDeltaSeed, ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, Variable,
-    VariableId, VariableSet,
+    RegularPathConstraint, ResidualDeltaExpandBatch, ResidualDeltaExpandCursor,
+    ResidualDeltaExpandPage, ResidualDeltaNode, ResidualDeltaOutput, ResidualDeltaSeed,
+    ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, Variable, VariableId, VariableSet,
 };
 use triblespace_core::trible::{Trible, TribleSet};
 
@@ -5117,6 +5117,46 @@ fn positive_transition_frontiers_page_by_automaton_branch_and_value() {
     expected.sort_unstable();
     assert_eq!(actual, expected);
     assert!(outputs.iter().all(|output| output.accepted));
+
+    let nodes = [node, node];
+    let cursors = [ResidualDeltaExpandCursor::Start; 2];
+    let limits = [5, 6];
+    let mut pages = Vec::new();
+    let mut tagged = Vec::new();
+    path.residual_delta_expand_pages(
+        END,
+        ResidualDeltaExpandBatch {
+            nodes: &nodes,
+            cursors: &cursors,
+            limits: &limits,
+        },
+        &mut pages,
+        &mut tagged,
+    );
+    assert_eq!(
+        pages,
+        vec![
+            Some(ResidualDeltaExpandPage {
+                next: None,
+                examined: 5,
+            });
+            2
+        ],
+        "the counted multi-row frontier is terminal"
+    );
+    assert_eq!(
+        tagged.iter().map(|(row, _)| *row).collect::<Vec<_>>(),
+        [vec![0; 5], vec![1; 5]].concat(),
+        "bulk traversal preserves grouped row tags"
+    );
+    let mut bulk_values: Vec<_> = tagged
+        .iter()
+        .map(|(_, output)| output.node.value)
+        .collect();
+    bulk_values.sort_unstable();
+    let mut doubled_expected = [expected.clone(), expected.clone()].concat();
+    doubled_expected.sort_unstable();
+    assert_eq!(bulk_values, doubled_expected);
 
     let inverse_attribute = other_attribute();
     graph.set.insert(&Trible::new(

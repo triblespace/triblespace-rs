@@ -1774,6 +1774,30 @@ impl RegularPathConstraint {
         }
     }
 
+    /// Returns the complete positive-branch fanout from a fresh node cursor.
+    /// Negated branches return `None`: their destination predicate makes raw
+    /// frontier size a separate concern and they retain ordinary paging.
+    fn positive_delta_fanout(&self, step: DeltaStep, source: &RawInline) -> Option<usize> {
+        match step {
+            DeltaStep::Attr(attribute) => {
+                let Some(entity) = value_as_entity(source) else {
+                    return Some(0);
+                };
+                let mut prefix = [0u8; ID_LEN * 2];
+                prefix[..ID_LEN].copy_from_slice(&entity);
+                prefix[ID_LEN..].copy_from_slice(&attribute);
+                Some(usize::try_from(self.set.eav.segmented_len(&prefix)).unwrap_or(usize::MAX))
+            }
+            DeltaStep::InverseAttr(attribute) => {
+                let mut prefix = [0u8; 32 + ID_LEN];
+                prefix[..32].copy_from_slice(source);
+                prefix[32..].copy_from_slice(&attribute);
+                Some(usize::try_from(self.set.vae.segmented_len(&prefix)).unwrap_or(usize::MAX))
+            }
+            DeltaStep::NotAttr(_) | DeltaStep::InverseNotAttr(_) => None,
+        }
+    }
+
     fn pageable_delta_value_is_included(
         &self,
         step: DeltaStep,
@@ -1846,6 +1870,7 @@ impl RegularPathConstraint {
         let begin = successors.len();
         let mut resume = cursor;
         let mut examined = 0usize;
+
         while examined < limit {
             let Some((branch, step, value, target)) =
                 self.next_pageable_delta_successor(program, node, resume)
@@ -2276,6 +2301,48 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
                 program
             }
         };
+
+        // A cohort of fresh positive frontiers whose complete fanouts fit can
+        // reuse the existing bulk transition kernel. Cached segment counts
+        // prove every page terminal before PATCH's native traversal, avoiding
+        // per-successor lower-bound descent, terminal lookahead, and one
+        // temporary successor allocation per row.
+        let mut fanouts = Vec::with_capacity(batch.nodes.len());
+        let all_fit = batch.nodes.iter().zip(batch.cursors).zip(batch.limits).all(
+            |((&node, &cursor), &limit)| {
+                if cursor != ResidualDeltaExpandCursor::Start {
+                    return false;
+                }
+                let state = program.decode(node.continuation);
+                if program.steps[state].is_empty() {
+                    return false;
+                }
+                let mut fanout = 0usize;
+                for &(step, _) in &program.steps[state] {
+                    let Some(branch_fanout) = self.positive_delta_fanout(step, &node.value) else {
+                        return false;
+                    };
+                    fanout = fanout.saturating_add(branch_fanout);
+                    if fanout > limit {
+                        return false;
+                    }
+                }
+                fanouts.push(fanout);
+                true
+            },
+        );
+        if all_fit {
+            self.expand_delta_program(program, batch.nodes, successors);
+            pages.extend(fanouts.into_iter().map(|examined| {
+                Some(ResidualDeltaExpandPage {
+                    next: None,
+                    examined,
+                })
+            }));
+            return;
+        }
+
+        let mut row_successors = Vec::new();
         for (row, ((&node, &cursor), &limit)) in batch
             .nodes
             .iter()
@@ -2283,7 +2350,7 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
             .zip(batch.limits)
             .enumerate()
         {
-            let mut row_successors = Vec::new();
+            row_successors.clear();
             let page =
                 self.expand_delta_program_page(program, node, cursor, limit, &mut row_successors);
             if page.is_none() {
@@ -2291,7 +2358,7 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
                 assert!(row_successors.is_empty());
             } else {
                 let row = u32::try_from(row).expect("too many RPQ transition pages in one cohort");
-                successors.extend(row_successors.into_iter().map(|output| (row, output)));
+                successors.extend(row_successors.drain(..).map(|output| (row, output)));
             }
             pages.push(page);
         }

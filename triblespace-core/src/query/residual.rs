@@ -1661,6 +1661,11 @@ pub struct ResidualStateStats {
     /// stable continuation, and therefore widened the global cold-harvest
     /// demand.
     pub delta_transition_negative_steps: usize,
+    /// Affine cyclic activations that reached quiescence. This is the feedback
+    /// unit for geometric breadth across independent private fixpoints.
+    pub delta_activations_completed: usize,
+    /// Numeric increases of the independent quiescent-activation cohort width.
+    pub delta_activation_width_increases: usize,
     /// One-atom continuation pops used to probe a delta-to-stable handoff
     /// before returning the rest of that cohort to global cold harvesting.
     pub delta_handoff_probe_pops: usize,
@@ -6308,9 +6313,19 @@ impl ResidualStateMachine {
         self.width = next;
     }
 
+    fn increase_delta_activation_width(&mut self) {
+        if self.delta.grow_activation_width(self.growth, self.cap) {
+            self.stats.delta_activation_width_increases += 1;
+        }
+    }
+
     /// Applies geometric feedback from one delta scheduler step without
     /// confusing exact dead-page telemetry with a globally negative step.
     fn account_delta_feedback(&mut self, outcome: &DeltaStepOutcome) {
+        self.stats.delta_activations_completed += outcome.completed_activations;
+        if outcome.completed_activations > 0 && outcome.continuation.is_none() {
+            self.increase_delta_activation_width();
+        }
         if outcome.continuation.is_none() {
             self.stats.delta_source_negative_steps += usize::from(outcome.source_dead_pages > 0);
             self.stats.delta_transition_negative_steps +=
@@ -6321,10 +6336,20 @@ impl ResidualStateMachine {
         }
     }
 
-    /// Accepts a delta-to-stable handoff into the one-atom latency probe.
+    /// Accepts a delta-to-stable handoff into its geometric continuation mode.
     fn accept_delta_step(&mut self, outcome: DeltaStepOutcome) {
         self.account_delta_feedback(&outcome);
-        self.continuation = outcome.continuation.map(ActiveContinuation::probe_one);
+        self.continuation = outcome.continuation.map(|token| {
+            if outcome.completed_activations > 1 {
+                // A geometrically selected activation cohort is already the
+                // engine's chosen throughput unit. Keep its exact appended
+                // tail hot so one successful probe does not strand the other
+                // completed activations behind the delta readiness barrier.
+                ActiveContinuation::cohort(token)
+            } else {
+                ActiveContinuation::probe_one(token)
+            }
+        });
     }
 
     fn continuation_after_advanced(
@@ -6427,11 +6452,13 @@ impl ResidualStateMachine {
                 MachineStep::Stable(StepOutcome::Dead) => {
                     self.continuation = None;
                     self.increase_width();
+                    self.increase_delta_activation_width();
                 }
                 MachineStep::Stable(StepOutcome::Emit(rows)) => {
                     self.continuation = None;
                     self.stage_emit(rows);
                     self.increase_width();
+                    self.increase_delta_activation_width();
                 }
                 MachineStep::DeltaSeeded {
                     continuation,
@@ -6679,10 +6706,14 @@ impl ResidualStateMachine {
                 // been partitioned.
                 MachineStep::Stable(StepOutcome::Advanced(_)) | MachineStep::DeltaSeeded { .. } => {
                 }
-                MachineStep::Stable(StepOutcome::Dead) => self.increase_width(),
+                MachineStep::Stable(StepOutcome::Dead) => {
+                    self.increase_width();
+                    self.increase_delta_activation_width();
+                }
                 MachineStep::Stable(StepOutcome::Emit(rows)) => {
                     self.stage_emit(rows);
                     self.increase_width();
+                    self.increase_delta_activation_width();
                 }
             }
         }
@@ -14503,6 +14534,7 @@ mod tests {
             dead_pages: 2,
             source_dead_pages: 2,
             transition_dead_pages: 0,
+            completed_activations: 0,
         });
         assert_eq!(machine.width, 4);
         assert_eq!(machine.stats.delta_source_negative_steps, 0);
@@ -14512,14 +14544,39 @@ mod tests {
         );
 
         machine.accept_delta_step(DeltaStepOutcome {
+            continuation: Some(token),
+            dead_pages: 0,
+            source_dead_pages: 0,
+            transition_dead_pages: 0,
+            completed_activations: 2,
+        });
+        assert_eq!(
+            machine.continuation,
+            Some(ActiveContinuation::cohort(token))
+        );
+
+        machine.accept_delta_step(DeltaStepOutcome {
             continuation: None,
             dead_pages: 2,
             source_dead_pages: 2,
             transition_dead_pages: 0,
+            completed_activations: 0,
         });
         assert_eq!(machine.width, 8);
         assert_eq!(machine.stats.delta_source_negative_steps, 1);
         assert!(machine.continuation.is_none());
+
+        machine.accept_delta_step(DeltaStepOutcome {
+            continuation: None,
+            dead_pages: 0,
+            source_dead_pages: 0,
+            transition_dead_pages: 0,
+            completed_activations: 1,
+        });
+        assert_eq!(machine.width, 8);
+        assert_eq!(machine.delta.activation_width(), 2);
+        assert_eq!(machine.stats.delta_activations_completed, 3);
+        assert_eq!(machine.stats.delta_activation_width_increases, 1);
     }
 
     #[test]
