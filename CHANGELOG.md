@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SuccinctArchive preserves equality for repeated pattern variables.**
+  Triple patterns that reuse one unbound variable across E/V, E/A, A/V, or
+  all three positions now estimate, propose, and confirm through exact Ring
+  membership filters instead of reaching an unreachable distinct-position
+  dispatch. The existing non-paged fallback remains intact.
 - **Succinct shard unions page one globally normalized source.** `UnionArchive`
   now merges one ordered head per shard behind a single activation-local
   `After(value)` cursor, preserving cross-shard deduplication without

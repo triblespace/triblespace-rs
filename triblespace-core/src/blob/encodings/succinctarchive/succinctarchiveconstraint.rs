@@ -2,6 +2,7 @@ use std::ops::Not;
 use std::ops::Range;
 
 use super::*;
+use crate::id::id_from_value;
 use crate::inline::encodings::genid::GenId;
 use crate::query::*;
 use jerky::bit_vector::Select;
@@ -184,6 +185,11 @@ impl Positions {
     #[inline]
     fn v<'r>(&'r self, row: &'r [RawInline]) -> Option<&'r RawInline> {
         self.pv.as_ref().map(|s| s.get(row))
+    }
+
+    #[inline]
+    fn target_count(&self) -> usize {
+        usize::from(self.e_var) + usize::from(self.a_var) + usize::from(self.v_var)
     }
 }
 
@@ -380,10 +386,110 @@ where
         }
     }
 
+    /// Exact E/A/V membership in the Ring. Entity and attribute positions
+    /// must use the canonical GenId inline representation; the value remains
+    /// an arbitrary raw inline.
+    fn contains_trible(
+        &self,
+        entity: &RawInline,
+        attribute: &RawInline,
+        value: &RawInline,
+    ) -> bool {
+        if id_from_value(entity).is_none() || id_from_value(attribute).is_none() {
+            return false;
+        }
+        let entity_range = base_range(&self.archive.domain, &self.archive.e_a, entity);
+        let attribute_range = restrict_range(
+            &self.archive.domain,
+            &self.archive.a_a,
+            &self.archive.eva_c,
+            attribute,
+            &entity_range,
+        );
+        restrict_len(
+            &self.archive.domain,
+            &self.archive.aev_c,
+            value,
+            &attribute_range,
+        ) != 0
+    }
+
+    /// Tests one candidate when the queried variable occupies two or three
+    /// trible positions. The remaining position may be bound/constant or
+    /// unbound; in the latter case the test is existential over that axis.
+    fn repeated_value_matches(&self, p: &Positions, row: &[RawInline], value: &RawInline) -> bool {
+        if id_from_value(value).is_none() {
+            return false;
+        }
+
+        match (p.e_var, p.a_var, p.v_var) {
+            (true, false, true) => match p.a(row) {
+                Some(attribute) => self.contains_trible(value, attribute, value),
+                None => {
+                    // exists a . (value, a, value)
+                    let range = base_range(&self.archive.domain, &self.archive.e_a, value);
+                    restrict_len(&self.archive.domain, &self.archive.eav_c, value, &range) != 0
+                }
+            },
+            (true, true, false) => match p.v(row) {
+                Some(bound_value) => self.contains_trible(value, value, bound_value),
+                None => {
+                    // exists v . (value, value, v)
+                    let range = base_range(&self.archive.domain, &self.archive.e_a, value);
+                    restrict_len(&self.archive.domain, &self.archive.eva_c, value, &range) != 0
+                }
+            },
+            (false, true, true) => match p.e(row) {
+                Some(entity) => self.contains_trible(entity, value, value),
+                None => {
+                    // exists e . (e, value, value)
+                    let range = base_range(&self.archive.domain, &self.archive.a_a, value);
+                    restrict_len(&self.archive.domain, &self.archive.aev_c, value, &range) != 0
+                }
+            },
+            (true, true, true) => self.contains_trible(value, value, value),
+            _ => unreachable!("a repeated target occupies two or three trible positions"),
+        }
+    }
+
+    /// Conservative candidate upper bound for a repeated-position target.
+    /// These mirror TribleSet's covering-index estimates; proposal performs
+    /// the exact equality test.
+    fn repeated_estimate_row(&self, p: &Positions, row: &[RawInline]) -> usize {
+        match (p.e_var, p.a_var, p.v_var) {
+            (true, false, true) => match p.a(row) {
+                Some(attribute) => {
+                    let range = base_range(&self.archive.domain, &self.archive.a_a, attribute);
+                    self.archive.distinct_in(&self.archive.changed_a_e, &range)
+                }
+                None => self.archive.entity_count,
+            },
+            (true, true, false) => match p.v(row) {
+                Some(value) => {
+                    let range = base_range(&self.archive.domain, &self.archive.v_a, value);
+                    self.archive.distinct_in(&self.archive.changed_v_a, &range)
+                }
+                None => self.archive.attribute_count,
+            },
+            (false, true, true) => match p.e(row) {
+                Some(entity) => {
+                    let range = base_range(&self.archive.domain, &self.archive.e_a, entity);
+                    self.archive.distinct_in(&self.archive.changed_e_a, &range)
+                }
+                None => self.archive.attribute_count,
+            },
+            (true, true, true) => self.archive.entity_count,
+            _ => unreachable!("a repeated target occupies two or three trible positions"),
+        }
+    }
+
     /// Candidate count for one row: `distinct_in` bitvector ranks for the
     /// one-bound arms, `restrict_len` wavelet ranks for the two-bound
     /// arms.
     fn estimate_row(&self, p: &Positions, row: &[RawInline]) -> usize {
+        if p.target_count() > 1 {
+            return self.repeated_estimate_row(p, row);
+        }
         let Positions {
             e_var,
             a_var,
@@ -444,6 +550,22 @@ where
     /// monomorphized `push`; the sink dispatch happens once per protocol
     /// call in [`Constraint::propose`].
     fn propose_row<F: FnMut(RawInline)>(&self, p: &Positions, row: &[RawInline], push: &mut F) {
+        if p.target_count() > 1 {
+            // E=V, E=A, and E=A=V all have to occur on the entity axis;
+            // A=V uses the attribute axis. Each top-level prefix iterator is
+            // already raw-inline sorted and distinct, so filtering preserves
+            // the ordinary proposal contract without a seen set.
+            let prefix = if p.e_var {
+                &self.archive.e_a
+            } else {
+                &self.archive.a_a
+            };
+            self.archive
+                .enumerate_domain(prefix)
+                .filter(|value| self.repeated_value_matches(p, row, value))
+                .for_each(push);
+            return;
+        }
         let Positions {
             e_var,
             a_var,
@@ -848,6 +970,12 @@ where
         }
 
         let p = self.positions(variable, view);
+        if p.target_count() > 1 {
+            candidates.retain(|row_idx, value| {
+                self.repeated_value_matches(&p, view.row(row_idx as usize), value)
+            });
+            return;
+        }
         let archive = self.archive;
         type RangeFn<'f> = Box<dyn Fn(&[RawInline]) -> Range<usize> + 'f>;
         let (rotation, range_fn): (SuccinctRotation, RangeFn<'_>) =
