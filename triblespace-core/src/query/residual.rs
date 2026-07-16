@@ -5412,6 +5412,118 @@ pub(super) struct ResidualQueryState {
     machine: ResidualStateMachine,
 }
 
+/// One canonical row used to enter a private residual frame with local
+/// variables already bound.
+///
+/// Values are stored in ascending [`VariableId`] order, exactly like every
+/// other residual-state row. The frame owns a separate plan and interner, so
+/// these local variable numbers never enter the caller's variable namespace.
+pub(super) struct FrameSeedRow {
+    bound: VariableSet,
+    values: Vec<RawInline>,
+}
+
+impl FrameSeedRow {
+    /// The ordinary empty binding, represented as one virtual zero-width row.
+    pub(super) fn empty() -> Self {
+        Self {
+            bound: VariableSet::new_empty(),
+            values: Vec::new(),
+        }
+    }
+
+    /// A one-column seed for a captured caller value.
+    pub(super) fn one(variable: VariableId, value: RawInline) -> Self {
+        Self {
+            bound: VariableSet::new_singleton(variable),
+            values: vec![value],
+        }
+    }
+}
+
+/// Private, synchronously executed residual submachine.
+///
+/// The owning value is the frame-plan namespace: its local [`StateDesc`] ranks
+/// are never compared with an outer query's ranks. This is intentionally an
+/// internal bridge for nested constraint helpers, not cross-plan worklist
+/// cohosting.
+pub(super) struct SeededResidualFrame<C> {
+    root: C,
+    plan: ResidualPlan,
+    machine: ResidualStateMachine,
+    influences: [VariableSet; 128],
+    base_estimates: [usize; 128],
+}
+
+impl<'a, C> SeededResidualFrame<C>
+where
+    C: Constraint<'a> + 'a,
+{
+    pub(super) fn new(root: C, seed: FrameSeedRow, lowering: ResidualLowering) -> Self {
+        let full = root.variables();
+        assert!(
+            seed.bound.is_subset_of(&full),
+            "residual frame seed binds a variable outside its local plan"
+        );
+        assert_eq!(
+            seed.values.len(),
+            seed.bound.count(),
+            "residual frame seed storage disagrees with its bound schema"
+        );
+
+        let variables: Vec<_> = seed.bound.into_iter().collect();
+        let seed_view = RowsView::new_with_row_count(&variables, &seed.values, 1);
+        let mode = if root.satisfied(&seed_view) {
+            Search::NextVariable
+        } else {
+            Search::Done
+        };
+
+        let influences = std::array::from_fn(|variable| {
+            if full.is_set(variable) {
+                root.influence(variable)
+            } else {
+                VariableSet::new_empty()
+            }
+        });
+        let base_estimates = std::array::from_fn(|variable| {
+            if !full.is_set(variable) {
+                return usize::MAX;
+            }
+            let mut estimate = 0usize;
+            assert!(
+                root.estimate(
+                    variable,
+                    &RowsView::EMPTY,
+                    &mut EstimateSink::Scalar(&mut estimate),
+                ),
+                "unconstrained variable in residual frame"
+            );
+            estimate
+        });
+
+        let plan = ResidualPlan::compile_lowering(&root, lowering);
+        let machine = ResidualStateMachine::new_seeded_for_plan(full, &plan, mode, seed);
+        Self {
+            root,
+            plan,
+            machine,
+            influences,
+            base_estimates,
+        }
+    }
+
+    pub(super) fn next_binding(&mut self) -> Option<Binding> {
+        self.machine.pull(
+            &self.root,
+            &self.plan,
+            &|binding| Some(binding.clone()),
+            &self.influences,
+            &self.base_estimates,
+        )
+    }
+}
+
 impl ResidualQueryState {
     pub(super) fn new<'a>(
         root: &dyn Constraint<'a>,
@@ -5445,14 +5557,34 @@ impl ResidualStateMachine {
     }
 
     fn new_for_plan(full: VariableSet, plan: &ResidualPlan, mode: Search) -> Self {
-        Self::new_with_span(full, plan.len(), plan.action_span(), mode)
+        Self::new_seeded_for_plan(full, plan, mode, FrameSeedRow::empty())
     }
 
+    fn new_seeded_for_plan(
+        full: VariableSet,
+        plan: &ResidualPlan,
+        mode: Search,
+        seed: FrameSeedRow,
+    ) -> Self {
+        Self::new_with_span_and_seed(full, plan.len(), plan.action_span(), mode, seed)
+    }
+
+    #[cfg(test)]
     fn new_with_span(
         full: VariableSet,
         leaf_count: usize,
         action_span: usize,
         mode: Search,
+    ) -> Self {
+        Self::new_with_span_and_seed(full, leaf_count, action_span, mode, FrameSeedRow::empty())
+    }
+
+    fn new_with_span_and_seed(
+        full: VariableSet,
+        leaf_count: usize,
+        action_span: usize,
+        mode: Search,
+        seed: FrameSeedRow,
     ) -> Self {
         let cap = block_row_cap();
         let mut state = Self {
@@ -5486,10 +5618,13 @@ impl ResidualStateMachine {
                 action_span,
                 None,
                 StateDesc {
-                    bound: VariableSet::new_empty(),
+                    bound: seed.bound,
                     phase: ResidualPhase::Ready,
                 },
-                StateBucket::Rows(RowBatch::seed()),
+                StateBucket::Rows(RowBatch {
+                    rows: seed.values,
+                    row_count: 1,
+                }),
                 &mut state.stats,
             );
         }
@@ -7477,6 +7612,8 @@ mod parallel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inline::encodings::genid::GenId;
+    use crate::inline::Inline;
     use crate::query::intersectionconstraint::IntersectionConstraint;
     use crate::query::unionconstraint::UnionConstraint;
     #[cfg(feature = "parallel")]
@@ -7930,6 +8067,92 @@ mod tests {
         fn satisfied(&self, _view: &RowsView<'_>) -> bool {
             self.0
         }
+    }
+
+    #[test]
+    fn private_seeded_frame_settles_fully_bound_truth_before_filing() {
+        let mut live = SeededResidualFrame::new(
+            ZeroVariableTruth(true),
+            FrameSeedRow::empty(),
+            ResidualLowering::FULL,
+        );
+        let first = live
+            .next_binding()
+            .expect("a true zero-variable seed emits once");
+        assert!(first.bound.is_empty());
+        assert!(live.next_binding().is_none());
+
+        let mut dead = SeededResidualFrame::new(
+            ZeroVariableTruth(false),
+            FrameSeedRow::empty(),
+            ResidualLowering::FULL,
+        );
+        assert!(dead.next_binding().is_none());
+        assert!(dead.machine.worklist.is_empty());
+        assert!(dead.machine.delta.is_empty());
+
+        let mut context = VariableContext::new();
+        let variable = context.next_variable::<GenId>();
+        let accepted = [3; 32];
+        let mut accepted_seed = SeededResidualFrame::new(
+            variable.is(Inline::new(accepted)),
+            FrameSeedRow::one(variable.index, accepted),
+            ResidualLowering::FULL,
+        );
+        assert_eq!(
+            accepted_seed
+                .next_binding()
+                .expect("a satisfied fully bound seed emits once")
+                .get(variable.index),
+            Some(&accepted),
+        );
+        assert!(accepted_seed.next_binding().is_none());
+
+        let mut rejected_seed = SeededResidualFrame::new(
+            variable.is(Inline::new(accepted)),
+            FrameSeedRow::one(variable.index, [4; 32]),
+            ResidualLowering::FULL,
+        );
+        assert!(rejected_seed.next_binding().is_none());
+        assert!(rejected_seed.machine.worklist.is_empty());
+        assert!(rejected_seed.machine.delta.is_empty());
+    }
+
+    #[test]
+    fn private_seeded_frame_starts_at_its_local_bound_rank() {
+        let value = [7; 32];
+        let mut frame = SeededResidualFrame::new(
+            FanoutLeaf {
+                variable: 0,
+                values: Arc::new(vec![[9; 32]]),
+            },
+            FrameSeedRow::one(0, value),
+            ResidualLowering::FULL,
+        );
+
+        let (&rank, level) = frame
+            .machine
+            .worklist
+            .first_key_value()
+            .expect("the live seed is filed");
+        let (&state, _) = level.first_key_value().expect("one seed state");
+        let desc = frame.machine.interner.get(state);
+        assert_eq!(desc.bound, VariableSet::new_singleton(0));
+        assert!(matches!(desc.phase, ResidualPhase::Ready));
+        assert_eq!(
+            rank,
+            desc.rank_with_span(
+                frame.plan.len(),
+                frame.plan.action_span(),
+                Some(&frame.plan.finite_formula),
+            )
+        );
+
+        let binding = frame
+            .next_binding()
+            .expect("a fully bound true seed emits exactly once");
+        assert_eq!(binding.get(0), Some(&value));
+        assert!(frame.next_binding().is_none());
     }
 
     #[derive(Clone)]
