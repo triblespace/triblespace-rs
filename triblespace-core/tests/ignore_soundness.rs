@@ -9,6 +9,7 @@
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::iu256::U256BE;
 use triblespace_core::prelude::*;
+use triblespace_core::query::residual::ResidualLowering;
 
 use std::collections::HashSet;
 
@@ -153,6 +154,61 @@ fn repeated_ignored_name_does_not_join_across_clauses() {
     let expected = sorted(vec![matching.to_inline(), mismatching.to_inline()]);
     assert_eq!(sorted(query!().collect()), expected);
     assert_eq!(sorted(query!().solve_dag()), expected);
+}
+
+/// A wildcard-scoped conjunction must prove every already-bound visible
+/// component before it can contribute another variable through a union arm.
+/// Otherwise a dead `p(x, _)` half can borrow `x` from the fallback arm and
+/// leak the unrelated `q(y, target)` half into a hybrid row.
+#[test]
+fn partially_bound_ignored_union_arm_cannot_leak_a_hybrid_row() {
+    let good_x = ufoid();
+    let pinned_x = ufoid();
+    let hidden = ufoid();
+    let target = ufoid();
+    let primary_y: Vec<_> = (0..3).map(|_| ufoid()).collect();
+    let fallback_y = ufoid();
+    let mut kb = TribleSet::new();
+    kb += entity! { &good_x @ world::p: &hidden };
+    for y in &primary_y {
+        kb += entity! { y @ world::q: &target };
+    }
+    let pinned_x = *pinned_x;
+    let target = *target;
+    let fallback_y = *fallback_y;
+
+    let query = || {
+        find!(
+            (x: Inline<GenId>, y: Inline<GenId>),
+            and!(
+                x.is(pinned_x.to_inline()),
+                or!(
+                    ignore!(
+                        (h),
+                        and!(
+                            pattern!(&kb, [{ ?x @ world::p: ?h }]),
+                            pattern!(&kb, [{ ?y @ world::q: &target }])
+                        )
+                    ),
+                    and!(
+                        x.is(pinned_x.to_inline()),
+                        y.is(fallback_y.to_inline())
+                    )
+                )
+            )
+        )
+    };
+
+    let expected = vec![(pinned_x.to_inline(), fallback_y.to_inline())];
+    assert_eq!(query().collect::<Vec<_>>(), expected);
+    assert_eq!(query().solve_dag(), expected);
+    assert_eq!(query().solve_residual_state(), expected);
+    assert_eq!(
+        query()
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .collect::<Vec<_>>(),
+        expected
+    );
 }
 
 /// An atomic pattern with a surviving `x` is not inert merely because its

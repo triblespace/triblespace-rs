@@ -95,11 +95,13 @@ search could discover failure, so [`Query::new`](triblespace::core::query::Query
 settles it with an exact `satisfied` call against the seed block.
 
 `ignore!` removes its wildcard positions from the outward variable set. When a
-union needs to gate such an arm after all surviving variables are bound, the
-wrapper replays each visible variable as a singleton `confirm` call with that
-variable temporarily omitted. This is the same filtering operation the
-historical wrapper performed during search, including for confirm-only range
-constraints. Hidden-only clauses remain inert and ignored names never become a
+union needs to gate such an arm, the wrapper replays every surviving variable
+already present in the row as a singleton `confirm` call with that variable
+temporarily omitted. Not-yet-bound positions remain wildcards. This is the
+same filtering operation the historical wrapper performed during search,
+including for confirm-only range constraints, and it lets a failed partial
+component close the arm before an unrelated component proposes the last
+variable. Hidden-only clauses remain inert and ignored names never become a
 shared existential witness.
 
 Constraints are otherwise stateless. Each method receives the current

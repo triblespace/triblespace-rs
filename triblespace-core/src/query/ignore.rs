@@ -192,36 +192,38 @@ impl<'a> Constraint<'a> for IgnoreConstraint<'a> {
                 .residual_delta_expand(variable, nodes, successors)
     }
 
-    /// Replays the historical wildcard filter once every outward variable is
-    /// bound.
+    /// Replays the historical wildcard filter for every outward variable that
+    /// is already bound.
     ///
     /// [`UnionConstraint`](super::unionconstraint::UnionConstraint) calls
     /// `satisfied` to gate an arm while proposing a variable owned by another
-    /// arm. Returning the usual optimistic `true` after all outward variables
-    /// are bound would let a dead visible arm leak candidates. To ask whether
-    /// a completed row belongs to the same relation that the old wrapper
-    /// exposed, this method removes each outward variable in turn, seeds its
-    /// actual value as a candidate, and delegates
+    /// arm. Returning the usual optimistic `true` for an already-impossible
+    /// partial row can let a dead visible component borrow another arm's
+    /// binding and leak unrelated candidates. To ask whether the bound part of
+    /// a row can still belong to the same relation that the old wrapper
+    /// exposed, this method removes each bound outward variable in turn, seeds
+    /// its actual value as a candidate, and delegates
     /// [`confirm`](Constraint::confirm). The value must survive.
     ///
     /// This replays exactly how historical `IgnoreConstraint` filtered a value
     /// proposed elsewhere, including confirm-only constraints such as
     /// [`InlineRange`](super::rangeconstraint::InlineRange). Checking every
-    /// visible variable makes the answer independent of binding order and
-    /// validates every visible-bearing child. Ignored variables are never
-    /// added to the replay view: it is rebuilt strictly from the other outward
+    /// bound visible variable makes the answer independent of binding order
+    /// and validates every visible-bearing child that can already prove
+    /// failure. Ignored and not-yet-bound variables are never added to the
+    /// replay view: it is rebuilt strictly from the other bound outward
     /// variables, rather than inheriting arbitrary columns from the caller.
     /// Hidden-only children therefore remain inert and even a manually reused
-    /// variable ID cannot turn an ignored name into a shared witness. With no
-    /// outward variables the check is vacuously true.
+    /// variable ID cannot turn an ignored name into a shared witness.
     ///
-    /// While any outward variable is unbound the answer remains the
-    /// optimistic `true` permitted by the protocol.
+    /// An unbound outward variable remains a wildcard in each replay. With no
+    /// bound outward variables the check is vacuously true.
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
-        let visible: Vec<VariableId> = self.variables().into_iter().collect();
-        if visible.iter().any(|&v| view.col(v).is_none()) {
-            return true;
-        }
+        let visible: Vec<VariableId> = self
+            .variables()
+            .into_iter()
+            .filter(|&variable| view.col(variable).is_some())
+            .collect();
 
         let mut replay_vars = Vec::with_capacity(visible.len().saturating_sub(1));
         let mut replay_values = Vec::with_capacity(visible.len().saturating_sub(1));
@@ -231,7 +233,7 @@ impl<'a> Constraint<'a> for IgnoreConstraint<'a> {
             for &variable in &visible {
                 let actual = row[view
                     .col(variable)
-                    .expect("all outward Ignore variables were checked as bound")];
+                    .expect("the replay variable was collected as bound")];
 
                 replay_vars.clear();
                 replay_values.clear();
@@ -241,7 +243,7 @@ impl<'a> Constraint<'a> for IgnoreConstraint<'a> {
                         replay_values.push(
                             row[view
                                 .col(bound)
-                                .expect("all outward Ignore variables were checked as bound")],
+                                .expect("the replay variable was collected as bound")],
                         );
                     }
                 }
