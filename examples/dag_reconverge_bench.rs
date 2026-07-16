@@ -31,6 +31,9 @@
 //!     # Repeat only the controlled GPU matrix after the archive is built:
 //!     TRIBLES_WGPU_ONLY=1 cargo run --release --features gpu \
 //!         --example dag_reconverge_bench -- 2048 16 8
+//!     # Run only the exact ordinary oracle and latency ladder on both backends:
+//!     TRIBLES_ORDINARY_ONLY=1 cargo run --release \
+//!         --example dag_reconverge_bench -- 2048 16 8
 //!
 //! Runs sequential / ordinary parallel-scalar / explicit parallel-DAG /
 //! explicit parallel residual-state /
@@ -490,9 +493,13 @@ fn bench_backend<S: TriblePattern>(
     markers: (Id, Id, Id, Id, Id),
     expected_rows: &[QueryRow],
     reps: usize,
+    ordinary_only: bool,
 ) {
     check_ordinary_oracle(label, kb, markers, expected_rows);
     bench_ordinary(kb, markers, expected_rows, reps);
+    if ordinary_only {
+        return;
+    }
     let expected = expected_rows.len();
 
     let mut modes = vec![("seq", Mode::Seq)];
@@ -933,8 +940,9 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
     assert!(reps > 0, "reps must be at least one");
+    let ordinary_only = std::env::var("TRIBLES_ORDINARY_ONLY").as_deref() == Ok("1");
     #[cfg(feature = "gpu")]
-    let controlled_gpu_only = std::env::var_os("TRIBLES_WGPU_ONLY").is_some();
+    let controlled_gpu_only = std::env::var_os("TRIBLES_WGPU_ONLY").is_some() && !ordinary_only;
     #[cfg(not(feature = "gpu"))]
     let controlled_gpu_only = false;
 
@@ -942,6 +950,9 @@ fn main() {
         "revision: {ENGINE_REVISION}; block row cap: {}",
         triblespace::core::query::block_row_cap()
     );
+    if ordinary_only {
+        println!("ordinary-only mode: enabled");
+    }
     #[cfg(feature = "parallel")]
     eprintln!("Rayon worker threads: {}", rayon::current_num_threads());
 
@@ -957,7 +968,14 @@ fn main() {
 
     if !controlled_gpu_only {
         println!("\n== TribleSet backend (default blocked delegation) ==");
-        bench_backend("reconverge 24-route", &kb, markers, &expected_rows, reps);
+        bench_backend(
+            "reconverge 24-route",
+            &kb,
+            markers,
+            &expected_rows,
+            reps,
+            ordinary_only,
+        );
     }
 
     let t0 = Instant::now();
@@ -972,11 +990,14 @@ fn main() {
             markers,
             &expected_rows,
             reps,
+            ordinary_only,
         );
     }
 
     #[cfg(feature = "gpu")]
     {
-        bench_wgpu_backend(&archive, markers, expected, reps);
+        if !ordinary_only {
+            bench_wgpu_backend(&archive, markers, expected, reps);
+        }
     }
 }
