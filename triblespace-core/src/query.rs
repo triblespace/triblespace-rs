@@ -740,6 +740,14 @@ pub enum ConstraintShape<'s, 'a> {
     Opaque,
     /// An associative logical conjunction whose children may be inspected.
     And(&'s dyn ConstraintChildren<'a>),
+    /// A conjunction behind a semantic scope boundary.
+    ///
+    /// Shape-aware engines may descend into the children for `estimate`,
+    /// `propose`, and `confirm`, but must execute `satisfied` and residual
+    /// Support on the owning constraint as one atomic action. This lets a
+    /// wrapper expose candidate-stage homomorphism without losing its outward
+    /// schema or support semantics.
+    ScopedAnd(&'s dyn ConstraintChildren<'a>),
 }
 
 /// One engine-owned node in a residual transition program.
@@ -1102,13 +1110,16 @@ pub trait Constraint<'a> {
     ///
     /// The default keeps the constraint opaque. Implementations must expose
     /// only structure whose flattening preserves the ordinary protocol's
-    /// semantics; wrappers that change scope, multiplicity, or evaluation
-    /// meaning should retain the default. The exposed shape must be a finite,
-    /// acyclic tree. Its variants, child counts, and child order are structural
-    /// facts and MUST remain stable for the entire query execution. A
-    /// path-based engine may resolve the plan repeatedly, so changing shape
-    /// through interior mutability can silently select a different constraint
-    /// occurrence even when every individual borrow is memory-safe.
+    /// semantics. Wrappers that change scope, multiplicity, or evaluation
+    /// meaning should retain the default unless only their candidate verbs
+    /// distribute over an inner conjunction, in which case
+    /// [`ScopedAnd`](ConstraintShape::ScopedAnd) preserves their atomic Support
+    /// boundary. The exposed shape must be a finite, acyclic tree. Its variants,
+    /// child counts, and child order are structural facts and MUST remain stable
+    /// for the entire query execution. A path-based engine may resolve the plan
+    /// repeatedly, so changing shape through interior mutability can silently
+    /// select a different constraint occurrence even when every individual
+    /// borrow is memory-safe.
     #[doc(hidden)]
     fn residual_shape(&self) -> ConstraintShape<'_, 'a> {
         ConstraintShape::Opaque

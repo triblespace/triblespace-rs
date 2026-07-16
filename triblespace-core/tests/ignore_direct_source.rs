@@ -1,4 +1,4 @@
-//! Direct proposal paging receipts for the opaque `ignore!` scope boundary.
+//! Direct proposal paging receipts for the scoped `ignore!` boundary.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -55,6 +55,19 @@ fn ignored_entity_source<'a>(set: &'a TribleSet, attribute: Id) -> IgnoreConstra
         VariableSet::new_singleton(hidden.index),
         Box::new(set.pattern(entity, attribute, hidden)),
     )
+}
+
+fn ignored_entity_intersection_source<'a>(
+    set: &'a TribleSet,
+    attribute: Id,
+) -> IgnoreConstraint<'a> {
+    let entity = Variable::<GenId>::new(ENTITY);
+    let hidden = Variable::<UnknownInline>::new(HIDDEN_VALUE);
+    let attribute: Inline<GenId> = attribute.to_inline();
+    let inner =
+        IntersectionConstraint::new(vec![Box::new(set.pattern(entity, attribute, hidden))
+            as Box<dyn Constraint<'a> + Send + Sync>]);
+    IgnoreConstraint::new(VariableSet::new_singleton(hidden.index), Box::new(inner))
 }
 
 fn project_entity(binding: &Binding) -> Option<RawInline> {
@@ -148,6 +161,72 @@ fn ignored_wildcard_pages_match_eager_and_all_residual_entry_paths() {
     assert_eq!(full_query.stats().delta_source_direct_candidates, set.len());
     assert_eq!(full_query.stats().delta_source_roots, 0);
     assert_eq!(full_query.stats().max_propose_candidates, 1);
+}
+
+#[test]
+fn ignored_candidate_and_exposes_its_atomic_direct_source() {
+    let attribute = id(0xef);
+    let set = relation(attribute, 1..=5);
+    let mut sequential: Vec<_> = Query::new(
+        ignored_entity_intersection_source(&set, attribute),
+        project_entity,
+    )
+    .sequential()
+    .collect();
+    let mut ordinary: Vec<_> = Query::new(
+        ignored_entity_intersection_source(&set, attribute),
+        project_entity,
+    )
+    .collect();
+    let mut dag = Query::new(
+        ignored_entity_intersection_source(&set, attribute),
+        project_entity,
+    )
+    .solve_dag();
+    let mut conservative = Query::new(
+        ignored_entity_intersection_source(&set, attribute),
+        project_entity,
+    )
+    .solve_residual_state();
+    let mut query = Query::new(
+        Arc::new(ignored_entity_intersection_source(&set, attribute)),
+        project_entity,
+    )
+    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .cap(1)
+    .start_width(1);
+    let first = query.next().expect("ignored source must produce one row");
+    let clone = query.clone();
+    let dropped = query.clone();
+    drop(dropped);
+    let mut remainder: Vec<_> = query.by_ref().collect();
+    let clone_remainder: Vec<_> = clone.collect();
+    assert_eq!(
+        remainder, clone_remainder,
+        "cloning preserves the affine tail"
+    );
+    let mut actual = vec![first];
+    actual.append(&mut remainder);
+    let mut expected: Vec<_> = Query::new(ignored_entity_source(&set, attribute), project_entity)
+        .sequential()
+        .collect();
+    for bag in [
+        &mut sequential,
+        &mut ordinary,
+        &mut dag,
+        &mut conservative,
+        &mut actual,
+        &mut expected,
+    ] {
+        bag.sort_unstable();
+    }
+    assert_eq!(sequential, expected);
+    assert_eq!(ordinary, expected);
+    assert_eq!(dag, expected);
+    assert_eq!(conservative, expected);
+    assert_eq!(actual, expected);
+    assert!(query.stats().delta_source_pages > 0);
+    assert_eq!(query.stats().delta_source_direct_candidates, set.len());
 }
 
 #[derive(Clone, Copy)]
