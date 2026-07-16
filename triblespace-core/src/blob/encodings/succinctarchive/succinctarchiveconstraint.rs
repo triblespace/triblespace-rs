@@ -227,6 +227,9 @@ fn page_indexed_distinct(
     let mut index = match cursor {
         ResidualDeltaSourceCursor::Start => 0,
         ResidualDeltaSourceCursor::After(after) => upper_bound_indexed(0, len, &after, &at),
+        ResidualDeltaSourceCursor::Offset(_) => {
+            panic!("SuccinctArchive source received an ordinal cursor")
+        }
     };
     let mut examined = 0usize;
     let mut last = None;
@@ -264,8 +267,14 @@ where
     U: Universe,
 {
     assert!(limit > 0, "residual source pages require positive demand");
-    if let ResidualDeltaSourceCursor::After(after) = cursor {
-        code_range.start = code_range.start.max(archive.domain.search_upper(&after));
+    match cursor {
+        ResidualDeltaSourceCursor::Start => {}
+        ResidualDeltaSourceCursor::After(after) => {
+            code_range.start = code_range.start.max(archive.domain.search_upper(&after));
+        }
+        ResidualDeltaSourceCursor::Offset(_) => {
+            panic!("SuccinctArchive source received an ordinal cursor")
+        }
     }
     code_range.end = code_range.end.min(archive.domain.len());
     code_range.start = code_range.start.min(code_range.end);

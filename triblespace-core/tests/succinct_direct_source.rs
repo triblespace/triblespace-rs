@@ -129,6 +129,7 @@ fn assert_pages_equal_eager<'a, C>(
                 ResidualDeltaSourceCursor::After(next),
             ) => assert!(next > previous, "{name}: cursor failed strict progress"),
             (_, ResidualDeltaSourceCursor::Start) => panic!("{name}: cursor restarted"),
+            _ => panic!("{name}: source changed cursor families"),
         }
         cursor = next;
     }
@@ -426,6 +427,7 @@ fn first_pull_is_one_direct_candidate_and_drop_cancels_the_rest() {
     assert_eq!(*pages.lock().unwrap(), vec![(1, 1, 0, 1)]);
     assert_eq!(query.stats().delta_source_pages, 1);
     assert_eq!(query.stats().delta_source_candidates_examined, 1);
+    assert_eq!(query.stats().delta_source_direct_candidates, 1);
     assert_eq!(query.stats().delta_source_roots, 0);
     drop(query);
     assert_eq!(
@@ -528,6 +530,7 @@ fn direct_sources_preserve_affine_parent_multiplicity() {
     assert_eq!(residual, sequential);
     assert_eq!(residual, expected);
     assert_eq!(residual_query.stats().delta_source_candidates_examined, 8);
+    assert_eq!(residual_query.stats().delta_source_direct_candidates, 8);
     assert_eq!(residual_query.stats().delta_source_roots, 0);
 }
 
