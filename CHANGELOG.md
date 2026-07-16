@@ -252,6 +252,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Partially bound ignored union arms cannot leak hybrid rows.**
+  `IgnoreConstraint::satisfied` now replays every outward variable already
+  present in the row, leaving only the not-yet-bound and ignored positions as
+  wildcards. A visible component that has already failed therefore closes its
+  union arm before another component proposes a value borrowed by that arm;
+  hidden-only clauses remain inert and ignored names still never join.
 - **The query-engine guide now describes the agglomerator's actual hub set.**
   Agglomeration starts from nonempty exact-choice groups and only absorbs a
   complete active group into another active target; it does not open a variable

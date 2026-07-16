@@ -287,12 +287,13 @@ appear in multiple places.
 
 There is one composition detail under `or!`: a union asks each arm whether it
 is still satisfied before that arm participates in another variable's proposal.
-Once all of an `ignore!` arm's surviving variables are bound, the wrapper
-replays each visible variable as a singleton confirmation with that variable
-temporarily omitted and requires the bound value to survive. This includes
-confirm-only filters such as ranges, prevents a dead *visible* arm from leaking
-candidates, and still leaves ignored-only clauses inert without binding a
-shared hidden witness.
+The wrapper replays each surviving variable already present in the row as a
+singleton confirmation with that variable temporarily omitted and requires the
+bound value to survive; surviving variables not yet present remain wildcards.
+This includes confirm-only filters such as ranges and prevents one failed
+visible component from borrowing bindings from another arm while an unrelated
+component proposes the last variable. Ignored-only clauses remain inert and no
+shared hidden witness is bound.
 
 ### Temporary variables (temp!)
 
