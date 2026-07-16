@@ -347,6 +347,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **RPQ transition programs quotient equivalent residual kernels.** After
+  epsilon elimination, deterministic forward-bisimulation refinement merges
+  program counters with the same accepting bit and ordered labeled future.
+  Remapping retains the first occurrence of each distinct transition and drops
+  only copies that would recreate an identical product node already rejected
+  by activation novelty. Syntactic Thompson branches therefore no longer make
+  repeated unions traverse the same graph state once per equivalent counter;
+  regular-path set semantics and first-discovery order remain unchanged.
 - **Grouped transition confirmation is a predicate of canonical bound state.**
   The former solve-wide Boolean capability is replaced by per-variable bound
   prerequisites compiled into the residual plan. Candidate pages remain

@@ -1164,7 +1164,7 @@ pub struct RegularPathConstraint {
     set: TribleSet,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DeltaStep {
     Attr(RawId),
     InverseAttr(RawId),
@@ -1225,6 +1225,87 @@ enum ResidualDeltaRoute<'p> {
 }
 
 impl DeltaProgram {
+    /// Quotients the epsilon-eliminated transition graph by forward
+    /// bisimulation.
+    ///
+    /// Thompson construction deliberately preserves syntactic branch
+    /// identity. After epsilon closure, several of those program counters can
+    /// have the same accepting bit and the same ordered labeled future. A
+    /// product-state traversal would otherwise visit every graph value once
+    /// per redundant counter. Partition refinement computes the greatest
+    /// history-independent equivalence supported by those futures. Identical
+    /// transitions created by remapping equivalent targets are retained only
+    /// at their first position: they produce the same product node in the same
+    /// order, and the activation novelty set would discard every later copy.
+    fn quotient_bisimilar_states(self) -> Self {
+        fn canonical_steps(steps: &[(DeltaStep, u32)], classes: &[u32]) -> Vec<(DeltaStep, u32)> {
+            let mut canonical = Vec::with_capacity(steps.len());
+            for &(step, target) in steps {
+                let mapped = (step, classes[target as usize]);
+                if !canonical.contains(&mapped) {
+                    canonical.push(mapped);
+                }
+            }
+            canonical
+        }
+
+        let state_count = self.steps.len();
+        debug_assert_eq!(self.accepting.len(), state_count);
+        let mut classes = vec![0u32; state_count];
+        loop {
+            let signatures: Vec<_> = (0..state_count)
+                .map(|state| {
+                    (
+                        self.accepting[state],
+                        canonical_steps(&self.steps[state], &classes),
+                    )
+                })
+                .collect();
+            let mut representatives = Vec::<usize>::new();
+            let mut refined = Vec::with_capacity(state_count);
+            for state in 0..state_count {
+                let class = representatives
+                    .iter()
+                    .position(|&representative| signatures[representative] == signatures[state])
+                    .unwrap_or_else(|| {
+                        representatives.push(state);
+                        representatives.len() - 1
+                    });
+                refined.push(u32::try_from(class).expect("RPQ delta class space exhausted"));
+            }
+            if refined == classes {
+                break;
+            }
+            classes = refined;
+        }
+
+        let class_count = classes
+            .iter()
+            .copied()
+            .max()
+            .map_or(0, |class| class as usize + 1);
+        let mut representatives = vec![usize::MAX; class_count];
+        for (state, &class) in classes.iter().enumerate() {
+            let representative = &mut representatives[class as usize];
+            if *representative == usize::MAX {
+                *representative = state;
+            }
+        }
+        let accepting = representatives
+            .iter()
+            .map(|&state| self.accepting[state])
+            .collect();
+        let steps = representatives
+            .iter()
+            .map(|&state| canonical_steps(&self.steps[state], &classes))
+            .collect();
+        Self {
+            start: classes[self.start as usize],
+            accepting,
+            steps,
+        }
+    }
+
     fn compile(expr: &PathExpr) -> Self {
         fn state(states: &mut Vec<ThompsonState>) -> u32 {
             let id = u32::try_from(states.len()).expect("RPQ delta program is too large");
@@ -1344,6 +1425,7 @@ impl DeltaProgram {
             accepting,
             steps,
         }
+        .quotient_bisimilar_states()
     }
 
     fn encode(&self, state: u32) -> u32 {
@@ -2508,6 +2590,93 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
                 .all(|row| has_path_gated(&self.set, &self.expr, &row[cs], &row[ce])),
             _ => true,
         }
+    }
+}
+
+#[cfg(test)]
+mod delta_program_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_union_quotients_equivalent_accepting_tails() {
+        let primary = [0x11; ID_LEN];
+        let secondary = [0x22; ID_LEN];
+        let program = DeltaProgram::compile(&PathExpr::Plus(Box::new(PathExpr::Union(
+            Box::new(PathExpr::Attr(primary)),
+            Box::new(PathExpr::Attr(secondary)),
+        ))));
+
+        let start = program.start as usize;
+        assert!(!program.accepting[start]);
+        assert_eq!(program.steps[start].len(), 2);
+        assert_eq!(program.steps[start][0].0, DeltaStep::Attr(primary));
+        assert_eq!(program.steps[start][1].0, DeltaStep::Attr(secondary));
+
+        let loop_state = program.steps[start][0].1;
+        assert_eq!(program.steps[start][1].1, loop_state);
+        assert_ne!(program.start, loop_state, "acceptance separates the states");
+        let loop_state = loop_state as usize;
+        assert!(program.accepting[loop_state]);
+        assert_eq!(program.steps[loop_state].len(), 2);
+        assert_eq!(
+            program.steps[loop_state][0],
+            (DeltaStep::Attr(primary), loop_state as u32)
+        );
+        assert_eq!(
+            program.steps[loop_state][1],
+            (DeltaStep::Attr(secondary), loop_state as u32)
+        );
+
+        let mut reachable = vec![false; program.steps.len()];
+        let mut pending = vec![program.start];
+        while let Some(state) = pending.pop() {
+            if std::mem::replace(&mut reachable[state as usize], true) {
+                continue;
+            }
+            pending.extend(
+                program.steps[state as usize]
+                    .iter()
+                    .map(|(_, target)| *target),
+            );
+        }
+        assert_eq!(
+            reachable.into_iter().filter(|reachable| *reachable).count(),
+            2,
+            "the repeated union needs only its start and accepting loop kernels"
+        );
+    }
+
+    #[test]
+    fn quotient_refines_recursive_futures_and_preserves_transition_order() {
+        let first = DeltaStep::Attr([0x01; ID_LEN]);
+        let second = DeltaStep::Attr([0x02; ID_LEN]);
+        let enter_first = DeltaStep::Attr([0x11; ID_LEN]);
+        let enter_second = DeltaStep::Attr([0x12; ID_LEN]);
+        let enter_reversed = DeltaStep::Attr([0x13; ID_LEN]);
+        let quotient = DeltaProgram {
+            start: 0,
+            accepting: vec![false, true, true, true],
+            steps: vec![
+                vec![(enter_first, 1), (enter_second, 2), (enter_reversed, 3)],
+                vec![(first, 1), (second, 1)],
+                vec![(first, 2), (second, 2)],
+                vec![(second, 3), (first, 3)],
+            ],
+        }
+        .quotient_bisimilar_states();
+
+        let entries = &quotient.steps[quotient.start as usize];
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].1, entries[1].1);
+        assert_ne!(entries[0].1, entries[2].1);
+        assert_eq!(
+            quotient.steps[entries[0].1 as usize],
+            vec![(first, entries[0].1), (second, entries[0].1)]
+        );
+        assert_eq!(
+            quotient.steps[entries[2].1 as usize],
+            vec![(second, entries[2].1), (first, entries[2].1)]
+        );
     }
 }
 
