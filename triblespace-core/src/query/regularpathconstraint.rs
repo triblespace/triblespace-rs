@@ -1562,6 +1562,52 @@ impl RegularPathConstraint {
         }
     }
 
+    fn has_forward_not_attr(&self, entity: &RawId, value: &RawInline, excluded: &RawId) -> bool {
+        let mut prefix = [0u8; ID_LEN + 32];
+        prefix[..ID_LEN].copy_from_slice(entity);
+        prefix[ID_LEN..].copy_from_slice(value);
+        let Some(first) =
+            self.set
+                .eva
+                .first_infix_range(&prefix, &[u8::MIN; ID_LEN], &[u8::MAX; ID_LEN])
+        else {
+            return false;
+        };
+        first != *excluded
+            || self
+                .set
+                .eva
+                .next_infix_after(&prefix, excluded, &[u8::MAX; ID_LEN])
+                .is_some()
+    }
+
+    fn has_inverse_not_attr(&self, value: &RawInline, entity: &RawId, excluded: &RawId) -> bool {
+        let mut prefix = [0u8; 32 + ID_LEN];
+        prefix[..32].copy_from_slice(value);
+        prefix[32..].copy_from_slice(entity);
+        let Some(first) =
+            self.set
+                .vea
+                .first_infix_range(&prefix, &[u8::MIN; ID_LEN], &[u8::MAX; ID_LEN])
+        else {
+            return false;
+        };
+        first != *excluded
+            || self
+                .set
+                .vea
+                .next_infix_after(&prefix, excluded, &[u8::MAX; ID_LEN])
+                .is_some()
+    }
+
+    /// Returns the next distinct destination considered by one automaton
+    /// branch without evaluating that destination's branch predicate.
+    ///
+    /// Positive steps enumerate their fixed-attribute edge directly. Negated
+    /// steps use EVA/VEA so the pageable axis is the distinct destination,
+    /// then decide `exists attribute != excluded` from its attribute suffix.
+    /// With the current single excluded attribute, that exact inner test needs
+    /// at most the first attribute and its strict successor.
     fn next_pageable_delta_value(
         &self,
         step: DeltaStep,
@@ -1574,7 +1620,7 @@ impl RegularPathConstraint {
                 let mut prefix = [0u8; ID_LEN * 2];
                 prefix[..ID_LEN].copy_from_slice(&entity);
                 prefix[ID_LEN..].copy_from_slice(&attribute);
-                match after {
+                let value = match after {
                     None => self
                         .set
                         .eav
@@ -1583,7 +1629,8 @@ impl RegularPathConstraint {
                         .set
                         .eav
                         .next_infix_after(&prefix, value, &[u8::MAX; 32]),
-                }
+                }?;
+                Some(value)
             }
             DeltaStep::InverseAttr(attribute) => {
                 let mut prefix = [0u8; 32 + ID_LEN];
@@ -1604,7 +1651,51 @@ impl RegularPathConstraint {
                 }?;
                 Some(id_into_value(&entity))
             }
-            DeltaStep::NotAttr(_) | DeltaStep::InverseNotAttr(_) => None,
+            DeltaStep::NotAttr(_) => {
+                let entity = value_as_entity(source)?;
+                let value = match after {
+                    None => self
+                        .set
+                        .eva
+                        .first_infix_range(&entity, &[u8::MIN; 32], &[u8::MAX; 32]),
+                    Some(value) => self
+                        .set
+                        .eva
+                        .next_infix_after(&entity, value, &[u8::MAX; 32]),
+                }?;
+                Some(value)
+            }
+            DeltaStep::InverseNotAttr(_) => {
+                let entity = match after {
+                    None => self.set.vea.first_infix_range(
+                        source,
+                        &[u8::MIN; ID_LEN],
+                        &[u8::MAX; ID_LEN],
+                    ),
+                    Some(value) => {
+                        let entity = value_as_entity(value)?;
+                        self.set
+                            .vea
+                            .next_infix_after(source, &entity, &[u8::MAX; ID_LEN])
+                    }
+                }?;
+                Some(id_into_value(&entity))
+            }
+        }
+    }
+
+    fn pageable_delta_value_is_included(
+        &self,
+        step: DeltaStep,
+        source: &RawInline,
+        value: &RawInline,
+    ) -> bool {
+        match step {
+            DeltaStep::Attr(_) | DeltaStep::InverseAttr(_) => true,
+            DeltaStep::NotAttr(excluded) => value_as_entity(source)
+                .is_some_and(|entity| self.has_forward_not_attr(&entity, value, &excluded)),
+            DeltaStep::InverseNotAttr(excluded) => value_as_entity(value)
+                .is_some_and(|entity| self.has_inverse_not_attr(source, &entity, &excluded)),
         }
     }
 
@@ -1613,7 +1704,7 @@ impl RegularPathConstraint {
         program: &DeltaProgram,
         node: ResidualDeltaNode,
         cursor: ResidualDeltaExpandCursor,
-    ) -> Option<(u32, RawInline, u32)> {
+    ) -> Option<(u32, DeltaStep, RawInline, u32)> {
         let state = program.decode(node.continuation);
         let steps = &program.steps[state];
         let (start_branch, after) = match cursor {
@@ -1631,6 +1722,7 @@ impl RegularPathConstraint {
             {
                 return Some((
                     u32::try_from(branch).expect("too many RPQ transition branches"),
+                    step,
                     value,
                     target,
                 ));
@@ -1652,11 +1744,7 @@ impl RegularPathConstraint {
             "residual transition pages require positive demand"
         );
         let state = program.decode(node.continuation);
-        if program.steps[state].is_empty()
-            || program.steps[state].iter().any(|(step, _)| {
-                matches!(step, DeltaStep::NotAttr(_) | DeltaStep::InverseNotAttr(_))
-            })
-        {
+        if program.steps[state].is_empty() {
             assert_eq!(
                 cursor,
                 ResidualDeltaExpandCursor::Start,
@@ -1667,24 +1755,28 @@ impl RegularPathConstraint {
 
         let begin = successors.len();
         let mut resume = cursor;
-        while successors.len() - begin < limit {
-            let Some((branch, value, target)) =
+        let mut examined = 0usize;
+        while examined < limit {
+            let Some((branch, step, value, target)) =
                 self.next_pageable_delta_successor(program, node, resume)
             else {
                 break;
             };
-            successors.push(ResidualDeltaOutput {
-                node: ResidualDeltaNode {
-                    source: node.source,
-                    value,
-                    continuation: program.encode(target),
-                },
-                accepted: program.accepting[target as usize]
-                    && node.source.is_none_or(|anchor| value == anchor),
-            });
+            examined += 1;
             resume = ResidualDeltaExpandCursor::After { branch, value };
+            if self.pageable_delta_value_is_included(step, &node.value, &value) {
+                successors.push(ResidualDeltaOutput {
+                    node: ResidualDeltaNode {
+                        source: node.source,
+                        value,
+                        continuation: program.encode(target),
+                    },
+                    accepted: program.accepting[target as usize]
+                        && node.source.is_none_or(|anchor| value == anchor),
+                });
+            }
         }
-        let examined = successors.len() - begin;
+        debug_assert!(successors.len() - begin <= examined);
         let next = (examined == limit
             && self
                 .next_pageable_delta_successor(program, node, resume)

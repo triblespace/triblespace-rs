@@ -192,14 +192,22 @@ the same low-latency-to-throughput ramp as the DAG without requiring a complete
 intersection to run eagerly for one binding.
 
 Regular-path product states apply that demand inside a node as well as across
-nodes. Positive and inverse attribute transitions expose an ordered frontier
-whose cursor is `(automaton branch, last value)`. A width-one pull can therefore
-inspect one edge of a high-degree node, file both its affine expansion
-continuation and any novel child, and descend toward a result without first
-materializing the complete adjacency. Branch-qualified cursors keep distinct
-NFA futures separate even when they produce the same graph value. Negated
-property transitions still use their eager two-level attribute/value scan;
-their exact pageable representation remains an explicit capability boundary.
+nodes. Positive, inverse, and negated attribute transitions expose an ordered
+frontier whose cursor is `(automaton branch, last value)`. A width-one pull can
+therefore inspect one distinct destination of a high-degree node, file both its
+affine expansion continuation and any novel child, and descend toward a result
+without first materializing the complete adjacency. Branch-qualified cursors
+keep distinct NFA futures separate even when they produce the same graph value.
+For `!p`, EVA pages distinct forward destinations and VEA pages distinct
+inverse subjects. The destination's attribute suffix then answers `exists a !=
+p`; because the current path algebra excludes one attribute, the exact inner
+test needs at most its first attribute and one strict successor. Destinations
+reachable only through `p` count against demand but produce no child. This
+keeps mixed positive/negated states under one global width without enlarging
+the activation-private cursor or relying on fixpoint deduplication. A
+transition page that produces no novel child, accepted endpoint, or stable
+continuation contributes negative feedback, so a rejected prefix grows from
+one to two to four destinations instead of remaining a width-one serial scan.
 An initial nullable endpoint is already recorded by the activation, but becomes
 visible when that root performs its first expansion page; publishing this
 epsilon effect before any transition lookup is a remaining latency refinement.

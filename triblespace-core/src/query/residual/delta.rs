@@ -1030,6 +1030,8 @@ struct SourceBucket {
 pub(super) struct DeltaStepOutcome {
     pub(super) continuation: Option<ContinuationToken>,
     pub(super) dead_pages: usize,
+    pub(super) source_dead_pages: usize,
+    pub(super) transition_dead_pages: usize,
 }
 
 impl DeltaBucket {
@@ -1687,6 +1689,7 @@ impl DeltaScheduler {
             tagged_ranges(&tagged_successors, task_count, "transition successor");
         let mut successors = vec![Vec::new(); task_count];
         let mut next_cursors = vec![None; task_count];
+        let mut paged = vec![false; task_count];
         let mut legacy_indices = Vec::new();
         let mut legacy_nodes = Vec::new();
         let mut paged_count = 0usize;
@@ -1735,6 +1738,7 @@ impl DeltaScheduler {
             stats.delta_transition_pages += 1;
             stats.delta_transition_candidates_examined += page.examined;
             next_cursors[index] = page.next;
+            paged[index] = true;
         }
         if paged_count > 0 {
             stats.delta_transition_cohorts += 1;
@@ -1766,6 +1770,8 @@ impl DeltaScheduler {
         let mut resumed_sources = Vec::new();
         let mut continuation = None;
         let mut dead_pages = 0usize;
+        let mut source_dead_pages = 0usize;
+        let mut transition_dead_pages = 0usize;
         for (task_index, task) in tasks.into_iter().enumerate() {
             assert_eq!(task.activation, task.credit.key.activation);
             let outcome = self.registry.replace_traversal_page(
@@ -1774,6 +1780,8 @@ impl DeltaScheduler {
                 next_cursors[task_index],
             );
             let retired_source_page = outcome.retired_source_page;
+            let transition_page_had_effect =
+                !outcome.children.is_empty() || !outcome.accepted.is_empty();
             let mut task_continuation = None;
             if let Some((cursor, credit)) = outcome.resumed_traversal {
                 next_tasks.push(DeltaTask {
@@ -1821,19 +1829,26 @@ impl DeltaScheduler {
                     Self::release_completion(completed, plan, stable, stable_interner, stats),
                 );
             }
-            if retired_source_page.is_some_and(|page| !page.had_stable_effect)
-                && task_continuation.is_none()
-            {
+            let source_page_dead = retired_source_page.is_some_and(|page| !page.had_stable_effect)
+                && task_continuation.is_none();
+            let transition_page_dead =
+                paged[task_index] && !transition_page_had_effect && task_continuation.is_none();
+            if source_page_dead || transition_page_dead {
                 dead_pages += 1;
             }
+            source_dead_pages += usize::from(source_page_dead);
+            transition_dead_pages += usize::from(transition_page_dead);
             prefer_continuation(&mut continuation, task_continuation);
         }
         self.file(desc.clone(), next_tasks);
         self.file_source(desc, resumed_sources);
-        stats.delta_source_dead_pages += dead_pages;
+        stats.delta_source_dead_pages += source_dead_pages;
+        stats.delta_transition_dead_pages += transition_dead_pages;
         DeltaStepOutcome {
             continuation,
             dead_pages,
+            source_dead_pages,
+            transition_dead_pages,
         }
     }
 
@@ -1990,6 +2005,8 @@ impl DeltaScheduler {
         DeltaStepOutcome {
             continuation,
             dead_pages,
+            source_dead_pages: dead_pages,
+            transition_dead_pages: 0,
         }
     }
 

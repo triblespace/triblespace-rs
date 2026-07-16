@@ -1589,6 +1589,9 @@ pub struct ResidualStateStats {
     pub max_delta_transition_cohort: usize,
     /// Ordered outgoing transition candidates consumed across those pages.
     pub delta_transition_candidates_examined: usize,
+    /// Transition pages that produced no novel child, accepted endpoint, or
+    /// stable continuation and therefore contributed negative-width feedback.
+    pub delta_transition_dead_pages: usize,
     /// Direct proposal candidates admitted from bounded source pages without
     /// creating product-state traversal roots.
     pub delta_source_direct_candidates: usize,
@@ -1600,6 +1603,10 @@ pub struct ResidualStateStats {
     /// Delta steps that contained at least one dead source page and no stable
     /// continuation, and therefore widened the global cold-harvest demand.
     pub delta_source_negative_steps: usize,
+    /// Delta steps that contained at least one dead transition page and no
+    /// stable continuation, and therefore widened the global cold-harvest
+    /// demand.
+    pub delta_transition_negative_steps: usize,
     /// One-atom continuation pops used to probe a delta-to-stable handoff
     /// before returning the rest of that cohort to global cold harvesting.
     pub delta_handoff_probe_pops: usize,
@@ -6106,8 +6113,12 @@ impl ResidualStateMachine {
     /// Applies geometric feedback from one delta scheduler step without
     /// confusing exact dead-page telemetry with a globally negative step.
     fn account_delta_feedback(&mut self, outcome: &DeltaStepOutcome) {
+        if outcome.continuation.is_none() {
+            self.stats.delta_source_negative_steps += usize::from(outcome.source_dead_pages > 0);
+            self.stats.delta_transition_negative_steps +=
+                usize::from(outcome.transition_dead_pages > 0);
+        }
         if outcome.dead_pages > 0 && outcome.continuation.is_none() {
-            self.stats.delta_source_negative_steps += 1;
             self.increase_width();
         }
     }
@@ -14128,6 +14139,8 @@ mod tests {
         machine.accept_delta_step(DeltaStepOutcome {
             continuation: Some(token),
             dead_pages: 2,
+            source_dead_pages: 2,
+            transition_dead_pages: 0,
         });
         assert_eq!(machine.width, 4);
         assert_eq!(machine.stats.delta_source_negative_steps, 0);
@@ -14139,6 +14152,8 @@ mod tests {
         machine.accept_delta_step(DeltaStepOutcome {
             continuation: None,
             dead_pages: 2,
+            source_dead_pages: 2,
+            transition_dead_pages: 0,
         });
         assert_eq!(machine.width, 8);
         assert_eq!(machine.stats.delta_source_negative_steps, 1);
