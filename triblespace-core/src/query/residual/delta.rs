@@ -68,6 +68,18 @@ impl DeltaDesc {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct DeltaStateId(u32);
 
+/// Physical preference for one newly filed cyclic activation.
+///
+/// The structural state remains the canonical batching key. Activation
+/// identity is deliberately payload-only: this token merely lets the outer
+/// latency scheduler follow the affine lineage it just created before cold
+/// stable work harvests a wider cohort.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ActiveDeltaContinuation {
+    state: DeltaStateId,
+    activation: ActivationId,
+}
+
 #[derive(Clone, Default)]
 struct DeltaInterner {
     by_desc: AHashMap<DeltaDesc, DeltaStateId>,
@@ -737,6 +749,10 @@ impl ProducerRegistry {
             .streams()
     }
 
+    fn is_live(&self, activation: ActivationId) -> bool {
+        self.state.activations.contains_key(&activation)
+    }
+
     /// Takes one activation-local early effect. Support mutates its reducer at
     /// this exact boundary so duplicate witnesses and later expansion cohorts
     /// cannot replay `true`.
@@ -1026,6 +1042,7 @@ struct SourceBucket {
 /// Stable progress and dead pages are deliberately independent: one batched
 /// expansion can retire an ineffective page for one activation while another
 /// activation files a stable continuation.
+#[derive(Debug)]
 pub(super) struct DeltaStepOutcome {
     pub(super) continuation: Option<ContinuationToken>,
     pub(super) dead_pages: usize,
@@ -1038,7 +1055,54 @@ pub(super) struct DeltaStepOutcome {
     pub(super) completed_transition_cohort: bool,
 }
 
+/// Result of seeding an ordinary action into the cyclic scheduler.
+///
+/// Stable seed effects and deferred traversal are independent. An accepting
+/// seed may file both at once, while an empty seed range may file neither.
+#[derive(Debug)]
+pub(super) struct DeltaSeedOutcome {
+    pub(super) continuation: Option<ContinuationToken>,
+    pub(super) active: Option<ActiveDeltaContinuation>,
+}
+
+/// Exact liveness classification after a directed cyclic step.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ActiveDeltaStatus {
+    /// The activation filed stable work; the ordinary continuation takes over.
+    Yielded,
+    /// The activation still owns a scheduled source or transition credit.
+    Pending,
+    /// The activation reached quiescence and was removed from the registry.
+    Quiescent,
+}
+
+#[derive(Debug)]
+pub(super) struct ActiveDeltaStepOutcome {
+    pub(super) outcome: DeltaStepOutcome,
+    pub(super) status: ActiveDeltaStatus,
+}
+
 impl DeltaBucket {
+    /// Removes at most `width` tasks owned by one exact activation while
+    /// preserving the relative order of both the selected and retained
+    /// subsequences.
+    fn take_activation(&mut self, activation: ActivationId, width: usize) -> Vec<DeltaTask> {
+        let width = width.max(1);
+        let mut selected = Vec::with_capacity(width.min(self.tasks.len()));
+        let mut retained = Vec::with_capacity(self.tasks.len());
+        for task in std::mem::take(&mut self.tasks).into_iter().rev() {
+            if task.activation == activation && selected.len() < width {
+                selected.push(task);
+            } else {
+                retained.push(task);
+            }
+        }
+        selected.reverse();
+        retained.reverse();
+        self.tasks = retained;
+        selected
+    }
+
     fn take_tail(
         &mut self,
         registry: &ProducerRegistry,
@@ -1076,6 +1140,29 @@ impl DeltaBucket {
             }
         }
         selected.reverse();
+        retained.reverse();
+        self.tasks = retained;
+        selected
+    }
+}
+
+impl SourceBucket {
+    /// Source credits are activation-affine just like transition credits. A
+    /// directed latency step must not absorb compatible generators from cold
+    /// sibling activations merely because they share one canonical state. The
+    /// selected tasks retain the global source pop's LIFO dispatch order;
+    /// retained cold tasks keep their storage order.
+    fn take_activation(&mut self, activation: ActivationId, width: usize) -> Vec<SourceTask> {
+        let width = width.max(1);
+        let mut selected = Vec::with_capacity(width.min(self.tasks.len()));
+        let mut retained = Vec::with_capacity(self.tasks.len());
+        for task in std::mem::take(&mut self.tasks).into_iter().rev() {
+            if task.activation == activation && selected.len() < width {
+                selected.push(task);
+            } else {
+                retained.push(task);
+            }
+        }
         retained.reverse();
         self.tasks = retained;
         selected
@@ -1134,7 +1221,7 @@ impl DeltaScheduler {
         stable: &mut Worklist,
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
-    ) -> Option<ContinuationToken> {
+    ) -> DeltaSeedOutcome {
         let ranges = seed_ranges(&seeds, parents.row_count);
         let stride = successor.bound.count();
         let mut tasks = Vec::with_capacity(seeds.len());
@@ -1181,8 +1268,11 @@ impl DeltaScheduler {
                 assert!(matches!(completed.return_to, DeltaReturn::Stable { .. }));
             }
         }
-        self.file(desc, tasks);
-        continuation
+        let active = self.file(desc, tasks);
+        DeltaSeedOutcome {
+            continuation,
+            active,
+        }
     }
 
     pub(super) fn seed_source_proposals(
@@ -1190,7 +1280,7 @@ impl DeltaScheduler {
         desc: DeltaDesc,
         successor: StateDesc,
         parents: RowBatch,
-    ) {
+    ) -> Option<ActiveDeltaContinuation> {
         let stride = successor.bound.count();
         let mut tasks = Vec::with_capacity(parents.row_count);
         for row in 0..parents.row_count {
@@ -1212,7 +1302,7 @@ impl DeltaScheduler {
                 cursor: ResidualDeltaSourceCursor::Start,
             });
         }
-        self.file_source(desc, tasks);
+        self.file_source(desc, tasks)
     }
 
     pub(super) fn seed_confirms(
@@ -1221,7 +1311,7 @@ impl DeltaScheduler {
         successor: StateDesc,
         batch: CandidateBatch,
         seeds: Vec<ResidualDeltaSeed>,
-    ) {
+    ) -> Option<ActiveDeltaContinuation> {
         let seed_ranges = seed_ranges(&seeds, batch.parents.row_count);
         let stride = successor.bound.count();
         let mut candidate_ranges = Vec::with_capacity(batch.parents.row_count);
@@ -1274,7 +1364,7 @@ impl DeltaScheduler {
                 assert!(matches!(completed.return_to, DeltaReturn::Stable { .. }));
             }
         }
-        self.file(desc, tasks);
+        self.file(desc, tasks)
     }
 
     pub(super) fn seed_source_confirms(
@@ -1282,7 +1372,7 @@ impl DeltaScheduler {
         desc: DeltaDesc,
         successor: StateDesc,
         batch: CandidateBatch,
-    ) {
+    ) -> Option<ActiveDeltaContinuation> {
         let stride = successor.bound.count();
         let mut candidate_ranges = Vec::with_capacity(batch.parents.row_count);
         let mut cursor = 0usize;
@@ -1331,7 +1421,7 @@ impl DeltaScheduler {
                 cursor: ResidualDeltaSourceCursor::Start,
             });
         }
-        self.file_source(desc, tasks);
+        self.file_source(desc, tasks)
     }
 
     /// Suspends each affine formula parent behind one activation-local reducer.
@@ -1350,7 +1440,7 @@ impl DeltaScheduler {
         stable: &mut Worklist,
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
-    ) -> Option<ContinuationToken> {
+    ) -> DeltaSeedOutcome {
         let ranges = seed_ranges(&seeds, batch.parents.row_count);
         let stage = match counter.focus {
             FormulaFocus::Action { stage, .. } => stage,
@@ -1410,7 +1500,7 @@ impl DeltaScheduler {
                 completed.push(self.registry.finish(proof));
             }
         }
-        self.file(desc, tasks);
+        let active = self.file(desc, tasks);
 
         for completed in completed {
             prefer_continuation(
@@ -1418,7 +1508,10 @@ impl DeltaScheduler {
                 Self::release_completion(completed, plan, stable, stable_interner, stats),
             );
         }
-        continuation
+        DeltaSeedOutcome {
+            continuation,
+            active,
+        }
     }
 
     /// Suspends one bounded source generator per affine formula parent. The
@@ -1431,7 +1524,7 @@ impl DeltaScheduler {
         counter: FormulaProgramCounter,
         batch: FormulaBatch,
         stream_proposal: bool,
-    ) {
+    ) -> Option<ActiveDeltaContinuation> {
         let stage = match counter.focus {
             FormulaFocus::Action { stage, .. } => stage,
             _ => panic!("delta formula seeding requires an Action PC"),
@@ -1478,7 +1571,7 @@ impl DeltaScheduler {
                 cursor: ResidualDeltaSourceCursor::Start,
             });
         }
-        self.file_source(desc, tasks);
+        self.file_source(desc, tasks)
     }
 
     fn release_completion(
@@ -1653,28 +1746,106 @@ impl DeltaScheduler {
         )
     }
 
-    fn file(&mut self, desc: DeltaDesc, mut tasks: Vec<DeltaTask>) {
-        if tasks.is_empty() {
-            return;
-        }
+    fn file(
+        &mut self,
+        desc: DeltaDesc,
+        mut tasks: Vec<DeltaTask>,
+    ) -> Option<ActiveDeltaContinuation> {
+        let activation = tasks.last()?.activation;
         let id = self.interner.intern(desc);
         self.worklist
             .entry(id)
             .or_default()
             .tasks
             .append(&mut tasks);
+        Some(ActiveDeltaContinuation {
+            state: id,
+            activation,
+        })
     }
 
-    fn file_source(&mut self, desc: DeltaDesc, mut tasks: Vec<SourceTask>) {
-        if tasks.is_empty() {
-            return;
-        }
+    fn file_source(
+        &mut self,
+        desc: DeltaDesc,
+        mut tasks: Vec<SourceTask>,
+    ) -> Option<ActiveDeltaContinuation> {
+        let activation = tasks.last()?.activation;
         let id = self.interner.intern(desc);
         self.source_worklist
             .entry(id)
             .or_default()
             .tasks
             .append(&mut tasks);
+        Some(ActiveDeltaContinuation {
+            state: id,
+            activation,
+        })
+    }
+
+    fn has_active_source(&self, active: ActiveDeltaContinuation) -> bool {
+        self.source_worklist
+            .get(&active.state)
+            .is_some_and(|bucket| {
+                bucket
+                    .tasks
+                    .iter()
+                    .any(|task| task.activation == active.activation)
+            })
+    }
+
+    fn has_active_transition(&self, active: ActiveDeltaContinuation) -> bool {
+        self.worklist.get(&active.state).is_some_and(|bucket| {
+            bucket
+                .tasks
+                .iter()
+                .any(|task| task.activation == active.activation)
+        })
+    }
+
+    fn pop_active_transition(
+        &mut self,
+        active: ActiveDeltaContinuation,
+        width: usize,
+    ) -> (DeltaDesc, Vec<DeltaTask>) {
+        let (tasks, empty) = {
+            let bucket = self
+                .worklist
+                .get_mut(&active.state)
+                .expect("active delta transition state remains live");
+            let tasks = bucket.take_activation(active.activation, width);
+            (tasks, bucket.tasks.is_empty())
+        };
+        assert!(
+            !tasks.is_empty(),
+            "active delta transition lost its affine task"
+        );
+        if empty {
+            self.worklist.remove(&active.state);
+        }
+        (self.interner.get(active.state).clone(), tasks)
+    }
+
+    fn pop_active_source(
+        &mut self,
+        active: ActiveDeltaContinuation,
+        width: usize,
+    ) -> (DeltaDesc, Vec<SourceTask>) {
+        let (tasks, empty) = {
+            let bucket = self
+                .source_worklist
+                .get_mut(&active.state)
+                .expect("active delta source state remains live");
+            let tasks = bucket.take_activation(active.activation, width);
+            (tasks, bucket.tasks.is_empty())
+        };
+        assert!(
+            !tasks.is_empty(),
+            "active delta source lost its affine task"
+        );
+        if empty {
+            self.source_worklist.remove(&active.state);
+        }
+        (self.interner.get(active.state).clone(), tasks)
     }
 
     fn pop(&mut self, width: usize) -> (DeltaDesc, Vec<DeltaTask>) {
@@ -1738,6 +1909,69 @@ impl DeltaScheduler {
         (self.interner.get(id).clone(), tasks)
     }
 
+    /// Advances only the affine activation named by a physical continuation.
+    ///
+    /// A suspended source generator wins over unrelated transition work. At
+    /// scheduler boundaries one activation cannot own both kinds at once, but
+    /// checking source first makes the intended source -> transition -> source
+    /// cycle explicit and prevents a cold global bucket from preempting it.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn step_active<'a>(
+        &mut self,
+        root: &dyn Constraint<'a>,
+        plan: &ResidualPlan,
+        active: ActiveDeltaContinuation,
+        width: usize,
+        stable: &mut Worklist,
+        stable_interner: &mut StateInterner,
+        stats: &mut ResidualStateStats,
+    ) -> ActiveDeltaStepOutcome {
+        let has_source = self.has_active_source(active);
+        let has_transition = self.has_active_transition(active);
+        assert!(
+            has_source || has_transition,
+            "active delta continuation has no scheduled affine task"
+        );
+        debug_assert!(
+            !(has_source && has_transition),
+            "one delta activation owns source and transition credits simultaneously"
+        );
+
+        let outcome = if has_source {
+            let (desc, tasks) = self.pop_active_source(active, width);
+            self.step_sources(
+                root,
+                plan,
+                desc,
+                tasks,
+                width.max(1),
+                stable,
+                stable_interner,
+                stats,
+            )
+        } else {
+            let (desc, tasks) = self.pop_active_transition(active, width);
+            self.step_transitions(
+                root,
+                plan,
+                desc,
+                tasks,
+                width,
+                stable,
+                stable_interner,
+                stats,
+            )
+        };
+        let status = if outcome.continuation.is_some() {
+            ActiveDeltaStatus::Yielded
+        } else if self.registry.is_live(active.activation) {
+            ActiveDeltaStatus::Pending
+        } else {
+            ActiveDeltaStatus::Quiescent
+        };
+        ActiveDeltaStepOutcome { outcome, status }
+    }
+
     /// Executes one structural product-state cohort and files accepted
     /// proposal endpoints or quiescent confirmation reductions back into the
     /// ordinary acyclic Candidate continuation.
@@ -1755,6 +1989,30 @@ impl DeltaScheduler {
         }
 
         let (desc, tasks) = self.pop(width);
+        self.step_transitions(
+            root,
+            plan,
+            desc,
+            tasks,
+            width,
+            stable,
+            stable_interner,
+            stats,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn step_transitions<'a>(
+        &mut self,
+        root: &dyn Constraint<'a>,
+        plan: &ResidualPlan,
+        desc: DeltaDesc,
+        tasks: Vec<DeltaTask>,
+        width: usize,
+        stable: &mut Worklist,
+        stable_interner: &mut StateInterner,
+        stats: &mut ResidualStateStats,
+    ) -> DeltaStepOutcome {
         let constraint = desc.resolve(root, plan);
         let task_count = tasks.len();
         let page_budget = width.max(1);
@@ -1954,8 +2212,8 @@ impl DeltaScheduler {
             transition_dead_pages += usize::from(transition_page_dead);
             prefer_continuation(&mut continuation, task_continuation);
         }
-        self.file(desc.clone(), next_tasks);
-        self.file_source(desc, resumed_sources);
+        let _ = self.file(desc.clone(), next_tasks);
+        let _ = self.file_source(desc, resumed_sources);
         stats.delta_source_dead_pages += source_dead_pages;
         stats.delta_transition_dead_pages += transition_dead_pages;
         DeltaStepOutcome {
@@ -1980,6 +2238,30 @@ impl DeltaScheduler {
     ) -> DeltaStepOutcome {
         let budget = width.max(1);
         let (desc, tasks) = self.pop_source(budget);
+        self.step_sources(
+            root,
+            plan,
+            desc,
+            tasks,
+            budget,
+            stable,
+            stable_interner,
+            stats,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn step_sources<'a>(
+        &mut self,
+        root: &dyn Constraint<'a>,
+        plan: &ResidualPlan,
+        desc: DeltaDesc,
+        tasks: Vec<SourceTask>,
+        budget: usize,
+        stable: &mut Worklist,
+        stable_interner: &mut StateInterner,
+        stats: &mut ResidualStateStats,
+    ) -> DeltaStepOutcome {
         assert!(!tasks.is_empty());
         assert!(tasks.len() <= budget);
         let dispatch_key = SourceDispatchKey::of(&self.registry, &tasks[0]);
@@ -2117,8 +2399,8 @@ impl DeltaScheduler {
             }
             prefer_continuation(&mut continuation, task_continuation);
         }
-        self.file(desc.clone(), traversal);
-        self.file_source(desc, resumed_sources);
+        let _ = self.file(desc.clone(), traversal);
+        let _ = self.file_source(desc, resumed_sources);
         stats.delta_source_dead_pages += dead_pages;
         DeltaStepOutcome {
             continuation,
@@ -2436,6 +2718,87 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct SourceTransitionCycle;
+
+    impl Constraint<'static> for SourceTransitionCycle {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(0)
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != 0 {
+                return false;
+            }
+            out.fill(1, view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn residual_delta_source_pages(
+            &self,
+            variable: VariableId,
+            batch: ResidualDeltaSourceBatch<'_>,
+            pages: &mut Vec<ResidualDeltaSourcePage>,
+            roots: &mut Vec<(u32, ResidualDeltaOutput)>,
+            accepted: &mut Vec<(u32, RawInline)>,
+        ) -> bool {
+            assert_eq!(variable, 0);
+            assert!(pages.is_empty());
+            assert!(roots.is_empty());
+            assert!(accepted.is_empty());
+            for (row, cursor) in batch.cursors.iter().copied().enumerate() {
+                let row = u32::try_from(row).expect("too many cycle rows");
+                match cursor {
+                    ResidualDeltaSourceCursor::Start => {
+                        roots.push((row, output(1, 0, false)));
+                        pages.push(ResidualDeltaSourcePage {
+                            next: Some(ResidualDeltaSourceCursor::Offset(1)),
+                            examined: 1,
+                        });
+                    }
+                    ResidualDeltaSourceCursor::Offset(1) => {
+                        pages.push(ResidualDeltaSourcePage {
+                            next: None,
+                            examined: 0,
+                        });
+                    }
+                    _ => panic!("cycle source received an unexpected cursor"),
+                }
+            }
+            true
+        }
+
+        fn residual_delta_expand(
+            &self,
+            _variable: VariableId,
+            _nodes: &[ResidualDeltaNode],
+            _successors: &mut Vec<(u32, ResidualDeltaOutput)>,
+        ) -> bool {
+            true
+        }
+    }
+
     fn value(byte: u8) -> RawInline {
         [byte; 32]
     }
@@ -2685,7 +3048,7 @@ mod tests {
         let second_activation = second.activation;
         let (second_node, second_credit) = second.roots.remove(0);
 
-        scheduler.file(
+        let _ = scheduler.file(
             desc,
             vec![
                 DeltaTask {
@@ -2727,6 +3090,283 @@ mod tests {
     }
 
     #[test]
+    fn active_transition_pop_is_exact_and_preserves_global_task_order() {
+        let mut scheduler = DeltaScheduler::new();
+        let desc = DeltaDesc::leaf(0, 0);
+        let mut first = scheduler.registry.start_many(
+            DeltaReducer::QuiescentProposal,
+            candidate_return(Vec::new()),
+            [
+                output(1, 0, false),
+                output(2, 0, false),
+                output(3, 0, false),
+            ],
+        );
+        let first_activation = first.activation;
+        let mut second = scheduler.registry.start_many(
+            DeltaReducer::QuiescentProposal,
+            candidate_return(Vec::new()),
+            [output(4, 0, false), output(5, 0, false)],
+        );
+        let second_activation = second.activation;
+        let task = |started: &mut StartOutcome| {
+            let (node, credit) = started.roots.remove(0);
+            DeltaTask {
+                activation: started.activation,
+                credit,
+                node,
+                cursor: ResidualDeltaExpandCursor::Start,
+            }
+        };
+        let tasks = vec![
+            task(&mut first),
+            task(&mut second),
+            task(&mut first),
+            task(&mut second),
+            task(&mut first),
+        ];
+        let active = scheduler
+            .file(desc.clone(), tasks)
+            .expect("the interleaved bucket is live");
+        assert_eq!(active.activation, first_activation);
+        assert_eq!(scheduler.interner.get(active.state), &desc);
+        assert!(scheduler.file(desc, Vec::new()).is_none());
+        assert_eq!(scheduler.interner.descs.len(), 1);
+
+        let (_, selected) = scheduler.pop_active_transition(active, 2);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|task| (task.activation, task.node.value))
+                .collect::<Vec<_>>(),
+            [(first_activation, value(2)), (first_activation, value(3))]
+        );
+        let retained = &scheduler
+            .worklist
+            .get(&active.state)
+            .expect("cold tasks remain")
+            .tasks;
+        assert_eq!(
+            retained
+                .iter()
+                .map(|task| (task.activation, task.node.value))
+                .collect::<Vec<_>>(),
+            [
+                (first_activation, value(1)),
+                (second_activation, value(4)),
+                (second_activation, value(5)),
+            ]
+        );
+    }
+
+    #[test]
+    fn seed_token_names_last_filed_live_activation_not_last_created_parent() {
+        let root = MixedExpansion;
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let relevant = ChildSet::empty(plan.len()).with_inserted(0);
+        let successor = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Candidate {
+                variable: 0,
+                relevant: relevant.clone(),
+                checked: relevant,
+            },
+        };
+        let mut scheduler = DeltaScheduler::new();
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let seeded = scheduler.seed_proposals(
+            DeltaDesc::leaf(0, 0),
+            successor.clone(),
+            RowBatch {
+                rows: Vec::new(),
+                row_count: 2,
+            },
+            vec![ResidualDeltaSeed {
+                parent: 0,
+                output: output(1, 0, false),
+            }],
+            &plan,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        let active = seeded.active.expect("the first parent filed one root");
+        assert_eq!(active.activation, ActivationId(0));
+        assert!(scheduler.registry.is_live(active.activation));
+        assert_eq!(
+            scheduler.registry.state.next_activation, 2,
+            "the later empty parent was created and immediately retired"
+        );
+        assert!(seeded.continuation.is_none());
+
+        let empty = scheduler.seed_proposals(
+            DeltaDesc::leaf(0, 0),
+            successor,
+            RowBatch {
+                rows: Vec::new(),
+                row_count: 1,
+            },
+            Vec::new(),
+            &plan,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert!(empty.active.is_none());
+        assert!(empty.continuation.is_none());
+    }
+
+    #[test]
+    fn active_source_cycles_through_transition_before_unrelated_work() {
+        let root = SourceTransitionCycle;
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let desc = DeltaDesc::leaf(0, 0);
+        let mut scheduler = DeltaScheduler::new();
+        let active = scheduler
+            .seed_source_proposals(
+                desc.clone(),
+                StateDesc {
+                    bound: VariableSet::new_empty(),
+                    phase: ResidualPhase::Ready,
+                },
+                RowBatch {
+                    rows: Vec::new(),
+                    row_count: 1,
+                },
+            )
+            .expect("the source generator was filed");
+
+        let mut cloned = scheduler.clone();
+        let mut clone_stable = Worklist::new();
+        let mut clone_interner = StateInterner::default();
+        let mut clone_stats = ResidualStateStats::default();
+        assert_eq!(
+            cloned
+                .step_active(
+                    &root,
+                    &plan,
+                    active,
+                    1,
+                    &mut clone_stable,
+                    &mut clone_interner,
+                    &mut clone_stats,
+                )
+                .status,
+            ActiveDeltaStatus::Pending,
+            "deep clone must preserve state and activation identities named by the token"
+        );
+
+        let mut unrelated = scheduler.registry.start_many(
+            DeltaReducer::StreamProposal,
+            candidate_return(Vec::new()),
+            [output(9, 0, false)],
+        );
+        let unrelated_activation = unrelated.activation;
+        let (node, credit) = unrelated.roots.pop().expect("one unrelated root");
+        let _ = scheduler.file(
+            desc,
+            vec![DeltaTask {
+                activation: unrelated_activation,
+                credit,
+                node,
+                cursor: ResidualDeltaExpandCursor::Start,
+            }],
+        );
+
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let source = scheduler.step_active(
+            &root,
+            &plan,
+            active,
+            1,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert_eq!(source.status, ActiveDeltaStatus::Pending);
+        assert_eq!(stats.delta_source_pages, 1);
+        assert!(scheduler.has_active_transition(active));
+
+        let transition = scheduler.step_active(
+            &root,
+            &plan,
+            active,
+            1,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert_eq!(transition.status, ActiveDeltaStatus::Pending);
+        assert!(scheduler.has_active_source(active));
+
+        let terminal_source = scheduler.step_active(
+            &root,
+            &plan,
+            active,
+            1,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert_eq!(terminal_source.status, ActiveDeltaStatus::Quiescent);
+        assert_eq!(stats.delta_source_pages, 2);
+        assert!(stable.is_empty());
+        let retained = scheduler
+            .worklist
+            .get(&active.state)
+            .expect("unrelated transition remains cold");
+        assert_eq!(retained.tasks.len(), 1);
+        assert_eq!(retained.tasks[0].activation, unrelated_activation);
+    }
+
+    #[test]
+    fn active_transition_yield_is_classified_before_registry_liveness() {
+        let root = MixedExpansion;
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let desc = DeltaDesc::leaf(0, 0);
+        let mut scheduler = DeltaScheduler::new();
+        let mut started = scheduler.registry.start_many(
+            DeltaReducer::StreamProposal,
+            candidate_return(Vec::new()),
+            [output(2, 0, false)],
+        );
+        let activation = started.activation;
+        let (node, credit) = started.roots.pop().expect("one accepting lineage");
+        let active = scheduler
+            .file(
+                desc,
+                vec![DeltaTask {
+                    activation,
+                    credit,
+                    node,
+                    cursor: ResidualDeltaExpandCursor::Start,
+                }],
+            )
+            .unwrap();
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+
+        let yielded = scheduler.step_active(
+            &root,
+            &plan,
+            active,
+            1,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert_eq!(yielded.status, ActiveDeltaStatus::Yielded);
+        assert!(yielded.outcome.continuation.is_some());
+        assert!(scheduler.registry.is_live(activation));
+        assert!(scheduler.has_active_transition(active));
+    }
+
+    #[test]
     fn transition_pages_dispatch_as_one_affine_cohort_with_mixed_eager_fallback() {
         let trace = Arc::new(Mutex::new(None));
         let scalar_page_calls = Arc::new(AtomicUsize::new(0));
@@ -2757,7 +3397,7 @@ mod tests {
                 cursor: ResidualDeltaExpandCursor::Start,
             });
         }
-        scheduler.file(desc.clone(), tasks);
+        let _ = scheduler.file(desc.clone(), tasks);
 
         let mut stable = Worklist::new();
         let mut stable_interner = StateInterner::default();
@@ -2876,7 +3516,7 @@ mod tests {
         );
         assert!(seed_continuation.is_some());
 
-        scheduler.file(
+        let _ = scheduler.file(
             desc,
             vec![
                 DeltaTask {
@@ -3244,7 +3884,7 @@ mod tests {
             stable_return(Vec::new()),
             None,
         );
-        scheduler.file_source(
+        let _ = scheduler.file_source(
             desc.clone(),
             vec![SourceTask {
                 activation: first_activation,
@@ -3252,7 +3892,7 @@ mod tests {
                 cursor: ResidualDeltaSourceCursor::Start,
             }],
         );
-        scheduler.file_source(
+        let _ = scheduler.file_source(
             desc,
             vec![SourceTask {
                 activation: second_activation,
@@ -3390,7 +4030,7 @@ mod tests {
             source_task(schema_a, None, ResidualDeltaSourceCursor::Start, value(4)),
             source_task(schema_a, None, ResidualDeltaSourceCursor::Start, value(5)),
         ];
-        scheduler.file_source(desc.clone(), tasks);
+        let _ = scheduler.file_source(desc.clone(), tasks);
         assert_eq!(scheduler.interner.descs, [desc]);
         assert_eq!(scheduler.source_worklist.len(), 1);
 
@@ -3657,7 +4297,7 @@ mod tests {
                     cursor: ResidualDeltaExpandCursor::Start,
                 })
                 .collect();
-            scheduler.file(desc.clone(), tasks);
+            let _ = scheduler.file(desc.clone(), tasks);
         }
 
         assert_eq!(scheduler.interner.descs, vec![desc]);

@@ -74,7 +74,10 @@ use std::time::{Duration, Instant};
 use super::*;
 
 mod delta;
-use delta::{DeltaDesc, DeltaScheduler, DeltaStepOutcome};
+use delta::{
+    ActiveDeltaContinuation, ActiveDeltaStatus, DeltaDesc, DeltaScheduler, DeltaSeedOutcome,
+    DeltaStepOutcome,
+};
 
 /// One deterministic route from the owned root to an opaque residual leaf.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5235,9 +5238,14 @@ enum MachineStep {
     /// have resumed their stable formula continuation.
     DeltaSeeded {
         continuation: Option<ContinuationToken>,
-        /// At least one affine input is suspended in the cyclic scheduler.
-        /// This is dispatch-outcome metadata, not canonical state identity.
-        deferred: bool,
+        /// Last newly filed live cyclic activation. The outer scheduler may
+        /// arm it only when the selected action was already in a scalar
+        /// continuation sprint.
+        active: Option<ActiveDeltaContinuation>,
+        /// Exact affine parents transferred by the selected action. One delta
+        /// activation is created per parent; a last-filed token therefore
+        /// names the complete new cohort only when this is one.
+        seeded_parents: usize,
     },
 }
 
@@ -5451,12 +5459,15 @@ impl ResidualActionDispatch for ShadowActionDispatch<'_> {
             MachineStep::Stable(StepOutcome::Advanced(continuation))
             | MachineStep::DeltaSeeded {
                 continuation: Some(continuation),
-                deferred: false,
+                active: None,
+                ..
             } => ActionOutcome::Advanced(ActionSurvival {
                 parent_rows: continuation.rows,
                 candidate_occurrences: continuation.candidates,
             }),
-            MachineStep::DeltaSeeded { deferred: true, .. } => {
+            MachineStep::DeltaSeeded {
+                active: Some(_), ..
+            } => {
                 // Native cyclic lowering transfers the selected affine input
                 // into a reopenable delta frontier. Expansion is deliberately
                 // not attributed to one event: one canonical expansion cohort
@@ -5469,7 +5480,8 @@ impl ResidualActionDispatch for ShadowActionDispatch<'_> {
             MachineStep::Stable(StepOutcome::Dead)
             | MachineStep::DeltaSeeded {
                 continuation: None,
-                deferred: false,
+                active: None,
+                ..
             } => ActionOutcome::Dead,
             MachineStep::Stable(StepOutcome::Emit(_)) => {
                 unreachable!("only Propose and Confirm tasks enter a residual shadow action")
@@ -5543,6 +5555,10 @@ struct ResidualStateMachine {
     /// or a delta-to-stable handoff. Its physical scheduling mode remains
     /// outside canonical state identity.
     continuation: Option<ActiveContinuation>,
+    /// Exact cyclic activation created while probing one stable continuation
+    /// atom. This is a physical latency preference only; all logical work
+    /// remains owned by [`DeltaScheduler`].
+    active_delta: Option<ActiveDeltaContinuation>,
     #[cfg(test)]
     continuation_sprint_enabled: bool,
     last_selection: SelectionKind,
@@ -5754,6 +5770,7 @@ impl ResidualStateMachine {
             emit_next: 0,
             emit_count: 0,
             continuation: None,
+            active_delta: None,
             #[cfg(test)]
             continuation_sprint_enabled: true,
             last_selection: SelectionKind::Readiness,
@@ -5999,7 +6016,7 @@ impl ResidualStateMachine {
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
         task: SelectedResidualTask,
-    ) -> Result<(Option<ContinuationToken>, bool), SelectedResidualTask> {
+    ) -> Result<DeltaSeedOutcome, SelectedResidualTask> {
         if !plan.transition_programs {
             return Err(task);
         }
@@ -6056,9 +6073,15 @@ impl ResidualStateMachine {
                     checked,
                 },
             };
-            self.delta
-                .seed_source_proposals(DeltaDesc::leaf(variable, proposer), successor, rows);
-            return Ok((None, true));
+            let active = self.delta.seed_source_proposals(
+                DeltaDesc::leaf(variable, proposer),
+                successor,
+                rows,
+            );
+            return Ok(DeltaSeedOutcome {
+                continuation: None,
+                active,
+            });
         }
         let mut seeds = Vec::new();
         let supported = constraint.residual_delta_seeds(variable, &view, &mut seeds);
@@ -6089,8 +6112,7 @@ impl ResidualStateMachine {
                 checked,
             },
         };
-        let deferred = !seeds.is_empty();
-        let continuation = self.delta.seed_proposals(
+        let outcome = self.delta.seed_proposals(
             DeltaDesc::leaf(variable, proposer),
             successor,
             rows,
@@ -6100,7 +6122,7 @@ impl ResidualStateMachine {
             &mut self.interner,
             &mut self.stats,
         );
-        Ok((continuation, deferred))
+        Ok(outcome)
     }
 
     /// Converts one eligible confirmer into one transition activation per
@@ -6113,7 +6135,7 @@ impl ResidualStateMachine {
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
         task: SelectedResidualTask,
-    ) -> Result<bool, SelectedResidualTask> {
+    ) -> Result<DeltaSeedOutcome, SelectedResidualTask> {
         if !plan.transition_programs {
             return Err(task);
         }
@@ -6178,9 +6200,15 @@ impl ResidualStateMachine {
                     checked: checked.with_inserted(confirmer),
                 },
             };
-            self.delta
-                .seed_source_confirms(DeltaDesc::leaf(variable, confirmer), successor, batch);
-            return Ok(true);
+            let active = self.delta.seed_source_confirms(
+                DeltaDesc::leaf(variable, confirmer),
+                successor,
+                batch,
+            );
+            return Ok(DeltaSeedOutcome {
+                continuation: None,
+                active,
+            });
         }
         let mut seeds = Vec::new();
         let supported = constraint.residual_delta_seeds(variable, &view, &mut seeds);
@@ -6215,14 +6243,16 @@ impl ResidualStateMachine {
                 checked: checked.with_inserted(confirmer),
             },
         };
-        let deferred = !seeds.is_empty();
-        self.delta.seed_confirms(
+        let active = self.delta.seed_confirms(
             DeltaDesc::leaf(variable, confirmer),
             successor,
             batch,
             seeds,
         );
-        Ok(deferred)
+        Ok(DeltaSeedOutcome {
+            continuation: None,
+            active,
+        })
     }
 
     /// Suspends a currently focused formula Atom behind one transition reducer
@@ -6236,7 +6266,7 @@ impl ResidualStateMachine {
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
         task: SelectedResidualTask,
-    ) -> Result<(Option<ContinuationToken>, bool), SelectedResidualTask> {
+    ) -> Result<DeltaSeedOutcome, SelectedResidualTask> {
         if !plan.transition_programs {
             return Err(task);
         }
@@ -6351,30 +6381,29 @@ impl ResidualStateMachine {
             }
         }
         if paged {
-            self.delta.seed_source_formula(
+            let active = self.delta.seed_source_formula(
                 DeltaDesc::formula(variable, occurrence, node),
                 desc.bound,
                 counter,
                 batch,
                 stream_proposal,
             );
-            return Ok((None, true));
+            return Ok(DeltaSeedOutcome {
+                continuation: None,
+                active,
+            });
         }
-        let deferred = !seeds.is_empty();
-        Ok((
-            self.delta.seed_formula(
-                DeltaDesc::formula(variable, occurrence, node),
-                desc.bound,
-                counter,
-                batch,
-                seeds,
-                stream_proposal,
-                plan,
-                &mut self.worklist,
-                &mut self.interner,
-                &mut self.stats,
-            ),
-            deferred,
+        Ok(self.delta.seed_formula(
+            DeltaDesc::formula(variable, occurrence, node),
+            desc.bound,
+            counter,
+            batch,
+            seeds,
+            stream_proposal,
+            plan,
+            &mut self.worklist,
+            &mut self.interner,
+            &mut self.stats,
         ))
     }
 
@@ -6386,29 +6415,42 @@ impl ResidualStateMachine {
         influences: &[VariableSet; 128],
         base_estimates: &[usize; 128],
     ) -> MachineStep {
+        let seeded_parents = task.bucket.row_count();
         let task = match self.seed_delta_proposal(root, plan, task) {
-            Ok((continuation, deferred)) => {
+            Ok(DeltaSeedOutcome {
+                continuation,
+                active,
+            }) => {
                 return MachineStep::DeltaSeeded {
                     continuation,
-                    deferred,
+                    active,
+                    seeded_parents,
                 }
             }
             Err(task) => task,
         };
         let task = match self.seed_delta_confirm(root, plan, task) {
-            Ok(deferred) => {
+            Ok(DeltaSeedOutcome {
+                continuation,
+                active,
+            }) => {
                 return MachineStep::DeltaSeeded {
-                    continuation: None,
-                    deferred,
+                    continuation,
+                    active,
+                    seeded_parents,
                 }
             }
             Err(task) => task,
         };
         let task = match self.seed_delta_formula(root, plan, task) {
-            Ok((continuation, deferred)) => {
+            Ok(DeltaSeedOutcome {
+                continuation,
+                active,
+            }) => {
                 return MachineStep::DeltaSeeded {
                     continuation,
-                    deferred,
+                    active,
+                    seeded_parents,
                 }
             }
             Err(task) => task,
@@ -6507,6 +6549,7 @@ impl ResidualStateMachine {
     /// Accepts a delta-to-stable handoff into its geometric continuation mode.
     fn accept_delta_step(&mut self, outcome: DeltaStepOutcome) {
         self.account_delta_feedback(&outcome);
+        self.active_delta = None;
         self.continuation = outcome.continuation.map(|token| {
             let desc = self.interner.get(token.state);
             let commits_terminal_candidates = match &desc.phase {
@@ -6565,6 +6608,45 @@ impl ResidualStateMachine {
         }
     }
 
+    /// A cyclic seed inherits depth-first preference only from an existing
+    /// continuation lineage when the selected action transferred exactly one
+    /// affine parent. Full selections and multi-parent cohorts retain their
+    /// deliberate batching unit instead of choosing one arbitrary activation.
+    fn active_delta_after_seed(
+        &self,
+        active: Option<ActiveDeltaContinuation>,
+        seeded_parents: usize,
+    ) -> Option<ActiveDeltaContinuation> {
+        #[cfg(test)]
+        if !self.continuation_sprint_enabled {
+            return None;
+        }
+        (seeded_parents == 1
+            && matches!(
+                self.last_selection,
+                SelectionKind::Continuation(ContinuationMode::ProbeOne)
+                    | SelectionKind::Continuation(ContinuationMode::Cohort)
+            ))
+        .then_some(active)
+        .flatten()
+    }
+
+    fn accept_delta_seed(
+        &mut self,
+        continuation: Option<ContinuationToken>,
+        active: Option<ActiveDeltaContinuation>,
+        seeded_parents: usize,
+    ) {
+        // An immediate stable seed effect is already the earliest legal
+        // continuation. It is the yield boundary for this cyclic activation,
+        // so no old or new delta focus survives beside it.
+        self.active_delta = continuation
+            .is_none()
+            .then(|| self.active_delta_after_seed(active, seeded_parents))
+            .flatten();
+        self.continuation = continuation.map(ActiveContinuation::probe_one);
+    }
+
     fn stage_emit(&mut self, rows: RowBatch) {
         debug_assert!(self.emit_next >= self.emit_count);
         self.emit_rows = rows.rows;
@@ -6604,6 +6686,35 @@ impl ResidualStateMachine {
             }
 
             let width = self.width;
+            // A newly seeded activation on the scalar continuation path is
+            // the cyclic analogue of `ActiveContinuation`: follow that exact
+            // affine lineage before any cold stable cohort. It owns no work;
+            // dropping the token merely returns scheduling to the global
+            // source/transition worklists.
+            if self.continuation.is_none() {
+                if let Some(active) = self.active_delta.take() {
+                    let focused = self.delta.step_active(
+                        root,
+                        plan,
+                        active,
+                        width,
+                        &mut self.worklist,
+                        &mut self.interner,
+                        &mut self.stats,
+                    );
+                    match focused.status {
+                        ActiveDeltaStatus::Yielded => self.accept_delta_step(focused.outcome),
+                        ActiveDeltaStatus::Pending => {
+                            self.account_delta_feedback(&focused.outcome);
+                            self.active_delta = Some(active);
+                        }
+                        ActiveDeltaStatus::Quiescent => {
+                            self.account_delta_feedback(&focused.outcome);
+                        }
+                    }
+                    continue;
+                }
+            }
             // An underfilled stable bucket is readiness-safe only after every
             // cyclic feeder is quiescent. Full stable work and explicit
             // latency continuations need no harvest lemma and may run first.
@@ -6646,9 +6757,10 @@ impl ResidualStateMachine {
                 }
                 MachineStep::DeltaSeeded {
                     continuation,
-                    deferred: _,
+                    active,
+                    seeded_parents,
                 } => {
-                    self.continuation = continuation.map(ActiveContinuation::probe_one);
+                    self.accept_delta_seed(continuation, active, seeded_parents);
                 }
             }
         }
@@ -6722,6 +6834,7 @@ impl ResidualStateMachine {
             emit_next: 0,
             emit_count: 0,
             continuation: None,
+            active_delta: None,
             #[cfg(test)]
             continuation_sprint_enabled: self.continuation_sprint_enabled,
             last_selection: SelectionKind::Readiness,
@@ -6755,6 +6868,7 @@ impl ResidualStateMachine {
         // defensively: dropping it never drops affine work, while retaining it
         // across a bucket split could leave the receipt naming the wrong tail.
         self.continuation = None;
+        self.active_delta = None;
         loop {
             debug_assert_eq!(
                 self.emit_next, 0,
@@ -7828,7 +7942,7 @@ mod parallel {
 mod tests {
     use super::*;
     use crate::inline::encodings::genid::GenId;
-    use crate::inline::Inline;
+    use crate::inline::{Inline, IntoInline};
     use crate::query::intersectionconstraint::IntersectionConstraint;
     use crate::query::unionconstraint::UnionConstraint;
     #[cfg(feature = "parallel")]
@@ -13005,6 +13119,160 @@ mod tests {
     }
 
     #[test]
+    fn singleton_rpq_seed_stays_hot_but_wide_cold_seed_remains_batched() {
+        use crate::id::{id_into_value, ExclusiveId, Id};
+        use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
+        use crate::trible::{Trible, TribleSet};
+
+        let kind = Id::new([200; crate::id::ID_LEN]).unwrap();
+        let p = Id::new([201; crate::id::ID_LEN]).unwrap();
+        let q = Id::new([202; crate::id::ID_LEN]).unwrap();
+        let seed = Id::new([210; crate::id::ID_LEN]).unwrap();
+        let alternate = Id::new([211; crate::id::ID_LEN]).unwrap();
+        let red = Id::new([212; crate::id::ID_LEN]).unwrap();
+        let blue = Id::new([213; crate::id::ID_LEN]).unwrap();
+        let nodes: Vec<Vec<Id>> = (0..4)
+            .map(|component| {
+                (0..16)
+                    .map(|position| {
+                        let ordinal = component * 16 + position + 1;
+                        Id::new([u8::try_from(ordinal).unwrap(); crate::id::ID_LEN]).unwrap()
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut graph = TribleSet::new();
+        let insert = |graph: &mut TribleSet, from: &Id, attribute: &Id, to: &Id| {
+            graph.insert(&Trible::new::<GenId>(
+                ExclusiveId::force_ref(from),
+                attribute,
+                &to.to_inline(),
+            ));
+        };
+        for component in &nodes {
+            for (position, node) in component.iter().enumerate() {
+                let source_class = match position % 4 {
+                    0 => &seed,
+                    1 => &alternate,
+                    _ => &red,
+                };
+                insert(&mut graph, node, &kind, source_class);
+                insert(
+                    &mut graph,
+                    node,
+                    &kind,
+                    if position % 2 == 0 { &red } else { &blue },
+                );
+                for offset in 1..=2 {
+                    insert(
+                        &mut graph,
+                        node,
+                        &p,
+                        &component[(position + offset) % component.len()],
+                    );
+                    insert(
+                        &mut graph,
+                        node,
+                        &q,
+                        &component[(position + 2 + offset) % component.len()],
+                    );
+                }
+            }
+        }
+        let graph = Arc::new(graph);
+        let make = || {
+            let source_var = Variable::<GenId>::new(0);
+            let target_var = Variable::<GenId>::new(1);
+            let source = UnionConstraint::new(vec![
+                graph.pattern(
+                    source_var,
+                    Inline::<GenId>::new(id_into_value(&kind)),
+                    Inline::<GenId>::new(id_into_value(&seed)),
+                ),
+                graph.pattern(
+                    source_var,
+                    Inline::<GenId>::new(id_into_value(&kind)),
+                    Inline::<GenId>::new(id_into_value(&alternate)),
+                ),
+            ]);
+            let path = RegularPathConstraint::new(
+                graph.as_ref().clone(),
+                source_var,
+                target_var,
+                &[
+                    PathOp::Attr(p.raw()),
+                    PathOp::Attr(q.raw()),
+                    PathOp::Union,
+                    PathOp::Plus,
+                ],
+            );
+            let target = UnionConstraint::new(vec![
+                graph.pattern(
+                    target_var,
+                    Inline::<GenId>::new(id_into_value(&kind)),
+                    Inline::<GenId>::new(id_into_value(&red)),
+                ),
+                graph.pattern(
+                    target_var,
+                    Inline::<GenId>::new(id_into_value(&kind)),
+                    Inline::<GenId>::new(id_into_value(&blue)),
+                ),
+            ]);
+            IntersectionConstraint::new(vec![
+                Box::new(source) as ShapeConstraint,
+                Box::new(path) as ShapeConstraint,
+                Box::new(target) as ShapeConstraint,
+            ])
+        };
+        let project =
+            |binding: &Binding| Some((binding.get(0).copied()?, binding.get(1).copied()?));
+
+        let mut focused = Query::new(make(), project)
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .cap(64)
+            .start_width(1)
+            .growth(2);
+        let focused_first = focused.next().expect("the ring has a path result");
+        let focused_first_stats = focused.stats().clone();
+        assert_eq!(focused_first_stats.propose_rows, 3);
+        assert_eq!(focused_first_stats.max_propose_rows, 1);
+        assert_eq!(
+            focused_first_stats.support_action_pops
+                + focused_first_stats.propose_action_pops
+                + focused_first_stats.confirm_action_pops,
+            10,
+            "the singleton path seed must reach target confirmation before the cold source remainder"
+        );
+
+        let mut cold = Query::new(make(), project)
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .cap(64)
+            .start_width(1)
+            .growth(2);
+        cold.state.continuation_sprint_enabled = false;
+        let cold_first = cold.next().expect("the control ring has a path result");
+        let cold_first_stats = cold.stats().clone();
+        assert!(cold_first_stats.propose_rows > focused_first_stats.propose_rows);
+        assert!(cold_first_stats.max_propose_rows > 1);
+        assert!(
+            cold_first_stats.support_action_pops
+                + cold_first_stats.propose_action_pops
+                + cold_first_stats.confirm_action_pops
+                > focused_first_stats.support_action_pops
+                    + focused_first_stats.propose_action_pops
+                    + focused_first_stats.confirm_action_pops,
+            "without physical focus wider cold work runs before target confirmation"
+        );
+
+        let mut focused_bag: Vec<_> = std::iter::once(focused_first).chain(focused).collect();
+        let mut cold_bag: Vec<_> = std::iter::once(cold_first).chain(cold).collect();
+        focused_bag.sort_unstable();
+        cold_bag.sort_unstable();
+        assert_eq!(focused_bag, cold_bag);
+        assert_eq!(focused_bag.len(), 4 * 8 * 16);
+    }
+
+    #[test]
     fn finite_one_arm_union_is_a_valid_submachine() {
         let make = || {
             UnionConstraint::new(vec![FanoutLeaf {
@@ -14203,6 +14471,49 @@ mod tests {
 
     #[cfg(feature = "parallel")]
     #[test]
+    fn parallel_split_drops_only_active_delta_preference() {
+        let root = ShapeLeaf(0);
+        let plan = ResidualPlan::compile(&root);
+        let influences = [VariableSet::new_empty(); 128];
+        let base_estimates = [usize::MAX; 128];
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            plan.len(),
+            ready_desc(1),
+            StateBucket::Rows(RowBatch {
+                rows: vec![raw(1), raw(2)],
+                row_count: 2,
+            }),
+            &mut machine.stats,
+        );
+        let active = machine
+            .delta
+            .seed_source_proposals(
+                DeltaDesc::leaf(0, 0),
+                StateDesc {
+                    bound: VariableSet::new_empty(),
+                    phase: ResidualPhase::Ready,
+                },
+                RowBatch::seed(),
+            )
+            .expect("one physical delta preference was filed");
+        machine.active_delta = Some(active);
+
+        let right = machine
+            .split_for_parallel(&root, &plan, &influences, &base_estimates)
+            .expect("the two stable rows are splittable");
+        assert!(machine.active_delta.is_none());
+        assert!(right.active_delta.is_none());
+        assert!(
+            !machine.delta.is_empty(),
+            "clearing the preference must not drop its affine scheduler work"
+        );
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
     fn parallel_split_clears_live_continuation_without_losing_affine_rows() {
         let root = ShapeLeaf(0);
         let plan = ResidualPlan::compile(&root);
@@ -15155,6 +15466,75 @@ mod tests {
         assert_eq!(machine.delta.activation_width(), 2);
         assert_eq!(machine.stats.delta_activations_completed, 3);
         assert_eq!(machine.stats.delta_activation_width_increases, 1);
+    }
+
+    #[test]
+    fn active_delta_seed_requires_one_parent_continuation_lineage() {
+        let root = CapabilityLeaf {
+            variable: 0,
+            page_local: true,
+        };
+        let plan = ResidualPlan::compile(&root);
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        let active = machine
+            .delta
+            .seed_source_proposals(
+                DeltaDesc::leaf(0, 0),
+                StateDesc {
+                    bound: VariableSet::new_empty(),
+                    phase: ResidualPhase::Ready,
+                },
+                RowBatch::seed(),
+            )
+            .expect("one cyclic source activation was filed");
+
+        machine.last_selection = SelectionKind::Continuation(ContinuationMode::ProbeOne);
+        machine.accept_delta_seed(None, Some(active), 1);
+        assert_eq!(machine.active_delta, Some(active));
+
+        machine.last_selection = SelectionKind::Continuation(ContinuationMode::Cohort);
+        machine.accept_delta_seed(None, Some(active), 1);
+        assert_eq!(
+            machine.active_delta,
+            Some(active),
+            "the action after a one-atom planning probe is a singleton cohort"
+        );
+        machine.accept_delta_seed(None, Some(active), 512);
+        assert!(
+            machine.active_delta.is_none(),
+            "a wide cohort must not pick an arbitrary last activation"
+        );
+
+        machine.last_selection = SelectionKind::Full;
+        machine.accept_delta_seed(None, Some(active), 1);
+        assert!(machine.active_delta.is_none());
+
+        machine.last_selection = SelectionKind::Continuation(ContinuationMode::ProbeOne);
+        let stable = file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            plan.len(),
+            ready_desc(0),
+            StateBucket::Rows(RowBatch::seed()),
+            &mut machine.stats,
+        )
+        .expect("one stable seed effect was filed");
+        machine.accept_delta_seed(Some(stable), Some(active), 1);
+        assert!(
+            machine.active_delta.is_none(),
+            "an immediate stable effect is the activation's yield boundary"
+        );
+        assert_eq!(
+            machine.continuation,
+            Some(ActiveContinuation::probe_one(stable))
+        );
+
+        machine.continuation_sprint_enabled = false;
+        machine.accept_delta_seed(None, Some(active), 1);
+        assert!(
+            machine.active_delta.is_none(),
+            "the stable continuation ablation must also disable cyclic focus"
+        );
     }
 
     #[test]

@@ -347,6 +347,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Singleton continuation-selected cyclic seeds retain physical focus.** The
+  residual scheduler follows the activation-local source/transition lineage it
+  just seeded until its first stable effect or quiescence; canonical delta
+  identity and affine work ownership remain unchanged.
 - **Whole-root lowering erases formula identity shells.** An opaque non-union
   atom, including one wrapped only in unary exposed AND nodes, now enters the
   flat residual action plan even when `FormulaScope::WholeRoot` is selected.
