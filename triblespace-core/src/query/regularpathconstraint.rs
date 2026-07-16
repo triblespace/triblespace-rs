@@ -1399,6 +1399,68 @@ impl RegularPathConstraint {
         }
     }
 
+    /// Pages the first endpoint of a distinct-endpoint RPQ while the other
+    /// endpoint is still free. Nullable expressions range over NODES(G);
+    /// otherwise the endpoint must be able to take a FIRST step in the chosen
+    /// orientation. This is the same exact candidate superset as ordinary
+    /// `propose_row`, but the source generator exposes its work to geometric
+    /// scheduling before materializing the complete domain.
+    fn first_binding_source_page(
+        &self,
+        variable: VariableId,
+        cursor: ResidualDeltaSourceCursor,
+        limit: usize,
+        accepted: &mut Vec<RawInline>,
+    ) -> ResidualDeltaSourcePage {
+        assert!(limit > 0, "residual source pages require positive demand");
+        let expr = if variable == self.start {
+            &self.expr
+        } else {
+            assert_eq!(variable, self.end);
+            &self.inverse_expr
+        };
+        let nullable = nullable(expr);
+        let mut first = Vec::new();
+        first_steps(expr, &mut first);
+        let exact = |source: &RawInline| {
+            if nullable {
+                is_graph_term(&self.set, source)
+            } else {
+                can_take_first_step(&self.set, &first, source)
+            }
+        };
+        let after = match cursor {
+            ResidualDeltaSourceCursor::Start => None,
+            ResidualDeltaSourceCursor::After(value) => Some(value),
+        };
+
+        let source_steps: &[FirstStep] = if nullable {
+            &[FirstStep::AnyFwd, FirstStep::AnyInv]
+        } else {
+            &first
+        };
+        let mut examined = 0usize;
+        let mut current = after;
+        while examined < limit {
+            let Some(source) = next_first_source(&self.set, source_steps, current.as_ref()) else {
+                return ResidualDeltaSourcePage {
+                    next: None,
+                    examined,
+                };
+            };
+            current = Some(source);
+            examined += 1;
+            debug_assert!(exact(&source));
+            accepted.push(source);
+        }
+        let last_examined = current.expect("a full positive page examined a source");
+        ResidualDeltaSourcePage {
+            next: next_first_source(&self.set, source_steps, Some(&last_examined))
+                .map(|_| ResidualDeltaSourceCursor::After(last_examined)),
+            examined,
+        }
+    }
+
     /// Selects the transition-program orientation for a bound endpoint or a
     /// same-variable source frontier. Finite and repeated expressions share the
     /// same product-state representation; the latter are the cyclic special
@@ -1739,6 +1801,17 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         ) && view.col(variable).is_none()
     }
 
+    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
+        if view.col(variable).is_some() {
+            return false;
+        }
+        matches!(
+            self.residual_delta_program(variable),
+            Some(ResidualDeltaRoute::BoundEndpoint { source, .. })
+                if view.col(source).is_none()
+        )
+    }
+
     fn residual_delta_source_page(
         &self,
         variable: VariableId,
@@ -1747,16 +1820,20 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         cursor: ResidualDeltaSourceCursor,
         limit: usize,
         roots: &mut Vec<ResidualDeltaOutput>,
+        accepted: &mut Vec<RawInline>,
     ) -> Option<ResidualDeltaSourcePage> {
-        let Some(ResidualDeltaRoute::SameVariable { program }) =
-            self.residual_delta_program(variable)
-        else {
-            return None;
-        };
         if view.len() != 1 || view.col(variable).is_some() {
             return None;
         }
-        Some(self.same_variable_source_page(program, candidates, cursor, limit, roots))
+        match self.residual_delta_program(variable)? {
+            ResidualDeltaRoute::SameVariable { program } => {
+                Some(self.same_variable_source_page(program, candidates, cursor, limit, roots))
+            }
+            ResidualDeltaRoute::BoundEndpoint { source, .. } if view.col(source).is_none() => {
+                Some(self.first_binding_source_page(variable, cursor, limit, accepted))
+            }
+            ResidualDeltaRoute::BoundEndpoint { .. } => None,
+        }
     }
 
     fn residual_delta_seeds(

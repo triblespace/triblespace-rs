@@ -5655,7 +5655,9 @@ impl ResidualStateMachine {
         let vars: Vec<VariableId> = task.desc.bound.into_iter().collect();
         let view = rows_view(&vars, &rows.rows, rows.row_count);
         let constraint = plan.resolve(root, proposer);
-        if constraint.residual_delta_source_is_paged(variable, &view) {
+        if constraint.residual_delta_source_is_paged(variable, &view)
+            || constraint.residual_proposal_source_is_paged(variable, &view)
+        {
             let SelectedResidualTask {
                 state: _,
                 desc,
@@ -5890,7 +5892,9 @@ impl ResidualStateMachine {
             (route, false)
         } else {
             let variable = counter.resume.variable;
-            let paged = constraint.residual_delta_source_is_paged(variable, &view);
+            let paged = constraint.residual_delta_source_is_paged(variable, &view)
+                || (stage == FormulaStage::Propose
+                    && constraint.residual_proposal_source_is_paged(variable, &view));
             if !paged {
                 let supported = constraint.residual_delta_seeds(variable, &view, &mut seeds);
                 if !supported {

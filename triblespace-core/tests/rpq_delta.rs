@@ -205,6 +205,10 @@ impl<'a> Constraint<'a> for CountingPath {
         self.inner.residual_delta_source_is_paged(variable, view)
     }
 
+    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
+        self.inner.residual_proposal_source_is_paged(variable, view)
+    }
+
     fn residual_delta_source_page(
         &self,
         variable: VariableId,
@@ -213,11 +217,13 @@ impl<'a> Constraint<'a> for CountingPath {
         cursor: ResidualDeltaSourceCursor,
         limit: usize,
         roots: &mut Vec<ResidualDeltaOutput>,
+        accepted: &mut Vec<RawInline>,
     ) -> Option<ResidualDeltaSourcePage> {
         let before = roots.len();
+        let accepted_before = accepted.len();
         let page = self
             .inner
-            .residual_delta_source_page(variable, view, candidates, cursor, limit, roots);
+            .residual_delta_source_page(variable, view, candidates, cursor, limit, roots, accepted);
         if page.is_some() {
             if let Some(counter) = &self.seeded_roots {
                 counter.fetch_add(roots.len() - before, Ordering::Relaxed);
@@ -227,7 +233,7 @@ impl<'a> Constraint<'a> for CountingPath {
             pages.lock().expect("source-page recorder poisoned").push((
                 limit,
                 page.examined,
-                roots.len() - before,
+                roots.len() - before + accepted.len() - accepted_before,
             ));
         }
         page
@@ -703,6 +709,23 @@ fn counted_bound_end_root(
     ]))
 }
 
+fn counted_two_free_root(
+    set: TribleSet,
+    ops: &[PathOp],
+    seeded_roots: Arc<AtomicUsize>,
+    source_pages: Arc<Mutex<Vec<(usize, usize, usize)>>>,
+    expanded_nodes: Arc<AtomicUsize>,
+) -> Root {
+    let start_var = Variable::<GenId>::new(START);
+    let end_var = Variable::<GenId>::new(END);
+    Arc::new(IntersectionConstraint::new(vec![Box::new(CountingPath {
+        inner: RegularPathConstraint::new(set, start_var, end_var, ops),
+        seeded_roots: Some(seeded_roots),
+        source_pages: Some(source_pages),
+        expanded_nodes,
+    }) as DynConstraint]))
+}
+
 fn target_confirm_root(
     set: TribleSet,
     candidate_variable: VariableId,
@@ -1126,6 +1149,7 @@ fn collect_same_variable_source_frontier(
     let mut pages = Vec::new();
     loop {
         let mut roots = Vec::new();
+        let mut accepted = Vec::new();
         let page = path
             .residual_delta_source_page(
                 START,
@@ -1134,13 +1158,51 @@ fn collect_same_variable_source_frontier(
                 cursor,
                 limit,
                 &mut roots,
+                &mut accepted,
             )
             .expect("same-variable repeated path exposes a source frontier");
+        assert!(accepted.is_empty());
         pages.push((page.examined, roots.len()));
         sources.extend(roots.into_iter().map(|root| {
             assert_eq!(root.node.source, Some(root.node.value));
             root.node.value
         }));
+        let Some(next) = page.next else {
+            break;
+        };
+        assert!(page.examined > 0, "a live cursor must consume its page");
+        cursor = next;
+    }
+    (sources, pages)
+}
+
+fn collect_distinct_proposal_frontier(
+    path: &RegularPathConstraint,
+    variable: VariableId,
+    limit: usize,
+) -> (Vec<RawInline>, Vec<(usize, usize)>) {
+    assert!(limit > 0);
+    assert!(path.residual_proposal_source_is_paged(variable, &RowsView::EMPTY));
+    let mut cursor = ResidualDeltaSourceCursor::Start;
+    let mut sources = Vec::new();
+    let mut pages = Vec::new();
+    loop {
+        let mut roots = Vec::new();
+        let mut accepted = Vec::new();
+        let page = path
+            .residual_delta_source_page(
+                variable,
+                &RowsView::EMPTY,
+                None,
+                cursor,
+                limit,
+                &mut roots,
+                &mut accepted,
+            )
+            .expect("a two-free-endpoint path exposes its first binding frontier");
+        assert!(roots.is_empty());
+        pages.push((page.examined, accepted.len()));
+        sources.extend(accepted);
         let Some(next) = page.next else {
             break;
         };
@@ -3518,6 +3580,146 @@ fn bound_literal_endpoint_uses_the_inverse_delta_route() {
         vec![graph.value(0).raw]
     );
     assert_eq!(expanded.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn two_free_distinct_endpoints_page_the_first_binding_before_traversal() {
+    let graph = Graph::new(
+        16,
+        &[
+            (0, 1),
+            (2, 3),
+            (4, 5),
+            (6, 7),
+            (8, 9),
+            (10, 11),
+            (12, 13),
+            (14, 15),
+        ],
+    );
+    let seeded = Arc::new(AtomicUsize::new(0));
+    let pages = Arc::new(Mutex::new(Vec::new()));
+    let expanded = Arc::new(AtomicUsize::new(0));
+    let root = counted_two_free_root(
+        graph.set.clone(),
+        &repeated(graph.attribute, false),
+        Arc::clone(&seeded),
+        Arc::clone(&pages),
+        Arc::clone(&expanded),
+    );
+    let expected: Vec<_> = (0..8)
+        .map(|edge| (graph.value(edge * 2).raw, graph.value(edge * 2 + 1).raw))
+        .collect();
+
+    let mut query = Query::new(root, project_pair)
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .cap(1)
+        .start_width(1);
+    let first = query.next().expect("one two-free RPQ edge");
+    assert!(expected.contains(&first));
+    assert_eq!(
+        *pages.lock().expect("source-page recorder poisoned"),
+        [(1, 1, 1)],
+        "the first endpoint must come from one bounded source page"
+    );
+    assert_eq!(seeded.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        expanded.load(Ordering::Relaxed),
+        1,
+        "only the bound-endpoint traversal should expand before the first pair"
+    );
+    drop(query);
+    assert_eq!(
+        expanded.load(Ordering::Relaxed),
+        1,
+        "dropping the query must cancel the remaining source frontier"
+    );
+}
+
+#[test]
+fn two_free_path_end_pages_the_inverse_first_frontier() {
+    let graph = Graph::new(5, &[(0, 1), (2, 1), (3, 4)]);
+    let path_end = Variable::<GenId>::new(START);
+    let path_start = Variable::<GenId>::new(END);
+    let ops = vec![PathOp::Attr(graph.attribute.raw())];
+    let path = RegularPathConstraint::new(graph.set.clone(), path_start, path_end, &ops);
+    let (mut sources, pages) = collect_distinct_proposal_frontier(&path, START, 1);
+    let mut expected_sources = vec![graph.value(1).raw, graph.value(4).raw];
+    sources.sort_unstable();
+    expected_sources.sort_unstable();
+    assert_eq!(sources, expected_sources);
+    assert_eq!(pages, vec![(1, 1), (1, 1)]);
+
+    let make_root = || {
+        Arc::new(IntersectionConstraint::new(vec![Box::new(CountingPath {
+            inner: RegularPathConstraint::new(graph.set.clone(), path_start, path_end, &ops),
+            seeded_roots: None,
+            source_pages: None,
+            expanded_nodes: Arc::new(AtomicUsize::new(0)),
+        })
+            as DynConstraint]))
+    };
+    let mut sequential: Vec<_> = Query::new(make_root(), project_pair).sequential().collect();
+    let mut residual: Vec<_> = Query::new(make_root(), project_pair)
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .cap(1)
+        .start_width(1)
+        .collect();
+    sequential.sort_unstable();
+    residual.sort_unstable();
+    assert_eq!(residual, sequential);
+    let mut expected = vec![
+        (graph.value(1).raw, graph.value(0).raw),
+        (graph.value(1).raw, graph.value(2).raw),
+        (graph.value(4).raw, graph.value(3).raw),
+    ];
+    expected.sort_unstable();
+    assert_eq!(residual, expected);
+}
+
+#[test]
+fn nullable_two_free_first_frontier_is_exactly_the_graph_term_union() {
+    let graph = Graph::new(3, &[(0, 1)]);
+    let ops = vec![PathOp::Attr(graph.attribute.raw()), PathOp::Optional];
+    let path = RegularPathConstraint::new(
+        graph.set.clone(),
+        Variable::<GenId>::new(START),
+        Variable::<GenId>::new(END),
+        &ops,
+    );
+    let (mut sources, pages) = collect_distinct_proposal_frontier(&path, START, 1);
+    let mut expected_sources = vec![graph.value(0).raw, graph.value(1).raw];
+    sources.sort_unstable();
+    expected_sources.sort_unstable();
+    assert_eq!(sources, expected_sources);
+    assert_eq!(pages, vec![(1, 1), (1, 1)]);
+    assert!(!sources.contains(&graph.value(2).raw));
+
+    let make_root = || {
+        counted_two_free_root(
+            graph.set.clone(),
+            &ops,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(AtomicUsize::new(0)),
+        )
+    };
+    let mut sequential: Vec<_> = Query::new(make_root(), project_pair).sequential().collect();
+    let mut residual: Vec<_> = Query::new(make_root(), project_pair)
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .cap(1)
+        .start_width(1)
+        .collect();
+    sequential.sort_unstable();
+    residual.sort_unstable();
+    assert_eq!(residual, sequential);
+    let mut expected = vec![
+        (graph.value(0).raw, graph.value(0).raw),
+        (graph.value(0).raw, graph.value(1).raw),
+        (graph.value(1).raw, graph.value(1).raw),
+    ];
+    expected.sort_unstable();
+    assert_eq!(residual, expected);
 }
 
 #[test]

@@ -529,6 +529,7 @@ impl ProducerRegistry {
         &mut self,
         generator: ProducerCredit,
         roots: impl IntoIterator<Item = ResidualDeltaOutput>,
+        direct: impl IntoIterator<Item = RawInline>,
         next: Option<ResidualDeltaSourceCursor>,
     ) -> SourcePageOutcome {
         assert_eq!(
@@ -545,6 +546,7 @@ impl ProducerRegistry {
         assert_eq!(owner.kind, CreditKind::Generator);
 
         let roots: Vec<_> = roots.into_iter().collect();
+        let direct: Vec<_> = direct.into_iter().collect();
         let mut distinct_nodes = HashSet::with_capacity(roots.len());
         assert!(
             roots
@@ -565,9 +567,14 @@ impl ProducerRegistry {
             assert_eq!(activation.live.len(), 1);
             assert!(activation.live.contains(&generator.key.nonce));
             assert!(activation.suspended_source_page.is_none());
-            for output in &roots {
-                if output.accepted && activation.accepted.insert(output.node.value) {
-                    accepted.push(output.node.value);
+            for value in direct.iter().copied().chain(
+                roots
+                    .iter()
+                    .filter(|output| output.accepted)
+                    .map(|output| output.node.value),
+            ) {
+                if activation.accepted.insert(value) {
+                    accepted.push(value);
                 }
             }
             had_stable_effect = activation.reducer.streams() && !accepted.is_empty();
@@ -1581,6 +1588,7 @@ impl DeltaScheduler {
         let vars: Vec<VariableId> = bound.into_iter().collect();
         let view = rows_view(&vars, &parent, 1);
         let mut roots = Vec::new();
+        let mut direct = Vec::new();
         let page = desc
             .resolve(root, plan)
             .residual_delta_source_page(
@@ -1590,10 +1598,11 @@ impl DeltaScheduler {
                 task.cursor,
                 width.max(1),
                 &mut roots,
+                &mut direct,
             )
             .expect("paged delta source became unsupported after seeding");
         assert!(page.examined <= width.max(1));
-        assert!(roots.len() <= page.examined);
+        assert!(roots.len() + direct.len() <= page.examined);
         if let Some(next) = page.next {
             match (task.cursor, next) {
                 (ResidualDeltaSourceCursor::Start, ResidualDeltaSourceCursor::After(_)) => {}
@@ -1610,7 +1619,9 @@ impl DeltaScheduler {
         stats.delta_source_candidates_examined += page.examined;
         stats.delta_source_roots += roots.len();
 
-        let outcome = self.registry.replace_source(task.credit, roots, page.next);
+        let outcome = self
+            .registry
+            .replace_source(task.credit, roots, direct, page.next);
         let mut traversal = Vec::with_capacity(outcome.roots.len());
         for (node, credit) in outcome.roots {
             traversal.push(DeltaTask {
@@ -1990,6 +2001,7 @@ mod tests {
         let dead_page = scheduler.registry.replace_source(
             dead_generator,
             [output(1, 0, false)],
+            [],
             Some(ResidualDeltaSourceCursor::After(value(1))),
         );
         let (dead_node, dead_credit) = dead_page.roots.into_iter().next().unwrap();
@@ -2218,6 +2230,7 @@ mod tests {
                 sourced_output(1, 1, 0, false),
                 sourced_output(2, 2, 0, false),
             ],
+            [],
             Some(next),
         );
         assert_eq!(page.roots.len(), 2);
@@ -2260,6 +2273,62 @@ mod tests {
     }
 
     #[test]
+    fn direct_source_effect_resumes_without_a_fake_traversal_credit() {
+        let mut registry = ProducerRegistry::new();
+        let (activation, generator) = registry.start_source(
+            DeltaReducer::StreamProposal,
+            stable_return(Vec::new()),
+            None,
+        );
+        let next = ResidualDeltaSourceCursor::After(value(9));
+        let first = registry.replace_source(generator, [], [value(1)], Some(next));
+        assert!(first.roots.is_empty());
+        assert_eq!(first.accepted, [value(1)]);
+        assert_eq!(
+            first
+                .retired_source_page
+                .expect("the rootless page retires immediately")
+                .had_stable_effect,
+            true
+        );
+        let (cursor, generator) = first
+            .resumed_source
+            .expect("the next direct page resumes immediately");
+        assert_eq!(cursor, next);
+        assert!(first.quiescence.is_none());
+        assert_eq!(
+            registry
+                .take_streaming_return(activation)
+                .expect("the direct candidate has a streaming return")
+                .effect,
+            DeltaStreamingEffect::Candidates
+        );
+
+        let last = registry.replace_source(generator, [], [value(2)], None);
+        assert!(last.roots.is_empty());
+        assert_eq!(last.accepted, [value(2)]);
+        assert!(last.resumed_source.is_none());
+        assert!(
+            last.retired_source_page
+                .expect("the terminal direct page retires immediately")
+                .had_stable_effect
+        );
+        assert_eq!(
+            registry
+                .take_streaming_return(activation)
+                .expect("the terminal candidate has a streaming return")
+                .effect,
+            DeltaStreamingEffect::Candidates
+        );
+        assert_eq!(
+            registry
+                .finish(last.quiescence.expect("the last page quiesces"))
+                .effect,
+            DeltaCompletion::Cleanup
+        );
+    }
+
+    #[test]
     fn grouped_confirm_waits_for_all_source_pages_before_reducing() {
         let first = value(1);
         let second = value(2);
@@ -2275,6 +2344,7 @@ mod tests {
         let first_page = registry.replace_source(
             generator,
             [sourced_output(1, 1, 0, true)],
+            [],
             Some(ResidualDeltaSourceCursor::After(first)),
         );
         assert_eq!(first_page.accepted, vec![first]);
@@ -2292,7 +2362,12 @@ mod tests {
             .resumed_source
             .expect("second page cursor resumed");
 
-        let second_page = registry.replace_source(generator, [sourced_output(2, 2, 0, true)], None);
+        let second_page = registry.replace_source(
+            generator,
+            [sourced_output(2, 2, 0, true)],
+            [],
+            None,
+        );
         assert!(second_page.quiescence.is_none());
         let (_, second_root) = second_page.roots.into_iter().next().expect("second root");
         let second_retired = registry.replace_traversal(second_root, []);
@@ -2433,7 +2508,7 @@ mod tests {
                 .resumed_source
                 .expect("retiring the page root resumes its generator");
             assert_eq!(cursor, ResidualDeltaSourceCursor::After(value(9)));
-            let terminal = registry.replace_source(generator, [], None);
+            let terminal = registry.replace_source(generator, [], [], None);
             assert!(terminal.roots.is_empty());
             let proof = terminal
                 .quiescence
@@ -2478,6 +2553,7 @@ mod tests {
         let page = original.replace_source(
             generator,
             [output(7, 0, true)],
+            [],
             Some(ResidualDeltaSourceCursor::After(value(9))),
         );
         assert_eq!(page.roots.len(), 1);

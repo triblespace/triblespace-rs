@@ -1116,15 +1116,32 @@ pub trait Constraint<'a> {
         false
     }
 
-    /// Produce at most `limit` roots from one activation's ordered source
+    /// Whether this proposal can expose an ordered direct-candidate source
+    /// frontier without first materializing its complete output.
+    ///
+    /// Unlike `residual_delta_source_is_paged`, this capability is consulted
+    /// only for Propose. A direct accepted value returned by the page hook is
+    /// already a proposal candidate and owns no transition lineage.
+    #[doc(hidden)]
+    fn residual_proposal_source_is_paged(
+        &self,
+        _variable: VariableId,
+        _view: &RowsView<'_>,
+    ) -> bool {
+        false
+    }
+
+    /// Consume at most `limit` entries from one activation's ordered source
     /// frontier.
     ///
     /// `view` contains exactly one immutable parent row. During grouped
     /// confirmation, `candidates` is the sorted, deduplicated set of values in
     /// that parent's immutable original candidate sequence; proposal actions
     /// pass `None`. Appended roots belong to this one activation and therefore
-    /// carry no parent tags. Returning `Some` declares support and must satisfy
-    /// `page.examined <= limit` plus `roots_added <= page.examined`.
+    /// carry no parent tags. Appended `accepted` values are terminal source
+    /// effects that need no transition expansion. Returning `Some` declares
+    /// support and must satisfy `page.examined <= limit` plus
+    /// `roots_added + accepted_added <= page.examined`.
     /// `page.next` is suspended until every root lineage from this page has
     /// retired. The conservative default is unsupported.
     #[doc(hidden)]
@@ -1136,6 +1153,7 @@ pub trait Constraint<'a> {
         _cursor: ResidualDeltaSourceCursor,
         _limit: usize,
         _roots: &mut Vec<ResidualDeltaOutput>,
+        _accepted: &mut Vec<RawInline>,
     ) -> Option<ResidualDeltaSourcePage> {
         None
     }
@@ -1276,6 +1294,11 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.residual_delta_source_is_paged(variable, view)
     }
 
+    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
+        let inner: &T = self;
+        inner.residual_proposal_source_is_paged(variable, view)
+    }
+
     fn residual_delta_source_page(
         &self,
         variable: VariableId,
@@ -1284,9 +1307,10 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         cursor: ResidualDeltaSourceCursor,
         limit: usize,
         roots: &mut Vec<ResidualDeltaOutput>,
+        accepted: &mut Vec<RawInline>,
     ) -> Option<ResidualDeltaSourcePage> {
         let inner: &T = self;
-        inner.residual_delta_source_page(variable, view, candidates, cursor, limit, roots)
+        inner.residual_delta_source_page(variable, view, candidates, cursor, limit, roots, accepted)
     }
 
     fn residual_delta_seeds(
@@ -1390,6 +1414,11 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
         inner.residual_delta_source_is_paged(variable, view)
     }
 
+    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
+        let inner: &T = self;
+        inner.residual_proposal_source_is_paged(variable, view)
+    }
+
     fn residual_delta_source_page(
         &self,
         variable: VariableId,
@@ -1398,9 +1427,10 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
         cursor: ResidualDeltaSourceCursor,
         limit: usize,
         roots: &mut Vec<ResidualDeltaOutput>,
+        accepted: &mut Vec<RawInline>,
     ) -> Option<ResidualDeltaSourcePage> {
         let inner: &T = self;
-        inner.residual_delta_source_page(variable, view, candidates, cursor, limit, roots)
+        inner.residual_delta_source_page(variable, view, candidates, cursor, limit, roots, accepted)
     }
 
     fn residual_delta_seeds(
