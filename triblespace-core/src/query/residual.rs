@@ -65,12 +65,13 @@
 //! computation while row values remain payload.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use indexmap::IndexSet;
 use smallvec::SmallVec;
 
 use super::*;
@@ -2768,8 +2769,8 @@ struct StateId(u32);
 
 #[derive(Clone, Default)]
 struct StateInterner {
-    by_desc: HashMap<StateDesc, StateId>,
-    descs: Vec<StateDesc>,
+    // The insertion index is the stable StateId; hashing never determines IDs.
+    descs: IndexSet<StateDesc, ahash::RandomState>,
 }
 
 impl StateInterner {
@@ -2779,20 +2780,30 @@ impl StateInterner {
         desc: StateDesc,
         stats: &mut ResidualStateStats,
     ) -> (StateId, bool) {
-        if let Some(&id) = self.by_desc.get(&desc) {
-            stats.interner_hits += 1;
-            return (id, true);
+        // Preserve successful lookups after the representable StateId space is
+        // full, while rejecting a genuinely new state before mutating the set.
+        if self.descs.len() > u32::MAX as usize {
+            if let Some(raw) = self.descs.get_index_of(&desc) {
+                stats.interner_hits += 1;
+                return (StateId(raw as u32), true);
+            }
+            panic!("too many residual states");
         }
-        let raw = u32::try_from(self.descs.len()).expect("too many residual states");
-        let id = StateId(raw);
-        self.descs.push(desc.clone());
-        self.by_desc.insert(desc, id);
-        stats.states_interned += 1;
-        (id, false)
+        let (raw, inserted) = self.descs.insert_full(desc);
+        let id = StateId(u32::try_from(raw).expect("too many residual states"));
+        if inserted {
+            stats.states_interned += 1;
+            (id, false)
+        } else {
+            stats.interner_hits += 1;
+            (id, true)
+        }
     }
 
     fn get(&self, id: StateId) -> &StateDesc {
-        &self.descs[id.0 as usize]
+        self.descs
+            .get_index(id.0 as usize)
+            .expect("interned residual state exists")
     }
 }
 
@@ -16407,6 +16418,61 @@ mod tests {
             .0;
         assert_eq!(left, right);
         assert_eq!(stats.states_interned, 1);
+        assert_eq!(stats.interner_hits, 1);
+    }
+
+    #[test]
+    fn interner_ids_follow_insertion_order_across_hashers_and_clones() {
+        let first = ready_desc(0);
+        let second = ready_desc(1);
+        let third = ready_desc(2);
+        let mut stats = ResidualStateStats::default();
+        let mut interner = StateInterner::default();
+
+        assert_eq!(
+            interner.intern_with_status(first.clone(), &mut stats),
+            (StateId(0), false)
+        );
+        assert_eq!(
+            interner.intern_with_status(second.clone(), &mut stats),
+            (StateId(1), false)
+        );
+        assert_eq!(
+            interner.intern_with_status(first.clone(), &mut stats),
+            (StateId(0), true)
+        );
+        assert_eq!(interner.get(StateId(0)), &first);
+        assert_eq!(interner.get(StateId(1)), &second);
+
+        let mut cloned = interner.clone();
+        let mut cloned_stats = ResidualStateStats::default();
+        assert_eq!(cloned.get(StateId(0)), &first);
+        assert_eq!(cloned.get(StateId(1)), &second);
+        assert_eq!(
+            interner.intern_with_status(third.clone(), &mut stats),
+            (StateId(2), false)
+        );
+        assert_eq!(
+            cloned.intern_with_status(third.clone(), &mut cloned_stats),
+            (StateId(2), false)
+        );
+
+        // A fresh randomized hasher must produce the same insertion-order IDs.
+        let mut fresh = StateInterner::default();
+        let mut fresh_stats = ResidualStateStats::default();
+        assert_eq!(
+            fresh.intern_with_status(first, &mut fresh_stats),
+            (StateId(0), false)
+        );
+        assert_eq!(
+            fresh.intern_with_status(second, &mut fresh_stats),
+            (StateId(1), false)
+        );
+        assert_eq!(
+            fresh.intern_with_status(third, &mut fresh_stats),
+            (StateId(2), false)
+        );
+        assert_eq!(stats.states_interned, 3);
         assert_eq!(stats.interner_hits, 1);
     }
 
