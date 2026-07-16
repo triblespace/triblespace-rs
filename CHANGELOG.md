@@ -346,6 +346,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   structural capability keeps product-state root sources and heterogeneous
   formula/path frontiers on the bounded transition substrate. Exact arm-local
   bags and the normalization barrier remain unchanged.
+- **Delta scheduling retains native successor ranges and unordered registries.**
+  Transition cohorts now pass their contiguous tagged output slices directly
+  into activation replacement, allocating per-task successor vectors only for
+  constraints that use the legacy eager fallback. Internal interner, credit,
+  activation, novelty, and acceptance maps use fast unordered storage wherever
+  iteration order is semantically invisible, while cohort selection retains
+  its canonical ordering. Complete positive-transition batches reserve their
+  cached fanout before the bulk PATCH expansion kernel.
 - **Residual RPQ scheduling separates fixpoint depth from parent breadth.**
   Transition work that can publish endpoints immediately still batches across
   activations. Quiescent formula, support, and grouped-confirm reducers instead

@@ -2340,6 +2340,7 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
             },
         );
         if all_fit {
+            successors.reserve(fanouts.iter().sum());
             self.expand_delta_program(program, batch.nodes, successors);
             pages.extend(fanouts.into_iter().map(|examined| {
                 Some(ResidualDeltaExpandPage {

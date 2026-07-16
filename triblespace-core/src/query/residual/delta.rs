@@ -4,8 +4,10 @@
 //! producer credits, and parent rows remain payload, so unrelated traversals
 //! can share one expansion cohort without becoming semantically conflated.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use ahash::{AHashMap, AHashSet};
 
 use super::*;
 
@@ -68,7 +70,7 @@ struct DeltaStateId(u32);
 
 #[derive(Clone, Default)]
 struct DeltaInterner {
-    by_desc: HashMap<DeltaDesc, DeltaStateId>,
+    by_desc: AHashMap<DeltaDesc, DeltaStateId>,
     descs: Vec<DeltaDesc>,
 }
 
@@ -208,14 +210,14 @@ struct Activation {
     /// The continuation cursor is suspended while every traversal lineage
     /// rooted in the current page owns the activation's affine credits.
     suspended_source_page: Option<SuspendedSourcePage>,
-    seen: HashMap<ResidualDeltaNode, bool>,
-    accepted: HashSet<RawInline>,
+    seen: AHashMap<ResidualDeltaNode, bool>,
+    accepted: AHashSet<RawInline>,
     /// Occurrence-preserving direct proposal effects retained only by a
     /// quiescent formula reducer. Streaming reducers file these immediately;
     /// transition acceptance continues to use the distinct `accepted` set.
     direct_candidates: Vec<RawInline>,
-    live: BTreeSet<CreditNonce>,
-    retired: BTreeSet<CreditNonce>,
+    live: AHashSet<CreditNonce>,
+    retired: AHashSet<CreditNonce>,
     status: ActivationStatus,
 }
 
@@ -223,8 +225,8 @@ struct Activation {
 struct RegistryState {
     next_activation: u64,
     next_credit: u64,
-    credit_owner: BTreeMap<CreditNonce, CreditOwner>,
-    activations: BTreeMap<ActivationId, Activation>,
+    credit_owner: AHashMap<CreditNonce, CreditOwner>,
+    activations: AHashMap<ActivationId, Activation>,
 }
 
 struct ProducerRegistry {
@@ -304,8 +306,8 @@ impl ProducerRegistry {
             state: RegistryState {
                 next_activation: 0,
                 next_credit: 0,
-                credit_owner: BTreeMap::new(),
-                activations: BTreeMap::new(),
+                credit_owner: AHashMap::new(),
+                activations: AHashMap::new(),
             },
         }
     }
@@ -322,8 +324,8 @@ impl ProducerRegistry {
             &mut self.state.next_activation,
             "activation",
         ));
-        let mut live = BTreeSet::new();
-        let mut accepted = HashSet::new();
+        let mut live = AHashSet::new();
+        let mut accepted = AHashSet::new();
         let mut initial_accepted = Vec::new();
         let mut roots = Vec::with_capacity(seeds.size_hint().0);
         for seed in seeds {
@@ -368,11 +370,11 @@ impl ProducerRegistry {
                         return_to,
                         source_candidates: None,
                         suspended_source_page: None,
-                        seen: HashMap::new(),
+                        seen: AHashMap::new(),
                         accepted,
                         direct_candidates: Vec::new(),
                         live,
-                        retired: BTreeSet::new(),
+                        retired: AHashSet::new(),
                         status,
                     },
                 )
@@ -411,11 +413,11 @@ impl ProducerRegistry {
                         return_to,
                         source_candidates,
                         suspended_source_page: None,
-                        seen: HashMap::new(),
-                        accepted: HashSet::new(),
+                        seen: AHashMap::new(),
+                        accepted: AHashSet::new(),
                         direct_candidates: Vec::new(),
-                        live: BTreeSet::new(),
-                        retired: BTreeSet::new(),
+                        live: AHashSet::new(),
+                        retired: AHashSet::new(),
                         status: ActivationStatus::Open,
                     },
                 )
@@ -573,7 +575,7 @@ impl ProducerRegistry {
 
         let roots: Vec<_> = roots.into_iter().collect();
         let direct: Vec<_> = direct.into_iter().collect();
-        let mut distinct_nodes = HashSet::with_capacity(roots.len());
+        let mut distinct_nodes = AHashSet::with_capacity(roots.len());
         assert!(
             roots
                 .iter()
@@ -1821,7 +1823,6 @@ impl DeltaScheduler {
         );
         let successor_ranges =
             tagged_ranges(&tagged_successors, task_count, "transition successor");
-        let mut successors = vec![Vec::new(); task_count];
         let mut next_cursors = vec![None; task_count];
         let mut paged = vec![false; task_count];
         let mut legacy_indices = Vec::new();
@@ -1830,11 +1831,10 @@ impl DeltaScheduler {
         for (index, (((task, page), range), &limit)) in tasks
             .iter()
             .zip(pages)
-            .zip(successor_ranges)
+            .zip(&successor_ranges)
             .zip(&limits)
             .enumerate()
         {
-            successors[index].extend(tagged_successors[range].iter().map(|(_, output)| *output));
             let Some(page) = page else {
                 assert_eq!(
                     task.cursor,
@@ -1842,7 +1842,7 @@ impl DeltaScheduler {
                     "paged delta expansion became unsupported after suspension"
                 );
                 assert!(
-                    successors[index].is_empty(),
+                    range.is_empty(),
                     "unsupported delta expansion page mutated its output"
                 );
                 legacy_indices.push(index);
@@ -1851,7 +1851,7 @@ impl DeltaScheduler {
             };
             paged_count += 1;
             assert!(page.examined <= limit);
-            assert!(successors[index].len() <= page.examined);
+            assert!(range.len() <= page.examined);
             if let Some(next) = page.next {
                 assert!(
                     page.examined > 0,
@@ -1879,6 +1879,7 @@ impl DeltaScheduler {
             stats.max_delta_transition_cohort = stats.max_delta_transition_cohort.max(paged_count);
         }
 
+        let mut legacy_successors = vec![Vec::new(); legacy_nodes.len()];
         if !legacy_nodes.is_empty() {
             let mut tagged = Vec::new();
             assert!(
@@ -1896,7 +1897,7 @@ impl DeltaScheduler {
                     "delta successor tags are not grouped in ascending order"
                 );
                 previous = tag;
-                successors[legacy_indices[tag as usize]].push(output);
+                legacy_successors[tag as usize].push(output);
             }
         }
 
@@ -1909,11 +1910,24 @@ impl DeltaScheduler {
         let mut completed_activations = 0usize;
         for (task_index, task) in tasks.into_iter().enumerate() {
             assert_eq!(task.activation, task.credit.key.activation);
-            let outcome = self.registry.replace_traversal_page(
-                task.credit,
-                successors[task_index].iter().copied(),
-                next_cursors[task_index],
-            );
+            let outcome = if paged[task_index] {
+                self.registry.replace_traversal_page(
+                    task.credit,
+                    tagged_successors[successor_ranges[task_index].clone()]
+                        .iter()
+                        .map(|(_, output)| *output),
+                    next_cursors[task_index],
+                )
+            } else {
+                let legacy_index = legacy_indices
+                    .binary_search(&task_index)
+                    .expect("unsupported transition task lost its legacy result slot");
+                self.registry.replace_traversal_page(
+                    task.credit,
+                    legacy_successors[legacy_index].iter().copied(),
+                    None,
+                )
+            };
             let retired_source_page = outcome.retired_source_page;
             let transition_page_had_effect =
                 !outcome.children.is_empty() || !outcome.accepted.is_empty();

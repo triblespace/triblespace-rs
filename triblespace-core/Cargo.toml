@@ -12,6 +12,7 @@ repository = "https://github.com/triblespace/triblespace-rs"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+ahash = "0.8"
 memmap2 = "0.9.5"
 json-event-parser = "0.2.2"
 winnow = "0.7.13"
