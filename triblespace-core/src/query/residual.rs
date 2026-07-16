@@ -1065,7 +1065,7 @@ impl FiniteFormulaProgram {
             _ => {
                 return FormulaProposalStreamability::Barrier(
                     FormulaProposalStreamBarrier::NotProposalAction,
-                )
+                );
             }
         };
         if !matches!(self.node(focused).kind, FiniteFormulaNodeKind::Atom) {
@@ -1323,8 +1323,8 @@ impl ResidualPlan {
             }
         }
 
-        let synthetic_root_formula = formula_scope == FormulaScope::WholeRoot
-            && !is_formula_identity(root);
+        let synthetic_root_formula =
+            formula_scope == FormulaScope::WholeRoot && !is_formula_identity(root);
         let mut leaves = Vec::new();
         let mut page_local_confirms = Vec::new();
         let mut grouped_delta_confirm_requirements: Vec<Box<[(VariableId, VariableSet)]>> =
@@ -1505,8 +1505,7 @@ impl ResidualPlan {
                 FiniteFormulaNodeKind::Atom => {
                     let constraint = plan.resolve_formula_node(root, occurrence, node);
                     constraint.residual_delta_source_is_paged(variable, view)
-                        || constraint
-                            .residual_proposal_source_has_transition_roots(variable, view)
+                        || constraint.residual_proposal_source_has_transition_roots(variable, view)
                 }
                 FiniteFormulaNodeKind::And { children }
                 | FiniteFormulaNodeKind::Or { children } => children.iter().any(|&child| {
@@ -1520,8 +1519,7 @@ impl ResidualPlan {
                 || {
                     let constraint = self.resolve(root, occurrence);
                     constraint.residual_delta_source_is_paged(variable, view)
-                        || constraint
-                            .residual_proposal_source_has_transition_roots(variable, view)
+                        || constraint.residual_proposal_source_has_transition_roots(variable, view)
                 },
                 |formula_root| {
                     formula_has_source(self, root, occurrence, formula_root, variable, view)
@@ -2839,13 +2837,339 @@ impl RowBatch {
     }
 }
 
+/// Physical candidate representation, kept outside canonical state identity.
+///
+/// A live one-parent payload has no row-coordinate information to preserve, so
+/// it stores the same plain value vector as the scalar DFS. Multi-parent
+/// payloads use the block-native tagged COO representation. The scheduler
+/// promotes only when independently affine parent domains reconverge and
+/// normalizes back after a split or compaction leaves one parent.
+#[derive(Clone, Debug)]
+enum CandidatePayload {
+    Values(Vec<RawInline>),
+    Tagged(Candidates),
+}
+
+#[cfg(test)]
+enum CandidatePayloadIter<'a> {
+    Values(std::slice::Iter<'a, RawInline>),
+    Tagged(std::slice::Iter<'a, (u32, RawInline)>),
+}
+
+#[cfg(test)]
+impl<'a> Iterator for CandidatePayloadIter<'a> {
+    type Item = (u32, &'a RawInline);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Values(values) => values.next().map(|value| (0, value)),
+            Self::Tagged(pairs) => pairs.next().map(|(parent, value)| (*parent, value)),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Values(values) => values.size_hint(),
+            Self::Tagged(pairs) => pairs.size_hint(),
+        }
+    }
+}
+
+impl CandidatePayload {
+    fn empty(parent_count: usize) -> Self {
+        if parent_count == 1 {
+            Self::Values(Vec::new())
+        } else {
+            Self::Tagged(Vec::new())
+        }
+    }
+
+    fn from_tagged(pairs: Candidates, parent_count: usize) -> Self {
+        if parent_count == 1 {
+            let mut values = Vec::with_capacity(pairs.len());
+            for (parent, value) in pairs {
+                assert_eq!(parent, 0, "one-parent candidate tag must be zero");
+                values.push(value);
+            }
+            Self::Values(values)
+        } else {
+            if parent_count == 0 {
+                assert!(pairs.is_empty(), "an empty parent shell carried candidates");
+            }
+            Self::Tagged(pairs)
+        }
+    }
+
+    fn normalize_for(&mut self, parent_count: usize) {
+        let payload = std::mem::replace(self, Self::Tagged(Vec::new()));
+        *self = match (payload, parent_count) {
+            (Self::Values(values), 1) => Self::Values(values),
+            (Self::Tagged(pairs), 1) => Self::from_tagged(pairs, 1),
+            (Self::Tagged(pairs), 0) => {
+                assert!(pairs.is_empty(), "an empty parent shell carried candidates");
+                Self::Tagged(pairs)
+            }
+            (Self::Values(values), 0) => {
+                assert!(
+                    values.is_empty(),
+                    "an empty parent shell carried candidates"
+                );
+                Self::Tagged(Vec::new())
+            }
+            (Self::Tagged(pairs), _) => Self::Tagged(pairs),
+            (Self::Values(values), _) => {
+                let mut pairs = Vec::with_capacity(values.len());
+                pairs.extend(values.into_iter().map(|value| (0, value)));
+                Self::Tagged(pairs)
+            }
+        };
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Values(values) => values.len(),
+            Self::Tagged(pairs) => pairs.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[cfg(test)]
+    fn iter(&self) -> CandidatePayloadIter<'_> {
+        match self {
+            Self::Values(values) => CandidatePayloadIter::Values(values.iter()),
+            Self::Tagged(pairs) => CandidatePayloadIter::Tagged(pairs.iter()),
+        }
+    }
+
+    fn sink(&mut self, parent_count: usize) -> CandidateSink<'_> {
+        self.debug_assert_valid_for(parent_count);
+        match self {
+            Self::Values(values) => {
+                assert_eq!(parent_count, 1, "plain candidates require one parent");
+                CandidateSink::Values(values)
+            }
+            Self::Tagged(pairs) => CandidateSink::Tagged(pairs),
+        }
+    }
+
+    fn as_tagged_mut(&mut self) -> &mut Candidates {
+        match self {
+            Self::Tagged(pairs) => pairs,
+            Self::Values(_) => panic!("tagged candidate payload required"),
+        }
+    }
+
+    fn one_parent_values(&self) -> &[RawInline] {
+        match self {
+            Self::Values(values) => values,
+            Self::Tagged(_) => panic!("one-parent payload was not normalized to plain values"),
+        }
+    }
+
+    #[inline]
+    fn all_parents_in(&self, parent_count: usize) -> bool {
+        match self {
+            Self::Values(_) => parent_count == 1,
+            Self::Tagged(pairs) => pairs
+                .iter()
+                .all(|(parent, _)| (*parent as usize) < parent_count),
+        }
+    }
+
+    #[inline]
+    fn mark_live_parents(&self, live: &mut [bool]) {
+        match self {
+            Self::Values(values) => {
+                assert_eq!(live.len(), 1, "plain candidates require one parent");
+                live[0] = !values.is_empty();
+            }
+            Self::Tagged(pairs) => {
+                for (parent, _) in pairs {
+                    live[*parent as usize] = true;
+                }
+            }
+        }
+    }
+
+    fn append_disjoint(&mut self, other: Self, left_parents: usize, right_parents: usize) {
+        assert!(left_parents > 0 && right_parents > 0);
+        self.debug_assert_valid_for(left_parents);
+        other.debug_assert_valid_for(right_parents);
+        let offset = u32::try_from(left_parents).expect("too many candidate parents");
+        let left = std::mem::replace(self, Self::Tagged(Vec::new()));
+        *self = match (left, other) {
+            (Self::Values(left), Self::Values(right)) => {
+                let mut pairs = Vec::with_capacity(left.len() + right.len());
+                pairs.extend(left.into_iter().map(|value| (0, value)));
+                pairs.extend(right.into_iter().map(|value| (offset, value)));
+                Self::Tagged(pairs)
+            }
+            (Self::Values(left), Self::Tagged(right)) => {
+                let mut pairs = Vec::with_capacity(left.len() + right.len());
+                pairs.extend(left.into_iter().map(|value| (0, value)));
+                pairs.extend(right.into_iter().map(|(parent, value)| {
+                    (
+                        parent.checked_add(offset).expect("candidate row overflow"),
+                        value,
+                    )
+                }));
+                Self::Tagged(pairs)
+            }
+            (Self::Tagged(mut left), Self::Values(right)) => {
+                left.extend(right.into_iter().map(|value| (offset, value)));
+                Self::Tagged(left)
+            }
+            (Self::Tagged(mut left), Self::Tagged(right)) => {
+                left.extend(right.into_iter().map(|(parent, value)| {
+                    (
+                        parent.checked_add(offset).expect("candidate row overflow"),
+                        value,
+                    )
+                }));
+                Self::Tagged(left)
+            }
+        };
+    }
+
+    /// Appends candidates that already share the same affine parent domain.
+    /// Formula OR reduction uses this operation; unlike bucket reconvergence,
+    /// the right-hand row coordinates must not be shifted.
+    fn extend_same_domain(&mut self, other: Self, parent_count: usize) {
+        self.debug_assert_valid_for(parent_count);
+        other.debug_assert_valid_for(parent_count);
+        match (self, other) {
+            (Self::Values(left), Self::Values(mut right)) => left.append(&mut right),
+            (Self::Tagged(left), Self::Tagged(mut right)) => left.append(&mut right),
+            _ => unreachable!("same parent domain selected incompatible candidate shapes"),
+        }
+    }
+
+    fn sort_unstable(&mut self) {
+        match self {
+            Self::Values(values) => values.sort_unstable(),
+            Self::Tagged(pairs) => pairs.sort_unstable(),
+        }
+    }
+
+    fn is_sorted(&self) -> bool {
+        match self {
+            Self::Values(values) => values.is_sorted(),
+            Self::Tagged(pairs) => pairs.is_sorted(),
+        }
+    }
+
+    fn dedup(&mut self) {
+        match self {
+            Self::Values(values) => values.dedup(),
+            Self::Tagged(pairs) => pairs.dedup(),
+        }
+    }
+
+    fn take_parent_tail(&mut self, first: usize, parent_count: usize) -> Self {
+        assert!(first > 0 && first < parent_count);
+        self.debug_assert_valid_for(parent_count);
+        let Self::Tagged(pairs) = self else {
+            unreachable!("a partial parent split requires tagged candidates")
+        };
+        let cut = pairs.partition_point(|(parent, _)| (*parent as usize) < first);
+        let mut tail = pairs.split_off(cut);
+        let first_tag = u32::try_from(first).expect("too many candidate parents");
+        for (parent, _) in &mut tail {
+            *parent = parent
+                .checked_sub(first_tag)
+                .expect("candidate tail contained an earlier parent");
+        }
+        self.normalize_for(first);
+        Self::from_tagged(tail, parent_count - first)
+    }
+
+    /// Splits a disjoint candidate-occurrence tail. Returns the tail payload,
+    /// its first parent in the old domain, and the number of parents retained
+    /// by the prefix. A one-parent Values payload stays Values on both sides.
+    fn take_candidate_tail(&mut self, parent_count: usize, take: usize) -> (Self, usize, usize) {
+        assert!(take > 0 && take < self.len());
+        self.debug_assert_valid_for(parent_count);
+        let cut = self.len() - take;
+        match self {
+            Self::Values(values) => {
+                assert_eq!(parent_count, 1);
+                (Self::Values(values.split_off(cut)), 0, 1)
+            }
+            Self::Tagged(pairs) => {
+                let mut tail = pairs.split_off(cut);
+                let first_tail_parent = tail[0].0 as usize;
+                let prefix_parent_count = pairs.last().unwrap().0 as usize + 1;
+                assert!(first_tail_parent < parent_count);
+                assert!(prefix_parent_count <= first_tail_parent + 1);
+                let first_tag =
+                    u32::try_from(first_tail_parent).expect("too many candidate parents");
+                for (parent, _) in &mut tail {
+                    *parent = parent
+                        .checked_sub(first_tag)
+                        .expect("candidate tail contained an earlier parent");
+                }
+                self.normalize_for(prefix_parent_count);
+                (
+                    Self::from_tagged(tail, parent_count - first_tail_parent),
+                    first_tail_parent,
+                    prefix_parent_count,
+                )
+            }
+        }
+    }
+
+    fn debug_assert_valid_for(&self, parent_count: usize) {
+        match self {
+            Self::Values(_) => debug_assert_eq!(parent_count, 1),
+            Self::Tagged(pairs) => {
+                debug_assert_ne!(parent_count, 1);
+                debug_assert!(
+                    pairs.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+                    "candidate tags must remain grouped by ascending parent"
+                );
+                debug_assert!(pairs
+                    .iter()
+                    .all(|(parent, _)| (*parent as usize) < parent_count));
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn is_values(&self) -> bool {
+        matches!(self, Self::Values(_))
+    }
+
+    #[cfg(test)]
+    fn tagged_snapshot(&self) -> Candidates {
+        self.iter()
+            .map(|(parent, value)| (parent, *value))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+impl<T: ?Sized> PartialEq<T> for CandidatePayload
+where
+    T: AsRef<[(u32, RawInline)]>,
+{
+    fn eq(&self, other: &T) -> bool {
+        self.iter().eq(other
+            .as_ref()
+            .iter()
+            .map(|(parent, value)| (*parent, value)))
+    }
+}
+
 #[derive(Clone, Debug)]
 struct CandidateBatch {
     /// Committed parent bindings. The speculative variable is deliberately
     /// absent from this block and travels only in `candidates`.
     parents: RowBatch,
-    /// Ragged candidates grouped by parent row.
-    candidates: Candidates,
+    /// Ragged candidates in the representation implied by `parents.row_count`.
+    candidates: CandidatePayload,
 }
 
 impl CandidateBatch {
@@ -2853,16 +3177,12 @@ impl CandidateBatch {
         self.candidates.len()
     }
 
-    fn append(&mut self, mut other: Self) {
-        let offset = u32::try_from(self.parents.row_count).expect("too many candidate parents");
+    fn append(&mut self, other: Self) {
+        let left_parents = self.parents.row_count;
+        let right_parents = other.parents.row_count;
         self.parents.append(other.parents);
         self.candidates
-            .extend(other.candidates.drain(..).map(|(row, value)| {
-                (
-                    row.checked_add(offset).expect("candidate row overflow"),
-                    value,
-                )
-            }));
+            .append_disjoint(other.candidates, left_parents, right_parents);
     }
 
     /// Takes at most `width` complete parent atoms from the tail.
@@ -2885,7 +3205,10 @@ impl CandidateBatch {
                         row_count: 0,
                     },
                 ),
-                candidates: std::mem::take(&mut self.candidates),
+                candidates: std::mem::replace(
+                    &mut self.candidates,
+                    CandidatePayload::Tagged(Vec::new()),
+                ),
             };
         }
 
@@ -2893,10 +3216,11 @@ impl CandidateBatch {
         let tail_rows = self.parents.rows.split_off(first * stride);
         self.parents.row_count = first;
 
-        let candidate_cut = self
-            .candidates
-            .partition_point(|(row, _)| (*row as usize) < first);
-        let mut candidates = self.candidates.split_off(candidate_cut);
+        let CandidatePayload::Tagged(pairs) = &mut self.candidates else {
+            unreachable!("a partial parent split requires tagged candidates")
+        };
+        let candidate_cut = pairs.partition_point(|(row, _)| (*row as usize) < first);
+        let mut candidates = pairs.split_off(candidate_cut);
         let first = u32::try_from(first).expect("too many candidate parents");
         for (row, _) in &mut candidates {
             *row = row
@@ -2904,13 +3228,16 @@ impl CandidateBatch {
                 .expect("candidate tail contained a prefix row");
         }
 
-        Self {
+        self.candidates.normalize_for(self.parents.row_count);
+        let mut tail = Self {
             parents: RowBatch {
                 rows: tail_rows,
                 row_count: take,
             },
-            candidates,
-        }
+            candidates: CandidatePayload::Tagged(candidates),
+        };
+        tail.candidates.normalize_for(tail.parents.row_count);
+        tail
     }
 
     /// Takes at most `width` candidate occurrences from the tail, allowing a
@@ -2928,14 +3255,28 @@ impl CandidateBatch {
                         row_count: 0,
                     },
                 ),
-                candidates: std::mem::take(&mut self.candidates),
+                candidates: std::mem::replace(
+                    &mut self.candidates,
+                    CandidatePayload::Tagged(Vec::new()),
+                ),
             };
         }
 
         let cut = self.candidate_count() - take;
-        let mut tail_candidates = self.candidates.split_off(cut);
+        if let CandidatePayload::Values(values) = &mut self.candidates {
+            assert_eq!(self.parents.row_count, 1);
+            let tail_candidates = values.split_off(cut);
+            return Self {
+                parents: self.parents.clone(),
+                candidates: CandidatePayload::Values(tail_candidates),
+            };
+        }
+        let CandidatePayload::Tagged(pairs) = &mut self.candidates else {
+            unreachable!()
+        };
+        let mut tail_candidates = pairs.split_off(cut);
         let first_tail_parent = tail_candidates[0].0 as usize;
-        let prefix_parent_count = self.candidates.last().unwrap().0 as usize + 1;
+        let prefix_parent_count = pairs.last().unwrap().0 as usize + 1;
         assert!(
             first_tail_parent < self.parents.row_count,
             "constraint emitted an invalid candidate row tag"
@@ -2958,14 +3299,17 @@ impl CandidateBatch {
         }
         self.parents.rows.truncate(prefix_parent_count * stride);
         self.parents.row_count = prefix_parent_count;
+        self.candidates.normalize_for(prefix_parent_count);
 
-        Self {
+        let mut tail = Self {
             parents: RowBatch {
                 rows: tail_rows,
                 row_count: tail_parent_count,
             },
-            candidates: tail_candidates,
-        }
+            candidates: CandidatePayload::Tagged(tail_candidates),
+        };
+        tail.candidates.normalize_for(tail_parent_count);
+        tail
     }
 
     /// Stable-partitions parents and their ragged candidate groups in one
@@ -2985,7 +3329,7 @@ impl CandidateBatch {
                     rows: Vec::new(),
                     row_count: 0,
                 },
-                candidates: Vec::new(),
+                candidates: CandidatePayload::Tagged(Vec::new()),
             });
             remap[parent] =
                 u32::try_from(group.parents.row_count).expect("too many candidate parents");
@@ -2997,30 +3341,54 @@ impl CandidateBatch {
             group.parents.row_count += 1;
         }
 
-        for (parent, value) in self.candidates {
-            let parent = parent as usize;
-            assert!(
-                parent < row_count,
-                "constraint emitted an invalid candidate row tag"
-            );
-            groups
-                .get_mut(&assignment[parent])
-                .expect("every parent assignment created its group")
-                .candidates
-                .push((remap[parent], value));
+        match self.candidates {
+            CandidatePayload::Values(values) => {
+                assert_eq!(row_count, 1, "plain candidates require one parent");
+                let group = groups
+                    .get_mut(&assignment[0])
+                    .expect("the only parent assignment created its group");
+                group.candidates = CandidatePayload::Values(values);
+            }
+            CandidatePayload::Tagged(pairs) => {
+                for (parent, value) in pairs {
+                    let parent = parent as usize;
+                    assert!(
+                        parent < row_count,
+                        "constraint emitted an invalid candidate row tag"
+                    );
+                    groups
+                        .get_mut(&assignment[parent])
+                        .expect("every parent assignment created its group")
+                        .candidates
+                        .as_tagged_mut()
+                        .push((remap[parent], value));
+                }
+            }
+        }
+        for group in groups.values_mut() {
+            group.candidates.normalize_for(group.parents.row_count);
         }
         groups
     }
 
     /// Drops parents with no surviving candidates and densely remaps tags.
     fn compact(mut self, stride: usize) -> Option<Self> {
+        self.candidates
+            .debug_assert_valid_for(self.parents.row_count);
         if self.candidates.is_empty() {
             return None;
         }
+        if matches!(self.candidates, CandidatePayload::Values(_)) {
+            assert_eq!(self.parents.row_count, 1);
+            return Some(self);
+        }
+        let CandidatePayload::Tagged(pairs) = &mut self.candidates else {
+            unreachable!()
+        };
         let parent_count = self.parents.row_count;
         let mut next_parent = 0usize;
         let mut no_gap = true;
-        for &(row, _) in &self.candidates {
+        for &(row, _) in pairs.iter() {
             let row = row as usize;
             assert!(
                 row < parent_count,
@@ -3041,7 +3409,7 @@ impl CandidateBatch {
         }
 
         let mut live = vec![false; parent_count];
-        for &(row, _) in &self.candidates {
+        for &(row, _) in pairs.iter() {
             live[row as usize] = true;
         }
         let mut remap = vec![u32::MAX; parent_count];
@@ -3053,10 +3421,38 @@ impl CandidateBatch {
             }
         }
         self.parents = self.parents.selected(stride, &indices);
-        for (row, _) in &mut self.candidates {
+        for (row, _) in pairs.iter_mut() {
             *row = remap[*row as usize];
         }
+        self.candidates.normalize_for(self.parents.row_count);
         Some(self)
+    }
+
+    fn into_parent_candidates(self) -> (RowBatch, Vec<Vec<RawInline>>) {
+        let parent_count = self.parents.row_count;
+        let groups = match self.candidates {
+            CandidatePayload::Values(values) => {
+                assert_eq!(parent_count, 1);
+                vec![values]
+            }
+            CandidatePayload::Tagged(pairs) => {
+                let mut groups = vec![Vec::new(); parent_count];
+                let mut previous = 0;
+                for (parent, value) in pairs {
+                    let parent = parent as usize;
+                    assert!(parent < parent_count, "invalid candidate parent tag");
+                    assert!(parent >= previous, "candidate tags are not grouped");
+                    previous = parent;
+                    groups[parent].push(value);
+                }
+                groups
+            }
+        };
+        assert!(
+            groups.iter().all(|group| !group.is_empty()),
+            "compacted candidate parent has no candidates"
+        );
+        (self.parents, groups)
     }
 }
 
@@ -3070,11 +3466,8 @@ impl CandidateBatch {
 struct ActivationId(u64);
 
 #[inline]
-fn debug_assert_candidates_grouped(candidates: &Candidates) {
-    debug_assert!(
-        candidates.windows(2).all(|pair| pair[0].0 <= pair[1].0),
-        "candidate tags must remain grouped by ascending parent"
-    );
+fn debug_assert_candidates_grouped(candidates: &CandidatePayload, parent_count: usize) {
+    candidates.debug_assert_valid_for(parent_count);
 }
 
 #[derive(Clone, Debug)]
@@ -3084,40 +3477,44 @@ enum FormulaPayloadFrame {
     /// protocol's ascending-parent grouping; `output` is fully sorted after
     /// every child accumulation so frame completion can deduplicate in place.
     Or {
-        source: Candidates,
-        output: Candidates,
+        source: CandidatePayload,
+        output: CandidatePayload,
     },
     /// AND threads one ascending-parent-grouped candidate stream through its
     /// selected proposer and remaining confirmers. Empty current streams
     /// annihilate this branch without erasing the enclosing OR activation.
-    And { current: Candidates },
+    And { current: CandidatePayload },
 }
 
 impl FormulaPayloadFrame {
-    fn empty_like(&self) -> Self {
+    fn empty_like(&self, parent_count: usize) -> Self {
         match self {
             Self::Or { .. } => Self::Or {
-                source: Vec::new(),
-                output: Vec::new(),
+                source: CandidatePayload::empty(parent_count),
+                output: CandidatePayload::empty(parent_count),
             },
             Self::And { .. } => Self::And {
-                current: Vec::new(),
+                current: CandidatePayload::empty(parent_count),
             },
         }
     }
 
-    fn result(self) -> Candidates {
+    fn result(self, parent_count: usize) -> CandidatePayload {
         match self {
             Self::Or { mut output, .. } => {
                 // OR is a set-valued reducer. Normalize at this frame's own
                 // completion boundary so an enclosing AND never observes
                 // duplicate candidates produced by sibling histories. Every
                 // accumulation already sorted the complete output.
+                output.debug_assert_valid_for(parent_count);
                 debug_assert!(output.is_sorted());
                 output.dedup();
                 output
             }
-            Self::And { current } => current,
+            Self::And { current } => {
+                current.debug_assert_valid_for(parent_count);
+                current
+            }
         }
     }
 }
@@ -3133,11 +3530,15 @@ struct FormulaBatch {
 }
 
 impl FormulaBatch {
-    fn root_frame(kind: &FiniteFormulaNodeKind, source: Candidates) -> FormulaPayloadFrame {
+    fn root_frame(
+        kind: &FiniteFormulaNodeKind,
+        source: CandidatePayload,
+        parent_count: usize,
+    ) -> FormulaPayloadFrame {
         match kind {
             FiniteFormulaNodeKind::Or { .. } => FormulaPayloadFrame::Or {
                 source,
-                output: Vec::new(),
+                output: CandidatePayload::empty(parent_count),
             },
             // A root Atom uses the same single-stream payload as a one-child
             // conjunction. Nested atoms continue to operate directly on
@@ -3154,10 +3555,15 @@ impl FormulaBatch {
         root_kind: &FiniteFormulaNodeKind,
     ) -> Self {
         assert_eq!(parents.row_count, activations.len());
+        let parent_count = activations.len();
         Self {
             activations,
             parents,
-            frames: vec![Self::root_frame(root_kind, Vec::new())],
+            frames: vec![Self::root_frame(
+                root_kind,
+                CandidatePayload::empty(parent_count),
+                parent_count,
+            )],
         }
     }
 
@@ -3169,11 +3575,12 @@ impl FormulaBatch {
         assert_eq!(batch.parents.row_count, activations.len());
         // CandidateBatch inherits the protocol's ascending-parent grouping;
         // formula traversal and splitting require no stronger value order.
-        debug_assert_candidates_grouped(&batch.candidates);
+        debug_assert_candidates_grouped(&batch.candidates, batch.parents.row_count);
+        let parent_count = batch.parents.row_count;
         Self {
             activations,
             parents: batch.parents,
-            frames: vec![Self::root_frame(root_kind, batch.candidates)],
+            frames: vec![Self::root_frame(root_kind, batch.candidates, parent_count)],
         }
     }
 
@@ -3184,7 +3591,7 @@ impl FormulaBatch {
         }
     }
 
-    fn input(&self) -> &Candidates {
+    fn input(&self) -> &CandidatePayload {
         match self
             .frames
             .last()
@@ -3206,7 +3613,7 @@ impl FormulaBatch {
     /// Ordinary protocol execution and quiescent cyclic execution share this
     /// exact boundary so AND replaces its working stream while OR accumulates
     /// one independently evaluated arm.
-    fn apply_action_result(&mut self, stage: FormulaStage, result: Candidates) {
+    fn apply_action_result(&mut self, stage: FormulaStage, result: CandidatePayload) {
         assert_ne!(
             stage,
             FormulaStage::Support,
@@ -3214,13 +3621,13 @@ impl FormulaBatch {
         );
         // Both protocol verbs preserve ascending parent groups. AND needs
         // only that grouping; OR sorts once after combining sibling arms.
-        debug_assert_candidates_grouped(&result);
+        debug_assert_candidates_grouped(&result, self.parents.row_count);
         match (self.frames.last_mut().unwrap(), stage) {
             (
                 FormulaPayloadFrame::Or { output, .. },
                 FormulaStage::Propose | FormulaStage::Confirm,
             ) => {
-                output.extend(result);
+                output.extend_same_domain(result, self.parents.row_count);
                 output.sort_unstable();
             }
             (FormulaPayloadFrame::And { current }, FormulaStage::Propose) => {
@@ -3237,13 +3644,13 @@ impl FormulaBatch {
     fn validate_tags(&self) {
         assert!(
             self.frames.iter().all(|frame| match frame {
-                FormulaPayloadFrame::Or { source, output } => source
-                    .iter()
-                    .chain(output.iter())
-                    .all(|(parent, _)| (*parent as usize) < self.parents.row_count),
-                FormulaPayloadFrame::And { current } => current
-                    .iter()
-                    .all(|(parent, _)| (*parent as usize) < self.parents.row_count),
+                FormulaPayloadFrame::Or { source, output } => {
+                    source.all_parents_in(self.parents.row_count)
+                        && output.all_parents_in(self.parents.row_count)
+                }
+                FormulaPayloadFrame::And { current } => {
+                    current.all_parents_in(self.parents.row_count)
+                }
             }),
             "formula action emitted an invalid candidate row tag"
         );
@@ -3254,14 +3661,14 @@ impl FormulaBatch {
             FormulaStage::Support => {
                 panic!("Boolean support does not allocate candidate reducer frames")
             }
-            FormulaStage::Propose => Vec::new(),
+            FormulaStage::Propose => CandidatePayload::empty(self.parents.row_count),
             FormulaStage::Confirm => self.input().clone(),
         };
         self.frames.push(match kind {
             FiniteFormulaNodeKind::And { .. } => FormulaPayloadFrame::And { current: input },
             FiniteFormulaNodeKind::Or { .. } => FormulaPayloadFrame::Or {
                 source: input,
-                output: Vec::new(),
+                output: CandidatePayload::empty(self.parents.row_count),
             },
             FiniteFormulaNodeKind::Atom => panic!("an Atom cannot own a formula payload frame"),
         });
@@ -3276,14 +3683,14 @@ impl FormulaBatch {
             .frames
             .pop()
             .expect("a returning formula node has a payload frame")
-            .result();
+            .result(self.parents.row_count);
         match self
             .frames
             .last_mut()
             .expect("a returning formula node has a parent frame")
         {
             FormulaPayloadFrame::Or { output, .. } => {
-                output.extend(result);
+                output.extend_same_domain(result, self.parents.row_count);
                 output.sort_unstable();
             }
             FormulaPayloadFrame::And { current } => *current = result,
@@ -3299,26 +3706,17 @@ impl FormulaBatch {
             panic!("only an AND frame has annihilating current streams")
         };
         let mut live = vec![false; self.parents.row_count];
-        for &(parent, _) in current {
-            live[parent as usize] = true;
-        }
+        current.mark_live_parents(&mut live);
         live
     }
 
     fn append(&mut self, mut other: Self) {
-        let offset = u32::try_from(self.parents.row_count).expect("too many formula parents");
+        let left_parents = self.parents.row_count;
+        let right_parents = other.parents.row_count;
         self.parents.append(other.parents);
         self.activations.append(&mut other.activations);
         assert_eq!(self.frames.len(), other.frames.len());
 
-        fn append_values(left: &mut Candidates, right: Candidates, offset: u32) {
-            left.extend(right.into_iter().map(|(parent, value)| {
-                (
-                    parent.checked_add(offset).expect("formula parent overflow"),
-                    value,
-                )
-            }));
-        }
         for (left, right) in self.frames.iter_mut().zip(other.frames) {
             match (left, right) {
                 (
@@ -3331,8 +3729,8 @@ impl FormulaBatch {
                         output: right_output,
                     },
                 ) => {
-                    append_values(left_source, right_source, offset);
-                    append_values(left_output, right_output, offset);
+                    left_source.append_disjoint(right_source, left_parents, right_parents);
+                    left_output.append_disjoint(right_output, left_parents, right_parents);
                 }
                 (
                     FormulaPayloadFrame::And {
@@ -3341,7 +3739,7 @@ impl FormulaBatch {
                     FormulaPayloadFrame::And {
                         current: right_current,
                     },
-                ) => append_values(left_current, right_current, offset),
+                ) => left_current.append_disjoint(right_current, left_parents, right_parents),
                 _ => panic!("one formula state received incompatible payload-frame shapes"),
             }
         }
@@ -3363,7 +3761,7 @@ impl FormulaBatch {
                 frames: self
                     .frames
                     .iter_mut()
-                    .map(|frame| std::mem::replace(frame, frame.empty_like()))
+                    .map(|frame| std::mem::replace(frame, frame.empty_like(0)))
                     .collect(),
             };
         }
@@ -3373,28 +3771,17 @@ impl FormulaBatch {
         self.parents.row_count = first;
         let activations = self.activations.split_off(first);
 
-        fn take_tagged_tail(values: &mut Candidates, first: usize) -> Candidates {
-            let cut = values.partition_point(|(parent, _)| (*parent as usize) < first);
-            let mut tail = values.split_off(cut);
-            let first = u32::try_from(first).expect("too many formula parents");
-            for (parent, _) in &mut tail {
-                *parent = parent
-                    .checked_sub(first)
-                    .expect("formula tail contained an earlier parent");
-            }
-            tail
-        }
-
+        let old_parent_count = first + take;
         let frames = self
             .frames
             .iter_mut()
             .map(|frame| match frame {
                 FormulaPayloadFrame::Or { source, output } => FormulaPayloadFrame::Or {
-                    source: take_tagged_tail(source, first),
-                    output: take_tagged_tail(output, first),
+                    source: source.take_parent_tail(first, old_parent_count),
+                    output: output.take_parent_tail(first, old_parent_count),
                 },
                 FormulaPayloadFrame::And { current } => FormulaPayloadFrame::And {
-                    current: take_tagged_tail(current, first),
+                    current: current.take_parent_tail(first, old_parent_count),
                 },
             })
             .collect();
@@ -3434,15 +3821,13 @@ impl FormulaBatch {
                     },
                 ),
                 frames: vec![FormulaPayloadFrame::And {
-                    current: std::mem::take(current),
+                    current: std::mem::replace(current, CandidatePayload::Tagged(Vec::new())),
                 }],
             };
         }
 
-        let cut = current.len() - take;
-        let mut tail_candidates = current.split_off(cut);
-        let first_tail_parent = tail_candidates[0].0 as usize;
-        let prefix_parent_count = current.last().unwrap().0 as usize + 1;
+        let (tail_candidates, first_tail_parent, prefix_parent_count) =
+            current.take_candidate_tail(self.parents.row_count, take);
         assert!(
             first_tail_parent < self.parents.row_count,
             "constraint emitted an invalid candidate row tag"
@@ -3455,12 +3840,6 @@ impl FormulaBatch {
         let tail_rows = self.parents.rows[first_tail_parent * stride..].to_vec();
         let tail_parent_count = self.parents.row_count - first_tail_parent;
         let tail_activations = self.activations[first_tail_parent..].to_vec();
-        let first_tail_parent = u32::try_from(first_tail_parent).expect("too many parents");
-        for (parent, _) in &mut tail_candidates {
-            *parent = parent
-                .checked_sub(first_tail_parent)
-                .expect("candidate tail contained an earlier parent");
-        }
         self.parents.rows.truncate(prefix_parent_count * stride);
         self.parents.row_count = prefix_parent_count;
         self.activations.truncate(prefix_parent_count);
@@ -3494,7 +3873,7 @@ impl FormulaBatch {
         let empty_frames: Vec<_> = self
             .frames
             .iter()
-            .map(FormulaPayloadFrame::empty_like)
+            .map(|frame| frame.empty_like(0))
             .collect();
 
         for (parent, (child, activation)) in assignment
@@ -3522,7 +3901,7 @@ impl FormulaBatch {
         }
 
         fn partition_values<K>(
-            values: Candidates,
+            values: CandidatePayload,
             assignment: &[K],
             remap: &[u32],
             groups: &mut BTreeMap<K, FormulaBatch>,
@@ -3531,20 +3910,23 @@ impl FormulaBatch {
         ) where
             K: Clone + Ord,
         {
-            for (parent, value) in values {
+            let CandidatePayload::Tagged(pairs) = values else {
+                unreachable!("a non-uniform formula partition requires multiple parents")
+            };
+            for (parent, value) in pairs {
                 let parent = parent as usize;
                 let target = groups
                     .get_mut(&assignment[parent])
                     .expect("every formula assignment created its group");
                 match (&mut target.frames[frame], field) {
                     (FormulaPayloadFrame::Or { source, .. }, 0) => {
-                        source.push((remap[parent], value))
+                        source.as_tagged_mut().push((remap[parent], value))
                     }
                     (FormulaPayloadFrame::Or { output, .. }, 1) => {
-                        output.push((remap[parent], value))
+                        output.as_tagged_mut().push((remap[parent], value))
                     }
                     (FormulaPayloadFrame::And { current }, 0) => {
-                        current.push((remap[parent], value))
+                        current.as_tagged_mut().push((remap[parent], value))
                     }
                     _ => panic!("formula frame field disagrees with its structural shape"),
                 }
@@ -3558,6 +3940,20 @@ impl FormulaBatch {
                 }
                 FormulaPayloadFrame::And { current } => {
                     partition_values(current, assignment, &remap, &mut groups, frame, 0);
+                }
+            }
+        }
+        for group in groups.values_mut() {
+            let parent_count = group.parents.row_count;
+            for frame in &mut group.frames {
+                match frame {
+                    FormulaPayloadFrame::Or { source, output } => {
+                        source.normalize_for(parent_count);
+                        output.normalize_for(parent_count);
+                    }
+                    FormulaPayloadFrame::And { current } => {
+                        current.normalize_for(parent_count);
+                    }
                 }
             }
         }
@@ -3580,7 +3976,7 @@ impl FormulaBatch {
         let root = self.frames.pop().unwrap();
         CandidateBatch {
             parents: self.parents,
-            candidates: root.result(),
+            candidates: root.result(self.activations.len()),
         }
     }
 }
@@ -4342,14 +4738,14 @@ fn propose_action_transition<'a>(
     }
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
     let view = rows_view(&vars, &rows.rows, rows.row_count);
-    let mut candidates = Vec::new();
+    let mut candidates = CandidatePayload::empty(rows.row_count);
     propose_leaf(
         root,
         plan,
         proposer,
         variable,
         &view,
-        &mut CandidateSink::Tagged(&mut candidates),
+        &mut candidates.sink(rows.row_count),
     );
     stats.propose_calls += 1;
     stats.propose_rows += rows.row_count;
@@ -4399,7 +4795,7 @@ fn commit_candidates(
     let next_vars: Vec<VariableId> = next_bound.into_iter().collect();
     let mut next_rows = Vec::with_capacity(batch.candidates.len() * next_vars.len());
 
-    for (parent, candidate) in batch.candidates {
+    let mut commit_one = |parent: usize, candidate: RawInline| {
         let parent = parent as usize;
         let parent_row =
             &batch.parents.rows[parent * parent_vars.len()..(parent + 1) * parent_vars.len()];
@@ -4410,6 +4806,19 @@ fn commit_candidates(
             } else {
                 next_rows.push(parent_row[source]);
                 source += 1;
+            }
+        }
+    };
+    match batch.candidates {
+        CandidatePayload::Values(values) => {
+            assert_eq!(batch.parents.row_count, 1);
+            for candidate in values {
+                commit_one(0, candidate);
+            }
+        }
+        CandidatePayload::Tagged(pairs) => {
+            for (parent, candidate) in pairs {
+                commit_one(parent as usize, candidate);
             }
         }
     }
@@ -4583,7 +4992,7 @@ fn confirm_action_transition<'a>(
         confirmer,
         variable,
         &view,
-        &mut CandidateSink::Tagged(&mut batch.candidates),
+        &mut batch.candidates.sink(batch.parents.row_count),
     );
     stats.confirm_calls += 1;
     stats.confirm_rows += batch.parents.row_count;
@@ -5122,7 +5531,7 @@ fn finish_formula_action_result(
     bound: VariableSet,
     counter: &FormulaProgramCounter,
     mut batch: FormulaBatch,
-    result: Candidates,
+    result: CandidatePayload,
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
@@ -5201,7 +5610,7 @@ fn formula_action_transition<'a>(
 
     let mut result = match stage {
         FormulaStage::Support => unreachable!("support returned above"),
-        FormulaStage::Propose => Vec::new(),
+        FormulaStage::Propose => CandidatePayload::empty(batch.parents.row_count),
         FormulaStage::Confirm => batch.input().clone(),
     };
     let candidates_before = result.len();
@@ -5211,7 +5620,7 @@ fn formula_action_transition<'a>(
             constraint.propose(
                 counter.resume.variable,
                 &view,
-                &mut CandidateSink::Tagged(&mut result),
+                &mut result.sink(batch.parents.row_count),
             );
             stats.candidates_proposed += result.len();
             stats.max_propose_candidates = stats.max_propose_candidates.max(result.len());
@@ -5220,7 +5629,7 @@ fn formula_action_transition<'a>(
             constraint.confirm(
                 counter.resume.variable,
                 &view,
-                &mut CandidateSink::Tagged(&mut result),
+                &mut result.sink(batch.parents.row_count),
             );
             stats.candidates_confirmed += candidates_before;
             stats.max_confirm_candidates = stats.max_confirm_candidates.max(candidates_before);
@@ -6453,7 +6862,7 @@ impl ResidualStateMachine {
                     continuation,
                     active,
                     seeded_parents,
-                }
+                };
             }
             Err(task) => task,
         };
@@ -6466,7 +6875,7 @@ impl ResidualStateMachine {
                     continuation,
                     active,
                     seeded_parents,
-                }
+                };
             }
             Err(task) => task,
         };
@@ -6479,7 +6888,7 @@ impl ResidualStateMachine {
                     continuation,
                     active,
                     seeded_parents,
-                }
+                };
             }
             Err(task) => task,
         };
@@ -8798,6 +9207,61 @@ mod tests {
         confirms: Arc<AtomicUsize>,
     }
 
+    #[derive(Clone)]
+    struct SinkShapeLeaf {
+        variable: VariableId,
+        estimate: usize,
+        log: Arc<Mutex<Vec<(ActionVerb, bool)>>>,
+    }
+
+    impl Constraint<'static> for SinkShapeLeaf {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(self.variable)
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != self.variable {
+                return false;
+            }
+            out.fill(self.estimate, view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            assert_eq!(variable, self.variable);
+            self.log.lock().unwrap().push((
+                ActionVerb::Propose,
+                matches!(candidates, CandidateSink::Values(_)),
+            ));
+            for row in 0..view.len() {
+                candidates.push(row as u32, raw(42));
+            }
+        }
+
+        fn confirm(
+            &self,
+            variable: VariableId,
+            _view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            assert_eq!(variable, self.variable);
+            self.log.lock().unwrap().push((
+                ActionVerb::Confirm,
+                matches!(candidates, CandidateSink::Values(_)),
+            ));
+        }
+    }
+
     impl Constraint<'static> for VerbLeaf {
         fn variables(&self) -> VariableSet {
             VariableSet::new_singleton(self.variable)
@@ -9307,6 +9771,10 @@ mod tests {
         value
     }
 
+    fn candidate_payload(parent_count: usize, candidates: Candidates) -> CandidatePayload {
+        CandidatePayload::from_tagged(candidates, parent_count)
+    }
+
     fn ready_desc(bound_count: usize) -> StateDesc {
         let mut bound = VariableSet::new_empty();
         for variable in 0..bound_count {
@@ -9787,10 +10255,7 @@ mod tests {
             .finite_formula
             .select_child_as_action(&linear_start, 0);
         assert_eq!(
-            linear_plan.formula_proposal_streamability(
-                &linear_action,
-                VariableSet::new_empty(),
-            ),
+            linear_plan.formula_proposal_streamability(&linear_action, VariableSet::new_empty(),),
             FormulaProposalStreamability::Linear,
             "the focused proposer itself need not be a page-local confirmer"
         );
@@ -9810,10 +10275,8 @@ mod tests {
             .finite_formula
             .select_child_as_action(&start(&non_local_plan), 0);
         assert_eq!(
-            non_local_plan.formula_proposal_streamability(
-                &non_local_action,
-                VariableSet::new_empty(),
-            ),
+            non_local_plan
+                .formula_proposal_streamability(&non_local_action, VariableSet::new_empty(),),
             FormulaProposalStreamability::Barrier(
                 FormulaProposalStreamBarrier::NonPageLocalConfirm
             )
@@ -9834,10 +10297,7 @@ mod tests {
             .finite_formula
             .select_child_as_action(&start(&grouped_plan), 0);
         assert_eq!(
-            grouped_plan.formula_proposal_streamability(
-                &grouped_action,
-                VariableSet::new_empty(),
-            ),
+            grouped_plan.formula_proposal_streamability(&grouped_action, VariableSet::new_empty(),),
             FormulaProposalStreamability::Barrier(FormulaProposalStreamBarrier::GroupedConfirm)
         );
 
@@ -9856,10 +10316,7 @@ mod tests {
             .finite_formula
             .select_child_as_action(&start(&union_plan), 0);
         assert_eq!(
-            union_plan.formula_proposal_streamability(
-                &union_action,
-                VariableSet::new_empty(),
-            ),
+            union_plan.formula_proposal_streamability(&union_action, VariableSet::new_empty(),),
             FormulaProposalStreamability::Barrier(FormulaProposalStreamBarrier::OrFrame)
         );
 
@@ -9871,10 +10328,8 @@ mod tests {
             .finite_formula
             .select_child_as_action(&start(&old_formula_plan), 0);
         assert_eq!(
-            old_formula_plan.formula_proposal_streamability(
-                &old_formula_action,
-                VariableSet::new_empty(),
-            ),
+            old_formula_plan
+                .formula_proposal_streamability(&old_formula_action, VariableSet::new_empty(),),
             FormulaProposalStreamability::Barrier(FormulaProposalStreamBarrier::NotSyntheticRoot)
         );
     }
@@ -9980,10 +10435,7 @@ mod tests {
             }
         ));
         assert!(program.grade(&guard) > program.grade(&start));
-        assert!(!plan.formula_uses_candidate_pages(
-            &guard,
-            VariableSet::new_empty(),
-        ));
+        assert!(!plan.formula_uses_candidate_pages(&guard, VariableSet::new_empty(),));
 
         let guard_complete = program.complete(&guard);
         assert!(program.grade(&guard_complete) > program.grade(&guard));
@@ -10221,25 +10673,80 @@ mod tests {
             },
             frames: vec![
                 FormulaPayloadFrame::And {
-                    current: Vec::new(),
+                    current: CandidatePayload::Values(Vec::new()),
                 },
                 FormulaPayloadFrame::Or {
-                    source: vec![(0, raw(9))],
-                    output: Vec::new(),
+                    source: CandidatePayload::Values(vec![raw(9)]),
+                    output: CandidatePayload::Values(Vec::new()),
                 },
             ],
         };
 
         batch.apply_action_result(
             FormulaStage::Propose,
-            vec![(0, raw(2)), (0, raw(1)), (0, raw(2))],
+            CandidatePayload::Values(vec![raw(2), raw(1), raw(2)]),
         );
         batch.return_frame();
         assert_eq!(batch.frames.len(), 1);
         let FormulaPayloadFrame::And { current } = &batch.frames[0] else {
             panic!("local OR returned into the wrong parent-frame shape")
         };
-        assert_eq!(current, &vec![(0, raw(1)), (0, raw(2))]);
+        assert!(current.is_values());
+        assert_eq!(current.one_parent_values(), [raw(1), raw(2)]);
+    }
+
+    #[test]
+    fn formula_or_deduplicates_within_an_affine_parent_but_not_across_parents() {
+        let candidate = raw(7);
+        let result = FormulaPayloadFrame::Or {
+            source: candidate_payload(2, Vec::new()),
+            output: candidate_payload(
+                2,
+                vec![
+                    (0, candidate),
+                    (0, candidate),
+                    (1, candidate),
+                    (1, candidate),
+                ],
+            ),
+        }
+        .result(2);
+
+        assert_eq!(result, [(0, candidate), (1, candidate)]);
+        assert!(!result.is_values());
+    }
+
+    #[test]
+    fn one_parent_ordinary_and_formula_actions_receive_plain_value_sinks() {
+        for lowering in [
+            ResidualLowering::CONSERVATIVE,
+            ResidualLowering::new(FormulaScope::WholeRoot, false),
+        ] {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let root = IntersectionConstraint::new(vec![
+                Box::new(SinkShapeLeaf {
+                    variable: 0,
+                    estimate: 1,
+                    log: Arc::clone(&log),
+                }) as ShapeConstraint,
+                Box::new(SinkShapeLeaf {
+                    variable: 0,
+                    estimate: 2,
+                    log: Arc::clone(&log),
+                }) as ShapeConstraint,
+            ]);
+
+            let results: Vec<_> = Query::new(root, |binding: &Binding| binding.get(0).copied())
+                .solve_residual_state_lazy_with(lowering)
+                .collect();
+
+            assert_eq!(results, [raw(42)]);
+            assert_eq!(
+                *log.lock().unwrap(),
+                [(ActionVerb::Propose, true), (ActionVerb::Confirm, true)],
+                "one-parent actions must stay tagless under {lowering:?}"
+            );
+        }
     }
 
     #[test]
@@ -10251,7 +10758,7 @@ mod tests {
                     rows: vec![raw(20), raw(21)],
                     row_count: 2,
                 },
-                candidates: initial.clone(),
+                candidates: candidate_payload(2, initial.clone()),
             },
             vec![ActivationId(0), ActivationId(1)],
             &FiniteFormulaNodeKind::Atom,
@@ -10260,7 +10767,10 @@ mod tests {
         assert_eq!(batch.input(), initial.as_slice());
 
         let confirmed = vec![(0, raw(7)), (0, raw(3)), (1, raw(6)), (1, raw(4))];
-        batch.apply_action_result(FormulaStage::Confirm, confirmed.clone());
+        batch.apply_action_result(
+            FormulaStage::Confirm,
+            candidate_payload(2, confirmed.clone()),
+        );
         assert_eq!(batch.input(), confirmed.as_slice());
     }
 
@@ -10274,11 +10784,11 @@ mod tests {
             },
             frames: vec![
                 FormulaPayloadFrame::Or {
-                    source: vec![(0, raw(20)), (2, raw(21))],
-                    output: vec![(1, raw(22))],
+                    source: candidate_payload(3, vec![(0, raw(20)), (2, raw(21))]),
+                    output: candidate_payload(3, vec![(1, raw(22))]),
                 },
                 FormulaPayloadFrame::And {
-                    current: vec![(0, raw(30)), (1, raw(31)), (2, raw(32))],
+                    current: candidate_payload(3, vec![(0, raw(30)), (1, raw(31)), (2, raw(32))]),
                 },
             ],
         };
@@ -10291,19 +10801,14 @@ mod tests {
         );
         assert_eq!(group.parents.rows, [1, 2, 3, 4, 5, 6].map(raw));
         assert_eq!(group.parents.row_count, 3);
-        let [
-            FormulaPayloadFrame::Or { source, output },
-            FormulaPayloadFrame::And { current },
-        ] = group.frames.as_slice()
+        let [FormulaPayloadFrame::Or { source, output }, FormulaPayloadFrame::And { current }] =
+            group.frames.as_slice()
         else {
             panic!("uniform partition changed formula frame shapes")
         };
         assert_eq!(source, &vec![(0, raw(20)), (2, raw(21))]);
         assert_eq!(output, &vec![(1, raw(22))]);
-        assert_eq!(
-            current,
-            &vec![(0, raw(30)), (1, raw(31)), (2, raw(32))]
-        );
+        assert_eq!(current, &vec![(0, raw(30)), (1, raw(31)), (2, raw(32))]);
 
         let empty = FormulaBatch {
             activations: Vec::new(),
@@ -10312,7 +10817,7 @@ mod tests {
                 row_count: 0,
             },
             frames: vec![FormulaPayloadFrame::And {
-                current: Vec::new(),
+                current: CandidatePayload::Tagged(Vec::new()),
             }],
         };
         assert!(empty.partition::<u8>(0, &[]).is_empty());
@@ -10982,12 +11487,13 @@ mod tests {
                 rows: vec![raw(0), raw(1), raw(2)],
                 row_count: 3,
             },
-            candidates: original_candidates.clone(),
+            candidates: candidate_payload(3, original_candidates.clone()),
         };
 
         let tail = prefix.take_tail(1, 2);
         assert_eq!(prefix.parents.rows, [raw(0)]);
         assert_eq!(prefix.parents.row_count, 1);
+        assert!(prefix.candidates.is_values());
         assert_eq!(prefix.candidates, [(0, raw(10)), (0, raw(10))]);
         assert_eq!(tail.parents.rows, [raw(1), raw(2)]);
         assert_eq!(tail.parents.row_count, 2);
@@ -11002,12 +11508,78 @@ mod tests {
     }
 
     #[test]
+    fn disjoint_candidate_append_promotes_once_and_preserves_occurrence_order() {
+        let mut values_values = CandidatePayload::Values(vec![raw(1), raw(1)]);
+        values_values.append_disjoint(CandidatePayload::Values(vec![raw(2)]), 1, 1);
+        assert_eq!(values_values, [(0, raw(1)), (0, raw(1)), (1, raw(2))]);
+
+        let mut values_tagged = CandidatePayload::Values(vec![raw(3)]);
+        values_tagged.append_disjoint(
+            candidate_payload(2, vec![(0, raw(4)), (1, raw(5)), (1, raw(5))]),
+            1,
+            2,
+        );
+        assert_eq!(
+            values_tagged,
+            [(0, raw(3)), (1, raw(4)), (2, raw(5)), (2, raw(5))]
+        );
+
+        let mut tagged_values = candidate_payload(2, vec![(0, raw(6)), (1, raw(7)), (1, raw(7))]);
+        tagged_values.append_disjoint(CandidatePayload::Values(vec![raw(8)]), 2, 1);
+        assert_eq!(
+            tagged_values,
+            [(0, raw(6)), (1, raw(7)), (1, raw(7)), (2, raw(8))]
+        );
+
+        let mut tagged_tagged = candidate_payload(2, vec![(0, raw(9)), (1, raw(10))]);
+        tagged_tagged.append_disjoint(candidate_payload(2, vec![(0, raw(11)), (1, raw(12))]), 2, 2);
+        assert_eq!(
+            tagged_tagged,
+            [(0, raw(9)), (1, raw(10)), (2, raw(11)), (3, raw(12))]
+        );
+    }
+
+    #[test]
+    fn candidate_partition_and_compaction_demote_single_parent_groups() {
+        let mut empty_shell = CandidatePayload::Values(Vec::new());
+        empty_shell.normalize_for(0);
+        assert!(!empty_shell.is_values());
+
+        let batch = CandidateBatch {
+            parents: RowBatch {
+                rows: vec![raw(20), raw(21)],
+                row_count: 2,
+            },
+            candidates: candidate_payload(2, vec![(0, raw(1)), (1, raw(2)), (1, raw(2))]),
+        };
+        let groups = batch.partition(1, &[0u8, 1u8]);
+        assert_eq!(groups.len(), 2);
+        for group in groups.values() {
+            assert_eq!(group.parents.row_count, 1);
+            assert!(group.candidates.is_values());
+        }
+
+        let compacted = CandidateBatch {
+            parents: RowBatch {
+                rows: vec![raw(30), raw(31), raw(32)],
+                row_count: 3,
+            },
+            candidates: candidate_payload(3, vec![(1, raw(4)), (1, raw(4))]),
+        }
+        .compact(1)
+        .expect("one parent survives");
+        assert_eq!(compacted.parents.rows, [raw(31)]);
+        assert!(compacted.candidates.is_values());
+        assert_eq!(compacted.candidates.one_parent_values(), [raw(4), raw(4)]);
+    }
+
+    #[test]
     fn candidate_pages_may_bisect_one_parent_without_losing_occurrences() {
         fn expanded(batch: &CandidateBatch) -> Vec<(RawInline, RawInline)> {
             batch
                 .candidates
                 .iter()
-                .map(|&(parent, candidate)| (batch.parents.rows[parent as usize], candidate))
+                .map(|(parent, candidate)| (batch.parents.rows[parent as usize], *candidate))
                 .collect()
         }
 
@@ -11016,20 +11588,24 @@ mod tests {
                 rows: vec![raw(20), raw(21)],
                 row_count: 2,
             },
-            candidates: vec![
-                (0, raw(1)),
-                (0, raw(1)),
-                (0, raw(2)),
-                (0, raw(3)),
-                (1, raw(4)),
-                (1, raw(5)),
-            ],
+            candidates: candidate_payload(
+                2,
+                vec![
+                    (0, raw(1)),
+                    (0, raw(1)),
+                    (0, raw(2)),
+                    (0, raw(3)),
+                    (1, raw(4)),
+                    (1, raw(5)),
+                ],
+            ),
         };
         let expected = expanded(&original);
         let mut prefix = original;
         let page = prefix.take_candidate_tail(1, 3);
 
         assert_eq!(prefix.parents.rows, [raw(20)]);
+        assert!(prefix.candidates.is_values());
         assert_eq!(prefix.candidates, [(0, raw(1)), (0, raw(1)), (0, raw(2))]);
         assert_eq!(page.parents.rows, [raw(20), raw(21)]);
         assert_eq!(page.candidates, [(0, raw(3)), (1, raw(4)), (1, raw(5))]);
@@ -11055,12 +11631,12 @@ mod tests {
             batch
                 .candidates
                 .iter()
-                .map(|&(parent, candidate)| {
+                .map(|(parent, candidate)| {
                     let parent = parent as usize;
                     let start = parent * stride;
                     (
                         batch.parents.rows[start..start + stride].to_vec(),
-                        candidate,
+                        *candidate,
                     )
                 })
                 .collect()
@@ -11071,13 +11647,11 @@ mod tests {
             assert!(batch
                 .candidates
                 .iter()
-                .all(|(row, _)| (*row as usize) < batch.parents.row_count));
-            assert!(batch
-                .candidates
-                .windows(2)
-                .all(|pair| pair[0].0 <= pair[1].0));
+                .all(|(row, _)| (row as usize) < batch.parents.row_count));
+            let snapshot = batch.candidates.tagged_snapshot();
+            assert!(snapshot.windows(2).all(|pair| pair[0].0 <= pair[1].0));
             let mut seen = vec![false; batch.parents.row_count];
-            for &(row, _) in &batch.candidates {
+            for (row, _) in snapshot {
                 seen[row as usize] = true;
             }
             assert!(seen.into_iter().all(|live| live));
@@ -11110,7 +11684,7 @@ mod tests {
                         rows: parent_rows,
                         row_count: parent_count,
                     },
-                    candidates,
+                    candidates: candidate_payload(parent_count, candidates),
                 };
                 let mut expected = expanded(&original, stride);
                 let mut remainder = original;
@@ -11229,7 +11803,7 @@ mod tests {
             desc.clone(),
             StateBucket::Candidates(CandidateBatch {
                 parents: RowBatch::seed(),
-                candidates: (0..8).map(|value| (0, raw(value))).collect(),
+                candidates: CandidatePayload::Values((0..8).map(raw).collect()),
             }),
             &mut machine.stats,
         )
@@ -11244,6 +11818,7 @@ mod tests {
             panic!("candidate state returned row payload")
         };
         assert_eq!(page.parents.row_count, 1);
+        assert!(page.candidates.is_values());
         assert_eq!(page.candidates, [(0, raw(6)), (0, raw(7))]);
 
         let (_, level) = machine
@@ -11313,13 +11888,16 @@ mod tests {
                 rows: vec![raw(20), raw(21)],
                 row_count: 2,
             },
-            candidates: vec![
-                (0, raw(1)),
-                (0, raw(2)),
-                (0, raw(3)),
-                (1, raw(4)),
-                (1, raw(5)),
-            ],
+            candidates: candidate_payload(
+                2,
+                vec![
+                    (0, raw(1)),
+                    (0, raw(2)),
+                    (0, raw(3)),
+                    (1, raw(4)),
+                    (1, raw(5)),
+                ],
+            ),
         };
         let candidate = SelectedResidualTask {
             state: StateId(42),
@@ -15038,7 +15616,7 @@ mod tests {
                     rows: Vec::new(),
                     row_count,
                 },
-                candidates,
+                candidates: candidate_payload(row_count, candidates),
             })
         };
         let mut candidate_machine = ResidualStateMachine::new(
@@ -15129,7 +15707,9 @@ mod tests {
                     rows: Vec::new(),
                     row_count,
                 },
-                frames: vec![FormulaPayloadFrame::And { current }],
+                frames: vec![FormulaPayloadFrame::And {
+                    current: candidate_payload(row_count, current),
+                }],
             })
         };
         let mut formula_machine =
@@ -15226,7 +15806,7 @@ mod tests {
                 rows: vec![raw(10)],
                 row_count: 1,
             },
-            candidates: vec![(0, raw(1)), (0, raw(2)), (0, raw(3))],
+            candidates: CandidatePayload::Values(vec![raw(1), raw(2), raw(3)]),
         });
         let _old_token = file(
             &mut machine.worklist,
@@ -15247,7 +15827,7 @@ mod tests {
                     rows: vec![raw(99)],
                     row_count: 1,
                 },
-                candidates: vec![(0, raw(42))],
+                candidates: CandidatePayload::Values(vec![raw(42)]),
             }),
             &mut machine.stats,
         )
@@ -15756,7 +16336,7 @@ mod tests {
                     rows: vec![raw(3); parent_count],
                     row_count: parent_count,
                 },
-                candidates,
+                candidates: candidate_payload(parent_count, candidates),
             })
         }
 
@@ -15786,7 +16366,8 @@ mod tests {
             StateBucket::Candidates(batch) => {
                 assert_eq!(batch.parents.row_count, 1);
                 assert_eq!(batch.candidates.len(), 64);
-                assert!(batch.candidates.iter().all(|(parent, _)| *parent == 0));
+                assert!(batch.candidates.is_values());
+                assert!(batch.candidates.iter().all(|(parent, _)| parent == 0));
             }
             StateBucket::Rows(_) | StateBucket::Formula(_) => {
                 panic!("confirmation returned a non-candidate payload")
@@ -15814,7 +16395,14 @@ mod tests {
             StateBucket::Candidates(batch) => {
                 assert_eq!(batch.parents.row_count, 2);
                 assert_eq!(batch.candidates.len(), 65);
-                assert_eq!(batch.candidates.last().map(|(parent, _)| *parent), Some(1));
+                assert_eq!(
+                    batch
+                        .candidates
+                        .tagged_snapshot()
+                        .last()
+                        .map(|(parent, _)| *parent),
+                    Some(1)
+                );
             }
             StateBucket::Rows(_) | StateBucket::Formula(_) => {
                 panic!("confirmation returned a non-candidate payload")
@@ -15895,7 +16483,7 @@ mod tests {
             candidate_desc,
             StateBucket::Candidates(CandidateBatch {
                 parents: RowBatch::seed(),
-                candidates: vec![(0, raw(7))],
+                candidates: CandidatePayload::Values(vec![raw(7)]),
             }),
             &mut stats,
         )
@@ -16038,7 +16626,7 @@ mod tests {
         };
         let candidate_bucket = StateBucket::Candidates(CandidateBatch {
             parents: RowBatch::seed(),
-            candidates: vec![(0, raw(1))],
+            candidates: CandidatePayload::Values(vec![raw(1)]),
         });
         let mut worklist = Worklist::new();
         let mut interner = StateInterner::default();
@@ -16117,7 +16705,7 @@ mod tests {
         };
         let bucket = StateBucket::Candidates(CandidateBatch {
             parents: RowBatch::seed(),
-            candidates: vec![(0, raw(7))],
+            candidates: CandidatePayload::Values(vec![raw(7)]),
         });
         let mut worklist = Worklist::new();
         let mut interner = StateInterner::default();
@@ -16197,7 +16785,7 @@ mod tests {
         };
         let candidate_bucket = StateBucket::Candidates(CandidateBatch {
             parents: RowBatch::seed(),
-            candidates: vec![(0, raw(1))],
+            candidates: CandidatePayload::Values(vec![raw(1)]),
         });
         let mut worklist = Worklist::new();
         let mut interner = StateInterner::default();
@@ -16304,7 +16892,7 @@ mod tests {
                     rows: vec![raw(first_parent), raw(first_parent + 1)],
                     row_count: 2,
                 },
-                candidates: vec![(0, raw(10)), (1, raw(11))],
+                candidates: candidate_payload(2, vec![(0, raw(10)), (1, raw(11))]),
             })
         };
         let mut worklist = Worklist::new();

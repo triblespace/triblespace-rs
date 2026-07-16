@@ -347,6 +347,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **One-parent residual candidate payloads stay tagless.** Ordinary and lowered
+  formula actions now receive the scalar `Values` candidate sink whenever one
+  affine parent is live, while reconverged multi-parent work promotes to the
+  existing tagged COO representation. Splits, partitions, compaction, and
+  delta handoffs normalize back to values at singleton boundaries without
+  changing candidate order, multiplicity, OR deduplication, or canonical state
+  identity.
 - **Residual formula payloads retain only their required ordering.** Candidate
   actions and confirmation handoffs now trust the protocol's ascending-parent
   grouping instead of value-sorting every leaf result. OR accumulators still
