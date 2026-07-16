@@ -31,8 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   activation payload rather than canonical state identity; clones retain the
   exact remainder, duplicate outer parents remain distinct bags, and accepted
   endpoints keep their existing per-activation set semantics. Negated-property
-  transitions retain the eager expansion path until their two-level
-  attribute/value frontier has an equally exact cursor.
+  branches page distinct destinations in EVA/VEA order with the same cursor,
+  then test the destination's attribute suffix for an exact non-excluded
+  witness. Excluded-only destinations consume demand without producing a
+  successor, so mixed positive/negated nodes obey one global width; pages with
+  no novel effect feed the same geometric negative-width ramp as dead source
+  pages.
 - **Ordered proposal sources can page direct candidate occurrences.** The
   residual source cursor now distinguishes raw-value and native-ordinal
   frontiers while preserving proposal order and multiplicity. Sorted slices
