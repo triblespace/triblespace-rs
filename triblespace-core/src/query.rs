@@ -790,14 +790,17 @@ pub struct ResidualDeltaSeed {
 /// Borrow-free cursor for a constraint-owned residual source frontier.
 ///
 /// The cursor is activation payload, never part of the canonical residual or
-/// delta state identifier. `After(value)` means that the next page must
-/// consider only source candidates strictly greater than `value` in raw-inline
-/// lexicographic order.
+/// delta state identifier. A source must choose one cursor family and retain it
+/// for the activation. `After(value)` resumes strictly after `value` in
+/// raw-inline lexicographic order. `Offset(index)` resumes at a strictly later
+/// ordinal position in an immutable constraint-owned sequence whose native
+/// order need not agree with raw-inline order.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ResidualDeltaSourceCursor {
     Start,
     After(RawInline),
+    Offset(u64),
 }
 
 /// Result metadata for one bounded residual source page.
@@ -1120,7 +1123,7 @@ pub trait Constraint<'a> {
     /// frontier without first materializing its complete output.
     ///
     /// Unlike `residual_delta_source_is_paged`, this capability is consulted
-    /// only for Propose. A direct accepted value returned by the page hook is
+    /// only for Propose. A direct candidate returned by the page hook is
     /// already a proposal candidate and owns no transition lineage.
     #[doc(hidden)]
     fn residual_proposal_source_is_paged(
@@ -1138,8 +1141,10 @@ pub trait Constraint<'a> {
     /// confirmation, `candidates` is the sorted, deduplicated set of values in
     /// that parent's immutable original candidate sequence; proposal actions
     /// pass `None`. Appended roots belong to this one activation and therefore
-    /// carry no parent tags. Appended `accepted` values are terminal source
-    /// effects that need no transition expansion. Returning `Some` declares
+    /// carry no parent tags. Appended `accepted` values are direct candidate
+    /// occurrences that need no transition expansion; their order and
+    /// multiplicity are preserved exactly, unlike transition witnesses that
+    /// reduce to distinct accepted endpoints. Returning `Some` declares
     /// support and must satisfy `page.examined <= limit` plus
     /// `roots_added + accepted_added <= page.examined`.
     /// `page.next` is suspended until every root lineage from this page has

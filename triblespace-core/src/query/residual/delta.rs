@@ -210,6 +210,10 @@ struct Activation {
     suspended_source_page: Option<SuspendedSourcePage>,
     seen: HashMap<ResidualDeltaNode, bool>,
     accepted: HashSet<RawInline>,
+    /// Occurrence-preserving direct proposal effects retained only by a
+    /// quiescent formula reducer. Streaming reducers file these immediately;
+    /// transition acceptance continues to use the distinct `accepted` set.
+    direct_candidates: Vec<RawInline>,
     pending_accepted: Vec<RawInline>,
     live: BTreeSet<CreditNonce>,
     retired: BTreeSet<CreditNonce>,
@@ -362,6 +366,7 @@ impl ProducerRegistry {
                         suspended_source_page: None,
                         seen: HashMap::new(),
                         accepted,
+                        direct_candidates: Vec::new(),
                         pending_accepted,
                         live,
                         retired: BTreeSet::new(),
@@ -404,6 +409,7 @@ impl ProducerRegistry {
                         suspended_source_page: None,
                         seen: HashMap::new(),
                         accepted: HashSet::new(),
+                        direct_candidates: Vec::new(),
                         pending_accepted: Vec::new(),
                         live: BTreeSet::new(),
                         retired: BTreeSet::new(),
@@ -555,7 +561,12 @@ impl ProducerRegistry {
             "one residual source page repeated a root node"
         );
 
-        let mut accepted = Vec::new();
+        // Direct proposal effects are candidate occurrences, not transition
+        // witnesses. Preserve their order and multiplicity exactly as an
+        // ordinary `propose` call would. Product-state acceptance remains a
+        // set operation: several traversal witnesses for one endpoint emit
+        // that endpoint once per activation.
+        let mut accepted = direct;
         let had_stable_effect;
         {
             let activation = self
@@ -567,12 +578,21 @@ impl ProducerRegistry {
             assert_eq!(activation.live.len(), 1);
             assert!(activation.live.contains(&generator.key.nonce));
             assert!(activation.suspended_source_page.is_none());
-            for value in direct.iter().copied().chain(
-                roots
-                    .iter()
-                    .filter(|output| output.accepted)
-                    .map(|output| output.node.value),
-            ) {
+            match &activation.reducer {
+                DeltaReducer::QuiescentProposal => activation
+                    .direct_candidates
+                    .extend(accepted.iter().copied()),
+                DeltaReducer::StreamProposal | DeltaReducer::StreamFormulaProposal => {}
+                DeltaReducer::Support { .. } | DeltaReducer::Confirm { .. } => assert!(
+                    accepted.is_empty(),
+                    "a non-proposal reducer received direct source candidates"
+                ),
+            }
+            for value in roots
+                .iter()
+                .filter(|output| output.accepted)
+                .map(|output| output.node.value)
+            {
                 if activation.accepted.insert(value) {
                     accepted.push(value);
                 }
@@ -755,6 +775,7 @@ impl ProducerRegistry {
 
         let effect = match activation.reducer {
             DeltaReducer::StreamProposal | DeltaReducer::StreamFormulaProposal => {
+                assert!(activation.direct_candidates.is_empty());
                 DeltaCompletion::Cleanup
             }
             DeltaReducer::QuiescentProposal => {
@@ -763,25 +784,38 @@ impl ProducerRegistry {
                     .into_iter()
                     .map(|value| (0, value))
                     .collect();
+                result.extend(
+                    activation
+                        .direct_candidates
+                        .into_iter()
+                        .map(|value| (0, value)),
+                );
                 result.sort_unstable();
                 DeltaCompletion::Candidates(result)
             }
-            DeltaReducer::Support { published: true } => DeltaCompletion::Cleanup,
+            DeltaReducer::Support { published: true } => {
+                assert!(activation.direct_candidates.is_empty());
+                DeltaCompletion::Cleanup
+            }
             DeltaReducer::Support { published: false } => {
+                assert!(activation.direct_candidates.is_empty());
                 assert!(
                     activation.accepted.is_empty(),
                     "an unpublished support reducer quiesced with a witness"
                 );
                 DeltaCompletion::Support(false)
             }
-            DeltaReducer::Confirm { original } => DeltaCompletion::Candidates(
-                original
-                    .iter()
-                    .filter(|candidate| activation.accepted.contains(*candidate))
-                    .copied()
-                    .map(|candidate| (0, candidate))
-                    .collect(),
-            ),
+            DeltaReducer::Confirm { original } => {
+                assert!(activation.direct_candidates.is_empty());
+                DeltaCompletion::Candidates(
+                    original
+                        .iter()
+                        .filter(|candidate| activation.accepted.contains(*candidate))
+                        .copied()
+                        .map(|candidate| (0, candidate))
+                        .collect(),
+                )
+            }
         };
         CompletedActivation {
             return_to: activation.return_to,
@@ -1605,19 +1639,28 @@ impl DeltaScheduler {
         assert!(roots.len() + direct.len() <= page.examined);
         if let Some(next) = page.next {
             match (task.cursor, next) {
-                (ResidualDeltaSourceCursor::Start, ResidualDeltaSourceCursor::After(_)) => {}
+                (
+                    ResidualDeltaSourceCursor::Start,
+                    ResidualDeltaSourceCursor::After(_) | ResidualDeltaSourceCursor::Offset(1..),
+                ) => {}
                 (
                     ResidualDeltaSourceCursor::After(previous),
                     ResidualDeltaSourceCursor::After(next),
                 ) => assert!(next > previous, "residual source cursor did not advance"),
+                (
+                    ResidualDeltaSourceCursor::Offset(previous),
+                    ResidualDeltaSourceCursor::Offset(next),
+                ) => assert!(next > previous, "residual source cursor did not advance"),
                 (_, ResidualDeltaSourceCursor::Start) => {
                     panic!("residual source page restarted its cursor")
                 }
+                _ => panic!("residual source page changed cursor families"),
             }
         }
         stats.delta_source_pages += 1;
         stats.delta_source_candidates_examined += page.examined;
         stats.delta_source_roots += roots.len();
+        stats.delta_source_direct_candidates += direct.len();
 
         let outcome = self
             .registry
@@ -2281,9 +2324,9 @@ mod tests {
             None,
         );
         let next = ResidualDeltaSourceCursor::After(value(9));
-        let first = registry.replace_source(generator, [], [value(1)], Some(next));
+        let first = registry.replace_source(generator, [], [value(1), value(1)], Some(next));
         assert!(first.roots.is_empty());
-        assert_eq!(first.accepted, [value(1)]);
+        assert_eq!(first.accepted, [value(1), value(1)]);
         assert_eq!(
             first
                 .retired_source_page
@@ -2553,7 +2596,7 @@ mod tests {
         let page = original.replace_source(
             generator,
             [output(7, 0, true)],
-            [],
+            [value(3), value(3)],
             Some(ResidualDeltaSourceCursor::After(value(9))),
         );
         assert_eq!(page.roots.len(), 1);
@@ -2580,7 +2623,7 @@ mod tests {
         ] {
             assert_eq!(
                 completed.effect,
-                DeltaCompletion::Candidates(vec![(0, value(7))])
+                DeltaCompletion::Candidates(vec![(0, value(3)), (0, value(3)), (0, value(7))])
             );
             let DeltaReturn::Formula {
                 bound: returned_bound,
