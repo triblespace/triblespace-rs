@@ -605,6 +605,78 @@ impl<'a> Constraint<'a> for PagedDirectDomain {
     }
 }
 
+/// The same source law without a native cohort override. This pins the
+/// production default that lowers a real compatible block to scalar pages.
+struct ScalarPagedDirectDomain(PagedDirectDomain);
+
+impl<'a> Constraint<'a> for ScalarPagedDirectDomain {
+    fn variables(&self) -> VariableSet {
+        self.0.variables()
+    }
+
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        self.0.estimate(variable, view, out)
+    }
+
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.0.propose(variable, view, candidates);
+    }
+
+    fn confirm(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.0.confirm(variable, view, candidates);
+    }
+
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        self.0.satisfied(view)
+    }
+
+    fn residual_confirm_is_page_local(&self) -> bool {
+        self.0.residual_confirm_is_page_local()
+    }
+
+    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
+        self.0.residual_proposal_source_is_paged(variable, view)
+    }
+
+    fn residual_delta_source_page(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: Option<&[RawInline]>,
+        cursor: ResidualDeltaSourceCursor,
+        limit: usize,
+        roots: &mut Vec<ResidualDeltaOutput>,
+        accepted: &mut Vec<RawInline>,
+    ) -> Option<ResidualDeltaSourcePage> {
+        self.0
+            .source_page(variable, view, candidates, cursor, limit, roots, accepted)
+    }
+
+    fn residual_delta_expand(
+        &self,
+        variable: VariableId,
+        nodes: &[ResidualDeltaNode],
+        successors: &mut Vec<(u32, ResidualDeltaOutput)>,
+    ) -> bool {
+        self.0.residual_delta_expand(variable, nodes, successors)
+    }
+}
+
 fn direct_source_fixture(values: Vec<RawInline>, evidence: Arc<DirectSourceEvidence>) -> Root {
     assert!(values.windows(2).all(|pair| pair[0] <= pair[1]));
     Arc::new(IntersectionConstraint::new(vec![
@@ -618,6 +690,25 @@ fn direct_source_fixture(values: Vec<RawInline>, evidence: Arc<DirectSourceEvide
             values: Arc::new(values),
             evidence,
         }) as DynConstraint,
+    ]))
+}
+
+fn scalar_direct_source_fixture(
+    values: Vec<RawInline>,
+    evidence: Arc<DirectSourceEvidence>,
+) -> Root {
+    assert!(values.windows(2).all(|pair| pair[0] <= pair[1]));
+    Arc::new(IntersectionConstraint::new(vec![
+        Box::new(PageLocalDomain {
+            variable: PARENT,
+            estimate: 2,
+            values: Arc::new(vec![raw(8), raw(9)]),
+        }) as DynConstraint,
+        Box::new(ScalarPagedDirectDomain(PagedDirectDomain {
+            variable: START,
+            values: Arc::new(values),
+            evidence,
+        })) as DynConstraint,
     ]))
 }
 
@@ -1064,6 +1155,46 @@ fn custom_direct_source_batches_compatible_parents_with_one_global_budget() {
             _ => unreachable!(),
         }
     }
+}
+
+#[test]
+fn default_scalar_source_pages_consume_one_real_compatible_cohort() {
+    let values = vec![raw(1), raw(2), raw(3)];
+    let oracle = sorted(
+        Query::new(
+            scalar_direct_source_fixture(values.clone(), Arc::default()),
+            project_start,
+        )
+        .sequential()
+        .collect(),
+    );
+    let evidence = Arc::new(DirectSourceEvidence::default());
+    let residual = Query::new(
+        scalar_direct_source_fixture(values, Arc::clone(&evidence)),
+        project_start,
+    )
+    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .cap(3)
+    .start_width(3)
+    .collect_profiled();
+
+    assert_eq!(sorted(residual.results), oracle);
+    assert_eq!(residual.stats.delta_source_cohorts, 2);
+    assert_eq!(residual.stats.max_delta_source_cohort, 2);
+    assert_eq!(residual.stats.delta_source_pages, 4);
+    assert!(
+        evidence
+            .cohorts
+            .lock()
+            .expect("direct source cohort trace poisoned")
+            .is_empty(),
+        "the scalar leaf must use the trait default rather than a native override"
+    );
+    let pages = evidence.pages.lock().expect("direct source trace poisoned");
+    assert_eq!(pages.len(), 4);
+    assert!(pages
+        .chunks_exact(2)
+        .all(|cohort| cohort.iter().map(|page| page.limit).eq([2, 1])));
 }
 
 #[test]

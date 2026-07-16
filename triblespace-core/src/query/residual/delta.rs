@@ -1984,6 +1984,85 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct ZeroColumnBatchTrace {
+        row_count: usize,
+        vars: Vec<VariableId>,
+        candidate_modes: Vec<bool>,
+        cursors: Vec<ResidualDeltaSourceCursor>,
+        limits: Vec<usize>,
+    }
+
+    struct ZeroColumnSource {
+        trace: Arc<Mutex<Option<ZeroColumnBatchTrace>>>,
+    }
+
+    impl Constraint<'static> for ZeroColumnSource {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(0)
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != 0 {
+                return false;
+            }
+            out.fill(1, view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn residual_delta_source_pages(
+            &self,
+            variable: VariableId,
+            batch: ResidualDeltaSourceBatch<'_>,
+            pages: &mut Vec<ResidualDeltaSourcePage>,
+            roots: &mut Vec<(u32, ResidualDeltaOutput)>,
+            accepted: &mut Vec<(u32, RawInline)>,
+        ) -> bool {
+            assert_eq!(variable, 0);
+            assert!(pages.is_empty());
+            assert!(roots.is_empty());
+            assert!(accepted.is_empty());
+            *self.trace.lock().expect("zero-column trace poisoned") =
+                Some(ZeroColumnBatchTrace {
+                    row_count: batch.view.len(),
+                    vars: batch.view.vars.to_vec(),
+                    candidate_modes: batch
+                        .candidate_sets
+                        .iter()
+                        .map(|candidates| candidates.is_some())
+                        .collect(),
+                    cursors: batch.cursors.to_vec(),
+                    limits: batch.limits.to_vec(),
+                });
+            pages.extend((0..batch.view.len()).map(|_| ResidualDeltaSourcePage {
+                next: None,
+                examined: 0,
+            }));
+            true
+        }
+    }
+
     fn value(byte: u8) -> RawInline {
         [byte; 32]
     }
@@ -2621,6 +2700,61 @@ mod tests {
         assert_ne!(tasks[0].activation, tasks[1].activation);
         assert_eq!(tasks[0].cursor, ResidualDeltaSourceCursor::Start);
         assert_eq!(tasks[1].cursor, ResidualDeltaSourceCursor::After(value(7)));
+    }
+
+    #[test]
+    fn source_cohort_preserves_multiple_zero_column_affine_rows() {
+        let trace = Arc::new(Mutex::new(None));
+        let root = ZeroColumnSource {
+            trace: Arc::clone(&trace),
+        };
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let mut scheduler = DeltaScheduler::new();
+        scheduler.seed_source_proposals(
+            DeltaDesc::leaf(0, 0),
+            StateDesc {
+                bound: VariableSet::new_empty(),
+                phase: ResidualPhase::Ready,
+            },
+            RowBatch {
+                rows: Vec::new(),
+                row_count: 2,
+            },
+        );
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+
+        let outcome = scheduler.step(
+            &root,
+            &plan,
+            2,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+
+        assert_eq!(
+            *trace.lock().expect("zero-column trace poisoned"),
+            Some(ZeroColumnBatchTrace {
+                row_count: 2,
+                vars: Vec::new(),
+                candidate_modes: vec![false, false],
+                cursors: vec![
+                    ResidualDeltaSourceCursor::Start,
+                    ResidualDeltaSourceCursor::Start,
+                ],
+                limits: vec![1, 1],
+            })
+        );
+        assert_eq!(outcome.dead_pages, 2);
+        assert!(outcome.continuation.is_none());
+        assert_eq!(stats.delta_source_cohorts, 1);
+        assert_eq!(stats.max_delta_source_cohort, 2);
+        assert_eq!(stats.delta_source_pages, 2);
+        assert_eq!(stats.delta_source_candidates_examined, 0);
+        assert!(scheduler.is_empty());
+        assert!(stable.is_empty());
     }
 
     #[test]

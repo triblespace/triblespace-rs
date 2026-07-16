@@ -1183,11 +1183,16 @@ pub trait Constraint<'a> {
     /// Consume one physically compatible cohort of affine source pages.
     ///
     /// `pages` receives exactly one row-aligned page descriptor. Roots and
-    /// direct accepted occurrences carry ascending input-row tags, just like
-    /// [`Self::residual_delta_expand`] successors. An implementation may
-    /// override this hook with a native batched kernel. The default preserves
-    /// compatibility by invoking [`Self::residual_delta_source_page`] once per
-    /// row and rolling back every output if any row reports unsupported.
+    /// direct accepted occurrences carry in-range input-row tags grouped in
+    /// ascending order, just like [`Self::residual_delta_expand`] successors.
+    /// Returning `false` declares the complete cohort unsupported and must
+    /// leave all three output vectors unchanged. Once the corresponding source
+    /// capability admitted these activations, changing that answer is an
+    /// engine error and the scheduler panics rather than falling back after
+    /// consuming affine credits. An implementation may override this hook with
+    /// a native batched kernel. The default preserves compatibility by invoking
+    /// [`Self::residual_delta_source_page`] once per row and rolling back every
+    /// output if any row reports unsupported.
     #[doc(hidden)]
     fn residual_delta_source_pages(
         &self,
