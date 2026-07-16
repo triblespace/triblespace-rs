@@ -2127,7 +2127,11 @@ fn synthetic_root_atom_streams_a_cycle_before_fixpoint_cleanup() {
 
     assert_eq!(query.next(), Some(graph.value(0).raw));
     assert_eq!(expanded.load(Ordering::Relaxed), 1);
-    assert_eq!(query.stats().delta_handoff_probe_pops, 1);
+    assert_eq!(
+        query.stats().delta_handoff_probe_pops,
+        0,
+        "a fully checked final candidate tail is already exact output"
+    );
     assert_eq!(query.next(), None);
     assert_eq!(expanded.load(Ordering::Relaxed), 2);
 }
@@ -2278,7 +2282,11 @@ fn clone_and_drop_preserve_a_live_linear_formula_stream() {
     let first = query.next().expect("the first endpoint streamed");
     assert_eq!(first, graph.value(1).raw);
     assert_eq!(expanded.load(Ordering::Relaxed), 1);
-    assert_eq!(query.stats().delta_handoff_probe_pops, 1);
+    assert_eq!(
+        query.stats().delta_handoff_probe_pops,
+        0,
+        "terminal streamed candidates keep their exact cohort hot"
+    );
     let exact_clone = query.clone();
     let cancelled = query.clone();
     drop(cancelled);
@@ -3263,7 +3271,11 @@ fn same_variable_late_hit_keeps_the_geometric_negative_prefix() {
     assert_eq!(query.stats().width_increases, 3);
     assert_eq!(query.stats().delta_source_dead_pages, 2);
     assert_eq!(query.stats().delta_source_negative_steps, 2);
-    assert_eq!(query.stats().delta_handoff_probe_pops, 1);
+    assert_eq!(
+        query.stats().delta_handoff_probe_pops,
+        0,
+        "the late hit is terminal and needs no selective probe"
+    );
     drop(query);
 }
 

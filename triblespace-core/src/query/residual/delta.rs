@@ -1066,6 +1066,10 @@ pub(super) struct DeltaStepOutcome {
     pub(super) source_dead_pages: usize,
     pub(super) transition_dead_pages: usize,
     pub(super) completed_activations: usize,
+    /// More than one activation from the scheduler's deliberately bounded
+    /// transition cohort completed in this step. Source paging batches rows
+    /// for storage efficiency, not as a latency/throughput activation choice.
+    pub(super) completed_transition_cohort: bool,
 }
 
 impl DeltaBucket {
@@ -1982,6 +1986,7 @@ impl DeltaScheduler {
             source_dead_pages,
             transition_dead_pages,
             completed_activations,
+            completed_transition_cohort: completed_activations > 1,
         }
     }
 
@@ -2143,6 +2148,7 @@ impl DeltaScheduler {
             source_dead_pages: dead_pages,
             transition_dead_pages: 0,
             completed_activations,
+            completed_transition_cohort: false,
         }
     }
 

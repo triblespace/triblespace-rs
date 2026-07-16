@@ -6340,11 +6340,27 @@ impl ResidualStateMachine {
     fn accept_delta_step(&mut self, outcome: DeltaStepOutcome) {
         self.account_delta_feedback(&outcome);
         self.continuation = outcome.continuation.map(|token| {
-            if outcome.completed_activations > 1 {
+            let desc = self.interner.get(token.state);
+            let commits_terminal_candidates = match &desc.phase {
+                ResidualPhase::Candidate {
+                    variable,
+                    relevant,
+                    checked,
+                } if relevant == checked => {
+                    let mut committed = desc.bound;
+                    committed.set(*variable);
+                    committed == self.full
+                }
+                _ => false,
+            };
+            if outcome.completed_transition_cohort || commits_terminal_candidates {
                 // A geometrically selected activation cohort is already the
                 // engine's chosen throughput unit. Keep its exact appended
-                // tail hot so one successful probe does not strand the other
-                // completed activations behind the delta readiness barrier.
+                // tail hot. The same is safe for fully checked candidates
+                // whose commit binds the final variable: their next step can
+                // only emit, so probing one cannot reveal downstream
+                // selectivity and would strand exact results behind live
+                // cyclic work.
                 ActiveContinuation::cohort(token)
             } else {
                 ActiveContinuation::probe_one(token)
@@ -14519,12 +14535,25 @@ mod tests {
 
     #[test]
     fn mixed_delta_feedback_arms_probe_without_widening() {
-        let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 1, Search::Done);
+        let mut machine = ResidualStateMachine::new(VariableSet::new_singleton(0), 1, Search::Done);
         machine.width = 4;
         machine.cap = 64;
+        let mut relevant = ChildSet::empty(1);
+        relevant.insert(0);
+        let (state, _) = machine.interner.intern_with_status(
+            StateDesc {
+                bound: VariableSet::new_empty(),
+                phase: ResidualPhase::Candidate {
+                    variable: 0,
+                    relevant: relevant.clone(),
+                    checked: ChildSet::empty(1),
+                },
+            },
+            &mut machine.stats,
+        );
         let token = ContinuationToken {
             rank: 7,
-            state: StateId(3),
+            state,
             rows: 2,
             candidates: 0,
         };
@@ -14535,6 +14564,7 @@ mod tests {
             source_dead_pages: 2,
             transition_dead_pages: 0,
             completed_activations: 0,
+            completed_transition_cohort: false,
         });
         assert_eq!(machine.width, 4);
         assert_eq!(machine.stats.delta_source_negative_steps, 0);
@@ -14549,10 +14579,40 @@ mod tests {
             source_dead_pages: 0,
             transition_dead_pages: 0,
             completed_activations: 2,
+            completed_transition_cohort: true,
         });
         assert_eq!(
             machine.continuation,
             Some(ActiveContinuation::cohort(token))
+        );
+
+        let (terminal_state, _) = machine.interner.intern_with_status(
+            StateDesc {
+                bound: VariableSet::new_empty(),
+                phase: ResidualPhase::Candidate {
+                    variable: 0,
+                    relevant: relevant.clone(),
+                    checked: relevant,
+                },
+            },
+            &mut machine.stats,
+        );
+        let terminal = ContinuationToken {
+            state: terminal_state,
+            ..token
+        };
+        machine.accept_delta_step(DeltaStepOutcome {
+            continuation: Some(terminal),
+            dead_pages: 0,
+            source_dead_pages: 0,
+            transition_dead_pages: 0,
+            completed_activations: 0,
+            completed_transition_cohort: false,
+        });
+        assert_eq!(
+            machine.continuation,
+            Some(ActiveContinuation::cohort(terminal)),
+            "fully checked candidates that bind the last variable emit directly"
         );
 
         machine.accept_delta_step(DeltaStepOutcome {
@@ -14561,6 +14621,7 @@ mod tests {
             source_dead_pages: 2,
             transition_dead_pages: 0,
             completed_activations: 0,
+            completed_transition_cohort: false,
         });
         assert_eq!(machine.width, 8);
         assert_eq!(machine.stats.delta_source_negative_steps, 1);
@@ -14572,6 +14633,7 @@ mod tests {
             source_dead_pages: 0,
             transition_dead_pages: 0,
             completed_activations: 1,
+            completed_transition_cohort: false,
         });
         assert_eq!(machine.width, 8);
         assert_eq!(machine.delta.activation_width(), 2);

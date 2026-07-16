@@ -343,8 +343,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   activations. Quiescent formula, support, and grouped-confirm reducers instead
   spend the ordinary geometric row budget within a bounded activation cohort;
   that cohort grows independently after visible or terminal progress. Exact
-  multi-activation handoffs remain hot as one appended stable tail, so completed
-  parents are not stranded behind the cyclic readiness barrier. Positive
+  transition-cohort handoffs remain hot as one appended stable tail, while
+  storage-oriented source-page batches retain the one-row latency probe.
+  Fully checked candidates that bind the final variable also keep their exact
+  output tail hot, so terminal rows are not stranded behind the cyclic
+  readiness barrier. Positive
   transition cohorts whose complete fanouts fit their page limits now use
   cached PATCH segment counts and the existing bulk expansion kernel, avoiding
   per-successor trie descent and per-row scratch allocation without changing
