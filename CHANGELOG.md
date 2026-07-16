@@ -352,6 +352,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   grouping instead of value-sorting every leaf result. OR accumulators still
   sort after combining sibling arms, so their completion boundary can
   deduplicate exactly without sorting the already-normalized output again.
+- **The residual worklist stores canonical buckets in one ordered map.** A
+  composite `(rank, state)` key preserves deepest-full, minimum-rank/highest-ID,
+  continuation, and parallel split ordering while removing the nested map
+  allocated for every live rank.
 - **Canonical residual child sets keep one bitset word inline.** State
   descriptor cloning and interning avoid heap allocation for the common
   at-most-64-leaf formula while wider formulas transparently spill, preserving
