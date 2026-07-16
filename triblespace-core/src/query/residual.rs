@@ -3456,6 +3456,91 @@ impl CandidateBatch {
     }
 }
 
+/// Fully confirmed row extensions waiting in a canonical `Ready` bucket.
+///
+/// The speculative values are already committed logically, but retaining the
+/// parent/candidate overlay postpones the `O(rows * columns)` canonical-row
+/// copy until a scheduler pull actually selects those occurrences. Physical
+/// shape is deliberately absent from [`StateDesc`].
+#[derive(Clone, Debug)]
+struct DeferredRows {
+    /// Canonical child-column position occupied by the committed candidate.
+    insert_at: usize,
+    /// Parent bindings plus one disjoint occurrence for every committed row.
+    source: CandidateBatch,
+}
+
+impl DeferredRows {
+    fn row_count(&self) -> usize {
+        self.source.candidate_count()
+    }
+
+    fn parent_stride(&self) -> usize {
+        let parent_count = self.source.parents.row_count;
+        assert!(parent_count > 0, "deferred rows require a live parent");
+        assert_eq!(
+            self.source.parents.rows.len() % parent_count,
+            0,
+            "deferred parent rows are not rectangular"
+        );
+        self.source.parents.rows.len() / parent_count
+    }
+
+    /// Removes a committed candidate-occurrence tail. Parent backing may be
+    /// copied when the cut bisects one ragged group, but every logical row
+    /// occurrence remains owned by exactly one side.
+    fn take_tail(&mut self, child_stride: usize, width: usize) -> Self {
+        let parent_stride = self.parent_stride();
+        assert_eq!(
+            child_stride,
+            parent_stride + 1,
+            "deferred row schema disagrees with its canonical state"
+        );
+        let source = self.source.take_candidate_tail(parent_stride, width);
+        Self {
+            insert_at: self.insert_at,
+            source,
+        }
+    }
+
+    fn into_rows(self) -> RowBatch {
+        let parent_stride = self.parent_stride();
+        assert!(
+            self.insert_at <= parent_stride,
+            "deferred insertion lies outside the child row"
+        );
+        let row_count = self.row_count();
+        let child_stride = parent_stride + 1;
+        let mut rows = Vec::with_capacity(row_count.saturating_mul(child_stride));
+        let parents = self.source.parents.rows;
+
+        let mut append = |parent: usize, candidate: RawInline| {
+            let start = parent
+                .checked_mul(parent_stride)
+                .expect("deferred parent offset overflow");
+            let parent = &parents[start..start + parent_stride];
+            rows.extend_from_slice(&parent[..self.insert_at]);
+            rows.push(candidate);
+            rows.extend_from_slice(&parent[self.insert_at..]);
+        };
+        match self.source.candidates {
+            CandidatePayload::Values(values) => {
+                assert_eq!(self.source.parents.row_count, 1);
+                for candidate in values {
+                    append(0, candidate);
+                }
+            }
+            CandidatePayload::Tagged(pairs) => {
+                for (parent, candidate) in pairs {
+                    append(parent as usize, candidate);
+                }
+            }
+        }
+        debug_assert_eq!(rows.len(), row_count * child_stride);
+        RowBatch { rows, row_count }
+    }
+}
+
 /// Stable payload identity for one affine parent entering a lowered formula.
 ///
 /// Tokens are machine-local and never participate in canonical state
@@ -3984,6 +4069,7 @@ impl FormulaBatch {
 #[derive(Clone, Debug)]
 enum StateBucket {
     Rows(RowBatch),
+    DeferredRows(DeferredRows),
     Candidates(CandidateBatch),
     Formula(FormulaBatch),
 }
@@ -3992,6 +4078,7 @@ impl StateBucket {
     fn row_count(&self) -> usize {
         match self {
             StateBucket::Rows(rows) => rows.row_count,
+            StateBucket::DeferredRows(rows) => rows.row_count(),
             StateBucket::Candidates(batch) => batch.parents.row_count,
             StateBucket::Formula(batch) => batch.parents.row_count,
         }
@@ -4009,11 +4096,80 @@ impl StateBucket {
     }
 
     fn append(&mut self, other: Self) {
-        match (self, other) {
-            (StateBucket::Rows(left), StateBucket::Rows(right)) => left.append(right),
-            (StateBucket::Candidates(left), StateBucket::Candidates(right)) => left.append(right),
-            (StateBucket::Formula(left), StateBucket::Formula(right)) => left.append(right),
-            _ => panic!("one canonical residual state received incompatible payloads"),
+        match other {
+            StateBucket::DeferredRows(right) => match self {
+                StateBucket::DeferredRows(left) if left.insert_at == right.insert_at => {
+                    left.source.append(right.source);
+                }
+                StateBucket::DeferredRows(_) => {
+                    let left = match std::mem::replace(
+                        self,
+                        StateBucket::Rows(RowBatch {
+                            rows: Vec::new(),
+                            row_count: 0,
+                        }),
+                    ) {
+                        StateBucket::DeferredRows(left) => left,
+                        _ => unreachable!(),
+                    };
+                    let mut rows = left.into_rows();
+                    rows.append(right.into_rows());
+                    *self = StateBucket::Rows(rows);
+                }
+                StateBucket::Rows(left) => left.append(right.into_rows()),
+                StateBucket::Candidates(_) | StateBucket::Formula(_) => {
+                    panic!("one canonical residual state received incompatible payloads")
+                }
+            },
+            StateBucket::Rows(right) => match self {
+                StateBucket::Rows(left) => left.append(right),
+                StateBucket::DeferredRows(_) => {
+                    let left = match std::mem::replace(
+                        self,
+                        StateBucket::Rows(RowBatch {
+                            rows: Vec::new(),
+                            row_count: 0,
+                        }),
+                    ) {
+                        StateBucket::DeferredRows(left) => left,
+                        _ => unreachable!(),
+                    };
+                    let mut rows = left.into_rows();
+                    rows.append(right);
+                    *self = StateBucket::Rows(rows);
+                }
+                StateBucket::Candidates(_) | StateBucket::Formula(_) => {
+                    panic!("one canonical residual state received incompatible payloads")
+                }
+            },
+            StateBucket::Candidates(right) => match self {
+                StateBucket::Candidates(left) => left.append(right),
+                StateBucket::Rows(_) | StateBucket::DeferredRows(_) | StateBucket::Formula(_) => {
+                    panic!("one canonical residual state received incompatible payloads")
+                }
+            },
+            StateBucket::Formula(right) => match self {
+                StateBucket::Formula(left) => left.append(right),
+                StateBucket::Rows(_)
+                | StateBucket::DeferredRows(_)
+                | StateBucket::Candidates(_) => {
+                    panic!("one canonical residual state received incompatible payloads")
+                }
+            },
+        }
+    }
+
+    /// Turns the private Ready overlay into the ordinary row representation
+    /// before any selected task can cross into planning or protocol code.
+    fn materialize_selected(self, desc: &StateDesc) -> Self {
+        match (self, &desc.phase) {
+            (StateBucket::DeferredRows(rows), ResidualPhase::Ready) => {
+                StateBucket::Rows(rows.into_rows())
+            }
+            (StateBucket::DeferredRows(_), _) => {
+                panic!("deferred rows escaped their canonical Ready state")
+            }
+            (bucket, _) => bucket,
         }
     }
 
@@ -4029,6 +4185,10 @@ impl StateBucket {
         match self {
             StateBucket::Rows(batch) if batch.row_count >= 2 => {
                 let right_rows = batch.row_count / 2;
+                Some(self.take_tail(stride, right_rows, false))
+            }
+            StateBucket::DeferredRows(batch) if batch.row_count() >= 2 => {
+                let right_rows = batch.row_count() / 2;
                 Some(self.take_tail(stride, right_rows, false))
             }
             StateBucket::Candidates(batch) if candidate_pages && batch.candidate_count() >= 2 => {
@@ -4047,7 +4207,10 @@ impl StateBucket {
                 let right_parents = batch.parents.row_count / 2;
                 Some(self.take_tail(stride, right_parents, false))
             }
-            StateBucket::Rows(_) | StateBucket::Candidates(_) | StateBucket::Formula(_) => None,
+            StateBucket::Rows(_)
+            | StateBucket::DeferredRows(_)
+            | StateBucket::Candidates(_)
+            | StateBucket::Formula(_) => None,
         }
     }
 
@@ -4073,6 +4236,9 @@ impl StateBucket {
                     rows,
                     row_count: take,
                 })
+            }
+            StateBucket::DeferredRows(batch) => {
+                StateBucket::DeferredRows(batch.take_tail(stride, width))
             }
             StateBucket::Candidates(batch) if candidate_pages => {
                 StateBucket::Candidates(batch.take_candidate_tail(stride, width))
@@ -4168,6 +4334,15 @@ struct SelectedResidualTask {
 }
 
 impl SelectedResidualTask {
+    fn new(state: StateId, desc: StateDesc, bucket: StateBucket) -> Self {
+        let bucket = bucket.materialize_selected(&desc);
+        Self {
+            state,
+            desc,
+            bucket,
+        }
+    }
+
     /// Cheap phase classification used by the latency scheduler. It must not
     /// materialize executor geometry on the default path.
     fn is_action_for_plan(&self, plan: &ResidualPlan) -> bool {
@@ -4413,7 +4588,7 @@ fn file_with_span(
         return None;
     }
     let candidates = match &bucket {
-        StateBucket::Rows(_) => 0,
+        StateBucket::Rows(_) | StateBucket::DeferredRows(_) => 0,
         StateBucket::Candidates(batch) => batch.candidate_count(),
         StateBucket::Formula(batch) => batch.page_candidate_count(),
     };
@@ -4789,45 +4964,17 @@ fn commit_candidates(
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
 ) -> Option<ContinuationToken> {
-    let parent_vars: Vec<VariableId> = desc.bound.into_iter().collect();
+    assert!(
+        !desc.bound.is_set(variable),
+        "cannot commit an already-bound residual variable"
+    );
     let mut next_bound = desc.bound;
     next_bound.set(variable);
-    let next_vars: Vec<VariableId> = next_bound.into_iter().collect();
-    let mut next_rows = Vec::with_capacity(batch.candidates.len() * next_vars.len());
-
-    let mut commit_one = |parent: usize, candidate: RawInline| {
-        let parent = parent as usize;
-        let parent_row =
-            &batch.parents.rows[parent * parent_vars.len()..(parent + 1) * parent_vars.len()];
-        let mut source = 0usize;
-        for &column_variable in &next_vars {
-            if column_variable == variable {
-                next_rows.push(candidate);
-            } else {
-                next_rows.push(parent_row[source]);
-                source += 1;
-            }
-        }
-    };
-    match batch.candidates {
-        CandidatePayload::Values(values) => {
-            assert_eq!(batch.parents.row_count, 1);
-            for candidate in values {
-                commit_one(0, candidate);
-            }
-        }
-        CandidatePayload::Tagged(pairs) => {
-            for (parent, candidate) in pairs {
-                commit_one(parent as usize, candidate);
-            }
-        }
-    }
-
-    let row_count = if next_vars.is_empty() {
-        0
-    } else {
-        next_rows.len() / next_vars.len()
-    };
+    let insert_at = desc
+        .bound
+        .into_iter()
+        .take_while(|&bound| bound < variable)
+        .count();
     file_with_plan(
         worklist,
         interner,
@@ -4836,9 +4983,9 @@ fn commit_candidates(
             bound: next_bound,
             phase: ResidualPhase::Ready,
         },
-        StateBucket::Rows(RowBatch {
-            rows: next_rows,
-            row_count,
+        StateBucket::DeferredRows(DeferredRows {
+            insert_at,
+            source: batch,
         }),
         stats,
     )
@@ -5948,14 +6095,14 @@ fn execute_state<'a>(
     execute_task(
         root,
         plan,
-        SelectedResidualTask {
+        SelectedResidualTask::new(
             // Direct transition tests do not select through the interner. The
             // executor does not consult this synthetic identity; production
             // eager and lazy paths always carry the exact selected StateId.
-            state: StateId(u32::MAX),
-            desc: desc.clone(),
+            StateId(u32::MAX),
+            desc.clone(),
             bucket,
-        },
+        ),
         full,
         influences,
         base_estimates,
@@ -6344,11 +6491,7 @@ impl ResidualStateMachine {
             self.stats.readiness_pops += 1;
             self.last_selection = SelectionKind::Readiness;
         }
-        Some(SelectedResidualTask {
-            state: id,
-            desc,
-            bucket: chunk,
-        })
+        Some(SelectedResidualTask::new(id, desc, chunk))
     }
 
     /// Removes one coalesced-receipt chunk from the current canonical tail.
@@ -6427,11 +6570,7 @@ impl ResidualStateMachine {
         if cohort_occupancy < width.max(1) {
             self.stats.underfilled_continuation_pops += 1;
         }
-        SelectedResidualTask {
-            state: token.state,
-            desc,
-            bucket: chunk,
-        }
+        SelectedResidualTask::new(token.state, desc, chunk)
     }
 
     /// Whether ordinary acyclic work can fill the current demand width
@@ -7345,6 +7484,7 @@ impl ResidualStateMachine {
                     let candidate_pages = desc.uses_candidate_pages(plan);
                     let can_split = match bucket {
                         StateBucket::Rows(batch) => batch.row_count >= 2,
+                        StateBucket::DeferredRows(batch) => batch.row_count() >= 2,
                         StateBucket::Candidates(batch) if candidate_pages => {
                             batch.candidate_count() >= 2
                         }
@@ -7827,11 +7967,7 @@ where
             match execute_task(
                 root,
                 &plan,
-                SelectedResidualTask {
-                    state: id,
-                    desc,
-                    bucket,
-                },
+                SelectedResidualTask::new(id, desc, bucket),
                 full,
                 &influences,
                 &base_estimates,
@@ -9775,6 +9911,42 @@ mod tests {
         CandidatePayload::from_tagged(candidates, parent_count)
     }
 
+    fn deferred_rows(
+        insert_at: usize,
+        parent_rows: Vec<RawInline>,
+        parent_count: usize,
+        candidates: Candidates,
+    ) -> DeferredRows {
+        DeferredRows {
+            insert_at,
+            source: CandidateBatch {
+                parents: RowBatch {
+                    rows: parent_rows,
+                    row_count: parent_count,
+                },
+                candidates: candidate_payload(parent_count, candidates),
+            },
+        }
+    }
+
+    fn eagerly_expand_deferred(deferred: &DeferredRows) -> RowBatch {
+        let parent_count = deferred.source.parents.row_count;
+        assert!(parent_count > 0);
+        let parent_stride = deferred.source.parents.rows.len() / parent_count;
+        let mut rows = Vec::new();
+        for (parent, candidate) in deferred.source.candidates.iter() {
+            let start = parent as usize * parent_stride;
+            let source = &deferred.source.parents.rows[start..start + parent_stride];
+            rows.extend_from_slice(&source[..deferred.insert_at]);
+            rows.push(*candidate);
+            rows.extend_from_slice(&source[deferred.insert_at..]);
+        }
+        RowBatch {
+            row_count: deferred.row_count(),
+            rows,
+        }
+    }
+
     fn ready_desc(bound_count: usize) -> StateDesc {
         let mut bound = VariableSet::new_empty();
         for variable in 0..bound_count {
@@ -10000,6 +10172,80 @@ mod tests {
         assert_eq!(actions, [(LEFT, 0, 1), (RIGHT, 0, 1)]);
         assert_eq!(stats.ready_preferred_variable_groups, 2);
         assert_eq!(stats.ready_scheduled_variable_groups, 2);
+    }
+
+    #[test]
+    fn heterogeneous_last_variable_remerge_matches_exact_oracle() {
+        const PARENT: VariableId = 0;
+        const LEFT: VariableId = 1;
+        const RIGHT: VariableId = 2;
+        let expected = vec![
+            (raw(0), raw(11), raw(22)),
+            (raw(1), raw(11), raw(22)),
+        ];
+        let make_query = || {
+            let root = Arc::new(IntersectionConstraint::new(vec![
+                Arc::new(FanoutLeaf {
+                    variable: PARENT,
+                    values: Arc::new(vec![raw(0), raw(1)]),
+                }) as Arc<dyn Constraint<'static> + Send + Sync>,
+                Arc::new(RowAdaptiveLeaf {
+                    parent: PARENT,
+                    variable: LEFT,
+                    estimates: [1, 64, 1, 64],
+                    value: raw(11),
+                    proposed_parents: Arc::new(Mutex::new(Vec::new())),
+                }) as Arc<dyn Constraint<'static> + Send + Sync>,
+                Arc::new(RowAdaptiveLeaf {
+                    parent: PARENT,
+                    variable: RIGHT,
+                    estimates: [64, 1, 64, 1],
+                    value: raw(22),
+                    proposed_parents: Arc::new(Mutex::new(Vec::new())),
+                }) as Arc<dyn Constraint<'static> + Send + Sync>,
+            ]));
+            Query::new(root, |binding: &Binding| {
+                Some((
+                    *binding.get(PARENT)?,
+                    *binding.get(LEFT)?,
+                    *binding.get(RIGHT)?,
+                ))
+            })
+        };
+        let check = |label: &str, mut actual: Vec<_>| {
+            actual.sort_unstable();
+            assert_eq!(actual, expected, "{label}");
+        };
+
+        check("scalar oracle", make_query().sequential().collect());
+        check("ordinary", make_query().collect());
+        check("eager residual", make_query().solve_residual_state());
+        check(
+            "geometric residual",
+            make_query().solve_residual_state_lazy().collect(),
+        );
+        check(
+            "width-one residual",
+            make_query()
+                .solve_residual_state_lazy()
+                .start_width(1)
+                .growth(1)
+                .cap(1)
+                .collect(),
+        );
+        check(
+            "forced-harvest residual",
+            make_query().solve_residual_state_lazy().cap(2).collect(),
+        );
+        #[cfg(feature = "parallel")]
+        check(
+            "parallel residual",
+            with_parallel_workers(4, || {
+                make_query()
+                    .into_par_residual_state_iter()
+                    .collect::<Vec<_>>()
+            }),
+        );
     }
 
     #[test]
@@ -11721,6 +11967,327 @@ mod tests {
                 assert_eq!(actual, expected, "stride={stride}, case={case}");
             }
         }
+    }
+
+    #[test]
+    fn deferred_rows_match_eager_expansion_across_randomized_insertions() {
+        fn next(seed: &mut u64) -> usize {
+            *seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (*seed >> 32) as usize
+        }
+
+        let mut seed = 0xD3FE_22ED_5EED_1234u64;
+        for parent_stride in 0..=4 {
+            for insert_at in 0..=parent_stride {
+                for case in 0..48usize {
+                    let parent_count = 1 + next(&mut seed) % 6;
+                    let mut parents = Vec::with_capacity(parent_count * parent_stride);
+                    let mut candidates = Vec::new();
+                    for parent in 0..parent_count {
+                        for column in 0..parent_stride {
+                            let mut value = raw(80 + parent as u8);
+                            value[1] = column as u8;
+                            value[2] = case as u8;
+                            parents.push(value);
+                        }
+                        let occurrence_count = 1 + next(&mut seed) % 6;
+                        for occurrence in 0..occurrence_count {
+                            let mut value = raw((next(&mut seed) % 16) as u8);
+                            // Deliberately retain duplicate occurrences.
+                            value[1] = (occurrence / 2) as u8;
+                            value[2] = case as u8;
+                            candidates.push((parent as u32, value));
+                        }
+                    }
+
+                    let deferred = deferred_rows(insert_at, parents, parent_count, candidates);
+                    let expected = eagerly_expand_deferred(&deferred);
+                    let actual = deferred.into_rows();
+                    assert_eq!(actual.row_count, expected.row_count);
+                    assert_eq!(
+                        actual.rows, expected.rows,
+                        "stride={parent_stride}, insert={insert_at}, case={case}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_append_is_homomorphic_and_promotes_only_on_shape_mismatch() {
+        let left = deferred_rows(1, vec![raw(10), raw(11)], 1, vec![(0, raw(1)), (0, raw(1))]);
+        let right = deferred_rows(1, vec![raw(20), raw(21)], 1, vec![(0, raw(2))]);
+        let mut expected = eagerly_expand_deferred(&left);
+        expected.append(eagerly_expand_deferred(&right));
+        let mut same = StateBucket::DeferredRows(left);
+        same.append(StateBucket::DeferredRows(right));
+        let StateBucket::DeferredRows(same_overlay) = &same else {
+            panic!("equal insertion overlays materialized eagerly")
+        };
+        assert_eq!(same_overlay.row_count(), 3);
+        let StateBucket::Rows(actual) = same.materialize_selected(&ready_desc(3)) else {
+            unreachable!()
+        };
+        assert_eq!(actual.rows, expected.rows);
+        assert_eq!(actual.row_count, expected.row_count);
+
+        // Two histories bind different last variables into the same canonical
+        // two-column Ready state. Their insertion positions differ, so the
+        // exact left-then-right sequence promotes without a heuristic cutoff.
+        let first = deferred_rows(0, vec![raw(30)], 1, vec![(0, raw(3))]);
+        let second = deferred_rows(1, vec![raw(40)], 1, vec![(0, raw(4)), (0, raw(4))]);
+        let mut promoted = StateBucket::DeferredRows(first);
+        promoted.append(StateBucket::DeferredRows(second));
+        let StateBucket::Rows(rows) = &promoted else {
+            panic!("different insertion histories did not promote")
+        };
+        assert_eq!(
+            rows.rows,
+            [raw(3), raw(30), raw(40), raw(4), raw(40), raw(4)]
+        );
+        assert_eq!(rows.row_count, 3);
+
+        // Promotion is permanent for the bucket: later deferred tails are
+        // materialized once and appended after every older occurrence.
+        promoted.append(StateBucket::DeferredRows(deferred_rows(
+            0,
+            vec![raw(50)],
+            1,
+            vec![(0, raw(5))],
+        )));
+        let StateBucket::Rows(rows) = &promoted else {
+            unreachable!()
+        };
+        assert_eq!(
+            rows.rows,
+            [
+                raw(3),
+                raw(30),
+                raw(40),
+                raw(4),
+                raw(40),
+                raw(4),
+                raw(5),
+                raw(50),
+            ]
+        );
+
+        let deferred = deferred_rows(0, vec![raw(60)], 1, vec![(0, raw(6))]);
+        let mut deferred_then_rows = StateBucket::DeferredRows(deferred);
+        deferred_then_rows.append(StateBucket::Rows(RowBatch {
+            rows: vec![raw(70), raw(7)],
+            row_count: 1,
+        }));
+        let StateBucket::Rows(rows) = deferred_then_rows else {
+            unreachable!()
+        };
+        assert_eq!(rows.rows, [raw(6), raw(60), raw(70), raw(7)]);
+    }
+
+    #[test]
+    fn deferred_zero_column_duplicate_tail_splits_before_materializing() {
+        let desc = ready_desc(1);
+        let mut machine = ResidualStateMachine::new(desc.bound, 1, Search::Done);
+        file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            machine.leaf_count,
+            desc.clone(),
+            StateBucket::DeferredRows(deferred_rows(
+                0,
+                Vec::new(),
+                1,
+                vec![(0, raw(1)), (0, raw(1)), (0, raw(2))],
+            )),
+            &mut machine.stats,
+        );
+
+        let (selected_desc, selected) = machine.take_next(1).unwrap();
+        assert_eq!(selected_desc, desc);
+        let StateBucket::Rows(selected) = selected else {
+            panic!("selected deferred tail crossed the task boundary")
+        };
+        assert_eq!(selected.rows, [raw(2)]);
+        assert_eq!(selected.row_count, 1);
+
+        let remainder = machine
+            .worklist
+            .values()
+            .flat_map(|level| level.values())
+            .next()
+            .expect("two duplicate occurrences remain deferred");
+        let StateBucket::DeferredRows(remainder) = remainder else {
+            panic!("unselected deferred prefix was materialized")
+        };
+        assert_eq!(remainder.row_count(), 2);
+        assert_eq!(remainder.source.parents.rows, Vec::<RawInline>::new());
+        assert_eq!(remainder.source.candidates, [(0, raw(1)), (0, raw(1))]);
+    }
+
+    #[test]
+    fn deferred_continuation_receipt_cuts_only_its_new_tail() {
+        let root = ShapeLeaf(7);
+        let plan = ResidualPlan::compile(&root);
+        let desc = ready_desc(2);
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        file_with_plan(
+            &mut machine.worklist,
+            &mut machine.interner,
+            &plan,
+            desc.clone(),
+            StateBucket::DeferredRows(deferred_rows(
+                1,
+                vec![raw(10)],
+                1,
+                vec![(0, raw(1)), (0, raw(2))],
+            )),
+            &mut machine.stats,
+        );
+        let hot = file_with_plan(
+            &mut machine.worklist,
+            &mut machine.interner,
+            &plan,
+            desc.clone(),
+            StateBucket::DeferredRows(deferred_rows(
+                1,
+                vec![raw(99)],
+                1,
+                vec![(0, raw(40)), (0, raw(41)), (0, raw(42))],
+            )),
+            &mut machine.stats,
+        )
+        .unwrap();
+        assert_eq!(hot.rows, 3);
+        assert_eq!(hot.candidates, 0);
+
+        let task = machine.take_continuation(&plan, ActiveContinuation::cohort(hot), 2);
+        assert_eq!(task.desc, desc);
+        let StateBucket::Rows(rows) = task.bucket else {
+            panic!("selected continuation was not materialized")
+        };
+        assert_eq!(rows.rows, [raw(99), raw(41), raw(99), raw(42)]);
+        assert_eq!(rows.row_count, 2);
+
+        let remainder = machine
+            .worklist
+            .get(&hot.rank)
+            .and_then(|level| level.get(&hot.state))
+            .expect("old prefix and one hot occurrence remain");
+        let StateBucket::DeferredRows(remainder) = remainder else {
+            panic!("unselected same-insert prefix was materialized")
+        };
+        let remainder = remainder.clone().into_rows();
+        assert_eq!(
+            remainder.rows,
+            [raw(10), raw(1), raw(10), raw(2), raw(99), raw(40)]
+        );
+        assert_eq!(remainder.row_count, 3);
+    }
+
+    #[test]
+    fn mixed_insert_promotion_keeps_new_tail_receipts_exact() {
+        let root = ShapeLeaf(7);
+        let plan = ResidualPlan::compile(&root);
+        let desc = ready_desc(2);
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        file_with_plan(
+            &mut machine.worklist,
+            &mut machine.interner,
+            &plan,
+            desc.clone(),
+            StateBucket::DeferredRows(deferred_rows(
+                0,
+                vec![raw(10)],
+                1,
+                vec![(0, raw(1)), (0, raw(2))],
+            )),
+            &mut machine.stats,
+        );
+        let promoted_hot = file_with_plan(
+            &mut machine.worklist,
+            &mut machine.interner,
+            &plan,
+            desc.clone(),
+            StateBucket::DeferredRows(deferred_rows(
+                1,
+                vec![raw(20)],
+                1,
+                vec![(0, raw(3)), (0, raw(4))],
+            )),
+            &mut machine.stats,
+        )
+        .unwrap();
+        assert_eq!(promoted_hot.rows, 2);
+        let task =
+            machine.take_continuation(&plan, ActiveContinuation::cohort(promoted_hot), usize::MAX);
+        let StateBucket::Rows(rows) = task.bucket else {
+            unreachable!()
+        };
+        assert_eq!(rows.rows, [raw(20), raw(3), raw(20), raw(4)]);
+
+        let later_hot = file_with_plan(
+            &mut machine.worklist,
+            &mut machine.interner,
+            &plan,
+            desc,
+            StateBucket::DeferredRows(deferred_rows(
+                0,
+                vec![raw(30)],
+                1,
+                vec![(0, raw(5)), (0, raw(6))],
+            )),
+            &mut machine.stats,
+        )
+        .unwrap();
+        let task =
+            machine.take_continuation(&plan, ActiveContinuation::cohort(later_hot), usize::MAX);
+        let StateBucket::Rows(rows) = task.bucket else {
+            unreachable!()
+        };
+        assert_eq!(rows.rows, [raw(5), raw(30), raw(6), raw(30)]);
+
+        let cold = machine.take_next_with_plan(&plan, usize::MAX).unwrap();
+        let StateBucket::Rows(rows) = cold.bucket else {
+            unreachable!()
+        };
+        assert_eq!(rows.rows, [raw(1), raw(10), raw(2), raw(10)]);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_split_bisects_committed_duplicate_fanout_without_loss() {
+        let original = deferred_rows(
+            0,
+            Vec::new(),
+            1,
+            vec![
+                (0, raw(1)),
+                (0, raw(1)),
+                (0, raw(1)),
+                (0, raw(2)),
+                (0, raw(2)),
+                (0, raw(3)),
+            ],
+        );
+        let expected = original.clone().into_rows().rows;
+        let mut left = StateBucket::DeferredRows(original);
+        let right = left
+            .split_for_parallel(1, false)
+            .expect("one committed fanout is splittable by occurrence");
+
+        let StateBucket::Rows(left) = left.materialize_selected(&ready_desc(1)) else {
+            unreachable!()
+        };
+        let StateBucket::Rows(right) = right.materialize_selected(&ready_desc(1)) else {
+            unreachable!()
+        };
+        assert_eq!(left.row_count, 3);
+        assert_eq!(right.row_count, 3);
+        let mut actual = left.rows;
+        actual.extend(right.rows);
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -16369,7 +16936,7 @@ mod tests {
                 assert!(batch.candidates.is_values());
                 assert!(batch.candidates.iter().all(|(parent, _)| parent == 0));
             }
-            StateBucket::Rows(_) | StateBucket::Formula(_) => {
+            StateBucket::Rows(_) | StateBucket::DeferredRows(_) | StateBucket::Formula(_) => {
                 panic!("confirmation returned a non-candidate payload")
             }
         }
@@ -16404,7 +16971,7 @@ mod tests {
                     Some(1)
                 );
             }
-            StateBucket::Rows(_) | StateBucket::Formula(_) => {
+            StateBucket::Rows(_) | StateBucket::DeferredRows(_) | StateBucket::Formula(_) => {
                 panic!("confirmation returned a non-candidate payload")
             }
         }
@@ -16743,8 +17310,16 @@ mod tests {
                 phase: ResidualPhase::Ready,
             }
         );
-        let StateBucket::Rows(rows) = payload else {
-            panic!("committed candidate did not become a row payload")
+        let StateBucket::DeferredRows(rows) = payload else {
+            panic!("committed candidate was expanded before Ready selection")
+        };
+        assert_eq!(rows.insert_at, 0);
+        assert_eq!(rows.row_count(), 1);
+        assert_eq!(rows.source.candidates, [(0, raw(7))]);
+
+        let selected = SelectedResidualTask::new(id, interner.get(id).clone(), payload.clone());
+        let StateBucket::Rows(rows) = selected.bucket else {
+            panic!("selected Ready task did not materialize its deferred rows")
         };
         assert_eq!((rows.row_count, rows.rows.as_slice()), (1, &[raw(7)][..]));
     }

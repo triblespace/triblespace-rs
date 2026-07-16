@@ -347,6 +347,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Fully confirmed residual rows materialize only when selected.** A canonical
+  Ready bucket retains its parent bindings and committed candidate occurrences
+  as a private overlay, splits and receipts that overlay by logical row, and
+  expands only the selected tail before planning or protocol code can observe
+  it. Equal insertion histories stay deferred; heterogeneous histories promote
+  in exact append order without changing canonical state identity or bag
+  semantics.
 - **One-parent residual candidate payloads stay tagless.** Ordinary and lowered
   formula actions now receive the scalar `Values` candidate sink whenever one
   affine parent is live, while reconverged multi-parent work promotes to the
