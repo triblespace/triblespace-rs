@@ -65,6 +65,39 @@ impl DeltaDesc {
     }
 }
 
+/// Immutable occurrence-local address of one constructed typed program.
+///
+/// The structural site distinguishes repeated references to the same `Arc`;
+/// the family-local key distinguishes routes of that occurrence without a
+/// query-global program catalog.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(super) struct ProgramAddress {
+    desc: DeltaDesc,
+    key: ProgramKey,
+    stratum: ProgramStratum,
+}
+
+impl ProgramAddress {
+    fn new(desc: DeltaDesc, route: ProgramRoute) -> Self {
+        assert_eq!(
+            desc.variable, route.variable,
+            "constructed program route changed its structural variable"
+        );
+        Self {
+            desc,
+            key: route.key,
+            stratum: route.stratum,
+        }
+    }
+
+    fn resolve<'r, 'a>(&self, root: &'r dyn Constraint<'a>, plan: &ResidualPlan) -> ProgramRef<'r> {
+        self.desc
+            .resolve(root, plan)
+            .residual_program()
+            .expect("constructed typed program disappeared during execution")
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct DeltaStateId(u32);
 
@@ -83,7 +116,9 @@ pub(super) struct ActiveDeltaContinuation {
 #[derive(Clone, Default)]
 struct DeltaInterner {
     by_desc: AHashMap<DeltaDesc, DeltaStateId>,
+    by_program: AHashMap<ProgramAddress, DeltaStateId>,
     descs: Vec<DeltaDesc>,
+    programs: Vec<Option<ProgramAddress>>,
 }
 
 impl DeltaInterner {
@@ -93,12 +128,28 @@ impl DeltaInterner {
         }
         let id = DeltaStateId(u32::try_from(self.descs.len()).expect("too many delta states"));
         self.descs.push(desc.clone());
+        self.programs.push(None);
         self.by_desc.insert(desc, id);
+        id
+    }
+
+    fn intern_program(&mut self, address: ProgramAddress) -> DeltaStateId {
+        if let Some(&id) = self.by_program.get(&address) {
+            return id;
+        }
+        let id = DeltaStateId(u32::try_from(self.descs.len()).expect("too many program states"));
+        self.descs.push(address.desc.clone());
+        self.programs.push(Some(address.clone()));
+        self.by_program.insert(address, id);
         id
     }
 
     fn get(&self, id: DeltaStateId) -> &DeltaDesc {
         &self.descs[id.0 as usize]
+    }
+
+    fn program(&self, id: DeltaStateId) -> Option<&ProgramAddress> {
+        self.programs[id.0 as usize].as_ref()
     }
 }
 
@@ -141,10 +192,14 @@ struct CreditKey {
     nonce: CreditNonce,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ProgramJoinId(u64);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CreditKind {
     Generator,
     Traversal,
+    Program { join: Option<ProgramJoinId> },
 }
 
 /// Affine authority to replace one cyclic producer with its novel successors.
@@ -189,6 +244,10 @@ enum DeltaReducer {
     Confirm {
         original: Box<[RawInline]>,
     },
+    /// Formula confirmation reads its immutable original stream directly
+    /// from the activation's owned return frame, avoiding a second candidate
+    /// allocation solely for reducer finalization.
+    FormulaConfirm,
 }
 
 impl DeltaReducer {
@@ -224,6 +283,33 @@ struct SuspendedSourcePage {
     had_stable_effect: bool,
 }
 
+/// Receipt-local structured join for an opaque typed continuation.
+///
+/// Child credits drain independently. Only this join's final child releases
+/// the stored exact resume, and the resume then inherits the parent lineage's
+/// join without involving unrelated work in the activation.
+#[derive(Clone)]
+struct ProgramJoin {
+    remaining: usize,
+    resume: Option<ProgramWork>,
+    state: DeltaStateId,
+    parent: Option<ProgramJoinId>,
+    /// A Search-paced page owns this receipt-local child barrier. Its children
+    /// may perform many Activation-paced steps, but the page contributes at
+    /// most one geometric negative receipt when the barrier drains.
+    search_page: bool,
+    /// Independently records whether family telemetry classified the page as
+    /// a source page. This affects counters only, never join semantics.
+    source_telemetry: bool,
+    had_stable_effect: bool,
+}
+
+struct ProgramJoinCompletion {
+    scheduled: Option<(DeltaStateId, ProgramWork, ProducerCredit)>,
+    dead_search_pages: usize,
+    dead_source_telemetry_pages: usize,
+}
+
 /// One affine parent reducer scope. Several speculative source roots may own
 /// live credits inside it; they share novelty and Accepted, while source stays
 /// in each node so their product states cannot suppress one another.
@@ -232,8 +318,8 @@ struct Activation {
     reducer: DeltaReducer,
     return_to: DeltaReturn,
     physical_class: DeltaPhysicalClass,
-    /// Examined-work quantum for a terminal activation whose current sparse
-    /// page did not publish. This is activation-local search evidence:
+    /// Physical grant quantum for a terminal activation whose current sparse
+    /// dispatch did not publish. This is engine-owned activation-local search evidence:
     /// publication resets it to one, while the independent search width
     /// supplies only the hard cap.
     terminal_sparse_quantum: usize,
@@ -243,6 +329,7 @@ struct Activation {
     /// The continuation cursor is suspended while every traversal lineage
     /// rooted in the current page owns the activation's affine credits.
     suspended_source_page: Option<SuspendedSourcePage>,
+    program_joins: AHashMap<ProgramJoinId, ProgramJoin>,
     seen: AHashMap<ResidualDeltaNode, bool>,
     accepted: AHashSet<RawInline>,
     /// Occurrence-preserving direct proposal effects retained only by a
@@ -260,6 +347,7 @@ struct Activation {
 struct RegistryState {
     next_activation: u64,
     next_credit: u64,
+    next_program_join: u64,
     activations: AHashMap<ActivationId, Activation>,
 }
 
@@ -304,6 +392,20 @@ struct StartOutcome {
     /// records them before issuing this receipt, so reducers that cannot
     /// stream may simply retain them until quiescence.
     initial_accepted: Vec<RawInline>,
+    quiescence: Option<QuiescenceProof>,
+}
+
+struct ProgramInstallOutcome {
+    roots: Vec<(ProgramWork, ProducerCredit)>,
+    initial_accepted: Vec<RawInline>,
+    quiescence: Option<QuiescenceProof>,
+}
+
+struct ProgramReplaceOutcome {
+    scheduled: Vec<(DeltaStateId, ProgramWork, ProducerCredit)>,
+    accepted: Vec<RawInline>,
+    dead_search_pages: usize,
+    dead_source_telemetry_pages: usize,
     quiescence: Option<QuiescenceProof>,
 }
 
@@ -393,6 +495,7 @@ impl ProducerRegistry {
             state: RegistryState {
                 next_activation: 0,
                 next_credit: 0,
+                next_program_join: 0,
                 activations: AHashMap::new(),
             },
         }
@@ -495,6 +598,7 @@ impl ProducerRegistry {
                         terminal_sparse_quantum: 1,
                         source_candidates: None,
                         suspended_source_page: None,
+                        program_joins: AHashMap::new(),
                         seen: AHashMap::new(),
                         accepted,
                         direct_candidates: Vec::new(),
@@ -566,6 +670,7 @@ impl ProducerRegistry {
                         terminal_sparse_quantum: 1,
                         source_candidates,
                         suspended_source_page: None,
+                        program_joins: AHashMap::new(),
                         seen: AHashMap::new(),
                         accepted: AHashSet::new(),
                         direct_candidates: Vec::new(),
@@ -578,6 +683,100 @@ impl ProducerRegistry {
         );
         let credit = self.issue_credit(activation, CreditKind::Generator);
         (activation, credit)
+    }
+
+    /// Creates one reducer activation before typed seed states are installed.
+    /// The engine-created identity is passed into the typed adapter so every
+    /// arena slot is owned from birth by its affine parent.
+    fn open_program_activation(
+        &mut self,
+        reducer: DeltaReducer,
+        return_to: DeltaReturn,
+        source_candidates: Option<Box<[RawInline]>>,
+        terminal_full: Option<VariableSet>,
+    ) -> ActivationId {
+        let physical_class = Self::physical_class(&reducer, &return_to, terminal_full);
+        let activation = ActivationId(take_monotonic(
+            &mut self.state.next_activation,
+            "activation",
+        ));
+        assert!(
+            self.state
+                .activations
+                .insert(
+                    activation,
+                    Activation {
+                        reducer,
+                        return_to,
+                        physical_class,
+                        terminal_sparse_quantum: 1,
+                        source_candidates,
+                        suspended_source_page: None,
+                        program_joins: AHashMap::new(),
+                        seen: AHashMap::new(),
+                        accepted: AHashSet::new(),
+                        direct_candidates: Vec::new(),
+                        live: AHashMap::new(),
+                        status: ActivationStatus::Open,
+                    },
+                )
+                .is_none(),
+            "program activation identifier was reused"
+        );
+        activation
+    }
+
+    fn install_program_roots(
+        &mut self,
+        activation_id: ActivationId,
+        seeds: impl IntoIterator<Item = ProgramSeedWork>,
+    ) -> ProgramInstallOutcome {
+        {
+            let activation = self
+                .state
+                .activations
+                .get(&activation_id)
+                .expect("unknown program activation");
+            assert_eq!(activation.status, ActivationStatus::Open);
+            assert!(activation.live.is_empty());
+            assert!(activation.program_joins.is_empty());
+        }
+
+        let mut roots = Vec::new();
+        let mut initial_accepted = Vec::new();
+        for seed in seeds {
+            if let Some(value) = seed.accepted {
+                if self
+                    .state
+                    .activations
+                    .get_mut(&activation_id)
+                    .expect("unknown program activation")
+                    .accepted
+                    .insert(value)
+                {
+                    initial_accepted.push(value);
+                }
+            }
+            let credit = self.issue_credit(activation_id, CreditKind::Program { join: None });
+            roots.push((seed.work, credit));
+        }
+        let status = if roots.is_empty() {
+            ActivationStatus::Quiescent
+        } else {
+            ActivationStatus::Open
+        };
+        self.state
+            .activations
+            .get_mut(&activation_id)
+            .expect("unknown program activation")
+            .status = status;
+        ProgramInstallOutcome {
+            roots,
+            initial_accepted,
+            quiescence: (status == ActivationStatus::Quiescent).then_some(QuiescenceProof {
+                activation: activation_id,
+            }),
+        }
     }
 
     fn physical_class(
@@ -769,7 +968,9 @@ impl ProducerRegistry {
                     .direct_candidates
                     .extend(accepted.iter().copied()),
                 DeltaReducer::StreamProposal | DeltaReducer::StreamFormulaProposal => {}
-                DeltaReducer::Support { .. } | DeltaReducer::Confirm { .. } => assert!(
+                DeltaReducer::Support { .. }
+                | DeltaReducer::Confirm { .. }
+                | DeltaReducer::FormulaConfirm => assert!(
                     accepted.is_empty(),
                     "a non-proposal reducer received direct source candidates"
                 ),
@@ -819,6 +1020,368 @@ impl ProducerRegistry {
             accepted,
             resumed_source,
             retired_source_page,
+            quiescence,
+        }
+    }
+
+    fn new_program_join(
+        &mut self,
+        activation: ActivationId,
+        remaining: usize,
+        resume: Option<ProgramWork>,
+        state: DeltaStateId,
+        parent: Option<ProgramJoinId>,
+        search_page: bool,
+        source_telemetry: bool,
+        had_stable_effect: bool,
+    ) -> ProgramJoinId {
+        assert!(remaining > 0, "program join requires at least one child");
+        let join = ProgramJoinId(take_monotonic(
+            &mut self.state.next_program_join,
+            "program join",
+        ));
+        assert!(
+            self.state
+                .activations
+                .get_mut(&activation)
+                .expect("unknown program activation")
+                .program_joins
+                .insert(
+                    join,
+                    ProgramJoin {
+                        remaining,
+                        resume,
+                        state,
+                        parent,
+                        search_page,
+                        source_telemetry,
+                        had_stable_effect,
+                    },
+                )
+                .is_none(),
+            "program join identifier was reused"
+        );
+        join
+    }
+
+    fn finish_program_join_member(
+        &mut self,
+        activation: ActivationId,
+        mut join: ProgramJoinId,
+    ) -> ProgramJoinCompletion {
+        let mut dead_search_pages = 0usize;
+        let mut dead_source_telemetry_pages = 0usize;
+        loop {
+            let completed = {
+                let joins = &mut self
+                    .state
+                    .activations
+                    .get_mut(&activation)
+                    .expect("unknown program activation")
+                    .program_joins;
+                let record = joins.get_mut(&join).expect("unknown program join");
+                record.remaining = record
+                    .remaining
+                    .checked_sub(1)
+                    .expect("program join child retired twice");
+                (record.remaining == 0).then(|| {
+                    joins
+                        .remove(&join)
+                        .expect("completed program join disappeared")
+                })
+            };
+            let Some(record) = completed else {
+                return ProgramJoinCompletion {
+                    scheduled: None,
+                    dead_search_pages,
+                    dead_source_telemetry_pages,
+                };
+            };
+            dead_search_pages += usize::from(record.search_page && !record.had_stable_effect);
+            dead_source_telemetry_pages +=
+                usize::from(record.source_telemetry && !record.had_stable_effect);
+            if let Some(resume) = record.resume {
+                let credit = self.issue_credit(
+                    activation,
+                    CreditKind::Program {
+                        join: record.parent,
+                    },
+                );
+                return ProgramJoinCompletion {
+                    scheduled: Some((record.state, resume, credit)),
+                    dead_search_pages,
+                    dead_source_telemetry_pages,
+                };
+            }
+            let Some(parent) = record.parent else {
+                return ProgramJoinCompletion {
+                    scheduled: None,
+                    dead_search_pages,
+                    dead_source_telemetry_pages,
+                };
+            };
+            // A barrier without a resume retires as one member of its parent
+            // barrier. Continue iteratively so a final source page can close
+            // an arbitrarily nested receipt tree without a sentinel task.
+            join = parent;
+        }
+    }
+
+    fn mark_program_join_stable_effect(
+        &mut self,
+        activation: ActivationId,
+        mut join: Option<ProgramJoinId>,
+    ) {
+        while let Some(id) = join {
+            let record = self
+                .state
+                .activations
+                .get_mut(&activation)
+                .expect("unknown program activation")
+                .program_joins
+                .get_mut(&id)
+                .expect("program effect named an unknown join");
+            record.had_stable_effect = true;
+            join = record.parent;
+        }
+    }
+
+    fn program_credit_within_search_page(&self, credit: &ProducerCredit) -> bool {
+        let activation = self
+            .state
+            .activations
+            .get(&credit.key.activation)
+            .expect("unknown program activation");
+        let mut join = match activation.live.get(&credit.key.nonce) {
+            Some(CreditKind::Program { join }) => *join,
+            _ => panic!("unknown, replayed, or wrong-kind program credit"),
+        };
+        while let Some(id) = join {
+            let record = activation
+                .program_joins
+                .get(&id)
+                .expect("program credit named an unknown join");
+            if record.search_page {
+                return true;
+            }
+            join = record.parent;
+        }
+        false
+    }
+
+    /// Replaces one opaque typed producer through the single affine law.
+    ///
+    /// Immediate resumes are siblings of admitted children. `AfterChildren`
+    /// creates a receipt-local join whose final descendant releases exactly
+    /// that resume; the engine never inspects the typed state that requested
+    /// either disposition.
+    fn replace_program(
+        &mut self,
+        parent: ProducerCredit,
+        state: DeltaStateId,
+        children: &[ProgramChild],
+        observed: impl IntoIterator<Item = RawInline>,
+        direct: impl IntoIterator<Item = RawInline>,
+        reported_support: bool,
+        search_page: bool,
+        source_telemetry: bool,
+        resume: Option<ProgramResume>,
+    ) -> ProgramReplaceOutcome {
+        assert_eq!(
+            parent.brand, self.brand,
+            "program credit crossed registries"
+        );
+        let activation_id = parent.key.activation;
+        let parent_join = {
+            let activation = self
+                .state
+                .activations
+                .get(&activation_id)
+                .expect("unknown program activation");
+            assert_eq!(activation.status, ActivationStatus::Open);
+            match activation.live.get(&parent.key.nonce) {
+                Some(CreditKind::Program { join }) => *join,
+                _ => panic!("unknown, replayed, or wrong-kind program credit"),
+            }
+        };
+
+        let observed: Vec<_> = observed.into_iter().collect();
+        let direct: Vec<_> = direct.into_iter().collect();
+        let mut accepted = Vec::new();
+        {
+            let activation = self
+                .state
+                .activations
+                .get_mut(&activation_id)
+                .expect("unknown program activation");
+            match &activation.reducer {
+                DeltaReducer::QuiescentProposal => {
+                    activation.direct_candidates.extend_from_slice(&direct)
+                }
+                DeltaReducer::StreamProposal | DeltaReducer::StreamFormulaProposal => {
+                    accepted.extend_from_slice(&direct)
+                }
+                DeltaReducer::Support { .. }
+                | DeltaReducer::Confirm { .. }
+                | DeltaReducer::FormulaConfirm => assert!(
+                    direct.is_empty(),
+                    "a non-proposal program reducer observed direct candidates"
+                ),
+            }
+            for value in observed
+                .into_iter()
+                .chain(children.iter().filter_map(|child| child.accepted))
+            {
+                if activation.accepted.insert(value) {
+                    accepted.push(value);
+                }
+            }
+        }
+
+        let publishes_stable_effect = {
+            let activation = self
+                .state
+                .activations
+                .get(&activation_id)
+                .expect("unknown program activation");
+            match &activation.reducer {
+                DeltaReducer::StreamProposal | DeltaReducer::StreamFormulaProposal => {
+                    !accepted.is_empty()
+                }
+                DeltaReducer::Support { published } => {
+                    !*published && (reported_support || !accepted.is_empty())
+                }
+                DeltaReducer::QuiescentProposal
+                | DeltaReducer::Confirm { .. }
+                | DeltaReducer::FormulaConfirm => false,
+            }
+        };
+        if publishes_stable_effect {
+            self.mark_program_join_stable_effect(activation_id, parent_join);
+        }
+
+        let no_replacement =
+            children.is_empty() && matches!(&resume, None | Some(ProgramResume::AfterChildrenDone));
+        let mut scheduled = Vec::new();
+        match resume {
+            Some(ProgramResume::AfterChildren(resume)) if !children.is_empty() => {
+                let join = self.new_program_join(
+                    activation_id,
+                    children.len(),
+                    Some(resume),
+                    state,
+                    parent_join,
+                    search_page,
+                    source_telemetry,
+                    publishes_stable_effect,
+                );
+                for child in children {
+                    let credit =
+                        self.issue_credit(activation_id, CreditKind::Program { join: Some(join) });
+                    scheduled.push((state, child.work.clone(), credit));
+                }
+            }
+            Some(ProgramResume::AfterChildrenDone) if !children.is_empty() => {
+                let join = self.new_program_join(
+                    activation_id,
+                    children.len(),
+                    None,
+                    state,
+                    parent_join,
+                    search_page,
+                    source_telemetry,
+                    publishes_stable_effect,
+                );
+                for child in children {
+                    let credit =
+                        self.issue_credit(activation_id, CreditKind::Program { join: Some(join) });
+                    scheduled.push((state, child.work.clone(), credit));
+                }
+            }
+            resume => {
+                let immediate_resume = match resume {
+                    Some(ProgramResume::Immediate(work) | ProgramResume::AfterChildren(work)) => {
+                        Some(work)
+                    }
+                    Some(ProgramResume::AfterChildrenDone) | None => None,
+                };
+                let replacement_count = children.len() + usize::from(immediate_resume.is_some());
+                if let Some(join) = parent_join {
+                    let record = self
+                        .state
+                        .activations
+                        .get_mut(&activation_id)
+                        .expect("unknown program activation")
+                        .program_joins
+                        .get_mut(&join)
+                        .expect("program parent named an unknown join");
+                    if replacement_count > 0 {
+                        record.remaining = record
+                            .remaining
+                            .checked_add(replacement_count - 1)
+                            .expect("program join width overflow");
+                    }
+                }
+                for child in children {
+                    let credit =
+                        self.issue_credit(activation_id, CreditKind::Program { join: parent_join });
+                    scheduled.push((state, child.work.clone(), credit));
+                }
+                if let Some(work) = immediate_resume {
+                    let credit =
+                        self.issue_credit(activation_id, CreditKind::Program { join: parent_join });
+                    scheduled.push((state, work, credit));
+                }
+            }
+        }
+
+        assert_eq!(
+            self.state
+                .activations
+                .get_mut(&activation_id)
+                .expect("unknown program activation")
+                .live
+                .remove(&parent.key.nonce),
+            Some(CreditKind::Program { join: parent_join })
+        );
+
+        let mut dead_search_pages = 0usize;
+        let mut dead_source_telemetry_pages = 0usize;
+        if no_replacement {
+            if let Some(join) = parent_join {
+                let completed = self.finish_program_join_member(activation_id, join);
+                dead_search_pages += completed.dead_search_pages;
+                dead_source_telemetry_pages += completed.dead_source_telemetry_pages;
+                if let Some(resumed) = completed.scheduled {
+                    scheduled.push(resumed);
+                }
+            }
+        }
+
+        let quiescence = {
+            let activation = self
+                .state
+                .activations
+                .get_mut(&activation_id)
+                .expect("unknown program activation");
+            if activation.live.is_empty() {
+                assert!(
+                    activation.program_joins.is_empty(),
+                    "program activation lost every credit behind a live join"
+                );
+                activation.status = ActivationStatus::Quiescent;
+                Some(QuiescenceProof {
+                    activation: activation_id,
+                })
+            } else {
+                None
+            }
+        };
+        ProgramReplaceOutcome {
+            scheduled,
+            accepted,
+            dead_search_pages,
+            dead_source_telemetry_pages,
             quiescence,
         }
     }
@@ -884,27 +1447,35 @@ impl ProducerRegistry {
     fn source_context(
         &self,
         activation: ActivationId,
-    ) -> (VariableSet, Vec<RawInline>, Option<Vec<RawInline>>) {
+    ) -> (VariableSet, &[RawInline], Option<&[RawInline]>) {
         let activation = self
             .state
             .activations
             .get(&activation)
             .expect("unknown delta activation");
         let (bound, parent) = match &activation.return_to {
-            DeltaReturn::Stable { desc, parent } => (desc.bound, parent.to_vec()),
+            DeltaReturn::Stable { desc, parent } => (desc.bound, parent.as_ref()),
             DeltaReturn::Formula { bound, batch, .. } => {
                 assert_eq!(batch.parents.row_count, 1);
-                (*bound, batch.parents.rows.clone())
+                (*bound, batch.parents.rows.as_slice())
             }
         };
-        (
-            bound,
-            parent,
-            activation
-                .source_candidates
-                .as_deref()
-                .map(<[RawInline]>::to_vec),
-        )
+        (bound, parent, Self::activation_candidates(activation))
+    }
+
+    fn activation_candidates(activation: &Activation) -> Option<&[RawInline]> {
+        activation.source_candidates.as_deref().or_else(|| {
+            match (&activation.reducer, &activation.return_to) {
+                (DeltaReducer::Confirm { original }, _) => Some(original.as_ref()),
+                (DeltaReducer::FormulaConfirm, DeltaReturn::Formula { batch, .. }) => {
+                    Some(batch.input().one_parent_values())
+                }
+                (DeltaReducer::FormulaConfirm, DeltaReturn::Stable { .. }) => {
+                    panic!("formula confirmation returned to a stable continuation")
+                }
+                _ => None,
+            }
+        })
     }
 
     fn source_dispatch_shape(&self, activation: ActivationId) -> (VariableSet, bool) {
@@ -917,7 +1488,7 @@ impl ProducerRegistry {
             DeltaReturn::Stable { desc, .. } => desc.bound,
             DeltaReturn::Formula { bound, .. } => *bound,
         };
-        (bound, activation.source_candidates.is_some())
+        (bound, Self::activation_candidates(activation).is_some())
     }
 
     fn activation_streams(&self, activation: ActivationId) -> bool {
@@ -988,7 +1559,10 @@ impl ProducerRegistry {
         let before = activation.terminal_sparse_quantum;
         if published {
             activation.terminal_sparse_quantum = 1;
-        } else if kind == PhysicalDispatchKind::Transition {
+        } else if matches!(
+            kind,
+            PhysicalDispatchKind::Transition | PhysicalDispatchKind::Program
+        ) {
             activation.terminal_sparse_quantum =
                 before.saturating_mul(2).min(search_width.max(1)).max(1);
         }
@@ -1027,11 +1601,39 @@ impl ProducerRegistry {
             }
             DeltaReducer::Support { .. }
             | DeltaReducer::QuiescentProposal
-            | DeltaReducer::Confirm { .. } => return None,
+            | DeltaReducer::Confirm { .. }
+            | DeltaReducer::FormulaConfirm => return None,
         };
         Some(DeltaStreamingReturn {
             return_to: activation.return_to.clone(),
             effect,
+        })
+    }
+
+    /// Observes an idempotent typed Boolean support effect.
+    ///
+    /// The first witness publishes `true`; later witnesses from independent
+    /// pages in the same activation are harmless. Reporting this effect to a
+    /// non-support reducer remains a contract violation.
+    fn take_program_support_return(
+        &mut self,
+        activation: ActivationId,
+    ) -> Option<DeltaStreamingReturn> {
+        let activation = self
+            .state
+            .activations
+            .get_mut(&activation)
+            .expect("unknown delta activation");
+        let DeltaReducer::Support { published } = &mut activation.reducer else {
+            panic!("typed support observation reached a non-support reducer")
+        };
+        if *published {
+            return None;
+        }
+        *published = true;
+        Some(DeltaStreamingReturn {
+            return_to: activation.return_to.clone(),
+            effect: DeltaStreamingEffect::Support,
         })
     }
 
@@ -1073,6 +1675,21 @@ impl ProducerRegistry {
                 assert!(activation.direct_candidates.is_empty());
                 DeltaCompletion::Candidates(
                     original
+                        .iter()
+                        .filter(|candidate| activation.accepted.contains(*candidate))
+                        .copied()
+                        .collect(),
+                )
+            }
+            DeltaReducer::FormulaConfirm => {
+                assert!(activation.direct_candidates.is_empty());
+                let DeltaReturn::Formula { batch, .. } = &activation.return_to else {
+                    panic!("formula confirmation returned to a stable continuation")
+                };
+                DeltaCompletion::Candidates(
+                    batch
+                        .input()
+                        .one_parent_values()
                         .iter()
                         .filter(|candidate| activation.accepted.contains(*candidate))
                         .copied()
@@ -1146,6 +1763,48 @@ fn seed_ranges(seeds: &[ResidualDeltaSeed], parent_count: usize) -> Vec<std::ops
     ranges
 }
 
+fn program_seed_ranges(
+    seeds: &[ProgramSeedWork],
+    parent_count: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::with_capacity(parent_count);
+    let mut cursor = 0usize;
+    for parent in 0..parent_count {
+        let begin = cursor;
+        while cursor < seeds.len() && seeds[cursor].parent as usize == parent {
+            cursor += 1;
+        }
+        ranges.push(begin..cursor);
+    }
+    assert_eq!(
+        cursor,
+        seeds.len(),
+        "typed program seed tags skipped a parent range"
+    );
+    ranges
+}
+
+fn program_child_ranges(
+    children: &[ProgramChild],
+    input_count: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::with_capacity(input_count);
+    let mut cursor = 0usize;
+    for input in 0..input_count {
+        let begin = cursor;
+        while cursor < children.len() && children[cursor].input as usize == input {
+            cursor += 1;
+        }
+        ranges.push(begin..cursor);
+    }
+    assert_eq!(
+        cursor,
+        children.len(),
+        "typed program child tags skipped an input range"
+    );
+    ranges
+}
+
 fn tagged_ranges<T>(
     values: &[(u32, T)],
     parent_count: usize,
@@ -1192,17 +1851,53 @@ enum TransitionDispatchKey {
 }
 
 impl TransitionDispatchKey {
-    fn of(registry: &ProducerRegistry, task: &DeltaTask) -> Self {
-        if registry.physical_activation_class(task.activation)
-            == DeltaPhysicalClass::TerminalStreaming
-        {
+    fn for_activation(registry: &ProducerRegistry, activation: ActivationId) -> Self {
+        if registry.physical_activation_class(activation) == DeltaPhysicalClass::TerminalStreaming {
             Self::TerminalStreaming
-        } else if registry.activation_streams(task.activation) {
+        } else if registry.activation_streams(activation) {
             Self::Streaming
         } else {
-            Self::Quiescent(task.activation)
+            Self::Quiescent(activation)
         }
     }
+
+    fn of(registry: &ProducerRegistry, task: &DeltaTask) -> Self {
+        Self::for_activation(registry, task.activation)
+    }
+}
+
+#[derive(Debug)]
+struct ProgramTask {
+    activation: ActivationId,
+    credit: ProducerCredit,
+    work: ProgramWork,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProgramDispatchKey {
+    dispatch: DispatchClass,
+    pacing: ProgramPacing,
+    bound: VariableSet,
+    has_candidates: bool,
+    publication: TransitionDispatchKey,
+}
+
+impl ProgramDispatchKey {
+    fn of(registry: &ProducerRegistry, task: &ProgramTask) -> Self {
+        let (bound, has_candidates) = registry.source_dispatch_shape(task.activation);
+        Self {
+            dispatch: task.work.dispatch,
+            pacing: task.work.pacing,
+            bound,
+            has_candidates,
+            publication: TransitionDispatchKey::for_activation(registry, task.activation),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ProgramBucket {
+    tasks: Vec<ProgramTask>,
 }
 
 #[derive(Debug)]
@@ -1328,12 +2023,81 @@ struct SourceBucket {
 #[derive(Debug)]
 struct PhysicalDispatch {
     terminal_activations: OrderedActivationSet,
+    /// Assigned work and the activation-local quantum in force before this
+    /// dispatch. Cohort totals are never evidence that one affine activation
+    /// saturated its own sparse search budget.
+    terminal_budgets: Vec<TerminalActivationBudget>,
     kind: PhysicalDispatchKind,
     task_limits: Vec<usize>,
     remainder_tasks: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TerminalActivationBudget {
+    activation: ActivationId,
+    assigned: usize,
+    quantum: usize,
+}
+
 impl PhysicalDispatch {
+    fn new(
+        registry: &ProducerRegistry,
+        kind: PhysicalDispatchKind,
+        search_width: usize,
+        task_activations: impl IntoIterator<Item = ActivationId>,
+        task_limits: Vec<usize>,
+        remainder_tasks: usize,
+    ) -> Self {
+        let mut terminal_budgets: Vec<TerminalActivationBudget> = Vec::new();
+        let mut slots = AHashMap::new();
+        let activations: Vec<_> = task_activations.into_iter().collect();
+        assert_eq!(activations.len(), task_limits.len());
+        for (activation, &assigned) in activations.iter().zip(&task_limits) {
+            if registry.physical_activation_class(*activation)
+                != DeltaPhysicalClass::TerminalStreaming
+            {
+                continue;
+            }
+            let slot = *slots.entry(*activation).or_insert_with(|| {
+                let quantum = match kind {
+                    PhysicalDispatchKind::Source => {
+                        registry.source_dispatch_width(*activation, search_width)
+                    }
+                    PhysicalDispatchKind::Transition | PhysicalDispatchKind::Program => {
+                        registry.transition_dispatch_width(*activation, search_width)
+                    }
+                };
+                terminal_budgets.push(TerminalActivationBudget {
+                    activation: *activation,
+                    assigned: 0,
+                    quantum,
+                });
+                terminal_budgets.len() - 1
+            });
+            terminal_budgets[slot].assigned = terminal_budgets[slot]
+                .assigned
+                .checked_add(assigned)
+                .expect("terminal activation work budget overflow");
+        }
+        let terminal_activations = terminal_budgets
+            .iter()
+            .map(|receipt| receipt.activation)
+            .collect();
+        assert!(
+            terminal_budgets
+                .iter()
+                .all(|receipt| receipt.assigned <= receipt.quantum),
+            "one terminal activation was assigned beyond its local physical quantum"
+        );
+        Self {
+            terminal_activations,
+            terminal_budgets,
+            kind,
+            task_limits,
+            remainder_tasks,
+        }
+    }
+
     fn work_budget(&self) -> usize {
         self.task_limits.iter().sum()
     }
@@ -1346,6 +2110,9 @@ impl PhysicalDispatch {
 struct DeltaPhysicalOutcome {
     outcome: DeltaStepOutcome,
     terminal_publications: OrderedActivationSet,
+    /// A Search-paced receipt completed under a descendant's physical
+    /// Activation dispatch. It still owns outer geometric feedback.
+    retired_search_receipt: bool,
 }
 
 /// Insertion-ordered activation membership with an allocation-free singleton
@@ -1458,19 +2225,6 @@ fn even_limits(work_budget: usize, task_count: usize) -> Vec<usize> {
     limits
 }
 
-fn terminal_activations(
-    registry: &ProducerRegistry,
-    activations: impl IntoIterator<Item = ActivationId>,
-) -> OrderedActivationSet {
-    let mut terminal = OrderedActivationSet::default();
-    for activation in activations {
-        if registry.physical_activation_class(activation) == DeltaPhysicalClass::TerminalStreaming {
-            let _ = terminal.insert(activation);
-        }
-    }
-    terminal
-}
-
 /// Which physical layer consumed one bounded backend call. Source misses are
 /// evidence about root discovery, not about the sparse graph traversal credit
 /// retained by the activation; only transition misses widen that credit.
@@ -1478,6 +2232,7 @@ fn terminal_activations(
 enum PhysicalDispatchKind {
     Source,
     Transition,
+    Program,
 }
 
 /// One delta scheduler step as observed by the outer geometric policy.
@@ -1968,6 +2723,11 @@ pub(super) struct DeltaScheduler {
     interner: DeltaInterner,
     worklist: BTreeMap<DeltaStateId, DeltaBucket>,
     source_worklist: BTreeMap<DeltaStateId, SourceBucket>,
+    /// One unified queue of opaque typed continuations. Source generation and
+    /// product expansion are family-private states distinguished only by
+    /// opaque physical dispatch classes.
+    program_worklist: BTreeMap<DeltaStateId, ProgramBucket>,
+    program_runtimes: AHashMap<DeltaStateId, ProgramRuntime>,
     /// Number of independent quiescent activations that may share one
     /// transition cohort. This grows only when activations complete; `width`
     /// remains the separate intra-activation page/work budget.
@@ -1986,6 +2746,8 @@ impl DeltaScheduler {
             interner: DeltaInterner::default(),
             worklist: BTreeMap::new(),
             source_worklist: BTreeMap::new(),
+            program_worklist: BTreeMap::new(),
+            program_runtimes: AHashMap::new(),
             activation_width: 1,
             terminal_selection_slots: AHashMap::new(),
             terminal_selections: Vec::new(),
@@ -2019,7 +2781,363 @@ impl DeltaScheduler {
     }
 
     pub(super) fn is_empty(&self) -> bool {
-        self.worklist.is_empty() && self.source_worklist.is_empty()
+        self.worklist.is_empty()
+            && self.source_worklist.is_empty()
+            && self.program_worklist.is_empty()
+    }
+
+    fn prepare_program(
+        &mut self,
+        desc: DeltaDesc,
+        route: ProgramRoute,
+        spec: ProgramRef<'_>,
+    ) -> DeltaStateId {
+        let state = self
+            .interner
+            .intern_program(ProgramAddress::new(desc, route));
+        self.program_runtimes
+            .entry(state)
+            .or_insert_with(|| spec.new_runtime());
+        state
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn seed_program_proposals_with_full(
+        &mut self,
+        spec: ProgramRef<'_>,
+        desc: DeltaDesc,
+        request: ProgramRequest,
+        route: ProgramRoute,
+        successor: StateDesc,
+        parents: RowBatch,
+        full: VariableSet,
+        direct_terminal_publication_full: Option<VariableSet>,
+        plan: &ResidualPlan,
+        stable: &mut Worklist,
+        stable_interner: &mut StateInterner,
+        stats: &mut ResidualStateStats,
+    ) -> DeltaSeedOutcome {
+        let seeded_parents = parents.row_count;
+        let state = self.prepare_program(desc, route, spec);
+        let stride = successor.bound.count();
+        let mut activations = Vec::with_capacity(parents.row_count);
+        let mut terminal_activations = Vec::with_capacity(parents.row_count);
+        for row in 0..parents.row_count {
+            let start = row * stride;
+            let parent = parents.rows[start..start + stride]
+                .to_vec()
+                .into_boxed_slice();
+            let activation = self.registry.open_program_activation(
+                DeltaReducer::StreamProposal,
+                DeltaReturn::Stable {
+                    desc: successor.clone(),
+                    parent,
+                },
+                None,
+                Some(full),
+            );
+            if self.registry.physical_activation_class(activation)
+                == DeltaPhysicalClass::TerminalStreaming
+            {
+                terminal_activations.push(activation);
+            }
+            activations.push(activation);
+        }
+        let program_activations: Vec<_> = activations
+            .iter()
+            .map(|activation| ProgramActivation(activation.0))
+            .collect();
+        let vars: Vec<_> = successor.bound.into_iter().collect();
+        let view = rows_view(&vars, &parents.rows, parents.row_count);
+        let mut seeded = ProgramSeedEffects::default();
+        spec.seed_batch(
+            self.program_runtimes
+                .get_mut(&state)
+                .expect("prepared program lost its runtime"),
+            ProgramSeedBatch {
+                request,
+                route,
+                view,
+                activations: &program_activations,
+            },
+            &mut seeded,
+        );
+        let ranges = program_seed_ranges(&seeded.work, parents.row_count);
+        let mut tasks = Vec::with_capacity(seeded.work.len());
+        let mut effects = DeltaStableEffects::default();
+        let mut completed_activation_ids = Vec::new();
+        for (activation, range) in activations.iter().copied().zip(ranges) {
+            let installed = self
+                .registry
+                .install_program_roots(activation, seeded.work[range].iter().cloned());
+            if !installed.initial_accepted.is_empty() {
+                let direct_terminal = direct_terminal_publication_full.filter(|_| {
+                    self.registry.physical_activation_class(activation)
+                        == DeltaPhysicalClass::TerminalStreaming
+                });
+                let streamed = self
+                    .registry
+                    .take_streaming_return(activation)
+                    .expect("typed streaming proposal rejected accepting seed effects");
+                effects.absorb(Self::release_streaming(
+                    activation,
+                    streamed,
+                    installed.initial_accepted,
+                    direct_terminal,
+                    plan,
+                    stable,
+                    stable_interner,
+                    stats,
+                ));
+            }
+            tasks.extend(
+                installed
+                    .roots
+                    .into_iter()
+                    .map(|(work, credit)| ProgramTask {
+                        activation,
+                        credit,
+                        work,
+                    }),
+            );
+            if let Some(proof) = installed.quiescence {
+                let completed = self.registry.finish(proof);
+                assert_eq!(completed.effect, DeltaCompletion::Cleanup);
+                completed_activation_ids.push(completed.activation);
+            }
+        }
+        if !completed_activation_ids.is_empty() {
+            let retired: Vec<_> = completed_activation_ids
+                .iter()
+                .map(|activation| ProgramActivation(activation.0))
+                .collect();
+            spec.retire_activations(
+                self.program_runtimes
+                    .get_mut(&state)
+                    .expect("prepared program lost its runtime"),
+                &retired,
+            );
+        }
+        let active = self.file_program_state(state, tasks);
+        DeltaSeedOutcome {
+            continuation: effects.continuation,
+            publication: effects.publication,
+            active,
+            terminal_activations,
+            completed_activation_ids,
+            terminal_family: None,
+            seeded_parents,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn seed_program_confirms(
+        &mut self,
+        spec: ProgramRef<'_>,
+        desc: DeltaDesc,
+        request: ProgramRequest,
+        route: ProgramRoute,
+        successor: StateDesc,
+        batch: CandidateBatch,
+    ) -> Option<ActiveDeltaContinuation> {
+        let state = self.prepare_program(desc, route, spec);
+        let stride = successor.bound.count();
+        let parent_count = batch.parents.row_count;
+        let (parents, candidate_groups) = batch.into_parent_candidates();
+        let mut activations = Vec::with_capacity(parent_count);
+        for (row, original) in candidate_groups.into_iter().enumerate() {
+            let start = row * stride;
+            let parent = parents.rows[start..start + stride]
+                .to_vec()
+                .into_boxed_slice();
+            let original = original.into_boxed_slice();
+            activations.push(self.registry.open_program_activation(
+                DeltaReducer::Confirm { original },
+                DeltaReturn::Stable {
+                    desc: successor.clone(),
+                    parent,
+                },
+                None,
+                None,
+            ));
+        }
+        let program_activations: Vec<_> = activations
+            .iter()
+            .map(|activation| ProgramActivation(activation.0))
+            .collect();
+        let vars: Vec<_> = successor.bound.into_iter().collect();
+        let view = rows_view(&vars, &parents.rows, parent_count);
+        let mut seeded = ProgramSeedEffects::default();
+        spec.seed_batch(
+            self.program_runtimes
+                .get_mut(&state)
+                .expect("prepared program lost its runtime"),
+            ProgramSeedBatch {
+                request,
+                route,
+                view,
+                activations: &program_activations,
+            },
+            &mut seeded,
+        );
+        let ranges = program_seed_ranges(&seeded.work, parent_count);
+        let mut tasks = Vec::with_capacity(seeded.work.len());
+        let mut retired = Vec::new();
+        for (activation, range) in activations.into_iter().zip(ranges) {
+            let installed = self
+                .registry
+                .install_program_roots(activation, seeded.work[range].iter().cloned());
+            tasks.extend(
+                installed
+                    .roots
+                    .into_iter()
+                    .map(|(work, credit)| ProgramTask {
+                        activation,
+                        credit,
+                        work,
+                    }),
+            );
+            if let Some(proof) = installed.quiescence {
+                let completed = self.registry.finish(proof);
+                assert_eq!(completed.effect, DeltaCompletion::Candidates(Vec::new()));
+                retired.push(ProgramActivation(completed.activation.0));
+            }
+        }
+        if !retired.is_empty() {
+            spec.retire_activations(
+                self.program_runtimes
+                    .get_mut(&state)
+                    .expect("prepared program lost its runtime"),
+                &retired,
+            );
+        }
+        self.file_program_state(state, tasks)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn seed_program_formula(
+        &mut self,
+        spec: ProgramRef<'_>,
+        desc: DeltaDesc,
+        request: ProgramRequest,
+        route: ProgramRoute,
+        bound: VariableSet,
+        counter: FormulaPcId,
+        stage: FormulaStage,
+        batch: FormulaBatch,
+        stream_proposal: bool,
+        plan: &ResidualPlan,
+        stable: &mut Worklist,
+        stable_interner: &mut StateInterner,
+        stats: &mut ResidualStateStats,
+    ) -> DeltaSeedOutcome {
+        let seeded_parents = batch.parents.row_count;
+        let parent_rows = batch.parents.rows.clone();
+        let singletons = batch.into_singletons(bound.count());
+        let state = self.prepare_program(desc, route, spec);
+        let mut activations = Vec::with_capacity(singletons.len());
+        for batch in singletons {
+            let reducer = match stage {
+                FormulaStage::Support => DeltaReducer::Support { published: false },
+                FormulaStage::Propose if stream_proposal => DeltaReducer::StreamFormulaProposal,
+                FormulaStage::Propose => DeltaReducer::QuiescentProposal,
+                FormulaStage::Confirm => DeltaReducer::FormulaConfirm,
+            };
+            activations.push(self.registry.open_program_activation(
+                reducer,
+                DeltaReturn::Formula {
+                    bound,
+                    counter,
+                    batch,
+                },
+                None,
+                None,
+            ));
+        }
+        let program_activations: Vec<_> = activations
+            .iter()
+            .map(|activation| ProgramActivation(activation.0))
+            .collect();
+        let vars: Vec<_> = bound.into_iter().collect();
+        let view = rows_view(&vars, &parent_rows, seeded_parents);
+        let mut seeded = ProgramSeedEffects::default();
+        spec.seed_batch(
+            self.program_runtimes
+                .get_mut(&state)
+                .expect("prepared program lost its runtime"),
+            ProgramSeedBatch {
+                request,
+                route,
+                view,
+                activations: &program_activations,
+            },
+            &mut seeded,
+        );
+        let ranges = program_seed_ranges(&seeded.work, seeded_parents);
+        let mut tasks = Vec::with_capacity(seeded.work.len());
+        let mut completed = Vec::new();
+        let mut retired = Vec::new();
+        let mut continuation = None;
+        for (activation, range) in activations.into_iter().zip(ranges) {
+            let installed = self
+                .registry
+                .install_program_roots(activation, seeded.work[range].iter().cloned());
+            if !installed.initial_accepted.is_empty() {
+                if let Some(streamed) = self.registry.take_streaming_return(activation) {
+                    let released = Self::release_streaming(
+                        activation,
+                        streamed,
+                        installed.initial_accepted,
+                        None,
+                        plan,
+                        stable,
+                        stable_interner,
+                        stats,
+                    );
+                    debug_assert!(released.publication.is_none());
+                    prefer_continuation(&mut continuation, released.continuation);
+                }
+            }
+            tasks.extend(
+                installed
+                    .roots
+                    .into_iter()
+                    .map(|(work, credit)| ProgramTask {
+                        activation,
+                        credit,
+                        work,
+                    }),
+            );
+            if let Some(proof) = installed.quiescence {
+                let completed_activation = self.registry.finish(proof);
+                retired.push(ProgramActivation(completed_activation.activation.0));
+                completed.push(completed_activation);
+            }
+        }
+        let active = self.file_program_state(state, tasks);
+        for completed in completed {
+            prefer_continuation(
+                &mut continuation,
+                Self::release_completion(completed, plan, stable, stable_interner, stats),
+            );
+        }
+        if !retired.is_empty() {
+            spec.retire_activations(
+                self.program_runtimes
+                    .get_mut(&state)
+                    .expect("prepared program lost its runtime"),
+                &retired,
+            );
+        }
+        DeltaSeedOutcome {
+            continuation,
+            publication: None,
+            active,
+            terminal_activations: Vec::new(),
+            completed_activation_ids: Vec::new(),
+            terminal_family: None,
+            seeded_parents,
+        }
     }
 
     #[cfg(test)]
@@ -2511,7 +3629,6 @@ impl DeltaScheduler {
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
     ) -> DeltaStableEffects {
-        debug_assert!(!accepted.is_empty());
         if streamed.effect == DeltaStreamingEffect::Support {
             return DeltaStableEffects {
                 continuation: Self::release_support(
@@ -2525,6 +3642,7 @@ impl DeltaScheduler {
                 publication: None,
             };
         }
+        debug_assert!(!accepted.is_empty());
         stats.candidates_proposed += accepted.len();
         stats.max_propose_candidates = stats.max_propose_candidates.max(accepted.len());
         let candidates = CandidatePayload::Values(accepted);
@@ -2671,6 +3789,24 @@ impl DeltaScheduler {
         })
     }
 
+    fn file_program_state(
+        &mut self,
+        state: DeltaStateId,
+        mut tasks: Vec<ProgramTask>,
+    ) -> Option<ActiveDeltaContinuation> {
+        let activation = tasks.last()?.activation;
+        assert!(
+            self.interner.program(state).is_some(),
+            "typed program task was filed under a legacy delta state"
+        );
+        self.program_worklist
+            .entry(state)
+            .or_default()
+            .tasks
+            .append(&mut tasks);
+        Some(ActiveDeltaContinuation { state, activation })
+    }
+
     fn has_active_source(&self, active: ActiveDeltaContinuation) -> bool {
         self.source_worklist
             .get(&active.state)
@@ -2688,16 +3824,33 @@ impl DeltaScheduler {
             .is_some_and(|bucket| bucket.contains_activation(active.activation))
     }
 
-    fn allows_global_width_growth(&self, dispatch: &PhysicalDispatch, search_width: usize) -> bool {
+    fn has_active_program(&self, active: ActiveDeltaContinuation) -> bool {
+        self.program_worklist
+            .get(&active.state)
+            .is_some_and(|bucket| {
+                bucket
+                    .tasks
+                    .iter()
+                    .any(|task| task.activation == active.activation)
+            })
+    }
+
+    fn allows_global_width_growth(
+        &self,
+        dispatch: &PhysicalDispatch,
+        search_width: usize,
+        terminal_publications: &OrderedActivationSet,
+    ) -> bool {
         if dispatch.terminal_activations.is_empty() {
             return true;
         }
         dispatch.kind == PhysicalDispatchKind::Source
-            || (dispatch.work_budget() >= search_width.max(1)
-                && dispatch
-                    .terminal_activations
-                    .iter()
-                    .any(|&activation| self.registry.is_live(activation)))
+            || dispatch.terminal_budgets.iter().any(|receipt| {
+                receipt.assigned == search_width.max(1)
+                    && receipt.quantum == search_width.max(1)
+                    && self.registry.is_live(receipt.activation)
+                    && !terminal_publications.contains(&receipt.activation)
+            })
     }
 
     fn account_physical_dispatch(
@@ -2730,17 +3883,26 @@ impl DeltaScheduler {
             .saturating_add(stats.delta_transition_candidates_examined);
         stats.delta_terminal_candidates_examined += examined_after.saturating_sub(examined_before);
         stats.delta_terminal_publications += usize::from(published);
-        for &activation in dispatch.terminal_activations.iter() {
-            let (reset, widened) = self.registry.finish_dispatch(
-                activation,
-                search_width,
-                dispatch.kind,
-                terminal_publications.contains(&activation),
-            );
+        for receipt in &dispatch.terminal_budgets {
+            let published = terminal_publications.contains(&receipt.activation);
+            // Publication is always activation-local reset evidence. A miss
+            // advances sparse effort only after this activation, rather than
+            // the physical cohort in aggregate, received its complete
+            // pre-dispatch quantum.
+            let (reset, widened) = if published || receipt.assigned >= receipt.quantum {
+                self.registry.finish_dispatch(
+                    receipt.activation,
+                    search_width,
+                    dispatch.kind,
+                    published,
+                )
+            } else {
+                (false, false)
+            };
             stats.delta_terminal_sparse_resets += usize::from(reset);
             stats.delta_terminal_sparse_widenings += usize::from(widened);
         }
-        self.allows_global_width_growth(&dispatch, search_width)
+        self.allows_global_width_growth(&dispatch, search_width, terminal_publications)
     }
 
     fn pop_active_transition(
@@ -2789,6 +3951,192 @@ impl DeltaScheduler {
         (self.interner.get(active.state).clone(), tasks)
     }
 
+    fn pop_active_program(
+        &mut self,
+        active: ActiveDeltaContinuation,
+        search_width: usize,
+    ) -> (DeltaStateId, Vec<ProgramTask>, ProgramPacing) {
+        let (tasks, empty, pacing) = {
+            let registry = &self.registry;
+            let bucket = self
+                .program_worklist
+                .get_mut(&active.state)
+                .expect("active typed program state remains live");
+            let key = bucket
+                .tasks
+                .iter()
+                .rev()
+                .find(|task| task.activation == active.activation)
+                .map(|task| ProgramDispatchKey::of(registry, task))
+                .expect("active typed program lost its affine task");
+            let width = match key.pacing {
+                ProgramPacing::Search => {
+                    registry.source_dispatch_width(active.activation, search_width)
+                }
+                ProgramPacing::Activation => {
+                    registry.transition_dispatch_width(active.activation, search_width)
+                }
+            };
+            let mut selected = Vec::new();
+            let mut retained = Vec::with_capacity(bucket.tasks.len());
+            for task in std::mem::take(&mut bucket.tasks).into_iter().rev() {
+                if selected.len() < width
+                    && task.activation == active.activation
+                    && ProgramDispatchKey::of(registry, &task) == key
+                {
+                    selected.push(task);
+                } else {
+                    retained.push(task);
+                }
+            }
+            retained.reverse();
+            bucket.tasks = retained;
+            (selected, bucket.tasks.is_empty(), key.pacing)
+        };
+        assert!(!tasks.is_empty(), "active typed program pop was empty");
+        if empty {
+            self.program_worklist.remove(&active.state);
+        }
+        (active.state, tasks, pacing)
+    }
+
+    fn pop_program_bounded(
+        &mut self,
+        search_width: usize,
+    ) -> (DeltaStateId, Vec<ProgramTask>, PhysicalDispatch) {
+        let id = *self
+            .program_worklist
+            .last_key_value()
+            .expect("typed program pop requires live work")
+            .0;
+        let hot = self
+            .program_worklist
+            .get(&id)
+            .and_then(|bucket| bucket.tasks.last())
+            .expect("typed program bucket is nonempty");
+        let hot_key = ProgramDispatchKey::of(&self.registry, hot);
+        let terminal_activation_cohort = hot_key.pacing == ProgramPacing::Activation
+            && hot_key.publication == TransitionDispatchKey::TerminalStreaming;
+        let width = if terminal_activation_cohort {
+            search_width.max(1)
+        } else {
+            match hot_key.pacing {
+                ProgramPacing::Search => self
+                    .registry
+                    .source_dispatch_width(hot.activation, search_width),
+                ProgramPacing::Activation => self
+                    .registry
+                    .transition_dispatch_width(hot.activation, search_width),
+            }
+        };
+        let (tasks, task_limits, empty, remainder_tasks) = {
+            let registry = &self.registry;
+            let selection_slots = &mut self.terminal_selection_slots;
+            let selections = &mut self.terminal_selections;
+            let bucket = self
+                .program_worklist
+                .get_mut(&id)
+                .expect("selected typed program state");
+            let key = ProgramDispatchKey::of(
+                registry,
+                bucket
+                    .tasks
+                    .last()
+                    .expect("typed program bucket is nonempty"),
+            );
+            let tasks = std::mem::take(&mut bucket.tasks);
+            let (selected, limits, retained) = if terminal_activation_cohort {
+                let mut remaining = width;
+                selection_slots.clear();
+                selections.clear();
+                for task in tasks.iter().rev() {
+                    if ProgramDispatchKey::of(registry, task) != key
+                        || selection_slots.contains_key(&task.activation)
+                    {
+                        continue;
+                    }
+                    let budget = registry
+                        .transition_dispatch_width(task.activation, search_width)
+                        .min(remaining);
+                    let slot = selections.len();
+                    selections.push(TerminalActivationSelection {
+                        activation: task.activation,
+                        budget,
+                        selected: 0,
+                        ordinal: 0,
+                    });
+                    selection_slots.insert(task.activation, slot);
+                    remaining -= budget;
+                    if remaining == 0 {
+                        break;
+                    }
+                }
+
+                let mut selected = Vec::new();
+                let mut retained = Vec::with_capacity(tasks.len());
+                for task in tasks.into_iter().rev() {
+                    let selection = (ProgramDispatchKey::of(registry, &task) == key)
+                        .then(|| selection_slots.get(&task.activation).copied())
+                        .flatten();
+                    if let Some(slot) = selection
+                        .filter(|&slot| selections[slot].selected < selections[slot].budget)
+                    {
+                        selections[slot].selected += 1;
+                        selected.push(task);
+                    } else {
+                        retained.push(task);
+                    }
+                }
+                retained.reverse();
+                let mut limits = Vec::with_capacity(selected.len());
+                for task in &selected {
+                    let selection = &mut selections[selection_slots[&task.activation]];
+                    let quotient = selection.budget / selection.selected;
+                    let remainder = selection.budget % selection.selected;
+                    limits.push(quotient + usize::from(selection.ordinal < remainder));
+                    selection.ordinal += 1;
+                }
+                (selected, limits, retained)
+            } else {
+                let mut selected = Vec::new();
+                let mut retained = Vec::with_capacity(tasks.len());
+                for task in tasks.into_iter().rev() {
+                    if selected.len() < width && ProgramDispatchKey::of(registry, &task) == key {
+                        selected.push(task);
+                    } else {
+                        retained.push(task);
+                    }
+                }
+                retained.reverse();
+                let limits = even_limits(width, selected.len());
+                (selected, limits, retained)
+            };
+            bucket.tasks = retained;
+            (
+                selected,
+                limits,
+                bucket.tasks.is_empty(),
+                bucket.tasks.len(),
+            )
+        };
+        if empty {
+            self.program_worklist.remove(&id);
+        }
+        let kind = match hot_key.pacing {
+            ProgramPacing::Search => PhysicalDispatchKind::Source,
+            ProgramPacing::Activation => PhysicalDispatchKind::Program,
+        };
+        let dispatch = PhysicalDispatch::new(
+            &self.registry,
+            kind,
+            search_width,
+            tasks.iter().map(|task| task.activation),
+            task_limits,
+            remainder_tasks,
+        );
+        (id, tasks, dispatch)
+    }
+
     #[cfg(test)]
     fn pop(&mut self, width: usize) -> (DeltaDesc, Vec<DeltaTask>) {
         let (desc, tasks, _) = self.pop_bounded(width);
@@ -2832,14 +4180,14 @@ impl DeltaScheduler {
         if empty {
             self.worklist.remove(&id);
         }
-        let terminal_activations =
-            terminal_activations(&self.registry, tasks.iter().map(|task| task.activation));
-        let dispatch = PhysicalDispatch {
-            terminal_activations,
-            kind: PhysicalDispatchKind::Transition,
+        let dispatch = PhysicalDispatch::new(
+            &self.registry,
+            PhysicalDispatchKind::Transition,
+            search_width,
+            tasks.iter().map(|task| task.activation),
             task_limits,
             remainder_tasks,
-        };
+        );
         (self.interner.get(id).clone(), tasks, dispatch)
     }
 
@@ -2894,14 +4242,14 @@ impl DeltaScheduler {
         if empty {
             self.source_worklist.remove(&id);
         }
-        let terminal_activations =
-            terminal_activations(&self.registry, tasks.iter().map(|task| task.activation));
-        let dispatch = PhysicalDispatch {
-            terminal_activations,
-            kind: PhysicalDispatchKind::Source,
-            task_limits: even_limits(width, tasks.len()),
+        let dispatch = PhysicalDispatch::new(
+            &self.registry,
+            PhysicalDispatchKind::Source,
+            search_width,
+            tasks.iter().map(|task| task.activation),
+            even_limits(width, tasks.len()),
             remainder_tasks,
-        };
+        );
         (self.interner.get(id).clone(), tasks, dispatch)
     }
 
@@ -2948,24 +4296,76 @@ impl DeltaScheduler {
     ) -> ActiveDeltaStepOutcome {
         let has_source = self.has_active_source(active);
         let has_transition = self.has_active_transition(active);
+        let has_program = self.has_active_program(active);
         assert!(
-            has_source || has_transition,
+            has_source || has_transition || has_program,
             "active delta continuation has no scheduled affine task"
         );
         debug_assert!(
-            !(has_source && has_transition),
-            "one delta activation owns source and transition credits simultaneously"
+            usize::from(has_source) + usize::from(has_transition) + usize::from(has_program) == 1,
+            "one delta activation owns incompatible scheduler queue kinds simultaneously"
         );
 
-        let terminal_activation = (self.registry.physical_activation_class(active.activation)
-            == DeltaPhysicalClass::TerminalStreaming)
-            .then_some(active.activation);
-        let direct_terminal_full =
-            direct_terminal_publication_full.filter(|_| terminal_activation.is_some());
+        let terminal = self.registry.physical_activation_class(active.activation)
+            == DeltaPhysicalClass::TerminalStreaming;
+        let direct_terminal_full = direct_terminal_publication_full.filter(|_| terminal);
         let examined_before = stats
             .delta_source_candidates_examined
             .saturating_add(stats.delta_transition_candidates_examined);
-        let outcome = if has_source {
+        let outcome = if has_program {
+            let (state, tasks, pacing) = self.pop_active_program(active, search_width);
+            let task_count = tasks.len();
+            let remainder_tasks = self
+                .program_worklist
+                .get(&active.state)
+                .map_or(0, |bucket| bucket.tasks.len());
+            let kind = match pacing {
+                ProgramPacing::Search => PhysicalDispatchKind::Source,
+                ProgramPacing::Activation => PhysicalDispatchKind::Program,
+            };
+            let task_limits = even_limits(
+                match pacing {
+                    ProgramPacing::Search => self
+                        .registry
+                        .source_dispatch_width(active.activation, search_width),
+                    ProgramPacing::Activation => self
+                        .registry
+                        .transition_dispatch_width(active.activation, search_width),
+                },
+                task_count,
+            );
+            let dispatch = PhysicalDispatch::new(
+                &self.registry,
+                kind,
+                search_width,
+                tasks.iter().map(|task| task.activation),
+                task_limits,
+                remainder_tasks,
+            );
+            let physical = self.step_program(
+                root,
+                plan,
+                state,
+                tasks,
+                &dispatch.task_limits,
+                direct_terminal_full,
+                stable,
+                stable_interner,
+                stats,
+            );
+            let retired_search_receipt = physical.retired_search_receipt;
+            let mut outcome = physical.outcome;
+            let physical_allows_global_width_growth = self.account_physical_dispatch(
+                dispatch,
+                search_width,
+                examined_before,
+                &physical.terminal_publications,
+                stats,
+            );
+            outcome.allows_global_width_growth =
+                retired_search_receipt || physical_allows_global_width_growth;
+            outcome
+        } else if has_source {
             let width = self
                 .registry
                 .source_dispatch_width(active.activation, search_width);
@@ -2975,12 +4375,14 @@ impl DeltaScheduler {
                 .source_worklist
                 .get(&active.state)
                 .map_or(0, |bucket| bucket.tasks.len());
-            let dispatch = PhysicalDispatch {
-                terminal_activations: terminal_activation.into_iter().collect(),
-                kind: PhysicalDispatchKind::Source,
-                task_limits: even_limits(width, task_count),
+            let dispatch = PhysicalDispatch::new(
+                &self.registry,
+                PhysicalDispatchKind::Source,
+                search_width,
+                tasks.iter().map(|task| task.activation),
+                even_limits(width, task_count),
                 remainder_tasks,
-            };
+            );
             let physical = self.step_sources(
                 root,
                 plan,
@@ -3008,12 +4410,14 @@ impl DeltaScheduler {
             let (desc, tasks) = self.pop_active_transition(active, width);
             let task_count = tasks.len();
             let remainder_tasks = self.worklist.get(&active.state).map_or(0, DeltaBucket::len);
-            let dispatch = PhysicalDispatch {
-                terminal_activations: terminal_activation.into_iter().collect(),
-                kind: PhysicalDispatchKind::Transition,
-                task_limits: even_limits(width, task_count),
+            let dispatch = PhysicalDispatch::new(
+                &self.registry,
+                PhysicalDispatchKind::Transition,
+                search_width,
+                tasks.iter().map(|task| task.activation),
+                even_limits(width, task_count),
                 remainder_tasks,
-            };
+            );
             let physical = self.step_transitions(
                 root,
                 plan,
@@ -3077,6 +4481,35 @@ impl DeltaScheduler {
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
     ) -> DeltaStepOutcome {
+        if !self.program_worklist.is_empty() {
+            let (state, tasks, dispatch) = self.pop_program_bounded(search_width);
+            let examined_before = stats
+                .delta_source_candidates_examined
+                .saturating_add(stats.delta_transition_candidates_examined);
+            let physical = self.step_program(
+                root,
+                plan,
+                state,
+                tasks,
+                &dispatch.task_limits,
+                direct_terminal_publication_full,
+                stable,
+                stable_interner,
+                stats,
+            );
+            let retired_search_receipt = physical.retired_search_receipt;
+            let mut outcome = physical.outcome;
+            let physical_allows_global_width_growth = self.account_physical_dispatch(
+                dispatch,
+                search_width,
+                examined_before,
+                &physical.terminal_publications,
+                stats,
+            );
+            outcome.allows_global_width_growth =
+                retired_search_receipt || physical_allows_global_width_growth;
+            return outcome;
+        }
         if self.worklist.is_empty() {
             return self.step_source(
                 root,
@@ -3349,6 +4782,300 @@ impl DeltaScheduler {
                 allows_global_width_growth: true,
             },
             terminal_publications,
+            retired_search_receipt: false,
+        }
+    }
+
+    /// Executes one physically compatible cohort of opaque typed
+    /// continuations. The erased family boundary is crossed once: handles are
+    /// affinely taken into a dense typed vector, and the adapter returns one
+    /// replacement receipt per input in scheduler order.
+    #[allow(clippy::too_many_arguments)]
+    fn step_program<'a>(
+        &mut self,
+        root: &dyn Constraint<'a>,
+        plan: &ResidualPlan,
+        state: DeltaStateId,
+        tasks: Vec<ProgramTask>,
+        limits: &[usize],
+        direct_terminal_full: Option<VariableSet>,
+        stable: &mut Worklist,
+        stable_interner: &mut StateInterner,
+        stats: &mut ResidualStateStats,
+    ) -> DeltaPhysicalOutcome {
+        assert!(!tasks.is_empty());
+        assert_eq!(tasks.len(), limits.len());
+        assert!(limits.iter().all(|&limit| limit > 0));
+
+        let address = self
+            .interner
+            .program(state)
+            .cloned()
+            .expect("typed program task was scheduled under a legacy delta state");
+        let spec = address.resolve(root, plan);
+        let dispatch_key = ProgramDispatchKey::of(&self.registry, &tasks[0]);
+        assert!(
+            tasks
+                .iter()
+                .all(|task| ProgramDispatchKey::of(&self.registry, task) == dispatch_key),
+            "one typed program cohort mixed incompatible physical dispatch shapes"
+        );
+
+        let row_count = tasks.len();
+        let mut parents = Vec::new();
+        let mut candidate_sets = Vec::with_capacity(row_count);
+        for task in &tasks {
+            assert_eq!(task.activation, task.credit.key.activation);
+            let (bound, parent, candidates) = self.registry.source_context(task.activation);
+            assert_eq!(bound, dispatch_key.bound);
+            assert_eq!(candidates.is_some(), dispatch_key.has_candidates);
+            parents.extend_from_slice(parent);
+            candidate_sets.push(candidates);
+        }
+        let vars: Vec<_> = dispatch_key.bound.into_iter().collect();
+        let view = rows_view(&vars, &parents, row_count);
+        let activations: Vec<_> = tasks
+            .iter()
+            .map(|task| ProgramActivation(task.activation.0))
+            .collect();
+        let mut task_receipts = Vec::with_capacity(row_count);
+        let mut work = Vec::with_capacity(row_count);
+        for task in tasks {
+            task_receipts.push((task.activation, task.credit));
+            work.push(task.work);
+        }
+        let mut receipt = ProgramBatchEffects::default();
+        spec.step_batch(
+            self.program_runtimes
+                .get_mut(&state)
+                .expect("typed program state lost its runtime"),
+            ProgramBatch {
+                stratum: address.stratum,
+                view,
+                candidate_sets: &candidate_sets,
+                activations: &activations,
+                work: &work,
+                limits,
+            },
+            &mut receipt,
+        );
+        drop(candidate_sets);
+        assert_eq!(
+            receipt.pages.len(),
+            row_count,
+            "typed program returned the wrong page count"
+        );
+        for (page, &limit) in receipt.pages.iter().zip(limits) {
+            assert!(
+                page.examined <= limit,
+                "typed program exceeded one input's physical work budget"
+            );
+        }
+        let child_ranges = program_child_ranges(&receipt.children, row_count);
+        let direct_ranges = tagged_ranges(&receipt.direct, row_count, "program direct effect");
+        let accepted_ranges = tagged_ranges(
+            &receipt.accepted,
+            row_count,
+            "program candidate observation",
+        );
+        let supported_ranges =
+            tagged_ranges(&receipt.supported, row_count, "program support observation");
+
+        // Source/transition naming remains family-reported telemetry; it is
+        // never consulted for dispatch, novelty, or replacement semantics.
+        stats.delta_source_pages += receipt.source_pages;
+        stats.delta_source_candidates_examined += receipt.source_examined;
+        stats.delta_source_roots += receipt.source_roots;
+        stats.delta_source_direct_candidates += receipt.direct.len();
+        if receipt.source_pages > 0 {
+            stats.delta_source_cohorts += 1;
+            stats.max_delta_source_cohort = stats.max_delta_source_cohort.max(receipt.source_pages);
+        }
+        stats.delta_transition_pages += receipt.transition_pages;
+        stats.delta_transition_candidates_examined += receipt.transition_examined;
+        if receipt.transition_pages > 0 {
+            stats.delta_transition_cohorts += 1;
+            stats.max_delta_transition_cohort = stats
+                .max_delta_transition_cohort
+                .max(receipt.transition_pages);
+        }
+
+        // Physical pacing is revalidated by the typed adapter from canonical
+        // state before this receipt is produced. Family-reported source and
+        // transition counts remain telemetry only.
+        let search_cohort = dispatch_key.pacing == ProgramPacing::Search;
+        let source_telemetry_cohort = receipt.source_pages > 0 && receipt.transition_pages == 0;
+        let mut scheduled = Vec::new();
+        let mut effects = DeltaStableEffects::default();
+        let mut completed_activation_ids = Vec::new();
+        let mut retired_activations = Vec::new();
+        let mut dead_pages = 0usize;
+        let mut source_dead_pages = 0usize;
+        let mut transition_dead_pages = 0usize;
+        let mut retired_search_receipts = 0usize;
+        let mut completed_activations = 0usize;
+        let mut terminal_publications = OrderedActivationSet::default();
+
+        for (
+            input,
+            (
+                (((((activation, credit), page), child_range), direct_range), accepted_range),
+                supported_range,
+            ),
+        ) in task_receipts
+            .into_iter()
+            .zip(receipt.pages)
+            .zip(child_ranges)
+            .zip(direct_ranges)
+            .zip(accepted_ranges)
+            .zip(supported_ranges)
+            .enumerate()
+        {
+            let terminal = self.registry.physical_activation_class(activation)
+                == DeltaPhysicalClass::TerminalStreaming;
+            let within_search_page = self.registry.program_credit_within_search_page(&credit);
+            assert!(
+                page.examined > 0 || (page.resume.is_none() && child_range.is_empty()),
+                "typed program scheduled zero-examined continuation work without a positive work receipt"
+            );
+            assert!(
+                supported_range.len() <= 1,
+                "one typed input page reported Boolean support more than once"
+            );
+            let page_had_program_effect = !child_range.is_empty()
+                || !direct_range.is_empty()
+                || !accepted_range.is_empty()
+                || !supported_range.is_empty();
+            let outcome = self.registry.replace_program(
+                credit,
+                state,
+                &receipt.children[child_range],
+                receipt.accepted[accepted_range]
+                    .iter()
+                    .map(|(_, value)| *value),
+                receipt.direct[direct_range].iter().map(|(_, value)| *value),
+                !supported_range.is_empty(),
+                search_cohort,
+                source_telemetry_cohort,
+                page.resume,
+            );
+            for (scheduled_state, work, credit) in outcome.scheduled {
+                assert_eq!(
+                    scheduled_state, state,
+                    "typed program continuation crossed occurrence-local runtime state"
+                );
+                scheduled.push(ProgramTask {
+                    activation,
+                    credit,
+                    work,
+                });
+            }
+
+            let mut task_effects = DeltaStableEffects::default();
+            if !supported_range.is_empty() {
+                assert!(
+                    outcome.accepted.is_empty(),
+                    "one typed page mixed Boolean support with candidate acceptance"
+                );
+                if let Some(streamed) = self.registry.take_program_support_return(activation) {
+                    task_effects.absorb(Self::release_streaming(
+                        activation,
+                        streamed,
+                        Vec::new(),
+                        None,
+                        plan,
+                        stable,
+                        stable_interner,
+                        stats,
+                    ));
+                }
+            }
+            if !outcome.accepted.is_empty() {
+                let direct_terminal = direct_terminal_full.filter(|_| terminal);
+                if let Some(streamed) = self.registry.take_streaming_return(activation) {
+                    task_effects.absorb(Self::release_streaming(
+                        activation,
+                        streamed,
+                        outcome.accepted,
+                        direct_terminal,
+                        plan,
+                        stable,
+                        stable_interner,
+                        stats,
+                    ));
+                }
+            }
+            if let Some(proof) = outcome.quiescence {
+                assert_eq!(proof.activation, activation);
+                completed_activations += 1;
+                let completed = self.registry.finish(proof);
+                completed_activation_ids.push(completed.activation);
+                retired_activations.push(ProgramActivation(completed.activation.0));
+                prefer_continuation(
+                    &mut task_effects.continuation,
+                    Self::release_completion(completed, plan, stable, stable_interner, stats),
+                );
+            }
+
+            let page_dead = !page_had_program_effect && !task_effects.has_effect();
+            if page_dead {
+                // A child nested below an AfterChildren source receipt is
+                // local work for that one source page. Preserve its exact
+                // transition telemetry, but defer geometric feedback until
+                // the receipt-local barrier knows whether any descendant
+                // produced a stable effect.
+                dead_pages += usize::from(!within_search_page);
+                if source_telemetry_cohort {
+                    source_dead_pages += 1;
+                } else {
+                    transition_dead_pages += 1;
+                }
+            }
+            let retired_search_dead_pages = if task_effects.has_effect() {
+                0
+            } else {
+                outcome.dead_search_pages
+            };
+            let retired_source_telemetry_dead_pages = if task_effects.has_effect() {
+                0
+            } else {
+                outcome.dead_source_telemetry_pages
+            };
+            dead_pages += retired_search_dead_pages;
+            retired_search_receipts += retired_search_dead_pages;
+            source_dead_pages += retired_source_telemetry_dead_pages;
+            if terminal && task_effects.has_effect() {
+                let _ = terminal_publications.insert(activation);
+            }
+            effects.absorb(task_effects);
+            debug_assert!(input < row_count);
+        }
+
+        let _ = self.file_program_state(state, scheduled);
+        if !retired_activations.is_empty() {
+            spec.retire_activations(
+                self.program_runtimes
+                    .get_mut(&state)
+                    .expect("typed program state lost its runtime during retirement"),
+                &retired_activations,
+            );
+        }
+        stats.delta_source_dead_pages += source_dead_pages;
+        stats.delta_transition_dead_pages += transition_dead_pages;
+        DeltaPhysicalOutcome {
+            outcome: DeltaStepOutcome {
+                continuation: effects.continuation,
+                publication: effects.publication,
+                completed_activation_ids,
+                dead_pages,
+                source_dead_pages,
+                transition_dead_pages,
+                completed_activations,
+                completed_transition_cohort: !search_cohort && completed_activations > 1,
+                allows_global_width_growth: true,
+            },
+            terminal_publications,
+            retired_search_receipt: retired_search_receipts > 0,
         }
     }
 
@@ -3416,21 +5143,17 @@ impl DeltaScheduler {
         let row_count = tasks.len();
 
         let mut parents = Vec::new();
-        let mut candidate_storage = Vec::with_capacity(row_count);
+        let mut candidate_sets = Vec::with_capacity(row_count);
         for task in &tasks {
             assert_eq!(task.activation, task.credit.key.activation);
             let (bound, parent, candidates) = self.registry.source_context(task.activation);
             assert_eq!(bound, dispatch_key.bound);
             assert_eq!(candidates.is_some(), dispatch_key.has_candidates);
-            parents.extend(parent);
-            candidate_storage.push(candidates);
+            parents.extend_from_slice(parent);
+            candidate_sets.push(candidates);
         }
         let vars: Vec<VariableId> = dispatch_key.bound.into_iter().collect();
         let view = rows_view(&vars, &parents, row_count);
-        let candidate_sets: Vec<Option<&[RawInline]>> = candidate_storage
-            .iter()
-            .map(|candidates| candidates.as_deref())
-            .collect();
         let cursors: Vec<_> = tasks.iter().map(|task| task.cursor).collect();
         let batch = ResidualDeltaSourceBatch {
             view,
@@ -3451,6 +5174,7 @@ impl DeltaScheduler {
             ),
             "paged delta source became unsupported after seeding"
         );
+        drop(candidate_sets);
         assert_eq!(pages.len(), row_count);
         let root_ranges = tagged_ranges(&roots, row_count, "root");
         let direct_ranges = tagged_ranges(&direct, row_count, "direct candidate");
@@ -3560,6 +5284,7 @@ impl DeltaScheduler {
                 allows_global_width_growth: true,
             },
             terminal_publications,
+            retired_search_receipt: false,
         }
     }
 
@@ -3598,6 +5323,21 @@ impl DeltaScheduler {
             }
             source_worklist.insert(id, SourceBucket { tasks });
         }
+        let mut program_worklist = BTreeMap::new();
+        for (&id, bucket) in &self.program_worklist {
+            let mut tasks = Vec::with_capacity(bucket.tasks.len());
+            for task in &bucket.tasks {
+                let credit = remap
+                    .remove(&task.credit.key)
+                    .expect("delta clone omitted one live program credit");
+                tasks.push(ProgramTask {
+                    activation: task.activation,
+                    credit,
+                    work: task.work.clone(),
+                });
+            }
+            program_worklist.insert(id, ProgramBucket { tasks });
+        }
         assert!(
             remap.is_empty(),
             "delta registry held a live credit without a scheduled task"
@@ -3607,6 +5347,8 @@ impl DeltaScheduler {
             interner: self.interner.clone(),
             worklist,
             source_worklist,
+            program_worklist,
+            program_runtimes: self.program_runtimes.clone(),
             activation_width: self.activation_width,
             terminal_selection_slots: AHashMap::new(),
             terminal_selections: Vec::new(),
@@ -3629,6 +5371,114 @@ mod tests {
     use crate::query::unionconstraint::UnionConstraint;
 
     use super::*;
+
+    #[derive(Clone)]
+    struct ZeroProgressState(u64);
+
+    struct ZeroProgressProgram;
+
+    impl TypedProgramSpec for ZeroProgressProgram {
+        type State = ZeroProgressState;
+        type NoveltyKey = u8;
+        type Rank = u64;
+
+        fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+            matches!(request.action, ProgramAction::Propose(0)).then_some(ProgramRoute {
+                key: ProgramKey::new(0),
+                variable: 0,
+                stratum: ProgramStratum::Finite,
+                grouping: ProgramGrouping::PageLocal,
+            })
+        }
+
+        fn dispatch(&self, _state: &Self::State) -> DispatchClass {
+            DispatchClass::new(0)
+        }
+
+        fn progress(&self, state: &Self::State) -> Self::Rank {
+            state.0
+        }
+
+        fn seed_typed(
+            &self,
+            batch: ProgramSeedBatch<'_>,
+            effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+        ) {
+            for parent in 0..batch.view.len() {
+                effects.finite_root(parent as u32, ZeroProgressState(1), None);
+            }
+        }
+
+        fn step_typed(
+            &self,
+            states: Vec<Self::State>,
+            _batch: TypedProgramBatch<'_>,
+            effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+        ) {
+            for _ in states {
+                effects.page(0, Some(TypedResume::Immediate(ZeroProgressState(0))));
+            }
+        }
+    }
+
+    impl Constraint<'static> for ZeroProgressProgram {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(0)
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != 0 {
+                return false;
+            }
+            out.fill(1, view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+            panic!("typed program unexpectedly fell back to ordinary propose")
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn residual_program(&self) -> Option<ProgramRef<'_>> {
+            Some(ProgramRef::new(self))
+        }
+    }
+
+    #[test]
+    fn scheduler_rejects_zero_examined_program_recurrence() {
+        let mut query = Query::new(ZeroProgressProgram, |binding: &crate::query::Binding| {
+            binding.get(0).copied()
+        })
+        .solve_residual_state_lazy_with(ResidualLowering::FULL);
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| query.next()));
+        let payload = rejected.expect_err("zero-cost recurrence must fail closed");
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            message.contains("zero-examined continuation work"),
+            "unexpected panic: {message}"
+        );
+    }
 
     #[derive(Clone, Copy)]
     struct MixedExpansion;
@@ -4255,30 +6105,65 @@ mod tests {
         let activation = started.activation;
 
         assert!(scheduler.allows_global_width_growth(
-            &PhysicalDispatch {
-                terminal_activations: vec![activation].into(),
-                kind: PhysicalDispatchKind::Source,
-                task_limits: vec![1],
-                remainder_tasks: 0,
-            },
+            &PhysicalDispatch::new(
+                &scheduler.registry,
+                PhysicalDispatchKind::Source,
+                64,
+                [activation],
+                vec![1],
+                0,
+            ),
             64,
+            &OrderedActivationSet::default(),
+        ));
+        for expected in [2, 4, 8, 16, 32] {
+            let _ = scheduler.registry.finish_dispatch(
+                activation,
+                64,
+                PhysicalDispatchKind::Transition,
+                false,
+            );
+            assert_eq!(
+                scheduler.registry.transition_dispatch_width(activation, 64),
+                expected
+            );
+        }
+        assert!(!scheduler.allows_global_width_growth(
+            &PhysicalDispatch::new(
+                &scheduler.registry,
+                PhysicalDispatchKind::Transition,
+                64,
+                [activation],
+                vec![32],
+                0,
+            ),
+            64,
+            &OrderedActivationSet::default(),
+        ));
+        let _ = scheduler.registry.finish_dispatch(
+            activation,
+            64,
+            PhysicalDispatchKind::Transition,
+            false,
+        );
+        let saturated = PhysicalDispatch::new(
+            &scheduler.registry,
+            PhysicalDispatchKind::Transition,
+            64,
+            [activation],
+            vec![64],
+            0,
+        );
+        assert!(scheduler.allows_global_width_growth(
+            &saturated,
+            64,
+            &OrderedActivationSet::default()
         ));
         assert!(!scheduler.allows_global_width_growth(
-            &PhysicalDispatch {
-                terminal_activations: vec![activation].into(),
-                kind: PhysicalDispatchKind::Transition,
-                task_limits: vec![32],
-                remainder_tasks: 0,
-            },
+            &saturated,
             64,
+            &OrderedActivationSet::from(vec![activation])
         ));
-        let saturated = PhysicalDispatch {
-            terminal_activations: vec![activation].into(),
-            kind: PhysicalDispatchKind::Transition,
-            task_limits: vec![64],
-            remainder_tasks: 0,
-        };
-        assert!(scheduler.allows_global_width_growth(&saturated, 64));
 
         let (_, credit) = started.roots.into_iter().next().unwrap();
         let replaced = scheduler
@@ -4286,7 +6171,11 @@ mod tests {
             .replace_traversal(credit, std::iter::empty());
         let proof = replaced.quiescence.expect("empty traversal quiesces");
         let _ = scheduler.registry.finish(proof);
-        assert!(!scheduler.allows_global_width_growth(&saturated, 64));
+        assert!(!scheduler.allows_global_width_growth(
+            &saturated,
+            64,
+            &OrderedActivationSet::default()
+        ));
     }
 
     #[test]
@@ -4366,6 +6255,43 @@ mod tests {
         assert!(activation_work.iter().all(|(&activation, &work)| {
             work <= scheduler.registry.transition_dispatch_width(activation, 5)
         }));
+        assert_eq!(
+            dispatch.terminal_budgets,
+            [
+                TerminalActivationBudget {
+                    activation: first.activation,
+                    assigned: 1,
+                    quantum: 2,
+                },
+                TerminalActivationBudget {
+                    activation: second.activation,
+                    assigned: 4,
+                    quantum: 4,
+                },
+            ]
+        );
+        let mut stats = ResidualStateStats::default();
+        assert!(!scheduler.account_physical_dispatch(
+            dispatch,
+            5,
+            0,
+            &OrderedActivationSet::default(),
+            &mut stats,
+        ));
+        assert_eq!(
+            scheduler
+                .registry
+                .transition_dispatch_width(first.activation, 5),
+            2,
+            "the truncated activation did not spend its complete local quantum"
+        );
+        assert_eq!(
+            scheduler
+                .registry
+                .transition_dispatch_width(second.activation, 5),
+            5
+        );
+        assert_eq!(stats.delta_terminal_sparse_widenings, 1);
     }
 
     #[test]
@@ -4395,12 +6321,14 @@ mod tests {
         let mut stats = ResidualStateStats::default();
         let published = OrderedActivationSet::from(vec![first.activation]);
         assert!(!scheduler.account_physical_dispatch(
-            PhysicalDispatch {
-                terminal_activations: vec![first.activation, second.activation].into(),
-                kind: PhysicalDispatchKind::Transition,
-                task_limits: vec![2, 2],
-                remainder_tasks: 0,
-            },
+            PhysicalDispatch::new(
+                &scheduler.registry,
+                PhysicalDispatchKind::Transition,
+                8,
+                [first.activation, second.activation],
+                vec![2, 2],
+                0,
+            ),
             8,
             0,
             &published,
@@ -4423,12 +6351,14 @@ mod tests {
         assert_eq!(stats.delta_terminal_sparse_widenings, 1);
 
         assert!(scheduler.account_physical_dispatch(
-            PhysicalDispatch {
-                terminal_activations: vec![first.activation, second.activation].into(),
-                kind: PhysicalDispatchKind::Source,
-                task_limits: vec![4, 4],
-                remainder_tasks: 0,
-            },
+            PhysicalDispatch::new(
+                &scheduler.registry,
+                PhysicalDispatchKind::Source,
+                8,
+                [first.activation, second.activation],
+                vec![4, 4],
+                0,
+            ),
             8,
             0,
             &OrderedActivationSet::default(),
@@ -4693,6 +6623,468 @@ mod tests {
                 },
             ),
         }
+    }
+
+    #[test]
+    fn duplicate_typed_support_is_idempotent_across_sibling_receipts_and_clone() {
+        let mut registry = ProducerRegistry::new();
+        let activation = registry.open_program_activation(
+            DeltaReducer::Support { published: false },
+            support_formula_return(),
+            None,
+            None,
+        );
+        let roots = [0, 1].map(|slot| ProgramSeedWork {
+            parent: 0,
+            work: ProgramWork {
+                handle: ProgramWorkHandle::test(slot),
+                dispatch: DispatchClass::new(0),
+                pacing: ProgramPacing::Activation,
+            },
+            accepted: None,
+        });
+        let installed = registry.install_program_roots(activation, roots);
+        assert_eq!(installed.roots.len(), 2);
+        let mut roots = installed.roots.into_iter();
+        let (_, first_credit) = roots.next().unwrap();
+        let (_, second_credit) = roots.next().unwrap();
+
+        let first = registry.replace_program(
+            first_credit,
+            DeltaStateId(0),
+            &[],
+            std::iter::empty::<RawInline>(),
+            std::iter::empty::<RawInline>(),
+            false,
+            false,
+            false,
+            None,
+        );
+        assert!(first.quiescence.is_none());
+        assert!(registry.take_program_support_return(activation).is_some());
+
+        let second_key = second_credit.key;
+        let (mut cloned, mut rebranded) = registry.deep_clone();
+        let cloned_second = rebranded
+            .remove(&second_key)
+            .expect("deep clone omitted the live sibling credit");
+
+        for (registry, credit) in [(&mut registry, second_credit), (&mut cloned, cloned_second)] {
+            let second = registry.replace_program(
+                credit,
+                DeltaStateId(0),
+                &[],
+                std::iter::empty::<RawInline>(),
+                std::iter::empty::<RawInline>(),
+                false,
+                false,
+                false,
+                None,
+            );
+            assert!(
+                registry.take_program_support_return(activation).is_none(),
+                "the cloned published reducer must suppress a later true witness"
+            );
+            let completed = registry.finish(second.quiescence.unwrap());
+            assert_eq!(completed.effect, DeltaCompletion::Cleanup);
+        }
+    }
+
+    #[test]
+    fn after_children_resume_remains_credit_backed_and_preserves_sparse_quantum() {
+        let mut registry = ProducerRegistry::new();
+        let activation = registry.open_program_activation(
+            DeltaReducer::StreamProposal,
+            candidate_return(Vec::new()),
+            None,
+            Some(VariableSet::new_singleton(0)),
+        );
+        assert_eq!(
+            registry.finish_dispatch(activation, 8, PhysicalDispatchKind::Program, false,),
+            (false, true)
+        );
+        assert_eq!(registry.transition_dispatch_width(activation, 8), 2);
+        let work = |slot| ProgramWork {
+            handle: ProgramWorkHandle::test(slot),
+            dispatch: DispatchClass::new(0),
+            pacing: ProgramPacing::Activation,
+        };
+        let (_, root) = registry
+            .install_program_roots(
+                activation,
+                [ProgramSeedWork {
+                    parent: 0,
+                    work: work(0),
+                    accepted: None,
+                }],
+            )
+            .roots
+            .pop()
+            .unwrap();
+        let parent = registry.replace_program(
+            root,
+            DeltaStateId(0),
+            &[ProgramChild {
+                input: 0,
+                work: work(1),
+                accepted: None,
+            }],
+            std::iter::empty::<RawInline>(),
+            std::iter::empty::<RawInline>(),
+            false,
+            false,
+            false,
+            Some(ProgramResume::AfterChildren(work(2))),
+        );
+        assert!(parent.quiescence.is_none());
+        assert_eq!(parent.scheduled.len(), 1);
+        assert_eq!(registry.transition_dispatch_width(activation, 8), 2);
+
+        let (_, _, child) = parent.scheduled.into_iter().next().unwrap();
+        let child = registry.replace_program(
+            child,
+            DeltaStateId(0),
+            &[],
+            std::iter::empty::<RawInline>(),
+            std::iter::empty::<RawInline>(),
+            false,
+            false,
+            false,
+            None,
+        );
+        assert!(child.quiescence.is_none());
+        assert_eq!(child.scheduled.len(), 1);
+        assert_eq!(registry.transition_dispatch_width(activation, 8), 2);
+
+        assert_eq!(
+            registry.finish_dispatch(activation, 8, PhysicalDispatchKind::Program, true,),
+            (true, false),
+            "only an activation-local publication resets the sparse grant"
+        );
+        assert_eq!(registry.transition_dispatch_width(activation, 8), 1);
+        let (_, _, resume) = child.scheduled.into_iter().next().unwrap();
+        let resume = registry.replace_program(
+            resume,
+            DeltaStateId(0),
+            &[],
+            std::iter::empty::<RawInline>(),
+            std::iter::empty::<RawInline>(),
+            false,
+            false,
+            false,
+            None,
+        );
+        let completed = registry.finish(
+            resume
+                .quiescence
+                .expect("the delayed resume retained the final live credit"),
+        );
+        assert_eq!(completed.effect, DeltaCompletion::Cleanup);
+    }
+
+    #[test]
+    fn search_after_children_dead_receipt_is_atomic_and_private_publication_suppresses_it() {
+        let run = |publishes: bool| {
+            let mut registry = ProducerRegistry::new();
+            let activation = registry.open_program_activation(
+                DeltaReducer::StreamProposal,
+                stable_return(Vec::new()),
+                None,
+                None,
+            );
+            let work = |slot| ProgramWork {
+                handle: ProgramWorkHandle::test(slot),
+                dispatch: DispatchClass::new(0),
+                pacing: ProgramPacing::Activation,
+            };
+            let (_, root) = registry
+                .install_program_roots(
+                    activation,
+                    [ProgramSeedWork {
+                        parent: 0,
+                        work: work(0),
+                        accepted: None,
+                    }],
+                )
+                .roots
+                .pop()
+                .unwrap();
+            let parent = registry.replace_program(
+                root,
+                DeltaStateId(0),
+                &[ProgramChild {
+                    input: 0,
+                    work: work(1),
+                    accepted: None,
+                }],
+                std::iter::empty::<RawInline>(),
+                std::iter::empty::<RawInline>(),
+                false,
+                true,
+                true,
+                Some(ProgramResume::AfterChildrenDone),
+            );
+            assert_eq!(parent.dead_search_pages, 0);
+            assert_eq!(parent.dead_source_telemetry_pages, 0);
+            assert!(parent.quiescence.is_none());
+            let (_, _, child) = parent.scheduled.into_iter().next().unwrap();
+            let observed = publishes.then_some(value(7));
+            let child = registry.replace_program(
+                child,
+                DeltaStateId(0),
+                &[],
+                observed,
+                std::iter::empty::<RawInline>(),
+                false,
+                false,
+                false,
+                None,
+            );
+            assert_eq!(child.dead_search_pages, usize::from(!publishes));
+            assert_eq!(child.dead_source_telemetry_pages, usize::from(!publishes));
+            if publishes {
+                assert_eq!(child.accepted, [value(7)]);
+                assert!(registry.take_streaming_return(activation).is_some());
+            }
+            let completed = registry.finish(
+                child
+                    .quiescence
+                    .expect("the barrier verdict and quiescence are one receipt"),
+            );
+            assert_eq!(completed.effect, DeltaCompletion::Cleanup);
+        };
+        run(false);
+        run(true);
+    }
+
+    #[test]
+    fn program_source_context_borrows_large_candidate_sets_across_pages() {
+        let mut registry = ProducerRegistry::new();
+        let candidates: Vec<_> = (0..4096)
+            .map(|ordinal| value((ordinal % 251) as u8))
+            .collect();
+        let original = candidates.into_boxed_slice();
+        let original_ptr = original.as_ptr();
+        let activation = registry.open_program_activation(
+            DeltaReducer::Confirm { original },
+            stable_return(Vec::new()),
+            None,
+            None,
+        );
+        let (_, _, first) = registry.source_context(activation);
+        let first = first.unwrap();
+        let (_, _, second) = registry.source_context(activation);
+        let second = second.unwrap();
+        assert_eq!(first.len(), 4096);
+        assert_eq!(first.as_ptr(), original_ptr);
+        assert_eq!(first.as_ptr(), second.as_ptr());
+
+        let formula_values: Vec<_> = (0..2048)
+            .map(|ordinal| value((ordinal % 239) as u8))
+            .collect();
+        let formula_ptr = formula_values.as_ptr();
+        let formula_batch = FormulaBatch::from_confirmation(
+            CandidateBatch {
+                parents: RowBatch::seed(),
+                candidates: CandidatePayload::Values(formula_values),
+            },
+            vec![super::super::ActivationId(9)],
+            &FiniteFormulaNodeKind::Atom,
+        );
+        let formula = registry.open_program_activation(
+            DeltaReducer::FormulaConfirm,
+            DeltaReturn::Formula {
+                bound: VariableSet::new_empty(),
+                counter: FormulaPcId(0),
+                batch: formula_batch,
+            },
+            None,
+            None,
+        );
+        let (_, _, formula_candidates) = registry.source_context(formula);
+        let formula_candidates = formula_candidates.unwrap();
+        assert_eq!(formula_candidates.len(), 2048);
+        assert_eq!(formula_candidates.as_ptr(), formula_ptr);
+    }
+
+    #[test]
+    fn singleton_program_lease_selects_one_lineage_inside_the_canonical_bucket() {
+        let mut scheduler = DeltaScheduler::new();
+        let route = ProgramRoute {
+            key: ProgramKey::new(0),
+            variable: 0,
+            stratum: ProgramStratum::Fixpoint,
+            grouping: ProgramGrouping::PageLocal,
+        };
+        let state = scheduler
+            .interner
+            .intern_program(ProgramAddress::new(DeltaDesc::leaf(0, 0), route));
+        let first = scheduler.registry.open_program_activation(
+            DeltaReducer::StreamProposal,
+            stable_return(Vec::new()),
+            None,
+            None,
+        );
+        let second = scheduler.registry.open_program_activation(
+            DeltaReducer::StreamProposal,
+            stable_return(Vec::new()),
+            None,
+            None,
+        );
+        let install = |registry: &mut ProducerRegistry, activation, slot| {
+            registry.install_program_roots(
+                activation,
+                [ProgramSeedWork {
+                    parent: 0,
+                    work: ProgramWork {
+                        handle: ProgramWorkHandle::test(slot),
+                        dispatch: DispatchClass::new(0),
+                        pacing: ProgramPacing::Activation,
+                    },
+                    accepted: None,
+                }],
+            )
+        };
+        let first_root = install(&mut scheduler.registry, first, 0)
+            .roots
+            .pop()
+            .unwrap();
+        let active = scheduler
+            .file_program_state(
+                state,
+                vec![ProgramTask {
+                    activation: first,
+                    work: first_root.0,
+                    credit: first_root.1,
+                }],
+            )
+            .unwrap();
+        let second_root = install(&mut scheduler.registry, second, 1)
+            .roots
+            .pop()
+            .unwrap();
+        let _ = scheduler.file_program_state(
+            state,
+            vec![ProgramTask {
+                activation: second,
+                work: second_root.0,
+                credit: second_root.1,
+            }],
+        );
+
+        assert_eq!(scheduler.program_worklist.len(), 1);
+        assert_eq!(scheduler.program_worklist[&state].tasks.len(), 2);
+        let (popped_state, hot, pacing) = scheduler.pop_active_program(active, 1);
+        assert_eq!(popped_state, state);
+        assert_eq!(pacing, ProgramPacing::Activation);
+        assert_eq!(hot.len(), 1);
+        assert_eq!(hot[0].activation, first);
+        assert_eq!(scheduler.program_worklist[&state].tasks.len(), 1);
+        assert_eq!(
+            scheduler.program_worklist[&state].tasks[0].activation,
+            second
+        );
+    }
+
+    #[test]
+    fn terminal_program_pop_funds_the_hot_activation_without_cross_quantum_averaging() {
+        let mut scheduler = DeltaScheduler::new();
+        let route = ProgramRoute {
+            key: ProgramKey::new(0),
+            variable: 0,
+            stratum: ProgramStratum::Fixpoint,
+            grouping: ProgramGrouping::PageLocal,
+        };
+        let state = scheduler
+            .interner
+            .intern_program(ProgramAddress::new(DeltaDesc::leaf(0, 0), route));
+        let full = VariableSet::new_singleton(0);
+        let narrow = scheduler.registry.open_program_activation(
+            DeltaReducer::StreamProposal,
+            candidate_return(Vec::new()),
+            None,
+            Some(full),
+        );
+        let wide = scheduler.registry.open_program_activation(
+            DeltaReducer::StreamProposal,
+            candidate_return(Vec::new()),
+            None,
+            Some(full),
+        );
+        for expected in [2, 4, 8] {
+            let (_, widened) =
+                scheduler
+                    .registry
+                    .finish_dispatch(wide, 8, PhysicalDispatchKind::Program, false);
+            assert!(widened);
+            assert_eq!(
+                scheduler.registry.transition_dispatch_width(wide, 8),
+                expected
+            );
+        }
+
+        let install = |registry: &mut ProducerRegistry, activation, slot| {
+            registry
+                .install_program_roots(
+                    activation,
+                    [ProgramSeedWork {
+                        parent: 0,
+                        work: ProgramWork {
+                            handle: ProgramWorkHandle::test(slot),
+                            dispatch: DispatchClass::new(0),
+                            pacing: ProgramPacing::Activation,
+                        },
+                        accepted: None,
+                    }],
+                )
+                .roots
+                .pop()
+                .unwrap()
+        };
+        let narrow_root = install(&mut scheduler.registry, narrow, 0);
+        let wide_root = install(&mut scheduler.registry, wide, 1);
+        let _ = scheduler.file_program_state(
+            state,
+            vec![
+                ProgramTask {
+                    activation: narrow,
+                    work: narrow_root.0,
+                    credit: narrow_root.1,
+                },
+                ProgramTask {
+                    activation: wide,
+                    work: wide_root.0,
+                    credit: wide_root.1,
+                },
+            ],
+        );
+
+        let (popped_state, tasks, dispatch) = scheduler.pop_program_bounded(8);
+        assert_eq!(popped_state, state);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].activation, wide);
+        assert_eq!(dispatch.task_limits, [8]);
+        assert_eq!(dispatch.remainder_tasks, 1);
+        assert_eq!(
+            dispatch.terminal_budgets,
+            [TerminalActivationBudget {
+                activation: wide,
+                assigned: 8,
+                quantum: 8,
+            }]
+        );
+
+        let mut stats = ResidualStateStats::default();
+        assert!(scheduler.account_physical_dispatch(
+            dispatch,
+            8,
+            0,
+            &OrderedActivationSet::default(),
+            &mut stats,
+        ));
+        assert_eq!(scheduler.registry.transition_dispatch_width(narrow, 8), 1);
+        assert_eq!(scheduler.registry.transition_dispatch_width(wide, 8), 8);
+        assert_eq!(stats.delta_terminal_sparse_widenings, 0);
     }
 
     #[test]

@@ -140,10 +140,21 @@ fn compile_grouped_delta_confirm_requirements<'a>(
     if !transition_programs {
         return Box::new([]);
     }
-    constraint
-        .variables()
+    let variables = constraint.variables();
+    variables
         .into_iter()
         .filter_map(|variable| {
+            if let Some(program) = constraint.residual_program() {
+                let mut required = variables;
+                required.unset(variable);
+                return program
+                    .route(ProgramRequest {
+                        action: ProgramAction::Confirm(variable),
+                        bound: required,
+                    })
+                    .filter(|route| route.grouping == ProgramGrouping::ParentAtomic)
+                    .map(|_| (variable, required));
+            }
             constraint
                 .residual_delta_confirm_grouping_requirements(variable)
                 .map(|required| (variable, required))
@@ -1788,6 +1799,26 @@ impl ResidualPlan {
         variable: VariableId,
         view: &RowsView<'_>,
     ) -> bool {
+        fn bound_variables(view: &RowsView<'_>) -> VariableSet {
+            view.vars
+                .iter()
+                .copied()
+                .fold(VariableSet::new_empty(), |mut bound, variable| {
+                    bound.set(variable);
+                    bound
+                })
+        }
+        let program_source = |constraint: &dyn Constraint<'a>| {
+            let bound = bound_variables(view);
+            constraint.residual_program().is_some_and(|program| {
+                program
+                    .route(ProgramRequest {
+                        action: ProgramAction::Propose(variable),
+                        bound,
+                    })
+                    .is_some()
+            })
+        };
         fn formula_has_source<'a>(
             plan: &ResidualPlan,
             root: &dyn Constraint<'a>,
@@ -1799,7 +1830,15 @@ impl ResidualPlan {
             match &plan.finite_formula.node(node).kind {
                 FiniteFormulaNodeKind::Atom => {
                     let constraint = plan.resolve_formula_node(root, occurrence, node);
-                    constraint.residual_delta_source_is_paged(variable, view)
+                    let bound = bound_variables(view);
+                    constraint.residual_program().is_some_and(|program| {
+                        program
+                            .route(ProgramRequest {
+                                action: ProgramAction::Propose(variable),
+                                bound,
+                            })
+                            .is_some()
+                    }) || constraint.residual_delta_source_is_paged(variable, view)
                         || constraint.residual_proposal_source_has_transition_roots(variable, view)
                 }
                 FiniteFormulaNodeKind::And { children }
@@ -1813,7 +1852,8 @@ impl ResidualPlan {
             self.finite_formula.root(occurrence).map_or_else(
                 || {
                     let constraint = self.resolve(root, occurrence);
-                    constraint.residual_delta_source_is_paged(variable, view)
+                    program_source(constraint)
+                        || constraint.residual_delta_source_is_paged(variable, view)
                         || constraint.residual_proposal_source_has_transition_roots(variable, view)
                 },
                 |formula_root| {
@@ -7334,6 +7374,9 @@ where
 
         let variables: Vec<_> = seed.bound.into_iter().collect();
         let seed_view = RowsView::new_with_row_count(&variables, &seed.values, 1);
+        // Preserve the ordinary optimistic preflight for partial bindings.
+        // Typed Support owns only an explicit residual action; it does not
+        // perturb admission or exact zero-variable truth at this boundary.
         let mode = if root.satisfied(&seed_view) {
             Search::NextVariable
         } else {
@@ -7878,6 +7921,21 @@ impl ResidualStateMachine {
         let terminal_streaming = commits_final_checked_candidate(&successor, self.full);
 
         let constraint = plan.resolve(root, proposer);
+        let program_request = ProgramRequest {
+            action: ProgramAction::Propose(variable),
+            bound: task.desc.bound,
+        };
+        let program = if let Some(spec) = constraint.residual_program() {
+            let Some(route) = spec.route(program_request) else {
+                // Owning the typed family excludes all legacy residual hooks.
+                // An unsupported structural action returns to the ordinary
+                // constraint protocol instead.
+                return Err(task);
+            };
+            Some((spec, route))
+        } else {
+            None
+        };
         let selected_parent_count = rows.row_count;
         let admitted_parent_count = if terminal_streaming {
             self.terminal_admission_width(task.state, selected_parent_count)
@@ -7886,7 +7944,8 @@ impl ResidualStateMachine {
         };
         let vars: Vec<VariableId> = task.desc.bound.into_iter().collect();
         let view = rows_view(&vars, &rows.rows, rows.row_count);
-        let eager_terminal_phase = terminal_streaming
+        let eager_terminal_phase = program.is_none()
+            && terminal_streaming
             && admitted_parent_count > 1
             && self.uses_eager_terminal_phase()
             && constraint.residual_terminal_eager_proposal_equivalent(variable, &view);
@@ -7895,7 +7954,7 @@ impl ResidualStateMachine {
         // materialize and then discard sparse seed roots for such a cohort.
         let mut paged = false;
         let mut seeds = Vec::new();
-        if !eager_terminal_phase {
+        if program.is_none() && !eager_terminal_phase {
             paged = constraint.residual_delta_source_is_paged(variable, &view)
                 || constraint.residual_proposal_source_is_paged(variable, &view);
             if !paged && !constraint.residual_delta_seeds(variable, &view, &mut seeds) {
@@ -7941,7 +8000,7 @@ impl ResidualStateMachine {
             debug_assert_eq!(receipt.state, state);
             bucket = admitted;
             self.stats.delta_terminal_admission_remainders += remainder_rows;
-            if !eager_terminal_phase && !paged {
+            if program.is_none() && !eager_terminal_phase && !paged {
                 seeds.retain(|seed| seed.parent as usize >= first_admitted);
                 for seed in &mut seeds {
                     seed.parent = u32::try_from(seed.parent as usize - first_admitted)
@@ -7959,6 +8018,28 @@ impl ResidualStateMachine {
         self.stats.max_propose_rows = self.stats.max_propose_rows.max(rows.row_count);
         if eager_terminal_phase {
             return Ok(self.eager_terminal_proposal(constraint, state, desc.bound, variable, rows));
+        }
+        if let Some((spec, route)) = program {
+            let mut outcome = self.delta.seed_program_proposals_with_full(
+                spec,
+                DeltaDesc::leaf(variable, proposer),
+                program_request,
+                route,
+                successor,
+                rows,
+                self.full,
+                direct_terminal_publication_full,
+                plan,
+                &mut self.worklist,
+                &mut self.interner,
+                &mut self.stats,
+            );
+            if terminal_streaming && self.uses_direct_terminal_publication() {
+                outcome.terminal_family = Some(state);
+            } else {
+                outcome.terminal_activations.clear();
+            }
+            return Ok(outcome);
         }
         if paged {
             let mut outcome = self.delta.seed_source_proposals_with_full_receipt(
@@ -8046,6 +8127,65 @@ impl ResidualStateMachine {
         let vars: Vec<VariableId> = task.desc.bound.into_iter().collect();
         let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
         let constraint = plan.resolve(root, confirmer);
+        let program_request = ProgramRequest {
+            action: ProgramAction::Confirm(variable),
+            bound: task.desc.bound,
+        };
+        if let Some(spec) = constraint.residual_program() {
+            let Some(route) = spec.route(program_request) else {
+                return Err(task);
+            };
+            if route.grouping == ProgramGrouping::ParentAtomic {
+                assert!(
+                    !task
+                        .desc
+                        .uses_candidate_pages(plan, &self.interner.formula_pcs),
+                    "parent-atomic typed confirmation was split into candidate pages"
+                );
+            }
+            let SelectedResidualTask {
+                state: _,
+                desc,
+                bucket,
+            } = task;
+            let StateBucket::Candidates(batch) = bucket else {
+                unreachable!("typed program confirmer was checked above")
+            };
+            let candidates_before = batch.candidate_count();
+            self.stats.confirm_action_pops += 1;
+            self.stats.confirm_calls += 1;
+            self.stats.confirm_rows += batch.parents.row_count;
+            self.stats.max_confirm_rows = self.stats.max_confirm_rows.max(batch.parents.row_count);
+            self.stats.candidates_confirmed += candidates_before;
+            self.stats.max_confirm_candidates =
+                self.stats.max_confirm_candidates.max(candidates_before);
+            let successor = StateDesc {
+                bound: desc.bound,
+                phase: ResidualPhase::Candidate {
+                    variable,
+                    relevant,
+                    checked: checked.with_inserted(confirmer),
+                },
+            };
+            let seeded_parents = batch.parents.row_count;
+            let active = self.delta.seed_program_confirms(
+                spec,
+                DeltaDesc::leaf(variable, confirmer),
+                program_request,
+                route,
+                successor,
+                batch,
+            );
+            return Ok(DeltaSeedOutcome {
+                continuation: None,
+                publication: None,
+                active,
+                terminal_activations: Vec::new(),
+                completed_activation_ids: Vec::new(),
+                terminal_family: None,
+                seeded_parents,
+            });
+        }
         if constraint.residual_delta_source_is_paged(variable, &view) {
             let SelectedResidualTask {
                 state: _,
@@ -8191,8 +8331,34 @@ impl ResidualStateMachine {
         let vars: Vec<VariableId> = task.desc.bound.into_iter().collect();
         let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
         let constraint = plan.resolve_formula_node(root, occurrence, node);
+        let program_request = ProgramRequest {
+            action: match stage {
+                FormulaStage::Support => ProgramAction::Support,
+                FormulaStage::Propose => ProgramAction::Propose(outer_variable),
+                FormulaStage::Confirm => ProgramAction::Confirm(outer_variable),
+            },
+            bound: task.desc.bound,
+        };
+        let program = if let Some(spec) = constraint.residual_program() {
+            let Some(route) = spec.route(program_request) else {
+                return Err(task);
+            };
+            if stage == FormulaStage::Confirm && route.grouping == ProgramGrouping::ParentAtomic {
+                assert!(
+                    !task
+                        .desc
+                        .uses_candidate_pages(plan, &self.interner.formula_pcs),
+                    "parent-atomic typed formula confirmation was split into candidate pages"
+                );
+            }
+            Some((spec, route))
+        } else {
+            None
+        };
         let mut seeds = Vec::new();
-        let (variable, paged) = if stage == FormulaStage::Support {
+        let (variable, paged) = if let Some((_, route)) = program {
+            (route.variable, false)
+        } else if stage == FormulaStage::Support {
             let Some(route) = constraint.residual_delta_support_seeds(&view, &mut seeds) else {
                 assert!(
                     seeds.is_empty(),
@@ -8270,6 +8436,23 @@ impl ResidualStateMachine {
                 self.stats.max_confirm_candidates =
                     self.stats.max_confirm_candidates.max(candidates_before);
             }
+        }
+        if let Some((spec, route)) = program {
+            return Ok(self.delta.seed_program_formula(
+                spec,
+                DeltaDesc::formula(variable, occurrence, node),
+                program_request,
+                route,
+                desc.bound,
+                counter,
+                stage,
+                batch,
+                stream_proposal,
+                plan,
+                &mut self.worklist,
+                &mut self.interner,
+                &mut self.stats,
+            ));
         }
         if paged {
             let seeded_parents = batch.parents.row_count;
@@ -8591,11 +8774,6 @@ impl ResidualStateMachine {
             return false;
         }
         seeded_parents == 1
-            && matches!(
-                self.last_selection,
-                SelectionKind::Continuation(ContinuationMode::ProbeOne)
-                    | SelectionKind::Continuation(ContinuationMode::Cohort)
-            )
     }
 
     fn direct_terminal_publication_full(&self) -> Option<VariableSet> {
@@ -8619,10 +8797,11 @@ impl ResidualStateMachine {
         true
     }
 
-    /// A cyclic seed inherits depth-first preference only from an existing
-    /// continuation lineage when the selected action transferred exactly one
-    /// affine parent. Full selections and multi-parent cohorts retain their
-    /// deliberate batching unit instead of choosing one arbitrary activation.
+    /// A cyclic seed inherits depth-first preference whenever the selected
+    /// action transferred exactly one affine parent. That parent names the
+    /// whole new activation even for Full and Readiness selections;
+    /// multi-parent cohorts still retain their deliberate batching unit
+    /// instead of choosing one arbitrary activation.
     fn active_delta_after_seed(
         &self,
         active: Option<ActiveDeltaContinuation>,
@@ -9039,17 +9218,19 @@ impl ResidualStateMachine {
         if self.terminal_yield.ever_admitted {
             return None;
         }
-        // A public producer only splits an unpulled iterator, so no latency
-        // continuation can be live here. Clear the physical preference
-        // defensively: dropping it never drops affine work, while retaining it
-        // across a bucket split could leave the receipt naming the wrong tail.
-        self.continuation = None;
-        self.active_delta = None;
-        self.active_delta_after_yield = false;
         loop {
             if self.terminal_yield.ever_admitted {
                 return None;
             }
+            // Split negotiation owns only cold logical queues. An internal
+            // seed or global delta step may arm a serial sprint preference,
+            // then the next negotiation iteration may consume, move, or
+            // retire the named bucket before returning a shard. Clear those
+            // physical hints on every iteration; all affine work remains in
+            // the stable/delta queues.
+            self.continuation = None;
+            self.active_delta = None;
+            self.active_delta_after_yield = false;
             debug_assert_eq!(
                 self.emit_next, 0,
                 "parallel residual splits before fold consumption"
@@ -17150,8 +17331,560 @@ mod tests {
         assert!(calls.iter().all(|call| call.parent_rows == 1));
     }
 
+    struct ProgramOnlyRpq {
+        inner: crate::query::regularpathconstraint::RegularPathConstraint,
+        ordinary_propose: Arc<AtomicUsize>,
+        ordinary_confirm: Arc<AtomicUsize>,
+        ordinary_support: Arc<AtomicUsize>,
+    }
+
+    impl Constraint<'static> for ProgramOnlyRpq {
+        fn variables(&self) -> VariableSet {
+            self.inner.variables()
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            self.inner.estimate(variable, view, out)
+        }
+
+        fn propose(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+            self.ordinary_propose.fetch_add(1, Ordering::Relaxed);
+            panic!("ordinary RPQ propose fallback")
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+            self.ordinary_confirm.fetch_add(1, Ordering::Relaxed);
+            panic!("ordinary RPQ confirm fallback")
+        }
+
+        fn residual_confirm_is_page_local(&self) -> bool {
+            self.inner.residual_confirm_is_page_local()
+        }
+
+        fn residual_program(&self) -> Option<ProgramRef<'_>> {
+            self.inner.residual_program()
+        }
+
+        fn satisfied(&self, view: &RowsView<'_>) -> bool {
+            let variables = self.inner.variables();
+            let fully_bound = variables
+                .into_iter()
+                .all(|variable| view.col(variable).is_some());
+            if fully_bound {
+                self.ordinary_support.fetch_add(1, Ordering::Relaxed);
+                panic!("ordinary fully-bound RPQ support fallback")
+            }
+            self.inner.satisfied(view)
+        }
+    }
+
+    type ProgramFallbackCounters = (Arc<AtomicUsize>, Arc<AtomicUsize>, Arc<AtomicUsize>);
+
+    fn program_fallback_counters() -> ProgramFallbackCounters {
+        (
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        )
+    }
+
+    fn program_only_rpq(
+        inner: crate::query::regularpathconstraint::RegularPathConstraint,
+        counters: &ProgramFallbackCounters,
+    ) -> ProgramOnlyRpq {
+        ProgramOnlyRpq {
+            inner,
+            ordinary_propose: Arc::clone(&counters.0),
+            ordinary_confirm: Arc::clone(&counters.1),
+            ordinary_support: Arc::clone(&counters.2),
+        }
+    }
+
+    fn assert_program_fallbacks_unused(counters: &ProgramFallbackCounters) {
+        assert_eq!(counters.0.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.1.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.2.load(Ordering::Relaxed), 0);
+    }
+
+    fn preferred_fanout(
+        variable: VariableId,
+        values: Vec<RawInline>,
+        estimate: usize,
+    ) -> ShapeConstraint {
+        let mut leaf = crate::debug::query::EstimateOverrideConstraint::new(FanoutLeaf {
+            variable,
+            values: Arc::new(values),
+        });
+        leaf.set_estimate(variable, estimate);
+        Box::new(leaf)
+    }
+
     #[test]
-    fn singleton_rpq_seed_stays_hot_but_wide_cold_seed_remains_batched() {
+    fn rpq_program_is_total_for_both_partial_confirm_directions_and_formula_support() {
+        use crate::id::{id_into_value, ExclusiveId, Id};
+        use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
+        use crate::trible::{Trible, TribleSet};
+
+        let attribute = Id::new([181; crate::id::ID_LEN]).unwrap();
+        let alternate = Id::new([180; crate::id::ID_LEN]).unwrap();
+        let nodes: Vec<_> = (182..=191)
+            .map(|byte| Id::new([byte; crate::id::ID_LEN]).unwrap())
+            .collect();
+        let mut graph = TribleSet::new();
+        for pair in nodes.chunks_exact(2) {
+            graph.insert(&Trible::new::<GenId>(
+                ExclusiveId::force_ref(&pair[0]),
+                &attribute,
+                &pair[1].to_inline(),
+            ));
+        }
+        graph.insert(&Trible::new::<GenId>(
+            ExclusiveId::force_ref(&nodes[2]),
+            &alternate,
+            &nodes[4].to_inline(),
+        ));
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let ops = [PathOp::Attr(attribute.raw())];
+        let alternate_ops = [PathOp::Attr(alternate.raw())];
+        let wrap = |counters: &ProgramFallbackCounters| {
+            program_only_rpq(
+                RegularPathConstraint::new(graph.clone(), start, end, &ops),
+                counters,
+            )
+        };
+        let project = |binding: &Binding| {
+            Some((
+                binding.get(start.index).copied()?,
+                binding.get(end.index).copied()?,
+            ))
+        };
+
+        // The one-row leaf wins planning before the wider RPQ source. Its
+        // candidate must therefore pass through Confirm(start) while `end`
+        // is still absent.
+        let source_candidates = vec![
+            id_into_value(&nodes[2]),
+            id_into_value(&nodes[0]),
+            id_into_value(&nodes[2]),
+            id_into_value(&nodes[1]),
+            id_into_value(&nodes[0]),
+        ];
+        let confirm_counters = program_fallback_counters();
+        let confirm_root = IntersectionConstraint::new(vec![
+            preferred_fanout(start.index, source_candidates.clone(), 0),
+            Box::new(wrap(&confirm_counters)) as ShapeConstraint,
+        ]);
+        let mut source_residual_query = Query::new(confirm_root, project)
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .cap(1)
+            .start_width(1);
+        let mut residual: Vec<_> = source_residual_query.by_ref().collect();
+        let oracle_root = IntersectionConstraint::new(vec![
+            preferred_fanout(start.index, source_candidates, 0),
+            Box::new(RegularPathConstraint::new(graph.clone(), start, end, &ops))
+                as ShapeConstraint,
+        ]);
+        let mut oracle: Vec<_> = Query::new(oracle_root, project).sequential().collect();
+        residual.sort_unstable();
+        oracle.sort_unstable();
+        assert_eq!(residual, oracle);
+        assert_eq!(residual.len(), 4, "duplicate source candidates are a bag");
+        assert!(source_residual_query.stats().confirm_action_pops > 0);
+        assert_program_fallbacks_unused(&confirm_counters);
+
+        // The inverse partial-confirm route has the same affine bag law: the
+        // candidate offsets are neither sorted nor deduplicated before the
+        // finite FIRST-step filter walks them.
+        let end_candidates = vec![
+            id_into_value(&nodes[3]),
+            id_into_value(&nodes[1]),
+            id_into_value(&nodes[3]),
+            id_into_value(&nodes[0]),
+            id_into_value(&nodes[1]),
+        ];
+        let inverse_counters = program_fallback_counters();
+        let inverse_root = IntersectionConstraint::new(vec![
+            preferred_fanout(end.index, end_candidates.clone(), 0),
+            Box::new(wrap(&inverse_counters)) as ShapeConstraint,
+        ]);
+        let mut inverse_query = Query::new(inverse_root, project)
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .cap(1)
+            .start_width(1);
+        let mut inverse: Vec<_> = inverse_query.by_ref().collect();
+        let inverse_oracle = IntersectionConstraint::new(vec![
+            preferred_fanout(end.index, end_candidates, 0),
+            Box::new(RegularPathConstraint::new(graph.clone(), start, end, &ops))
+                as ShapeConstraint,
+        ]);
+        let mut inverse_expected: Vec<_> =
+            Query::new(inverse_oracle, project).sequential().collect();
+        inverse.sort_unstable();
+        inverse_expected.sort_unstable();
+        assert_eq!(inverse, inverse_expected);
+        assert_eq!(inverse.len(), 4, "duplicate end candidates are a bag");
+        assert!(inverse_query.stats().confirm_action_pops > 0);
+        assert_program_fallbacks_unused(&inverse_counters);
+
+        // Lowered OR atoms are guarded by Support before proposal. The RPQ
+        // endpoints are absent at that point, so this exercises the explicit
+        // typed Boolean disposition rather than ordinary `satisfied`.
+        let support_counters = program_fallback_counters();
+        let support_root = UnionConstraint::new(vec![
+            Box::new(wrap(&support_counters)) as ShapeConstraint,
+            Box::new(RegularPathConstraint::new(
+                graph.clone(),
+                start,
+                end,
+                &alternate_ops,
+            )) as ShapeConstraint,
+        ]);
+        let mut supported_query = Query::new(support_root, project)
+            .solve_residual_state_lazy_with(ResidualLowering::FULL);
+        let mut supported: Vec<_> = supported_query.by_ref().collect();
+        let support_oracle = UnionConstraint::new(vec![
+            Box::new(RegularPathConstraint::new(graph.clone(), start, end, &ops))
+                as ShapeConstraint,
+            Box::new(RegularPathConstraint::new(
+                graph.clone(),
+                start,
+                end,
+                &alternate_ops,
+            )) as ShapeConstraint,
+        ]);
+        let mut expected: Vec<_> = Query::new(support_oracle, project).sequential().collect();
+        supported.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(supported, expected);
+        assert!(supported.contains(&(id_into_value(&nodes[0]), id_into_value(&nodes[1]))));
+        assert!(supported.contains(&(id_into_value(&nodes[2]), id_into_value(&nodes[4]))));
+        assert!(supported_query.stats().support_action_pops > 0);
+        assert!(supported_query.stats().delta_transition_pages > 0);
+        assert_program_fallbacks_unused(&support_counters);
+    }
+
+    #[test]
+    fn rpq_program_bound_product_confirm_is_total_in_both_directions_and_strata() {
+        use crate::id::{id_into_value, ExclusiveId, Id};
+        use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
+        use crate::trible::{Trible, TribleSet};
+
+        let attribute = Id::new([161; crate::id::ID_LEN]).unwrap();
+        let nodes: Vec<_> = (11..=22)
+            .map(|byte| Id::new([byte; crate::id::ID_LEN]).unwrap())
+            .collect();
+        let [source, forward_a, forward_b, forward_c, target, inverse_a, inverse_b, inverse_c, wrong_a, wrong_b, forward_two_hop, inverse_two_hop] =
+            nodes.as_slice()
+        else {
+            unreachable!()
+        };
+        let mut graph = TribleSet::new();
+        for (from, to) in [
+            (source, forward_a),
+            (source, forward_b),
+            (source, forward_c),
+            (forward_c, forward_two_hop),
+            (inverse_a, target),
+            (inverse_b, target),
+            (inverse_c, target),
+            (inverse_two_hop, inverse_c),
+        ] {
+            graph.insert(&Trible::new::<GenId>(
+                ExclusiveId::force_ref(from),
+                &attribute,
+                &to.to_inline(),
+            ));
+        }
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let project = |binding: &Binding| {
+            Some((
+                binding.get(start.index).copied()?,
+                binding.get(end.index).copied()?,
+            ))
+        };
+
+        for repeated in [false, true] {
+            let ops = if repeated {
+                vec![PathOp::Attr(attribute.raw()), PathOp::Plus]
+            } else {
+                vec![PathOp::Attr(attribute.raw())]
+            };
+            for forward in [true, false] {
+                let counters = program_fallback_counters();
+                let (bound_variable, bound_value, candidate_variable, candidates) = if forward {
+                    (
+                        start.index,
+                        id_into_value(source),
+                        end.index,
+                        vec![
+                            id_into_value(forward_b),
+                            id_into_value(forward_a),
+                            id_into_value(forward_b),
+                            id_into_value(wrong_a),
+                            id_into_value(forward_a),
+                            id_into_value(forward_two_hop),
+                            id_into_value(forward_two_hop),
+                        ],
+                    )
+                } else {
+                    (
+                        end.index,
+                        id_into_value(target),
+                        start.index,
+                        vec![
+                            id_into_value(inverse_b),
+                            id_into_value(inverse_a),
+                            id_into_value(inverse_b),
+                            id_into_value(wrong_b),
+                            id_into_value(inverse_a),
+                            id_into_value(inverse_two_hop),
+                            id_into_value(inverse_two_hop),
+                        ],
+                    )
+                };
+                let make_prefix = || {
+                    vec![
+                        preferred_fanout(bound_variable, vec![bound_value], 0),
+                        preferred_fanout(candidate_variable, candidates.clone(), 1),
+                    ]
+                };
+                let mut children = make_prefix();
+                children.push(Box::new(program_only_rpq(
+                    RegularPathConstraint::new(graph.clone(), start, end, &ops),
+                    &counters,
+                )) as ShapeConstraint);
+                let mut query = Query::new(IntersectionConstraint::new(children), project)
+                    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+                    .cap(1)
+                    .start_width(1);
+                let mut actual: Vec<_> = query.by_ref().collect();
+
+                let mut oracle_children = make_prefix();
+                oracle_children.push(Box::new(RegularPathConstraint::new(
+                    graph.clone(),
+                    start,
+                    end,
+                    &ops,
+                )) as ShapeConstraint);
+                let mut expected: Vec<_> =
+                    Query::new(IntersectionConstraint::new(oracle_children), project)
+                        .sequential()
+                        .collect();
+                actual.sort_unstable();
+                expected.sort_unstable();
+                assert_eq!(
+                    actual, expected,
+                    "bound-product Confirm mismatch: repeated={repeated}, forward={forward}"
+                );
+                assert_eq!(
+                    actual.len(),
+                    if repeated { 6 } else { 4 },
+                    "the duplicated two-hop-only candidates did not follow the route stratum"
+                );
+                assert!(
+                    query.stats().confirm_action_pops > 0,
+                    "fixture never reached Confirm: repeated={repeated}, forward={forward}"
+                );
+                assert!(query.stats().delta_transition_pages > 0);
+                assert_program_fallbacks_unused(&counters);
+            }
+        }
+    }
+
+    #[test]
+    fn rpq_program_full_support_is_total_for_true_false_and_nullable_absent_rows() {
+        use crate::id::{id_into_value, ExclusiveId, Id};
+        use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
+        use crate::trible::{Trible, TribleSet};
+
+        let attribute = Id::new([151; crate::id::ID_LEN]).unwrap();
+        let a = Id::new([152; crate::id::ID_LEN]).unwrap();
+        let b = Id::new([153; crate::id::ID_LEN]).unwrap();
+        let absent = Id::new([154; crate::id::ID_LEN]).unwrap();
+        let mut graph = TribleSet::new();
+        graph.insert(&Trible::new::<GenId>(
+            ExclusiveId::force_ref(&a),
+            &attribute,
+            &b.to_inline(),
+        ));
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let ops = [PathOp::Attr(attribute.raw()), PathOp::Star];
+        let cases = [
+            ("edge", id_into_value(&a), id_into_value(&b), true),
+            ("reverse miss", id_into_value(&b), id_into_value(&a), false),
+            (
+                "nullable graph identity",
+                id_into_value(&a),
+                id_into_value(&a),
+                true,
+            ),
+            (
+                "nullable absent identity",
+                id_into_value(&absent),
+                id_into_value(&absent),
+                false,
+            ),
+        ];
+
+        for (name, source, target, accepted) in cases {
+            let counters = program_fallback_counters();
+            let guarded_value = raw(71);
+            let sibling_value = raw(72);
+            let guarded = Box::new(IntersectionConstraint::new(vec![
+                Box::new(program_only_rpq(
+                    RegularPathConstraint::new(graph.clone(), start, end, &ops),
+                    &counters,
+                )) as ShapeConstraint,
+                preferred_fanout(2, vec![guarded_value], 0),
+            ])) as ShapeConstraint;
+            let sibling = Box::new(IntersectionConstraint::new(vec![
+                Box::new(start.is(Inline::<GenId>::new(source))) as ShapeConstraint,
+                Box::new(end.is(Inline::<GenId>::new(target))) as ShapeConstraint,
+                preferred_fanout(2, vec![sibling_value], 1),
+            ])) as ShapeConstraint;
+            let root = IntersectionConstraint::new(vec![
+                preferred_fanout(start.index, vec![source], 0),
+                preferred_fanout(end.index, vec![target], 0),
+                Box::new(UnionConstraint::new(vec![guarded, sibling])) as ShapeConstraint,
+            ]);
+            let mut query = Query::new(root, |binding: &Binding| binding.get(2).copied())
+                .solve_residual_state_lazy_with(ResidualLowering::FULL)
+                .cap(1)
+                .start_width(1);
+            let mut actual: Vec<_> = query.by_ref().collect();
+            actual.sort_unstable();
+            let mut expected = vec![sibling_value];
+            if accepted {
+                expected.push(guarded_value);
+            }
+            expected.sort_unstable();
+            assert_eq!(actual, expected, "{name}");
+            assert!(query.stats().support_action_pops > 0, "{name}");
+            assert_program_fallbacks_unused(&counters);
+        }
+    }
+
+    #[test]
+    fn rpq_program_inverse_product_starts_from_a_bound_literal() {
+        use crate::id::{id_into_value, ExclusiveId, Id};
+        use crate::inline::encodings::UnknownInline;
+        use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
+        use crate::trible::{Trible, TribleSet};
+
+        let attribute = Id::new([141; crate::id::ID_LEN]).unwrap();
+        let subject = Id::new([142; crate::id::ID_LEN]).unwrap();
+        let literal = Inline::<UnknownInline>::new([0xA5; 32]);
+        let mut graph = TribleSet::new();
+        graph.insert(&Trible::new(
+            ExclusiveId::force_ref(&subject),
+            &attribute,
+            &literal,
+        ));
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<UnknownInline>::new(1);
+        let ops = [PathOp::Attr(attribute.raw())];
+        let counters = program_fallback_counters();
+        let root = IntersectionConstraint::new(vec![
+            preferred_fanout(end.index, vec![literal.raw], 0),
+            Box::new(program_only_rpq(
+                RegularPathConstraint::new(graph, start, end, &ops),
+                &counters,
+            )) as ShapeConstraint,
+        ]);
+        let mut query = Query::new(root, |binding: &Binding| binding.get(start.index).copied())
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .cap(1)
+            .start_width(1);
+        assert_eq!(query.next(), Some(id_into_value(&subject)));
+        assert_eq!(query.next(), None);
+        assert!(query.stats().propose_action_pops > 0);
+        assert!(query.stats().delta_transition_pages > 0);
+        assert_program_fallbacks_unused(&counters);
+    }
+
+    #[test]
+    fn repeated_same_variable_confirm_offsets_preserve_an_unsorted_duplicate_bag() {
+        use crate::id::{id_into_value, ExclusiveId, Id};
+        use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
+        use crate::trible::{Trible, TribleSet};
+
+        let attribute = Id::new([171; crate::id::ID_LEN]).unwrap();
+        let accepted_a = Id::new([172; crate::id::ID_LEN]).unwrap();
+        let rejected = Id::new([173; crate::id::ID_LEN]).unwrap();
+        let accepted_c = Id::new([174; crate::id::ID_LEN]).unwrap();
+        let mut graph = TribleSet::new();
+        for node in [&accepted_a, &accepted_c] {
+            graph.insert(&Trible::new::<GenId>(
+                ExclusiveId::force_ref(node),
+                &attribute,
+                &node.to_inline(),
+            ));
+        }
+        let variable = Variable::<GenId>::new(0);
+        let ops = [PathOp::Attr(attribute.raw()), PathOp::Plus];
+        let candidates = vec![
+            id_into_value(&accepted_c),
+            id_into_value(&accepted_a),
+            id_into_value(&accepted_c),
+            id_into_value(&rejected),
+            id_into_value(&accepted_a),
+        ];
+        let counters = program_fallback_counters();
+        let root = IntersectionConstraint::new(vec![
+            preferred_fanout(variable.index, candidates.clone(), 0),
+            Box::new(program_only_rpq(
+                RegularPathConstraint::new(graph.clone(), variable, variable, &ops),
+                &counters,
+            )) as ShapeConstraint,
+        ]);
+        let project = |binding: &Binding| binding.get(variable.index).copied();
+        let mut query = Query::new(root, project)
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .cap(1)
+            .start_width(1);
+        let mut actual: Vec<_> = query.by_ref().collect();
+
+        let oracle = IntersectionConstraint::new(vec![
+            preferred_fanout(variable.index, candidates, 0),
+            Box::new(RegularPathConstraint::new(graph, variable, variable, &ops))
+                as ShapeConstraint,
+        ]);
+        let mut expected: Vec<_> = Query::new(oracle, project).sequential().collect();
+        let mut exact_bag = vec![
+            id_into_value(&accepted_c),
+            id_into_value(&accepted_a),
+            id_into_value(&accepted_c),
+            id_into_value(&accepted_a),
+        ];
+        actual.sort_unstable();
+        expected.sort_unstable();
+        exact_bag.sort_unstable();
+        assert_eq!(actual, exact_bag);
+        assert_eq!(actual, expected);
+        assert!(query.stats().delta_source_pages > 1);
+        assert_program_fallbacks_unused(&counters);
+    }
+
+    #[test]
+    fn singleton_rpq_seed_stays_hot_but_cold_traversal_remains_batched() {
         use crate::id::{id_into_value, ExclusiveId, Id};
         use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
         use crate::trible::{Trible, TribleSet};
@@ -17266,7 +17999,10 @@ mod tests {
             .growth(2);
         let focused_first = focused.next().expect("the ring has a path result");
         let focused_first_stats = focused.stats().clone();
-        assert_eq!(focused_first_stats.propose_rows, 3);
+        assert_eq!(
+            focused_first_stats.propose_rows, 3,
+            "{focused_first_stats:#?}"
+        );
         assert_eq!(focused_first_stats.max_propose_rows, 1);
         assert_eq!(
             focused_first_stats.support_action_pops
@@ -17285,7 +18021,7 @@ mod tests {
         let cold_first = cold.next().expect("the control ring has a path result");
         let cold_first_stats = cold.stats().clone();
         assert!(cold_first_stats.propose_rows > focused_first_stats.propose_rows);
-        assert!(cold_first_stats.max_propose_rows > 1);
+        assert!(cold_first_stats.max_delta_transition_cohort > 1);
         assert!(
             cold_first_stats.support_action_pops
                 + cold_first_stats.propose_action_pops
@@ -17344,10 +18080,10 @@ mod tests {
             pure.stats()
         );
         assert!(pure.stats().delta_active_post_yield_resumptions > 0);
-        assert_eq!(
-            pure.stats().delta_active_live_yields_retained,
-            pure.stats().delta_active_post_yield_resumptions,
-            "a complete drain must resume every lease retained at publication"
+        assert!(
+            pure.stats().delta_active_post_yield_resumptions
+                <= pure.stats().delta_active_live_yields_retained,
+            "only a retained lease may be resumed"
         );
         assert!(
             pure.state
@@ -17368,8 +18104,8 @@ mod tests {
 
         // Eight byte-identical affine parents exercise both duplicate outer
         // bag semantics and the path program's convergent p/q witnesses. The
-        // explicit capability must make the eager and forced-sparse regimes
-        // interchangeable after full drain.
+        // typed program must preserve the duplicate outer bag while keeping
+        // bound-endpoint traversal budgeted in both physical configurations.
         let duplicate_source = id_into_value(&nodes[0][0]);
         let make_duplicates = || {
             IntersectionConstraint::new(vec![
@@ -17397,13 +18133,11 @@ mod tests {
         sparse_duplicates.results.sort_unstable();
         assert_eq!(eager_duplicates.results, sparse_duplicates.results);
         assert_eq!(eager_duplicates.results.len(), 8 * nodes[0].len());
-        assert!(
+        assert_eq!(
             eager_duplicates
                 .stats
-                .delta_terminal_eager_cohort_admissions
-                > 0,
-            "duplicate RPQ parents never crossed into the eager regime: {:#?}",
-            eager_duplicates.stats
+                .delta_terminal_eager_cohort_admissions,
+            0
         );
         assert_eq!(
             sparse_duplicates
@@ -17411,10 +18145,11 @@ mod tests {
                 .delta_terminal_eager_cohort_admissions,
             0
         );
+        assert!(eager_duplicates.stats.delta_terminal_calls > 0);
     }
 
     #[test]
-    fn eager_terminal_rpq_phase_matches_sparse_and_sequential_across_path_shapes() {
+    fn typed_terminal_rpq_matches_sparse_and_sequential_across_path_shapes() {
         use crate::debug::query::EstimateOverrideConstraint;
         use crate::id::{id_into_value, ExclusiveId, Id};
         use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
@@ -17476,25 +18211,30 @@ mod tests {
             ])
         };
 
-        // The opt-in must survive wrappers that preserve proposal semantics,
-        // while Ignore must suppress it when the proposed endpoint is hidden.
+        // RPQ deliberately declines the unbounded eager-proposal shortcut.
+        // Wrappers that preserve the concrete family still expose the typed
+        // program, while Ignore keeps its scope boundary opaque.
         let capability_ops = [PathOp::Attr(p.raw()), PathOp::Plus];
         let bound_vars = [0];
         let bound_rows = [source];
         let bound_view = RowsView::new(&bound_vars, &bound_rows);
         let boxed: Box<dyn Constraint<'static> + Send + Sync> =
             Box::new(make_path(&capability_ops));
-        assert!(boxed.residual_terminal_eager_proposal_equivalent(1, &bound_view));
+        assert!(!boxed.residual_terminal_eager_proposal_equivalent(1, &bound_view));
+        assert!(boxed.residual_program().is_some());
         let shared: Arc<dyn Constraint<'static> + Send + Sync> =
             Arc::new(make_path(&capability_ops));
-        assert!(shared.residual_terminal_eager_proposal_equivalent(1, &bound_view));
+        assert!(!shared.residual_terminal_eager_proposal_equivalent(1, &bound_view));
+        assert!(shared.residual_program().is_some());
         let estimated = EstimateOverrideConstraint::new(make_path(&capability_ops));
-        assert!(estimated.residual_terminal_eager_proposal_equivalent(1, &bound_view));
+        assert!(!estimated.residual_terminal_eager_proposal_equivalent(1, &bound_view));
+        assert!(estimated.residual_program().is_some());
         let visible = IgnoreConstraint::new(
             VariableSet::new_empty(),
             Box::new(make_path(&capability_ops)),
         );
-        assert!(visible.residual_terminal_eager_proposal_equivalent(1, &bound_view));
+        assert!(!visible.residual_terminal_eager_proposal_equivalent(1, &bound_view));
+        assert!(visible.residual_program().is_none());
         let hidden = IgnoreConstraint::new(
             VariableSet::new_singleton(1),
             Box::new(make_path(&capability_ops)),
@@ -17524,7 +18264,7 @@ mod tests {
 
         for (name, ops) in cases {
             let mut sequential: Vec<_> = Query::new(make(&ops), project).sequential().collect();
-            let mut eager = Query::new(make(&ops), project)
+            let mut typed = Query::new(make(&ops), project)
                 .solve_residual_state_lazy_with(ResidualLowering::new(
                     FormulaScope::OpaqueLeaves,
                     true,
@@ -17545,15 +18285,16 @@ mod tests {
             let mut sparse = sparse.collect_profiled();
 
             sequential.sort_unstable();
-            eager.results.sort_unstable();
+            typed.results.sort_unstable();
             sparse.results.sort_unstable();
-            assert_eq!(eager.results, sequential, "eager mismatch for {name}");
+            assert_eq!(typed.results, sequential, "typed mismatch for {name}");
             assert_eq!(sparse.results, sequential, "sparse mismatch for {name}");
             assert!(
-                eager.stats.delta_terminal_eager_cohort_admissions > 0,
-                "{name} never entered the eager terminal phase: {:#?}",
-                eager.stats
+                typed.stats.delta_terminal_calls > 0,
+                "{name} never entered typed terminal traversal: {:#?}",
+                typed.stats
             );
+            assert_eq!(typed.stats.delta_terminal_eager_cohort_admissions, 0);
             assert_eq!(
                 sparse.stats.delta_terminal_eager_cohort_admissions, 0,
                 "forced sparse control entered the eager phase for {name}"
@@ -17569,13 +18310,11 @@ mod tests {
                 .start_width(1)
                 .growth(2);
             let mut prefix = Vec::new();
-            while clone_source.stats().delta_terminal_eager_cohort_admissions == 0 {
-                prefix.push(
-                    clone_source
-                        .next()
-                        .unwrap_or_else(|| panic!("{name} drained before eager phase")),
-                );
-            }
+            prefix.push(
+                clone_source
+                    .next()
+                    .unwrap_or_else(|| panic!("{name} drained before typed publication")),
+            );
             let mut clone = clone_source.clone();
             drop(clone_source);
             prefix.extend(clone.by_ref());
@@ -19854,7 +20593,7 @@ mod tests {
     }
 
     #[test]
-    fn active_delta_seed_requires_one_parent_continuation_lineage() {
+    fn active_delta_seed_follows_every_exact_one_parent_activation() {
         let root = CapabilityLeaf {
             variable: 0,
             page_local: true,
@@ -19892,7 +20631,11 @@ mod tests {
 
         machine.last_selection = SelectionKind::Full;
         machine.accept_delta_seed(None, None, Some(active), 1, None, Vec::new(), Vec::new());
-        assert!(machine.active_delta.is_none());
+        assert_eq!(machine.active_delta, Some(active));
+
+        machine.last_selection = SelectionKind::Readiness;
+        machine.accept_delta_seed(None, None, Some(active), 1, None, Vec::new(), Vec::new());
+        assert_eq!(machine.active_delta, Some(active));
 
         machine.last_selection = SelectionKind::Continuation(ContinuationMode::ProbeOne);
         let stable = file(

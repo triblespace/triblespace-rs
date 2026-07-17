@@ -16,6 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Residual RPQs now execute through one typed affine program runtime.**
+  Occurrence-local program addresses erase each family once per dense cohort
+  while generational handles retain exact typed continuations, family-owned
+  novelty keys and finite ranks, and receipt-local `AfterChildren` joins.
+  Every RPQ Propose, Confirm, and Support shape—including inverse products,
+  same-variable duplicate bags, nullable graph-gated identities, and cyclic
+  fixpoints—uses this route without legacy transition-hook fallback. Generic
+  Search/Activation pacing keeps physical grants independent of family
+  telemetry; terminal cohorts allocate and advance sparse grants per affine
+  activation, so aggregate or truncated cohorts cannot manufacture widening.
 - **Demand-wide terminal RPQ admissions change execution regime without
   disturbing live sparse traversals.** When completed-yield evidence admits
   more than one new terminal parent in a turn, that exact suffix runs through

@@ -7,7 +7,6 @@ use crate::id::ID_LEN;
 use crate::inline::encodings::genid::GenId;
 use crate::inline::IntoInline;
 use crate::inline::RawInline;
-use crate::patch::PATCHBoundedInfixes;
 use crate::query::confirm_per_row;
 use crate::query::intersectionconstraint::IntersectionConstraint;
 use crate::query::residual::FrameSeedRow;
@@ -15,25 +14,29 @@ use crate::query::residual::ResidualLowering;
 use crate::query::residual::SeededResidualFrame;
 use crate::query::CandidateSink;
 use crate::query::Constraint;
+use crate::query::DispatchClass;
 use crate::query::EstimateSink;
-use crate::query::ResidualDeltaExpandBatch;
-use crate::query::ResidualDeltaExpandCursor;
-use crate::query::ResidualDeltaExpandPage;
-use crate::query::ResidualDeltaNode;
-use crate::query::ResidualDeltaOutput;
-use crate::query::ResidualDeltaSeed;
-use crate::query::ResidualDeltaSourceCursor;
-use crate::query::ResidualDeltaSourcePage;
+use crate::query::ProgramAction;
+use crate::query::ProgramGrouping;
+use crate::query::ProgramKey;
+use crate::query::ProgramPacing;
+use crate::query::ProgramRef;
+use crate::query::ProgramRequest;
+use crate::query::ProgramRoute;
+use crate::query::ProgramSeedBatch;
+use crate::query::ProgramStratum;
 use crate::query::RowsView;
 use crate::query::TriblePattern;
+use crate::query::TypedEffectSink;
+use crate::query::TypedProgramBatch;
+use crate::query::TypedProgramSpec;
+use crate::query::TypedResume;
+use crate::query::TypedSeedSink;
 use crate::query::Variable;
 use crate::query::VariableContext;
 use crate::query::VariableId;
 use crate::query::VariableSet;
-use crate::trible::EAVOrder;
 use crate::trible::TribleSet;
-use crate::trible::VAEOrder;
-use crate::trible::TRIBLE_LEN;
 
 // ── Path expression types ────────────────────────────────────────────────
 
@@ -1153,6 +1156,13 @@ pub struct RegularPathConstraint {
     /// one-time clone-and-invert at construction pays for
     /// itself.
     inverse_expr: PathExpr,
+    /// One-time structural FIRST/nullability analysis reused by every paged
+    /// source and partial-confirm receipt. Expression-size work must not hide
+    /// behind a per-candidate physical grant.
+    first: Box<[FirstStep]>,
+    inverse_first: Box<[FirstStep]>,
+    nullable: bool,
+    inverse_nullable: bool,
     /// Thompson-style transition programs for the forward and inverse
     /// expressions. Epsilon closure is compiled into each state's accepting bit
     /// and labeled frontier, so runtime residual nodes need only
@@ -1172,36 +1182,6 @@ enum DeltaStep {
     InverseNotAttr(RawId),
 }
 
-enum PositiveDeltaInfixes<'a> {
-    Empty,
-    Attr(PATCHBoundedInfixes<'a, TRIBLE_LEN, { ID_LEN * 2 }, 32, EAVOrder, ()>),
-    InverseAttr(PATCHBoundedInfixes<'a, TRIBLE_LEN, { 32 + ID_LEN }, ID_LEN, VAEOrder, ()>),
-}
-
-impl PositiveDeltaInfixes<'_> {
-    fn len(&self) -> usize {
-        match self {
-            Self::Empty => 0,
-            Self::Attr(infixes) => {
-                usize::try_from(infixes.len()).expect("bounded PATCH count must fit usize")
-            }
-            Self::InverseAttr(infixes) => {
-                usize::try_from(infixes.len()).expect("bounded PATCH count must fit usize")
-            }
-        }
-    }
-
-    fn for_each(self, mut for_each: impl FnMut(RawInline)) {
-        match self {
-            Self::Empty => {}
-            Self::Attr(infixes) => infixes.for_each(|value: &[u8; 32]| for_each(*value)),
-            Self::InverseAttr(infixes) => {
-                infixes.for_each(|entity: &[u8; ID_LEN]| for_each(id_into_value(entity)))
-            }
-        }
-    }
-}
-
 #[derive(Default)]
 struct ThompsonState {
     epsilon: Vec<u32>,
@@ -1212,9 +1192,133 @@ struct DeltaProgram {
     start: u32,
     accepting: Vec<bool>,
     steps: Vec<Vec<(DeltaStep, u32)>>,
+    finite_depth: Option<Box<[u32]>>,
 }
 
-enum ResidualDeltaRoute<'p> {
+#[derive(Clone, Copy, Debug)]
+struct RpqNode {
+    source: Option<RawInline>,
+    value: RawInline,
+    pc: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RpqOutput {
+    node: RpqNode,
+    accepted: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RpqSourceCursor {
+    Start,
+    After(RawInline),
+    /// Candidate-backed pages preserve reducer order and multiplicity by
+    /// indexing the immutable original slice directly. Graph-index pages use
+    /// `After` because their frontier is intrinsically value ordered.
+    Offset(usize),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RpqSourcePage {
+    next: Option<RpqSourceCursor>,
+    examined: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum RpqExpandCursor {
+    Start,
+    After { branch: u32, value: RawInline },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RpqExpandPage {
+    next: Option<RpqExpandCursor>,
+    examined: usize,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct RpqState(RpqStateKind);
+
+#[derive(Clone, Debug)]
+enum RpqStateKind {
+    Source {
+        variable: VariableId,
+        cursor: RpqSourceCursor,
+        roots: bool,
+    },
+    Transition {
+        variable: VariableId,
+        node: RpqNode,
+        cursor: RpqExpandCursor,
+    },
+    CandidateFilter {
+        variable: VariableId,
+        offset: usize,
+    },
+    Support,
+}
+
+impl RpqState {
+    fn source(variable: VariableId, cursor: RpqSourceCursor, roots: bool) -> Self {
+        Self(RpqStateKind::Source {
+            variable,
+            cursor,
+            roots,
+        })
+    }
+
+    fn transition(variable: VariableId, node: RpqNode, cursor: RpqExpandCursor) -> Self {
+        Self(RpqStateKind::Transition {
+            variable,
+            node,
+            cursor,
+        })
+    }
+
+    fn candidate_filter(variable: VariableId, offset: usize) -> Self {
+        Self(RpqStateKind::CandidateFilter { variable, offset })
+    }
+
+    fn support() -> Self {
+        Self(RpqStateKind::Support)
+    }
+
+    fn kind(&self) -> &RpqStateKind {
+        &self.0
+    }
+
+    fn into_kind(self) -> RpqStateKind {
+        self.0
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct RpqNoveltyKey {
+    source: Option<RawInline>,
+    value: RawInline,
+    pc: u32,
+}
+
+const RPQ_BOUND_FORWARD: ProgramKey = ProgramKey::new(0);
+const RPQ_BOUND_INVERSE: ProgramKey = ProgramKey::new(1);
+const RPQ_SAME_VARIABLE: ProgramKey = ProgramKey::new(2);
+const RPQ_FIRST_FORWARD: ProgramKey = ProgramKey::new(3);
+const RPQ_FIRST_INVERSE: ProgramKey = ProgramKey::new(4);
+const RPQ_CONFIRM_FIRST_FORWARD: ProgramKey = ProgramKey::new(5);
+const RPQ_CONFIRM_FIRST_INVERSE: ProgramKey = ProgramKey::new(6);
+const RPQ_SUPPORT_TRUE: ProgramKey = ProgramKey::new(7);
+
+const RPQ_SOURCE_START: DispatchClass = DispatchClass::new(0);
+const RPQ_SOURCE_AFTER: DispatchClass = DispatchClass::new(1);
+const RPQ_TRANSITION_START: DispatchClass = DispatchClass::new(2);
+const RPQ_TRANSITION_AFTER: DispatchClass = DispatchClass::new(3);
+const RPQ_CANDIDATE_FILTER: DispatchClass = DispatchClass::new(4);
+const RPQ_SUPPORT: DispatchClass = DispatchClass::new(5);
+const RPQ_SOURCE_OFFSET: DispatchClass = DispatchClass::new(6);
+
+enum RpqRoute<'p> {
     BoundEndpoint {
         source: VariableId,
         program: &'p DeltaProgram,
@@ -1303,7 +1407,44 @@ impl DeltaProgram {
             start: classes[self.start as usize],
             accepting,
             steps,
+            finite_depth: None,
         }
+    }
+
+    /// Longest-path rank for an acyclic epsilon-eliminated program.
+    /// Recurrent programs return `None`; their product edges require novelty.
+    fn acyclic_depths(&self) -> Option<Box<[u32]>> {
+        fn visit(
+            state: usize,
+            steps: &[Vec<(DeltaStep, u32)>],
+            marks: &mut [u8],
+            depths: &mut [u32],
+        ) -> Option<u32> {
+            match marks[state] {
+                1 => return None,
+                2 => return Some(depths[state]),
+                _ => {}
+            }
+            marks[state] = 1;
+            let mut depth = 0u32;
+            for &(_, target) in &steps[state] {
+                depth = depth.max(
+                    visit(target as usize, steps, marks, depths)?
+                        .checked_add(1)
+                        .expect("RPQ finite program depth exhausted"),
+                );
+            }
+            marks[state] = 2;
+            depths[state] = depth;
+            Some(depth)
+        }
+
+        let mut marks = vec![0u8; self.steps.len()];
+        let mut depths = vec![0u32; self.steps.len()];
+        for state in 0..self.steps.len() {
+            visit(state, &self.steps, &mut marks, &mut depths)?;
+        }
+        Some(depths.into_boxed_slice())
     }
 
     fn compile(expr: &PathExpr) -> Self {
@@ -1420,12 +1561,15 @@ impl DeltaProgram {
                     .collect(),
             );
         }
-        Self {
+        let mut program = Self {
             start,
             accepting,
             steps,
+            finite_depth: None,
         }
-        .quotient_bisimilar_states()
+        .quotient_bisimilar_states();
+        program.finite_depth = program.acyclic_depths();
+        program
     }
 
     fn encode(&self, state: u32) -> u32 {
@@ -1433,8 +1577,8 @@ impl DeltaProgram {
         state
     }
 
-    fn decode(&self, continuation: u32) -> usize {
-        let state = continuation as usize;
+    fn decode(&self, pc: u32) -> usize {
+        let state = pc as usize;
         assert!(state < self.steps.len(), "invalid RPQ delta continuation");
         state
     }
@@ -1459,13 +1603,30 @@ impl RegularPathConstraint {
     ) -> Self {
         let expr = PathExpr::from_postfix(ops);
         let inverse_expr = invert(expr.clone());
+        let mut first = Vec::new();
+        first_steps(&expr, &mut first);
+        let mut inverse_first = Vec::new();
+        first_steps(&inverse_expr, &mut inverse_first);
+        let expr_nullable = nullable(&expr);
+        let inverse_nullable = nullable(&inverse_expr);
         let delta_program = DeltaProgram::compile(&expr);
         let inverse_delta_program = DeltaProgram::compile(&inverse_expr);
+        if !has_repetition(&expr) {
+            assert!(
+                delta_program.finite_depth.is_some()
+                    && inverse_delta_program.finite_depth.is_some(),
+                "a repetition-free RPQ compiled to a cyclic transition program"
+            );
+        }
         RegularPathConstraint {
             start: start.index,
             end: end.index,
             expr,
             inverse_expr,
+            first: first.into_boxed_slice(),
+            inverse_first: inverse_first.into_boxed_slice(),
+            nullable: expr_nullable,
+            inverse_nullable,
             delta_program,
             inverse_delta_program,
             set,
@@ -1494,7 +1655,7 @@ impl RegularPathConstraint {
     /// intersection of the forward and inverse FIRST seed sets is an exact
     /// candidate superset and avoids roots that cannot possibly close.
     fn same_variable_sources(&self) -> Vec<RawInline> {
-        if nullable(&self.expr) {
+        if self.nullable {
             self.all_terms()
         } else {
             let firsts = first_step_seeds(&self.set, &self.expr);
@@ -1503,31 +1664,23 @@ impl RegularPathConstraint {
         }
     }
 
-    fn same_variable_source_output(
-        program: &DeltaProgram,
-        source: RawInline,
-    ) -> ResidualDeltaOutput {
-        ResidualDeltaOutput {
-            node: ResidualDeltaNode {
+    fn same_variable_source_output(program: &DeltaProgram, source: RawInline) -> RpqOutput {
+        RpqOutput {
+            node: RpqNode {
                 source: Some(source),
                 value: source,
-                continuation: program.encode(program.start),
+                pc: program.encode(program.start),
             },
             accepted: program.accepting[program.start as usize],
         }
     }
 
-    fn same_variable_source_is_exact(
-        &self,
-        source: &RawInline,
-        first: &[FirstStep],
-        last: &[FirstStep],
-    ) -> bool {
-        if nullable(&self.expr) {
+    fn same_variable_source_is_exact(&self, source: &RawInline) -> bool {
+        if self.nullable {
             is_graph_term(&self.set, source)
         } else {
-            can_take_first_step(&self.set, first, source)
-                && can_take_first_step(&self.set, last, source)
+            can_take_first_step(&self.set, &self.first, source)
+                && can_take_first_step(&self.set, &self.inverse_first, source)
         }
     }
 
@@ -1535,78 +1688,72 @@ impl RegularPathConstraint {
         &self,
         program: &DeltaProgram,
         candidates: Option<&[RawInline]>,
-        cursor: ResidualDeltaSourceCursor,
+        cursor: RpqSourceCursor,
         limit: usize,
-        roots: &mut Vec<ResidualDeltaOutput>,
-    ) -> ResidualDeltaSourcePage {
+        roots: &mut Vec<RpqOutput>,
+    ) -> RpqSourcePage {
         assert!(limit > 0, "residual source pages require positive demand");
-        let after = match cursor {
-            ResidualDeltaSourceCursor::Start => None,
-            ResidualDeltaSourceCursor::After(value) => Some(value),
-            ResidualDeltaSourceCursor::Offset(_) => {
-                panic!("regular-path source received an ordinal cursor")
-            }
-        };
-        let mut first = Vec::new();
-        let mut last = Vec::new();
-        first_steps(&self.expr, &mut first);
-        first_steps(&self.inverse_expr, &mut last);
-
         if let Some(candidates) = candidates {
-            debug_assert!(candidates.windows(2).all(|pair| pair[0] < pair[1]));
-            let begin = after.map_or(0, |after| {
-                candidates.partition_point(|candidate| *candidate <= after)
-            });
+            let begin = match cursor {
+                RpqSourceCursor::Start => 0,
+                RpqSourceCursor::Offset(offset) => offset,
+                RpqSourceCursor::After(_) => {
+                    panic!("candidate-backed RPQ source resumed with a graph cursor")
+                }
+            };
+            assert!(begin <= candidates.len());
             let end = begin.saturating_add(limit).min(candidates.len());
             for &source in &candidates[begin..end] {
-                if self.same_variable_source_is_exact(&source, &first, &last) {
+                if self.same_variable_source_is_exact(&source) {
                     roots.push(Self::same_variable_source_output(program, source));
                 }
             }
-            return ResidualDeltaSourcePage {
-                next: (end < candidates.len()).then(|| {
-                    ResidualDeltaSourceCursor::After(
-                        *candidates
-                            .get(end - 1)
-                            .expect("a nonterminal positive page examined a candidate"),
-                    )
-                }),
+            return RpqSourcePage {
+                next: (end < candidates.len()).then_some(RpqSourceCursor::Offset(end)),
                 examined: end - begin,
             };
         }
+
+        let after = match cursor {
+            RpqSourceCursor::Start => None,
+            RpqSourceCursor::After(value) => Some(value),
+            RpqSourceCursor::Offset(_) => {
+                panic!("graph-backed RPQ source resumed with a candidate offset")
+            }
+        };
 
         // Nullable NODES(G) is the sorted union of EAV subjects and VEA
         // values. A nonnullable source frontier is the sorted union of its
         // FIRST arms, followed by the exact inverse-FIRST (LAST) membership
         // test. Rejected LAST candidates still consume page budget: otherwise
         // a long negative prefix could hide unbounded work behind width one.
-        let source_steps: &[FirstStep] = if nullable(&self.expr) {
+        let source_steps: &[FirstStep] = if self.nullable {
             &[FirstStep::AnyFwd, FirstStep::AnyInv]
         } else {
-            &first
+            &self.first
         };
         let mut examined = 0usize;
         let mut current = after;
         while examined < limit {
             let Some(source) = next_first_source(&self.set, source_steps, current.as_ref()) else {
-                return ResidualDeltaSourcePage {
+                return RpqSourcePage {
                     next: None,
                     examined,
                 };
             };
             current = Some(source);
             examined += 1;
-            if nullable(&self.expr)
-                || (can_take_first_step(&self.set, &first, &source)
-                    && can_take_first_step(&self.set, &last, &source))
+            if self.nullable
+                || (can_take_first_step(&self.set, &self.first, &source)
+                    && can_take_first_step(&self.set, &self.inverse_first, &source))
             {
                 roots.push(Self::same_variable_source_output(program, source));
             }
         }
         let last_examined = current.expect("a full positive page examined a source");
-        ResidualDeltaSourcePage {
+        RpqSourcePage {
             next: next_first_source(&self.set, source_steps, Some(&last_examined))
-                .map(|_| ResidualDeltaSourceCursor::After(last_examined)),
+                .map(|_| RpqSourceCursor::After(last_examined)),
             examined,
         }
     }
@@ -1620,58 +1767,56 @@ impl RegularPathConstraint {
     fn first_binding_source_page(
         &self,
         variable: VariableId,
-        cursor: ResidualDeltaSourceCursor,
+        cursor: RpqSourceCursor,
         limit: usize,
         accepted: &mut Vec<RawInline>,
-    ) -> ResidualDeltaSourcePage {
+    ) -> RpqSourcePage {
         assert!(limit > 0, "residual source pages require positive demand");
-        let expr = if variable == self.start {
-            &self.expr
+        let (nullable, first) = if variable == self.start {
+            (self.nullable, self.first.as_ref())
         } else {
             assert_eq!(variable, self.end);
-            &self.inverse_expr
+            (self.inverse_nullable, self.inverse_first.as_ref())
         };
-        let nullable = nullable(expr);
-        let mut first = Vec::new();
-        first_steps(expr, &mut first);
         let exact = |source: &RawInline| {
             if nullable {
                 is_graph_term(&self.set, source)
             } else {
-                can_take_first_step(&self.set, &first, source)
+                can_take_first_step(&self.set, first, source)
             }
         };
         let after = match cursor {
-            ResidualDeltaSourceCursor::Start => None,
-            ResidualDeltaSourceCursor::After(value) => Some(value),
-            ResidualDeltaSourceCursor::Offset(_) => {
-                panic!("regular-path source received an ordinal cursor")
+            RpqSourceCursor::Start => None,
+            RpqSourceCursor::After(value) => Some(value),
+            RpqSourceCursor::Offset(_) => {
+                panic!("graph-backed RPQ source resumed with a candidate offset")
             }
         };
 
         let source_steps: &[FirstStep] = if nullable {
             &[FirstStep::AnyFwd, FirstStep::AnyInv]
         } else {
-            &first
+            first
         };
         let mut examined = 0usize;
         let mut current = after;
         while examined < limit {
             let Some(source) = next_first_source(&self.set, source_steps, current.as_ref()) else {
-                return ResidualDeltaSourcePage {
+                return RpqSourcePage {
                     next: None,
                     examined,
                 };
             };
             current = Some(source);
             examined += 1;
-            debug_assert!(exact(&source));
-            accepted.push(source);
+            if exact(&source) {
+                accepted.push(source);
+            }
         }
         let last_examined = current.expect("a full positive page examined a source");
-        ResidualDeltaSourcePage {
+        RpqSourcePage {
             next: next_first_source(&self.set, source_steps, Some(&last_examined))
-                .map(|_| ResidualDeltaSourceCursor::After(last_examined)),
+                .map(|_| RpqSourceCursor::After(last_examined)),
             examined,
         }
     }
@@ -1680,91 +1825,27 @@ impl RegularPathConstraint {
     /// same-variable source frontier. Finite and repeated expressions share the
     /// same product-state representation; the latter are the cyclic special
     /// case whose novelty set computes a least fixpoint.
-    fn residual_delta_program(&self, variable: VariableId) -> Option<ResidualDeltaRoute<'_>> {
+    fn program_for_variable(&self, variable: VariableId) -> Option<RpqRoute<'_>> {
         if self.start == self.end {
             if variable != self.start {
                 return None;
             }
-            return Some(ResidualDeltaRoute::SameVariable {
+            return Some(RpqRoute::SameVariable {
                 program: &self.delta_program,
             });
         }
         if variable == self.end {
-            Some(ResidualDeltaRoute::BoundEndpoint {
+            Some(RpqRoute::BoundEndpoint {
                 source: self.start,
                 program: &self.delta_program,
             })
         } else if variable == self.start {
-            Some(ResidualDeltaRoute::BoundEndpoint {
+            Some(RpqRoute::BoundEndpoint {
                 source: self.end,
                 program: &self.inverse_delta_program,
             })
         } else {
             None
-        }
-    }
-
-    fn expand_delta_program(
-        &self,
-        program: &DeltaProgram,
-        nodes: &[ResidualDeltaNode],
-        successors: &mut Vec<(u32, ResidualDeltaOutput)>,
-    ) {
-        for (index, node) in nodes.iter().enumerate() {
-            let index = u32::try_from(index).expect("too many residual delta nodes");
-            let state = program.decode(node.continuation);
-            for &(step, target) in &program.steps[state] {
-                let continuation = program.encode(target);
-                let mut push = |value| {
-                    let accepted = program.accepting[target as usize]
-                        && node.source.is_none_or(|anchor| value == anchor);
-                    successors.push((
-                        index,
-                        ResidualDeltaOutput {
-                            node: ResidualDeltaNode {
-                                source: node.source,
-                                value,
-                                continuation,
-                            },
-                            accepted,
-                        },
-                    ));
-                };
-                match step {
-                    DeltaStep::Attr(attribute) => {
-                        let Some(entity) = value_as_entity(&node.value) else {
-                            continue;
-                        };
-                        let mut prefix = [0u8; ID_LEN * 2];
-                        prefix[..ID_LEN].copy_from_slice(&entity);
-                        prefix[ID_LEN..].copy_from_slice(&attribute);
-                        self.set
-                            .eav
-                            .infixes::<{ ID_LEN * 2 }, 32, _>(&prefix, |value: &[u8; 32]| {
-                                push(*value)
-                            });
-                    }
-                    DeltaStep::InverseAttr(attribute) => {
-                        let mut prefix = [0u8; 32 + ID_LEN];
-                        prefix[..32].copy_from_slice(&node.value);
-                        prefix[32..].copy_from_slice(&attribute);
-                        self.set.vae.infixes::<{ 32 + ID_LEN }, ID_LEN, _>(
-                            &prefix,
-                            |entity: &[u8; ID_LEN]| push(id_into_value(entity)),
-                        );
-                    }
-                    DeltaStep::NotAttr(excluded) => {
-                        for value in eval_not_attr(&self.set, &excluded, &node.value) {
-                            push(value);
-                        }
-                    }
-                    DeltaStep::InverseNotAttr(excluded) => {
-                        for value in eval_not_attr_inverse(&self.set, &excluded, &node.value) {
-                            push(value);
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -1890,47 +1971,6 @@ impl RegularPathConstraint {
         }
     }
 
-    /// Locate a complete positive transition branch only when it fits in
-    /// `limit`. Negated branches return `None`: their destination predicate
-    /// makes raw frontier size a separate concern and they retain ordinary
-    /// paging.
-    ///
-    /// PATCH locates the fixed prefix once, checks the cached distinct-segment
-    /// count, and returns a borrowed view of that same subtree. The cohort can
-    /// therefore finish planning and reserve exactly before any enumeration.
-    fn bounded_positive_delta_infixes<'a>(
-        &'a self,
-        step: DeltaStep,
-        source: &RawInline,
-        limit: usize,
-    ) -> Option<PositiveDeltaInfixes<'a>> {
-        let limit = u64::try_from(limit).unwrap_or(u64::MAX);
-        match step {
-            DeltaStep::Attr(attribute) => {
-                let Some(entity) = value_as_entity(source) else {
-                    return Some(PositiveDeltaInfixes::Empty);
-                };
-                let mut prefix = [0u8; ID_LEN * 2];
-                prefix[..ID_LEN].copy_from_slice(&entity);
-                prefix[ID_LEN..].copy_from_slice(&attribute);
-                self.set
-                    .eav
-                    .bounded_infixes(&prefix, limit)
-                    .map(PositiveDeltaInfixes::Attr)
-            }
-            DeltaStep::InverseAttr(attribute) => {
-                let mut prefix = [0u8; 32 + ID_LEN];
-                prefix[..32].copy_from_slice(source);
-                prefix[32..].copy_from_slice(&attribute);
-                self.set
-                    .vae
-                    .bounded_infixes(&prefix, limit)
-                    .map(PositiveDeltaInfixes::InverseAttr)
-            }
-            DeltaStep::NotAttr(_) | DeltaStep::InverseNotAttr(_) => None,
-        }
-    }
-
     fn pageable_delta_value_is_included(
         &self,
         step: DeltaStep,
@@ -1949,14 +1989,14 @@ impl RegularPathConstraint {
     fn next_pageable_delta_successor(
         &self,
         program: &DeltaProgram,
-        node: ResidualDeltaNode,
-        cursor: ResidualDeltaExpandCursor,
+        node: RpqNode,
+        cursor: RpqExpandCursor,
     ) -> Option<(u32, DeltaStep, RawInline, u32)> {
-        let state = program.decode(node.continuation);
+        let state = program.decode(node.pc);
         let steps = &program.steps[state];
         let (start_branch, after) = match cursor {
-            ResidualDeltaExpandCursor::Start => (0usize, None),
-            ResidualDeltaExpandCursor::After { branch, value } => {
+            RpqExpandCursor::Start => (0usize, None),
+            RpqExpandCursor::After { branch, value } => {
                 let branch = usize::try_from(branch).expect("RPQ branch index does not fit usize");
                 assert!(branch < steps.len(), "invalid RPQ transition-page cursor");
                 (branch, Some(value))
@@ -1981,20 +2021,20 @@ impl RegularPathConstraint {
     fn expand_delta_program_page(
         &self,
         program: &DeltaProgram,
-        node: ResidualDeltaNode,
-        cursor: ResidualDeltaExpandCursor,
+        node: RpqNode,
+        cursor: RpqExpandCursor,
         limit: usize,
-        successors: &mut Vec<ResidualDeltaOutput>,
-    ) -> Option<ResidualDeltaExpandPage> {
+        successors: &mut Vec<RpqOutput>,
+    ) -> Option<RpqExpandPage> {
         assert!(
             limit > 0,
             "residual transition pages require positive demand"
         );
-        let state = program.decode(node.continuation);
+        let state = program.decode(node.pc);
         if program.steps[state].is_empty() {
             assert_eq!(
                 cursor,
-                ResidualDeltaExpandCursor::Start,
+                RpqExpandCursor::Start,
                 "an RPQ transition page became unsupported after suspension"
             );
             return None;
@@ -2011,13 +2051,13 @@ impl RegularPathConstraint {
                 break;
             };
             examined += 1;
-            resume = ResidualDeltaExpandCursor::After { branch, value };
+            resume = RpqExpandCursor::After { branch, value };
             if self.pageable_delta_value_is_included(step, &node.value, &value) {
-                successors.push(ResidualDeltaOutput {
-                    node: ResidualDeltaNode {
+                successors.push(RpqOutput {
+                    node: RpqNode {
                         source: node.source,
                         value,
-                        continuation: program.encode(target),
+                        pc: program.encode(target),
                     },
                     accepted: program.accepting[target as usize]
                         && node.source.is_none_or(|anchor| value == anchor),
@@ -2030,7 +2070,7 @@ impl RegularPathConstraint {
                 .next_pageable_delta_successor(program, node, resume)
                 .is_some())
         .then_some(resume);
-        Some(ResidualDeltaExpandPage { next, examined })
+        Some(RpqExpandPage { next, examined })
     }
 }
 
@@ -2150,7 +2190,7 @@ impl RegularPathConstraint {
             // EvalRPQ_VV seed restriction, generalised from "first
             // IRI of a + expression" to the FIRST set of any
             // expression.
-            if nullable(&self.expr) {
+            if self.nullable {
                 proposals.extend(self.all_terms());
             } else if variable == self.start {
                 proposals.extend(first_step_seeds(&self.set, &self.expr));
@@ -2178,24 +2218,519 @@ impl RegularPathConstraint {
             if let Some(end_val) = end_val {
                 let end_val = *end_val;
                 proposals.retain(|v| has_path_gated(&self.set, &self.expr, v, &end_val));
-            } else if !nullable(&self.expr) {
+            } else if !self.nullable {
                 // End unbound: a non-nullable path from `v` exists
                 // only if `v` can take a FIRST step — one prefix
                 // probe per FIRST entry. Exact (necessary condition
                 // for ∃ end), and prunes join candidates early.
-                let mut steps = Vec::new();
-                first_steps(&self.expr, &mut steps);
-                proposals.retain(|v| can_take_first_step(&self.set, &steps, v));
+                proposals.retain(|v| can_take_first_step(&self.set, &self.first, v));
             }
         } else if variable == self.end {
             if let Some(start_val) = start_val {
                 let start_val = *start_val;
                 proposals.retain(|v| has_path_gated(&self.set, &self.expr, &start_val, v));
-            } else if !nullable(&self.expr) {
-                let mut steps = Vec::new();
-                first_steps(&self.inverse_expr, &mut steps);
-                proposals.retain(|v| can_take_first_step(&self.set, &steps, v));
+            } else if !self.inverse_nullable {
+                proposals.retain(|v| can_take_first_step(&self.set, &self.inverse_first, v));
             }
+        }
+    }
+}
+
+impl TypedProgramSpec for RegularPathConstraint {
+    type State = RpqState;
+    type NoveltyKey = RpqNoveltyKey;
+    type Rank = [u64; 8];
+
+    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+        let repeated = has_repetition(&self.expr);
+        let stratum = if repeated {
+            ProgramStratum::Fixpoint
+        } else {
+            ProgramStratum::Finite
+        };
+        let route = match request.action {
+            ProgramAction::Support => {
+                if request.bound.is_set(self.start) && request.bound.is_set(self.end) {
+                    ProgramRoute {
+                        key: if self.start == self.end {
+                            RPQ_SAME_VARIABLE
+                        } else {
+                            RPQ_BOUND_FORWARD
+                        },
+                        variable: self.end,
+                        stratum,
+                        grouping: ProgramGrouping::ParentAtomic,
+                    }
+                } else {
+                    // Ordinary `satisfied` is deliberately optimistic while
+                    // either endpoint is absent. Keep that structural
+                    // disposition inside the typed family as an explicit
+                    // Boolean effect rather than a manufactured value.
+                    ProgramRoute {
+                        key: RPQ_SUPPORT_TRUE,
+                        variable: self.end,
+                        stratum: ProgramStratum::Finite,
+                        grouping: ProgramGrouping::PageLocal,
+                    }
+                }
+            }
+            ProgramAction::Propose(variable) | ProgramAction::Confirm(variable) => {
+                if request.bound.is_set(variable)
+                    || (variable != self.start && variable != self.end)
+                {
+                    return None;
+                }
+                let confirming = matches!(request.action, ProgramAction::Confirm(_));
+                if self.start == self.end {
+                    ProgramRoute {
+                        key: RPQ_SAME_VARIABLE,
+                        variable,
+                        stratum,
+                        grouping: if confirming && repeated {
+                            ProgramGrouping::ParentAtomic
+                        } else {
+                            ProgramGrouping::PageLocal
+                        },
+                    }
+                } else {
+                    let (opposite, bound_key, first_key, confirm_first_key) =
+                        if variable == self.end {
+                            (
+                                self.start,
+                                RPQ_BOUND_FORWARD,
+                                RPQ_FIRST_FORWARD,
+                                RPQ_CONFIRM_FIRST_FORWARD,
+                            )
+                        } else {
+                            (
+                                self.end,
+                                RPQ_BOUND_INVERSE,
+                                RPQ_FIRST_INVERSE,
+                                RPQ_CONFIRM_FIRST_INVERSE,
+                            )
+                        };
+                    if request.bound.is_set(opposite) {
+                        ProgramRoute {
+                            key: bound_key,
+                            variable,
+                            stratum,
+                            grouping: if confirming && repeated {
+                                ProgramGrouping::ParentAtomic
+                            } else {
+                                ProgramGrouping::PageLocal
+                            },
+                        }
+                    } else if matches!(request.action, ProgramAction::Propose(_)) {
+                        // First-endpoint paging is a finite direct observation
+                        // source even when the later bound-endpoint product
+                        // route computes a fixpoint.
+                        ProgramRoute {
+                            key: first_key,
+                            variable,
+                            stratum: ProgramStratum::Finite,
+                            grouping: ProgramGrouping::PageLocal,
+                        }
+                    } else {
+                        // With the opposite endpoint absent, confirmation is
+                        // the finite existential FIRST-step filter over the
+                        // activation's candidate set. Nullable paths retain
+                        // every candidate, matching the ordinary optimistic
+                        // partial-binding law.
+                        ProgramRoute {
+                            key: confirm_first_key,
+                            variable,
+                            stratum: ProgramStratum::Finite,
+                            grouping: ProgramGrouping::PageLocal,
+                        }
+                    }
+                }
+            }
+        };
+        Some(route)
+    }
+
+    fn dispatch(&self, state: &Self::State) -> DispatchClass {
+        match state.kind() {
+            RpqStateKind::Source {
+                cursor: RpqSourceCursor::Start,
+                ..
+            } => RPQ_SOURCE_START,
+            RpqStateKind::Source {
+                cursor: RpqSourceCursor::After(_),
+                ..
+            } => RPQ_SOURCE_AFTER,
+            RpqStateKind::Source {
+                cursor: RpqSourceCursor::Offset(_),
+                ..
+            } => RPQ_SOURCE_OFFSET,
+            RpqStateKind::Transition {
+                cursor: RpqExpandCursor::Start,
+                ..
+            } => RPQ_TRANSITION_START,
+            RpqStateKind::Transition {
+                cursor: RpqExpandCursor::After { .. },
+                ..
+            } => RPQ_TRANSITION_AFTER,
+            RpqStateKind::CandidateFilter { .. } => RPQ_CANDIDATE_FILTER,
+            RpqStateKind::Support => RPQ_SUPPORT,
+        }
+    }
+
+    fn pacing(&self, state: &Self::State) -> ProgramPacing {
+        match state.kind() {
+            RpqStateKind::Source { .. }
+            | RpqStateKind::CandidateFilter { .. }
+            | RpqStateKind::Support => ProgramPacing::Search,
+            RpqStateKind::Transition { .. } => ProgramPacing::Activation,
+        }
+    }
+
+    fn progress(&self, state: &Self::State) -> Self::Rank {
+        fn complemented_value_words(value: &RawInline) -> [u64; 4] {
+            std::array::from_fn(|word| {
+                let begin = word * 8;
+                !u64::from_be_bytes(value[begin..begin + 8].try_into().unwrap())
+            })
+        }
+
+        let mut rank = [0u64; 8];
+        match state.kind() {
+            RpqStateKind::Support => {}
+            RpqStateKind::CandidateFilter { offset, .. } => {
+                rank[0] = 1;
+                rank[1] = u64::MAX
+                    - u64::try_from(*offset).expect("RPQ candidate offset exceeds rank limb");
+            }
+            RpqStateKind::Transition {
+                variable,
+                node,
+                cursor,
+            } => {
+                rank[0] = 2;
+                let program = match self
+                    .program_for_variable(*variable)
+                    .expect("ranked RPQ transition lost its program")
+                {
+                    RpqRoute::BoundEndpoint { program, .. }
+                    | RpqRoute::SameVariable { program } => program,
+                };
+                rank[1] = program
+                    .finite_depth
+                    .as_deref()
+                    .map_or(0, |depths| depths[program.decode(node.pc)] as u64);
+                match cursor {
+                    RpqExpandCursor::Start => rank[2] = u64::MAX,
+                    RpqExpandCursor::After { branch, value } => {
+                        rank[2] = u64::MAX - 1;
+                        rank[3] = !u64::from(*branch);
+                        rank[4..].copy_from_slice(&complemented_value_words(value));
+                    }
+                }
+            }
+            RpqStateKind::Source { cursor, .. } => {
+                rank[0] = 3;
+                match cursor {
+                    RpqSourceCursor::Start => rank[2] = u64::MAX,
+                    RpqSourceCursor::After(value) => {
+                        rank[2] = u64::MAX - 2;
+                        rank[4..].copy_from_slice(&complemented_value_words(value));
+                    }
+                    RpqSourceCursor::Offset(offset) => {
+                        rank[2] = u64::MAX - 1;
+                        rank[3] = u64::MAX
+                            - u64::try_from(*offset).expect("RPQ source offset exceeds rank limb");
+                    }
+                }
+            }
+        }
+        rank
+    }
+
+    fn seed_typed(
+        &self,
+        batch: ProgramSeedBatch<'_>,
+        effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+    ) {
+        debug_assert_eq!(batch.view.len(), batch.activations.len());
+        if batch.route.key == RPQ_SUPPORT_TRUE {
+            for parent in 0..batch.view.len() {
+                effects.finite_root(
+                    u32::try_from(parent).expect("too many RPQ program parents"),
+                    RpqState::support(),
+                    None,
+                );
+            }
+            return;
+        }
+        if batch.route.key == RPQ_CONFIRM_FIRST_FORWARD
+            || batch.route.key == RPQ_CONFIRM_FIRST_INVERSE
+        {
+            debug_assert!(matches!(batch.request.action, ProgramAction::Confirm(_)));
+            for parent in 0..batch.view.len() {
+                effects.finite_root(
+                    u32::try_from(parent).expect("too many RPQ program parents"),
+                    RpqState::candidate_filter(batch.route.variable, 0),
+                    None,
+                );
+            }
+            return;
+        }
+        let direct_source =
+            batch.route.key == RPQ_FIRST_FORWARD || batch.route.key == RPQ_FIRST_INVERSE;
+        let same_source = batch.route.key == RPQ_SAME_VARIABLE
+            && !matches!(batch.request.action, ProgramAction::Support);
+        if direct_source || same_source {
+            for parent in 0..batch.view.len() {
+                effects.finite_root(
+                    u32::try_from(parent).expect("too many RPQ program parents"),
+                    RpqState::source(batch.route.variable, RpqSourceCursor::Start, same_source),
+                    None,
+                );
+            }
+            return;
+        }
+
+        let (program, source_column) = match batch.request.action {
+            ProgramAction::Support => (&self.delta_program, batch.view.col(self.start)),
+            ProgramAction::Propose(_) | ProgramAction::Confirm(_) => {
+                match self
+                    .program_for_variable(batch.route.variable)
+                    .expect("constructed RPQ route lost its program")
+                {
+                    RpqRoute::BoundEndpoint { source, program } => {
+                        (program, batch.view.col(source))
+                    }
+                    RpqRoute::SameVariable { .. } => {
+                        unreachable!("same-variable action was not seeded as a source")
+                    }
+                }
+            }
+        };
+        let source_column = source_column.expect("constructed RPQ route lost its bound endpoint");
+        let target_column = matches!(batch.request.action, ProgramAction::Support).then(|| {
+            batch
+                .view
+                .col(self.end)
+                .expect("RPQ Support route lost its target")
+        });
+        for (parent, row) in batch.view.iter().enumerate() {
+            let value = row[source_column];
+            let anchor = target_column.map(|column| row[column]);
+            let node = RpqNode {
+                source: anchor,
+                value,
+                pc: program.encode(program.start),
+            };
+            let accepted = program.accepting[program.start as usize]
+                && anchor.is_none_or(|target| target == value)
+                && is_graph_term(&self.set, &value);
+            let parent = u32::try_from(parent).expect("too many RPQ program parents");
+            let state = RpqState::transition(batch.route.variable, node, RpqExpandCursor::Start);
+            let accepted = accepted.then_some(value);
+            match batch.route.stratum {
+                ProgramStratum::Finite => effects.finite_root(parent, state, accepted),
+                ProgramStratum::Fixpoint => effects.fixpoint_root(
+                    parent,
+                    state,
+                    RpqNoveltyKey {
+                        source: node.source,
+                        value: node.value,
+                        pc: node.pc,
+                    },
+                    accepted,
+                ),
+            }
+        }
+    }
+
+    fn step_typed(
+        &self,
+        states: Vec<Self::State>,
+        batch: TypedProgramBatch<'_>,
+        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+    ) {
+        assert_eq!(states.len(), batch.view.len());
+        if states
+            .first()
+            .is_some_and(|state| matches!(state.kind(), RpqStateKind::Support))
+        {
+            for (input, state) in states.into_iter().enumerate() {
+                let RpqStateKind::Support = state.into_kind() else {
+                    panic!("one typed RPQ support cohort mixed continuation variants")
+                };
+                let input = u32::try_from(input).expect("too many typed RPQ inputs in one cohort");
+                effects.support(input);
+                // This is a finite structural Boolean disposition, not a
+                // graph transition. Its positive generic work receipt still
+                // budgets the typed effect, while RPQ transition telemetry
+                // remains reserved for product-state adjacency work.
+                effects.page(1, None);
+            }
+            return;
+        }
+        if states
+            .first()
+            .is_some_and(|state| matches!(state.kind(), RpqStateKind::CandidateFilter { .. }))
+        {
+            for (input, state) in states.into_iter().enumerate() {
+                let RpqStateKind::CandidateFilter { variable, offset } = state.into_kind() else {
+                    panic!("one typed RPQ candidate cohort mixed continuation variants")
+                };
+                let candidates = batch.candidate_sets[input]
+                    .expect("typed RPQ confirmation filter lost its candidate set");
+                assert!(offset <= candidates.len());
+                let end = offset
+                    .saturating_add(batch.limits[input])
+                    .min(candidates.len());
+                let (nullable, first) = if variable == self.start {
+                    (self.nullable, self.first.as_ref())
+                } else {
+                    assert_eq!(variable, self.end);
+                    (self.inverse_nullable, self.inverse_first.as_ref())
+                };
+                let input_tag =
+                    u32::try_from(input).expect("too many typed RPQ inputs in one cohort");
+                for &candidate in &candidates[offset..end] {
+                    if nullable || can_take_first_step(&self.set, first, &candidate) {
+                        effects.accept(input_tag, candidate);
+                    }
+                }
+                let resume = (end < candidates.len())
+                    .then(|| TypedResume::Immediate(RpqState::candidate_filter(variable, end)));
+                // Candidate filtering is a finite confirmation receipt, not
+                // product-state adjacency. The generic page budget accounts
+                // its probes; RPQ transition telemetry remains comparable to
+                // the historical traversal counters.
+                effects.page(end - offset, resume);
+            }
+            return;
+        }
+        if states
+            .first()
+            .is_some_and(|state| matches!(state.kind(), RpqStateKind::Source { .. }))
+        {
+            for (input, state) in states.into_iter().enumerate() {
+                let RpqStateKind::Source {
+                    variable,
+                    cursor,
+                    roots,
+                } = state.into_kind()
+                else {
+                    panic!("one typed RPQ source cohort mixed continuation variants")
+                };
+                let limit = batch.limits[input];
+                let mut root_outputs = Vec::new();
+                let mut direct = Vec::new();
+                let page = if roots {
+                    let program = match self
+                        .program_for_variable(variable)
+                        .expect("same-variable RPQ source lost its program")
+                    {
+                        RpqRoute::SameVariable { program } => program,
+                        RpqRoute::BoundEndpoint { .. } => {
+                            panic!("root-producing source changed RPQ route")
+                        }
+                    };
+                    self.same_variable_source_page(
+                        program,
+                        batch.candidate_sets[input],
+                        cursor,
+                        limit,
+                        &mut root_outputs,
+                    )
+                } else {
+                    self.first_binding_source_page(variable, cursor, limit, &mut direct)
+                };
+                let input_tag =
+                    u32::try_from(input).expect("too many typed RPQ inputs in one cohort");
+                for output in root_outputs.iter().copied() {
+                    let node = output.node;
+                    let state = RpqState::transition(variable, node, RpqExpandCursor::Start);
+                    let accepted = output.accepted.then_some(node.value);
+                    match batch.stratum {
+                        ProgramStratum::Finite => effects.finite_child(input_tag, state, accepted),
+                        ProgramStratum::Fixpoint => effects.fixpoint_child(
+                            input_tag,
+                            state,
+                            RpqNoveltyKey {
+                                source: node.source,
+                                value: node.value,
+                                pc: node.pc,
+                            },
+                            accepted,
+                        ),
+                    }
+                }
+                for value in direct {
+                    effects.direct(input_tag, value);
+                }
+                let resume = match page.next {
+                    Some(cursor) => Some(TypedResume::AfterChildren(RpqState::source(
+                        variable, cursor, roots,
+                    ))),
+                    None if !root_outputs.is_empty() => Some(TypedResume::AfterChildrenDone),
+                    None => None,
+                };
+                effects.account_source(page.examined, root_outputs.len());
+                effects.page(page.examined, resume);
+            }
+            return;
+        }
+
+        for (input, state) in states.into_iter().enumerate() {
+            let RpqStateKind::Transition {
+                variable,
+                node,
+                cursor,
+            } = state.into_kind()
+            else {
+                panic!("one typed RPQ transition cohort mixed continuation variants")
+            };
+            let program = match self
+                .program_for_variable(variable)
+                .expect("typed RPQ transition lost its program")
+            {
+                RpqRoute::BoundEndpoint { program, .. } | RpqRoute::SameVariable { program } => {
+                    program
+                }
+            };
+            let mut successors = Vec::new();
+            let page = self.expand_delta_program_page(
+                program,
+                node,
+                cursor,
+                batch.limits[input],
+                &mut successors,
+            );
+            let input_tag = u32::try_from(input).expect("too many typed RPQ transition inputs");
+            for output in successors {
+                let child = output.node;
+                let state = RpqState::transition(variable, child, RpqExpandCursor::Start);
+                let accepted = output.accepted.then_some(child.value);
+                match batch.stratum {
+                    ProgramStratum::Finite => effects.finite_child(input_tag, state, accepted),
+                    ProgramStratum::Fixpoint => effects.fixpoint_child(
+                        input_tag,
+                        state,
+                        RpqNoveltyKey {
+                            source: child.source,
+                            value: child.value,
+                            pc: child.pc,
+                        },
+                        accepted,
+                    ),
+                }
+            }
+            let (examined, resume) = page.map_or((0, None), |page| {
+                effects.account_transition(page.examined);
+                (
+                    page.examined,
+                    page.next.map(|cursor| {
+                        TypedResume::Immediate(RpqState::transition(variable, node, cursor))
+                    }),
+                )
+            });
+            effects.page(examined, resume);
         }
     }
 }
@@ -2270,327 +2805,8 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         true
     }
 
-    fn residual_delta_confirm_grouping_requirements(
-        &self,
-        variable: VariableId,
-    ) -> Option<VariableSet> {
-        if !has_repetition(&self.expr) || (variable != self.start && variable != self.end) {
-            return None;
-        }
-
-        // A repeated path confirmation only enters the quiescent transition
-        // reducer when its opposite endpoint is already bound. With neither
-        // endpoint bound, confirm_row merely filters direct first-step
-        // candidates and is homomorphic over candidate pages.
-        if self.start == self.end {
-            Some(VariableSet::new_empty())
-        } else if variable == self.start {
-            Some(VariableSet::new_singleton(self.end))
-        } else {
-            Some(VariableSet::new_singleton(self.start))
-        }
-    }
-
-    fn residual_delta_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
-        matches!(
-            self.residual_delta_program(variable),
-            Some(ResidualDeltaRoute::SameVariable { .. })
-        ) && view.col(variable).is_none()
-    }
-
-    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
-        if view.col(variable).is_some() {
-            return false;
-        }
-        matches!(
-            self.residual_delta_program(variable),
-            Some(ResidualDeltaRoute::BoundEndpoint { source, .. })
-                if view.col(source).is_none()
-        )
-    }
-
-    fn residual_terminal_eager_proposal_equivalent(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-    ) -> bool {
-        if view.col(variable).is_some() {
-            return false;
-        }
-        matches!(
-            self.residual_delta_program(variable),
-            Some(ResidualDeltaRoute::BoundEndpoint { source, .. })
-                if view.col(source).is_some()
-        )
-    }
-
-    fn residual_proposal_source_has_transition_roots(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-    ) -> bool {
-        self.residual_proposal_source_is_paged(variable, view)
-    }
-
-    fn residual_delta_source_page(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: Option<&[RawInline]>,
-        cursor: ResidualDeltaSourceCursor,
-        limit: usize,
-        roots: &mut Vec<ResidualDeltaOutput>,
-        accepted: &mut Vec<RawInline>,
-    ) -> Option<ResidualDeltaSourcePage> {
-        if view.len() != 1 || view.col(variable).is_some() {
-            return None;
-        }
-        match self.residual_delta_program(variable)? {
-            ResidualDeltaRoute::SameVariable { program } => {
-                Some(self.same_variable_source_page(program, candidates, cursor, limit, roots))
-            }
-            ResidualDeltaRoute::BoundEndpoint { source, .. } if view.col(source).is_none() => {
-                Some(self.first_binding_source_page(variable, cursor, limit, accepted))
-            }
-            ResidualDeltaRoute::BoundEndpoint { .. } => None,
-        }
-    }
-
-    fn residual_delta_seeds(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        seeds: &mut Vec<ResidualDeltaSeed>,
-    ) -> bool {
-        let Some(route) = self.residual_delta_program(variable) else {
-            return false;
-        };
-        match route {
-            ResidualDeltaRoute::BoundEndpoint { source, program } => {
-                let Some(column) = view.col(source) else {
-                    return false;
-                };
-                seeds.extend(view.iter().enumerate().map(|(parent, row)| {
-                    let value = row[column];
-                    ResidualDeltaSeed {
-                        parent: u32::try_from(parent).expect("too many residual parent rows"),
-                        output: ResidualDeltaOutput {
-                            node: ResidualDeltaNode {
-                                source: None,
-                                value,
-                                continuation: program.encode(program.start),
-                            },
-                            accepted: program.accepting[program.start as usize]
-                                && is_graph_term(&self.set, &value),
-                        },
-                    }
-                }));
-            }
-            ResidualDeltaRoute::SameVariable { program } => {
-                let _ = program;
-                // Same-variable roots are supplied exclusively through the
-                // bounded source-page hook. Falling back to this eager hook
-                // would silently restore a graph-universe bootstrap scan.
-                return false;
-            }
-        }
-        true
-    }
-
-    fn residual_delta_support_seeds(
-        &self,
-        view: &RowsView<'_>,
-        seeds: &mut Vec<ResidualDeltaSeed>,
-    ) -> Option<VariableId> {
-        let start = view.col(self.start)?;
-        let end = view.col(self.end)?;
-        let program = &self.delta_program;
-        seeds.extend(view.iter().enumerate().map(|(parent, row)| {
-            let source = row[start];
-            let target = row[end];
-            ResidualDeltaSeed {
-                parent: u32::try_from(parent).expect("too many residual parent rows"),
-                output: ResidualDeltaOutput {
-                    node: ResidualDeltaNode {
-                        source: Some(target),
-                        value: source,
-                        continuation: program.encode(program.start),
-                    },
-                    // SPARQL zero-length paths range over NODES(G), not every
-                    // representable inline value. Non-epsilon witnesses cross
-                    // a real edge and therefore establish graph membership by
-                    // construction during expansion.
-                    accepted: program.accepting[program.start as usize]
-                        && source == target
-                        && is_graph_term(&self.set, &source),
-                },
-            }
-        }));
-        Some(self.end)
-    }
-
-    fn residual_delta_expand_page(
-        &self,
-        variable: VariableId,
-        node: ResidualDeltaNode,
-        cursor: ResidualDeltaExpandCursor,
-        limit: usize,
-        successors: &mut Vec<ResidualDeltaOutput>,
-    ) -> Option<ResidualDeltaExpandPage> {
-        let route = self.residual_delta_program(variable)?;
-        let program = match route {
-            ResidualDeltaRoute::BoundEndpoint { program, .. } => program,
-            ResidualDeltaRoute::SameVariable { program } => {
-                assert!(
-                    node.source.is_some(),
-                    "same-variable delta activation lost its source anchor"
-                );
-                program
-            }
-        };
-        self.expand_delta_program_page(program, node, cursor, limit, successors)
-    }
-
-    fn residual_delta_expand_pages(
-        &self,
-        variable: VariableId,
-        batch: ResidualDeltaExpandBatch<'_>,
-        pages: &mut Vec<Option<ResidualDeltaExpandPage>>,
-        successors: &mut Vec<(u32, ResidualDeltaOutput)>,
-    ) {
-        assert_eq!(batch.nodes.len(), batch.cursors.len());
-        assert_eq!(batch.nodes.len(), batch.limits.len());
-        let Some(route) = self.residual_delta_program(variable) else {
-            pages.resize(pages.len() + batch.nodes.len(), None);
-            return;
-        };
-        let program = match route {
-            ResidualDeltaRoute::BoundEndpoint { program, .. } => program,
-            ResidualDeltaRoute::SameVariable { program } => {
-                assert!(
-                    batch.nodes.iter().all(|node| node.source.is_some()),
-                    "same-variable delta activation lost its source anchor"
-                );
-                program
-            }
-        };
-
-        // A cohort of fresh positive frontiers whose complete fanouts fit can
-        // use PATCH's native bulk traversal. Each branch locates its prefix
-        // once, proves the page terminal from the cached segment count, and
-        // retains that subtree until the complete cohort has proved eligible.
-        // This avoids duplicate prefix descent and per-successor lower-bound
-        // work while preserving exact preallocation and atomic fallback.
-        let mut plans = Vec::new();
-        let mut fanouts = Vec::with_capacity(batch.nodes.len());
-        let mut all_fit = true;
-        'rows: for (row, ((&node, &cursor), &limit)) in batch
-            .nodes
-            .iter()
-            .zip(batch.cursors)
-            .zip(batch.limits)
-            .enumerate()
-        {
-            if cursor != ResidualDeltaExpandCursor::Start {
-                all_fit = false;
-                break;
-            }
-            let state = program.decode(node.continuation);
-            if program.steps[state].is_empty() {
-                all_fit = false;
-                break;
-            }
-            let row = u32::try_from(row).expect("too many RPQ transition pages in one cohort");
-            let mut fanout = 0usize;
-            for &(step, target) in &program.steps[state] {
-                debug_assert!(
-                    fanout <= limit,
-                    "each accepted transition branch must fit the remaining page budget"
-                );
-                let Some(infixes) =
-                    self.bounded_positive_delta_infixes(step, &node.value, limit - fanout)
-                else {
-                    all_fit = false;
-                    break 'rows;
-                };
-                let branch_fanout = infixes.len();
-                fanout += branch_fanout;
-                plans.push((row, node, target, infixes));
-            }
-            fanouts.push(fanout);
-        }
-        if all_fit {
-            successors.reserve(fanouts.iter().sum());
-            for (row, node, target, infixes) in plans {
-                let continuation = program.encode(target);
-                infixes.for_each(|value| {
-                    let accepted = program.accepting[target as usize]
-                        && node.source.is_none_or(|anchor| value == anchor);
-                    successors.push((
-                        row,
-                        ResidualDeltaOutput {
-                            node: ResidualDeltaNode {
-                                source: node.source,
-                                value,
-                                continuation,
-                            },
-                            accepted,
-                        },
-                    ));
-                });
-            }
-            pages.extend(fanouts.into_iter().map(|examined| {
-                Some(ResidualDeltaExpandPage {
-                    next: None,
-                    examined,
-                })
-            }));
-            return;
-        }
-
-        let mut row_successors = Vec::new();
-        for (row, ((&node, &cursor), &limit)) in batch
-            .nodes
-            .iter()
-            .zip(batch.cursors)
-            .zip(batch.limits)
-            .enumerate()
-        {
-            row_successors.clear();
-            let page =
-                self.expand_delta_program_page(program, node, cursor, limit, &mut row_successors);
-            if page.is_none() {
-                assert_eq!(cursor, ResidualDeltaExpandCursor::Start);
-                assert!(row_successors.is_empty());
-            } else {
-                let row = u32::try_from(row).expect("too many RPQ transition pages in one cohort");
-                successors.extend(row_successors.drain(..).map(|output| (row, output)));
-            }
-            pages.push(page);
-        }
-    }
-
-    fn residual_delta_expand(
-        &self,
-        variable: VariableId,
-        nodes: &[ResidualDeltaNode],
-        successors: &mut Vec<(u32, ResidualDeltaOutput)>,
-    ) -> bool {
-        let Some(route) = self.residual_delta_program(variable) else {
-            return false;
-        };
-        let program = match route {
-            ResidualDeltaRoute::BoundEndpoint { program, .. } => program,
-            ResidualDeltaRoute::SameVariable { program } => {
-                assert!(
-                    nodes.iter().all(|node| node.source.is_some()),
-                    "same-variable delta activation lost its source anchor"
-                );
-                program
-            }
-        };
-        self.expand_delta_program(program, nodes, successors);
-        true
+    fn residual_program(&self) -> Option<ProgramRef<'_>> {
+        Some(ProgramRef::new(self))
     }
 
     /// Exact when both endpoints are bound: checks reachability from the
@@ -2677,6 +2893,7 @@ mod delta_program_tests {
                 vec![(first, 2), (second, 2)],
                 vec![(second, 3), (first, 3)],
             ],
+            finite_depth: None,
         }
         .quotient_bisimilar_states();
 
@@ -2700,8 +2917,13 @@ mod seeded_frame_tests {
     use super::*;
     use crate::id::rngid;
     use crate::id::ExclusiveId;
+    use crate::inline::encodings::UnknownInline;
     use crate::inline::Inline;
     use crate::query::Binding;
+    use crate::query::ProgramActivation;
+    use crate::query::ProgramBatch;
+    use crate::query::ProgramBatchEffects;
+    use crate::query::ProgramSeedEffects;
     use crate::query::Query;
     use crate::trible::Trible;
 
@@ -2718,21 +2940,56 @@ mod seeded_frame_tests {
             &[PathOp::Attr(attribute), PathOp::Plus],
         );
 
+        let program = repeated.residual_program().unwrap();
+        let start_route = program
+            .route(ProgramRequest {
+                action: ProgramAction::Confirm(start.index),
+                bound: VariableSet::new_singleton(end.index),
+            })
+            .unwrap();
+        assert_eq!(start_route.grouping, ProgramGrouping::ParentAtomic);
+        assert_eq!(start_route.stratum, ProgramStratum::Fixpoint);
+        let end_route = program
+            .route(ProgramRequest {
+                action: ProgramAction::Confirm(end.index),
+                bound: VariableSet::new_singleton(start.index),
+            })
+            .unwrap();
+        assert_eq!(end_route.grouping, ProgramGrouping::ParentAtomic);
+        let partial_route = program
+            .route(ProgramRequest {
+                action: ProgramAction::Confirm(start.index),
+                bound: VariableSet::new_empty(),
+            })
+            .expect("partial confirmation remains inside the typed RPQ family");
+        assert_eq!(partial_route.grouping, ProgramGrouping::PageLocal);
+        assert_eq!(partial_route.stratum, ProgramStratum::Finite);
+        let support_route = program
+            .route(ProgramRequest {
+                action: ProgramAction::Support,
+                bound: VariableSet::new_empty(),
+            })
+            .expect("optimistic partial support is an explicit typed disposition");
+        assert_eq!(support_route.grouping, ProgramGrouping::PageLocal);
+        assert_eq!(support_route.stratum, ProgramStratum::Finite);
         assert_eq!(
             repeated.residual_delta_confirm_grouping_requirements(start.index),
-            Some(VariableSet::new_singleton(end.index))
-        );
-        assert_eq!(
-            repeated.residual_delta_confirm_grouping_requirements(end.index),
-            Some(VariableSet::new_singleton(start.index))
+            None,
+            "RPQ no longer exposes the legacy grouped-transition hook"
         );
 
         let direct =
             RegularPathConstraint::new(TribleSet::new(), start, end, &[PathOp::Attr(attribute)]);
-        assert_eq!(
-            direct.residual_delta_confirm_grouping_requirements(start.index),
-            None
-        );
+        let direct_route = direct
+            .residual_program()
+            .unwrap()
+            .route(ProgramRequest {
+                action: ProgramAction::Confirm(start.index),
+                bound: VariableSet::new_singleton(end.index),
+            })
+            .unwrap();
+        assert_eq!(direct_route.grouping, ProgramGrouping::PageLocal);
+        assert_eq!(direct_route.stratum, ProgramStratum::Finite);
 
         let same_endpoint = RegularPathConstraint::new(
             TribleSet::new(),
@@ -2740,10 +2997,202 @@ mod seeded_frame_tests {
             start,
             &[PathOp::Attr(attribute), PathOp::Star],
         );
-        assert_eq!(
-            same_endpoint.residual_delta_confirm_grouping_requirements(start.index),
-            Some(VariableSet::new_empty())
+        let same_route = same_endpoint
+            .residual_program()
+            .unwrap()
+            .route(ProgramRequest {
+                action: ProgramAction::Confirm(start.index),
+                bound: VariableSet::new_empty(),
+            })
+            .unwrap();
+        assert_eq!(same_route.grouping, ProgramGrouping::ParentAtomic);
+        assert_eq!(same_route.stratum, ProgramStratum::Fixpoint);
+    }
+
+    #[test]
+    fn typed_full_support_exposes_nullable_seed_and_first_adjacency_witness_locally() {
+        let source = rngid();
+        let attribute = rngid();
+        let mut destinations = [
+            id_into_value(&rngid().id.raw()),
+            id_into_value(&rngid().id.raw()),
+        ];
+        destinations.sort_unstable();
+        let target = destinations[0];
+        let irrelevant_tail = destinations[1];
+        let source_value = id_into_value(&source.id.raw());
+        let mut set = TribleSet::new();
+        insert_edge(&mut set, &source, &attribute, target);
+        insert_edge(&mut set, &source, &attribute, irrelevant_tail);
+
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let mut bound = VariableSet::new_singleton(start.index);
+        bound.set(end.index);
+        let request = ProgramRequest {
+            action: ProgramAction::Support,
+            bound,
+        };
+        let vars = [start.index, end.index];
+        let activations = [ProgramActivation(1)];
+
+        // Nullable full Support is an accepted seed receipt. No typed step is
+        // needed to expose the graph-gated identity witness.
+        let nullable = RegularPathConstraint::new(
+            set.clone(),
+            start,
+            end,
+            &[PathOp::Attr(attribute.id.raw()), PathOp::Star],
         );
+        let nullable_program = nullable.residual_program().unwrap();
+        let nullable_route = nullable_program.route(request).unwrap();
+        let nullable_rows = [source_value, source_value];
+        let nullable_view = RowsView::new(&vars, &nullable_rows);
+        let mut nullable_runtime = nullable_program.new_runtime();
+        let mut nullable_seed = ProgramSeedEffects::default();
+        nullable_program.seed_batch(
+            &mut nullable_runtime,
+            ProgramSeedBatch {
+                request,
+                route: nullable_route,
+                view: nullable_view,
+                activations: &activations,
+            },
+            &mut nullable_seed,
+        );
+        assert_eq!(nullable_seed.work.len(), 1);
+        assert_eq!(nullable_seed.work[0].accepted, Some(source_value));
+
+        // The first sorted adjacency is the bound target. A one-unit adapter
+        // grant exposes that witness while retaining the irrelevant tail as
+        // an exact immediate resume.
+        let direct =
+            RegularPathConstraint::new(set, start, end, &[PathOp::Attr(attribute.id.raw())]);
+        let direct_program = direct.residual_program().unwrap();
+        let direct_route = direct_program.route(request).unwrap();
+        let direct_rows = [source_value, target];
+        let direct_view = RowsView::new(&vars, &direct_rows);
+        let mut direct_runtime = direct_program.new_runtime();
+        let mut direct_seed = ProgramSeedEffects::default();
+        direct_program.seed_batch(
+            &mut direct_runtime,
+            ProgramSeedBatch {
+                request,
+                route: direct_route,
+                view: direct_view,
+                activations: &activations,
+            },
+            &mut direct_seed,
+        );
+        assert_eq!(direct_seed.work.len(), 1);
+        assert_eq!(direct_seed.work[0].accepted, None);
+        let work = [direct_seed.work.pop().unwrap().work];
+        let candidates = [None];
+        let limits = [1];
+        let mut effects = ProgramBatchEffects::default();
+        direct_program.step_batch(
+            &mut direct_runtime,
+            ProgramBatch {
+                stratum: direct_route.stratum,
+                view: direct_view,
+                candidate_sets: &candidates,
+                activations: &activations,
+                work: &work,
+                limits: &limits,
+            },
+            &mut effects,
+        );
+        assert_eq!(effects.pages.len(), 1);
+        assert_eq!(effects.pages[0].examined, 1);
+        assert!(matches!(
+            effects.pages[0].resume,
+            Some(crate::query::ProgramResume::Immediate(_))
+        ));
+        assert_eq!(effects.children.len(), 1);
+        assert_eq!(effects.children[0].accepted, Some(target));
+        assert_eq!(effects.transition_pages, 1);
+        assert_eq!(effects.transition_examined, 1);
+    }
+
+    #[test]
+    fn rpq_program_rank_descends_on_every_finite_spine() {
+        let mut variables = VariableContext::new();
+        let start = variables.next_variable::<GenId>();
+        let end = variables.next_variable::<GenId>();
+        let attribute = rngid().id.raw();
+        let direct =
+            RegularPathConstraint::new(TribleSet::new(), start, end, &[PathOp::Attr(attribute)]);
+        let low = [1; 32];
+        let high = [2; 32];
+
+        let source_start = RpqState::source(start.index, RpqSourceCursor::Start, false);
+        let source_low = RpqState::source(start.index, RpqSourceCursor::After(low), false);
+        let source_high = RpqState::source(start.index, RpqSourceCursor::After(high), false);
+        assert!(direct.progress(&source_start) > direct.progress(&source_low));
+        assert!(direct.progress(&source_low) > direct.progress(&source_high));
+
+        let filter_zero = RpqState::candidate_filter(start.index, 0);
+        let filter_one = RpqState::candidate_filter(start.index, 1);
+        assert!(direct.progress(&filter_zero) > direct.progress(&filter_one));
+
+        let program = &direct.delta_program;
+        let origin = RpqNode {
+            source: None,
+            value: low,
+            pc: program.start,
+        };
+        let target = program.steps[program.start as usize][0].1;
+        let child = RpqNode {
+            pc: target,
+            ..origin
+        };
+        let transition_start = RpqState::transition(end.index, origin, RpqExpandCursor::Start);
+        let transition_low = RpqState::transition(
+            end.index,
+            origin,
+            RpqExpandCursor::After {
+                branch: 0,
+                value: low,
+            },
+        );
+        let transition_high = RpqState::transition(
+            end.index,
+            origin,
+            RpqExpandCursor::After {
+                branch: 0,
+                value: high,
+            },
+        );
+        let transition_next_branch = RpqState::transition(
+            end.index,
+            origin,
+            RpqExpandCursor::After {
+                branch: 1,
+                value: low,
+            },
+        );
+        let child_start = RpqState::transition(end.index, child, RpqExpandCursor::Start);
+        assert!(direct.progress(&transition_start) > direct.progress(&transition_low));
+        assert!(direct.progress(&transition_low) > direct.progress(&transition_high));
+        assert!(direct.progress(&transition_high) > direct.progress(&transition_next_branch));
+        assert!(direct.progress(&transition_start) > direct.progress(&child_start));
+
+        let repeated = RegularPathConstraint::new(
+            TribleSet::new(),
+            start,
+            end,
+            &[PathOp::Attr(attribute), PathOp::Plus],
+        );
+        assert!(repeated.delta_program.finite_depth.is_none());
+        let repeated_route = repeated
+            .residual_program()
+            .unwrap()
+            .route(ProgramRequest {
+                action: ProgramAction::Propose(end.index),
+                bound: VariableSet::new_singleton(start.index),
+            })
+            .unwrap();
+        assert_eq!(repeated_route.stratum, ProgramStratum::Fixpoint);
     }
 
     struct GraphFixture {
@@ -2950,5 +3399,286 @@ mod seeded_frame_tests {
         for _ in 0..26 {
             assert_eq!(eval_from(&graph.set, &chain, &graph.nodes[0]), expected);
         }
+    }
+
+    #[test]
+    fn typed_nullable_same_variable_graph_source_pages_use_exact_after_cursors() {
+        let attribute = rngid();
+        let entities: Vec<_> = (0..4).map(|_| rngid()).collect();
+        let entity_values: Vec<_> = entities
+            .iter()
+            .map(|entity| id_into_value(&entity.id.raw()))
+            .collect();
+        let literal = [0xA5; 32];
+        let absent = [0xC7; 32];
+        let mut set = TribleSet::new();
+        insert_edge(&mut set, &entities[0], &attribute, entity_values[1]);
+        set.insert(&Trible::new(
+            &entities[2],
+            &attribute,
+            &Inline::<UnknownInline>::new(literal),
+        ));
+        insert_edge(&mut set, &entities[3], &attribute, entity_values[0]);
+
+        let variable = Variable::<UnknownInline>::new(0);
+        let path = RegularPathConstraint::new(
+            set,
+            variable,
+            variable,
+            &[PathOp::Attr(attribute.id.raw()), PathOp::Optional],
+        );
+        let mut expected = entity_values;
+        expected.push(literal);
+        expected.sort_unstable();
+        expected.dedup();
+        assert_eq!(expected.len(), 5);
+        assert!(!expected.contains(&absent));
+
+        let mut cursor = RpqSourceCursor::Start;
+        let mut offset = 0usize;
+        let mut examined_pages = Vec::new();
+        let mut actual = Vec::new();
+        loop {
+            let mut roots = Vec::new();
+            let page =
+                path.same_variable_source_page(&path.delta_program, None, cursor, 2, &mut roots);
+            let end = offset.saturating_add(2).min(expected.len());
+            let values: Vec<_> = roots.iter().map(|output| output.node.value).collect();
+            assert_eq!(values, expected[offset..end]);
+            assert!(roots.iter().all(|output| {
+                output.accepted && output.node.source == Some(output.node.value)
+            }));
+            assert_eq!(page.examined, end - offset);
+            examined_pages.push(page.examined);
+            actual.extend(values);
+            match page.next {
+                Some(RpqSourceCursor::After(after)) => {
+                    assert_eq!(after, expected[end - 1]);
+                    assert!(end < expected.len());
+                    cursor = RpqSourceCursor::After(after);
+                    offset = end;
+                }
+                Some(RpqSourceCursor::Start | RpqSourceCursor::Offset(_)) => {
+                    panic!("graph-backed source returned a non-After cursor")
+                }
+                None => {
+                    assert_eq!(end, expected.len());
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(actual, expected);
+        assert_eq!(examined_pages, vec![2, 2, 1]);
+    }
+
+    #[test]
+    fn typed_same_variable_candidate_source_pages_preserve_offset_bag_order() {
+        let attribute = rngid();
+        let accepted_entities = [rngid(), rngid()];
+        let mut accepted_values: Vec<_> = accepted_entities
+            .iter()
+            .map(|entity| id_into_value(&entity.id.raw()))
+            .collect();
+        let rejected = id_into_value(&rngid().id.raw());
+        let mut set = TribleSet::new();
+        for (entity, value) in accepted_entities
+            .iter()
+            .zip(accepted_values.iter().copied())
+        {
+            insert_edge(&mut set, entity, &attribute, value);
+        }
+        accepted_values.sort_unstable();
+        let low = accepted_values[0];
+        let high = accepted_values[1];
+        let candidates = [high, low, high, rejected, low];
+
+        let variable = Variable::<GenId>::new(0);
+        let path = RegularPathConstraint::new(
+            set,
+            variable,
+            variable,
+            &[PathOp::Attr(attribute.id.raw())],
+        );
+        let expectations = [
+            (2, Some(2), vec![high, low]),
+            (2, Some(4), vec![high]),
+            (1, None, vec![low]),
+        ];
+        let mut cursor = RpqSourceCursor::Start;
+        let mut actual = Vec::new();
+
+        for (examined, next_offset, expected_values) in expectations {
+            let mut roots = Vec::new();
+            let page = path.same_variable_source_page(
+                &path.delta_program,
+                Some(&candidates),
+                cursor,
+                2,
+                &mut roots,
+            );
+            let values: Vec<_> = roots.iter().map(|output| output.node.value).collect();
+            assert_eq!(page.examined, examined);
+            assert_eq!(values, expected_values);
+            assert!(roots
+                .iter()
+                .all(|output| output.node.source == Some(output.node.value)));
+            actual.extend(values);
+            match (page.next, next_offset) {
+                (Some(RpqSourceCursor::Offset(actual)), Some(expected)) => {
+                    assert_eq!(actual, expected);
+                    cursor = RpqSourceCursor::Offset(actual);
+                }
+                (None, None) => {}
+                (Some(RpqSourceCursor::Start | RpqSourceCursor::After(_)), _) => {
+                    panic!("candidate-backed source returned a non-Offset cursor")
+                }
+                (actual, expected) => panic!(
+                    "candidate cursor mismatch: actual={actual:?}, expected offset={expected:?}"
+                ),
+            }
+        }
+
+        assert_eq!(actual, vec![high, low, high, low]);
+    }
+
+    #[test]
+    fn typed_positive_and_negated_transition_pages_account_exact_cursors() {
+        let source = rngid();
+        let attribute = rngid();
+        let mut destinations: Vec<_> = (0..5).map(|_| id_into_value(&rngid().id.raw())).collect();
+        destinations.sort_unstable();
+        let mut positive_set = TribleSet::new();
+        for destination in destinations.iter().copied() {
+            insert_edge(&mut positive_set, &source, &attribute, destination);
+        }
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let positive = RegularPathConstraint::new(
+            positive_set,
+            start,
+            end,
+            &[PathOp::Attr(attribute.id.raw())],
+        );
+        let positive_node = RpqNode {
+            source: None,
+            value: id_into_value(&source.id.raw()),
+            pc: positive.delta_program.start,
+        };
+        let mut cursor = RpqExpandCursor::Start;
+        let mut offset = 0usize;
+        let mut examined_pages = Vec::new();
+        let mut positive_values = Vec::new();
+        loop {
+            let mut outputs = Vec::new();
+            let page = positive
+                .expand_delta_program_page(
+                    &positive.delta_program,
+                    positive_node,
+                    cursor,
+                    2,
+                    &mut outputs,
+                )
+                .expect("a positive program state owns a transition frontier");
+            let next_offset = offset.saturating_add(2).min(destinations.len());
+            assert_eq!(page.examined, next_offset - offset);
+            assert_eq!(
+                outputs
+                    .iter()
+                    .map(|output| output.node.value)
+                    .collect::<Vec<_>>(),
+                destinations[offset..next_offset]
+            );
+            assert!(outputs.iter().all(|output| output.accepted));
+            positive_values.extend(outputs.into_iter().map(|output| output.node.value));
+            examined_pages.push(page.examined);
+            match page.next {
+                Some(RpqExpandCursor::After { branch, value }) => {
+                    assert_eq!(branch, 0);
+                    assert_eq!(value, destinations[next_offset - 1]);
+                    assert!(next_offset < destinations.len());
+                    cursor = RpqExpandCursor::After { branch, value };
+                    offset = next_offset;
+                }
+                Some(RpqExpandCursor::Start) => {
+                    panic!("transition page returned a Start resume cursor")
+                }
+                None => {
+                    assert_eq!(next_offset, destinations.len());
+                    break;
+                }
+            }
+        }
+        assert_eq!(positive_values, destinations);
+        assert_eq!(examined_pages, vec![2, 2, 1]);
+
+        let excluded = rngid();
+        let other = rngid();
+        let another = rngid();
+        let negated_source = rngid();
+        let mut negated_destinations: Vec<_> =
+            (0..5).map(|_| id_into_value(&rngid().id.raw())).collect();
+        negated_destinations.sort_unstable();
+        let mut negated_set = TribleSet::new();
+        let mut insert = |attribute: &ExclusiveId, destination: RawInline| {
+            insert_edge(&mut negated_set, &negated_source, attribute, destination);
+        };
+        insert(&excluded, negated_destinations[0]);
+        insert(&excluded, negated_destinations[1]);
+        insert(&other, negated_destinations[1]);
+        insert(&other, negated_destinations[2]);
+        insert(&another, negated_destinations[2]);
+        insert(&excluded, negated_destinations[3]);
+        insert(&other, negated_destinations[4]);
+        drop(insert);
+
+        let negated = RegularPathConstraint::new(
+            negated_set,
+            start,
+            end,
+            &[PathOp::NotAttr(excluded.id.raw())],
+        );
+        let negated_node = RpqNode {
+            source: None,
+            value: id_into_value(&negated_source.id.raw()),
+            pc: negated.delta_program.start,
+        };
+        let expected_output_counts = [0, 1, 1, 0, 1];
+        let mut cursor = RpqExpandCursor::Start;
+        let mut negated_values = Vec::new();
+        for (index, expected_count) in expected_output_counts.into_iter().enumerate() {
+            let mut outputs = Vec::new();
+            let page = negated
+                .expand_delta_program_page(
+                    &negated.delta_program,
+                    negated_node,
+                    cursor,
+                    1,
+                    &mut outputs,
+                )
+                .expect("a negated program state owns a transition frontier");
+            assert_eq!(page.examined, 1);
+            assert_eq!(outputs.len(), expected_count);
+            assert!(outputs.iter().all(|output| output.accepted));
+            negated_values.extend(outputs.into_iter().map(|output| output.node.value));
+            if index + 1 < negated_destinations.len() {
+                let Some(RpqExpandCursor::After { branch, value }) = page.next else {
+                    panic!("negated transition page lost its exact resume cursor")
+                };
+                assert_eq!(branch, 0);
+                assert_eq!(value, negated_destinations[index]);
+                cursor = RpqExpandCursor::After { branch, value };
+            } else {
+                assert!(page.next.is_none());
+            }
+        }
+        assert_eq!(
+            negated_values,
+            vec![
+                negated_destinations[1],
+                negated_destinations[2],
+                negated_destinations[4],
+            ]
+        );
     }
 }

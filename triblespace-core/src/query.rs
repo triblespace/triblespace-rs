@@ -61,17 +61,18 @@ use crate::inline::Inline;
 use crate::inline::InlineEncoding;
 use crate::inline::RawInline;
 
+#[doc(hidden)]
+pub use program::{
+    DispatchClass, ProgramAction, ProgramActivation, ProgramBatch, ProgramBatchEffects,
+    ProgramChild, ProgramGrouping, ProgramKey, ProgramPacing, ProgramPage, ProgramRef,
+    ProgramRequest, ProgramResume, ProgramRoute, ProgramRuntime, ProgramSeedBatch,
+    ProgramSeedEffects, ProgramSeedWork, ProgramStratum, ProgramWork, ProgramWorkHandle,
+    TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink,
+};
 /// Re-export of [`PathOp`].
 pub use regularpathconstraint::PathOp;
 /// Re-export of [`RegularPathConstraint`].
 pub use regularpathconstraint::RegularPathConstraint;
-#[doc(hidden)]
-pub use program::{
-    DispatchClass, ProgramActivation, ProgramAction, ProgramBatch, ProgramBatchEffects,
-    ProgramPage, ProgramRoute, ProgramSeedBatch, ProgramSeedEffects, ProgramSeedWork,
-    ProgramWork, ProgramWorkHandle, ProgramWorkKind, ResidualProgramRuntime,
-    ResidualProgramSpec, TypedProgramRuntime,
-};
 /// Re-export of [`VariableSet`](variableset::VariableSet).
 pub use variableset::VariableSet;
 
@@ -1196,6 +1197,16 @@ pub trait Constraint<'a> {
         None
     }
 
+    /// Exposes one immutable typed residual-program family.
+    ///
+    /// Occurrence identity and query-local runtime state are owned by the
+    /// residual lowering engine; sharing one constraint object at several
+    /// structural paths must therefore still produce isolated runtimes.
+    #[doc(hidden)]
+    fn residual_program(&self) -> Option<ProgramRef<'_>> {
+        None
+    }
+
     /// Whether this action owns an ordered, page-producing source frontier.
     ///
     /// Returning `true` replaces eager [`Self::residual_delta_seeds`] for the
@@ -1556,6 +1567,11 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.residual_delta_confirm_grouping_requirements(variable)
     }
 
+    fn residual_program(&self) -> Option<ProgramRef<'_>> {
+        let inner: &T = self;
+        inner.residual_program()
+    }
+
     fn residual_delta_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
         let inner: &T = self;
         inner.residual_delta_source_is_paged(variable, view)
@@ -1730,6 +1746,11 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     ) -> Option<VariableSet> {
         let inner: &T = self;
         inner.residual_delta_confirm_grouping_requirements(variable)
+    }
+
+    fn residual_program(&self) -> Option<ProgramRef<'_>> {
+        let inner: &T = self;
+        inner.residual_program()
     }
 
     fn residual_delta_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {

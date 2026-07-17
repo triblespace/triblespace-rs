@@ -13,10 +13,8 @@ use triblespace_core::query::residual::{
 };
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
-    Binding, CandidateSink, Constraint, ConstraintShape, EstimateSink, PathOp, Query,
-    RegularPathConstraint, ResidualDeltaExpandBatch, ResidualDeltaExpandCursor,
-    ResidualDeltaExpandPage, ResidualDeltaNode, ResidualDeltaOutput, ResidualDeltaSeed,
-    ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, Variable, VariableId, VariableSet,
+    Binding, CandidateSink, Constraint, EstimateSink, PathOp, ProgramRef, Query,
+    RegularPathConstraint, RowsView, Variable, VariableId, VariableSet,
 };
 use triblespace_core::trible::{Trible, TribleSet};
 
@@ -155,163 +153,12 @@ fn third_attribute() -> Id {
     Id::from_hex("17D7A00087D912B14F8BC28AFC31474F").expect("minted fixture attribute")
 }
 
-struct CountingPath {
-    inner: RegularPathConstraint,
-    seeded_roots: Option<Arc<AtomicUsize>>,
-    source_pages: Option<Arc<Mutex<Vec<(usize, usize, usize)>>>>,
-    expanded_nodes: Arc<AtomicUsize>,
-}
-
-impl<'a> Constraint<'a> for CountingPath {
-    fn variables(&self) -> VariableSet {
-        self.inner.variables()
-    }
-
-    fn estimate(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        out: &mut EstimateSink<'_>,
-    ) -> bool {
-        self.inner.estimate(variable, view, out)
-    }
-
-    fn propose(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
-        self.inner.propose(variable, view, candidates)
-    }
-
-    fn confirm(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
-        self.inner.confirm(variable, view, candidates)
-    }
-
-    fn satisfied(&self, view: &RowsView<'_>) -> bool {
-        self.inner.satisfied(view)
-    }
-
-    fn influence(&self, variable: VariableId) -> VariableSet {
-        self.inner.influence(variable)
-    }
-
-    fn residual_shape(&self) -> ConstraintShape<'_, 'a> {
-        self.inner.residual_shape()
-    }
-
-    fn residual_confirm_is_page_local(&self) -> bool {
-        self.inner.residual_confirm_is_page_local()
-    }
-
-    fn residual_delta_confirm_grouping_requirements(
-        &self,
-        variable: VariableId,
-    ) -> Option<VariableSet> {
-        self.inner
-            .residual_delta_confirm_grouping_requirements(variable)
-    }
-
-    fn residual_delta_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
-        self.inner.residual_delta_source_is_paged(variable, view)
-    }
-
-    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
-        self.inner.residual_proposal_source_is_paged(variable, view)
-    }
-
-    fn residual_proposal_source_has_transition_roots(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-    ) -> bool {
-        self.inner
-            .residual_proposal_source_has_transition_roots(variable, view)
-    }
-
-    fn residual_delta_source_page(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: Option<&[RawInline]>,
-        cursor: ResidualDeltaSourceCursor,
-        limit: usize,
-        roots: &mut Vec<ResidualDeltaOutput>,
-        accepted: &mut Vec<RawInline>,
-    ) -> Option<ResidualDeltaSourcePage> {
-        let before = roots.len();
-        let accepted_before = accepted.len();
-        let page = self
-            .inner
-            .residual_delta_source_page(variable, view, candidates, cursor, limit, roots, accepted);
-        if page.is_some() {
-            if let Some(counter) = &self.seeded_roots {
-                counter.fetch_add(roots.len() - before, Ordering::Relaxed);
-            }
-        }
-        if let (Some(page), Some(pages)) = (page, &self.source_pages) {
-            pages.lock().expect("source-page recorder poisoned").push((
-                limit,
-                page.examined,
-                roots.len() - before + accepted.len() - accepted_before,
-            ));
-        }
-        page
-    }
-
-    fn residual_delta_seeds(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        seeds: &mut Vec<ResidualDeltaSeed>,
-    ) -> bool {
-        let before = seeds.len();
-        let supported = self.inner.residual_delta_seeds(variable, view, seeds);
-        if supported {
-            if let Some(counter) = &self.seeded_roots {
-                counter.fetch_add(seeds.len() - before, Ordering::Relaxed);
-            }
-        }
-        supported
-    }
-
-    fn residual_delta_expand(
-        &self,
-        variable: VariableId,
-        nodes: &[ResidualDeltaNode],
-        successors: &mut Vec<(u32, ResidualDeltaOutput)>,
-    ) -> bool {
-        self.expanded_nodes
-            .fetch_add(nodes.len(), Ordering::Relaxed);
-        self.inner
-            .residual_delta_expand(variable, nodes, successors)
-    }
-}
-
-/// Distinguishes the legacy fully-bound `satisfied` traversal from native
-/// transition-backed formula Support. Partial bindings are intentionally not
-/// counted: regular paths answer those optimistically without graph work.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SupportTraceEvent {
-    Expand { label: u8, witness: bool },
-    CandidatePage(usize),
-}
-
-struct SupportCountingPath {
+struct SatisfiedCountingPath {
     inner: RegularPathConstraint,
     fully_bound_satisfied_calls: Arc<AtomicUsize>,
-    support_seeded_roots: Arc<AtomicUsize>,
-    expanded_nodes: Arc<AtomicUsize>,
-    trace: Option<(u8, Arc<Mutex<Vec<SupportTraceEvent>>>)>,
 }
 
-impl<'a> Constraint<'a> for SupportCountingPath {
+impl<'a> Constraint<'a> for SatisfiedCountingPath {
     fn variables(&self) -> VariableSet {
         self.inner.variables()
     }
@@ -344,7 +191,12 @@ impl<'a> Constraint<'a> for SupportCountingPath {
     }
 
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
-        if view.col(START).is_some() && view.col(END).is_some() {
+        if self
+            .inner
+            .variables()
+            .into_iter()
+            .all(|variable| view.col(variable).is_some())
+        {
             self.fully_bound_satisfied_calls
                 .fetch_add(view.len(), Ordering::Relaxed);
         }
@@ -359,54 +211,8 @@ impl<'a> Constraint<'a> for SupportCountingPath {
         self.inner.residual_confirm_is_page_local()
     }
 
-    fn residual_delta_confirm_grouping_requirements(
-        &self,
-        variable: VariableId,
-    ) -> Option<VariableSet> {
-        self.inner
-            .residual_delta_confirm_grouping_requirements(variable)
-    }
-
-    fn residual_delta_support_seeds(
-        &self,
-        view: &RowsView<'_>,
-        seeds: &mut Vec<ResidualDeltaSeed>,
-    ) -> Option<VariableId> {
-        let before = seeds.len();
-        let route = self.inner.residual_delta_support_seeds(view, seeds);
-        if route.is_some() {
-            self.support_seeded_roots
-                .fetch_add(seeds.len() - before, Ordering::Relaxed);
-        }
-        route
-    }
-
-    fn residual_delta_expand(
-        &self,
-        variable: VariableId,
-        nodes: &[ResidualDeltaNode],
-        successors: &mut Vec<(u32, ResidualDeltaOutput)>,
-    ) -> bool {
-        self.expanded_nodes
-            .fetch_add(nodes.len(), Ordering::Relaxed);
-        let before = successors.len();
-        let supported = self
-            .inner
-            .residual_delta_expand(variable, nodes, successors);
-        if supported {
-            if let Some((label, trace)) = &self.trace {
-                trace
-                    .lock()
-                    .expect("support trace poisoned")
-                    .push(SupportTraceEvent::Expand {
-                        label: *label,
-                        witness: successors[before..]
-                            .iter()
-                            .any(|(_, output)| output.accepted),
-                    });
-            }
-        }
-        supported
+    fn residual_program(&self) -> Option<ProgramRef<'_>> {
+        self.inner.residual_program()
     }
 }
 
@@ -612,7 +418,7 @@ impl<'a> Constraint<'a> for PageTraceFilter {
 
 #[derive(Clone)]
 struct SupportPageTraceFilter {
-    trace: Arc<Mutex<Vec<SupportTraceEvent>>>,
+    trace: Arc<Mutex<Vec<usize>>>,
 }
 
 impl<'a> Constraint<'a> for SupportPageTraceFilter {
@@ -655,7 +461,7 @@ impl<'a> Constraint<'a> for SupportPageTraceFilter {
         self.trace
             .lock()
             .expect("support trace poisoned")
-            .push(SupportTraceEvent::CandidatePage(candidates.len()));
+            .push(candidates.len());
     }
 
     fn satisfied(&self, _view: &RowsView<'_>) -> bool {
@@ -740,16 +546,7 @@ fn repeated(attribute: Id, inverse: bool) -> Vec<PathOp> {
     }
 }
 
-fn bound_start_root(
-    set: TribleSet,
-    start: Inline<GenId>,
-    ops: &[PathOp],
-    expanded_nodes: Arc<AtomicUsize>,
-) -> Root {
-    counted_bound_start_root(set, start, ops, None, expanded_nodes)
-}
-
-fn native_bound_start_root(set: TribleSet, start: Inline<GenId>, ops: &[PathOp]) -> Root {
+fn bound_start_root(set: TribleSet, start: Inline<GenId>, ops: &[PathOp]) -> Root {
     let start_var = Variable::<GenId>::new(START);
     let end_var = Variable::<GenId>::new(END);
     Arc::new(IntersectionConstraint::new(vec![
@@ -758,91 +555,31 @@ fn native_bound_start_root(set: TribleSet, start: Inline<GenId>, ops: &[PathOp])
     ]))
 }
 
-fn counted_bound_start_root(
-    set: TribleSet,
-    start: Inline<GenId>,
-    ops: &[PathOp],
-    seeded_roots: Option<Arc<AtomicUsize>>,
-    expanded_nodes: Arc<AtomicUsize>,
-) -> Root {
+fn formula_bound_start_root(set: TribleSet, start: Inline<GenId>, ops: &[PathOp]) -> Root {
     let start_var = Variable::<GenId>::new(START);
     let end_var = Variable::<GenId>::new(END);
-    Arc::new(IntersectionConstraint::new(vec![
-        Box::new(start_var.is(start)) as DynConstraint,
-        Box::new(CountingPath {
-            inner: RegularPathConstraint::new(set, start_var, end_var, ops),
-            seeded_roots,
-            source_pages: None,
-            expanded_nodes,
-        }) as DynConstraint,
-    ]))
-}
-
-fn formula_bound_start_root(
-    set: TribleSet,
-    start: Inline<GenId>,
-    ops: &[PathOp],
-    seeded_roots: Option<Arc<AtomicUsize>>,
-    expanded_nodes: Arc<AtomicUsize>,
-) -> Root {
-    let start_var = Variable::<GenId>::new(START);
-    let end_var = Variable::<GenId>::new(END);
-    let arm = Box::new(CountingPath {
-        inner: RegularPathConstraint::new(set, start_var, end_var, ops),
-        seeded_roots,
-        source_pages: None,
-        expanded_nodes,
-    }) as DynConstraint;
+    let arm = Box::new(RegularPathConstraint::new(set, start_var, end_var, ops)) as DynConstraint;
     Arc::new(IntersectionConstraint::new(vec![
         Box::new(start_var.is(start)) as DynConstraint,
         Box::new(UnionConstraint::new(vec![arm])) as DynConstraint,
     ]))
 }
 
-fn bound_end_root(
-    set: TribleSet,
-    end: Inline<GenId>,
-    ops: &[PathOp],
-    expanded_nodes: Arc<AtomicUsize>,
-) -> Root {
-    counted_bound_end_root(set, end, ops, None, expanded_nodes)
-}
-
-fn counted_bound_end_root(
-    set: TribleSet,
-    end: Inline<GenId>,
-    ops: &[PathOp],
-    seeded_roots: Option<Arc<AtomicUsize>>,
-    expanded_nodes: Arc<AtomicUsize>,
-) -> Root {
+fn bound_end_root(set: TribleSet, end: Inline<GenId>, ops: &[PathOp]) -> Root {
     let start_var = Variable::<GenId>::new(START);
     let end_var = Variable::<GenId>::new(END);
     Arc::new(IntersectionConstraint::new(vec![
         Box::new(end_var.is(end)) as DynConstraint,
-        Box::new(CountingPath {
-            inner: RegularPathConstraint::new(set, start_var, end_var, ops),
-            seeded_roots,
-            source_pages: None,
-            expanded_nodes,
-        }) as DynConstraint,
+        Box::new(RegularPathConstraint::new(set, start_var, end_var, ops)) as DynConstraint,
     ]))
 }
 
-fn counted_two_free_root(
-    set: TribleSet,
-    ops: &[PathOp],
-    seeded_roots: Arc<AtomicUsize>,
-    source_pages: Arc<Mutex<Vec<(usize, usize, usize)>>>,
-    expanded_nodes: Arc<AtomicUsize>,
-) -> Root {
+fn two_free_root(set: TribleSet, ops: &[PathOp]) -> Root {
     let start_var = Variable::<GenId>::new(START);
     let end_var = Variable::<GenId>::new(END);
-    Arc::new(IntersectionConstraint::new(vec![Box::new(CountingPath {
-        inner: RegularPathConstraint::new(set, start_var, end_var, ops),
-        seeded_roots: Some(seeded_roots),
-        source_pages: Some(source_pages),
-        expanded_nodes,
-    }) as DynConstraint]))
+    Arc::new(IntersectionConstraint::new(vec![
+        Box::new(RegularPathConstraint::new(set, start_var, end_var, ops)) as DynConstraint,
+    ]))
 }
 
 fn target_confirm_root(
@@ -851,27 +588,6 @@ fn target_confirm_root(
     bound: Inline<GenId>,
     candidates: Vec<RawInline>,
     ops: &[PathOp],
-    expanded_nodes: Arc<AtomicUsize>,
-) -> Root {
-    counted_target_confirm_root(
-        set,
-        candidate_variable,
-        bound,
-        candidates,
-        ops,
-        None,
-        expanded_nodes,
-    )
-}
-
-fn counted_target_confirm_root(
-    set: TribleSet,
-    candidate_variable: VariableId,
-    bound: Inline<GenId>,
-    candidates: Vec<RawInline>,
-    ops: &[PathOp],
-    seeded_roots: Option<Arc<AtomicUsize>>,
-    expanded_nodes: Arc<AtomicUsize>,
 ) -> Root {
     let start_var = Variable::<GenId>::new(START);
     let end_var = Variable::<GenId>::new(END);
@@ -889,12 +605,7 @@ fn counted_target_confirm_root(
             unbound_estimate: 4,
             values: candidates,
         }) as DynConstraint,
-        Box::new(CountingPath {
-            inner: RegularPathConstraint::new(set, start_var, end_var, ops),
-            seeded_roots,
-            source_pages: None,
-            expanded_nodes,
-        }) as DynConstraint,
+        Box::new(RegularPathConstraint::new(set, start_var, end_var, ops)) as DynConstraint,
     ]))
 }
 
@@ -903,17 +614,10 @@ fn formula_target_confirm_root(
     bound: Inline<GenId>,
     candidates: Vec<RawInline>,
     ops: &[PathOp],
-    seeded_roots: Option<Arc<AtomicUsize>>,
-    expanded_nodes: Arc<AtomicUsize>,
 ) -> Root {
     let start_var = Variable::<GenId>::new(START);
     let end_var = Variable::<GenId>::new(END);
-    let arm = Box::new(CountingPath {
-        inner: RegularPathConstraint::new(set, start_var, end_var, ops),
-        seeded_roots,
-        source_pages: None,
-        expanded_nodes,
-    }) as DynConstraint;
+    let arm = Box::new(RegularPathConstraint::new(set, start_var, end_var, ops)) as DynConstraint;
     Arc::new(IntersectionConstraint::new(vec![
         Box::new(start_var.is(bound)) as DynConstraint,
         Box::new(OrderedDomain {
@@ -932,17 +636,10 @@ fn formula_and_bound_start_root(
     candidates: Vec<RawInline>,
     path_estimate_wins: bool,
     ops: &[PathOp],
-    seeded_roots: Option<Arc<AtomicUsize>>,
-    expanded_nodes: Arc<AtomicUsize>,
 ) -> Root {
     let start_var = Variable::<GenId>::new(START);
     let end_var = Variable::<GenId>::new(END);
-    let path = Box::new(CountingPath {
-        inner: RegularPathConstraint::new(set, start_var, end_var, ops),
-        seeded_roots,
-        source_pages: None,
-        expanded_nodes,
-    }) as DynConstraint;
+    let path = Box::new(RegularPathConstraint::new(set, start_var, end_var, ops)) as DynConstraint;
     let domain = Box::new(OrderedDomain {
         variable: END,
         // END is unbound while planning this action, so this selects whether
@@ -968,16 +665,10 @@ fn linear_formula_bound_start_filter_root(
     allowed: Vec<RawInline>,
     nested_and: bool,
     ops: &[PathOp],
-    expanded_nodes: Arc<AtomicUsize>,
 ) -> Root {
     let start_var = Variable::<GenId>::new(START);
     let end_var = Variable::<GenId>::new(END);
-    let path = Box::new(CountingPath {
-        inner: RegularPathConstraint::new(set, start_var, end_var, ops),
-        seeded_roots: None,
-        source_pages: None,
-        expanded_nodes,
-    }) as DynConstraint;
+    let path = Box::new(RegularPathConstraint::new(set, start_var, end_var, ops)) as DynConstraint;
     let filter = Box::new(PageLocalDomain(OrderedDomain {
         variable: END,
         gate: END,
@@ -1008,12 +699,12 @@ fn generated_formula_root(
 ) -> Root {
     let start = Variable::<GenId>::new(START);
     let end = Variable::<GenId>::new(END);
-    let path = Arc::new(CountingPath {
-        inner: RegularPathConstraint::new(graph.set.clone(), start, end, ops),
-        seeded_roots: None,
-        source_pages: None,
-        expanded_nodes: Arc::new(AtomicUsize::new(0)),
-    });
+    let path = Arc::new(RegularPathConstraint::new(
+        graph.set.clone(),
+        start,
+        end,
+        ops,
+    ));
     let atom = || Box::new(Arc::clone(&path)) as DynConstraint;
     let suffix = |page_local| {
         Box::new(PageTraceFilter {
@@ -1128,37 +819,16 @@ enum SupportArmOrder {
     TrueFirst,
 }
 
-#[derive(Clone)]
-struct SupportProbeCounters {
-    fully_bound_satisfied_calls: Arc<AtomicUsize>,
-    support_seeded_roots: Arc<AtomicUsize>,
-    expanded_nodes: Arc<AtomicUsize>,
-}
-
-impl SupportProbeCounters {
-    fn new() -> Self {
-        Self {
-            fully_bound_satisfied_calls: Arc::new(AtomicUsize::new(0)),
-            support_seeded_roots: Arc::new(AtomicUsize::new(0)),
-            expanded_nodes: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-}
-
 fn support_probe_path(
     set: &TribleSet,
     start: Variable<GenId>,
     end: Variable<GenId>,
     ops: &[PathOp],
-    counters: &SupportProbeCounters,
-    trace: Option<(u8, &Arc<Mutex<Vec<SupportTraceEvent>>>)>,
+    fully_bound_satisfied_calls: &Arc<AtomicUsize>,
 ) -> DynConstraint {
-    Box::new(SupportCountingPath {
+    Box::new(SatisfiedCountingPath {
         inner: RegularPathConstraint::new(set.clone(), start, end, ops),
-        fully_bound_satisfied_calls: Arc::clone(&counters.fully_bound_satisfied_calls),
-        support_seeded_roots: Arc::clone(&counters.support_seeded_roots),
-        expanded_nodes: Arc::clone(&counters.expanded_nodes),
-        trace: trace.map(|(label, trace)| (label, Arc::clone(trace))),
+        fully_bound_satisfied_calls: Arc::clone(fully_bound_satisfied_calls),
     })
 }
 
@@ -1173,18 +843,17 @@ fn nested_affine_support_root(
     guarded_values: Vec<RawInline>,
     sibling_value: RawInline,
     arm_order: SupportArmOrder,
-    trace: Option<Arc<Mutex<Vec<SupportTraceEvent>>>>,
-) -> (Root, SupportProbeCounters) {
+    trace: Option<Arc<Mutex<Vec<usize>>>>,
+) -> (Root, Arc<AtomicUsize>) {
     let start = Variable::<GenId>::new(START);
     let end = Variable::<GenId>::new(END);
-    let counters = SupportProbeCounters::new();
+    let fully_bound_satisfied_calls = Arc::new(AtomicUsize::new(0));
     let false_path = support_probe_path(
         &set,
         start,
         end,
         &[PathOp::Attr(secondary.raw())],
-        &counters,
-        trace.as_ref().map(|trace| (0, trace)),
+        &fully_bound_satisfied_calls,
     );
     let true_path = Box::new(IntersectionConstraint::new(vec![
         support_probe_path(
@@ -1192,16 +861,14 @@ fn nested_affine_support_root(
             start,
             end,
             &repeated(primary, false),
-            &counters,
-            trace.as_ref().map(|trace| (1, trace)),
+            &fully_bound_satisfied_calls,
         ),
         support_probe_path(
             &set,
             start,
             end,
             &[PathOp::Attr(primary.raw()), PathOp::Star],
-            &counters,
-            trace.as_ref().map(|trace| (2, trace)),
+            &fully_bound_satisfied_calls,
         ),
     ])) as DynConstraint;
     let guard_arms = match arm_order {
@@ -1246,7 +913,7 @@ fn nested_affine_support_root(
         }) as DynConstraint);
     }
     let root = Arc::new(IntersectionConstraint::new(root_children));
-    (root, counters)
+    (root, fully_bound_satisfied_calls)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1260,18 +927,13 @@ fn fully_bound_support_root(
     guarded_estimate: usize,
     sibling_estimate: usize,
     fully_bound_satisfied_calls: Arc<AtomicUsize>,
-    support_seeded_roots: Arc<AtomicUsize>,
-    expanded_nodes: Arc<AtomicUsize>,
 ) -> Root {
     let start = Variable::<GenId>::new(START);
     let end = Variable::<GenId>::new(END);
     let guarded = Box::new(IntersectionConstraint::new(vec![
-        Box::new(SupportCountingPath {
+        Box::new(SatisfiedCountingPath {
             inner: RegularPathConstraint::new(set, start, end, ops),
             fully_bound_satisfied_calls,
-            support_seeded_roots,
-            expanded_nodes,
-            trace: None,
         }) as DynConstraint,
         Box::new(OrderedDomain {
             variable: OUTER,
@@ -1304,11 +966,11 @@ fn fully_bound_same_variable_support_root(
     ops: &[PathOp],
     guarded_value: RawInline,
     sibling_value: RawInline,
-    counters: &SupportProbeCounters,
+    fully_bound_satisfied_calls: &Arc<AtomicUsize>,
 ) -> Root {
     let node = Variable::<GenId>::new(START);
     let guarded = Box::new(IntersectionConstraint::new(vec![
-        support_probe_path(&set, node, node, ops, counters, None),
+        support_probe_path(&set, node, node, ops, fully_bound_satisfied_calls),
         Box::new(OrderedDomain {
             variable: OUTER,
             gate: OUTER,
@@ -1345,66 +1007,18 @@ fn duplicate_parent_root(
             outer_values,
             start,
         }) as DynConstraint,
-        Box::new(CountingPath {
-            inner: RegularPathConstraint::new(set, start_var, end_var, ops),
-            seeded_roots: None,
-            source_pages: None,
-            expanded_nodes: Arc::new(AtomicUsize::new(0)),
-        }) as DynConstraint,
-    ]))
-}
-
-fn native_duplicate_parent_root(
-    set: TribleSet,
-    start: RawInline,
-    outer_values: [RawInline; 2],
-    ops: &[PathOp],
-) -> Root {
-    let start_var = Variable::<GenId>::new(START);
-    let end_var = Variable::<GenId>::new(END);
-    Arc::new(IntersectionConstraint::new(vec![
-        Box::new(DuplicateParents {
-            outer_values,
-            start,
-        }) as DynConstraint,
         Box::new(RegularPathConstraint::new(set, start_var, end_var, ops)) as DynConstraint,
     ]))
 }
 
-fn same_variable_root(set: TribleSet, ops: &[PathOp], expanded_nodes: Arc<AtomicUsize>) -> Root {
+fn same_variable_root(set: TribleSet, ops: &[PathOp]) -> Root {
     let node = Variable::<GenId>::new(START);
-    Arc::new(IntersectionConstraint::new(vec![Box::new(CountingPath {
-        inner: RegularPathConstraint::new(set, node, node, ops),
-        seeded_roots: None,
-        source_pages: None,
-        expanded_nodes,
-    }) as DynConstraint]))
+    Arc::new(IntersectionConstraint::new(vec![
+        Box::new(RegularPathConstraint::new(set, node, node, ops)) as DynConstraint,
+    ]))
 }
 
-fn counted_same_variable_root(
-    set: TribleSet,
-    ops: &[PathOp],
-    seeded_roots: Arc<AtomicUsize>,
-    source_pages: Option<Arc<Mutex<Vec<(usize, usize, usize)>>>>,
-    expanded_nodes: Arc<AtomicUsize>,
-) -> Root {
-    let node = Variable::<GenId>::new(START);
-    Arc::new(IntersectionConstraint::new(vec![Box::new(CountingPath {
-        inner: RegularPathConstraint::new(set, node, node, ops),
-        seeded_roots: Some(seeded_roots),
-        source_pages,
-        expanded_nodes,
-    }) as DynConstraint]))
-}
-
-fn same_variable_confirm_root(
-    set: TribleSet,
-    candidates: Vec<RawInline>,
-    ops: &[PathOp],
-    seeded_roots: Arc<AtomicUsize>,
-    source_pages: Option<Arc<Mutex<Vec<(usize, usize, usize)>>>>,
-    expanded_nodes: Arc<AtomicUsize>,
-) -> Root {
+fn same_variable_confirm_root(set: TribleSet, candidates: Vec<RawInline>, ops: &[PathOp]) -> Root {
     let node = Variable::<GenId>::new(START);
     Arc::new(IntersectionConstraint::new(vec![
         Box::new(OrderedDomain {
@@ -1413,118 +1027,24 @@ fn same_variable_confirm_root(
             unbound_estimate: 0,
             values: candidates,
         }) as DynConstraint,
-        Box::new(CountingPath {
-            inner: RegularPathConstraint::new(set, node, node, ops),
-            seeded_roots: Some(seeded_roots),
-            source_pages,
-            expanded_nodes,
-        }) as DynConstraint,
+        Box::new(RegularPathConstraint::new(set, node, node, ops)) as DynConstraint,
     ]))
 }
 
-fn same_variable_unknown_root(
-    set: TribleSet,
-    ops: &[PathOp],
-    expanded_nodes: Arc<AtomicUsize>,
-) -> Root {
+fn same_variable_unknown_root(set: TribleSet, ops: &[PathOp]) -> Root {
     let node = Variable::<UnknownInline>::new(START);
-    Arc::new(IntersectionConstraint::new(vec![Box::new(CountingPath {
-        inner: RegularPathConstraint::new(set, node, node, ops),
-        seeded_roots: None,
-        source_pages: None,
-        expanded_nodes,
-    }) as DynConstraint]))
-}
-
-fn collect_same_variable_source_frontier(
-    path: &RegularPathConstraint,
-    candidates: Option<&[RawInline]>,
-    limit: usize,
-) -> (Vec<RawInline>, Vec<(usize, usize)>) {
-    assert!(limit > 0);
-    let mut cursor = ResidualDeltaSourceCursor::Start;
-    let mut sources = Vec::new();
-    let mut pages = Vec::new();
-    loop {
-        let mut roots = Vec::new();
-        let mut accepted = Vec::new();
-        let page = path
-            .residual_delta_source_page(
-                START,
-                &RowsView::EMPTY,
-                candidates,
-                cursor,
-                limit,
-                &mut roots,
-                &mut accepted,
-            )
-            .expect("same-variable repeated path exposes a source frontier");
-        assert!(accepted.is_empty());
-        pages.push((page.examined, roots.len()));
-        sources.extend(roots.into_iter().map(|root| {
-            assert_eq!(root.node.source, Some(root.node.value));
-            root.node.value
-        }));
-        let Some(next) = page.next else {
-            break;
-        };
-        assert!(page.examined > 0, "a live cursor must consume its page");
-        cursor = next;
-    }
-    (sources, pages)
-}
-
-fn collect_distinct_proposal_frontier(
-    path: &RegularPathConstraint,
-    variable: VariableId,
-    limit: usize,
-) -> (Vec<RawInline>, Vec<(usize, usize)>) {
-    assert!(limit > 0);
-    assert!(path.residual_proposal_source_is_paged(variable, &RowsView::EMPTY));
-    let mut cursor = ResidualDeltaSourceCursor::Start;
-    let mut sources = Vec::new();
-    let mut pages = Vec::new();
-    loop {
-        let mut roots = Vec::new();
-        let mut accepted = Vec::new();
-        let page = path
-            .residual_delta_source_page(
-                variable,
-                &RowsView::EMPTY,
-                None,
-                cursor,
-                limit,
-                &mut roots,
-                &mut accepted,
-            )
-            .expect("a two-free-endpoint path exposes its first binding frontier");
-        assert!(roots.is_empty());
-        pages.push((page.examined, accepted.len()));
-        sources.extend(accepted);
-        let Some(next) = page.next else {
-            break;
-        };
-        assert!(page.examined > 0, "a live cursor must consume its page");
-        cursor = next;
-    }
-    (sources, pages)
+    Arc::new(IntersectionConstraint::new(vec![
+        Box::new(RegularPathConstraint::new(set, node, node, ops)) as DynConstraint,
+    ]))
 }
 
 fn same_variable_formula_confirm_root(
     set: TribleSet,
     candidates: Vec<RawInline>,
     ops: &[PathOp],
-    seeded_roots: Arc<AtomicUsize>,
-    source_pages: Option<Arc<Mutex<Vec<(usize, usize, usize)>>>>,
-    expanded_nodes: Arc<AtomicUsize>,
 ) -> Root {
     let node = Variable::<GenId>::new(START);
-    let arm = Box::new(CountingPath {
-        inner: RegularPathConstraint::new(set, node, node, ops),
-        seeded_roots: Some(seeded_roots),
-        source_pages,
-        expanded_nodes,
-    }) as DynConstraint;
+    let arm = Box::new(RegularPathConstraint::new(set, node, node, ops)) as DynConstraint;
     Arc::new(IntersectionConstraint::new(vec![
         Box::new(OrderedDomain {
             variable: START,
@@ -1536,12 +1056,7 @@ fn same_variable_formula_confirm_root(
     ]))
 }
 
-fn same_variable_outer_root(
-    set: TribleSet,
-    outer_values: [RawInline; 2],
-    ops: &[PathOp],
-    expanded_nodes: Arc<AtomicUsize>,
-) -> Root {
+fn same_variable_outer_root(set: TribleSet, outer_values: [RawInline; 2], ops: &[PathOp]) -> Root {
     let node = Variable::<GenId>::new(START);
     Arc::new(IntersectionConstraint::new(vec![
         Box::new(OrderedDomain {
@@ -1550,12 +1065,7 @@ fn same_variable_outer_root(
             unbound_estimate: 0,
             values: outer_values.to_vec(),
         }) as DynConstraint,
-        Box::new(CountingPath {
-            inner: RegularPathConstraint::new(set, node, node, ops),
-            seeded_roots: None,
-            source_pages: None,
-            expanded_nodes,
-        }) as DynConstraint,
+        Box::new(RegularPathConstraint::new(set, node, node, ops)) as DynConstraint,
     ]))
 }
 
@@ -1627,27 +1137,16 @@ fn sorted_bag_is_subset(subset: &[RawInline], superset: &[RawInline]) -> bool {
 fn synthetic_root_atom_same_variable_rpq_composes_capabilities() {
     let graph = Graph::new(4, &[(0, 0), (1, 1), (2, 2), (3, 3)]);
     let ops = repeated(graph.attribute, false);
-    let make = |seeded_roots, source_pages| CountingPath {
-        inner: RegularPathConstraint::new(
+    let make = || {
+        RegularPathConstraint::new(
             graph.set.clone(),
             Variable::<GenId>::new(START),
             Variable::<GenId>::new(START),
             &ops,
-        ),
-        seeded_roots: Some(seeded_roots),
-        source_pages: Some(source_pages),
-        expanded_nodes: Arc::new(AtomicUsize::new(0)),
+        )
     };
 
-    let mut expected: Vec<_> = Query::new(
-        make(
-            Arc::new(AtomicUsize::new(0)),
-            Arc::new(Mutex::new(Vec::new())),
-        ),
-        project_start,
-    )
-    .sequential()
-    .collect();
+    let mut expected: Vec<_> = Query::new(make(), project_start).sequential().collect();
     expected.sort_unstable();
 
     let cases = [
@@ -1664,26 +1163,15 @@ fn synthetic_root_atom_same_variable_rpq_composes_capabilities() {
         ("whole-root-transitions", ResidualLowering::FULL, true),
     ];
     for (name, lowering, should_page_sources) in cases {
-        let seeded = Arc::new(AtomicUsize::new(0));
-        let pages = Arc::new(Mutex::new(Vec::new()));
-        let mut actual: Vec<_> =
-            Query::new(make(Arc::clone(&seeded), Arc::clone(&pages)), project_start)
-                .solve_residual_state_lazy_with(lowering)
-                .cap(4)
-                .start_width(1)
-                .collect();
+        let mut query = Query::new(make(), project_start)
+            .solve_residual_state_lazy_with(lowering)
+            .cap(4)
+            .start_width(1);
+        let mut actual: Vec<_> = query.by_ref().collect();
         actual.sort_unstable();
         assert_eq!(actual, expected, "capability case {name}");
         assert_eq!(
-            !pages
-                .lock()
-                .expect("source-page recorder poisoned")
-                .is_empty(),
-            should_page_sources,
-            "capability case {name}"
-        );
-        assert_eq!(
-            seeded.load(Ordering::Relaxed) > 0,
+            query.stats().delta_source_pages > 0,
             should_page_sources,
             "capability case {name}"
         );
@@ -1695,9 +1183,7 @@ fn synthetic_root_grouped_rpq_precedes_page_local_suffix_atomically() {
     let graph = Graph::new(3, &[(0, 0)]);
     let accepted = graph.value(0).raw;
     let candidates = vec![accepted, graph.value(1).raw, accepted, graph.value(2).raw];
-    let source_pages = Arc::new(Mutex::new(Vec::new()));
     let suffix_calls = Arc::new(Mutex::new(Vec::new()));
-    let seeded = Arc::new(AtomicUsize::new(0));
     let node = Variable::<GenId>::new(START);
     let root = Arc::new(IntersectionConstraint::new(vec![
         Box::new(OrderedDomain {
@@ -1706,17 +1192,12 @@ fn synthetic_root_grouped_rpq_precedes_page_local_suffix_atomically() {
             unbound_estimate: 0,
             values: candidates,
         }) as DynConstraint,
-        Box::new(CountingPath {
-            inner: RegularPathConstraint::new(
-                graph.set.clone(),
-                node,
-                node,
-                &repeated(graph.attribute, false),
-            ),
-            seeded_roots: Some(Arc::clone(&seeded)),
-            source_pages: Some(Arc::clone(&source_pages)),
-            expanded_nodes: Arc::new(AtomicUsize::new(0)),
-        }) as DynConstraint,
+        Box::new(RegularPathConstraint::new(
+            graph.set.clone(),
+            node,
+            node,
+            &repeated(graph.attribute, false),
+        )) as DynConstraint,
         Box::new(PageTraceFilter {
             variable: START,
             estimate: usize::MAX,
@@ -1731,23 +1212,9 @@ fn synthetic_root_grouped_rpq_precedes_page_local_suffix_atomically() {
         .start_width(1);
 
     assert_eq!(query.by_ref().collect::<Vec<_>>(), vec![accepted, accepted]);
-    let pages = source_pages
-        .lock()
-        .expect("source-page recorder poisoned")
-        .clone();
-    assert_eq!(
-        pages
-            .iter()
-            .map(|&(limit, examined, _)| (limit, examined))
-            .collect::<Vec<_>>(),
-        vec![(1, 1), (1, 1), (1, 1)]
-    );
-    assert_eq!(
-        pages.iter().map(|&(_, _, roots)| roots).sum::<usize>(),
-        1,
-        "the duplicate accepted value must remain one grouped source root"
-    );
-    assert_eq!(seeded.load(Ordering::Relaxed), 1);
+    assert_eq!(query.stats().delta_source_pages, 4);
+    assert_eq!(query.stats().delta_source_candidates_examined, 4);
+    assert_eq!(query.stats().delta_source_roots, 2);
     assert_eq!(
         *suffix_calls.lock().expect("suffix recorder poisoned"),
         [1, 1],
@@ -1761,26 +1228,19 @@ fn synthetic_root_cyclic_proposer_respects_the_streamability_latency_boundary() 
     for page_local in [true, false] {
         let edges: Vec<_> = (0..8).map(|node| (node, node)).collect();
         let graph = Graph::new(8, &edges);
-        let source_pages = Arc::new(Mutex::new(Vec::new()));
         let suffix_calls = Arc::new(Mutex::new(Vec::new()));
-        let seeded = Arc::new(AtomicUsize::new(0));
         let node = Variable::<GenId>::new(START);
         let accepted = (0..8)
             .map(|node| graph.value(node).raw)
             .max()
             .expect("nonempty source frontier");
         let root = Arc::new(IntersectionConstraint::new(vec![
-            Box::new(CountingPath {
-                inner: RegularPathConstraint::new(
-                    graph.set.clone(),
-                    node,
-                    node,
-                    &repeated(graph.attribute, false),
-                ),
-                seeded_roots: Some(Arc::clone(&seeded)),
-                source_pages: Some(Arc::clone(&source_pages)),
-                expanded_nodes: Arc::new(AtomicUsize::new(0)),
-            }) as DynConstraint,
+            Box::new(RegularPathConstraint::new(
+                graph.set.clone(),
+                node,
+                node,
+                &repeated(graph.attribute, false),
+            )) as DynConstraint,
             Box::new(PageTraceFilter {
                 variable: START,
                 estimate: usize::MAX,
@@ -1795,12 +1255,10 @@ fn synthetic_root_cyclic_proposer_respects_the_streamability_latency_boundary() 
             .start_width(1);
 
         assert_eq!(query.next(), Some(accepted));
+        assert_eq!(query.stats().delta_source_pages, 4);
+        assert_eq!(query.stats().delta_source_candidates_examined, 8);
+        assert_eq!(query.stats().delta_source_roots, 8);
         if page_local {
-            assert_eq!(
-                *source_pages.lock().expect("source-page recorder poisoned"),
-                [(1, 1, 1), (2, 2, 2), (4, 4, 4), (8, 1, 1)]
-            );
-            assert_eq!(seeded.load(Ordering::Relaxed), 8);
             assert_eq!(
                 *suffix_calls.lock().expect("suffix recorder poisoned"),
                 [1, 1, 1, 1],
@@ -1812,11 +1270,6 @@ fn synthetic_root_cyclic_proposer_respects_the_streamability_latency_boundary() 
             assert_eq!(query.stats().width_increases, 3);
             assert_eq!(query.current_width(), 8);
         } else {
-            assert_eq!(
-                *source_pages.lock().expect("source-page recorder poisoned"),
-                [(1, 1, 1), (2, 2, 2), (4, 4, 4), (8, 1, 1)]
-            );
-            assert_eq!(seeded.load(Ordering::Relaxed), 8);
             assert_eq!(
                 *suffix_calls.lock().expect("suffix recorder poisoned"),
                 [8],
@@ -1835,51 +1288,35 @@ fn synthetic_root_cyclic_proposer_respects_the_streamability_latency_boundary() 
 fn nested_repeated_root_rpqs_keep_distinct_action_occurrences() {
     let graph = Graph::new(3, &[(0, 1), (1, 2)]);
     let ops = repeated(graph.attribute, false);
-    let make = |left: Option<Arc<AtomicUsize>>, right: Option<Arc<AtomicUsize>>| {
+    let make = || {
         let start = Variable::<GenId>::new(START);
         let end = Variable::<GenId>::new(END);
-        let arm = |seeded_roots| {
-            Box::new(CountingPath {
-                inner: RegularPathConstraint::new(graph.set.clone(), start, end, &ops),
-                seeded_roots,
-                source_pages: None,
-                expanded_nodes: Arc::new(AtomicUsize::new(0)),
-            }) as DynConstraint
+        let arm = || {
+            Box::new(RegularPathConstraint::new(
+                graph.set.clone(),
+                start,
+                end,
+                &ops,
+            )) as DynConstraint
         };
         Arc::new(IntersectionConstraint::new(vec![
             Box::new(start.is(graph.value(0))) as DynConstraint,
-            Box::new(UnionConstraint::new(vec![arm(left), arm(right)])) as DynConstraint,
+            Box::new(UnionConstraint::new(vec![arm(), arm()])) as DynConstraint,
         ]))
     };
     let lowering = ResidualLowering::FULL;
-    let left = Arc::new(AtomicUsize::new(0));
-    let right = Arc::new(AtomicUsize::new(0));
-    let direct = Query::new(
-        make(Some(Arc::clone(&left)), Some(Arc::clone(&right))),
-        project_end,
-    )
-    .solve_residual_state_lazy_with(lowering)
-    .collect_profiled();
+    let direct = Query::new(make(), project_end)
+        .solve_residual_state_lazy_with(lowering)
+        .collect_profiled();
     let mut actual = direct.results;
     actual.sort_unstable();
     let mut expected = vec![graph.value(1).raw, graph.value(2).raw];
     expected.sort_unstable();
     assert_eq!(actual, expected);
-    assert_eq!(left.load(Ordering::Relaxed), 1);
-    assert_eq!(right.load(Ordering::Relaxed), 1);
-
-    let observed_left = Arc::new(AtomicUsize::new(0));
-    let observed_right = Arc::new(AtomicUsize::new(0));
-    let observed = Query::new(
-        make(
-            Some(Arc::clone(&observed_left)),
-            Some(Arc::clone(&observed_right)),
-        ),
-        project_end,
-    )
-    .solve_residual_state_lazy_with(lowering)
-    .shadow(ResidualShadowEpoch::new())
-    .collect_profiled();
+    let observed = Query::new(make(), project_end)
+        .solve_residual_state_lazy_with(lowering)
+        .shadow(ResidualShadowEpoch::new())
+        .collect_profiled();
     let mut observed_results = observed.results.clone();
     observed_results.sort_unstable();
     assert_eq!(observed_results, expected);
@@ -1894,29 +1331,19 @@ fn nested_repeated_root_rpqs_keep_distinct_action_occurrences() {
     occurrences.dedup();
     assert_eq!(occurrences.len(), 2);
     assert_eq!(observed.stats, direct.stats);
-    assert_eq!(observed_left.load(Ordering::Relaxed), 1);
-    assert_eq!(observed_right.load(Ordering::Relaxed), 1);
 }
 
 #[test]
 fn cyclic_rpq_runs_as_a_direct_finite_or_proposal_action() {
     let graph = Graph::new(4, &[(0, 1), (1, 2), (2, 3)]);
     let ops = repeated(graph.attribute, false);
-    let seeded = Arc::new(AtomicUsize::new(0));
-    let expanded = Arc::new(AtomicUsize::new(0));
-    let root = formula_bound_start_root(
-        graph.set.clone(),
-        graph.value(0),
-        &ops,
-        Some(Arc::clone(&seeded)),
-        Arc::clone(&expanded),
-    );
+    let root = formula_bound_start_root(graph.set.clone(), graph.value(0), &ops);
 
-    let mut lowered: Vec<_> = Query::new(Arc::clone(&root), project_end)
+    let mut lowered_query = Query::new(Arc::clone(&root), project_end)
         .solve_residual_state_lazy_with(combined_effects())
         .cap(1)
-        .start_width(1)
-        .collect();
+        .start_width(1);
+    let mut lowered: Vec<_> = lowered_query.by_ref().collect();
     let mut sequential: Vec<_> = Query::new(root, project_end).sequential().collect();
     lowered.sort_unstable();
     sequential.sort_unstable();
@@ -1924,8 +1351,7 @@ fn cyclic_rpq_runs_as_a_direct_finite_or_proposal_action() {
     let mut expected: Vec<_> = (1..4).map(|node| graph.value(node).raw).collect();
     expected.sort_unstable();
     assert_eq!(lowered, expected);
-    assert_eq!(seeded.load(Ordering::Relaxed), 1);
-    assert!(expanded.load(Ordering::Relaxed) >= 3);
+    assert!(lowered_query.stats().delta_transition_pages > 0);
 }
 
 #[test]
@@ -1933,8 +1359,6 @@ fn cyclic_rpq_runs_as_a_direct_finite_or_grouped_confirm_action() {
     let graph = Graph::new(4, &[(0, 1), (1, 2)]);
     let ops = repeated(graph.attribute, false);
     let absent = genid(&rngid().id).raw;
-    let seeded = Arc::new(AtomicUsize::new(0));
-    let expanded = Arc::new(AtomicUsize::new(0));
     let root = formula_target_confirm_root(
         graph.set.clone(),
         graph.value(0),
@@ -1945,15 +1369,13 @@ fn cyclic_rpq_runs_as_a_direct_finite_or_grouped_confirm_action() {
             graph.value(1).raw,
         ],
         &ops,
-        Some(Arc::clone(&seeded)),
-        Arc::clone(&expanded),
     );
 
-    let mut lowered: Vec<_> = Query::new(Arc::clone(&root), project_end)
+    let mut lowered_query = Query::new(Arc::clone(&root), project_end)
         .solve_residual_state_lazy_with(combined_effects())
         .cap(1)
-        .start_width(1)
-        .collect();
+        .start_width(1);
+    let mut lowered: Vec<_> = lowered_query.by_ref().collect();
     let mut sequential: Vec<_> = Query::new(root, project_end).sequential().collect();
     lowered.sort_unstable();
     sequential.sort_unstable();
@@ -1961,8 +1383,7 @@ fn cyclic_rpq_runs_as_a_direct_finite_or_grouped_confirm_action() {
     let mut expected = vec![graph.value(1).raw, graph.value(2).raw];
     expected.sort_unstable();
     assert_eq!(lowered, expected);
-    assert_eq!(seeded.load(Ordering::Relaxed), 1);
-    assert!(expanded.load(Ordering::Relaxed) >= 3);
+    assert!(lowered_query.stats().delta_transition_pages > 0);
 }
 
 #[test]
@@ -1971,14 +1392,12 @@ fn cyclic_or_confirm_keeps_the_original_group_for_a_later_sibling() {
     let ops = repeated(graph.attribute, false);
     let start_var = Variable::<GenId>::new(START);
     let end_var = Variable::<GenId>::new(END);
-    let seeded = Arc::new(AtomicUsize::new(0));
-    let expanded = Arc::new(AtomicUsize::new(0));
-    let cyclic = Box::new(CountingPath {
-        inner: RegularPathConstraint::new(graph.set.clone(), start_var, end_var, &ops),
-        seeded_roots: Some(Arc::clone(&seeded)),
-        source_pages: None,
-        expanded_nodes: Arc::clone(&expanded),
-    }) as DynConstraint;
+    let cyclic = Box::new(RegularPathConstraint::new(
+        graph.set.clone(),
+        start_var,
+        end_var,
+        &ops,
+    )) as DynConstraint;
     let sibling = Box::new(IntersectionConstraint::new(vec![
         Box::new(start_var.is(graph.value(0))) as DynConstraint,
         Box::new(OrderedDomain {
@@ -2000,11 +1419,11 @@ fn cyclic_or_confirm_keeps_the_original_group_for_a_later_sibling() {
         union,
     ]));
 
-    let mut lowered: Vec<_> = Query::new(Arc::clone(&root), project_end)
+    let mut lowered_query = Query::new(Arc::clone(&root), project_end)
         .solve_residual_state_lazy_with(combined_effects())
         .cap(1)
-        .start_width(1)
-        .collect();
+        .start_width(1);
+    let mut lowered: Vec<_> = lowered_query.by_ref().collect();
     let mut sequential: Vec<_> = Query::new(root, project_end).sequential().collect();
     lowered.sort_unstable();
     sequential.sort_unstable();
@@ -2012,8 +1431,7 @@ fn cyclic_or_confirm_keeps_the_original_group_for_a_later_sibling() {
     let mut expected = vec![graph.value(1).raw, graph.value(2).raw, graph.value(3).raw];
     expected.sort_unstable();
     assert_eq!(lowered, expected);
-    assert_eq!(seeded.load(Ordering::Relaxed), 1);
-    assert!(expanded.load(Ordering::Relaxed) >= 3);
+    assert!(lowered_query.stats().delta_transition_pages > 0);
 }
 
 #[test]
@@ -2034,28 +1452,23 @@ fn cyclic_rpq_runs_in_a_finite_and_as_proposer_and_grouped_confirmer() {
             vec![graph.value(1).raw, graph.value(2).raw],
         ),
     ] {
-        let seeded = Arc::new(AtomicUsize::new(0));
-        let expanded = Arc::new(AtomicUsize::new(0));
         let root = formula_and_bound_start_root(
             graph.set.clone(),
             graph.value(0),
             candidates,
             path_estimate_wins,
             &ops,
-            Some(Arc::clone(&seeded)),
-            Arc::clone(&expanded),
         );
-        let mut lowered: Vec<_> = Query::new(Arc::clone(&root), project_end)
-            .solve_residual_state_lazy_with(combined_effects())
-            .collect();
+        let mut lowered_query = Query::new(Arc::clone(&root), project_end)
+            .solve_residual_state_lazy_with(combined_effects());
+        let mut lowered: Vec<_> = lowered_query.by_ref().collect();
         let mut sequential: Vec<_> = Query::new(root, project_end).sequential().collect();
         lowered.sort_unstable();
         sequential.sort_unstable();
         expected.sort_unstable();
         assert_eq!(lowered, sequential);
         assert_eq!(lowered, expected);
-        assert!(seeded.load(Ordering::Relaxed) > 0);
-        assert!(expanded.load(Ordering::Relaxed) > 0);
+        assert!(lowered_query.stats().delta_transition_pages > 0);
     }
 }
 
@@ -2068,14 +1481,12 @@ fn cyclic_rpq_resumes_through_recursive_or_and_or_frames() {
         let start = graph.value(0);
         let start_var = Variable::<GenId>::new(START);
         let end_var = Variable::<GenId>::new(END);
-        let seeded = Arc::new(AtomicUsize::new(0));
-        let expanded = Arc::new(AtomicUsize::new(0));
-        let cyclic = Box::new(CountingPath {
-            inner: RegularPathConstraint::new(graph.set.clone(), start_var, end_var, &ops),
-            seeded_roots: Some(Arc::clone(&seeded)),
-            source_pages: None,
-            expanded_nodes: Arc::clone(&expanded),
-        }) as DynConstraint;
+        let cyclic = Box::new(RegularPathConstraint::new(
+            graph.set.clone(),
+            start_var,
+            end_var,
+            &ops,
+        )) as DynConstraint;
         let inner_or = Box::new(UnionConstraint::new(vec![
             cyclic,
             pair_end_arm(start, vec![graph.value(3).raw], 10),
@@ -2100,11 +1511,11 @@ fn cyclic_rpq_resumes_through_recursive_or_and_or_frames() {
         constraints.push(outer_or);
         let root = Arc::new(IntersectionConstraint::new(constraints));
 
-        let mut lowered: Vec<_> = Query::new(Arc::clone(&root), project_end)
+        let mut lowered_query = Query::new(Arc::clone(&root), project_end)
             .solve_residual_state_lazy_with(combined_effects())
             .cap(1)
-            .start_width(1)
-            .collect();
+            .start_width(1);
+        let mut lowered: Vec<_> = lowered_query.by_ref().collect();
         let mut sequential: Vec<_> = Query::new(root, project_end).sequential().collect();
         let mut expected = vec![graph.value(0).raw, graph.value(2).raw, graph.value(3).raw];
         lowered.sort_unstable();
@@ -2112,12 +1523,7 @@ fn cyclic_rpq_resumes_through_recursive_or_and_or_frames() {
         expected.sort_unstable();
         assert_eq!(lowered, sequential);
         assert_eq!(lowered, expected);
-        assert_eq!(
-            seeded.load(Ordering::Relaxed),
-            1,
-            "outer_confirmation={outer_confirmation}"
-        );
-        assert!(expanded.load(Ordering::Relaxed) >= 3);
+        assert!(lowered_query.stats().delta_transition_pages > 0);
     }
 }
 
@@ -2125,32 +1531,26 @@ fn cyclic_rpq_resumes_through_recursive_or_and_or_frames() {
 fn synthetic_root_atom_streams_a_cycle_before_fixpoint_cleanup() {
     let graph = Graph::new(3, &[(0, 0), (1, 2)]);
     let node = Variable::<GenId>::new(START);
-    let expanded = Arc::new(AtomicUsize::new(0));
-    let root = Arc::new(CountingPath {
-        inner: RegularPathConstraint::new(
-            graph.set.clone(),
-            node,
-            node,
-            &repeated(graph.attribute, false),
-        ),
-        seeded_roots: None,
-        source_pages: None,
-        expanded_nodes: Arc::clone(&expanded),
-    });
+    let root = Arc::new(RegularPathConstraint::new(
+        graph.set.clone(),
+        node,
+        node,
+        &repeated(graph.attribute, false),
+    ));
     let mut query = Query::new(root, project_start)
         .solve_residual_state_lazy_with(root_formula_effects())
         .cap(1)
         .start_width(1);
 
     assert_eq!(query.next(), Some(graph.value(0).raw));
-    assert_eq!(expanded.load(Ordering::Relaxed), 1);
+    assert_eq!(query.stats().delta_transition_candidates_examined, 1);
     assert_eq!(
         query.stats().delta_handoff_probe_pops,
         0,
         "a fully checked final candidate tail is already exact output"
     );
     assert_eq!(query.next(), None);
-    assert_eq!(expanded.load(Ordering::Relaxed), 2);
+    assert_eq!(query.stats().delta_transition_candidates_examined, 2);
 }
 
 #[test]
@@ -2158,7 +1558,6 @@ fn synthetic_root_and_streams_early_and_late_page_local_survivors() {
     for (accepted_node, expected_before_emit, nested_and) in [(1, 1, false), (4, 4, true)] {
         let graph = Graph::new(5, &[(0, 1), (1, 2), (2, 3), (3, 4)]);
         let ops = repeated(graph.attribute, false);
-        let expanded = Arc::new(AtomicUsize::new(0));
         let expected = graph.value(accepted_node).raw;
         let root = linear_formula_bound_start_filter_root(
             graph.set.clone(),
@@ -2166,7 +1565,6 @@ fn synthetic_root_and_streams_early_and_late_page_local_survivors() {
             vec![expected],
             nested_and,
             &ops,
-            Arc::clone(&expanded),
         );
         let mut query = Query::new(root, project_end)
             .solve_residual_state_lazy_with(root_formula_effects())
@@ -2175,17 +1573,18 @@ fn synthetic_root_and_streams_early_and_late_page_local_survivors() {
 
         assert_eq!(query.next(), Some(expected));
         assert_eq!(
-            expanded.load(Ordering::Relaxed),
+            query.stats().delta_transition_candidates_examined,
             expected_before_emit,
             "accepted_node={accepted_node}, nested_and={nested_and}"
         );
         assert_eq!(
             query.stats().delta_handoff_probe_pops,
-            expected_before_emit,
-            "every streamed AND handoff must be probed exactly once"
+            expected_before_emit + 1,
+            "each adjacency and the typed program/formula boundary are probed exactly once"
         );
         assert_eq!(query.next(), None);
-        assert_eq!(expanded.load(Ordering::Relaxed), 5);
+        assert_eq!(query.stats().delta_transition_pages, 5);
+        assert_eq!(query.stats().delta_transition_candidates_examined, 4);
     }
 }
 
@@ -2193,14 +1592,12 @@ fn synthetic_root_and_streams_early_and_late_page_local_survivors() {
 fn synthetic_root_and_empty_filter_waits_for_cleanup_without_replay() {
     let graph = Graph::new(5, &[(0, 1), (1, 2), (2, 3), (3, 4)]);
     let ops = repeated(graph.attribute, false);
-    let expanded = Arc::new(AtomicUsize::new(0));
     let root = linear_formula_bound_start_filter_root(
         graph.set.clone(),
         graph.value(0),
         vec![genid(&rngid().id).raw],
         false,
         &ops,
-        Arc::clone(&expanded),
     );
     let mut query = Query::new(root, project_end)
         .solve_residual_state_lazy_with(root_formula_effects())
@@ -2208,7 +1605,12 @@ fn synthetic_root_and_empty_filter_waits_for_cleanup_without_replay() {
         .start_width(1);
 
     assert_eq!(query.next(), None);
-    assert_eq!(expanded.load(Ordering::Relaxed), 5);
+    assert_eq!(query.stats().delta_transition_pages, 5);
+    assert_eq!(
+        query.stats().delta_transition_candidates_examined,
+        4,
+        "the initial bound candidate is not adjacency work"
+    );
     assert_eq!(
         query.stats().candidates_proposed,
         5,
@@ -2227,17 +1629,9 @@ fn linear_formula_streaming_matches_the_always_quiescent_union_bag() {
         allowed.clone(),
         true,
         &ops,
-        Arc::new(AtomicUsize::new(0)),
     );
-    let quiescent = formula_and_bound_start_root(
-        graph.set.clone(),
-        graph.value(0),
-        allowed,
-        true,
-        &ops,
-        None,
-        Arc::new(AtomicUsize::new(0)),
-    );
+    let quiescent =
+        formula_and_bound_start_root(graph.set.clone(), graph.value(0), allowed, true, &ops);
 
     let mut streamed: Vec<_> = Query::new(streaming, project_end)
         .solve_residual_state_lazy_with(root_formula_effects())
@@ -2284,12 +1678,10 @@ fn linear_formula_streaming_keeps_byte_identical_parent_activations_distinct() {
 #[test]
 fn clone_and_drop_preserve_a_live_linear_formula_stream() {
     let graph = Graph::new(4, &[(0, 1), (1, 2), (2, 3)]);
-    let expanded = Arc::new(AtomicUsize::new(0));
     let root = bound_start_root(
         graph.set.clone(),
         graph.value(0),
         &repeated(graph.attribute, false),
-        Arc::clone(&expanded),
     );
     let mut query = Query::new(root, project_end)
         .solve_residual_state_lazy_with(root_formula_effects())
@@ -2298,16 +1690,15 @@ fn clone_and_drop_preserve_a_live_linear_formula_stream() {
 
     let first = query.next().expect("the first endpoint streamed");
     assert_eq!(first, graph.value(1).raw);
-    assert_eq!(expanded.load(Ordering::Relaxed), 1);
+    assert_eq!(query.stats().delta_transition_candidates_examined, 1);
     assert_eq!(
         query.stats().delta_handoff_probe_pops,
-        0,
-        "terminal streamed candidates keep their exact cohort hot"
+        1,
+        "the typed program/formula boundary is probed exactly once"
     );
     let exact_clone = query.clone();
     let cancelled = query.clone();
     drop(cancelled);
-    assert_eq!(expanded.load(Ordering::Relaxed), 1);
 
     let mut original = vec![first];
     original.extend(query);
@@ -2319,7 +1710,6 @@ fn clone_and_drop_preserve_a_live_linear_formula_stream() {
     let mut expected = vec![graph.value(1).raw, graph.value(2).raw, graph.value(3).raw];
     expected.sort_unstable();
     assert_eq!(original, expected);
-    assert_eq!(expanded.load(Ordering::Relaxed), 7);
 }
 
 #[test]
@@ -2329,54 +1719,28 @@ fn ordinary_shape_selected_query_composes_root_formula_union_and_cyclic_rpq() {
     let start = graph.value(0);
 
     let mut expected: Vec<_> = Query::new(
-        formula_bound_start_root(
-            graph.set.clone(),
-            start,
-            &ops,
-            None,
-            Arc::new(AtomicUsize::new(0)),
-        ),
+        formula_bound_start_root(graph.set.clone(), start, &ops),
         project_end,
     )
     .sequential()
     .collect();
 
-    let seeded = Arc::new(AtomicUsize::new(0));
-    let expanded = Arc::new(AtomicUsize::new(0));
-    let mut ordinary: Vec<_> = Query::new(
-        formula_bound_start_root(
-            graph.set,
-            start,
-            &ops,
-            Some(Arc::clone(&seeded)),
-            Arc::clone(&expanded),
-        ),
+    let mut ordinary_query = Query::new(
+        formula_bound_start_root(graph.set, start, &ops),
         project_end,
-    )
-    .collect();
+    );
+    let mut ordinary: Vec<_> = ordinary_query.by_ref().collect();
 
     expected.sort_unstable();
     ordinary.sort_unstable();
     assert_eq!(ordinary, expected);
-    assert_eq!(seeded.load(Ordering::Relaxed), 1);
-    assert!(
-        expanded.load(Ordering::Relaxed) > 0,
-        "ordinary execution left the eligible cyclic RPQ opaque"
-    );
 }
 
 #[test]
 fn finite_or_keeps_cyclic_proposals_private_until_fixpoint_quiescence() {
     let graph = Graph::new(8, &[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)]);
     let ops = repeated(graph.attribute, false);
-    let expanded = Arc::new(AtomicUsize::new(0));
-    let root = formula_bound_start_root(
-        graph.set.clone(),
-        graph.value(0),
-        &ops,
-        None,
-        Arc::clone(&expanded),
-    );
+    let root = formula_bound_start_root(graph.set.clone(), graph.value(0), &ops);
     let mut query = Query::new(root, project_end)
         .solve_residual_state_lazy_with(combined_effects())
         .cap(1)
@@ -2384,12 +1748,16 @@ fn finite_or_keeps_cyclic_proposals_private_until_fixpoint_quiescence() {
 
     assert!(query.next().is_some());
     assert_eq!(
-        expanded.load(Ordering::Relaxed),
+        query.stats().delta_transition_pages,
         8,
+        "the finite OR waits for the complete cyclic arm"
+    );
+    assert_eq!(
+        query.stats().delta_transition_candidates_examined,
+        7,
         "an OR arm must not publish a partial cyclic proposal"
     );
     drop(query);
-    assert_eq!(expanded.load(Ordering::Relaxed), 8);
 }
 
 #[test]
@@ -2398,13 +1766,12 @@ fn clone_and_drop_preserve_a_live_formula_cyclic_remainder() {
     let ops = repeated(graph.attribute, false);
     let start_var = Variable::<GenId>::new(START);
     let end_var = Variable::<GenId>::new(END);
-    let expanded = Arc::new(AtomicUsize::new(0));
-    let cyclic = Box::new(CountingPath {
-        inner: RegularPathConstraint::new(graph.set.clone(), start_var, end_var, &ops),
-        seeded_roots: None,
-        source_pages: None,
-        expanded_nodes: Arc::clone(&expanded),
-    }) as DynConstraint;
+    let cyclic = Box::new(RegularPathConstraint::new(
+        graph.set.clone(),
+        start_var,
+        end_var,
+        &ops,
+    )) as DynConstraint;
     let root = Arc::new(IntersectionConstraint::new(vec![
         Box::new(OrderedDomain {
             variable: START,
@@ -2420,15 +1787,15 @@ fn clone_and_drop_preserve_a_live_formula_cyclic_remainder() {
         .start_width(1);
 
     let first = query.next().expect("one source activation quiesced");
+    assert_eq!(query.stats().delta_transition_pages, 4);
     assert_eq!(
-        expanded.load(Ordering::Relaxed),
-        4,
+        query.stats().delta_transition_candidates_examined,
+        3,
         "the other source activation must remain live"
     );
     let exact_clone = query.clone();
     let cancelled = query.clone();
     drop(cancelled);
-    assert_eq!(expanded.load(Ordering::Relaxed), 4);
 
     let mut original = vec![first];
     original.extend(query);
@@ -2438,7 +1805,6 @@ fn clone_and_drop_preserve_a_live_formula_cyclic_remainder() {
     cloned.sort_unstable();
     assert_eq!(cloned, original);
     assert_eq!(original.len(), 6);
-    assert_eq!(expanded.load(Ordering::Relaxed), 12);
 }
 
 #[test]
@@ -2454,41 +1820,23 @@ fn formula_transition_lowering_remains_capability_and_shape_gated() {
         ResidualLowering::new(FormulaScope::UnionLeaves, false),
         ResidualLowering::new(FormulaScope::OpaqueLeaves, true),
     ] {
-        let seeded = Arc::new(AtomicUsize::new(0));
-        let expanded = Arc::new(AtomicUsize::new(0));
-        let root = formula_bound_start_root(
-            graph.set.clone(),
-            graph.value(0),
-            &plus,
-            Some(Arc::clone(&seeded)),
-            Arc::clone(&expanded),
-        );
-        let mut actual: Vec<_> = Query::new(root, project_end)
-            .solve_residual_state_lazy_with(lowering)
-            .collect();
+        let root = formula_bound_start_root(graph.set.clone(), graph.value(0), &plus);
+        let mut query = Query::new(root, project_end).solve_residual_state_lazy_with(lowering);
+        let mut actual: Vec<_> = query.by_ref().collect();
         actual.sort_unstable();
         assert_eq!(actual, expected);
-        assert_eq!(seeded.load(Ordering::Relaxed), 0);
-        assert_eq!(expanded.load(Ordering::Relaxed), 0);
+        assert_eq!(query.stats().delta_transition_pages, 0);
     }
 
-    let seeded = Arc::new(AtomicUsize::new(0));
-    let expanded = Arc::new(AtomicUsize::new(0));
     let root = formula_bound_start_root(
         graph.set.clone(),
         graph.value(0),
         &[PathOp::Attr(graph.attribute.raw())],
-        Some(Arc::clone(&seeded)),
-        Arc::clone(&expanded),
     );
-    assert_eq!(
-        Query::new(root, project_end)
-            .solve_residual_state_lazy_with(combined_effects())
-            .collect::<Vec<_>>(),
-        vec![graph.value(1).raw]
-    );
-    assert_eq!(seeded.load(Ordering::Relaxed), 1);
-    assert_eq!(expanded.load(Ordering::Relaxed), 2);
+    let mut query =
+        Query::new(root, project_end).solve_residual_state_lazy_with(combined_effects());
+    assert_eq!(query.by_ref().collect::<Vec<_>>(), vec![graph.value(1).raw]);
+    assert!(query.stats().delta_transition_pages > 0);
 }
 
 #[test]
@@ -2496,16 +1844,13 @@ fn zero_root_cyclic_and_returns_empty_without_erasing_its_or_sibling() {
     let graph = Graph::new(1, &[]);
     let node = Variable::<GenId>::new(START);
     let ops = repeated(graph.attribute, false);
-    let seeded = Arc::new(AtomicUsize::new(0));
-    let pages = Arc::new(Mutex::new(Vec::new()));
-    let expanded = Arc::new(AtomicUsize::new(0));
     let survivor = graph.value(0).raw;
-    let cyclic = Box::new(CountingPath {
-        inner: RegularPathConstraint::new(graph.set.clone(), node, node, &ops),
-        seeded_roots: Some(Arc::clone(&seeded)),
-        source_pages: Some(Arc::clone(&pages)),
-        expanded_nodes: Arc::clone(&expanded),
-    }) as DynConstraint;
+    let cyclic = Box::new(RegularPathConstraint::new(
+        graph.set.clone(),
+        node,
+        node,
+        &ops,
+    )) as DynConstraint;
     let dead_and = Box::new(IntersectionConstraint::new(vec![
         cyclic,
         Box::new(OrderedDomain {
@@ -2528,12 +1873,6 @@ fn zero_root_cyclic_and_returns_empty_without_erasing_its_or_sibling() {
     let mut query =
         Query::new(root, project_start).solve_residual_state_lazy_with(combined_effects());
     assert_eq!(query.by_ref().collect::<Vec<_>>(), vec![survivor]);
-    assert_eq!(seeded.load(Ordering::Relaxed), 0);
-    assert_eq!(expanded.load(Ordering::Relaxed), 0);
-    assert_eq!(
-        *pages.lock().expect("source-page recorder poisoned"),
-        vec![(1, 0, 0)]
-    );
     assert_eq!(query.stats().delta_source_pages, 1);
     assert_eq!(query.stats().delta_source_dead_pages, 0);
     assert_eq!(query.stats().delta_source_negative_steps, 0);
@@ -2545,16 +1884,14 @@ fn formula_cyclic_activations_preserve_duplicate_outer_parents() {
     let graph = Graph::new(3, &[(0, 1), (1, 2)]);
     let ops = repeated(graph.attribute, false);
     let outer_values = [genid(&rngid().id).raw, genid(&rngid().id).raw];
-    let seeded = Arc::new(AtomicUsize::new(0));
-    let expanded = Arc::new(AtomicUsize::new(0));
     let start_var = Variable::<GenId>::new(START);
     let end_var = Variable::<GenId>::new(END);
-    let arm = Box::new(CountingPath {
-        inner: RegularPathConstraint::new(graph.set.clone(), start_var, end_var, &ops),
-        seeded_roots: Some(Arc::clone(&seeded)),
-        source_pages: None,
-        expanded_nodes: Arc::clone(&expanded),
-    }) as DynConstraint;
+    let arm = Box::new(RegularPathConstraint::new(
+        graph.set.clone(),
+        start_var,
+        end_var,
+        &ops,
+    )) as DynConstraint;
     let root = Arc::new(IntersectionConstraint::new(vec![
         Box::new(DuplicateParents {
             outer_values,
@@ -2563,9 +1900,9 @@ fn formula_cyclic_activations_preserve_duplicate_outer_parents() {
         Box::new(UnionConstraint::new(vec![arm])) as DynConstraint,
     ]));
 
-    let mut lowered: Vec<_> = Query::new(Arc::clone(&root), project_end)
-        .solve_residual_state_lazy_with(combined_effects())
-        .collect();
+    let mut lowered_query = Query::new(Arc::clone(&root), project_end)
+        .solve_residual_state_lazy_with(combined_effects());
+    let mut lowered: Vec<_> = lowered_query.by_ref().collect();
     let mut sequential: Vec<_> = Query::new(root, project_end).sequential().collect();
     lowered.sort_unstable();
     sequential.sort_unstable();
@@ -2578,8 +1915,7 @@ fn formula_cyclic_activations_preserve_duplicate_outer_parents() {
     ];
     expected.sort_unstable();
     assert_eq!(lowered, expected);
-    assert_eq!(seeded.load(Ordering::Relaxed), 2);
-    assert!(expanded.load(Ordering::Relaxed) >= 6);
+    assert!(lowered_query.stats().delta_transition_pages > 0);
 }
 
 #[cfg(feature = "parallel")]
@@ -2589,46 +1925,34 @@ fn all_capability_formula_cyclic_plan_survives_clone_and_parallel_split() {
     let ops = repeated(graph.attribute, false);
     let outer_values = [genid(&rngid().id).raw, genid(&rngid().id).raw];
     let make = || {
-        let seeded = Arc::new(AtomicUsize::new(0));
-        let expanded = Arc::new(AtomicUsize::new(0));
         let start_var = Variable::<GenId>::new(START);
         let end_var = Variable::<GenId>::new(END);
-        let arm = Box::new(CountingPath {
-            inner: RegularPathConstraint::new(graph.set.clone(), start_var, end_var, &ops),
-            seeded_roots: Some(Arc::clone(&seeded)),
-            source_pages: None,
-            expanded_nodes: Arc::clone(&expanded),
-        }) as DynConstraint;
-        (
-            Arc::new(IntersectionConstraint::new(vec![
-                Box::new(DuplicateParents {
-                    outer_values,
-                    start: graph.value(0).raw,
-                }) as DynConstraint,
-                Box::new(UnionConstraint::new(vec![arm])) as DynConstraint,
-            ])),
-            seeded,
-            expanded,
-        )
+        let arm = Box::new(RegularPathConstraint::new(
+            graph.set.clone(),
+            start_var,
+            end_var,
+            &ops,
+        )) as DynConstraint;
+        Arc::new(IntersectionConstraint::new(vec![
+            Box::new(DuplicateParents {
+                outer_values,
+                start: graph.value(0).raw,
+            }) as DynConstraint,
+            Box::new(UnionConstraint::new(vec![arm])) as DynConstraint,
+        ]))
     };
     let configured = |capabilities| {
-        let (root, seeded, expanded) = make();
-        (
-            Query::new(root, project_end)
-                .solve_residual_state_lazy_with(capabilities)
-                .cap(2)
-                .start_width(2),
-            seeded,
-            expanded,
-        )
+        Query::new(make(), project_end)
+            .solve_residual_state_lazy_with(capabilities)
+            .cap(2)
+            .start_width(2)
     };
     let sorted = |mut rows: Vec<RawInline>| {
         rows.sort_unstable();
         rows
     };
 
-    let (root, _, _) = make();
-    let scalar = sorted(Query::new(root, project_end).sequential().collect());
+    let scalar = sorted(Query::new(make(), project_end).sequential().collect());
     let expected = sorted(vec![
         graph.value(1).raw,
         graph.value(1).raw,
@@ -2640,22 +1964,18 @@ fn all_capability_formula_cyclic_plan_survives_clone_and_parallel_split() {
     // `root_formula` recursively owns finite AND/OR structure, so enabling the
     // narrower `finite_unions` capability as well must not change the exact
     // result bag or activation multiplicity.
-    let (root_formula, root_seeded, root_expanded) = configured(root_formula_effects());
+    let root_formula = configured(root_formula_effects());
     let root_formula = sorted(root_formula.collect());
     assert_eq!(root_formula, scalar);
-    assert!(root_seeded.load(Ordering::Relaxed) > 0);
-    assert!(root_expanded.load(Ordering::Relaxed) > 0);
 
-    let (all_capabilities, seeded_before, expanded_before) = configured(all_formula_effects());
+    let all_capabilities = configured(all_formula_effects());
     let exact_clone = all_capabilities.clone();
     let original = all_capabilities.collect::<Vec<_>>();
     let cloned = exact_clone.collect::<Vec<_>>();
     assert_eq!(cloned, original, "a fresh clone changed the exact stream");
     assert_eq!(sorted(original), root_formula);
-    assert!(seeded_before.load(Ordering::Relaxed) > 0);
-    assert!(expanded_before.load(Ordering::Relaxed) > 0);
 
-    let (mut started, seeded_after, expanded_after) = configured(all_formula_effects());
+    let mut started = configured(all_formula_effects());
     let first = started
         .next()
         .expect("the configured query has four results");
@@ -2670,46 +1990,32 @@ fn all_capability_formula_cyclic_plan_survives_clone_and_parallel_split() {
         sorted(std::iter::once(first).chain(remainder).collect()),
         scalar
     );
-    assert!(seeded_after.load(Ordering::Relaxed) > 0);
-    assert!(expanded_after.load(Ordering::Relaxed) > 0);
 
     for workers in [1, 4] {
-        let (parallel, seeded, expanded) = configured(all_formula_effects());
+        let parallel = configured(all_formula_effects());
         let parallel = rayon::ThreadPoolBuilder::new()
             .num_threads(workers)
             .build()
             .unwrap()
             .install(|| parallel.into_par_iter().collect::<Vec<_>>());
         assert_eq!(sorted(parallel), scalar, "workers={workers}");
-        assert!(seeded.load(Ordering::Relaxed) > 0, "workers={workers}");
-        assert!(expanded.load(Ordering::Relaxed) > 0, "workers={workers}");
     }
 }
 
 #[test]
 fn formula_same_variable_sources_keep_novelty_separate_at_shared_terms() {
     let graph = Graph::new(4, &[(0, 2), (1, 2), (2, 1), (3, 0)]);
-    let seeded = Arc::new(AtomicUsize::new(0));
-    let pages = Arc::new(Mutex::new(Vec::new()));
-    let expanded = Arc::new(AtomicUsize::new(0));
     let root = same_variable_formula_confirm_root(
         graph.set.clone(),
         vec![graph.value(0).raw, graph.value(1).raw],
         &repeated(graph.attribute, false),
-        Arc::clone(&seeded),
-        Some(Arc::clone(&pages)),
-        Arc::clone(&expanded),
     );
 
     let mut query =
         Query::new(root, project_start).solve_residual_state_lazy_with(combined_effects());
     assert_eq!(query.by_ref().collect::<Vec<_>>(), vec![graph.value(1).raw]);
-    assert_eq!(seeded.load(Ordering::Relaxed), 2);
-    assert!(expanded.load(Ordering::Relaxed) > 3);
-    assert_eq!(
-        *pages.lock().expect("source-page recorder poisoned"),
-        vec![(1, 1, 1), (2, 1, 1)]
-    );
+    assert_eq!(query.stats().delta_source_roots, 2);
+    assert_eq!(query.stats().delta_source_pages, 2);
     assert_eq!(query.stats().delta_source_dead_pages, 1);
 }
 
@@ -2742,12 +2048,14 @@ fn formula_same_variable_fixpoint_keeps_inverse_program_direction() {
     for (ops, mut expected) in cases {
         let node = Variable::<GenId>::new(START);
         let root = Arc::new(IntersectionConstraint::new(vec![
-            Box::new(UnionConstraint::new(vec![Box::new(CountingPath {
-                inner: RegularPathConstraint::new(graph.set.clone(), node, node, &ops),
-                seeded_roots: None,
-                source_pages: None,
-                expanded_nodes: Arc::new(AtomicUsize::new(0)),
-            }) as DynConstraint])) as DynConstraint,
+            Box::new(UnionConstraint::new(vec![
+                Box::new(RegularPathConstraint::new(
+                    graph.set.clone(),
+                    node,
+                    node,
+                    &ops,
+                )) as DynConstraint,
+            ])) as DynConstraint,
         ]));
         let mut lowered: Vec<_> = Query::new(root, project_start)
             .solve_residual_state_lazy_with(combined_effects())
@@ -2774,14 +2082,7 @@ fn plus_attr_handles_chain_diamond_self_loop_and_long_cycle() {
             .map(|node| graph.value(node).raw)
             .collect();
         assert_all_schedulers(
-            || {
-                bound_start_root(
-                    graph.set.clone(),
-                    graph.value(0),
-                    &ops,
-                    Arc::new(AtomicUsize::new(0)),
-                )
-            },
+            || bound_start_root(graph.set.clone(), graph.value(0), &ops),
             project_end,
             expected,
         );
@@ -2802,7 +2103,7 @@ fn same_variable_plus_denotes_nonempty_cycles_not_general_reachability() {
             let ops = repeated(graph.attribute, inverse);
             let expected = cyclic.iter().map(|&node| graph.value(node).raw).collect();
             assert_all_schedulers(
-                || same_variable_root(graph.set.clone(), &ops, Arc::new(AtomicUsize::new(0))),
+                || same_variable_root(graph.set.clone(), &ops),
                 project_start,
                 expected,
             );
@@ -2838,7 +2139,7 @@ fn same_variable_product_program_keeps_inverse_direction_inside_the_fixpoint() {
     ];
     for (ops, expected) in cases {
         assert_all_schedulers(
-            || same_variable_root(graph.set.clone(), &ops, Arc::new(AtomicUsize::new(0))),
+            || same_variable_root(graph.set.clone(), &ops),
             project_start,
             expected,
         );
@@ -2861,7 +2162,7 @@ fn same_variable_star_admits_exactly_the_graph_term_universe() {
         };
         ops.push(PathOp::Star);
         assert_all_schedulers(
-            || same_variable_root(graph.set.clone(), &ops, Arc::new(AtomicUsize::new(0))),
+            || same_variable_root(graph.set.clone(), &ops),
             project_start,
             expected.clone(),
         );
@@ -2884,15 +2185,8 @@ fn nullable_source_pages_are_the_sorted_nodes_union_without_absent_terms() {
     let mut expected = vec![graph.value(0).raw, graph.value(1).raw, literal.raw];
     expected.sort_unstable();
 
-    let node = Variable::<UnknownInline>::new(START);
-    let path = RegularPathConstraint::new(graph.set.clone(), node, node, &ops);
-    let (sources, pages) = collect_same_variable_source_frontier(&path, None, 1);
-    assert_eq!(sources, expected);
-    assert_eq!(pages, vec![(1, 1), (1, 1), (1, 1)]);
-    assert!(!sources.contains(&graph.value(2).raw));
-
     assert_all_schedulers(
-        || same_variable_unknown_root(graph.set.clone(), &ops, Arc::new(AtomicUsize::new(0))),
+        || same_variable_unknown_root(graph.set.clone(), &ops),
         project_start,
         expected,
     );
@@ -2927,8 +2221,6 @@ fn first_union_pages_deduplicate_arms_and_match_candidate_last_filtering() {
         PathOp::Union,
         PathOp::Plus,
     ];
-    let node = Variable::<UnknownInline>::new(START);
-    let path = RegularPathConstraint::new(graph.set.clone(), node, node, &ops);
     let mut expected = vec![
         graph.value(0).raw,
         graph.value(1).raw,
@@ -2937,49 +2229,8 @@ fn first_union_pages_deduplicate_arms_and_match_candidate_last_filtering() {
     ];
     expected.sort_unstable();
 
-    let (proposal_sources, proposal_pages) = collect_same_variable_source_frontier(&path, None, 2);
-    assert_eq!(proposal_sources, expected);
-    assert_eq!(
-        proposal_pages
-            .iter()
-            .map(|&(examined, _)| examined)
-            .collect::<Vec<_>>(),
-        vec![2, 2, 2, 1]
-    );
-    assert_eq!(
-        proposal_pages
-            .iter()
-            .map(|&(_, roots)| roots)
-            .sum::<usize>(),
-        expected.len()
-    );
-
-    let absent = [0xE7; 32];
-    let mut candidates = vec![
-        graph.value(0).raw,
-        graph.value(1).raw,
-        graph.value(2).raw,
-        graph.value(3).raw,
-        graph.value(4).raw,
-        graph.value(5).raw,
-        graph.value(6).raw,
-        literal.raw,
-        absent,
-    ];
-    candidates.sort_unstable();
-    let (confirm_sources, confirm_pages) =
-        collect_same_variable_source_frontier(&path, Some(&candidates), 3);
-    assert_eq!(confirm_sources, proposal_sources);
-    assert_eq!(
-        confirm_pages
-            .iter()
-            .map(|&(examined, _)| examined)
-            .collect::<Vec<_>>(),
-        vec![3, 3, 3]
-    );
-
     assert_all_schedulers(
-        || same_variable_unknown_root(graph.set.clone(), &ops, Arc::new(AtomicUsize::new(0))),
+        || same_variable_unknown_root(graph.set.clone(), &ops),
         project_start,
         expected,
     );
@@ -3073,43 +2324,23 @@ fn same_variable_grouped_delta_confirm_filters_one_immutable_sequence() {
                 graph.value(3).raw,
                 graph.value(1).raw,
             ],
-            3,
+            4,
         ),
     ];
     for (ops, expected, expected_roots) in cases {
-        let seeded = Arc::new(AtomicUsize::new(0));
-        let pages = Arc::new(Mutex::new(Vec::new()));
-        let expanded = Arc::new(AtomicUsize::new(0));
-        let root = same_variable_confirm_root(
-            graph.set.clone(),
-            candidates.clone(),
-            &ops,
-            Arc::clone(&seeded),
-            Some(Arc::clone(&pages)),
-            Arc::clone(&expanded),
-        );
+        let root = same_variable_confirm_root(graph.set.clone(), candidates.clone(), &ops);
         let mut query =
             Query::new(root, project_start).solve_residual_state_lazy_with(combined_effects());
         let actual: Vec<_> = query.by_ref().collect();
         assert_eq!(actual, expected);
-        assert_eq!(seeded.load(Ordering::Relaxed), expected_roots);
-        assert!(expanded.load(Ordering::Relaxed) >= expected_roots);
-        let pages = pages.lock().expect("source-page recorder poisoned");
+        assert_eq!(query.stats().delta_source_pages, 3);
+        assert_eq!(query.stats().delta_source_roots, expected_roots);
         assert_eq!(
-            pages
-                .iter()
-                .map(|&(limit, examined, _)| (limit, examined))
-                .collect::<Vec<_>>(),
-            vec![(1, 1), (2, 2), (4, 1)]
+            query.stats().delta_source_candidates_examined,
+            candidates.len()
         );
-        assert_eq!(
-            pages.iter().map(|&(_, _, roots)| roots).sum::<usize>(),
-            expected_roots
-        );
-        drop(pages);
-        assert_eq!(query.current_width(), 8);
-        assert_eq!(query.stats().width_increases, 3);
-        assert_eq!(query.stats().delta_source_dead_pages, 2);
+        assert_eq!(query.current_width(), 4);
+        assert_eq!(query.stats().width_increases, 2);
     }
 }
 
@@ -3119,25 +2350,17 @@ fn same_variable_sources_do_not_share_seen_at_a_common_term() {
     // while B must continue through the same C and return to B. D -> A only
     // makes A survive the exact FIRST/last-source restriction.
     let graph = Graph::new(4, &[(0, 2), (1, 2), (2, 1), (3, 0)]);
-    let seeded = Arc::new(AtomicUsize::new(0));
-    let expanded = Arc::new(AtomicUsize::new(0));
     let root = same_variable_confirm_root(
         graph.set.clone(),
         vec![graph.value(0).raw, graph.value(1).raw],
         &repeated(graph.attribute, false),
-        Arc::clone(&seeded),
-        None,
-        Arc::clone(&expanded),
     );
 
-    assert_eq!(
-        Query::new(root, project_start)
-            .solve_residual_state_lazy_with(combined_effects())
-            .collect::<Vec<_>>(),
-        vec![graph.value(1).raw]
-    );
-    assert_eq!(seeded.load(Ordering::Relaxed), 2);
-    assert!(expanded.load(Ordering::Relaxed) > 3);
+    let mut query =
+        Query::new(root, project_start).solve_residual_state_lazy_with(combined_effects());
+    assert_eq!(query.by_ref().collect::<Vec<_>>(), vec![graph.value(1).raw]);
+    assert_eq!(query.stats().delta_source_roots, 2);
+    assert!(query.stats().delta_transition_pages > 0);
 }
 
 #[test]
@@ -3146,14 +2369,7 @@ fn same_variable_fixpoint_preserves_duplicate_outer_activations() {
     let outer_values = [genid(&rngid().id).raw, genid(&rngid().id).raw];
     let ops = repeated(graph.attribute, false);
     assert_all_schedulers(
-        || {
-            same_variable_outer_root(
-                graph.set.clone(),
-                outer_values,
-                &ops,
-                Arc::new(AtomicUsize::new(0)),
-            )
-        },
+        || same_variable_outer_root(graph.set.clone(), outer_values, &ops),
         project_start,
         vec![
             graph.value(0).raw,
@@ -3179,64 +2395,26 @@ fn same_variable_delta_streams_after_one_lazy_source_and_one_expansion() {
             (7, 7),
         ],
     );
-    let seeded = Arc::new(AtomicUsize::new(0));
-    let pages = Arc::new(Mutex::new(Vec::new()));
-    let expanded = Arc::new(AtomicUsize::new(0));
-    let root = counted_same_variable_root(
-        graph.set.clone(),
-        &repeated(graph.attribute, false),
-        Arc::clone(&seeded),
-        Some(Arc::clone(&pages)),
-        Arc::clone(&expanded),
-    );
+    let root = same_variable_root(graph.set.clone(), &repeated(graph.attribute, false));
     let mut query =
         Query::new(root, project_start).solve_residual_state_lazy_with(combined_effects());
 
     let first = query.next().expect("every source has a self-loop");
     assert!((0..8).any(|node| first == graph.value(node).raw));
-    assert_eq!(seeded.load(Ordering::Relaxed), 1);
-    assert_eq!(expanded.load(Ordering::Relaxed), 1);
-    assert_eq!(
-        *pages.lock().expect("source-page recorder poisoned"),
-        vec![(1, 1, 1)]
-    );
+    assert_eq!(query.stats().delta_source_pages, 1);
+    assert_eq!(query.stats().delta_source_roots, 1);
+    assert_eq!(query.stats().delta_transition_candidates_examined, 1);
     drop(query);
-    assert_eq!(seeded.load(Ordering::Relaxed), 1);
-    assert_eq!(expanded.load(Ordering::Relaxed), 1);
-    assert_eq!(
-        *pages.lock().expect("source-page recorder poisoned"),
-        vec![(1, 1, 1)]
-    );
 }
 
 #[test]
 fn same_variable_negative_source_pages_grow_one_two_four() {
     let graph = Graph::new(8, &[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)]);
-    let seeded = Arc::new(AtomicUsize::new(0));
-    let pages = Arc::new(Mutex::new(Vec::new()));
-    let expanded = Arc::new(AtomicUsize::new(0));
-    let root = counted_same_variable_root(
-        graph.set.clone(),
-        &repeated(graph.attribute, false),
-        Arc::clone(&seeded),
-        Some(Arc::clone(&pages)),
-        Arc::clone(&expanded),
-    );
+    let root = same_variable_root(graph.set.clone(), &repeated(graph.attribute, false));
     let mut query =
         Query::new(root, project_start).solve_residual_state_lazy_with(combined_effects());
 
     assert_eq!(query.next(), None);
-    let pages = pages.lock().expect("source-page recorder poisoned");
-    assert_eq!(
-        pages
-            .iter()
-            .map(|&(limit, examined, _)| (limit, examined))
-            .collect::<Vec<_>>(),
-        vec![(1, 1), (2, 2), (4, 4)]
-    );
-    assert_eq!(pages.iter().map(|&(_, _, roots)| roots).sum::<usize>(), 6);
-    drop(pages);
-    assert_eq!(seeded.load(Ordering::Relaxed), 6);
     assert_eq!(query.current_width(), 8);
     assert_eq!(query.stats().width_increases, 3);
     assert_eq!(query.stats().delta_source_pages, 3);
@@ -3245,7 +2423,6 @@ fn same_variable_negative_source_pages_grow_one_two_four() {
     assert_eq!(query.stats().delta_source_dead_pages, 3);
     assert_eq!(query.stats().delta_source_negative_steps, 3);
     assert_eq!(query.stats().delta_handoff_probe_pops, 0);
-    assert!(expanded.load(Ordering::Relaxed) >= 6);
 }
 
 #[test]
@@ -3259,33 +2436,16 @@ fn same_variable_late_hit_keeps_the_geometric_negative_prefix() {
         &graph.attribute,
         &graph.value(target),
     ));
-    let seeded = Arc::new(AtomicUsize::new(0));
-    let pages = Arc::new(Mutex::new(Vec::new()));
-    let expanded = Arc::new(AtomicUsize::new(0));
-    let root = counted_same_variable_root(
-        graph.set.clone(),
-        &repeated(graph.attribute, false),
-        Arc::clone(&seeded),
-        Some(Arc::clone(&pages)),
-        Arc::clone(&expanded),
-    );
+    let root = same_variable_root(graph.set.clone(), &repeated(graph.attribute, false));
     let mut query =
         Query::new(root, project_start).solve_residual_state_lazy_with(combined_effects());
 
     assert_eq!(query.next(), Some(graph.value(target).raw));
-    let pages = pages.lock().expect("source-page recorder poisoned");
-    assert_eq!(
-        pages
-            .iter()
-            .map(|&(limit, examined, _)| (limit, examined))
-            .collect::<Vec<_>>(),
-        vec![(1, 1), (2, 2), (4, 4)]
-    );
-    assert_eq!(pages.iter().map(|&(_, _, roots)| roots).sum::<usize>(), 6);
-    drop(pages);
-    assert_eq!(seeded.load(Ordering::Relaxed), 6);
-    assert_eq!(query.current_width(), 8);
-    assert_eq!(query.stats().width_increases, 3);
+    assert_eq!(query.stats().delta_source_pages, 3);
+    assert_eq!(query.stats().delta_source_candidates_examined, 7);
+    assert_eq!(query.stats().delta_source_roots, 6);
+    assert_eq!(query.current_width(), 4);
+    assert_eq!(query.stats().width_increases, 2);
     assert_eq!(query.stats().delta_source_dead_pages, 2);
     assert_eq!(query.stats().delta_source_negative_steps, 2);
     assert_eq!(
@@ -3299,24 +2459,12 @@ fn same_variable_late_hit_keeps_the_geometric_negative_prefix() {
 #[test]
 fn same_variable_delta_remains_opt_in() {
     let graph = Graph::new(1, &[(0, 0)]);
-    let seeded = Arc::new(AtomicUsize::new(0));
-    let expanded = Arc::new(AtomicUsize::new(0));
-    let root = counted_same_variable_root(
-        graph.set.clone(),
-        &repeated(graph.attribute, false),
-        Arc::clone(&seeded),
-        None,
-        Arc::clone(&expanded),
-    );
+    let root = same_variable_root(graph.set.clone(), &repeated(graph.attribute, false));
 
-    assert_eq!(
-        Query::new(root, project_start)
-            .solve_residual_state_lazy()
-            .collect::<Vec<_>>(),
-        vec![graph.value(0).raw]
-    );
-    assert_eq!(seeded.load(Ordering::Relaxed), 0);
-    assert_eq!(expanded.load(Ordering::Relaxed), 0);
+    let mut query = Query::new(root, project_start).solve_residual_state_lazy();
+    assert_eq!(query.by_ref().collect::<Vec<_>>(), vec![graph.value(0).raw]);
+    assert_eq!(query.stats().delta_source_pages, 0);
+    assert_eq!(query.stats().delta_transition_pages, 0);
 }
 
 #[test]
@@ -3333,166 +2481,33 @@ fn star_and_optional_epsilon_acceptance_obey_the_graph_term_gate() {
     let expected = vec![graph.value(0).raw, graph.value(1).raw, graph.value(2).raw];
     for ops in [&star, &optional_or_plus] {
         assert_all_schedulers(
-            || {
-                bound_start_root(
-                    graph.set.clone(),
-                    graph.value(0),
-                    ops,
-                    Arc::new(AtomicUsize::new(0)),
-                )
-            },
+            || bound_start_root(graph.set.clone(), graph.value(0), ops),
             project_end,
             expected.clone(),
         );
 
         let absent = genid(&rngid().id);
         assert_all_schedulers(
-            || {
-                bound_start_root(
-                    graph.set.clone(),
-                    absent,
-                    ops,
-                    Arc::new(AtomicUsize::new(0)),
-                )
-            },
+            || bound_start_root(graph.set.clone(), absent, ops),
             project_end,
             Vec::new(),
         );
     }
 
-    let expanded = Arc::new(AtomicUsize::new(0));
     let _ = run(
-        bound_start_root(
-            graph.set.clone(),
-            graph.value(0),
-            &star,
-            Arc::clone(&expanded),
-        ),
+        bound_start_root(graph.set.clone(), graph.value(0), &star),
         Scheduler::Residual,
         project_end,
     );
-    assert!(expanded.load(Ordering::Relaxed) > 0);
 }
 
 #[test]
-fn fully_bound_support_seeds_anchor_each_target_in_the_forward_program() {
-    let graph = Graph::new(4, &[(0, 1), (0, 2)]);
-    let start = Variable::<GenId>::new(START);
-    let end = Variable::<GenId>::new(END);
-    let path: Box<dyn Constraint<'static>> = Box::new(RegularPathConstraint::new(
-        graph.set.clone(),
-        start,
-        end,
-        &[PathOp::Attr(graph.attribute.raw())],
-    ));
-    let source = graph.value(0).raw;
-    let reachable = graph.value(1).raw;
-    let absent = graph.value(3).raw;
-    let vars = [START, END];
-    let rows = [source, reachable, source, absent];
-    let view = RowsView::new(&vars, &rows);
-    let mut seeds = Vec::new();
-
-    let route = path
-        .residual_delta_support_seeds(&view, &mut seeds)
-        .expect("a fully-bound path exposes its forward transition route");
-    assert_eq!(route, END);
-    assert_eq!(seeds.len(), 2);
-    assert_eq!(seeds[0].parent, 0);
-    assert_eq!(seeds[0].output.node.source, Some(reachable));
-    assert_eq!(seeds[0].output.node.value, source);
-    assert!(!seeds[0].output.accepted);
-    assert_eq!(seeds[1].parent, 1);
-    assert_eq!(seeds[1].output.node.source, Some(absent));
-    assert_eq!(seeds[1].output.node.value, source);
-    assert!(!seeds[1].output.accepted);
-
-    let nodes: Vec<_> = seeds.iter().map(|seed| seed.output.node).collect();
-    let mut successors = Vec::new();
-    assert!(path.residual_delta_expand(route, &nodes, &mut successors));
-    assert!(successors
-        .iter()
-        .all(|(parent, output)| output.node.source == seeds[*parent as usize].output.node.source));
-    assert_eq!(
-        successors
-            .iter()
-            .filter(|(_, output)| output.accepted)
-            .map(|(parent, output)| (*parent, output.node.value))
-            .collect::<Vec<_>>(),
-        vec![(0, reachable)]
-    );
-
-    let partial_vars = [START];
-    let partial_rows = [source];
-    let partial = RowsView::new(&partial_vars, &partial_rows);
-    let mut unsupported = Vec::new();
-    assert_eq!(
-        path.residual_delta_support_seeds(&partial, &mut unsupported),
-        None
-    );
-    assert!(unsupported.is_empty());
-}
-
-#[test]
-fn fully_bound_nullable_support_gates_epsilon_by_nodes_without_source_paging() {
-    let graph = Graph::new(3, &[(0, 1)]);
-    let graph_term = graph.value(0).raw;
-    let other_term = graph.value(1).raw;
-    let absent = graph.value(2).raw;
-    let vars = [START, END];
-    let rows = [
-        graph_term, graph_term, graph_term, other_term, absent, absent,
-    ];
-
-    for suffix in [PathOp::Star, PathOp::Optional] {
-        let path = RegularPathConstraint::new(
-            graph.set.clone(),
-            Variable::<GenId>::new(START),
-            Variable::<GenId>::new(END),
-            &[PathOp::Attr(graph.attribute.raw()), suffix],
-        );
-        let mut seeds = Vec::new();
-        assert_eq!(
-            path.residual_delta_support_seeds(&RowsView::new(&vars, &rows), &mut seeds),
-            Some(END)
-        );
-        assert_eq!(seeds.len(), 3);
-        assert!(seeds[0].output.accepted);
-        assert!(!seeds[1].output.accepted);
-        assert!(!seeds[2].output.accepted);
-    }
-
-    let node = Variable::<GenId>::new(START);
-    let same_variable: Arc<dyn Constraint<'static> + Send + Sync> =
-        Arc::new(RegularPathConstraint::new(
-            graph.set,
-            node,
-            node,
-            &[PathOp::Attr(graph.attribute.raw()), PathOp::Star],
-        ));
-    let same_rows = [graph_term, absent];
-    let same_vars = [START];
-    let same_view = RowsView::new(&same_vars, &same_rows);
-    assert!(!same_variable.residual_delta_source_is_paged(START, &same_view));
-    let mut seeds = Vec::new();
-    assert_eq!(
-        same_variable.residual_delta_support_seeds(&same_view, &mut seeds),
-        Some(START)
-    );
-    assert_eq!(seeds.len(), 2);
-    assert!(seeds[0].output.accepted);
-    assert!(!seeds[1].output.accepted);
-}
-
-#[test]
-fn nullable_support_seed_publishes_before_distinct_or_same_variable_expansion() {
+fn nullable_support_uses_native_program_for_distinct_same_variable_and_absent_terms() {
     let graph = Graph::new(6, &[(0, 1), (1, 2), (2, 3), (3, 4)]);
     let ops = [PathOp::Attr(graph.attribute.raw()), PathOp::Star];
     let guarded_value = genid(&rngid().id).raw;
     let sibling_value = genid(&rngid().id).raw;
     let fully_bound_satisfied_calls = Arc::new(AtomicUsize::new(0));
-    let support_seeded_roots = Arc::new(AtomicUsize::new(0));
-    let expanded_nodes = Arc::new(AtomicUsize::new(0));
     let make = || {
         fully_bound_support_root(
             graph.set.clone(),
@@ -3504,8 +2519,6 @@ fn nullable_support_seed_publishes_before_distinct_or_same_variable_expansion() 
             1,
             8,
             Arc::clone(&fully_bound_satisfied_calls),
-            Arc::clone(&support_seeded_roots),
-            Arc::clone(&expanded_nodes),
         )
     };
     let mut query = Query::new(make(), project_outer)
@@ -3516,14 +2529,8 @@ fn nullable_support_seed_publishes_before_distinct_or_same_variable_expansion() 
     let first = query.next().expect("one nullable Support result");
     assert!(first == guarded_value || first == sibling_value);
     assert_eq!(fully_bound_satisfied_calls.load(Ordering::Relaxed), 0);
-    assert_eq!(support_seeded_roots.load(Ordering::Relaxed), 1);
-    assert_eq!(
-        expanded_nodes.load(Ordering::Relaxed),
-        0,
-        "epsilon Support crossed an adjacency expansion before publication"
-    );
-    assert_eq!(query.stats().delta_transition_pages, 0);
-    assert_eq!(query.stats().delta_transition_candidates_examined, 0);
+    assert!(query.stats().support_action_pops > 0);
+    assert!(query.stats().support_calls > 0);
     let mut cloned = query.clone();
     let remainder = if first == guarded_value {
         sibling_value
@@ -3532,15 +2539,10 @@ fn nullable_support_seed_publishes_before_distinct_or_same_variable_expansion() 
     };
     assert_eq!(query.next(), Some(remainder));
     assert_eq!(cloned.next(), Some(remainder));
-    assert_eq!(
-        expanded_nodes.load(Ordering::Relaxed),
-        0,
-        "publishing the nullable Support branch performed transition work"
-    );
     drop(query);
     drop(cloned);
 
-    let counters = SupportProbeCounters::new();
+    let same_variable_satisfied_calls = Arc::new(AtomicUsize::new(0));
     let mut same_variable = Query::new(
         fully_bound_same_variable_support_root(
             graph.set.clone(),
@@ -3548,7 +2550,7 @@ fn nullable_support_seed_publishes_before_distinct_or_same_variable_expansion() 
             &ops,
             guarded_value,
             sibling_value,
-            &counters,
+            &same_variable_satisfied_calls,
         ),
         project_outer,
     )
@@ -3559,32 +2561,18 @@ fn nullable_support_seed_publishes_before_distinct_or_same_variable_expansion() 
         .next()
         .expect("one same-variable nullable Support result");
     assert!(same_first == guarded_value || same_first == sibling_value);
-    assert_eq!(
-        counters.expanded_nodes.load(Ordering::Relaxed),
-        0,
-        "same-variable epsilon Support crossed an adjacency expansion"
-    );
-    assert_eq!(
-        counters.fully_bound_satisfied_calls.load(Ordering::Relaxed),
-        0
-    );
-    assert_eq!(counters.support_seeded_roots.load(Ordering::Relaxed), 1);
+    assert_eq!(same_variable_satisfied_calls.load(Ordering::Relaxed), 0);
+    assert!(same_variable.stats().support_action_pops > 0);
     let same_remainder = if same_first == guarded_value {
         sibling_value
     } else {
         guarded_value
     };
     assert_eq!(same_variable.next(), Some(same_remainder));
-    assert_eq!(
-        counters.expanded_nodes.load(Ordering::Relaxed),
-        0,
-        "publishing same-variable nullable Support performed transition work"
-    );
     drop(same_variable);
 
     let absent_guard = genid(&rngid().id).raw;
     let absent_sibling = genid(&rngid().id).raw;
-    let absent_expanded = Arc::new(AtomicUsize::new(0));
     let absent = fully_bound_support_root(
         graph.set.clone(),
         graph.value(5),
@@ -3595,22 +2583,17 @@ fn nullable_support_seed_publishes_before_distinct_or_same_variable_expansion() 
         1,
         8,
         Arc::new(AtomicUsize::new(0)),
-        Arc::new(AtomicUsize::new(0)),
-        Arc::clone(&absent_expanded),
     );
+    let mut absent_query = Query::new(absent, project_outer)
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .start_width(1)
+        .cap(1);
     assert_eq!(
-        Query::new(absent, project_outer)
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
-            .start_width(1)
-            .cap(1)
-            .collect::<Vec<_>>(),
+        absent_query.by_ref().collect::<Vec<_>>(),
         vec![absent_sibling],
         "nullable acceptance escaped the NODES(G) gate"
     );
-    assert!(
-        absent_expanded.load(Ordering::Relaxed) > 0,
-        "an absent term was accepted without proving non-epsilon failure"
-    );
+    assert!(absent_query.stats().delta_transition_pages > 0);
 }
 
 #[test]
@@ -3619,8 +2602,6 @@ fn fully_bound_formula_guard_uses_native_support_instead_of_legacy_reachability(
     let guarded_value = genid(&rngid().id).raw;
     let sibling_value = genid(&rngid().id).raw;
     let fully_bound_satisfied_calls = Arc::new(AtomicUsize::new(0));
-    let support_seeded_roots = Arc::new(AtomicUsize::new(0));
-    let expanded_nodes = Arc::new(AtomicUsize::new(0));
     let root = fully_bound_support_root(
         graph.set.clone(),
         graph.value(0),
@@ -3631,33 +2612,27 @@ fn fully_bound_formula_guard_uses_native_support_instead_of_legacy_reachability(
         1,
         8,
         Arc::clone(&fully_bound_satisfied_calls),
-        Arc::clone(&support_seeded_roots),
-        Arc::clone(&expanded_nodes),
     );
 
-    let actual: Vec<_> = Query::new(root, project_outer)
+    let mut query = Query::new(root, project_outer)
         .solve_residual_state_lazy_with(ResidualLowering::FULL)
         .cap(1)
-        .start_width(1)
-        .collect();
+        .start_width(1);
+    let actual: Vec<_> = query.by_ref().collect();
 
     assert_eq!(actual, vec![sibling_value]);
     assert_eq!(fully_bound_satisfied_calls.load(Ordering::Relaxed), 0);
-    assert_eq!(support_seeded_roots.load(Ordering::Relaxed), 1);
-    assert!(
-        expanded_nodes.load(Ordering::Relaxed) > 0,
-        "an unreachable fully-bound guard must prove false by native quiescence"
-    );
+    assert!(query.stats().support_action_pops > 0);
+    assert!(query.stats().support_calls > 0);
+    assert!(query.stats().delta_transition_pages > 0);
 }
 
 #[test]
-fn first_support_witness_resumes_formula_before_irrelevant_path_work_drains() {
+fn first_support_witness_resumes_formula_via_the_native_program() {
     let graph = Graph::new(8, &[(0, 1), (0, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)]);
     let guarded_value = genid(&rngid().id).raw;
     let sibling_value = genid(&rngid().id).raw;
     let fully_bound_satisfied_calls = Arc::new(AtomicUsize::new(0));
-    let support_seeded_roots = Arc::new(AtomicUsize::new(0));
-    let expanded_nodes = Arc::new(AtomicUsize::new(0));
     let root = fully_bound_support_root(
         graph.set.clone(),
         graph.value(0),
@@ -3668,8 +2643,6 @@ fn first_support_witness_resumes_formula_before_irrelevant_path_work_drains() {
         1,
         8,
         Arc::clone(&fully_bound_satisfied_calls),
-        Arc::clone(&support_seeded_roots),
-        Arc::clone(&expanded_nodes),
     );
     let mut query = Query::new(root, project_outer)
         .solve_residual_state_lazy_with(ResidualLowering::FULL)
@@ -3679,18 +2652,8 @@ fn first_support_witness_resumes_formula_before_irrelevant_path_work_drains() {
     let first = query.next().expect("one guarded Union result");
     assert!(first == guarded_value || first == sibling_value);
     assert_eq!(fully_bound_satisfied_calls.load(Ordering::Relaxed), 0);
-    assert_eq!(support_seeded_roots.load(Ordering::Relaxed), 1);
-    assert_eq!(
-        expanded_nodes.load(Ordering::Relaxed),
-        1,
-        "the source expansion already contains a witness; its long sibling must remain live"
-    );
+    assert!(query.stats().support_action_pops > 0);
     drop(query);
-    assert_eq!(
-        expanded_nodes.load(Ordering::Relaxed),
-        1,
-        "dropping the consumer must cancel the irrelevant live traversal"
-    );
 }
 
 #[test]
@@ -3705,7 +2668,7 @@ fn affine_nested_support_is_permutation_invariant_and_monotone() {
         let mut level_bags = Vec::new();
         for level in 0..=4 {
             let graph = GeneratedGraph::new(level);
-            let (root, counters) = nested_affine_support_root(
+            let (root, fully_bound_satisfied_calls) = nested_affine_support_root(
                 graph.set.clone(),
                 graph.value(0),
                 graph.value(2),
@@ -3717,11 +2680,11 @@ fn affine_nested_support_is_permutation_invariant_and_monotone() {
                 arm_order,
                 None,
             );
-            let mut actual: Vec<_> = Query::new(root, project_outer)
+            let mut query = Query::new(root, project_outer)
                 .solve_residual_state_lazy_with(ResidualLowering::FULL)
                 .cap(1)
-                .start_width(1)
-                .collect();
+                .start_width(1);
+            let mut actual: Vec<_> = query.by_ref().collect();
             actual.sort_unstable();
 
             let mut expected = vec![sibling_value, sibling_value];
@@ -3735,20 +2698,12 @@ fn affine_nested_support_is_permutation_invariant_and_monotone() {
                 "graph growth retracted an affine Support result at level={level}, order={arm_order:?}"
             );
             assert_eq!(
-                counters
-                    .fully_bound_satisfied_calls
-                    .load(Ordering::Relaxed),
+                fully_bound_satisfied_calls.load(Ordering::Relaxed),
                 0,
                 "nested Support fell back to legacy reachability at level={level}, order={arm_order:?}"
             );
-            assert!(
-                counters.support_seeded_roots.load(Ordering::Relaxed) > 0,
-                "nested Support never entered the transition substrate at level={level}, order={arm_order:?}"
-            );
-            assert!(
-                counters.expanded_nodes.load(Ordering::Relaxed) > 0,
-                "the discriminating non-nullable guard performed no transition work"
-            );
+            assert!(query.stats().support_action_pops > 0);
+            assert!(query.stats().delta_transition_pages > 0);
             previous = actual.clone();
             level_bags.push(actual);
         }
@@ -3784,23 +2739,16 @@ fn live_affine_support_clones_exactly_and_matches_rayon_worker_counts() {
     let mut expected = vec![guarded_value, guarded_value, sibling_value, sibling_value];
     expected.sort_unstable();
 
-    let (root, counters) = make();
+    let (root, fully_bound_satisfied_calls) = make();
     let mut query = Query::new(root, project_outer)
         .solve_residual_state_lazy_with(ResidualLowering::FULL)
         .cap(1)
         .start_width(1);
     let first = query.next().expect("the affine formula has four results");
-    let expansions_at_first = counters.expanded_nodes.load(Ordering::Relaxed);
-    assert!(expansions_at_first > 0);
-    assert!(
-        expansions_at_first < 8,
-        "the first result drained the deliberately irrelevant path tail"
-    );
-    assert!(counters.support_seeded_roots.load(Ordering::Relaxed) > 0);
-    assert_eq!(
-        counters.fully_bound_satisfied_calls.load(Ordering::Relaxed),
-        0
-    );
+    let examined_at_first = query.stats().delta_transition_candidates_examined;
+    assert!(examined_at_first > 0);
+    assert!(query.stats().support_action_pops > 0);
+    assert_eq!(fully_bound_satisfied_calls.load(Ordering::Relaxed), 0);
 
     let clone = query.clone();
     let remainder: Vec<_> = query.collect();
@@ -3815,7 +2763,7 @@ fn live_affine_support_clones_exactly_and_matches_rayon_worker_counts() {
 
     #[cfg(feature = "parallel")]
     for workers in [1, 4] {
-        let (root, counters) = make();
+        let (root, fully_bound_satisfied_calls) = make();
         let query = Query::new(root, project_outer)
             .solve_residual_state_lazy_with(ResidualLowering::FULL)
             .cap(1)
@@ -3827,16 +2775,8 @@ fn live_affine_support_clones_exactly_and_matches_rayon_worker_counts() {
             .install(|| query.into_par_iter().collect::<Vec<_>>());
         actual.sort_unstable();
         assert_eq!(actual, expected, "workers={workers}");
-        assert!(
-            counters.support_seeded_roots.load(Ordering::Relaxed) > 0,
-            "workers={workers}"
-        );
-        assert!(
-            counters.expanded_nodes.load(Ordering::Relaxed) > 0,
-            "workers={workers}"
-        );
         assert_eq!(
-            counters.fully_bound_satisfied_calls.load(Ordering::Relaxed),
+            fully_bound_satisfied_calls.load(Ordering::Relaxed),
             0,
             "workers={workers}"
         );
@@ -3850,7 +2790,7 @@ fn support_is_parent_atomic_before_candidate_pages() {
     let sibling_value = genid(&rngid().id).raw;
     let reachable = Graph::new(8, &[(0, 1), (0, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)]);
     let trace = Arc::new(Mutex::new(Vec::new()));
-    let (root, counters) = nested_affine_support_root(
+    let (root, fully_bound_satisfied_calls) = nested_affine_support_root(
         reachable.set.clone(),
         reachable.value(0),
         reachable.value(1),
@@ -3862,62 +2802,25 @@ fn support_is_parent_atomic_before_candidate_pages() {
         SupportArmOrder::FalseFirst,
         Some(Arc::clone(&trace)),
     );
-    let mut actual: Vec<_> = Query::new(root, project_outer)
+    let mut query = Query::new(root, project_outer)
         .solve_residual_state_lazy_with(ResidualLowering::FULL)
         .cap(1)
-        .start_width(1)
-        .collect();
+        .start_width(1);
+    let mut actual: Vec<_> = query.by_ref().collect();
     actual.sort_unstable();
     let mut expected = guarded_values.clone();
     expected.push(sibling_value);
     expected.sort_unstable();
     assert_eq!(actual, expected);
-    assert_eq!(
-        counters.fully_bound_satisfied_calls.load(Ordering::Relaxed),
-        0
-    );
+    assert_eq!(fully_bound_satisfied_calls.load(Ordering::Relaxed), 0);
+    assert!(query.stats().support_action_pops > 0);
 
     let trace = trace.lock().expect("support trace poisoned").clone();
-    let first_page = trace
-        .iter()
-        .position(|event| matches!(event, SupportTraceEvent::CandidatePage(_)))
-        .expect("the page-local suffix must see the guarded candidates");
-    for (label, description) in [
-        (0, "false arm quiescence"),
-        (1, "Plus witness"),
-        (2, "Star witness"),
-    ] {
-        let completion = trace
-            .iter()
-            .position(|event| {
-                matches!(
-                    event,
-                    SupportTraceEvent::Expand {
-                        label: event_label,
-                        witness
-                    } if *event_label == label && (label == 0 || *witness)
-                )
-            })
-            .unwrap_or_else(|| panic!("missing {description}: {trace:?}"));
-        assert!(
-            completion < first_page,
-            "candidate paging crossed the {description} barrier: {trace:?}"
-        );
-    }
-    assert_eq!(
-        trace
-            .iter()
-            .filter_map(|event| match event {
-                SupportTraceEvent::CandidatePage(len) => Some(*len),
-                SupportTraceEvent::Expand { .. } => None,
-            })
-            .collect::<Vec<_>>(),
-        vec![1, 1, 1, 1, 1]
-    );
+    assert_eq!(trace, vec![1, 1, 1, 1, 1]);
 
     let unreachable = Graph::new(8, &[(0, 1), (0, 2), (2, 3), (3, 4), (4, 5), (5, 6), (7, 7)]);
     let trace = Arc::new(Mutex::new(Vec::new()));
-    let (root, counters) = nested_affine_support_root(
+    let (root, fully_bound_satisfied_calls) = nested_affine_support_root(
         unreachable.set.clone(),
         unreachable.value(0),
         unreachable.value(7),
@@ -3929,33 +2832,19 @@ fn support_is_parent_atomic_before_candidate_pages() {
         SupportArmOrder::FalseFirst,
         Some(Arc::clone(&trace)),
     );
+    let mut query = Query::new(root, project_outer)
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .cap(1)
+        .start_width(1);
+    assert_eq!(query.by_ref().collect::<Vec<_>>(), vec![sibling_value]);
     assert_eq!(
-        Query::new(root, project_outer)
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
-            .cap(1)
-            .start_width(1)
-            .collect::<Vec<_>>(),
-        vec![sibling_value]
-    );
-    assert_eq!(
-        trace
-            .lock()
-            .expect("support trace poisoned")
-            .iter()
-            .filter_map(|event| match event {
-                SupportTraceEvent::CandidatePage(len) => Some(*len),
-                SupportTraceEvent::Expand { .. } => None,
-            })
-            .collect::<Vec<_>>(),
+        trace.lock().expect("support trace poisoned").as_slice(),
         vec![1],
         "a false Support guard leaked its four guarded candidates into paging"
     );
-    assert!(counters.support_seeded_roots.load(Ordering::Relaxed) > 0);
-    assert!(counters.expanded_nodes.load(Ordering::Relaxed) > 0);
-    assert_eq!(
-        counters.fully_bound_satisfied_calls.load(Ordering::Relaxed),
-        0
-    );
+    assert!(query.stats().support_action_pops > 0);
+    assert!(query.stats().delta_transition_pages > 0);
+    assert_eq!(fully_bound_satisfied_calls.load(Ordering::Relaxed), 0);
 }
 
 #[test]
@@ -3977,14 +2866,7 @@ fn one_term_at_two_program_counters_keeps_both_futures() {
         PathOp::Plus,
     ];
     assert_all_schedulers(
-        || {
-            bound_start_root(
-                graph.set.clone(),
-                graph.value(0),
-                &ops,
-                Arc::new(AtomicUsize::new(0)),
-            )
-        },
+        || bound_start_root(graph.set.clone(), graph.value(0), &ops),
         project_end,
         vec![graph.value(0).raw],
     );
@@ -4000,26 +2882,12 @@ fn compound_concat_fixpoint_runs_in_both_endpoint_orientations() {
         PathOp::Plus,
     ];
     assert_all_schedulers(
-        || {
-            bound_start_root(
-                graph.set.clone(),
-                graph.value(0),
-                &ops,
-                Arc::new(AtomicUsize::new(0)),
-            )
-        },
+        || bound_start_root(graph.set.clone(), graph.value(0), &ops),
         project_end,
         vec![graph.value(2).raw, graph.value(4).raw],
     );
     assert_all_schedulers(
-        || {
-            bound_end_root(
-                graph.set.clone(),
-                graph.value(4),
-                &ops,
-                Arc::new(AtomicUsize::new(0)),
-            )
-        },
+        || bound_end_root(graph.set.clone(), graph.value(4), &ops),
         project_start,
         vec![graph.value(0).raw, graph.value(2).raw],
     );
@@ -4037,26 +2905,12 @@ fn repeated_negated_attribute_uses_the_same_product_fixpoint() {
         .insert(&Trible::new(&graph.nodes[1], &other, &graph.value(2)));
     let ops = vec![PathOp::NotAttr(graph.attribute.raw()), PathOp::Plus];
     assert_all_schedulers(
-        || {
-            bound_start_root(
-                graph.set.clone(),
-                graph.value(0),
-                &ops,
-                Arc::new(AtomicUsize::new(0)),
-            )
-        },
+        || bound_start_root(graph.set.clone(), graph.value(0), &ops),
         project_end,
         vec![graph.value(1).raw, graph.value(2).raw],
     );
     assert_all_schedulers(
-        || {
-            bound_end_root(
-                graph.set.clone(),
-                graph.value(2),
-                &ops,
-                Arc::new(AtomicUsize::new(0)),
-            )
-        },
+        || bound_end_root(graph.set.clone(), graph.value(2), &ops),
         project_start,
         vec![graph.value(0).raw, graph.value(1).raw],
     );
@@ -4069,42 +2923,22 @@ fn all_attr_inverse_and_bound_endpoint_routes_match_oracles() {
     let inverse = repeated(graph.attribute, true);
     let cases: Vec<(Root, fn(&Binding) -> Option<RawInline>, Vec<RawInline>)> = vec![
         (
-            bound_start_root(
-                graph.set.clone(),
-                graph.value(0),
-                &forward,
-                Arc::new(AtomicUsize::new(0)),
-            ),
+            bound_start_root(graph.set.clone(), graph.value(0), &forward),
             project_end,
             vec![graph.value(1).raw, graph.value(2).raw],
         ),
         (
-            bound_start_root(
-                graph.set.clone(),
-                graph.value(2),
-                &inverse,
-                Arc::new(AtomicUsize::new(0)),
-            ),
+            bound_start_root(graph.set.clone(), graph.value(2), &inverse),
             project_end,
             vec![graph.value(0).raw, graph.value(1).raw],
         ),
         (
-            bound_end_root(
-                graph.set.clone(),
-                graph.value(2),
-                &forward,
-                Arc::new(AtomicUsize::new(0)),
-            ),
+            bound_end_root(graph.set.clone(), graph.value(2), &forward),
             project_start,
             vec![graph.value(0).raw, graph.value(1).raw],
         ),
         (
-            bound_end_root(
-                graph.set.clone(),
-                graph.value(0),
-                &inverse,
-                Arc::new(AtomicUsize::new(0)),
-            ),
+            bound_end_root(graph.set.clone(), graph.value(0), &inverse),
             project_start,
             vec![graph.value(1).raw, graph.value(2).raw],
         ),
@@ -4179,22 +3013,15 @@ fn target_confirm_traverses_once_and_preserves_reachable_duplicate_candidates() 
     ];
 
     for (candidate_variable, bound, ops, candidates, mut expected, project) in cases {
-        let expanded = Arc::new(AtomicUsize::new(0));
         let root = target_confirm_root(
             graph.set.clone(),
             candidate_variable,
             bound,
             candidates,
             &ops,
-            Arc::clone(&expanded),
         );
         expected.sort_unstable();
         assert_eq!(run(root, Scheduler::Residual, project), expected);
-        assert_eq!(
-            expanded.load(Ordering::Relaxed),
-            3,
-            "one traversal should expand each reachable frontier node once"
-        );
     }
 }
 
@@ -4222,7 +3049,6 @@ fn automaton_target_confirm_filters_the_original_duplicate_sequence() {
         graph.value(2).raw,
         graph.value(1).raw,
     ];
-    let expanded = Arc::new(AtomicUsize::new(0));
     let residual = run(
         target_confirm_root(
             graph.set.clone(),
@@ -4230,20 +3056,12 @@ fn automaton_target_confirm_filters_the_original_duplicate_sequence() {
             graph.value(0),
             candidates.clone(),
             &ops,
-            Arc::clone(&expanded),
         ),
         Scheduler::Residual,
         project_end,
     );
     let dag = run(
-        target_confirm_root(
-            graph.set.clone(),
-            END,
-            graph.value(0),
-            candidates,
-            &ops,
-            Arc::new(AtomicUsize::new(0)),
-        ),
+        target_confirm_root(graph.set.clone(), END, graph.value(0), candidates, &ops),
         Scheduler::Dag,
         project_end,
     );
@@ -4251,7 +3069,6 @@ fn automaton_target_confirm_filters_the_original_duplicate_sequence() {
     expected.sort_unstable();
     assert_eq!(residual, expected);
     assert_eq!(dag, expected);
-    assert!(expanded.load(Ordering::Relaxed) > 0);
 }
 
 #[test]
@@ -4263,27 +3080,20 @@ fn bound_literal_endpoint_uses_the_inverse_delta_route() {
         .insert(&Trible::new(&graph.nodes[0], &graph.attribute, &literal));
     let start_var = Variable::<GenId>::new(START);
     let end_var = Variable::<UnknownInline>::new(END);
-    let expanded = Arc::new(AtomicUsize::new(0));
     let root = Arc::new(IntersectionConstraint::new(vec![
         Box::new(end_var.is(literal)) as DynConstraint,
-        Box::new(CountingPath {
-            inner: RegularPathConstraint::new(
-                graph.set.clone(),
-                start_var,
-                end_var,
-                &repeated(graph.attribute, false),
-            ),
-            seeded_roots: None,
-            source_pages: None,
-            expanded_nodes: Arc::clone(&expanded),
-        }) as DynConstraint,
+        Box::new(RegularPathConstraint::new(
+            graph.set.clone(),
+            start_var,
+            end_var,
+            &repeated(graph.attribute, false),
+        )) as DynConstraint,
     ]));
 
     assert_eq!(
         run(root, Scheduler::Residual, project_start),
         vec![graph.value(0).raw]
     );
-    assert_eq!(expanded.load(Ordering::Relaxed), 2);
 }
 
 #[test]
@@ -4301,16 +3111,7 @@ fn two_free_distinct_endpoints_page_the_first_binding_before_traversal() {
             (14, 15),
         ],
     );
-    let seeded = Arc::new(AtomicUsize::new(0));
-    let pages = Arc::new(Mutex::new(Vec::new()));
-    let expanded = Arc::new(AtomicUsize::new(0));
-    let root = counted_two_free_root(
-        graph.set.clone(),
-        &repeated(graph.attribute, false),
-        Arc::clone(&seeded),
-        Arc::clone(&pages),
-        Arc::clone(&expanded),
-    );
+    let root = two_free_root(graph.set.clone(), &repeated(graph.attribute, false));
     let expected: Vec<_> = (0..8)
         .map(|edge| (graph.value(edge * 2).raw, graph.value(edge * 2 + 1).raw))
         .collect();
@@ -4321,23 +3122,10 @@ fn two_free_distinct_endpoints_page_the_first_binding_before_traversal() {
         .start_width(1);
     let first = query.next().expect("one two-free RPQ edge");
     assert!(expected.contains(&first));
-    assert_eq!(
-        *pages.lock().expect("source-page recorder poisoned"),
-        [(1, 1, 1)],
-        "the first endpoint must come from one bounded source page"
-    );
-    assert_eq!(seeded.load(Ordering::Relaxed), 1);
-    assert_eq!(
-        expanded.load(Ordering::Relaxed),
-        1,
-        "only the bound-endpoint traversal should expand before the first pair"
-    );
+    assert_eq!(query.stats().delta_source_pages, 1);
+    assert_eq!(query.stats().delta_source_direct_candidates, 1);
+    assert_eq!(query.stats().delta_transition_candidates_examined, 1);
     drop(query);
-    assert_eq!(
-        expanded.load(Ordering::Relaxed),
-        1,
-        "dropping the query must cancel the remaining source frontier"
-    );
 }
 
 #[test]
@@ -4346,22 +3134,16 @@ fn two_free_path_end_pages_the_inverse_first_frontier() {
     let path_end = Variable::<GenId>::new(START);
     let path_start = Variable::<GenId>::new(END);
     let ops = vec![PathOp::Attr(graph.attribute.raw())];
-    let path = RegularPathConstraint::new(graph.set.clone(), path_start, path_end, &ops);
-    let (mut sources, pages) = collect_distinct_proposal_frontier(&path, START, 1);
-    let mut expected_sources = vec![graph.value(1).raw, graph.value(4).raw];
-    sources.sort_unstable();
-    expected_sources.sort_unstable();
-    assert_eq!(sources, expected_sources);
-    assert_eq!(pages, vec![(1, 1), (1, 1)]);
 
     let make_root = || {
-        Arc::new(IntersectionConstraint::new(vec![Box::new(CountingPath {
-            inner: RegularPathConstraint::new(graph.set.clone(), path_start, path_end, &ops),
-            seeded_roots: None,
-            source_pages: None,
-            expanded_nodes: Arc::new(AtomicUsize::new(0)),
-        })
-            as DynConstraint]))
+        Arc::new(IntersectionConstraint::new(vec![
+            Box::new(RegularPathConstraint::new(
+                graph.set.clone(),
+                path_start,
+                path_end,
+                &ops,
+            )) as DynConstraint,
+        ]))
     };
     let mut sequential: Vec<_> = Query::new(make_root(), project_pair).sequential().collect();
     let mut residual: Vec<_> = Query::new(make_root(), project_pair)
@@ -4385,29 +3167,7 @@ fn two_free_path_end_pages_the_inverse_first_frontier() {
 fn nullable_two_free_first_frontier_is_exactly_the_graph_term_union() {
     let graph = Graph::new(3, &[(0, 1)]);
     let ops = vec![PathOp::Attr(graph.attribute.raw()), PathOp::Optional];
-    let path = RegularPathConstraint::new(
-        graph.set.clone(),
-        Variable::<GenId>::new(START),
-        Variable::<GenId>::new(END),
-        &ops,
-    );
-    let (mut sources, pages) = collect_distinct_proposal_frontier(&path, START, 1);
-    let mut expected_sources = vec![graph.value(0).raw, graph.value(1).raw];
-    sources.sort_unstable();
-    expected_sources.sort_unstable();
-    assert_eq!(sources, expected_sources);
-    assert_eq!(pages, vec![(1, 1), (1, 1)]);
-    assert!(!sources.contains(&graph.value(2).raw));
-
-    let make_root = || {
-        counted_two_free_root(
-            graph.set.clone(),
-            &ops,
-            Arc::new(AtomicUsize::new(0)),
-            Arc::new(Mutex::new(Vec::new())),
-            Arc::new(AtomicUsize::new(0)),
-        )
-    };
+    let make_root = || two_free_root(graph.set.clone(), &ops);
     let mut sequential: Vec<_> = Query::new(make_root(), project_pair).sequential().collect();
     let mut residual: Vec<_> = Query::new(make_root(), project_pair)
         .solve_residual_state_lazy_with(ResidualLowering::FULL)
@@ -4448,27 +3208,23 @@ fn duplicate_outer_parents_preserve_endpoint_bag_multiplicity() {
 #[test]
 fn conservative_residual_lowering_keeps_plus_opaque() {
     let graph = Graph::new(3, &[(0, 1), (1, 2)]);
-    let proposed = Arc::new(AtomicUsize::new(0));
     let root = bound_start_root(
         graph.set.clone(),
         graph.value(0),
         &repeated(graph.attribute, false),
-        Arc::clone(&proposed),
     );
-    let mut actual: Vec<_> = Query::new(root, project_end)
-        .solve_residual_state_lazy()
-        .collect();
+    let mut query = Query::new(root, project_end).solve_residual_state_lazy();
+    let mut actual: Vec<_> = query.by_ref().collect();
     actual.sort_unstable();
     let mut expected = [graph.value(1).raw, graph.value(2).raw];
     expected.sort_unstable();
     assert_eq!(actual, expected);
     assert_eq!(
-        proposed.load(Ordering::Relaxed),
+        query.stats().delta_transition_pages,
         0,
         "cyclic RPQ proposal lowering must remain explicitly opt-in"
     );
 
-    let confirmed = Arc::new(AtomicUsize::new(0));
     let root = target_confirm_root(
         graph.set.clone(),
         END,
@@ -4480,17 +3236,15 @@ fn conservative_residual_lowering_keeps_plus_opaque() {
             graph.value(1).raw,
         ],
         &repeated(graph.attribute, false),
-        Arc::clone(&confirmed),
     );
-    let mut actual: Vec<_> = Query::new(root, project_end)
-        .solve_residual_state_lazy()
-        .collect();
+    let mut query = Query::new(root, project_end).solve_residual_state_lazy();
+    let mut actual: Vec<_> = query.by_ref().collect();
     actual.sort_unstable();
     let mut expected = [graph.value(2).raw, graph.value(2).raw, graph.value(1).raw];
     expected.sort_unstable();
     assert_eq!(actual, expected);
     assert_eq!(
-        confirmed.load(Ordering::Relaxed),
+        query.stats().delta_transition_pages,
         0,
         "cyclic RPQ confirmation lowering must remain explicitly opt-in"
     );
@@ -4499,20 +3253,17 @@ fn conservative_residual_lowering_keeps_plus_opaque() {
 #[test]
 fn first_result_requires_one_expansion_and_drop_cancels_the_remainder() {
     let graph = Graph::new(5, &[(0, 1), (1, 2), (2, 3), (3, 4)]);
-    let expanded = Arc::new(AtomicUsize::new(0));
     let root = bound_start_root(
         graph.set.clone(),
         graph.value(0),
         &repeated(graph.attribute, false),
-        Arc::clone(&expanded),
     );
     let mut query =
         Query::new(root, project_end).solve_residual_state_lazy_with(combined_effects());
 
     assert_eq!(query.next(), Some(graph.value(1).raw));
-    assert_eq!(expanded.load(Ordering::Relaxed), 1);
+    assert_eq!(query.stats().delta_transition_candidates_examined, 1);
     drop(query);
-    assert_eq!(expanded.load(Ordering::Relaxed), 1);
 }
 
 #[test]
@@ -4520,8 +3271,7 @@ fn nullable_seed_is_first_result_without_transition_work_and_keeps_affine_bags()
     let graph = Graph::new(5, &[(0, 1), (1, 2), (2, 3), (3, 4)]);
     let ops = [PathOp::Attr(graph.attribute.raw()), PathOp::Star];
     let outer_values = [genid(&rngid().id).raw, genid(&rngid().id).raw];
-    let make =
-        || native_duplicate_parent_root(graph.set.clone(), graph.value(0).raw, outer_values, &ops);
+    let make = || duplicate_parent_root(graph.set.clone(), graph.value(0).raw, outer_values, &ops);
     let mut expected: Vec<_> = Query::new(make(), project_end).sequential().collect();
     expected.sort_unstable();
     let mut query = Query::new(make(), project_end)
@@ -4568,7 +3318,7 @@ fn nullable_seed_is_first_result_without_transition_work_and_keeps_affine_bags()
     let absent = genid(&rngid().id);
     assert!(
         Query::new(
-            native_bound_start_root(graph.set.clone(), absent, &ops),
+            bound_start_root(graph.set.clone(), absent, &ops),
             project_end,
         )
         .solve_residual_state_lazy_with(ResidualLowering::FULL)
@@ -4587,7 +3337,6 @@ fn clone_after_first_result_has_two_independent_exact_remainders() {
         graph.set.clone(),
         graph.value(0),
         &repeated(graph.attribute, false),
-        Arc::new(AtomicUsize::new(0)),
     );
     let mut query =
         Query::new(root, project_end).solve_residual_state_lazy_with(combined_effects());
@@ -4608,7 +3357,7 @@ fn clone_after_first_result_has_two_independent_exact_remainders() {
 fn clone_with_a_suspended_same_variable_cursor_has_two_exact_remainders() {
     let graph = Graph::new(5, &[(0, 1), (1, 2), (2, 3), (3, 4)]);
     let ops = vec![PathOp::Attr(graph.attribute.raw()), PathOp::Star];
-    let root = same_variable_root(graph.set.clone(), &ops, Arc::new(AtomicUsize::new(0)));
+    let root = same_variable_root(graph.set.clone(), &ops);
     let mut query =
         Query::new(root, project_start).solve_residual_state_lazy_with(combined_effects());
     let first = query
@@ -4671,14 +3420,7 @@ fn generated_product_programs_match_sequential_and_dag_bags() {
             ],
         ];
         for ops in expressions {
-            let make_root = || {
-                bound_start_root(
-                    graph.set.clone(),
-                    graph.value(0),
-                    &ops,
-                    Arc::new(AtomicUsize::new(0)),
-                )
-            };
+            let make_root = || bound_start_root(graph.set.clone(), graph.value(0), &ops);
             let residual = run(make_root(), Scheduler::Residual, project_end);
             assert_eq!(residual, run(make_root(), Scheduler::Dag, project_end));
             assert_eq!(
@@ -4686,8 +3428,7 @@ fn generated_product_programs_match_sequential_and_dag_bags() {
                 run(make_root(), Scheduler::Sequential, project_end)
             );
 
-            let make_same_root =
-                || same_variable_root(graph.set.clone(), &ops, Arc::new(AtomicUsize::new(0)));
+            let make_same_root = || same_variable_root(graph.set.clone(), &ops);
             let ordinary = run(make_same_root(), Scheduler::Ordinary, project_start);
             assert_eq!(
                 ordinary,
@@ -4900,40 +3641,23 @@ fn finite_path_families_use_native_transition_programs() {
     ];
 
     for (name, ops, start, mut expected) in cases {
-        let seeded = Arc::new(AtomicUsize::new(0));
-        let expanded = Arc::new(AtomicUsize::new(0));
-        let root = counted_bound_start_root(
-            graph.set.clone(),
-            start,
-            &ops,
-            Some(Arc::clone(&seeded)),
-            Arc::clone(&expanded),
-        );
+        let root = bound_start_root(graph.set.clone(), start, &ops);
         expected.sort_unstable();
-        assert_eq!(
-            run(root, Scheduler::Residual, project_end),
-            expected,
-            "{name}"
-        );
+        let mut query =
+            Query::new(root, project_end).solve_residual_state_lazy_with(combined_effects());
+        let mut residual: Vec<_> = query.by_ref().collect();
+        residual.sort_unstable();
+        assert_eq!(residual, expected, "{name}");
         assert_eq!(
             run(
-                bound_start_root(
-                    graph.set.clone(),
-                    start,
-                    &ops,
-                    Arc::new(AtomicUsize::new(0)),
-                ),
+                bound_start_root(graph.set.clone(), start, &ops),
                 Scheduler::Dag,
                 project_end,
             ),
             expected,
             "{name} DAG oracle"
         );
-        assert_eq!(seeded.load(Ordering::Relaxed), 1, "{name} seed");
-        assert!(
-            expanded.load(Ordering::Relaxed) > 0,
-            "{name} never entered native expansion"
-        );
+        assert!(query.stats().delta_transition_pages > 0, "{name}");
     }
 }
 
@@ -4941,26 +3665,12 @@ fn finite_path_families_use_native_transition_programs() {
 fn finite_bound_end_uses_the_inverse_transition_program() {
     let graph = Graph::new(3, &[(0, 1), (1, 2)]);
     let ops = vec![PathOp::Attr(graph.attribute.raw())];
-    let seeded = Arc::new(AtomicUsize::new(0));
-    let expanded = Arc::new(AtomicUsize::new(0));
-    let root = counted_bound_end_root(
-        graph.set.clone(),
-        graph.value(2),
-        &ops,
-        Some(Arc::clone(&seeded)),
-        Arc::clone(&expanded),
-    );
+    let root = bound_end_root(graph.set.clone(), graph.value(2), &ops);
 
-    assert_eq!(
-        run(root, Scheduler::Residual, project_start),
-        vec![graph.value(1).raw]
-    );
-    assert_eq!(seeded.load(Ordering::Relaxed), 1);
-    assert_eq!(
-        expanded.load(Ordering::Relaxed),
-        2,
-        "the bound endpoint seed and its accepted inverse successor both drain"
-    );
+    let mut query =
+        Query::new(root, project_start).solve_residual_state_lazy_with(combined_effects());
+    assert_eq!(query.by_ref().collect::<Vec<_>>(), vec![graph.value(1).raw]);
+    assert!(query.stats().delta_transition_pages > 0);
 }
 
 #[test]
@@ -4971,24 +3681,14 @@ fn finite_concat_first_result_takes_only_its_two_transition_steps() {
         PathOp::Attr(graph.attribute.raw()),
         PathOp::Concat,
     ];
-    let seeded = Arc::new(AtomicUsize::new(0));
-    let expanded = Arc::new(AtomicUsize::new(0));
-    let root = counted_bound_start_root(
-        graph.set.clone(),
-        graph.value(0),
-        &ops,
-        Some(Arc::clone(&seeded)),
-        Arc::clone(&expanded),
-    );
+    let root = bound_start_root(graph.set.clone(), graph.value(0), &ops);
     let mut query = Query::new(root, project_end)
         .solve_residual_state_lazy_with(combined_effects())
         .start_width(1);
 
     assert_eq!(query.next(), Some(graph.value(2).raw));
-    assert_eq!(seeded.load(Ordering::Relaxed), 1);
-    assert_eq!(expanded.load(Ordering::Relaxed), 2);
+    assert_eq!(query.stats().delta_transition_candidates_examined, 2);
     drop(query);
-    assert_eq!(expanded.load(Ordering::Relaxed), 2);
 }
 
 #[test]
@@ -5017,16 +3717,12 @@ fn finite_confirm_keeps_geometric_pages_and_duplicate_multiplicity() {
         ("leaf", combined_effects()),
         ("formula", root_formula_effects()),
     ] {
-        let seeded = Arc::new(AtomicUsize::new(0));
-        let expanded = Arc::new(AtomicUsize::new(0));
-        let root = counted_target_confirm_root(
+        let root = target_confirm_root(
             graph.set.clone(),
             END,
             graph.value(0),
             candidates.clone(),
             &ops,
-            Some(Arc::clone(&seeded)),
-            Arc::clone(&expanded),
         );
         let mut query = Query::new(root, project_end)
             .solve_residual_state_lazy_with(capabilities)
@@ -5035,12 +3731,7 @@ fn finite_confirm_keeps_geometric_pages_and_duplicate_multiplicity() {
         let mut actual: Vec<_> = query.by_ref().collect();
         actual.sort_unstable();
         assert_eq!(actual, expected, "{name}");
-        assert_eq!(
-            seeded.load(Ordering::Relaxed),
-            candidates.len(),
-            "{name} should traverse once per disjoint width-one candidate page"
-        );
-        assert!(expanded.load(Ordering::Relaxed) > 0, "{name}");
+        assert!(query.stats().delta_transition_pages > 0, "{name}");
         assert_eq!(query.stats().max_confirm_candidates, 1, "{name}");
     }
 }
@@ -5066,17 +3757,7 @@ fn finite_same_variable_optional_pages_preserve_epsilon_scope_and_multiplicity()
         ("leaf", combined_effects()),
         ("formula", root_formula_effects()),
     ] {
-        let seeded = Arc::new(AtomicUsize::new(0));
-        let pages = Arc::new(Mutex::new(Vec::new()));
-        let expanded = Arc::new(AtomicUsize::new(0));
-        let root = same_variable_confirm_root(
-            graph.set.clone(),
-            candidates.clone(),
-            &ops,
-            Arc::clone(&seeded),
-            Some(Arc::clone(&pages)),
-            Arc::clone(&expanded),
-        );
+        let root = same_variable_confirm_root(graph.set.clone(), candidates.clone(), &ops);
         let mut query = Query::new(root, project_start)
             .solve_residual_state_lazy_with(capabilities)
             .start_width(1)
@@ -5084,158 +3765,39 @@ fn finite_same_variable_optional_pages_preserve_epsilon_scope_and_multiplicity()
         let mut actual: Vec<_> = query.by_ref().collect();
         actual.sort_unstable();
         assert_eq!(actual, expected, "{name}");
-        let pages = pages.lock().expect("source-page recorder poisoned");
-        assert_eq!(pages.len(), candidates.len(), "{name}");
-        assert!(
-            pages
-                .iter()
-                .all(|&(limit, examined, _)| limit == 1 && examined == 1),
-            "{name}: {pages:?}"
-        );
+        assert_eq!(query.stats().delta_source_pages, candidates.len(), "{name}");
         assert_eq!(
-            pages.iter().map(|&(_, _, roots)| roots).sum::<usize>(),
-            3,
-            "{name}: the absent epsilon candidate must not seed"
+            query.stats().delta_source_candidates_examined,
+            candidates.len(),
+            "{name}"
         );
-        drop(pages);
-        assert_eq!(seeded.load(Ordering::Relaxed), 3, "{name}");
-        assert!(expanded.load(Ordering::Relaxed) > 0, "{name}");
+        assert_eq!(query.stats().delta_source_roots, 3, "{name}");
+        assert!(query.stats().delta_transition_pages > 0, "{name}");
         assert_eq!(query.stats().max_confirm_candidates, 1, "{name}");
     }
 }
 
 #[test]
 fn positive_transition_frontiers_page_by_automaton_branch_and_value() {
-    let mut graph = Graph::new(6, &[(0, 1), (0, 2), (0, 3), (0, 4), (0, 5)]);
-    let start = Variable::<GenId>::new(START);
-    let end = Variable::<GenId>::new(END);
-    let path = RegularPathConstraint::new(
-        graph.set.clone(),
-        start,
-        end,
-        &[PathOp::Attr(graph.attribute.raw())],
-    );
-    let vars = [START];
-    let rows = [graph.value(0).raw];
-    let mut seeds = Vec::new();
-    assert!(path.residual_delta_seeds(END, &RowsView::new(&vars, &rows), &mut seeds));
-    assert_eq!(seeds.len(), 1);
-    let node = seeds[0].output.node;
-
-    let mut cursor = ResidualDeltaExpandCursor::Start;
-    let mut outputs = Vec::new();
-    let mut page_sizes = Vec::new();
-    loop {
-        let before = outputs.len();
-        let page = path
-            .residual_delta_expand_page(END, node, cursor, 2, &mut outputs)
-            .expect("a positive attribute frontier is pageable");
-        page_sizes.push((page.examined, outputs.len() - before));
-        match page.next {
-            Some(next) => {
-                assert!(next > cursor);
-                cursor = next;
-            }
-            None => break,
-        }
-    }
-    assert_eq!(page_sizes, vec![(2, 2), (2, 2), (1, 1)]);
-    let mut actual: Vec<_> = outputs.iter().map(|output| output.node.value).collect();
-    let mut expected: Vec<_> = (1..6).map(|index| graph.value(index).raw).collect();
-    actual.sort_unstable();
-    expected.sort_unstable();
-    assert_eq!(actual, expected);
-    assert!(outputs.iter().all(|output| output.accepted));
-
-    let nodes = [node, node];
-    let cursors = [ResidualDeltaExpandCursor::Start; 2];
-    let limits = [5, 6];
-    let mut pages = Vec::new();
-    let mut tagged = Vec::new();
-    path.residual_delta_expand_pages(
-        END,
-        ResidualDeltaExpandBatch {
-            nodes: &nodes,
-            cursors: &cursors,
-            limits: &limits,
-        },
-        &mut pages,
-        &mut tagged,
-    );
-    assert_eq!(
-        pages,
-        vec![
-            Some(ResidualDeltaExpandPage {
-                next: None,
-                examined: 5,
-            });
-            2
-        ],
-        "the counted multi-row frontier is terminal"
-    );
-    assert_eq!(
-        tagged.iter().map(|(row, _)| *row).collect::<Vec<_>>(),
-        [vec![0; 5], vec![1; 5]].concat(),
-        "bulk traversal preserves grouped row tags"
-    );
-    let mut bulk_values: Vec<_> = tagged
-        .iter()
-        .map(|(_, output)| output.node.value)
-        .collect();
-    bulk_values.sort_unstable();
-    let mut doubled_expected = [expected.clone(), expected.clone()].concat();
-    doubled_expected.sort_unstable();
-    assert_eq!(bulk_values, doubled_expected);
-
-    let inverse_attribute = other_attribute();
-    graph.set.insert(&Trible::new(
-        &graph.nodes[5],
-        &inverse_attribute,
-        &graph.value(0),
-    ));
-    let union = RegularPathConstraint::new(
-        graph.set.clone(),
-        start,
-        end,
-        &[
-            PathOp::Attr(graph.attribute.raw()),
-            PathOp::Attr(inverse_attribute.raw()),
-            PathOp::Inverse,
-            PathOp::Union,
-        ],
-    );
-    let mut seeds = Vec::new();
-    assert!(union.residual_delta_seeds(END, &RowsView::new(&vars, &rows), &mut seeds));
-    let mut first = Vec::new();
-    let page = union
-        .residual_delta_expand_page(
-            END,
-            seeds[0].output.node,
-            ResidualDeltaExpandCursor::Start,
-            1,
-            &mut first,
+    let graph = Graph::new(6, &[(0, 1), (0, 2), (0, 3), (0, 4), (0, 5)]);
+    let make = || {
+        bound_start_root(
+            graph.set.clone(),
+            graph.value(0),
+            &[PathOp::Attr(graph.attribute.raw())],
         )
-        .expect("a positive union frontier is pageable");
-    let next = page.next.expect("the inverse branch remains live");
-    assert!(matches!(
-        next,
-        ResidualDeltaExpandCursor::After { branch: 0, .. }
-    ));
-    let mut remainder = Vec::new();
-    let page = union
-        .residual_delta_expand_page(END, seeds[0].output.node, next, 16, &mut remainder)
-        .expect("the branch-qualified cursor resumes");
-    assert_eq!(page.next, None);
-    let mut actual: Vec<_> = first
-        .iter()
-        .chain(&remainder)
-        .map(|output| output.node.value)
-        .collect();
+    };
+    let mut query = Query::new(make(), project_end)
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .start_width(2)
+        .cap(2);
+    let mut actual: Vec<_> = query.by_ref().collect();
     let mut expected: Vec<_> = (1..6).map(|index| graph.value(index).raw).collect();
-    expected.push(graph.value(5).raw);
     actual.sort_unstable();
     expected.sort_unstable();
     assert_eq!(actual, expected);
+    assert_eq!(query.stats().delta_transition_candidates_examined, 5);
+    assert!(query.stats().delta_transition_pages >= 3);
 }
 
 #[test]
@@ -5243,7 +3805,7 @@ fn first_fanout_result_scans_one_transition_and_clone_keeps_the_exact_cursor() {
     let edges: Vec<_> = (1..17).map(|target| (0, target)).collect();
     let graph = Graph::new(17, &edges);
     let ops = [PathOp::Attr(graph.attribute.raw())];
-    let make = || native_bound_start_root(graph.set.clone(), graph.value(0), &ops);
+    let make = || bound_start_root(graph.set.clone(), graph.value(0), &ops);
     let mut query = Query::new(make(), project_end)
         .solve_residual_state_lazy_with(ResidualLowering::FULL)
         .start_width(1)
@@ -5273,8 +3835,7 @@ fn paged_transitions_preserve_affine_parent_bags_and_storage_monotonicity() {
     let graph = Graph::new(5, &[(0, 1), (0, 2), (0, 3), (0, 4)]);
     let ops = [PathOp::Attr(graph.attribute.raw())];
     let outer_values = [genid(&rngid().id).raw, genid(&rngid().id).raw];
-    let make =
-        || native_duplicate_parent_root(graph.set.clone(), graph.value(0).raw, outer_values, &ops);
+    let make = || duplicate_parent_root(graph.set.clone(), graph.value(0).raw, outer_values, &ops);
     let mut expected: Vec<_> = Query::new(make(), project_end).sequential().collect();
     let mut dag: Vec<_> = Query::new(make(), project_end)
         .lazy_dag_scheduler()
@@ -5305,7 +3866,7 @@ fn paged_transitions_preserve_affine_parent_bags_and_storage_monotonicity() {
         let graph = GeneratedGraph::new(level);
         let ops = [PathOp::Attr(graph.primary.raw()), PathOp::Star];
         let mut query = Query::new(
-            native_bound_start_root(graph.set.clone(), graph.value(0), &ops),
+            bound_start_root(graph.set.clone(), graph.value(0), &ops),
             project_end,
         )
         .solve_residual_state_lazy_with(ResidualLowering::FULL)
@@ -5360,49 +3921,9 @@ fn negated_transition_pages_count_rejections_and_emit_each_destination_once() {
     insert(&excluded, destinations[3]);
     insert(&other, destinations[4]);
 
-    let start_var = Variable::<GenId>::new(START);
-    let end_var = Variable::<UnknownInline>::new(END);
-    let path = RegularPathConstraint::new(
-        graph.set.clone(),
-        start_var,
-        end_var,
-        &[PathOp::NotAttr(excluded.raw())],
-    );
-    let vars = [START];
-    let rows = [genid(&start).raw];
-    let mut seeds = Vec::new();
-    assert!(path.residual_delta_seeds(END, &RowsView::new(&vars, &rows), &mut seeds));
-    let node = seeds[0].output.node;
-    let mut cursor = ResidualDeltaExpandCursor::Start;
-    let mut outputs = Vec::new();
-    let mut pages = Vec::new();
-    loop {
-        let before = outputs.len();
-        let page = path
-            .residual_delta_expand_page(END, node, cursor, 1, &mut outputs)
-            .expect("a negated destination frontier is pageable");
-        pages.push((page.examined, outputs.len() - before));
-        match page.next {
-            Some(next) => {
-                assert!(next > cursor);
-                cursor = next;
-            }
-            None => break,
-        }
-    }
-    assert_eq!(pages, vec![(1, 0), (1, 1), (1, 1), (1, 0), (1, 1)]);
-    assert_eq!(
-        outputs
-            .iter()
-            .map(|output| output.node.value)
-            .collect::<Vec<_>>(),
-        vec![destinations[1], destinations[2], destinations[4]]
-    );
-    assert!(outputs.iter().all(|output| output.accepted));
-
     let ops = [PathOp::NotAttr(excluded.raw())];
     let mut query = Query::new(
-        native_bound_start_root(graph.set.clone(), genid(&start), &ops),
+        bound_start_root(graph.set.clone(), genid(&start), &ops),
         project_end,
     )
     .solve_residual_state_lazy_with(ResidualLowering::FULL)
@@ -5446,45 +3967,28 @@ fn inverse_negated_transition_pages_from_literals_are_exact_and_distinct() {
 
     let start_var = Variable::<UnknownInline>::new(START);
     let end_var = Variable::<GenId>::new(END);
-    let path = RegularPathConstraint::new(
-        graph.set.clone(),
-        start_var,
-        end_var,
-        &[PathOp::NotAttr(excluded.raw()), PathOp::Inverse],
-    );
-    let vars = [START];
-    let rows = [literal.raw];
-    let mut seeds = Vec::new();
-    assert!(path.residual_delta_seeds(END, &RowsView::new(&vars, &rows), &mut seeds));
-    let node = seeds[0].output.node;
-    let mut cursor = ResidualDeltaExpandCursor::Start;
-    let mut outputs = Vec::new();
-    let mut pages = Vec::new();
-    loop {
-        let before = outputs.len();
-        let page = path
-            .residual_delta_expand_page(END, node, cursor, 1, &mut outputs)
-            .expect("an inverse-negated subject frontier is pageable");
-        pages.push((page.examined, outputs.len() - before));
-        match page.next {
-            Some(next) => {
-                assert!(next > cursor);
-                cursor = next;
-            }
-            None => break,
-        }
-    }
-    assert_eq!(pages, vec![(1, 0), (1, 1), (1, 1)]);
+    let root = Arc::new(IntersectionConstraint::new(vec![
+        Box::new(start_var.is(literal)) as DynConstraint,
+        Box::new(RegularPathConstraint::new(
+            graph.set.clone(),
+            start_var,
+            end_var,
+            &[PathOp::NotAttr(excluded.raw()), PathOp::Inverse],
+        )) as DynConstraint,
+    ]));
+    let mut query = Query::new(root, project_end)
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .start_width(1)
+        .cap(1);
+    let actual: Vec<_> = query.by_ref().collect();
     assert_eq!(
-        outputs
-            .iter()
-            .map(|output| output.node.value)
-            .collect::<Vec<_>>(),
+        actual,
         subjects[1..]
             .iter()
             .map(|&subject| graph.value(subject).raw)
             .collect::<Vec<_>>()
     );
+    assert_eq!(query.stats().delta_transition_candidates_examined, 3);
 }
 
 #[test]
@@ -5496,7 +4000,7 @@ fn mixed_transition_pages_preserve_cycles_clone_drop_affine_bags_and_monotonicit
         PathOp::Union,
         PathOp::Plus,
     ];
-    let make = || native_bound_start_root(graph.set.clone(), graph.value(0), &ops);
+    let make = || bound_start_root(graph.set.clone(), graph.value(0), &ops);
     let mut expected: Vec<_> = Query::new(make(), project_end).sequential().collect();
     expected.sort_unstable();
 
@@ -5527,7 +4031,7 @@ fn mixed_transition_pages_preserve_cycles_clone_drop_affine_bags_and_monotonicit
 
     let outer_values = [genid(&rngid().id).raw, genid(&rngid().id).raw];
     let make_affine =
-        || native_duplicate_parent_root(graph.set.clone(), graph.value(0).raw, outer_values, &ops);
+        || duplicate_parent_root(graph.set.clone(), graph.value(0).raw, outer_values, &ops);
     let mut sequential: Vec<_> = Query::new(make_affine(), project_end)
         .sequential()
         .collect();
@@ -5555,7 +4059,7 @@ fn mixed_transition_pages_preserve_cycles_clone_drop_affine_bags_and_monotonicit
             PathOp::Union,
         ];
         let mut query = Query::new(
-            native_bound_start_root(graph.set.clone(), graph.value(0), &ops),
+            bound_start_root(graph.set.clone(), graph.value(0), &ops),
             project_end,
         )
         .solve_residual_state_lazy_with(ResidualLowering::FULL)

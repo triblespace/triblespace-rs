@@ -18,7 +18,6 @@ use triblespace_core::query::regularpathconstraint::{PathOp, RegularPathConstrai
 use triblespace_core::query::sortedsliceconstraint::SortedSlice;
 use triblespace_core::query::{
     CandidateSink, Candidates, Constraint, ContainsConstraint, RowsView, TriblePattern, Variable,
-    VariableSet,
 };
 use triblespace_core::trible::Trible;
 
@@ -302,7 +301,7 @@ fn pointwise_builtin_confirms_are_page_homomorphisms() {
 }
 
 #[test]
-fn whole_group_reducers_remain_explicitly_atomic() {
+fn whole_group_reducers_are_explicitly_atomic_or_program_owned() {
     let x = Variable::<UnknownInline>::new(0);
     let union = or!(x.is(Inline::new(raw(2))), x.is(Inline::new(raw(3))));
     assert!(
@@ -325,7 +324,7 @@ fn whole_group_reducers_remain_explicitly_atomic() {
     );
     assert_eq!(
         repeated_path.residual_delta_confirm_grouping_requirements(start.index),
-        Some(VariableSet::new_singleton(end.index)),
-        "the cyclic RPQ reducer becomes grouped once its opposite endpoint is bound"
+        None,
+        "RPQ grouping belongs to the typed residual program, not the legacy delta confirmer"
     );
 }

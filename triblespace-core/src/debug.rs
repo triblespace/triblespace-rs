@@ -4,6 +4,7 @@ pub mod query {
     use crate::query::CandidateSink;
     use crate::query::Constraint;
     use crate::query::EstimateSink;
+    use crate::query::ProgramRef;
     use crate::query::ResidualDeltaExpandBatch;
     use crate::query::ResidualDeltaExpandCursor;
     use crate::query::ResidualDeltaExpandPage;
@@ -172,6 +173,10 @@ pub mod query {
         ) -> Option<VariableSet> {
             self.constraint
                 .residual_delta_confirm_grouping_requirements(variable)
+        }
+
+        fn residual_program(&self) -> Option<ProgramRef<'_>> {
+            self.constraint.residual_program()
         }
 
         fn residual_delta_source_is_paged(
