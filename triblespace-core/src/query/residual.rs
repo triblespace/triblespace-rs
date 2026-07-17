@@ -248,7 +248,7 @@ impl FiniteFormulaProgram {
         root: &dyn Constraint<'a>,
         leaves: &[ResidualLeaf],
         transition_programs: bool,
-        synthetic_root: bool,
+        root_certificates: &[FormulaRootCertificate],
     ) -> Self {
         struct Builder {
             nodes: Vec<Option<FiniteFormulaNode>>,
@@ -505,33 +505,31 @@ impl FiniteFormulaProgram {
             nodes: Vec::new(),
             transition_programs,
         };
-        if synthetic_root {
-            assert_eq!(
-                leaves.len(),
-                1,
-                "a synthetic residual formula has one outer occurrence"
-            );
-            let root = builder.compile_root(root);
-            return Self {
-                nodes: builder
-                    .nodes
-                    .into_iter()
-                    .map(|node| node.expect("reserved residual formula node was not compiled"))
-                    .collect(),
-                roots: vec![Some(root)],
-            };
-        }
+        assert_eq!(
+            leaves.len(),
+            root_certificates.len(),
+            "every residual occurrence needs one formula-root certificate"
+        );
         let mut roots = vec![None; leaves.len()];
         for (occurrence, leaf) in leaves.iter().enumerate() {
             if leaf.lowering != LeafLowering::FiniteFormula {
+                assert_eq!(
+                    root_certificates[occurrence],
+                    FormulaRootCertificate::NONE,
+                    "an opaque occurrence cannot claim synthetic formula capabilities"
+                );
                 continue;
             }
             let constraint = resolve_leaf(root, leaf);
-            assert!(
-                constraint.residual_union_children().is_some(),
-                "a finite-formula root stopped being a Union"
-            );
-            roots[occurrence] = Some(builder.compile_node(constraint, &mut Vec::new()));
+            roots[occurrence] = Some(if root_certificates[occurrence].synthetic {
+                builder.compile_root(constraint)
+            } else {
+                assert!(
+                    constraint.residual_union_children().is_some(),
+                    "a non-synthetic finite-formula root stopped being a Union"
+                );
+                builder.compile_node(constraint, &mut Vec::new())
+            });
         }
         Self {
             nodes: builder
@@ -1447,6 +1445,34 @@ struct ResidualLeaf {
     lowering: LeafLowering,
 }
 
+/// Execution capabilities proven for one outer formula occurrence.
+///
+/// Union-leaf lowering owns a formula reducer but is not allowed to borrow
+/// the paging and streaming laws proved for a synthetic whole boundary.  The
+/// old plan represented that distinction with one global bit.  Keeping it
+/// per occurrence is the minimum representation needed for a local synthetic
+/// root beside ordinary WCO leaves in the same residual machine.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FormulaRootCertificate {
+    synthetic: bool,
+    candidate_pages: bool,
+    proposal_streaming: bool,
+}
+
+impl FormulaRootCertificate {
+    const NONE: Self = Self {
+        synthetic: false,
+        candidate_pages: false,
+        proposal_streaming: false,
+    };
+
+    const SYNTHETIC: Self = Self {
+        synthetic: true,
+        candidate_pages: true,
+        proposal_streaming: true,
+    };
+}
+
 #[cfg(test)]
 impl PartialEq<ConstraintPath> for ResidualLeaf {
     fn eq(&self, other: &ConstraintPath) -> bool {
@@ -1476,9 +1502,10 @@ struct ResidualPlan {
     /// confirmation needs the immutable complete candidate sequence for each
     /// parent until traversal quiescence.
     grouped_delta_confirm_requirements: Vec<Box<[(VariableId, VariableSet)]>>,
-    /// The nontrivial exposed root is one formula occurrence. Whole-root
-    /// identity shells around one opaque atom normalize to the flat plan.
-    synthetic_root_formula: bool,
+    /// Per-occurrence proof that a formula root is synthetic and may use the
+    /// whole-boundary candidate paging and proposal-streaming laws.  Opaque
+    /// leaves and ordinary lowered Union roots carry the empty certificate.
+    formula_root_certificates: Vec<FormulaRootCertificate>,
 }
 
 /// Closed-world structural proxy used by the experimental built-in grouped-
@@ -1542,6 +1569,59 @@ fn exposed_grouped_confirm_witness_below_connective<'a>(root: &dyn Constraint<'a
     visit(root, root.variables(), false)
 }
 
+fn append_flattened_residual_leaves<'a>(
+    constraint: &dyn Constraint<'a>,
+    formula_scope: FormulaScope,
+    transition_programs: bool,
+    path: &mut Vec<usize>,
+    leaves: &mut Vec<ResidualLeaf>,
+    page_local_confirms: &mut Vec<bool>,
+    grouped_delta_confirm_requirements: &mut Vec<Box<[(VariableId, VariableSet)]>>,
+    formula_root_certificates: &mut Vec<FormulaRootCertificate>,
+) {
+    match constraint.residual_shape() {
+        ConstraintShape::And(children) | ConstraintShape::ScopedAnd(children) => {
+            for child in 0..children.len() {
+                path.push(child);
+                append_flattened_residual_leaves(
+                    children.child(child),
+                    formula_scope,
+                    transition_programs,
+                    path,
+                    leaves,
+                    page_local_confirms,
+                    grouped_delta_confirm_requirements,
+                    formula_root_certificates,
+                );
+                path.pop();
+            }
+        }
+        ConstraintShape::Opaque => {
+            let lowering = if formula_scope == FormulaScope::UnionLeaves
+                && constraint.residual_union_children().is_some()
+            {
+                LeafLowering::FiniteFormula
+            } else {
+                LeafLowering::Opaque
+            };
+            leaves.push(ResidualLeaf {
+                path: ConstraintPath(path.clone().into_boxed_slice()),
+                lowering,
+            });
+            page_local_confirms.push(
+                matches!(lowering, LeafLowering::Opaque)
+                    && constraint.residual_confirm_is_page_local(),
+            );
+            grouped_delta_confirm_requirements.push(if matches!(lowering, LeafLowering::Opaque) {
+                compile_grouped_delta_confirm_requirements(constraint, transition_programs)
+            } else {
+                Box::new([])
+            });
+            formula_root_certificates.push(FormulaRootCertificate::NONE);
+        }
+    }
+}
+
 impl ResidualPlan {
     fn compile<'a>(root: &dyn Constraint<'a>) -> Self {
         Self::compile_mode(root, FormulaScope::OpaqueLeaves, false)
@@ -1553,6 +1633,11 @@ impl ResidualPlan {
     }
 
     fn compile_lowering<'a>(root: &dyn Constraint<'a>, lowering: ResidualLowering) -> Self {
+        if lowering.builtin_aligned_component_scope() {
+            if let Some(plan) = Self::compile_aligned_direct_components(root) {
+                return plan;
+            }
+        }
         let formula_scope = if lowering.builtin_grouped_witness_root() {
             if exposed_grouped_confirm_witness_below_connective(root) {
                 FormulaScope::WholeRoot
@@ -1563,6 +1648,79 @@ impl ResidualPlan {
             lowering.formula_scope()
         };
         Self::compile_mode(root, formula_scope, lowering.transition_programs())
+    }
+
+    /// Narrow scope-only probe: one maximal root AND, direct child subtrees,
+    /// and pairwise-disjoint outward schemas. Witness-bearing children become
+    /// local synthetic WT roots while finite siblings remain ordinary OT
+    /// leaves in this same plan and scheduler.
+    fn compile_aligned_direct_components<'a>(root: &dyn Constraint<'a>) -> Option<Self> {
+        let ConstraintShape::And(children) = root.residual_shape() else {
+            return None;
+        };
+        if root.residual_union_children().is_some() || children.len() < 2 {
+            return None;
+        }
+
+        let mut seen = VariableSet::new_empty();
+        let mut witnesses = Vec::with_capacity(children.len());
+        for child in 0..children.len() {
+            let constraint = children.child(child);
+            let variables = constraint.variables();
+            if !seen.intersect(variables).is_empty() {
+                return None;
+            }
+            seen = seen.union(variables);
+            witnesses.push(exposed_grouped_confirm_witness_below_connective(constraint));
+        }
+        if !witnesses.iter().any(|&witness| witness) || !witnesses.iter().any(|&witness| !witness) {
+            return None;
+        }
+
+        let transition_programs = true;
+        let mut leaves = Vec::new();
+        let mut page_local_confirms = Vec::new();
+        let mut grouped_delta_confirm_requirements: Vec<Box<[(VariableId, VariableSet)]>> =
+            Vec::new();
+        let mut formula_root_certificates = Vec::new();
+        for (child, &witness) in witnesses.iter().enumerate() {
+            let constraint = children.child(child);
+            if witness {
+                leaves.push(ResidualLeaf {
+                    path: ConstraintPath(vec![child].into_boxed_slice()),
+                    lowering: LeafLowering::FiniteFormula,
+                });
+                page_local_confirms.push(false);
+                grouped_delta_confirm_requirements.push(Box::new([]));
+                formula_root_certificates.push(FormulaRootCertificate::SYNTHETIC);
+            } else {
+                let mut path = vec![child];
+                append_flattened_residual_leaves(
+                    constraint,
+                    FormulaScope::OpaqueLeaves,
+                    transition_programs,
+                    &mut path,
+                    &mut leaves,
+                    &mut page_local_confirms,
+                    &mut grouped_delta_confirm_requirements,
+                    &mut formula_root_certificates,
+                );
+            }
+        }
+        let finite_formula = FiniteFormulaProgram::compile(
+            root,
+            &leaves,
+            transition_programs,
+            &formula_root_certificates,
+        );
+        Some(Self {
+            leaves,
+            finite_formula,
+            page_local_confirms,
+            transition_programs,
+            grouped_delta_confirm_requirements,
+            formula_root_certificates,
+        })
     }
 
     fn compile_mode<'a>(
@@ -1582,67 +1740,13 @@ impl ResidualPlan {
             }
         }
 
-        fn visit<'a>(
-            constraint: &dyn Constraint<'a>,
-            formula_scope: FormulaScope,
-            transition_programs: bool,
-            path: &mut Vec<usize>,
-            leaves: &mut Vec<ResidualLeaf>,
-            page_local_confirms: &mut Vec<bool>,
-            grouped_delta_confirm_requirements: &mut Vec<Box<[(VariableId, VariableSet)]>>,
-        ) {
-            match constraint.residual_shape() {
-                ConstraintShape::And(children) | ConstraintShape::ScopedAnd(children) => {
-                    for child in 0..children.len() {
-                        path.push(child);
-                        visit(
-                            children.child(child),
-                            formula_scope,
-                            transition_programs,
-                            path,
-                            leaves,
-                            page_local_confirms,
-                            grouped_delta_confirm_requirements,
-                        );
-                        path.pop();
-                    }
-                }
-                ConstraintShape::Opaque => {
-                    let lowering = if formula_scope == FormulaScope::UnionLeaves
-                        && constraint.residual_union_children().is_some()
-                    {
-                        LeafLowering::FiniteFormula
-                    } else {
-                        LeafLowering::Opaque
-                    };
-                    leaves.push(ResidualLeaf {
-                        path: ConstraintPath(path.clone().into_boxed_slice()),
-                        lowering,
-                    });
-                    page_local_confirms.push(
-                        matches!(lowering, LeafLowering::Opaque)
-                            && constraint.residual_confirm_is_page_local(),
-                    );
-                    grouped_delta_confirm_requirements.push(
-                        if matches!(lowering, LeafLowering::Opaque) {
-                            compile_grouped_delta_confirm_requirements(
-                                constraint,
-                                transition_programs,
-                            )
-                        } else {
-                            Box::new([])
-                        },
-                    );
-                }
-            }
-        }
-
         let synthetic_root_formula =
             formula_scope == FormulaScope::WholeRoot && !is_formula_identity(root);
         let mut leaves = Vec::new();
         let mut page_local_confirms = Vec::new();
         let mut grouped_delta_confirm_requirements: Vec<Box<[(VariableId, VariableSet)]>> =
             Vec::new();
+        let mut formula_root_certificates = Vec::new();
         if synthetic_root_formula {
             leaves.push(ResidualLeaf {
                 path: ConstraintPath(Box::new([])),
@@ -1653,8 +1757,9 @@ impl ResidualPlan {
             // page-local or grouped confirmer.
             page_local_confirms.push(false);
             grouped_delta_confirm_requirements.push(Box::new([]));
+            formula_root_certificates.push(FormulaRootCertificate::SYNTHETIC);
         } else {
-            visit(
+            append_flattened_residual_leaves(
                 root,
                 formula_scope,
                 transition_programs,
@@ -1662,13 +1767,14 @@ impl ResidualPlan {
                 &mut leaves,
                 &mut page_local_confirms,
                 &mut grouped_delta_confirm_requirements,
+                &mut formula_root_certificates,
             );
         }
         let finite_formula = FiniteFormulaProgram::compile(
             root,
             &leaves,
             transition_programs,
-            synthetic_root_formula,
+            &formula_root_certificates,
         );
         Self {
             leaves,
@@ -1676,7 +1782,7 @@ impl ResidualPlan {
             page_local_confirms,
             transition_programs,
             grouped_delta_confirm_requirements,
-            synthetic_root_formula,
+            formula_root_certificates,
         }
     }
 
@@ -1695,8 +1801,15 @@ impl ResidualPlan {
         self.finite_formula.root(occurrence).is_some()
     }
 
+    #[cfg(test)]
+    fn has_synthetic_formula_root(&self) -> bool {
+        self.formula_root_certificates
+            .iter()
+            .any(|certificate| certificate.synthetic)
+    }
+
     fn formula_action_occurrence(&self, outer: usize, node: FormulaNodeId) -> usize {
-        if self.synthetic_root_formula {
+        if self.formula_root_certificates[outer].synthetic {
             self.len()
                 .checked_add(node.0 as usize)
                 .expect("formula action occurrence overflow")
@@ -1711,7 +1824,7 @@ impl ResidualPlan {
         counter: &FormulaProgramCounter,
         bound: VariableSet,
     ) -> bool {
-        self.synthetic_root_formula
+        self.formula_root_certificates[counter.resume.occurrence].candidate_pages
             && self
                 .finite_formula
                 .root_confirm_suffix_accepts_pages(counter, bound)
@@ -1723,7 +1836,7 @@ impl ResidualPlan {
         counter: FormulaPcId,
         bound: VariableSet,
     ) -> bool {
-        self.synthetic_root_formula
+        self.formula_root_certificates[formula_pcs.resume(counter).occurrence].candidate_pages
             && self
                 .finite_formula
                 .interned_root_confirm_suffix_accepts_pages(formula_pcs, counter, bound)
@@ -1735,7 +1848,7 @@ impl ResidualPlan {
         counter: &FormulaProgramCounter,
         bound: VariableSet,
     ) -> FormulaProposalStreamability {
-        if !self.synthetic_root_formula {
+        if !self.formula_root_certificates[counter.resume.occurrence].proposal_streaming {
             return FormulaProposalStreamability::Barrier(
                 FormulaProposalStreamBarrier::NotSyntheticRoot,
             );
@@ -1766,7 +1879,8 @@ impl ResidualPlan {
         counter: FormulaPcId,
         bound: VariableSet,
     ) -> FormulaProposalStreamability {
-        if !self.synthetic_root_formula {
+        let resume = formula_pcs.resume(counter);
+        if !self.formula_root_certificates[resume.occurrence].proposal_streaming {
             return FormulaProposalStreamability::Barrier(
                 FormulaProposalStreamBarrier::NotSyntheticRoot,
             );
@@ -1778,7 +1892,6 @@ impl ResidualPlan {
             return streamability;
         }
 
-        let resume = formula_pcs.resume(counter);
         let UnionVerb::Propose { relevant } = &resume.verb else {
             return FormulaProposalStreamability::Barrier(
                 FormulaProposalStreamBarrier::NotProposalAction,
@@ -1985,15 +2098,17 @@ pub enum FormulaScope {
 /// Formula scope is a three-element chain. Transition programs form the one
 /// independent capability axis, giving exactly six canonical fixed lowering
 /// forms. [`BUILTIN_GROUPED_WITNESS_ROOT`](Self::BUILTIN_GROUPED_WITNESS_ROOT)
-/// is a seventh, explicitly experimental structural selector: it keeps
-/// transition programs enabled and chooses either `OpaqueLeaves` or
-/// `WholeRoot` for the complete root from an exposed grouped-confirm witness.
+/// and the aligned-component probe are explicitly experimental structural
+/// selectors. Both keep transition programs enabled; the first chooses one
+/// root-wide fixed form, while the latter may place a synthetic formula on a
+/// direct independent child without absorbing its finite siblings.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 #[must_use]
 pub struct ResidualLowering {
     formula_scope: FormulaScope,
     transition_programs: bool,
     builtin_grouped_witness_root: bool,
+    builtin_aligned_component_scope: bool,
 }
 
 impl ResidualLowering {
@@ -2014,6 +2129,21 @@ impl ResidualLowering {
         formula_scope: FormulaScope::OpaqueLeaves,
         transition_programs: true,
         builtin_grouped_witness_root: true,
+        builtin_aligned_component_scope: false,
+    };
+    /// Scope-only probe for pairwise-independent direct root-AND children.
+    ///
+    /// A witness-bearing direct child becomes one local synthetic formula
+    /// root while finite siblings stay on the ordinary opaque-leaf route in
+    /// the same residual machine. Non-aligned roots fall back to
+    /// [`BUILTIN_GROUPED_WITNESS_ROOT`](Self::BUILTIN_GROUPED_WITNESS_ROOT).
+    /// This intentionally does not discover deeper components or share any
+    /// result computation.
+    pub const BUILTIN_ALIGNED_COMPONENT_SCOPE: Self = Self {
+        formula_scope: FormulaScope::OpaqueLeaves,
+        transition_programs: true,
+        builtin_grouped_witness_root: true,
+        builtin_aligned_component_scope: true,
     };
 
     /// Constructs one of the six canonical lowering forms.
@@ -2022,6 +2152,7 @@ impl ResidualLowering {
             formula_scope,
             transition_programs,
             builtin_grouped_witness_root: false,
+            builtin_aligned_component_scope: false,
         }
     }
 
@@ -2040,6 +2171,11 @@ impl ResidualLowering {
     /// built-in grouped-confirm witness proxy.
     pub const fn builtin_grouped_witness_root(self) -> bool {
         self.builtin_grouped_witness_root
+    }
+
+    /// Whether the narrow direct-child aligned component probe is enabled.
+    pub const fn builtin_aligned_component_scope(self) -> bool {
+        self.builtin_aligned_component_scope
     }
 }
 
@@ -10260,7 +10396,7 @@ mod tests {
     use std::sync::Mutex;
 
     #[test]
-    fn residual_lowering_has_six_fixed_forms_plus_one_structural_selector() {
+    fn residual_lowering_has_six_fixed_forms_plus_structural_selectors() {
         let forms: std::collections::HashSet<_> = [
             FormulaScope::OpaqueLeaves,
             FormulaScope::UnionLeaves,
@@ -10276,6 +10412,7 @@ mod tests {
 
         assert_eq!(forms.len(), 6);
         assert!(!forms.contains(&ResidualLowering::BUILTIN_GROUPED_WITNESS_ROOT));
+        assert!(!forms.contains(&ResidualLowering::BUILTIN_ALIGNED_COMPONENT_SCOPE));
         assert_eq!(ResidualLowering::default(), ResidualLowering::CONSERVATIVE);
         assert_eq!(
             ResidualLowering::FULL,
@@ -13414,7 +13551,7 @@ mod tests {
             &opaque,
             ResidualLowering::new(FormulaScope::WholeRoot, true),
         );
-        assert!(!opaque_plan.synthetic_root_formula);
+        assert!(!opaque_plan.has_synthetic_formula_root());
         assert_eq!(opaque_plan.len(), 1);
         assert!(opaque_plan.finite_formula.root(0).is_none());
         assert!(opaque_plan.leaves[0].path.0.is_empty());
@@ -13424,7 +13561,7 @@ mod tests {
             nested.as_ref(),
             ResidualLowering::new(FormulaScope::WholeRoot, true),
         );
-        assert!(!nested_plan.synthetic_root_formula);
+        assert!(!nested_plan.has_synthetic_formula_root());
         assert_eq!(nested_plan.len(), 1);
         assert!(nested_plan.finite_formula.root(0).is_none());
         assert_eq!(nested_plan.leaves[0].path.0.as_ref(), [0, 0]);
@@ -13457,7 +13594,7 @@ mod tests {
         );
 
         assert_eq!(selected, opaque);
-        assert!(!selected.synthetic_root_formula);
+        assert!(!selected.has_synthetic_formula_root());
     }
 
     #[test]
@@ -13471,7 +13608,124 @@ mod tests {
         let whole = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
 
         assert_eq!(selected, whole);
-        assert!(selected.synthetic_root_formula);
+        assert!(selected.has_synthetic_formula_root());
+    }
+
+    #[test]
+    fn aligned_component_scope_keeps_finite_sibling_outside_local_formula_root() {
+        let root = IntersectionConstraint::new(vec![
+            shape_leaf(4),
+            shape_and(vec![Box::new(repeated_test_path(0, 1)), shape_leaf(3)]),
+        ]);
+        let plan = ResidualPlan::compile_lowering(
+            &root,
+            ResidualLowering::BUILTIN_ALIGNED_COMPONENT_SCOPE,
+        );
+
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan.leaves[0].path.0.as_ref(), [0]);
+        assert_eq!(plan.leaves[0].lowering, LeafLowering::Opaque);
+        assert_eq!(plan.leaves[1].path.0.as_ref(), [1]);
+        assert_eq!(plan.leaves[1].lowering, LeafLowering::FiniteFormula);
+        assert_eq!(
+            plan.formula_root_certificates,
+            [
+                FormulaRootCertificate::NONE,
+                FormulaRootCertificate::SYNTHETIC,
+            ]
+        );
+        assert!(plan.finite_formula.root(0).is_none());
+        let formula_root = plan
+            .finite_formula
+            .root(1)
+            .expect("the witness-bearing child owns one local formula root");
+        let FiniteFormulaNodeKind::And { children } = &plan.finite_formula.node(formula_root).kind
+        else {
+            panic!("the aligned mixed child did not retain its root AND")
+        };
+        assert_eq!(children.len(), 2);
+        assert_eq!(
+            plan.finite_formula.node(children[0]).path.0.as_ref(),
+            [FormulaStep::And(0)]
+        );
+        assert_eq!(
+            plan.finite_formula.node(children[1]).path.0.as_ref(),
+            [FormulaStep::And(1)]
+        );
+        assert_eq!(
+            plan.resolve(&root, 0).variables(),
+            VariableSet::new_singleton(4)
+        );
+        assert_eq!(
+            plan.resolve_formula_node(&root, 1, children[0]).variables(),
+            VariableSet::new_singleton(0).union(VariableSet::new_singleton(1))
+        );
+    }
+
+    #[test]
+    fn aligned_component_scope_is_order_invariant_and_fails_closed_on_overlap() {
+        let make_mixed = || shape_and(vec![Box::new(repeated_test_path(0, 1)), shape_leaf(3)]);
+        let reversed = IntersectionConstraint::new(vec![make_mixed(), shape_leaf(4)]);
+        let reversed_plan = ResidualPlan::compile_lowering(
+            &reversed,
+            ResidualLowering::BUILTIN_ALIGNED_COMPONENT_SCOPE,
+        );
+        assert_eq!(reversed_plan.len(), 2);
+        assert_eq!(reversed_plan.leaves[0].path.0.as_ref(), [0]);
+        assert_eq!(reversed_plan.leaves[1].path.0.as_ref(), [1]);
+        assert_eq!(
+            reversed_plan.formula_root_certificates,
+            [
+                FormulaRootCertificate::SYNTHETIC,
+                FormulaRootCertificate::NONE,
+            ]
+        );
+
+        let connected = IntersectionConstraint::new(vec![shape_leaf(0), make_mixed()]);
+        let aligned = ResidualPlan::compile_lowering(
+            &connected,
+            ResidualLowering::BUILTIN_ALIGNED_COMPONENT_SCOPE,
+        );
+        let grouped = ResidualPlan::compile_lowering(
+            &connected,
+            ResidualLowering::BUILTIN_GROUPED_WITNESS_ROOT,
+        );
+        assert_eq!(aligned, grouped);
+        assert_eq!(aligned.len(), 1);
+        assert!(aligned.has_synthetic_formula_root());
+    }
+
+    #[test]
+    fn aligned_local_formula_retains_scoped_support_and_union_owner() {
+        let scoped = IgnoreConstraint::new(
+            VariableSet::new_empty(),
+            Box::new(IntersectionConstraint::new(vec![
+                Box::new(repeated_test_path(0, 1)) as ShapeConstraint,
+                Box::new(UnionConstraint::new(vec![shape_leaf(1), shape_leaf(1)]))
+                    as ShapeConstraint,
+            ])),
+        );
+        let root =
+            IntersectionConstraint::new(vec![shape_leaf(4), Box::new(scoped) as ShapeConstraint]);
+        let plan = ResidualPlan::compile_lowering(
+            &root,
+            ResidualLowering::BUILTIN_ALIGNED_COMPONENT_SCOPE,
+        );
+        let local_root = plan
+            .finite_formula
+            .root(1)
+            .expect("the scoped witness child owns one local root");
+        let local = plan.finite_formula.node(local_root);
+        assert!(local.support_atomic, "ScopedAnd Support lost its owner");
+        let FiniteFormulaNodeKind::And { children } = &local.kind else {
+            panic!("ScopedAnd did not retain its conjunction")
+        };
+        assert!(children.iter().any(|&child| {
+            matches!(
+                &plan.finite_formula.node(child).kind,
+                FiniteFormulaNodeKind::Or { .. }
+            )
+        }));
     }
 
     #[test]
@@ -13494,7 +13748,7 @@ mod tests {
         );
 
         assert_eq!(selected, opaque);
-        assert!(!selected.synthetic_root_formula);
+        assert!(!selected.has_synthetic_formula_root());
     }
 
     #[test]
@@ -13521,7 +13775,7 @@ mod tests {
             ResidualLowering::new(FormulaScope::OpaqueLeaves, true),
         );
         assert_eq!(debug_selected, debug_opaque);
-        assert!(!debug_selected.synthetic_root_formula);
+        assert!(!debug_selected.has_synthetic_formula_root());
 
         let estimate_root = IntersectionConstraint::new(vec![
             Box::new(ShapeLeaf(2)) as LocalConstraint,
@@ -13533,7 +13787,7 @@ mod tests {
         );
         let estimate_whole = ResidualPlan::compile_lowering(&estimate_root, ResidualLowering::FULL);
         assert_eq!(estimate_selected, estimate_whole);
-        assert!(estimate_selected.synthetic_root_formula);
+        assert!(estimate_selected.has_synthetic_formula_root());
     }
 
     #[test]
@@ -13549,7 +13803,7 @@ mod tests {
             ResidualLowering::new(FormulaScope::WholeRoot, false),
         );
         assert_eq!(plan.len(), 1);
-        assert!(plan.synthetic_root_formula);
+        assert!(plan.has_synthetic_formula_root());
         let program = &plan.finite_formula;
         let root = program.root(0).expect("synthetic formula has a root");
         let FiniteFormulaNodeKind::And { children } = &program.node(root).kind else {
@@ -13581,7 +13835,7 @@ mod tests {
             &root,
             ResidualLowering::new(FormulaScope::UnionLeaves, false),
         );
-        assert!(!union_leaves.synthetic_root_formula);
+        assert!(!union_leaves.has_synthetic_formula_root());
         assert_eq!(union_leaves.len(), 2);
         assert!(union_leaves.finite_formula.root(0).is_none());
         assert!(union_leaves.finite_formula.root(1).is_some());
@@ -13590,7 +13844,7 @@ mod tests {
             &root,
             ResidualLowering::new(FormulaScope::WholeRoot, false),
         );
-        assert!(whole_root.synthetic_root_formula);
+        assert!(whole_root.has_synthetic_formula_root());
         assert_eq!(whole_root.len(), 1);
         assert!(whole_root.finite_formula.root(0).is_some());
         assert!(whole_root

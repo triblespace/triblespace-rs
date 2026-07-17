@@ -9,14 +9,15 @@ use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace_core::query::residual::{
-    ActionVerb, FormulaScope, ResidualLowering, ResidualShadowEpoch,
+    ActionVerb, FormulaScope, ResidualLowering, ResidualShadowEpoch, ResidualShadowStatus,
 };
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, ConstraintShape, EstimateSink, PathOp, Query,
     RegularPathConstraint, ResidualDeltaExpandBatch, ResidualDeltaExpandCursor,
     ResidualDeltaExpandPage, ResidualDeltaNode, ResidualDeltaOutput, ResidualDeltaSeed,
-    ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, Variable, VariableId, VariableSet,
+    ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, Variable, VariableId,
+    VariableSet,
 };
 use triblespace_core::trible::{Trible, TribleSet};
 
@@ -24,6 +25,7 @@ const START: VariableId = 0;
 const END: VariableId = 1;
 const OUTER: VariableId = 2;
 const PARENT: VariableId = 3;
+const ALIGNED_FINITE: VariableId = 4;
 
 type DynConstraint = Box<dyn Constraint<'static> + Send + Sync>;
 type Root = Arc<IntersectionConstraint<DynConstraint>>;
@@ -1048,6 +1050,69 @@ fn generated_formula_root(
         Box::new(start.is(graph.value(0))) as DynConstraint,
         formula,
     ]))
+}
+
+fn aligned_component_value(ordinal: usize) -> RawInline {
+    let mut value = [0; 32];
+    value[24..].copy_from_slice(&(ordinal as u64 + 1).to_be_bytes());
+    value
+}
+
+fn aligned_component_root(
+    graph: &GeneratedGraph,
+    finite_cardinality: usize,
+    mixed_first: bool,
+) -> Root {
+    let ops = vec![PathOp::Attr(graph.primary.raw()), PathOp::Plus];
+    let start = Variable::<GenId>::new(START);
+    let end = Variable::<GenId>::new(END);
+    aligned_component_root_with_path(
+        graph,
+        finite_cardinality,
+        mixed_first,
+        Box::new(RegularPathConstraint::new(
+            graph.set.clone(),
+            start,
+            end,
+            &ops,
+        )),
+    )
+}
+
+fn aligned_component_root_with_path(
+    graph: &GeneratedGraph,
+    finite_cardinality: usize,
+    mixed_first: bool,
+    path: DynConstraint,
+) -> Root {
+    let end = Variable::<GenId>::new(END);
+    let mixed = Box::new(IntersectionConstraint::new(vec![
+        Box::new(OrderedDomain {
+            variable: START,
+            gate: START,
+            unbound_estimate: usize::MAX,
+            values: vec![graph.value(0).raw, graph.value(1).raw],
+        }) as DynConstraint,
+        path,
+        Box::new(UnionConstraint::new(vec![
+            Box::new(end.is(graph.value(1))) as DynConstraint,
+            Box::new(end.is(graph.value(2))) as DynConstraint,
+        ])) as DynConstraint,
+    ])) as DynConstraint;
+    let finite = Box::new(OrderedDomain {
+        variable: ALIGNED_FINITE,
+        gate: ALIGNED_FINITE,
+        unbound_estimate: finite_cardinality,
+        values: (0..finite_cardinality)
+            .map(aligned_component_value)
+            .collect(),
+    }) as DynConstraint;
+    let children = if mixed_first {
+        vec![mixed, finite]
+    } else {
+        vec![finite, mixed]
+    };
+    Arc::new(IntersectionConstraint::new(children))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4873,6 +4938,127 @@ fn builtin_grouped_witness_root_enters_the_mixed_formula_delta_route_before_firs
 }
 
 #[test]
+fn aligned_component_scope_matches_sequential_bags_at_empty_affine_and_phase_boundary_sizes() {
+    let graph = GeneratedGraph::new(4);
+    let lowerings = [
+        ResidualLowering::FULL,
+        ResidualLowering::BUILTIN_GROUPED_WITNESS_ROOT,
+        ResidualLowering::BUILTIN_ALIGNED_COMPONENT_SCOPE,
+    ];
+
+    for finite_cardinality in [0, 2, 65] {
+        let mut expected: Vec<_> = Query::new(
+            aligned_component_root(&graph, finite_cardinality, false),
+            project_pair,
+        )
+        .sequential()
+        .collect();
+        expected.sort_unstable();
+        if finite_cardinality == 2 {
+            assert!(!expected.is_empty());
+            assert_eq!(
+                expected.len() % 2,
+                0,
+                "two projected-away finite rows must preserve affine multiplicity"
+            );
+        }
+
+        for mixed_first in [false, true] {
+            for lowering in lowerings {
+                let mut actual: Vec<_> = Query::new(
+                    aligned_component_root(&graph, finite_cardinality, mixed_first),
+                    project_pair,
+                )
+                .solve_residual_state_lazy_with(lowering)
+                .cap(128)
+                .start_width(1)
+                .collect();
+                actual.sort_unstable();
+                assert_eq!(
+                    actual, expected,
+                    "aligned scope changed the bag at finite_cardinality={finite_cardinality}, \
+                     mixed_first={mixed_first}, lowering={lowering:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn aligned_component_scope_routes_rpq_before_first_emit_and_keeps_finite_action_outer() {
+    let graph = GeneratedGraph::new(4);
+    for mixed_first in [false, true] {
+        let seeded_roots = Arc::new(AtomicUsize::new(0));
+        let expanded_nodes = Arc::new(AtomicUsize::new(0));
+        let start = Variable::<GenId>::new(START);
+        let end = Variable::<GenId>::new(END);
+        let ops = vec![PathOp::Attr(graph.primary.raw()), PathOp::Plus];
+        let root = aligned_component_root_with_path(
+            &graph,
+            2,
+            mixed_first,
+            Box::new(CountingPath {
+                inner: RegularPathConstraint::new(graph.set.clone(), start, end, &ops),
+                seeded_roots: Some(Arc::clone(&seeded_roots)),
+                source_pages: None,
+                expanded_nodes: Arc::clone(&expanded_nodes),
+            }),
+        );
+        let epoch = ResidualShadowEpoch::new();
+        let finite_occurrence = usize::from(mixed_first);
+        let mut query = Query::new(root, project_pair)
+            .solve_residual_state_lazy_with(ResidualLowering::BUILTIN_ALIGNED_COMPONENT_SCOPE)
+            .cap(128)
+            .start_width(1)
+            .shadow(epoch.clone());
+        let first = query.next().expect("the aligned product is nonempty");
+        let stats = query.stats().clone();
+        let before_drop = query.snapshot();
+
+        assert!(
+            seeded_roots.load(Ordering::Relaxed) > 0,
+            "the native RPQ source hook never seeded a root: {stats:#?}"
+        );
+        assert!(
+            expanded_nodes.load(Ordering::Relaxed) > 0,
+            "the native RPQ transition hook never expanded a node: {stats:#?}"
+        );
+        assert!(
+            stats.delta_handoff_probe_pops > 0,
+            "no native RPQ handoff before result one: {stats:#?}"
+        );
+        let finite_actions: Vec<_> = before_drop
+            .events
+            .iter()
+            .filter(|event| event.site.variable == ALIGNED_FINITE)
+            .collect();
+        assert!(
+            !finite_actions.is_empty(),
+            "the projected-away finite component never executed"
+        );
+        assert!(finite_actions
+            .iter()
+            .all(|event| event.site.leaf_occurrence == finite_occurrence));
+        assert!(before_drop.events.iter().any(|event| {
+            matches!(event.site.verb, ActionVerb::Propose | ActionVerb::Confirm)
+                && matches!(event.site.variable, START | END)
+                && event.site.leaf_occurrence >= 2
+        }));
+
+        std::hint::black_box(first);
+        let events_before_drop = before_drop.events.len();
+        drop(query);
+        let after_drop = epoch.snapshot();
+        assert_eq!(after_drop.status, ResidualShadowStatus::Invalidated);
+        assert_eq!(
+            after_drop.events.len(),
+            events_before_drop,
+            "dropping the take(1) remainder executed additional protocol work"
+        );
+    }
+}
+
+#[test]
 fn finite_path_families_use_native_transition_programs() {
     let mut graph = Graph::new(3, &[(0, 1), (1, 2)]);
     let other = other_attribute();
@@ -5211,10 +5397,7 @@ fn positive_transition_frontiers_page_by_automaton_branch_and_value() {
         [vec![0; 5], vec![1; 5]].concat(),
         "bulk traversal preserves grouped row tags"
     );
-    let mut bulk_values: Vec<_> = tagged
-        .iter()
-        .map(|(_, output)| output.node.value)
-        .collect();
+    let mut bulk_values: Vec<_> = tagged.iter().map(|(_, output)| output.node.value).collect();
     bulk_values.sort_unstable();
     let mut doubled_expected = [expected.clone(), expected.clone()].concat();
     doubled_expected.sort_unstable();

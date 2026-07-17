@@ -29,6 +29,8 @@
 ))]
 compile_error!("select exactly one benchmark engine");
 
+#[cfg(engine_current_residual)]
+use std::collections::HashSet;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
@@ -78,10 +80,11 @@ fn benchmark_lowering() -> triblespace::core::query::residual::ResidualLowering 
         Ok("whole") => ResidualLowering::new(FormulaScope::WholeRoot, false),
         Ok("whole-transitions") | Err(_) => ResidualLowering::FULL,
         Ok("builtin-grouped-witness-root") => ResidualLowering::BUILTIN_GROUPED_WITNESS_ROOT,
+        Ok("builtin-aligned-component-scope") => ResidualLowering::BUILTIN_ALIGNED_COMPONENT_SCOPE,
         Ok(other) => panic!(
             "unknown ENGINE_LOWERING={other:?}; expected opaque, opaque-transitions, \
              union, union-transitions, whole, whole-transitions, or \
-             builtin-grouped-witness-root"
+             builtin-grouped-witness-root, or builtin-aligned-component-scope"
         ),
     })
 }
@@ -91,6 +94,7 @@ fn benchmark_lowering_name() -> &'static str {
     use triblespace::core::query::residual::{FormulaScope, ResidualLowering};
 
     match benchmark_lowering() {
+        ResidualLowering::BUILTIN_ALIGNED_COMPONENT_SCOPE => "builtin-aligned-component-scope",
         ResidualLowering::BUILTIN_GROUPED_WITNESS_ROOT => "builtin-grouped-witness-root",
         lowering if lowering == ResidualLowering::new(FormulaScope::OpaqueLeaves, false) => {
             "opaque"
@@ -207,6 +211,56 @@ macro_rules! mixed_formula_rpq_query {
                 ),
             )
         ))
+    };
+}
+
+#[cfg(engine_current_residual)]
+macro_rules! aligned_mixed_formula_rpq_query {
+    ($store:expr, $fixture:expr, $domain:expr, $lowering:expr, finite_first) => {
+        find!(
+            (source: Inline<GenId>, target: Inline<GenId>),
+            temp!((independent), and!(
+                ($domain).has(independent),
+                and!(
+                    or!(
+                        pattern!($store, [{ ?source @ bench_schema::kind: (&($fixture).seed) }]),
+                        pattern!($store, [{ ?source @ bench_schema::kind: (&($fixture).alternate) }]),
+                    ),
+                    path!(
+                        ($fixture).graph.clone(),
+                        source (bench_schema::p | bench_schema::q)+ target
+                    ),
+                    or!(
+                        pattern!($store, [{ ?target @ bench_schema::kind: (&($fixture).red) }]),
+                        pattern!($store, [{ ?target @ bench_schema::kind: (&($fixture).blue) }]),
+                    ),
+                ),
+            ))
+        )
+        .residual_lowering($lowering)
+    };
+    ($store:expr, $fixture:expr, $domain:expr, $lowering:expr, mixed_first) => {
+        find!(
+            (source: Inline<GenId>, target: Inline<GenId>),
+            temp!((independent), and!(
+                and!(
+                    or!(
+                        pattern!($store, [{ ?source @ bench_schema::kind: (&($fixture).seed) }]),
+                        pattern!($store, [{ ?source @ bench_schema::kind: (&($fixture).alternate) }]),
+                    ),
+                    path!(
+                        ($fixture).graph.clone(),
+                        source (bench_schema::p | bench_schema::q)+ target
+                    ),
+                    or!(
+                        pattern!($store, [{ ?target @ bench_schema::kind: (&($fixture).red) }]),
+                        pattern!($store, [{ ?target @ bench_schema::kind: (&($fixture).blue) }]),
+                    ),
+                ),
+                ($domain).has(independent),
+            ))
+        )
+        .residual_lowering($lowering)
     };
 }
 
@@ -499,6 +553,131 @@ fn mixed_prefix<S: TriblePattern>(store: &S, fixture: &Fixture, limit: usize) ->
     tally(mixed_formula_rpq_query!(store, fixture).take(limit))
 }
 
+#[cfg(engine_current_residual)]
+fn aligned_domain(cardinality: usize) -> HashSet<Inline<GenId>> {
+    const DOMAIN_NAMESPACE: u64 = 0xD46A_0003_0000_0003;
+    (0..cardinality)
+        .map(|ordinal| fixture_id(DOMAIN_NAMESPACE, ordinal as u64).to_inline())
+        .collect()
+}
+
+#[cfg(engine_current_residual)]
+fn aligned_collect<S: TriblePattern>(
+    store: &S,
+    fixture: &Fixture,
+    domain: &HashSet<Inline<GenId>>,
+    lowering: triblespace::core::query::residual::ResidualLowering,
+    mixed_first: bool,
+) -> Vec<Pair> {
+    if mixed_first {
+        aligned_mixed_formula_rpq_query!(store, fixture, domain, lowering, mixed_first).collect()
+    } else {
+        aligned_mixed_formula_rpq_query!(store, fixture, domain, lowering, finite_first).collect()
+    }
+}
+
+#[cfg(engine_current_residual)]
+fn aligned_sequential_collect<S: TriblePattern>(
+    store: &S,
+    fixture: &Fixture,
+    domain: &HashSet<Inline<GenId>>,
+    mixed_first: bool,
+) -> Vec<Pair> {
+    if mixed_first {
+        aligned_mixed_formula_rpq_query!(
+            store,
+            fixture,
+            domain,
+            triblespace::core::query::residual::ResidualLowering::CONSERVATIVE,
+            mixed_first
+        )
+        .sequential()
+        .collect()
+    } else {
+        aligned_mixed_formula_rpq_query!(
+            store,
+            fixture,
+            domain,
+            triblespace::core::query::residual::ResidualLowering::CONSERVATIVE,
+            finite_first
+        )
+        .sequential()
+        .collect()
+    }
+}
+
+#[cfg(engine_current_residual)]
+fn aligned_construct<S: TriblePattern>(
+    store: &S,
+    fixture: &Fixture,
+    domain: &HashSet<Inline<GenId>>,
+    lowering: triblespace::core::query::residual::ResidualLowering,
+    mixed_first: bool,
+) {
+    if mixed_first {
+        drop(black_box(aligned_mixed_formula_rpq_query!(
+            store,
+            fixture,
+            domain,
+            lowering,
+            mixed_first
+        )));
+    } else {
+        drop(black_box(aligned_mixed_formula_rpq_query!(
+            store,
+            fixture,
+            domain,
+            lowering,
+            finite_first
+        )));
+    }
+}
+
+#[cfg(engine_current_residual)]
+fn aligned_pull<S: TriblePattern>(
+    store: &S,
+    fixture: &Fixture,
+    domain: &HashSet<Inline<GenId>>,
+    lowering: triblespace::core::query::residual::ResidualLowering,
+    mixed_first: bool,
+) -> (Duration, bool) {
+    if mixed_first {
+        let mut query =
+            aligned_mixed_formula_rpq_query!(store, fixture, domain, lowering, mixed_first);
+        let start = Instant::now();
+        let found = black_box(query.next()).is_some();
+        (start.elapsed(), found)
+    } else {
+        let mut query =
+            aligned_mixed_formula_rpq_query!(store, fixture, domain, lowering, finite_first);
+        let start = Instant::now();
+        let found = black_box(query.next()).is_some();
+        (start.elapsed(), found)
+    }
+}
+
+#[cfg(engine_current_residual)]
+fn aligned_prefix<S: TriblePattern>(
+    store: &S,
+    fixture: &Fixture,
+    domain: &HashSet<Inline<GenId>>,
+    lowering: triblespace::core::query::residual::ResidualLowering,
+    mixed_first: bool,
+    limit: usize,
+) -> Signature {
+    if mixed_first {
+        tally(
+            aligned_mixed_formula_rpq_query!(store, fixture, domain, lowering, mixed_first)
+                .take(limit),
+        )
+    } else {
+        tally(
+            aligned_mixed_formula_rpq_query!(store, fixture, domain, lowering, finite_first)
+                .take(limit),
+        )
+    }
+}
+
 fn percentile(samples: &[f64], quantile: f64) -> f64 {
     let mut sorted = samples.to_vec();
     sorted.sort_by(|left, right| left.total_cmp(right));
@@ -578,6 +757,25 @@ fn bench_case(
         }
     }
 
+    if std::env::var_os("ENGINE_RAW_SAMPLES").is_some() {
+        for repetition in 0..repetitions {
+            println!(
+                "raw label={label:?} backend={backend:?} repetition={repetition} \
+                 construct_ns={} pull_first_ns={}",
+                construction[repetition] * 1e9,
+                pull_samples[repetition] * 1e9,
+            );
+            for (point_index, &point) in points.iter().enumerate() {
+                println!(
+                    "raw label={label:?} backend={backend:?} repetition={repetition} \
+                     checkpoint={} elapsed_ns={}",
+                    if point == usize::MAX { 0 } else { point },
+                    point_samples[point_index][repetition] * 1e9,
+                );
+            }
+        }
+    }
+
     println!("\n{label} / {backend}  ({expected_rows} rows)");
     println!(
         "  construct+drop       p50 {:>10.3} us  p95 {:>10.3} us",
@@ -624,6 +822,94 @@ fn bench_case(
     }
 }
 
+#[cfg(engine_current_residual)]
+fn run_aligned_scope_matrix(fixture: &Fixture, repetitions: usize) {
+    use triblespace::core::query::residual::ResidualLowering;
+
+    let modes = [
+        ("global WT", ResidualLowering::FULL),
+        (
+            "grouped-root AUTO",
+            ResidualLowering::BUILTIN_GROUPED_WITNESS_ROOT,
+        ),
+        (
+            "aligned direct-child scope",
+            ResidualLowering::BUILTIN_ALIGNED_COMPONENT_SCOPE,
+        ),
+    ];
+
+    println!("aligned scope matrix: one binary, one hot TribleSet fixture");
+    for cardinality in [0, 2, 65] {
+        let domain = aligned_domain(cardinality);
+        let mut expected = aligned_sequential_collect(&fixture.graph, fixture, &domain, false);
+        expected.sort_unstable();
+        let mut swapped = aligned_sequential_collect(&fixture.graph, fixture, &domain, true);
+        swapped.sort_unstable();
+        assert_eq!(
+            swapped, expected,
+            "sequential child-order swap changed the bag"
+        );
+        for mixed_first in [false, true] {
+            for &(name, lowering) in &modes {
+                let mut actual =
+                    aligned_collect(&fixture.graph, fixture, &domain, lowering, mixed_first);
+                actual.sort_unstable();
+                assert_eq!(
+                    actual, expected,
+                    "{name}: exact bag mismatch at cardinality={cardinality}, \
+                     mixed_first={mixed_first}"
+                );
+            }
+        }
+        println!(
+            "  exact cardinality {cardinality:>2}: {:>8} projected rows; both child orders; all modes",
+            expected.len()
+        );
+    }
+
+    let domain_one = aligned_domain(1);
+    let base = aligned_sequential_collect(&fixture.graph, fixture, &domain_one, false).len();
+    let domain_two = aligned_domain(2);
+    let affine = aligned_sequential_collect(&fixture.graph, fixture, &domain_two, false).len();
+    assert_eq!(
+        affine,
+        base * 2,
+        "projected-away finite rows lost bag multiplicity"
+    );
+    println!("  affine receipt: cardinality 2 multiplies the projected bag exactly 2x");
+
+    let domain = aligned_domain(65);
+    let mut expected = aligned_sequential_collect(&fixture.graph, fixture, &domain, false);
+    expected.sort_unstable();
+    for mixed_first in [false, true] {
+        let order = if mixed_first {
+            "mixed child first"
+        } else {
+            "finite child first"
+        };
+        for &(mode, lowering) in &modes {
+            bench_case(
+                &format!("independent finite(65) x connected mixed / {mode}"),
+                order,
+                &expected,
+                repetitions,
+                || aligned_construct(&fixture.graph, fixture, &domain, lowering, mixed_first),
+                || aligned_pull(&fixture.graph, fixture, &domain, lowering, mixed_first),
+                |limit| {
+                    aligned_prefix(
+                        &fixture.graph,
+                        fixture,
+                        &domain,
+                        lowering,
+                        mixed_first,
+                        limit,
+                    )
+                },
+            );
+        }
+    }
+}
+
 fn parse_arg(position: usize, default: usize) -> usize {
     std::env::args()
         .nth(position)
@@ -642,6 +928,20 @@ fn main() {
     let fixture_start = Instant::now();
     let fixture = Fixture::new(component_count, ring_size, fanout);
     let fixture_elapsed = fixture_start.elapsed();
+    #[cfg(engine_current_residual)]
+    if std::env::var_os("ENGINE_ALIGNED_SCOPE_MATRIX").is_some() {
+        println!("engine: {ENGINE}");
+        println!("revision: {REVISION}");
+        println!(
+            "fixture: {component_count} components x {ring_size} nodes, fanout {fanout}, \
+             {} tribles; built in {:?} (excluded)",
+            fixture.graph.len(),
+            fixture_elapsed,
+        );
+        println!("samples: {repetitions}; hot cache; release profile");
+        run_aligned_scope_matrix(&fixture, repetitions);
+        return;
+    }
     let archive_start = Instant::now();
     let archive: SuccinctArchive<OrderedUniverse> = (&fixture.graph).into();
     let archive_elapsed = archive_start.elapsed();

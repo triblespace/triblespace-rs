@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **An experimental aligned-component lowering keeps one global residual
+  scheduler while placing formula scope locally.** When the maximal root is an
+  AND whose direct child subtrees have pairwise-disjoint outward schemas, a
+  grouped-witness child becomes one synthetic WT formula occurrence and a
+  finite sibling remains an ordinary OT leaf. The probe performs no component
+  result sharing or caching and falls back to the grouped-root selector when
+  the narrow structural certificate does not hold.
 - **An experimental built-in grouped-witness selector chooses residual formula
   scope without numeric cutoffs.** Transition programs stay enabled; the
   complete root uses `WholeRoot` only when the executable exposed formula walk
