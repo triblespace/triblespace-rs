@@ -10569,6 +10569,8 @@ mod tests {
         Divergent,
         Empty,
         Panic,
+        OutOfRange,
+        Descending,
     }
 
     #[derive(Clone, Copy)]
@@ -10649,6 +10651,13 @@ mod tests {
                 TerminalProgramMode::Divergent | TerminalProgramMode::Empty => {}
                 TerminalProgramMode::Panic => {
                     panic!("intentional complete Program action panic")
+                }
+                TerminalProgramMode::OutOfRange => {
+                    effects.push(batch.view.len() as u32, raw(1));
+                }
+                TerminalProgramMode::Descending => {
+                    effects.push(1, raw(1));
+                    effects.push(0, raw(2));
                 }
             }
         }
@@ -11625,6 +11634,47 @@ mod tests {
             [DeltaActivationId::test(0)],
             "a failed eager proposal must not consume a ghost receipt"
         );
+    }
+
+    #[test]
+    fn malformed_complete_parent_tags_fail_before_terminal_receipts() {
+        let full = VariableSet::new_singleton(0).union(VariableSet::new_singleton(1));
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(1),
+            bound: VariableSet::new_singleton(0),
+        };
+
+        for mode in [
+            TerminalProgramMode::OutOfRange,
+            TerminalProgramMode::Descending,
+        ] {
+            let mut machine = ResidualStateMachine::new(full, 1, Search::Done);
+            let malformed = TerminalProgramLeaf { variable: 1, mode };
+            let route = TypedProgramSpec::route(&malformed, request).unwrap();
+            let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                machine.complete_terminal_program_proposal(
+                    ProgramRef::new(&malformed),
+                    request,
+                    route,
+                    StateId(u32::MAX),
+                    RowBatch {
+                        rows: vec![raw(1), raw(2), raw(3)],
+                        row_count: 3,
+                    },
+                )
+            }));
+
+            assert!(rejected.is_err(), "malformed complete output was accepted");
+            assert!(machine.terminal_yield.families.is_empty());
+            assert!(machine.terminal_yield.samples.is_empty());
+            assert!(machine.delta.is_empty());
+            assert_eq!(machine.stats.delta_terminal_eager_cohort_admissions, 0);
+            assert_eq!(
+                machine.delta.reserve_terminal_receipts(1),
+                [DeltaActivationId::test(0)],
+                "adapter validation must precede receipt reservation"
+            );
+        }
     }
 
     fn direct_terminal_paged_iter<P, R>(
@@ -18176,6 +18226,163 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn typed_terminal_rpq_preserves_heterogeneous_parent_tuples_in_both_directions() {
+        use crate::debug::query::EstimateOverrideConstraint;
+        use crate::id::{id_into_value, ExclusiveId, Id};
+        use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
+        use crate::trible::{Trible, TribleSet};
+
+        let p = Id::new([211; crate::id::ID_LEN]).unwrap();
+        let q = Id::new([212; crate::id::ID_LEN]).unwrap();
+        let nodes: Vec<_> = (41..=48)
+            .map(|byte| Id::new([byte; crate::id::ID_LEN]).unwrap())
+            .collect();
+        let [a, b, c, d, e, f, g, h] = nodes.as_slice() else {
+            unreachable!()
+        };
+        let mut graph = TribleSet::new();
+        let insert = |graph: &mut TribleSet, from: &Id, attribute: &Id, to: &Id| {
+            graph.insert(&Trible::new::<GenId>(
+                ExclusiveId::force_ref(from),
+                attribute,
+                &to.to_inline(),
+            ));
+        };
+        for (from, attribute, to) in [
+            (a, &p, b),
+            (a, &p, c),
+            (d, &p, e),
+            (f, &p, b),
+            (g, &p, h),
+            (b, &q, d),
+            (c, &q, e),
+            (e, &q, f),
+        ] {
+            insert(&mut graph, from, attribute, to);
+        }
+        let graph = Arc::new(graph);
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let tag = 2;
+        let tags = vec![raw(231), raw(232), raw(233)];
+        let project = |binding: &Binding| {
+            Some((
+                binding.get(start.index).copied()?,
+                binding.get(end.index).copied()?,
+                binding.get(tag).copied()?,
+            ))
+        };
+
+        let mut reverse_expected = Vec::new();
+        for (source, target) in [(a, b), (f, b), (a, c), (d, e), (g, h)] {
+            for &tag in &tags {
+                reverse_expected.push((id_into_value(source), id_into_value(target), tag));
+            }
+        }
+        let mut concat_expected = Vec::new();
+        for (source, target) in [(a, d), (a, e), (d, f), (f, d)] {
+            for &tag in &tags {
+                concat_expected.push((id_into_value(source), id_into_value(target), tag));
+            }
+        }
+
+        let cases = [
+            (
+                "reverse finite Attr",
+                end.index,
+                start.index,
+                vec![
+                    id_into_value(b),
+                    id_into_value(c),
+                    id_into_value(e),
+                    id_into_value(h),
+                ],
+                vec![PathOp::Attr(p.raw())],
+                reverse_expected,
+            ),
+            (
+                "forward finite Concat",
+                start.index,
+                end.index,
+                vec![
+                    id_into_value(a),
+                    id_into_value(d),
+                    id_into_value(f),
+                    id_into_value(g),
+                ],
+                vec![PathOp::Attr(p.raw()), PathOp::Attr(q.raw()), PathOp::Concat],
+                concat_expected,
+            ),
+        ];
+
+        for (name, bound_variable, proposed_variable, bound_values, ops, mut expected) in cases {
+            let make = || {
+                let mut path = EstimateOverrideConstraint::new(RegularPathConstraint::new(
+                    graph.as_ref().clone(),
+                    start,
+                    end,
+                    &ops,
+                ));
+                // The unrelated tag and endpoint leaves deliberately form a
+                // heterogeneous bound-row cohort before the RPQ proposes the
+                // final endpoint.
+                path.set_estimate(proposed_variable, 64);
+                IntersectionConstraint::new(vec![
+                    preferred_fanout(bound_variable, bound_values.clone(), 0),
+                    preferred_fanout(tag, tags.clone(), 0),
+                    Box::new(path) as ShapeConstraint,
+                ])
+            };
+
+            let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
+            let mut complete = Query::new(make(), project)
+                .solve_residual_state_lazy_with(ResidualLowering::new(
+                    FormulaScope::OpaqueLeaves,
+                    true,
+                ))
+                .cap(64)
+                .start_width(1)
+                .growth(2)
+                .collect_profiled();
+            let mut sparse = Query::new(make(), project)
+                .solve_residual_state_lazy_with(ResidualLowering::new(
+                    FormulaScope::OpaqueLeaves,
+                    true,
+                ))
+                .cap(64)
+                .start_width(1)
+                .growth(2);
+            sparse.state.eager_terminal_phase_enabled = false;
+            let mut sparse = sparse.collect_profiled();
+
+            expected.sort_unstable();
+            sequential.sort_unstable();
+            complete.results.sort_unstable();
+            sparse.results.sort_unstable();
+            assert_eq!(sequential, expected, "sequential tuple mismatch for {name}");
+            assert_eq!(complete.results, expected, "complete mismatch for {name}");
+            assert_eq!(
+                sparse.results, expected,
+                "forced-sparse mismatch for {name}"
+            );
+            assert!(
+                complete.stats.delta_terminal_eager_cohort_admissions > 0,
+                "{name} never entered the complete Program phase: {:#?}",
+                complete.stats
+            );
+            assert_eq!(
+                sparse.stats.delta_terminal_eager_cohort_admissions, 0,
+                "forced-sparse control entered the complete phase for {name}"
+            );
+            assert!(
+                sparse.stats.delta_transition_pages > 0,
+                "forced-sparse control never paged the RPQ for {name}: {:#?}",
+                sparse.stats
+            );
         }
     }
 
