@@ -2459,7 +2459,7 @@ impl DeltaScheduler {
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
     ) -> DeltaStepOutcome {
-        self.step_bounded(root, plan, width, stable, stable_interner, stats)
+        self.step_bounded(root, plan, width, None, stable, stable_interner, stats)
     }
 
     pub(super) fn step_bounded<'a>(
@@ -2467,6 +2467,7 @@ impl DeltaScheduler {
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
         search_width: usize,
+        direct_terminal_publication_full: Option<VariableSet>,
         stable: &mut Worklist,
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
@@ -2476,6 +2477,7 @@ impl DeltaScheduler {
                 root,
                 plan,
                 search_width,
+                direct_terminal_publication_full,
                 stable,
                 stable_interner,
                 stats,
@@ -2492,7 +2494,7 @@ impl DeltaScheduler {
             desc,
             tasks,
             dispatch.work_budget,
-            None,
+            direct_terminal_publication_full,
             stable,
             stable_interner,
             stats,
@@ -2743,6 +2745,7 @@ impl DeltaScheduler {
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
         search_width: usize,
+        direct_terminal_publication_full: Option<VariableSet>,
         stable: &mut Worklist,
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
@@ -2757,7 +2760,7 @@ impl DeltaScheduler {
             desc,
             tasks,
             dispatch.work_budget,
-            None,
+            direct_terminal_publication_full,
             stable,
             stable_interner,
             stats,

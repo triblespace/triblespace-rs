@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **All proven terminal activations publish directly.** Terminal rows now
+  bypass canonical Candidate/Ready/Emit states whether the activation is the
+  depth-first lease or globally scheduled cold work. The scheduler still
+  transfers exactly one affine parent per admission in this causal step.
 - **Terminal source search and graph-traversal effort are scheduled separately.**
   Confirmed result windows may raise stable, nonterminal, and source-search
   `S`, while a terminal transition activation widens its local examined-work

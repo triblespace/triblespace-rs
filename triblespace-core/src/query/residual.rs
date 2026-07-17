@@ -7560,8 +7560,7 @@ impl ResidualStateMachine {
         let StateBucket::Rows(rows) = bucket else {
             unreachable!("terminal admission preserved proposal rows")
         };
-        let direct_terminal_publication_full =
-            self.direct_terminal_publication_full(rows.row_count);
+        let direct_terminal_publication_full = self.direct_terminal_publication_full();
         self.stats.propose_action_pops += 1;
         self.stats.propose_calls += 1;
         self.stats.propose_rows += rows.row_count;
@@ -8151,12 +8150,11 @@ impl ResidualStateMachine {
             )
     }
 
-    fn direct_terminal_publication_full(&self, seeded_parents: usize) -> Option<VariableSet> {
+    fn direct_terminal_publication_full(&self) -> Option<VariableSet> {
         if !self.uses_direct_terminal_publication() {
             return None;
         }
-        self.selected_singleton_delta_lane(seeded_parents)
-            .then_some(self.full)
+        Some(self.full)
     }
 
     fn uses_direct_terminal_publication(&self) -> bool {
@@ -8341,6 +8339,7 @@ impl ResidualStateMachine {
                     root,
                     plan,
                     width,
+                    self.uses_direct_terminal_publication().then_some(self.full),
                     &mut self.worklist,
                     &mut self.interner,
                     &mut self.stats,
@@ -8603,6 +8602,7 @@ impl ResidualStateMachine {
                     root,
                     plan,
                     width,
+                    None,
                     &mut self.worklist,
                     &mut self.interner,
                     &mut self.stats,
@@ -10335,7 +10335,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_terminal_publication_does_not_admit_cold_scheduler_work() {
+    fn global_direct_terminal_publication_bypasses_canonical_churn() {
         let pages = Arc::new(AtomicUsize::new(0));
         let mut cold = direct_terminal_paged_iter(
             Arc::new(vec![raw(3), raw(1), raw(3), raw(2)]),
@@ -10357,12 +10357,12 @@ mod tests {
                 (raw(9), raw(2)),
             ]
         );
-        assert!(pages.load(Ordering::Relaxed) > 0);
+        assert_eq!(pages.load(Ordering::Relaxed), 3);
         assert_eq!(cold.stats().delta_active_lease_steps, 0);
-        assert_eq!(cold.stats().delta_direct_terminal_publication_batches, 0);
-        assert_eq!(cold.stats().delta_direct_terminal_publication_rows, 0);
-        assert!(cold.stats().candidate_plan_pops > 0);
-        assert!(cold.stats().emit_pops > 0);
+        assert_eq!(cold.stats().delta_direct_terminal_publication_batches, 3);
+        assert_eq!(cold.stats().delta_direct_terminal_publication_rows, 4);
+        assert_eq!(cold.stats().candidate_plan_pops, 0);
+        assert_eq!(cold.stats().emit_pops, 0);
     }
 
     #[test]
