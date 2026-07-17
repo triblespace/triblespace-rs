@@ -1245,6 +1245,13 @@ struct DeltaPhysicalOutcome {
     terminal_publications: Vec<ActivationId>,
 }
 
+#[derive(Debug)]
+struct TerminalActivationSelection {
+    budget: usize,
+    selected: usize,
+    ordinal: usize,
+}
+
 fn even_limits(work_budget: usize, task_count: usize) -> Vec<usize> {
     assert!(
         task_count > 0,
@@ -1390,35 +1397,57 @@ impl DeltaBucket {
             // may contribute several tasks, but its ragged task limits sum to
             // at most its own quantum. Thus B=min(S, sum_a t_a) without
             // multiplying S by the number of compatible affine parents.
-            let mut remaining = width;
-            let mut activation_budgets = AHashMap::new();
-            for task in self.tasks.iter().rev() {
-                if TransitionDispatchKey::of(registry, task) != key
-                    || activation_budgets.contains_key(&task.activation)
-                {
-                    continue;
-                }
-                let budget = registry
-                    .transition_dispatch_width(task.activation, width)
-                    .min(remaining);
-                debug_assert!(budget > 0);
-                activation_budgets.insert(task.activation, budget);
-                remaining -= budget;
-                if remaining == 0 {
-                    break;
-                }
+            let hot_activation = self
+                .tasks
+                .last()
+                .expect("live delta bucket is nonempty")
+                .activation;
+            if registry.transition_dispatch_width(hot_activation, width) == width {
+                // The hot activation alone exhausts the shared budget, so no
+                // sibling can enter this physical cohort. Preserve the exact
+                // activation-affine order without constructing a lookup table.
+                let selected = self.take_activation(hot_activation, width);
+                let limits = even_limits(width, selected.len());
+                return (selected, limits);
             }
-            let work_budget = width - remaining;
-            debug_assert!(work_budget > 0);
 
-            let mut selected_counts = AHashMap::new();
-            let mut selected = Vec::with_capacity(work_budget.min(self.tasks.len()));
+            let mut remaining = width;
+            let mut selection_slots = AHashMap::<ActivationId, usize>::new();
+            let mut selections = Vec::<TerminalActivationSelection>::new();
+            let mut selected = Vec::with_capacity(width.min(self.tasks.len()));
+            // During selection this parallel vector holds selection slots. It
+            // is rewritten in place to the final ragged task limits once all
+            // selected counts are known.
+            let mut limits = Vec::with_capacity(width.min(self.tasks.len()));
             let mut retained = Vec::with_capacity(self.tasks.len());
             for task in std::mem::take(&mut self.tasks).into_iter().rev() {
-                if let Some(&budget) = activation_budgets.get(&task.activation) {
-                    let selected_count = selected_counts.entry(task.activation).or_insert(0usize);
-                    if *selected_count < budget {
-                        *selected_count += 1;
+                if TransitionDispatchKey::of(registry, &task) == key {
+                    let selection_slot = if let Some(&slot) = selection_slots.get(&task.activation)
+                    {
+                        Some(slot)
+                    } else if remaining > 0 {
+                        let budget = registry
+                            .transition_dispatch_width(task.activation, width)
+                            .min(remaining);
+                        debug_assert!(budget > 0);
+                        remaining -= budget;
+                        let slot = selections.len();
+                        selections.push(TerminalActivationSelection {
+                            budget,
+                            selected: 0,
+                            ordinal: 0,
+                        });
+                        selection_slots.insert(task.activation, slot);
+                        Some(slot)
+                    } else {
+                        None
+                    };
+                    if let Some((slot, selection)) = selection_slot
+                        .map(|slot| (slot, &mut selections[slot]))
+                        .filter(|(_, selection)| selection.selected < selection.budget)
+                    {
+                        selection.selected += 1;
+                        limits.push(slot);
                         selected.push(task);
                         continue;
                     }
@@ -1426,25 +1455,25 @@ impl DeltaBucket {
                 retained.push(task);
             }
             selected.reverse();
+            limits.reverse();
             retained.reverse();
             self.tasks = retained;
 
-            let mut task_ordinals = AHashMap::new();
-            let limits = selected
-                .iter()
-                .map(|task| {
-                    let budget = activation_budgets[&task.activation];
-                    let task_count = selected_counts[&task.activation];
-                    let ordinal = task_ordinals.entry(task.activation).or_insert(0usize);
-                    let quotient = budget / task_count;
-                    let remainder = budget % task_count;
-                    let limit = quotient + usize::from(*ordinal < remainder);
-                    *ordinal += 1;
-                    limit
-                })
-                .collect::<Vec<_>>();
+            for slot_or_limit in &mut limits {
+                let selection = &mut selections[*slot_or_limit];
+                let quotient = selection.budget / selection.selected;
+                let remainder = selection.budget % selection.selected;
+                *slot_or_limit = quotient + usize::from(selection.ordinal < remainder);
+                selection.ordinal += 1;
+            }
             debug_assert!(limits.iter().all(|&limit| limit > 0));
-            debug_assert_eq!(limits.iter().sum::<usize>(), work_budget);
+            debug_assert_eq!(
+                limits.iter().sum::<usize>(),
+                selections
+                    .iter()
+                    .map(|selection| selection.budget)
+                    .sum::<usize>()
+            );
             return (selected, limits);
         }
 
