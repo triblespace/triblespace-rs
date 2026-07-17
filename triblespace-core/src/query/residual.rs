@@ -84,7 +84,7 @@
 //! computation while row values remain payload.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
@@ -199,6 +199,64 @@ enum FiniteFormulaNodeKind {
     Or { children: Box<[FormulaNodeId]> },
 }
 
+/// Collects the exact structural paths whose subtrees contain a grouped
+/// transition confirmation.
+///
+/// Repeated regular-path constraints expose this fact through
+/// `residual_delta_confirm_grouping_requirements`; no concrete-type test or
+/// separate fixpoint capability is needed. The witness is deliberately
+/// conservative for custom transition constraints: a custom fixpoint program
+/// without a grouped confirmer remains outside this experimental lowering.
+fn collect_grouped_transition_spine<'a>(root: &dyn Constraint<'a>) -> HashSet<FormulaPath> {
+    fn visit<'a>(
+        constraint: &dyn Constraint<'a>,
+        visible: VariableSet,
+        path: &mut Vec<FormulaStep>,
+        spine: &mut HashSet<FormulaPath>,
+    ) -> bool {
+        let visible = visible.intersect(constraint.variables());
+        let requirements = compile_grouped_delta_confirm_requirements(constraint, true);
+        let mut contains = requirements
+            .iter()
+            .any(|(variable, _)| visible.is_set(*variable));
+
+        if let Some(children) = constraint.residual_union_children() {
+            for child in 0..children.len() {
+                path.push(FormulaStep::Or(child));
+                contains |= visit(children.child(child), visible, path, spine);
+                path.pop();
+            }
+        } else {
+            match constraint.residual_shape() {
+                ConstraintShape::And(children) => {
+                    for child in 0..children.len() {
+                        path.push(FormulaStep::And(child));
+                        contains |= visit(children.child(child), visible, path, spine);
+                        path.pop();
+                    }
+                }
+                ConstraintShape::ScopedAnd(children) => {
+                    for child in 0..children.len() {
+                        path.push(FormulaStep::ScopedAnd(child));
+                        contains |= visit(children.child(child), visible, path, spine);
+                        path.pop();
+                    }
+                }
+                ConstraintShape::Opaque => {}
+            }
+        }
+
+        if contains {
+            spine.insert(FormulaPath(path.clone().into_boxed_slice()));
+        }
+        contains
+    }
+
+    let mut spine = HashSet::new();
+    visit(root, root.variables(), &mut Vec::new(), &mut spine);
+    spine
+}
+
 /// One compiled structural formula occurrence.
 ///
 /// The spans are compiler-derived topological measures, not scheduler tuning
@@ -249,13 +307,15 @@ impl FiniteFormulaProgram {
         leaves: &[ResidualLeaf],
         transition_programs: bool,
         synthetic_root: bool,
+        fixpoint_spine: Option<&HashSet<FormulaPath>>,
     ) -> Self {
-        struct Builder {
+        struct Builder<'spine> {
             nodes: Vec<Option<FiniteFormulaNode>>,
             transition_programs: bool,
+            fixpoint_spine: Option<&'spine HashSet<FormulaPath>>,
         }
 
-        impl Builder {
+        impl Builder<'_> {
             fn reserve_node(&mut self) -> FormulaNodeId {
                 let id = FormulaNodeId(
                     u32::try_from(self.nodes.len()).expect("too many residual formula nodes"),
@@ -334,53 +394,57 @@ impl FiniteFormulaProgram {
                         self.transition_programs,
                     ),
                 };
-                let (kind, support_atomic) =
-                    if let Some(children) = constraint.residual_union_children() {
-                        assert!(
-                            children.len() > 0,
-                            "a residual finite union must expose at least one arm"
-                        );
-                        let mut compiled = Vec::with_capacity(children.len());
-                        self.compile_or_children(constraint, path, &mut compiled);
-                        (
-                            FiniteFormulaNodeKind::Or {
-                                children: compiled.into_boxed_slice(),
-                            },
-                            false,
-                        )
-                    } else {
-                        match constraint.residual_shape() {
-                            ConstraintShape::And(children) => {
-                                let mut compiled = Vec::with_capacity(children.len());
-                                for child in 0..children.len() {
-                                    path.push(FormulaStep::And(child));
-                                    compiled.push(self.compile_node(children.child(child), path));
-                                    path.pop();
-                                }
-                                (
-                                    FiniteFormulaNodeKind::And {
-                                        children: compiled.into_boxed_slice(),
-                                    },
-                                    false,
-                                )
+                let expand = self.fixpoint_spine.as_ref().is_none_or(|spine| {
+                    spine.contains(&FormulaPath(path.clone().into_boxed_slice()))
+                });
+                let (kind, support_atomic) = if !expand {
+                    (FiniteFormulaNodeKind::Atom, false)
+                } else if let Some(children) = constraint.residual_union_children() {
+                    assert!(
+                        children.len() > 0,
+                        "a residual finite union must expose at least one arm"
+                    );
+                    let mut compiled = Vec::with_capacity(children.len());
+                    self.compile_or_children(constraint, path, &mut compiled);
+                    (
+                        FiniteFormulaNodeKind::Or {
+                            children: compiled.into_boxed_slice(),
+                        },
+                        false,
+                    )
+                } else {
+                    match constraint.residual_shape() {
+                        ConstraintShape::And(children) => {
+                            let mut compiled = Vec::with_capacity(children.len());
+                            for child in 0..children.len() {
+                                path.push(FormulaStep::And(child));
+                                compiled.push(self.compile_node(children.child(child), path));
+                                path.pop();
                             }
-                            ConstraintShape::ScopedAnd(children) => {
-                                let mut compiled = Vec::with_capacity(children.len());
-                                for child in 0..children.len() {
-                                    path.push(FormulaStep::ScopedAnd(child));
-                                    compiled.push(self.compile_node(children.child(child), path));
-                                    path.pop();
-                                }
-                                (
-                                    FiniteFormulaNodeKind::And {
-                                        children: compiled.into_boxed_slice(),
-                                    },
-                                    true,
-                                )
-                            }
-                            ConstraintShape::Opaque => (FiniteFormulaNodeKind::Atom, false),
+                            (
+                                FiniteFormulaNodeKind::And {
+                                    children: compiled.into_boxed_slice(),
+                                },
+                                false,
+                            )
                         }
-                    };
+                        ConstraintShape::ScopedAnd(children) => {
+                            let mut compiled = Vec::with_capacity(children.len());
+                            for child in 0..children.len() {
+                                path.push(FormulaStep::ScopedAnd(child));
+                                compiled.push(self.compile_node(children.child(child), path));
+                                path.pop();
+                            }
+                            (
+                                FiniteFormulaNodeKind::And {
+                                    children: compiled.into_boxed_slice(),
+                                },
+                                true,
+                            )
+                        }
+                        ConstraintShape::Opaque => (FiniteFormulaNodeKind::Atom, false),
+                    }
+                };
                 let (support_span, execution_span) = self.spans(&kind, support_atomic);
                 self.nodes[id.0 as usize] = Some(FiniteFormulaNode {
                     kind,
@@ -398,6 +462,9 @@ impl FiniteFormulaProgram {
             /// OR remains inside that arm, preserving the union's private
             /// candidate reducer boundary.
             fn compile_root<'a>(&mut self, root: &dyn Constraint<'a>) -> FormulaNodeId {
+                if self.fixpoint_spine.is_some() {
+                    return self.compile_node(root, &mut Vec::new());
+                }
                 if root.residual_union_children().is_some() {
                     return self.compile_node(root, &mut Vec::new());
                 }
@@ -473,7 +540,10 @@ impl FiniteFormulaProgram {
                 for child in 0..children.len() {
                     path.push(FormulaStep::Or(child));
                     let constraint = children.child(child);
-                    if constraint.residual_union_children().is_some() {
+                    let expand = self.fixpoint_spine.as_ref().is_none_or(|spine| {
+                        spine.contains(&FormulaPath(path.clone().into_boxed_slice()))
+                    });
+                    if expand && constraint.residual_union_children().is_some() {
                         self.compile_or_children(constraint, path, compiled);
                     } else {
                         compiled.push(self.compile_node(constraint, path));
@@ -504,6 +574,7 @@ impl FiniteFormulaProgram {
         let mut builder = Builder {
             nodes: Vec::new(),
             transition_programs,
+            fixpoint_spine,
         };
         if synthetic_root {
             assert_eq!(
@@ -1571,8 +1642,14 @@ impl ResidualPlan {
             }
         }
 
-        let synthetic_root_formula =
-            formula_scope == FormulaScope::WholeRoot && !is_formula_identity(root);
+        let fixpoint_spine = (formula_scope == FormulaScope::GroupedTransitionSpine
+            && transition_programs)
+            .then(|| collect_grouped_transition_spine(root));
+        let synthetic_root_formula = !is_formula_identity(root)
+            && (formula_scope == FormulaScope::WholeRoot
+                || fixpoint_spine
+                    .as_ref()
+                    .is_some_and(|spine| spine.contains(&FormulaPath(Box::new([])))));
         let mut leaves = Vec::new();
         let mut page_local_confirms = Vec::new();
         let mut grouped_delta_confirm_requirements: Vec<Box<[(VariableId, VariableSet)]>> =
@@ -1603,6 +1680,7 @@ impl ResidualPlan {
             &leaves,
             transition_programs,
             synthetic_root_formula,
+            fixpoint_spine.as_ref(),
         );
         Self {
             leaves,
@@ -1900,8 +1978,9 @@ pub(super) fn useful_default_shape<'a>(root: &dyn Constraint<'a>) -> bool {
 
 /// Formula boundary exposed to the canonical residual machine.
 ///
-/// These variants form a chain, not independent feature bits: lowering the
-/// whole root necessarily absorbs union-leaf lowering below it.
+/// The first three variants form the production chain: lowering the whole
+/// root necessarily absorbs union-leaf lowering below it. The grouped
+/// transition spine is an explicit experiment beside that chain.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 #[must_use]
 pub enum FormulaScope {
@@ -1912,12 +1991,21 @@ pub enum FormulaScope {
     UnionLeaves,
     /// Lower the maximal exposed root as one synthetic formula occurrence.
     WholeRoot,
+    /// Lower only connective paths from grouped transition atoms to the root.
+    ///
+    /// Maximal sibling subtrees without that witness remain opaque formula
+    /// actions, preserving their ordinary composite protocol implementation.
+    /// This deliberately does not claim to discover custom fixpoints that do
+    /// not expose grouped-confirm requirements.
+    GroupedTransitionSpine,
 }
 
 /// Orthogonal structural lowering selected for one residual solve.
 ///
-/// Formula scope is a three-element chain. Transition programs form the one
-/// independent capability axis, giving exactly six canonical lowering forms.
+/// Production formula scope is a three-element chain. Transition programs
+/// form the one independent capability axis, giving exactly six canonical
+/// production forms. `GROUPED_TRANSITION_SPINE` is a seventh explicit
+/// experiment and always enables transition programs.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 #[must_use]
 pub struct ResidualLowering {
@@ -1930,9 +2018,20 @@ impl ResidualLowering {
     pub const CONSERVATIVE: Self = Self::new(FormulaScope::OpaqueLeaves, false);
     /// Full formula and transition-program lowering used by ordinary queries.
     pub const FULL: Self = Self::new(FormulaScope::WholeRoot, true);
+    /// Experimental per-subtree lowering around grouped transition work.
+    pub const GROUPED_TRANSITION_SPINE: Self =
+        Self::new(FormulaScope::GroupedTransitionSpine, true);
 
-    /// Constructs one of the six canonical lowering forms.
+    /// Constructs a production lowering or the grouped-transition experiment.
+    ///
+    /// The experimental spine is inseparable from transition execution; the
+    /// invalid `GroupedTransitionSpine`/`false` pair panics even in const
+    /// evaluation rather than silently creating an eighth behavior.
     pub const fn new(formula_scope: FormulaScope, transition_programs: bool) -> Self {
+        assert!(
+            !matches!(formula_scope, FormulaScope::GroupedTransitionSpine) || transition_programs,
+            "the grouped transition spine requires transition programs"
+        );
         Self {
             formula_scope,
             transition_programs,
@@ -10183,11 +10282,22 @@ mod tests {
         .collect();
 
         assert_eq!(forms.len(), 6);
+        assert!(!forms.contains(&ResidualLowering::GROUPED_TRANSITION_SPINE));
         assert_eq!(ResidualLowering::default(), ResidualLowering::CONSERVATIVE);
         assert_eq!(
             ResidualLowering::FULL,
             ResidualLowering::new(FormulaScope::WholeRoot, true)
         );
+        assert_eq!(
+            ResidualLowering::GROUPED_TRANSITION_SPINE,
+            ResidualLowering::new(FormulaScope::GroupedTransitionSpine, true)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "grouped transition spine requires transition programs")]
+    fn grouped_transition_spine_cannot_disable_transition_programs() {
+        let _ = ResidualLowering::new(FormulaScope::GroupedTransitionSpine, false);
     }
 
     #[derive(Clone, Copy)]
@@ -12829,6 +12939,18 @@ mod tests {
         Box::new(IntersectionConstraint::new(children))
     }
 
+    fn repeated_shape_path(start: VariableId, end: VariableId) -> ShapeConstraint {
+        use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
+        use crate::trible::TribleSet;
+
+        Box::new(RegularPathConstraint::new(
+            TribleSet::new(),
+            Variable::<GenId>::new(start),
+            Variable::<GenId>::new(end),
+            &[PathOp::Attr([1; crate::id::ID_LEN]), PathOp::Plus],
+        ))
+    }
+
     fn raw(byte: u8) -> RawInline {
         let mut value = [0; 32];
         value[0] = byte;
@@ -13335,6 +13457,287 @@ mod tests {
         assert_eq!(nested_plan.len(), 1);
         assert!(nested_plan.finite_formula.root(0).is_none());
         assert_eq!(nested_plan.leaves[0].path.0.as_ref(), [0, 0]);
+    }
+
+    #[test]
+    fn grouped_transition_spine_is_identical_to_opaque_lowering_without_a_witness() {
+        let make = || {
+            IntersectionConstraint::new(vec![
+                shape_and(vec![shape_leaf(0), shape_leaf(1)]),
+                shape_and(vec![shape_leaf(1), shape_leaf(2)]),
+            ])
+        };
+        let opaque = ResidualPlan::compile_lowering(
+            &make(),
+            ResidualLowering::new(FormulaScope::OpaqueLeaves, true),
+        );
+        let spine =
+            ResidualPlan::compile_lowering(&make(), ResidualLowering::GROUPED_TRANSITION_SPINE);
+        assert_eq!(spine, opaque);
+        assert!(!spine.synthetic_root_formula);
+
+        let finite_union = || UnionConstraint::new(vec![shape_leaf(0), shape_leaf(0)]);
+        let opaque = ResidualPlan::compile_lowering(
+            &finite_union(),
+            ResidualLowering::new(FormulaScope::OpaqueLeaves, true),
+        );
+        let spine = ResidualPlan::compile_lowering(
+            &finite_union(),
+            ResidualLowering::GROUPED_TRANSITION_SPINE,
+        );
+        assert_eq!(spine, opaque, "a finite Union is not on a witness spine");
+        assert!(spine.finite_formula.root(0).is_none());
+    }
+
+    #[test]
+    fn grouped_transition_spine_collapses_maximal_finite_siblings() {
+        let root = IntersectionConstraint::new(vec![
+            shape_and(vec![
+                shape_leaf(0),
+                shape_and(vec![shape_leaf(1), shape_leaf(2)]),
+            ]),
+            repeated_shape_path(0, 1),
+        ]);
+        let plan =
+            ResidualPlan::compile_lowering(&root, ResidualLowering::GROUPED_TRANSITION_SPINE);
+        let whole = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        assert!(plan.synthetic_root_formula);
+        assert_eq!(plan.len(), 1);
+        assert!(plan.grouped_delta_confirm_requirements[0].is_empty());
+
+        let program = &plan.finite_formula;
+        let root = program.root(0).unwrap();
+        let FiniteFormulaNodeKind::And { children } = &program.node(root).kind else {
+            panic!("the witness path did not retain its root conjunction")
+        };
+        assert_eq!(children.len(), 2);
+        let finite = program.node(children[0]);
+        let repeated = program.node(children[1]);
+        assert_eq!(finite.kind, FiniteFormulaNodeKind::Atom);
+        assert_eq!(repeated.kind, FiniteFormulaNodeKind::Atom);
+        assert_eq!(
+            finite.path,
+            FormulaPath(vec![FormulaStep::And(0)].into_boxed_slice())
+        );
+        assert_eq!(
+            repeated.path,
+            FormulaPath(vec![FormulaStep::And(1)].into_boxed_slice())
+        );
+        assert!(finite
+            .capabilities
+            .grouped_delta_confirm_requirements
+            .is_empty());
+        assert!(!repeated
+            .capabilities
+            .grouped_delta_confirm_requirements
+            .is_empty());
+        assert_eq!(
+            program.nodes.len(),
+            3,
+            "the finite nested AND leaked into formula control"
+        );
+        assert!(
+            program.nodes.len() < whole.finite_formula.nodes.len(),
+            "the spine did not actually reduce compiled formula structure"
+        );
+    }
+
+    #[test]
+    fn grouped_transition_spine_expands_only_connectives_on_the_witness_path() {
+        let repeated_arm = shape_and(vec![
+            shape_and(vec![shape_leaf(0), shape_leaf(2)]),
+            repeated_shape_path(0, 1),
+        ]);
+        let finite_arm = shape_and(vec![
+            shape_leaf(0),
+            shape_and(vec![shape_leaf(1), shape_leaf(2)]),
+        ]);
+        let union = UnionConstraint::new(vec![repeated_arm, finite_arm]);
+        let root = IntersectionConstraint::new(vec![
+            shape_and(vec![shape_leaf(0), shape_leaf(2)]),
+            Box::new(union) as ShapeConstraint,
+        ]);
+        let plan =
+            ResidualPlan::compile_lowering(&root, ResidualLowering::GROUPED_TRANSITION_SPINE);
+        let program = &plan.finite_formula;
+        let root = program.root(0).unwrap();
+        let FiniteFormulaNodeKind::And {
+            children: root_children,
+        } = &program.node(root).kind
+        else {
+            panic!("synthetic root is not an AND")
+        };
+        assert_eq!(root_children.len(), 2);
+        assert_eq!(
+            program.node(root_children[0]).kind,
+            FiniteFormulaNodeKind::Atom,
+            "the finite root sibling was opened"
+        );
+
+        let union = root_children[1];
+        let FiniteFormulaNodeKind::Or { children: arms } = &program.node(union).kind else {
+            panic!("the OR on the repeated path was collapsed")
+        };
+        assert_eq!(arms.len(), 2);
+        let FiniteFormulaNodeKind::And {
+            children: repeated_children,
+        } = &program.node(arms[0]).kind
+        else {
+            panic!("the AND on the repeated path was collapsed")
+        };
+        assert_eq!(repeated_children.len(), 2);
+        assert_eq!(
+            program.node(repeated_children[0]).kind,
+            FiniteFormulaNodeKind::Atom,
+            "the finite sibling within the repeated arm was opened"
+        );
+        assert!(!program
+            .node(repeated_children[1])
+            .capabilities
+            .grouped_delta_confirm_requirements
+            .is_empty());
+        assert_eq!(
+            program.node(arms[1]).kind,
+            FiniteFormulaNodeKind::Atom,
+            "the finite OR arm was opened"
+        );
+        assert_eq!(
+            program.node(arms[1]).path,
+            FormulaPath(vec![FormulaStep::And(1), FormulaStep::Or(1)].into_boxed_slice())
+        );
+
+        let nested_finite_union = UnionConstraint::new(vec![
+            shape_and(vec![shape_leaf(0), shape_leaf(1)]),
+            shape_and(vec![shape_leaf(0), shape_leaf(1)]),
+        ]);
+        let outer_union = UnionConstraint::new(vec![
+            repeated_shape_path(0, 1),
+            Box::new(nested_finite_union) as ShapeConstraint,
+        ]);
+        let plan = ResidualPlan::compile_lowering(
+            &outer_union,
+            ResidualLowering::GROUPED_TRANSITION_SPINE,
+        );
+        let program = &plan.finite_formula;
+        let root = program.root(0).unwrap();
+        let FiniteFormulaNodeKind::Or { children } = &program.node(root).kind else {
+            panic!("the witness union did not stay explicit")
+        };
+        assert_eq!(
+            children.len(),
+            2,
+            "associative OR flattening crossed into a finite-only sibling"
+        );
+        assert!(!program
+            .node(children[0])
+            .capabilities
+            .grouped_delta_confirm_requirements
+            .is_empty());
+        assert_eq!(program.node(children[1]).kind, FiniteFormulaNodeKind::Atom);
+        assert_eq!(
+            program.node(children[1]).path,
+            FormulaPath(vec![FormulaStep::Or(1)].into_boxed_slice())
+        );
+    }
+
+    #[test]
+    fn grouped_transition_spine_preserves_occurrence_and_scope_boundaries() {
+        use crate::debug::query::{DebugConstraint, EstimateOverrideConstraint};
+        use crate::query::IgnoreConstraint;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let shared: Arc<dyn Constraint<'static> + Send + Sync> =
+            Arc::from(repeated_shape_path(0, 1));
+        let repeated_twice = IntersectionConstraint::new(vec![shared.clone(), shared]);
+        let repeated_plan = ResidualPlan::compile_lowering(
+            &repeated_twice,
+            ResidualLowering::GROUPED_TRANSITION_SPINE,
+        );
+        let repeated_root = repeated_plan.finite_formula.root(0).unwrap();
+        let FiniteFormulaNodeKind::And { children } =
+            &repeated_plan.finite_formula.node(repeated_root).kind
+        else {
+            panic!("two repeated occurrences did not retain their conjunction")
+        };
+        assert_ne!(children[0], children[1]);
+        assert_ne!(
+            repeated_plan.finite_formula.node(children[0]).path,
+            repeated_plan.finite_formula.node(children[1]).path
+        );
+        assert_ne!(
+            repeated_plan.formula_action_occurrence(0, children[0]),
+            repeated_plan.formula_action_occurrence(0, children[1])
+        );
+
+        let ignored = IgnoreConstraint::new(
+            VariableSet::new_singleton(2),
+            Box::new(IntersectionConstraint::new(vec![
+                shape_and(vec![shape_leaf(0), shape_leaf(2)]),
+                repeated_shape_path(0, 1),
+            ])),
+        );
+        let ignored_plan =
+            ResidualPlan::compile_lowering(&ignored, ResidualLowering::GROUPED_TRANSITION_SPINE);
+        let ignored_root = ignored_plan.finite_formula.root(0).unwrap();
+        let ignored_node = ignored_plan.finite_formula.node(ignored_root);
+        assert!(ignored_node.support_atomic);
+        let FiniteFormulaNodeKind::And { children } = &ignored_node.kind else {
+            panic!("Ignore lost its scoped candidate conjunction")
+        };
+        assert_eq!(children.len(), 2);
+        assert_eq!(
+            ignored_plan.finite_formula.node(children[0]).kind,
+            FiniteFormulaNodeKind::Atom
+        );
+        assert!(!ignored_plan
+            .finite_formula
+            .node(children[1])
+            .capabilities
+            .grouped_delta_confirm_requirements
+            .is_empty());
+
+        let ignored_path_and_sibling = || {
+            Box::new(IntersectionConstraint::new(vec![
+                repeated_shape_path(0, 1),
+                shape_leaf(0),
+            ]))
+        };
+        let fully_hidden = IgnoreConstraint::new(
+            VariableSet::new_singleton(0).union(VariableSet::new_singleton(1)),
+            ignored_path_and_sibling(),
+        );
+        assert!(collect_grouped_transition_spine(&fully_hidden).is_empty());
+        let fully_hidden_plan = ResidualPlan::compile_lowering(
+            &fully_hidden,
+            ResidualLowering::GROUPED_TRANSITION_SPINE,
+        );
+        assert!(!fully_hidden_plan.synthetic_root_formula);
+        assert!(fully_hidden_plan.finite_formula.root(0).is_none());
+
+        let partially_hidden =
+            IgnoreConstraint::new(VariableSet::new_singleton(0), ignored_path_and_sibling());
+        assert!(collect_grouped_transition_spine(&partially_hidden)
+            .contains(&FormulaPath(Box::new([]))));
+        let partially_hidden_plan = ResidualPlan::compile_lowering(
+            &partially_hidden,
+            ResidualLowering::GROUPED_TRANSITION_SPINE,
+        );
+        let partially_hidden_root = partially_hidden_plan.finite_formula.root(0).unwrap();
+        let partially_hidden_node = partially_hidden_plan
+            .finite_formula
+            .node(partially_hidden_root);
+        assert!(partially_hidden_node.support_atomic);
+        assert!(matches!(
+            partially_hidden_node.kind,
+            FiniteFormulaNodeKind::And { .. }
+        ));
+
+        let estimated = EstimateOverrideConstraint::new(repeated_shape_path(0, 1));
+        assert!(collect_grouped_transition_spine(&estimated).contains(&FormulaPath(Box::new([]))));
+        let debugged =
+            DebugConstraint::new(repeated_shape_path(0, 1), Rc::new(RefCell::new(Vec::new())));
+        assert!(collect_grouped_transition_spine(&debugged).is_empty());
     }
 
     #[test]

@@ -11,6 +11,8 @@
 //! RUSTFLAGS="--cfg engine_current_residual" cargo run --release --example query_engine_generation_bench
 //! ENGINE_LOWERING=union-transitions RUSTFLAGS="--cfg engine_current_residual" \
 //!   cargo run --release --example query_engine_generation_bench
+//! ENGINE_LOWERING=grouped-transition-spine RUSTFLAGS="--cfg engine_current_residual" \
+//!   cargo run --release --example query_engine_generation_bench
 //! RUSTFLAGS="--cfg engine_current_residual --cfg engine_prefix_checkpoints" \
 //!   cargo run --release --example query_engine_generation_bench
 //! ```
@@ -77,9 +79,11 @@ fn benchmark_lowering() -> triblespace::core::query::residual::ResidualLowering 
         Ok("union-transitions") => ResidualLowering::new(FormulaScope::UnionLeaves, true),
         Ok("whole") => ResidualLowering::new(FormulaScope::WholeRoot, false),
         Ok("whole-transitions") | Err(_) => ResidualLowering::FULL,
+        Ok("grouped-transition-spine") => ResidualLowering::GROUPED_TRANSITION_SPINE,
         Ok(other) => panic!(
             "unknown ENGINE_LOWERING={other:?}; expected opaque, opaque-transitions, \
-             union, union-transitions, whole, or whole-transitions"
+             union, union-transitions, whole, whole-transitions, or \
+             grouped-transition-spine"
         ),
     })
 }
@@ -101,7 +105,10 @@ fn benchmark_lowering_name() -> &'static str {
         }
         lowering if lowering == ResidualLowering::new(FormulaScope::WholeRoot, false) => "whole",
         lowering if lowering == ResidualLowering::FULL => "whole-transitions",
-        _ => unreachable!("ResidualLowering has exactly six canonical forms"),
+        lowering if lowering == ResidualLowering::GROUPED_TRANSITION_SPINE => {
+            "grouped-transition-spine"
+        }
+        _ => unreachable!("ResidualLowering has six canonical forms and one experiment"),
     }
 }
 

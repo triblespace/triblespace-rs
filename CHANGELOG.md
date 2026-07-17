@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **An experimental grouped-transition spine lowers only connective paths to
+  built-in repeated work.** `GROUPED_TRANSITION_SPINE` discovers paths through
+  the existing grouped-confirm witness, keeps maximal finite-only siblings as
+  opaque atoms, preserves occurrence and scoped-support identity, and leaves
+  stable formula rank separate from activation-private delta quiescence. It
+  deliberately does not claim custom fixpoints without grouped confirmation;
+  the generation benchmark exposes it through
+  `ENGINE_LOWERING=grouped-transition-spine` for controlled comparison.
 - **The cross-generation query benchmark can select every canonical residual
   lowering form.** `ENGINE_LOWERING` chooses formula scope and transition
   lowering independently, while the seven workload/backend cells retain exact

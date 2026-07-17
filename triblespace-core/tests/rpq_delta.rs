@@ -4497,6 +4497,69 @@ fn conservative_residual_lowering_keeps_plus_opaque() {
 }
 
 #[test]
+fn grouped_transition_spine_keeps_the_cyclic_route_inside_formula_control() {
+    let graph = Graph::new(5, &[(0, 1), (1, 2), (2, 3), (3, 4)]);
+    let ops = repeated(graph.attribute, false);
+    let outer_values = [genid(&rngid().id).raw, genid(&rngid().id).raw];
+    let make = || {
+        let start = Variable::<GenId>::new(START);
+        let end = Variable::<GenId>::new(END);
+        Arc::new(IntersectionConstraint::new(vec![
+            Box::new(DuplicateParents {
+                outer_values,
+                start: graph.value(0).raw,
+            }) as DynConstraint,
+            Box::new(RegularPathConstraint::new(
+                graph.set.clone(),
+                start,
+                end,
+                &ops,
+            )) as DynConstraint,
+        ]))
+    };
+
+    let mut expected: Vec<_> = Query::new(make(), project_end).sequential().collect();
+    expected.sort_unstable();
+
+    let observed = Query::new(make(), project_end)
+        .solve_residual_state_lazy_with(ResidualLowering::GROUPED_TRANSITION_SPINE)
+        .shadow(ResidualShadowEpoch::new())
+        .collect_profiled();
+    let mut actual = observed.results;
+    actual.sort_unstable();
+    assert_eq!(actual, expected);
+    for node in 1..5 {
+        assert_eq!(
+            actual
+                .iter()
+                .filter(|&&value| value == graph.value(node).raw)
+                .count(),
+            2,
+            "one affine duplicate was lost for endpoint {node}"
+        );
+    }
+    assert!(
+        observed.stats.delta_transition_pages > 0,
+        "{:#?}",
+        observed.stats
+    );
+    assert!(
+        observed.stats.delta_nonterminal_calls > 0,
+        "{:#?}",
+        observed.stats
+    );
+    assert!(
+        observed
+            .shadow
+            .events
+            .iter()
+            .any(|event| { event.site.variable == END && event.site.leaf_occurrence > 1 }),
+        "the repeated action did not execute at a synthetic formula-node occurrence: {:#?}",
+        observed.shadow.events
+    );
+}
+
+#[test]
 fn first_result_requires_one_expansion_and_drop_cancels_the_remainder() {
     let graph = Graph::new(5, &[(0, 1), (1, 2), (2, 3), (3, 4)]);
     let expanded = Arc::new(AtomicUsize::new(0));
@@ -4746,6 +4809,10 @@ fn generated_combined_formula_rpq_matrix_matches_frozen_schedulers_and_is_monoto
             ResidualLowering::new(FormulaScope::UnionLeaves, true),
         ),
         ("whole-root-transitions", ResidualLowering::FULL),
+        (
+            "grouped-transition-spine",
+            ResidualLowering::GROUPED_TRANSITION_SPINE,
+        ),
     ];
     let mut saw_root_cyclic_probe_one = false;
 

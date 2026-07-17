@@ -934,6 +934,58 @@ fn custom_support_recursive_formula_is_affine_and_monotone() {
 }
 
 #[test]
+fn grouped_transition_spine_keeps_ungrouped_custom_fixpoint_opaque() {
+    let guarded_value = raw(10);
+    let sibling_value = raw(11);
+    let expected = sorted(vec![
+        guarded_value,
+        guarded_value,
+        sibling_value,
+        sibling_value,
+    ]);
+
+    let oracle_evidence = Arc::new(DeltaEvidence::default());
+    let oracle = sorted(
+        Query::new(
+            recursive_support_fixture(
+                Arc::clone(&oracle_evidence),
+                true,
+                guarded_value,
+                sibling_value,
+            ),
+            project_outer,
+        )
+        .sequential()
+        .collect(),
+    );
+    assert_eq!(oracle, expected);
+
+    let evidence = Arc::new(DeltaEvidence::default());
+    let observed = Query::new(
+        recursive_support_fixture(Arc::clone(&evidence), true, guarded_value, sibling_value),
+        project_outer,
+    )
+    .solve_residual_state_lazy_with(ResidualLowering::GROUPED_TRANSITION_SPINE)
+    .cap(1)
+    .start_width(1)
+    .collect_profiled();
+
+    assert_eq!(sorted(observed.results), oracle);
+    assert!(
+        evidence.fully_bound_satisfied_calls.load(Ordering::Relaxed) > 0,
+        "the opaque composite must use its ordinary fully-bound fallback"
+    );
+    assert_eq!(evidence.seeded_roots.load(Ordering::Relaxed), 0);
+    assert_eq!(evidence.expanded_nodes.load(Ordering::Relaxed), 0);
+    assert_eq!(evidence.support_seeded_roots.load(Ordering::Relaxed), 0);
+    assert_eq!(evidence.support_expanded_nodes.load(Ordering::Relaxed), 0);
+    assert_eq!(evidence.support_witnesses.load(Ordering::Relaxed), 0);
+    assert_eq!(evidence.continuation_mask.load(Ordering::Relaxed), 0);
+    assert_eq!(observed.stats.delta_transition_pages, 0);
+    assert_eq!(observed.stats.delta_nonterminal_calls, 0);
+}
+
+#[test]
 fn custom_direct_source_first_pull_is_rootless_and_drop_cancels_the_frontier() {
     let evidence = Arc::new(DirectSourceEvidence::default());
     let mut query = Query::new(
