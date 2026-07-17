@@ -28,12 +28,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   activation, so aggregate or truncated cohorts cannot manufacture widening.
 - **Demand-wide terminal RPQ admissions change execution regime without
   disturbing live sparse traversals.** When completed-yield evidence admits
-  more than one new terminal parent in a turn, that exact suffix runs through
-  the constraint's ordinary block-native proposer and publishes full rows
-  directly. Per-parent receipts share the delta activation namespace but own
-  no registry state or producer credit; registration, publication staging,
-  and immediate completion preserve exact zero-yield and projected-yield
-  accounting while existing activations remain sparse.
+  more than one new terminal parent in a turn, an action-specific Program route
+  certificate lets that fresh suffix run through the family's exact complete
+  proposal executor and publish full rows directly. The semantic certificate
+  is pure in the request and bound schema; the scheduler independently supplies
+  terminality, cohort width, and physical phase evidence. Per-parent receipts
+  are reserved only after the family call succeeds and share the delta
+  activation namespace without owning registry state or producer credit;
+  publication staging and immediate completion preserve exact zero-yield and
+  projected-yield accounting while existing activations remain sparse.
 - **Activation-indexed terminal delta buckets preserve affine cohort order
   without rescanning mixed work.** Ordinary and formula transition buckets
   remain contiguous vectors; terminal cohort selection lazily promotes only

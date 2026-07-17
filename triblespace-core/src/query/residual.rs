@@ -2118,12 +2118,12 @@ pub struct ResidualStateStats {
     /// Admissions whose projected-yield demand quote transferred more than
     /// the scalar miss/fairness floor.
     pub delta_terminal_demand_wide_admissions: usize,
-    /// Demand-wide terminal admissions evaluated by the ordinary block-native
-    /// proposer instead of creating sparse cyclic activations.
+    /// Demand-wide terminal admissions evaluated by the family-owned complete
+    /// Program action instead of opening sparse cyclic activations.
     pub delta_terminal_eager_cohort_admissions: usize,
-    /// Exact terminal parents evaluated in those eager phase-change cohorts.
+    /// Exact terminal parents evaluated in those physical phase-change cohorts.
     pub delta_terminal_eager_cohort_parents: usize,
-    /// Full rows published by eager phase-change cohorts.
+    /// Full rows published by those complete-action cohorts.
     pub delta_terminal_eager_cohort_rows: usize,
     /// Parent rows refiled under the same canonical proposal state when a
     /// terminal admission split a wider selected chunk.
@@ -7763,12 +7763,12 @@ impl ResidualStateMachine {
         request: ProgramRequest,
         route: ProgramRoute,
         family: StateId,
-        bound: VariableSet,
-        variable: VariableId,
         rows: RowBatch,
     ) -> DeltaSeedOutcome {
         assert!(rows.row_count > 1, "eager terminal phase requires a cohort");
         let seeded_parents = rows.row_count;
+        let bound = request.bound;
+        let variable = route.variable;
 
         let vars: Vec<VariableId> = bound.into_iter().collect();
         let view = rows_view(&vars, &rows.rows, rows.row_count);
@@ -7805,7 +7805,7 @@ impl ResidualStateMachine {
         );
         assert_eq!(
             next_bound, self.full,
-            "eager terminal proposal did not commit a full row"
+            "complete terminal Program action did not commit a full row"
         );
         assert_eq!(origins.len(), published.row_count);
 
@@ -7900,8 +7900,6 @@ impl ResidualStateMachine {
         } else {
             selected_parent_count
         };
-        let vars: Vec<VariableId> = task.desc.bound.into_iter().collect();
-        let view = rows_view(&vars, &rows.rows, rows.row_count);
         let complete_terminal_phase = terminal_streaming
             && admitted_parent_count > 1
             && self.uses_eager_terminal_phase()
@@ -7914,6 +7912,8 @@ impl ResidualStateMachine {
         let mut paged = false;
         let mut seeds = Vec::new();
         if program.is_none() {
+            let vars: Vec<VariableId> = task.desc.bound.into_iter().collect();
+            let view = rows_view(&vars, &rows.rows, rows.row_count);
             paged = constraint.residual_delta_source_is_paged(variable, &view)
                 || constraint.residual_proposal_source_is_paged(variable, &view);
             if !paged && !constraint.residual_delta_seeds(variable, &view, &mut seeds) {
@@ -7982,8 +7982,6 @@ impl ResidualStateMachine {
                     program_request,
                     route,
                     state,
-                    desc.bound,
-                    variable,
                     rows,
                 ));
             }
@@ -10641,11 +10639,7 @@ mod tests {
             }
         }
 
-        fn complete_typed(
-            &self,
-            batch: ProgramCompleteBatch<'_>,
-            effects: &mut TypedCompleteSink,
-        ) {
+        fn complete_typed(&self, batch: ProgramCompleteBatch<'_>, effects: &mut TypedCompleteSink) {
             match self.mode {
                 TerminalProgramMode::Equivalent => {
                     for (parent, row) in batch.view.iter().enumerate() {
@@ -11236,7 +11230,7 @@ mod tests {
                     }),
                 },
             )
-            .expect("the eager terminal proposer is delta-lowerable");
+            .expect("the complete terminal Program is delta-lowerable");
 
         assert_eq!(outcome.seeded_parents, 3);
         assert_eq!(outcome.terminal_family, Some(state));
@@ -11455,8 +11449,6 @@ mod tests {
             request,
             route,
             family,
-            VariableSet::new_singleton(0),
-            1,
             RowBatch {
                 rows: (12..15).map(raw).collect(),
                 row_count: 3,
@@ -11572,8 +11564,6 @@ mod tests {
             empty_request,
             empty_route,
             StateId(u32::MAX),
-            VariableSet::new_singleton(0),
-            1,
             RowBatch {
                 rows: vec![raw(1), raw(2), raw(3)],
                 row_count: 3,
@@ -11621,8 +11611,6 @@ mod tests {
                 panic_request,
                 panic_route,
                 StateId(u32::MAX),
-                VariableSet::new_singleton(0),
-                1,
                 RowBatch {
                     rows: vec![raw(1), raw(2), raw(3)],
                     row_count: 3,
@@ -18048,13 +18036,23 @@ mod tests {
         let boxed: Box<dyn Constraint<'static> + Send + Sync> =
             Box::new(make_path(&capability_ops));
         assert_eq!(
-            boxed.residual_program().unwrap().route(request).unwrap().completion,
+            boxed
+                .residual_program()
+                .unwrap()
+                .route(request)
+                .unwrap()
+                .completion,
             ProgramCompletion::CompleteActionEquivalent
         );
         let shared: Arc<dyn Constraint<'static> + Send + Sync> =
             Arc::new(make_path(&capability_ops));
         assert_eq!(
-            shared.residual_program().unwrap().route(request).unwrap().completion,
+            shared
+                .residual_program()
+                .unwrap()
+                .route(request)
+                .unwrap()
+                .completion,
             ProgramCompletion::CompleteActionEquivalent
         );
         let estimated = EstimateOverrideConstraint::new(make_path(&capability_ops));
@@ -18136,10 +18134,16 @@ mod tests {
                 .start_width(1)
                 .growth(2);
             let mut prefix = Vec::new();
-            prefix.push(
-                clone_source
-                    .next()
-                    .unwrap_or_else(|| panic!("{name} drained before typed publication")),
+            while clone_source.stats().delta_terminal_eager_cohort_admissions == 0 {
+                prefix.push(
+                    clone_source.next().unwrap_or_else(|| {
+                        panic!("{name} drained before the complete Program phase")
+                    }),
+                );
+            }
+            assert!(
+                clone_source.stats().delta_terminal_eager_cohort_admissions > 0,
+                "{name} clone oracle did not cross the complete Program phase"
             );
             let mut clone = clone_source.clone();
             drop(clone_source);

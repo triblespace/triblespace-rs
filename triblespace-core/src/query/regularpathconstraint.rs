@@ -29,8 +29,8 @@ use crate::query::ProgramSeedBatch;
 use crate::query::ProgramStratum;
 use crate::query::RowsView;
 use crate::query::TriblePattern;
-use crate::query::TypedEffectSink;
 use crate::query::TypedCompleteSink;
+use crate::query::TypedEffectSink;
 use crate::query::TypedProgramBatch;
 use crate::query::TypedProgramSpec;
 use crate::query::TypedResume;
@@ -2203,11 +2203,13 @@ impl RegularPathConstraint {
         }
     }
 
-    /// Enumerates the exact ordered proposal occurrence bag for a row block.
+    /// Enumerates the exact parent-grouped proposal occurrence bag for a row
+    /// block.
     ///
     /// Both the ordinary Constraint protocol and the Program complete-action
-    /// route use this one family-owned implementation. The latter therefore
-    /// cannot silently drift from pageable proposal semantics.
+    /// route use this one family-owned implementation, pinning their identity.
+    /// Equivalence with the independently pageable Program route is covered by
+    /// the cross-regime RPQ oracle tests.
     fn for_each_proposal_row(
         &self,
         variable: VariableId,
@@ -2391,11 +2393,7 @@ impl TypedProgramSpec for RegularPathConstraint {
         Some(route)
     }
 
-    fn complete_typed(
-        &self,
-        batch: ProgramCompleteBatch<'_>,
-        effects: &mut TypedCompleteSink,
-    ) {
+    fn complete_typed(&self, batch: ProgramCompleteBatch<'_>, effects: &mut TypedCompleteSink) {
         self.for_each_proposal_row(batch.route.variable, &batch.view, |parent, values| {
             effects.extend_parent(parent, values.iter().copied());
         });
@@ -2866,6 +2864,62 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
 #[cfg(test)]
 mod delta_program_tests {
     use super::*;
+
+    #[test]
+    fn complete_action_certificate_is_exactly_bound_endpoint_propose() {
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let path =
+            RegularPathConstraint::new(TribleSet::new(), start, end, &[PathOp::Attr([1; ID_LEN])]);
+        let completion = |action, bound| {
+            TypedProgramSpec::route(&path, ProgramRequest { action, bound })
+                .unwrap()
+                .completion
+        };
+
+        assert_eq!(
+            completion(ProgramAction::Propose(1), VariableSet::new_empty()),
+            ProgramCompletion::PageableOnly
+        );
+        assert_eq!(
+            completion(ProgramAction::Propose(1), VariableSet::new_singleton(0)),
+            ProgramCompletion::CompleteActionEquivalent
+        );
+        assert_eq!(
+            completion(ProgramAction::Propose(0), VariableSet::new_singleton(1)),
+            ProgramCompletion::CompleteActionEquivalent
+        );
+        assert_eq!(
+            completion(ProgramAction::Confirm(1), VariableSet::new_singleton(0)),
+            ProgramCompletion::PageableOnly
+        );
+        assert_eq!(
+            completion(
+                ProgramAction::Support,
+                VariableSet::new_singleton(0).union(VariableSet::new_singleton(1))
+            ),
+            ProgramCompletion::PageableOnly
+        );
+
+        let same = RegularPathConstraint::new(
+            TribleSet::new(),
+            start,
+            start,
+            &[PathOp::Attr([1; ID_LEN])],
+        );
+        assert_eq!(
+            TypedProgramSpec::route(
+                &same,
+                ProgramRequest {
+                    action: ProgramAction::Propose(0),
+                    bound: VariableSet::new_empty(),
+                }
+            )
+            .unwrap()
+            .completion,
+            ProgramCompletion::PageableOnly
+        );
+    }
 
     #[test]
     fn repeated_union_quotients_equivalent_accepting_tails() {

@@ -201,11 +201,7 @@ impl TypedCompleteSink {
         self.occurrences.push((parent, value));
     }
 
-    pub fn extend_parent(
-        &mut self,
-        parent: u32,
-        values: impl IntoIterator<Item = RawInline>,
-    ) {
+    pub fn extend_parent(&mut self, parent: u32, values: impl IntoIterator<Item = RawInline>) {
         self.occurrences
             .extend(values.into_iter().map(|value| (parent, value)));
     }
@@ -598,11 +594,7 @@ trait ErasedProgramSpec {
         effects: &mut ProgramBatchEffects,
     );
 
-    fn complete_batch(
-        &self,
-        batch: ProgramCompleteBatch<'_>,
-        effects: &mut ProgramCompleteEffects,
-    );
+    fn complete_batch(&self, batch: ProgramCompleteBatch<'_>, effects: &mut ProgramCompleteEffects);
 
     fn retire_activations(&self, runtime: &mut ProgramRuntime, activations: &[ProgramActivation]);
 }
@@ -1109,18 +1101,17 @@ where
             Some(batch.route),
             "typed complete action route was not pure for its request"
         );
+        let mut view_bound = VariableSet::new_empty();
+        for &bound in batch.view.vars {
+            assert!(
+                !view_bound.is_set(bound),
+                "typed complete action view repeated a bound variable"
+            );
+            view_bound.set(bound);
+        }
         assert_eq!(
-            batch.view.vars.len(),
-            batch.request.bound.count(),
+            view_bound, batch.request.bound,
             "typed complete action view disagreed with its bound schema"
-        );
-        assert!(
-            batch
-                .view
-                .vars
-                .iter()
-                .all(|&bound| batch.request.bound.is_set(bound)),
-            "typed complete action view carried an undeclared bound variable"
         );
         assert!(
             batch.view.col(variable).is_none(),
@@ -1287,6 +1278,84 @@ mod tests {
         Step,
     }
 
+    #[derive(Clone, Copy)]
+    enum CompleteTagProbe {
+        RepeatedInOrder,
+        OutOfRange,
+        Descending,
+    }
+
+    impl TypedProgramSpec for CompleteTagProbe {
+        type State = ();
+        type NoveltyKey = ();
+        type Rank = u8;
+
+        fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+            matches!(request.action, ProgramAction::Propose(1)).then_some(ProgramRoute {
+                key: ProgramKey::new(7),
+                variable: 1,
+                stratum: ProgramStratum::Finite,
+                grouping: ProgramGrouping::PageLocal,
+                completion: ProgramCompletion::CompleteActionEquivalent,
+            })
+        }
+
+        fn dispatch(&self, _state: &Self::State) -> DispatchClass {
+            DispatchClass::new(0)
+        }
+
+        fn progress(&self, _state: &Self::State) -> Self::Rank {
+            0
+        }
+
+        fn seed_typed(
+            &self,
+            _batch: ProgramSeedBatch<'_>,
+            _effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+        ) {
+        }
+
+        fn step_typed(
+            &self,
+            _states: Vec<Self::State>,
+            _batch: TypedProgramBatch<'_>,
+            _effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+        ) {
+        }
+
+        fn complete_typed(
+            &self,
+            _batch: ProgramCompleteBatch<'_>,
+            effects: &mut TypedCompleteSink,
+        ) {
+            let value = RawInline::default();
+            match self {
+                Self::RepeatedInOrder => {
+                    effects.push(0, value);
+                    effects.push(0, value);
+                    effects.push(1, value);
+                }
+                Self::OutOfRange => effects.push(2, value),
+                Self::Descending => {
+                    effects.push(1, value);
+                    effects.push(0, value);
+                }
+            }
+        }
+    }
+
+    fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                payload
+                    .downcast_ref::<&str>()
+                    .map(|text| (*text).to_owned())
+            })
+            .unwrap_or_default()
+    }
+
     impl TypedProgramSpec for AmplificationAttack {
         type State = NonComparableState;
         type NoveltyKey = Key;
@@ -1401,6 +1470,109 @@ mod tests {
         assert!(!runtime.admit(ProgramActivation(1), Key(3), None));
         assert!(runtime.admit(ProgramActivation(2), Key(3), None));
         assert_eq!(runtime.take(activation, handle).exact_cursor, 7);
+    }
+
+    #[test]
+    fn complete_adapter_accepts_repeated_ordered_occurrences_and_rejects_bad_parent_tags() {
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(1),
+            bound: VariableSet::new_singleton(0),
+        };
+        let vars = [0];
+        let rows = [RawInline::default(), RawInline::default()];
+        let view = RowsView::new(&vars, &rows);
+
+        let valid = CompleteTagProbe::RepeatedInOrder;
+        let program = ProgramRef::new(&valid);
+        let route = program.route(request).unwrap();
+        let mut effects = ProgramCompleteEffects::default();
+        program.complete_batch(
+            ProgramCompleteBatch {
+                request,
+                route,
+                view,
+            },
+            &mut effects,
+        );
+        assert_eq!(
+            effects
+                .occurrences
+                .iter()
+                .map(|(parent, _)| *parent)
+                .collect::<Vec<_>>(),
+            [0, 0, 1]
+        );
+
+        for attack in [CompleteTagProbe::OutOfRange, CompleteTagProbe::Descending] {
+            let program = ProgramRef::new(&attack);
+            let route = program.route(request).unwrap();
+            let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                program.complete_batch(
+                    ProgramCompleteBatch {
+                        request,
+                        route,
+                        view,
+                    },
+                    &mut ProgramCompleteEffects::default(),
+                );
+            }));
+            let message = panic_text(rejected.expect_err("bad parent tags must fail closed"));
+            match attack {
+                CompleteTagProbe::OutOfRange => assert!(message.contains("out of range")),
+                CompleteTagProbe::Descending => {
+                    assert!(message.contains("not grouped in ascending order"))
+                }
+                CompleteTagProbe::RepeatedInOrder => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn complete_adapter_rejects_forged_route_and_completion_before_engine_dispatch() {
+        let spec = CompleteTagProbe::RepeatedInOrder;
+        let program = ProgramRef::new(&spec);
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(1),
+            bound: VariableSet::new_singleton(0),
+        };
+        let vars = [0];
+        let rows = [RawInline::default(), RawInline::default()];
+        let view = RowsView::new(&vars, &rows);
+        let canonical = program.route(request).unwrap();
+
+        let mut wrong_route = canonical;
+        wrong_route.key = ProgramKey::new(8);
+        let rejected_route = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            program.complete_batch(
+                ProgramCompleteBatch {
+                    request,
+                    route: wrong_route,
+                    view,
+                },
+                &mut ProgramCompleteEffects::default(),
+            );
+        }));
+        assert!(
+            panic_text(rejected_route.expect_err("forged route must fail"))
+                .contains("route was not pure")
+        );
+
+        let mut wrong_completion = canonical;
+        wrong_completion.completion = ProgramCompletion::PageableOnly;
+        let rejected_completion = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            program.complete_batch(
+                ProgramCompleteBatch {
+                    request,
+                    route: wrong_completion,
+                    view,
+                },
+                &mut ProgramCompleteEffects::default(),
+            );
+        }));
+        assert!(
+            panic_text(rejected_completion.expect_err("forged completion must fail"))
+                .contains("lacked an equivalence certificate")
+        );
     }
 
     #[test]
