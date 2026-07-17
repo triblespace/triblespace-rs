@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Typed Program activation retirement is proportional to the retiring set.**
+  A positive-only per-activation live-handle count preserves the release-mode
+  affine ownership assertion without rescanning the arena high-water mark for
+  every completed activation; bulk retirement validates all owners before
+  removing their novelty state.
 - **Residual RPQs now execute through one typed affine program runtime.**
   Occurrence-local program addresses erase each family once per dense cohort
   while generational handles retain exact typed continuations, family-owned
