@@ -30,6 +30,8 @@ pub mod ignore;
 pub mod intersectionconstraint;
 /// [`PatchValueConstraint`](patchconstraint::PatchValueConstraint) and [`PatchIdConstraint`](patchconstraint::PatchIdConstraint) — constrains variables to PATCH entries.
 pub mod patchconstraint;
+#[doc(hidden)]
+pub mod program;
 /// [`InlineRange`](rangeconstraint::InlineRange) — restricts a variable to a byte-lexicographic range.
 pub mod rangeconstraint;
 /// [`RegularPathConstraint`] — regular path expressions over graphs.
@@ -63,6 +65,13 @@ use crate::inline::RawInline;
 pub use regularpathconstraint::PathOp;
 /// Re-export of [`RegularPathConstraint`].
 pub use regularpathconstraint::RegularPathConstraint;
+#[doc(hidden)]
+pub use program::{
+    DispatchClass, ProgramActivation, ProgramAction, ProgramBatch, ProgramBatchEffects,
+    ProgramPage, ProgramRoute, ProgramSeedBatch, ProgramSeedEffects, ProgramSeedWork,
+    ProgramWork, ProgramWorkHandle, ProgramWorkKind, ResidualProgramRuntime,
+    ResidualProgramSpec, TypedProgramRuntime,
+};
 /// Re-export of [`VariableSet`](variableset::VariableSet).
 pub use variableset::VariableSet;
 
