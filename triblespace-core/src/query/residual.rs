@@ -58,7 +58,8 @@
 //! identity. A final-variable streaming activation is admitted one parent at
 //! a time and gets an activation-affine physical lease bounded by confirmed
 //! result demand, sparse-search effort, and the independent search width. When
-//! it publishes an accepted endpoint, the stable tail runs first while a
+//! it publishes an accepted endpoint, the shared candidate-commit layout may
+//! build the final row directly in the ordinary projection buffer while a
 //! still-live activation token remains suspended; the next pull resumes that
 //! exact affine traversal rather than abandoning locality to cold harvesting.
 //! This first causal probe has bounded leases but no strong fairness rotation
@@ -2102,6 +2103,11 @@ pub struct ResidualStateStats {
     pub delta_active_post_yield_resumptions: usize,
     /// Directed cyclic leases released because their activation quiesced.
     pub delta_active_quiescent_releases: usize,
+    /// Direct-terminal publication batches staged without filing and popping
+    /// the intermediate Candidate and full Ready states.
+    pub delta_direct_terminal_publication_batches: usize,
+    /// Full-bound rows carried by direct-terminal publication batches.
+    pub delta_direct_terminal_publication_rows: usize,
     /// Cold terminal-streaming proposal actions admitted into the cyclic
     /// scheduler. Each admission transfers exactly one affine parent.
     pub delta_terminal_admissions: usize,
@@ -2125,7 +2131,8 @@ pub struct ResidualStateStats {
     pub delta_terminal_remainder_tasks: usize,
     /// Source and transition candidates examined by terminal calls.
     pub delta_terminal_candidates_examined: usize,
-    /// Terminal calls that filed at least one stable continuation.
+    /// Terminal calls that produced at least one stable effect, including a
+    /// direct physical publication receipt.
     pub delta_terminal_publications: usize,
     /// Publication resets that changed a terminal activation's local sparse
     /// quantum back to the still-open projected-demand remainder.
@@ -5704,17 +5711,13 @@ fn propose_action_transition<'a>(
     }
 }
 
-fn commit_candidates(
-    plan: &ResidualPlan,
-    desc: &StateDesc,
+fn committed_candidate_rows(
+    bound: VariableSet,
     variable: VariableId,
     batch: CandidateBatch,
-    worklist: &mut Worklist,
-    interner: &mut StateInterner,
-    stats: &mut ResidualStateStats,
-) -> Option<ContinuationToken> {
-    let parent_vars: Vec<VariableId> = desc.bound.into_iter().collect();
-    let mut next_bound = desc.bound;
+) -> (VariableSet, RowBatch) {
+    let parent_vars: Vec<VariableId> = bound.into_iter().collect();
+    let mut next_bound = bound;
     next_bound.set(variable);
     let next_vars: Vec<VariableId> = next_bound.into_iter().collect();
     let mut next_rows = Vec::with_capacity(batch.candidates.len() * next_vars.len());
@@ -5752,6 +5755,25 @@ fn commit_candidates(
     } else {
         next_rows.len() / next_vars.len()
     };
+    (
+        next_bound,
+        RowBatch {
+            rows: next_rows,
+            row_count,
+        },
+    )
+}
+
+fn commit_candidates(
+    plan: &ResidualPlan,
+    desc: &StateDesc,
+    variable: VariableId,
+    batch: CandidateBatch,
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+) -> Option<ContinuationToken> {
+    let (next_bound, rows) = committed_candidate_rows(desc.bound, variable, batch);
     file_with_plan(
         worklist,
         interner,
@@ -5760,10 +5782,7 @@ fn commit_candidates(
             bound: next_bound,
             phase: ResidualPhase::Ready,
         },
-        StateBucket::Rows(RowBatch {
-            rows: next_rows,
-            row_count,
-        }),
+        StateBucket::Rows(rows),
         stats,
     )
 }
@@ -6618,6 +6637,9 @@ enum MachineStep {
     /// have resumed their stable formula continuation.
     DeltaSeeded {
         continuation: Option<ContinuationToken>,
+        /// Full-bound rows published directly by a proven terminal streaming
+        /// reducer. Staging remains the outer iterator's responsibility.
+        publication: Option<RowBatch>,
         /// Last newly filed live cyclic activation. The outer scheduler may
         /// arm it only when the selected action was already in a scalar
         /// continuation sprint.
@@ -6862,6 +6884,14 @@ impl ResidualActionDispatch for ShadowActionDispatch<'_> {
                 candidate_occurrences: continuation.candidates,
             }),
             MachineStep::DeltaSeeded {
+                publication: Some(rows),
+                active: None,
+                ..
+            } => ActionOutcome::Advanced(ActionSurvival {
+                parent_rows: action.parent_rows,
+                candidate_occurrences: rows.row_count,
+            }),
+            MachineStep::DeltaSeeded {
                 active: Some(_), ..
             } => {
                 // Native cyclic lowering transfers the selected affine input
@@ -6960,6 +6990,8 @@ struct ResidualStateMachine {
     active_delta_after_yield: bool,
     #[cfg(test)]
     continuation_sprint_enabled: bool,
+    #[cfg(test)]
+    direct_terminal_publication_enabled: bool,
     last_selection: SelectionKind,
     last_was_action: bool,
     /// Independent confirmed projected-result window. Unlike `width`, this
@@ -7179,6 +7211,8 @@ impl ResidualStateMachine {
             active_delta_after_yield: false,
             #[cfg(test)]
             continuation_sprint_enabled: true,
+            #[cfg(test)]
+            direct_terminal_publication_enabled: true,
             last_selection: SelectionKind::Readiness,
             last_was_action: false,
             terminal_demand_width: 1,
@@ -7522,6 +7556,8 @@ impl ResidualStateMachine {
         let StateBucket::Rows(rows) = bucket else {
             unreachable!("terminal admission preserved proposal rows")
         };
+        let direct_terminal_publication_full =
+            self.direct_terminal_publication_full(rows.row_count);
         self.stats.propose_action_pops += 1;
         self.stats.propose_calls += 1;
         self.stats.propose_rows += rows.row_count;
@@ -7536,6 +7572,7 @@ impl ResidualStateMachine {
             );
             return Ok(DeltaSeedOutcome {
                 continuation: None,
+                publication: None,
                 active,
                 seeded_parents,
             });
@@ -7546,6 +7583,7 @@ impl ResidualStateMachine {
             rows,
             seeds,
             self.full,
+            direct_terminal_publication_full,
             plan,
             &mut self.worklist,
             &mut self.interner,
@@ -7639,6 +7677,7 @@ impl ResidualStateMachine {
             );
             return Ok(DeltaSeedOutcome {
                 continuation: None,
+                publication: None,
                 active,
                 seeded_parents,
             });
@@ -7685,6 +7724,7 @@ impl ResidualStateMachine {
         );
         Ok(DeltaSeedOutcome {
             continuation: None,
+            publication: None,
             active,
             seeded_parents,
         })
@@ -7835,6 +7875,7 @@ impl ResidualStateMachine {
             );
             return Ok(DeltaSeedOutcome {
                 continuation: None,
+                publication: None,
                 active,
                 seeded_parents,
             });
@@ -7865,11 +7906,13 @@ impl ResidualStateMachine {
         let task = match self.seed_delta_proposal(root, plan, task) {
             Ok(DeltaSeedOutcome {
                 continuation,
+                publication,
                 active,
                 seeded_parents,
             }) => {
                 return MachineStep::DeltaSeeded {
                     continuation,
+                    publication,
                     active,
                     seeded_parents,
                 };
@@ -7879,11 +7922,13 @@ impl ResidualStateMachine {
         let task = match self.seed_delta_confirm(root, plan, task) {
             Ok(DeltaSeedOutcome {
                 continuation,
+                publication,
                 active,
                 seeded_parents,
             }) => {
                 return MachineStep::DeltaSeeded {
                     continuation,
+                    publication,
                     active,
                     seeded_parents,
                 };
@@ -7893,11 +7938,13 @@ impl ResidualStateMachine {
         let task = match self.seed_delta_formula(root, plan, task) {
             Ok(DeltaSeedOutcome {
                 continuation,
+                publication,
                 active,
                 seeded_parents,
             }) => {
                 return MachineStep::DeltaSeeded {
                     continuation,
+                    publication,
                     active,
                     seeded_parents,
                 };
@@ -7985,16 +8032,17 @@ impl ResidualStateMachine {
     /// Applies geometric feedback from one delta scheduler step without
     /// confusing exact dead-page telemetry with a globally negative step.
     fn account_delta_feedback(&mut self, outcome: &DeltaStepOutcome) {
+        let progressed = outcome.continuation.is_some() || outcome.publication.is_some();
         self.stats.delta_activations_completed += outcome.completed_activations;
-        if outcome.completed_activations > 0 && outcome.continuation.is_none() {
+        if outcome.completed_activations > 0 && !progressed {
             self.increase_delta_activation_width();
         }
-        if outcome.continuation.is_none() {
+        if !progressed {
             self.stats.delta_source_negative_steps += usize::from(outcome.source_dead_pages > 0);
             self.stats.delta_transition_negative_steps +=
                 usize::from(outcome.transition_dead_pages > 0);
         }
-        if outcome.dead_pages > 0 && outcome.continuation.is_none() {
+        if outcome.dead_pages > 0 && !progressed {
             self.increase_width();
         }
     }
@@ -8008,15 +8056,17 @@ impl ResidualStateMachine {
     /// activation as a suspended physical lease when it still owns work.
     fn accept_delta_step_with_resume(
         &mut self,
-        outcome: DeltaStepOutcome,
+        mut outcome: DeltaStepOutcome,
         resume: Option<ActiveDeltaContinuation>,
     ) {
         self.account_delta_feedback(&outcome);
-        debug_assert!(resume.is_none() || outcome.continuation.is_some());
+        debug_assert!(
+            resume.is_none() || outcome.continuation.is_some() || outcome.publication.is_some()
+        );
         self.active_delta = resume;
         self.active_delta_after_yield = resume.is_some();
         self.stats.delta_active_live_yields_retained += usize::from(resume.is_some());
-        self.continuation = outcome.continuation.map(|token| {
+        self.continuation = outcome.continuation.take().map(|token| {
             let desc = self.interner.get(token.state);
             let commits_terminal_candidates = match &desc.phase {
                 ResidualPhase::Candidate {
@@ -8043,6 +8093,9 @@ impl ResidualStateMachine {
                 ActiveContinuation::probe_one(token)
             }
         });
+        if let Some(rows) = outcome.publication.take() {
+            self.stage_direct_terminal_publication(rows);
+        }
     }
 
     fn continuation_after_advanced(
@@ -8075,6 +8128,34 @@ impl ResidualStateMachine {
         }
     }
 
+    fn selected_singleton_delta_lane(&self, seeded_parents: usize) -> bool {
+        #[cfg(test)]
+        if !self.continuation_sprint_enabled {
+            return false;
+        }
+        seeded_parents == 1
+            && matches!(
+                self.last_selection,
+                SelectionKind::Continuation(ContinuationMode::ProbeOne)
+                    | SelectionKind::Continuation(ContinuationMode::Cohort)
+            )
+    }
+
+    fn direct_terminal_publication_full(&self, seeded_parents: usize) -> Option<VariableSet> {
+        if !self.uses_direct_terminal_publication() {
+            return None;
+        }
+        self.selected_singleton_delta_lane(seeded_parents)
+            .then_some(self.full)
+    }
+
+    fn uses_direct_terminal_publication(&self) -> bool {
+        #[cfg(test)]
+        return self.direct_terminal_publication_enabled;
+        #[cfg(not(test))]
+        true
+    }
+
     /// A cyclic seed inherits depth-first preference only from an existing
     /// continuation lineage when the selected action transferred exactly one
     /// affine parent. Full selections and multi-parent cohorts retain their
@@ -8084,23 +8165,15 @@ impl ResidualStateMachine {
         active: Option<ActiveDeltaContinuation>,
         seeded_parents: usize,
     ) -> Option<ActiveDeltaContinuation> {
-        #[cfg(test)]
-        if !self.continuation_sprint_enabled {
-            return None;
-        }
-        (seeded_parents == 1
-            && matches!(
-                self.last_selection,
-                SelectionKind::Continuation(ContinuationMode::ProbeOne)
-                    | SelectionKind::Continuation(ContinuationMode::Cohort)
-            ))
-        .then_some(active)
-        .flatten()
+        self.selected_singleton_delta_lane(seeded_parents)
+            .then_some(active)
+            .flatten()
     }
 
     fn accept_delta_seed(
         &mut self,
         continuation: Option<ContinuationToken>,
+        publication: Option<RowBatch>,
         active: Option<ActiveDeltaContinuation>,
         seeded_parents: usize,
     ) {
@@ -8109,10 +8182,14 @@ impl ResidualStateMachine {
         // singleton activation suspended beside that stable handoff exactly
         // as we do for an acceptance discovered by a later directed step.
         let retained = self.active_delta_after_seed(active, seeded_parents);
-        self.active_delta_after_yield = continuation.is_some() && retained.is_some();
+        self.active_delta_after_yield =
+            (continuation.is_some() || publication.is_some()) && retained.is_some();
         self.stats.delta_active_live_yields_retained += usize::from(self.active_delta_after_yield);
         self.active_delta = retained;
         self.continuation = continuation.map(ActiveContinuation::probe_one);
+        if let Some(rows) = publication {
+            self.stage_direct_terminal_publication(rows);
+        }
     }
 
     fn stage_emit(&mut self, rows: RowBatch) {
@@ -8120,6 +8197,20 @@ impl ResidualStateMachine {
         self.emit_rows = rows.rows;
         self.emit_next = 0;
         self.emit_count = rows.row_count;
+    }
+
+    fn stage_direct_terminal_publication(&mut self, rows: RowBatch) {
+        assert!(rows.row_count > 0, "direct publication staged no rows");
+        self.stats.delta_direct_terminal_publication_batches += 1;
+        self.stats.delta_direct_terminal_publication_rows += rows.row_count;
+        self.emit_vars.clear();
+        self.emit_vars.extend(self.full);
+        self.stage_emit(rows);
+        // This replaces exactly one eventual terminal Emit batch. In this
+        // scheduler output is not search feedback: S stays unchanged, q is
+        // charged only by a successful projection, and the independent
+        // activation-breadth receipt remains identical to ordinary Emit.
+        self.increase_delta_activation_width();
     }
 
     /// Opens the next confirmed terminal-demand window at a public pull
@@ -8216,6 +8307,7 @@ impl ResidualStateMachine {
                         active,
                         width,
                         terminal_demand_remaining,
+                        self.uses_direct_terminal_publication().then_some(self.full),
                         &mut self.worklist,
                         &mut self.interner,
                         &mut self.stats,
@@ -8278,10 +8370,11 @@ impl ResidualStateMachine {
                 }
                 MachineStep::DeltaSeeded {
                     continuation,
+                    publication,
                     active,
                     seeded_parents,
                 } => {
-                    self.accept_delta_seed(continuation, active, seeded_parents);
+                    self.accept_delta_seed(continuation, publication, active, seeded_parents);
                 }
             }
         }
@@ -8362,6 +8455,8 @@ impl ResidualStateMachine {
             active_delta_after_yield: false,
             #[cfg(test)]
             continuation_sprint_enabled: self.continuation_sprint_enabled,
+            #[cfg(test)]
+            direct_terminal_publication_enabled: self.direct_terminal_publication_enabled,
             last_selection: SelectionKind::Readiness,
             last_was_action: false,
             terminal_demand_width: self.terminal_demand_width,
@@ -9935,6 +10030,246 @@ mod tests {
         assert_eq!(profiled.stats.max_delta_terminal_task_cohort, 1);
         assert!(profiled.stats.delta_terminal_publications > 0);
         assert!(profiled.stats.max_delta_terminal_work_budget <= 8);
+    }
+
+    fn direct_terminal_paged_iter<P, R>(
+        values: Arc<Vec<RawInline>>,
+        proposes: Arc<AtomicUsize>,
+        pages: Arc<AtomicUsize>,
+        postprocessing: P,
+    ) -> ResidualStateIter<IntersectionConstraint<ShapeConstraint>, P, R>
+    where
+        P: Fn(&Binding) -> Option<R>,
+    {
+        let root = IntersectionConstraint::new(vec![
+            Box::new(FanoutLeaf {
+                variable: 0,
+                values: Arc::new(vec![raw(9)]),
+            }) as ShapeConstraint,
+            Box::new(PagedProposalLeaf {
+                variable: 1,
+                values,
+                transition_source: false,
+                proposes,
+                pages,
+            }) as ShapeConstraint,
+        ]);
+        let mut iter = Query::new(root, postprocessing)
+            .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::OpaqueLeaves, true))
+            .cap(64)
+            .start_width(1)
+            .growth(2);
+        iter.state =
+            ResidualStateMachine::new_for_plan(iter.root.variables(), &iter.plan, Search::Done);
+        iter.state.cap = 64;
+        iter.state.width = 1;
+        iter.state.growth = 2;
+
+        // Model the exact physical boundary reached after the first variable's
+        // singleton lineage selected this proposal action. The ordinary seed
+        // path proves TerminalStreaming from the reducer and return payload;
+        // the fixture does not forge a publication receipt.
+        let relevant = ChildSet::empty(iter.plan.len()).with_inserted(1);
+        iter.state.last_selection = SelectionKind::Continuation(ContinuationMode::ProbeOne);
+        let seeded = iter
+            .state
+            .seed_delta_proposal(
+                &iter.root,
+                &iter.plan,
+                SelectedResidualTask {
+                    state: StateId(u32::MAX),
+                    desc: StateDesc {
+                        bound: VariableSet::new_singleton(0),
+                        phase: ResidualPhase::Propose {
+                            variable: 1,
+                            relevant,
+                            proposer: 1,
+                        },
+                    },
+                    bucket: StateBucket::Rows(RowBatch {
+                        rows: vec![raw(9)],
+                        row_count: 1,
+                    }),
+                },
+            )
+            .expect("the paged proposal action seeded its delta source");
+        assert!(seeded.continuation.is_none());
+        assert!(seeded.publication.is_none());
+        let active = seeded.active.expect("the paged source remained live");
+        iter.state
+            .accept_delta_seed(None, None, Some(active), seeded.seeded_parents);
+        assert_eq!(iter.state.active_delta, Some(active));
+        iter
+    }
+
+    #[test]
+    fn direct_terminal_publication_preserves_order_duplicates_and_feedback() {
+        let values = Arc::new(vec![raw(3), raw(1), raw(3), raw(2)]);
+        let direct_proposes = Arc::new(AtomicUsize::new(0));
+        let direct_pages = Arc::new(AtomicUsize::new(0));
+        let mut direct = direct_terminal_paged_iter(
+            Arc::clone(&values),
+            Arc::clone(&direct_proposes),
+            Arc::clone(&direct_pages),
+            |binding: &Binding| Some((binding.get(0).copied()?, binding.get(1).copied()?)),
+        );
+        let direct_results: Vec<_> = direct.by_ref().collect();
+        let direct_stats = direct.stats().clone();
+
+        let control_proposes = Arc::new(AtomicUsize::new(0));
+        let control_pages = Arc::new(AtomicUsize::new(0));
+        let mut control = direct_terminal_paged_iter(
+            values,
+            Arc::clone(&control_proposes),
+            Arc::clone(&control_pages),
+            |binding: &Binding| Some((binding.get(0).copied()?, binding.get(1).copied()?)),
+        );
+        control.state.direct_terminal_publication_enabled = false;
+        let control_results: Vec<_> = control.by_ref().collect();
+        let control_stats = control.stats().clone();
+
+        let expected = [
+            (raw(9), raw(3)),
+            (raw(9), raw(1)),
+            (raw(9), raw(3)),
+            (raw(9), raw(2)),
+        ];
+        assert_eq!(direct_results, expected);
+        assert_eq!(control_results, expected);
+        assert_eq!(direct_pages.load(Ordering::Relaxed), 4);
+        assert_eq!(control_pages.load(Ordering::Relaxed), 4);
+        assert_eq!(direct_proposes.load(Ordering::Relaxed), 0);
+        assert_eq!(control_proposes.load(Ordering::Relaxed), 0);
+
+        assert_eq!(direct_stats.delta_direct_terminal_publication_batches, 4);
+        assert_eq!(direct_stats.delta_direct_terminal_publication_rows, 4);
+        assert_eq!(control_stats.delta_direct_terminal_publication_batches, 0);
+        assert_eq!(control_stats.delta_direct_terminal_publication_rows, 0);
+        assert_eq!(direct_stats.delta_active_lease_steps, 4);
+        assert_eq!(direct_stats.delta_source_pages, 4);
+        assert_eq!(direct_stats.max_delta_source_cohort, 1);
+        assert_eq!(direct_stats.delta_source_direct_candidates, 4);
+        assert_eq!(
+            (
+                direct_stats.propose_action_pops,
+                direct_stats.propose_calls,
+                direct_stats.propose_rows,
+                direct_stats.candidates_proposed,
+                direct_stats.max_propose_candidates,
+            ),
+            (1, 1, 1, 4, 1)
+        );
+        assert_eq!(
+            direct_stats.candidates_proposed,
+            control_stats.candidates_proposed
+        );
+        assert_eq!(direct_stats.propose_calls, control_stats.propose_calls);
+        assert_eq!(direct_stats.propose_rows, control_stats.propose_rows);
+        assert_eq!(
+            direct_stats.max_propose_candidates,
+            control_stats.max_propose_candidates
+        );
+        assert_eq!(direct_stats.width_increases, 0);
+        assert_eq!(direct_stats.width_increases, control_stats.width_increases);
+        assert_eq!(direct_stats.delta_activation_width_increases, 4);
+        assert_eq!(
+            direct_stats.delta_activation_width_increases,
+            control_stats.delta_activation_width_increases
+        );
+        assert_eq!(
+            direct_stats.terminal_demand_projected_rows,
+            control_stats.terminal_demand_projected_rows
+        );
+        assert_eq!(
+            direct_stats.terminal_demand_width_promotions,
+            control_stats.terminal_demand_width_promotions
+        );
+        assert_eq!(
+            direct_stats.delta_terminal_publications,
+            control_stats.delta_terminal_publications
+        );
+        assert_eq!(direct_stats.candidate_plan_pops, 0);
+        assert_eq!(direct_stats.emit_pops, 0);
+        assert_eq!(
+            control_stats.candidate_plan_pops,
+            direct_stats.candidate_plan_pops + 4
+        );
+        assert_eq!(control_stats.emit_pops, direct_stats.emit_pops + 4);
+    }
+
+    #[test]
+    fn direct_terminal_publication_drop_does_not_prefetch_another_page() {
+        let pages = Arc::new(AtomicUsize::new(0));
+        let mut iter = direct_terminal_paged_iter(
+            Arc::new(vec![raw(3), raw(1), raw(3), raw(2)]),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::clone(&pages),
+            |binding: &Binding| Some((binding.get(0).copied()?, binding.get(1).copied()?)),
+        );
+
+        assert_eq!(iter.next(), Some((raw(9), raw(3))));
+        assert_eq!(pages.load(Ordering::Relaxed), 1);
+        assert_eq!(iter.stats().delta_direct_terminal_publication_batches, 1);
+        assert_eq!(iter.stats().delta_direct_terminal_publication_rows, 1);
+        drop(iter);
+        assert_eq!(pages.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn direct_terminal_publication_does_not_admit_cold_scheduler_work() {
+        let pages = Arc::new(AtomicUsize::new(0));
+        let mut cold = direct_terminal_paged_iter(
+            Arc::new(vec![raw(3), raw(1), raw(3), raw(2)]),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::clone(&pages),
+            |binding: &Binding| Some((binding.get(0).copied()?, binding.get(1).copied()?)),
+        );
+        // The token is only a physical preference; clearing it returns the
+        // exact activation to global W without dropping any affine credit.
+        cold.state.active_delta = None;
+
+        let results: Vec<_> = cold.by_ref().collect();
+        assert_eq!(
+            results,
+            [
+                (raw(9), raw(3)),
+                (raw(9), raw(1)),
+                (raw(9), raw(3)),
+                (raw(9), raw(2)),
+            ]
+        );
+        assert!(pages.load(Ordering::Relaxed) > 0);
+        assert_eq!(cold.stats().delta_active_lease_steps, 0);
+        assert_eq!(cold.stats().delta_direct_terminal_publication_batches, 0);
+        assert_eq!(cold.stats().delta_direct_terminal_publication_rows, 0);
+        assert!(cold.stats().candidate_plan_pops > 0);
+        assert!(cold.stats().emit_pops > 0);
+    }
+
+    #[test]
+    fn direct_terminal_publication_consumes_before_projection_unwind() {
+        let pages = Arc::new(AtomicUsize::new(0));
+        let panic_once = Arc::new(AtomicBool::new(true));
+        let projection_guard = Arc::clone(&panic_once);
+        let mut iter = direct_terminal_paged_iter(
+            Arc::new(vec![raw(3), raw(1), raw(3), raw(2)]),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::clone(&pages),
+            move |binding: &Binding| {
+                let result = Some((binding.get(0).copied()?, binding.get(1).copied()?));
+                if projection_guard.swap(false, Ordering::SeqCst) {
+                    panic!("intentional direct-terminal projection panic");
+                }
+                result
+            },
+        );
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| iter.next()));
+        assert!(unwind.is_err());
+        assert_eq!(pages.load(Ordering::Relaxed), 1);
+        assert_eq!(iter.next(), Some((raw(9), raw(1))));
+        assert_eq!(pages.load(Ordering::Relaxed), 2);
+        assert_eq!(iter.next(), Some((raw(9), raw(3))));
     }
 
     #[derive(Clone, Copy)]
@@ -17613,6 +17948,7 @@ mod tests {
 
         machine.accept_delta_step(DeltaStepOutcome {
             continuation: Some(token),
+            publication: None,
             dead_pages: 2,
             source_dead_pages: 2,
             transition_dead_pages: 0,
@@ -17628,6 +17964,7 @@ mod tests {
 
         machine.accept_delta_step(DeltaStepOutcome {
             continuation: Some(token),
+            publication: None,
             dead_pages: 0,
             source_dead_pages: 0,
             transition_dead_pages: 0,
@@ -17656,6 +17993,7 @@ mod tests {
         };
         machine.accept_delta_step(DeltaStepOutcome {
             continuation: Some(terminal),
+            publication: None,
             dead_pages: 0,
             source_dead_pages: 0,
             transition_dead_pages: 0,
@@ -17670,6 +18008,7 @@ mod tests {
 
         machine.accept_delta_step(DeltaStepOutcome {
             continuation: None,
+            publication: None,
             dead_pages: 2,
             source_dead_pages: 2,
             transition_dead_pages: 0,
@@ -17682,6 +18021,7 @@ mod tests {
 
         machine.accept_delta_step(DeltaStepOutcome {
             continuation: None,
+            publication: None,
             dead_pages: 0,
             source_dead_pages: 0,
             transition_dead_pages: 0,
@@ -17715,24 +18055,24 @@ mod tests {
             .expect("one cyclic source activation was filed");
 
         machine.last_selection = SelectionKind::Continuation(ContinuationMode::ProbeOne);
-        machine.accept_delta_seed(None, Some(active), 1);
+        machine.accept_delta_seed(None, None, Some(active), 1);
         assert_eq!(machine.active_delta, Some(active));
 
         machine.last_selection = SelectionKind::Continuation(ContinuationMode::Cohort);
-        machine.accept_delta_seed(None, Some(active), 1);
+        machine.accept_delta_seed(None, None, Some(active), 1);
         assert_eq!(
             machine.active_delta,
             Some(active),
             "the action after a one-atom planning probe is a singleton cohort"
         );
-        machine.accept_delta_seed(None, Some(active), 512);
+        machine.accept_delta_seed(None, None, Some(active), 512);
         assert!(
             machine.active_delta.is_none(),
             "a wide cohort must not pick an arbitrary last activation"
         );
 
         machine.last_selection = SelectionKind::Full;
-        machine.accept_delta_seed(None, Some(active), 1);
+        machine.accept_delta_seed(None, None, Some(active), 1);
         assert!(machine.active_delta.is_none());
 
         machine.last_selection = SelectionKind::Continuation(ContinuationMode::ProbeOne);
@@ -17745,7 +18085,7 @@ mod tests {
             &mut machine.stats,
         )
         .expect("one stable seed effect was filed");
-        machine.accept_delta_seed(Some(stable), Some(active), 1);
+        machine.accept_delta_seed(Some(stable), None, Some(active), 1);
         assert_eq!(
             machine.active_delta,
             Some(active),
@@ -17758,7 +18098,7 @@ mod tests {
         );
 
         machine.continuation_sprint_enabled = false;
-        machine.accept_delta_seed(None, Some(active), 1);
+        machine.accept_delta_seed(None, None, Some(active), 1);
         assert!(
             machine.active_delta.is_none(),
             "the stable continuation ablation must also disable cyclic focus"

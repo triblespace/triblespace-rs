@@ -16,6 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Proven direct-terminal delta lanes publish final rows without stable-state
+  churn.** A selected singleton or retained affine lease may turn accepted
+  proposal pages directly into the ordinary projection buffer only when its
+  reducer and return payload already classify it as terminal. The path shares
+  the candidate-commit row builder, preserves source order, bag multiplicity,
+  and independent cyclic credits, and bypasses Candidate planning plus terminal
+  Ready pops. Cold cohorts and nonterminal leases remain unchanged; output does
+  not widen search `S`, and projected demand `q` is still charged only after a
+  successful public projection.
 - **A source-identical benchmark compares query-engine generations.**
   `query_engine_generation_bench` runs finite unions, recursive AND/OR,
   cyclic regular paths, and mixed formula/path queries against independent

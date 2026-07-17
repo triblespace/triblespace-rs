@@ -319,6 +319,32 @@ struct DeltaStreamingReturn {
     effect: DeltaStreamingEffect,
 }
 
+#[derive(Default)]
+struct DeltaStableEffects {
+    continuation: Option<ContinuationToken>,
+    /// Full-bound raw rows ready for the outer iterator's ordinary staging
+    /// buffer. This is a physical publication receipt, never a canonical
+    /// delta or stable state.
+    publication: Option<RowBatch>,
+}
+
+impl DeltaStableEffects {
+    fn absorb(&mut self, mut other: Self) {
+        prefer_continuation(&mut self.continuation, other.continuation);
+        if let Some(rows) = other.publication.take() {
+            if let Some(existing) = &mut self.publication {
+                existing.append(rows);
+            } else {
+                self.publication = Some(rows);
+            }
+        }
+    }
+
+    fn has_effect(&self) -> bool {
+        self.continuation.is_some() || self.publication.is_some()
+    }
+}
+
 impl ProducerRegistry {
     fn new() -> Self {
         Self {
@@ -1206,6 +1232,7 @@ struct PhysicalDispatch {
 #[derive(Debug)]
 pub(super) struct DeltaStepOutcome {
     pub(super) continuation: Option<ContinuationToken>,
+    pub(super) publication: Option<RowBatch>,
     pub(super) dead_pages: usize,
     pub(super) source_dead_pages: usize,
     pub(super) transition_dead_pages: usize,
@@ -1216,6 +1243,12 @@ pub(super) struct DeltaStepOutcome {
     pub(super) completed_transition_cohort: bool,
 }
 
+impl DeltaStepOutcome {
+    fn has_stable_effect(&self) -> bool {
+        self.continuation.is_some() || self.publication.is_some()
+    }
+}
+
 /// Result of seeding an ordinary action into the cyclic scheduler.
 ///
 /// Stable seed effects and deferred traversal are independent. An accepting
@@ -1223,6 +1256,7 @@ pub(super) struct DeltaStepOutcome {
 #[derive(Debug)]
 pub(super) struct DeltaSeedOutcome {
     pub(super) continuation: Option<ContinuationToken>,
+    pub(super) publication: Option<RowBatch>,
     pub(super) active: Option<ActiveDeltaContinuation>,
     /// Exact affine parents transferred after any physical admission split.
     pub(super) seeded_parents: usize,
@@ -1400,6 +1434,7 @@ impl DeltaScheduler {
             parents,
             seeds,
             VariableSet::new_empty(),
+            None,
             plan,
             stable,
             stable_interner,
@@ -1414,6 +1449,7 @@ impl DeltaScheduler {
         parents: RowBatch,
         seeds: Vec<ResidualDeltaSeed>,
         full: VariableSet,
+        direct_terminal_publication_full: Option<VariableSet>,
         plan: &ResidualPlan,
         stable: &mut Worklist,
         stable_interner: &mut StateInterner,
@@ -1423,7 +1459,7 @@ impl DeltaScheduler {
         let ranges = seed_ranges(&seeds, parents.row_count);
         let stride = successor.bound.count();
         let mut tasks = Vec::with_capacity(seeds.len());
-        let mut continuation = None;
+        let mut effects = DeltaStableEffects::default();
         for (row, range) in ranges.into_iter().enumerate() {
             let start = row * stride;
             let parent = parents.rows[start..start + stride]
@@ -1439,21 +1475,23 @@ impl DeltaScheduler {
                 full,
             );
             if !started.initial_accepted.is_empty() {
+                let direct_terminal = direct_terminal_publication_full.filter(|_| {
+                    self.registry.physical_activation_class(started.activation)
+                        == DeltaPhysicalClass::TerminalStreaming
+                });
                 let streamed = self
                     .registry
                     .take_streaming_return(started.activation)
                     .expect("a streaming proposal rejected its accepting seed receipt");
-                prefer_continuation(
-                    &mut continuation,
-                    Self::release_streaming(
-                        streamed,
-                        started.initial_accepted,
-                        plan,
-                        stable,
-                        stable_interner,
-                        stats,
-                    ),
-                );
+                effects.absorb(Self::release_streaming(
+                    streamed,
+                    started.initial_accepted,
+                    direct_terminal,
+                    plan,
+                    stable,
+                    stable_interner,
+                    stats,
+                ));
             }
             tasks.extend(started.roots.into_iter().map(|(node, credit)| DeltaTask {
                 activation: started.activation,
@@ -1469,7 +1507,8 @@ impl DeltaScheduler {
         }
         let active = self.file(desc, tasks);
         DeltaSeedOutcome {
-            continuation,
+            continuation: effects.continuation,
+            publication: effects.publication,
             active,
             seeded_parents,
         }
@@ -1647,17 +1686,17 @@ impl DeltaScheduler {
             );
             if !started.initial_accepted.is_empty() {
                 if let Some(streamed) = self.registry.take_streaming_return(started.activation) {
-                    prefer_continuation(
-                        &mut continuation,
-                        Self::release_streaming(
-                            streamed,
-                            started.initial_accepted,
-                            plan,
-                            stable,
-                            stable_interner,
-                            stats,
-                        ),
+                    let released = Self::release_streaming(
+                        streamed,
+                        started.initial_accepted,
+                        None,
+                        plan,
+                        stable,
+                        stable_interner,
+                        stats,
                     );
+                    debug_assert!(released.publication.is_none());
+                    prefer_continuation(&mut continuation, released.continuation);
                 }
             }
             tasks.extend(started.roots.into_iter().map(|(node, credit)| DeltaTask {
@@ -1680,6 +1719,7 @@ impl DeltaScheduler {
         }
         DeltaSeedOutcome {
             continuation,
+            publication: None,
             active,
             seeded_parents,
         }
@@ -1821,26 +1861,66 @@ impl DeltaScheduler {
     fn release_streaming(
         streamed: DeltaStreamingReturn,
         accepted: Vec<RawInline>,
+        direct_terminal_full: Option<VariableSet>,
         plan: &ResidualPlan,
         stable: &mut Worklist,
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
-    ) -> Option<ContinuationToken> {
+    ) -> DeltaStableEffects {
         debug_assert!(!accepted.is_empty());
         if streamed.effect == DeltaStreamingEffect::Support {
-            return Self::release_support(
-                streamed.return_to,
-                true,
-                plan,
-                stable,
-                stable_interner,
-                stats,
-            );
+            return DeltaStableEffects {
+                continuation: Self::release_support(
+                    streamed.return_to,
+                    true,
+                    plan,
+                    stable,
+                    stable_interner,
+                    stats,
+                ),
+                publication: None,
+            };
         }
         stats.candidates_proposed += accepted.len();
         stats.max_propose_candidates = stats.max_propose_candidates.max(accepted.len());
         let candidates = CandidatePayload::Values(accepted);
-        match streamed.return_to {
+        if let Some(full) = direct_terminal_full {
+            let DeltaReturn::Stable { desc, parent } = streamed.return_to else {
+                panic!("a direct-terminal publication returned through a formula")
+            };
+            let ResidualPhase::Candidate {
+                variable,
+                relevant,
+                checked,
+            } = &desc.phase
+            else {
+                panic!("a direct-terminal publication did not return to candidates")
+            };
+            assert_eq!(
+                relevant, checked,
+                "a direct-terminal publication retained unchecked confirmers"
+            );
+            let (committed, rows) = committed_candidate_rows(
+                desc.bound,
+                *variable,
+                CandidateBatch {
+                    parents: RowBatch {
+                        rows: parent.into_vec(),
+                        row_count: 1,
+                    },
+                    candidates,
+                },
+            );
+            assert_eq!(
+                committed, full,
+                "a direct-terminal publication did not bind the full result schema"
+            );
+            return DeltaStableEffects {
+                continuation: None,
+                publication: Some(rows),
+            };
+        }
+        let continuation = match streamed.return_to {
             DeltaReturn::Stable { desc, parent } => file_with_plan(
                 stable,
                 stable_interner,
@@ -1869,6 +1949,10 @@ impl DeltaScheduler {
                 stable_interner,
                 stats,
             ),
+        };
+        DeltaStableEffects {
+            continuation,
+            publication: None,
         }
     }
 
@@ -2199,6 +2283,7 @@ impl DeltaScheduler {
             active,
             width,
             width,
+            None,
             stable,
             stable_interner,
             stats,
@@ -2212,6 +2297,7 @@ impl DeltaScheduler {
         active: ActiveDeltaContinuation,
         search_width: usize,
         terminal_demand_remaining: usize,
+        direct_terminal_publication_full: Option<VariableSet>,
         stable: &mut Worklist,
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
@@ -2235,6 +2321,8 @@ impl DeltaScheduler {
         let terminal_activation = (self.registry.physical_activation_class(active.activation)
             == DeltaPhysicalClass::TerminalStreaming)
             .then_some(active.activation);
+        let direct_terminal_full =
+            direct_terminal_publication_full.filter(|_| terminal_activation.is_some());
         let examined_before = stats
             .delta_source_candidates_examined
             .saturating_add(stats.delta_transition_candidates_examined);
@@ -2257,6 +2345,7 @@ impl DeltaScheduler {
                 desc,
                 tasks,
                 width.max(1),
+                direct_terminal_full,
                 stable,
                 stable_interner,
                 stats,
@@ -2266,7 +2355,7 @@ impl DeltaScheduler {
                 search_width,
                 terminal_demand_remaining,
                 examined_before,
-                outcome.continuation.is_some(),
+                outcome.has_stable_effect(),
                 stats,
             );
             outcome
@@ -2289,6 +2378,7 @@ impl DeltaScheduler {
                 desc,
                 tasks,
                 width,
+                direct_terminal_full,
                 stable,
                 stable_interner,
                 stats,
@@ -2298,14 +2388,14 @@ impl DeltaScheduler {
                 search_width,
                 terminal_demand_remaining,
                 examined_before,
-                outcome.continuation.is_some(),
+                outcome.has_stable_effect(),
                 stats,
             );
             outcome
         };
-        let resume = (outcome.continuation.is_some() && self.registry.is_live(active.activation))
-            .then_some(active);
-        let status = if outcome.continuation.is_some() {
+        let yielded = outcome.has_stable_effect();
+        let resume = (yielded && self.registry.is_live(active.activation)).then_some(active);
+        let status = if yielded {
             ActiveDeltaStatus::Yielded
         } else if self.registry.is_live(active.activation) {
             ActiveDeltaStatus::Pending
@@ -2367,6 +2457,7 @@ impl DeltaScheduler {
             desc,
             tasks,
             dispatch.work_budget,
+            None,
             stable,
             stable_interner,
             stats,
@@ -2376,7 +2467,7 @@ impl DeltaScheduler {
             search_width,
             terminal_demand_remaining,
             examined_before,
-            outcome.continuation.is_some(),
+            outcome.has_stable_effect(),
             stats,
         );
         outcome
@@ -2390,6 +2481,7 @@ impl DeltaScheduler {
         desc: DeltaDesc,
         tasks: Vec<DeltaTask>,
         width: usize,
+        direct_terminal_full: Option<VariableSet>,
         stable: &mut Worklist,
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
@@ -2506,7 +2598,7 @@ impl DeltaScheduler {
 
         let mut next_tasks = Vec::new();
         let mut resumed_sources = Vec::new();
-        let mut continuation = None;
+        let mut effects = DeltaStableEffects::default();
         let mut dead_pages = 0usize;
         let mut source_dead_pages = 0usize;
         let mut transition_dead_pages = 0usize;
@@ -2534,7 +2626,7 @@ impl DeltaScheduler {
             let retired_source_page = outcome.retired_source_page;
             let transition_page_had_effect =
                 !outcome.children.is_empty() || !outcome.accepted.is_empty();
-            let mut task_continuation = None;
+            let mut task_effects = DeltaStableEffects::default();
             if let Some((cursor, credit)) = outcome.resumed_traversal {
                 next_tasks.push(DeltaTask {
                     activation: task.activation,
@@ -2559,18 +2651,20 @@ impl DeltaScheduler {
                 });
             }
             if !outcome.accepted.is_empty() {
+                let direct_terminal = direct_terminal_full.filter(|_| {
+                    self.registry.physical_activation_class(task.activation)
+                        == DeltaPhysicalClass::TerminalStreaming
+                });
                 if let Some(streamed) = self.registry.take_streaming_return(task.activation) {
-                    prefer_continuation(
-                        &mut task_continuation,
-                        Self::release_streaming(
-                            streamed,
-                            outcome.accepted,
-                            plan,
-                            stable,
-                            stable_interner,
-                            stats,
-                        ),
-                    );
+                    task_effects.absorb(Self::release_streaming(
+                        streamed,
+                        outcome.accepted,
+                        direct_terminal,
+                        plan,
+                        stable,
+                        stable_interner,
+                        stats,
+                    ));
                 }
             }
             if let Some(proof) = outcome.quiescence {
@@ -2578,27 +2672,28 @@ impl DeltaScheduler {
                 completed_activations += 1;
                 let completed = self.registry.finish(proof);
                 prefer_continuation(
-                    &mut task_continuation,
+                    &mut task_effects.continuation,
                     Self::release_completion(completed, plan, stable, stable_interner, stats),
                 );
             }
             let source_page_dead = retired_source_page.is_some_and(|page| !page.had_stable_effect)
-                && task_continuation.is_none();
+                && !task_effects.has_effect();
             let transition_page_dead =
-                paged[task_index] && !transition_page_had_effect && task_continuation.is_none();
+                paged[task_index] && !transition_page_had_effect && !task_effects.has_effect();
             if source_page_dead || transition_page_dead {
                 dead_pages += 1;
             }
             source_dead_pages += usize::from(source_page_dead);
             transition_dead_pages += usize::from(transition_page_dead);
-            prefer_continuation(&mut continuation, task_continuation);
+            effects.absorb(task_effects);
         }
         let _ = self.file(desc.clone(), next_tasks);
         let _ = self.file_source(desc, resumed_sources);
         stats.delta_source_dead_pages += source_dead_pages;
         stats.delta_transition_dead_pages += transition_dead_pages;
         DeltaStepOutcome {
-            continuation,
+            continuation: effects.continuation,
+            publication: effects.publication,
             dead_pages,
             source_dead_pages,
             transition_dead_pages,
@@ -2629,6 +2724,7 @@ impl DeltaScheduler {
             desc,
             tasks,
             dispatch.work_budget,
+            None,
             stable,
             stable_interner,
             stats,
@@ -2638,7 +2734,7 @@ impl DeltaScheduler {
             search_width,
             terminal_demand_remaining,
             examined_before,
-            outcome.continuation.is_some(),
+            outcome.has_stable_effect(),
             stats,
         );
         outcome
@@ -2652,6 +2748,7 @@ impl DeltaScheduler {
         desc: DeltaDesc,
         tasks: Vec<SourceTask>,
         budget: usize,
+        direct_terminal_full: Option<VariableSet>,
         stable: &mut Worklist,
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
@@ -2718,7 +2815,7 @@ impl DeltaScheduler {
         stats.delta_source_cohorts += 1;
         stats.max_delta_source_cohort = stats.max_delta_source_cohort.max(row_count);
         stats.delta_source_pages += row_count;
-        let mut continuation = None;
+        let mut effects = DeltaStableEffects::default();
         let mut traversal = Vec::new();
         let mut resumed_sources = Vec::new();
         let mut dead_pages = 0usize;
@@ -2761,20 +2858,22 @@ impl DeltaScheduler {
                 });
             }
             let retired_source_page = outcome.retired_source_page;
-            let mut task_continuation = None;
+            let mut task_effects = DeltaStableEffects::default();
             if !outcome.accepted.is_empty() {
+                let direct_terminal = direct_terminal_full.filter(|_| {
+                    self.registry.physical_activation_class(task.activation)
+                        == DeltaPhysicalClass::TerminalStreaming
+                });
                 if let Some(streamed) = self.registry.take_streaming_return(task.activation) {
-                    prefer_continuation(
-                        &mut task_continuation,
-                        Self::release_streaming(
-                            streamed,
-                            outcome.accepted,
-                            plan,
-                            stable,
-                            stable_interner,
-                            stats,
-                        ),
-                    );
+                    task_effects.absorb(Self::release_streaming(
+                        streamed,
+                        outcome.accepted,
+                        direct_terminal,
+                        plan,
+                        stable,
+                        stable_interner,
+                        stats,
+                    ));
                 }
             }
             if let Some(proof) = outcome.quiescence {
@@ -2782,22 +2881,23 @@ impl DeltaScheduler {
                 completed_activations += 1;
                 let completed = self.registry.finish(proof);
                 prefer_continuation(
-                    &mut task_continuation,
+                    &mut task_effects.continuation,
                     Self::release_completion(completed, plan, stable, stable_interner, stats),
                 );
             }
             if retired_source_page.is_some_and(|page| !page.had_stable_effect)
-                && task_continuation.is_none()
+                && !task_effects.has_effect()
             {
                 dead_pages += 1;
             }
-            prefer_continuation(&mut continuation, task_continuation);
+            effects.absorb(task_effects);
         }
         let _ = self.file(desc.clone(), traversal);
         let _ = self.file_source(desc, resumed_sources);
         stats.delta_source_dead_pages += dead_pages;
         DeltaStepOutcome {
-            continuation,
+            continuation: effects.continuation,
+            publication: effects.publication,
             dead_pages,
             source_dead_pages: dead_pages,
             transition_dead_pages: 0,
@@ -3320,6 +3420,63 @@ mod tests {
         let _ = scheduler.file(desc.clone(), tasks);
         assert_eq!(scheduler.interner.descs, [desc]);
         assert_eq!(scheduler.worklist.len(), 1);
+    }
+
+    #[test]
+    fn proven_terminal_accepting_seed_publishes_rows_and_retains_its_credit() {
+        let root = MixedExpansion;
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let relevant = ChildSet::empty(plan.len()).with_inserted(0);
+        let successor = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Candidate {
+                variable: 0,
+                relevant: relevant.clone(),
+                checked: relevant,
+            },
+        };
+        let full = VariableSet::new_singleton(0);
+        let mut scheduler = DeltaScheduler::new();
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+
+        let seeded = scheduler.seed_proposals_with_full(
+            DeltaDesc::leaf(0, 0),
+            successor,
+            RowBatch::seed(),
+            vec![ResidualDeltaSeed {
+                parent: 0,
+                output: output(7, 0, true),
+            }],
+            full,
+            Some(full),
+            &plan,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+
+        assert!(seeded.continuation.is_none());
+        let rows = seeded
+            .publication
+            .expect("the proven terminal accepting seed published directly");
+        assert_eq!((rows.row_count, rows.rows.as_slice()), (1, &[value(7)][..]));
+        assert!(stable.is_empty());
+        assert_eq!(
+            (stats.candidates_proposed, stats.max_propose_candidates),
+            (1, 1)
+        );
+        let active = seeded
+            .active
+            .expect("the accepted seed retained its independent traversal root");
+        assert_eq!(
+            scheduler
+                .registry
+                .physical_activation_class(active.activation),
+            DeltaPhysicalClass::TerminalStreaming
+        );
+        assert!(scheduler.registry.is_live(active.activation));
     }
 
     fn streaming_formula_return(
@@ -3974,12 +4131,14 @@ mod tests {
         let seed_continuation = DeltaScheduler::release_streaming(
             streamed,
             live.initial_accepted,
+            None,
             &plan,
             &mut stable,
             &mut stable_interner,
             &mut stats,
         );
-        assert!(seed_continuation.is_some());
+        assert!(seed_continuation.continuation.is_some());
+        assert!(seed_continuation.publication.is_none());
 
         let _ = scheduler.file(
             desc,
