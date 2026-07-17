@@ -111,7 +111,6 @@ freely.
 | ----- | ------- | ----- |
 | [`and!`](triblespace::core::prelude::and) | Require every sub-constraint to hold | Builds an [`IntersectionConstraint`](triblespace::core::query::intersectionconstraint::IntersectionConstraint). |
 | [`or!`](triblespace::core::prelude::or) | Accept any satisfied alternative | Produces a [`UnionConstraint`](triblespace::core::query::unionconstraint::UnionConstraint) whose branches must reference the same variables. |
-| [`ignore!`](triblespace::core::ignore) | Drop variables from a sub-query | Removes the listed variables from planning so a constraint can contribute only along the remaining bindings. |
 | [`temp!`](triblespace::core::temp) | Mint hidden helper variables | Allocates fresh bindings for the nested expression so the helpers can join across patterns without being projected. |
 | [`pattern!`](triblespace::core::macros::pattern) | Match attribute assignments in a collection | Expands to a [`TriblePattern`](triblespace::core::query::TriblePattern)-backed constraint that relates attributes and values for the same entity. |
 | [`pattern_changes!`](triblespace::core::macros::pattern_changes) | Track attribute updates incrementally | Builds a [`TriblePattern`](triblespace::core::query::TriblePattern) constraint that yields newly added triples from a change set because incremental evaluation stays monotonic; see [Incremental Queries](incremental-queries.md) for the broader evaluation workflow. |
@@ -190,8 +189,8 @@ Here the membership test over `favourites` and the attribute pattern from
 `dataset` run as part of the same conjunction.  The solver joins them on their
 shared bindings (`book` and `author`) so only tuples that satisfy every clause
 make it into the result set.  Because `and!` simply returns a constraint, you
-can nest it inside other combinators such as `temp!`, `ignore!`, or `or!` to
-structure queries however you like.
+can nest it inside other combinators such as `temp!` or `or!` to structure
+queries however you like.
 
 ### Alternatives (`or!`)
 
@@ -231,68 +230,7 @@ panics at construction time, naming the mismatched sets. Note that an
 anonymous entity (`{ attr: ?v }` without an `?entity @` id) introduces a
 fresh variable scoped to its own `pattern!`, so bind entities explicitly —
 as the example does with `temp!((entity), ...)` — when combining such
-patterns with `or!`. Because each branch is still a full constraint, you
-can also wrap portions in `ignore!` to drop positions that do not matter
-for a particular alternative.
-
-### Ignoring bindings (ignore!)
-
-Ignored variables are handy when a sub-expression references fields you want to
-drop. The [`IgnoreConstraint`](triblespace::core::query::ignore::IgnoreConstraint)
-subtracts the listed bindings from the constraint's
-[`VariableSet`](triblespace::core::query::VariableSet), so the planner never attempts to
-join them with the outer query, project them into the results, or even solve
-for those positions. From the solver's perspective those slots vanish
-completely—it keeps evaluating the remaining bindings while treating the
-ignored ones as don't-care wildcards. Triple-based constraints, for example,
-always propose entity/attribute/value combinations; wrapping them in
-`ignore!((value), ...)` continues to constrain the entity and attribute while
-discarding the value column entirely. Clauses that reference at least one
-surviving variable still run and continue to narrow those bindings. If a branch
-mentions only ignored variables there is nothing left to relate to the outer
-query, so the planner has no variable along which to schedule it; the inner
-constraint is never consulted and the expression behaves as though it were
-omitted.
-
-The identifiers you list inside `ignore!` expand to fresh bindings scoped to
-the nested expression, but subtracting them from the outer plan means the solver
-never unifies those bindings—or even asks the constraint to propose values for
-them. Even if you repeat the same name across multiple clauses, each occurrence
-behaves like an independent wildcard. Reach for [`temp!`](triblespace::core::temp) when you
-want a hidden variable to participate in the surrounding plan without being
-projected; reach for `ignore!` when you want to use a multi-column constraint
-while only keeping some of its positions.
-
-This inertness is a strict scoping rule rather than existential quantification.
-If you need to assert that some related fact exists without reifying its value,
-structure the pattern so the surviving variables capture that dependency. The
-macro automatically uses the ambient context that `find!` or `exists!`
-provides, so typical invocations only specify the variable list and nested
-constraint:
-
-```rust,ignore
-find!((person: Inline<_>),
-      ignore!((street_value),
-              pattern!(&dataset, [{ ?person @ contacts::street: ?street_value }])));
-```
-
-Here the pattern still constrains `person` because the triple ties the entity to
-an attribute, yet the actual street string is ignored. Had the block mentioned
-only `street_value`, the entire expression would have evaporated—there would be
-no remaining link to the rest of the query—so the outer query would not learn
-anything. Reusing `street_value` elsewhere in the ignored expression also does
-not force the sub-clauses to agree, because each occurrence is treated as its
-own wildcard; introduce a `temp!` binding when you need the same hidden value to
-appear in multiple places.
-
-There is one composition detail under `or!`: a union asks each arm whether it
-is still satisfied before that arm participates in another variable's proposal.
-Once all of an `ignore!` arm's surviving variables are bound, the wrapper
-replays each visible variable as a singleton confirmation with that variable
-temporarily omitted and requires the bound value to survive. This includes
-confirm-only filters such as ranges, prevents a dead *visible* arm from leaking
-candidates, and still leaves ignored-only clauses inert without binding a
-shared hidden witness.
+patterns with `or!`.
 
 ### Temporary variables (temp!)
 
@@ -312,8 +250,8 @@ find!((person: Inline<_>),
 
 The helper binding `friend` links the two patterns, ensuring the same entity is
 used across both clauses without expanding the result tuple. `temp!` can create
-multiple variables at once (`temp!((street, city), ...)`). Like `ignore!`, you
-always wrap the hidden bindings in a tuple, so each invocation reads
+multiple variables at once (`temp!((street, city), ...)`). You always wrap the
+hidden bindings in a tuple, so each invocation reads
 `temp!((...vars...), ...)`. Here `social` would be a namespace module exporting
 the `person`, `friend`, and `city` attributes. The variables adopt the value
 schemas implied by the constraints they appear in, so no extra annotations are

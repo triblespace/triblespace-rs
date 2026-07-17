@@ -94,14 +94,6 @@ satisfies. A fully constant pattern similarly has no variable through which the
 search could discover failure, so [`Query::new`](triblespace::core::query::Query::new)
 settles it with an exact `satisfied` call against the seed block.
 
-`ignore!` removes its wildcard positions from the outward variable set. When a
-union needs to gate such an arm after all surviving variables are bound, the
-wrapper replays each visible variable as a singleton `confirm` call with that
-variable temporarily omitted. This is the same filtering operation the
-historical wrapper performed during search, including for confirm-only range
-constraints. Hidden-only clauses remain inert and ignored names never become a
-shared existential witness.
-
 Constraints are otherwise stateless. Each method receives the current
 `RowsView`; the engine does not notify constraints when it backtracks, chunks a
 frontier, or processes work in a different order. This is what allows the same
@@ -152,9 +144,9 @@ there is no useful frontier to fuse.
 The residual engine keys a bucket by its **remaining computation**, not merely
 by the bindings or the route that produced it. It recursively flattens the
 maximal associative AND region exposed at the root into deterministic preorder
-leaf occurrences. Union, regular-path, ignore, and custom constraints remain
-opaque leaves unless they explicitly expose associative AND structure, so
-flattening never crosses a semantic boundary.
+leaf occurrences. Union, regular-path, and custom constraints remain opaque
+leaves unless they explicitly expose associative AND structure, so flattening
+never crosses a semantic boundary.
 
 Each canonical descriptor includes the bound-variable schema and one of four
 phases:

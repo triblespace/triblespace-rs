@@ -467,10 +467,10 @@ proptest! {
             "query(A ∪ B) should equal query(A) ∪ query(B)");
     }
 
-    // ── ignore! hides variables without breaking joins ─────────────────
+    // ── _?var hides variables without breaking joins ───────────────────
 
     #[test]
-    fn ignore_hides_entity_but_join_works(
+    fn pattern_local_var_hides_entity_but_join_works(
         names in vec("[a-z]{1,6}", 2..6),
     ) {
         let hub = rngid();
@@ -482,7 +482,7 @@ proptest! {
             set += entity! { &e @ test_ns::label: name.as_str(), test_ns::link: &hub };
         }
 
-        // Without ignore!: get both name and entity
+        // Projecting the entity: get both name and entity
         let full_results: Vec<(Inline<_>, String)> = find!(
             (entity: Inline<_>, name: String),
             pattern!(&set, [
@@ -491,7 +491,7 @@ proptest! {
             ])
         ).collect();
 
-        // With temp! (equivalent of ignore for our purposes): get just name
+        // With `_?entity`: get just name
         let name_only: Vec<String> = find!(
             name: String,
             pattern!(&set, [

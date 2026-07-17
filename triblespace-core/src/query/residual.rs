@@ -3,7 +3,7 @@
 //! A bucket is identified by its remaining computation rather than its
 //! history. The engine can lower any root [`Constraint`]. An exposed
 //! associative AND region becomes deterministic preorder leaf occurrences; an
-//! opaque root is one leaf at the empty path. Union, ignore, and regular-path
+//! opaque root is one leaf at the empty path. Union and regular-path
 //! constraints therefore remain ordinary indivisible leaves, as do custom
 //! constraints unless they explicitly expose an associative AND shape.
 //!
@@ -3612,10 +3612,9 @@ where
     /// interned states. Planning states only estimate and partition; explicit
     /// action states invoke one flattened leaf over their assembled row or
     /// whole-parent candidate bucket. Histories with identical future work
-    /// append into one bucket before that state runs. Union, ignore, and
-    /// regular-path constraints remain opaque semantic boundaries; custom
-    /// constraints do too unless they explicitly expose an associative AND
-    /// shape. Opaque leaves continue through the ordinary [`Constraint`]
+    /// append into one bucket before that state runs. Union and regular-path
+    /// constraints remain opaque semantic boundaries; custom constraints do
+    /// too unless they explicitly expose an associative AND shape. Opaque leaves continue through the ordinary [`Constraint`]
     /// protocol.
     ///
     /// Result order may differ from the ordinary iterator; the result
@@ -5292,14 +5291,10 @@ mod tests {
     }
 
     #[test]
-    fn ignore_and_regular_path_wrappers_remain_single_opaque_occurrences() {
+    fn regular_path_and_union_wrappers_remain_single_opaque_occurrences() {
         use crate::inline::encodings::genid::GenId;
         use crate::trible::TribleSet;
 
-        let ignored = IgnoreConstraint::new(
-            VariableSet::new_singleton(0),
-            shape_and(vec![shape_leaf(0), shape_leaf(1)]),
-        );
         let path = RegularPathConstraint::new(
             TribleSet::new(),
             Variable::<GenId>::new(2),
@@ -5307,7 +5302,7 @@ mod tests {
             &[PathOp::Attr([0; 16])],
         );
         let root = IntersectionConstraint::new(vec![
-            Box::new(ignored) as ShapeConstraint,
+            shape_leaf(0),
             Box::new(path) as ShapeConstraint,
         ]);
         let plan = ResidualPlan::compile(&root);

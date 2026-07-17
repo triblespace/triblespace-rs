@@ -24,8 +24,6 @@ pub mod equalityconstraint;
 pub mod hashmapconstraint;
 /// [`SetConstraint`](hashsetconstraint::SetConstraint) — constrains a variable to HashSet members.
 pub mod hashsetconstraint;
-/// [`IgnoreConstraint`] — hides variables from the outer query.
-pub mod ignore;
 /// [`IntersectionConstraint`](intersectionconstraint::IntersectionConstraint) — logical AND.
 pub mod intersectionconstraint;
 /// [`PatchValueConstraint`](patchconstraint::PatchValueConstraint) and [`PatchIdConstraint`](patchconstraint::PatchIdConstraint) — constrains variables to PATCH entries.
@@ -51,8 +49,6 @@ use agglomerative::plan_agglomerative_partition;
 use agglomerative::AgglomerativePlan;
 use arrayvec::ArrayVec;
 use constantconstraint::*;
-/// Re-export of [`IgnoreConstraint`].
-pub use ignore::IgnoreConstraint;
 
 use crate::inline::encodings::genid::GenId;
 use crate::inline::Inline;
@@ -3775,7 +3771,7 @@ mod parallel {
 /// The macro takes two arguments: a tuple of variables with optional type
 /// annotations, and a constraint expression. It injects a `__local_find_context!`
 /// macro that provides the variable context to nested query macros like
-/// [`pattern!`](crate::macros::pattern) and [`ignore!`](crate::ignore).
+/// [`pattern!`](crate::macros::pattern) and [`temp!`](crate::temp).
 ///
 /// # Variable syntax
 ///
@@ -3899,7 +3895,6 @@ pub use temp;
 mod tests {
     use inlineencodings::ShortString;
 
-    use crate::ignore;
     use crate::prelude::inlineencodings::*;
     use crate::prelude::*;
 
@@ -4121,18 +4116,6 @@ mod tests {
 
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].0.try_from_inline::<&str>().unwrap(), "Alice");
-    }
-
-    #[test]
-    fn ignore_skips_variables() {
-        let results: Vec<_> = find!(
-            (x: Inline<_>),
-            ignore!((y), and!(x.is(I256BE::inline_from(1)), y.is(I256BE::inline_from(2))))
-        )
-        .collect();
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, I256BE::inline_from(1));
     }
 
     #[test]

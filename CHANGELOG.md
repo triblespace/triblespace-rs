@@ -43,8 +43,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Constraints gain an opt-in canonical residual-state solver.** Any root
   `Constraint` can use the residual APIs: roots that expose associative AND
   structure are recursively flattened, while an opaque root is represented by
-  one empty-path leaf and retains its own union, ignore, path, constant, range,
-  or custom semantics.
+  one empty-path leaf and retains its own union, path, constant, range, or
+  custom semantics.
   `solve_residual_state` jointly chooses each row's next variable and proposing
   leaf occurrence, then interns both planning states and uniform
   `Propose`/`Confirm` protocol actions as exact control-state descriptors.
@@ -54,7 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and independently planned action histories reconverge before shared work
   runs, while row payloads retain multiplicity. The maximal nested AND region
   is flattened into deterministic preorder leaf occurrences; unions and
-  ignore/path wrappers remain opaque semantic boundaries; custom constraints
+  path wrappers remain opaque semantic boundaries; custom constraints
   do too unless they explicitly expose an associative AND shape. A profiled
   entry point reports planning/action pops, interner and bucket merges, and
   leaf-call batch measurements.
@@ -259,7 +259,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   least one variable. Nested ANDs flatten; zero-variable constants do not
   count; and opaque roots, one-leaf conjunctions, disjoint conjunctions, and
   queries rejected by exact seed settlement retain the lazy DAG. Union,
-  regular-path, ignore, and custom opaque wrappers remain single leaf
+  regular-path, and custom opaque wrappers remain single leaf
   boundaries. This conservative selector avoids residual control-state cost
   where there is no sibling proposer/confirm work to canonicalize, while
   `residual_state_scheduler`, `lazy_dag_scheduler`, and `sequential` remain
@@ -300,14 +300,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   result multiset, but result order may differ. Probe solvers require a
   never-pulled `Query`; freshness is tracked explicitly so exhausted
   zero-variable queries cannot be mistaken for untouched ones.
-- **`ignore!` keeps its wildcard scoping semantics under union gating.**
-  Ignored variables disappear from planning and projection: hidden-only clauses
-  are inert, and repeated ignored names do not create a shared witness. Once an
-  arm's outward variables are bound, `satisfied` replays each visible variable
-  as a singleton confirmation with that variable omitted. This also respects
-  confirm-only constraints, and rejects a dead visible union arm without ever
-  binding hidden variables or turning `ignore!` into an existential join; use
-  `temp!` for a non-projected helper that must participate in a join.
 - **`Pile::restore()` is now `Pile::amputate()` — the destructive
   truncation stops wearing a comforting name.** The operation TRUNCATES
   the pile file at the first invalid record, destroying everything after
@@ -575,6 +567,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **`ignore!` and `IgnoreConstraint`.** The wrapper dropped variable slots
+  from a sub-constraint's outward set, but each occurrence of an ignored
+  variable acted as an independent wildcard — no join across occurrences —
+  which read like existential quantification and repeatedly confused users.
+  Its sound uses are covered by pattern-local `_?var` helpers (equality
+  without projection, scoped to one `pattern!`) and by `temp!` when a hidden
+  helper must join across clauses. No replacement shim; the surface is gone.
 - **`BlobStorePut::put_aligned`.** Vestigial since V3: every record is a
   uniform 256-byte multiple with data at a fixed header offset, so every
   `put` is already GPU-aliasably aligned; the method had collapsed into an

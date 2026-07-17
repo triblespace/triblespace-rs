@@ -10,7 +10,7 @@ The macros fall into three layers:
 - **Encoding definition**: `attributes!`
 - **Fact construction**: `entity!`
 - **Query construction**: `find!`, `exists!`, `pattern!`, `pattern_changes!`,
-  `path!`, `and!`, `or!`, `temp!`, `ignore!`
+  `path!`, `and!`, `or!`, `temp!`
 
 ## Define attributes with `attributes!`
 
@@ -360,26 +360,9 @@ find!(
 ```
 
 This is useful when the helper participates in joins but should not be
-projected.
-
-## Drop wildcard positions with `ignore!`
-
-Use [`ignore!`](triblespace::core::prelude::ignore) when only some positions of
-a multi-column constraint should contribute to the outer query.
-
-```rust,ignore
-find!(
-    (person: Inline<_>),
-    ignore!((friend),
-        pattern!(&kb, [{ ?person @ social::friend: ?friend }])
-    )
-)
-```
-
-The ignored position is an independent don't-care wildcard: it is never bound,
-and a clause mentioning only ignored positions is inert. Repeating an ignored
-name does not create a hidden join. Use `temp!` above when the non-projected
-helper must actually connect multiple clauses.
+projected. When the helper lives entirely within a single `pattern!`, prefer a
+`_?var` placeholder: it enforces equality across its occurrences inside that
+pattern without being projected.
 
 ## Which macro should I use?
 
@@ -394,8 +377,8 @@ If you are:
 - traversing recursive edges: use `path!`
 - requiring all clauses: use `and!`
 - allowing alternatives: use `or!`
-- introducing a fresh helper variable: use `temp!`
-- dropping don't-care positions from a constraint: use `ignore!`
+- introducing a fresh helper variable: use `temp!` (or `_?var` inside a
+  single `pattern!`)
 
 From here, the best next stops are:
 
