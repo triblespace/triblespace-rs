@@ -490,7 +490,7 @@ fn bench_case(
     // so all results below are explicitly hot-cache query measurements.
     construct();
     assert!(pull().1);
-    for limit in [1, 10, 100, 1_000, usize::MAX] {
+    for limit in [1, 10, 64, 65, 1_000, usize::MAX] {
         black_box(prefix(limit));
     }
 
@@ -502,7 +502,7 @@ fn bench_case(
         pull_samples.push(elapsed.as_secs_f64());
     }
 
-    let mut points: Vec<usize> = [1, 10, 100, 1_000]
+    let mut points: Vec<usize> = [1, 10, 64, 65, 1_000]
         .into_iter()
         .map(|point| point.min(expected_rows))
         .collect();
