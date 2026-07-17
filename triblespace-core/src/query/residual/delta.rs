@@ -4148,6 +4148,43 @@ mod tests {
     }
 
     #[test]
+    fn eager_receipts_and_sparse_activations_share_a_nonreusing_namespace() {
+        let mut registry = ProducerRegistry::new();
+
+        let receipts = registry.reserve_terminal_receipts(3);
+        assert_eq!(
+            receipts,
+            [
+                ActivationId::test(0),
+                ActivationId::test(1),
+                ActivationId::test(2),
+            ]
+        );
+        assert!(
+            receipts
+                .iter()
+                .all(|receipt| !registry.state.activations.contains_key(receipt)),
+            "eager receipts must not manufacture sparse registry state"
+        );
+
+        let sparse = registry.start_many(
+            DeltaReducer::StreamProposal,
+            stable_return(Vec::new()),
+            [output(9, 0, false)],
+        );
+        assert_eq!(sparse.activation, ActivationId::test(3));
+        assert!(registry.state.activations.contains_key(&sparse.activation));
+        assert!(receipts
+            .iter()
+            .all(|receipt| !registry.state.activations.contains_key(receipt)));
+
+        assert_eq!(
+            registry.reserve_terminal_receipts(1),
+            [ActivationId::test(4)]
+        );
+    }
+
+    #[test]
     fn terminal_source_search_and_transition_effort_are_independent() {
         let mut registry = ProducerRegistry::new();
         let full = VariableSet::new_singleton(0);

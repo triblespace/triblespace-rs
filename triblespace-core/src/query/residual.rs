@@ -17414,6 +17414,198 @@ mod tests {
     }
 
     #[test]
+    fn eager_terminal_rpq_phase_matches_sparse_and_sequential_across_path_shapes() {
+        use crate::debug::query::EstimateOverrideConstraint;
+        use crate::id::{id_into_value, ExclusiveId, Id};
+        use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
+        use crate::query::IgnoreConstraint;
+        use crate::trible::{Trible, TribleSet};
+
+        let p = Id::new([221; crate::id::ID_LEN]).unwrap();
+        let q = Id::new([222; crate::id::ID_LEN]).unwrap();
+        let excluded = Id::new([223; crate::id::ID_LEN]).unwrap();
+        let nodes: Vec<_> = (31..=36)
+            .map(|byte| Id::new([byte; crate::id::ID_LEN]).unwrap())
+            .collect();
+        let [a, b, c, d, e, f] = nodes.as_slice() else {
+            unreachable!()
+        };
+        let mut graph = TribleSet::new();
+        let insert = |graph: &mut TribleSet, from: &Id, attribute: &Id, to: &Id| {
+            graph.insert(&Trible::new::<GenId>(
+                ExclusiveId::force_ref(from),
+                attribute,
+                &to.to_inline(),
+            ));
+        };
+        for (from, attribute, to) in [
+            (a, &p, b),
+            (b, &p, c),
+            (c, &p, a),
+            (d, &p, c),
+            (a, &q, b),
+            (a, &q, d),
+            (d, &q, e),
+            (e, &q, a),
+            (a, &excluded, f),
+            (b, &excluded, f),
+        ] {
+            insert(&mut graph, from, attribute, to);
+        }
+        let graph = Arc::new(graph);
+        let source = id_into_value(a);
+        let project =
+            |binding: &Binding| Some((binding.get(0).copied()?, binding.get(1).copied()?));
+        let make_path = |ops: &[PathOp]| {
+            RegularPathConstraint::new(
+                graph.as_ref().clone(),
+                Variable::<GenId>::new(0),
+                Variable::<GenId>::new(1),
+                ops,
+            )
+        };
+        let make = |ops: &[PathOp]| {
+            let mut sources = EstimateOverrideConstraint::new(FanoutLeaf {
+                variable: 0,
+                values: Arc::new(vec![source; 16]),
+            });
+            sources.set_estimate(0, 1);
+            IntersectionConstraint::new(vec![
+                Box::new(sources) as ShapeConstraint,
+                Box::new(make_path(ops)) as ShapeConstraint,
+            ])
+        };
+
+        // The opt-in must survive wrappers that preserve proposal semantics,
+        // while Ignore must suppress it when the proposed endpoint is hidden.
+        let capability_ops = [PathOp::Attr(p.raw()), PathOp::Plus];
+        let bound_vars = [0];
+        let bound_rows = [source];
+        let bound_view = RowsView::new(&bound_vars, &bound_rows);
+        let boxed: Box<dyn Constraint<'static> + Send + Sync> =
+            Box::new(make_path(&capability_ops));
+        assert!(boxed.residual_terminal_eager_proposal_equivalent(1, &bound_view));
+        let shared: Arc<dyn Constraint<'static> + Send + Sync> =
+            Arc::new(make_path(&capability_ops));
+        assert!(shared.residual_terminal_eager_proposal_equivalent(1, &bound_view));
+        let estimated = EstimateOverrideConstraint::new(make_path(&capability_ops));
+        assert!(estimated.residual_terminal_eager_proposal_equivalent(1, &bound_view));
+        let visible = IgnoreConstraint::new(
+            VariableSet::new_empty(),
+            Box::new(make_path(&capability_ops)),
+        );
+        assert!(visible.residual_terminal_eager_proposal_equivalent(1, &bound_view));
+        let hidden = IgnoreConstraint::new(
+            VariableSet::new_singleton(1),
+            Box::new(make_path(&capability_ops)),
+        );
+        assert!(!hidden.residual_terminal_eager_proposal_equivalent(1, &bound_view));
+
+        let cases = [
+            ("nullable star", vec![PathOp::Attr(p.raw()), PathOp::Star]),
+            (
+                "inverse closure",
+                vec![PathOp::Attr(p.raw()), PathOp::Inverse, PathOp::Plus],
+            ),
+            (
+                "negated closure",
+                vec![PathOp::NotAttr(excluded.raw()), PathOp::Plus],
+            ),
+            (
+                "convergent union",
+                vec![
+                    PathOp::Attr(p.raw()),
+                    PathOp::Attr(q.raw()),
+                    PathOp::Union,
+                    PathOp::Plus,
+                ],
+            ),
+        ];
+
+        for (name, ops) in cases {
+            let mut sequential: Vec<_> = Query::new(make(&ops), project).sequential().collect();
+            let mut eager = Query::new(make(&ops), project)
+                .solve_residual_state_lazy_with(ResidualLowering::new(
+                    FormulaScope::OpaqueLeaves,
+                    true,
+                ))
+                .cap(64)
+                .start_width(1)
+                .growth(2)
+                .collect_profiled();
+            let mut sparse = Query::new(make(&ops), project)
+                .solve_residual_state_lazy_with(ResidualLowering::new(
+                    FormulaScope::OpaqueLeaves,
+                    true,
+                ))
+                .cap(64)
+                .start_width(1)
+                .growth(2);
+            sparse.state.eager_terminal_phase_enabled = false;
+            let mut sparse = sparse.collect_profiled();
+
+            sequential.sort_unstable();
+            eager.results.sort_unstable();
+            sparse.results.sort_unstable();
+            assert_eq!(eager.results, sequential, "eager mismatch for {name}");
+            assert_eq!(sparse.results, sequential, "sparse mismatch for {name}");
+            assert!(
+                eager.stats.delta_terminal_eager_cohort_admissions > 0,
+                "{name} never entered the eager terminal phase: {:#?}",
+                eager.stats
+            );
+            assert_eq!(
+                sparse.stats.delta_terminal_eager_cohort_admissions, 0,
+                "forced sparse control entered the eager phase for {name}"
+            );
+
+            let expected = sequential.clone();
+            let mut clone_source = Query::new(Arc::new(make(&ops)), project)
+                .solve_residual_state_lazy_with(ResidualLowering::new(
+                    FormulaScope::OpaqueLeaves,
+                    true,
+                ))
+                .cap(64)
+                .start_width(1)
+                .growth(2);
+            let mut prefix = Vec::new();
+            while clone_source.stats().delta_terminal_eager_cohort_admissions == 0 {
+                prefix.push(
+                    clone_source
+                        .next()
+                        .unwrap_or_else(|| panic!("{name} drained before eager phase")),
+                );
+            }
+            let mut clone = clone_source.clone();
+            drop(clone_source);
+            prefix.extend(clone.by_ref());
+            prefix.sort_unstable();
+            assert_eq!(
+                prefix, expected,
+                "post-phase clone/drop mismatch for {name}"
+            );
+
+            #[cfg(feature = "parallel")]
+            {
+                let mut parallel: Vec<_> = with_parallel_workers(4, || {
+                    Query::new(Arc::new(make(&ops)), project)
+                        .solve_residual_state_lazy_with(ResidualLowering::new(
+                            FormulaScope::OpaqueLeaves,
+                            true,
+                        ))
+                        .cap(64)
+                        .start_width(1)
+                        .growth(2)
+                        .into_par_iter()
+                        .collect()
+                });
+                parallel.sort_unstable();
+                assert_eq!(parallel, expected, "parallel mismatch for {name}");
+            }
+        }
+    }
+
+    #[test]
     fn finite_one_arm_union_is_a_valid_submachine() {
         let make = || {
             UnionConstraint::new(vec![FanoutLeaf {
