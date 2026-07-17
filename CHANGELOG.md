@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Demand-wide terminal RPQ admissions change execution regime without
+  disturbing live sparse traversals.** When completed-yield evidence admits
+  more than one new terminal parent in a turn, that exact suffix runs through
+  the constraint's ordinary block-native proposer and publishes full rows
+  directly. Per-parent receipts share the delta activation namespace but own
+  no registry state or producer credit; registration, publication staging,
+  and immediate completion preserve exact zero-yield and projected-yield
+  accounting while existing activations remain sparse.
 - **Activation-indexed terminal delta buckets preserve affine cohort order
   without rescanning mixed work.** Ordinary and formula transition buckets
   remain contiguous vectors; terminal cohort selection lazily promotes only

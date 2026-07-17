@@ -117,6 +117,17 @@ impl<'a> Constraint<'a> for IgnoreConstraint<'a> {
                 .residual_proposal_source_is_paged(variable, view)
     }
 
+    fn residual_terminal_eager_proposal_equivalent(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+    ) -> bool {
+        self.exposes(variable)
+            && self
+                .constraint
+                .residual_terminal_eager_proposal_equivalent(variable, view)
+    }
+
     fn residual_proposal_source_has_transition_roots(
         &self,
         variable: VariableId,

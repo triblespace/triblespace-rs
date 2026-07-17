@@ -2309,6 +2309,21 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         )
     }
 
+    fn residual_terminal_eager_proposal_equivalent(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+    ) -> bool {
+        if view.col(variable).is_some() {
+            return false;
+        }
+        matches!(
+            self.residual_delta_program(variable),
+            Some(ResidualDeltaRoute::BoundEndpoint { source, .. })
+                if view.col(source).is_some()
+        )
+    }
+
     fn residual_proposal_source_has_transition_roots(
         &self,
         variable: VariableId,

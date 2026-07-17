@@ -398,6 +398,29 @@ impl ProducerRegistry {
         }
     }
 
+    /// Reserves query-local activation identities for a terminal cohort that
+    /// is evaluated eagerly instead of entering the sparse fixpoint machine.
+    ///
+    /// These are receipts, not activations: they deliberately have no
+    /// registry entry and mint no affine producer credit. Sharing the same
+    /// monotone namespace lets the outer projected-yield ledger treat eager
+    /// and sparse parents uniformly without manufacturing fake cyclic work.
+    fn reserve_terminal_receipts(&mut self, count: usize) -> Vec<ActivationId> {
+        let mut receipts = Vec::with_capacity(count);
+        for _ in 0..count {
+            let receipt = ActivationId(take_monotonic(
+                &mut self.state.next_activation,
+                "activation",
+            ));
+            debug_assert!(
+                !self.state.activations.contains_key(&receipt),
+                "eager terminal receipt unexpectedly owns a live activation"
+            );
+            receipts.push(receipt);
+        }
+        receipts
+    }
+
     /// Starts one parent-scoped activation with one affine credit per root.
     fn start_many(
         &mut self,
@@ -1967,6 +1990,17 @@ impl DeltaScheduler {
             terminal_selection_slots: AHashMap::new(),
             terminal_selections: Vec::new(),
         }
+    }
+
+    /// Mints exact per-parent terminal receipts without filing sparse source
+    /// or transition work. The caller returns each identity as both an
+    /// admission registration and an immediate completion receipt.
+    pub(super) fn reserve_terminal_receipts(&mut self, count: usize) -> Vec<ActivationId> {
+        self.registry.reserve_terminal_receipts(count)
+    }
+
+    pub(super) fn receipt_has_live_activation(&self, receipt: ActivationId) -> bool {
+        self.registry.state.activations.contains_key(&receipt)
     }
 
     pub(super) fn grow_activation_width(&mut self, growth: usize, cap: usize) -> bool {
