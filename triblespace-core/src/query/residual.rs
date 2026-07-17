@@ -4436,6 +4436,27 @@ impl FormulaBatch {
         }
     }
 
+    /// Takes the candidate stream consumed by one confirmation continuation.
+    ///
+    /// An AND continuation has exactly one future: its selected child filters
+    /// the current stream and returns the replacement. The stream is therefore
+    /// affine and can move into that child. An OR continuation evaluates more
+    /// than one child against the same immutable source, so that source is the
+    /// genuine fan-out boundary and must still be cloned.
+    fn take_confirm_input(&mut self) -> CandidatePayload {
+        let parent_count = self.parents.row_count;
+        match self
+            .frames
+            .last_mut()
+            .expect("formula payload has no root frame")
+        {
+            FormulaPayloadFrame::Or { source, .. } => source.clone(),
+            FormulaPayloadFrame::And { current } => {
+                std::mem::replace(current, CandidatePayload::empty(parent_count))
+            }
+        }
+    }
+
     fn action_candidate_count(&self, stage: FormulaStage) -> usize {
         match stage {
             FormulaStage::Support | FormulaStage::Propose => 0,
@@ -4496,7 +4517,7 @@ impl FormulaBatch {
                 panic!("Boolean support does not allocate candidate reducer frames")
             }
             FormulaStage::Propose => CandidatePayload::empty(self.parents.row_count),
-            FormulaStage::Confirm => self.input().clone(),
+            FormulaStage::Confirm => self.take_confirm_input(),
         };
         self.frames.push(match kind {
             FiniteFormulaNodeKind::And { .. } => FormulaPayloadFrame::And { current: input },
@@ -6446,7 +6467,7 @@ fn formula_action_transition<'a>(
     plan: &ResidualPlan,
     desc: &StateDesc,
     counter: FormulaPcId,
-    batch: FormulaBatch,
+    mut batch: FormulaBatch,
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
@@ -6457,6 +6478,14 @@ fn formula_action_transition<'a>(
         _ => panic!("formula action received a planning continuation"),
     };
     assert_eq!(batch.activations.len(), batch.parents.row_count);
+
+    // Take an affine AND input before the parent-row view borrows the batch.
+    // OR inputs remain cloned at their genuine sibling fan-out boundary.
+    let result = match stage {
+        FormulaStage::Support => None,
+        FormulaStage::Propose => Some(CandidatePayload::empty(batch.parents.row_count)),
+        FormulaStage::Confirm => Some(batch.take_confirm_input()),
+    };
 
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
     let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
@@ -6481,11 +6510,7 @@ fn formula_action_transition<'a>(
         return continuation;
     }
 
-    let mut result = match stage {
-        FormulaStage::Support => unreachable!("support returned above"),
-        FormulaStage::Propose => CandidatePayload::empty(batch.parents.row_count),
-        FormulaStage::Confirm => batch.input().clone(),
-    };
+    let mut result = result.expect("support returned before candidate execution");
     let candidates_before = result.len();
     match stage {
         FormulaStage::Support => unreachable!("support returned above"),
@@ -11966,6 +11991,102 @@ mod tests {
             candidate_payload(2, confirmed.clone()),
         );
         assert_eq!(batch.input(), confirmed.as_slice());
+    }
+
+    #[test]
+    fn formula_confirm_input_moves_through_and_but_clones_at_or() {
+        let mut and_batch = FormulaBatch {
+            activations: vec![ActivationId(0)],
+            parents: RowBatch {
+                rows: Vec::new(),
+                row_count: 1,
+            },
+            frames: vec![FormulaPayloadFrame::And {
+                current: CandidatePayload::Values(vec![raw(1), raw(2), raw(3)]),
+            }],
+        };
+        let and_source = match and_batch.input() {
+            CandidatePayload::Values(values) => values.as_ptr(),
+            CandidatePayload::Tagged(_) => panic!("one parent should use plain values"),
+        };
+        let and_input = and_batch.take_confirm_input();
+        let FormulaPayloadFrame::And { current } = &and_batch.frames[0] else {
+            panic!("AND input changed frame shape")
+        };
+        assert!(current.is_empty(), "an entered AND child owns the stream");
+        let CandidatePayload::Values(and_values) = &and_input else {
+            panic!("moved one-parent input acquired row tags")
+        };
+        assert_eq!(and_values.as_ptr(), and_source);
+
+        let mut or_batch = FormulaBatch {
+            activations: vec![ActivationId(0)],
+            parents: RowBatch {
+                rows: Vec::new(),
+                row_count: 1,
+            },
+            frames: vec![FormulaPayloadFrame::Or {
+                source: CandidatePayload::Values(vec![raw(4), raw(5), raw(6)]),
+                output: CandidatePayload::Values(Vec::new()),
+            }],
+        };
+        let or_source = match or_batch.input() {
+            CandidatePayload::Values(values) => values.as_ptr(),
+            CandidatePayload::Tagged(_) => panic!("one parent should use plain values"),
+        };
+        let or_input = or_batch.take_confirm_input();
+        let CandidatePayload::Values(or_values) = &or_input else {
+            panic!("cloned one-parent input acquired row tags")
+        };
+        assert_ne!(or_values.as_ptr(), or_source);
+        assert_eq!(or_values.as_slice(), [raw(4), raw(5), raw(6)]);
+        let CandidatePayload::Values(source) = or_batch.input() else {
+            panic!("OR source changed representation")
+        };
+        assert_eq!(source.as_ptr(), or_source);
+        assert_eq!(source.as_slice(), [raw(4), raw(5), raw(6)]);
+    }
+
+    #[test]
+    fn nested_confirm_frame_returns_the_moved_and_stream() {
+        let mut batch = FormulaBatch {
+            activations: vec![ActivationId(0)],
+            parents: RowBatch {
+                rows: Vec::new(),
+                row_count: 1,
+            },
+            frames: vec![FormulaPayloadFrame::And {
+                current: CandidatePayload::Values(vec![raw(7), raw(8)]),
+            }],
+        };
+        let source = match batch.input() {
+            CandidatePayload::Values(values) => values.as_ptr(),
+            CandidatePayload::Tagged(_) => panic!("one parent should use plain values"),
+        };
+
+        batch.enter(
+            &FiniteFormulaNodeKind::And {
+                children: Vec::new().into_boxed_slice(),
+            },
+            FormulaStage::Confirm,
+        );
+        let [FormulaPayloadFrame::And { current: parent }, FormulaPayloadFrame::And { current }] =
+            batch.frames.as_slice()
+        else {
+            panic!("nested AND changed frame shapes")
+        };
+        assert!(parent.is_empty());
+        let CandidatePayload::Values(values) = current else {
+            panic!("moved nested input acquired row tags")
+        };
+        assert_eq!(values.as_ptr(), source);
+
+        batch.return_frame();
+        let CandidatePayload::Values(values) = batch.input() else {
+            panic!("returned nested input acquired row tags")
+        };
+        assert_eq!(values.as_ptr(), source);
+        assert_eq!(values.as_slice(), [raw(7), raw(8)]);
     }
 
     #[test]

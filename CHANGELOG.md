@@ -354,6 +354,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Residual AND formulas move their affine candidate stream.** Nested AND
+  frames and leaf confirmations now take ownership of the one future candidate
+  sequence instead of cloning it before filtering and then overwriting the
+  original. OR frames retain an immutable source clone at their genuine sibling
+  fan-out boundary, preserving exact arm-local set reduction, clone/Rayon
+  behavior, and canonical state identity.
 - **Residual formula continuations use compact persistent arena records.**
   Canonical state descriptors now carry a four-byte query-local program-counter
   ID. Each arena record names its exact parent return edge and outer WCO resume
