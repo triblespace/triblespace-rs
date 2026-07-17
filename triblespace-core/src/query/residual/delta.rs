@@ -119,6 +119,12 @@ impl RegistryBrand {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(super) struct ActivationId(u64);
 
+impl ActivationId {
+    pub(super) fn index(self) -> usize {
+        usize::try_from(self.0).expect("delta activation index exceeds usize")
+    }
+}
+
 #[cfg(test)]
 impl ActivationId {
     pub(super) const fn test(raw: u64) -> Self {
@@ -334,18 +340,22 @@ struct DeltaStreamingReturn {
 #[derive(Debug)]
 pub(super) struct TerminalPublicationBatch {
     pub(super) rows: RowBatch,
-    pub(super) origins: Vec<ActivationId>,
+    /// Terminal sparse search overwhelmingly publishes one row at a time.
+    /// Keep that exact origin inline; wider/mixed cohorts spill only when
+    /// they actually need more storage.
+    pub(super) origins: SmallVec<[ActivationId; 1]>,
 }
 
 impl TerminalPublicationBatch {
     fn new(activation: ActivationId, rows: RowBatch) -> Self {
-        let origins = vec![activation; rows.row_count];
+        let mut origins = SmallVec::new();
+        origins.resize(rows.row_count, activation);
         Self { rows, origins }
     }
 
     fn append(&mut self, mut other: Self) {
         self.rows.append(other.rows);
-        self.origins.append(&mut other.origins);
+        self.origins.extend(other.origins.drain(..));
         debug_assert_eq!(self.origins.len(), self.rows.row_count);
     }
 }
@@ -357,9 +367,6 @@ struct DeltaStableEffects {
     /// buffer. This is a physical publication receipt, never a canonical
     /// delta or stable state.
     publication: Option<TerminalPublicationBatch>,
-    /// Exact affine activations that became quiescent during this physical
-    /// step. Counts are insufficient for projected-yield sample closure.
-    completed_activation_ids: Vec<ActivationId>,
 }
 
 impl DeltaStableEffects {
@@ -372,8 +379,6 @@ impl DeltaStableEffects {
                 self.publication = Some(rows);
             }
         }
-        self.completed_activation_ids
-            .append(&mut other.completed_activation_ids);
     }
 
     fn has_effect(&self) -> bool {
@@ -1752,6 +1757,7 @@ impl DeltaScheduler {
         let stride = successor.bound.count();
         let mut tasks = Vec::with_capacity(seeds.len());
         let mut effects = DeltaStableEffects::default();
+        let mut completed_activation_ids = Vec::new();
         let mut terminal_activations = Vec::with_capacity(parents.row_count);
         for (row, range) in ranges.into_iter().enumerate() {
             let start = row * stride;
@@ -1802,7 +1808,7 @@ impl DeltaScheduler {
                 let completed = self.registry.finish(proof);
                 assert_eq!(completed.effect, DeltaCompletion::Cleanup);
                 assert!(matches!(completed.return_to, DeltaReturn::Stable { .. }));
-                effects.completed_activation_ids.push(completed.activation);
+                completed_activation_ids.push(completed.activation);
             }
         }
         let active = self.file(desc, tasks);
@@ -1811,7 +1817,7 @@ impl DeltaScheduler {
             publication: effects.publication,
             active,
             terminal_activations,
-            completed_activation_ids: effects.completed_activation_ids,
+            completed_activation_ids,
             terminal_family: None,
             seeded_parents,
         }
@@ -2208,7 +2214,6 @@ impl DeltaScheduler {
                     stats,
                 ),
                 publication: None,
-                completed_activation_ids: Vec::new(),
             };
         }
         stats.candidates_proposed += accepted.len();
@@ -2248,7 +2253,6 @@ impl DeltaScheduler {
             return DeltaStableEffects {
                 continuation: None,
                 publication: Some(TerminalPublicationBatch::new(activation, rows)),
-                completed_activation_ids: Vec::new(),
             };
         }
         let continuation = match streamed.return_to {
@@ -2284,7 +2288,6 @@ impl DeltaScheduler {
         DeltaStableEffects {
             continuation,
             publication: None,
-            completed_activation_ids: Vec::new(),
         }
     }
 
@@ -2937,6 +2940,7 @@ impl DeltaScheduler {
         let mut next_tasks = Vec::new();
         let mut resumed_sources = Vec::new();
         let mut effects = DeltaStableEffects::default();
+        let mut completed_activation_ids = Vec::new();
         let mut dead_pages = 0usize;
         let mut source_dead_pages = 0usize;
         let mut transition_dead_pages = 0usize;
@@ -3013,9 +3017,7 @@ impl DeltaScheduler {
                 assert_eq!(proof.activation, task.activation);
                 completed_activations += 1;
                 let completed = self.registry.finish(proof);
-                task_effects
-                    .completed_activation_ids
-                    .push(completed.activation);
+                completed_activation_ids.push(completed.activation);
                 prefer_continuation(
                     &mut task_effects.continuation,
                     Self::release_completion(completed, plan, stable, stable_interner, stats),
@@ -3043,7 +3045,7 @@ impl DeltaScheduler {
             outcome: DeltaStepOutcome {
                 continuation: effects.continuation,
                 publication: effects.publication,
-                completed_activation_ids: effects.completed_activation_ids,
+                completed_activation_ids,
                 dead_pages,
                 source_dead_pages,
                 transition_dead_pages,
@@ -3162,6 +3164,7 @@ impl DeltaScheduler {
         stats.max_delta_source_cohort = stats.max_delta_source_cohort.max(row_count);
         stats.delta_source_pages += row_count;
         let mut effects = DeltaStableEffects::default();
+        let mut completed_activation_ids = Vec::new();
         let mut traversal = Vec::new();
         let mut resumed_sources = Vec::new();
         let mut dead_pages = 0usize;
@@ -3230,9 +3233,7 @@ impl DeltaScheduler {
                 assert_eq!(proof.activation, task.activation);
                 completed_activations += 1;
                 let completed = self.registry.finish(proof);
-                task_effects
-                    .completed_activation_ids
-                    .push(completed.activation);
+                completed_activation_ids.push(completed.activation);
                 prefer_continuation(
                     &mut task_effects.continuation,
                     Self::release_completion(completed, plan, stable, stable_interner, stats),
@@ -3255,7 +3256,7 @@ impl DeltaScheduler {
             outcome: DeltaStepOutcome {
                 continuation: effects.continuation,
                 publication: effects.publication,
-                completed_activation_ids: effects.completed_activation_ids,
+                completed_activation_ids,
                 dead_pages,
                 source_dead_pages: dead_pages,
                 transition_dead_pages: 0,
