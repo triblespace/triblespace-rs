@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Typed RPQ Programs retain complete positive PATCH transition cohorts.**
+  Fresh compatible transition pages first plan every input and ordered branch
+  against that input's exact ragged grant without publishing effects. When the
+  whole cohort fits, one family-owned transaction retains and enumerates the
+  proven PATCH subtrees, reserves the exact raw-child capacity, and emits
+  terminal receipts; a resumed, empty, negated, or over-limit member keeps the
+  entire cohort on the unchanged scalar pageable route. Telemetry-only counters
+  expose native hits and causal miss reasons without steering execution.
 - **Residual RPQs now execute through one typed affine program runtime.**
   Occurrence-local program addresses erase each family once per dense cohort
   while generational handles retain exact typed continuations, family-owned

@@ -4893,6 +4893,20 @@ impl DeltaScheduler {
         }
         stats.delta_transition_pages += receipt.transition_pages;
         stats.delta_transition_candidates_examined += receipt.transition_examined;
+        stats.program_transition_start_cohorts += receipt.program_transition_start_cohorts;
+        stats.program_transition_native_cohorts += receipt.program_transition_native_cohorts;
+        stats.program_transition_native_inputs += receipt.program_transition_native_inputs;
+        stats.program_transition_native_branches += receipt.program_transition_native_branches;
+        stats.program_transition_native_examined += receipt.program_transition_native_examined;
+        stats.program_transition_scalar_inputs += receipt.program_transition_scalar_inputs;
+        stats.program_transition_native_miss_incompatible +=
+            receipt.program_transition_native_miss_incompatible;
+        stats.program_transition_native_miss_no_step +=
+            receipt.program_transition_native_miss_no_step;
+        stats.program_transition_native_miss_negated +=
+            receipt.program_transition_native_miss_negated;
+        stats.program_transition_native_miss_over_limit +=
+            receipt.program_transition_native_miss_over_limit;
         if receipt.transition_pages > 0 {
             stats.delta_transition_cohorts += 1;
             stats.max_delta_transition_cohort = stats

@@ -7,6 +7,7 @@ use crate::id::ID_LEN;
 use crate::inline::encodings::genid::GenId;
 use crate::inline::IntoInline;
 use crate::inline::RawInline;
+use crate::patch::PATCHBoundedInfixes;
 use crate::query::confirm_per_row;
 use crate::query::intersectionconstraint::IntersectionConstraint;
 use crate::query::residual::FrameSeedRow;
@@ -39,7 +40,10 @@ use crate::query::Variable;
 use crate::query::VariableContext;
 use crate::query::VariableId;
 use crate::query::VariableSet;
+use crate::trible::EAVOrder;
 use crate::trible::TribleSet;
+use crate::trible::VAEOrder;
+use crate::trible::TRIBLE_LEN;
 
 // ── Path expression types ────────────────────────────────────────────────
 
@@ -1185,6 +1189,65 @@ enum DeltaStep {
     InverseNotAttr(RawId),
 }
 
+/// Retained storage view for one complete positive Program transition branch.
+///
+/// The view is only constructed after PATCH has proved that its exact distinct
+/// fanout fits the caller's remaining per-input grant. Keeping the subtree
+/// borrowed through cohort planning lets the commit phase enumerate without a
+/// second prefix descent.
+enum PositiveTransitionView<'a> {
+    Empty,
+    Forward(PATCHBoundedInfixes<'a, TRIBLE_LEN, { ID_LEN * 2 }, 32, EAVOrder, ()>),
+    Inverse(PATCHBoundedInfixes<'a, TRIBLE_LEN, { 32 + ID_LEN }, ID_LEN, VAEOrder, ()>),
+}
+
+impl PositiveTransitionView<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Forward(infixes) => {
+                usize::try_from(infixes.len()).expect("bounded PATCH count must fit usize")
+            }
+            Self::Inverse(infixes) => {
+                usize::try_from(infixes.len()).expect("bounded PATCH count must fit usize")
+            }
+        }
+    }
+
+    fn for_each(self, mut visit: impl FnMut(RawInline)) {
+        match self {
+            Self::Empty => {}
+            Self::Forward(infixes) => infixes.for_each(|value: &[u8; 32]| visit(*value)),
+            Self::Inverse(infixes) => {
+                infixes.for_each(|entity: &[u8; ID_LEN]| visit(id_into_value(entity)))
+            }
+        }
+    }
+}
+
+struct PositiveTransitionPlan<'a> {
+    input: u32,
+    variable: VariableId,
+    source: Option<RawInline>,
+    target_pc: u32,
+    target_accepting: bool,
+    view: PositiveTransitionView<'a>,
+}
+
+struct PositiveTransitionCohortPlan<'a> {
+    branches: Vec<PositiveTransitionPlan<'a>>,
+    fanouts: Vec<usize>,
+    total_fanout: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PositiveTransitionCohortMiss {
+    Incompatible,
+    EmptyFrontier,
+    Negated,
+    OverLimit,
+}
+
 #[derive(Default)]
 struct ThompsonState {
     epsilon: Vec<u32>,
@@ -1974,6 +2037,174 @@ impl RegularPathConstraint {
         }
     }
 
+    /// Retain one complete positive adjacency branch if its exact fanout fits
+    /// `limit`. Negated branches deliberately decline this physical path: the
+    /// distinct destination frontier and its attribute predicate remain
+    /// pageable scalar work.
+    fn bounded_positive_transition_view(
+        &self,
+        step: DeltaStep,
+        source: &RawInline,
+        limit: usize,
+    ) -> Result<PositiveTransitionView<'_>, PositiveTransitionCohortMiss> {
+        let limit = u64::try_from(limit).unwrap_or(u64::MAX);
+        match step {
+            DeltaStep::Attr(attribute) => {
+                let Some(entity) = value_as_entity(source) else {
+                    return Ok(PositiveTransitionView::Empty);
+                };
+                let mut prefix = [0u8; ID_LEN * 2];
+                prefix[..ID_LEN].copy_from_slice(&entity);
+                prefix[ID_LEN..].copy_from_slice(&attribute);
+                self.set
+                    .eav
+                    .bounded_infixes(&prefix, limit)
+                    .map(PositiveTransitionView::Forward)
+                    .ok_or(PositiveTransitionCohortMiss::OverLimit)
+            }
+            DeltaStep::InverseAttr(attribute) => {
+                let mut prefix = [0u8; 32 + ID_LEN];
+                prefix[..32].copy_from_slice(source);
+                prefix[32..].copy_from_slice(&attribute);
+                self.set
+                    .vae
+                    .bounded_infixes(&prefix, limit)
+                    .map(PositiveTransitionView::Inverse)
+                    .ok_or(PositiveTransitionCohortMiss::OverLimit)
+            }
+            DeltaStep::NotAttr(_) | DeltaStep::InverseNotAttr(_) => {
+                Err(PositiveTransitionCohortMiss::Negated)
+            }
+        }
+    }
+
+    /// Plan a complete retained-view transaction for an already-selected
+    /// typed Program cohort. This phase is immutable: no effect-sink mutation
+    /// happens unless every input and every ordered branch proves complete
+    /// against that input's own ragged grant.
+    fn plan_complete_positive_transition_cohort<'a>(
+        &'a self,
+        states: &[RpqState],
+        limits: &[usize],
+    ) -> Result<PositiveTransitionCohortPlan<'a>, PositiveTransitionCohortMiss> {
+        debug_assert_eq!(states.len(), limits.len());
+        let mut branches = Vec::new();
+        let mut fanouts = Vec::with_capacity(states.len());
+        let mut total_fanout = 0usize;
+
+        for (input, (state, &limit)) in states.iter().zip(limits).enumerate() {
+            let RpqStateKind::Transition {
+                variable,
+                node,
+                cursor: RpqExpandCursor::Start,
+            } = state.kind()
+            else {
+                return Err(PositiveTransitionCohortMiss::Incompatible);
+            };
+            let program = match self
+                .program_for_variable(*variable)
+                .expect("typed RPQ transition lost its program")
+            {
+                RpqRoute::BoundEndpoint { program, .. } | RpqRoute::SameVariable { program } => {
+                    program
+                }
+            };
+            let program_state = program.decode(node.pc);
+            let steps = &program.steps[program_state];
+            if steps.is_empty() {
+                return Err(PositiveTransitionCohortMiss::EmptyFrontier);
+            }
+
+            let input = u32::try_from(input).expect("too many typed RPQ transition inputs");
+            let mut fanout = 0usize;
+            for &(step, target) in steps {
+                let remaining = limit.checked_sub(fanout).expect(
+                    "an admitted positive RPQ branch exceeded its input grant during planning",
+                );
+                let view = self.bounded_positive_transition_view(step, &node.value, remaining)?;
+                let branch_fanout = view.len();
+                fanout = fanout
+                    .checked_add(branch_fanout)
+                    .expect("RPQ transition fanout exceeds usize");
+                branches.push(PositiveTransitionPlan {
+                    input,
+                    variable: *variable,
+                    source: node.source,
+                    target_pc: program.encode(target),
+                    target_accepting: program.accepting[target as usize],
+                    view,
+                });
+            }
+            total_fanout = total_fanout
+                .checked_add(fanout)
+                .expect("RPQ transition cohort fanout exceeds usize");
+            fanouts.push(fanout);
+        }
+
+        Ok(PositiveTransitionCohortPlan {
+            branches,
+            fanouts,
+            total_fanout,
+        })
+    }
+
+    /// Commit one fully planned positive transition cohort into the typed
+    /// effect sink. The plan's exact counts make every page terminal and make
+    /// raw child amplification equal to examined work before novelty filtering.
+    fn commit_complete_positive_transition_cohort(
+        &self,
+        plan: PositiveTransitionCohortPlan<'_>,
+        stratum: ProgramStratum,
+        effects: &mut TypedEffectSink<RpqState, RpqNoveltyKey>,
+    ) {
+        let input_count = plan.fanouts.len();
+        let branch_count = plan.branches.len();
+        effects.reserve_children(plan.total_fanout);
+        effects.reserve_pages(input_count);
+        effects.account_transition_native_cohort(
+            input_count,
+            branch_count,
+            plan.total_fanout,
+        );
+
+        for branch in plan.branches {
+            branch.view.for_each(|value| {
+                let node = RpqNode {
+                    source: branch.source,
+                    value,
+                    pc: branch.target_pc,
+                };
+                let state = RpqState::transition(
+                    branch.variable,
+                    node,
+                    RpqExpandCursor::Start,
+                );
+                let accepted = (branch.target_accepting
+                    && branch.source.is_none_or(|anchor| value == anchor))
+                .then_some(value);
+                match stratum {
+                    ProgramStratum::Finite => {
+                        effects.finite_child(branch.input, state, accepted)
+                    }
+                    ProgramStratum::Fixpoint => effects.fixpoint_child(
+                        branch.input,
+                        state,
+                        RpqNoveltyKey {
+                            source: branch.source,
+                            value,
+                            pc: branch.target_pc,
+                        },
+                        accepted,
+                    ),
+                }
+            });
+        }
+        for fanout in plan.fanouts {
+            effects.account_transition(fanout);
+            effects.page(fanout, None);
+        }
+    }
+
     fn pageable_delta_value_is_included(
         &self,
         step: DeltaStep,
@@ -2727,6 +2958,52 @@ impl TypedProgramSpec for RegularPathConstraint {
             return;
         }
 
+        // The Program scheduler has already selected one compatible physical
+        // cohort and assigned every input its exact positive grant. A fresh
+        // transition cohort may therefore use one family-owned PATCH
+        // transaction, but only after the complete cohort proves positive and
+        // terminal. Planning is immutable; a single miss keeps every input on
+        // the unchanged scalar pageable route.
+        if states.first().is_some_and(|state| {
+            matches!(
+                state.kind(),
+                RpqStateKind::Transition {
+                    cursor: RpqExpandCursor::Start,
+                    ..
+                }
+            )
+        }) {
+            match self.plan_complete_positive_transition_cohort(&states, batch.limits) {
+                Ok(plan) => {
+                    effects.account_transition_start_cohort();
+                    self.commit_complete_positive_transition_cohort(
+                        plan,
+                        batch.stratum,
+                        effects,
+                    );
+                    return;
+                }
+                Err(miss) => {
+                    effects.account_transition_start_cohort();
+                    match miss {
+                        PositiveTransitionCohortMiss::Incompatible => {
+                            effects.account_transition_native_miss_incompatible()
+                        }
+                        PositiveTransitionCohortMiss::EmptyFrontier => {
+                            effects.account_transition_native_miss_no_step()
+                        }
+                        PositiveTransitionCohortMiss::Negated => {
+                            effects.account_transition_native_miss_negated()
+                        }
+                        PositiveTransitionCohortMiss::OverLimit => {
+                            effects.account_transition_native_miss_over_limit()
+                        }
+                    }
+                }
+            }
+        }
+        effects.account_transition_scalar_inputs(states.len());
+
         for (input, state) in states.into_iter().enumerate() {
             let RpqStateKind::Transition {
                 variable,
@@ -3016,7 +3293,10 @@ mod seeded_frame_tests {
     use crate::query::ProgramActivation;
     use crate::query::ProgramBatch;
     use crate::query::ProgramBatchEffects;
+    use crate::query::ProgramResume;
+    use crate::query::ProgramRuntime;
     use crate::query::ProgramSeedEffects;
+    use crate::query::ProgramWork;
     use crate::query::Query;
     use crate::trible::Trible;
 
@@ -3342,6 +3622,101 @@ mod seeded_frame_tests {
         to: RawInline,
     ) {
         set.insert(&Trible::new(from, attribute, &Inline::<GenId>::new(to)));
+    }
+
+    fn seed_bound_start_program<'a>(
+        path: &'a RegularPathConstraint,
+        sources: &[RawInline],
+    ) -> (
+        ProgramRef<'a>,
+        ProgramRoute,
+        ProgramRuntime,
+        Vec<ProgramActivation>,
+        Vec<ProgramWork>,
+    ) {
+        let program = path
+            .residual_program()
+            .expect("built-in RPQ must expose its typed Program");
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(path.end),
+            bound: VariableSet::new_singleton(path.start),
+        };
+        let route = program
+            .route(request)
+            .expect("bound-start RPQ must expose a Program route");
+        let activations: Vec<_> = (0..sources.len())
+            .map(|index| ProgramActivation(10_000 + index as u64))
+            .collect();
+        let vars = [path.start];
+        let view = RowsView::new(&vars, sources);
+        let mut runtime = program.new_runtime();
+        let mut seed = ProgramSeedEffects::default();
+        program.seed_batch(
+            &mut runtime,
+            ProgramSeedBatch {
+                request,
+                route,
+                view,
+                activations: &activations,
+            },
+            &mut seed,
+        );
+        assert_eq!(seed.work.len(), sources.len());
+        assert_eq!(
+            seed.work.iter().map(|work| work.parent).collect::<Vec<_>>(),
+            (0..sources.len())
+                .map(|index| u32::try_from(index).unwrap())
+                .collect::<Vec<_>>()
+        );
+        let work = seed.work.into_iter().map(|seed| seed.work).collect();
+        (program, route, runtime, activations, work)
+    }
+
+    fn step_bound_start_program(
+        path: &RegularPathConstraint,
+        program: ProgramRef<'_>,
+        route: ProgramRoute,
+        runtime: &mut ProgramRuntime,
+        sources: &[RawInline],
+        activations: &[ProgramActivation],
+        work: &[ProgramWork],
+        limits: &[usize],
+    ) -> ProgramBatchEffects {
+        assert_eq!(sources.len(), activations.len());
+        assert_eq!(sources.len(), work.len());
+        assert_eq!(sources.len(), limits.len());
+        let vars = [path.start];
+        let view = RowsView::new(&vars, sources);
+        let candidate_sets = vec![None; sources.len()];
+        let mut effects = ProgramBatchEffects::default();
+        program.step_batch(
+            runtime,
+            ProgramBatch {
+                stratum: route.stratum,
+                view,
+                candidate_sets: &candidate_sets,
+                activations,
+                work,
+                limits,
+            },
+            &mut effects,
+        );
+        effects
+    }
+
+    fn accepted_children(effects: &ProgramBatchEffects) -> Vec<(u32, RawInline)> {
+        effects
+            .children
+            .iter()
+            .map(|child| {
+                (
+                    child.input,
+                    child
+                        .accepted
+                        .expect("a terminal direct-attribute child must be accepted"),
+                )
+            })
+            .collect()
     }
 
     /// The historical import boundary: capture the outer value by adding a
@@ -3773,5 +4148,518 @@ mod seeded_frame_tests {
                 negated_destinations[4],
             ]
         );
+    }
+
+    #[test]
+    fn program_positive_patch_cohort_is_one_exact_ragged_transaction() {
+        let sources = [rngid(), rngid()];
+        let primary = rngid();
+        let secondary = rngid();
+        let mut destinations: Vec<_> = (0..5)
+            .map(|_| id_into_value(&rngid().id.raw()))
+            .collect();
+        destinations.sort_unstable();
+        let mut set = TribleSet::new();
+        insert_edge(&mut set, &sources[0], &primary, destinations[0]);
+        insert_edge(&mut set, &sources[0], &primary, destinations[1]);
+        insert_edge(&mut set, &sources[0], &secondary, destinations[0]);
+        insert_edge(&mut set, &sources[1], &primary, destinations[2]);
+        insert_edge(&mut set, &sources[1], &secondary, destinations[3]);
+        insert_edge(&mut set, &sources[1], &secondary, destinations[4]);
+
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let path = RegularPathConstraint::new(
+            set,
+            start,
+            end,
+            &[
+                PathOp::Attr(primary.id.raw()),
+                PathOp::Attr(secondary.id.raw()),
+                PathOp::Union,
+            ],
+        );
+        let source_values = sources
+            .iter()
+            .map(|source| id_into_value(&source.id.raw()))
+            .collect::<Vec<_>>();
+        let (program, route, mut runtime, activations, work) =
+            seed_bound_start_program(&path, &source_values);
+        let effects = step_bound_start_program(
+            &path,
+            program,
+            route,
+            &mut runtime,
+            &source_values,
+            &activations,
+            &work,
+            &[3, 4],
+        );
+
+        assert_eq!(
+            effects
+                .pages
+                .iter()
+                .map(|page| page.examined)
+                .collect::<Vec<_>>(),
+            vec![3, 3]
+        );
+        assert!(effects.pages.iter().all(|page| page.resume.is_none()));
+        assert_eq!(
+            accepted_children(&effects),
+            vec![
+                (0, destinations[0]),
+                (0, destinations[1]),
+                (0, destinations[0]),
+                (1, destinations[2]),
+                (1, destinations[3]),
+                (1, destinations[4]),
+            ],
+            "branch order and duplicate raw occurrences must survive the native fill"
+        );
+        assert_eq!(effects.program_transition_start_cohorts, 1);
+        assert_eq!(effects.program_transition_native_cohorts, 1);
+        assert_eq!(effects.program_transition_native_inputs, 2);
+        assert_eq!(effects.program_transition_native_branches, 4);
+        assert_eq!(effects.program_transition_native_examined, 6);
+        assert_eq!(effects.program_transition_scalar_inputs, 0);
+        assert_eq!(effects.program_transition_native_miss_incompatible, 0);
+        assert_eq!(effects.program_transition_native_miss_no_step, 0);
+        assert_eq!(effects.program_transition_native_miss_negated, 0);
+        assert_eq!(effects.program_transition_native_miss_over_limit, 0);
+    }
+
+    #[test]
+    fn program_inverse_patch_cohort_accepts_literal_sources() {
+        let attribute = rngid();
+        let subjects = [rngid(), rngid(), rngid()];
+        let literal = [0xA5; 32];
+        let mut set = TribleSet::new();
+        for subject in &subjects {
+            set.insert(&Trible::new(
+                subject,
+                &attribute,
+                &Inline::<UnknownInline>::new(literal),
+            ));
+        }
+        let start = Variable::<UnknownInline>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let path = RegularPathConstraint::new(
+            set,
+            start,
+            end,
+            &[PathOp::Attr(attribute.id.raw()), PathOp::Inverse],
+        );
+        let (program, route, mut runtime, activations, work) =
+            seed_bound_start_program(&path, &[literal]);
+        let effects = step_bound_start_program(
+            &path,
+            program,
+            route,
+            &mut runtime,
+            &[literal],
+            &activations,
+            &work,
+            &[subjects.len()],
+        );
+        let mut expected = subjects
+            .iter()
+            .map(|subject| id_into_value(&subject.id.raw()))
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+
+        assert_eq!(
+            accepted_children(&effects),
+            expected.into_iter().map(|value| (0, value)).collect::<Vec<_>>()
+        );
+        assert_eq!(effects.pages[0].examined, subjects.len());
+        assert!(effects.pages[0].resume.is_none());
+        assert_eq!(effects.program_transition_native_cohorts, 1);
+        assert_eq!(effects.program_transition_native_branches, 1);
+        assert_eq!(effects.program_transition_scalar_inputs, 0);
+    }
+
+    #[test]
+    fn program_patch_over_limit_falls_back_atomically_and_resume_stays_scalar() {
+        let sources = [rngid(), rngid(), rngid()];
+        let attribute = rngid();
+        let mut first_destinations: Vec<_> = (0..2)
+            .map(|_| id_into_value(&rngid().id.raw()))
+            .collect();
+        let mut second_destinations: Vec<_> = (0..3)
+            .map(|_| id_into_value(&rngid().id.raw()))
+            .collect();
+        let third_destination = id_into_value(&rngid().id.raw());
+        first_destinations.sort_unstable();
+        second_destinations.sort_unstable();
+        let mut set = TribleSet::new();
+        for value in first_destinations.iter().copied() {
+            insert_edge(&mut set, &sources[0], &attribute, value);
+        }
+        for value in second_destinations.iter().copied() {
+            insert_edge(&mut set, &sources[1], &attribute, value);
+        }
+        insert_edge(&mut set, &sources[2], &attribute, third_destination);
+
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let path = RegularPathConstraint::new(
+            set,
+            start,
+            end,
+            &[PathOp::Attr(attribute.id.raw())],
+        );
+        let source_values = sources
+            .iter()
+            .map(|source| id_into_value(&source.id.raw()))
+            .collect::<Vec<_>>();
+        let (program, route, mut runtime, activations, work) =
+            seed_bound_start_program(&path, &source_values);
+        let effects = step_bound_start_program(
+            &path,
+            program,
+            route,
+            &mut runtime,
+            &source_values[..2],
+            &activations[..2],
+            &work[..2],
+            &[2, 2],
+        );
+
+        assert_eq!(effects.program_transition_start_cohorts, 1);
+        assert_eq!(effects.program_transition_native_cohorts, 0);
+        assert_eq!(effects.program_transition_native_inputs, 0);
+        assert_eq!(effects.program_transition_scalar_inputs, 2);
+        assert_eq!(effects.program_transition_native_miss_over_limit, 1);
+        assert_eq!(
+            effects
+                .pages
+                .iter()
+                .map(|page| page.examined)
+                .collect::<Vec<_>>(),
+            vec![2, 2]
+        );
+        assert!(effects.pages[0].resume.is_none());
+        assert_eq!(
+            accepted_children(&effects),
+            first_destinations
+                .iter()
+                .copied()
+                .map(|value| (0, value))
+                .chain(
+                    second_destinations[..2]
+                        .iter()
+                        .copied()
+                        .map(|value| (1, value))
+                )
+                .collect::<Vec<_>>()
+        );
+        let resume = match effects.pages[1]
+            .resume
+            .clone()
+            .expect("the over-limit input must retain its exact cursor")
+        {
+            ProgramResume::Immediate(work) => work,
+            ProgramResume::AfterChildren(_) | ProgramResume::AfterChildrenDone => {
+                panic!("transition pagination returned the wrong resume disposition")
+            }
+        };
+
+        // A defensive direct call that mixes a fresh Start state with the
+        // resumed state must reject the native transaction before emitting
+        // anything, then process both inputs through the scalar route.
+        let mut mixed_runtime = runtime.clone();
+        let mixed_work = [work[2].clone(), resume.clone()];
+        let mixed_sources = [source_values[2], source_values[1]];
+        let mixed_activations = [activations[2], activations[1]];
+        let mixed = step_bound_start_program(
+            &path,
+            program,
+            route,
+            &mut mixed_runtime,
+            &mixed_sources,
+            &mixed_activations,
+            &mixed_work,
+            &[1, 1],
+        );
+        assert_eq!(mixed.program_transition_start_cohorts, 1);
+        assert_eq!(mixed.program_transition_native_cohorts, 0);
+        assert_eq!(mixed.program_transition_scalar_inputs, 2);
+        assert_eq!(mixed.program_transition_native_miss_incompatible, 1);
+        assert_eq!(
+            accepted_children(&mixed),
+            vec![(0, third_destination), (1, second_destinations[2])]
+        );
+
+        let resumed = step_bound_start_program(
+            &path,
+            program,
+            route,
+            &mut runtime,
+            &[source_values[1]],
+            &[activations[1]],
+            &[resume],
+            &[1],
+        );
+        assert_eq!(resumed.program_transition_start_cohorts, 0);
+        assert_eq!(resumed.program_transition_native_cohorts, 0);
+        assert_eq!(resumed.program_transition_scalar_inputs, 1);
+        assert_eq!(
+            accepted_children(&resumed),
+            vec![(0, second_destinations[2])]
+        );
+        assert!(resumed.pages[0].resume.is_none());
+    }
+
+    #[test]
+    fn program_patch_negated_and_empty_frontiers_fall_back_for_whole_cohort() {
+        let source = rngid();
+        let excluded = rngid();
+        let other = rngid();
+        let mut destinations: Vec<_> = (0..3)
+            .map(|_| id_into_value(&rngid().id.raw()))
+            .collect();
+        destinations.sort_unstable();
+        let mut negated_set = TribleSet::new();
+        insert_edge(&mut negated_set, &source, &excluded, destinations[0]);
+        insert_edge(&mut negated_set, &source, &excluded, destinations[1]);
+        insert_edge(&mut negated_set, &source, &other, destinations[1]);
+        insert_edge(&mut negated_set, &source, &other, destinations[2]);
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let negated = RegularPathConstraint::new(
+            negated_set,
+            start,
+            end,
+            &[PathOp::NotAttr(excluded.id.raw())],
+        );
+        let source_value = id_into_value(&source.id.raw());
+        let (program, route, mut runtime, activations, work) =
+            seed_bound_start_program(&negated, &[source_value]);
+        let negated_effects = step_bound_start_program(
+            &negated,
+            program,
+            route,
+            &mut runtime,
+            &[source_value],
+            &activations,
+            &work,
+            &[3],
+        );
+        assert_eq!(negated_effects.program_transition_start_cohorts, 1);
+        assert_eq!(negated_effects.program_transition_native_cohorts, 0);
+        assert_eq!(negated_effects.program_transition_scalar_inputs, 1);
+        assert_eq!(negated_effects.program_transition_native_miss_negated, 1);
+        assert_eq!(negated_effects.pages[0].examined, 3);
+        assert_eq!(
+            accepted_children(&negated_effects),
+            vec![(0, destinations[1]), (0, destinations[2])]
+        );
+
+        let sources = [rngid(), rngid()];
+        let attribute = rngid();
+        let targets = [
+            id_into_value(&rngid().id.raw()),
+            id_into_value(&rngid().id.raw()),
+        ];
+        let mut set = TribleSet::new();
+        insert_edge(&mut set, &sources[0], &attribute, targets[0]);
+        insert_edge(&mut set, &sources[1], &attribute, targets[1]);
+        let path = RegularPathConstraint::new(
+            set,
+            start,
+            end,
+            &[PathOp::Attr(attribute.id.raw())],
+        );
+        let source_values = sources
+            .iter()
+            .map(|source| id_into_value(&source.id.raw()))
+            .collect::<Vec<_>>();
+        let (program, route, mut runtime, activations, work) =
+            seed_bound_start_program(&path, &source_values);
+        let first = step_bound_start_program(
+            &path,
+            program,
+            route,
+            &mut runtime,
+            &source_values[..1],
+            &activations[..1],
+            &work[..1],
+            &[1],
+        );
+        assert_eq!(first.program_transition_native_cohorts, 1);
+        let terminal = first.children[0].work.clone();
+        let mixed_work = [terminal, work[1].clone()];
+        let mixed = step_bound_start_program(
+            &path,
+            program,
+            route,
+            &mut runtime,
+            &source_values,
+            &activations,
+            &mixed_work,
+            &[1, 1],
+        );
+        assert_eq!(mixed.program_transition_start_cohorts, 1);
+        assert_eq!(mixed.program_transition_native_cohorts, 0);
+        assert_eq!(mixed.program_transition_scalar_inputs, 2);
+        assert_eq!(mixed.program_transition_native_miss_no_step, 1);
+        assert_eq!(
+            mixed
+                .pages
+                .iter()
+                .map(|page| page.examined)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(accepted_children(&mixed), vec![(1, targets[1])]);
+    }
+
+    #[test]
+    fn program_patch_fixpoint_duplicate_cohort_equals_split_execution() {
+        let source = rngid();
+        let target = rngid();
+        let attribute = rngid();
+        let source_value = id_into_value(&source.id.raw());
+        let target_value = id_into_value(&target.id.raw());
+        let mut set = TribleSet::new();
+        insert_edge(&mut set, &source, &attribute, target_value);
+        insert_edge(&mut set, &target, &attribute, source_value);
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let path = RegularPathConstraint::new(
+            set,
+            start,
+            end,
+            &[PathOp::Attr(attribute.id.raw()), PathOp::Plus],
+        );
+        let duplicate_sources = [source_value, source_value];
+        let (program, route, mut runtime, activations, work) =
+            seed_bound_start_program(&path, &duplicate_sources);
+        assert_eq!(route.stratum, ProgramStratum::Fixpoint);
+        let cohort = step_bound_start_program(
+            &path,
+            program,
+            route,
+            &mut runtime,
+            &duplicate_sources,
+            &activations,
+            &work,
+            &[1, 1],
+        );
+        assert_eq!(cohort.program_transition_native_cohorts, 1);
+        assert_eq!(cohort.program_transition_native_inputs, 2);
+        assert_eq!(
+            accepted_children(&cohort),
+            vec![(0, target_value), (1, target_value)]
+        );
+
+        let mut split = Vec::new();
+        for parent in 0..2u32 {
+            let (program, route, mut runtime, activations, work) =
+                seed_bound_start_program(&path, &[source_value]);
+            let effects = step_bound_start_program(
+                &path,
+                program,
+                route,
+                &mut runtime,
+                &[source_value],
+                &activations,
+                &work,
+                &[1],
+            );
+            split.extend(
+                accepted_children(&effects)
+                    .into_iter()
+                    .map(|(_, value)| (parent, value)),
+            );
+        }
+        assert_eq!(accepted_children(&cohort), split);
+    }
+
+    #[test]
+    fn program_patch_cohorts_preserve_finite_and_fixpoint_end_to_end_results() {
+        fn solve(
+            set: TribleSet,
+            ops: &[PathOp],
+            source: RawInline,
+        ) -> (
+            Vec<RawInline>,
+            Vec<RawInline>,
+            crate::query::residual::ResidualStateStats,
+        ) {
+            let start = Variable::<GenId>::new(0);
+            let end = Variable::<GenId>::new(1);
+            let make = || {
+                let constraints: Vec<Box<dyn Constraint<'static> + 'static>> = vec![
+                    Box::new(start.is(Inline::<GenId>::new(source))),
+                    Box::new(RegularPathConstraint::new(
+                        set.clone(),
+                        start,
+                        end,
+                        ops,
+                    )),
+                ];
+                IntersectionConstraint::new(constraints)
+            };
+            let project = move |binding: &Binding| binding.get(end.index).copied();
+            let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
+            let mut residual = Query::new(make(), project)
+                .solve_residual_state_lazy_with(ResidualLowering::FULL)
+                .start_width(1)
+                .cap(4);
+            let mut actual: Vec<_> = residual.by_ref().collect();
+            sequential.sort_unstable();
+            actual.sort_unstable();
+            (sequential, actual, residual.stats().clone())
+        }
+
+        let source = rngid();
+        let middle = rngid();
+        let target = rngid();
+        let first = rngid();
+        let second = rngid();
+        let source_value = id_into_value(&source.id.raw());
+        let target_value = id_into_value(&target.id.raw());
+        let mut finite_set = TribleSet::new();
+        insert_edge(
+            &mut finite_set,
+            &source,
+            &first,
+            id_into_value(&middle.id.raw()),
+        );
+        insert_edge(&mut finite_set, &middle, &second, target_value);
+        let (expected, actual, stats) = solve(
+            finite_set,
+            &[
+                PathOp::Attr(first.id.raw()),
+                PathOp::Attr(second.id.raw()),
+                PathOp::Concat,
+            ],
+            source_value,
+        );
+        assert_eq!(actual, expected);
+        assert_eq!(actual, vec![target_value]);
+        assert!(stats.program_transition_start_cohorts > 0);
+        assert!(stats.program_transition_native_cohorts > 0);
+        assert!(stats.program_transition_native_examined > 0);
+
+        let attribute = rngid();
+        let middle_value = id_into_value(&middle.id.raw());
+        let mut fixpoint_set = TribleSet::new();
+        insert_edge(&mut fixpoint_set, &source, &attribute, middle_value);
+        insert_edge(&mut fixpoint_set, &middle, &attribute, source_value);
+        let (expected, actual, stats) = solve(
+            fixpoint_set,
+            &[PathOp::Attr(attribute.id.raw()), PathOp::Plus],
+            source_value,
+        );
+        assert_eq!(actual, expected);
+        let mut reachable = vec![source_value, middle_value];
+        reachable.sort_unstable();
+        assert_eq!(actual, reachable);
+        assert!(stats.program_transition_start_cohorts > 0);
+        assert!(stats.program_transition_native_cohorts > 0);
+        assert!(stats.program_transition_native_examined >= 2);
     }
 }

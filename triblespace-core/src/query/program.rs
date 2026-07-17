@@ -306,6 +306,19 @@ pub struct ProgramBatchEffects {
     pub source_roots: usize,
     pub transition_pages: usize,
     pub transition_examined: usize,
+    /// Family-reported physical-path telemetry. These counters describe the
+    /// implementation selected inside an already-granted Program cohort and
+    /// never participate in routing, budgeting, or affine replacement.
+    pub program_transition_start_cohorts: usize,
+    pub program_transition_native_cohorts: usize,
+    pub program_transition_native_inputs: usize,
+    pub program_transition_native_branches: usize,
+    pub program_transition_native_examined: usize,
+    pub program_transition_scalar_inputs: usize,
+    pub program_transition_native_miss_incompatible: usize,
+    pub program_transition_native_miss_no_step: usize,
+    pub program_transition_native_miss_negated: usize,
+    pub program_transition_native_miss_over_limit: usize,
 }
 
 struct TypedSeedWork<State, NoveltyKey> {
@@ -401,6 +414,16 @@ pub struct TypedEffectSink<State, NoveltyKey> {
     source_roots: usize,
     transition_pages: usize,
     transition_examined: usize,
+    program_transition_start_cohorts: usize,
+    program_transition_native_cohorts: usize,
+    program_transition_native_inputs: usize,
+    program_transition_native_branches: usize,
+    program_transition_native_examined: usize,
+    program_transition_scalar_inputs: usize,
+    program_transition_native_miss_incompatible: usize,
+    program_transition_native_miss_no_step: usize,
+    program_transition_native_miss_negated: usize,
+    program_transition_native_miss_over_limit: usize,
 }
 
 impl<State, NoveltyKey> Default for TypedEffectSink<State, NoveltyKey> {
@@ -416,11 +439,29 @@ impl<State, NoveltyKey> Default for TypedEffectSink<State, NoveltyKey> {
             source_roots: 0,
             transition_pages: 0,
             transition_examined: 0,
+            program_transition_start_cohorts: 0,
+            program_transition_native_cohorts: 0,
+            program_transition_native_inputs: 0,
+            program_transition_native_branches: 0,
+            program_transition_native_examined: 0,
+            program_transition_scalar_inputs: 0,
+            program_transition_native_miss_incompatible: 0,
+            program_transition_native_miss_no_step: 0,
+            program_transition_native_miss_negated: 0,
+            program_transition_native_miss_over_limit: 0,
         }
     }
 }
 
 impl<State, NoveltyKey> TypedEffectSink<State, NoveltyKey> {
+    pub fn reserve_pages(&mut self, additional: usize) {
+        self.pages.reserve(additional);
+    }
+
+    pub fn reserve_children(&mut self, additional: usize) {
+        self.children.reserve(additional);
+    }
+
     pub fn page(&mut self, examined: usize, resume: Option<TypedResume<State>>) {
         self.pages.push(TypedPage { examined, resume });
     }
@@ -472,6 +513,42 @@ impl<State, NoveltyKey> TypedEffectSink<State, NoveltyKey> {
     pub fn account_transition(&mut self, examined: usize) {
         self.transition_pages += 1;
         self.transition_examined += examined;
+    }
+
+    pub fn account_transition_start_cohort(&mut self) {
+        self.program_transition_start_cohorts += 1;
+    }
+
+    pub fn account_transition_native_cohort(
+        &mut self,
+        inputs: usize,
+        branches: usize,
+        examined: usize,
+    ) {
+        self.program_transition_native_cohorts += 1;
+        self.program_transition_native_inputs += inputs;
+        self.program_transition_native_branches += branches;
+        self.program_transition_native_examined += examined;
+    }
+
+    pub fn account_transition_scalar_inputs(&mut self, inputs: usize) {
+        self.program_transition_scalar_inputs += inputs;
+    }
+
+    pub fn account_transition_native_miss_incompatible(&mut self) {
+        self.program_transition_native_miss_incompatible += 1;
+    }
+
+    pub fn account_transition_native_miss_no_step(&mut self) {
+        self.program_transition_native_miss_no_step += 1;
+    }
+
+    pub fn account_transition_native_miss_negated(&mut self) {
+        self.program_transition_native_miss_negated += 1;
+    }
+
+    pub fn account_transition_native_miss_over_limit(&mut self) {
+        self.program_transition_native_miss_over_limit += 1;
     }
 }
 
@@ -1073,6 +1150,20 @@ where
         effects.source_roots += typed.source_roots;
         effects.transition_pages += typed.transition_pages;
         effects.transition_examined += typed.transition_examined;
+        effects.program_transition_start_cohorts += typed.program_transition_start_cohorts;
+        effects.program_transition_native_cohorts += typed.program_transition_native_cohorts;
+        effects.program_transition_native_inputs += typed.program_transition_native_inputs;
+        effects.program_transition_native_branches += typed.program_transition_native_branches;
+        effects.program_transition_native_examined += typed.program_transition_native_examined;
+        effects.program_transition_scalar_inputs += typed.program_transition_scalar_inputs;
+        effects.program_transition_native_miss_incompatible +=
+            typed.program_transition_native_miss_incompatible;
+        effects.program_transition_native_miss_no_step +=
+            typed.program_transition_native_miss_no_step;
+        effects.program_transition_native_miss_negated +=
+            typed.program_transition_native_miss_negated;
+        effects.program_transition_native_miss_over_limit +=
+            typed.program_transition_native_miss_over_limit;
     }
 
     fn complete_batch(

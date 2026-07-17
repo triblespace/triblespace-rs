@@ -2068,6 +2068,35 @@ pub struct ResidualStateStats {
     pub max_delta_transition_cohort: usize,
     /// Ordered outgoing transition candidates consumed across those pages.
     pub delta_transition_candidates_examined: usize,
+    /// Typed Program transition calls whose selected cohort began entirely at
+    /// fresh product-state cursors and was therefore eligible for family-local
+    /// complete-positive planning. Telemetry only.
+    pub program_transition_start_cohorts: usize,
+    /// Start cohorts committed through the RPQ family's retained PATCH view
+    /// transaction after every input and branch proved complete.
+    pub program_transition_native_cohorts: usize,
+    /// Inputs owned by committed retained-view cohorts.
+    pub program_transition_native_inputs: usize,
+    /// Ordered positive automaton branches retained by native cohorts.
+    pub program_transition_native_branches: usize,
+    /// Raw adjacency occurrences enumerated by native cohorts before novelty
+    /// admission.
+    pub program_transition_native_examined: usize,
+    /// Transition inputs executed by the ordinary scalar pageable path,
+    /// including resumed cohorts and whole-cohort native misses.
+    pub program_transition_scalar_inputs: usize,
+    /// Start-cohort native misses caused by incompatible typed states. This is
+    /// defensive telemetry: the real scheduler normally separates cursors by
+    /// dispatch class.
+    pub program_transition_native_miss_incompatible: usize,
+    /// Start-cohort native misses caused by a product state with no outgoing
+    /// automaton branch.
+    pub program_transition_native_miss_no_step: usize,
+    /// Start-cohort native misses caused by at least one negated branch.
+    pub program_transition_native_miss_negated: usize,
+    /// Start-cohort native misses caused by at least one exact PATCH fanout
+    /// exceeding its input's remaining ragged grant.
+    pub program_transition_native_miss_over_limit: usize,
     /// Transition pages that produced no novel child, accepted endpoint, or
     /// stable continuation and therefore contributed negative-width feedback.
     pub delta_transition_dead_pages: usize,
