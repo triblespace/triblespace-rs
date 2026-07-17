@@ -232,10 +232,11 @@ struct Activation {
     reducer: DeltaReducer,
     return_to: DeltaReturn,
     physical_class: DeltaPhysicalClass,
-    /// Examined-work quantum for a terminal activation whose current sparse
-    /// page did not publish. This is activation-local search evidence:
-    /// publication resets it to one, while the independent search width
-    /// supplies only the hard cap.
+    /// Examined-work quantum for one terminal activation.  A miss doubles it;
+    /// publication retains the number of distinct endpoints already released
+    /// from this activation, while the independent search width remains the
+    /// hard cap.  The retained floor is demand evidence only when the staged
+    /// publications have drained and the activation is resumed.
     terminal_sparse_quantum: usize,
     /// Sorted distinct source scope for grouped confirmation. Proposals own a
     /// constraint-generated graph frontier and therefore store `None`.
@@ -967,11 +968,13 @@ impl ProducerRegistry {
         search_width.max(1)
     }
 
-    /// Updates only physical sparse-search effort. Publication from either
-    /// layer resets to one; a live transition no-publication step doubles
-    /// toward `search_width`, while a source miss leaves traversal effort
-    /// unchanged. Confirmed result demand may widen source/nonterminal search,
-    /// but is not itself evidence that one traversal should become broader.
+    /// Updates only physical sparse-search effort.  Publication retains a
+    /// floor equal to this activation's distinct released endpoints, capped by
+    /// the outer search width.  The activation cannot resume until its staged
+    /// raw publications have drained, so those endpoints are exact positive
+    /// or negative demand evidence rather than speculative lookahead.  A live
+    /// transition miss doubles toward `search_width`; a source miss leaves
+    /// traversal effort unchanged.
     fn finish_dispatch(
         &mut self,
         activation: ActivationId,
@@ -987,13 +990,14 @@ impl ProducerRegistry {
         }
         let before = activation.terminal_sparse_quantum;
         if published {
-            activation.terminal_sparse_quantum = 1;
+            activation.terminal_sparse_quantum =
+                activation.accepted.len().max(1).min(search_width.max(1));
         } else if kind == PhysicalDispatchKind::Transition {
             activation.terminal_sparse_quantum =
                 before.saturating_mul(2).min(search_width.max(1)).max(1);
         }
         (
-            published && activation.terminal_sparse_quantum != before,
+            published && activation.terminal_sparse_quantum < before,
             !published && activation.terminal_sparse_quantum > before,
         )
     }
@@ -4241,6 +4245,38 @@ mod tests {
             registry.transition_dispatch_width(started.activation, 64),
             1
         );
+    }
+
+    #[test]
+    fn terminal_publication_retains_drained_endpoint_evidence() {
+        let mut registry = ProducerRegistry::new();
+        let full = VariableSet::new_singleton(0);
+        let started = registry.start_many_terminal(
+            DeltaReducer::StreamProposal,
+            candidate_return(Vec::new()),
+            [
+                output(1, 0, true),
+                output(2, 0, true),
+                output(3, 0, true),
+                output(4, 0, true),
+            ],
+            full,
+        );
+
+        assert_eq!(
+            registry.finish_dispatch(
+                started.activation,
+                64,
+                PhysicalDispatchKind::Transition,
+                true,
+            ),
+            (false, false)
+        );
+        assert_eq!(
+            registry.transition_dispatch_width(started.activation, 64),
+            4
+        );
+        assert_eq!(registry.transition_dispatch_width(started.activation, 2), 2);
     }
 
     #[test]
