@@ -7089,10 +7089,7 @@ impl TerminalYieldLedger {
         self.finalize_if_ready(activation);
     }
 
-    fn begin_projection(
-        &mut self,
-        activation: DeltaActivationId,
-    ) -> TerminalProjectionAttempt<'_> {
+    fn begin_projection(&mut self, activation: DeltaActivationId) -> TerminalProjectionAttempt<'_> {
         let sample = self
             .samples
             .get_mut(&activation)
@@ -7788,8 +7785,7 @@ impl ResidualStateMachine {
                 usize::from(admitted_parent_count > 1);
         }
         if terminal_streaming && first_admitted > 0 {
-            let admitted =
-                bucket.take_tail(desc.bound.count(), admitted_parent_count, false);
+            let admitted = bucket.take_tail(desc.bound.count(), admitted_parent_count, false);
             let remainder_rows = bucket.row_count();
             let receipt = file_with_plan(
                 &mut self.worklist,
@@ -8599,12 +8595,9 @@ impl ResidualStateMachine {
                 // Consume before invoking user code. If it panics and the
                 // unwind is caught, a later pull must not repeat its effects.
                 self.emit_next += 1;
-                let origin = self
-                    .emit_origins
-                    .as_ref()
-                    .map(|origins| origins[row]);
-                let mut projection = origin
-                    .map(|activation| self.terminal_yield.begin_projection(activation));
+                let origin = self.emit_origins.as_ref().map(|origins| origins[row]);
+                let mut projection =
+                    origin.map(|activation| self.terminal_yield.begin_projection(activation));
                 let stride = self.emit_vars.len();
                 let start = row * stride;
                 for (column, &variable) in self.emit_vars.iter().enumerate() {
