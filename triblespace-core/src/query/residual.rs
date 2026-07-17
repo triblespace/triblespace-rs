@@ -56,9 +56,11 @@
 //! candidate mode, and cursor family. One same-schema block-native hook gets
 //! ragged per-parent limits whose sum is the current global width, so batching
 //! does not multiply the geometric work budget or refine canonical state
-//! identity. Final-variable streaming parents are admitted from a cumulative
-//! projected-yield quote: completed activation samples estimate rows per
-//! parent, while unseen or zero-yield families retain a scalar miss floor.
+//! identity. For a single observed final-variable proposer family, parents are
+//! admitted from a cumulative projected-yield quote: completed activation
+//! samples estimate rows per parent. Unseen, zero-yield, and known multi-family
+//! workloads retain a scalar floor until query-global demand has an explicit
+//! cross-family partition.
 //! Cumulative admissions remain distinct from live activations. The source
 //! pager receives global search `S`, while graph traversal gets an activation-
 //! local sparse quantum capped by `S`; confirmed demand is never passed as a
@@ -7036,6 +7038,12 @@ impl TerminalYieldLedger {
         let Some(yield_) = self.families.get(&family) else {
             return usize::from(demand > 0);
         };
+        if self.families.len() > 1 {
+            // Query-global confirmed capacity needs an explicit partition
+            // before it can justify independent wide grants to several
+            // proposer families. Preserve scalar discovery in the meantime.
+            return 1usize.saturating_sub(yield_.admitted);
+        }
         let target = if yield_.completed == 0 || yield_.projected == 0 {
             1
         } else {
@@ -10456,6 +10464,24 @@ mod tests {
         assert_eq!(ledger.additional_for_demand(family, 64), 0);
         assert_eq!(ledger.additional_for_demand(family, 65), 1);
         assert_eq!(ledger.additional_for_demand(family, 192), 2);
+
+        let other = StateId(90);
+        ledger.families.insert(
+            other,
+            TerminalFamilyYield {
+                admitted: 1,
+                live: 0,
+                completed: 1,
+                projected: 64,
+            },
+        );
+        assert_eq!(
+            ledger.additional_for_demand(family, 192),
+            0,
+            "global demand cannot be granted in full to every family"
+        );
+        assert_eq!(ledger.additional_for_demand(other, 192), 0);
+        ledger.families.remove(&other);
 
         let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 0, Search::Done);
         machine.terminal_yield = ledger;
