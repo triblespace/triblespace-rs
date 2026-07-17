@@ -1224,7 +1224,7 @@ struct SourceBucket {
 
 #[derive(Debug)]
 struct PhysicalDispatch {
-    terminal_activations: OrderedActivationSet,
+    terminal_activations: Vec<ActivationId>,
     kind: PhysicalDispatchKind,
     task_limits: Vec<usize>,
     remainder_tasks: usize,
@@ -1298,17 +1298,8 @@ impl OrderedActivationSet {
         }
     }
 
-    fn is_empty(&self) -> bool {
-        self.values.is_empty()
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.values.len()
-    }
-
-    fn iter(&self) -> impl Iterator<Item = &ActivationId> {
-        self.values.iter()
+    fn into_values(self) -> Vec<ActivationId> {
+        self.values
     }
 }
 
@@ -1330,9 +1321,11 @@ impl FromIterator<ActivationId> for OrderedActivationSet {
 
 #[derive(Debug)]
 struct TerminalActivationSelection {
+    activation: ActivationId,
     budget: usize,
     selected: usize,
     ordinal: usize,
+    ordered: bool,
 }
 
 fn even_limits(work_budget: usize, task_count: usize) -> Vec<usize> {
@@ -1357,14 +1350,14 @@ fn even_limits(work_budget: usize, task_count: usize) -> Vec<usize> {
 fn terminal_activations(
     registry: &ProducerRegistry,
     activations: impl IntoIterator<Item = ActivationId>,
-) -> OrderedActivationSet {
+) -> Vec<ActivationId> {
     let mut terminal = OrderedActivationSet::default();
     for activation in activations {
         if registry.physical_activation_class(activation) == DeltaPhysicalClass::TerminalStreaming {
             let _ = terminal.insert(activation);
         }
     }
-    terminal
+    terminal.into_values()
 }
 
 /// Which physical layer consumed one bounded backend call. Source misses are
@@ -1467,7 +1460,7 @@ impl DeltaBucket {
         activation_width: usize,
         terminal_selection_slots: &mut AHashMap<ActivationId, usize>,
         terminal_selections: &mut Vec<TerminalActivationSelection>,
-    ) -> (Vec<DeltaTask>, Vec<usize>) {
+    ) -> (Vec<DeltaTask>, Vec<usize>, Vec<ActivationId>) {
         let width = width.max(1);
         let activation_width = activation_width.max(1);
         let key = TransitionDispatchKey::of(
@@ -1491,7 +1484,7 @@ impl DeltaBucket {
                 // activation-affine order without constructing a lookup table.
                 let selected = self.take_activation(hot_activation, width);
                 let limits = even_limits(width, selected.len());
-                return (selected, limits);
+                return (selected, limits, vec![hot_activation]);
             }
 
             let mut remaining = width;
@@ -1516,9 +1509,11 @@ impl DeltaBucket {
                             remaining -= budget;
                             let slot = terminal_selections.len();
                             terminal_selections.push(TerminalActivationSelection {
+                                activation: task.activation,
                                 budget,
                                 selected: 0,
                                 ordinal: 0,
+                                ordered: false,
                             });
                             terminal_selection_slots.insert(task.activation, slot);
                             Some(slot)
@@ -1542,8 +1537,13 @@ impl DeltaBucket {
             retained.reverse();
             self.tasks = retained;
 
+            let mut terminal_activations = Vec::with_capacity(terminal_selections.len());
             for slot_or_limit in &mut limits {
                 let selection = &mut terminal_selections[*slot_or_limit];
+                if !selection.ordered {
+                    terminal_activations.push(selection.activation);
+                    selection.ordered = true;
+                }
                 let quotient = selection.budget / selection.selected;
                 let remainder = selection.budget % selection.selected;
                 *slot_or_limit = quotient + usize::from(selection.ordinal < remainder);
@@ -1557,7 +1557,7 @@ impl DeltaBucket {
                     .map(|selection| selection.budget)
                     .sum::<usize>()
             );
-            return (selected, limits);
+            return (selected, limits, terminal_activations);
         }
 
         let mut activations = BTreeSet::new();
@@ -1588,7 +1588,7 @@ impl DeltaBucket {
         retained.reverse();
         self.tasks = retained;
         let limits = even_limits(width, selected.len());
-        (selected, limits)
+        (selected, limits, Vec::new())
     }
 }
 
@@ -2428,13 +2428,13 @@ impl DeltaScheduler {
                 .expect("delta pop requires live work")
                 .0
         });
-        let (tasks, task_limits, empty, remainder_tasks) = {
+        let (tasks, task_limits, terminal_activations, empty, remainder_tasks) = {
             let registry = &self.registry;
             let activation_width = self.activation_width;
             let terminal_selection_slots = &mut self.terminal_selection_slots;
             let terminal_selections = &mut self.terminal_selections;
             let bucket = self.worklist.get_mut(&id).expect("selected delta state");
-            let (tasks, task_limits) = bucket.take_tail(
+            let (tasks, task_limits, terminal_activations) = bucket.take_tail(
                 registry,
                 search_width,
                 activation_width,
@@ -2442,13 +2442,17 @@ impl DeltaScheduler {
                 terminal_selections,
             );
             let remainder_tasks = bucket.tasks.len();
-            (tasks, task_limits, bucket.tasks.is_empty(), remainder_tasks)
+            (
+                tasks,
+                task_limits,
+                terminal_activations,
+                bucket.tasks.is_empty(),
+                remainder_tasks,
+            )
         };
         if empty {
             self.worklist.remove(&id);
         }
-        let terminal_activations =
-            terminal_activations(&self.registry, tasks.iter().map(|task| task.activation));
         let dispatch = PhysicalDispatch {
             terminal_activations,
             kind: PhysicalDispatchKind::Transition,
@@ -3761,7 +3765,7 @@ mod tests {
 
         assert!(scheduler.allows_global_width_growth(
             &PhysicalDispatch {
-                terminal_activations: vec![activation].into(),
+                terminal_activations: vec![activation],
                 kind: PhysicalDispatchKind::Source,
                 task_limits: vec![1],
                 remainder_tasks: 0,
@@ -3770,7 +3774,7 @@ mod tests {
         ));
         assert!(!scheduler.allows_global_width_growth(
             &PhysicalDispatch {
-                terminal_activations: vec![activation].into(),
+                terminal_activations: vec![activation],
                 kind: PhysicalDispatchKind::Transition,
                 task_limits: vec![32],
                 remainder_tasks: 0,
@@ -3778,7 +3782,7 @@ mod tests {
             64,
         ));
         let saturated = PhysicalDispatch {
-            terminal_activations: vec![activation].into(),
+            terminal_activations: vec![activation],
             kind: PhysicalDispatchKind::Transition,
             task_limits: vec![64],
             remainder_tasks: 0,
@@ -3901,7 +3905,7 @@ mod tests {
         let published = OrderedActivationSet::from(vec![first.activation]);
         assert!(!scheduler.account_physical_dispatch(
             PhysicalDispatch {
-                terminal_activations: vec![first.activation, second.activation].into(),
+                terminal_activations: vec![first.activation, second.activation],
                 kind: PhysicalDispatchKind::Transition,
                 task_limits: vec![2, 2],
                 remainder_tasks: 0,
@@ -3929,7 +3933,7 @@ mod tests {
 
         assert!(scheduler.account_physical_dispatch(
             PhysicalDispatch {
-                terminal_activations: vec![first.activation, second.activation].into(),
+                terminal_activations: vec![first.activation, second.activation],
                 kind: PhysicalDispatchKind::Source,
                 task_limits: vec![4, 4],
                 remainder_tasks: 0,
