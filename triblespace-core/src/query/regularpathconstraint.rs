@@ -2161,11 +2161,7 @@ impl RegularPathConstraint {
         let branch_count = plan.branches.len();
         effects.reserve_children(plan.total_fanout);
         effects.reserve_pages(input_count);
-        effects.account_transition_native_cohort(
-            input_count,
-            branch_count,
-            plan.total_fanout,
-        );
+        effects.account_transition_native_cohort(input_count, branch_count, plan.total_fanout);
 
         for branch in plan.branches {
             branch.view.for_each(|value| {
@@ -2174,18 +2170,12 @@ impl RegularPathConstraint {
                     value,
                     pc: branch.target_pc,
                 };
-                let state = RpqState::transition(
-                    branch.variable,
-                    node,
-                    RpqExpandCursor::Start,
-                );
+                let state = RpqState::transition(branch.variable, node, RpqExpandCursor::Start);
                 let accepted = (branch.target_accepting
                     && branch.source.is_none_or(|anchor| value == anchor))
                 .then_some(value);
                 match stratum {
-                    ProgramStratum::Finite => {
-                        effects.finite_child(branch.input, state, accepted)
-                    }
+                    ProgramStratum::Finite => effects.finite_child(branch.input, state, accepted),
                     ProgramStratum::Fixpoint => effects.fixpoint_child(
                         branch.input,
                         state,
@@ -2976,11 +2966,7 @@ impl TypedProgramSpec for RegularPathConstraint {
             match self.plan_complete_positive_transition_cohort(&states, batch.limits) {
                 Ok(plan) => {
                     effects.account_transition_start_cohort();
-                    self.commit_complete_positive_transition_cohort(
-                        plan,
-                        batch.stratum,
-                        effects,
-                    );
+                    self.commit_complete_positive_transition_cohort(plan, batch.stratum, effects);
                     return;
                 }
                 Err(miss) => {
@@ -4155,9 +4141,7 @@ mod seeded_frame_tests {
         let sources = [rngid(), rngid()];
         let primary = rngid();
         let secondary = rngid();
-        let mut destinations: Vec<_> = (0..5)
-            .map(|_| id_into_value(&rngid().id.raw()))
-            .collect();
+        let mut destinations: Vec<_> = (0..5).map(|_| id_into_value(&rngid().id.raw())).collect();
         destinations.sort_unstable();
         let mut set = TribleSet::new();
         insert_edge(&mut set, &sources[0], &primary, destinations[0]);
@@ -4268,9 +4252,15 @@ mod seeded_frame_tests {
             .collect::<Vec<_>>();
         expected.sort_unstable();
 
+        let mut actual = accepted_children(&effects);
+        actual.sort_unstable();
         assert_eq!(
-            accepted_children(&effects),
-            expected.into_iter().map(|value| (0, value)).collect::<Vec<_>>()
+            actual,
+            expected
+                .into_iter()
+                .map(|value| (0, value))
+                .collect::<Vec<_>>(),
+            "inverse PATCH traversal order is physical; the accepted bag is semantic"
         );
         assert_eq!(effects.pages[0].examined, subjects.len());
         assert!(effects.pages[0].resume.is_none());
@@ -4283,12 +4273,10 @@ mod seeded_frame_tests {
     fn program_patch_over_limit_falls_back_atomically_and_resume_stays_scalar() {
         let sources = [rngid(), rngid(), rngid()];
         let attribute = rngid();
-        let mut first_destinations: Vec<_> = (0..2)
-            .map(|_| id_into_value(&rngid().id.raw()))
-            .collect();
-        let mut second_destinations: Vec<_> = (0..3)
-            .map(|_| id_into_value(&rngid().id.raw()))
-            .collect();
+        let mut first_destinations: Vec<_> =
+            (0..2).map(|_| id_into_value(&rngid().id.raw())).collect();
+        let mut second_destinations: Vec<_> =
+            (0..3).map(|_| id_into_value(&rngid().id.raw())).collect();
         let third_destination = id_into_value(&rngid().id.raw());
         first_destinations.sort_unstable();
         second_destinations.sort_unstable();
@@ -4303,12 +4291,7 @@ mod seeded_frame_tests {
 
         let start = Variable::<GenId>::new(0);
         let end = Variable::<GenId>::new(1);
-        let path = RegularPathConstraint::new(
-            set,
-            start,
-            end,
-            &[PathOp::Attr(attribute.id.raw())],
-        );
+        let path = RegularPathConstraint::new(set, start, end, &[PathOp::Attr(attribute.id.raw())]);
         let source_values = sources
             .iter()
             .map(|source| id_into_value(&source.id.raw()))
@@ -4416,9 +4399,7 @@ mod seeded_frame_tests {
         let source = rngid();
         let excluded = rngid();
         let other = rngid();
-        let mut destinations: Vec<_> = (0..3)
-            .map(|_| id_into_value(&rngid().id.raw()))
-            .collect();
+        let mut destinations: Vec<_> = (0..3).map(|_| id_into_value(&rngid().id.raw())).collect();
         destinations.sort_unstable();
         let mut negated_set = TribleSet::new();
         insert_edge(&mut negated_set, &source, &excluded, destinations[0]);
@@ -4465,12 +4446,7 @@ mod seeded_frame_tests {
         let mut set = TribleSet::new();
         insert_edge(&mut set, &sources[0], &attribute, targets[0]);
         insert_edge(&mut set, &sources[1], &attribute, targets[1]);
-        let path = RegularPathConstraint::new(
-            set,
-            start,
-            end,
-            &[PathOp::Attr(attribute.id.raw())],
-        );
+        let path = RegularPathConstraint::new(set, start, end, &[PathOp::Attr(attribute.id.raw())]);
         let source_values = sources
             .iter()
             .map(|source| id_into_value(&source.id.raw()))
@@ -4593,12 +4569,7 @@ mod seeded_frame_tests {
             let make = || {
                 let constraints: Vec<Box<dyn Constraint<'static> + 'static>> = vec![
                     Box::new(start.is(Inline::<GenId>::new(source))),
-                    Box::new(RegularPathConstraint::new(
-                        set.clone(),
-                        start,
-                        end,
-                        ops,
-                    )),
+                    Box::new(RegularPathConstraint::new(set.clone(), start, end, ops)),
                 ];
                 IntersectionConstraint::new(constraints)
             };
