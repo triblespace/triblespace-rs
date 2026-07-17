@@ -24,8 +24,6 @@ pub mod equalityconstraint;
 pub mod hashmapconstraint;
 /// [`SetConstraint`](hashsetconstraint::SetConstraint) — constrains a variable to HashSet members.
 pub mod hashsetconstraint;
-/// [`IgnoreConstraint`] — hides variables from the outer query.
-pub mod ignore;
 /// [`IntersectionConstraint`](intersectionconstraint::IntersectionConstraint) — logical AND.
 pub mod intersectionconstraint;
 /// [`PatchValueConstraint`](patchconstraint::PatchValueConstraint) and [`PatchIdConstraint`](patchconstraint::PatchIdConstraint) — constrains variables to PATCH entries.
@@ -53,8 +51,6 @@ use agglomerative::plan_agglomerative_partition;
 use agglomerative::AgglomerativePlan;
 use arrayvec::ArrayVec;
 use constantconstraint::*;
-/// Re-export of [`IgnoreConstraint`].
-pub use ignore::IgnoreConstraint;
 
 use crate::inline::encodings::genid::GenId;
 use crate::inline::Inline;
@@ -750,14 +746,6 @@ pub enum ConstraintShape<'s, 'a> {
     Opaque,
     /// An associative logical conjunction whose children may be inspected.
     And(&'s dyn ConstraintChildren<'a>),
-    /// A conjunction behind a semantic scope boundary.
-    ///
-    /// Shape-aware engines may descend into the children for `estimate`,
-    /// `propose`, and `confirm`, but must execute `satisfied` and residual
-    /// Support on the owning constraint as one atomic action. This lets a
-    /// wrapper expose candidate-stage homomorphism without losing its outward
-    /// schema or support semantics.
-    ScopedAnd(&'s dyn ConstraintChildren<'a>),
 }
 
 /// One engine-owned node in a residual transition program.
@@ -1121,15 +1109,12 @@ pub trait Constraint<'a> {
     /// The default keeps the constraint opaque. Implementations must expose
     /// only structure whose flattening preserves the ordinary protocol's
     /// semantics. Wrappers that change scope, multiplicity, or evaluation
-    /// meaning should retain the default unless only their candidate verbs
-    /// distribute over an inner conjunction, in which case
-    /// [`ScopedAnd`](ConstraintShape::ScopedAnd) preserves their atomic Support
-    /// boundary. The exposed shape must be a finite, acyclic tree. Its variants,
-    /// child counts, and child order are structural facts and MUST remain stable
-    /// for the entire query execution. A path-based engine may resolve the plan
-    /// repeatedly, so changing shape through interior mutability can silently
-    /// select a different constraint occurrence even when every individual
-    /// borrow is memory-safe.
+    /// meaning should retain the default. The exposed shape must be a finite,
+    /// acyclic tree. Its variants, child counts, and child order are structural
+    /// facts and MUST remain stable for the entire query execution. A path-based
+    /// engine may resolve the plan repeatedly, so changing shape through
+    /// interior mutability can silently select a different constraint occurrence
+    /// even when every individual borrow is memory-safe.
     #[doc(hidden)]
     fn residual_shape(&self) -> ConstraintShape<'_, 'a> {
         ConstraintShape::Opaque
@@ -4539,7 +4524,7 @@ mod parallel {
 /// The macro takes two arguments: a tuple of variables with optional type
 /// annotations, and a constraint expression. It injects a `__local_find_context!`
 /// macro that provides the variable context to nested query macros like
-/// [`pattern!`](crate::macros::pattern) and [`ignore!`](crate::ignore).
+/// [`pattern!`](crate::macros::pattern) and [`temp!`](crate::temp).
 ///
 /// # Variable syntax
 ///
@@ -4663,7 +4648,6 @@ pub use temp;
 mod tests {
     use inlineencodings::ShortString;
 
-    use crate::ignore;
     use crate::prelude::inlineencodings::*;
     use crate::prelude::*;
 
@@ -4917,18 +4901,6 @@ mod tests {
 
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].0.try_from_inline::<&str>().unwrap(), "Alice");
-    }
-
-    #[test]
-    fn ignore_skips_variables() {
-        let results: Vec<_> = find!(
-            (x: Inline<_>),
-            ignore!((y), and!(x.is(I256BE::inline_from(1)), y.is(I256BE::inline_from(2))))
-        )
-        .collect();
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, I256BE::inline_from(1));
     }
 
     #[test]

@@ -48,7 +48,6 @@ pub use crate::id::ExclusiveId;
 pub use crate::id::Id;
 pub use crate::id::IdOwner;
 pub use crate::id::RawId;
-pub use crate::ignore;
 pub use crate::inline::encodings::UnknownInline;
 pub use crate::inline::Encoded;
 pub use crate::inline::Inline;

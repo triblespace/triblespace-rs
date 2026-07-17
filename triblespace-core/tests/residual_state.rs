@@ -12,8 +12,8 @@ use triblespace_core::query::rangeconstraint::InlineRange;
 use triblespace_core::query::residual::ResidualLowering;
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
-    Binding, CandidateSink, Constraint, EstimateSink, IgnoreConstraint, PathOp, Query,
-    RegularPathConstraint, RowsView, Variable, VariableId, VariableSet,
+    Binding, CandidateSink, Constraint, EstimateSink, PathOp, Query, RegularPathConstraint,
+    RowsView, Variable, VariableId, VariableSet,
 };
 use triblespace_core::trible::{Trible, TribleSet};
 
@@ -739,23 +739,6 @@ fn top_level_union_root_preserves_set_semantics() {
 }
 
 #[test]
-fn top_level_ignore_root_preserves_wildcard_scope() {
-    let expected: Vec<_> = (0..4).map(|parent| encoded(P_MARKER, parent)).collect();
-
-    assert_arbitrary_root_equivalent(
-        || {
-            let trace = Arc::new(Mutex::new(Trace::default()));
-            IgnoreConstraint::new(
-                VariableSet::new_singleton(X),
-                Box::new(TableChild::relation(Child::A, 4, trace)),
-            )
-        },
-        project_parent,
-        expected,
-    );
-}
-
-#[test]
 fn top_level_regular_path_root_preserves_graph_semantics() {
     let a = rngid();
     let b = rngid();
@@ -1117,39 +1100,6 @@ fn repeated_shared_arc_is_executed_once_per_and_occurrence() {
         (1, 1),
         "the first shared occurrence proposes and the second independently confirms"
     );
-}
-
-#[test]
-fn nested_ignore_keeps_hidden_only_children_inert_and_visible_slots_wildcarded() {
-    const N: usize = 4;
-    let make = || {
-        let trace = Arc::new(Mutex::new(Trace::default()));
-        let (empty_hidden, _) = finite_domain(X, Vec::new(), 0);
-        let inner = IntersectionConstraint::new(vec![
-            Box::new(TableChild::relation(Child::A, N, trace)) as OwnedConstraint,
-            Box::new(empty_hidden) as OwnedConstraint,
-        ]);
-        let ignored = IgnoreConstraint::new(VariableSet::new_singleton(X), Box::new(inner));
-        IntersectionConstraint::new(vec![Box::new(IntersectionConstraint::new(vec![
-            Box::new(ignored) as OwnedConstraint,
-        ])) as OwnedConstraint])
-    };
-    let mut expected: Vec<_> = (0..N).map(|parent| encoded(P_MARKER, parent)).collect();
-    let mut eager = Query::new(make(), project_parent).solve_residual_state();
-    let mut lazy: Vec<_> = Query::new(make(), project_parent)
-        .solve_residual_state_lazy()
-        .cap(usize::MAX)
-        .start_width(1)
-        .growth(1)
-        .collect();
-    let mut sequential: Vec<_> = Query::new(make(), project_parent).sequential().collect();
-    expected.sort_unstable();
-    eager.sort_unstable();
-    lazy.sort_unstable();
-    sequential.sort_unstable();
-    assert_eq!(eager, expected);
-    assert_eq!(lazy, expected);
-    assert_eq!(sequential, expected);
 }
 
 #[test]

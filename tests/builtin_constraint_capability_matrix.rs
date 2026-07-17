@@ -15,8 +15,7 @@ use triblespace::core::debug::query::{DebugConstraint, EstimateOverrideConstrain
 use triblespace::core::query::equalityconstraint::EqualityConstraint;
 use triblespace::core::query::residual::{ResidualLowering, ResidualStateStats};
 use triblespace::core::query::{
-    Binding, Constraint, ConstraintShape, IgnoreConstraint, Query, RowsView, Variable, VariableId,
-    VariableSet,
+    Binding, Constraint, ConstraintShape, Query, RowsView, Variable, VariableId,
 };
 use triblespace::prelude::inlineencodings::GenId;
 use triblespace::prelude::*;
@@ -259,26 +258,6 @@ fn built_in_capability_receipts_distinguish_native_paths_from_opaque_fallbacks()
         "UnionConstraint exposes finite formula arms but keeps group-global confirm"
     );
 
-    let mut tagged = TribleSet::new();
-    insert_tag(&mut tagged, &fixture_id(10), &fixture_id(20));
-    let entity = Variable::<GenId>::new(0);
-    let hidden_tag = Variable::<GenId>::new(1);
-    let tag_attribute: Inline<GenId> = triblespace::core::metadata::tag.id().to_inline();
-    let ignored = IgnoreConstraint::new(
-        VariableSet::new_singleton(hidden_tag.index),
-        Box::new(tagged.pattern(entity, tag_attribute, hidden_tag)),
-    );
-    assert_eq!(
-        capability_receipt(&ignored, entity.index),
-        CapabilityReceipt {
-            opaque_shape: true,
-            finite_union_arms: None,
-            page_local_confirm: true,
-            direct_proposal_source: true,
-        },
-        "IgnoreConstraint is an opaque scope boundary that forwards safe visible-variable paging"
-    );
-
     let debug = DebugConstraint::new(sorted.has(x), Rc::new(RefCell::new(Vec::new())));
     assert_eq!(
         capability_receipt(&debug, x.index),
@@ -402,7 +381,7 @@ fn membership_constraints_record_native_and_fallback_execution() {
 }
 
 #[test]
-fn finite_union_ignore_and_wrappers_have_explicit_execution_receipts() {
+fn finite_union_and_wrappers_have_explicit_execution_receipts() {
     let a = value(1);
     let b = value(2);
     let union_profiles =
@@ -416,74 +395,6 @@ fn finite_union_ignore_and_wrappers_have_explicit_execution_receipts() {
     assert!(
         union_profiles.full_geometric.support_calls > 0,
         "FULL lowering must execute the exposed finite formula arms"
-    );
-
-    let e1 = fixture_id(11);
-    let e2 = fixture_id(12);
-    let t1 = fixture_id(21);
-    let t2 = fixture_id(22);
-    let mut tagged = TribleSet::new();
-    insert_tag(&mut tagged, &e1, &t1);
-    insert_tag(&mut tagged, &e1, &t2);
-    insert_tag(&mut tagged, &e2, &t2);
-    let expected_entities: Vec<Inline<GenId>> = vec![(&e1).to_inline(), (&e2).to_inline()];
-    let tag_attribute: Inline<GenId> = triblespace::core::metadata::tag.id().to_inline();
-    let ignore_direct_profiles = assert_scheduler_matrix(
-        "ignored tag wildcard over direct TriblePattern",
-        expected_entities.clone(),
-        || {
-            find!(
-                entity: Inline<GenId>,
-                Arc::new({
-                    let tag = Variable::<GenId>::new(1);
-                    IgnoreConstraint::new(
-                        VariableSet::new_singleton(tag.index),
-                        Box::new(tagged.pattern(entity, tag_attribute, tag)),
-                    )
-                })
-            )
-        },
-    );
-    assert_eq!(
-        ignore_direct_profiles
-            .conservative_geometric
-            .delta_source_pages,
-        0
-    );
-    assert!(
-        ignore_direct_profiles.full_geometric.delta_source_pages > 0,
-        "FULL lowering must retain Ignore's visible-variable direct source"
-    );
-
-    let ignore_pattern_profiles = assert_scheduler_matrix(
-        "ignored tag wildcard over pattern macro intersection",
-        expected_entities,
-        || {
-            find!(
-                entity: Inline<GenId>,
-                Arc::new(ignore!(
-                    (tag),
-                    pattern!(&tagged, [{ ?entity @ triblespace::core::metadata::tag: ?tag }])
-                ))
-            )
-        },
-    );
-    assert_eq!(
-        ignore_pattern_profiles
-            .conservative_geometric
-            .delta_source_pages,
-        0
-    );
-    assert!(
-        ignore_pattern_profiles.full_geometric.delta_source_pages > 0,
-        "the pattern macro's internal AND must expose its visible source at candidate stage"
-    );
-    assert_eq!(
-        ignore_pattern_profiles
-            .full_geometric
-            .delta_source_direct_candidates,
-        2,
-        "scoped-AND paging must retain the two distinct visible entities"
     );
 
     let sorted_values = [a, a, b];

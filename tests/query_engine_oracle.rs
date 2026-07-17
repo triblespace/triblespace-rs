@@ -794,23 +794,18 @@ proptest! {
 
     /// The generated database has four visible entities and four possible
     /// related values. `p` and `r` are arbitrary binary relations; `kind` is
-    /// arbitrary membership in two constant-labelled sets; and `q(_, target)`
-    /// is an arbitrary unary relation over the hidden values.
+    /// arbitrary membership in two constant-labelled sets.
     ///
-    /// Three independently evaluated templates cover:
+    /// Two independently evaluated templates cover:
     ///
     /// 1. nested AND plus an explicit `ConstantConstraint`;
-    /// 2. OR of two intersections, including overlapping-arm deduplication;
-    /// 3. historical wildcard projection through `ignore!`: a clause with a
-    ///    surviving `x` still constrains `x`, while a hidden-only clause is
-    ///    inert and repeating the ignored name does not create a join.
+    /// 2. OR of two intersections, including overlapping-arm deduplication.
     #[test]
     fn generated_constraint_trees_match_relational_oracles(
         human_mask in 0u8..16,
         robot_mask in 0u8..16,
         p_masks in prop::array::uniform4(0u8..16),
         r_masks in prop::array::uniform4(0u8..16),
-        q_target_mask in 0u8..16,
         anchor in 0usize..4,
     ) {
         const N: usize = 4;
@@ -818,7 +813,6 @@ proptest! {
         let hs: Vec<Id> = (11..11 + N).map(|i| fixture_id(i as u8)).collect();
         let human = fixture_id(21);
         let robot = fixture_id(22);
-        let target = fixture_id(23);
 
         let mut kb = TribleSet::new();
         for i in 0..N {
@@ -835,11 +829,6 @@ proptest! {
                 if has_bit(r_masks[i], j) {
                     insert_edge(&mut kb, &xs[i], &oracle::r, &hs[j]);
                 }
-            }
-        }
-        for j in 0..N {
-            if has_bit(q_target_mask, j) {
-                insert_edge(&mut kb, &hs[j], &oracle::q, &target);
             }
         }
         let archive: SuccinctArchive<OrderedUniverse> = (&kb).into();
@@ -902,43 +891,5 @@ proptest! {
         }
         assert_all_engines_match!("union-of-ands/tribleset", union_oracle.clone(), union_query!(&kb));
         assert_all_engines_match!("union-of-ands/archive", union_oracle, union_query!(&archive));
-
-        // Historical wildcard projection:
-        // { x | human(x) and p(x, _) }.
-        // The q(_, target) clause has no surviving variable and is omitted;
-        // spelling both wildcards `h` does not turn them into a hidden join.
-        let mut projected_oracle = HashSet::new();
-        for i in 0..N {
-            if has_bit(human_mask, i) && p_masks[i] != 0 {
-                projected_oracle.insert(xs[i].to_inline());
-            }
-        }
-        macro_rules! projected_query {
-            ($store:expr) => {
-                find!(
-                    x: Inline<GenId>,
-                    and!(
-                        pattern!($store, [{ ?x @ oracle::kind: (&human) }]),
-                        ignore!(
-                            (h),
-                            and!(
-                                pattern!($store, [{ ?x @ oracle::p: ?h }]),
-                                pattern!($store, [{ ?h @ oracle::q: (&target) }])
-                            )
-                        )
-                    )
-                )
-            };
-        }
-        assert_all_engines_match!(
-            "wildcard-projection/tribleset",
-            projected_oracle.clone(),
-            projected_query!(&kb)
-        );
-        assert_all_engines_match!(
-            "wildcard-projection/archive",
-            projected_oracle,
-            projected_query!(&archive)
-        );
     }
 }

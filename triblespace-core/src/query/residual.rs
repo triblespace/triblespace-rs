@@ -5,15 +5,12 @@
 //! associative AND region becomes deterministic preorder leaf occurrences; an
 //! opaque root is one leaf at the empty path. Union and regular-path constraints
 //! therefore remain ordinary indivisible leaves, as do custom constraints
-//! unless they explicitly expose structure. An ignored conjunction may expose
-//! its candidate children while retaining the wrapper as one atomic Support
-//! action.
+//! unless they explicitly expose structure.
 //! [`FormulaScope`] selects a chain of formula boundaries. `UnionLeaves`
 //! executes exposed Unions as arbitrary finite AND/OR trees through a canonical
 //! program counter and affine payload-frame stack. Candidate actions descend to
-//! Atom nodes; scoped conjunction Support invokes its owner as one explicit
-//! action. `WholeRoot` absorbs that scope and instead makes the maximal exposed
-//! root one synthetic formula occurrence after outer
+//! Atom nodes. `WholeRoot` absorbs that scope and instead makes the maximal
+//! exposed root one synthetic formula occurrence after outer
 //! variable selection. It flattens only the maximal root AND region and retains
 //! candidate-occurrence paging once that AND's exact remaining confirmation
 //! suffix is page-local. The independent transition-program axis admits both
@@ -113,7 +110,6 @@ struct ConstraintPath(Box<[usize]>);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum FormulaStep {
     And(usize),
-    ScopedAnd(usize),
     Or(usize),
 }
 
@@ -220,9 +216,6 @@ enum FiniteFormulaNodeKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FiniteFormulaNode {
     kind: FiniteFormulaNodeKind,
-    /// Candidate verbs may inspect this node's AND children, while Support
-    /// remains one action on the owning semantic scope boundary.
-    support_atomic: bool,
     /// Exact structural route from the enclosing residual leaf. Composite
     /// nodes retain their route because an execution capability may choose to
     /// treat that whole subtree as one opaque action boundary.
@@ -281,8 +274,8 @@ impl FiniteFormulaProgram {
                     .expect("formula child was not compiled")
             }
 
-            fn spans(&self, kind: &FiniteFormulaNodeKind, support_atomic: bool) -> (usize, usize) {
-                let spans = match kind {
+            fn spans(&self, kind: &FiniteFormulaNodeKind) -> (usize, usize) {
+                match kind {
                     FiniteFormulaNodeKind::Atom => (2, 2),
                     FiniteFormulaNodeKind::And { children } => children
                         .iter()
@@ -319,15 +312,6 @@ impl FiniteFormulaProgram {
                             Some((support, execution))
                         })
                         .expect("residual formula OR span overflow"),
-                };
-                if support_atomic {
-                    assert!(
-                        matches!(kind, FiniteFormulaNodeKind::And { .. }),
-                        "only a conjunction can retain an atomic Support boundary"
-                    );
-                    (2, spans.1)
-                } else {
-                    spans
                 }
             }
 
@@ -345,57 +329,35 @@ impl FiniteFormulaProgram {
                         self.transition_programs,
                     ),
                 };
-                let (kind, support_atomic) =
-                    if let Some(children) = constraint.residual_union_children() {
-                        assert!(
-                            children.len() > 0,
-                            "a residual finite union must expose at least one arm"
-                        );
-                        let mut compiled = Vec::with_capacity(children.len());
-                        self.compile_or_children(constraint, path, &mut compiled);
-                        (
-                            FiniteFormulaNodeKind::Or {
+                let kind = if let Some(children) = constraint.residual_union_children() {
+                    assert!(
+                        children.len() > 0,
+                        "a residual finite union must expose at least one arm"
+                    );
+                    let mut compiled = Vec::with_capacity(children.len());
+                    self.compile_or_children(constraint, path, &mut compiled);
+                    FiniteFormulaNodeKind::Or {
+                        children: compiled.into_boxed_slice(),
+                    }
+                } else {
+                    match constraint.residual_shape() {
+                        ConstraintShape::And(children) => {
+                            let mut compiled = Vec::with_capacity(children.len());
+                            for child in 0..children.len() {
+                                path.push(FormulaStep::And(child));
+                                compiled.push(self.compile_node(children.child(child), path));
+                                path.pop();
+                            }
+                            FiniteFormulaNodeKind::And {
                                 children: compiled.into_boxed_slice(),
-                            },
-                            false,
-                        )
-                    } else {
-                        match constraint.residual_shape() {
-                            ConstraintShape::And(children) => {
-                                let mut compiled = Vec::with_capacity(children.len());
-                                for child in 0..children.len() {
-                                    path.push(FormulaStep::And(child));
-                                    compiled.push(self.compile_node(children.child(child), path));
-                                    path.pop();
-                                }
-                                (
-                                    FiniteFormulaNodeKind::And {
-                                        children: compiled.into_boxed_slice(),
-                                    },
-                                    false,
-                                )
                             }
-                            ConstraintShape::ScopedAnd(children) => {
-                                let mut compiled = Vec::with_capacity(children.len());
-                                for child in 0..children.len() {
-                                    path.push(FormulaStep::ScopedAnd(child));
-                                    compiled.push(self.compile_node(children.child(child), path));
-                                    path.pop();
-                                }
-                                (
-                                    FiniteFormulaNodeKind::And {
-                                        children: compiled.into_boxed_slice(),
-                                    },
-                                    true,
-                                )
-                            }
-                            ConstraintShape::Opaque => (FiniteFormulaNodeKind::Atom, false),
                         }
-                    };
-                let (support_span, execution_span) = self.spans(&kind, support_atomic);
+                        ConstraintShape::Opaque => FiniteFormulaNodeKind::Atom,
+                    }
+                };
+                let (support_span, execution_span) = self.spans(&kind);
                 self.nodes[id.0 as usize] = Some(FiniteFormulaNode {
                     kind,
-                    support_atomic,
                     path: node_path,
                     capabilities,
                     support_span,
@@ -429,10 +391,9 @@ impl FiniteFormulaProgram {
                 let kind = FiniteFormulaNodeKind::And {
                     children: children.into_boxed_slice(),
                 };
-                let (support_span, execution_span) = self.spans(&kind, false);
+                let (support_span, execution_span) = self.spans(&kind);
                 self.nodes[id.0 as usize] = Some(FiniteFormulaNode {
                     kind,
-                    support_atomic: false,
                     path: FormulaPath(Box::new([])),
                     capabilities,
                     support_span,
@@ -501,9 +462,7 @@ impl FiniteFormulaProgram {
             let mut constraint = root;
             for &child in leaf.path.0.iter() {
                 constraint = match constraint.residual_shape() {
-                    ConstraintShape::And(children) | ConstraintShape::ScopedAnd(children) => {
-                        children.child(child)
-                    }
+                    ConstraintShape::And(children) => children.child(child),
                     ConstraintShape::Opaque => {
                         panic!("residual AND shape changed during formula compilation")
                     }
@@ -631,9 +590,6 @@ impl FiniteFormulaProgram {
 
     fn entry_focus(&self, node: FormulaNodeId, stage: FormulaStage) -> FormulaFocus {
         let compiled = self.node(node);
-        if stage == FormulaStage::Support && compiled.support_atomic {
-            return FormulaFocus::Action { node, stage };
-        }
         match &compiled.kind {
             FiniteFormulaNodeKind::Atom => FormulaFocus::Action { node, stage },
             FiniteFormulaNodeKind::And { children } | FiniteFormulaNodeKind::Or { children } => {
@@ -1523,7 +1479,7 @@ impl ResidualPlan {
                     is_formula_identity(children.child(0))
                 }
                 ConstraintShape::Opaque => constraint.residual_union_children().is_none(),
-                ConstraintShape::And(_) | ConstraintShape::ScopedAnd(_) => false,
+                ConstraintShape::And(_) => false,
             }
         }
 
@@ -1537,7 +1493,7 @@ impl ResidualPlan {
             grouped_delta_confirm_requirements: &mut Vec<Box<[(VariableId, VariableSet)]>>,
         ) {
             match constraint.residual_shape() {
-                ConstraintShape::And(children) | ConstraintShape::ScopedAnd(children) => {
+                ConstraintShape::And(children) => {
                     for child in 0..children.len() {
                         path.push(child);
                         visit(
@@ -1746,9 +1702,7 @@ impl ResidualPlan {
         let mut constraint = root;
         for &child in self.leaves[occurrence].path.0.iter() {
             constraint = match constraint.residual_shape() {
-                ConstraintShape::And(children) | ConstraintShape::ScopedAnd(children) => {
-                    children.child(child)
-                }
+                ConstraintShape::And(children) => children.child(child),
                 ConstraintShape::Opaque => {
                     panic!("residual AND shape changed during query execution")
                 }
@@ -1772,14 +1726,8 @@ impl ResidualPlan {
                     .child(child),
                 FormulaStep::And(child) => match constraint.residual_shape() {
                     ConstraintShape::And(children) => children.child(child),
-                    ConstraintShape::ScopedAnd(_) | ConstraintShape::Opaque => {
+                    ConstraintShape::Opaque => {
                         panic!("residual AND shape changed during query execution")
-                    }
-                },
-                FormulaStep::ScopedAnd(child) => match constraint.residual_shape() {
-                    ConstraintShape::ScopedAnd(children) => children.child(child),
-                    ConstraintShape::And(_) | ConstraintShape::Opaque => {
-                        panic!("residual scoped-AND shape changed during query execution")
                     }
                 },
             };
@@ -1905,7 +1853,7 @@ impl ResidualPlan {
 pub(super) fn useful_default_shape<'a>(root: &dyn Constraint<'a>) -> bool {
     fn overlaps_seen_leaf<'a>(constraint: &dyn Constraint<'a>, seen: &mut VariableSet) -> bool {
         match constraint.residual_shape() {
-            ConstraintShape::Opaque | ConstraintShape::ScopedAnd(_) => {
+            ConstraintShape::Opaque => {
                 let variables = constraint.variables();
                 if variables.is_empty() {
                     return false;
@@ -1927,7 +1875,7 @@ pub(super) fn useful_default_shape<'a>(root: &dyn Constraint<'a>) -> bool {
 
     let children = match root.residual_shape() {
         ConstraintShape::And(children) => children,
-        ConstraintShape::ScopedAnd(_) | ConstraintShape::Opaque => return false,
+        ConstraintShape::Opaque => return false,
     };
     let mut seen = VariableSet::new_empty();
     for child in 0..children.len() {
@@ -9904,10 +9852,9 @@ where
     /// interned states. Planning states only estimate and partition; explicit
     /// action states invoke one flattened leaf over their assembled row or
     /// whole-parent candidate bucket. Histories with identical future work
-    /// append into one bucket before that state runs. Union, ignore, and
-    /// regular-path constraints remain opaque semantic boundaries; custom
-    /// constraints do too unless they explicitly expose an associative AND
-    /// shape. Opaque leaves continue through the ordinary [`Constraint`]
+    /// append into one bucket before that state runs. Union and regular-path
+    /// constraints remain opaque semantic boundaries; custom constraints do
+    /// too unless they explicitly expose an associative AND shape. Opaque leaves continue through the ordinary [`Constraint`]
     /// protocol.
     ///
     /// Result order may differ from the ordinary iterator; the result
@@ -13406,7 +13353,7 @@ mod tests {
             Box::new(IntersectionConstraint::new(vec![ShapeLeaf(0)]));
         let boxed_children = match boxed.residual_shape() {
             ConstraintShape::And(children) => children,
-            ConstraintShape::ScopedAnd(_) | ConstraintShape::Opaque => {
+            ConstraintShape::Opaque => {
                 panic!("boxed intersection changed shape")
             }
         };
@@ -13420,7 +13367,7 @@ mod tests {
             Arc::new(IntersectionConstraint::new(vec![ShapeLeaf(1)]));
         let arc_children = match arc.residual_shape() {
             ConstraintShape::And(children) => children,
-            ConstraintShape::ScopedAnd(_) | ConstraintShape::Opaque => {
+            ConstraintShape::Opaque => {
                 panic!("Arc intersection changed shape")
             }
         };
@@ -15008,33 +14955,25 @@ mod tests {
     }
 
     #[test]
-    fn ignored_candidate_and_flattens_but_other_scope_boundaries_stay_opaque() {
+    fn regular_path_and_union_wrappers_remain_single_opaque_occurrences() {
         use crate::inline::encodings::genid::GenId;
         use crate::trible::TribleSet;
 
-        let ignored = IgnoreConstraint::new(
-            VariableSet::new_singleton(0),
-            shape_and(vec![shape_leaf(0), shape_leaf(1)]),
-        );
         let path = RegularPathConstraint::new(
             TribleSet::new(),
             Variable::<GenId>::new(2),
             Variable::<GenId>::new(3),
             &[PathOp::Attr([0; 16])],
         );
-        let root = IntersectionConstraint::new(vec![
-            Box::new(ignored) as ShapeConstraint,
-            Box::new(path) as ShapeConstraint,
-        ]);
+        let root =
+            IntersectionConstraint::new(vec![shape_leaf(0), Box::new(path) as ShapeConstraint]);
         let plan = ResidualPlan::compile(&root);
         assert_eq!(
             plan.leaves,
             vec![
-                ConstraintPath(vec![0, 0].into_boxed_slice()),
-                ConstraintPath(vec![0, 1].into_boxed_slice()),
+                ConstraintPath(vec![0].into_boxed_slice()),
                 ConstraintPath(vec![1].into_boxed_slice())
-            ],
-            "Ignore exposes candidate AND children, while the path stays atomic"
+            ]
         );
 
         let union = UnionConstraint::new(vec![
@@ -16536,110 +16475,7 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_root_formula_preserves_ignore_support_and_zero_variable_boundaries() {
-        let make_ignored = || {
-            let inner = IntersectionConstraint::new(vec![
-                Box::new(FanoutLeaf {
-                    variable: 0,
-                    values: Arc::new(vec![raw(4), raw(5)]),
-                }) as ShapeConstraint,
-                Box::new(FanoutLeaf {
-                    variable: 1,
-                    values: Arc::new(vec![raw(9)]),
-                }) as ShapeConstraint,
-            ]);
-            IgnoreConstraint::new(VariableSet::new_singleton(1), Box::new(inner))
-        };
-        let plan = ResidualPlan::compile_lowering(
-            &make_ignored(),
-            ResidualLowering::new(FormulaScope::WholeRoot, false),
-        );
-        let root = plan.finite_formula.root(0).unwrap();
-        let node = plan.finite_formula.node(root);
-        let FiniteFormulaNodeKind::And { children } = &node.kind else {
-            panic!("Ignore must expose only candidate-stage AND structure")
-        };
-        assert!(node.support_atomic);
-        assert_eq!(children.len(), 2);
-        assert_eq!(node.support_span, 2, "Ignore Support remains one action");
-        assert!(node.execution_span > node.support_span);
-        assert!(matches!(
-            plan.finite_formula.entry_focus(root, FormulaStage::Support),
-            FormulaFocus::Action {
-                node: focused,
-                stage: FormulaStage::Support,
-            } if focused == root
-        ));
-        assert!(matches!(
-            plan.finite_formula.entry_focus(root, FormulaStage::Propose),
-            FormulaFocus::Plan {
-                node: focused,
-                stage: FormulaStage::Propose,
-                ..
-            } if focused == root
-        ));
-
-        let mut relevant = ChildSet::empty(plan.len());
-        relevant.insert(0);
-        let candidate_start = plan
-            .finite_formula
-            .start(0, 0, UnionVerb::Propose { relevant });
-        let candidate_child = plan.finite_formula.select_child(&candidate_start, 0);
-        assert!(
-            plan.finite_formula.grade(&candidate_child)
-                > plan.finite_formula.grade(&candidate_start),
-            "entering scoped candidate structure must strictly raise rank"
-        );
-        let support_start = FormulaProgramCounter {
-            focus: plan.finite_formula.entry_focus(root, FormulaStage::Support),
-            returns: Box::new([]),
-            resume: candidate_start.resume.clone(),
-        };
-        let support_complete = plan.finite_formula.complete(&support_start);
-        assert!(
-            plan.finite_formula.grade(&support_complete)
-                > plan.finite_formula.grade(&support_start),
-            "atomic scoped Support must strictly raise rank"
-        );
-
-        let outer = IntersectionConstraint::new(vec![
-            Box::new(FanoutLeaf {
-                variable: 0,
-                values: Arc::new(vec![raw(4)]),
-            }) as ShapeConstraint,
-            Box::new(make_ignored()) as ShapeConstraint,
-        ]);
-        let outer_plan = ResidualPlan::compile_lowering(
-            &outer,
-            ResidualLowering::new(FormulaScope::WholeRoot, false),
-        );
-        let outer_root = outer_plan.finite_formula.root(0).unwrap();
-        let FiniteFormulaNodeKind::And { children } =
-            &outer_plan.finite_formula.node(outer_root).kind
-        else {
-            panic!("synthetic root must remain a conjunction")
-        };
-        assert_eq!(
-            children.len(),
-            2,
-            "root flattening must retain the nested scoped-AND node"
-        );
-        let scoped = outer_plan.finite_formula.node(children[1]);
-        assert!(scoped.support_atomic);
-        assert_eq!(
-            scoped.path,
-            FormulaPath(vec![FormulaStep::And(1)].into_boxed_slice())
-        );
-
-        let project = |binding: &Binding| binding.get(0).copied();
-        let mut expected: Vec<_> = Query::new(make_ignored(), project).sequential().collect();
-        let mut actual: Vec<_> = Query::new(make_ignored(), project)
-            .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::WholeRoot, false))
-            .collect();
-        expected.sort_unstable();
-        actual.sort_unstable();
-        assert_eq!(actual, expected);
-
+    fn synthetic_root_formula_preserves_zero_variable_boundaries() {
         for truth in [false, true] {
             let expected = if truth { vec![()] } else { Vec::new() };
             let actual = Query::new(ZeroVariableTruth(truth), |_| Some(()))
@@ -18153,7 +17989,6 @@ mod tests {
         use crate::debug::query::EstimateOverrideConstraint;
         use crate::id::{id_into_value, ExclusiveId, Id};
         use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
-        use crate::query::IgnoreConstraint;
         use crate::trible::{Trible, TribleSet};
 
         let p = Id::new([221; crate::id::ID_LEN]).unwrap();
@@ -18213,7 +18048,7 @@ mod tests {
 
         // RPQ deliberately declines the unbounded eager-proposal shortcut.
         // Wrappers that preserve the concrete family still expose the typed
-        // program, while Ignore keeps its scope boundary opaque.
+        // program.
         let capability_ops = [PathOp::Attr(p.raw()), PathOp::Plus];
         let bound_vars = [0];
         let bound_rows = [source];
@@ -18229,17 +18064,6 @@ mod tests {
         let estimated = EstimateOverrideConstraint::new(make_path(&capability_ops));
         assert!(!estimated.residual_terminal_eager_proposal_equivalent(1, &bound_view));
         assert!(estimated.residual_program().is_some());
-        let visible = IgnoreConstraint::new(
-            VariableSet::new_empty(),
-            Box::new(make_path(&capability_ops)),
-        );
-        assert!(!visible.residual_terminal_eager_proposal_equivalent(1, &bound_view));
-        assert!(visible.residual_program().is_none());
-        let hidden = IgnoreConstraint::new(
-            VariableSet::new_singleton(1),
-            Box::new(make_path(&capability_ops)),
-        );
-        assert!(!hidden.residual_terminal_eager_proposal_equivalent(1, &bound_view));
 
         let cases = [
             ("nullable star", vec![PathOp::Attr(p.raw()), PathOp::Star]),

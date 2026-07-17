@@ -94,16 +94,6 @@ satisfies. A fully constant pattern similarly has no variable through which the
 search could discover failure, so [`Query::new`](triblespace::core::query::Query::new)
 settles it with an exact `satisfied` call against the seed block.
 
-`ignore!` removes its wildcard positions from the outward variable set. When a
-union needs to gate such an arm, the wrapper replays every surviving variable
-already present in the row as a singleton `confirm` call with that variable
-temporarily omitted. Not-yet-bound positions remain wildcards. This is the
-same filtering operation the historical wrapper performed during search,
-including for confirm-only range constraints, and it lets a failed partial
-component close the arm before an unrelated component proposes the last
-variable. Hidden-only clauses remain inert and ignored names never become a
-shared existential witness.
-
 Constraints are otherwise stateless. Each method receives the current
 `RowsView`; the engine does not notify constraints when it backtracks, chunks a
 frontier, or processes work in a different order. This is what allows the same
@@ -156,12 +146,7 @@ by the bindings or the route that produced it. Its conservative explicit
 controls recursively flatten the maximal associative AND region exposed at the
 root into deterministic preorder leaf occurrences. Union, regular-path, and
 custom constraints remain opaque leaves unless a capability explicitly exposes
-more structure, so lowering never crosses an undeclared semantic boundary. An
-`ignore!` around an exposed conjunction uses a scoped-AND capability: estimate,
-propose, and confirm may descend into the conjunction because those verbs
-distribute over the wildcard wrapper, but Support still invokes the owning
-`IgnoreConstraint` as one action. Its partial replay therefore remains the gate
-seen by an enclosing union, and hidden names never become state keys.
+more structure, so lowering never crosses an undeclared semantic boundary.
 
 Every live ordinary root runs as one finite formula after variable selection.
 Exposed AND/OR progress then becomes canonical formula state, and eligible
