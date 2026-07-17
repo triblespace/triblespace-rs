@@ -54,7 +54,11 @@
 //! candidate mode, and cursor family. One same-schema block-native hook gets
 //! ragged per-parent limits whose sum is the current global width, so batching
 //! does not multiply the geometric work budget or refine canonical state
-//! identity.
+//! identity. A cyclic activation seeded from a singleton stable continuation
+//! receives a scalar physical lease. When it publishes an accepted endpoint,
+//! the stable tail runs first while a still-live activation token remains
+//! suspended; the next pull resumes that exact affine traversal rather than
+//! abandoning its locality to cold global harvesting.
 //!
 //! As with the other batched engines, flattened leaves must obey the
 //! [`Constraint::estimate`] protocol: relevance is a structural answer,
@@ -82,6 +86,11 @@ use delta::{
     ActiveDeltaContinuation, ActiveDeltaStatus, DeltaDesc, DeltaScheduler, DeltaSeedOutcome,
     DeltaStepOutcome,
 };
+
+/// Directed cyclic work stays scalar after the global harvest width grows.
+/// This first-cut lease isolates activation affinity from batching; a later
+/// policy may spend a bounded examined-work quantum instead.
+const ACTIVE_DELTA_LEASE_WIDTH: usize = 1;
 
 /// One deterministic route from the owned root to an opaque residual leaf.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2085,6 +2094,15 @@ pub struct ResidualStateStats {
     /// One-atom continuation pops used to probe a delta-to-stable handoff
     /// before returning the rest of that cohort to global cold harvesting.
     pub delta_handoff_probe_pops: usize,
+    /// Directed scalar steps spent following one exact cyclic activation.
+    pub delta_active_lease_steps: usize,
+    /// Stable yields after which the same cyclic activation remained live and
+    /// its physical lease was retained.
+    pub delta_active_live_yields_retained: usize,
+    /// Retained cyclic leases actually resumed after their stable handoff ran.
+    pub delta_active_post_yield_resumptions: usize,
+    /// Directed cyclic leases released because their activation quiesced.
+    pub delta_active_quiescent_releases: usize,
 }
 
 /// Results and measurements from [`Query::solve_residual_state_profiled`].
@@ -6877,6 +6895,9 @@ struct ResidualStateMachine {
     /// atom. This is a physical latency preference only; all logical work
     /// remains owned by [`DeltaScheduler`].
     active_delta: Option<ActiveDeltaContinuation>,
+    /// Whether `active_delta` crossed a stable-yield boundary and has not yet
+    /// been resumed. This is physical state, not canonical residual identity.
+    active_delta_after_yield: bool,
     #[cfg(test)]
     continuation_sprint_enabled: bool,
     last_selection: SelectionKind,
@@ -7089,6 +7110,7 @@ impl ResidualStateMachine {
             emit_count: 0,
             continuation: None,
             active_delta: None,
+            active_delta_after_yield: false,
             #[cfg(test)]
             continuation_sprint_enabled: true,
             last_selection: SelectionKind::Readiness,
@@ -7889,8 +7911,21 @@ impl ResidualStateMachine {
 
     /// Accepts a delta-to-stable handoff into its geometric continuation mode.
     fn accept_delta_step(&mut self, outcome: DeltaStepOutcome) {
+        self.accept_delta_step_with_resume(outcome, None);
+    }
+
+    /// Accepts a directed delta handoff while retaining the yielding affine
+    /// activation as a suspended physical lease when it still owns work.
+    fn accept_delta_step_with_resume(
+        &mut self,
+        outcome: DeltaStepOutcome,
+        resume: Option<ActiveDeltaContinuation>,
+    ) {
         self.account_delta_feedback(&outcome);
-        self.active_delta = None;
+        debug_assert!(resume.is_none() || outcome.continuation.is_some());
+        self.active_delta = resume;
+        self.active_delta_after_yield = resume.is_some();
+        self.stats.delta_active_live_yields_retained += usize::from(resume.is_some());
         self.continuation = outcome.continuation.map(|token| {
             let desc = self.interner.get(token.state);
             let commits_terminal_candidates = match &desc.phase {
@@ -7979,13 +8014,14 @@ impl ResidualStateMachine {
         active: Option<ActiveDeltaContinuation>,
         seeded_parents: usize,
     ) {
-        // An immediate stable seed effect is already the earliest legal
-        // continuation. It is the yield boundary for this cyclic activation,
-        // so no old or new delta focus survives beside it.
-        self.active_delta = continuation
-            .is_none()
-            .then(|| self.active_delta_after_seed(active, seeded_parents))
-            .flatten();
+        // An immediate accepting seed effect runs first, but it does not own
+        // the independent traversal credits created by the same seed. Keep a
+        // singleton activation suspended beside that stable handoff exactly
+        // as we do for an acceptance discovered by a later directed step.
+        let retained = self.active_delta_after_seed(active, seeded_parents);
+        self.active_delta_after_yield = continuation.is_some() && retained.is_some();
+        self.stats.delta_active_live_yields_retained += usize::from(self.active_delta_after_yield);
+        self.active_delta = retained;
         self.continuation = continuation.map(ActiveContinuation::probe_one);
     }
 
@@ -8035,23 +8071,30 @@ impl ResidualStateMachine {
             // source/transition worklists.
             if self.continuation.is_none() {
                 if let Some(active) = self.active_delta.take() {
+                    self.stats.delta_active_lease_steps += 1;
+                    self.stats.delta_active_post_yield_resumptions +=
+                        usize::from(self.active_delta_after_yield);
+                    self.active_delta_after_yield = false;
                     let focused = self.delta.step_active(
                         root,
                         plan,
                         active,
-                        width,
+                        ACTIVE_DELTA_LEASE_WIDTH,
                         &mut self.worklist,
                         &mut self.interner,
                         &mut self.stats,
                     );
                     match focused.status {
-                        ActiveDeltaStatus::Yielded => self.accept_delta_step(focused.outcome),
+                        ActiveDeltaStatus::Yielded => {
+                            self.accept_delta_step_with_resume(focused.outcome, focused.resume)
+                        }
                         ActiveDeltaStatus::Pending => {
                             self.account_delta_feedback(&focused.outcome);
                             self.active_delta = Some(active);
                         }
                         ActiveDeltaStatus::Quiescent => {
                             self.account_delta_feedback(&focused.outcome);
+                            self.stats.delta_active_quiescent_releases += 1;
                         }
                     }
                     continue;
@@ -8180,6 +8223,7 @@ impl ResidualStateMachine {
             emit_count: 0,
             continuation: None,
             active_delta: None,
+            active_delta_after_yield: false,
             #[cfg(test)]
             continuation_sprint_enabled: self.continuation_sprint_enabled,
             last_selection: SelectionKind::Readiness,
@@ -8214,6 +8258,7 @@ impl ResidualStateMachine {
         // across a bucket split could leave the receipt naming the wrong tail.
         self.continuation = None;
         self.active_delta = None;
+        self.active_delta_after_yield = false;
         loop {
             debug_assert_eq!(
                 self.emit_next, 0,
@@ -15141,12 +15186,59 @@ mod tests {
             "without physical focus wider cold work runs before target confirmation"
         );
 
-        let mut focused_bag: Vec<_> = std::iter::once(focused_first).chain(focused).collect();
-        let mut cold_bag: Vec<_> = std::iter::once(cold_first).chain(cold).collect();
+        let mut focused_bag: Vec<_> = std::iter::once(focused_first)
+            .chain(focused.by_ref())
+            .collect();
+        let mut cold_bag: Vec<_> = std::iter::once(cold_first).chain(cold.by_ref()).collect();
         focused_bag.sort_unstable();
         cold_bag.sort_unstable();
         assert_eq!(focused_bag, cold_bag);
         assert_eq!(focused_bag.len(), 4 * 8 * 16);
+        assert!(focused.stats().delta_active_lease_steps > 0);
+        assert_eq!(cold.stats().delta_active_live_yields_retained, 0);
+        assert_eq!(cold.stats().delta_active_post_yield_resumptions, 0);
+
+        let make_path = || {
+            RegularPathConstraint::new(
+                graph.as_ref().clone(),
+                Variable::<GenId>::new(0),
+                Variable::<GenId>::new(1),
+                &[
+                    PathOp::Attr(p.raw()),
+                    PathOp::Attr(q.raw()),
+                    PathOp::Union,
+                    PathOp::Plus,
+                ],
+            )
+        };
+        let mut pure = Query::new(make_path(), project)
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .cap(64)
+            .start_width(1)
+            .growth(2);
+        let mut pure_bag: Vec<_> = pure.by_ref().collect();
+        let mut pure_expected = Vec::new();
+        for component in &nodes {
+            for source in component {
+                for target in component {
+                    pure_expected.push((id_into_value(source), id_into_value(target)));
+                }
+            }
+        }
+        pure_bag.sort_unstable();
+        pure_expected.sort_unstable();
+        assert_eq!(pure_bag, pure_expected);
+        assert!(
+            pure.stats().delta_active_live_yields_retained > 0,
+            "{:#?}",
+            pure.stats()
+        );
+        assert!(pure.stats().delta_active_post_yield_resumptions > 0);
+        assert_eq!(
+            pure.stats().delta_active_live_yields_retained,
+            pure.stats().delta_active_post_yield_resumptions,
+            "a complete drain must resume every lease retained at publication"
+        );
     }
 
     #[test]
@@ -17414,10 +17506,12 @@ mod tests {
         )
         .expect("one stable seed effect was filed");
         machine.accept_delta_seed(Some(stable), Some(active), 1);
-        assert!(
-            machine.active_delta.is_none(),
-            "an immediate stable effect is the activation's yield boundary"
+        assert_eq!(
+            machine.active_delta,
+            Some(active),
+            "an immediate stable effect must not discard independent traversal affinity"
         );
+        assert!(machine.active_delta_after_yield);
         assert_eq!(
             machine.continuation,
             Some(ActiveContinuation::probe_one(stable))
