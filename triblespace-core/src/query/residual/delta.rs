@@ -232,10 +232,10 @@ struct Activation {
     reducer: DeltaReducer,
     return_to: DeltaReturn,
     physical_class: DeltaPhysicalClass,
-    /// Examined-work quantum for a terminal activation whose current sparse
-    /// page did not publish. This is activation-local search evidence:
-    /// publication resets it to one, while the independent search width
-    /// supplies only the hard cap.
+    /// Examined-work quantum for one terminal activation. A miss doubles it;
+    /// publication retains the square root of the distinct endpoints already
+    /// released by this activation. This balances result latency against page
+    /// fragmentation while the independent search width remains the hard cap.
     terminal_sparse_quantum: usize,
     /// Sorted distinct source scope for grouped confirmation. Proposals own a
     /// constraint-generated graph frontier and therefore store `None`.
@@ -967,11 +967,11 @@ impl ProducerRegistry {
         search_width.max(1)
     }
 
-    /// Updates only physical sparse-search effort. Publication from either
-    /// layer resets to one; a live transition no-publication step doubles
-    /// toward `search_width`, while a source miss leaves traversal effort
-    /// unchanged. Confirmed result demand may widen source/nonterminal search,
-    /// but is not itself evidence that one traversal should become broader.
+    /// Updates only physical sparse-search effort. Publication retains a
+    /// sublinear floor from this activation's distinct released endpoints;
+    /// a live transition miss doubles toward `search_width`, while a source
+    /// miss leaves traversal effort unchanged. The square-root floor gives
+    /// equal asymptotic weight to per-result latency and cursor-page overhead.
     fn finish_dispatch(
         &mut self,
         activation: ActivationId,
@@ -987,13 +987,18 @@ impl ProducerRegistry {
         }
         let before = activation.terminal_sparse_quantum;
         if published {
-            activation.terminal_sparse_quantum = 1;
+            activation.terminal_sparse_quantum = activation
+                .accepted
+                .len()
+                .isqrt()
+                .max(1)
+                .min(search_width.max(1));
         } else if kind == PhysicalDispatchKind::Transition {
             activation.terminal_sparse_quantum =
                 before.saturating_mul(2).min(search_width.max(1)).max(1);
         }
         (
-            published && activation.terminal_sparse_quantum != before,
+            published && activation.terminal_sparse_quantum < before,
             !published && activation.terminal_sparse_quantum > before,
         )
     }
