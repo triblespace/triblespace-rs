@@ -220,8 +220,9 @@ struct Activation {
     return_to: DeltaReturn,
     physical_class: DeltaPhysicalClass,
     /// Examined-work quantum for a terminal activation whose current sparse
-    /// page did not publish. Confirmed demand supplies the reset floor while
-    /// the independent search width supplies the hard cap.
+    /// page did not publish. This is activation-local search evidence:
+    /// publication resets it to one, while the independent search width
+    /// supplies only the hard cap.
     terminal_sparse_quantum: usize,
     /// Sorted distinct source scope for grouped confirmation. Proposals own a
     /// constraint-generated graph frontier and therefore store `None`.
@@ -873,12 +874,7 @@ impl ProducerRegistry {
             .physical_class
     }
 
-    fn dispatch_width(
-        &self,
-        activation: ActivationId,
-        search_width: usize,
-        terminal_demand_remaining: usize,
-    ) -> usize {
+    fn dispatch_width(&self, activation: ActivationId, search_width: usize) -> usize {
         let activation = self
             .state
             .activations
@@ -887,7 +883,6 @@ impl ProducerRegistry {
         if activation.physical_class == DeltaPhysicalClass::TerminalStreaming {
             activation
                 .terminal_sparse_quantum
-                .max(terminal_demand_remaining.max(1))
                 .min(search_width.max(1))
                 .max(1)
         } else {
@@ -895,14 +890,15 @@ impl ProducerRegistry {
         }
     }
 
-    /// Updates only physical sparse-search effort. Publication resets to the
-    /// still-open demand remainder; a live no-publication step doubles toward
-    /// `search_width`. Quiescent activations have already left the registry.
+    /// Updates only physical sparse-search effort. Publication resets to one;
+    /// a live no-publication step doubles toward `search_width`. Confirmed
+    /// result demand may widen nonterminal search, but is not itself evidence
+    /// that one terminal traversal should become broader. Quiescent
+    /// activations have already left the registry.
     fn finish_dispatch(
         &mut self,
         activation: ActivationId,
         search_width: usize,
-        terminal_demand_remaining: usize,
         published: bool,
     ) -> (bool, bool) {
         let Some(activation) = self.state.activations.get_mut(&activation) else {
@@ -913,10 +909,9 @@ impl ProducerRegistry {
         }
         let before = activation.terminal_sparse_quantum;
         if published {
-            activation.terminal_sparse_quantum = terminal_demand_remaining.max(1);
+            activation.terminal_sparse_quantum = 1;
         } else {
             activation.terminal_sparse_quantum = before
-                .max(terminal_demand_remaining.max(1))
                 .saturating_mul(2)
                 .min(search_width.max(1))
                 .max(1);
@@ -2059,7 +2054,6 @@ impl DeltaScheduler {
         &mut self,
         dispatch: PhysicalDispatch,
         search_width: usize,
-        terminal_demand_remaining: usize,
         examined_before: usize,
         published: bool,
         stats: &mut ResidualStateStats,
@@ -2083,12 +2077,9 @@ impl DeltaScheduler {
             .saturating_add(stats.delta_transition_candidates_examined);
         stats.delta_terminal_candidates_examined += examined_after.saturating_sub(examined_before);
         stats.delta_terminal_publications += usize::from(published);
-        let (reset, widened) = self.registry.finish_dispatch(
-            activation,
-            search_width,
-            terminal_demand_remaining,
-            published,
-        );
+        let (reset, widened) =
+            self.registry
+                .finish_dispatch(activation, search_width, published);
         stats.delta_terminal_sparse_resets += usize::from(reset);
         stats.delta_terminal_sparse_widenings += usize::from(widened);
     }
@@ -2141,20 +2132,17 @@ impl DeltaScheduler {
 
     #[cfg(test)]
     fn pop(&mut self, width: usize) -> (DeltaDesc, Vec<DeltaTask>) {
-        let (desc, tasks, _) = self.pop_with_demand(width, width);
+        let (desc, tasks, _) = self.pop_bounded(width);
         (desc, tasks)
     }
 
-    fn pop_with_demand(
+    fn pop_bounded(
         &mut self,
         search_width: usize,
-        terminal_demand_remaining: usize,
     ) -> (DeltaDesc, Vec<DeltaTask>, PhysicalDispatch) {
         let full = self.worklist.iter().rev().find_map(|(&id, bucket)| {
             let activation = bucket.tasks.last()?.activation;
-            let width =
-                self.registry
-                    .dispatch_width(activation, search_width, terminal_demand_remaining);
+            let width = self.registry.dispatch_width(activation, search_width);
             (bucket.tasks.len() >= width).then_some(id)
         });
         let id = full.unwrap_or_else(|| {
@@ -2170,9 +2158,7 @@ impl DeltaScheduler {
             .and_then(|bucket| bucket.tasks.last())
             .expect("selected delta state has live work")
             .activation;
-        let width =
-            self.registry
-                .dispatch_width(activation, search_width, terminal_demand_remaining);
+        let width = self.registry.dispatch_width(activation, search_width);
         let terminal_activation = (self.registry.physical_activation_class(activation)
             == DeltaPhysicalClass::TerminalStreaming)
             .then_some(activation);
@@ -2197,14 +2183,13 @@ impl DeltaScheduler {
 
     #[cfg(test)]
     fn pop_source(&mut self, width: usize) -> (DeltaDesc, Vec<SourceTask>) {
-        let (desc, tasks, _) = self.pop_source_with_demand(width, width);
+        let (desc, tasks, _) = self.pop_source_bounded(width);
         (desc, tasks)
     }
 
-    fn pop_source_with_demand(
+    fn pop_source_bounded(
         &mut self,
         search_width: usize,
-        terminal_demand_remaining: usize,
     ) -> (DeltaDesc, Vec<SourceTask>, PhysicalDispatch) {
         let id = *self
             .source_worklist
@@ -2217,9 +2202,7 @@ impl DeltaScheduler {
             .and_then(|bucket| bucket.tasks.last())
             .expect("selected source state has live work")
             .activation;
-        let width =
-            self.registry
-                .dispatch_width(activation, search_width, terminal_demand_remaining);
+        let width = self.registry.dispatch_width(activation, search_width);
         let terminal_activation = (self.registry.physical_activation_class(activation)
             == DeltaPhysicalClass::TerminalStreaming)
             .then_some(activation);
@@ -2277,11 +2260,10 @@ impl DeltaScheduler {
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
     ) -> ActiveDeltaStepOutcome {
-        self.step_active_with_demand(
+        self.step_active_bounded(
             root,
             plan,
             active,
-            width,
             width,
             None,
             stable,
@@ -2290,13 +2272,12 @@ impl DeltaScheduler {
         )
     }
 
-    pub(super) fn step_active_with_demand<'a>(
+    pub(super) fn step_active_bounded<'a>(
         &mut self,
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
         active: ActiveDeltaContinuation,
         search_width: usize,
-        terminal_demand_remaining: usize,
         direct_terminal_publication_full: Option<VariableSet>,
         stable: &mut Worklist,
         stable_interner: &mut StateInterner,
@@ -2313,11 +2294,7 @@ impl DeltaScheduler {
             "one delta activation owns source and transition credits simultaneously"
         );
 
-        let width = self.registry.dispatch_width(
-            active.activation,
-            search_width,
-            terminal_demand_remaining,
-        );
+        let width = self.registry.dispatch_width(active.activation, search_width);
         let terminal_activation = (self.registry.physical_activation_class(active.activation)
             == DeltaPhysicalClass::TerminalStreaming)
             .then_some(active.activation);
@@ -2353,7 +2330,6 @@ impl DeltaScheduler {
             self.account_physical_dispatch(
                 dispatch,
                 search_width,
-                terminal_demand_remaining,
                 examined_before,
                 outcome.has_stable_effect(),
                 stats,
@@ -2386,7 +2362,6 @@ impl DeltaScheduler {
             self.account_physical_dispatch(
                 dispatch,
                 search_width,
-                terminal_demand_remaining,
                 examined_before,
                 outcome.has_stable_effect(),
                 stats,
@@ -2422,15 +2397,14 @@ impl DeltaScheduler {
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
     ) -> DeltaStepOutcome {
-        self.step_with_demand(root, plan, width, width, stable, stable_interner, stats)
+        self.step_bounded(root, plan, width, stable, stable_interner, stats)
     }
 
-    pub(super) fn step_with_demand<'a>(
+    pub(super) fn step_bounded<'a>(
         &mut self,
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
         search_width: usize,
-        terminal_demand_remaining: usize,
         stable: &mut Worklist,
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
@@ -2440,14 +2414,13 @@ impl DeltaScheduler {
                 root,
                 plan,
                 search_width,
-                terminal_demand_remaining,
                 stable,
                 stable_interner,
                 stats,
             );
         }
 
-        let (desc, tasks, dispatch) = self.pop_with_demand(search_width, terminal_demand_remaining);
+        let (desc, tasks, dispatch) = self.pop_bounded(search_width);
         let examined_before = stats
             .delta_source_candidates_examined
             .saturating_add(stats.delta_transition_candidates_examined);
@@ -2465,7 +2438,6 @@ impl DeltaScheduler {
         self.account_physical_dispatch(
             dispatch,
             search_width,
-            terminal_demand_remaining,
             examined_before,
             outcome.has_stable_effect(),
             stats,
@@ -2708,13 +2680,11 @@ impl DeltaScheduler {
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
         search_width: usize,
-        terminal_demand_remaining: usize,
         stable: &mut Worklist,
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
     ) -> DeltaStepOutcome {
-        let (desc, tasks, dispatch) =
-            self.pop_source_with_demand(search_width, terminal_demand_remaining);
+        let (desc, tasks, dispatch) = self.pop_source_bounded(search_width);
         let examined_before = stats
             .delta_source_candidates_examined
             .saturating_add(stats.delta_transition_candidates_examined);
@@ -2732,7 +2702,6 @@ impl DeltaScheduler {
         self.account_physical_dispatch(
             dispatch,
             search_width,
-            terminal_demand_remaining,
             examined_before,
             outcome.has_stable_effect(),
             stats,
@@ -3420,6 +3389,35 @@ mod tests {
         let _ = scheduler.file(desc.clone(), tasks);
         assert_eq!(scheduler.interner.descs, [desc]);
         assert_eq!(scheduler.worklist.len(), 1);
+    }
+
+    #[test]
+    fn terminal_sparse_effort_uses_only_local_search_evidence() {
+        let mut registry = ProducerRegistry::new();
+        let full = VariableSet::new_singleton(0);
+        let started = registry.start_many_terminal(
+            DeltaReducer::StreamProposal,
+            candidate_return(Vec::new()),
+            [output(1, 0, false)],
+            full,
+        );
+
+        assert_eq!(registry.dispatch_width(started.activation, 64), 1);
+        assert_eq!(
+            registry.finish_dispatch(started.activation, 64, false),
+            (false, true)
+        );
+        assert_eq!(registry.dispatch_width(started.activation, 64), 2);
+        assert_eq!(
+            registry.finish_dispatch(started.activation, 64, false),
+            (false, true)
+        );
+        assert_eq!(registry.dispatch_width(started.activation, 3), 3);
+        assert_eq!(
+            registry.finish_dispatch(started.activation, 64, true),
+            (true, false)
+        );
+        assert_eq!(registry.dispatch_width(started.activation, 64), 1);
     }
 
     #[test]

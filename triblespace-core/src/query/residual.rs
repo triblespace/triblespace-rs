@@ -2137,7 +2137,7 @@ pub struct ResidualStateStats {
     /// direct physical publication receipt.
     pub delta_terminal_publications: usize,
     /// Publication resets that changed a terminal activation's local sparse
-    /// quantum back to the still-open projected-demand remainder.
+    /// quantum back to one examined-work unit.
     pub delta_terminal_sparse_resets: usize,
     /// Live no-publication calls that doubled a terminal activation's local
     /// sparse-search quantum toward the independent search width.
@@ -8242,13 +8242,6 @@ impl ResidualStateMachine {
         self.terminal_demand_exhausted = false;
     }
 
-    fn terminal_demand_remaining(&self) -> usize {
-        debug_assert!(!self.terminal_demand_exhausted);
-        self.terminal_demand_width
-            .saturating_sub(self.terminal_demand_consumed)
-            .max(1)
-    }
-
     fn charge_projected_result(&mut self) {
         debug_assert!(!self.terminal_demand_exhausted);
         self.terminal_demand_consumed = self
@@ -8298,7 +8291,6 @@ impl ResidualStateMachine {
             }
 
             let width = self.width;
-            let terminal_demand_remaining = self.terminal_demand_remaining();
             // A newly seeded activation on the scalar continuation path is
             // the cyclic analogue of `ActiveContinuation`: follow that exact
             // affine lineage before any cold stable cohort. It owns no work;
@@ -8310,12 +8302,11 @@ impl ResidualStateMachine {
                     self.stats.delta_active_post_yield_resumptions +=
                         usize::from(self.active_delta_after_yield);
                     self.active_delta_after_yield = false;
-                    let focused = self.delta.step_active_with_demand(
+                    let focused = self.delta.step_active_bounded(
                         root,
                         plan,
                         active,
                         width,
-                        terminal_demand_remaining,
                         self.uses_direct_terminal_publication().then_some(self.full),
                         &mut self.worklist,
                         &mut self.interner,
@@ -8344,11 +8335,10 @@ impl ResidualStateMachine {
                 && !self.delta.is_empty()
                 && !self.has_full_stable(plan, width)
             {
-                let outcome = self.delta.step_with_demand(
+                let outcome = self.delta.step_bounded(
                     root,
                     plan,
                     width,
-                    terminal_demand_remaining,
                     &mut self.worklist,
                     &mut self.interner,
                     &mut self.stats,
@@ -8606,13 +8596,11 @@ impl ResidualStateMachine {
             // One unsplittable affine atom remains. Advance the exact machine
             // rather than manufacturing a second query from the seed.
             let width = self.width.max(1);
-            let terminal_demand_remaining = self.terminal_demand_remaining();
             if !self.delta.is_empty() && !self.has_full_stable(plan, width) {
-                let outcome = self.delta.step_with_demand(
+                let outcome = self.delta.step_bounded(
                     root,
                     plan,
                     width,
-                    terminal_demand_remaining,
                     &mut self.worklist,
                     &mut self.interner,
                     &mut self.stats,
@@ -10265,17 +10253,17 @@ mod tests {
         ];
         assert_eq!(direct_results, expected);
         assert_eq!(control_results, expected);
-        assert_eq!(direct_pages.load(Ordering::Relaxed), 3);
-        assert_eq!(control_pages.load(Ordering::Relaxed), 3);
+        assert_eq!(direct_pages.load(Ordering::Relaxed), 4);
+        assert_eq!(control_pages.load(Ordering::Relaxed), 4);
         assert_eq!(direct_proposes.load(Ordering::Relaxed), 0);
         assert_eq!(control_proposes.load(Ordering::Relaxed), 0);
 
-        assert_eq!(direct_stats.delta_direct_terminal_publication_batches, 3);
+        assert_eq!(direct_stats.delta_direct_terminal_publication_batches, 4);
         assert_eq!(direct_stats.delta_direct_terminal_publication_rows, 4);
         assert_eq!(control_stats.delta_direct_terminal_publication_batches, 0);
         assert_eq!(control_stats.delta_direct_terminal_publication_rows, 0);
-        assert_eq!(direct_stats.delta_active_lease_steps, 3);
-        assert_eq!(direct_stats.delta_source_pages, 3);
+        assert_eq!(direct_stats.delta_active_lease_steps, 4);
+        assert_eq!(direct_stats.delta_source_pages, 4);
         assert_eq!(direct_stats.max_delta_source_cohort, 1);
         assert_eq!(direct_stats.delta_source_direct_candidates, 4);
         assert_eq!(
@@ -10286,7 +10274,7 @@ mod tests {
                 direct_stats.candidates_proposed,
                 direct_stats.max_propose_candidates,
             ),
-            (1, 1, 1, 4, 2)
+            (1, 1, 1, 4, 1)
         );
         assert_eq!(
             direct_stats.candidates_proposed,
@@ -10300,7 +10288,7 @@ mod tests {
         );
         assert_eq!(direct_stats.width_increases, 2);
         assert_eq!(direct_stats.width_increases, control_stats.width_increases);
-        assert_eq!(direct_stats.delta_activation_width_increases, 3);
+        assert_eq!(direct_stats.delta_activation_width_increases, 4);
         assert_eq!(
             direct_stats.delta_activation_width_increases,
             control_stats.delta_activation_width_increases
@@ -10321,9 +10309,9 @@ mod tests {
         assert_eq!(direct_stats.emit_pops, 0);
         assert_eq!(
             control_stats.candidate_plan_pops,
-            direct_stats.candidate_plan_pops + 3
+            direct_stats.candidate_plan_pops + 4
         );
-        assert_eq!(control_stats.emit_pops, direct_stats.emit_pops + 3);
+        assert_eq!(control_stats.emit_pops, direct_stats.emit_pops + 4);
     }
 
     #[test]
