@@ -32,6 +32,8 @@ use std::time::{Duration, Instant};
 
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use triblespace::core::query::TriblePattern;
+#[cfg(engine_current_residual)]
+use triblespace::core::query::residual::ResidualLowering;
 use triblespace::core::trible::TribleSet;
 use triblespace::prelude::inlineencodings::GenId;
 use triblespace::prelude::*;
@@ -71,7 +73,11 @@ macro_rules! engine_query {
         {
             query.sequential()
         }
-        #[cfg(not(engine_current_scalar))]
+        #[cfg(engine_current_residual)]
+        {
+            query.residual_lowering(ResidualLowering::CONSERVATIVE)
+        }
+        #[cfg(not(any(engine_current_scalar, engine_current_residual)))]
         {
             query
         }
