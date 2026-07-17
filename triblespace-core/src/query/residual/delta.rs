@@ -1080,6 +1080,10 @@ pub(super) enum ActiveDeltaStatus {
 pub(super) struct ActiveDeltaStepOutcome {
     pub(super) outcome: DeltaStepOutcome,
     pub(super) status: ActiveDeltaStatus,
+    /// The same affine activation may be resumed after the yielded stable
+    /// continuation runs. Publishing one accepted value and retaining cyclic
+    /// traversal work are independent facts.
+    pub(super) resume: Option<ActiveDeltaContinuation>,
 }
 
 impl DeltaBucket {
@@ -1917,6 +1921,8 @@ impl DeltaScheduler {
                 stats,
             )
         };
+        let resume = (outcome.continuation.is_some() && self.registry.is_live(active.activation))
+            .then_some(active);
         let status = if outcome.continuation.is_some() {
             ActiveDeltaStatus::Yielded
         } else if self.registry.is_live(active.activation) {
@@ -1924,7 +1930,11 @@ impl DeltaScheduler {
         } else {
             ActiveDeltaStatus::Quiescent
         };
-        ActiveDeltaStepOutcome { outcome, status }
+        ActiveDeltaStepOutcome {
+            outcome,
+            status,
+            resume,
+        }
     }
 
     /// Executes one structural product-state cohort and files accepted
@@ -3239,6 +3249,7 @@ mod tests {
             &mut stats,
         );
         assert_eq!(source.status, ActiveDeltaStatus::Pending);
+        assert!(source.resume.is_none());
         assert_eq!(stats.delta_source_pages, 1);
         assert!(scheduler.has_active_transition(active));
 
@@ -3252,6 +3263,7 @@ mod tests {
             &mut stats,
         );
         assert_eq!(transition.status, ActiveDeltaStatus::Pending);
+        assert!(transition.resume.is_none());
         assert!(scheduler.has_active_source(active));
 
         let terminal_source = scheduler.step_active(
@@ -3264,6 +3276,7 @@ mod tests {
             &mut stats,
         );
         assert_eq!(terminal_source.status, ActiveDeltaStatus::Quiescent);
+        assert!(terminal_source.resume.is_none());
         assert_eq!(stats.delta_source_pages, 2);
         assert!(stable.is_empty());
         let retained = scheduler
@@ -3313,6 +3326,7 @@ mod tests {
         );
         assert_eq!(yielded.status, ActiveDeltaStatus::Yielded);
         assert!(yielded.outcome.continuation.is_some());
+        assert_eq!(yielded.resume, Some(active));
         assert!(scheduler.registry.is_live(activation));
         assert!(scheduler.has_active_transition(active));
     }
