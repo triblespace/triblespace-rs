@@ -722,7 +722,7 @@ fn main() {
 }
 
 #[cfg(engine_prefix_checkpoints)]
-const PREFIX_CHECKPOINTS: [usize; 7] = [1, 10, 63, 64, 65, 100, 1_000];
+const PREFIX_CHECKPOINTS: [usize; 8] = [1, 10, 63, 64, 65, 100, 1_000, 131_072];
 
 #[cfg(engine_prefix_checkpoints)]
 #[derive(Clone, Copy, Debug)]
@@ -1007,6 +1007,9 @@ where
             checkpoint_index += 1;
         }
     }
+    assert!(query.next().is_none(), "{label}: iterator had rows beyond the oracle");
+    let (current_width, stats) = snapshot(&query);
+    println!("residual_drained_stats cell={label:?} current_width={current_width} stats={stats}");
 }
 
 #[cfg(engine_prefix_checkpoints)]
@@ -1069,6 +1072,7 @@ fn main() {
             cyclic_rpq_query!(&fixture).solve_residual_state_lazy_with(ResidualLowering::FULL),
             |query| (query.current_width(), format!("{:?}", query.stats())),
         );
+        return;
         residual_checkpoint_stats(
             "formula + cyclic RPQ / TribleSet sibling",
             mixed_formula_rpq_query!(&fixture.graph, &fixture)
