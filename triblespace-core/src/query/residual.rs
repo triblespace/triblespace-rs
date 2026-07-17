@@ -56,10 +56,13 @@
 //! candidate mode, and cursor family. One same-schema block-native hook gets
 //! ragged per-parent limits whose sum is the current global width, so batching
 //! does not multiply the geometric work budget or refine canonical state
-//! identity. A final-variable streaming activation is admitted one parent at
-//! a time. Its source pager receives global search `S`, while graph traversal
-//! gets an activation-local sparse quantum capped by `S`; confirmed demand is
-//! never passed as a separate traversal floor. When it publishes an accepted
+//! identity. Final-variable streaming parents are admitted from a cumulative
+//! projected-yield quote: completed activation samples estimate rows per
+//! parent, while unseen or zero-yield families retain a scalar miss floor.
+//! Cumulative admissions remain distinct from live activations. The source
+//! pager receives global search `S`, while graph traversal gets an activation-
+//! local sparse quantum capped by `S`; confirmed demand is never passed as a
+//! separate traversal floor. When it publishes an accepted
 //! endpoint, the shared candidate-commit layout may
 //! build the final row directly in the ordinary projection buffer while a
 //! still-live activation token remains suspended; the next pull resumes that
@@ -2113,8 +2116,15 @@ pub struct ResidualStateStats {
     /// Full-bound rows carried by direct-terminal publication batches.
     pub delta_direct_terminal_publication_rows: usize,
     /// Cold terminal-streaming proposal actions admitted into the cyclic
-    /// scheduler. Each admission transfers exactly one affine parent.
+    /// scheduler.
     pub delta_terminal_admissions: usize,
+    /// Exact affine parents transferred by terminal admission actions.
+    pub delta_terminal_admitted_parents: usize,
+    /// Largest exact parent cohort transferred by one terminal admission.
+    pub max_delta_terminal_admission_parents: usize,
+    /// Admissions whose projected-yield demand quote transferred more than
+    /// the scalar miss/fairness floor.
+    pub delta_terminal_demand_wide_admissions: usize,
     /// Parent rows refiled under the same canonical proposal state when a
     /// terminal admission split a wider selected chunk.
     pub delta_terminal_admission_remainders: usize,
@@ -7019,6 +7029,19 @@ impl TerminalYieldLedger {
         }
     }
 
+    fn additional_for_demand(&self, family: StateId, demand: usize) -> usize {
+        let Some(yield_) = self.families.get(&family) else {
+            return usize::from(demand > 0);
+        };
+        let target = if yield_.completed == 0 || yield_.projected == 0 {
+            1
+        } else {
+            let projected_per_parent = ceil_div(yield_.projected, yield_.completed);
+            ceil_div(demand, projected_per_parent)
+        };
+        target.saturating_sub(yield_.admitted)
+    }
+
     fn stage(&mut self, origins: &[DeltaActivationId]) {
         for &origin in origins {
             let sample = self
@@ -7104,6 +7127,11 @@ impl TerminalYieldLedger {
         family.completed = family.completed.saturating_add(1);
         family.projected = family.projected.saturating_add(sample.projected);
     }
+}
+
+fn ceil_div(numerator: usize, denominator: usize) -> usize {
+    assert!(denominator > 0, "ceil division requires a positive divisor");
+    numerator / denominator + usize::from(numerator % denominator != 0)
 }
 
 struct TerminalProjectionAttempt<'a> {
@@ -7641,6 +7669,28 @@ impl ResidualStateMachine {
         })
     }
 
+    fn terminal_admission_width(&self, family: StateId, reservoir: usize) -> usize {
+        assert!(reservoir > 0, "terminal admission reservoir is empty");
+        if !self.uses_direct_terminal_publication() {
+            return 1;
+        }
+        let remaining_window = self
+            .terminal_demand_width
+            .checked_sub(self.terminal_demand_consumed)
+            .expect("terminal demand consumption exceeded its window");
+        let demand = self
+            .terminal_projected_rows
+            .saturating_add(remaining_window);
+        let demand_width = self.terminal_yield.additional_for_demand(family, demand);
+
+        // The current miss floor is the scalar base scheduling atom. Strong
+        // fair rotation is a separate physical policy and contributes zero
+        // until its activation ring lands.
+        let miss_width = 1;
+        let fair_width = 0;
+        reservoir.min(demand_width.max(miss_width).max(fair_width))
+    }
+
     /// Converts one eligible proposer action into activation-owned cyclic
     /// work.
     fn seed_delta_proposal<'a>(
@@ -7709,9 +7759,26 @@ impl ResidualStateMachine {
         let StateBucket::Rows(selected_rows) = &bucket else {
             unreachable!("delta proposer was checked above")
         };
-        let selected_parent = selected_rows.row_count - 1;
-        if terminal_streaming && selected_rows.row_count > 1 {
-            let admitted = bucket.take_tail(desc.bound.count(), 1, false);
+        let selected_parent_count = selected_rows.row_count;
+        let admitted_parent_count = if terminal_streaming {
+            self.terminal_admission_width(state, selected_parent_count)
+        } else {
+            selected_parent_count
+        };
+        let first_admitted = selected_parent_count - admitted_parent_count;
+        if terminal_streaming {
+            self.stats.delta_terminal_admissions += 1;
+            self.stats.delta_terminal_admitted_parents += admitted_parent_count;
+            self.stats.max_delta_terminal_admission_parents = self
+                .stats
+                .max_delta_terminal_admission_parents
+                .max(admitted_parent_count);
+            self.stats.delta_terminal_demand_wide_admissions +=
+                usize::from(admitted_parent_count > 1);
+        }
+        if terminal_streaming && first_admitted > 0 {
+            let admitted =
+                bucket.take_tail(desc.bound.count(), admitted_parent_count, false);
             let remainder_rows = bucket.row_count();
             let receipt = file_with_plan(
                 &mut self.worklist,
@@ -7724,16 +7791,14 @@ impl ResidualStateMachine {
             .expect("terminal admission remainder is nonempty");
             debug_assert_eq!(receipt.state, state);
             bucket = admitted;
-            self.stats.delta_terminal_admissions += 1;
             self.stats.delta_terminal_admission_remainders += remainder_rows;
             if !paged {
-                seeds.retain(|seed| seed.parent as usize == selected_parent);
+                seeds.retain(|seed| seed.parent as usize >= first_admitted);
                 for seed in &mut seeds {
-                    seed.parent = 0;
+                    seed.parent = u32::try_from(seed.parent as usize - first_admitted)
+                        .expect("rebased terminal seed parent exceeds u32");
                 }
             }
-        } else if terminal_streaming {
-            self.stats.delta_terminal_admissions += 1;
         }
         let StateBucket::Rows(rows) = bucket else {
             unreachable!("terminal admission preserved proposal rows")
@@ -10140,6 +10205,71 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct EagerAcceptedLeaf {
+        variable: VariableId,
+    }
+
+    impl Constraint<'static> for EagerAcceptedLeaf {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(self.variable)
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != self.variable {
+                return false;
+            }
+            out.fill(1, view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn residual_delta_seeds(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            seeds: &mut Vec<ResidualDeltaSeed>,
+        ) -> bool {
+            if variable != self.variable {
+                return false;
+            }
+            for row in 0..view.len() {
+                seeds.push(ResidualDeltaSeed {
+                    parent: row as u32,
+                    output: ResidualDeltaOutput {
+                        node: ResidualDeltaNode {
+                            source: None,
+                            value: raw(100 + row as u8),
+                            continuation: 0,
+                        },
+                        accepted: true,
+                    },
+                });
+            }
+            true
+        }
+    }
+
     #[derive(Clone)]
     struct PagedProposalLeaf {
         variable: VariableId,
@@ -10294,6 +10424,61 @@ mod tests {
             "a complete zero-row activation is an observed zero-yield sample"
         );
         assert!(ledger.samples.is_empty());
+    }
+
+    #[test]
+    fn terminal_admission_quote_uses_cumulative_completed_yield() {
+        let family = StateId(9);
+        let activation = DeltaActivationId::test(31);
+        let mut ledger = TerminalYieldLedger::default();
+        assert_eq!(ledger.additional_for_demand(family, 1_000), 1);
+
+        ledger.register(family, &[activation]);
+        let origins = vec![activation; 64];
+        ledger.stage(&origins);
+        ledger.complete(activation);
+        for _ in 0..64 {
+            let mut attempt = ledger.begin_projection(activation);
+            attempt.mark_successful();
+        }
+        assert_eq!(
+            (
+                ledger.families[&family].admitted,
+                ledger.families[&family].live,
+                ledger.families[&family].completed,
+                ledger.families[&family].projected,
+            ),
+            (1, 0, 1, 64)
+        );
+        assert_eq!(ledger.additional_for_demand(family, 64), 0);
+        assert_eq!(ledger.additional_for_demand(family, 65), 1);
+        assert_eq!(ledger.additional_for_demand(family, 192), 2);
+
+        let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 0, Search::Done);
+        machine.terminal_yield = ledger;
+        machine.terminal_projected_rows = 64;
+        machine.terminal_demand_width = 128;
+        machine.terminal_demand_consumed = 0;
+        assert_eq!(machine.terminal_admission_width(family, 16), 2);
+        assert_eq!(machine.terminal_admission_width(family, 1), 1);
+    }
+
+    #[test]
+    fn terminal_zero_yield_keeps_demand_width_at_scalar_miss_floor() {
+        let family = StateId(10);
+        let activation = DeltaActivationId::test(41);
+        let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 0, Search::Done);
+        machine.terminal_yield.register(family, &[activation]);
+        machine.terminal_yield.complete(activation);
+        machine.terminal_projected_rows = 64;
+        machine.terminal_demand_width = 128;
+
+        assert_eq!(
+            machine.terminal_yield.additional_for_demand(family, 192),
+            0,
+            "zero observed yield cannot justify demand-wide cold admission"
+        );
+        assert_eq!(machine.terminal_admission_width(family, 16), 1);
     }
 
     #[test]
@@ -10527,6 +10712,93 @@ mod tests {
         assert_eq!(profiled.stats.max_delta_terminal_task_cohort, 1);
         assert!(profiled.stats.delta_terminal_publications > 0);
         assert!(profiled.stats.max_delta_terminal_work_budget <= 8);
+    }
+
+    #[test]
+    fn demand_wide_terminal_admission_slices_exact_suffix_and_rebases_seeds() {
+        let root = IntersectionConstraint::new(vec![
+            Box::new(ShapeLeaf(0)) as ShapeConstraint,
+            Box::new(EagerAcceptedLeaf { variable: 1 }) as ShapeConstraint,
+        ]);
+        let plan = ResidualPlan::compile_lowering(
+            &root,
+            ResidualLowering::new(FormulaScope::OpaqueLeaves, true),
+        );
+        let mut relevant = ChildSet::empty(plan.len());
+        relevant.insert(1);
+        let desc = StateDesc {
+            bound: VariableSet::new_singleton(0),
+            phase: ResidualPhase::Propose {
+                variable: 1,
+                relevant,
+                proposer: 1,
+            },
+        };
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        let (state, _) = machine
+            .interner
+            .intern_with_status(desc.clone(), &mut machine.stats);
+        machine.terminal_yield.families.insert(
+            state,
+            TerminalFamilyYield {
+                admitted: 1,
+                live: 0,
+                completed: 1,
+                projected: 64,
+            },
+        );
+        machine.terminal_projected_rows = 64;
+        machine.terminal_demand_width = 192;
+
+        let outcome = machine
+            .seed_delta_proposal(
+                &root,
+                &plan,
+                SelectedResidualTask {
+                    state,
+                    desc,
+                    bucket: StateBucket::Rows(RowBatch {
+                        rows: (10..15).map(raw).collect(),
+                        row_count: 5,
+                    }),
+                },
+            )
+            .expect("the eager terminal proposer is delta-lowerable");
+
+        assert_eq!(outcome.seeded_parents, 3);
+        assert_eq!(outcome.terminal_family, Some(state));
+        assert_eq!(outcome.terminal_activations.len(), 3);
+        assert!(outcome.completed_activation_ids.is_empty());
+        let publication = outcome
+            .publication
+            .expect("each accepting eager seed publishes directly");
+        assert_eq!(publication.origins.len(), 3);
+        assert_eq!(publication.rows.row_count, 3);
+        assert_eq!(
+            publication.rows.rows,
+            vec![raw(12), raw(102), raw(13), raw(103), raw(14), raw(104)]
+        );
+
+        let remainder = machine
+            .worklist
+            .values()
+            .find_map(|level| level.get(&state))
+            .expect("the unadmitted prefix was refiled");
+        let StateBucket::Rows(remainder) = remainder else {
+            panic!("terminal proposal remainder changed payload shape")
+        };
+        assert_eq!(remainder.rows, [raw(10), raw(11)]);
+        assert_eq!(remainder.row_count, 2);
+        assert_eq!(
+            (
+                machine.stats.delta_terminal_admissions,
+                machine.stats.delta_terminal_admitted_parents,
+                machine.stats.max_delta_terminal_admission_parents,
+                machine.stats.delta_terminal_admission_remainders,
+                machine.stats.delta_terminal_demand_wide_admissions,
+            ),
+            (1, 3, 3, 2, 1)
+        );
     }
 
     fn direct_terminal_paged_iter<P, R>(

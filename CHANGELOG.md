@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Completed terminal yield drives exact parent admission.** For each
+  canonical proposer family, the scheduler estimates projected rows per
+  completed parent and admits only the cumulative parent deficit needed to
+  cover `produced + remaining-window` demand. Unseen and zero-yield families
+  keep a one-parent miss floor; parent suffix slicing and eager seed-tag
+  rebasing preserve exact order and multiplicity without cutoff constants.
 - **Terminal demand learns only from completed projected-yield samples.** Each
   admitted terminal parent now retains its exact delta activation through
   direct-publication batching and projection. Per-proposer ledgers distinguish
