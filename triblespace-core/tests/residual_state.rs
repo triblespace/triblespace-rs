@@ -1197,9 +1197,11 @@ fn lazy_width_one_reaches_a_result_before_draining_sibling_parents() {
     assert_eq!(decode(&first.0, P_MARKER), decode(&first.1, X_MARKER));
     assert_eq!(
         lazy.current_width(),
-        2,
-        "the first resumption must prepare a geometrically wider next chunk"
+        1,
+        "returning the first result alone must not speculate about later demand"
     );
+    assert_eq!(lazy.stats().width_increases, 0);
+    assert_eq!(lazy.stats().terminal_demand_width_promotions, 0);
     assert_eq!(lazy.stats().readiness_pops, 0);
     assert!(lazy.stats().full_pops > 0);
     assert!(lazy.stats().partial_pops > 0);
@@ -1255,7 +1257,7 @@ fn successful_first_path_has_the_same_ordered_trace_before_growth() {
     assert_eq!(fixed_stats.dead_action_pops, 0);
     assert_eq!(grown_stats.dead_action_pops, 0);
     assert_eq!((fixed_width, fixed_stats.width_increases), (1, 0));
-    assert_eq!((grown_width, grown_stats.width_increases), (2, 1));
+    assert_eq!((grown_width, grown_stats.width_increases), (1, 0));
 }
 
 #[test]
@@ -1381,7 +1383,7 @@ fn dead_paths_ramp_within_one_negative_pull() {
 }
 
 #[test]
-fn rejected_projection_still_grows_after_raw_emit() {
+fn rejected_projection_ramps_search_without_confirming_demand() {
     let values: Vec<_> = (0..7).map(|index| encoded(b'e', index)).collect();
     let (domain, _) = finite_domain(P, values, 1);
     let root = IntersectionConstraint::new(vec![domain]);
@@ -1395,6 +1397,8 @@ fn rejected_projection_still_grows_after_raw_emit() {
     assert_eq!(lazy.current_width(), 4);
     assert_eq!(lazy.stats().emit_pops, 3);
     assert_eq!(lazy.stats().width_increases, 2);
+    assert_eq!(lazy.stats().terminal_demand_projected_rows, 0);
+    assert_eq!(lazy.stats().terminal_demand_width_promotions, 0);
     assert_eq!(lazy.stats().dead_action_pops, 0);
 }
 
@@ -1404,7 +1408,7 @@ fn lazy_fixed_width_reopens_states_without_changing_the_result_bag() {
     let (root, _) = fixture(N);
     let mut lazy = Query::new(Arc::new(root), project_pair)
         .solve_residual_state_lazy()
-        .cap(usize::MAX)
+        .cap(1)
         .start_width(1)
         .growth(1)
         .collect_profiled();
@@ -1577,7 +1581,27 @@ fn occupancy_shape_is_independent_of_whether_width_equals_the_cap() {
     let (uncapped, uncapped_calls) = run(usize::MAX);
 
     assert_eq!(capped.results, uncapped.results);
-    assert_eq!(capped.stats, uncapped.stats);
+    let mut capped_shape = capped.stats.clone();
+    let mut uncapped_shape = uncapped.stats.clone();
+    for stats in [&mut capped_shape, &mut uncapped_shape] {
+        stats.width_increases = 0;
+        stats.terminal_demand_width_promotions = 0;
+    }
+    assert_eq!(capped_shape, uncapped_shape);
+    assert_eq!(
+        (
+            capped.stats.width_increases,
+            capped.stats.terminal_demand_width_promotions,
+        ),
+        (0, 1)
+    );
+    assert_eq!(
+        (
+            uncapped.stats.width_increases,
+            uncapped.stats.terminal_demand_width_promotions,
+        ),
+        (1, 2)
+    );
     assert_eq!(capped_calls, uncapped_calls);
 
     let (sequential_root, _) = fixture(N);
@@ -1589,8 +1613,8 @@ fn occupancy_shape_is_independent_of_whether_width_equals_the_cap() {
     sequential.sort_unstable();
     assert_eq!(capped_results, sequential);
 
-    // The cap only bounds width growth. It cannot switch scheduling policy:
-    // the width-W action shape must match the cap-above-width case.
+    // The cap bounds demand promotion telemetry as well as physical width, but
+    // it cannot switch scheduling policy while both runs execute at width W.
     let trace = Trace {
         calls: capped_calls,
     };
@@ -1723,10 +1747,14 @@ fn zero_variable_intersections_emit_the_empty_binding_iff_true() {
         .start_width(1)
         .growth(2);
     assert_eq!(lazy_true.next(), Some("empty binding"));
-    assert_eq!(lazy_true.current_width(), 2);
+    assert_eq!(lazy_true.current_width(), 1);
     assert_eq!(lazy_true.stats().emit_pops, 1);
-    assert_eq!(lazy_true.stats().width_increases, 1);
+    assert_eq!(lazy_true.stats().width_increases, 0);
+    assert_eq!(lazy_true.stats().terminal_demand_width_promotions, 0);
     assert_eq!(lazy_true.next(), None);
+    assert_eq!(lazy_true.current_width(), 2);
+    assert_eq!(lazy_true.stats().width_increases, 1);
+    assert_eq!(lazy_true.stats().terminal_demand_width_promotions, 1);
     assert_eq!(residual_true.results, ["empty binding"]);
     assert_eq!(residual_true.results, sequential_true);
     assert_eq!(residual_true.stats.state_pops, 1);
