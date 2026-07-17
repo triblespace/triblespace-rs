@@ -64,6 +64,9 @@
 //! build the final row directly in the ordinary projection buffer while a
 //! still-live activation token remains suspended; the next pull resumes that
 //! exact affine traversal rather than abandoning locality to cold harvesting.
+//! Global harvesting may cohort compatible terminal sources under one `S` and
+//! compatible transitions under `min(S, sum activation quanta)`, but
+//! publication and miss feedback remain activation-local.
 //! This first causal probe has bounded leases but no strong fairness rotation
 //! across perpetually productive terminal activations.
 //!
@@ -2127,7 +2130,7 @@ pub struct ResidualStateStats {
     pub max_delta_terminal_work_budget: usize,
     /// Affine source/transition tasks actually included in terminal calls.
     pub delta_terminal_tasks: usize,
-    /// Largest exact-activation task cohort in one terminal call.
+    /// Largest compatible affine task cohort in one terminal call.
     pub max_delta_terminal_task_cohort: usize,
     /// Compatible and incompatible scheduler tasks left cold after terminal
     /// pops, sampled as the selected structural bucket's physical remainder.

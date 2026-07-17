@@ -239,6 +239,19 @@ erase bounded positive work. The default lowers the cohort to scalar page
 calls, while storage or accelerator constraints can fuse it without changing
 canonical state or producer-credit semantics.
 
+Final-variable streaming activations use a second physical policy on that same
+seam. A directed hot continuation still advances exactly one activation: its
+source pager receives global search width `S`, while its transition pager
+receives the activation-local sparse quantum `t_a`, capped by `S`. Cold global
+harvesting may instead cohort compatible terminal activations. Source rows
+share one budget `B=S`; transition rows share
+`B=min(S, sum_a t_a)`, with ragged task limits that never spend more than one
+activation's `t_a` on its behalf. The backend call is shared, but feedback is
+not: an activation that publishes resets to one independently of a sibling
+whose live transition miss doubles its own quantum. Source misses leave every
+transition quantum unchanged. A negative transition cohort reaches outer
+search-width growth only after it saturates `S` and leaves terminal work live.
+
 The ordinary [`Query`](triblespace::core::query::Query) uses this engine whenever
 exact seed settlement leaves a live search. Opaque roots, one-leaf ANDs,
 disjoint conjunctions, finite Union roots, RPQ roots, and live zero-variable
