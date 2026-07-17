@@ -1224,7 +1224,7 @@ struct SourceBucket {
 
 #[derive(Debug)]
 struct PhysicalDispatch {
-    terminal_activations: Vec<ActivationId>,
+    terminal_activations: OrderedActivationSet,
     kind: PhysicalDispatchKind,
     task_limits: Vec<usize>,
     remainder_tasks: usize,
@@ -1242,7 +1242,89 @@ impl PhysicalDispatch {
 
 struct DeltaPhysicalOutcome {
     outcome: DeltaStepOutcome,
-    terminal_publications: Vec<ActivationId>,
+    terminal_publications: OrderedActivationSet,
+}
+
+/// Insertion-ordered activation membership with an allocation-free singleton
+/// lookup. Physical cohorts observe activation order while repeated feedback
+/// checks need set rather than quadratic vector membership.
+#[derive(Debug, Default)]
+struct OrderedActivationSet {
+    values: Vec<ActivationId>,
+    membership: Option<AHashSet<ActivationId>>,
+}
+
+impl OrderedActivationSet {
+    fn insert(&mut self, activation: ActivationId) -> bool {
+        match self.values.as_slice() {
+            [] => {
+                self.values.push(activation);
+                true
+            }
+            [only] if *only == activation => false,
+            [only] => {
+                let mut membership = AHashSet::with_capacity(2);
+                assert!(membership.insert(*only));
+                assert!(membership.insert(activation));
+                self.membership = Some(membership);
+                self.values.push(activation);
+                true
+            }
+            _ => {
+                if self
+                    .membership
+                    .as_mut()
+                    .expect("multi-activation set lost its membership index")
+                    .insert(activation)
+                {
+                    self.values.push(activation);
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    fn contains(&self, activation: &ActivationId) -> bool {
+        match self.values.as_slice() {
+            [] => false,
+            [only] => only == activation,
+            _ => self
+                .membership
+                .as_ref()
+                .expect("multi-activation set lost its membership index")
+                .contains(activation),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &ActivationId> {
+        self.values.iter()
+    }
+}
+
+impl From<Vec<ActivationId>> for OrderedActivationSet {
+    fn from(activations: Vec<ActivationId>) -> Self {
+        activations.into_iter().collect()
+    }
+}
+
+impl FromIterator<ActivationId> for OrderedActivationSet {
+    fn from_iter<T: IntoIterator<Item = ActivationId>>(iter: T) -> Self {
+        let mut activations = Self::default();
+        for activation in iter {
+            let _ = activations.insert(activation);
+        }
+        activations
+    }
 }
 
 #[derive(Debug)]
@@ -1274,13 +1356,11 @@ fn even_limits(work_budget: usize, task_count: usize) -> Vec<usize> {
 fn terminal_activations(
     registry: &ProducerRegistry,
     activations: impl IntoIterator<Item = ActivationId>,
-) -> Vec<ActivationId> {
-    let mut terminal = Vec::new();
+) -> OrderedActivationSet {
+    let mut terminal = OrderedActivationSet::default();
     for activation in activations {
-        if registry.physical_activation_class(activation) == DeltaPhysicalClass::TerminalStreaming
-            && !terminal.contains(&activation)
-        {
-            terminal.push(activation);
+        if registry.physical_activation_class(activation) == DeltaPhysicalClass::TerminalStreaming {
+            let _ = terminal.insert(activation);
         }
     }
     terminal
@@ -2230,7 +2310,7 @@ impl DeltaScheduler {
         dispatch: PhysicalDispatch,
         search_width: usize,
         examined_before: usize,
-        terminal_publications: &[ActivationId],
+        terminal_publications: &OrderedActivationSet,
         stats: &mut ResidualStateStats,
     ) -> bool {
         if dispatch.terminal_activations.is_empty() {
@@ -2255,7 +2335,7 @@ impl DeltaScheduler {
             .saturating_add(stats.delta_transition_candidates_examined);
         stats.delta_terminal_candidates_examined += examined_after.saturating_sub(examined_before);
         stats.delta_terminal_publications += usize::from(published);
-        for &activation in &dispatch.terminal_activations {
+        for &activation in dispatch.terminal_activations.iter() {
             let (reset, widened) = self.registry.finish_dispatch(
                 activation,
                 search_width,
@@ -2759,7 +2839,7 @@ impl DeltaScheduler {
         let mut source_dead_pages = 0usize;
         let mut transition_dead_pages = 0usize;
         let mut completed_activations = 0usize;
-        let mut terminal_publications = Vec::new();
+        let mut terminal_publications = OrderedActivationSet::default();
         for (task_index, task) in tasks.into_iter().enumerate() {
             assert_eq!(task.activation, task.credit.key.activation);
             let terminal = self.registry.physical_activation_class(task.activation)
@@ -2844,11 +2924,8 @@ impl DeltaScheduler {
             }
             source_dead_pages += usize::from(source_page_dead);
             transition_dead_pages += usize::from(transition_page_dead);
-            if terminal
-                && task_effects.has_effect()
-                && !terminal_publications.contains(&task.activation)
-            {
-                terminal_publications.push(task.activation);
+            if terminal && task_effects.has_effect() {
+                let _ = terminal_publications.insert(task.activation);
             }
             effects.absorb(task_effects);
         }
@@ -2982,7 +3059,7 @@ impl DeltaScheduler {
         let mut resumed_sources = Vec::new();
         let mut dead_pages = 0usize;
         let mut completed_activations = 0usize;
-        let mut terminal_publications = Vec::new();
+        let mut terminal_publications = OrderedActivationSet::default();
         for (row, (((task, page), root_range), direct_range)) in tasks
             .into_iter()
             .zip(pages)
@@ -3055,11 +3132,8 @@ impl DeltaScheduler {
             {
                 dead_pages += 1;
             }
-            if terminal
-                && task_effects.has_effect()
-                && !terminal_publications.contains(&task.activation)
-            {
-                terminal_publications.push(task.activation);
+            if terminal && task_effects.has_effect() {
+                let _ = terminal_publications.insert(task.activation);
             }
             effects.absorb(task_effects);
         }
@@ -3667,7 +3741,7 @@ mod tests {
 
         assert!(scheduler.allows_global_width_growth(
             &PhysicalDispatch {
-                terminal_activations: vec![activation],
+                terminal_activations: vec![activation].into(),
                 kind: PhysicalDispatchKind::Source,
                 task_limits: vec![1],
                 remainder_tasks: 0,
@@ -3676,7 +3750,7 @@ mod tests {
         ));
         assert!(!scheduler.allows_global_width_growth(
             &PhysicalDispatch {
-                terminal_activations: vec![activation],
+                terminal_activations: vec![activation].into(),
                 kind: PhysicalDispatchKind::Transition,
                 task_limits: vec![32],
                 remainder_tasks: 0,
@@ -3684,7 +3758,7 @@ mod tests {
             64,
         ));
         let saturated = PhysicalDispatch {
-            terminal_activations: vec![activation],
+            terminal_activations: vec![activation].into(),
             kind: PhysicalDispatchKind::Transition,
             task_limits: vec![64],
             remainder_tasks: 0,
@@ -3804,10 +3878,10 @@ mod tests {
             );
         }
         let mut stats = ResidualStateStats::default();
-        let published = [first.activation];
+        let published = OrderedActivationSet::from(vec![first.activation]);
         assert!(!scheduler.account_physical_dispatch(
             PhysicalDispatch {
-                terminal_activations: vec![first.activation, second.activation],
+                terminal_activations: vec![first.activation, second.activation].into(),
                 kind: PhysicalDispatchKind::Transition,
                 task_limits: vec![2, 2],
                 remainder_tasks: 0,
@@ -3835,14 +3909,14 @@ mod tests {
 
         assert!(scheduler.account_physical_dispatch(
             PhysicalDispatch {
-                terminal_activations: vec![first.activation, second.activation],
+                terminal_activations: vec![first.activation, second.activation].into(),
                 kind: PhysicalDispatchKind::Source,
                 task_limits: vec![4, 4],
                 remainder_tasks: 0,
             },
             8,
             0,
-            &[],
+            &OrderedActivationSet::default(),
             &mut stats,
         ));
         assert_eq!(
