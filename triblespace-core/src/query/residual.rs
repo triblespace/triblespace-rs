@@ -8591,6 +8591,7 @@ impl ResidualStateMachine {
     {
         self.confirm_terminal_demand();
         loop {
+            let draining_unprojected_emit = self.emit_next < self.emit_count;
             while self.emit_next < self.emit_count {
                 let row = self.emit_next;
                 // Consume before invoking user code. If it panics and the
@@ -8616,6 +8617,12 @@ impl ResidualStateMachine {
                     return Some(result);
                 }
                 drop(projection);
+            }
+            if draining_unprojected_emit {
+                // Exhausting a staged raw-result suffix without satisfying
+                // this public pull is negative search feedback, but it is not
+                // confirmed projected-result demand.
+                self.increase_width();
             }
             if self.worklist.is_empty() && self.delta.is_empty() {
                 return None;
