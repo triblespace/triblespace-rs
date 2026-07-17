@@ -119,6 +119,13 @@ impl RegistryBrand {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(super) struct ActivationId(u64);
 
+#[cfg(test)]
+impl ActivationId {
+    pub(super) const fn test(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct CreditNonce(u64);
 
@@ -295,6 +302,7 @@ struct StartOutcome {
 }
 
 struct CompletedActivation {
+    activation: ActivationId,
     return_to: DeltaReturn,
     effect: DeltaCompletion,
 }
@@ -320,13 +328,38 @@ struct DeltaStreamingReturn {
     effect: DeltaStreamingEffect,
 }
 
+/// Full-bound rows published by terminal streaming activations, with one
+/// exact affine origin per row.  Origin is physical evidence for the outer
+/// projected-yield ledger; it never enters canonical residual identity.
+#[derive(Debug)]
+pub(super) struct TerminalPublicationBatch {
+    pub(super) rows: RowBatch,
+    pub(super) origins: Vec<ActivationId>,
+}
+
+impl TerminalPublicationBatch {
+    fn new(activation: ActivationId, rows: RowBatch) -> Self {
+        let origins = vec![activation; rows.row_count];
+        Self { rows, origins }
+    }
+
+    fn append(&mut self, mut other: Self) {
+        self.rows.append(other.rows);
+        self.origins.append(&mut other.origins);
+        debug_assert_eq!(self.origins.len(), self.rows.row_count);
+    }
+}
+
 #[derive(Default)]
 struct DeltaStableEffects {
     continuation: Option<ContinuationToken>,
     /// Full-bound raw rows ready for the outer iterator's ordinary staging
     /// buffer. This is a physical publication receipt, never a canonical
     /// delta or stable state.
-    publication: Option<RowBatch>,
+    publication: Option<TerminalPublicationBatch>,
+    /// Exact affine activations that became quiescent during this physical
+    /// step. Counts are insufficient for projected-yield sample closure.
+    completed_activation_ids: Vec<ActivationId>,
 }
 
 impl DeltaStableEffects {
@@ -339,6 +372,8 @@ impl DeltaStableEffects {
                 self.publication = Some(rows);
             }
         }
+        self.completed_activation_ids
+            .append(&mut other.completed_activation_ids);
     }
 
     fn has_effect(&self) -> bool {
@@ -1024,6 +1059,7 @@ impl ProducerRegistry {
             }
         };
         CompletedActivation {
+            activation: proof.activation,
             return_to: activation.return_to,
             effect,
         }
@@ -1256,7 +1292,8 @@ enum PhysicalDispatchKind {
 #[derive(Debug)]
 pub(super) struct DeltaStepOutcome {
     pub(super) continuation: Option<ContinuationToken>,
-    pub(super) publication: Option<RowBatch>,
+    pub(super) publication: Option<TerminalPublicationBatch>,
+    pub(super) completed_activation_ids: Vec<ActivationId>,
     pub(super) dead_pages: usize,
     pub(super) source_dead_pages: usize,
     pub(super) transition_dead_pages: usize,
@@ -1284,8 +1321,15 @@ impl DeltaStepOutcome {
 #[derive(Debug)]
 pub(super) struct DeltaSeedOutcome {
     pub(super) continuation: Option<ContinuationToken>,
-    pub(super) publication: Option<RowBatch>,
+    pub(super) publication: Option<TerminalPublicationBatch>,
     pub(super) active: Option<ActiveDeltaContinuation>,
+    /// Every terminal-streaming activation created by this seed, in parent
+    /// order, including activations that quiesced immediately.
+    pub(super) terminal_activations: Vec<ActivationId>,
+    /// Seed activations whose complete lineage quiesced before returning.
+    pub(super) completed_activation_ids: Vec<ActivationId>,
+    /// Canonical stable proposer family assigned by the outer machine.
+    pub(super) terminal_family: Option<StateId>,
     /// Exact affine parents transferred after any physical admission split.
     pub(super) seeded_parents: usize,
 }
@@ -1488,6 +1532,7 @@ impl DeltaScheduler {
         let stride = successor.bound.count();
         let mut tasks = Vec::with_capacity(seeds.len());
         let mut effects = DeltaStableEffects::default();
+        let mut terminal_activations = Vec::with_capacity(parents.row_count);
         for (row, range) in ranges.into_iter().enumerate() {
             let start = row * stride;
             let parent = parents.rows[start..start + stride]
@@ -1502,6 +1547,11 @@ impl DeltaScheduler {
                 seeds[range].iter().map(|seed| seed.output),
                 full,
             );
+            if self.registry.physical_activation_class(started.activation)
+                == DeltaPhysicalClass::TerminalStreaming
+            {
+                terminal_activations.push(started.activation);
+            }
             if !started.initial_accepted.is_empty() {
                 let direct_terminal = direct_terminal_publication_full.filter(|_| {
                     self.registry.physical_activation_class(started.activation)
@@ -1512,6 +1562,7 @@ impl DeltaScheduler {
                     .take_streaming_return(started.activation)
                     .expect("a streaming proposal rejected its accepting seed receipt");
                 effects.absorb(Self::release_streaming(
+                    started.activation,
                     streamed,
                     started.initial_accepted,
                     direct_terminal,
@@ -1531,6 +1582,7 @@ impl DeltaScheduler {
                 let completed = self.registry.finish(proof);
                 assert_eq!(completed.effect, DeltaCompletion::Cleanup);
                 assert!(matches!(completed.return_to, DeltaReturn::Stable { .. }));
+                effects.completed_activation_ids.push(completed.activation);
             }
         }
         let active = self.file(desc, tasks);
@@ -1538,6 +1590,9 @@ impl DeltaScheduler {
             continuation: effects.continuation,
             publication: effects.publication,
             active,
+            terminal_activations,
+            completed_activation_ids: effects.completed_activation_ids,
+            terminal_family: None,
             seeded_parents,
         }
     }
@@ -1549,18 +1604,26 @@ impl DeltaScheduler {
         successor: StateDesc,
         parents: RowBatch,
     ) -> Option<ActiveDeltaContinuation> {
-        self.seed_source_proposals_with_full(desc, successor, parents, VariableSet::new_empty())
+        self.seed_source_proposals_with_full_receipt(
+            desc,
+            successor,
+            parents,
+            VariableSet::new_empty(),
+        )
+            .active
     }
 
-    pub(super) fn seed_source_proposals_with_full(
+    pub(super) fn seed_source_proposals_with_full_receipt(
         &mut self,
         desc: DeltaDesc,
         successor: StateDesc,
         parents: RowBatch,
         full: VariableSet,
-    ) -> Option<ActiveDeltaContinuation> {
+    ) -> DeltaSeedOutcome {
+        let seeded_parents = parents.row_count;
         let stride = successor.bound.count();
         let mut tasks = Vec::with_capacity(parents.row_count);
+        let mut terminal_activations = Vec::with_capacity(parents.row_count);
         for row in 0..parents.row_count {
             let start = row * stride;
             let parent = parents.rows[start..start + stride]
@@ -1575,13 +1638,26 @@ impl DeltaScheduler {
                 None,
                 full,
             );
+            if self.registry.physical_activation_class(activation)
+                == DeltaPhysicalClass::TerminalStreaming
+            {
+                terminal_activations.push(activation);
+            }
             tasks.push(SourceTask {
                 activation,
                 credit,
                 cursor: ResidualDeltaSourceCursor::Start,
             });
         }
-        self.file_source(desc, tasks)
+        DeltaSeedOutcome {
+            continuation: None,
+            publication: None,
+            active: self.file_source(desc, tasks),
+            terminal_activations,
+            completed_activation_ids: Vec::new(),
+            terminal_family: None,
+            seeded_parents,
+        }
     }
 
     pub(super) fn seed_confirms(
@@ -1715,6 +1791,7 @@ impl DeltaScheduler {
             if !started.initial_accepted.is_empty() {
                 if let Some(streamed) = self.registry.take_streaming_return(started.activation) {
                     let released = Self::release_streaming(
+                        started.activation,
                         streamed,
                         started.initial_accepted,
                         None,
@@ -1749,6 +1826,9 @@ impl DeltaScheduler {
             continuation,
             publication: None,
             active,
+            terminal_activations: Vec::new(),
+            completed_activation_ids: Vec::new(),
+            terminal_family: None,
             seeded_parents,
         }
     }
@@ -1887,6 +1967,7 @@ impl DeltaScheduler {
 
     #[allow(clippy::too_many_arguments)]
     fn release_streaming(
+        activation: ActivationId,
         streamed: DeltaStreamingReturn,
         accepted: Vec<RawInline>,
         direct_terminal_full: Option<VariableSet>,
@@ -1907,6 +1988,7 @@ impl DeltaScheduler {
                     stats,
                 ),
                 publication: None,
+                completed_activation_ids: Vec::new(),
             };
         }
         stats.candidates_proposed += accepted.len();
@@ -1945,7 +2027,8 @@ impl DeltaScheduler {
             );
             return DeltaStableEffects {
                 continuation: None,
-                publication: Some(rows),
+                publication: Some(TerminalPublicationBatch::new(activation, rows)),
+                completed_activation_ids: Vec::new(),
             };
         }
         let continuation = match streamed.return_to {
@@ -1981,6 +2064,7 @@ impl DeltaScheduler {
         DeltaStableEffects {
             continuation,
             publication: None,
+            completed_activation_ids: Vec::new(),
         }
     }
 
@@ -2693,6 +2777,7 @@ impl DeltaScheduler {
                 });
                 if let Some(streamed) = self.registry.take_streaming_return(task.activation) {
                     task_effects.absorb(Self::release_streaming(
+                        task.activation,
                         streamed,
                         outcome.accepted,
                         direct_terminal,
@@ -2707,6 +2792,9 @@ impl DeltaScheduler {
                 assert_eq!(proof.activation, task.activation);
                 completed_activations += 1;
                 let completed = self.registry.finish(proof);
+                task_effects
+                    .completed_activation_ids
+                    .push(completed.activation);
                 prefer_continuation(
                     &mut task_effects.continuation,
                     Self::release_completion(completed, plan, stable, stable_interner, stats),
@@ -2730,6 +2818,7 @@ impl DeltaScheduler {
         DeltaStepOutcome {
             continuation: effects.continuation,
             publication: effects.publication,
+            completed_activation_ids: effects.completed_activation_ids,
             dead_pages,
             source_dead_pages,
             transition_dead_pages,
@@ -2901,6 +2990,7 @@ impl DeltaScheduler {
                 });
                 if let Some(streamed) = self.registry.take_streaming_return(task.activation) {
                     task_effects.absorb(Self::release_streaming(
+                        task.activation,
                         streamed,
                         outcome.accepted,
                         direct_terminal,
@@ -2915,6 +3005,9 @@ impl DeltaScheduler {
                 assert_eq!(proof.activation, task.activation);
                 completed_activations += 1;
                 let completed = self.registry.finish(proof);
+                task_effects
+                    .completed_activation_ids
+                    .push(completed.activation);
                 prefer_continuation(
                     &mut task_effects.continuation,
                     Self::release_completion(completed, plan, stable, stable_interner, stats),
@@ -2933,6 +3026,7 @@ impl DeltaScheduler {
         DeltaStepOutcome {
             continuation: effects.continuation,
             publication: effects.publication,
+            completed_activation_ids: effects.completed_activation_ids,
             dead_pages,
             source_dead_pages: dead_pages,
             transition_dead_pages: 0,
@@ -3613,10 +3707,17 @@ mod tests {
         );
 
         assert!(seeded.continuation.is_none());
-        let rows = seeded
+        let publication = seeded
             .publication
             .expect("the proven terminal accepting seed published directly");
-        assert_eq!((rows.row_count, rows.rows.as_slice()), (1, &[value(7)][..]));
+        assert_eq!(
+            (
+                publication.rows.row_count,
+                publication.rows.rows.as_slice(),
+            ),
+            (1, &[value(7)][..])
+        );
+        assert_eq!(publication.origins.len(), 1);
         assert!(stable.is_empty());
         assert_eq!(
             (stats.candidates_proposed, stats.max_propose_candidates),
@@ -4284,6 +4385,7 @@ mod tests {
             .take_streaming_return(live_activation)
             .expect("an accepting formula seed has a streaming return");
         let seed_continuation = DeltaScheduler::release_streaming(
+            live_activation,
             streamed,
             live.initial_accepted,
             None,

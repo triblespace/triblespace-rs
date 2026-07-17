@@ -83,6 +83,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use ahash::AHashMap;
 use indexmap::IndexSet;
 use smallvec::SmallVec;
 
@@ -90,8 +91,8 @@ use super::*;
 
 mod delta;
 use delta::{
-    ActiveDeltaContinuation, ActiveDeltaStatus, DeltaDesc, DeltaScheduler, DeltaSeedOutcome,
-    DeltaStepOutcome,
+    ActivationId as DeltaActivationId, ActiveDeltaContinuation, ActiveDeltaStatus, DeltaDesc,
+    DeltaScheduler, DeltaSeedOutcome, DeltaStepOutcome, TerminalPublicationBatch,
 };
 
 /// One deterministic route from the owned root to an opaque residual leaf.
@@ -6642,7 +6643,7 @@ enum MachineStep {
         continuation: Option<ContinuationToken>,
         /// Full-bound rows published directly by a proven terminal streaming
         /// reducer. Staging remains the outer iterator's responsibility.
-        publication: Option<RowBatch>,
+        publication: Option<TerminalPublicationBatch>,
         /// Last newly filed live cyclic activation. The outer scheduler may
         /// arm it only when the selected action was already in a scalar
         /// continuation sprint.
@@ -6651,6 +6652,9 @@ enum MachineStep {
         /// activation is created per parent; a last-filed token therefore
         /// names the complete new cohort only when this is one.
         seeded_parents: usize,
+        terminal_family: Option<StateId>,
+        terminal_activations: Vec<DeltaActivationId>,
+        completed_activation_ids: Vec<DeltaActivationId>,
     },
 }
 
@@ -6887,12 +6891,12 @@ impl ResidualActionDispatch for ShadowActionDispatch<'_> {
                 candidate_occurrences: continuation.candidates,
             }),
             MachineStep::DeltaSeeded {
-                publication: Some(rows),
+                publication: Some(publication),
                 active: None,
                 ..
             } => ActionOutcome::Advanced(ActionSurvival {
                 parent_rows: action.parent_rows,
-                candidate_occurrences: rows.row_count,
+                candidate_occurrences: publication.rows.row_count,
             }),
             MachineStep::DeltaSeeded {
                 active: Some(_), ..
@@ -6958,6 +6962,169 @@ fn execute_state<'a>(
     )
 }
 
+#[derive(Clone, Debug, Default)]
+struct TerminalFamilyYield {
+    /// Cumulative exact parent transfers. This never decreases with liveness.
+    admitted: usize,
+    live: usize,
+    completed: usize,
+    projected: usize,
+}
+
+#[derive(Clone, Debug)]
+struct TerminalAdmissionSample {
+    family: StateId,
+    complete: bool,
+    pending_rows: usize,
+    projected: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TerminalYieldLedger {
+    families: AHashMap<StateId, TerminalFamilyYield>,
+    samples: AHashMap<DeltaActivationId, TerminalAdmissionSample>,
+    ever_admitted: bool,
+}
+
+impl TerminalYieldLedger {
+    fn register(&mut self, family: StateId, activations: &[DeltaActivationId]) {
+        if activations.is_empty() {
+            return;
+        }
+        self.ever_admitted = true;
+        let family_yield = self.families.entry(family).or_default();
+        family_yield.admitted = family_yield
+            .admitted
+            .checked_add(activations.len())
+            .expect("terminal admission count overflow");
+        family_yield.live = family_yield
+            .live
+            .checked_add(activations.len())
+            .expect("terminal live count overflow");
+        for &activation in activations {
+            assert!(
+                self.samples
+                    .insert(
+                        activation,
+                        TerminalAdmissionSample {
+                            family,
+                            complete: false,
+                            pending_rows: 0,
+                            projected: 0,
+                        },
+                    )
+                    .is_none(),
+                "terminal activation was registered twice"
+            );
+        }
+    }
+
+    fn stage(&mut self, origins: &[DeltaActivationId]) {
+        for &origin in origins {
+            let sample = self
+                .samples
+                .get_mut(&origin)
+                .expect("direct terminal publication has no admission sample");
+            assert!(
+                !sample.complete,
+                "a completed terminal activation published another row"
+            );
+            sample.pending_rows = sample
+                .pending_rows
+                .checked_add(1)
+                .expect("terminal pending row count overflow");
+        }
+    }
+
+    fn complete(&mut self, activation: DeltaActivationId) {
+        let Some(sample) = self.samples.get_mut(&activation) else {
+            // Nonterminal delta activations share the scheduler receipt stream.
+            return;
+        };
+        assert!(!sample.complete, "terminal activation completed twice");
+        sample.complete = true;
+        let family = sample.family;
+        let family_yield = self
+            .families
+            .get_mut(&family)
+            .expect("terminal sample lost its family");
+        family_yield.live = family_yield
+            .live
+            .checked_sub(1)
+            .expect("terminal live count underflow");
+        self.finalize_if_ready(activation);
+    }
+
+    fn begin_projection(
+        &mut self,
+        activation: DeltaActivationId,
+    ) -> TerminalProjectionAttempt<'_> {
+        let sample = self
+            .samples
+            .get_mut(&activation)
+            .expect("staged terminal row lost its admission sample");
+        sample.pending_rows = sample
+            .pending_rows
+            .checked_sub(1)
+            .expect("terminal projection consumed an unstaged row");
+        TerminalProjectionAttempt {
+            ledger: self,
+            activation,
+            successful: false,
+        }
+    }
+
+    fn settle_projection(&mut self, activation: DeltaActivationId, successful: bool) {
+        if successful {
+            let sample = self
+                .samples
+                .get_mut(&activation)
+                .expect("terminal projection settled after sample removal");
+            sample.projected = sample.projected.saturating_add(1);
+        }
+        self.finalize_if_ready(activation);
+    }
+
+    fn finalize_if_ready(&mut self, activation: DeltaActivationId) {
+        let ready = self
+            .samples
+            .get(&activation)
+            .is_some_and(|sample| sample.complete && sample.pending_rows == 0);
+        if !ready {
+            return;
+        }
+        let sample = self
+            .samples
+            .remove(&activation)
+            .expect("ready terminal sample disappeared");
+        let family = self
+            .families
+            .get_mut(&sample.family)
+            .expect("terminal sample lost its family at finalization");
+        family.completed = family.completed.saturating_add(1);
+        family.projected = family.projected.saturating_add(sample.projected);
+    }
+}
+
+struct TerminalProjectionAttempt<'a> {
+    ledger: &'a mut TerminalYieldLedger,
+    activation: DeltaActivationId,
+    successful: bool,
+}
+
+impl TerminalProjectionAttempt<'_> {
+    fn mark_successful(&mut self) {
+        self.successful = true;
+    }
+}
+
+impl Drop for TerminalProjectionAttempt<'_> {
+    fn drop(&mut self) {
+        self.ledger
+            .settle_projection(self.activation, self.successful);
+    }
+}
+
 /// Resumable execution state for [`ResidualStateIter`].
 ///
 /// The exact interner deliberately outlives live buckets. Occupancy scheduling
@@ -6978,6 +7145,10 @@ struct ResidualStateMachine {
     binding: Binding,
     emit_vars: Vec<VariableId>,
     emit_rows: Vec<RawInline>,
+    /// Exact terminal activation responsible for each staged direct row.
+    /// Ordinary stable emission stores `None`. This physical sideband never
+    /// contributes to canonical state identity or observable result order.
+    emit_origins: Option<Vec<DeltaActivationId>>,
     emit_next: usize,
     emit_count: usize,
     /// Exact physical cohort activated by a partially surviving full action
@@ -6991,6 +7162,7 @@ struct ResidualStateMachine {
     /// Whether `active_delta` crossed a stable-yield boundary and has not yet
     /// been resumed. This is physical state, not canonical residual identity.
     active_delta_after_yield: bool,
+    terminal_yield: TerminalYieldLedger,
     #[cfg(test)]
     continuation_sprint_enabled: bool,
     #[cfg(test)]
@@ -7004,6 +7176,9 @@ struct ResidualStateMachine {
     terminal_demand_width: usize,
     terminal_demand_consumed: usize,
     terminal_demand_exhausted: bool,
+    /// Cumulative successful public projections, independent of telemetry
+    /// resets and of the currently open demand window.
+    terminal_projected_rows: usize,
     width: usize,
     growth: usize,
     cap: usize,
@@ -7208,11 +7383,13 @@ impl ResidualStateMachine {
             binding: Binding::default(),
             emit_vars: Vec::new(),
             emit_rows: Vec::new(),
+            emit_origins: None,
             emit_next: 0,
             emit_count: 0,
             continuation: None,
             active_delta: None,
             active_delta_after_yield: false,
+            terminal_yield: TerminalYieldLedger::default(),
             #[cfg(test)]
             continuation_sprint_enabled: true,
             #[cfg(test)]
@@ -7222,6 +7399,7 @@ impl ResidualStateMachine {
             terminal_demand_width: 1,
             terminal_demand_consumed: 0,
             terminal_demand_exhausted: false,
+            terminal_projected_rows: 0,
             width: lazy_start_width().clamp(1, cap),
             growth: lazy_growth(),
             cap,
@@ -7566,21 +7744,20 @@ impl ResidualStateMachine {
         self.stats.propose_rows += rows.row_count;
         self.stats.max_propose_rows = self.stats.max_propose_rows.max(rows.row_count);
         if paged {
-            let seeded_parents = rows.row_count;
-            let active = self.delta.seed_source_proposals_with_full(
+            let mut outcome = self.delta.seed_source_proposals_with_full_receipt(
                 DeltaDesc::leaf(variable, proposer),
                 successor,
                 rows,
                 self.full,
             );
-            return Ok(DeltaSeedOutcome {
-                continuation: None,
-                publication: None,
-                active,
-                seeded_parents,
-            });
+            if terminal_streaming && self.uses_direct_terminal_publication() {
+                outcome.terminal_family = Some(state);
+            } else {
+                outcome.terminal_activations.clear();
+            }
+            return Ok(outcome);
         }
-        let outcome = self.delta.seed_proposals_with_full(
+        let mut outcome = self.delta.seed_proposals_with_full(
             DeltaDesc::leaf(variable, proposer),
             successor,
             rows,
@@ -7592,6 +7769,11 @@ impl ResidualStateMachine {
             &mut self.interner,
             &mut self.stats,
         );
+        if terminal_streaming && self.uses_direct_terminal_publication() {
+            outcome.terminal_family = Some(state);
+        } else {
+            outcome.terminal_activations.clear();
+        }
         Ok(outcome)
     }
 
@@ -7682,6 +7864,9 @@ impl ResidualStateMachine {
                 continuation: None,
                 publication: None,
                 active,
+                terminal_activations: Vec::new(),
+                completed_activation_ids: Vec::new(),
+                terminal_family: None,
                 seeded_parents,
             });
         }
@@ -7729,6 +7914,9 @@ impl ResidualStateMachine {
             continuation: None,
             publication: None,
             active,
+            terminal_activations: Vec::new(),
+            completed_activation_ids: Vec::new(),
+            terminal_family: None,
             seeded_parents,
         })
     }
@@ -7880,6 +8068,9 @@ impl ResidualStateMachine {
                 continuation: None,
                 publication: None,
                 active,
+                terminal_activations: Vec::new(),
+                completed_activation_ids: Vec::new(),
+                terminal_family: None,
                 seeded_parents,
             });
         }
@@ -7912,12 +8103,18 @@ impl ResidualStateMachine {
                 publication,
                 active,
                 seeded_parents,
+                terminal_family,
+                terminal_activations,
+                completed_activation_ids,
             }) => {
                 return MachineStep::DeltaSeeded {
                     continuation,
                     publication,
                     active,
                     seeded_parents,
+                    terminal_family,
+                    terminal_activations,
+                    completed_activation_ids,
                 };
             }
             Err(task) => task,
@@ -7928,12 +8125,18 @@ impl ResidualStateMachine {
                 publication,
                 active,
                 seeded_parents,
+                terminal_family,
+                terminal_activations,
+                completed_activation_ids,
             }) => {
                 return MachineStep::DeltaSeeded {
                     continuation,
                     publication,
                     active,
                     seeded_parents,
+                    terminal_family,
+                    terminal_activations,
+                    completed_activation_ids,
                 };
             }
             Err(task) => task,
@@ -7944,12 +8147,18 @@ impl ResidualStateMachine {
                 publication,
                 active,
                 seeded_parents,
+                terminal_family,
+                terminal_activations,
+                completed_activation_ids,
             }) => {
                 return MachineStep::DeltaSeeded {
                     continuation,
                     publication,
                     active,
                     seeded_parents,
+                    terminal_family,
+                    terminal_activations,
+                    completed_activation_ids,
                 };
             }
             Err(task) => task,
@@ -8102,8 +8311,11 @@ impl ResidualStateMachine {
                 ActiveContinuation::probe_one(token)
             }
         });
-        if let Some(rows) = outcome.publication.take() {
-            self.stage_direct_terminal_publication(rows);
+        if let Some(publication) = outcome.publication.take() {
+            self.stage_direct_terminal_publication(publication);
+        }
+        for activation in std::mem::take(&mut outcome.completed_activation_ids) {
+            self.terminal_yield.complete(activation);
         }
     }
 
@@ -8181,10 +8393,26 @@ impl ResidualStateMachine {
     fn accept_delta_seed(
         &mut self,
         continuation: Option<ContinuationToken>,
-        publication: Option<RowBatch>,
+        publication: Option<TerminalPublicationBatch>,
         active: Option<ActiveDeltaContinuation>,
         seeded_parents: usize,
+        terminal_family: Option<StateId>,
+        terminal_activations: Vec<DeltaActivationId>,
+        completed_activation_ids: Vec<DeltaActivationId>,
     ) {
+        if let Some(family) = terminal_family {
+            assert_eq!(
+                terminal_activations.len(),
+                seeded_parents,
+                "one terminal activation must own each admitted parent"
+            );
+            self.terminal_yield.register(family, &terminal_activations);
+        } else {
+            assert!(
+                terminal_activations.is_empty(),
+                "terminal activations lost their proposer family"
+            );
+        }
         // An immediate accepting seed effect runs first, but it does not own
         // the independent traversal credits created by the same seed. Keep a
         // singleton activation suspended beside that stable handoff exactly
@@ -8195,25 +8423,40 @@ impl ResidualStateMachine {
         self.stats.delta_active_live_yields_retained += usize::from(self.active_delta_after_yield);
         self.active_delta = retained;
         self.continuation = continuation.map(ActiveContinuation::probe_one);
-        if let Some(rows) = publication {
-            self.stage_direct_terminal_publication(rows);
+        if let Some(publication) = publication {
+            self.stage_direct_terminal_publication(publication);
+        }
+        for activation in completed_activation_ids {
+            self.terminal_yield.complete(activation);
         }
     }
 
     fn stage_emit(&mut self, rows: RowBatch) {
         debug_assert!(self.emit_next >= self.emit_count);
+        self.emit_origins = None;
         self.emit_rows = rows.rows;
         self.emit_next = 0;
         self.emit_count = rows.row_count;
     }
 
-    fn stage_direct_terminal_publication(&mut self, rows: RowBatch) {
+    fn stage_direct_terminal_publication(&mut self, publication: TerminalPublicationBatch) {
+        let TerminalPublicationBatch { rows, origins } = publication;
         assert!(rows.row_count > 0, "direct publication staged no rows");
+        assert_eq!(
+            origins.len(),
+            rows.row_count,
+            "direct publication lost activation origins"
+        );
+        self.terminal_yield.stage(&origins);
         self.stats.delta_direct_terminal_publication_batches += 1;
         self.stats.delta_direct_terminal_publication_rows += rows.row_count;
         self.emit_vars.clear();
         self.emit_vars.extend(self.full);
-        self.stage_emit(rows);
+        debug_assert!(self.emit_next >= self.emit_count);
+        self.emit_origins = Some(origins);
+        self.emit_rows = rows.rows;
+        self.emit_next = 0;
+        self.emit_count = rows.row_count;
         // This replaces exactly one eventual terminal Emit batch. In this
         // scheduler output is not search feedback: S stays unchanged, q is
         // charged only by a successful projection, and the independent
@@ -8244,6 +8487,10 @@ impl ResidualStateMachine {
 
     fn charge_projected_result(&mut self) {
         debug_assert!(!self.terminal_demand_exhausted);
+        self.terminal_projected_rows = self
+            .terminal_projected_rows
+            .checked_add(1)
+            .expect("terminal projected row count overflow");
         self.terminal_demand_consumed = self
             .terminal_demand_consumed
             .checked_add(1)
@@ -8276,15 +8523,26 @@ impl ResidualStateMachine {
                 // Consume before invoking user code. If it panics and the
                 // unwind is caught, a later pull must not repeat its effects.
                 self.emit_next += 1;
+                let origin = self
+                    .emit_origins
+                    .as_ref()
+                    .map(|origins| origins[row]);
+                let mut projection = origin
+                    .map(|activation| self.terminal_yield.begin_projection(activation));
                 let stride = self.emit_vars.len();
                 let start = row * stride;
                 for (column, &variable) in self.emit_vars.iter().enumerate() {
                     self.binding.set(variable, &self.emit_rows[start + column]);
                 }
                 if let Some(result) = postprocessing(&self.binding) {
+                    if let Some(projection) = &mut projection {
+                        projection.mark_successful();
+                    }
+                    drop(projection);
                     self.charge_projected_result();
                     return Some(result);
                 }
+                drop(projection);
             }
             if self.worklist.is_empty() && self.delta.is_empty() {
                 return None;
@@ -8373,8 +8631,19 @@ impl ResidualStateMachine {
                     publication,
                     active,
                     seeded_parents,
+                    terminal_family,
+                    terminal_activations,
+                    completed_activation_ids,
                 } => {
-                    self.accept_delta_seed(continuation, publication, active, seeded_parents);
+                    self.accept_delta_seed(
+                        continuation,
+                        publication,
+                        active,
+                        seeded_parents,
+                        terminal_family,
+                        terminal_activations,
+                        completed_activation_ids,
+                    );
                 }
             }
         }
@@ -8448,11 +8717,13 @@ impl ResidualStateMachine {
             binding: Binding::default(),
             emit_vars: Vec::new(),
             emit_rows: Vec::new(),
+            emit_origins: None,
             emit_next: 0,
             emit_count: 0,
             continuation: None,
             active_delta: None,
             active_delta_after_yield: false,
+            terminal_yield: self.terminal_yield.clone(),
             #[cfg(test)]
             continuation_sprint_enabled: self.continuation_sprint_enabled,
             #[cfg(test)]
@@ -8462,6 +8733,7 @@ impl ResidualStateMachine {
             terminal_demand_width: self.terminal_demand_width,
             terminal_demand_consumed: 0,
             terminal_demand_exhausted: false,
+            terminal_projected_rows: self.terminal_projected_rows,
             width: self.width,
             growth: self.growth,
             cap: self.cap,
@@ -8486,6 +8758,12 @@ impl ResidualStateMachine {
         influences: &[VariableSet; 128],
         base_estimates: &[usize; 128],
     ) -> Option<Self> {
+        // StateId is a machine-local family key. Once a terminal admission
+        // exists, splitting would require either a shared projected-yield
+        // ledger or origin propagation through every stable bucket.
+        if self.terminal_yield.ever_admitted {
+            return None;
+        }
         // A public producer only splits an unpulled iterator, so no latency
         // continuation can be live here. Clear the physical preference
         // defensively: dropping it never drops affine work, while retaining it
@@ -8494,6 +8772,9 @@ impl ResidualStateMachine {
         self.active_delta = None;
         self.active_delta_after_yield = false;
         loop {
+            if self.terminal_yield.ever_admitted {
+                return None;
+            }
             debug_assert_eq!(
                 self.emit_next, 0,
                 "parallel residual splits before fold consumption"
@@ -8508,6 +8789,10 @@ impl ResidualStateMachine {
                 let mut right = self.parallel_sibling();
                 right.emit_vars = self.emit_vars.clone();
                 right.emit_rows = self.emit_rows.split_off(left_count * stride);
+                right.emit_origins = self
+                    .emit_origins
+                    .as_mut()
+                    .map(|origins| origins.split_off(left_count));
                 right.emit_count = right_count;
                 self.emit_count = left_count;
                 return Some(right);
@@ -8519,6 +8804,7 @@ impl ResidualStateMachine {
                 let mut right = self.parallel_sibling();
                 right.emit_vars = std::mem::take(&mut self.emit_vars);
                 right.emit_rows = std::mem::take(&mut self.emit_rows);
+                right.emit_origins = self.emit_origins.take();
                 right.emit_count = 1;
                 self.emit_count = 0;
                 return Some(right);
@@ -8628,8 +8914,24 @@ impl ResidualStateMachine {
                 // every successor normally and deliberately does not arm the
                 // first-result continuation sprint before the frontier has
                 // been partitioned.
-                MachineStep::Stable(StepOutcome::Advanced(_)) | MachineStep::DeltaSeeded { .. } => {
-                }
+                MachineStep::Stable(StepOutcome::Advanced(_)) => {}
+                MachineStep::DeltaSeeded {
+                    continuation,
+                    publication,
+                    active,
+                    seeded_parents,
+                    terminal_family,
+                    terminal_activations,
+                    completed_activation_ids,
+                } => self.accept_delta_seed(
+                    continuation,
+                    publication,
+                    active,
+                    seeded_parents,
+                    terminal_family,
+                    terminal_activations,
+                    completed_activation_ids,
+                ),
                 MachineStep::Stable(StepOutcome::Dead) => {
                     self.increase_width();
                     self.increase_delta_activation_width();
@@ -9945,6 +10247,82 @@ mod tests {
     }
 
     #[test]
+    fn terminal_yield_finalizes_only_after_completion_and_projection() {
+        let family = StateId(7);
+        let first = DeltaActivationId::test(11);
+        let empty = DeltaActivationId::test(12);
+        let mut ledger = TerminalYieldLedger::default();
+
+        ledger.register(family, &[first, empty]);
+        ledger.stage(&[first, first]);
+        ledger.complete(first);
+        assert_eq!(
+            (
+                ledger.families[&family].admitted,
+                ledger.families[&family].live,
+                ledger.families[&family].completed,
+                ledger.families[&family].projected,
+            ),
+            (2, 1, 0, 0),
+            "quiescence cannot finalize while projected rows remain pending"
+        );
+
+        {
+            let mut attempt = ledger.begin_projection(first);
+            attempt.mark_successful();
+        }
+        drop(ledger.begin_projection(first));
+        assert_eq!(
+            (
+                ledger.families[&family].admitted,
+                ledger.families[&family].live,
+                ledger.families[&family].completed,
+                ledger.families[&family].projected,
+            ),
+            (2, 1, 1, 1)
+        );
+
+        ledger.complete(empty);
+        assert_eq!(
+            (
+                ledger.families[&family].admitted,
+                ledger.families[&family].live,
+                ledger.families[&family].completed,
+                ledger.families[&family].projected,
+            ),
+            (2, 0, 2, 1),
+            "a complete zero-row activation is an observed zero-yield sample"
+        );
+        assert!(ledger.samples.is_empty());
+    }
+
+    #[test]
+    fn terminal_projection_unwind_settles_as_rejected_and_closes_sample() {
+        let family = StateId(8);
+        let activation = DeltaActivationId::test(21);
+        let mut ledger = TerminalYieldLedger::default();
+        ledger.register(family, &[activation]);
+        ledger.stage(&[activation]);
+        ledger.complete(activation);
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _attempt = ledger.begin_projection(activation);
+            panic!("intentional projection unwind");
+        }));
+        assert!(unwind.is_err());
+        assert!(ledger.samples.is_empty());
+        assert_eq!(
+            (
+                ledger.families[&family].admitted,
+                ledger.families[&family].live,
+                ledger.families[&family].completed,
+                ledger.families[&family].projected,
+            ),
+            (1, 0, 1, 0)
+        );
+    }
+
+    #[test]
     fn projected_demand_floors_search_only_on_the_pull_after_a_consumed_window() {
         let projected_calls = Arc::new(AtomicUsize::new(0));
         let calls = Arc::clone(&projected_calls);
@@ -10214,9 +10592,26 @@ mod tests {
             .expect("the paged proposal action seeded its delta source");
         assert!(seeded.continuation.is_none());
         assert!(seeded.publication.is_none());
-        let active = seeded.active.expect("the paged source remained live");
-        iter.state
-            .accept_delta_seed(None, None, Some(active), seeded.seeded_parents);
+        let DeltaSeedOutcome {
+            active: Some(active),
+            seeded_parents,
+            terminal_family,
+            terminal_activations,
+            completed_activation_ids,
+            ..
+        } = seeded
+        else {
+            panic!("the paged source remained live")
+        };
+        iter.state.accept_delta_seed(
+            None,
+            None,
+            Some(active),
+            seeded_parents,
+            terminal_family,
+            terminal_activations,
+            completed_activation_ids,
+        );
         assert_eq!(iter.state.active_delta, Some(active));
         iter
     }
@@ -10234,6 +10629,16 @@ mod tests {
         );
         let direct_results: Vec<_> = direct.by_ref().collect();
         let direct_stats = direct.stats().clone();
+        let direct_yield = &direct.state.terminal_yield.families[&StateId(u32::MAX)];
+        assert_eq!(
+            (
+                direct_yield.admitted,
+                direct_yield.live,
+                direct_yield.completed,
+                direct_yield.projected,
+            ),
+            (1, 0, 1, 4)
+        );
 
         let control_proposes = Arc::new(AtomicUsize::new(0));
         let control_pages = Arc::new(AtomicUsize::new(0));
@@ -10244,8 +10649,15 @@ mod tests {
             |binding: &Binding| Some((binding.get(0).copied()?, binding.get(1).copied()?)),
         );
         control.state.direct_terminal_publication_enabled = false;
+        // The ablation is toggled after the fixture already seeded its source;
+        // discard that now-unobservable sample just as a no-direct seed would.
+        control.state.terminal_yield = TerminalYieldLedger::default();
         let control_results: Vec<_> = control.by_ref().collect();
         let control_stats = control.stats().clone();
+        assert!(
+            control.state.terminal_yield.families.is_empty(),
+            "the no-direct ablation cannot honestly attribute stable projection"
+        );
 
         let expected = [
             (raw(9), raw(3)),
@@ -10389,6 +10801,19 @@ mod tests {
         assert_eq!(iter.next(), Some((raw(9), raw(1))));
         assert_eq!(pages.load(Ordering::Relaxed), 2);
         assert_eq!(iter.next(), Some((raw(9), raw(3))));
+        assert_eq!(iter.next(), Some((raw(9), raw(2))));
+        assert_eq!(iter.next(), None);
+        let family = &iter.state.terminal_yield.families[&StateId(u32::MAX)];
+        assert_eq!(
+            (
+                family.admitted,
+                family.live,
+                family.completed,
+                family.projected,
+            ),
+            (1, 0, 1, 3),
+            "the unwound row is consumed but contributes no projected yield"
+        );
     }
 
     #[derive(Clone, Copy)]
@@ -17113,6 +17538,7 @@ mod tests {
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
         machine.emit_vars = vec![0];
         machine.emit_rows = (0..7).map(raw).collect();
+        machine.emit_origins = None;
         machine.emit_count = 7;
 
         let right = machine
@@ -17126,8 +17552,10 @@ mod tests {
 
         assert_eq!(machine.emit_count, 4);
         assert_eq!(machine.emit_rows, (0..4).map(raw).collect::<Vec<_>>());
+        assert!(machine.emit_origins.is_none());
         assert_eq!(right.emit_count, 3);
         assert_eq!(right.emit_rows, (4..7).map(raw).collect::<Vec<_>>());
+        assert!(right.emit_origins.is_none());
         assert!(machine.worklist.is_empty());
         assert!(right.worklist.is_empty());
     }
@@ -18068,6 +18496,7 @@ mod tests {
         machine.accept_delta_step(DeltaStepOutcome {
             continuation: Some(token),
             publication: None,
+            completed_activation_ids: Vec::new(),
             dead_pages: 2,
             source_dead_pages: 2,
             transition_dead_pages: 0,
@@ -18085,6 +18514,7 @@ mod tests {
         machine.accept_delta_step(DeltaStepOutcome {
             continuation: Some(token),
             publication: None,
+            completed_activation_ids: Vec::new(),
             dead_pages: 0,
             source_dead_pages: 0,
             transition_dead_pages: 0,
@@ -18115,6 +18545,7 @@ mod tests {
         machine.accept_delta_step(DeltaStepOutcome {
             continuation: Some(terminal),
             publication: None,
+            completed_activation_ids: Vec::new(),
             dead_pages: 0,
             source_dead_pages: 0,
             transition_dead_pages: 0,
@@ -18131,6 +18562,7 @@ mod tests {
         machine.accept_delta_step(DeltaStepOutcome {
             continuation: None,
             publication: None,
+            completed_activation_ids: Vec::new(),
             dead_pages: 2,
             source_dead_pages: 2,
             transition_dead_pages: 0,
@@ -18145,6 +18577,7 @@ mod tests {
         machine.accept_delta_step(DeltaStepOutcome {
             continuation: None,
             publication: None,
+            completed_activation_ids: Vec::new(),
             dead_pages: 1,
             source_dead_pages: 0,
             transition_dead_pages: 1,
@@ -18161,6 +18594,7 @@ mod tests {
         machine.accept_delta_step(DeltaStepOutcome {
             continuation: None,
             publication: None,
+            completed_activation_ids: Vec::new(),
             dead_pages: 0,
             source_dead_pages: 0,
             transition_dead_pages: 0,
@@ -18195,24 +18629,24 @@ mod tests {
             .expect("one cyclic source activation was filed");
 
         machine.last_selection = SelectionKind::Continuation(ContinuationMode::ProbeOne);
-        machine.accept_delta_seed(None, None, Some(active), 1);
+        machine.accept_delta_seed(None, None, Some(active), 1, None, Vec::new(), Vec::new());
         assert_eq!(machine.active_delta, Some(active));
 
         machine.last_selection = SelectionKind::Continuation(ContinuationMode::Cohort);
-        machine.accept_delta_seed(None, None, Some(active), 1);
+        machine.accept_delta_seed(None, None, Some(active), 1, None, Vec::new(), Vec::new());
         assert_eq!(
             machine.active_delta,
             Some(active),
             "the action after a one-atom planning probe is a singleton cohort"
         );
-        machine.accept_delta_seed(None, None, Some(active), 512);
+        machine.accept_delta_seed(None, None, Some(active), 512, None, Vec::new(), Vec::new());
         assert!(
             machine.active_delta.is_none(),
             "a wide cohort must not pick an arbitrary last activation"
         );
 
         machine.last_selection = SelectionKind::Full;
-        machine.accept_delta_seed(None, None, Some(active), 1);
+        machine.accept_delta_seed(None, None, Some(active), 1, None, Vec::new(), Vec::new());
         assert!(machine.active_delta.is_none());
 
         machine.last_selection = SelectionKind::Continuation(ContinuationMode::ProbeOne);
@@ -18225,7 +18659,15 @@ mod tests {
             &mut machine.stats,
         )
         .expect("one stable seed effect was filed");
-        machine.accept_delta_seed(Some(stable), None, Some(active), 1);
+        machine.accept_delta_seed(
+            Some(stable),
+            None,
+            Some(active),
+            1,
+            None,
+            Vec::new(),
+            Vec::new(),
+        );
         assert_eq!(
             machine.active_delta,
             Some(active),
@@ -18238,7 +18680,7 @@ mod tests {
         );
 
         machine.continuation_sprint_enabled = false;
-        machine.accept_delta_seed(None, None, Some(active), 1);
+        machine.accept_delta_seed(None, None, Some(active), 1, None, Vec::new(), Vec::new());
         assert!(
             machine.active_delta.is_none(),
             "the stable continuation ablation must also disable cyclic focus"

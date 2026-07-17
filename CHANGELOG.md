@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Terminal demand learns only from completed projected-yield samples.** Each
+  admitted terminal parent now retains its exact delta activation through
+  direct-publication batching and projection. Per-proposer ledgers distinguish
+  cumulative admissions from live activations, close a sample only after both
+  affine quiescence and every staged projection attempt, and treat a caught
+  projection unwind as consumed but rejected. Exact seed and completion
+  receipts cover immediately quiescent activations; Rayon conservatively keeps
+  an admitted learner in one shard until cross-shard origin transfer exists.
 - **All proven terminal activations publish directly.** Terminal rows now
   bypass canonical Candidate/Ready/Emit states whether the activation is the
   depth-first lease or globally scheduled cold work. The scheduler still
