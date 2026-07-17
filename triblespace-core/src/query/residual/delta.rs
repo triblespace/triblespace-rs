@@ -1338,6 +1338,7 @@ impl OrderedActivationSet {
         self.values.is_empty()
     }
 
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.values.len()
     }
