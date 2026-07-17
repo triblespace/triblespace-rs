@@ -32,6 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Ready pops. Cold cohorts and nonterminal leases remain unchanged; output does
   not widen search `S`, and projected demand `q` is still charged only after a
   successful public projection.
+- **The cross-generation query benchmark can diagnose live prefix costs.**
+  Its opt-in checkpoint mode separates cumulative time-to-N, fresh-query
+  time-to-N, and drop-at-N cancellation cost at 1/10/63/64/65/100/1,000 rows,
+  while preserving exact full-result oracle gates and reporting untimed prefix
+  order evidence plus FULL-residual scheduler snapshots.
 - **A source-identical benchmark compares query-engine generations.**
   `query_engine_generation_bench` runs finite unions, recursive AND/OR,
   cyclic regular paths, and mixed formula/path queries against independent
