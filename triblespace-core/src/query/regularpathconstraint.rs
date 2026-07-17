@@ -2399,6 +2399,7 @@ impl TypedProgramSpec for RegularPathConstraint {
         });
     }
 
+    #[allow(unexpected_cfgs)]
     fn dispatch(&self, state: &Self::State) -> DispatchClass {
         match state.kind() {
             RpqStateKind::Source {
@@ -2420,7 +2421,21 @@ impl TypedProgramSpec for RegularPathConstraint {
             RpqStateKind::Transition {
                 cursor: RpqExpandCursor::After { .. },
                 ..
-            } => RPQ_TRANSITION_AFTER,
+            } => {
+                // Diagnostic ablation: DispatchClass is physical-only. Start
+                // and After are both Transition states with Activation pacing;
+                // step_typed destructures every input independently and passes
+                // its exact (node, cursor, limit) to expand_delta_program_page.
+                // The enclosing Program state/key still pins occurrence/spec,
+                // schema, candidates, and publication compatibility, so this
+                // cannot mix Source, Support, CandidateFilter, or terminal
+                // publication classes into the transition cohort.
+                if cfg!(engine_rpq_collapse_transition_dispatch) {
+                    RPQ_TRANSITION_START
+                } else {
+                    RPQ_TRANSITION_AFTER
+                }
+            }
             RpqStateKind::CandidateFilter { .. } => RPQ_CANDIDATE_FILTER,
             RpqStateKind::Support => RPQ_SUPPORT,
         }
@@ -2864,6 +2879,56 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
 #[cfg(test)]
 mod delta_program_tests {
     use super::*;
+
+    #[allow(unexpected_cfgs)]
+    #[test]
+    fn transition_cursor_dispatch_collapse_is_physical_only() {
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let path =
+            RegularPathConstraint::new(TribleSet::new(), start, end, &[PathOp::Attr([1; ID_LEN])]);
+        let node = RpqNode {
+            source: None,
+            value: [2; 32],
+            pc: path.delta_program.encode(path.delta_program.start),
+        };
+        let transition_start = RpqState::transition(end.index, node, RpqExpandCursor::Start);
+        let transition_after = RpqState::transition(
+            end.index,
+            node,
+            RpqExpandCursor::After {
+                branch: 0,
+                value: [3; 32],
+            },
+        );
+
+        if cfg!(engine_rpq_collapse_transition_dispatch) {
+            assert_eq!(
+                path.dispatch(&transition_start),
+                path.dispatch(&transition_after)
+            );
+        } else {
+            assert_ne!(
+                path.dispatch(&transition_start),
+                path.dispatch(&transition_after)
+            );
+        }
+        assert_eq!(path.pacing(&transition_start), ProgramPacing::Activation);
+        assert_eq!(path.pacing(&transition_after), ProgramPacing::Activation);
+
+        let source_start = RpqState::source(start.index, RpqSourceCursor::Start, false);
+        let source_after = RpqState::source(start.index, RpqSourceCursor::After([4; 32]), false);
+        let source_offset = RpqState::source(start.index, RpqSourceCursor::Offset(1), false);
+        let source_dispatches = [
+            path.dispatch(&source_start),
+            path.dispatch(&source_after),
+            path.dispatch(&source_offset),
+        ];
+        for (index, dispatch) in source_dispatches.iter().enumerate() {
+            assert!(!source_dispatches[..index].contains(dispatch));
+            assert_ne!(*dispatch, path.dispatch(&transition_start));
+        }
+    }
 
     #[test]
     fn complete_action_certificate_is_exactly_bound_endpoint_propose() {
