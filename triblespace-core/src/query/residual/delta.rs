@@ -1509,6 +1509,8 @@ impl DeltaBucket {
         registry: &ProducerRegistry,
         width: usize,
         activation_width: usize,
+        terminal_selection_slots: &mut AHashMap<ActivationId, usize>,
+        terminal_selections: &mut Vec<TerminalActivationSelection>,
     ) -> (Vec<DeltaTask>, Vec<usize>) {
         let width = width.max(1);
         let activation_width = activation_width.max(1);
@@ -1537,8 +1539,8 @@ impl DeltaBucket {
             }
 
             let mut remaining = width;
-            let mut selection_slots = AHashMap::<ActivationId, usize>::new();
-            let mut selections = Vec::<TerminalActivationSelection>::new();
+            terminal_selection_slots.clear();
+            terminal_selections.clear();
             let mut selected = Vec::with_capacity(width.min(self.tasks.len()));
             // During selection this parallel vector holds selection slots. It
             // is rewritten in place to the final ragged task limits once all
@@ -1547,28 +1549,28 @@ impl DeltaBucket {
             let mut retained = Vec::with_capacity(self.tasks.len());
             for task in std::mem::take(&mut self.tasks).into_iter().rev() {
                 if TransitionDispatchKey::of(registry, &task) == key {
-                    let selection_slot = if let Some(&slot) = selection_slots.get(&task.activation)
-                    {
-                        Some(slot)
-                    } else if remaining > 0 {
-                        let budget = registry
-                            .transition_dispatch_width(task.activation, width)
-                            .min(remaining);
-                        debug_assert!(budget > 0);
-                        remaining -= budget;
-                        let slot = selections.len();
-                        selections.push(TerminalActivationSelection {
-                            budget,
-                            selected: 0,
-                            ordinal: 0,
-                        });
-                        selection_slots.insert(task.activation, slot);
-                        Some(slot)
-                    } else {
-                        None
-                    };
+                    let selection_slot =
+                        if let Some(&slot) = terminal_selection_slots.get(&task.activation) {
+                            Some(slot)
+                        } else if remaining > 0 {
+                            let budget = registry
+                                .transition_dispatch_width(task.activation, width)
+                                .min(remaining);
+                            debug_assert!(budget > 0);
+                            remaining -= budget;
+                            let slot = terminal_selections.len();
+                            terminal_selections.push(TerminalActivationSelection {
+                                budget,
+                                selected: 0,
+                                ordinal: 0,
+                            });
+                            terminal_selection_slots.insert(task.activation, slot);
+                            Some(slot)
+                        } else {
+                            None
+                        };
                     if let Some((slot, selection)) = selection_slot
-                        .map(|slot| (slot, &mut selections[slot]))
+                        .map(|slot| (slot, &mut terminal_selections[slot]))
                         .filter(|(_, selection)| selection.selected < selection.budget)
                     {
                         selection.selected += 1;
@@ -1585,7 +1587,7 @@ impl DeltaBucket {
             self.tasks = retained;
 
             for slot_or_limit in &mut limits {
-                let selection = &mut selections[*slot_or_limit];
+                let selection = &mut terminal_selections[*slot_or_limit];
                 let quotient = selection.budget / selection.selected;
                 let remainder = selection.budget % selection.selected;
                 *slot_or_limit = quotient + usize::from(selection.ordinal < remainder);
@@ -1594,7 +1596,7 @@ impl DeltaBucket {
             debug_assert!(limits.iter().all(|&limit| limit > 0));
             debug_assert_eq!(
                 limits.iter().sum::<usize>(),
-                selections
+                terminal_selections
                     .iter()
                     .map(|selection| selection.budget)
                     .sum::<usize>()
@@ -1667,6 +1669,11 @@ pub(super) struct DeltaScheduler {
     /// transition cohort. This grows only when activations complete; `width`
     /// remains the separate intra-activation page/work budget.
     activation_width: usize,
+    /// Query-local scratch for the exact terminal cohort partition. Keeping
+    /// it beside the scheduler amortizes hash-table and record allocation
+    /// without making scratch state part of canonical delta identity.
+    terminal_selection_slots: AHashMap<ActivationId, usize>,
+    terminal_selections: Vec<TerminalActivationSelection>,
 }
 
 impl DeltaScheduler {
@@ -1677,6 +1684,8 @@ impl DeltaScheduler {
             worklist: BTreeMap::new(),
             source_worklist: BTreeMap::new(),
             activation_width: 1,
+            terminal_selection_slots: AHashMap::new(),
+            terminal_selections: Vec::new(),
         }
     }
 
@@ -2505,9 +2514,17 @@ impl DeltaScheduler {
         });
         let (tasks, task_limits, empty, remainder_tasks) = {
             let registry = &self.registry;
+            let activation_width = self.activation_width;
+            let terminal_selection_slots = &mut self.terminal_selection_slots;
+            let terminal_selections = &mut self.terminal_selections;
             let bucket = self.worklist.get_mut(&id).expect("selected delta state");
-            let (tasks, task_limits) =
-                bucket.take_tail(registry, search_width, self.activation_width);
+            let (tasks, task_limits) = bucket.take_tail(
+                registry,
+                search_width,
+                activation_width,
+                terminal_selection_slots,
+                terminal_selections,
+            );
             let remainder_tasks = bucket.tasks.len();
             (tasks, task_limits, bucket.tasks.is_empty(), remainder_tasks)
         };
@@ -3293,6 +3310,8 @@ impl DeltaScheduler {
             worklist,
             source_worklist,
             activation_width: self.activation_width,
+            terminal_selection_slots: AHashMap::new(),
+            terminal_selections: Vec::new(),
         }
     }
 }
