@@ -140,6 +140,22 @@ pub enum ProgramGrouping {
     ParentAtomic,
 }
 
+/// Action-specific certificate for replacing pageable execution with one
+/// complete family-owned batch.
+///
+/// This is a semantic equivalence claim for the exact [`ProgramRequest`] and
+/// bound schema carried by a route. It does not select the physical phase:
+/// terminality, demand, and cohort width remain scheduler evidence.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProgramCompletion {
+    /// The route must be evaluated through its budgeted affine continuation.
+    PageableOnly,
+    /// [`TypedProgramSpec::complete_typed`] returns the exact complete
+    /// per-parent Propose occurrence bag produced by draining this route.
+    CompleteActionEquivalent,
+}
+
 /// Structural route selected by an immutable program spec for one action.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -149,6 +165,50 @@ pub struct ProgramRoute {
     pub variable: VariableId,
     pub stratum: ProgramStratum,
     pub grouping: ProgramGrouping,
+    pub completion: ProgramCompletion,
+}
+
+/// Runtime-free complete-action call for one certified route.
+///
+/// No activation or work handle appears here: successful completion retires
+/// the fresh parent cohort without ever opening sparse Program state.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct ProgramCompleteBatch<'v> {
+    pub request: ProgramRequest,
+    pub route: ProgramRoute,
+    pub view: RowsView<'v>,
+}
+
+/// Exact parent-tagged Propose occurrences returned by a complete action.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct ProgramCompleteEffects {
+    pub occurrences: Vec<(u32, RawInline)>,
+}
+
+/// Family-facing complete-action sink.
+///
+/// Parent bounds and grouping are intentionally checked by the erased adapter
+/// after the family call, rather than trusted at each public push site.
+#[doc(hidden)]
+pub struct TypedCompleteSink {
+    occurrences: Vec<(u32, RawInline)>,
+}
+
+impl TypedCompleteSink {
+    pub fn push(&mut self, parent: u32, value: RawInline) {
+        self.occurrences.push((parent, value));
+    }
+
+    pub fn extend_parent(
+        &mut self,
+        parent: u32,
+        values: impl IntoIterator<Item = RawInline>,
+    ) {
+        self.occurrences
+            .extend(values.into_iter().map(|value| (parent, value)));
+    }
 }
 
 /// Row block used to construct initial typed work handles.
@@ -467,6 +527,15 @@ pub trait TypedProgramSpec {
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     );
+
+    /// Executes one complete action certified by the selected route.
+    ///
+    /// V1 deliberately supports only complete Propose occurrence bags. A
+    /// family that never returns [`ProgramCompletion::CompleteActionEquivalent`]
+    /// need not implement this method.
+    fn complete_typed(&self, _batch: ProgramCompleteBatch<'_>, _effects: &mut TypedCompleteSink) {
+        panic!("typed Program certified a complete action without implementing it")
+    }
 }
 
 trait ErasedProgramRuntime: Any + Send {
@@ -529,6 +598,12 @@ trait ErasedProgramSpec {
         effects: &mut ProgramBatchEffects,
     );
 
+    fn complete_batch(
+        &self,
+        batch: ProgramCompleteBatch<'_>,
+        effects: &mut ProgramCompleteEffects,
+    );
+
     fn retire_activations(&self, runtime: &mut ProgramRuntime, activations: &[ProgramActivation]);
 }
 
@@ -571,6 +646,14 @@ impl<'a> ProgramRef<'a> {
         effects: &mut ProgramBatchEffects,
     ) {
         self.erased.step_batch(runtime, batch, effects);
+    }
+
+    pub(crate) fn complete_batch(
+        self,
+        batch: ProgramCompleteBatch<'_>,
+        effects: &mut ProgramCompleteEffects,
+    ) {
+        self.erased.complete_batch(batch, effects);
     }
 
     pub(crate) fn retire_activations(
@@ -1000,6 +1083,70 @@ where
         effects.transition_examined += typed.transition_examined;
     }
 
+    fn complete_batch(
+        &self,
+        batch: ProgramCompleteBatch<'_>,
+        effects: &mut ProgramCompleteEffects,
+    ) {
+        assert!(
+            matches!(batch.request.action, ProgramAction::Propose(_)),
+            "typed complete actions currently support only Propose"
+        );
+        let ProgramAction::Propose(variable) = batch.request.action else {
+            unreachable!()
+        };
+        assert_eq!(
+            variable, batch.route.variable,
+            "typed complete action route changed its proposal variable"
+        );
+        assert_eq!(
+            batch.route.completion,
+            ProgramCompletion::CompleteActionEquivalent,
+            "typed complete action lacked an equivalence certificate"
+        );
+        assert_eq!(
+            TypedProgramSpec::route(self, batch.request),
+            Some(batch.route),
+            "typed complete action route was not pure for its request"
+        );
+        assert_eq!(
+            batch.view.vars.len(),
+            batch.request.bound.count(),
+            "typed complete action view disagreed with its bound schema"
+        );
+        assert!(
+            batch
+                .view
+                .vars
+                .iter()
+                .all(|&bound| batch.request.bound.is_set(bound)),
+            "typed complete action view carried an undeclared bound variable"
+        );
+        assert!(
+            batch.view.col(variable).is_none(),
+            "typed complete action proposal variable was already bound"
+        );
+
+        let mut typed = TypedCompleteSink {
+            occurrences: Vec::new(),
+        };
+        self.complete_typed(batch, &mut typed);
+
+        let mut previous = 0u32;
+        for (position, &(parent, _)) in typed.occurrences.iter().enumerate() {
+            assert!(
+                (parent as usize) < batch.view.len(),
+                "typed complete action parent tag is out of range"
+            );
+            assert!(
+                position == 0 || parent >= previous,
+                "typed complete action parent tags are not grouped in ascending order"
+            );
+            previous = parent;
+        }
+        effects.occurrences.extend(typed.occurrences);
+    }
+
     fn retire_activations(&self, runtime: &mut ProgramRuntime, activations: &[ProgramActivation]) {
         assert_eq!(
             runtime.family,
@@ -1048,6 +1195,7 @@ mod tests {
                 variable: 0,
                 stratum: ProgramStratum::Finite,
                 grouping: ProgramGrouping::PageLocal,
+                completion: ProgramCompletion::PageableOnly,
             })
         }
 
@@ -1150,6 +1298,7 @@ mod tests {
                 variable: 0,
                 stratum: ProgramStratum::Finite,
                 grouping: ProgramGrouping::PageLocal,
+                completion: ProgramCompletion::PageableOnly,
             })
         }
 
@@ -1200,6 +1349,7 @@ mod tests {
                     Self::FixpointFiniteChild => ProgramStratum::Fixpoint,
                 },
                 grouping: ProgramGrouping::PageLocal,
+                completion: ProgramCompletion::PageableOnly,
             })
         }
 
@@ -1453,6 +1603,7 @@ mod tests {
             variable: 0,
             stratum: ProgramStratum::Finite,
             grouping: ProgramGrouping::PageLocal,
+            completion: ProgramCompletion::PageableOnly,
         };
         let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             program.seed_batch(

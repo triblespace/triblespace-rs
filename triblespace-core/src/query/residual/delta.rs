@@ -5388,6 +5388,7 @@ mod tests {
                 variable: 0,
                 stratum: ProgramStratum::Finite,
                 grouping: ProgramGrouping::PageLocal,
+                completion: ProgramCompletion::PageableOnly,
             })
         }
 
@@ -6915,6 +6916,7 @@ mod tests {
             variable: 0,
             stratum: ProgramStratum::Fixpoint,
             grouping: ProgramGrouping::PageLocal,
+            completion: ProgramCompletion::PageableOnly,
         };
         let state = scheduler
             .interner
@@ -6994,6 +6996,7 @@ mod tests {
             variable: 0,
             stratum: ProgramStratum::Fixpoint,
             grouping: ProgramGrouping::PageLocal,
+            completion: ProgramCompletion::PageableOnly,
         };
         let state = scheduler
             .interner

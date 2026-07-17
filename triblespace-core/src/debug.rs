@@ -197,15 +197,6 @@ pub mod query {
                 .residual_proposal_source_is_paged(variable, view)
         }
 
-        fn residual_terminal_eager_proposal_equivalent(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-        ) -> bool {
-            self.constraint
-                .residual_terminal_eager_proposal_equivalent(variable, view)
-        }
-
         fn residual_delta_source_page(
             &self,
             variable: VariableId,

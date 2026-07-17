@@ -7752,14 +7752,16 @@ impl ResidualStateMachine {
         self.terminal_admission_width(task.state, rows.row_count) == 0
     }
 
-    /// Executes a demand-wide terminal parent cohort through the ordinary
-    /// block-native proposal verb. The proposer has already proved that
-    /// committing its candidate binds the full row and that every remaining
-    /// relevant occurrence has been checked, so no sparse product-state task
-    /// or stable Candidate/Ready roundtrip is necessary.
-    fn eager_terminal_proposal<'a>(
+    /// Executes a fresh demand-wide terminal parent cohort through the
+    /// Program family's certified complete action. The physical planner has
+    /// independently proved that committing its candidate binds the full row
+    /// and that every remaining relevant occurrence has been checked, so no
+    /// Program runtime, activation, or sparse product-state task is opened.
+    fn complete_terminal_program_proposal(
         &mut self,
-        constraint: &dyn Constraint<'a>,
+        program: ProgramRef<'_>,
+        request: ProgramRequest,
+        route: ProgramRoute,
         family: StateId,
         bound: VariableSet,
         variable: VariableId,
@@ -7770,12 +7772,20 @@ impl ResidualStateMachine {
 
         let vars: Vec<VariableId> = bound.into_iter().collect();
         let view = rows_view(&vars, &rows.rows, rows.row_count);
-        let mut candidates = CandidatePayload::empty(rows.row_count);
-        constraint.propose(variable, &view, &mut candidates.sink(rows.row_count));
+        let mut effects = ProgramCompleteEffects::default();
+        program.complete_batch(
+            ProgramCompleteBatch {
+                request,
+                route,
+                view,
+            },
+            &mut effects,
+        );
+        let candidates = CandidatePayload::from_tagged(effects.occurrences, rows.row_count);
         candidates.debug_assert_valid_for(rows.row_count);
-        // Proposal may unwind. Reserve receipt identities only after the
-        // ordinary verb succeeds so a caught action panic cannot leave ghost
-        // terminal samples in the shared activation namespace.
+        // The family call may unwind. Reserve receipt identities only after it
+        // succeeds so a caught action panic cannot leave ghost terminal
+        // samples in the shared activation namespace.
         let receipts = self.delta.reserve_terminal_receipts(seeded_parents);
         debug_assert!(receipts
             .iter()
@@ -7892,17 +7902,18 @@ impl ResidualStateMachine {
         };
         let vars: Vec<VariableId> = task.desc.bound.into_iter().collect();
         let view = rows_view(&vars, &rows.rows, rows.row_count);
-        let eager_terminal_phase = program.is_none()
-            && terminal_streaming
+        let complete_terminal_phase = terminal_streaming
             && admitted_parent_count > 1
             && self.uses_eager_terminal_phase()
-            && constraint.residual_terminal_eager_proposal_equivalent(variable, &view);
-        // The explicit capability promises that ordinary proposal and a fully
-        // drained residual route denote the same per-parent bag. Do not
-        // materialize and then discard sparse seed roots for such a cohort.
+            && program.is_some_and(|(_, route)| {
+                route.completion == ProgramCompletion::CompleteActionEquivalent
+            });
+        // A semantic Program certificate and independent physical evidence
+        // jointly select this phase. Do not open sparse roots for the fresh
+        // admitted suffix when both agree.
         let mut paged = false;
         let mut seeds = Vec::new();
-        if program.is_none() && !eager_terminal_phase {
+        if program.is_none() {
             paged = constraint.residual_delta_source_is_paged(variable, &view)
                 || constraint.residual_proposal_source_is_paged(variable, &view);
             if !paged && !constraint.residual_delta_seeds(variable, &view, &mut seeds) {
@@ -7948,7 +7959,7 @@ impl ResidualStateMachine {
             debug_assert_eq!(receipt.state, state);
             bucket = admitted;
             self.stats.delta_terminal_admission_remainders += remainder_rows;
-            if program.is_none() && !eager_terminal_phase && !paged {
+            if program.is_none() && !paged {
                 seeds.retain(|seed| seed.parent as usize >= first_admitted);
                 for seed in &mut seeds {
                     seed.parent = u32::try_from(seed.parent as usize - first_admitted)
@@ -7964,10 +7975,18 @@ impl ResidualStateMachine {
         self.stats.propose_calls += 1;
         self.stats.propose_rows += rows.row_count;
         self.stats.max_propose_rows = self.stats.max_propose_rows.max(rows.row_count);
-        if eager_terminal_phase {
-            return Ok(self.eager_terminal_proposal(constraint, state, desc.bound, variable, rows));
-        }
         if let Some((spec, route)) = program {
+            if complete_terminal_phase {
+                return Ok(self.complete_terminal_program_proposal(
+                    spec,
+                    program_request,
+                    route,
+                    state,
+                    desc.bound,
+                    variable,
+                    rows,
+                ));
+            }
             let mut outcome = self.delta.seed_program_proposals_with_full(
                 spec,
                 DeltaDesc::leaf(variable, proposer),
@@ -10546,12 +10565,102 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Copy)]
-    struct EagerAcceptedLeaf {
-        variable: VariableId,
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum TerminalProgramMode {
+        Equivalent,
+        Divergent,
+        Empty,
+        Panic,
     }
 
-    impl Constraint<'static> for EagerAcceptedLeaf {
+    #[derive(Clone, Copy)]
+    struct TerminalProgramLeaf {
+        variable: VariableId,
+        mode: TerminalProgramMode,
+    }
+
+    #[derive(Clone)]
+    struct TerminalProgramState;
+
+    impl TypedProgramSpec for TerminalProgramLeaf {
+        type State = TerminalProgramState;
+        type NoveltyKey = ();
+        type Rank = u8;
+
+        fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+            let ProgramAction::Propose(variable) = request.action else {
+                return None;
+            };
+            if variable != self.variable || request.bound.is_set(variable) {
+                return None;
+            }
+            Some(ProgramRoute {
+                key: ProgramKey::new(0),
+                variable,
+                stratum: ProgramStratum::Finite,
+                grouping: ProgramGrouping::PageLocal,
+                completion: if self.mode == TerminalProgramMode::Divergent {
+                    ProgramCompletion::PageableOnly
+                } else {
+                    ProgramCompletion::CompleteActionEquivalent
+                },
+            })
+        }
+
+        fn dispatch(&self, _state: &Self::State) -> DispatchClass {
+            DispatchClass::new(0)
+        }
+
+        fn progress(&self, _state: &Self::State) -> Self::Rank {
+            1
+        }
+
+        fn seed_typed(
+            &self,
+            batch: ProgramSeedBatch<'_>,
+            effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+        ) {
+            for (parent, row) in batch.view.iter().enumerate() {
+                let accepted = matches!(
+                    self.mode,
+                    TerminalProgramMode::Equivalent | TerminalProgramMode::Divergent
+                )
+                .then(|| raw(90 + row[0][0]));
+                effects.finite_root(parent as u32, TerminalProgramState, accepted);
+            }
+        }
+
+        fn step_typed(
+            &self,
+            states: Vec<Self::State>,
+            _batch: TypedProgramBatch<'_>,
+            effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+        ) {
+            for _ in states {
+                effects.page(1, None);
+            }
+        }
+
+        fn complete_typed(
+            &self,
+            batch: ProgramCompleteBatch<'_>,
+            effects: &mut TypedCompleteSink,
+        ) {
+            match self.mode {
+                TerminalProgramMode::Equivalent => {
+                    for (parent, row) in batch.view.iter().enumerate() {
+                        effects.push(parent as u32, raw(90 + row[0][0]));
+                    }
+                }
+                TerminalProgramMode::Divergent | TerminalProgramMode::Empty => {}
+                TerminalProgramMode::Panic => {
+                    panic!("intentional complete Program action panic")
+                }
+            }
+        }
+    }
+
+    impl Constraint<'static> for TerminalProgramLeaf {
         fn variables(&self) -> VariableSet {
             VariableSet::new_singleton(self.variable)
         }
@@ -10576,8 +10685,10 @@ mod tests {
             candidates: &mut CandidateSink<'_>,
         ) {
             assert_eq!(variable, self.variable);
-            for (row, parent) in view.iter().enumerate() {
-                candidates.push(row as u32, raw(90 + parent[0][0]));
+            if self.mode == TerminalProgramMode::Equivalent {
+                for (parent, row) in view.iter().enumerate() {
+                    candidates.push(parent as u32, raw(90 + row[0][0]));
+                }
             }
         }
 
@@ -10589,172 +10700,8 @@ mod tests {
         ) {
         }
 
-        fn residual_delta_seeds(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            seeds: &mut Vec<ResidualDeltaSeed>,
-        ) -> bool {
-            if variable != self.variable {
-                return false;
-            }
-            for (row, parent) in view.iter().enumerate() {
-                seeds.push(ResidualDeltaSeed {
-                    parent: row as u32,
-                    output: ResidualDeltaOutput {
-                        node: ResidualDeltaNode {
-                            source: None,
-                            value: raw(90 + parent[0][0]),
-                            continuation: 0,
-                        },
-                        accepted: true,
-                    },
-                });
-            }
-            true
-        }
-
-        fn residual_delta_expand(
-            &self,
-            variable: VariableId,
-            _nodes: &[ResidualDeltaNode],
-            _successors: &mut Vec<(u32, ResidualDeltaOutput)>,
-        ) -> bool {
-            variable == self.variable
-        }
-
-        fn residual_terminal_eager_proposal_equivalent(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-        ) -> bool {
-            variable == self.variable && view.col(variable).is_none()
-        }
-    }
-
-    #[derive(Clone, Copy)]
-    struct DivergentAcceptedLeaf {
-        variable: VariableId,
-    }
-
-    impl Constraint<'static> for DivergentAcceptedLeaf {
-        fn variables(&self) -> VariableSet {
-            VariableSet::new_singleton(self.variable)
-        }
-
-        fn estimate(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            out: &mut EstimateSink<'_>,
-        ) -> bool {
-            if variable != self.variable {
-                return false;
-            }
-            out.fill(1, view.len());
-            true
-        }
-
-        fn propose(
-            &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-            _candidates: &mut CandidateSink<'_>,
-        ) {
-            // Deliberately differs from the residual route below. This is a
-            // legal custom constraint precisely because it does not opt into
-            // terminal eager equivalence.
-        }
-
-        fn confirm(
-            &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-            _candidates: &mut CandidateSink<'_>,
-        ) {
-        }
-
-        fn residual_delta_seeds(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            seeds: &mut Vec<ResidualDeltaSeed>,
-        ) -> bool {
-            if variable != self.variable {
-                return false;
-            }
-            for (row, parent) in view.iter().enumerate() {
-                seeds.push(ResidualDeltaSeed {
-                    parent: row as u32,
-                    output: ResidualDeltaOutput {
-                        node: ResidualDeltaNode {
-                            source: None,
-                            value: raw(90 + parent[0][0]),
-                            continuation: 0,
-                        },
-                        accepted: true,
-                    },
-                });
-            }
-            true
-        }
-
-        fn residual_delta_expand(
-            &self,
-            variable: VariableId,
-            _nodes: &[ResidualDeltaNode],
-            _successors: &mut Vec<(u32, ResidualDeltaOutput)>,
-        ) -> bool {
-            variable == self.variable
-        }
-    }
-
-    #[derive(Clone, Copy)]
-    struct PanicEagerLeaf {
-        variable: VariableId,
-    }
-
-    impl Constraint<'static> for PanicEagerLeaf {
-        fn variables(&self) -> VariableSet {
-            VariableSet::new_singleton(self.variable)
-        }
-
-        fn estimate(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            out: &mut EstimateSink<'_>,
-        ) -> bool {
-            if variable != self.variable {
-                return false;
-            }
-            out.fill(1, view.len());
-            true
-        }
-
-        fn propose(
-            &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-            _candidates: &mut CandidateSink<'_>,
-        ) {
-            panic!("intentional eager-terminal proposal panic");
-        }
-
-        fn confirm(
-            &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-            _candidates: &mut CandidateSink<'_>,
-        ) {
-        }
-
-        fn residual_terminal_eager_proposal_equivalent(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-        ) -> bool {
-            variable == self.variable && view.col(variable).is_none()
+        fn residual_program(&self) -> Option<ProgramRef<'_>> {
+            Some(ProgramRef::new(self))
         }
     }
 
@@ -11241,7 +11188,10 @@ mod tests {
     fn demand_wide_terminal_admission_eagerly_evaluates_exact_suffix_receipts() {
         let root = IntersectionConstraint::new(vec![
             Box::new(ShapeLeaf(0)) as ShapeConstraint,
-            Box::new(EagerAcceptedLeaf { variable: 1 }) as ShapeConstraint,
+            Box::new(TerminalProgramLeaf {
+                variable: 1,
+                mode: TerminalProgramMode::Equivalent,
+            }) as ShapeConstraint,
         ]);
         let plan = ResidualPlan::compile_lowering(
             &root,
@@ -11387,7 +11337,10 @@ mod tests {
     fn demand_wide_divergent_delta_proposer_remains_sparse_without_opt_in() {
         let root = IntersectionConstraint::new(vec![
             Box::new(ShapeLeaf(0)) as ShapeConstraint,
-            Box::new(DivergentAcceptedLeaf { variable: 1 }) as ShapeConstraint,
+            Box::new(TerminalProgramLeaf {
+                variable: 1,
+                mode: TerminalProgramMode::Divergent,
+            }) as ShapeConstraint,
         ]);
         let plan = ResidualPlan::compile_lowering(
             &root,
@@ -11475,7 +11428,10 @@ mod tests {
     {
         let root = IntersectionConstraint::new(vec![
             Box::new(ShapeLeaf(0)) as ShapeConstraint,
-            Box::new(EagerAcceptedLeaf { variable: 1 }) as ShapeConstraint,
+            Box::new(TerminalProgramLeaf {
+                variable: 1,
+                mode: TerminalProgramMode::Equivalent,
+            }) as ShapeConstraint,
         ]);
         let mut iter = Query::new(root, postprocessing).solve_residual_state_lazy_with(
             ResidualLowering::new(FormulaScope::OpaqueLeaves, true),
@@ -11483,8 +11439,21 @@ mod tests {
         iter.state =
             ResidualStateMachine::new_for_plan(iter.root.variables(), &iter.plan, Search::Done);
         let family = StateId(u32::MAX);
-        let eager = iter.state.eager_terminal_proposal(
-            iter.plan.resolve(&iter.root, 1),
+        let constraint = iter.plan.resolve(&iter.root, 1);
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(1),
+            bound: VariableSet::new_singleton(0),
+        };
+        let program = constraint
+            .residual_program()
+            .expect("terminal test leaf exposes a Program");
+        let route = program
+            .route(request)
+            .expect("terminal test Program supports the proposal");
+        let eager = iter.state.complete_terminal_program_proposal(
+            program,
+            request,
+            route,
             family,
             VariableSet::new_singleton(0),
             1,
@@ -11589,8 +11558,19 @@ mod tests {
             1,
             Search::Done,
         );
-        let zero = empty.eager_terminal_proposal(
-            &ShapeLeaf(1),
+        let empty_program = TerminalProgramLeaf {
+            variable: 1,
+            mode: TerminalProgramMode::Empty,
+        };
+        let empty_request = ProgramRequest {
+            action: ProgramAction::Propose(1),
+            bound: VariableSet::new_singleton(0),
+        };
+        let empty_route = TypedProgramSpec::route(&empty_program, empty_request).unwrap();
+        let zero = empty.complete_terminal_program_proposal(
+            ProgramRef::new(&empty_program),
+            empty_request,
+            empty_route,
             StateId(u32::MAX),
             VariableSet::new_singleton(0),
             1,
@@ -11626,9 +11606,20 @@ mod tests {
             1,
             Search::Done,
         );
+        let panic_program = TerminalProgramLeaf {
+            variable: 1,
+            mode: TerminalProgramMode::Panic,
+        };
+        let panic_request = ProgramRequest {
+            action: ProgramAction::Propose(1),
+            bound: VariableSet::new_singleton(0),
+        };
+        let panic_route = TypedProgramSpec::route(&panic_program, panic_request).unwrap();
         let proposal_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            panicking.eager_terminal_proposal(
-                &PanicEagerLeaf { variable: 1 },
+            panicking.complete_terminal_program_proposal(
+                ProgramRef::new(&panic_program),
+                panic_request,
+                panic_route,
                 StateId(u32::MAX),
                 VariableSet::new_singleton(0),
                 1,
@@ -17969,11 +17960,12 @@ mod tests {
         sparse_duplicates.results.sort_unstable();
         assert_eq!(eager_duplicates.results, sparse_duplicates.results);
         assert_eq!(eager_duplicates.results.len(), 8 * nodes[0].len());
-        assert_eq!(
+        assert!(
             eager_duplicates
                 .stats
-                .delta_terminal_eager_cohort_admissions,
-            0
+                .delta_terminal_eager_cohort_admissions
+                > 0,
+            "certified RPQ never entered the complete Program phase"
         );
         assert_eq!(
             sparse_duplicates
@@ -17981,7 +17973,7 @@ mod tests {
                 .delta_terminal_eager_cohort_admissions,
             0
         );
-        assert!(eager_duplicates.stats.delta_terminal_calls > 0);
+        assert!(sparse_duplicates.stats.delta_terminal_calls > 0);
     }
 
     #[test]
@@ -18046,24 +18038,35 @@ mod tests {
             ])
         };
 
-        // RPQ deliberately declines the unbounded eager-proposal shortcut.
-        // Wrappers that preserve the concrete family still expose the typed
-        // program.
+        // Bound-endpoint Propose routes carry the family-owned exact-complete
+        // certificate through every ordinary constraint wrapper.
         let capability_ops = [PathOp::Attr(p.raw()), PathOp::Plus];
-        let bound_vars = [0];
-        let bound_rows = [source];
-        let bound_view = RowsView::new(&bound_vars, &bound_rows);
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(1),
+            bound: VariableSet::new_singleton(0),
+        };
         let boxed: Box<dyn Constraint<'static> + Send + Sync> =
             Box::new(make_path(&capability_ops));
-        assert!(!boxed.residual_terminal_eager_proposal_equivalent(1, &bound_view));
-        assert!(boxed.residual_program().is_some());
+        assert_eq!(
+            boxed.residual_program().unwrap().route(request).unwrap().completion,
+            ProgramCompletion::CompleteActionEquivalent
+        );
         let shared: Arc<dyn Constraint<'static> + Send + Sync> =
             Arc::new(make_path(&capability_ops));
-        assert!(!shared.residual_terminal_eager_proposal_equivalent(1, &bound_view));
-        assert!(shared.residual_program().is_some());
+        assert_eq!(
+            shared.residual_program().unwrap().route(request).unwrap().completion,
+            ProgramCompletion::CompleteActionEquivalent
+        );
         let estimated = EstimateOverrideConstraint::new(make_path(&capability_ops));
-        assert!(!estimated.residual_terminal_eager_proposal_equivalent(1, &bound_view));
-        assert!(estimated.residual_program().is_some());
+        assert_eq!(
+            estimated
+                .residual_program()
+                .unwrap()
+                .route(request)
+                .unwrap()
+                .completion,
+            ProgramCompletion::CompleteActionEquivalent
+        );
 
         let cases = [
             ("nullable star", vec![PathOp::Attr(p.raw()), PathOp::Star]),
@@ -18114,11 +18117,10 @@ mod tests {
             assert_eq!(typed.results, sequential, "typed mismatch for {name}");
             assert_eq!(sparse.results, sequential, "sparse mismatch for {name}");
             assert!(
-                typed.stats.delta_terminal_calls > 0,
-                "{name} never entered typed terminal traversal: {:#?}",
+                typed.stats.delta_terminal_eager_cohort_admissions > 0,
+                "{name} never entered the complete Program phase: {:#?}",
                 typed.stats
             );
-            assert_eq!(typed.stats.delta_terminal_eager_cohort_admissions, 0);
             assert_eq!(
                 sparse.stats.delta_terminal_eager_cohort_admissions, 0,
                 "forced sparse control entered the eager phase for {name}"
@@ -18150,20 +18152,25 @@ mod tests {
 
             #[cfg(feature = "parallel")]
             {
-                let mut parallel: Vec<_> = with_parallel_workers(4, || {
-                    Query::new(Arc::new(make(&ops)), project)
-                        .solve_residual_state_lazy_with(ResidualLowering::new(
-                            FormulaScope::OpaqueLeaves,
-                            true,
-                        ))
-                        .cap(64)
-                        .start_width(1)
-                        .growth(2)
-                        .into_par_iter()
-                        .collect()
-                });
-                parallel.sort_unstable();
-                assert_eq!(parallel, expected, "parallel mismatch for {name}");
+                for workers in [1, 4] {
+                    let mut parallel: Vec<_> = with_parallel_workers(workers, || {
+                        Query::new(Arc::new(make(&ops)), project)
+                            .solve_residual_state_lazy_with(ResidualLowering::new(
+                                FormulaScope::OpaqueLeaves,
+                                true,
+                            ))
+                            .cap(64)
+                            .start_width(1)
+                            .growth(2)
+                            .into_par_iter()
+                            .collect()
+                    });
+                    parallel.sort_unstable();
+                    assert_eq!(
+                        parallel, expected,
+                        "parallel mismatch for {name}, workers={workers}"
+                    );
+                }
             }
         }
     }

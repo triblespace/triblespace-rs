@@ -17,6 +17,8 @@ use crate::query::Constraint;
 use crate::query::DispatchClass;
 use crate::query::EstimateSink;
 use crate::query::ProgramAction;
+use crate::query::ProgramCompleteBatch;
+use crate::query::ProgramCompletion;
 use crate::query::ProgramGrouping;
 use crate::query::ProgramKey;
 use crate::query::ProgramPacing;
@@ -28,6 +30,7 @@ use crate::query::ProgramStratum;
 use crate::query::RowsView;
 use crate::query::TriblePattern;
 use crate::query::TypedEffectSink;
+use crate::query::TypedCompleteSink;
 use crate::query::TypedProgramBatch;
 use crate::query::TypedProgramSpec;
 use crate::query::TypedResume;
@@ -2200,6 +2203,35 @@ impl RegularPathConstraint {
         }
     }
 
+    /// Enumerates the exact ordered proposal occurrence bag for a row block.
+    ///
+    /// Both the ordinary Constraint protocol and the Program complete-action
+    /// route use this one family-owned implementation. The latter therefore
+    /// cannot silently drift from pageable proposal semantics.
+    fn for_each_proposal_row(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        mut emit: impl FnMut(u32, &[RawInline]),
+    ) {
+        if variable != self.start && variable != self.end {
+            return;
+        }
+        let ps = view.col(self.start);
+        let pe = view.col(self.end);
+        let mut scratch = Vec::new();
+        for (parent, row) in view.iter().enumerate() {
+            scratch.clear();
+            self.propose_row(
+                variable,
+                ps.map(|column| &row[column]),
+                pe.map(|column| &row[column]),
+                &mut scratch,
+            );
+            emit(parent as u32, &scratch);
+        }
+    }
+
     /// Filters one row's candidate values.
     fn confirm_row(
         &self,
@@ -2260,6 +2292,7 @@ impl TypedProgramSpec for RegularPathConstraint {
                         variable: self.end,
                         stratum,
                         grouping: ProgramGrouping::ParentAtomic,
+                        completion: ProgramCompletion::PageableOnly,
                     }
                 } else {
                     // Ordinary `satisfied` is deliberately optimistic while
@@ -2271,6 +2304,7 @@ impl TypedProgramSpec for RegularPathConstraint {
                         variable: self.end,
                         stratum: ProgramStratum::Finite,
                         grouping: ProgramGrouping::PageLocal,
+                        completion: ProgramCompletion::PageableOnly,
                     }
                 }
             }
@@ -2291,6 +2325,7 @@ impl TypedProgramSpec for RegularPathConstraint {
                         } else {
                             ProgramGrouping::PageLocal
                         },
+                        completion: ProgramCompletion::PageableOnly,
                     }
                 } else {
                     let (opposite, bound_key, first_key, confirm_first_key) =
@@ -2319,6 +2354,11 @@ impl TypedProgramSpec for RegularPathConstraint {
                             } else {
                                 ProgramGrouping::PageLocal
                             },
+                            completion: if confirming {
+                                ProgramCompletion::PageableOnly
+                            } else {
+                                ProgramCompletion::CompleteActionEquivalent
+                            },
                         }
                     } else if matches!(request.action, ProgramAction::Propose(_)) {
                         // First-endpoint paging is a finite direct observation
@@ -2329,6 +2369,7 @@ impl TypedProgramSpec for RegularPathConstraint {
                             variable,
                             stratum: ProgramStratum::Finite,
                             grouping: ProgramGrouping::PageLocal,
+                            completion: ProgramCompletion::PageableOnly,
                         }
                     } else {
                         // With the opposite endpoint absent, confirmation is
@@ -2341,12 +2382,23 @@ impl TypedProgramSpec for RegularPathConstraint {
                             variable,
                             stratum: ProgramStratum::Finite,
                             grouping: ProgramGrouping::PageLocal,
+                            completion: ProgramCompletion::PageableOnly,
                         }
                     }
                 }
             }
         };
         Some(route)
+    }
+
+    fn complete_typed(
+        &self,
+        batch: ProgramCompleteBatch<'_>,
+        effects: &mut TypedCompleteSink,
+    ) {
+        self.for_each_proposal_row(batch.route.variable, &batch.view, |parent, values| {
+            effects.extend_parent(parent, values.iter().copied());
+        });
     }
 
     fn dispatch(&self, state: &Self::State) -> DispatchClass {
@@ -2767,22 +2819,9 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         view: &RowsView<'_>,
         candidates: &mut CandidateSink<'_>,
     ) {
-        if variable != self.start && variable != self.end {
-            return;
-        }
-        let ps = view.col(self.start);
-        let pe = view.col(self.end);
-        let mut scratch: Vec<RawInline> = Vec::new();
-        for (i, row) in view.iter().enumerate() {
-            scratch.clear();
-            self.propose_row(
-                variable,
-                ps.map(|c| &row[c]),
-                pe.map(|c| &row[c]),
-                &mut scratch,
-            );
-            candidates.extend_row(i as u32, scratch.iter().copied());
-        }
+        self.for_each_proposal_row(variable, view, |parent, values| {
+            candidates.extend_row(parent, values.iter().copied());
+        });
     }
 
     fn confirm(

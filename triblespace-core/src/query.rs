@@ -60,10 +60,11 @@ use crate::inline::RawInline;
 #[doc(hidden)]
 pub use program::{
     DispatchClass, ProgramAction, ProgramActivation, ProgramBatch, ProgramBatchEffects,
-    ProgramChild, ProgramGrouping, ProgramKey, ProgramPacing, ProgramPage, ProgramRef,
-    ProgramRequest, ProgramResume, ProgramRoute, ProgramRuntime, ProgramSeedBatch,
-    ProgramSeedEffects, ProgramSeedWork, ProgramStratum, ProgramWork, ProgramWorkHandle,
-    TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink,
+    ProgramChild, ProgramCompleteBatch, ProgramCompleteEffects, ProgramCompletion, ProgramGrouping,
+    ProgramKey, ProgramPacing, ProgramPage, ProgramRef, ProgramRequest, ProgramResume,
+    ProgramRoute, ProgramRuntime, ProgramSeedBatch, ProgramSeedEffects, ProgramSeedWork,
+    ProgramStratum, ProgramWork, ProgramWorkHandle, TypedCompleteSink, TypedEffectSink,
+    TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink,
 };
 /// Re-export of [`PathOp`].
 pub use regularpathconstraint::PathOp;
@@ -1219,30 +1220,6 @@ pub trait Constraint<'a> {
         false
     }
 
-    /// Whether a terminal proposal may switch from the residual transition
-    /// program back to this constraint's ordinary block-native `propose`.
-    ///
-    /// Returning `true` promises that, for this variable and bound schema,
-    /// each parent's ordinary proposal candidate **bag** is exactly the entire
-    /// proposal bag produced by fully draining the residual route, including
-    /// any direct accepted occurrences emitted by its source pages. Parent
-    /// groups remain independent; candidate order may differ. The answer is
-    /// structural for the supplied schema, must not depend on row values, and
-    /// must remain stable for the solve.
-    ///
-    /// This is deliberately separate from source/transition paging support.
-    /// A custom residual program may denote a valid optimized proposal whose
-    /// output is not interchangeable with the ordinary verb. The conservative
-    /// default therefore forbids the phase change.
-    #[doc(hidden)]
-    fn residual_terminal_eager_proposal_equivalent(
-        &self,
-        _variable: VariableId,
-        _view: &RowsView<'_>,
-    ) -> bool {
-        false
-    }
-
     /// Whether a paged proposal source emits product-state roots rather than
     /// only finished direct candidates.
     ///
@@ -1567,15 +1544,6 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.residual_proposal_source_is_paged(variable, view)
     }
 
-    fn residual_terminal_eager_proposal_equivalent(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-    ) -> bool {
-        let inner: &T = self;
-        inner.residual_terminal_eager_proposal_equivalent(variable, view)
-    }
-
     fn residual_proposal_source_has_transition_roots(
         &self,
         variable: VariableId,
@@ -1746,15 +1714,6 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
         let inner: &T = self;
         inner.residual_proposal_source_is_paged(variable, view)
-    }
-
-    fn residual_terminal_eager_proposal_equivalent(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-    ) -> bool {
-        let inner: &T = self;
-        inner.residual_terminal_eager_proposal_equivalent(variable, view)
     }
 
     fn residual_proposal_source_has_transition_roots(
