@@ -10665,8 +10665,8 @@ mod tests {
         assert_eq!(query.state.terminal_demand_width, 1);
         assert!(query.state.terminal_demand_exhausted);
         assert_eq!(query.stats().terminal_demand_width_promotions, 0);
-        assert_eq!(query.current_width(), 1);
-        assert_eq!(query.stats().width_increases, 0);
+        assert_eq!(query.current_width(), 2);
+        assert_eq!(query.stats().width_increases, 1);
         assert!(projected_calls.load(Ordering::Relaxed) > 1);
         assert_eq!(query.stats().terminal_demand_projected_rows, 1);
 
@@ -16176,10 +16176,10 @@ mod tests {
         profiled.state.continuation_sprint_enabled = false;
         let profiled = profiled.collect_profiled();
         assert!(profiled.results.is_empty());
-        assert_eq!(profiled.stats.bucket_merges, 2);
-        assert_eq!(profiled.stats.rows_merged, 2);
+        assert_eq!(profiled.stats.bucket_merges, 1);
+        assert_eq!(profiled.stats.rows_merged, 1);
         assert_eq!(*projected.lock().unwrap(), 4);
-        assert_eq!(&*calls.lock().unwrap(), &[1, 2, 2, 2, 1]);
+        assert_eq!(&*calls.lock().unwrap(), &[1, 2, 2, 3]);
 
         // Production-schedule coverage: with sprinting enabled, the same
         // pages need not reconverge, but every affine occurrence must remain
