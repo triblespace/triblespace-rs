@@ -6649,6 +6649,10 @@ enum StepOutcome {
 #[derive(Debug)]
 enum MachineStep {
     Stable(StepOutcome),
+    /// A proven terminal proposer already has enough admitted live capacity
+    /// for the current cumulative demand target. Its exact stable reservoir
+    /// was refiled unchanged so cyclic work can make progress first.
+    DeferredTerminalAdmission,
     /// Cyclic work was seeded. Parents with an empty root set may already
     /// have resumed their stable formula continuation.
     DeltaSeeded {
@@ -6931,6 +6935,9 @@ impl ResidualActionDispatch for ShadowActionDispatch<'_> {
             MachineStep::Stable(StepOutcome::Emit(_)) => {
                 unreachable!("only Propose and Confirm tasks enter a residual shadow action")
             }
+            MachineStep::DeferredTerminalAdmission => {
+                unreachable!("terminal admission defers before shadow action dispatch")
+            }
         };
         span.finish(wall, observed_outcome);
         drop(scope);
@@ -6994,7 +7001,9 @@ struct TerminalAdmissionSample {
 #[derive(Clone, Debug, Default)]
 struct TerminalYieldLedger {
     families: AHashMap<StateId, TerminalFamilyYield>,
-    samples: AHashMap<DeltaActivationId, TerminalAdmissionSample>,
+    /// Delta activation IDs are query-local, monotone, and dense. Direct
+    /// indexing keeps the per-projected-row path free of hashing.
+    samples: Vec<Option<TerminalAdmissionSample>>,
     ever_admitted: bool,
 }
 
@@ -7014,17 +7023,21 @@ impl TerminalYieldLedger {
             .checked_add(activations.len())
             .expect("terminal live count overflow");
         for &activation in activations {
+            let index = activation.index();
+            let required = index
+                .checked_add(1)
+                .expect("terminal sample index overflow");
+            if self.samples.len() < required {
+                self.samples.resize_with(required, || None);
+            }
             assert!(
-                self.samples
-                    .insert(
-                        activation,
-                        TerminalAdmissionSample {
-                            family,
-                            complete: false,
-                            pending_rows: 0,
-                            projected: 0,
-                        },
-                    )
+                self.samples[index]
+                    .replace(TerminalAdmissionSample {
+                        family,
+                        complete: false,
+                        pending_rows: 0,
+                        projected: 0,
+                    })
                     .is_none(),
                 "terminal activation was registered twice"
             );
@@ -7054,7 +7067,8 @@ impl TerminalYieldLedger {
         for &origin in origins {
             let sample = self
                 .samples
-                .get_mut(&origin)
+                .get_mut(origin.index())
+                .and_then(Option::as_mut)
                 .expect("direct terminal publication has no admission sample");
             assert!(
                 !sample.complete,
@@ -7068,7 +7082,11 @@ impl TerminalYieldLedger {
     }
 
     fn complete(&mut self, activation: DeltaActivationId) {
-        let Some(sample) = self.samples.get_mut(&activation) else {
+        let Some(sample) = self
+            .samples
+            .get_mut(activation.index())
+            .and_then(Option::as_mut)
+        else {
             // Nonterminal delta activations share the scheduler receipt stream.
             return;
         };
@@ -7086,13 +7104,11 @@ impl TerminalYieldLedger {
         self.finalize_if_ready(activation);
     }
 
-    fn begin_projection(
-        &mut self,
-        activation: DeltaActivationId,
-    ) -> TerminalProjectionAttempt<'_> {
+    fn begin_projection(&mut self, activation: DeltaActivationId) -> TerminalProjectionAttempt<'_> {
         let sample = self
             .samples
-            .get_mut(&activation)
+            .get_mut(activation.index())
+            .and_then(Option::as_mut)
             .expect("staged terminal row lost its admission sample");
         sample.pending_rows = sample
             .pending_rows
@@ -7109,7 +7125,8 @@ impl TerminalYieldLedger {
         if successful {
             let sample = self
                 .samples
-                .get_mut(&activation)
+                .get_mut(activation.index())
+                .and_then(Option::as_mut)
                 .expect("terminal projection settled after sample removal");
             sample.projected = sample.projected.saturating_add(1);
         }
@@ -7119,14 +7136,16 @@ impl TerminalYieldLedger {
     fn finalize_if_ready(&mut self, activation: DeltaActivationId) {
         let ready = self
             .samples
-            .get(&activation)
+            .get(activation.index())
+            .and_then(Option::as_ref)
             .is_some_and(|sample| sample.complete && sample.pending_rows == 0);
         if !ready {
             return;
         }
         let sample = self
             .samples
-            .remove(&activation)
+            .get_mut(activation.index())
+            .and_then(Option::take)
             .expect("ready terminal sample disappeared");
         let family = self
             .families
@@ -7184,7 +7203,7 @@ struct ResidualStateMachine {
     /// Exact terminal activation responsible for each staged direct row.
     /// Ordinary stable emission stores `None`. This physical sideband never
     /// contributes to canonical state identity or observable result order.
-    emit_origins: Option<Vec<DeltaActivationId>>,
+    emit_origins: Option<SmallVec<[DeltaActivationId; 1]>>,
     emit_next: usize,
     emit_count: usize,
     /// Exact physical cohort activated by a partially surviving full action
@@ -7691,12 +7710,31 @@ impl ResidualStateMachine {
             .saturating_add(remaining_window);
         let demand_width = self.terminal_yield.additional_for_demand(family, demand);
 
-        // The current miss floor is the scalar base scheduling atom. Strong
-        // fair rotation is a separate physical policy and contributes zero
-        // until its activation ring lands.
-        let miss_width = 1;
+        // A miss grant is due only when this family has no remaining live
+        // capacity. While an admitted activation is live, an already-covered
+        // demand target defers the stable reservoir and services that lineage.
+        let miss_width = usize::from(
+            self.terminal_yield
+                .families
+                .get(&family)
+                .is_none_or(|yield_| yield_.live == 0),
+        );
+        // Strong fair rotation is a separate physical policy and contributes
+        // zero until its activation ring lands.
         let fair_width = 0;
         reservoir.min(demand_width.max(miss_width).max(fair_width))
+    }
+
+    fn should_defer_terminal_admission(&self, task: &SelectedResidualTask) -> bool {
+        if !self.uses_direct_terminal_publication()
+            || !self.terminal_yield.families.contains_key(&task.state)
+        {
+            return false;
+        }
+        let StateBucket::Rows(rows) = &task.bucket else {
+            return false;
+        };
+        self.terminal_admission_width(task.state, rows.row_count) == 0
     }
 
     /// Converts one eligible proposer action into activation-owned cyclic
@@ -7785,8 +7823,7 @@ impl ResidualStateMachine {
                 usize::from(admitted_parent_count > 1);
         }
         if terminal_streaming && first_admitted > 0 {
-            let admitted =
-                bucket.take_tail(desc.bound.count(), admitted_parent_count, false);
+            let admitted = bucket.take_tail(desc.bound.count(), admitted_parent_count, false);
             let remainder_rows = bucket.row_count();
             let receipt = file_with_plan(
                 &mut self.worklist,
@@ -8271,6 +8308,25 @@ impl ResidualStateMachine {
             self.take_next_with_plan(plan, width)
                 .expect("pop_once requires a non-empty residual worklist")
         };
+        if self.should_defer_terminal_admission(&task) {
+            let SelectedResidualTask {
+                state,
+                desc,
+                bucket,
+            } = task;
+            let receipt = file_with_plan(
+                &mut self.worklist,
+                &mut self.interner,
+                plan,
+                desc,
+                bucket,
+                &mut self.stats,
+            )
+            .expect("deferred terminal reservoir is nonempty");
+            debug_assert_eq!(receipt.state, state);
+            self.last_was_action = false;
+            return MachineStep::DeferredTerminalAdmission;
+        }
         self.last_was_action = task.is_action_for_plan(plan, &self.interner);
         let action = dispatch
             .observes_actions()
@@ -8596,12 +8652,9 @@ impl ResidualStateMachine {
                 // Consume before invoking user code. If it panics and the
                 // unwind is caught, a later pull must not repeat its effects.
                 self.emit_next += 1;
-                let origin = self
-                    .emit_origins
-                    .as_ref()
-                    .map(|origins| origins[row]);
-                let mut projection = origin
-                    .map(|activation| self.terminal_yield.begin_projection(activation));
+                let origin = self.emit_origins.as_ref().map(|origins| origins[row]);
+                let mut projection =
+                    origin.map(|activation| self.terminal_yield.begin_projection(activation));
                 let stride = self.emit_vars.len();
                 let start = row * stride;
                 for (column, &variable) in self.emit_vars.iter().enumerate() {
@@ -8648,11 +8701,16 @@ impl ResidualStateMachine {
                             self.accept_delta_step_with_resume(focused.outcome, focused.resume)
                         }
                         ActiveDeltaStatus::Pending => {
+                            debug_assert!(focused.outcome.completed_activation_ids.is_empty());
                             self.account_delta_feedback(&focused.outcome);
                             self.active_delta = Some(active);
                         }
                         ActiveDeltaStatus::Quiescent => {
-                            self.account_delta_feedback(&focused.outcome);
+                            // Quiescence carries the exact activation receipt
+                            // used by the terminal yield ledger. It has no
+                            // stable effect, but must still pass through the
+                            // ordinary receipt acceptance path.
+                            self.accept_delta_step(focused.outcome);
                             self.stats.delta_active_quiescent_releases += 1;
                         }
                     }
@@ -8698,6 +8756,27 @@ impl ResidualStateMachine {
                     self.continuation = None;
                     self.stage_emit(rows);
                     self.increase_delta_activation_width();
+                }
+                MachineStep::DeferredTerminalAdmission => {
+                    assert!(
+                        !self.delta.is_empty(),
+                        "a live terminal family deferred without cyclic work",
+                    );
+                    // The exact activation preference is only a lease; a
+                    // global step may retire that activation, so discard the
+                    // token before servicing the shared cyclic frontier.
+                    self.active_delta = None;
+                    self.active_delta_after_yield = false;
+                    let outcome = self.delta.step_bounded(
+                        root,
+                        plan,
+                        width,
+                        self.uses_direct_terminal_publication().then_some(self.full),
+                        &mut self.worklist,
+                        &mut self.interner,
+                        &mut self.stats,
+                    );
+                    self.accept_delta_step(outcome);
                 }
                 MachineStep::DeltaSeeded {
                     continuation,
@@ -8865,7 +8944,7 @@ impl ResidualStateMachine {
                 right.emit_origins = self
                     .emit_origins
                     .as_mut()
-                    .map(|origins| origins.split_off(left_count));
+                    .map(|origins| origins.drain(left_count..).collect::<SmallVec<[_; 1]>>());
                 right.emit_count = right_count;
                 self.emit_count = left_count;
                 return Some(right);
@@ -9012,6 +9091,9 @@ impl ResidualStateMachine {
                 MachineStep::Stable(StepOutcome::Emit(rows)) => {
                     self.stage_emit(rows);
                     self.increase_delta_activation_width();
+                }
+                MachineStep::DeferredTerminalAdmission => {
+                    unreachable!("parallel split refuses an admitted terminal learner")
                 }
             }
         }
@@ -10431,7 +10513,7 @@ mod tests {
             (2, 0, 2, 1),
             "a complete zero-row activation is an observed zero-yield sample"
         );
-        assert!(ledger.samples.is_empty());
+        assert!(ledger.samples.iter().all(Option::is_none));
     }
 
     #[test]
@@ -10487,6 +10569,22 @@ mod tests {
         machine.terminal_demand_consumed = 0;
         assert_eq!(machine.terminal_admission_width(family, 16), 2);
         assert_eq!(machine.terminal_admission_width(family, 1), 1);
+
+        let yield_ = machine.terminal_yield.families.get_mut(&family).unwrap();
+        yield_.admitted = 3;
+        yield_.live = 1;
+        assert_eq!(machine.terminal_admission_width(family, 16), 0);
+        machine
+            .terminal_yield
+            .families
+            .get_mut(&family)
+            .unwrap()
+            .live = 0;
+        assert_eq!(
+            machine.terminal_admission_width(family, 16),
+            1,
+            "only exhausted live capacity earns the scalar miss grant"
+        );
     }
 
     #[test]
@@ -10521,7 +10619,7 @@ mod tests {
             panic!("intentional projection unwind");
         }));
         assert!(unwind.is_err());
-        assert!(ledger.samples.is_empty());
+        assert!(ledger.samples.iter().all(Option::is_none));
         assert_eq!(
             (
                 ledger.families[&family].admitted,
@@ -10734,6 +10832,7 @@ mod tests {
             profiled.stats
         );
         assert!(profiled.stats.delta_terminal_admission_remainders > 0);
+        assert!(profiled.stats.delta_terminal_admitted_parents >= 4);
         assert!(profiled.stats.delta_terminal_calls > 0);
         assert_eq!(profiled.stats.max_delta_terminal_task_cohort, 1);
         assert!(profiled.stats.delta_terminal_publications > 0);
@@ -16655,6 +16754,22 @@ mod tests {
             pure.stats().delta_active_live_yields_retained,
             pure.stats().delta_active_post_yield_resumptions,
             "a complete drain must resume every lease retained at publication"
+        );
+        assert!(
+            pure.state
+                .terminal_yield
+                .families
+                .values()
+                .all(|family| family.live == 0),
+            "directed quiescence must retire every exact terminal activation receipt"
+        );
+        assert!(
+            pure.state
+                .terminal_yield
+                .samples
+                .iter()
+                .all(Option::is_none),
+            "a complete drain must leave no terminal yield sample live"
         );
     }
 

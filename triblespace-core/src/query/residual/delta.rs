@@ -119,6 +119,12 @@ impl RegistryBrand {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(super) struct ActivationId(u64);
 
+impl ActivationId {
+    pub(super) fn index(self) -> usize {
+        usize::try_from(self.0).expect("delta activation index exceeds usize")
+    }
+}
+
 #[cfg(test)]
 impl ActivationId {
     pub(super) const fn test(raw: u64) -> Self {
@@ -334,18 +340,22 @@ struct DeltaStreamingReturn {
 #[derive(Debug)]
 pub(super) struct TerminalPublicationBatch {
     pub(super) rows: RowBatch,
-    pub(super) origins: Vec<ActivationId>,
+    /// Terminal sparse search overwhelmingly publishes one row at a time.
+    /// Keep that exact origin inline; wider/mixed cohorts spill only when
+    /// they actually need more storage.
+    pub(super) origins: SmallVec<[ActivationId; 1]>,
 }
 
 impl TerminalPublicationBatch {
     fn new(activation: ActivationId, rows: RowBatch) -> Self {
-        let origins = vec![activation; rows.row_count];
+        let mut origins = SmallVec::new();
+        origins.resize(rows.row_count, activation);
         Self { rows, origins }
     }
 
     fn append(&mut self, mut other: Self) {
         self.rows.append(other.rows);
-        self.origins.append(&mut other.origins);
+        self.origins.extend(other.origins.drain(..));
         debug_assert_eq!(self.origins.len(), self.rows.row_count);
     }
 }
@@ -357,9 +367,6 @@ struct DeltaStableEffects {
     /// buffer. This is a physical publication receipt, never a canonical
     /// delta or stable state.
     publication: Option<TerminalPublicationBatch>,
-    /// Exact affine activations that became quiescent during this physical
-    /// step. Counts are insufficient for projected-yield sample closure.
-    completed_activation_ids: Vec<ActivationId>,
 }
 
 impl DeltaStableEffects {
@@ -372,8 +379,6 @@ impl DeltaStableEffects {
                 self.publication = Some(rows);
             }
         }
-        self.completed_activation_ids
-            .append(&mut other.completed_activation_ids);
     }
 
     fn has_effect(&self) -> bool {
@@ -912,11 +917,7 @@ impl ProducerRegistry {
     /// Transition expansion is activation-local sparse search. Confirmed
     /// demand may raise the outer search ceiling, but cannot itself make one
     /// traversal spend more of that ceiling.
-    fn transition_dispatch_width(
-        &self,
-        activation: ActivationId,
-        search_width: usize,
-    ) -> usize {
+    fn transition_dispatch_width(&self, activation: ActivationId, search_width: usize) -> usize {
         let activation = self
             .state
             .activations
@@ -965,10 +966,8 @@ impl ProducerRegistry {
         if published {
             activation.terminal_sparse_quantum = 1;
         } else if kind == PhysicalDispatchKind::Transition {
-            activation.terminal_sparse_quantum = before
-                .saturating_mul(2)
-                .min(search_width.max(1))
-                .max(1);
+            activation.terminal_sparse_quantum =
+                before.saturating_mul(2).min(search_width.max(1)).max(1);
         }
         (
             published && activation.terminal_sparse_quantum != before,
@@ -1532,6 +1531,7 @@ impl DeltaScheduler {
         let stride = successor.bound.count();
         let mut tasks = Vec::with_capacity(seeds.len());
         let mut effects = DeltaStableEffects::default();
+        let mut completed_activation_ids = Vec::new();
         let mut terminal_activations = Vec::with_capacity(parents.row_count);
         for (row, range) in ranges.into_iter().enumerate() {
             let start = row * stride;
@@ -1582,7 +1582,7 @@ impl DeltaScheduler {
                 let completed = self.registry.finish(proof);
                 assert_eq!(completed.effect, DeltaCompletion::Cleanup);
                 assert!(matches!(completed.return_to, DeltaReturn::Stable { .. }));
-                effects.completed_activation_ids.push(completed.activation);
+                completed_activation_ids.push(completed.activation);
             }
         }
         let active = self.file(desc, tasks);
@@ -1591,7 +1591,7 @@ impl DeltaScheduler {
             publication: effects.publication,
             active,
             terminal_activations,
-            completed_activation_ids: effects.completed_activation_ids,
+            completed_activation_ids,
             terminal_family: None,
             seeded_parents,
         }
@@ -1610,7 +1610,7 @@ impl DeltaScheduler {
             parents,
             VariableSet::new_empty(),
         )
-            .active
+        .active
     }
 
     pub(super) fn seed_source_proposals_with_full_receipt(
@@ -1988,7 +1988,6 @@ impl DeltaScheduler {
                     stats,
                 ),
                 publication: None,
-                completed_activation_ids: Vec::new(),
             };
         }
         stats.candidates_proposed += accepted.len();
@@ -2028,7 +2027,6 @@ impl DeltaScheduler {
             return DeltaStableEffects {
                 continuation: None,
                 publication: Some(TerminalPublicationBatch::new(activation, rows)),
-                completed_activation_ids: Vec::new(),
             };
         }
         let continuation = match streamed.return_to {
@@ -2064,7 +2062,6 @@ impl DeltaScheduler {
         DeltaStableEffects {
             continuation,
             publication: None,
-            completed_activation_ids: Vec::new(),
         }
     }
 
@@ -2167,17 +2164,12 @@ impl DeltaScheduler {
         })
     }
 
-    fn allows_global_width_growth(
-        &self,
-        dispatch: PhysicalDispatch,
-        search_width: usize,
-    ) -> bool {
+    fn allows_global_width_growth(&self, dispatch: PhysicalDispatch, search_width: usize) -> bool {
         let Some(activation) = dispatch.terminal_activation else {
             return true;
         };
         dispatch.kind == PhysicalDispatchKind::Source
-            || (dispatch.work_budget >= search_width.max(1)
-                && self.registry.is_live(activation))
+            || (dispatch.work_budget >= search_width.max(1) && self.registry.is_live(activation))
     }
 
     fn account_physical_dispatch(
@@ -2719,6 +2711,7 @@ impl DeltaScheduler {
         let mut next_tasks = Vec::new();
         let mut resumed_sources = Vec::new();
         let mut effects = DeltaStableEffects::default();
+        let mut completed_activation_ids = Vec::new();
         let mut dead_pages = 0usize;
         let mut source_dead_pages = 0usize;
         let mut transition_dead_pages = 0usize;
@@ -2792,9 +2785,7 @@ impl DeltaScheduler {
                 assert_eq!(proof.activation, task.activation);
                 completed_activations += 1;
                 let completed = self.registry.finish(proof);
-                task_effects
-                    .completed_activation_ids
-                    .push(completed.activation);
+                completed_activation_ids.push(completed.activation);
                 prefer_continuation(
                     &mut task_effects.continuation,
                     Self::release_completion(completed, plan, stable, stable_interner, stats),
@@ -2818,7 +2809,7 @@ impl DeltaScheduler {
         DeltaStepOutcome {
             continuation: effects.continuation,
             publication: effects.publication,
-            completed_activation_ids: effects.completed_activation_ids,
+            completed_activation_ids,
             dead_pages,
             source_dead_pages,
             transition_dead_pages,
@@ -2940,6 +2931,7 @@ impl DeltaScheduler {
         stats.max_delta_source_cohort = stats.max_delta_source_cohort.max(row_count);
         stats.delta_source_pages += row_count;
         let mut effects = DeltaStableEffects::default();
+        let mut completed_activation_ids = Vec::new();
         let mut traversal = Vec::new();
         let mut resumed_sources = Vec::new();
         let mut dead_pages = 0usize;
@@ -3005,9 +2997,7 @@ impl DeltaScheduler {
                 assert_eq!(proof.activation, task.activation);
                 completed_activations += 1;
                 let completed = self.registry.finish(proof);
-                task_effects
-                    .completed_activation_ids
-                    .push(completed.activation);
+                completed_activation_ids.push(completed.activation);
                 prefer_continuation(
                     &mut task_effects.continuation,
                     Self::release_completion(completed, plan, stable, stable_interner, stats),
@@ -3026,7 +3016,7 @@ impl DeltaScheduler {
         DeltaStepOutcome {
             continuation: effects.continuation,
             publication: effects.publication,
-            completed_activation_ids: effects.completed_activation_ids,
+            completed_activation_ids,
             dead_pages,
             source_dead_pages: dead_pages,
             transition_dead_pages: 0,
@@ -3569,12 +3559,7 @@ mod tests {
             1
         );
         assert_eq!(
-            registry.finish_dispatch(
-                started.activation,
-                64,
-                PhysicalDispatchKind::Source,
-                false,
-            ),
+            registry.finish_dispatch(started.activation, 64, PhysicalDispatchKind::Source, false,),
             (false, false)
         );
         assert_eq!(
@@ -3603,17 +3588,9 @@ mod tests {
             ),
             (false, true)
         );
+        assert_eq!(registry.transition_dispatch_width(started.activation, 3), 3);
         assert_eq!(
-            registry.transition_dispatch_width(started.activation, 3),
-            3
-        );
-        assert_eq!(
-            registry.finish_dispatch(
-                started.activation,
-                64,
-                PhysicalDispatchKind::Source,
-                true,
-            ),
+            registry.finish_dispatch(started.activation, 64, PhysicalDispatchKind::Source, true,),
             (true, false)
         );
         assert_eq!(
@@ -3711,10 +3688,7 @@ mod tests {
             .publication
             .expect("the proven terminal accepting seed published directly");
         assert_eq!(
-            (
-                publication.rows.row_count,
-                publication.rows.rows.as_slice(),
-            ),
+            (publication.rows.row_count, publication.rows.rows.as_slice(),),
             (1, &[value(7)][..])
         );
         assert_eq!(publication.origins.len(), 1);
