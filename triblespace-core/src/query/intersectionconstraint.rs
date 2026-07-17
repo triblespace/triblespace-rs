@@ -107,10 +107,22 @@ where
         }
     }
 
-    /// Frontier expansion: per row the tightest child proposes (one
-    /// estimate column per relevant child, argmin per row), then the
-    /// sibling confirms run as **whole-frontier passes** — one per child,
-    /// cheapest (first-row estimate) first.
+    /// Frontier expansion: per row the tightest child proposes (a running
+    /// argmin folded over one reused estimate column per relevant child),
+    /// then the sibling confirms run as **whole-frontier passes** — one per
+    /// child, cheapest (first-row estimate) first.
+    ///
+    /// This is the **single algorithm for every width and sink shape** —
+    /// the former width-1 scalar arm (sort + stack slots) is gone. Two
+    /// reasons beyond code size: the sequential mirror must exercise the
+    /// same verb algorithm as the blocked engines for scheduler
+    /// differential tests to test *scheduling* rather than divergent code
+    /// paths, and one path is one branch-prediction/i-cache footprint. At
+    /// `n_rows == 1` the argmin degenerates to the old sort's first
+    /// element and the uniform fast path always hits, so the sequential
+    /// semantics (tightest proposes, the rest confirm cheapest-first) are
+    /// unchanged; the only cost is one reused estimate-column allocation
+    /// per call, which the mirror is lawfully allowed to pay.
     ///
     /// When one child proposes for *every* row (the common case —
     /// proposer choice is usually structural), it receives the whole
@@ -129,52 +141,49 @@ where
         view: &RowsView<'_>,
         candidates: &mut CandidateSink<'_>,
     ) {
-        // The sequential cursor (a Values sink is always a block of 1):
-        // scalar child estimates in stack slots, argmin, propose, ordered
-        // confirms — no estimate columns, no heap scratch.
-        if matches!(candidates, CandidateSink::Values(_)) {
-            let mut relevant: SmallVec<[(usize, usize); 16]> = SmallVec::new();
-            for (ci, c) in self.constraints.iter().enumerate() {
-                let mut e = 0usize;
-                if c.estimate(variable, view, &mut EstimateSink::Scalar(&mut e)) {
-                    relevant.push((e, ci));
-                }
-            }
-            if relevant.is_empty() {
-                return;
-            }
-            relevant.sort_unstable_by_key(|&(estimate, _)| estimate);
-            self.constraints[relevant[0].1].propose(variable, view, candidates);
-            for &(_, ci) in &relevant[1..] {
-                self.constraints[ci].confirm(variable, view, candidates);
-            }
-            return;
-        }
-
         let n_rows = view.len();
 
-        // Pass 1: per-child estimate columns (flat, child-major) — the
-        // same cardinality data drives proposer choice AND confirm order.
-        let mut cols: Vec<usize> = Vec::new();
+        // Pass 1+2 fused: one reused column per child, folded into a
+        // running per-row argmin — no child-major matrix. `first_est`
+        // retains each relevant child's row-0 estimate, which drives the
+        // confirm order exactly as the old matrix's `cols[k * n_rows]` did.
+        let mut col: Vec<usize> = Vec::new();
         let mut relevant: SmallVec<[usize; 16]> = SmallVec::new();
+        let mut first_est: SmallVec<[usize; 16]> = SmallVec::new();
+        let mut propose_counts: SmallVec<[usize; 16]> = SmallVec::new();
+        let mut best_est: SmallVec<[usize; 32]> = SmallVec::new();
+        let mut proposers: SmallVec<[u32; 32]> = SmallVec::new();
         for (ci, c) in self.constraints.iter().enumerate() {
-            if c.estimate(variable, view, &mut EstimateSink::Column(&mut cols)) {
-                relevant.push(ci);
+            col.clear();
+            if !c.estimate(variable, view, &mut EstimateSink::Column(&mut col)) {
+                continue;
+            }
+            debug_assert_eq!(
+                col.len(),
+                n_rows,
+                "constraint estimate must append one value per row"
+            );
+            let k = relevant.len() as u32;
+            relevant.push(ci);
+            first_est.push(col.first().copied().unwrap_or(usize::MAX));
+            propose_counts.push(0);
+            if best_est.is_empty() {
+                best_est.extend(col.iter().copied());
+                proposers.extend(std::iter::repeat(k).take(n_rows));
+                propose_counts[k as usize] = n_rows;
+            } else {
+                for (i, &e) in col.iter().enumerate() {
+                    if e < best_est[i] {
+                        propose_counts[proposers[i] as usize] -= 1;
+                        propose_counts[k as usize] += 1;
+                        best_est[i] = e;
+                        proposers[i] = k;
+                    }
+                }
             }
         }
         if relevant.is_empty() {
             return;
-        }
-
-        // Pass 2: per-row proposer = argmin across the columns.
-        let mut propose_counts: SmallVec<[usize; 16]> = SmallVec::from_elem(0, relevant.len());
-        let mut proposers: SmallVec<[u32; 32]> = SmallVec::with_capacity(n_rows);
-        for i in 0..n_rows {
-            let k = (0..relevant.len())
-                .min_by_key(|&k| cols[k * n_rows + i])
-                .expect("non-empty relevant");
-            propose_counts[k] += 1;
-            proposers.push(k as u32);
         }
 
         // Pass 3: expand the frontier.
@@ -213,7 +222,7 @@ where
             .iter()
             .enumerate()
             .filter(|&(k, _)| uniform != Some(k))
-            .map(|(k, &ci)| (cols[k * n_rows], ci))
+            .map(|(k, &ci)| (first_est[k], ci))
             .collect();
         confirmers.sort_unstable_by_key(|&(estimate, _)| estimate);
         for (_, ci) in confirmers {
