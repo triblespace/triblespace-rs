@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Typed Program activation retirement is one atomic arena pass.** A retiring
+  cohort now builds activation membership once, rejects any still-live state
+  handle before deleting novelty, and then retires the requested activations.
+  This removes the prior activation-count multiplier from high-water arena
+  scans without adding bookkeeping to continuation insertion or affine take.
 - **Residual RPQs now execute through one typed affine program runtime.**
   Occurrence-local program addresses erase each family once per dense cohort
   while generational handles retain exact typed continuations, family-owned

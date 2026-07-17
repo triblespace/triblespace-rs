@@ -9,7 +9,7 @@
 use std::any::{type_name, Any, TypeId};
 use std::hash::Hash;
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 
 use super::{RawInline, RowsView, VariableId, VariableSet};
 
@@ -673,6 +673,8 @@ struct TypedProgramRuntime<State, NoveltyKey> {
     slots: Vec<ArenaSlot<State>>,
     free: Vec<u32>,
     novelty: AHashMap<ProgramActivation, AHashMap<NoveltyKey, Option<RawInline>>>,
+    #[cfg(test)]
+    retirement_slot_probes: usize,
 }
 
 impl<State, NoveltyKey> Default for TypedProgramRuntime<State, NoveltyKey> {
@@ -681,6 +683,8 @@ impl<State, NoveltyKey> Default for TypedProgramRuntime<State, NoveltyKey> {
             slots: Vec::new(),
             free: Vec::new(),
             novelty: AHashMap::new(),
+            #[cfg(test)]
+            retirement_slot_probes: 0,
         }
     }
 }
@@ -783,16 +787,42 @@ where
         }
     }
 
-    fn retire(&mut self, activation: ProgramActivation) {
+    /// Atomically retires a cohort after one arena ownership pass.
+    ///
+    /// The arena high-water mark is independent of the number of retiring
+    /// activations, so checking each activation separately would cost
+    /// `O(activations * slots)`. Building the cohort membership once makes the
+    /// check `O(activations + slots)` and, importantly, keeps novelty intact if
+    /// any member still owns a live handle.
+    fn retire_activations(&mut self, activations: &[ProgramActivation]) {
+        if activations.is_empty() {
+            return;
+        }
+
+        let retiring: AHashSet<_> = activations.iter().copied().collect();
+        #[cfg(test)]
+        let mut slot_probes = 0;
+        let live_owner = self.slots.iter().find_map(|slot| {
+            #[cfg(test)]
+            {
+                slot_probes += 1;
+            }
+            slot.value
+                .as_ref()
+                .map(|(owner, _)| *owner)
+                .filter(|owner| retiring.contains(owner))
+        });
+        #[cfg(test)]
+        {
+            self.retirement_slot_probes += slot_probes;
+        }
         assert!(
-            self.slots.iter().all(|slot| {
-                slot.value
-                    .as_ref()
-                    .is_none_or(|(owner, _)| *owner != activation)
-            }),
+            live_owner.is_none(),
             "program activation retired while a live state handle remained"
         );
-        self.novelty.remove(&activation);
+        for activation in activations {
+            self.novelty.remove(activation);
+        }
     }
 
     #[cfg(test)]
@@ -1152,9 +1182,7 @@ where
             .as_any_mut()
             .downcast_mut::<TypedProgramRuntime<T::State, T::NoveltyKey>>()
             .expect("residual program retirement received another family's runtime");
-        for &activation in activations {
-            runtime.retire(activation);
-        }
+        runtime.retire_activations(activations);
     }
 }
 
@@ -1473,6 +1501,70 @@ mod tests {
     }
 
     #[test]
+    fn activation_retirement_scans_the_arena_once_at_high_water() {
+        const HIGH_WATER: usize = 1_024;
+        const RETIRING: usize = 257;
+
+        let mut runtime = TypedProgramRuntime::<NonComparableState, Key>::default();
+        let keeper = ProgramActivation(0);
+        let handles: Vec<_> = (0..HIGH_WATER)
+            .map(|exact_cursor| runtime.insert(keeper, NonComparableState { exact_cursor }))
+            .collect();
+        let retiring: Vec<_> = (1..=RETIRING as u64).map(ProgramActivation).collect();
+        for &activation in &retiring {
+            assert!(runtime.admit(activation, Key(1), None));
+        }
+
+        runtime.retire_activations(&retiring);
+
+        // The former per-activation check probed HIGH_WATER * RETIRING slots.
+        assert_eq!(runtime.retirement_slot_probes, HIGH_WATER);
+        assert!(retiring
+            .iter()
+            .all(|activation| !runtime.novelty.contains_key(activation)));
+        assert!(handles.iter().all(|handle| runtime.contains(handle)));
+    }
+
+    #[test]
+    fn activation_retirement_accepts_duplicate_and_zero_root_receipts() {
+        let mut runtime = TypedProgramRuntime::<NonComparableState, Key>::default();
+        let zero_root = ProgramActivation(7);
+        let observed = ProgramActivation(8);
+        assert!(runtime.admit(observed, Key(2), None));
+
+        runtime.retire_activations(&[zero_root, observed, zero_root, observed]);
+        runtime.retire_activations(&[observed, zero_root]);
+
+        assert_eq!(runtime.retirement_slot_probes, 0);
+        assert!(!runtime.novelty.contains_key(&observed));
+    }
+
+    #[test]
+    fn activation_retirement_rejection_preserves_the_whole_cohort() {
+        let mut runtime = TypedProgramRuntime::<NonComparableState, Key>::default();
+        let quiescent = ProgramActivation(11);
+        let live = ProgramActivation(12);
+        assert!(runtime.admit(quiescent, Key(3), None));
+        assert!(runtime.admit(live, Key(4), None));
+        let handle = runtime.insert(live, NonComparableState { exact_cursor: 9 });
+
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.retire_activations(&[quiescent, live]);
+        }));
+
+        assert!(panic_text(rejected.expect_err("live cohort retirement must fail"))
+            .contains("live state handle remained"));
+        assert!(runtime.novelty.contains_key(&quiescent));
+        assert!(runtime.novelty.contains_key(&live));
+        assert!(runtime.contains(&handle));
+
+        assert_eq!(runtime.take(live, handle).exact_cursor, 9);
+        runtime.retire_activations(&[quiescent, live, quiescent]);
+        assert!(!runtime.novelty.contains_key(&quiescent));
+        assert!(!runtime.novelty.contains_key(&live));
+    }
+
+    #[test]
     fn complete_adapter_accepts_repeated_ordered_occurrences_and_rejects_bad_parent_tags() {
         let request = ProgramRequest {
             action: ProgramAction::Propose(1),
@@ -1602,7 +1694,14 @@ mod tests {
         assert_eq!(left.take(activation, handle.clone()).exact_cursor, 11);
         assert!(!left.contains(&handle));
         assert!(right.contains(&handle));
+        left.retire_activations(&[activation]);
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            right.retire_activations(&[activation]);
+        }));
+        assert!(rejected.is_err());
+        assert!(right.contains(&handle));
         assert_eq!(right.take(activation, handle).exact_cursor, 11);
+        right.retire_activations(&[activation]);
     }
 
     #[test]
