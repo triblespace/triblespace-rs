@@ -3590,6 +3590,8 @@ impl Clone for DeltaScheduler {
 mod tests {
     use std::sync::atomic::AtomicUsize;
 
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+
     use crate::query::unionconstraint::UnionConstraint;
 
     use super::*;
@@ -4938,6 +4940,311 @@ mod tests {
             [(first_activation, value(1)), (second.activation, value(5))]
         );
         bucket.assert_index_consistent();
+    }
+
+    #[test]
+    fn indexed_terminal_selection_matches_literal_reverse_scan_under_churn() {
+        type TaskKey = (ActivationId, ResidualDeltaNode, ResidualDeltaExpandCursor);
+
+        fn key(task: &DeltaTask) -> TaskKey {
+            (task.activation, task.node, task.cursor)
+        }
+
+        fn literal_take_activation(
+            tasks: &mut Vec<DeltaTask>,
+            activation: ActivationId,
+            width: usize,
+        ) -> Vec<DeltaTask> {
+            let width = width.max(1);
+            let mut selected = Vec::with_capacity(width.min(tasks.len()));
+            let mut retained = Vec::with_capacity(tasks.len());
+            for task in std::mem::take(tasks).into_iter().rev() {
+                if task.activation == activation && selected.len() < width {
+                    selected.push(task);
+                } else {
+                    retained.push(task);
+                }
+            }
+            selected.reverse();
+            retained.reverse();
+            *tasks = retained;
+            selected
+        }
+
+        fn literal_take_tail(
+            tasks: &mut Vec<DeltaTask>,
+            registry: &ProducerRegistry,
+            width: usize,
+            activation_width: usize,
+        ) -> (Vec<DeltaTask>, Vec<usize>) {
+            let width = width.max(1);
+            let activation_width = activation_width.max(1);
+            let key = TransitionDispatchKey::of(
+                registry,
+                tasks.last().expect("literal bucket is nonempty"),
+            );
+            if key == TransitionDispatchKey::TerminalStreaming {
+                let hot_activation = tasks.last().unwrap().activation;
+                if registry.transition_dispatch_width(hot_activation, width) == width {
+                    let selected = literal_take_activation(tasks, hot_activation, width);
+                    let limits = even_limits(width, selected.len());
+                    return (selected, limits);
+                }
+
+                #[derive(Debug)]
+                struct Selection {
+                    budget: usize,
+                    selected: usize,
+                    ordinal: usize,
+                }
+
+                let mut remaining = width;
+                let mut slots = AHashMap::new();
+                let mut selections = Vec::new();
+                let mut selected = Vec::with_capacity(width.min(tasks.len()));
+                let mut limits = Vec::with_capacity(width.min(tasks.len()));
+                let mut retained = Vec::with_capacity(tasks.len());
+                for task in std::mem::take(tasks).into_iter().rev() {
+                    if TransitionDispatchKey::of(registry, &task) == key {
+                        let selection_slot = if let Some(&slot) = slots.get(&task.activation) {
+                            Some(slot)
+                        } else if remaining > 0 {
+                            let budget = registry
+                                .transition_dispatch_width(task.activation, width)
+                                .min(remaining);
+                            remaining -= budget;
+                            let slot = selections.len();
+                            selections.push(Selection {
+                                budget,
+                                selected: 0,
+                                ordinal: 0,
+                            });
+                            slots.insert(task.activation, slot);
+                            Some(slot)
+                        } else {
+                            None
+                        };
+                        if let Some((slot, selection)) = selection_slot
+                            .map(|slot| (slot, &mut selections[slot]))
+                            .filter(|(_, selection)| selection.selected < selection.budget)
+                        {
+                            selection.selected += 1;
+                            limits.push(slot);
+                            selected.push(task);
+                            continue;
+                        }
+                    }
+                    retained.push(task);
+                }
+                selected.reverse();
+                limits.reverse();
+                retained.reverse();
+                *tasks = retained;
+                for slot_or_limit in &mut limits {
+                    let selection = &mut selections[*slot_or_limit];
+                    let quotient = selection.budget / selection.selected;
+                    let remainder = selection.budget % selection.selected;
+                    *slot_or_limit = quotient + usize::from(selection.ordinal < remainder);
+                    selection.ordinal += 1;
+                }
+                return (selected, limits);
+            }
+
+            let mut activations = BTreeSet::new();
+            let mut selected = Vec::with_capacity(width.min(tasks.len()));
+            let mut retained = Vec::with_capacity(tasks.len());
+            for task in std::mem::take(tasks).into_iter().rev() {
+                let compatible = match (key, TransitionDispatchKey::of(registry, &task)) {
+                    (TransitionDispatchKey::Streaming, TransitionDispatchKey::Streaming) => true,
+                    (
+                        TransitionDispatchKey::Quiescent(_),
+                        TransitionDispatchKey::Quiescent(activation),
+                    ) => {
+                        activations.contains(&activation)
+                            || (activations.len() < activation_width && {
+                                activations.insert(activation);
+                                true
+                            })
+                    }
+                    _ => false,
+                };
+                if selected.len() < width && compatible {
+                    selected.push(task);
+                } else {
+                    retained.push(task);
+                }
+            }
+            selected.reverse();
+            retained.reverse();
+            *tasks = retained;
+            let limits = even_limits(width, selected.len());
+            (selected, limits)
+        }
+
+        let mut rng = StdRng::seed_from_u64(0x5eed_1ade_7a11_2026);
+        for case in 0..32 {
+            let mut scheduler = DeltaScheduler::new();
+            let mut starts = Vec::new();
+            let mut terminal = Vec::new();
+            let mut next_value = 0u8;
+            for activation_index in 0..8 {
+                let outputs: Vec<_> = (0..8)
+                    .map(|_| {
+                        let current = next_value;
+                        next_value += 1;
+                        output(current, activation_index, false)
+                    })
+                    .collect();
+                let started = if activation_index % 3 == 0 {
+                    scheduler.registry.start_many(
+                        DeltaReducer::StreamProposal,
+                        candidate_return(Vec::new()),
+                        outputs,
+                    )
+                } else {
+                    let started = scheduler.registry.start_many_terminal(
+                        DeltaReducer::StreamProposal,
+                        candidate_return(Vec::new()),
+                        outputs,
+                        VariableSet::new_singleton(0),
+                    );
+                    terminal.push(started.activation);
+                    started
+                };
+                starts.push(started);
+            }
+            for &activation in &terminal {
+                for _ in 0..rng.gen_range(0..=5) {
+                    let _ = scheduler.registry.finish_dispatch(
+                        activation,
+                        64,
+                        PhysicalDispatchKind::Transition,
+                        false,
+                    );
+                }
+            }
+
+            let mut tasks = Vec::with_capacity(64);
+            while starts.iter().any(|started| !started.roots.is_empty()) {
+                let live: Vec<_> = starts
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, started)| (!started.roots.is_empty()).then_some(index))
+                    .collect();
+                let index = live[rng.gen_range(0..live.len())];
+                let (node, credit) = starts[index].roots.remove(0);
+                tasks.push(DeltaTask {
+                    activation: starts[index].activation,
+                    credit,
+                    node,
+                    cursor: ResidualDeltaExpandCursor::Start,
+                });
+            }
+            let terminal_tail = tasks
+                .iter()
+                .rposition(|task| terminal.contains(&task.activation))
+                .unwrap();
+            let tail = tasks.remove(terminal_tail);
+            tasks.push(tail);
+
+            let active = scheduler
+                .file(DeltaDesc::leaf(0, 0), tasks)
+                .expect("random bucket is live");
+            let churn_activation = terminal[0];
+            let churned = scheduler
+                .worklist
+                .get_mut(&active.state)
+                .unwrap()
+                .take_activation_indexed(churn_activation, 2);
+            scheduler
+                .worklist
+                .get_mut(&active.state)
+                .unwrap()
+                .extend(churned);
+
+            // Cloning an indexed arena with tombstones must produce an
+            // independent, append-order-equivalent plain sibling.
+            let mut oracle_scheduler = scheduler.deep_clone();
+            let mut indexed = scheduler.worklist.remove(&active.state).unwrap();
+            let mut oracle = oracle_scheduler
+                .worklist
+                .remove(&active.state)
+                .unwrap()
+                .drain_live();
+            let mut indexed_stash = Vec::new();
+            let mut oracle_stash = Vec::new();
+            let mut selection_slots = AHashMap::new();
+            let mut selections = Vec::new();
+
+            for step in 0..400 {
+                if !indexed_stash.is_empty() && (indexed.is_empty() || rng.gen_bool(0.2)) {
+                    let count = rng.gen_range(1..=indexed_stash.len());
+                    let indexed_append = indexed_stash.split_off(indexed_stash.len() - count);
+                    let oracle_append = oracle_stash.split_off(oracle_stash.len() - count);
+                    indexed.extend(indexed_append);
+                    oracle.extend(oracle_append);
+                } else {
+                    let widths = [0usize, 1, 2, 3, 5, 8, 13, 64, usize::MAX];
+                    let width = widths[rng.gen_range(0..widths.len())];
+                    let activation_width = rng.gen_range(0..=8);
+                    let exact = rng.gen_bool(0.35);
+                    let (indexed_selected, indexed_limits, oracle_selected, oracle_limits) =
+                        if exact {
+                            let live: Vec<_> = oracle.iter().map(|task| task.activation).collect();
+                            let activation = live[rng.gen_range(0..live.len())];
+                            (
+                                indexed.take_activation(activation, width),
+                                None,
+                                literal_take_activation(&mut oracle, activation, width),
+                                None,
+                            )
+                        } else {
+                            let (selected, limits) = indexed.take_tail(
+                                &scheduler.registry,
+                                width,
+                                activation_width,
+                                &mut selection_slots,
+                                &mut selections,
+                            );
+                            let (oracle_selected, oracle_limits) = literal_take_tail(
+                                &mut oracle,
+                                &oracle_scheduler.registry,
+                                width,
+                                activation_width,
+                            );
+                            (selected, Some(limits), oracle_selected, Some(oracle_limits))
+                        };
+                    assert_eq!(
+                        indexed_selected.iter().map(key).collect::<Vec<_>>(),
+                        oracle_selected.iter().map(key).collect::<Vec<_>>(),
+                        "selected order diverged in case {case}, step {step}"
+                    );
+                    assert_eq!(
+                        indexed_limits, oracle_limits,
+                        "budget allocation diverged in case {case}, step {step}"
+                    );
+                    if rng.gen_bool(0.45) {
+                        indexed.extend(indexed_selected);
+                        oracle.extend(oracle_selected);
+                    } else {
+                        indexed_stash.extend(indexed_selected);
+                        oracle_stash.extend(oracle_selected);
+                    }
+                }
+
+                assert_eq!(
+                    indexed.iter().map(key).collect::<Vec<_>>(),
+                    oracle.iter().map(key).collect::<Vec<_>>(),
+                    "retained order diverged in case {case}, step {step}"
+                );
+                assert_eq!(
+                    indexed_stash.iter().map(key).collect::<Vec<_>>(),
+                    oracle_stash.iter().map(key).collect::<Vec<_>>(),
+                    "stashed order diverged in case {case}, step {step}"
+                );
+                indexed.assert_index_consistent();
+            }
+        }
     }
 
     #[test]
