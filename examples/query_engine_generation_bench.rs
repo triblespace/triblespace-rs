@@ -27,9 +27,7 @@
 ))]
 compile_error!("select exactly one benchmark engine");
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
@@ -65,137 +63,6 @@ const REVISION: &str = match option_env!("ENGINE_REVISION") {
 };
 
 type Pair = (Inline<GenId>, Inline<GenId>);
-
-// Causal-probe instrumentation only. The relaxed counters deliberately trade
-// timing fidelity for exact allocation ownership; wall-clock profiles use a
-// build with this block reverted.
-struct CountingAllocator;
-
-static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
-static DEALLOCATIONS: AtomicU64 = AtomicU64::new(0);
-static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
-static DEALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
-static LIVE_BYTES: AtomicU64 = AtomicU64::new(0);
-static PEAK_LIVE_BYTES: AtomicU64 = AtomicU64::new(0);
-const ALLOC_LIMITS: [usize; 12] = [
-    32,
-    64,
-    128,
-    256,
-    512,
-    1024,
-    4096,
-    16384,
-    65536,
-    262144,
-    1048576,
-    usize::MAX,
-];
-static ALLOC_BINS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
-static ALLOC_BIN_BYTES: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
-
-fn allocation_bin(size: usize) -> usize {
-    ALLOC_LIMITS.partition_point(|&limit| limit < size)
-}
-
-fn record_allocation(size: usize) {
-    let size = size as u64;
-    ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-    ALLOCATED_BYTES.fetch_add(size, Ordering::Relaxed);
-    let live = LIVE_BYTES.fetch_add(size, Ordering::Relaxed) + size;
-    PEAK_LIVE_BYTES.fetch_max(live, Ordering::Relaxed);
-    let bin = allocation_bin(size as usize);
-    ALLOC_BINS[bin].fetch_add(1, Ordering::Relaxed);
-    ALLOC_BIN_BYTES[bin].fetch_add(size, Ordering::Relaxed);
-}
-
-fn record_deallocation(size: usize) {
-    let size = size as u64;
-    DEALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-    DEALLOCATED_BYTES.fetch_add(size, Ordering::Relaxed);
-    LIVE_BYTES.fetch_sub(size, Ordering::Relaxed);
-}
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = unsafe { System.alloc(layout) };
-        if !ptr.is_null() {
-            record_allocation(layout.size());
-        }
-        ptr
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        record_deallocation(layout.size());
-        unsafe { System.dealloc(ptr, layout) };
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, old: Layout, new_size: usize) -> *mut u8 {
-        let new_ptr = unsafe { System.realloc(ptr, old, new_size) };
-        if !new_ptr.is_null() {
-            record_deallocation(old.size());
-            record_allocation(new_size);
-        }
-        new_ptr
-    }
-}
-
-#[global_allocator]
-static GLOBAL: CountingAllocator = CountingAllocator;
-
-#[derive(Clone)]
-struct AllocSnapshot {
-    allocations: u64,
-    deallocations: u64,
-    allocated_bytes: u64,
-    deallocated_bytes: u64,
-    live_bytes: u64,
-    peak_live_bytes: u64,
-    bins: [u64; 12],
-    bin_bytes: [u64; 12],
-}
-
-impl AllocSnapshot {
-    fn now() -> Self {
-        Self {
-            allocations: ALLOCATIONS.load(Ordering::Relaxed),
-            deallocations: DEALLOCATIONS.load(Ordering::Relaxed),
-            allocated_bytes: ALLOCATED_BYTES.load(Ordering::Relaxed),
-            deallocated_bytes: DEALLOCATED_BYTES.load(Ordering::Relaxed),
-            live_bytes: LIVE_BYTES.load(Ordering::Relaxed),
-            peak_live_bytes: PEAK_LIVE_BYTES.load(Ordering::Relaxed),
-            bins: std::array::from_fn(|i| ALLOC_BINS[i].load(Ordering::Relaxed)),
-            bin_bytes: std::array::from_fn(|i| ALLOC_BIN_BYTES[i].load(Ordering::Relaxed)),
-        }
-    }
-
-    fn report_since(&self, before: &Self, label: &str) {
-        println!(
-            "alloc {label}: calls={} frees={} allocated={} deallocated={} live_delta={} peak_above_baseline={}",
-            self.allocations - before.allocations,
-            self.deallocations - before.deallocations,
-            self.allocated_bytes - before.allocated_bytes,
-            self.deallocated_bytes - before.deallocated_bytes,
-            self.live_bytes as i128 - before.live_bytes as i128,
-            self.peak_live_bytes.saturating_sub(before.live_bytes),
-        );
-        for i in 0..ALLOC_LIMITS.len() {
-            let count = self.bins[i] - before.bins[i];
-            if count != 0 {
-                println!(
-                    "alloc_bin upper={} count={} bytes={}",
-                    ALLOC_LIMITS[i],
-                    count,
-                    self.bin_bytes[i] - before.bin_bytes[i]
-                );
-            }
-        }
-    }
-}
-
-fn reset_peak_to_live() {
-    PEAK_LIVE_BYTES.store(LIVE_BYTES.load(Ordering::Relaxed), Ordering::Relaxed);
-}
 
 macro_rules! engine_query {
     ($query:expr) => {{
@@ -752,16 +619,13 @@ fn main() {
             "cyclic RPQ",
             "TribleSet",
         );
-        reset_peak_to_live();
-        let before = AllocSnapshot::now();
+        let start = Instant::now();
         #[cfg(engine_current_residual)]
         let (signature, stats) = {
             use triblespace::core::query::residual::ResidualLowering;
             let mut query =
                 cyclic_rpq_query!(&fixture).solve_residual_state_lazy_with(ResidualLowering::FULL);
             let signature = tally(query.by_ref());
-            let after_drain = AllocSnapshot::now();
-            after_drain.report_since(&before, "after_drain");
             let stats = format!("{:?}", query.stats());
             drop(query);
             (signature, stats)
@@ -770,13 +634,10 @@ fn main() {
         let (signature, stats) = {
             let mut query = cyclic_rpq_query!(&fixture);
             let signature = tally(query.by_ref());
-            let after_drain = AllocSnapshot::now();
-            after_drain.report_since(&before, "after_drain");
             drop(query);
             (signature, String::new())
         };
-        let after_drop = AllocSnapshot::now();
-        after_drop.report_since(&before, "after_drop");
+        println!("first_full_elapsed={:?}", start.elapsed());
         println!(
             "signature rows={} checksum={:#018x}",
             signature.rows, signature.checksum
