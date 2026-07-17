@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Activation-indexed delta buckets preserve affine cohort order without
+  rescanning mixed work.** Canonical transition buckets retain append-order
+  task slots alongside per-activation slot runs and an ordered tail index.
+  Exact continuations and terminal physical cohorts now remove only their
+  selected tasks, while geometric tombstone compaction preserves the original
+  order of selected and retained work without a full bucket scan per dispatch.
 - **Completed terminal yield drives exact parent admission.** For each
   canonical proposer family, the scheduler estimates projected rows per
   completed parent and admits only the cumulative parent deficit needed to
