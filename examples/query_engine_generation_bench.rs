@@ -9,6 +9,8 @@
 //! RUSTFLAGS="--cfg engine_legacy_binding" cargo run --release --example query_engine_generation_bench
 //! RUSTFLAGS="--cfg engine_current_scalar" cargo run --release --example query_engine_generation_bench
 //! RUSTFLAGS="--cfg engine_current_residual" cargo run --release --example query_engine_generation_bench
+//! RUSTFLAGS="--cfg engine_current_residual --cfg engine_prefix_checkpoints" \
+//!   cargo run --release --example query_engine_generation_bench
 //! ```
 //!
 //! Fixture/archive construction and the independent relational oracles are
@@ -16,6 +18,7 @@
 //! before its samples are reported.
 
 #![allow(unexpected_cfgs)]
+#![cfg_attr(engine_prefix_checkpoints, allow(dead_code))]
 
 #[cfg(any(
     all(engine_legacy_binding, engine_current_scalar),
@@ -578,6 +581,7 @@ fn parse_arg(position: usize, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+#[cfg(not(engine_prefix_checkpoints))]
 fn main() {
     let component_count = parse_arg(1, 32);
     let ring_size = parse_arg(2, 64);
@@ -714,5 +718,384 @@ fn main() {
         || mixed_construct(&archive, &fixture),
         || mixed_pull(&archive, &fixture),
         |limit| mixed_prefix(&archive, &fixture, limit),
+    );
+}
+
+#[cfg(engine_prefix_checkpoints)]
+const PREFIX_CHECKPOINTS: [usize; 7] = [1, 10, 63, 64, 65, 100, 1_000];
+
+#[cfg(engine_prefix_checkpoints)]
+#[derive(Clone, Copy, Debug)]
+struct PrefixSample {
+    checkpoint: usize,
+    cumulative: Duration,
+    fresh_time_to_n: Duration,
+    fresh_drop_at_n: Duration,
+    fresh_total: Duration,
+}
+
+#[cfg(engine_prefix_checkpoints)]
+#[derive(Clone, Debug)]
+struct PrefixEvidence {
+    rows: usize,
+    checksum: u64,
+    ordered_digest: u64,
+    last: Option<Pair>,
+    distinct_sources: std::collections::BTreeSet<Inline<GenId>>,
+}
+
+#[cfg(engine_prefix_checkpoints)]
+impl PrefixEvidence {
+    fn new() -> Self {
+        Self {
+            rows: 0,
+            checksum: 0,
+            ordered_digest: 0x6A09_E667_F3BC_C909,
+            last: None,
+            distinct_sources: std::collections::BTreeSet::new(),
+        }
+    }
+
+    fn observe(&mut self, row: Pair) {
+        let row_hash = pair_order_hash(&row);
+        self.rows += 1;
+        self.checksum = self.checksum.wrapping_add(pair_checksum(&row));
+        self.ordered_digest = mix64(
+            self.ordered_digest ^ row_hash ^ (self.rows as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        );
+        self.distinct_sources.insert(row.0);
+        self.last = Some(row);
+    }
+}
+
+#[cfg(engine_prefix_checkpoints)]
+fn pair_order_hash((left, right): &Pair) -> u64 {
+    left.raw
+        .chunks_exact(8)
+        .chain(right.raw.chunks_exact(8))
+        .enumerate()
+        .fold(0xBB67_AE85_84CA_A73B, |digest, (index, chunk)| {
+            let word = u64::from_be_bytes(chunk.try_into().unwrap());
+            mix64(digest ^ word.rotate_left((index * 7) as u32))
+        })
+}
+
+#[cfg(engine_prefix_checkpoints)]
+fn inline_hex(value: &Inline<GenId>) -> String {
+    use std::fmt::Write;
+
+    let mut rendered = String::with_capacity(64);
+    for byte in value.raw {
+        write!(&mut rendered, "{byte:02x}").unwrap();
+    }
+    rendered
+}
+
+#[cfg(engine_prefix_checkpoints)]
+fn render_pair(pair: Option<Pair>) -> String {
+    match pair {
+        Some((source, target)) => format!("{}:{}", inline_hex(&source), inline_hex(&target)),
+        None => "none".to_owned(),
+    }
+}
+
+#[cfg(engine_prefix_checkpoints)]
+fn checkpoint_evidence<I>(label: &str, query: I) -> Vec<PrefixEvidence>
+where
+    I: Iterator<Item = Pair>,
+{
+    let mut snapshots = Vec::with_capacity(PREFIX_CHECKPOINTS.len());
+    let mut evidence = PrefixEvidence::new();
+    let mut checkpoint_index = 0;
+
+    for row in query {
+        evidence.observe(row);
+        if evidence.rows == PREFIX_CHECKPOINTS[checkpoint_index] {
+            snapshots.push(evidence.clone());
+            checkpoint_index += 1;
+            if checkpoint_index == PREFIX_CHECKPOINTS.len() {
+                break;
+            }
+        }
+    }
+
+    assert_eq!(
+        snapshots.len(),
+        PREFIX_CHECKPOINTS.len(),
+        "{label}: iterator ended before the final prefix checkpoint"
+    );
+    snapshots
+}
+
+#[cfg(engine_prefix_checkpoints)]
+fn consume_exact<I>(label: &str, mut query: I, count: usize) -> Signature
+where
+    I: Iterator<Item = Pair>,
+{
+    let signature = tally(query.by_ref().take(count));
+    assert_eq!(
+        signature.rows, count,
+        "{label}: iterator ended before checkpoint {count}"
+    );
+    black_box(signature)
+}
+
+#[cfg(engine_prefix_checkpoints)]
+fn bench_prefix_cell<I, F>(label: &str, expected: &[Pair], repetitions: usize, mut make: F)
+where
+    I: Iterator<Item = Pair>,
+    F: FnMut() -> I,
+{
+    assert!(
+        expected.len() >= *PREFIX_CHECKPOINTS.last().unwrap(),
+        "{label}: fixture has {} rows, but the diagnostic requires at least {}",
+        expected.len(),
+        PREFIX_CHECKPOINTS.last().unwrap(),
+    );
+
+    // Warm both timing shapes without retaining their observations. The
+    // fixture, archive, and full sorted oracle were already built and checked.
+    consume_exact(label, make(), *PREFIX_CHECKPOINTS.last().unwrap());
+    for checkpoint in PREFIX_CHECKPOINTS {
+        consume_exact(label, make(), checkpoint);
+    }
+
+    let evidence = checkpoint_evidence(label, make());
+    for (checkpoint, evidence) in PREFIX_CHECKPOINTS.into_iter().zip(&evidence) {
+        println!(
+            "evidence cell={label:?} checkpoint={checkpoint} count={} checksum={:#018x} \
+             ordered_digest={:#018x} last_pair={} distinct_sources={}",
+            evidence.rows,
+            evidence.checksum,
+            evidence.ordered_digest,
+            render_pair(evidence.last),
+            evidence.distinct_sources.len(),
+        );
+    }
+
+    let mut samples = Vec::with_capacity(repetitions * PREFIX_CHECKPOINTS.len());
+    for repetition in 0..repetitions {
+        // One iterator supplies every cumulative timestamp in this repetition.
+        // Each timestamp is captured while the exact remainder is still live;
+        // dropping that remainder happens only after checkpoint 1,000.
+        let cumulative_start = Instant::now();
+        let mut cumulative_query = make();
+        let mut cumulative_signature = Signature {
+            rows: 0,
+            checksum: 0,
+        };
+        let mut cumulative = [Duration::ZERO; PREFIX_CHECKPOINTS.len()];
+        let mut checkpoint_index = 0;
+        while checkpoint_index < PREFIX_CHECKPOINTS.len() {
+            let row = cumulative_query.next().unwrap_or_else(|| {
+                panic!(
+                    "{label}: cumulative iterator ended before checkpoint {}",
+                    PREFIX_CHECKPOINTS[checkpoint_index]
+                )
+            });
+            cumulative_signature.rows += 1;
+            cumulative_signature.checksum = cumulative_signature
+                .checksum
+                .wrapping_add(pair_checksum(&row));
+            if cumulative_signature.rows == PREFIX_CHECKPOINTS[checkpoint_index] {
+                cumulative[checkpoint_index] = cumulative_start.elapsed();
+                checkpoint_index += 1;
+            }
+        }
+        black_box(cumulative_signature);
+        drop(cumulative_query);
+
+        // Rotate the fresh-query checkpoints to avoid giving one fixed prefix
+        // a permanent thermal/frequency position within every repetition.
+        for offset in 0..PREFIX_CHECKPOINTS.len() {
+            let point_index = (repetition + offset) % PREFIX_CHECKPOINTS.len();
+            let checkpoint = PREFIX_CHECKPOINTS[point_index];
+            let fresh_start = Instant::now();
+            let mut fresh_query = make();
+            let fresh_signature = tally(fresh_query.by_ref().take(checkpoint));
+            assert_eq!(
+                fresh_signature.rows, checkpoint,
+                "{label}: fresh iterator ended before checkpoint {checkpoint}"
+            );
+            black_box(fresh_signature);
+            let fresh_time_to_n = fresh_start.elapsed();
+            let drop_start = Instant::now();
+            drop(fresh_query);
+            let fresh_drop_at_n = drop_start.elapsed();
+            let fresh_total = fresh_start.elapsed();
+            samples.push((
+                repetition,
+                PrefixSample {
+                    checkpoint,
+                    cumulative: cumulative[point_index],
+                    fresh_time_to_n,
+                    fresh_drop_at_n,
+                    fresh_total,
+                },
+            ));
+        }
+    }
+
+    samples.sort_unstable_by_key(|(repetition, sample)| (*repetition, sample.checkpoint));
+    for (repetition, sample) in &samples {
+        println!(
+            "raw cell={label:?} repetition={repetition} checkpoint={} cumulative_ns={} \
+             fresh_time_to_n_ns={} fresh_drop_at_n_ns={} fresh_total_ns={}",
+            sample.checkpoint,
+            sample.cumulative.as_nanos(),
+            sample.fresh_time_to_n.as_nanos(),
+            sample.fresh_drop_at_n.as_nanos(),
+            sample.fresh_total.as_nanos(),
+        );
+    }
+
+    for checkpoint in PREFIX_CHECKPOINTS {
+        let at_checkpoint: Vec<_> = samples
+            .iter()
+            .filter_map(|(_, sample)| (sample.checkpoint == checkpoint).then_some(*sample))
+            .collect();
+        let durations = |project: fn(PrefixSample) -> Duration| {
+            at_checkpoint
+                .iter()
+                .map(|sample| project(*sample).as_secs_f64())
+                .collect::<Vec<_>>()
+        };
+        let cumulative = durations(|sample| sample.cumulative);
+        let fresh_time_to_n = durations(|sample| sample.fresh_time_to_n);
+        let fresh_drop_at_n = durations(|sample| sample.fresh_drop_at_n);
+        let fresh_total = durations(|sample| sample.fresh_total);
+        println!(
+            "summary cell={label:?} checkpoint={checkpoint} \
+             cumulative_p50_us={:.3} cumulative_p95_us={:.3} \
+             fresh_time_to_n_p50_us={:.3} fresh_time_to_n_p95_us={:.3} \
+             fresh_drop_at_n_p50_us={:.3} fresh_drop_at_n_p95_us={:.3} \
+             fresh_total_p50_us={:.3} fresh_total_p95_us={:.3}",
+            percentile(&cumulative, 0.50) * 1e6,
+            percentile(&cumulative, 0.95) * 1e6,
+            percentile(&fresh_time_to_n, 0.50) * 1e6,
+            percentile(&fresh_time_to_n, 0.95) * 1e6,
+            percentile(&fresh_drop_at_n, 0.50) * 1e6,
+            percentile(&fresh_drop_at_n, 0.95) * 1e6,
+            percentile(&fresh_total, 0.50) * 1e6,
+            percentile(&fresh_total, 0.95) * 1e6,
+        );
+    }
+}
+
+#[cfg(all(engine_prefix_checkpoints, engine_current_residual))]
+fn residual_checkpoint_stats<I, F>(label: &str, mut query: I, snapshot: F)
+where
+    I: Iterator<Item = Pair>,
+    F: Fn(&I) -> (usize, String),
+{
+    let mut rows = 0;
+    let mut checkpoint_index = 0;
+    while checkpoint_index < PREFIX_CHECKPOINTS.len() {
+        query.next().unwrap_or_else(|| {
+            panic!(
+                "{label}: residual iterator ended before stats checkpoint {}",
+                PREFIX_CHECKPOINTS[checkpoint_index]
+            )
+        });
+        rows += 1;
+        if rows == PREFIX_CHECKPOINTS[checkpoint_index] {
+            let (current_width, stats) = snapshot(&query);
+            println!(
+                "residual_stats cell={label:?} checkpoint={} current_width={} stats={}",
+                PREFIX_CHECKPOINTS[checkpoint_index], current_width, stats,
+            );
+            checkpoint_index += 1;
+        }
+    }
+}
+
+#[cfg(engine_prefix_checkpoints)]
+fn main() {
+    let component_count = parse_arg(1, 32);
+    let ring_size = parse_arg(2, 64);
+    let fanout = parse_arg(3, 2);
+    let repetitions = parse_arg(4, 21);
+    assert!(repetitions >= 3, "use at least three repetitions");
+
+    let fixture_start = Instant::now();
+    let fixture = Fixture::new(component_count, ring_size, fanout);
+    let fixture_elapsed = fixture_start.elapsed();
+    let archive_start = Instant::now();
+    let archive: SuccinctArchive<OrderedUniverse> = (&fixture.graph).into();
+    let archive_elapsed = archive_start.elapsed();
+
+    let rpq_expected = fixture.cyclic_rpq_oracle();
+    let mixed_expected = fixture.mixed_formula_rpq_oracle();
+
+    println!("diagnostic: source-identical prefix checkpoints");
+    println!("engine: {ENGINE}");
+    println!("revision: {REVISION}");
+    println!(
+        "fixture: {component_count} components x {ring_size} nodes, fanout {fanout}, \
+         {} tribles; built in {:?}; archive built in {:?} (excluded)",
+        fixture.graph.len(),
+        fixture_elapsed,
+        archive_elapsed,
+    );
+    println!("samples: {repetitions}; hot cache; release profile");
+    println!("checkpoints: {PREFIX_CHECKPOINTS:?}");
+
+    exact_check(
+        rpq_collect(&fixture),
+        &rpq_expected,
+        "cyclic RPQ",
+        "TribleSet",
+    );
+    exact_check(
+        mixed_collect(&fixture.graph, &fixture),
+        &mixed_expected,
+        "formula + cyclic RPQ",
+        "TribleSet sibling",
+    );
+    exact_check(
+        mixed_collect(&archive, &fixture),
+        &mixed_expected,
+        "formula + cyclic RPQ",
+        "SuccinctArchive sibling",
+    );
+    println!("oracle parity: all three prefix-diagnostic cells exact");
+
+    #[cfg(engine_current_residual)]
+    {
+        use triblespace::core::query::residual::ResidualLowering;
+
+        residual_checkpoint_stats(
+            "cyclic RPQ / TribleSet",
+            cyclic_rpq_query!(&fixture).solve_residual_state_lazy_with(ResidualLowering::FULL),
+            |query| (query.current_width(), format!("{:?}", query.stats())),
+        );
+        residual_checkpoint_stats(
+            "formula + cyclic RPQ / TribleSet sibling",
+            mixed_formula_rpq_query!(&fixture.graph, &fixture)
+                .solve_residual_state_lazy_with(ResidualLowering::FULL),
+            |query| (query.current_width(), format!("{:?}", query.stats())),
+        );
+        residual_checkpoint_stats(
+            "formula + cyclic RPQ / SuccinctArchive sibling",
+            mixed_formula_rpq_query!(&archive, &fixture)
+                .solve_residual_state_lazy_with(ResidualLowering::FULL),
+            |query| (query.current_width(), format!("{:?}", query.stats())),
+        );
+    }
+
+    bench_prefix_cell("cyclic RPQ / TribleSet", &rpq_expected, repetitions, || {
+        cyclic_rpq_query!(&fixture)
+    });
+    bench_prefix_cell(
+        "formula + cyclic RPQ / TribleSet sibling",
+        &mixed_expected,
+        repetitions,
+        || mixed_formula_rpq_query!(&fixture.graph, &fixture),
+    );
+    bench_prefix_cell(
+        "formula + cyclic RPQ / SuccinctArchive sibling",
+        &mixed_expected,
+        repetitions,
+        || mixed_formula_rpq_query!(&archive, &fixture),
     );
 }
