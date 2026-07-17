@@ -1941,22 +1941,22 @@ mod tests {
             .growth(2);
 
         assert_eq!(query.next(), expected);
-        assert_eq!(*counters.limits.lock().unwrap(), [1, 1, 2, 4, 8]);
-        assert_eq!(counters.page_calls.load(Ordering::Relaxed), 5);
+        assert_eq!(*counters.limits.lock().unwrap(), [1, 2, 4, 8]);
+        assert_eq!(counters.page_calls.load(Ordering::Relaxed), 4);
         assert_eq!(counters.examined.load(Ordering::Relaxed), 9);
-        assert_eq!(query.stats().delta_source_pages, 5);
+        assert_eq!(query.stats().delta_source_pages, 4);
         assert_eq!(query.stats().delta_source_candidates_examined, 9);
         assert_eq!(query.stats().delta_source_direct_candidates, 1);
-        assert_eq!(query.stats().delta_terminal_calls, 5);
+        assert_eq!(query.stats().delta_terminal_calls, 4);
         assert_eq!(query.stats().delta_nonterminal_calls, 0);
         assert_eq!(query.stats().delta_terminal_candidates_examined, 9);
         assert_eq!(query.stats().max_delta_terminal_work_budget, 8);
         assert_eq!(query.stats().max_delta_terminal_task_cohort, 1);
-        assert_eq!(query.stats().delta_terminal_sparse_widenings, 3);
+        assert_eq!(query.stats().delta_terminal_sparse_widenings, 0);
         assert_eq!(query.stats().terminal_demand_projected_rows, 1);
         assert_eq!(query.stats().terminal_demand_width_promotions, 0);
         drop(query);
-        assert_eq!(counters.page_calls.load(Ordering::Relaxed), 5);
+        assert_eq!(counters.page_calls.load(Ordering::Relaxed), 4);
         assert_eq!(counters.examined.load(Ordering::Relaxed), 9);
     }
 

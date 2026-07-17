@@ -874,7 +874,14 @@ impl ProducerRegistry {
             .physical_class
     }
 
-    fn dispatch_width(&self, activation: ActivationId, search_width: usize) -> usize {
+    /// Transition expansion is activation-local sparse search. Confirmed
+    /// demand may raise the outer search ceiling, but cannot itself make one
+    /// traversal spend more of that ceiling.
+    fn transition_dispatch_width(
+        &self,
+        activation: ActivationId,
+        search_width: usize,
+    ) -> usize {
         let activation = self
             .state
             .activations
@@ -890,6 +897,17 @@ impl ProducerRegistry {
         }
     }
 
+    /// Source paging discovers independent roots for one admitted parent. It
+    /// is search work, rather than graph traversal effort, so it receives the
+    /// outer search width (which confirmed projected demand may floor).
+    fn source_dispatch_width(&self, activation: ActivationId, search_width: usize) -> usize {
+        assert!(
+            self.state.activations.contains_key(&activation),
+            "unknown delta activation"
+        );
+        search_width.max(1)
+    }
+
     /// Updates only physical sparse-search effort. Publication resets to one;
     /// a live no-publication step doubles toward `search_width`. Confirmed
     /// result demand may widen nonterminal search, but is not itself evidence
@@ -899,6 +917,7 @@ impl ProducerRegistry {
         &mut self,
         activation: ActivationId,
         search_width: usize,
+        kind: PhysicalDispatchKind,
         published: bool,
     ) -> (bool, bool) {
         let Some(activation) = self.state.activations.get_mut(&activation) else {
@@ -910,7 +929,7 @@ impl ProducerRegistry {
         let before = activation.terminal_sparse_quantum;
         if published {
             activation.terminal_sparse_quantum = 1;
-        } else {
+        } else if kind == PhysicalDispatchKind::Transition {
             activation.terminal_sparse_quantum = before
                 .saturating_mul(2)
                 .min(search_width.max(1))
@@ -1214,9 +1233,19 @@ struct SourceBucket {
 #[derive(Clone, Copy, Debug)]
 struct PhysicalDispatch {
     terminal_activation: Option<ActivationId>,
+    kind: PhysicalDispatchKind,
     work_budget: usize,
     task_count: usize,
     remainder_tasks: usize,
+}
+
+/// Which physical layer consumed one bounded backend call. Source misses are
+/// evidence about root discovery, not about the sparse graph traversal credit
+/// retained by the activation; only transition misses widen that credit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PhysicalDispatchKind {
+    Source,
+    Transition,
 }
 
 /// One delta scheduler step as observed by the outer geometric policy.
@@ -1236,6 +1265,10 @@ pub(super) struct DeltaStepOutcome {
     /// transition cohort completed in this step. Source paging batches rows
     /// for storage efficiency, not as a latency/throughput activation choice.
     pub(super) completed_transition_cohort: bool,
+    /// Whether a globally negative physical step is mature evidence for
+    /// widening outer search `S`. Terminal traversal first exhausts its local
+    /// geometric quantum; only a saturated still-live miss reaches this tier.
+    pub(super) allows_global_width_growth: bool,
 }
 
 impl DeltaStepOutcome {
@@ -2057,10 +2090,10 @@ impl DeltaScheduler {
         examined_before: usize,
         published: bool,
         stats: &mut ResidualStateStats,
-    ) {
+    ) -> bool {
         let Some(activation) = dispatch.terminal_activation else {
             stats.delta_nonterminal_calls += 1;
-            return;
+            return true;
         };
         stats.delta_terminal_calls += 1;
         stats.delta_terminal_work_budget += dispatch.work_budget;
@@ -2079,9 +2112,12 @@ impl DeltaScheduler {
         stats.delta_terminal_publications += usize::from(published);
         let (reset, widened) =
             self.registry
-                .finish_dispatch(activation, search_width, published);
+                .finish_dispatch(activation, search_width, dispatch.kind, published);
         stats.delta_terminal_sparse_resets += usize::from(reset);
         stats.delta_terminal_sparse_widenings += usize::from(widened);
+        dispatch.kind == PhysicalDispatchKind::Source
+            || (dispatch.work_budget >= search_width.max(1)
+                && self.registry.is_live(activation))
     }
 
     fn pop_active_transition(
@@ -2142,7 +2178,9 @@ impl DeltaScheduler {
     ) -> (DeltaDesc, Vec<DeltaTask>, PhysicalDispatch) {
         let full = self.worklist.iter().rev().find_map(|(&id, bucket)| {
             let activation = bucket.tasks.last()?.activation;
-            let width = self.registry.dispatch_width(activation, search_width);
+            let width = self
+                .registry
+                .transition_dispatch_width(activation, search_width);
             (bucket.tasks.len() >= width).then_some(id)
         });
         let id = full.unwrap_or_else(|| {
@@ -2158,7 +2196,9 @@ impl DeltaScheduler {
             .and_then(|bucket| bucket.tasks.last())
             .expect("selected delta state has live work")
             .activation;
-        let width = self.registry.dispatch_width(activation, search_width);
+        let width = self
+            .registry
+            .transition_dispatch_width(activation, search_width);
         let terminal_activation = (self.registry.physical_activation_class(activation)
             == DeltaPhysicalClass::TerminalStreaming)
             .then_some(activation);
@@ -2174,6 +2214,7 @@ impl DeltaScheduler {
         }
         let dispatch = PhysicalDispatch {
             terminal_activation,
+            kind: PhysicalDispatchKind::Transition,
             work_budget: width,
             task_count: tasks.len(),
             remainder_tasks,
@@ -2202,7 +2243,9 @@ impl DeltaScheduler {
             .and_then(|bucket| bucket.tasks.last())
             .expect("selected source state has live work")
             .activation;
-        let width = self.registry.dispatch_width(activation, search_width);
+        let width = self
+            .registry
+            .source_dispatch_width(activation, search_width);
         let terminal_activation = (self.registry.physical_activation_class(activation)
             == DeltaPhysicalClass::TerminalStreaming)
             .then_some(activation);
@@ -2235,6 +2278,7 @@ impl DeltaScheduler {
         }
         let dispatch = PhysicalDispatch {
             terminal_activation,
+            kind: PhysicalDispatchKind::Source,
             work_budget: width,
             task_count: tasks.len(),
             remainder_tasks,
@@ -2294,7 +2338,6 @@ impl DeltaScheduler {
             "one delta activation owns source and transition credits simultaneously"
         );
 
-        let width = self.registry.dispatch_width(active.activation, search_width);
         let terminal_activation = (self.registry.physical_activation_class(active.activation)
             == DeltaPhysicalClass::TerminalStreaming)
             .then_some(active.activation);
@@ -2304,6 +2347,9 @@ impl DeltaScheduler {
             .delta_source_candidates_examined
             .saturating_add(stats.delta_transition_candidates_examined);
         let outcome = if has_source {
+            let width = self
+                .registry
+                .source_dispatch_width(active.activation, search_width);
             let (desc, tasks) = self.pop_active_source(active, width);
             let task_count = tasks.len();
             let remainder_tasks = self
@@ -2312,11 +2358,12 @@ impl DeltaScheduler {
                 .map_or(0, |bucket| bucket.tasks.len());
             let dispatch = PhysicalDispatch {
                 terminal_activation,
+                kind: PhysicalDispatchKind::Source,
                 work_budget: width,
                 task_count,
                 remainder_tasks,
             };
-            let outcome = self.step_sources(
+            let mut outcome = self.step_sources(
                 root,
                 plan,
                 desc,
@@ -2327,7 +2374,7 @@ impl DeltaScheduler {
                 stable_interner,
                 stats,
             );
-            self.account_physical_dispatch(
+            outcome.allows_global_width_growth = self.account_physical_dispatch(
                 dispatch,
                 search_width,
                 examined_before,
@@ -2336,6 +2383,9 @@ impl DeltaScheduler {
             );
             outcome
         } else {
+            let width = self
+                .registry
+                .transition_dispatch_width(active.activation, search_width);
             let (desc, tasks) = self.pop_active_transition(active, width);
             let task_count = tasks.len();
             let remainder_tasks = self
@@ -2344,11 +2394,12 @@ impl DeltaScheduler {
                 .map_or(0, |bucket| bucket.tasks.len());
             let dispatch = PhysicalDispatch {
                 terminal_activation,
+                kind: PhysicalDispatchKind::Transition,
                 work_budget: width,
                 task_count,
                 remainder_tasks,
             };
-            let outcome = self.step_transitions(
+            let mut outcome = self.step_transitions(
                 root,
                 plan,
                 desc,
@@ -2359,7 +2410,7 @@ impl DeltaScheduler {
                 stable_interner,
                 stats,
             );
-            self.account_physical_dispatch(
+            outcome.allows_global_width_growth = self.account_physical_dispatch(
                 dispatch,
                 search_width,
                 examined_before,
@@ -2424,7 +2475,7 @@ impl DeltaScheduler {
         let examined_before = stats
             .delta_source_candidates_examined
             .saturating_add(stats.delta_transition_candidates_examined);
-        let outcome = self.step_transitions(
+        let mut outcome = self.step_transitions(
             root,
             plan,
             desc,
@@ -2435,7 +2486,7 @@ impl DeltaScheduler {
             stable_interner,
             stats,
         );
-        self.account_physical_dispatch(
+        outcome.allows_global_width_growth = self.account_physical_dispatch(
             dispatch,
             search_width,
             examined_before,
@@ -2671,6 +2722,7 @@ impl DeltaScheduler {
             transition_dead_pages,
             completed_activations,
             completed_transition_cohort: completed_activations > 1,
+            allows_global_width_growth: true,
         }
     }
 
@@ -2688,7 +2740,7 @@ impl DeltaScheduler {
         let examined_before = stats
             .delta_source_candidates_examined
             .saturating_add(stats.delta_transition_candidates_examined);
-        let outcome = self.step_sources(
+        let mut outcome = self.step_sources(
             root,
             plan,
             desc,
@@ -2699,7 +2751,7 @@ impl DeltaScheduler {
             stable_interner,
             stats,
         );
-        self.account_physical_dispatch(
+        outcome.allows_global_width_growth = self.account_physical_dispatch(
             dispatch,
             search_width,
             examined_before,
@@ -2872,6 +2924,7 @@ impl DeltaScheduler {
             transition_dead_pages: 0,
             completed_activations,
             completed_transition_cohort: false,
+            allows_global_width_growth: true,
         }
     }
 
@@ -3392,7 +3445,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_sparse_effort_uses_only_local_search_evidence() {
+    fn terminal_source_search_and_transition_effort_are_independent() {
         let mut registry = ProducerRegistry::new();
         let full = VariableSet::new_singleton(0);
         let started = registry.start_many_terminal(
@@ -3402,22 +3455,63 @@ mod tests {
             full,
         );
 
-        assert_eq!(registry.dispatch_width(started.activation, 64), 1);
+        assert_eq!(registry.source_dispatch_width(started.activation, 64), 64);
         assert_eq!(
-            registry.finish_dispatch(started.activation, 64, false),
+            registry.transition_dispatch_width(started.activation, 64),
+            1
+        );
+        assert_eq!(
+            registry.finish_dispatch(
+                started.activation,
+                64,
+                PhysicalDispatchKind::Source,
+                false,
+            ),
+            (false, false)
+        );
+        assert_eq!(
+            registry.transition_dispatch_width(started.activation, 64),
+            1
+        );
+        assert_eq!(
+            registry.finish_dispatch(
+                started.activation,
+                64,
+                PhysicalDispatchKind::Transition,
+                false,
+            ),
             (false, true)
         );
-        assert_eq!(registry.dispatch_width(started.activation, 64), 2);
         assert_eq!(
-            registry.finish_dispatch(started.activation, 64, false),
+            registry.transition_dispatch_width(started.activation, 64),
+            2
+        );
+        assert_eq!(
+            registry.finish_dispatch(
+                started.activation,
+                64,
+                PhysicalDispatchKind::Transition,
+                false,
+            ),
             (false, true)
         );
-        assert_eq!(registry.dispatch_width(started.activation, 3), 3);
         assert_eq!(
-            registry.finish_dispatch(started.activation, 64, true),
+            registry.transition_dispatch_width(started.activation, 3),
+            3
+        );
+        assert_eq!(
+            registry.finish_dispatch(
+                started.activation,
+                64,
+                PhysicalDispatchKind::Source,
+                true,
+            ),
             (true, false)
         );
-        assert_eq!(registry.dispatch_width(started.activation, 64), 1);
+        assert_eq!(
+            registry.transition_dispatch_width(started.activation, 64),
+            1
+        );
     }
 
     #[test]

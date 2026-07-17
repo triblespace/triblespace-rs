@@ -16,12 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Terminal sparse effort is no longer floored by projected demand.**
-  Confirmed result windows may raise stable and nonterminal search `S`, but a
-  terminal activation now widens its local examined-work quantum only after a
-  live no-publication dispatch and resets to one after publication. This keeps
-  caller demand as admission/search evidence without turning it into premature
-  breadth inside one productive traversal.
+- **Terminal source search and graph-traversal effort are scheduled separately.**
+  Confirmed result windows may raise stable, nonterminal, and source-search
+  `S`, while a terminal transition activation widens its local examined-work
+  quantum only after a live no-publication dispatch and resets to one after
+  publication. Sub-`S` terminal traversal misses no longer double-charge the
+  outer geometric search width.
 - **Confirmed projected demand floors residual search width.** Exhausting a
   projected-result window leaves search width unchanged until the caller pulls
   again; that later pull doubles the result window and raises search `S` to at

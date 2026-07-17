@@ -57,9 +57,10 @@
 //! ragged per-parent limits whose sum is the current global width, so batching
 //! does not multiply the geometric work budget or refine canonical state
 //! identity. A final-variable streaming activation is admitted one parent at
-//! a time and gets an activation-affine physical lease bounded by confirmed
-//! result demand, sparse-search effort, and the independent search width. When
-//! it publishes an accepted endpoint, the shared candidate-commit layout may
+//! a time. Its source pager receives global search `S`, while graph traversal
+//! gets an activation-local sparse quantum capped by `S`; confirmed demand is
+//! never passed as a separate traversal floor. When it publishes an accepted
+//! endpoint, the shared candidate-commit layout may
 //! build the final row directly in the ordinary projection buffer while a
 //! still-live activation token remains suspended; the next pull resumes that
 //! exact affine traversal rather than abandoning locality to cold harvesting.
@@ -6996,9 +6997,10 @@ struct ResidualStateMachine {
     direct_terminal_publication_enabled: bool,
     last_selection: SelectionKind,
     last_was_action: bool,
-    /// Independent confirmed projected-result window. Unlike `width`, this
-    /// currency never controls nonterminal search batching and advances only
-    /// after the caller demonstrates demand past a fully consumed window.
+    /// Independent confirmed projected-result window. It advances only after
+    /// the caller demonstrates demand past a fully consumed window. A
+    /// confirmed promotion may floor global search `width`, but raw
+    /// publication never changes either currency.
     terminal_demand_width: usize,
     terminal_demand_consumed: usize,
     terminal_demand_exhausted: bool,
@@ -7448,7 +7450,7 @@ impl ResidualStateMachine {
         }
     }
 
-    /// Whether ordinary acyclic work can fill the current demand width
+    /// Whether ordinary acyclic work can fill the current search width
     /// without invoking the minimum-rank readiness lemma.
     fn has_full_stable(&self, plan: &ResidualPlan, width: usize) -> bool {
         let width = width.max(1);
@@ -8050,7 +8052,7 @@ impl ResidualStateMachine {
             self.stats.delta_transition_negative_steps +=
                 usize::from(outcome.transition_dead_pages > 0);
         }
-        if outcome.dead_pages > 0 && !progressed {
+        if outcome.dead_pages > 0 && !progressed && outcome.allows_global_width_growth {
             self.increase_width();
         }
     }
@@ -10253,17 +10255,17 @@ mod tests {
         ];
         assert_eq!(direct_results, expected);
         assert_eq!(control_results, expected);
-        assert_eq!(direct_pages.load(Ordering::Relaxed), 4);
-        assert_eq!(control_pages.load(Ordering::Relaxed), 4);
+        assert_eq!(direct_pages.load(Ordering::Relaxed), 3);
+        assert_eq!(control_pages.load(Ordering::Relaxed), 3);
         assert_eq!(direct_proposes.load(Ordering::Relaxed), 0);
         assert_eq!(control_proposes.load(Ordering::Relaxed), 0);
 
-        assert_eq!(direct_stats.delta_direct_terminal_publication_batches, 4);
+        assert_eq!(direct_stats.delta_direct_terminal_publication_batches, 3);
         assert_eq!(direct_stats.delta_direct_terminal_publication_rows, 4);
         assert_eq!(control_stats.delta_direct_terminal_publication_batches, 0);
         assert_eq!(control_stats.delta_direct_terminal_publication_rows, 0);
-        assert_eq!(direct_stats.delta_active_lease_steps, 4);
-        assert_eq!(direct_stats.delta_source_pages, 4);
+        assert_eq!(direct_stats.delta_active_lease_steps, 3);
+        assert_eq!(direct_stats.delta_source_pages, 3);
         assert_eq!(direct_stats.max_delta_source_cohort, 1);
         assert_eq!(direct_stats.delta_source_direct_candidates, 4);
         assert_eq!(
@@ -10274,7 +10276,7 @@ mod tests {
                 direct_stats.candidates_proposed,
                 direct_stats.max_propose_candidates,
             ),
-            (1, 1, 1, 4, 1)
+            (1, 1, 1, 4, 2)
         );
         assert_eq!(
             direct_stats.candidates_proposed,
@@ -10288,7 +10290,7 @@ mod tests {
         );
         assert_eq!(direct_stats.width_increases, 2);
         assert_eq!(direct_stats.width_increases, control_stats.width_increases);
-        assert_eq!(direct_stats.delta_activation_width_increases, 4);
+        assert_eq!(direct_stats.delta_activation_width_increases, 3);
         assert_eq!(
             direct_stats.delta_activation_width_increases,
             control_stats.delta_activation_width_increases
@@ -10309,9 +10311,9 @@ mod tests {
         assert_eq!(direct_stats.emit_pops, 0);
         assert_eq!(
             control_stats.candidate_plan_pops,
-            direct_stats.candidate_plan_pops + 4
+            direct_stats.candidate_plan_pops + 3
         );
-        assert_eq!(control_stats.emit_pops, direct_stats.emit_pops + 4);
+        assert_eq!(control_stats.emit_pops, direct_stats.emit_pops + 3);
     }
 
     #[test]
@@ -18071,6 +18073,7 @@ mod tests {
             transition_dead_pages: 0,
             completed_activations: 0,
             completed_transition_cohort: false,
+            allows_global_width_growth: true,
         });
         assert_eq!(machine.width, 4);
         assert_eq!(machine.stats.delta_source_negative_steps, 0);
@@ -18087,6 +18090,7 @@ mod tests {
             transition_dead_pages: 0,
             completed_activations: 2,
             completed_transition_cohort: true,
+            allows_global_width_growth: true,
         });
         assert_eq!(
             machine.continuation,
@@ -18116,6 +18120,7 @@ mod tests {
             transition_dead_pages: 0,
             completed_activations: 0,
             completed_transition_cohort: false,
+            allows_global_width_growth: true,
         });
         assert_eq!(
             machine.continuation,
@@ -18131,10 +18136,27 @@ mod tests {
             transition_dead_pages: 0,
             completed_activations: 0,
             completed_transition_cohort: false,
+            allows_global_width_growth: true,
         });
         assert_eq!(machine.width, 8);
         assert_eq!(machine.stats.delta_source_negative_steps, 1);
         assert!(machine.continuation.is_none());
+
+        machine.accept_delta_step(DeltaStepOutcome {
+            continuation: None,
+            publication: None,
+            dead_pages: 1,
+            source_dead_pages: 0,
+            transition_dead_pages: 1,
+            completed_activations: 0,
+            completed_transition_cohort: false,
+            allows_global_width_growth: false,
+        });
+        assert_eq!(
+            machine.width, 8,
+            "terminal traversal misses widen local effort rather than global search"
+        );
+        assert_eq!(machine.stats.delta_transition_negative_steps, 1);
 
         machine.accept_delta_step(DeltaStepOutcome {
             continuation: None,
@@ -18144,6 +18166,7 @@ mod tests {
             transition_dead_pages: 0,
             completed_activations: 1,
             completed_transition_cohort: false,
+            allows_global_width_growth: true,
         });
         assert_eq!(machine.width, 8);
         assert_eq!(machine.delta.activation_width(), 2);
