@@ -16,6 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Grouped Confirm reduction is an affine pageable scheduler lane.** Graph
+  quiescence moves the original candidate bag and accepted endpoint set into
+  typed `ConfirmFinalize` work with its own live producer credit. Each step
+  scans at most its explicit grant, preserves original order and duplicate
+  occurrences, resumes exactly across scheduler clones with a rebranded
+  credit, and releases the outer continuation only after the final page.
+  Pending pages feed ordinary geometric width growth without masquerading as
+  source or transition misses. This vertical slice bounds candidate scanning
+  and prefix copying; its one-time survivor-capacity reservation remains a
+  size-dependent allocation pending a chunked filing representation.
 - **Demand-wide terminal RPQ admissions change execution regime without
   disturbing live sparse traversals.** When completed-yield evidence admits
   more than one new terminal parent in a turn, that exact suffix runs through

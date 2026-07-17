@@ -2080,6 +2080,14 @@ pub struct ResidualStateStats {
     pub max_delta_transition_cohort: usize,
     /// Ordered outgoing transition candidates consumed across those pages.
     pub delta_transition_candidates_examined: usize,
+    /// Bounded reducer pages that scanned original Confirm occurrences after
+    /// graph quiescence and before releasing the outer continuation.
+    pub delta_confirm_finalizer_pages: usize,
+    /// Original Confirm occurrences examined by affine pageable finalizers.
+    pub delta_confirm_finalizer_candidates_examined: usize,
+    /// Largest original-occurrence scan performed by one Confirm finalizer
+    /// step. This is bounded by that step's explicit scheduler grant.
+    pub max_delta_confirm_finalizer_page_examined: usize,
     /// Transition pages that produced no novel child, accepted endpoint, or
     /// stable continuation and therefore contributed negative-width feedback.
     pub delta_transition_dead_pages: usize,
