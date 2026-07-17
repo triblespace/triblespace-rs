@@ -46,9 +46,10 @@
 //! Lazy width is unchanged while nonempty successors advance. Once a partial
 //! action activates an exact continuation cohort, that lineage outranks cold
 //! siblings—even when it merges into an already-live bucket—until it emits or
-//! dies. Search width grows geometrically after negative work, while a
-//! separate projected-result window grows only after the caller consumes the
-//! whole window and pulls again.
+//! dies. Search width grows geometrically after negative work. A separate
+//! projected-result window grows only after the caller consumes the whole
+//! window and pulls again; that confirmed promotion floors search width at the
+//! new demand window without treating emission itself as search feedback.
 //!
 //! Ordered cyclic sources retain an affine cursor per activation while a
 //! separate physical layer cohorts activations with the same row schema,
@@ -2042,8 +2043,9 @@ pub struct ResidualStateStats {
     pub max_support_rows: usize,
     /// Largest flattened-leaf confirmation batch.
     pub max_confirm_rows: usize,
-    /// Numeric increases of the lazy scheduler's desired actionable width.
-    /// Saturated or growth-one attempts do not increment this counter.
+    /// Numeric increases of the lazy scheduler's desired actionable width,
+    /// whether from geometric negative-work feedback or a confirmed projected-
+    /// demand floor. Saturated attempts do not increment this counter.
     pub width_increases: usize,
     /// Bounded pages requested from constraint-owned source frontiers.
     pub delta_source_pages: usize,
@@ -8017,10 +8019,16 @@ impl ResidualStateMachine {
 
     fn increase_width(&mut self) {
         let next = self.width.saturating_mul(self.growth).clamp(1, self.cap);
-        if next > self.width {
-            self.stats.width_increases += 1;
+        self.raise_width_to(next);
+    }
+
+    fn raise_width_to(&mut self, floor: usize) {
+        let floor = floor.clamp(1, self.cap);
+        if floor <= self.width {
+            return;
         }
-        self.width = next;
+        self.width = floor;
+        self.stats.width_increases += 1;
     }
 
     fn increase_delta_activation_width(&mut self) {
@@ -8229,6 +8237,7 @@ impl ResidualStateMachine {
             self.stats.terminal_demand_width_promotions += 1;
         }
         self.terminal_demand_width = next;
+        self.raise_width_to(next);
         self.terminal_demand_consumed = 0;
         self.terminal_demand_exhausted = false;
     }
@@ -8838,7 +8847,9 @@ impl<C, P: Fn(&Binding) -> Option<R>, R> ResidualStateIter<C, P, R> {
         self
     }
 
-    /// Overrides the geometric growth factor (`1` keeps a fixed width).
+    /// Overrides the geometric negative-work growth factor. A value of `1`
+    /// disables that feedback, but confirmed projected demand may still floor
+    /// search width at its independently doubling result window.
     pub fn growth(mut self, growth: usize) -> Self {
         self.state.growth = growth.max(1);
         self
@@ -9944,7 +9955,7 @@ mod tests {
     }
 
     #[test]
-    fn projected_demand_promotes_only_on_the_pull_after_a_consumed_window() {
+    fn projected_demand_floors_search_only_on_the_pull_after_a_consumed_window() {
         let projected_calls = Arc::new(AtomicUsize::new(0));
         let calls = Arc::clone(&projected_calls);
         let mut query = Query::new(
@@ -9967,6 +9978,8 @@ mod tests {
         assert_eq!(query.state.terminal_demand_width, 1);
         assert!(query.state.terminal_demand_exhausted);
         assert_eq!(query.stats().terminal_demand_width_promotions, 0);
+        assert_eq!(query.current_width(), 1);
+        assert_eq!(query.stats().width_increases, 0);
         assert!(projected_calls.load(Ordering::Relaxed) > 1);
         assert_eq!(query.stats().terminal_demand_projected_rows, 1);
 
@@ -9975,16 +9988,132 @@ mod tests {
         assert_eq!(query.state.terminal_demand_consumed, 1);
         assert!(!query.state.terminal_demand_exhausted);
         assert_eq!(query.stats().terminal_demand_width_promotions, 1);
-        assert_eq!(
-            query.current_width(),
-            1,
-            "q promotion must not widen search S"
-        );
+        assert_eq!(query.current_width(), 2);
+        assert_eq!(query.stats().width_increases, 1);
 
         assert!(query.next().is_some());
         assert!(query.state.terminal_demand_exhausted);
+        assert_eq!(
+            query.current_width(),
+            2,
+            "the q-th row alone cannot widen S"
+        );
         assert_eq!(query.stats().terminal_demand_projected_rows, 3);
         assert_eq!(query.stats().terminal_demand_width_promotions, 1);
+
+        assert!(query.next().is_some());
+        assert_eq!(query.state.terminal_demand_width, 4);
+        assert_eq!(query.current_width(), 4);
+        assert_eq!(query.stats().terminal_demand_width_promotions, 2);
+        assert_eq!(query.stats().width_increases, 2);
+    }
+
+    #[test]
+    fn projected_demand_floor_does_not_counter_charge_when_search_is_ahead() {
+        let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 0, Search::Done);
+        machine.cap = 8;
+        machine.width = 8;
+
+        machine.charge_projected_result();
+        assert!(machine.terminal_demand_exhausted);
+        assert_eq!((machine.width, machine.stats.width_increases), (8, 0));
+
+        machine.confirm_terminal_demand();
+        assert_eq!(machine.terminal_demand_width, 2);
+        assert_eq!((machine.width, machine.stats.width_increases), (8, 0));
+        assert_eq!(machine.stats.terminal_demand_width_promotions, 1);
+        assert_eq!(machine.stats.terminal_demand_windows_opened, 1);
+    }
+
+    #[test]
+    fn projected_demand_floor_ignores_growth_and_saturates_at_cap() {
+        let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 0, Search::Done);
+        machine.cap = 4;
+        machine.width = 1;
+        machine.growth = 1;
+
+        machine.charge_projected_result();
+        assert_eq!((machine.terminal_demand_width, machine.width), (1, 1));
+        assert_eq!(machine.stats.width_increases, 0);
+        machine.confirm_terminal_demand();
+        assert_eq!((machine.terminal_demand_width, machine.width), (2, 2));
+
+        for _ in 0..2 {
+            machine.charge_projected_result();
+        }
+        machine.confirm_terminal_demand();
+        assert_eq!((machine.terminal_demand_width, machine.width), (4, 4));
+
+        for _ in 0..4 {
+            machine.charge_projected_result();
+        }
+        machine.confirm_terminal_demand();
+        assert_eq!((machine.terminal_demand_width, machine.width), (4, 4));
+        assert_eq!(machine.stats.terminal_demand_width_promotions, 2);
+        assert_eq!(machine.stats.terminal_demand_windows_opened, 3);
+        assert_eq!(machine.stats.width_increases, 2);
+    }
+
+    #[test]
+    fn projected_demand_floor_clones_as_an_independent_pull_boundary() {
+        let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 0, Search::Done);
+        machine.cap = 8;
+        machine.width = 1;
+        machine.growth = 1;
+        machine.charge_projected_result();
+        let mut cloned = machine.clone();
+
+        machine.confirm_terminal_demand();
+        cloned.confirm_terminal_demand();
+        assert_eq!(
+            (
+                machine.terminal_demand_width,
+                machine.width,
+                machine.stats.width_increases,
+            ),
+            (2, 2, 1)
+        );
+        assert_eq!(
+            (
+                cloned.terminal_demand_width,
+                cloned.width,
+                cloned.stats.width_increases,
+            ),
+            (2, 2, 1)
+        );
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_sibling_inherits_only_already_confirmed_demand() {
+        let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 0, Search::Done);
+        machine.cap = 8;
+        machine.width = 1;
+        machine.growth = 1;
+        machine.charge_projected_result();
+        machine.confirm_terminal_demand();
+        for _ in 0..2 {
+            machine.charge_projected_result();
+        }
+        assert!(machine.terminal_demand_exhausted);
+
+        let sibling = machine.parallel_sibling();
+        assert_eq!((sibling.terminal_demand_width, sibling.width), (2, 2));
+        assert_eq!(sibling.terminal_demand_consumed, 0);
+        assert!(!sibling.terminal_demand_exhausted);
+        assert_eq!(sibling.stats.width_increases, 0);
+
+        machine.confirm_terminal_demand();
+        let promoted_sibling = machine.parallel_sibling();
+        assert_eq!(
+            (
+                promoted_sibling.terminal_demand_width,
+                promoted_sibling.width,
+            ),
+            (4, 4)
+        );
+        assert_eq!(promoted_sibling.terminal_demand_consumed, 0);
+        assert!(!promoted_sibling.terminal_demand_exhausted);
     }
 
     #[test]
@@ -10136,17 +10265,17 @@ mod tests {
         ];
         assert_eq!(direct_results, expected);
         assert_eq!(control_results, expected);
-        assert_eq!(direct_pages.load(Ordering::Relaxed), 4);
-        assert_eq!(control_pages.load(Ordering::Relaxed), 4);
+        assert_eq!(direct_pages.load(Ordering::Relaxed), 3);
+        assert_eq!(control_pages.load(Ordering::Relaxed), 3);
         assert_eq!(direct_proposes.load(Ordering::Relaxed), 0);
         assert_eq!(control_proposes.load(Ordering::Relaxed), 0);
 
-        assert_eq!(direct_stats.delta_direct_terminal_publication_batches, 4);
+        assert_eq!(direct_stats.delta_direct_terminal_publication_batches, 3);
         assert_eq!(direct_stats.delta_direct_terminal_publication_rows, 4);
         assert_eq!(control_stats.delta_direct_terminal_publication_batches, 0);
         assert_eq!(control_stats.delta_direct_terminal_publication_rows, 0);
-        assert_eq!(direct_stats.delta_active_lease_steps, 4);
-        assert_eq!(direct_stats.delta_source_pages, 4);
+        assert_eq!(direct_stats.delta_active_lease_steps, 3);
+        assert_eq!(direct_stats.delta_source_pages, 3);
         assert_eq!(direct_stats.max_delta_source_cohort, 1);
         assert_eq!(direct_stats.delta_source_direct_candidates, 4);
         assert_eq!(
@@ -10157,7 +10286,7 @@ mod tests {
                 direct_stats.candidates_proposed,
                 direct_stats.max_propose_candidates,
             ),
-            (1, 1, 1, 4, 1)
+            (1, 1, 1, 4, 2)
         );
         assert_eq!(
             direct_stats.candidates_proposed,
@@ -10169,9 +10298,9 @@ mod tests {
             direct_stats.max_propose_candidates,
             control_stats.max_propose_candidates
         );
-        assert_eq!(direct_stats.width_increases, 0);
+        assert_eq!(direct_stats.width_increases, 2);
         assert_eq!(direct_stats.width_increases, control_stats.width_increases);
-        assert_eq!(direct_stats.delta_activation_width_increases, 4);
+        assert_eq!(direct_stats.delta_activation_width_increases, 3);
         assert_eq!(
             direct_stats.delta_activation_width_increases,
             control_stats.delta_activation_width_increases
@@ -10192,9 +10321,9 @@ mod tests {
         assert_eq!(direct_stats.emit_pops, 0);
         assert_eq!(
             control_stats.candidate_plan_pops,
-            direct_stats.candidate_plan_pops + 4
+            direct_stats.candidate_plan_pops + 3
         );
-        assert_eq!(control_stats.emit_pops, direct_stats.emit_pops + 4);
+        assert_eq!(control_stats.emit_pops, direct_stats.emit_pops + 3);
     }
 
     #[test]

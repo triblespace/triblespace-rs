@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Confirmed projected demand floors residual search width.** Exhausting a
+  projected-result window leaves search width unchanged until the caller pulls
+  again; that later pull doubles the result window and raises search `S` to at
+  least the confirmed demand. The floor is cap-bounded and counter-neutral when
+  search is already ahead, while `growth(1)` continues to disable only
+  negative-work growth. Emission and rejected projections remain outside the
+  search-feedback signal.
 - **Proven direct-terminal delta lanes publish final rows without stable-state
   churn.** A selected singleton or retained affine lease may turn accepted
   proposal pages directly into the ordinary projection buffer only when its
