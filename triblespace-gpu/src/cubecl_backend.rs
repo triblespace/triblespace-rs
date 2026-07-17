@@ -1,5 +1,6 @@
 use cubecl::client::ComputeClient;
 use cubecl::prelude::*;
+use cubecl::server::Handle;
 use triblespace_core::blob::encodings::succinctarchive::{
     SuccinctRotation, WaveletMatrixFreezeBackend,
 };
@@ -140,18 +141,126 @@ fn stable_scatter(
     }
 }
 
+/// Whole number of host pages required by Metal's `newBufferWithBytesNoCopy:`.
+/// Apple silicon uses 16 KiB pages; 16 KiB-aligned, 16 KiB-granular regions are
+/// also valid on 4 KiB-page hosts because 16 KiB is a multiple of 4 KiB.
+#[cfg(all(feature = "wgpu", target_os = "macos"))]
+const HOST_PAGE_BYTES: usize = 16 * 1024;
+
+/// Page-aligned, page-granular, exclusively owned host allocation backing a
+/// registered sequence buffer. The whole region belongs to this allocation, so
+/// no foreign heap data ever shares a page with a buffer the GPU can see.
+#[cfg(all(feature = "wgpu", target_os = "macos"))]
+struct AlignedArena {
+    ptr: std::ptr::NonNull<u8>,
+    bytes: usize,
+}
+
+#[cfg(all(feature = "wgpu", target_os = "macos"))]
+impl AlignedArena {
+    fn layout(bytes: usize) -> std::alloc::Layout {
+        std::alloc::Layout::from_size_align(bytes, HOST_PAGE_BYTES)
+            .expect("page-rounded arena layout")
+    }
+
+    /// Allocate `bytes` (a nonzero whole number of pages) of zeroed memory.
+    fn zeroed(bytes: usize) -> Self {
+        debug_assert!(bytes > 0 && bytes % HOST_PAGE_BYTES == 0);
+        let layout = Self::layout(bytes);
+        // Zero-initialized so the registered tail beyond any pass's logical
+        // length is defined bytes, even though no kernel indexes it.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        let Some(ptr) = std::ptr::NonNull::new(ptr) else {
+            std::alloc::handle_alloc_error(layout);
+        };
+        Self { ptr, bytes }
+    }
+
+    fn ptr(&self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
+}
+
+// SAFETY: the arena is a plain owned allocation. Host writes go through raw
+// pointers (never references into the buffer) and are serialized by the
+// take-the-entry-out-of-the-slot discipline in `registered_sequence`, so no
+// two threads ever write it concurrently and no thread writes it while GPU
+// submissions referencing it are in flight.
+#[cfg(all(feature = "wgpu", target_os = "macos"))]
+unsafe impl Send for AlignedArena {}
+#[cfg(all(feature = "wgpu", target_os = "macos"))]
+unsafe impl Sync for AlignedArena {}
+
+#[cfg(all(feature = "wgpu", target_os = "macos"))]
+impl Drop for AlignedArena {
+    fn drop(&mut self) {
+        // Runs only after every `Arc` clone is gone — including the keepalive
+        // clone the registration hands to the runtime's storage, which the
+        // device holds until it is itself dropped. The host pages therefore
+        // outlive every command submission that can reference them.
+        unsafe { std::alloc::dealloc(self.ptr.as_ptr(), Self::layout(self.bytes)) };
+    }
+}
+
+/// One live external-buffer registration of an [`AlignedArena`].
+///
+/// An entry rests in the backend's shared slot only between passes, and only
+/// after the pass that used it drained the device queue with a successful
+/// `client.sync()`. A pass takes the entry out of the slot for exclusive use,
+/// so rewriting the arena before launching is free of both host-side data
+/// races and host-write-vs-GPU-read hazards.
+#[cfg(all(feature = "wgpu", target_os = "macos"))]
+struct RegisteredSequenceArena {
+    arena: std::sync::Arc<AlignedArena>,
+    handle: Handle,
+}
+
+/// Where a freeze pass's rotation codes live on the device.
+enum SequenceInput {
+    /// Transient device buffer filled by an ordinary host-to-device upload.
+    Uploaded(Handle),
+    /// Zero-upload registration of backend-owned host pages that the GPU
+    /// reads in place through unified memory.
+    #[cfg(all(feature = "wgpu", target_os = "macos"))]
+    Registered(RegisteredSequenceArena),
+}
+
+impl SequenceInput {
+    fn handle(&self) -> Handle {
+        match self {
+            Self::Uploaded(handle) => handle.clone(),
+            #[cfg(all(feature = "wgpu", target_os = "macos"))]
+            Self::Registered(entry) => entry.handle.clone(),
+        }
+    }
+
+    fn is_registered(&self) -> bool {
+        match self {
+            Self::Uploaded(_) => false,
+            #[cfg(all(feature = "wgpu", target_os = "macos"))]
+            Self::Registered(_) => true,
+        }
+    }
+}
+
 /// Reusable CubeCL wavelet-freeze backend.
 ///
 /// Construct it once and reuse it across LSM compactions so CubeCL's runtime,
-/// shader cache, and allocator survive between merges. Each rotation performs
-/// one upload, keeps all stable partitions device-resident, explicitly
-/// synchronizes queued work, and then performs one final readback.
+/// shader cache, and allocator survive between merges. Each rotation stages
+/// its codes once — on Apple silicon by copying them into a reusable
+/// page-aligned host arena the GPU reads in place, elsewhere by a
+/// host-to-device upload — keeps all stable partitions device-resident,
+/// explicitly synchronizes queued work, and then performs one final readback.
 ///
 /// Returned device and geometry errors are suitable for
 /// `AcceleratedSuccinctRollup`'s CPU fallback. Allocation failure, runtime
 /// panic, abort, and OOM are not converted into `GpuFreezeError`.
 pub struct CubeClWaveletFreeze<R: Runtime> {
     client: ComputeClient<R>,
+    #[cfg(all(feature = "wgpu", target_os = "macos"))]
+    sequence_arena: std::sync::Mutex<Option<RegisteredSequenceArena>>,
+    #[cfg(all(feature = "wgpu", target_os = "macos"))]
+    upload_sequences: bool,
 }
 
 impl<R: Runtime> CubeClWaveletFreeze<R> {
@@ -159,7 +268,136 @@ impl<R: Runtime> CubeClWaveletFreeze<R> {
     pub fn new(device: &R::Device) -> Self {
         Self {
             client: R::client(device),
+            #[cfg(all(feature = "wgpu", target_os = "macos"))]
+            sequence_arena: std::sync::Mutex::new(None),
+            #[cfg(all(feature = "wgpu", target_os = "macos"))]
+            upload_sequences: false,
         }
+    }
+
+    /// Force the transient host-to-device upload input path even where the
+    /// registration seam is available. Parity harnesses use this to compare
+    /// the registered and uploaded inputs byte for byte; production callers
+    /// should keep the default.
+    #[cfg(all(feature = "wgpu", target_os = "macos"))]
+    pub fn with_uploaded_sequences(mut self, upload: bool) -> Self {
+        self.upload_sequences = upload;
+        self
+    }
+
+    /// Whether this runtime's server implements `register_external_aliased`.
+    /// Only the WGPU server does (Metal, macOS); every other server keeps the
+    /// panicking default, so the registered path must never be selected there.
+    #[cfg(all(feature = "wgpu", target_os = "macos"))]
+    fn runtime_registers_host_buffers() -> bool {
+        core::any::TypeId::of::<R>() == core::any::TypeId::of::<cubecl::wgpu::WgpuRuntime>()
+    }
+
+    /// Allocate a fresh page-rounded arena of `capacity` bytes and register it
+    /// with the device as an immutable external buffer.
+    #[cfg(all(feature = "wgpu", target_os = "macos"))]
+    fn register_arena(&self, capacity: usize) -> RegisteredSequenceArena {
+        let arena = std::sync::Arc::new(AlignedArena::zeroed(capacity));
+        // SAFETY — the four properties the registration contract demands:
+        // * Alignment: `AlignedArena` allocates with 16 KiB alignment and a
+        //   16 KiB-multiple length, satisfying `newBufferWithBytesNoCopy:`'s
+        //   page-aligned base + whole-pages length requirement on both Apple
+        //   silicon (16 KiB pages) and 4 KiB-page hosts. `offset` 0 trivially
+        //   meets Metal's buffer-binding offset alignment.
+        // * Immutability: the arena is written only in `registered_sequence`,
+        //   which owns the entry exclusively (taken out of the shared slot)
+        //   and writes strictly before any launch of the pass. Entries return
+        //   to the slot only after a successful `client.sync()` drained every
+        //   submission referencing them, so no host write ever overlaps a
+        //   kernel that reads the buffer. The whole region is this allocation
+        //   alone — no foreign heap data shares its pages — and the handle is
+        //   used exclusively as a kernel *input*; the runtime additionally
+        //   pins it `can_mut() == false` so it can never become an in-place
+        //   destination.
+        // * Lifetime: the `keepalive` Arc clone passed here is held by the
+        //   runtime's storage until the device itself is dropped, so the host
+        //   pages outlive every command submission that can reference the
+        //   handle — even if this backend (and its own Arc) is dropped while
+        //   work is still queued.
+        // * Coherency: the buffer is created with `StorageModeShared` on
+        //   unified memory; Metal guarantees CPU writes issued before a
+        //   command buffer is committed are visible to the GPU, and our
+        //   write-then-launch program order (single pass, one thread) plus
+        //   the sync-before-reuse discipline above provides exactly that
+        //   ordering. The GPU never writes the buffer, so no GPU-to-CPU
+        //   coherency obligation exists.
+        let handle = unsafe {
+            self.client.register_external_aliased(
+                arena.ptr() as *mut core::ffi::c_void,
+                capacity as u64,
+                0,
+                capacity as u64,
+                std::sync::Arc::clone(&arena) as std::sync::Arc<dyn std::any::Any + Send + Sync>,
+            )
+        };
+        RegisteredSequenceArena { arena, handle }
+    }
+
+    /// Stage `sequence` in the reusable registered host arena, growing (and
+    /// re-registering) it when a pass needs more capacity.
+    #[cfg(all(feature = "wgpu", target_os = "macos"))]
+    fn registered_sequence(
+        &self,
+        sequence: &[u32],
+        sequence_bytes: usize,
+    ) -> Result<RegisteredSequenceArena, GpuFreezeError> {
+        let resident = self.sequence_arena.lock().unwrap().take();
+        let entry = match resident {
+            Some(entry) if entry.arena.bytes >= sequence_bytes => entry,
+            stale => {
+                // Grow geometrically so steadily growing compactions
+                // re-register O(log) times. Dropping `stale` releases only our
+                // Arc and handle clones: its registration (and keepalive) stay
+                // with the device, so pages of superseded arenas remain valid
+                // until the device drops. That retention is bounded by the
+                // geometric growth to less than the final arena's size.
+                let previous = stale.map_or(0, |entry| entry.arena.bytes);
+                let capacity = sequence_bytes
+                    .max(previous.saturating_mul(2))
+                    .checked_add(HOST_PAGE_BYTES - 1)
+                    .ok_or(GpuFreezeError::GeometryOverflow("registered arena bytes"))?
+                    & !(HOST_PAGE_BYTES - 1);
+                self.register_arena(capacity)
+            }
+        };
+        // SAFETY: the entry is exclusively ours (fresh, or taken from the slot
+        // where only fully synchronized passes return it), so no kernel is
+        // reading and no other thread is writing these pages. Raw-pointer
+        // writes; no `&mut` to the buffer is ever formed. Stale bytes beyond
+        // `sequence_bytes` are never indexed by the kernels, which bound every
+        // access by the pass's length parameter.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                sequence.as_ptr().cast::<u8>(),
+                entry.arena.ptr(),
+                sequence_bytes,
+            );
+        }
+        Ok(entry)
+    }
+
+    /// Stage the rotation codes for the device: registered host pages on the
+    /// Apple-silicon WGPU runtime, an ordinary upload everywhere else.
+    fn sequence_input(
+        &self,
+        sequence: &[u32],
+        sequence_bytes: usize,
+    ) -> Result<SequenceInput, GpuFreezeError> {
+        #[cfg(all(feature = "wgpu", target_os = "macos"))]
+        if !self.upload_sequences && Self::runtime_registers_host_buffers() {
+            return Ok(SequenceInput::Registered(
+                self.registered_sequence(sequence, sequence_bytes)?,
+            ));
+        }
+        let _ = sequence_bytes;
+        Ok(SequenceInput::Uploaded(
+            self.client.create_from_slice(u32::as_bytes(sequence)),
+        ))
     }
 
     fn freeze_with_alphabet(
@@ -188,11 +426,12 @@ impl<R: Runtime> CubeClWaveletFreeze<R> {
             return Ok(());
         }
 
-        let mut current = self.client.create_from_slice(u32::as_bytes(sequence));
         let sequence_bytes = sequence
             .len()
             .checked_mul(std::mem::size_of::<u32>())
             .ok_or(GpuFreezeError::GeometryOverflow("sequence byte count"))?;
+        let input = self.sequence_input(sequence, sequence_bytes)?;
+        let mut current = input.handle();
         let mut other = self.client.empty(sequence_bytes);
         let layers = self.client.empty(geometry.packed_bytes);
         let block_bytes = geometry.num_blocks as usize * std::mem::size_of::<u32>();
@@ -259,11 +498,47 @@ impl<R: Runtime> CubeClWaveletFreeze<R> {
                     BLOCK_SIZE,
                 )
             };
+            if layer == 0 && input.is_registered() {
+                // A registered buffer must never become a kernel destination:
+                // it aliases host pages the registration contract keeps
+                // immutable, and its handle is pinned `can_mut() == false`.
+                // Swapping it into the ping-pong pair would make it the
+                // layer-1 scatter output, so replace it with a fresh device
+                // buffer first. The buffer count matches the upload path: two
+                // transient device buffers per pass.
+                current = self.client.empty(sequence_bytes);
+            }
             std::mem::swap(&mut current, &mut other);
         }
 
         cubecl::future::block_on(self.client.sync())
             .map_err(|error| GpuFreezeError::Device(format!("{error:?}")))?;
+        // The successful sync above drained every submission that read the
+        // registered arena, so it may rest in the slot for the next pass to
+        // rewrite. Error paths drop the entry instead: its registration and
+        // keepalive stay with the device, so possibly still-queued kernels
+        // keep reading valid pages, and the next pass registers a fresh
+        // arena. (Failures also open `AcceleratedSuccinctRollup`'s circuit
+        // breaker, so this path does not recur.)
+        #[cfg(all(feature = "wgpu", target_os = "macos"))]
+        if let SequenceInput::Registered(entry) = input {
+            let mut slot = self.sequence_arena.lock().unwrap();
+            if slot
+                .as_ref()
+                .is_none_or(|resident| resident.arena.bytes < entry.arena.bytes)
+            {
+                *slot = Some(entry);
+            }
+        }
+        // The packed-planes readback cannot use a registered buffer: the
+        // fork's only registration surface (`register_external_aliased`)
+        // requires the aliased host region to stay immutable while the handle
+        // lives, and permanently pins external handles `can_mut() == false`
+        // precisely so they are never kernel destinations — `layers` is
+        // written by every `block_count_pack` dispatch. No mutable or
+        // import-for-write registration variant exists at the pinned rev, so
+        // the explicit sync-then-read discipline below remains the output
+        // path.
         let packed_bytes = self
             .client
             .read_one(layers)
