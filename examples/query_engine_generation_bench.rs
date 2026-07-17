@@ -1083,6 +1083,10 @@ fn main() {
         );
     }
 
+    if cfg!(engine_stats_only) {
+        return;
+    }
+
     bench_prefix_cell("cyclic RPQ / TribleSet", &rpq_expected, repetitions, || {
         cyclic_rpq_query!(&fixture)
     });

@@ -1893,6 +1893,21 @@ impl ProgramDispatchKey {
             publication: TransitionDispatchKey::for_activation(registry, task.activation),
         }
     }
+
+    fn quiescent_peer_compatible(self, other: Self) -> bool {
+        self.pacing == ProgramPacing::Activation
+            && self.dispatch == other.dispatch
+            && self.pacing == other.pacing
+            && self.bound == other.bound
+            && self.has_candidates == other.has_candidates
+            && matches!(
+                (self.publication, other.publication),
+                (
+                    TransitionDispatchKey::Quiescent(_),
+                    TransitionDispatchKey::Quiescent(_)
+                )
+            )
+    }
 }
 
 #[derive(Default)]
@@ -3951,6 +3966,7 @@ impl DeltaScheduler {
         (self.interner.get(active.state).clone(), tasks)
     }
 
+    #[allow(unexpected_cfgs)]
     fn pop_active_program(
         &mut self,
         active: ActiveDeltaContinuation,
@@ -3989,6 +4005,10 @@ impl DeltaScheduler {
                     retained.push(task);
                 }
             }
+            if cfg!(engine_program_restore_storage_order) && key.pacing == ProgramPacing::Activation
+            {
+                selected.reverse();
+            }
             retained.reverse();
             bucket.tasks = retained;
             (selected, bucket.tasks.is_empty(), key.pacing)
@@ -4000,6 +4020,7 @@ impl DeltaScheduler {
         (active.state, tasks, pacing)
     }
 
+    #[allow(unexpected_cfgs)]
     fn pop_program_bounded(
         &mut self,
         search_width: usize,
@@ -4029,6 +4050,7 @@ impl DeltaScheduler {
                     .transition_dispatch_width(hot.activation, search_width),
             }
         };
+        let activation_width = self.activation_width.max(1);
         let (tasks, task_limits, empty, remainder_tasks) = {
             let registry = &self.registry;
             let selection_slots = &mut self.terminal_selection_slots;
@@ -4098,14 +4120,32 @@ impl DeltaScheduler {
                 }
                 (selected, limits, retained)
             } else {
+                let mut activations = BTreeSet::new();
                 let mut selected = Vec::new();
                 let mut retained = Vec::with_capacity(tasks.len());
                 for task in tasks.into_iter().rev() {
-                    if selected.len() < width && ProgramDispatchKey::of(registry, &task) == key {
+                    let task_key = ProgramDispatchKey::of(registry, &task);
+                    let compatible = if cfg!(engine_program_restore_quiescent_compatibility)
+                        && key.quiescent_peer_compatible(task_key)
+                    {
+                        activations.contains(&task.activation)
+                            || (activations.len() < activation_width && {
+                                activations.insert(task.activation);
+                                true
+                            })
+                    } else {
+                        task_key == key
+                    };
+                    if selected.len() < width && compatible {
                         selected.push(task);
                     } else {
                         retained.push(task);
                     }
+                }
+                if cfg!(engine_program_restore_storage_order)
+                    && key.pacing == ProgramPacing::Activation
+                {
+                    selected.reverse();
                 }
                 retained.reverse();
                 let limits = even_limits(width, selected.len());
@@ -4790,7 +4830,7 @@ impl DeltaScheduler {
     /// continuations. The erased family boundary is crossed once: handles are
     /// affinely taken into a dense typed vector, and the adapter returns one
     /// replacement receipt per input in scheduler order.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, unexpected_cfgs)]
     fn step_program<'a>(
         &mut self,
         root: &dyn Constraint<'a>,
@@ -4815,9 +4855,12 @@ impl DeltaScheduler {
         let spec = address.resolve(root, plan);
         let dispatch_key = ProgramDispatchKey::of(&self.registry, &tasks[0]);
         assert!(
-            tasks
-                .iter()
-                .all(|task| ProgramDispatchKey::of(&self.registry, task) == dispatch_key),
+            tasks.iter().all(|task| {
+                let task_key = ProgramDispatchKey::of(&self.registry, task);
+                task_key == dispatch_key
+                    || (cfg!(engine_program_restore_quiescent_compatibility)
+                        && dispatch_key.quiescent_peer_compatible(task_key))
+            }),
             "one typed program cohort mixed incompatible physical dispatch shapes"
         );
 
@@ -6986,6 +7029,535 @@ mod tests {
             scheduler.program_worklist[&state].tasks[0].activation,
             second
         );
+    }
+
+    fn program_order_trace(
+        pacing: ProgramPacing,
+        active_pop: bool,
+    ) -> (Vec<CreditNonce>, Vec<CreditNonce>, Vec<CreditNonce>) {
+        let mut scheduler = DeltaScheduler::new();
+        let route = ProgramRoute {
+            key: ProgramKey::new(0),
+            variable: 0,
+            stratum: ProgramStratum::Fixpoint,
+            grouping: ProgramGrouping::PageLocal,
+            completion: ProgramCompletion::PageableOnly,
+        };
+        let state = scheduler
+            .interner
+            .intern_program(ProgramAddress::new(DeltaDesc::leaf(0, 0), route));
+        let activation = scheduler.registry.open_program_activation(
+            DeltaReducer::StreamProposal,
+            stable_return(Vec::new()),
+            None,
+            None,
+        );
+        let tasks: Vec<_> = scheduler
+            .registry
+            .install_program_roots(
+                activation,
+                (0..4).map(|slot| ProgramSeedWork {
+                    parent: 0,
+                    work: ProgramWork {
+                        handle: ProgramWorkHandle::test(slot),
+                        dispatch: DispatchClass::new(0),
+                        pacing,
+                    },
+                    accepted: None,
+                }),
+            )
+            .roots
+            .into_iter()
+            .map(|(work, credit)| ProgramTask {
+                activation,
+                work,
+                credit,
+            })
+            .collect();
+        let storage_nonces: Vec<_> = tasks.iter().map(|task| task.credit.key.nonce).collect();
+        let active = scheduler.file_program_state(state, tasks).unwrap();
+        let (popped_state, selected) = if active_pop {
+            let (popped_state, selected, popped_pacing) = scheduler.pop_active_program(active, 3);
+            assert_eq!(popped_pacing, pacing);
+            (popped_state, selected)
+        } else {
+            let (popped_state, selected, _) = scheduler.pop_program_bounded(3);
+            (popped_state, selected)
+        };
+        assert_eq!(popped_state, state);
+        let selected_nonces = selected.iter().map(|task| task.credit.key.nonce).collect();
+        let retained_nonces = scheduler.program_worklist[&state]
+            .tasks
+            .iter()
+            .map(|task| task.credit.key.nonce)
+            .collect();
+        (storage_nonces, selected_nonces, retained_nonces)
+    }
+
+    #[allow(unexpected_cfgs)]
+    #[test]
+    fn active_program_ablation_restores_order_only_for_activation_pacing() {
+        for pacing in [ProgramPacing::Activation, ProgramPacing::Search] {
+            let (storage, selected, retained) = program_order_trace(pacing, true);
+            let expected = if cfg!(engine_program_restore_storage_order)
+                && pacing == ProgramPacing::Activation
+            {
+                storage[1..].to_vec()
+            } else {
+                storage[1..].iter().copied().rev().collect()
+            };
+            assert_eq!(selected, expected);
+            assert_eq!(retained, storage[..1]);
+        }
+    }
+
+    #[allow(unexpected_cfgs)]
+    #[test]
+    fn global_program_ablation_restores_order_only_for_activation_pacing() {
+        for pacing in [ProgramPacing::Activation, ProgramPacing::Search] {
+            let (storage, selected, retained) = program_order_trace(pacing, false);
+            let expected = if cfg!(engine_program_restore_storage_order)
+                && pacing == ProgramPacing::Activation
+            {
+                storage[1..].to_vec()
+            } else {
+                storage[1..].iter().copied().rev().collect()
+            };
+            assert_eq!(selected, expected);
+            assert_eq!(retained, storage[..1]);
+        }
+    }
+
+    #[test]
+    fn quiescent_program_peer_compatibility_is_activation_paced_and_structural() {
+        let key = ProgramDispatchKey {
+            dispatch: DispatchClass::new(0),
+            pacing: ProgramPacing::Activation,
+            bound: VariableSet::new_empty(),
+            has_candidates: false,
+            publication: TransitionDispatchKey::Quiescent(ActivationId::test(0)),
+        };
+        let peer = ProgramDispatchKey {
+            publication: TransitionDispatchKey::Quiescent(ActivationId::test(1)),
+            ..key
+        };
+        assert!(key.quiescent_peer_compatible(peer));
+        assert!(!key.quiescent_peer_compatible(ProgramDispatchKey {
+            pacing: ProgramPacing::Search,
+            ..peer
+        }));
+        assert!(!key.quiescent_peer_compatible(ProgramDispatchKey {
+            dispatch: DispatchClass::new(1),
+            ..peer
+        }));
+        assert!(!key.quiescent_peer_compatible(ProgramDispatchKey {
+            publication: TransitionDispatchKey::Streaming,
+            ..peer
+        }));
+    }
+
+    #[allow(unexpected_cfgs)]
+    #[test]
+    fn global_program_ablation_restores_quiescent_activation_cap_and_storage_order() {
+        let mut scheduler = DeltaScheduler::new();
+        scheduler.activation_width = 2;
+        let route = ProgramRoute {
+            key: ProgramKey::new(0),
+            variable: 0,
+            stratum: ProgramStratum::Fixpoint,
+            grouping: ProgramGrouping::PageLocal,
+            completion: ProgramCompletion::PageableOnly,
+        };
+        let state = scheduler
+            .interner
+            .intern_program(ProgramAddress::new(DeltaDesc::leaf(0, 0), route));
+        let activations: Vec<_> = (0..4)
+            .map(|_| {
+                scheduler.registry.open_program_activation(
+                    DeltaReducer::QuiescentProposal,
+                    stable_return(Vec::new()),
+                    None,
+                    None,
+                )
+            })
+            .collect();
+        let install =
+            |registry: &mut ProducerRegistry, activation, slots: std::ops::Range<u32>, dispatch| {
+                registry
+                    .install_program_roots(
+                        activation,
+                        slots.map(|slot| ProgramSeedWork {
+                            parent: 0,
+                            work: ProgramWork {
+                                handle: ProgramWorkHandle::test(slot),
+                                dispatch,
+                                pacing: ProgramPacing::Activation,
+                            },
+                            accepted: None,
+                        }),
+                    )
+                    .roots
+                    .into_iter()
+                    .map(|(work, credit)| ProgramTask {
+                        activation,
+                        work,
+                        credit,
+                    })
+                    .collect::<Vec<_>>()
+            };
+        let mut a = install(
+            &mut scheduler.registry,
+            activations[0],
+            0..2,
+            DispatchClass::new(0),
+        )
+        .into_iter();
+        let mut b = install(
+            &mut scheduler.registry,
+            activations[1],
+            2..4,
+            DispatchClass::new(0),
+        )
+        .into_iter();
+        let mut c = install(
+            &mut scheduler.registry,
+            activations[2],
+            4..6,
+            DispatchClass::new(0),
+        )
+        .into_iter();
+        let mut incompatible = install(
+            &mut scheduler.registry,
+            activations[3],
+            6..7,
+            DispatchClass::new(1),
+        )
+        .into_iter();
+        let a0 = a.next().unwrap();
+        let a1 = a.next().unwrap();
+        let b0 = b.next().unwrap();
+        let b1 = b.next().unwrap();
+        let c0 = c.next().unwrap();
+        let c1 = c.next().unwrap();
+        let incompatible = incompatible.next().unwrap();
+        assert!(a.next().is_none() && b.next().is_none() && c.next().is_none());
+        let a_nonces = [a0.credit.key.nonce, a1.credit.key.nonce];
+        let b_nonces = [b0.credit.key.nonce, b1.credit.key.nonce];
+        let c_nonces = [c0.credit.key.nonce, c1.credit.key.nonce];
+        let incompatible_nonce = incompatible.credit.key.nonce;
+        let stored = vec![a0, b0, c0, a1, incompatible, b1, c1];
+        let _ = scheduler.file_program_state(state, stored);
+
+        let (popped_state, tasks, dispatch) = scheduler.pop_program_bounded(8);
+        assert_eq!(popped_state, state);
+        let compatibility = cfg!(engine_program_restore_quiescent_compatibility);
+        let expected_activations = if compatibility {
+            &activations[1..3]
+        } else {
+            &activations[2..3]
+        };
+        assert_eq!(tasks.len(), expected_activations.len() * 2);
+        assert!(tasks
+            .iter()
+            .all(|task| expected_activations.contains(&task.activation)));
+        assert_eq!(
+            tasks
+                .iter()
+                .map(|task| task.activation)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            expected_activations.len(),
+            "global quiescent batching must respect activation_width"
+        );
+        let mut expected_nonces = if compatibility {
+            vec![b_nonces[0], c_nonces[0], b_nonces[1], c_nonces[1]]
+        } else {
+            c_nonces.to_vec()
+        };
+        if !cfg!(engine_program_restore_storage_order) {
+            expected_nonces.reverse();
+        }
+        assert_eq!(
+            tasks
+                .iter()
+                .map(|task| task.credit.key.nonce)
+                .collect::<Vec<_>>(),
+            expected_nonces
+        );
+        let retained = &scheduler.program_worklist[&state].tasks;
+        assert!(retained.iter().any(|task| {
+            task.credit.key.nonce == incompatible_nonce
+                && task.work.dispatch == DispatchClass::new(1)
+        }));
+        assert!(a_nonces
+            .iter()
+            .all(|nonce| { retained.iter().any(|task| task.credit.key.nonce == *nonce) }));
+        if compatibility {
+            assert_eq!(dispatch.task_limits, [2, 2, 2, 2]);
+        } else {
+            assert_eq!(dispatch.task_limits, [4, 4]);
+        }
+        assert_eq!(dispatch.remainder_tasks, 7 - tasks.len());
+    }
+
+    #[derive(Clone)]
+    struct CoCompletionNovelty {
+        parent: u32,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl PartialEq for CoCompletionNovelty {
+        fn eq(&self, other: &Self) -> bool {
+            self.parent == other.parent
+        }
+    }
+
+    impl Eq for CoCompletionNovelty {}
+
+    impl std::hash::Hash for CoCompletionNovelty {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.parent.hash(state);
+        }
+    }
+
+    impl Drop for CoCompletionNovelty {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[derive(Clone)]
+    struct OneShotConfirmProgram {
+        novelty_drops: Arc<AtomicUsize>,
+    }
+
+    impl TypedProgramSpec for OneShotConfirmProgram {
+        type State = u8;
+        type NoveltyKey = CoCompletionNovelty;
+        type Rank = u8;
+
+        fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+            matches!(request.action, ProgramAction::Confirm(0)).then_some(ProgramRoute {
+                key: ProgramKey::new(0),
+                variable: 0,
+                stratum: ProgramStratum::Fixpoint,
+                grouping: ProgramGrouping::PageLocal,
+                completion: ProgramCompletion::PageableOnly,
+            })
+        }
+
+        fn dispatch(&self, _state: &Self::State) -> DispatchClass {
+            DispatchClass::new(0)
+        }
+
+        fn progress(&self, state: &Self::State) -> Self::Rank {
+            *state
+        }
+
+        fn seed_typed(
+            &self,
+            batch: ProgramSeedBatch<'_>,
+            effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+        ) {
+            for parent in 0..batch.view.len() {
+                effects.fixpoint_root(
+                    parent as u32,
+                    1,
+                    CoCompletionNovelty {
+                        parent: parent as u32,
+                        drops: Arc::clone(&self.novelty_drops),
+                    },
+                    None,
+                );
+            }
+        }
+
+        fn step_typed(
+            &self,
+            states: Vec<Self::State>,
+            batch: TypedProgramBatch<'_>,
+            effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+        ) {
+            assert_eq!(states.len(), batch.candidate_sets.len());
+            for (input, (state, candidates)) in states
+                .into_iter()
+                .zip(batch.candidate_sets.iter().copied())
+                .enumerate()
+            {
+                assert_eq!(state, 1);
+                let candidates = candidates.expect("Confirm activation lost its source set");
+                assert_eq!(candidates.len(), 1);
+                effects.page(1, None);
+                effects.accept(input as u32, candidates[0]);
+                effects.account_transition(1);
+            }
+        }
+    }
+
+    impl Constraint<'static> for OneShotConfirmProgram {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(0)
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != 0 {
+                return false;
+            }
+            out.fill(1, view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+            panic!("one-shot Confirm Program unexpectedly proposed")
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+            panic!("one-shot Confirm Program fell back to ordinary confirm")
+        }
+
+        fn residual_program(&self) -> Option<ProgramRef<'_>> {
+            Some(ProgramRef::new(self))
+        }
+    }
+
+    #[allow(unexpected_cfgs)]
+    #[test]
+    fn global_program_compatibility_co_completes_and_retires_real_confirm_activations() {
+        let compatibility = cfg!(engine_program_restore_quiescent_compatibility);
+        let novelty_drops = Arc::new(AtomicUsize::new(0));
+        let root = OneShotConfirmProgram {
+            novelty_drops: Arc::clone(&novelty_drops),
+        };
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let relevant = ChildSet::empty(plan.len()).with_inserted(0);
+        let successor = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Candidate {
+                variable: 0,
+                relevant: relevant.clone(),
+                checked: relevant,
+            },
+        };
+        let request = ProgramRequest {
+            action: ProgramAction::Confirm(0),
+            bound: VariableSet::new_empty(),
+        };
+        let spec = root.residual_program().unwrap();
+        let route = spec.route(request).unwrap();
+        let mut scheduler = DeltaScheduler::new();
+        scheduler.activation_width = 2;
+        let active = scheduler
+            .seed_program_confirms(
+                spec,
+                DeltaDesc::leaf(0, 0),
+                request,
+                route,
+                successor,
+                CandidateBatch {
+                    parents: RowBatch {
+                        rows: Vec::new(),
+                        row_count: 2,
+                    },
+                    candidates: CandidatePayload::Tagged(vec![(0, value(7)), (1, value(8))]),
+                },
+            )
+            .expect("both Confirm parents must seed one live Program root");
+        let stored_tasks = &scheduler.program_worklist[&active.state].tasks;
+        let hot_id = stored_tasks.last().unwrap().activation;
+        let mut all_ids: Vec<_> = stored_tasks.iter().map(|task| task.activation).collect();
+        all_ids.sort_unstable();
+        all_ids.dedup();
+        assert_eq!(all_ids.len(), 2, "the seed must open distinct activations");
+        let mut expected_completed_ids = if compatibility {
+            all_ids.clone()
+        } else {
+            vec![hot_id]
+        };
+        expected_completed_ids.sort_unstable();
+        let expected_completions = expected_completed_ids.len();
+        let drops_before_step = novelty_drops.load(Ordering::Relaxed);
+
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let outcome = scheduler.step_bounded(
+            &root,
+            &plan,
+            8,
+            None,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+
+        let mut completed_ids = outcome.completed_activation_ids.clone();
+        completed_ids.sort_unstable();
+        assert_eq!(completed_ids, expected_completed_ids);
+        assert_eq!(outcome.completed_activations, expected_completions);
+        assert_eq!(outcome.completed_transition_cohort, compatibility);
+        assert!(outcome.continuation.is_some());
+        assert_eq!(scheduler.program_worklist.is_empty(), compatibility);
+        assert!(expected_completed_ids
+            .iter()
+            .all(|activation| !scheduler.registry.is_live(*activation)));
+        if !compatibility {
+            let retained = &scheduler.program_worklist[&active.state].tasks;
+            assert_eq!(retained.len(), 1);
+            assert_ne!(retained[0].activation, hot_id);
+            assert!(scheduler.registry.is_live(retained[0].activation));
+        }
+        assert_eq!(
+            novelty_drops.load(Ordering::Relaxed),
+            drops_before_step + expected_completions,
+            "retiring the cohort must drop each activation-local novelty table"
+        );
+
+        let stable_batches: Vec<_> = stable.values().flat_map(|level| level.values()).collect();
+        assert_eq!(stable_batches.len(), 1);
+        let StateBucket::Candidates(batch) = stable_batches[0] else {
+            panic!("Confirm completions returned the wrong stable payload")
+        };
+        assert_eq!(batch.parents.row_count, expected_completions);
+        assert_eq!(batch.candidate_count(), expected_completions);
+        let snapshot = batch.candidates.tagged_snapshot();
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(|(parent, _)| *parent)
+                .collect::<Vec<_>>(),
+            (0..expected_completions as u32).collect::<Vec<_>>()
+        );
+        let mut returned_values: Vec<_> = snapshot.into_iter().map(|(_, value)| value).collect();
+        returned_values.sort_unstable();
+        let expected_values = if compatibility {
+            vec![value(7), value(8)]
+        } else {
+            vec![value(8)]
+        };
+        assert_eq!(returned_values, expected_values);
+        assert_eq!(stats.delta_transition_pages, expected_completions);
+        assert_eq!(
+            stats.delta_transition_candidates_examined,
+            expected_completions
+        );
+        assert_eq!(stats.delta_transition_cohorts, 1);
+        assert_eq!(stats.max_delta_transition_cohort, expected_completions);
+        assert_eq!(stats.delta_transition_dead_pages, 0);
     }
 
     #[test]
