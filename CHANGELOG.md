@@ -113,6 +113,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and non-linear formula proposals keep the same quiescent reducer barriers.
   Seed effects consume no transition demand, preserve affine parent bags and
   NODES(G) scope, and cannot replay during the first later expansion.
+- **Directed cyclic continuation work has a scalar latency quantum.** A cyclic
+  activation inherited from a singleton stable continuation advances one
+  source or transition item per directed step even after the global geometric
+  width grows. Its first stable yield still releases the physical preference;
+  cold delta harvesting, canonical identity, affine ownership, and result
+  ordering are unchanged.
 - **Ordered proposal sources can page direct candidate occurrences.** The
   residual source cursor now distinguishes raw-value and native-ordinal
   frontiers while preserving proposal order and multiplicity. Sorted slices

@@ -54,7 +54,10 @@
 //! candidate mode, and cursor family. One same-schema block-native hook gets
 //! ragged per-parent limits whose sum is the current global width, so batching
 //! does not multiply the geometric work budget or refine canonical state
-//! identity.
+//! identity. A singleton activation inherited from a stable continuation is a
+//! latency exception: its directed source/transition steps stay scalar even
+//! after the global width grows. The preference still ends at its first stable
+//! yield; ordinary cold harvesting remains geometrically batched.
 //!
 //! As with the other batched engines, flattened leaves must obey the
 //! [`Constraint::estimate`] protocol: relevance is a structural answer,
@@ -82,6 +85,11 @@ use delta::{
     ActiveDeltaContinuation, ActiveDeltaStatus, DeltaDesc, DeltaScheduler, DeltaSeedOutcome,
     DeltaStepOutcome,
 };
+
+/// A physically focused cyclic activation advances one source or transition
+/// item at a time. This directed latency quantum is independent of the global
+/// geometric harvest width and does not retain focus across a stable yield.
+const ACTIVE_DELTA_STEP_WIDTH: usize = 1;
 
 /// One deterministic route from the owned root to an opaque residual leaf.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -8039,7 +8047,7 @@ impl ResidualStateMachine {
                         root,
                         plan,
                         active,
-                        width,
+                        ACTIVE_DELTA_STEP_WIDTH,
                         &mut self.worklist,
                         &mut self.interner,
                         &mut self.stats,
