@@ -55,10 +55,11 @@
 //! ragged per-parent limits whose sum is the current global width, so batching
 //! does not multiply the geometric work budget or refine canonical state
 //! identity. A cyclic activation seeded from a singleton stable continuation
-//! receives a scalar physical lease. When it publishes an accepted endpoint,
-//! the stable tail runs first while a still-live activation token remains
-//! suspended; the next pull resumes that exact affine traversal rather than
-//! abandoning its locality to cold global harvesting.
+//! receives a directed physical lease that widens with the machine's current
+//! geometric work budget. When it publishes an accepted endpoint, the stable
+//! tail runs first while a still-live activation token remains suspended; the
+//! next pull resumes that exact affine traversal rather than abandoning its
+//! locality to cold global harvesting.
 //!
 //! As with the other batched engines, flattened leaves must obey the
 //! [`Constraint::estimate`] protocol: relevance is a structural answer,
@@ -86,11 +87,6 @@ use delta::{
     ActiveDeltaContinuation, ActiveDeltaStatus, DeltaDesc, DeltaScheduler, DeltaSeedOutcome,
     DeltaStepOutcome,
 };
-
-/// Directed cyclic work stays scalar after the global harvest width grows.
-/// This first-cut lease isolates activation affinity from batching; a later
-/// policy may spend a bounded examined-work quantum instead.
-const ACTIVE_DELTA_LEASE_WIDTH: usize = 1;
 
 /// One deterministic route from the owned root to an opaque residual leaf.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2094,7 +2090,7 @@ pub struct ResidualStateStats {
     /// One-atom continuation pops used to probe a delta-to-stable handoff
     /// before returning the rest of that cohort to global cold harvesting.
     pub delta_handoff_probe_pops: usize,
-    /// Directed scalar steps spent following one exact cyclic activation.
+    /// Directed lease steps spent following one exact cyclic activation.
     pub delta_active_lease_steps: usize,
     /// Stable yields after which the same cyclic activation remained live and
     /// its physical lease was retained.
@@ -8064,7 +8060,7 @@ impl ResidualStateMachine {
             }
 
             let width = self.width;
-            // A newly seeded activation on the scalar continuation path is
+            // A newly seeded activation on the singleton continuation path is
             // the cyclic analogue of `ActiveContinuation`: follow that exact
             // affine lineage before any cold stable cohort. It owns no work;
             // dropping the token merely returns scheduling to the global
@@ -8079,7 +8075,7 @@ impl ResidualStateMachine {
                         root,
                         plan,
                         active,
-                        ACTIVE_DELTA_LEASE_WIDTH,
+                        width,
                         &mut self.worklist,
                         &mut self.interner,
                         &mut self.stats,

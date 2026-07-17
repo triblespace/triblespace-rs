@@ -115,11 +115,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   NODES(G) scope, and cannot replay during the first later expansion.
 - **Positive path publications retain their live affine traversal.** A cyclic
   activation entered from a singleton stable continuation now advances through
-  a fixed one-atom physical lease. Its accepted endpoint still runs through the
-  ordinary stable continuation first, but a traversal that remains live is
-  resumed afterward instead of surrendering locality to the cold global delta
-  harvest. The lease never enters canonical state identity, result ordering or
-  bag ownership, and quiescence releases it without moving scheduler work.
+  a directed physical lease that shares the machine's geometrically widened
+  work budget. Its accepted endpoint still runs through the ordinary stable
+  continuation first, but a traversal that remains live is resumed afterward
+  instead of surrendering locality to the cold global delta harvest. The lease
+  never enters canonical state identity, result ordering or bag ownership, and
+  quiescence releases it without moving scheduler work.
 - **Ordered proposal sources can page direct candidate occurrences.** The
   residual source cursor now distinguishes raw-value and native-ordinal
   frontiers while preserving proposal order and multiplicity. Sorted slices
