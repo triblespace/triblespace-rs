@@ -1552,8 +1552,10 @@ mod tests {
             runtime.retire_activations(&[quiescent, live]);
         }));
 
-        assert!(panic_text(rejected.expect_err("live cohort retirement must fail"))
-            .contains("live state handle remained"));
+        assert!(
+            panic_text(rejected.expect_err("live cohort retirement must fail"))
+                .contains("live state handle remained")
+        );
         assert!(runtime.novelty.contains_key(&quiescent));
         assert!(runtime.novelty.contains_key(&live));
         assert!(runtime.contains(&handle));
