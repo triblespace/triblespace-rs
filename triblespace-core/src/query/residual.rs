@@ -2160,8 +2160,8 @@ pub struct ResidualStateStats {
     /// Terminal calls that produced at least one stable effect, including a
     /// direct physical publication receipt.
     pub delta_terminal_publications: usize,
-    /// Publication resets that changed a terminal activation's local sparse
-    /// quantum back to one examined-work unit.
+    /// Publications that changed a terminal activation's local sparse quantum
+    /// back to one examined-work unit.
     pub delta_terminal_sparse_resets: usize,
     /// Live transition no-publication calls that doubled a terminal
     /// activation's local sparse-search quantum toward global search width.

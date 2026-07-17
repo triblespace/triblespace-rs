@@ -206,6 +206,16 @@ impl<'a> Constraint<'a> for IgnoreConstraint<'a> {
             .residual_delta_expand_page(variable, node, cursor, limit, successors)
     }
 
+    fn residual_delta_recycles_unused_transition_budget(
+        &self,
+        variable: VariableId,
+    ) -> bool {
+        self.exposes(variable)
+            && self
+                .constraint
+                .residual_delta_recycles_unused_transition_budget(variable)
+    }
+
     fn residual_delta_expand_pages(
         &self,
         variable: VariableId,

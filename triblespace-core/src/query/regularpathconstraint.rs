@@ -2451,6 +2451,13 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         self.expand_delta_program_page(program, node, cursor, limit, successors)
     }
 
+    fn residual_delta_recycles_unused_transition_budget(
+        &self,
+        _variable: VariableId,
+    ) -> bool {
+        false
+    }
+
     fn residual_delta_expand_pages(
         &self,
         variable: VariableId,

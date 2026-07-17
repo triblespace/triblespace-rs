@@ -978,12 +978,12 @@ impl ProducerRegistry {
         search_width: usize,
         kind: PhysicalDispatchKind,
         published: bool,
-    ) -> (bool, bool) {
+    ) -> TerminalGrantFeedback {
         let Some(activation) = self.state.activations.get_mut(&activation) else {
-            return (false, false);
+            return TerminalGrantFeedback::default();
         };
         if activation.physical_class != DeltaPhysicalClass::TerminalStreaming {
-            return (false, false);
+            return TerminalGrantFeedback::default();
         }
         let before = activation.terminal_sparse_quantum;
         if published {
@@ -992,10 +992,10 @@ impl ProducerRegistry {
             activation.terminal_sparse_quantum =
                 before.saturating_mul(2).min(search_width.max(1)).max(1);
         }
-        (
-            published && activation.terminal_sparse_quantum != before,
-            !published && activation.terminal_sparse_quantum > before,
-        )
+        TerminalGrantFeedback {
+            reset: published && activation.terminal_sparse_quantum != before,
+            negative_widened: !published && activation.terminal_sparse_quantum > before,
+        }
     }
 
     fn is_live(&self, activation: ActivationId) -> bool {
@@ -1331,21 +1331,50 @@ struct PhysicalDispatch {
     kind: PhysicalDispatchKind,
     task_limits: Vec<usize>,
     remainder_tasks: usize,
+    charge: Option<PhysicalDispatchCharge>,
 }
 
 impl PhysicalDispatch {
     fn work_budget(&self) -> usize {
-        self.task_limits.iter().sum()
+        self.charge
+            .map_or_else(|| self.task_limits.iter().sum(), |charge| charge.work_budget)
     }
 
     fn task_count(&self) -> usize {
-        self.task_limits.len()
+        self.charge
+            .map_or(self.task_limits.len(), |charge| charge.task_count)
     }
+
+    fn apply_charge(&mut self, charge: Option<PhysicalDispatchCharge>) {
+        let Some(charge) = charge else {
+            return;
+        };
+        assert!(charge.work_budget <= self.task_limits.iter().sum());
+        assert!(charge.task_count <= self.task_limits.len());
+        self.remainder_tasks = self
+            .remainder_tasks
+            .saturating_add(charge.deferred_tasks);
+        self.charge = Some(charge);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PhysicalDispatchCharge {
+    work_budget: usize,
+    task_count: usize,
+    deferred_tasks: usize,
 }
 
 struct DeltaPhysicalOutcome {
     outcome: DeltaStepOutcome,
     terminal_publications: OrderedActivationSet,
+    dispatch_charge: Option<PhysicalDispatchCharge>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TerminalGrantFeedback {
+    reset: bool,
+    negative_widened: bool,
 }
 
 /// Insertion-ordered activation membership with an allocation-free singleton
@@ -2688,6 +2717,20 @@ impl DeltaScheduler {
             .is_some_and(|bucket| bucket.contains_activation(active.activation))
     }
 
+    fn active_transition_is_unanchored(&self, active: ActiveDeltaContinuation) -> bool {
+        let mut found = false;
+        let unanchored = self.worklist.get(&active.state).is_some_and(|bucket| {
+            bucket
+                .iter()
+                .filter(|task| task.activation == active.activation)
+                .all(|task| {
+                    found = true;
+                    task.node.source.is_none()
+                })
+        });
+        found && unanchored
+    }
+
     fn allows_global_width_growth(&self, dispatch: &PhysicalDispatch, search_width: usize) -> bool {
         if dispatch.terminal_activations.is_empty() {
             return true;
@@ -2731,14 +2774,15 @@ impl DeltaScheduler {
         stats.delta_terminal_candidates_examined += examined_after.saturating_sub(examined_before);
         stats.delta_terminal_publications += usize::from(published);
         for &activation in dispatch.terminal_activations.iter() {
-            let (reset, widened) = self.registry.finish_dispatch(
+            let feedback = self.registry.finish_dispatch(
                 activation,
                 search_width,
                 dispatch.kind,
                 terminal_publications.contains(&activation),
             );
-            stats.delta_terminal_sparse_resets += usize::from(reset);
-            stats.delta_terminal_sparse_widenings += usize::from(widened);
+            stats.delta_terminal_sparse_resets += usize::from(feedback.reset);
+            stats.delta_terminal_sparse_widenings +=
+                usize::from(feedback.negative_widened);
         }
         self.allows_global_width_growth(&dispatch, search_width)
     }
@@ -2839,6 +2883,7 @@ impl DeltaScheduler {
             kind: PhysicalDispatchKind::Transition,
             task_limits,
             remainder_tasks,
+            charge: None,
         };
         (self.interner.get(id).clone(), tasks, dispatch)
     }
@@ -2901,6 +2946,7 @@ impl DeltaScheduler {
             kind: PhysicalDispatchKind::Source,
             task_limits: even_limits(width, tasks.len()),
             remainder_tasks,
+            charge: None,
         };
         (self.interner.get(id).clone(), tasks, dispatch)
     }
@@ -2980,6 +3026,7 @@ impl DeltaScheduler {
                 kind: PhysicalDispatchKind::Source,
                 task_limits: even_limits(width, task_count),
                 remainder_tasks,
+                charge: None,
             };
             let physical = self.step_sources(
                 root,
@@ -3005,14 +3052,23 @@ impl DeltaScheduler {
             let width = self
                 .registry
                 .transition_dispatch_width(active.activation, search_width);
-            let (desc, tasks) = self.pop_active_transition(active, width);
+            let task_width = if terminal_activation.is_some()
+                && self.active_transition_is_unanchored(active)
+            {
+                let root = width.isqrt();
+                root + usize::from(root.saturating_mul(root) < width)
+            } else {
+                width
+            };
+            let (desc, tasks) = self.pop_active_transition(active, task_width);
             let task_count = tasks.len();
             let remainder_tasks = self.worklist.get(&active.state).map_or(0, DeltaBucket::len);
-            let dispatch = PhysicalDispatch {
+            let mut dispatch = PhysicalDispatch {
                 terminal_activations: terminal_activation.into_iter().collect(),
                 kind: PhysicalDispatchKind::Transition,
                 task_limits: even_limits(width, task_count),
                 remainder_tasks,
+                charge: None,
             };
             let physical = self.step_transitions(
                 root,
@@ -3025,6 +3081,7 @@ impl DeltaScheduler {
                 stable_interner,
                 stats,
             );
+            dispatch.apply_charge(physical.dispatch_charge);
             let mut outcome = physical.outcome;
             outcome.allows_global_width_growth = self.account_physical_dispatch(
                 dispatch,
@@ -3089,7 +3146,7 @@ impl DeltaScheduler {
             );
         }
 
-        let (desc, tasks, dispatch) = self.pop_bounded(search_width);
+        let (desc, tasks, mut dispatch) = self.pop_bounded(search_width);
         let examined_before = stats
             .delta_source_candidates_examined
             .saturating_add(stats.delta_transition_candidates_examined);
@@ -3104,6 +3161,7 @@ impl DeltaScheduler {
             stable_interner,
             stats,
         );
+        dispatch.apply_charge(physical.dispatch_charge);
         let mut outcome = physical.outcome;
         outcome.allows_global_width_growth = self.account_physical_dispatch(
             dispatch,
@@ -3129,24 +3187,64 @@ impl DeltaScheduler {
         stats: &mut ResidualStateStats,
     ) -> DeltaPhysicalOutcome {
         let constraint = desc.resolve(root, plan);
-        let task_count = tasks.len();
-        assert_eq!(limits.len(), task_count);
+        let original_task_count = tasks.len();
+        let one_terminal_activation = tasks.first().is_some_and(|first| {
+            self.registry.physical_activation_class(first.activation)
+                == DeltaPhysicalClass::TerminalStreaming
+                && tasks
+                    .iter()
+                    .all(|task| task.activation == first.activation)
+        });
+        assert_eq!(limits.len(), original_task_count);
         assert!(limits.iter().all(|&limit| limit > 0));
-        let nodes: Vec<_> = tasks.iter().map(|task| task.node).collect();
-        let cursors: Vec<_> = tasks.iter().map(|task| task.cursor).collect();
-        let batch = ResidualDeltaExpandBatch {
-            nodes: &nodes,
-            cursors: &cursors,
-            limits,
-        };
-        let mut pages = Vec::with_capacity(task_count);
+        let mut pages = Vec::with_capacity(original_task_count);
         let mut tagged_successors = Vec::new();
-        constraint.residual_delta_expand_pages(
-            desc.variable,
-            batch,
-            &mut pages,
-            &mut tagged_successors,
-        );
+        let mut charged_limits = limits.to_vec();
+        if one_terminal_activation
+            && constraint.residual_delta_recycles_unused_transition_budget(desc.variable)
+        {
+            let mut remaining: usize = limits.iter().sum();
+            for (row, task) in tasks.iter().enumerate() {
+                if remaining == 0 {
+                    break;
+                }
+                let limit = remaining;
+                charged_limits[row] = limit;
+                let mut row_successors = Vec::new();
+                let page = constraint
+                    .residual_delta_expand_page(
+                    desc.variable,
+                        task.node,
+                        task.cursor,
+                        limit,
+                        &mut row_successors,
+                    )
+                    .expect("budget-recycling transition became unsupported");
+                remaining = remaining
+                    .checked_sub(page.examined)
+                    .expect("transition page exceeded its remaining budget");
+                let row = u32::try_from(row).expect("too many transition pages in one cohort");
+                tagged_successors.extend(row_successors.into_iter().map(|output| (row, output)));
+                pages.push(Some(page));
+            }
+        } else {
+            let nodes: Vec<_> = tasks.iter().map(|task| task.node).collect();
+            let cursors: Vec<_> = tasks.iter().map(|task| task.cursor).collect();
+            constraint.residual_delta_expand_pages(
+                desc.variable,
+                ResidualDeltaExpandBatch {
+                    nodes: &nodes,
+                    cursors: &cursors,
+                    limits,
+                },
+                &mut pages,
+                &mut tagged_successors,
+            );
+        }
+        let mut tasks = tasks;
+        let deferred_tasks = tasks.split_off(pages.len());
+        charged_limits.truncate(tasks.len());
+        let task_count = tasks.len();
         assert_eq!(
             pages.len(),
             task_count,
@@ -3159,11 +3257,12 @@ impl DeltaScheduler {
         let mut legacy_indices = Vec::new();
         let mut legacy_nodes = Vec::new();
         let mut paged_count = 0usize;
+        let mut dispatch_work_budget = 0usize;
         for (index, (((task, page), range), &limit)) in tasks
             .iter()
             .zip(pages)
             .zip(&successor_ranges)
-            .zip(limits)
+            .zip(&charged_limits)
             .enumerate()
         {
             let Some(page) = page else {
@@ -3202,6 +3301,7 @@ impl DeltaScheduler {
             }
             stats.delta_transition_pages += 1;
             stats.delta_transition_candidates_examined += page.examined;
+            dispatch_work_budget = dispatch_work_budget.saturating_add(page.examined);
             next_cursors[index] = page.next;
             paged[index] = true;
         }
@@ -3241,6 +3341,7 @@ impl DeltaScheduler {
         let mut transition_dead_pages = 0usize;
         let mut completed_activations = 0usize;
         let mut terminal_publications = OrderedActivationSet::default();
+        let deferred_task_count = deferred_tasks.len();
         for (task_index, task) in tasks.into_iter().enumerate() {
             assert_eq!(task.activation, task.credit.key.activation);
             let terminal = self.registry.physical_activation_class(task.activation)
@@ -3332,6 +3433,7 @@ impl DeltaScheduler {
             }
             effects.absorb(task_effects);
         }
+        next_tasks.extend(deferred_tasks);
         let _ = self.file(desc.clone(), next_tasks);
         let _ = self.file_source(desc, resumed_sources);
         stats.delta_source_dead_pages += source_dead_pages;
@@ -3349,6 +3451,11 @@ impl DeltaScheduler {
                 allows_global_width_growth: true,
             },
             terminal_publications,
+            dispatch_charge: legacy_nodes.is_empty().then_some(PhysicalDispatchCharge {
+                work_budget: dispatch_work_budget,
+                task_count,
+                deferred_tasks: deferred_task_count,
+            }),
         }
     }
 
@@ -3560,6 +3667,7 @@ impl DeltaScheduler {
                 allows_global_width_growth: true,
             },
             terminal_publications,
+            dispatch_charge: None,
         }
     }
 
@@ -4165,7 +4273,7 @@ mod tests {
         );
         assert_eq!(
             registry.finish_dispatch(started.activation, 64, PhysicalDispatchKind::Source, false,),
-            (false, false)
+            TerminalGrantFeedback::default()
         );
         assert_eq!(
             registry.transition_dispatch_width(started.activation, 64),
@@ -4178,7 +4286,10 @@ mod tests {
                 PhysicalDispatchKind::Transition,
                 false,
             ),
-            (false, true)
+            TerminalGrantFeedback {
+                negative_widened: true,
+                ..TerminalGrantFeedback::default()
+            }
         );
         assert_eq!(
             registry.transition_dispatch_width(started.activation, 64),
@@ -4191,12 +4302,62 @@ mod tests {
                 PhysicalDispatchKind::Transition,
                 false,
             ),
-            (false, true)
+            TerminalGrantFeedback {
+                negative_widened: true,
+                ..TerminalGrantFeedback::default()
+            }
         );
         assert_eq!(registry.transition_dispatch_width(started.activation, 3), 3);
         assert_eq!(
             registry.finish_dispatch(started.activation, 64, PhysicalDispatchKind::Source, true,),
-            (true, false)
+            TerminalGrantFeedback {
+                reset: true,
+                ..TerminalGrantFeedback::default()
+            }
+        );
+        assert_eq!(
+            registry.transition_dispatch_width(started.activation, 64),
+            1
+        );
+    }
+
+    #[test]
+    fn productive_transition_resets_speculative_grant() {
+        let mut registry = ProducerRegistry::new();
+        let started = registry.start_many_terminal(
+            DeltaReducer::StreamProposal,
+            candidate_return(Vec::new()),
+            [output(1, 0, true)],
+            VariableSet::new_singleton(0),
+        );
+        for expected in [2, 4, 8] {
+            assert!(
+                registry
+                    .finish_dispatch(
+                        started.activation,
+                        64,
+                        PhysicalDispatchKind::Transition,
+                        false,
+                    )
+                    .negative_widened
+            );
+            assert_eq!(
+                registry.transition_dispatch_width(started.activation, 64),
+                expected
+            );
+        }
+
+        assert_eq!(
+            registry.finish_dispatch(
+                started.activation,
+                64,
+                PhysicalDispatchKind::Transition,
+                true,
+            ),
+            TerminalGrantFeedback {
+                reset: true,
+                ..TerminalGrantFeedback::default()
+            }
         );
         assert_eq!(
             registry.transition_dispatch_width(started.activation, 64),
@@ -4221,6 +4382,7 @@ mod tests {
                 kind: PhysicalDispatchKind::Source,
                 task_limits: vec![1],
                 remainder_tasks: 0,
+                charge: None,
             },
             64,
         ));
@@ -4230,6 +4392,7 @@ mod tests {
                 kind: PhysicalDispatchKind::Transition,
                 task_limits: vec![32],
                 remainder_tasks: 0,
+                charge: None,
             },
             64,
         ));
@@ -4238,6 +4401,7 @@ mod tests {
             kind: PhysicalDispatchKind::Transition,
             task_limits: vec![64],
             remainder_tasks: 0,
+            charge: None,
         };
         assert!(scheduler.allows_global_width_growth(&saturated, 64));
 
@@ -4273,7 +4437,10 @@ mod tests {
                 PhysicalDispatchKind::Transition,
                 false,
             ),
-            (false, true)
+            TerminalGrantFeedback {
+                negative_widened: true,
+                ..TerminalGrantFeedback::default()
+            }
         );
         for expected in [2, 4] {
             let _ = scheduler.registry.finish_dispatch(
@@ -4353,6 +4520,14 @@ mod tests {
                 false,
             );
         }
+        scheduler
+            .registry
+            .state
+            .activations
+            .get_mut(&first.activation)
+            .unwrap()
+            .accepted
+            .extend([value(1), value(3), value(5)]);
         let mut stats = ResidualStateStats::default();
         let published = OrderedActivationSet::from(vec![first.activation]);
         assert!(!scheduler.account_physical_dispatch(
@@ -4361,6 +4536,7 @@ mod tests {
                 kind: PhysicalDispatchKind::Transition,
                 task_limits: vec![2, 2],
                 remainder_tasks: 0,
+                charge: None,
             },
             8,
             0,
@@ -4389,6 +4565,7 @@ mod tests {
                 kind: PhysicalDispatchKind::Source,
                 task_limits: vec![4, 4],
                 remainder_tasks: 0,
+                charge: None,
             },
             8,
             0,

@@ -1415,6 +1415,22 @@ pub trait Constraint<'a> {
         None
     }
 
+    /// Whether consecutive transition pages may be invoked as singleton
+    /// batches while unused examined-work budget is transferred forward.
+    ///
+    /// Opting in promises that physical cohort boundaries carry no semantic
+    /// meaning and that [`Self::residual_delta_expand_page`] returns `Some`
+    /// for every selected node, cursor, and positive limit. The scheduler
+    /// still bounds the sum of actually examined candidates by its original
+    /// geometric grant.
+    #[doc(hidden)]
+    fn residual_delta_recycles_unused_transition_budget(
+        &self,
+        _variable: VariableId,
+    ) -> bool {
+        false
+    }
+
     /// Expands one physical cohort of bounded transition-node pages.
     ///
     /// `pages` receives one row-aligned entry per input node. `Some(page)`
@@ -1632,6 +1648,14 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.residual_delta_expand_page(variable, node, cursor, limit, successors)
     }
 
+    fn residual_delta_recycles_unused_transition_budget(
+        &self,
+        variable: VariableId,
+    ) -> bool {
+        let inner: &T = self;
+        inner.residual_delta_recycles_unused_transition_budget(variable)
+    }
+
     fn residual_delta_expand_pages(
         &self,
         variable: VariableId,
@@ -1806,6 +1830,14 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     ) -> Option<ResidualDeltaExpandPage> {
         let inner: &T = self;
         inner.residual_delta_expand_page(variable, node, cursor, limit, successors)
+    }
+
+    fn residual_delta_recycles_unused_transition_budget(
+        &self,
+        variable: VariableId,
+    ) -> bool {
+        let inner: &T = self;
+        inner.residual_delta_recycles_unused_transition_budget(variable)
     }
 
     fn residual_delta_expand_pages(
