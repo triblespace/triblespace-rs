@@ -1481,6 +1481,67 @@ struct ResidualPlan {
     synthetic_root_formula: bool,
 }
 
+/// Closed-world structural proxy used by the experimental built-in grouped-
+/// witness lowering.
+///
+/// The walk deliberately mirrors [`FiniteFormulaProgram::compile`]: an
+/// exposed Union owns its arms, otherwise exposed `And`/`ScopedAnd` children
+/// are traversed, and an opaque boundary ends the walk. Visibility is narrowed
+/// at every boundary so an `Ignore` scope cannot promote the outer root on the
+/// strength of a grouping prerequisite that the residual machine can never
+/// bind. A witness only counts at or below a connective; a bare opaque root is
+/// already a formula identity and remains on the ordinary opaque route.
+fn exposed_grouped_confirm_witness_below_connective<'a>(root: &dyn Constraint<'a>) -> bool {
+    fn visit<'a>(
+        constraint: &dyn Constraint<'a>,
+        visible: VariableSet,
+        below_connective: bool,
+    ) -> bool {
+        let visible = visible.intersect(constraint.variables());
+        let union = constraint.residual_union_children();
+        let shape = constraint.residual_shape();
+        let connective = union.is_some()
+            || matches!(
+                shape,
+                ConstraintShape::And(_) | ConstraintShape::ScopedAnd(_)
+            );
+
+        if (below_connective || connective)
+            && visible.into_iter().any(|variable| {
+                constraint
+                    .residual_delta_confirm_grouping_requirements(variable)
+                    .is_some_and(|required| required.is_subset_of(&visible))
+            })
+        {
+            return true;
+        }
+
+        if let Some(children) = union {
+            return (0..children.len()).any(|child| {
+                visit(
+                    children.child(child),
+                    visible,
+                    below_connective || connective,
+                )
+            });
+        }
+        match shape {
+            ConstraintShape::And(children) | ConstraintShape::ScopedAnd(children) => {
+                (0..children.len()).any(|child| {
+                    visit(
+                        children.child(child),
+                        visible,
+                        below_connective || connective,
+                    )
+                })
+            }
+            ConstraintShape::Opaque => false,
+        }
+    }
+
+    visit(root, root.variables(), false)
+}
+
 impl ResidualPlan {
     fn compile<'a>(root: &dyn Constraint<'a>) -> Self {
         Self::compile_mode(root, FormulaScope::OpaqueLeaves, false)
@@ -1492,11 +1553,16 @@ impl ResidualPlan {
     }
 
     fn compile_lowering<'a>(root: &dyn Constraint<'a>, lowering: ResidualLowering) -> Self {
-        Self::compile_mode(
-            root,
-            lowering.formula_scope(),
-            lowering.transition_programs(),
-        )
+        let formula_scope = if lowering.builtin_grouped_witness_root() {
+            if exposed_grouped_confirm_witness_below_connective(root) {
+                FormulaScope::WholeRoot
+            } else {
+                FormulaScope::OpaqueLeaves
+            }
+        } else {
+            lowering.formula_scope()
+        };
+        Self::compile_mode(root, formula_scope, lowering.transition_programs())
     }
 
     fn compile_mode<'a>(
@@ -1917,12 +1983,17 @@ pub enum FormulaScope {
 /// Orthogonal structural lowering selected for one residual solve.
 ///
 /// Formula scope is a three-element chain. Transition programs form the one
-/// independent capability axis, giving exactly six canonical lowering forms.
+/// independent capability axis, giving exactly six canonical fixed lowering
+/// forms. [`BUILTIN_GROUPED_WITNESS_ROOT`](Self::BUILTIN_GROUPED_WITNESS_ROOT)
+/// is a seventh, explicitly experimental structural selector: it keeps
+/// transition programs enabled and chooses either `OpaqueLeaves` or
+/// `WholeRoot` for the complete root from an exposed grouped-confirm witness.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 #[must_use]
 pub struct ResidualLowering {
     formula_scope: FormulaScope,
     transition_programs: bool,
+    builtin_grouped_witness_root: bool,
 }
 
 impl ResidualLowering {
@@ -1930,12 +2001,27 @@ impl ResidualLowering {
     pub const CONSERVATIVE: Self = Self::new(FormulaScope::OpaqueLeaves, false);
     /// Full formula and transition-program lowering used by ordinary queries.
     pub const FULL: Self = Self::new(FormulaScope::WholeRoot, true);
+    /// Experimental root-level selector for the closed set of built-in
+    /// grouped-confirm witnesses.
+    ///
+    /// The selector is intentionally honest about its evidence: a reachable
+    /// opt-in to [`Constraint::residual_delta_confirm_grouping_requirements`]
+    /// is a useful proxy for the current built-in repeated-path family, not a
+    /// public proof that every custom fixpoint has been recognized. A visible
+    /// witness below an exposed connective selects `WholeRoot` plus transition
+    /// programs; no witness selects `OpaqueLeaves` plus transition programs.
+    pub const BUILTIN_GROUPED_WITNESS_ROOT: Self = Self {
+        formula_scope: FormulaScope::OpaqueLeaves,
+        transition_programs: true,
+        builtin_grouped_witness_root: true,
+    };
 
     /// Constructs one of the six canonical lowering forms.
     pub const fn new(formula_scope: FormulaScope, transition_programs: bool) -> Self {
         Self {
             formula_scope,
             transition_programs,
+            builtin_grouped_witness_root: false,
         }
     }
 
@@ -1948,6 +2034,12 @@ impl ResidualLowering {
     /// the residual submachine.
     pub const fn transition_programs(self) -> bool {
         self.transition_programs
+    }
+
+    /// Whether this lowering chooses the complete root scope from the exposed
+    /// built-in grouped-confirm witness proxy.
+    pub const fn builtin_grouped_witness_root(self) -> bool {
+        self.builtin_grouped_witness_root
     }
 }
 
@@ -10168,7 +10260,7 @@ mod tests {
     use std::sync::Mutex;
 
     #[test]
-    fn residual_lowering_has_exactly_six_canonical_forms() {
+    fn residual_lowering_has_six_fixed_forms_plus_one_structural_selector() {
         let forms: std::collections::HashSet<_> = [
             FormulaScope::OpaqueLeaves,
             FormulaScope::UnionLeaves,
@@ -10183,6 +10275,7 @@ mod tests {
         .collect();
 
         assert_eq!(forms.len(), 6);
+        assert!(!forms.contains(&ResidualLowering::BUILTIN_GROUPED_WITNESS_ROOT));
         assert_eq!(ResidualLowering::default(), ResidualLowering::CONSERVATIVE);
         assert_eq!(
             ResidualLowering::FULL,
@@ -13335,6 +13428,112 @@ mod tests {
         assert_eq!(nested_plan.len(), 1);
         assert!(nested_plan.finite_formula.root(0).is_none());
         assert_eq!(nested_plan.leaves[0].path.0.as_ref(), [0, 0]);
+    }
+
+    fn repeated_test_path(start: VariableId, end: VariableId) -> RegularPathConstraint {
+        use crate::id::{Id, ID_LEN};
+        use crate::trible::TribleSet;
+
+        let attribute = Id::new([211; ID_LEN]).unwrap();
+        RegularPathConstraint::new(
+            TribleSet::new(),
+            Variable::<GenId>::new(start),
+            Variable::<GenId>::new(end),
+            &[PathOp::Attr(attribute.raw()), PathOp::Plus],
+        )
+    }
+
+    #[test]
+    fn builtin_grouped_witness_root_keeps_no_witness_on_opaque_leaves() {
+        let root = IntersectionConstraint::new(vec![
+            shape_leaf(0),
+            shape_and(vec![shape_leaf(1), shape_leaf(2)]),
+        ]);
+        let selected =
+            ResidualPlan::compile_lowering(&root, ResidualLowering::BUILTIN_GROUPED_WITNESS_ROOT);
+        let opaque = ResidualPlan::compile_lowering(
+            &root,
+            ResidualLowering::new(FormulaScope::OpaqueLeaves, true),
+        );
+
+        assert_eq!(selected, opaque);
+        assert!(!selected.synthetic_root_formula);
+    }
+
+    #[test]
+    fn builtin_grouped_witness_root_opens_a_nested_repeated_path() {
+        let root = IntersectionConstraint::new(vec![
+            shape_leaf(2),
+            shape_and(vec![Box::new(repeated_test_path(0, 1)), shape_leaf(3)]),
+        ]);
+        let selected =
+            ResidualPlan::compile_lowering(&root, ResidualLowering::BUILTIN_GROUPED_WITNESS_ROOT);
+        let whole = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+
+        assert_eq!(selected, whole);
+        assert!(selected.synthetic_root_formula);
+    }
+
+    #[test]
+    fn builtin_grouped_witness_root_cannot_see_through_fully_hidden_ignore() {
+        let hidden = VariableSet::new_singleton(0)
+            .union(VariableSet::new_singleton(1))
+            .union(VariableSet::new_singleton(2));
+        let inner = IntersectionConstraint::new(vec![
+            Box::new(repeated_test_path(0, 1)) as ShapeConstraint,
+            shape_leaf(2),
+        ]);
+        let ignored = IgnoreConstraint::new(hidden, Box::new(inner));
+        let root =
+            IntersectionConstraint::new(vec![shape_leaf(3), Box::new(ignored) as ShapeConstraint]);
+        let selected =
+            ResidualPlan::compile_lowering(&root, ResidualLowering::BUILTIN_GROUPED_WITNESS_ROOT);
+        let opaque = ResidualPlan::compile_lowering(
+            &root,
+            ResidualLowering::new(FormulaScope::OpaqueLeaves, true),
+        );
+
+        assert_eq!(selected, opaque);
+        assert!(!selected.synthetic_root_formula);
+    }
+
+    #[test]
+    fn builtin_grouped_witness_root_distinguishes_debug_from_estimate_override() {
+        use crate::debug::query::{DebugConstraint, EstimateOverrideConstraint};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        type LocalConstraint = Box<dyn Constraint<'static>>;
+
+        let debug_root = IntersectionConstraint::new(vec![
+            Box::new(ShapeLeaf(2)) as LocalConstraint,
+            Box::new(DebugConstraint::new(
+                repeated_test_path(0, 1),
+                Rc::new(RefCell::new(Vec::new())),
+            )) as LocalConstraint,
+        ]);
+        let debug_selected = ResidualPlan::compile_lowering(
+            &debug_root,
+            ResidualLowering::BUILTIN_GROUPED_WITNESS_ROOT,
+        );
+        let debug_opaque = ResidualPlan::compile_lowering(
+            &debug_root,
+            ResidualLowering::new(FormulaScope::OpaqueLeaves, true),
+        );
+        assert_eq!(debug_selected, debug_opaque);
+        assert!(!debug_selected.synthetic_root_formula);
+
+        let estimate_root = IntersectionConstraint::new(vec![
+            Box::new(ShapeLeaf(2)) as LocalConstraint,
+            Box::new(EstimateOverrideConstraint::new(repeated_test_path(0, 1))) as LocalConstraint,
+        ]);
+        let estimate_selected = ResidualPlan::compile_lowering(
+            &estimate_root,
+            ResidualLowering::BUILTIN_GROUPED_WITNESS_ROOT,
+        );
+        let estimate_whole = ResidualPlan::compile_lowering(&estimate_root, ResidualLowering::FULL);
+        assert_eq!(estimate_selected, estimate_whole);
+        assert!(estimate_selected.synthetic_root_formula);
     }
 
     #[test]

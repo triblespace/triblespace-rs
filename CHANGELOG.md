@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **An experimental built-in grouped-witness selector chooses residual formula
+  scope without numeric cutoffs.** Transition programs stay enabled; the
+  complete root uses `WholeRoot` only when the executable exposed formula walk
+  reaches a grouped-confirm witness whose prerequisites remain visible, and
+  otherwise uses `OpaqueLeaves`. Opaque wrappers and fully hidden `Ignore`
+  scopes fail closed, while capability-transparent wrappers preserve the
+  witness.
 - **The cross-generation query benchmark can select every canonical residual
   lowering form.** `ENGINE_LOWERING` chooses formula scope and transition
   lowering independently, while the seven workload/backend cells retain exact

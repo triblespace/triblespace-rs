@@ -4746,6 +4746,10 @@ fn generated_combined_formula_rpq_matrix_matches_frozen_schedulers_and_is_monoto
             ResidualLowering::new(FormulaScope::UnionLeaves, true),
         ),
         ("whole-root-transitions", ResidualLowering::FULL),
+        (
+            "builtin-grouped-witness-root",
+            ResidualLowering::BUILTIN_GROUPED_WITNESS_ROOT,
+        ),
     ];
     let mut saw_root_cyclic_probe_one = false;
 
@@ -4837,6 +4841,35 @@ fn generated_combined_formula_rpq_matrix_matches_frozen_schedulers_and_is_monoto
     occurrences.sort_unstable();
     occurrences.dedup();
     assert_eq!(occurrences.len(), 2);
+}
+
+#[test]
+fn builtin_grouped_witness_root_enters_the_mixed_formula_delta_route_before_first_emit() {
+    let graph = GeneratedGraph::new(4);
+    let ops = vec![PathOp::Attr(graph.primary.raw()), PathOp::Plus];
+    let make_root = || generated_formula_root(&graph, &ops, GeneratedFormulaCase::PageLocalAnd);
+    let mut expected: Vec<_> = Query::new(make_root(), project_end).sequential().collect();
+    expected.sort_unstable();
+
+    let mut selected = Query::new(make_root(), project_end)
+        .solve_residual_state_lazy_with(ResidualLowering::BUILTIN_GROUPED_WITNESS_ROOT)
+        .cap(1)
+        .start_width(1);
+    let first = selected.next().expect("the mixed query has one endpoint");
+    let first_stats = selected.stats().clone();
+    assert!(
+        first_stats.delta_nonterminal_calls > 0,
+        "the structural selector never invoked its mixed delta continuation: {first_stats:#?}"
+    );
+    assert!(
+        first_stats.delta_handoff_probe_pops > 0,
+        "no exact mixed-formula handoff receipt was consumed before emission: {first_stats:#?}"
+    );
+
+    let mut actual = vec![first];
+    actual.extend(selected);
+    actual.sort_unstable();
+    assert_eq!(actual, expected);
 }
 
 #[test]

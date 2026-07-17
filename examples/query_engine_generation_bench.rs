@@ -77,9 +77,11 @@ fn benchmark_lowering() -> triblespace::core::query::residual::ResidualLowering 
         Ok("union-transitions") => ResidualLowering::new(FormulaScope::UnionLeaves, true),
         Ok("whole") => ResidualLowering::new(FormulaScope::WholeRoot, false),
         Ok("whole-transitions") | Err(_) => ResidualLowering::FULL,
+        Ok("builtin-grouped-witness-root") => ResidualLowering::BUILTIN_GROUPED_WITNESS_ROOT,
         Ok(other) => panic!(
             "unknown ENGINE_LOWERING={other:?}; expected opaque, opaque-transitions, \
-             union, union-transitions, whole, or whole-transitions"
+             union, union-transitions, whole, whole-transitions, or \
+             builtin-grouped-witness-root"
         ),
     })
 }
@@ -89,6 +91,7 @@ fn benchmark_lowering_name() -> &'static str {
     use triblespace::core::query::residual::{FormulaScope, ResidualLowering};
 
     match benchmark_lowering() {
+        ResidualLowering::BUILTIN_GROUPED_WITNESS_ROOT => "builtin-grouped-witness-root",
         lowering if lowering == ResidualLowering::new(FormulaScope::OpaqueLeaves, false) => {
             "opaque"
         }
@@ -101,7 +104,7 @@ fn benchmark_lowering_name() -> &'static str {
         }
         lowering if lowering == ResidualLowering::new(FormulaScope::WholeRoot, false) => "whole",
         lowering if lowering == ResidualLowering::FULL => "whole-transitions",
-        _ => unreachable!("ResidualLowering has exactly six canonical forms"),
+        _ => unreachable!("benchmark selected an unsupported ResidualLowering"),
     }
 }
 
