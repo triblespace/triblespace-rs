@@ -16,6 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Quiescent proposal ordering has a scheduler-independent affine
+  construction proof.** Bounded arrival pages enter a segmented occurrence
+  store; explicit non-cloneable Seal credits create singleton immutable runs,
+  and explicit Merge credits perform binary LSM carries plus deterministic
+  final consolidation with at most the supplied grant per transition. The
+  completed sorted bag remains segmented and exposes an affine page cursor, so
+  no terminal `sort`, collect, or flatten is hidden in the prototype. It is
+  intentionally not wired into the delta scheduler until the unified Program
+  work/credit queue can host those transitions. Advance APIs require positive
+  grants; exact deep cloning is `O(remainder)` and outside the per-step grant.
 - **Grouped Confirm reduction is an affine pageable scheduler lane.** Graph
   quiescence moves the original candidate bag and accepted endpoint set into
   typed `ConfirmFinalize` work with its own live producer credit. Each step
