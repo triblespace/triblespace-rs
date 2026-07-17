@@ -1873,31 +1873,304 @@ struct ProgramTask {
     work: ProgramWork,
 }
 
+/// Physical Program-call class after removing activation-local reducer state.
+///
+/// Search pages may mix streaming and quiescent reducers because reducer
+/// finalization happens after the typed call and does not change its physical
+/// source shape. Activation-paced work retains the publication distinction:
+/// streaming work may use every compatible activation, while quiescent work
+/// admits only a bounded number of independent reducers. Terminal streaming
+/// remains its own physical feedback class at either pacing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ProgramDispatchKey {
-    dispatch: DispatchClass,
-    pacing: ProgramPacing,
-    bound: VariableSet,
-    has_candidates: bool,
-    publication: TransitionDispatchKey,
+enum ProgramCohortClass {
+    Search { physical: DeltaPhysicalClass },
+    ActivationStreaming,
+    ActivationQuiescent,
+    ActivationTerminalStreaming,
 }
 
-impl ProgramDispatchKey {
+impl ProgramCohortClass {
+    fn of(registry: &ProducerRegistry, task: &ProgramTask) -> Self {
+        let physical = registry.physical_activation_class(task.activation);
+        match task.work.pacing {
+            ProgramPacing::Search => Self::Search { physical },
+            ProgramPacing::Activation if physical == DeltaPhysicalClass::TerminalStreaming => {
+                Self::ActivationTerminalStreaming
+            }
+            ProgramPacing::Activation if registry.activation_streams(task.activation) => {
+                Self::ActivationStreaming
+            }
+            ProgramPacing::Activation => Self::ActivationQuiescent,
+        }
+    }
+
+    fn pacing(self) -> ProgramPacing {
+        match self {
+            Self::Search { .. } => ProgramPacing::Search,
+            Self::ActivationStreaming
+            | Self::ActivationQuiescent
+            | Self::ActivationTerminalStreaming => ProgramPacing::Activation,
+        }
+    }
+}
+
+/// Exact compatibility key for one erased typed Program call.
+///
+/// Activation identity deliberately remains on [`ProgramTask`]. It is reducer
+/// payload and affine feedback authority, not a property of the physical call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProgramCohortKey {
+    dispatch: DispatchClass,
+    bound: VariableSet,
+    has_candidates: bool,
+    class: ProgramCohortClass,
+}
+
+impl ProgramCohortKey {
     fn of(registry: &ProducerRegistry, task: &ProgramTask) -> Self {
         let (bound, has_candidates) = registry.source_dispatch_shape(task.activation);
         Self {
             dispatch: task.work.dispatch,
-            pacing: task.work.pacing,
             bound,
             has_candidates,
-            publication: TransitionDispatchKey::for_activation(registry, task.activation),
+            class: ProgramCohortClass::of(registry, task),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum ProgramSelectionOrder {
+    Lifo,
+    Append,
+}
+
+struct ProgramSelection {
+    key: ProgramCohortKey,
+    tasks: Vec<ProgramTask>,
+    limits: Vec<usize>,
 }
 
 #[derive(Default)]
 struct ProgramBucket {
     tasks: Vec<ProgramTask>,
+}
+
+impl ProgramBucket {
+    fn len(&self) -> usize {
+        self.tasks.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
+    }
+
+    fn last(&self) -> Option<&ProgramTask> {
+        self.tasks.last()
+    }
+
+    fn append(&mut self, tasks: &mut Vec<ProgramTask>) {
+        self.tasks.append(tasks);
+    }
+
+    fn contains_activation(&self, activation: ActivationId) -> bool {
+        self.tasks
+            .iter()
+            .any(|task| task.activation == activation)
+    }
+
+    /// Takes the newest matching tasks, preserving either physical LIFO order
+    /// or their original append order. Retained tasks always keep append
+    /// order, so selection is a stable partition of the stored bucket.
+    fn take_matching(
+        &mut self,
+        width: usize,
+        order: ProgramSelectionOrder,
+        mut matches: impl FnMut(&ProgramTask) -> bool,
+    ) -> Vec<ProgramTask> {
+        let width = width.max(1);
+        let mut selected = Vec::with_capacity(width.min(self.tasks.len()));
+        let mut retained = Vec::with_capacity(self.tasks.len());
+        for task in std::mem::take(&mut self.tasks).into_iter().rev() {
+            if selected.len() < width && matches(&task) {
+                selected.push(task);
+            } else {
+                retained.push(task);
+            }
+        }
+        retained.reverse();
+        self.tasks = retained;
+        if matches!(order, ProgramSelectionOrder::Append) {
+            selected.reverse();
+        }
+        selected
+    }
+
+    /// Directed latency selection remains activation-affine. Search pages use
+    /// their established LIFO cursor order; transition-like Activation pages
+    /// return the selected suffix in append order so geometric feedback sees
+    /// the same progression as the legacy delta queue.
+    fn take_active(
+        &mut self,
+        registry: &ProducerRegistry,
+        activation: ActivationId,
+        search_width: usize,
+    ) -> ProgramSelection {
+        let key = self
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.activation == activation)
+            .map(|task| ProgramCohortKey::of(registry, task))
+            .expect("active typed program lost its affine task");
+        let width = match key.class.pacing() {
+            ProgramPacing::Search => registry.source_dispatch_width(activation, search_width),
+            ProgramPacing::Activation => {
+                registry.transition_dispatch_width(activation, search_width)
+            }
+        };
+        let order = match key.class.pacing() {
+            ProgramPacing::Search => ProgramSelectionOrder::Lifo,
+            ProgramPacing::Activation => ProgramSelectionOrder::Append,
+        };
+        let tasks = self.take_matching(width, order, |task| {
+            task.activation == activation && ProgramCohortKey::of(registry, task) == key
+        });
+        assert!(!tasks.is_empty(), "active typed program pop was empty");
+        let limits = even_limits(width, tasks.len());
+        ProgramSelection { key, tasks, limits }
+    }
+
+    /// Selects one global physical Program cohort. The hot tail chooses the
+    /// exact normalized call key; class-specific policy controls only order,
+    /// activation breadth, and terminal per-activation budgets.
+    fn take_global(
+        &mut self,
+        registry: &ProducerRegistry,
+        search_width: usize,
+        activation_width: usize,
+        terminal_selection_slots: &mut AHashMap<ActivationId, usize>,
+        terminal_selections: &mut Vec<TerminalActivationSelection>,
+    ) -> ProgramSelection {
+        let hot = self.last().expect("typed program bucket is nonempty");
+        let key = ProgramCohortKey::of(registry, hot);
+        match key.class {
+            ProgramCohortClass::Search { .. } => {
+                let width = registry.source_dispatch_width(hot.activation, search_width);
+                let tasks = self.take_matching(width, ProgramSelectionOrder::Lifo, |task| {
+                    ProgramCohortKey::of(registry, task) == key
+                });
+                let limits = even_limits(width, tasks.len());
+                ProgramSelection { key, tasks, limits }
+            }
+            ProgramCohortClass::ActivationStreaming => {
+                let width = registry.transition_dispatch_width(hot.activation, search_width);
+                let tasks = self.take_matching(width, ProgramSelectionOrder::Append, |task| {
+                    ProgramCohortKey::of(registry, task) == key
+                });
+                let limits = even_limits(width, tasks.len());
+                ProgramSelection { key, tasks, limits }
+            }
+            ProgramCohortClass::ActivationQuiescent => {
+                let width = registry.transition_dispatch_width(hot.activation, search_width);
+                let activation_width = activation_width.max(1);
+                let mut activations = AHashSet::new();
+                let tasks = self.take_matching(width, ProgramSelectionOrder::Append, |task| {
+                    if ProgramCohortKey::of(registry, task) != key {
+                        return false;
+                    }
+                    activations.contains(&task.activation)
+                        || (activations.len() < activation_width
+                            && activations.insert(task.activation))
+                });
+                let limits = even_limits(width, tasks.len());
+                ProgramSelection { key, tasks, limits }
+            }
+            ProgramCohortClass::ActivationTerminalStreaming => self.take_terminal(
+                registry,
+                key,
+                search_width,
+                terminal_selection_slots,
+                terminal_selections,
+            ),
+        }
+    }
+
+    /// Assigns each admitted terminal activation its independent sparse
+    /// quantum, selects the newest tasks covered by those grants, then returns
+    /// `(task, limit)` pairs in original append order. Ordering the pair—not
+    /// merely the task—keeps budgets aligned when activations are interleaved.
+    fn take_terminal(
+        &mut self,
+        registry: &ProducerRegistry,
+        key: ProgramCohortKey,
+        search_width: usize,
+        terminal_selection_slots: &mut AHashMap<ActivationId, usize>,
+        terminal_selections: &mut Vec<TerminalActivationSelection>,
+    ) -> ProgramSelection {
+        let width = search_width.max(1);
+        let tasks = std::mem::take(&mut self.tasks);
+        let mut remaining = width;
+        terminal_selection_slots.clear();
+        terminal_selections.clear();
+        for task in tasks.iter().rev() {
+            if ProgramCohortKey::of(registry, task) != key
+                || terminal_selection_slots.contains_key(&task.activation)
+            {
+                continue;
+            }
+            let budget = registry
+                .transition_dispatch_width(task.activation, search_width)
+                .min(remaining);
+            let slot = terminal_selections.len();
+            terminal_selections.push(TerminalActivationSelection {
+                activation: task.activation,
+                budget,
+                selected: 0,
+                ordinal: 0,
+            });
+            terminal_selection_slots.insert(task.activation, slot);
+            remaining -= budget;
+            if remaining == 0 {
+                break;
+            }
+        }
+
+        let mut selected = Vec::new();
+        let mut retained = Vec::with_capacity(tasks.len());
+        for task in tasks.into_iter().rev() {
+            let selection = (ProgramCohortKey::of(registry, &task) == key)
+                .then(|| terminal_selection_slots.get(&task.activation).copied())
+                .flatten();
+            if let Some(slot) = selection
+                .filter(|&slot| terminal_selections[slot].selected < terminal_selections[slot].budget)
+            {
+                terminal_selections[slot].selected += 1;
+                selected.push(task);
+            } else {
+                retained.push(task);
+            }
+        }
+        selected.reverse();
+        retained.reverse();
+        self.tasks = retained;
+
+        let mut limits = Vec::with_capacity(selected.len());
+        for task in &selected {
+            let selection =
+                &mut terminal_selections[terminal_selection_slots[&task.activation]];
+            debug_assert!(selection.selected > 0);
+            let quotient = selection.budget / selection.selected;
+            let remainder = selection.budget % selection.selected;
+            limits.push(quotient + usize::from(selection.ordinal < remainder));
+            selection.ordinal += 1;
+        }
+        debug_assert!(limits.iter().all(|&limit| limit > 0));
+        ProgramSelection {
+            key,
+            tasks: selected,
+            limits,
+        }
+    }
 }
 
 #[derive(Debug)]
