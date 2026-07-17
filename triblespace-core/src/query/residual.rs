@@ -46,19 +46,23 @@
 //! Lazy width is unchanged while nonempty successors advance. Once a partial
 //! action activates an exact continuation cohort, that lineage outranks cold
 //! siblings—even when it merges into an already-live bucket—until it emits or
-//! dies. Width grows geometrically after an action dies or raw rows reach
-//! projection, so a negative prefix can widen within a single pull.
+//! dies. Search width grows geometrically after negative work, while a
+//! separate projected-result window grows only after the caller consumes the
+//! whole window and pulls again.
 //!
 //! Ordered cyclic sources retain an affine cursor per activation while a
 //! separate physical layer cohorts activations with the same row schema,
 //! candidate mode, and cursor family. One same-schema block-native hook gets
 //! ragged per-parent limits whose sum is the current global width, so batching
 //! does not multiply the geometric work budget or refine canonical state
-//! identity. A cyclic activation seeded from a singleton stable continuation
-//! receives a scalar physical lease. When it publishes an accepted endpoint,
-//! the stable tail runs first while a still-live activation token remains
-//! suspended; the next pull resumes that exact affine traversal rather than
-//! abandoning its locality to cold global harvesting.
+//! identity. A final-variable streaming activation is admitted one parent at
+//! a time and gets an activation-affine physical lease bounded by confirmed
+//! result demand, sparse-search effort, and the independent search width. When
+//! it publishes an accepted endpoint, the stable tail runs first while a
+//! still-live activation token remains suspended; the next pull resumes that
+//! exact affine traversal rather than abandoning locality to cold harvesting.
+//! This first causal probe has bounded leases but no strong fairness rotation
+//! across perpetually productive terminal activations.
 //!
 //! As with the other batched engines, flattened leaves must obey the
 //! [`Constraint::estimate`] protocol: relevance is a structural answer,
@@ -86,11 +90,6 @@ use delta::{
     ActiveDeltaContinuation, ActiveDeltaStatus, DeltaDesc, DeltaScheduler, DeltaSeedOutcome,
     DeltaStepOutcome,
 };
-
-/// Directed cyclic work stays scalar after the global harvest width grows.
-/// This first-cut lease isolates activation affinity from batching; a later
-/// policy may spend a bounded examined-work quantum instead.
-const ACTIVE_DELTA_LEASE_WIDTH: usize = 1;
 
 /// One deterministic route from the owned root to an opaque residual leaf.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2103,6 +2102,47 @@ pub struct ResidualStateStats {
     pub delta_active_post_yield_resumptions: usize,
     /// Directed cyclic leases released because their activation quiesced.
     pub delta_active_quiescent_releases: usize,
+    /// Cold terminal-streaming proposal actions admitted into the cyclic
+    /// scheduler. Each admission transfers exactly one affine parent.
+    pub delta_terminal_admissions: usize,
+    /// Parent rows refiled under the same canonical proposal state when a
+    /// terminal admission split a wider selected chunk.
+    pub delta_terminal_admission_remainders: usize,
+    /// Physical source/transition calls serving terminal-streaming work.
+    pub delta_terminal_calls: usize,
+    /// Physical source/transition calls serving all other cyclic work.
+    pub delta_nonterminal_calls: usize,
+    /// Sum of bounded examined-work budgets requested for terminal calls.
+    pub delta_terminal_work_budget: usize,
+    /// Largest bounded examined-work budget requested for one terminal call.
+    pub max_delta_terminal_work_budget: usize,
+    /// Affine source/transition tasks actually included in terminal calls.
+    pub delta_terminal_tasks: usize,
+    /// Largest exact-activation task cohort in one terminal call.
+    pub max_delta_terminal_task_cohort: usize,
+    /// Compatible and incompatible scheduler tasks left cold after terminal
+    /// pops, sampled as the selected structural bucket's physical remainder.
+    pub delta_terminal_remainder_tasks: usize,
+    /// Source and transition candidates examined by terminal calls.
+    pub delta_terminal_candidates_examined: usize,
+    /// Terminal calls that filed at least one stable continuation.
+    pub delta_terminal_publications: usize,
+    /// Publication resets that changed a terminal activation's local sparse
+    /// quantum back to the still-open projected-demand remainder.
+    pub delta_terminal_sparse_resets: usize,
+    /// Live no-publication calls that doubled a terminal activation's local
+    /// sparse-search quantum toward the independent search width.
+    pub delta_terminal_sparse_widenings: usize,
+    /// Projected result windows opened after the initial width-one window.
+    /// A window opens only when the caller pulls again after consuming every
+    /// projected result in the previous window.
+    pub terminal_demand_windows_opened: usize,
+    /// Numeric doublings of the confirmed projected-result demand width.
+    /// Reopening a saturated window does not increment this counter.
+    pub terminal_demand_width_promotions: usize,
+    /// Rows accepted by the query postprocessor and charged to confirmed
+    /// terminal demand. Raw bindings rejected by projection are excluded.
+    pub terminal_demand_projected_rows: usize,
 }
 
 /// Results and measurements from [`Query::solve_residual_state_profiled`].
@@ -2878,6 +2918,26 @@ impl Hash for StateDesc {
         }
         self.phase.hash(state);
     }
+}
+
+/// Physical terminal-publication predicate shared by stable admission and
+/// cyclic activation classification. It deliberately reads canonical state
+/// but never contributes a bit to that state's identity.
+fn commits_final_checked_candidate(desc: &StateDesc, full: VariableSet) -> bool {
+    let ResidualPhase::Candidate {
+        variable,
+        relevant,
+        checked,
+    } = &desc.phase
+    else {
+        return false;
+    };
+    if relevant != checked {
+        return false;
+    }
+    let mut committed = desc.bound;
+    committed.set(*variable);
+    committed == full
 }
 
 impl StateDesc {
@@ -6902,6 +6962,12 @@ struct ResidualStateMachine {
     continuation_sprint_enabled: bool,
     last_selection: SelectionKind,
     last_was_action: bool,
+    /// Independent confirmed projected-result window. Unlike `width`, this
+    /// currency never controls nonterminal search batching and advances only
+    /// after the caller demonstrates demand past a fully consumed window.
+    terminal_demand_width: usize,
+    terminal_demand_consumed: usize,
+    terminal_demand_exhausted: bool,
     width: usize,
     growth: usize,
     cap: usize,
@@ -7115,6 +7181,9 @@ impl ResidualStateMachine {
             continuation_sprint_enabled: true,
             last_selection: SelectionKind::Readiness,
             last_was_action: false,
+            terminal_demand_width: 1,
+            terminal_demand_consumed: 0,
+            terminal_demand_exhausted: false,
             width: lazy_start_width().clamp(1, cap),
             growth: lazy_growth(),
             cap,
@@ -7393,46 +7462,23 @@ impl ResidualStateMachine {
         let variable = *variable;
         let proposer = *proposer;
         let relevant = relevant.clone();
+        let successor = StateDesc {
+            bound: task.desc.bound,
+            phase: ResidualPhase::Candidate {
+                variable,
+                relevant: relevant.clone(),
+                checked: checked.clone(),
+            },
+        };
+        let terminal_streaming = commits_final_checked_candidate(&successor, self.full);
 
         let vars: Vec<VariableId> = task.desc.bound.into_iter().collect();
         let view = rows_view(&vars, &rows.rows, rows.row_count);
         let constraint = plan.resolve(root, proposer);
-        if constraint.residual_delta_source_is_paged(variable, &view)
-            || constraint.residual_proposal_source_is_paged(variable, &view)
-        {
-            let SelectedResidualTask {
-                state: _,
-                desc,
-                bucket,
-            } = task;
-            let StateBucket::Rows(rows) = bucket else {
-                unreachable!("delta proposer was checked above")
-            };
-            self.stats.propose_action_pops += 1;
-            self.stats.propose_calls += 1;
-            self.stats.propose_rows += rows.row_count;
-            self.stats.max_propose_rows = self.stats.max_propose_rows.max(rows.row_count);
-            let successor = StateDesc {
-                bound: desc.bound,
-                phase: ResidualPhase::Candidate {
-                    variable,
-                    relevant,
-                    checked,
-                },
-            };
-            let active = self.delta.seed_source_proposals(
-                DeltaDesc::leaf(variable, proposer),
-                successor,
-                rows,
-            );
-            return Ok(DeltaSeedOutcome {
-                continuation: None,
-                active,
-            });
-        }
+        let paged = constraint.residual_delta_source_is_paged(variable, &view)
+            || constraint.residual_proposal_source_is_paged(variable, &view);
         let mut seeds = Vec::new();
-        let supported = constraint.residual_delta_seeds(variable, &view, &mut seeds);
-        if !supported {
+        if !paged && !constraint.residual_delta_seeds(variable, &view, &mut seeds) {
             assert!(
                 seeds.is_empty(),
                 "unsupported delta seed hook mutated its output"
@@ -7440,30 +7486,66 @@ impl ResidualStateMachine {
             return Err(task);
         }
         let SelectedResidualTask {
-            state: _,
+            state,
             desc,
-            bucket,
+            mut bucket,
         } = task;
-        let StateBucket::Rows(rows) = bucket else {
+        let StateBucket::Rows(selected_rows) = &bucket else {
             unreachable!("delta proposer was checked above")
+        };
+        let selected_parent = selected_rows.row_count - 1;
+        if terminal_streaming && selected_rows.row_count > 1 {
+            let admitted = bucket.take_tail(desc.bound.count(), 1, false);
+            let remainder_rows = bucket.row_count();
+            let receipt = file_with_plan(
+                &mut self.worklist,
+                &mut self.interner,
+                plan,
+                desc.clone(),
+                bucket,
+                &mut self.stats,
+            )
+            .expect("terminal admission remainder is nonempty");
+            debug_assert_eq!(receipt.state, state);
+            bucket = admitted;
+            self.stats.delta_terminal_admissions += 1;
+            self.stats.delta_terminal_admission_remainders += remainder_rows;
+            if !paged {
+                seeds.retain(|seed| seed.parent as usize == selected_parent);
+                for seed in &mut seeds {
+                    seed.parent = 0;
+                }
+            }
+        } else if terminal_streaming {
+            self.stats.delta_terminal_admissions += 1;
+        }
+        let StateBucket::Rows(rows) = bucket else {
+            unreachable!("terminal admission preserved proposal rows")
         };
         self.stats.propose_action_pops += 1;
         self.stats.propose_calls += 1;
         self.stats.propose_rows += rows.row_count;
         self.stats.max_propose_rows = self.stats.max_propose_rows.max(rows.row_count);
-        let successor = StateDesc {
-            bound: desc.bound,
-            phase: ResidualPhase::Candidate {
-                variable,
-                relevant,
-                checked,
-            },
-        };
-        let outcome = self.delta.seed_proposals(
+        if paged {
+            let seeded_parents = rows.row_count;
+            let active = self.delta.seed_source_proposals_with_full(
+                DeltaDesc::leaf(variable, proposer),
+                successor,
+                rows,
+                self.full,
+            );
+            return Ok(DeltaSeedOutcome {
+                continuation: None,
+                active,
+                seeded_parents,
+            });
+        }
+        let outcome = self.delta.seed_proposals_with_full(
             DeltaDesc::leaf(variable, proposer),
             successor,
             rows,
             seeds,
+            self.full,
             plan,
             &mut self.worklist,
             &mut self.interner,
@@ -7549,6 +7631,7 @@ impl ResidualStateMachine {
                     checked: checked.with_inserted(confirmer),
                 },
             };
+            let seeded_parents = batch.parents.row_count;
             let active = self.delta.seed_source_confirms(
                 DeltaDesc::leaf(variable, confirmer),
                 successor,
@@ -7557,6 +7640,7 @@ impl ResidualStateMachine {
             return Ok(DeltaSeedOutcome {
                 continuation: None,
                 active,
+                seeded_parents,
             });
         }
         let mut seeds = Vec::new();
@@ -7592,6 +7676,7 @@ impl ResidualStateMachine {
                 checked: checked.with_inserted(confirmer),
             },
         };
+        let seeded_parents = batch.parents.row_count;
         let active = self.delta.seed_confirms(
             DeltaDesc::leaf(variable, confirmer),
             successor,
@@ -7601,6 +7686,7 @@ impl ResidualStateMachine {
         Ok(DeltaSeedOutcome {
             continuation: None,
             active,
+            seeded_parents,
         })
     }
 
@@ -7738,6 +7824,7 @@ impl ResidualStateMachine {
             }
         }
         if paged {
+            let seeded_parents = batch.parents.row_count;
             let active = self.delta.seed_source_formula(
                 DeltaDesc::formula(variable, occurrence, node),
                 desc.bound,
@@ -7749,6 +7836,7 @@ impl ResidualStateMachine {
             return Ok(DeltaSeedOutcome {
                 continuation: None,
                 active,
+                seeded_parents,
             });
         }
         Ok(self.delta.seed_formula(
@@ -7774,11 +7862,11 @@ impl ResidualStateMachine {
         influences: &[VariableSet; 128],
         base_estimates: &[usize; 128],
     ) -> MachineStep {
-        let seeded_parents = task.bucket.row_count();
         let task = match self.seed_delta_proposal(root, plan, task) {
             Ok(DeltaSeedOutcome {
                 continuation,
                 active,
+                seeded_parents,
             }) => {
                 return MachineStep::DeltaSeeded {
                     continuation,
@@ -7792,6 +7880,7 @@ impl ResidualStateMachine {
             Ok(DeltaSeedOutcome {
                 continuation,
                 active,
+                seeded_parents,
             }) => {
                 return MachineStep::DeltaSeeded {
                     continuation,
@@ -7805,6 +7894,7 @@ impl ResidualStateMachine {
             Ok(DeltaSeedOutcome {
                 continuation,
                 active,
+                seeded_parents,
             }) => {
                 return MachineStep::DeltaSeeded {
                     continuation,
@@ -8032,6 +8122,48 @@ impl ResidualStateMachine {
         self.emit_count = rows.row_count;
     }
 
+    /// Opens the next confirmed terminal-demand window at a public pull
+    /// boundary. Producing the last row in a window merely marks exhaustion;
+    /// only a later pull proves that the caller wanted more.
+    fn confirm_terminal_demand(&mut self) {
+        if !self.terminal_demand_exhausted {
+            return;
+        }
+        let next = self
+            .terminal_demand_width
+            .saturating_mul(2)
+            .clamp(1, self.cap);
+        self.stats.terminal_demand_windows_opened += 1;
+        if next > self.terminal_demand_width {
+            self.stats.terminal_demand_width_promotions += 1;
+        }
+        self.terminal_demand_width = next;
+        self.terminal_demand_consumed = 0;
+        self.terminal_demand_exhausted = false;
+    }
+
+    fn terminal_demand_remaining(&self) -> usize {
+        debug_assert!(!self.terminal_demand_exhausted);
+        self.terminal_demand_width
+            .saturating_sub(self.terminal_demand_consumed)
+            .max(1)
+    }
+
+    fn charge_projected_result(&mut self) {
+        debug_assert!(!self.terminal_demand_exhausted);
+        self.terminal_demand_consumed = self
+            .terminal_demand_consumed
+            .checked_add(1)
+            .expect("terminal demand consumption overflow");
+        self.stats.terminal_demand_projected_rows += 1;
+        assert!(
+            self.terminal_demand_consumed <= self.terminal_demand_width,
+            "projected results exceeded the open terminal-demand window"
+        );
+        self.terminal_demand_exhausted =
+            self.terminal_demand_consumed == self.terminal_demand_width;
+    }
+
     fn pull_with_dispatch<'a, P, R>(
         &mut self,
         dispatch: &impl ResidualActionDispatch,
@@ -8044,6 +8176,7 @@ impl ResidualStateMachine {
     where
         P: Fn(&Binding) -> Option<R>,
     {
+        self.confirm_terminal_demand();
         loop {
             while self.emit_next < self.emit_count {
                 let row = self.emit_next;
@@ -8056,6 +8189,7 @@ impl ResidualStateMachine {
                     self.binding.set(variable, &self.emit_rows[start + column]);
                 }
                 if let Some(result) = postprocessing(&self.binding) {
+                    self.charge_projected_result();
                     return Some(result);
                 }
             }
@@ -8064,6 +8198,7 @@ impl ResidualStateMachine {
             }
 
             let width = self.width;
+            let terminal_demand_remaining = self.terminal_demand_remaining();
             // A newly seeded activation on the scalar continuation path is
             // the cyclic analogue of `ActiveContinuation`: follow that exact
             // affine lineage before any cold stable cohort. It owns no work;
@@ -8075,11 +8210,12 @@ impl ResidualStateMachine {
                     self.stats.delta_active_post_yield_resumptions +=
                         usize::from(self.active_delta_after_yield);
                     self.active_delta_after_yield = false;
-                    let focused = self.delta.step_active(
+                    let focused = self.delta.step_active_with_demand(
                         root,
                         plan,
                         active,
-                        ACTIVE_DELTA_LEASE_WIDTH,
+                        width,
+                        terminal_demand_remaining,
                         &mut self.worklist,
                         &mut self.interner,
                         &mut self.stats,
@@ -8107,10 +8243,11 @@ impl ResidualStateMachine {
                 && !self.delta.is_empty()
                 && !self.has_full_stable(plan, width)
             {
-                let outcome = self.delta.step(
+                let outcome = self.delta.step_with_demand(
                     root,
                     plan,
                     width,
+                    terminal_demand_remaining,
                     &mut self.worklist,
                     &mut self.interner,
                     &mut self.stats,
@@ -8137,7 +8274,6 @@ impl ResidualStateMachine {
                 MachineStep::Stable(StepOutcome::Emit(rows)) => {
                     self.continuation = None;
                     self.stage_emit(rows);
-                    self.increase_width();
                     self.increase_delta_activation_width();
                 }
                 MachineStep::DeltaSeeded {
@@ -8228,6 +8364,9 @@ impl ResidualStateMachine {
             continuation_sprint_enabled: self.continuation_sprint_enabled,
             last_selection: SelectionKind::Readiness,
             last_was_action: false,
+            terminal_demand_width: self.terminal_demand_width,
+            terminal_demand_consumed: 0,
+            terminal_demand_exhausted: false,
             width: self.width,
             growth: self.growth,
             cap: self.cap,
@@ -8363,11 +8502,13 @@ impl ResidualStateMachine {
             // One unsplittable affine atom remains. Advance the exact machine
             // rather than manufacturing a second query from the seed.
             let width = self.width.max(1);
+            let terminal_demand_remaining = self.terminal_demand_remaining();
             if !self.delta.is_empty() && !self.has_full_stable(plan, width) {
-                let outcome = self.delta.step(
+                let outcome = self.delta.step_with_demand(
                     root,
                     plan,
                     width,
+                    terminal_demand_remaining,
                     &mut self.worklist,
                     &mut self.interner,
                     &mut self.stats,
@@ -8401,7 +8542,6 @@ impl ResidualStateMachine {
                 }
                 MachineStep::Stable(StepOutcome::Emit(rows)) => {
                     self.stage_emit(rows);
-                    self.increase_width();
                     self.increase_delta_activation_width();
                 }
             }
@@ -8451,9 +8591,11 @@ impl ResidualStateMachine {
 /// The iterator begins with a narrow desired actionable width, so full
 /// descendant buckets can produce a result before sibling rows or candidate
 /// values are evaluated.
-/// With a growth factor above one, semantic branch death or raw terminal output
-/// immediately prepares a geometrically wider width for later frontier work;
-/// filing any nonempty successor leaves the width unchanged. When a full
+/// With a growth factor above one, semantic branch death prepares a
+/// geometrically wider search width for later frontier work; filing a nonempty
+/// successor or staging raw output leaves that search width unchanged. A
+/// separate `1, 2, 4, ...` projected-result window advances only when the
+/// caller pulls after consuming its previous window. When a full
 /// Propose or Confirm action files fewer actionable atoms than that width, the
 /// coalesced-receipt physical tail becomes hot and outranks cold sibling
 /// harvesting until it emits or dies. Planning splits and readiness pops do not
@@ -8615,6 +8757,7 @@ impl<C, P: Fn(&Binding) -> Option<R>, R> ResidualStateIter<C, P, R> {
     pub fn cap(mut self, cap: usize) -> Self {
         self.state.cap = cap.max(1);
         self.state.width = self.state.width.min(self.state.cap);
+        self.state.terminal_demand_width = self.state.terminal_demand_width.min(self.state.cap);
         self
     }
 
@@ -8844,9 +8987,11 @@ where
     /// physical tail becomes the next continuation; it remains ahead of cold
     /// sibling harvesting until it emits or dies. Planning splits and
     /// readiness-selected work cannot activate a sprint themselves, but may
-    /// carry an already-hot lineage forward. Death or raw terminal output grows
-    /// the width geometrically for later work. Whenever no continuation is hot
-    /// and no live state can fill the desired width, the minimum-rank state
+    /// carry an already-hot lineage forward. Negative work grows the search
+    /// width geometrically; producing raw terminal rows does not. Confirmed
+    /// projected-result demand is tracked independently and grows only at a
+    /// later pull boundary. Whenever no continuation is hot and no live state
+    /// can fill the desired search width, the minimum-rank state
     /// drains readiness-safely. Result order may differ from the ordinary
     /// iterator; a full drain preserves its result multiset.
     ///
@@ -9701,6 +9846,95 @@ mod tests {
                 examined: end - offset,
             })
         }
+    }
+
+    #[test]
+    fn projected_demand_promotes_only_on_the_pull_after_a_consumed_window() {
+        let projected_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&projected_calls);
+        let mut query = Query::new(
+            FanoutLeaf {
+                variable: 0,
+                values: Arc::new((0..8).map(raw).collect()),
+            },
+            move |binding: &Binding| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                let value = *binding.get(0)?;
+                (value[0] % 2 == 0).then_some(value)
+            },
+        )
+        .solve_residual_state_lazy()
+        .cap(8)
+        .start_width(1)
+        .growth(2);
+
+        assert!(query.next().is_some());
+        assert_eq!(query.state.terminal_demand_width, 1);
+        assert!(query.state.terminal_demand_exhausted);
+        assert_eq!(query.stats().terminal_demand_width_promotions, 0);
+        assert!(projected_calls.load(Ordering::Relaxed) > 1);
+        assert_eq!(query.stats().terminal_demand_projected_rows, 1);
+
+        assert!(query.next().is_some());
+        assert_eq!(query.state.terminal_demand_width, 2);
+        assert_eq!(query.state.terminal_demand_consumed, 1);
+        assert!(!query.state.terminal_demand_exhausted);
+        assert_eq!(query.stats().terminal_demand_width_promotions, 1);
+        assert_eq!(
+            query.current_width(),
+            1,
+            "q promotion must not widen search S"
+        );
+
+        assert!(query.next().is_some());
+        assert!(query.state.terminal_demand_exhausted);
+        assert_eq!(query.stats().terminal_demand_projected_rows, 3);
+        assert_eq!(query.stats().terminal_demand_width_promotions, 1);
+    }
+
+    #[test]
+    fn terminal_admission_refiles_wide_parents_and_dispatches_one_activation() {
+        let root = IntersectionConstraint::new(vec![
+            Box::new(FanoutLeaf {
+                variable: 0,
+                values: Arc::new((0..4).map(raw).collect()),
+            }) as ShapeConstraint,
+            Box::new(PagedProposalLeaf {
+                variable: 1,
+                values: Arc::new((32..48).map(raw).collect()),
+                transition_source: false,
+                proposes: Arc::new(AtomicUsize::new(0)),
+                pages: Arc::new(AtomicUsize::new(0)),
+            }) as ShapeConstraint,
+        ]);
+        let profiled = Query::new(root, |binding: &Binding| {
+            Some((*binding.get(0)?, *binding.get(1)?))
+        })
+        .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::OpaqueLeaves, true))
+        .cap(8)
+        .start_width(8)
+        .growth(2)
+        .collect_profiled();
+        let mut actual = profiled.results;
+        let mut expected = Vec::new();
+        for left in 0..4 {
+            for right in 32..48 {
+                expected.push((raw(left), raw(right)));
+            }
+        }
+        actual.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+        assert!(
+            profiled.stats.delta_terminal_admissions >= 4,
+            "{:#?}",
+            profiled.stats
+        );
+        assert!(profiled.stats.delta_terminal_admission_remainders > 0);
+        assert!(profiled.stats.delta_terminal_calls > 0);
+        assert_eq!(profiled.stats.max_delta_terminal_task_cohort, 1);
+        assert!(profiled.stats.delta_terminal_publications > 0);
+        assert!(profiled.stats.max_delta_terminal_work_budget <= 8);
     }
 
     #[derive(Clone, Copy)]
@@ -14155,7 +14389,7 @@ mod tests {
         assert_eq!(stats.candidates_confirmed, 2);
         assert_eq!(stats.max_confirm_candidates, 1);
         assert_eq!(stats.partial_pops, 1);
-        assert_eq!(width, 2);
+        assert_eq!(width, 1, "terminal emission must not widen search S");
     }
 
     #[test]
@@ -14482,11 +14716,17 @@ mod tests {
             .residual_state_scheduler();
 
         assert!(query.next().is_some());
+        query
+            .residual
+            .as_deref_mut()
+            .expect("residual cursor started")
+            .machine
+            .width = 2;
         assert!(query.next().is_some());
         let runtime = query.residual.as_deref().expect("residual cursor started");
         assert!(
             runtime.machine.emit_next < runtime.machine.emit_count,
-            "the second geometric pull must leave one raw row staged"
+            "an explicit width-two output batch must leave one raw row staged"
         );
 
         let cloned = query.clone();
@@ -14512,8 +14752,8 @@ mod tests {
             stats.full_pops + stats.readiness_pops + stats.continuation_pops,
             "every state pop has exactly one physical selection policy"
         );
-        assert_eq!(stats.width_increases, 2);
-        assert_eq!(width, 4);
+        assert_eq!(stats.width_increases, 1);
+        assert_eq!(width, 2, "the surviving emission must not widen search S");
 
         let (old_result, old_first, old_second, old_stats, _) =
             paged_filter_first_trace(raw(62), false);
@@ -14536,8 +14776,8 @@ mod tests {
         assert_eq!(stats.max_confirm_candidates, 32);
         assert_eq!(stats.underfilled_continuation_pops, 2);
         assert_eq!(stats.delta_handoff_probe_pops, 0);
-        assert_eq!(stats.width_increases, 6);
-        assert_eq!(width, 64);
+        assert_eq!(stats.width_increases, 5);
+        assert_eq!(width, 32, "the surviving emission must not widen search S");
 
         let (old_result, old_first, old_second, old_stats, _) =
             paged_filter_first_trace(raw(32), false);
@@ -14650,10 +14890,10 @@ mod tests {
         profiled.state.continuation_sprint_enabled = false;
         let profiled = profiled.collect_profiled();
         assert!(profiled.results.is_empty());
-        assert_eq!(profiled.stats.bucket_merges, 1);
-        assert_eq!(profiled.stats.rows_merged, 1);
+        assert_eq!(profiled.stats.bucket_merges, 2);
+        assert_eq!(profiled.stats.rows_merged, 2);
         assert_eq!(*projected.lock().unwrap(), 4);
-        assert_eq!(&*calls.lock().unwrap(), &[1, 2, 2, 3]);
+        assert_eq!(&*calls.lock().unwrap(), &[1, 2, 2, 2, 1]);
 
         // Production-schedule coverage: with sprinting enabled, the same
         // pages need not reconverge, but every affine occurrence must remain

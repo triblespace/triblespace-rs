@@ -147,6 +147,14 @@ enum ActivationStatus {
     Quiescent,
 }
 
+/// Physical publication class for one affine activation. This is payload
+/// metadata only: it never participates in [`DeltaDesc`] or interner identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeltaPhysicalClass {
+    General,
+    TerminalStreaming,
+}
+
 #[derive(Clone)]
 enum DeltaReducer {
     /// Accepted values may immediately enter an ordinary Candidate state.
@@ -210,6 +218,11 @@ struct SuspendedSourcePage {
 struct Activation {
     reducer: DeltaReducer,
     return_to: DeltaReturn,
+    physical_class: DeltaPhysicalClass,
+    /// Examined-work quantum for a terminal activation whose current sparse
+    /// page did not publish. Confirmed demand supplies the reset floor while
+    /// the independent search width supplies the hard cap.
+    terminal_sparse_quantum: usize,
     /// Sorted distinct source scope for grouped confirmation. Proposals own a
     /// constraint-generated graph frontier and therefore store `None`.
     source_candidates: Option<Box<[RawInline]>>,
@@ -325,12 +338,33 @@ impl ProducerRegistry {
         return_to: DeltaReturn,
         seeds: impl IntoIterator<Item = ResidualDeltaOutput>,
     ) -> StartOutcome {
+        self.start_many_classified(reducer, return_to, seeds, None)
+    }
+
+    fn start_many_terminal(
+        &mut self,
+        reducer: DeltaReducer,
+        return_to: DeltaReturn,
+        seeds: impl IntoIterator<Item = ResidualDeltaOutput>,
+        full: VariableSet,
+    ) -> StartOutcome {
+        self.start_many_classified(reducer, return_to, seeds, Some(full))
+    }
+
+    fn start_many_classified(
+        &mut self,
+        reducer: DeltaReducer,
+        return_to: DeltaReturn,
+        seeds: impl IntoIterator<Item = ResidualDeltaOutput>,
+        terminal_full: Option<VariableSet>,
+    ) -> StartOutcome {
         debug_assert!(
             matches!(
                 &return_to,
                 DeltaReturn::Formula { batch, .. } if batch.parents.row_count == 1
             ) || !matches!(&return_to, DeltaReturn::Formula { .. })
         );
+        let physical_class = Self::physical_class(&reducer, &return_to, terminal_full);
         let seeds = seeds.into_iter();
         let activation = ActivationId(take_monotonic(
             &mut self.state.next_activation,
@@ -367,6 +401,8 @@ impl ProducerRegistry {
                     Activation {
                         reducer,
                         return_to,
+                        physical_class,
+                        terminal_sparse_quantum: 1,
                         source_candidates: None,
                         suspended_source_page: None,
                         seen: AHashMap::new(),
@@ -397,12 +433,33 @@ impl ProducerRegistry {
         return_to: DeltaReturn,
         source_candidates: Option<Box<[RawInline]>>,
     ) -> (ActivationId, ProducerCredit) {
+        self.start_source_classified(reducer, return_to, source_candidates, None)
+    }
+
+    fn start_source_terminal(
+        &mut self,
+        reducer: DeltaReducer,
+        return_to: DeltaReturn,
+        source_candidates: Option<Box<[RawInline]>>,
+        full: VariableSet,
+    ) -> (ActivationId, ProducerCredit) {
+        self.start_source_classified(reducer, return_to, source_candidates, Some(full))
+    }
+
+    fn start_source_classified(
+        &mut self,
+        reducer: DeltaReducer,
+        return_to: DeltaReturn,
+        source_candidates: Option<Box<[RawInline]>>,
+        terminal_full: Option<VariableSet>,
+    ) -> (ActivationId, ProducerCredit) {
         debug_assert!(
             matches!(
                 &return_to,
                 DeltaReturn::Formula { batch, .. } if batch.parents.row_count == 1
             ) || !matches!(&return_to, DeltaReturn::Formula { .. })
         );
+        let physical_class = Self::physical_class(&reducer, &return_to, terminal_full);
         let activation = ActivationId(take_monotonic(
             &mut self.state.next_activation,
             "activation",
@@ -415,6 +472,8 @@ impl ProducerRegistry {
                     Activation {
                         reducer,
                         return_to,
+                        physical_class,
+                        terminal_sparse_quantum: 1,
                         source_candidates,
                         suspended_source_page: None,
                         seen: AHashMap::new(),
@@ -429,6 +488,25 @@ impl ProducerRegistry {
         );
         let credit = self.issue_credit(activation, CreditKind::Generator);
         (activation, credit)
+    }
+
+    fn physical_class(
+        reducer: &DeltaReducer,
+        return_to: &DeltaReturn,
+        terminal_full: Option<VariableSet>,
+    ) -> DeltaPhysicalClass {
+        let Some(full) = terminal_full else {
+            return DeltaPhysicalClass::General;
+        };
+        let (DeltaReducer::StreamProposal, DeltaReturn::Stable { desc, .. }) = (reducer, return_to)
+        else {
+            return DeltaPhysicalClass::General;
+        };
+        if commits_final_checked_candidate(desc, full) {
+            DeltaPhysicalClass::TerminalStreaming
+        } else {
+            DeltaPhysicalClass::General
+        }
     }
 
     fn issue_credit(&mut self, activation: ActivationId, kind: CreditKind) -> ProducerCredit {
@@ -761,6 +839,68 @@ impl ProducerRegistry {
             .streams()
     }
 
+    fn physical_activation_class(&self, activation: ActivationId) -> DeltaPhysicalClass {
+        self.state
+            .activations
+            .get(&activation)
+            .expect("unknown delta activation")
+            .physical_class
+    }
+
+    fn dispatch_width(
+        &self,
+        activation: ActivationId,
+        search_width: usize,
+        terminal_demand_remaining: usize,
+    ) -> usize {
+        let activation = self
+            .state
+            .activations
+            .get(&activation)
+            .expect("unknown delta activation");
+        if activation.physical_class == DeltaPhysicalClass::TerminalStreaming {
+            activation
+                .terminal_sparse_quantum
+                .max(terminal_demand_remaining.max(1))
+                .min(search_width.max(1))
+                .max(1)
+        } else {
+            search_width.max(1)
+        }
+    }
+
+    /// Updates only physical sparse-search effort. Publication resets to the
+    /// still-open demand remainder; a live no-publication step doubles toward
+    /// `search_width`. Quiescent activations have already left the registry.
+    fn finish_dispatch(
+        &mut self,
+        activation: ActivationId,
+        search_width: usize,
+        terminal_demand_remaining: usize,
+        published: bool,
+    ) -> (bool, bool) {
+        let Some(activation) = self.state.activations.get_mut(&activation) else {
+            return (false, false);
+        };
+        if activation.physical_class != DeltaPhysicalClass::TerminalStreaming {
+            return (false, false);
+        }
+        let before = activation.terminal_sparse_quantum;
+        if published {
+            activation.terminal_sparse_quantum = terminal_demand_remaining.max(1);
+        } else {
+            activation.terminal_sparse_quantum = before
+                .max(terminal_demand_remaining.max(1))
+                .saturating_mul(2)
+                .min(search_width.max(1))
+                .max(1);
+        }
+        (
+            published && activation.terminal_sparse_quantum != before,
+            !published && activation.terminal_sparse_quantum > before,
+        )
+    }
+
     fn is_live(&self, activation: ActivationId) -> bool {
         self.state.activations.contains_key(&activation)
     }
@@ -946,13 +1086,20 @@ struct DeltaTask {
 /// would turn geometric width into breadth and postpone every first result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TransitionDispatchKey {
+    /// Terminal streams are activation-affine: batching sibling activations
+    /// would spend several projected-result windows at once.
+    TerminalStreaming(ActivationId),
     Streaming,
     Quiescent(ActivationId),
 }
 
 impl TransitionDispatchKey {
     fn of(registry: &ProducerRegistry, task: &DeltaTask) -> Self {
-        if registry.activation_streams(task.activation) {
+        if registry.physical_activation_class(task.activation)
+            == DeltaPhysicalClass::TerminalStreaming
+        {
+            Self::TerminalStreaming(task.activation)
+        } else if registry.activation_streams(task.activation) {
             Self::Streaming
         } else {
             Self::Quiescent(task.activation)
@@ -989,6 +1136,9 @@ struct SourceDispatchKey {
     bound: VariableSet,
     has_candidates: bool,
     cursor_family: SourceCursorFamily,
+    /// `Some` makes a terminal source cohort exact-activation affine while
+    /// leaving all ordinary compatible source batching unchanged.
+    terminal_activation: Option<ActivationId>,
 }
 
 impl SourceDispatchKey {
@@ -998,6 +1148,9 @@ impl SourceDispatchKey {
             bound,
             has_candidates,
             cursor_family: SourceCursorFamily::of(task.cursor),
+            terminal_activation: (registry.physical_activation_class(task.activation)
+                == DeltaPhysicalClass::TerminalStreaming)
+                .then_some(task.activation),
         }
     }
 }
@@ -1037,6 +1190,14 @@ struct SourceBucket {
     tasks: Vec<SourceTask>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PhysicalDispatch {
+    terminal_activation: Option<ActivationId>,
+    work_budget: usize,
+    task_count: usize,
+    remainder_tasks: usize,
+}
+
 /// One delta scheduler step as observed by the outer geometric policy.
 ///
 /// Stable progress and dead pages are deliberately independent: one batched
@@ -1063,6 +1224,8 @@ pub(super) struct DeltaStepOutcome {
 pub(super) struct DeltaSeedOutcome {
     pub(super) continuation: Option<ContinuationToken>,
     pub(super) active: Option<ActiveDeltaContinuation>,
+    /// Exact affine parents transferred after any physical admission split.
+    pub(super) seeded_parents: usize,
 }
 
 /// Exact liveness classification after a directed cyclic step.
@@ -1124,6 +1287,10 @@ impl DeltaBucket {
         let mut retained = Vec::with_capacity(self.tasks.len());
         for task in std::mem::take(&mut self.tasks).into_iter().rev() {
             let compatible = match (key, TransitionDispatchKey::of(registry, &task)) {
+                (
+                    TransitionDispatchKey::TerminalStreaming(selected),
+                    TransitionDispatchKey::TerminalStreaming(candidate),
+                ) => selected == candidate,
                 (TransitionDispatchKey::Streaming, TransitionDispatchKey::Streaming) => true,
                 (
                     TransitionDispatchKey::Quiescent(_),
@@ -1215,6 +1382,7 @@ impl DeltaScheduler {
         self.worklist.is_empty() && self.source_worklist.is_empty()
     }
 
+    #[cfg(test)]
     pub(super) fn seed_proposals(
         &mut self,
         desc: DeltaDesc,
@@ -1226,6 +1394,32 @@ impl DeltaScheduler {
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
     ) -> DeltaSeedOutcome {
+        self.seed_proposals_with_full(
+            desc,
+            successor,
+            parents,
+            seeds,
+            VariableSet::new_empty(),
+            plan,
+            stable,
+            stable_interner,
+            stats,
+        )
+    }
+
+    pub(super) fn seed_proposals_with_full(
+        &mut self,
+        desc: DeltaDesc,
+        successor: StateDesc,
+        parents: RowBatch,
+        seeds: Vec<ResidualDeltaSeed>,
+        full: VariableSet,
+        plan: &ResidualPlan,
+        stable: &mut Worklist,
+        stable_interner: &mut StateInterner,
+        stats: &mut ResidualStateStats,
+    ) -> DeltaSeedOutcome {
+        let seeded_parents = parents.row_count;
         let ranges = seed_ranges(&seeds, parents.row_count);
         let stride = successor.bound.count();
         let mut tasks = Vec::with_capacity(seeds.len());
@@ -1235,13 +1429,14 @@ impl DeltaScheduler {
             let parent = parents.rows[start..start + stride]
                 .to_vec()
                 .into_boxed_slice();
-            let started = self.registry.start_many(
+            let started = self.registry.start_many_terminal(
                 DeltaReducer::StreamProposal,
                 DeltaReturn::Stable {
                     desc: successor.clone(),
                     parent,
                 },
                 seeds[range].iter().map(|seed| seed.output),
+                full,
             );
             if !started.initial_accepted.is_empty() {
                 let streamed = self
@@ -1276,14 +1471,26 @@ impl DeltaScheduler {
         DeltaSeedOutcome {
             continuation,
             active,
+            seeded_parents,
         }
     }
 
+    #[cfg(test)]
     pub(super) fn seed_source_proposals(
         &mut self,
         desc: DeltaDesc,
         successor: StateDesc,
         parents: RowBatch,
+    ) -> Option<ActiveDeltaContinuation> {
+        self.seed_source_proposals_with_full(desc, successor, parents, VariableSet::new_empty())
+    }
+
+    pub(super) fn seed_source_proposals_with_full(
+        &mut self,
+        desc: DeltaDesc,
+        successor: StateDesc,
+        parents: RowBatch,
+        full: VariableSet,
     ) -> Option<ActiveDeltaContinuation> {
         let stride = successor.bound.count();
         let mut tasks = Vec::with_capacity(parents.row_count);
@@ -1292,13 +1499,14 @@ impl DeltaScheduler {
             let parent = parents.rows[start..start + stride]
                 .to_vec()
                 .into_boxed_slice();
-            let (activation, credit) = self.registry.start_source(
+            let (activation, credit) = self.registry.start_source_terminal(
                 DeltaReducer::StreamProposal,
                 DeltaReturn::Stable {
                     desc: successor.clone(),
                     parent,
                 },
                 None,
+                full,
             );
             tasks.push(SourceTask {
                 activation,
@@ -1407,6 +1615,7 @@ impl DeltaScheduler {
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
     ) -> DeltaSeedOutcome {
+        let seeded_parents = batch.parents.row_count;
         let ranges = seed_ranges(&seeds, batch.parents.row_count);
         let singletons = batch.into_singletons(bound.count());
         assert_eq!(singletons.len(), ranges.len());
@@ -1472,6 +1681,7 @@ impl DeltaScheduler {
         DeltaSeedOutcome {
             continuation,
             active,
+            seeded_parents,
         }
     }
 
@@ -1761,6 +1971,44 @@ impl DeltaScheduler {
         })
     }
 
+    fn account_physical_dispatch(
+        &mut self,
+        dispatch: PhysicalDispatch,
+        search_width: usize,
+        terminal_demand_remaining: usize,
+        examined_before: usize,
+        published: bool,
+        stats: &mut ResidualStateStats,
+    ) {
+        let Some(activation) = dispatch.terminal_activation else {
+            stats.delta_nonterminal_calls += 1;
+            return;
+        };
+        stats.delta_terminal_calls += 1;
+        stats.delta_terminal_work_budget += dispatch.work_budget;
+        stats.max_delta_terminal_work_budget = stats
+            .max_delta_terminal_work_budget
+            .max(dispatch.work_budget);
+        stats.delta_terminal_tasks += dispatch.task_count;
+        stats.max_delta_terminal_task_cohort = stats
+            .max_delta_terminal_task_cohort
+            .max(dispatch.task_count);
+        stats.delta_terminal_remainder_tasks += dispatch.remainder_tasks;
+        let examined_after = stats
+            .delta_source_candidates_examined
+            .saturating_add(stats.delta_transition_candidates_examined);
+        stats.delta_terminal_candidates_examined += examined_after.saturating_sub(examined_before);
+        stats.delta_terminal_publications += usize::from(published);
+        let (reset, widened) = self.registry.finish_dispatch(
+            activation,
+            search_width,
+            terminal_demand_remaining,
+            published,
+        );
+        stats.delta_terminal_sparse_resets += usize::from(reset);
+        stats.delta_terminal_sparse_widenings += usize::from(widened);
+    }
+
     fn pop_active_transition(
         &mut self,
         active: ActiveDeltaContinuation,
@@ -1807,12 +2055,24 @@ impl DeltaScheduler {
         (self.interner.get(active.state).clone(), tasks)
     }
 
+    #[cfg(test)]
     fn pop(&mut self, width: usize) -> (DeltaDesc, Vec<DeltaTask>) {
-        let full = self
-            .worklist
-            .iter()
-            .rev()
-            .find_map(|(&id, bucket)| (bucket.tasks.len() >= width.max(1)).then_some(id));
+        let (desc, tasks, _) = self.pop_with_demand(width, width);
+        (desc, tasks)
+    }
+
+    fn pop_with_demand(
+        &mut self,
+        search_width: usize,
+        terminal_demand_remaining: usize,
+    ) -> (DeltaDesc, Vec<DeltaTask>, PhysicalDispatch) {
+        let full = self.worklist.iter().rev().find_map(|(&id, bucket)| {
+            let activation = bucket.tasks.last()?.activation;
+            let width =
+                self.registry
+                    .dispatch_width(activation, search_width, terminal_demand_remaining);
+            (bucket.tasks.len() >= width).then_some(id)
+        });
         let id = full.unwrap_or_else(|| {
             *self
                 .worklist
@@ -1820,26 +2080,66 @@ impl DeltaScheduler {
                 .expect("delta pop requires live work")
                 .0
         });
-        let (tasks, empty) = {
+        let activation = self
+            .worklist
+            .get(&id)
+            .and_then(|bucket| bucket.tasks.last())
+            .expect("selected delta state has live work")
+            .activation;
+        let width =
+            self.registry
+                .dispatch_width(activation, search_width, terminal_demand_remaining);
+        let terminal_activation = (self.registry.physical_activation_class(activation)
+            == DeltaPhysicalClass::TerminalStreaming)
+            .then_some(activation);
+        let (tasks, empty, remainder_tasks) = {
             let registry = &self.registry;
             let bucket = self.worklist.get_mut(&id).expect("selected delta state");
             let tasks = bucket.take_tail(registry, width, self.activation_width);
-            (tasks, bucket.tasks.is_empty())
+            let remainder_tasks = bucket.tasks.len();
+            (tasks, bucket.tasks.is_empty(), remainder_tasks)
         };
         if empty {
             self.worklist.remove(&id);
         }
-        (self.interner.get(id).clone(), tasks)
+        let dispatch = PhysicalDispatch {
+            terminal_activation,
+            work_budget: width,
+            task_count: tasks.len(),
+            remainder_tasks,
+        };
+        (self.interner.get(id).clone(), tasks, dispatch)
     }
 
+    #[cfg(test)]
     fn pop_source(&mut self, width: usize) -> (DeltaDesc, Vec<SourceTask>) {
-        let width = width.max(1);
+        let (desc, tasks, _) = self.pop_source_with_demand(width, width);
+        (desc, tasks)
+    }
+
+    fn pop_source_with_demand(
+        &mut self,
+        search_width: usize,
+        terminal_demand_remaining: usize,
+    ) -> (DeltaDesc, Vec<SourceTask>, PhysicalDispatch) {
         let id = *self
             .source_worklist
             .last_key_value()
             .expect("source pop requires live work")
             .0;
-        let (tasks, empty) = {
+        let activation = self
+            .source_worklist
+            .get(&id)
+            .and_then(|bucket| bucket.tasks.last())
+            .expect("selected source state has live work")
+            .activation;
+        let width =
+            self.registry
+                .dispatch_width(activation, search_width, terminal_demand_remaining);
+        let terminal_activation = (self.registry.physical_activation_class(activation)
+            == DeltaPhysicalClass::TerminalStreaming)
+            .then_some(activation);
+        let (tasks, empty, remainder_tasks) = {
             let registry = &self.registry;
             let bucket = self
                 .source_worklist
@@ -1860,12 +2160,19 @@ impl DeltaScheduler {
             }
             retained.reverse();
             bucket.tasks = retained;
-            (selected, bucket.tasks.is_empty())
+            let remainder_tasks = bucket.tasks.len();
+            (selected, bucket.tasks.is_empty(), remainder_tasks)
         };
         if empty {
             self.source_worklist.remove(&id);
         }
-        (self.interner.get(id).clone(), tasks)
+        let dispatch = PhysicalDispatch {
+            terminal_activation,
+            work_budget: width,
+            task_count: tasks.len(),
+            remainder_tasks,
+        };
+        (self.interner.get(id).clone(), tasks, dispatch)
     }
 
     /// Advances only the affine activation named by a physical continuation.
@@ -1875,12 +2182,36 @@ impl DeltaScheduler {
     /// checking source first makes the intended source -> transition -> source
     /// cycle explicit and prevents a cold global bucket from preempting it.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(super) fn step_active<'a>(
         &mut self,
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
         active: ActiveDeltaContinuation,
         width: usize,
+        stable: &mut Worklist,
+        stable_interner: &mut StateInterner,
+        stats: &mut ResidualStateStats,
+    ) -> ActiveDeltaStepOutcome {
+        self.step_active_with_demand(
+            root,
+            plan,
+            active,
+            width,
+            width,
+            stable,
+            stable_interner,
+            stats,
+        )
+    }
+
+    pub(super) fn step_active_with_demand<'a>(
+        &mut self,
+        root: &dyn Constraint<'a>,
+        plan: &ResidualPlan,
+        active: ActiveDeltaContinuation,
+        search_width: usize,
+        terminal_demand_remaining: usize,
         stable: &mut Worklist,
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
@@ -1896,9 +2227,31 @@ impl DeltaScheduler {
             "one delta activation owns source and transition credits simultaneously"
         );
 
+        let width = self.registry.dispatch_width(
+            active.activation,
+            search_width,
+            terminal_demand_remaining,
+        );
+        let terminal_activation = (self.registry.physical_activation_class(active.activation)
+            == DeltaPhysicalClass::TerminalStreaming)
+            .then_some(active.activation);
+        let examined_before = stats
+            .delta_source_candidates_examined
+            .saturating_add(stats.delta_transition_candidates_examined);
         let outcome = if has_source {
             let (desc, tasks) = self.pop_active_source(active, width);
-            self.step_sources(
+            let task_count = tasks.len();
+            let remainder_tasks = self
+                .source_worklist
+                .get(&active.state)
+                .map_or(0, |bucket| bucket.tasks.len());
+            let dispatch = PhysicalDispatch {
+                terminal_activation,
+                work_budget: width,
+                task_count,
+                remainder_tasks,
+            };
+            let outcome = self.step_sources(
                 root,
                 plan,
                 desc,
@@ -1907,10 +2260,30 @@ impl DeltaScheduler {
                 stable,
                 stable_interner,
                 stats,
-            )
+            );
+            self.account_physical_dispatch(
+                dispatch,
+                search_width,
+                terminal_demand_remaining,
+                examined_before,
+                outcome.continuation.is_some(),
+                stats,
+            );
+            outcome
         } else {
             let (desc, tasks) = self.pop_active_transition(active, width);
-            self.step_transitions(
+            let task_count = tasks.len();
+            let remainder_tasks = self
+                .worklist
+                .get(&active.state)
+                .map_or(0, |bucket| bucket.tasks.len());
+            let dispatch = PhysicalDispatch {
+                terminal_activation,
+                work_budget: width,
+                task_count,
+                remainder_tasks,
+            };
+            let outcome = self.step_transitions(
                 root,
                 plan,
                 desc,
@@ -1919,7 +2292,16 @@ impl DeltaScheduler {
                 stable,
                 stable_interner,
                 stats,
-            )
+            );
+            self.account_physical_dispatch(
+                dispatch,
+                search_width,
+                terminal_demand_remaining,
+                examined_before,
+                outcome.continuation.is_some(),
+                stats,
+            );
+            outcome
         };
         let resume = (outcome.continuation.is_some() && self.registry.is_live(active.activation))
             .then_some(active);
@@ -1940,6 +2322,7 @@ impl DeltaScheduler {
     /// Executes one structural product-state cohort and files accepted
     /// proposal endpoints or quiescent confirmation reductions back into the
     /// ordinary acyclic Candidate continuation.
+    #[cfg(test)]
     pub(super) fn step<'a>(
         &mut self,
         root: &dyn Constraint<'a>,
@@ -1949,21 +2332,54 @@ impl DeltaScheduler {
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
     ) -> DeltaStepOutcome {
+        self.step_with_demand(root, plan, width, width, stable, stable_interner, stats)
+    }
+
+    pub(super) fn step_with_demand<'a>(
+        &mut self,
+        root: &dyn Constraint<'a>,
+        plan: &ResidualPlan,
+        search_width: usize,
+        terminal_demand_remaining: usize,
+        stable: &mut Worklist,
+        stable_interner: &mut StateInterner,
+        stats: &mut ResidualStateStats,
+    ) -> DeltaStepOutcome {
         if self.worklist.is_empty() {
-            return self.step_source(root, plan, width, stable, stable_interner, stats);
+            return self.step_source(
+                root,
+                plan,
+                search_width,
+                terminal_demand_remaining,
+                stable,
+                stable_interner,
+                stats,
+            );
         }
 
-        let (desc, tasks) = self.pop(width);
-        self.step_transitions(
+        let (desc, tasks, dispatch) = self.pop_with_demand(search_width, terminal_demand_remaining);
+        let examined_before = stats
+            .delta_source_candidates_examined
+            .saturating_add(stats.delta_transition_candidates_examined);
+        let outcome = self.step_transitions(
             root,
             plan,
             desc,
             tasks,
-            width,
+            dispatch.work_budget,
             stable,
             stable_interner,
             stats,
-        )
+        );
+        self.account_physical_dispatch(
+            dispatch,
+            search_width,
+            terminal_demand_remaining,
+            examined_before,
+            outcome.continuation.is_some(),
+            stats,
+        );
+        outcome
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2196,23 +2612,36 @@ impl DeltaScheduler {
         &mut self,
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
-        width: usize,
+        search_width: usize,
+        terminal_demand_remaining: usize,
         stable: &mut Worklist,
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
     ) -> DeltaStepOutcome {
-        let budget = width.max(1);
-        let (desc, tasks) = self.pop_source(budget);
-        self.step_sources(
+        let (desc, tasks, dispatch) =
+            self.pop_source_with_demand(search_width, terminal_demand_remaining);
+        let examined_before = stats
+            .delta_source_candidates_examined
+            .saturating_add(stats.delta_transition_candidates_examined);
+        let outcome = self.step_sources(
             root,
             plan,
             desc,
             tasks,
-            budget,
+            dispatch.work_budget,
             stable,
             stable_interner,
             stats,
-        )
+        );
+        self.account_physical_dispatch(
+            dispatch,
+            search_width,
+            terminal_demand_remaining,
+            examined_before,
+            outcome.continuation.is_some(),
+            stats,
+        );
+        outcome
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2817,6 +3246,80 @@ mod tests {
             },
             parent: parent.into_boxed_slice(),
         }
+    }
+
+    #[test]
+    fn terminal_streaming_is_activation_payload_not_delta_state_identity() {
+        let mut scheduler = DeltaScheduler::new();
+        let full = VariableSet::new_singleton(0);
+        let terminal = scheduler.registry.start_many_terminal(
+            DeltaReducer::StreamProposal,
+            candidate_return(Vec::new()),
+            [output(1, 0, false)],
+            full,
+        );
+        let ordinary = scheduler.registry.start_many(
+            DeltaReducer::StreamProposal,
+            candidate_return(Vec::new()),
+            [output(2, 0, false)],
+        );
+        let wrong_full = scheduler.registry.start_many_terminal(
+            DeltaReducer::StreamProposal,
+            candidate_return(Vec::new()),
+            [output(3, 0, false)],
+            VariableSet::new_empty(),
+        );
+        let wrong_reducer = scheduler.registry.start_many_terminal(
+            DeltaReducer::QuiescentProposal,
+            candidate_return(Vec::new()),
+            [output(4, 0, false)],
+            full,
+        );
+        assert_eq!(
+            scheduler
+                .registry
+                .physical_activation_class(terminal.activation),
+            DeltaPhysicalClass::TerminalStreaming
+        );
+        assert_eq!(
+            scheduler
+                .registry
+                .physical_activation_class(ordinary.activation),
+            DeltaPhysicalClass::General
+        );
+        assert_eq!(
+            scheduler
+                .registry
+                .physical_activation_class(wrong_full.activation),
+            DeltaPhysicalClass::General
+        );
+        assert_eq!(
+            scheduler
+                .registry
+                .physical_activation_class(wrong_reducer.activation),
+            DeltaPhysicalClass::General
+        );
+
+        let desc = DeltaDesc::leaf(0, 0);
+        let tasks = terminal
+            .roots
+            .into_iter()
+            .map(|(node, credit)| DeltaTask {
+                activation: terminal.activation,
+                credit,
+                node,
+                cursor: ResidualDeltaExpandCursor::Start,
+            })
+            .chain(ordinary.roots.into_iter().map(|(node, credit)| DeltaTask {
+                activation: ordinary.activation,
+                credit,
+                node,
+                cursor: ResidualDeltaExpandCursor::Start,
+            }))
+            .collect();
+        let _ = scheduler.file(desc.clone(), tasks);
+        assert_eq!(scheduler.interner.descs, [desc]);
+        assert_eq!(scheduler.worklist.len(), 1);
     }
 
     fn streaming_formula_return(
@@ -3999,6 +4502,7 @@ mod tests {
                     bound: schema_a,
                     has_candidates: false,
                     cursor_family: SourceCursorFamily::Start,
+                    terminal_activation: None,
                 }
         }));
 
