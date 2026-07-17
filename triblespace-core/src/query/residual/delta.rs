@@ -4233,7 +4233,7 @@ mod tests {
         assert_eq!(publication.rows.row_count, 2);
         assert_eq!(publication.rows.rows, [value(10), value(11)]);
         assert_eq!(
-            publication.origins,
+            publication.origins.as_slice(),
             [second_activation, first_activation],
             "cohort batching must not collapse projected-yield origins"
         );
