@@ -908,11 +908,11 @@ impl ProducerRegistry {
         search_width.max(1)
     }
 
-    /// Updates only physical sparse-search effort. Publication resets to one;
-    /// a live no-publication step doubles toward `search_width`. Confirmed
-    /// result demand may widen nonterminal search, but is not itself evidence
-    /// that one terminal traversal should become broader. Quiescent
-    /// activations have already left the registry.
+    /// Updates only physical sparse-search effort. Publication from either
+    /// layer resets to one; a live transition no-publication step doubles
+    /// toward `search_width`, while a source miss leaves traversal effort
+    /// unchanged. Confirmed result demand may widen source/nonterminal search,
+    /// but is not itself evidence that one traversal should become broader.
     fn finish_dispatch(
         &mut self,
         activation: ActivationId,
@@ -2083,6 +2083,19 @@ impl DeltaScheduler {
         })
     }
 
+    fn allows_global_width_growth(
+        &self,
+        dispatch: PhysicalDispatch,
+        search_width: usize,
+    ) -> bool {
+        let Some(activation) = dispatch.terminal_activation else {
+            return true;
+        };
+        dispatch.kind == PhysicalDispatchKind::Source
+            || (dispatch.work_budget >= search_width.max(1)
+                && self.registry.is_live(activation))
+    }
+
     fn account_physical_dispatch(
         &mut self,
         dispatch: PhysicalDispatch,
@@ -2115,9 +2128,7 @@ impl DeltaScheduler {
                 .finish_dispatch(activation, search_width, dispatch.kind, published);
         stats.delta_terminal_sparse_resets += usize::from(reset);
         stats.delta_terminal_sparse_widenings += usize::from(widened);
-        dispatch.kind == PhysicalDispatchKind::Source
-            || (dispatch.work_budget >= search_width.max(1)
-                && self.registry.is_live(activation))
+        self.allows_global_width_growth(dispatch, search_width)
     }
 
     fn pop_active_transition(
@@ -3512,6 +3523,55 @@ mod tests {
             registry.transition_dispatch_width(started.activation, 64),
             1
         );
+    }
+
+    #[test]
+    fn terminal_global_feedback_waits_for_live_local_saturation() {
+        let mut scheduler = DeltaScheduler::new();
+        let started = scheduler.registry.start_many_terminal(
+            DeltaReducer::StreamProposal,
+            candidate_return(Vec::new()),
+            [output(1, 0, false)],
+            VariableSet::new_singleton(0),
+        );
+        let activation = started.activation;
+
+        assert!(scheduler.allows_global_width_growth(
+            PhysicalDispatch {
+                terminal_activation: Some(activation),
+                kind: PhysicalDispatchKind::Source,
+                work_budget: 1,
+                task_count: 1,
+                remainder_tasks: 0,
+            },
+            64,
+        ));
+        assert!(!scheduler.allows_global_width_growth(
+            PhysicalDispatch {
+                terminal_activation: Some(activation),
+                kind: PhysicalDispatchKind::Transition,
+                work_budget: 32,
+                task_count: 1,
+                remainder_tasks: 0,
+            },
+            64,
+        ));
+        let saturated = PhysicalDispatch {
+            terminal_activation: Some(activation),
+            kind: PhysicalDispatchKind::Transition,
+            work_budget: 64,
+            task_count: 1,
+            remainder_tasks: 0,
+        };
+        assert!(scheduler.allows_global_width_growth(saturated, 64));
+
+        let (_, credit) = started.roots.into_iter().next().unwrap();
+        let replaced = scheduler
+            .registry
+            .replace_traversal(credit, std::iter::empty());
+        let proof = replaced.quiescence.expect("empty traversal quiesces");
+        let _ = scheduler.registry.finish(proof);
+        assert!(!scheduler.allows_global_width_growth(saturated, 64));
     }
 
     #[test]

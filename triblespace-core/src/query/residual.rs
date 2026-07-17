@@ -2140,8 +2140,8 @@ pub struct ResidualStateStats {
     /// Publication resets that changed a terminal activation's local sparse
     /// quantum back to one examined-work unit.
     pub delta_terminal_sparse_resets: usize,
-    /// Live no-publication calls that doubled a terminal activation's local
-    /// sparse-search quantum toward the independent search width.
+    /// Live transition no-publication calls that doubled a terminal
+    /// activation's local sparse-search quantum toward global search width.
     pub delta_terminal_sparse_widenings: usize,
     /// Projected result windows opened after the initial width-one window.
     /// A window opens only when the caller pulls again after consuming every
