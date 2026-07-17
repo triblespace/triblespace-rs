@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The cross-generation query benchmark can select every canonical residual
+  lowering form.** `ENGINE_LOWERING` chooses formula scope and transition
+  lowering independently, while the seven workload/backend cells retain exact
+  oracle gates and report the 64/65-row boundary needed to distinguish formula
+  placement from cyclic scheduler effects.
 - **Demand-wide terminal RPQ admissions change execution regime without
   disturbing live sparse traversals.** When completed-yield evidence admits
   more than one new terminal parent in a turn, that exact suffix runs through

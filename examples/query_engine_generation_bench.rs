@@ -9,6 +9,8 @@
 //! RUSTFLAGS="--cfg engine_legacy_binding" cargo run --release --example query_engine_generation_bench
 //! RUSTFLAGS="--cfg engine_current_scalar" cargo run --release --example query_engine_generation_bench
 //! RUSTFLAGS="--cfg engine_current_residual" cargo run --release --example query_engine_generation_bench
+//! ENGINE_LOWERING=union-transitions RUSTFLAGS="--cfg engine_current_residual" \
+//!   cargo run --release --example query_engine_generation_bench
 //! RUSTFLAGS="--cfg engine_current_residual --cfg engine_prefix_checkpoints" \
 //!   cargo run --release --example query_engine_generation_bench
 //! ```
@@ -62,6 +64,47 @@ const REVISION: &str = match option_env!("ENGINE_REVISION") {
     None => "unknown",
 };
 
+#[cfg(engine_current_residual)]
+fn benchmark_lowering() -> triblespace::core::query::residual::ResidualLowering {
+    use std::sync::OnceLock;
+    use triblespace::core::query::residual::{FormulaScope, ResidualLowering};
+
+    static LOWERING: OnceLock<ResidualLowering> = OnceLock::new();
+    *LOWERING.get_or_init(|| match std::env::var("ENGINE_LOWERING").as_deref() {
+        Ok("opaque") => ResidualLowering::new(FormulaScope::OpaqueLeaves, false),
+        Ok("opaque-transitions") => ResidualLowering::new(FormulaScope::OpaqueLeaves, true),
+        Ok("union") => ResidualLowering::new(FormulaScope::UnionLeaves, false),
+        Ok("union-transitions") => ResidualLowering::new(FormulaScope::UnionLeaves, true),
+        Ok("whole") => ResidualLowering::new(FormulaScope::WholeRoot, false),
+        Ok("whole-transitions") | Err(_) => ResidualLowering::FULL,
+        Ok(other) => panic!(
+            "unknown ENGINE_LOWERING={other:?}; expected opaque, opaque-transitions, \
+             union, union-transitions, whole, or whole-transitions"
+        ),
+    })
+}
+
+#[cfg(engine_current_residual)]
+fn benchmark_lowering_name() -> &'static str {
+    use triblespace::core::query::residual::{FormulaScope, ResidualLowering};
+
+    match benchmark_lowering() {
+        lowering if lowering == ResidualLowering::new(FormulaScope::OpaqueLeaves, false) => {
+            "opaque"
+        }
+        lowering if lowering == ResidualLowering::new(FormulaScope::OpaqueLeaves, true) => {
+            "opaque-transitions"
+        }
+        lowering if lowering == ResidualLowering::new(FormulaScope::UnionLeaves, false) => "union",
+        lowering if lowering == ResidualLowering::new(FormulaScope::UnionLeaves, true) => {
+            "union-transitions"
+        }
+        lowering if lowering == ResidualLowering::new(FormulaScope::WholeRoot, false) => "whole",
+        lowering if lowering == ResidualLowering::FULL => "whole-transitions",
+        _ => unreachable!("ResidualLowering has exactly six canonical forms"),
+    }
+}
+
 type Pair = (Inline<GenId>, Inline<GenId>);
 
 macro_rules! engine_query {
@@ -71,7 +114,11 @@ macro_rules! engine_query {
         {
             query.sequential()
         }
-        #[cfg(not(engine_current_scalar))]
+        #[cfg(engine_current_residual)]
+        {
+            query.residual_lowering(benchmark_lowering())
+        }
+        #[cfg(not(any(engine_current_scalar, engine_current_residual)))]
         {
             query
         }
@@ -490,7 +537,7 @@ fn bench_case(
     // so all results below are explicitly hot-cache query measurements.
     construct();
     assert!(pull().1);
-    for limit in [1, 10, 100, 1_000, usize::MAX] {
+    for limit in [1, 10, 64, 65, 1_000, usize::MAX] {
         black_box(prefix(limit));
     }
 
@@ -502,7 +549,7 @@ fn bench_case(
         pull_samples.push(elapsed.as_secs_f64());
     }
 
-    let mut points: Vec<usize> = [1, 10, 100, 1_000]
+    let mut points: Vec<usize> = [1, 10, 64, 65, 1_000]
         .into_iter()
         .map(|point| point.min(expected_rows))
         .collect();
@@ -611,6 +658,8 @@ fn main() {
         archive_elapsed,
     );
     println!("samples: {repetitions}; hot cache; release profile");
+    #[cfg(engine_current_residual)]
+    println!("residual lowering: {}", benchmark_lowering_name());
 
     exact_check(
         finite_collect(&fixture.graph, &fixture),
@@ -1038,6 +1087,8 @@ fn main() {
         archive_elapsed,
     );
     println!("samples: {repetitions}; hot cache; release profile");
+    #[cfg(engine_current_residual)]
+    println!("residual lowering: {}", benchmark_lowering_name());
     println!("checkpoints: {PREFIX_CHECKPOINTS:?}");
 
     exact_check(
@@ -1062,23 +1113,21 @@ fn main() {
 
     #[cfg(engine_current_residual)]
     {
-        use triblespace::core::query::residual::ResidualLowering;
-
         residual_checkpoint_stats(
             "cyclic RPQ / TribleSet",
-            cyclic_rpq_query!(&fixture).solve_residual_state_lazy_with(ResidualLowering::FULL),
+            cyclic_rpq_query!(&fixture).solve_residual_state_lazy_with(benchmark_lowering()),
             |query| (query.current_width(), format!("{:?}", query.stats())),
         );
         residual_checkpoint_stats(
             "formula + cyclic RPQ / TribleSet sibling",
             mixed_formula_rpq_query!(&fixture.graph, &fixture)
-                .solve_residual_state_lazy_with(ResidualLowering::FULL),
+                .solve_residual_state_lazy_with(benchmark_lowering()),
             |query| (query.current_width(), format!("{:?}", query.stats())),
         );
         residual_checkpoint_stats(
             "formula + cyclic RPQ / SuccinctArchive sibling",
             mixed_formula_rpq_query!(&archive, &fixture)
-                .solve_residual_state_lazy_with(ResidualLowering::FULL),
+                .solve_residual_state_lazy_with(benchmark_lowering()),
             |query| (query.current_width(), format!("{:?}", query.stats())),
         );
     }
