@@ -30,6 +30,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   projection unwind as consumed but rejected. Exact seed and completion
   receipts cover immediately quiescent activations; Rayon conservatively keeps
   an admitted learner in one shard until cross-shard origin transfer exists.
+- **Terminal cyclic work shares physical cohorts without sharing feedback.**
+  Compatible final-variable source activations now use one block call with a
+  shared budget `B=S`. Transition activations use
+  `B=min(S, sum activation_quantum)` and ragged per-task limits whose total for
+  each activation cannot exceed its own sparse quantum. Publication resets and
+  live misses update those quanta independently; source misses never widen
+  them, and directed latency continuations remain exact-activation affine.
 - **All proven terminal activations publish directly.** Terminal rows now
   bypass canonical Candidate/Ready/Emit states whether the activation is the
   depth-first lease or globally scheduled cold work. The scheduler still
