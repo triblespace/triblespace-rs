@@ -54,11 +54,12 @@
 //! candidate mode, and cursor family. One same-schema block-native hook gets
 //! ragged per-parent limits whose sum is the current global width, so batching
 //! does not multiply the geometric work budget or refine canonical state
-//! identity. A cyclic activation seeded from a singleton stable continuation
-//! receives a scalar physical lease. When it publishes an accepted endpoint,
-//! the stable tail runs first while a still-live activation token remains
-//! suspended; the next pull resumes that exact affine traversal rather than
-//! abandoning its locality to cold global harvesting.
+//! identity. A direct-terminal cyclic activation seeded from a singleton
+//! stable continuation receives a scalar physical lease. When it publishes an
+//! accepted endpoint, the stable tail runs first while a still-live activation
+//! token remains suspended; the next pull resumes that exact affine traversal
+//! rather than abandoning its locality to cold global harvesting. Any return
+//! with downstream or formula work remains in the ordinary geometric harvest.
 //!
 //! As with the other batched engines, flattened leaves must obey the
 //! [`Constraint::estimate`] protocol: relevance is a structural answer,
@@ -83,13 +84,13 @@ use super::*;
 
 mod delta;
 use delta::{
-    ActiveDeltaContinuation, ActiveDeltaStatus, DeltaDesc, DeltaScheduler, DeltaSeedOutcome,
-    DeltaStepOutcome,
+    ActiveDeltaClass, ActiveDeltaContinuation, ActiveDeltaStatus, DeltaDesc, DeltaScheduler,
+    DeltaSeedOutcome, DeltaStepOutcome,
 };
 
-/// Directed cyclic work stays scalar after the global harvest width grows.
-/// This first-cut lease isolates activation affinity from batching; a later
-/// policy may spend a bounded examined-work quantum instead.
+/// Direct-to-projection cyclic work stays scalar after the global harvest
+/// width grows. All nonterminal and formula work remains on the ordinary
+/// geometric scheduler.
 const ACTIVE_DELTA_LEASE_WIDTH: usize = 1;
 
 /// One deterministic route from the owned root to an opaque residual leaf.
@@ -2096,6 +2097,13 @@ pub struct ResidualStateStats {
     pub delta_handoff_probe_pops: usize,
     /// Directed scalar steps spent following one exact cyclic activation.
     pub delta_active_lease_steps: usize,
+    /// Directed lease steps whose physical reducer/return payload commits
+    /// directly to projection.
+    pub delta_active_terminal_lease_steps: usize,
+    /// Directed lease steps whose physical payload still has downstream work.
+    /// This is expected to remain zero; it makes accidental scope widening
+    /// visible in profiles.
+    pub delta_active_nonterminal_lease_steps: usize,
     /// Stable yields after which the same cyclic activation remained live and
     /// its physical lease was retained.
     pub delta_active_live_yields_retained: usize,
@@ -7923,6 +7931,9 @@ impl ResidualStateMachine {
     ) {
         self.account_delta_feedback(&outcome);
         debug_assert!(resume.is_none() || outcome.continuation.is_some());
+        let resume = resume.filter(|&active| {
+            self.delta.active_class(active, self.full) == ActiveDeltaClass::DirectTerminal
+        });
         self.active_delta = resume;
         self.active_delta_after_yield = resume.is_some();
         self.stats.delta_active_live_yields_retained += usize::from(resume.is_some());
@@ -8003,7 +8014,10 @@ impl ResidualStateMachine {
                 self.last_selection,
                 SelectionKind::Continuation(ContinuationMode::ProbeOne)
                     | SelectionKind::Continuation(ContinuationMode::Cohort)
-            ))
+            )
+            && active.is_some_and(|active| {
+                self.delta.active_class(active, self.full) == ActiveDeltaClass::DirectTerminal
+            }))
         .then_some(active)
         .flatten()
     }
@@ -8071,26 +8085,43 @@ impl ResidualStateMachine {
             // source/transition worklists.
             if self.continuation.is_none() {
                 if let Some(active) = self.active_delta.take() {
+                    let class = self.delta.active_class(active, self.full);
                     self.stats.delta_active_lease_steps += 1;
+                    match class {
+                        ActiveDeltaClass::DirectTerminal => {
+                            self.stats.delta_active_terminal_lease_steps += 1
+                        }
+                        ActiveDeltaClass::Nonterminal => {
+                            self.stats.delta_active_nonterminal_lease_steps += 1
+                        }
+                    }
                     self.stats.delta_active_post_yield_resumptions +=
                         usize::from(self.active_delta_after_yield);
                     self.active_delta_after_yield = false;
+                    let active_width = match class {
+                        ActiveDeltaClass::DirectTerminal => ACTIVE_DELTA_LEASE_WIDTH,
+                        ActiveDeltaClass::Nonterminal => width,
+                    };
                     let focused = self.delta.step_active(
                         root,
                         plan,
                         active,
-                        ACTIVE_DELTA_LEASE_WIDTH,
+                        active_width,
                         &mut self.worklist,
                         &mut self.interner,
                         &mut self.stats,
                     );
                     match focused.status {
                         ActiveDeltaStatus::Yielded => {
-                            self.accept_delta_step_with_resume(focused.outcome, focused.resume)
+                            let resume = (class == ActiveDeltaClass::DirectTerminal)
+                                .then_some(focused.resume)
+                                .flatten();
+                            self.accept_delta_step_with_resume(focused.outcome, resume)
                         }
                         ActiveDeltaStatus::Pending => {
                             self.account_delta_feedback(&focused.outcome);
-                            self.active_delta = Some(active);
+                            self.active_delta =
+                                (class == ActiveDeltaClass::DirectTerminal).then_some(active);
                         }
                         ActiveDeltaStatus::Quiescent => {
                             self.account_delta_feedback(&focused.outcome);
@@ -15041,7 +15072,7 @@ mod tests {
     }
 
     #[test]
-    fn singleton_rpq_seed_stays_hot_but_wide_cold_seed_remains_batched() {
+    fn only_direct_terminal_singleton_rpq_seed_stays_hot() {
         use crate::id::{id_into_value, ExclusiveId, Id};
         use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
         use crate::trible::{Trible, TribleSet};
@@ -15156,47 +15187,19 @@ mod tests {
             .growth(2);
         let focused_first = focused.next().expect("the ring has a path result");
         let focused_first_stats = focused.stats().clone();
-        assert_eq!(focused_first_stats.propose_rows, 3);
-        assert_eq!(focused_first_stats.max_propose_rows, 1);
         assert_eq!(
-            focused_first_stats.support_action_pops
-                + focused_first_stats.propose_action_pops
-                + focused_first_stats.confirm_action_pops,
-            10,
-            "the singleton path seed must reach target confirmation before the cold source remainder"
-        );
-
-        let mut cold = Query::new(make(), project)
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
-            .cap(64)
-            .start_width(1)
-            .growth(2);
-        cold.state.continuation_sprint_enabled = false;
-        let cold_first = cold.next().expect("the control ring has a path result");
-        let cold_first_stats = cold.stats().clone();
-        assert!(cold_first_stats.propose_rows > focused_first_stats.propose_rows);
-        assert!(cold_first_stats.max_propose_rows > 1);
-        assert!(
-            cold_first_stats.support_action_pops
-                + cold_first_stats.propose_action_pops
-                + cold_first_stats.confirm_action_pops
-                > focused_first_stats.support_action_pops
-                    + focused_first_stats.propose_action_pops
-                    + focused_first_stats.confirm_action_pops,
-            "without physical focus wider cold work runs before target confirmation"
+            focused_first_stats.delta_active_lease_steps, 0,
+            "the path still has a target filter, so its publication is nonterminal"
         );
 
         let mut focused_bag: Vec<_> = std::iter::once(focused_first)
             .chain(focused.by_ref())
             .collect();
-        let mut cold_bag: Vec<_> = std::iter::once(cold_first).chain(cold.by_ref()).collect();
         focused_bag.sort_unstable();
-        cold_bag.sort_unstable();
-        assert_eq!(focused_bag, cold_bag);
         assert_eq!(focused_bag.len(), 4 * 8 * 16);
-        assert!(focused.stats().delta_active_lease_steps > 0);
-        assert_eq!(cold.stats().delta_active_live_yields_retained, 0);
-        assert_eq!(cold.stats().delta_active_post_yield_resumptions, 0);
+        assert_eq!(focused.stats().delta_active_lease_steps, 0);
+        assert_eq!(focused.stats().delta_active_terminal_lease_steps, 0);
+        assert_eq!(focused.stats().delta_active_nonterminal_lease_steps, 0);
 
         let make_path = || {
             RegularPathConstraint::new(
@@ -15234,6 +15237,11 @@ mod tests {
             pure.stats()
         );
         assert!(pure.stats().delta_active_post_yield_resumptions > 0);
+        assert_eq!(
+            pure.stats().delta_active_terminal_lease_steps,
+            pure.stats().delta_active_lease_steps
+        );
+        assert_eq!(pure.stats().delta_active_nonterminal_lease_steps, 0);
         assert_eq!(
             pure.stats().delta_active_live_yields_retained,
             pure.stats().delta_active_post_yield_resumptions,
@@ -17455,14 +17463,14 @@ mod tests {
     }
 
     #[test]
-    fn active_delta_seed_requires_one_parent_continuation_lineage() {
+    fn active_delta_seed_requires_direct_terminal_one_parent_lineage() {
         let root = CapabilityLeaf {
             variable: 0,
             page_local: true,
         };
         let plan = ResidualPlan::compile(&root);
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
-        let active = machine
+        let nonterminal = machine
             .delta
             .seed_source_proposals(
                 DeltaDesc::leaf(0, 0),
@@ -17473,26 +17481,57 @@ mod tests {
                 RowBatch::seed(),
             )
             .expect("one cyclic source activation was filed");
+        assert_eq!(
+            machine.delta.active_class(nonterminal, machine.full),
+            ActiveDeltaClass::Nonterminal
+        );
 
         machine.last_selection = SelectionKind::Continuation(ContinuationMode::ProbeOne);
-        machine.accept_delta_seed(None, Some(active), 1);
-        assert_eq!(machine.active_delta, Some(active));
+        machine.accept_delta_seed(None, Some(nonterminal), 1);
+        assert!(
+            machine.active_delta.is_none(),
+            "an outer-source return must remain on the global scheduler"
+        );
+
+        let relevant = ChildSet::empty(plan.len()).with_inserted(0);
+        let terminal = machine
+            .delta
+            .seed_source_proposals(
+                DeltaDesc::leaf(0, 0),
+                StateDesc {
+                    bound: VariableSet::new_empty(),
+                    phase: ResidualPhase::Candidate {
+                        variable: 0,
+                        relevant: relevant.clone(),
+                        checked: relevant,
+                    },
+                },
+                RowBatch::seed(),
+            )
+            .expect("one direct-terminal cyclic source activation was filed");
+        assert_eq!(
+            machine.delta.active_class(terminal, machine.full),
+            ActiveDeltaClass::DirectTerminal
+        );
+
+        machine.accept_delta_seed(None, Some(terminal), 1);
+        assert_eq!(machine.active_delta, Some(terminal));
 
         machine.last_selection = SelectionKind::Continuation(ContinuationMode::Cohort);
-        machine.accept_delta_seed(None, Some(active), 1);
+        machine.accept_delta_seed(None, Some(terminal), 1);
         assert_eq!(
             machine.active_delta,
-            Some(active),
+            Some(terminal),
             "the action after a one-atom planning probe is a singleton cohort"
         );
-        machine.accept_delta_seed(None, Some(active), 512);
+        machine.accept_delta_seed(None, Some(terminal), 512);
         assert!(
             machine.active_delta.is_none(),
             "a wide cohort must not pick an arbitrary last activation"
         );
 
         machine.last_selection = SelectionKind::Full;
-        machine.accept_delta_seed(None, Some(active), 1);
+        machine.accept_delta_seed(None, Some(terminal), 1);
         assert!(machine.active_delta.is_none());
 
         machine.last_selection = SelectionKind::Continuation(ContinuationMode::ProbeOne);
@@ -17505,10 +17544,15 @@ mod tests {
             &mut machine.stats,
         )
         .expect("one stable seed effect was filed");
-        machine.accept_delta_seed(Some(stable), Some(active), 1);
+        machine.accept_delta_seed(Some(stable), Some(nonterminal), 1);
+        assert!(
+            machine.active_delta.is_none(),
+            "a nonterminal activation must not survive a stable-yield boundary"
+        );
+        machine.accept_delta_seed(Some(stable), Some(terminal), 1);
         assert_eq!(
             machine.active_delta,
-            Some(active),
+            Some(terminal),
             "an immediate stable effect must not discard independent traversal affinity"
         );
         assert!(machine.active_delta_after_yield);
@@ -17518,7 +17562,7 @@ mod tests {
         );
 
         machine.continuation_sprint_enabled = false;
-        machine.accept_delta_seed(None, Some(active), 1);
+        machine.accept_delta_seed(None, Some(terminal), 1);
         assert!(
             machine.active_delta.is_none(),
             "the stable continuation ablation must also disable cyclic focus"

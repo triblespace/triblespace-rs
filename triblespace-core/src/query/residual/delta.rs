@@ -80,6 +80,17 @@ pub(super) struct ActiveDeltaContinuation {
     activation: ActivationId,
 }
 
+/// Physical scheduling class of one live affine activation.
+///
+/// This is derived only from registry-owned reducer/return payload and the
+/// machine's projection boundary. It never participates in [`DeltaDesc`] or
+/// any other canonical state identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ActiveDeltaClass {
+    DirectTerminal,
+    Nonterminal,
+}
+
 #[derive(Clone, Default)]
 struct DeltaInterner {
     by_desc: AHashMap<DeltaDesc, DeltaStateId>,
@@ -761,6 +772,40 @@ impl ProducerRegistry {
             .streams()
     }
 
+    fn active_class(&self, activation: ActivationId, full: VariableSet) -> ActiveDeltaClass {
+        let activation = self
+            .state
+            .activations
+            .get(&activation)
+            .expect("unknown delta activation");
+        let direct_terminal = matches!(
+            (&activation.reducer, &activation.return_to),
+            (
+                DeltaReducer::StreamProposal,
+                DeltaReturn::Stable {
+                    desc: StateDesc {
+                        bound,
+                        phase: ResidualPhase::Candidate {
+                            variable,
+                            relevant,
+                            checked,
+                        },
+                    },
+                    ..
+                }
+            ) if relevant == checked && {
+                let mut committed = *bound;
+                committed.set(*variable);
+                committed == full
+            }
+        );
+        if direct_terminal {
+            ActiveDeltaClass::DirectTerminal
+        } else {
+            ActiveDeltaClass::Nonterminal
+        }
+    }
+
     fn is_live(&self, activation: ActivationId) -> bool {
         self.state.activations.contains_key(&activation)
     }
@@ -1213,6 +1258,16 @@ impl DeltaScheduler {
 
     pub(super) fn is_empty(&self) -> bool {
         self.worklist.is_empty() && self.source_worklist.is_empty()
+    }
+
+    /// Classifies one physical continuation without refining its canonical
+    /// delta bucket. The activation payload remains the sole source of truth.
+    pub(super) fn active_class(
+        &self,
+        active: ActiveDeltaContinuation,
+        full: VariableSet,
+    ) -> ActiveDeltaClass {
+        self.registry.active_class(active.activation, full)
     }
 
     pub(super) fn seed_proposals(
@@ -2867,6 +2922,124 @@ mod tests {
                 },
             ),
         }
+    }
+
+    fn file_test_activation(
+        scheduler: &mut DeltaScheduler,
+        reducer: DeltaReducer,
+        return_to: DeltaReturn,
+        marker: u8,
+    ) -> ActiveDeltaContinuation {
+        let mut started =
+            scheduler
+                .registry
+                .start_many(reducer, return_to, [output(marker, 0, false)]);
+        let (node, credit) = started.roots.pop().expect("one live test root");
+        scheduler
+            .file(
+                DeltaDesc::leaf(0, 0),
+                vec![DeltaTask {
+                    activation: started.activation,
+                    credit,
+                    node,
+                    cursor: ResidualDeltaExpandCursor::Start,
+                }],
+            )
+            .expect("the test activation was filed")
+    }
+
+    #[test]
+    fn active_class_comes_only_from_physical_reducer_and_return_payload() {
+        let mut scheduler = DeltaScheduler::new();
+        let full = VariableSet::new_singleton(0);
+
+        let terminal = file_test_activation(
+            &mut scheduler,
+            DeltaReducer::StreamProposal,
+            candidate_return(Vec::new()),
+            1,
+        );
+        assert_eq!(
+            scheduler.active_class(terminal, full),
+            ActiveDeltaClass::DirectTerminal
+        );
+
+        let outer_source = file_test_activation(
+            &mut scheduler,
+            DeltaReducer::StreamProposal,
+            stable_return(Vec::new()),
+            2,
+        );
+        assert_eq!(
+            scheduler.active_class(outer_source, full),
+            ActiveDeltaClass::Nonterminal
+        );
+
+        let relevant = ChildSet::empty(1).with_inserted(0);
+        let unchecked = file_test_activation(
+            &mut scheduler,
+            DeltaReducer::StreamProposal,
+            DeltaReturn::Stable {
+                desc: StateDesc {
+                    bound: VariableSet::new_empty(),
+                    phase: ResidualPhase::Candidate {
+                        variable: 0,
+                        relevant,
+                        checked: ChildSet::empty(1),
+                    },
+                },
+                parent: Box::new([]),
+            },
+            6,
+        );
+        assert_eq!(
+            scheduler.active_class(unchecked, full),
+            ActiveDeltaClass::Nonterminal,
+            "a streaming stable return is not terminal before every confirmer is checked"
+        );
+
+        let mut wider_full = full;
+        wider_full.set(1);
+        assert_eq!(
+            scheduler.active_class(terminal, wider_full),
+            ActiveDeltaClass::Nonterminal,
+            "a fully checked candidate is not terminal when another result variable remains"
+        );
+
+        let confirm = file_test_activation(
+            &mut scheduler,
+            DeltaReducer::Confirm {
+                original: Box::new([]),
+            },
+            candidate_return(Vec::new()),
+            3,
+        );
+        assert_eq!(
+            scheduler.active_class(confirm, full),
+            ActiveDeltaClass::Nonterminal
+        );
+
+        let formula = file_test_activation(
+            &mut scheduler,
+            DeltaReducer::StreamFormulaProposal,
+            support_formula_return(),
+            4,
+        );
+        assert_eq!(
+            scheduler.active_class(formula, full),
+            ActiveDeltaClass::Nonterminal
+        );
+
+        let support = file_test_activation(
+            &mut scheduler,
+            DeltaReducer::Support { published: false },
+            support_formula_return(),
+            5,
+        );
+        assert_eq!(
+            scheduler.active_class(support, full),
+            ActiveDeltaClass::Nonterminal
+        );
     }
 
     #[test]

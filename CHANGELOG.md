@@ -113,13 +113,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and non-linear formula proposals keep the same quiescent reducer barriers.
   Seed effects consume no transition demand, preserve affine parent bags and
   NODES(G) scope, and cannot replay during the first later expansion.
-- **Positive path publications retain their live affine traversal.** A cyclic
-  activation entered from a singleton stable continuation now advances through
-  a fixed one-atom physical lease. Its accepted endpoint still runs through the
-  ordinary stable continuation first, but a traversal that remains live is
-  resumed afterward instead of surrendering locality to the cold global delta
-  harvest. The lease never enters canonical state identity, result ordering or
-  bag ownership, and quiescence releases it without moving scheduler work.
+- **Direct terminal path publications retain their live affine traversal.** A
+  streaming stable activation entered from a singleton continuation advances
+  through a fixed one-atom physical lease only when its fully checked candidate
+  commits the final result variable. Its accepted endpoint still runs through
+  the ordinary stable continuation first, then the same live traversal resumes.
+  Outer-source proposals, formula actions, support, and confirmation stay on
+  the baseline geometric scheduler. Classification reads registry payload
+  metadata and never refines canonical state identity, ordering, or bag
+  ownership.
 - **Ordered proposal sources can page direct candidate occurrences.** The
   residual source cursor now distinguishes raw-value and native-ordinal
   frontiers while preserving proposal order and multiplicity. Sorted slices
