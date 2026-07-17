@@ -1250,7 +1250,16 @@ fn validate_source_cursor(
 
 #[derive(Default)]
 struct DeltaBucket {
-    tasks: Vec<DeltaTask>,
+    /// Append-order task arena. Removed tasks become tombstones until the
+    /// dead prefix exceeds the live payload, at which point the arena is
+    /// rebuilt geometrically.
+    tasks: Vec<Option<DeltaTask>>,
+    /// Live arena slots for each affine activation, in append order.
+    activation_slots: AHashMap<ActivationId, Vec<usize>>,
+    /// The latest live slot for every activation. Ordering these tails is
+    /// equivalent to discovering activations during the old reverse scan.
+    activation_tails: BTreeMap<usize, ActivationId>,
+    live_tasks: usize,
 }
 
 #[derive(Default)]
@@ -1366,6 +1375,7 @@ impl FromIterator<ActivationId> for OrderedActivationSet {
 
 #[derive(Debug)]
 struct TerminalActivationSelection {
+    activation: ActivationId,
     budget: usize,
     selected: usize,
     ordinal: usize,
@@ -1484,23 +1494,144 @@ pub(super) struct ActiveDeltaStepOutcome {
 }
 
 impl DeltaBucket {
+    fn len(&self) -> usize {
+        self.live_tasks
+    }
+
+    fn is_empty(&self) -> bool {
+        self.live_tasks == 0
+    }
+
+    fn last(&self) -> Option<&DeltaTask> {
+        let (&slot, _) = self.activation_tails.last_key_value()?;
+        self.tasks[slot].as_ref()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &DeltaTask> {
+        self.tasks.iter().filter_map(Option::as_ref)
+    }
+
+    fn contains_activation(&self, activation: ActivationId) -> bool {
+        self.activation_slots
+            .get(&activation)
+            .is_some_and(|slots| !slots.is_empty())
+    }
+
+    fn extend(&mut self, tasks: impl IntoIterator<Item = DeltaTask>) {
+        // Removing the old tail marks an activation as touched. We defer the
+        // replacement until the whole append finishes, so one activation
+        // costs one ordered-index update even when it contributes a run.
+        let mut touched = Vec::new();
+        for task in tasks {
+            let activation = task.activation;
+            let slot = self.tasks.len();
+            let slots = self.activation_slots.entry(activation).or_default();
+            if let Some(&old_tail) = slots.last() {
+                if self.activation_tails.remove(&old_tail).is_some() {
+                    touched.push(activation);
+                }
+            } else {
+                touched.push(activation);
+            }
+            slots.push(slot);
+            self.tasks.push(Some(task));
+            self.live_tasks += 1;
+        }
+        for activation in touched {
+            let tail = *self.activation_slots[&activation]
+                .last()
+                .expect("touched activation has one live task");
+            assert_eq!(self.activation_tails.insert(tail, activation), None);
+        }
+    }
+
+    /// Removes newest tasks from one activation and returns their arena slots
+    /// in descending order. The caller may combine several activations and
+    /// restore global append order by sorting on the slot.
+    fn take_activation_slots(
+        &mut self,
+        activation: ActivationId,
+        width: usize,
+    ) -> Vec<(usize, DeltaTask)> {
+        let width = width.max(1);
+        let slots = self
+            .activation_slots
+            .get_mut(&activation)
+            .expect("indexed activation has live tasks");
+        let old_tail = *slots.last().expect("indexed activation is nonempty");
+        assert_eq!(self.activation_tails.remove(&old_tail), Some(activation));
+
+        let take = width.min(slots.len());
+        let selected_slots = slots.split_off(slots.len() - take);
+        let new_tail = slots.last().copied();
+        if let Some(new_tail) = new_tail {
+            assert_eq!(self.activation_tails.insert(new_tail, activation), None);
+        } else {
+            self.activation_slots.remove(&activation);
+        }
+
+        self.live_tasks -= selected_slots.len();
+        selected_slots
+            .into_iter()
+            .rev()
+            .map(|slot| {
+                let task = self.tasks[slot]
+                    .take()
+                    .expect("activation index referenced a tombstone");
+                debug_assert_eq!(task.activation, activation);
+                (slot, task)
+            })
+            .collect()
+    }
+
+    fn drain_live(&mut self) -> Vec<DeltaTask> {
+        let tasks = std::mem::take(&mut self.tasks)
+            .into_iter()
+            .flatten()
+            .collect();
+        self.activation_slots.clear();
+        self.activation_tails.clear();
+        self.live_tasks = 0;
+        tasks
+    }
+
+    fn compact_if_sparse(&mut self) {
+        if self.tasks.len() > self.live_tasks.saturating_mul(2) {
+            let tasks = self.drain_live();
+            self.extend(tasks);
+        }
+    }
+
+    #[cfg(test)]
+    fn assert_index_consistent(&self) {
+        assert_eq!(self.iter().count(), self.live_tasks);
+        assert!(self.tasks.len() <= self.live_tasks.saturating_mul(2));
+        let indexed_tasks: usize = self.activation_slots.values().map(Vec::len).sum();
+        assert_eq!(indexed_tasks, self.live_tasks);
+        assert_eq!(self.activation_tails.len(), self.activation_slots.len());
+        for (&activation, slots) in &self.activation_slots {
+            assert!(!slots.is_empty());
+            for &slot in slots {
+                assert_eq!(self.tasks[slot].as_ref().unwrap().activation, activation);
+            }
+            assert_eq!(
+                self.activation_tails.get(slots.last().unwrap()),
+                Some(&activation)
+            );
+        }
+    }
+
     /// Removes at most `width` tasks owned by one exact activation while
     /// preserving the relative order of both the selected and retained
     /// subsequences.
     fn take_activation(&mut self, activation: ActivationId, width: usize) -> Vec<DeltaTask> {
-        let width = width.max(1);
-        let mut selected = Vec::with_capacity(width.min(self.tasks.len()));
-        let mut retained = Vec::with_capacity(self.tasks.len());
-        for task in std::mem::take(&mut self.tasks).into_iter().rev() {
-            if task.activation == activation && selected.len() < width {
-                selected.push(task);
-            } else {
-                retained.push(task);
-            }
-        }
+        let mut selected: Vec<_> = self
+            .take_activation_slots(activation, width)
+            .into_iter()
+            .map(|(_, task)| task)
+            .collect();
         selected.reverse();
-        retained.reverse();
-        self.tasks = retained;
+        self.compact_if_sparse();
         selected
     }
 
@@ -1516,7 +1647,7 @@ impl DeltaBucket {
         let activation_width = activation_width.max(1);
         let key = TransitionDispatchKey::of(
             registry,
-            self.tasks.last().expect("live delta bucket is nonempty"),
+            self.last().expect("live delta bucket is nonempty"),
         );
         if key == TransitionDispatchKey::TerminalStreaming {
             // Admit terminal activations from the hot tail until their local
@@ -1525,7 +1656,6 @@ impl DeltaBucket {
             // at most its own quantum. Thus B=min(S, sum_a t_a) without
             // multiplying S by the number of compatible affine parents.
             let hot_activation = self
-                .tasks
                 .last()
                 .expect("live delta bucket is nonempty")
                 .activation;
@@ -1541,58 +1671,54 @@ impl DeltaBucket {
             let mut remaining = width;
             terminal_selection_slots.clear();
             terminal_selections.clear();
-            let mut selected = Vec::with_capacity(width.min(self.tasks.len()));
-            // During selection this parallel vector holds selection slots. It
-            // is rewritten in place to the final ragged task limits once all
-            // selected counts are known.
-            let mut limits = Vec::with_capacity(width.min(self.tasks.len()));
-            let mut retained = Vec::with_capacity(self.tasks.len());
-            for task in std::mem::take(&mut self.tasks).into_iter().rev() {
-                if TransitionDispatchKey::of(registry, &task) == key {
-                    let selection_slot =
-                        if let Some(&slot) = terminal_selection_slots.get(&task.activation) {
-                            Some(slot)
-                        } else if remaining > 0 {
-                            let budget = registry
-                                .transition_dispatch_width(task.activation, width)
-                                .min(remaining);
-                            debug_assert!(budget > 0);
-                            remaining -= budget;
-                            let slot = terminal_selections.len();
-                            terminal_selections.push(TerminalActivationSelection {
-                                budget,
-                                selected: 0,
-                                ordinal: 0,
-                            });
-                            terminal_selection_slots.insert(task.activation, slot);
-                            Some(slot)
-                        } else {
-                            None
-                        };
-                    if let Some((slot, selection)) = selection_slot
-                        .map(|slot| (slot, &mut terminal_selections[slot]))
-                        .filter(|(_, selection)| selection.selected < selection.budget)
-                    {
-                        selection.selected += 1;
-                        limits.push(slot);
-                        selected.push(task);
-                        continue;
-                    }
+            // An activation's latest slot is exactly where the old reverse
+            // scan first encountered it. Selecting ordered activation tails
+            // therefore preserves the physical cohort and budget policy
+            // without walking unrelated rows.
+            for (_, &activation) in self.activation_tails.iter().rev() {
+                if registry.physical_activation_class(activation)
+                    != DeltaPhysicalClass::TerminalStreaming
+                {
+                    continue;
                 }
-                retained.push(task);
+                let budget = registry
+                    .transition_dispatch_width(activation, width)
+                    .min(remaining);
+                debug_assert!(budget > 0);
+                remaining -= budget;
+                let slot = terminal_selections.len();
+                terminal_selections.push(TerminalActivationSelection {
+                    activation,
+                    budget,
+                    selected: 0,
+                    ordinal: 0,
+                });
+                terminal_selection_slots.insert(activation, slot);
+                if remaining == 0 {
+                    break;
+                }
             }
-            selected.reverse();
-            limits.reverse();
-            retained.reverse();
-            self.tasks = retained;
 
-            for slot_or_limit in &mut limits {
-                let selection = &mut terminal_selections[*slot_or_limit];
+            let mut selected_with_slots = Vec::with_capacity(width.min(self.len()));
+            for selection in terminal_selections.iter_mut() {
+                let tasks = self.take_activation_slots(selection.activation, selection.budget);
+                selection.selected = tasks.len();
+                selected_with_slots.extend(tasks);
+            }
+            selected_with_slots.sort_unstable_by_key(|(slot, _)| *slot);
+
+            let mut selected = Vec::with_capacity(selected_with_slots.len());
+            let mut limits = Vec::with_capacity(selected_with_slots.len());
+            for (_, task) in selected_with_slots {
+                let selection =
+                    &mut terminal_selections[terminal_selection_slots[&task.activation]];
                 let quotient = selection.budget / selection.selected;
                 let remainder = selection.budget % selection.selected;
-                *slot_or_limit = quotient + usize::from(selection.ordinal < remainder);
+                limits.push(quotient + usize::from(selection.ordinal < remainder));
                 selection.ordinal += 1;
+                selected.push(task);
             }
+            self.compact_if_sparse();
             debug_assert!(limits.iter().all(|&limit| limit > 0));
             debug_assert_eq!(
                 limits.iter().sum::<usize>(),
@@ -1605,9 +1731,10 @@ impl DeltaBucket {
         }
 
         let mut activations = BTreeSet::new();
-        let mut selected = Vec::with_capacity(width.min(self.tasks.len()));
-        let mut retained = Vec::with_capacity(self.tasks.len());
-        for task in std::mem::take(&mut self.tasks).into_iter().rev() {
+        let tasks = self.drain_live();
+        let mut selected = Vec::with_capacity(width.min(tasks.len()));
+        let mut retained = Vec::with_capacity(tasks.len());
+        for task in tasks.into_iter().rev() {
             let compatible = match (key, TransitionDispatchKey::of(registry, &task)) {
                 (TransitionDispatchKey::Streaming, TransitionDispatchKey::Streaming) => true,
                 (
@@ -1630,7 +1757,7 @@ impl DeltaBucket {
         }
         selected.reverse();
         retained.reverse();
-        self.tasks = retained;
+        self.extend(retained);
         let limits = even_limits(width, selected.len());
         (selected, limits)
     }
@@ -2331,18 +2458,10 @@ impl DeltaScheduler {
         )
     }
 
-    fn file(
-        &mut self,
-        desc: DeltaDesc,
-        mut tasks: Vec<DeltaTask>,
-    ) -> Option<ActiveDeltaContinuation> {
+    fn file(&mut self, desc: DeltaDesc, tasks: Vec<DeltaTask>) -> Option<ActiveDeltaContinuation> {
         let activation = tasks.last()?.activation;
         let id = self.interner.intern(desc);
-        self.worklist
-            .entry(id)
-            .or_default()
-            .tasks
-            .append(&mut tasks);
+        self.worklist.entry(id).or_default().extend(tasks);
         Some(ActiveDeltaContinuation {
             state: id,
             activation,
@@ -2379,12 +2498,9 @@ impl DeltaScheduler {
     }
 
     fn has_active_transition(&self, active: ActiveDeltaContinuation) -> bool {
-        self.worklist.get(&active.state).is_some_and(|bucket| {
-            bucket
-                .tasks
-                .iter()
-                .any(|task| task.activation == active.activation)
-        })
+        self.worklist
+            .get(&active.state)
+            .is_some_and(|bucket| bucket.contains_activation(active.activation))
     }
 
     fn allows_global_width_growth(&self, dispatch: &PhysicalDispatch, search_width: usize) -> bool {
@@ -2453,7 +2569,7 @@ impl DeltaScheduler {
                 .get_mut(&active.state)
                 .expect("active delta transition state remains live");
             let tasks = bucket.take_activation(active.activation, width);
-            (tasks, bucket.tasks.is_empty())
+            (tasks, bucket.is_empty())
         };
         assert!(
             !tasks.is_empty(),
@@ -2499,11 +2615,11 @@ impl DeltaScheduler {
         search_width: usize,
     ) -> (DeltaDesc, Vec<DeltaTask>, PhysicalDispatch) {
         let full = self.worklist.iter().rev().find_map(|(&id, bucket)| {
-            let activation = bucket.tasks.last()?.activation;
+            let activation = bucket.last()?.activation;
             let width = self
                 .registry
                 .transition_dispatch_width(activation, search_width);
-            (bucket.tasks.len() >= width).then_some(id)
+            (bucket.len() >= width).then_some(id)
         });
         let id = full.unwrap_or_else(|| {
             *self
@@ -2525,8 +2641,8 @@ impl DeltaScheduler {
                 terminal_selection_slots,
                 terminal_selections,
             );
-            let remainder_tasks = bucket.tasks.len();
-            (tasks, task_limits, bucket.tasks.is_empty(), remainder_tasks)
+            let remainder_tasks = bucket.len();
+            (tasks, task_limits, bucket.is_empty(), remainder_tasks)
         };
         if empty {
             self.worklist.remove(&id);
@@ -2706,10 +2822,7 @@ impl DeltaScheduler {
                 .transition_dispatch_width(active.activation, search_width);
             let (desc, tasks) = self.pop_active_transition(active, width);
             let task_count = tasks.len();
-            let remainder_tasks = self
-                .worklist
-                .get(&active.state)
-                .map_or(0, |bucket| bucket.tasks.len());
+            let remainder_tasks = self.worklist.get(&active.state).map_or(0, DeltaBucket::len);
             let dispatch = PhysicalDispatch {
                 terminal_activations: terminal_activation.into_iter().collect(),
                 kind: PhysicalDispatchKind::Transition,
@@ -3271,8 +3384,8 @@ impl DeltaScheduler {
         let (registry, mut remap) = self.registry.deep_clone();
         let mut worklist = BTreeMap::new();
         for (&id, bucket) in &self.worklist {
-            let mut tasks = Vec::with_capacity(bucket.tasks.len());
-            for task in &bucket.tasks {
+            let mut tasks = Vec::with_capacity(bucket.len());
+            for task in bucket.iter() {
                 let credit = remap
                     .remove(&task.credit.key)
                     .expect("delta clone omitted one live credit");
@@ -3283,7 +3396,9 @@ impl DeltaScheduler {
                     cursor: task.cursor,
                 });
             }
-            worklist.insert(id, DeltaBucket { tasks });
+            let mut cloned_bucket = DeltaBucket::default();
+            cloned_bucket.extend(tasks);
+            worklist.insert(id, cloned_bucket);
         }
         let mut source_worklist = BTreeMap::new();
         for (&id, bucket) in &self.source_worklist {
@@ -4535,8 +4650,8 @@ mod tests {
             .values()
             .next()
             .expect("the independent activation remains queued");
-        assert_eq!(retained.tasks.len(), 1);
-        assert_eq!(retained.tasks[0].activation, second_activation);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained.last().unwrap().activation, second_activation);
     }
 
     #[test]
@@ -4591,11 +4706,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(first_activation, value(2)), (first_activation, value(3))]
         );
-        let retained = &scheduler
+        let retained = scheduler
             .worklist
             .get(&active.state)
-            .expect("cold tasks remain")
-            .tasks;
+            .expect("cold tasks remain");
         assert_eq!(
             retained
                 .iter()
@@ -4607,6 +4721,74 @@ mod tests {
                 (second_activation, value(5)),
             ]
         );
+        retained.assert_index_consistent();
+    }
+
+    #[test]
+    fn activation_index_compacts_geometrically_without_reordering_survivors() {
+        let mut scheduler = DeltaScheduler::new();
+        let desc = DeltaDesc::leaf(0, 0);
+        let mut first = scheduler.registry.start_many(
+            DeltaReducer::QuiescentProposal,
+            candidate_return(Vec::new()),
+            (1..=4).map(|value| output(value, 0, false)),
+        );
+        let first_activation = first.activation;
+        let mut second = scheduler.registry.start_many(
+            DeltaReducer::QuiescentProposal,
+            candidate_return(Vec::new()),
+            (5..=8).map(|value| output(value, 0, false)),
+        );
+        let task = |started: &mut StartOutcome| {
+            let (node, credit) = started.roots.remove(0);
+            DeltaTask {
+                activation: started.activation,
+                credit,
+                node,
+                cursor: ResidualDeltaExpandCursor::Start,
+            }
+        };
+        let tasks = vec![
+            task(&mut first),
+            task(&mut second),
+            task(&mut first),
+            task(&mut second),
+            task(&mut first),
+            task(&mut second),
+            task(&mut first),
+            task(&mut second),
+        ];
+        let active = scheduler.file(desc, tasks).unwrap();
+        let bucket = scheduler.worklist.get_mut(&active.state).unwrap();
+
+        let selected = bucket.take_activation(first_activation, 3);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|task| task.node.value)
+                .collect::<Vec<_>>(),
+            [value(2), value(3), value(4)]
+        );
+        assert_eq!((bucket.tasks.len(), bucket.len()), (8, 5));
+        bucket.assert_index_consistent();
+
+        let selected = bucket.take_activation(second.activation, 3);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|task| task.node.value)
+                .collect::<Vec<_>>(),
+            [value(6), value(7), value(8)]
+        );
+        assert_eq!((bucket.tasks.len(), bucket.len()), (2, 2));
+        assert_eq!(
+            bucket
+                .iter()
+                .map(|task| (task.activation, task.node.value))
+                .collect::<Vec<_>>(),
+            [(first_activation, value(1)), (second.activation, value(5))]
+        );
+        bucket.assert_index_consistent();
     }
 
     #[test]
@@ -4772,8 +4954,8 @@ mod tests {
             .worklist
             .get(&active.state)
             .expect("unrelated transition remains cold");
-        assert_eq!(retained.tasks.len(), 1);
-        assert_eq!(retained.tasks[0].activation, unrelated_activation);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained.last().unwrap().activation, unrelated_activation);
     }
 
     #[test]
@@ -4893,7 +5075,6 @@ mod tests {
             .next()
             .expect("transition children were refiled");
         let actual: Vec<_> = bucket
-            .tasks
             .iter()
             .map(|task| (task.activation, task.node.value, task.node.continuation))
             .collect();
@@ -5747,9 +5928,9 @@ mod tests {
 
         assert_eq!(scheduler.interner.descs, vec![desc]);
         assert_eq!(scheduler.worklist.len(), 1);
-        let tasks = &scheduler.worklist.values().next().unwrap().tasks;
-        assert_eq!(tasks.len(), 2);
-        let counters: Vec<_> = tasks
+        let bucket = scheduler.worklist.values().next().unwrap();
+        assert_eq!(bucket.len(), 2);
+        let counters: Vec<_> = bucket
             .iter()
             .map(|task| {
                 let activation = scheduler
