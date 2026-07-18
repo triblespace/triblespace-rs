@@ -215,6 +215,22 @@ pub enum BudgetContractError {
         /// Zero-based cohort input.
         input: usize,
     },
+    /// The cohort's resume-base count does not match its input rows.
+    BaseCountMismatch {
+        /// Number of cohort inputs submitted.
+        inputs: usize,
+        /// Number of resume bases supplied.
+        bases: usize,
+    },
+    /// A resume base points past its input's candidate interval. A lawful
+    /// cursor never exceeds the interval it was produced from, so this is a
+    /// cross-snapshot or corrupted continuation and fails the cohort closed.
+    ResumeBeyondInterval {
+        /// Zero-based cohort input.
+        input: usize,
+        /// The offending resume base.
+        base: u32,
+    },
     /// The device returned a different number of receipts than inputs.
     ReceiptCountMismatch {
         /// Number of cohort inputs granted.
@@ -255,6 +271,13 @@ impl fmt::Display for BudgetContractError {
             Self::ZeroGrant { input } => {
                 write!(f, "dispatched input {input} carries no work grant")
             }
+            Self::BaseCountMismatch { inputs, bases } => {
+                write!(f, "cohort submitted {inputs} inputs with {bases} resume bases")
+            }
+            Self::ResumeBeyondInterval { input, base } => write!(
+                f,
+                "input {input} resumes at base {base} beyond its candidate interval"
+            ),
             Self::ReceiptCountMismatch { inputs, receipts } => write!(
                 f,
                 "device returned {receipts} receipts for {inputs} granted inputs"

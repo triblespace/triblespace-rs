@@ -687,4 +687,109 @@ fn budgeted_transition_yields_stable_prefixes_and_lawful_receipts() {
         gpu.transition_on_budgeted(v, &parent, &zeroed).unwrap_err(),
         ResidentTransitionError::Budget(BudgetContractError::ZeroGrant { input: 7 })
     ));
+    let bases = vec![0u32; rows - 1];
+    assert!(matches!(
+        gpu.transition_on_budgeted_from(v, &parent, &grants, &bases)
+            .unwrap_err(),
+        ResidentTransitionError::Budget(BudgetContractError::BaseCountMismatch {
+            inputs,
+            bases,
+        }) if inputs == rows && bases == rows - 1
+    ));
+}
+
+#[test]
+#[ignore = "requires a native WGPU adapter"]
+fn budgeted_transition_resumes_from_bases_into_the_exact_whole() {
+    use triblespace_gpu::budgeted::CohortGrants;
+
+    let (archive, entities, attributes, _values) = fixture();
+    let resident = WgpuSuccinctArchive::new(archive).unwrap();
+    let e = ProgramVariable::new(0);
+    let a = ProgramVariable::new(1);
+    let v = ProgramVariable::new(2);
+    let program =
+        QueryProgram::compile(resident.archive(), 3, [QueryPattern::new(e, a, v)]).unwrap();
+    let gpu = WgpuQueryProgram::new(&program, &resident).unwrap();
+    let rows = BLOCK + 1;
+    let parent = frontier(
+        &program,
+        vec![e, a],
+        repeated_ea_rows(&entities, attributes[0], rows),
+    );
+    let whole = program.transition_on(v, &parent).unwrap();
+    let child_stride = whole.variables().len();
+
+    // Page one under mixed clamping grants, then feed every returned cursor
+    // back as that input's resume base under generous grants. The two device
+    // pages must concatenate per input into the exact unbudgeted whole.
+    let limits: Vec<usize> = (0..rows).map(|row| (row % 3) + 1).collect();
+    let grants = CohortGrants::from_task_limits(&limits).unwrap();
+    let (first, receipts) = gpu.transition_on_budgeted(v, &parent, &grants).unwrap();
+    let receipts = receipts.into_receipts();
+    let mut bases = vec![0u32; rows];
+    let mut clamped = 0usize;
+    for (input, receipt) in receipts.iter().enumerate() {
+        if receipt.physical_cursor.is_some() {
+            clamped += 1;
+        }
+        bases[input] = receipt.examined;
+    }
+    assert!(clamped > 0, "the fixture must observe real clamping");
+
+    let generous = CohortGrants::from_task_limits(&vec![64usize; rows]).unwrap();
+    let (second, second_receipts) = gpu
+        .transition_on_budgeted_from(v, &parent, &generous, &bases)
+        .unwrap();
+    let second_receipts = second_receipts.into_receipts();
+
+    // Cursors from the first page point exactly one full second page from
+    // the interval end: generous grants exhaust every remainder cursor-free.
+    let mut merged = Vec::new();
+    let mut merged_rows = 0usize;
+    let mut first_consumed = 0usize;
+    let mut second_consumed = 0usize;
+    for (input, (page_one, page_two)) in receipts.iter().zip(&second_receipts).enumerate() {
+        assert!(page_two.physical_cursor.is_none(), "input {input}");
+        assert_eq!(
+            (page_one.examined + page_two.examined) as usize,
+            {
+                let single = ProgramFrontier::new(
+                    parent.variables().to_vec(),
+                    parent.row(input).to_vec(),
+                    1,
+                )
+                .unwrap();
+                program.transition_on(v, &single).unwrap().len()
+            },
+            "input {input}"
+        );
+        for row in first_consumed..first_consumed + page_one.produced as usize {
+            merged.extend_from_slice(first.row(row));
+        }
+        for row in second_consumed..second_consumed + page_two.produced as usize {
+            merged.extend_from_slice(second.row(row));
+        }
+        merged_rows += (page_one.produced + page_two.produced) as usize;
+        first_consumed += page_one.produced as usize;
+        second_consumed += page_two.produced as usize;
+    }
+    let merged =
+        ProgramFrontier::new(whole.variables().to_vec(), merged, merged_rows).unwrap();
+    assert_eq!(merged, whole);
+    assert_eq!(merged.len() * child_stride, whole.values().len());
+
+    // A base beyond its interval is a corrupted continuation: the whole
+    // cohort fails closed on the device, no partial prefix escapes.
+    let mut corrupt = bases.clone();
+    let victim = second_receipts
+        .iter()
+        .position(|receipt| receipt.examined > 0)
+        .unwrap();
+    corrupt[victim] = u32::MAX;
+    assert!(matches!(
+        gpu.transition_on_budgeted_from(v, &parent, &generous, &corrupt)
+            .unwrap_err(),
+        ResidentTransitionError::DeviceInvariant
+    ));
 }

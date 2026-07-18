@@ -324,11 +324,42 @@ where
         frontier: &ProgramFrontier,
         grants: &CohortGrants,
     ) -> Result<(ProgramFrontier, CohortReceipts), ResidentTransitionError> {
+        let bases = vec![0u32; frontier.len()];
+        self.transition_on_budgeted_from(variable, frontier, grants, &bases)
+    }
+
+    /// Executes the budgeted transition resuming each input at its own base.
+    ///
+    /// `bases[i]` is the absolute offset into input `i`'s candidate interval
+    /// at which examination continues — exactly the offset a previous
+    /// cohort's [`PhysicalCursor`] converted to. Each candidate position is
+    /// `range_start + base + local`, the grant clamps the *remaining*
+    /// sub-interval element-wise, and a still-clamped input's cursor returns
+    /// `base + examined`, so successive budgeted pages concatenate into the
+    /// exact unbudgeted transition. A base beyond its interval is a
+    /// corrupted or cross-snapshot continuation and fails the whole cohort
+    /// closed on the device. All-zero bases are precisely
+    /// [`Self::transition_on_budgeted`].
+    pub fn transition_on_budgeted_from(
+        &self,
+        variable: ProgramVariable,
+        frontier: &ProgramFrontier,
+        grants: &CohortGrants,
+        bases: &[u32],
+    ) -> Result<(ProgramFrontier, CohortReceipts), ResidentTransitionError> {
         if grants.len() != frontier.len() {
             return Err(ResidentTransitionError::Budget(
                 BudgetContractError::GrantCountMismatch {
                     inputs: frontier.len(),
                     grants: grants.len(),
+                },
+            ));
+        }
+        if bases.len() != frontier.len() {
+            return Err(ResidentTransitionError::Budget(
+                BudgetContractError::BaseCountMismatch {
+                    inputs: frontier.len(),
+                    bases: bases.len(),
                 },
             ));
         }
@@ -347,8 +378,12 @@ where
             ResidentTransitionError::GeometryOverflow("child-row capacity"),
         )?;
         let child_capacity = granted.min(envelope);
-        let (child, receipts) =
-            self.transition_with_grants(variable, frontier, child_capacity, Some(grants))?;
+        let (child, receipts) = self.transition_with_grants(
+            variable,
+            frontier,
+            child_capacity,
+            Some((grants, bases)),
+        )?;
         let receipts = receipts.ok_or(ResidentTransitionError::DeviceInvariant)?;
         Ok((child, receipts))
     }
@@ -358,7 +393,7 @@ where
         variable: ProgramVariable,
         frontier: &ProgramFrontier,
         child_capacity: usize,
-        grants: Option<&CohortGrants>,
+        grants: Option<(&CohortGrants, &[u32])>,
     ) -> Result<(ProgramFrontier, Option<CohortReceipts>), ResidentTransitionError> {
         let admitted = self.validate_transition(variable, frontier)?;
         let child_variables = child_variables(frontier, variable);
@@ -366,7 +401,20 @@ where
             let child = ProgramFrontier::new(child_variables, Vec::new(), 0)
                 .map_err(ResidentTransitionError::Program)?;
             let receipts = grants
-                .map(|grants| self.exhausted_receipts(grants))
+                .map(|(grants, bases)| {
+                    // These legs perform no device work because every
+                    // interval is provably empty; a nonzero resume base
+                    // into an empty interval is a corrupted continuation.
+                    if let Some(input) = bases.iter().position(|&base| base != 0) {
+                        return Err(ResidentTransitionError::Budget(
+                            BudgetContractError::ResumeBeyondInterval {
+                                input,
+                                base: bases[input],
+                            },
+                        ));
+                    }
+                    self.exhausted_receipts(grants)
+                })
                 .transpose()?;
             return Ok((child, receipts));
         }
@@ -387,7 +435,19 @@ where
             let child = ProgramFrontier::new(child_variables, Vec::new(), 0)
                 .map_err(ResidentTransitionError::Program)?;
             let receipts = grants
-                .map(|grants| self.exhausted_receipts(grants))
+                .map(|(grants, bases)| {
+                    // A zero global fanout proves every interval empty; a
+                    // nonzero resume base cannot lawfully exist for one.
+                    if let Some(input) = bases.iter().position(|&base| base != 0) {
+                        return Err(ResidentTransitionError::Budget(
+                            BudgetContractError::ResumeBeyondInterval {
+                                input,
+                                base: bases[input],
+                            },
+                        ));
+                    }
+                    self.exhausted_receipts(grants)
+                })
                 .transpose()?;
             return Ok((child, receipts));
         }
@@ -477,12 +537,14 @@ where
         }
 
         // Budgeted-prefix clamp: each parent's exact candidate interval is
-        // clamped element-wise against its own grant, never against a pooled
-        // or averaged budget. The stable scan below then proves the receipt
-        // law for the clamped counts unchanged.
+        // first shifted by its own resume base, then clamped element-wise
+        // against its own grant, never against a pooled or averaged budget.
+        // The stable scan below then proves the receipt law for the clamped
+        // counts unchanged.
         let receipt_lanes = match grants {
-            Some(grants) => {
+            Some((grants, bases)) => {
                 let limits = context.upload_u32(grants.as_slice())?;
+                let base_offsets = context.upload_u32(bases)?;
                 let lane_words = rows
                     .checked_mul(RECEIPT_LANE_WORDS)
                     .ok_or(ResidentTransitionError::GeometryOverflow("receipt lanes"))?;
@@ -493,7 +555,10 @@ where
                         row_dispatch.cube_count(),
                         row_dispatch.cube_dim(),
                         limits.input_arg(),
+                        base_offsets.input_arg(),
+                        range_starts.output_arg(),
                         counts.output_arg(),
+                        row_errors.output_arg(),
                         lanes.output_arg(),
                         rows as u32,
                     );
@@ -648,13 +713,13 @@ where
             return Err(ResidentTransitionError::SpareOutputModified);
         }
         let receipts = match (grants, receipt_lanes) {
-            (Some(grants), Some(lanes)) => {
+            (Some((grants, bases)), Some(lanes)) => {
                 // TODO(P4.1): fold the receipt lane into the packed buffer so
                 // header, child rows, canary tail, and receipts share the one
                 // readback; a second read after the same synchronization is
                 // correct but pays one extra transfer.
                 let lanes = lanes.read();
-                Some(self.receipts_from_lanes(grants, &lanes)?)
+                Some(self.receipts_from_lanes(grants, bases, &lanes)?)
             }
             (None, None) => None,
             _ => return Err(ResidentTransitionError::DeviceInvariant),
@@ -693,16 +758,21 @@ where
 
     /// Decodes the device receipt lane and re-checks the receipt law before
     /// anything downstream can observe it.
+    ///
+    /// A resumable input's cursor is the absolute interval offset
+    /// `base + examined`, so a later cohort resumes exactly where this
+    /// clamped sub-interval ended.
     fn receipts_from_lanes(
         &self,
         grants: &CohortGrants,
+        bases: &[u32],
         lanes: &[u32],
     ) -> Result<CohortReceipts, ResidentTransitionError> {
         let expected = grants
             .len()
             .checked_mul(RECEIPT_LANE_WORDS)
             .ok_or(ResidentTransitionError::GeometryOverflow("receipt lanes"))?;
-        if lanes.len() != expected {
+        if lanes.len() != expected || bases.len() != grants.len() {
             return Err(ResidentTransitionError::DeviceInvariant);
         }
         let mut receipts = Vec::with_capacity(grants.len());
@@ -710,7 +780,11 @@ where
             let examined = lanes[input * RECEIPT_LANE_WORDS];
             let physical_cursor = match lanes[input * RECEIPT_LANE_WORDS + 1] {
                 0 => None,
-                1 => Some(PhysicalCursor::new(examined)),
+                1 => Some(PhysicalCursor::new(
+                    bases[input]
+                        .checked_add(examined)
+                        .ok_or(ResidentTransitionError::DeviceInvariant)?,
+                )),
                 _ => return Err(ResidentTransitionError::DeviceInvariant),
             };
             receipts.push(InputReceipt {
@@ -2071,7 +2145,10 @@ fn finish_proposal_ranges(
 #[cube(launch_unchecked)]
 fn clamp_counts_to_grants(
     limits: &Array<u32>,
+    bases: &Array<u32>,
+    range_starts: &mut Array<u32>,
     counts: &mut Array<u32>,
+    row_errors: &mut Array<u32>,
     receipt_lanes: &mut Array<u32>,
     rows: u32,
 ) {
@@ -2079,12 +2156,26 @@ fn clamp_counts_to_grants(
     if row < rows as usize {
         let full = counts[row];
         let limit = limits[row];
-        let mut examined = full;
+        let base = bases[row];
+        let mut examined = 0u32;
         let mut resumable = 0u32;
-        if full > limit {
-            examined = limit;
-            resumable = 1u32;
+        if base > full {
+            // A lawful cursor never exceeds the interval it was produced
+            // from; a base past the interval is a corrupted or
+            // cross-snapshot continuation and poisons the row fail-closed.
+            row_errors[row] = 1u32;
+        } else {
+            let remaining = full - base;
+            examined = remaining;
+            if remaining > limit {
+                examined = limit;
+                resumable = 1u32;
+            }
         }
+        // Skipping the consumed prefix here moves every downstream kernel —
+        // scan, candidate generation, access, scatter — onto the resumed
+        // sub-interval without further changes.
+        range_starts[row] = range_starts[row] + base;
         counts[row] = examined;
         let lane = row * 2usize;
         receipt_lanes[lane] = examined;

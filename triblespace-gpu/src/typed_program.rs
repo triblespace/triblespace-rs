@@ -26,10 +26,10 @@
 //!    input rows may route; below the threshold the kernel's fixed launch
 //!    cost exceeds its win.
 //! 2. **Kernel capability**: only the two-bound `(E,A) -> V` transition on
-//!    first-page (offset-zero), schema-uniform cohorts has a device lowering
-//!    today. Every other op — and any recoverable device failure — returns
-//!    `None`, which the typed adapter treats as the exact Native fallback
-//!    with the cohort batch intact.
+//!    schema-uniform cohorts has a device lowering today. Every other op —
+//!    and any recoverable device failure — returns `None`, which the typed
+//!    adapter treats as the exact Native fallback with the cohort batch
+//!    intact.
 //! 3. **The hard law**: ready/latency-priority work never waits for an
 //!    accelerator. Only `ProgramPacing::Search` cohorts (pageable domain
 //!    discovery) are eligible; the activation-local sparse quantum always
@@ -46,18 +46,15 @@
 //! static [`ProgramPhysicalReceipt`] this module attaches to each `Some`
 //! step.
 //!
-//! # First-page-only offload
+//! # Resumed cohorts
 //!
-//! [`WgpuQueryProgram::transition_on_budgeted`] clamps every parent's
-//! candidate interval **from its start** — the kernel carries no per-input
-//! base offsets yet. A resumed state (nonzero interval offset) re-entering
-//! that kernel would unlawfully replay its already-consumed prefix, so any
-//! cohort containing a resumed state declines the device
-//! ([`try_step_physical`] returns `None`) and Native owns every
-//! continuation. This is deliberate and labeled: the placement receipt
-//! operation is [`TWO_BOUND_FIRST_PAGE_OP`], naming the first-page-only
-//! scope. The offset-aware kernel form (per-input base offsets uploaded
-//! with the grants, `cursor = base + examined`) is the named follow-up.
+//! Resumed states ride the offset-aware kernel form
+//! ([`WgpuQueryProgram::transition_on_budgeted_from`]): each state's
+//! consumed-prefix offset uploads as its resume base, candidate positions
+//! shift to `range_start + base + local`, and a still-clamped input's
+//! cursor returns the absolute offset `base + examined`. Successive
+//! budgeted pages therefore concatenate into the exact unbudgeted
+//! transition, on the device or interchangeably through the Native step.
 
 use std::env;
 
@@ -89,9 +86,8 @@ pub const ROUTING_ENV: &str = "TRIBLESPACE_GPU_PROGRAM_ROUTING";
 pub const WGPU_RESIDENT_EXECUTOR: &str = "wgpu-resident";
 
 /// Static operation label for the exercised kernel: the budgeted two-bound
-/// `(E,A) -> V` transition, first-page cohorts only (see the module docs on
-/// resumed-state fallback).
-pub const TWO_BOUND_FIRST_PAGE_OP: &str = "two-bound-transition/first-page";
+/// `(E,A) -> V` transition with per-input resume bases.
+pub const TWO_BOUND_BUDGETED_OP: &str = "two-bound-transition/budgeted";
 
 /// Post-cohort-formation Native-vs-device decision.
 ///
@@ -380,8 +376,8 @@ impl<'p, 'a, U: Universe> SuccinctProgramFamily<'p, 'a, U> {
     ///
     /// Every decline and every recoverable failure returns `None`: the typed
     /// adapter then runs the exact Native step on the untouched batch. See
-    /// the module docs for the admission inputs and the first-page-only
-    /// capability bound.
+    /// the module docs for the admission inputs and the resumed-cohort
+    /// base semantics.
     fn device_outcome(
         &self,
         states: &[SuccinctFrontierState],
@@ -402,13 +398,11 @@ impl<'p, 'a, U: Universe> SuccinctProgramFamily<'p, 'a, U> {
         {
             return None;
         }
-        // Capability: schema-uniform, first-page cohorts only. A resumed
-        // state would replay its consumed prefix under the start-clamping
-        // kernel; Native owns every continuation (module docs).
+        // Capability: schema-uniform cohorts. Each state's consumed-prefix
+        // offset rides down as its resume base, so fresh and resumed states
+        // share one budgeted submission.
         let first = states.first()?;
-        if states.iter().any(|state| {
-            state.variables != first.variables || state.offset != 0
-        }) {
+        if states.iter().any(|state| state.variables != first.variables) {
             return None;
         }
         let target = self.target(first)?;
@@ -416,6 +410,7 @@ impl<'p, 'a, U: Universe> SuccinctProgramFamily<'p, 'a, U> {
         // Law gate 5: the scheduler grants in usize; any grant beyond the
         // device u32 lane declines to Native instead of erring.
         let grants = CohortGrants::from_task_limits(limits).ok()?;
+        let bases: Vec<u32> = states.iter().map(|state| state.offset).collect();
 
         let mut values = Vec::with_capacity(states.len() * first.variables.len());
         for state in states {
@@ -424,7 +419,10 @@ impl<'p, 'a, U: Universe> SuccinctProgramFamily<'p, 'a, U> {
         let parent = ProgramFrontier::new(first.variables.clone(), values, states.len()).ok()?;
         // Unsupported arms (not two-bound), archive mismatches, and device
         // failures are all recoverable here: decline and step Native.
-        let (child, receipts) = arm.gpu.transition_on_budgeted(target, &parent, &grants).ok()?;
+        let (child, receipts) = arm
+            .gpu
+            .transition_on_budgeted_from(target, &parent, &grants, &bases)
+            .ok()?;
         self.outcome_from_device(arm.resident.identity(), &child, receipts, states, limits, target)
     }
 
@@ -475,8 +473,8 @@ impl<'p, 'a, U: Universe> SuccinctProgramFamily<'p, 'a, U> {
             let resume = receipt.physical_cursor.map(|cursor: PhysicalCursor| {
                 // The sole legal cursor consumer: physical resume data
                 // becomes the canonical typed state through exactly this
-                // conversion. First-page cohorts make the returned offset
-                // the absolute interval offset.
+                // conversion. The returned offset is the absolute interval
+                // offset (`base + examined`).
                 SuccinctFrontierState {
                     offset: cursor.into_typed_conversion_offset(),
                     ..state.clone()
@@ -586,7 +584,7 @@ impl<'p, 'a, U: Universe> TypedProgramSpec for SuccinctProgramFamily<'p, 'a, U> 
         let outcome = self.device_outcome(states, batch.limits)?;
         let mut step = TypedPhysicalStep::new(ProgramPhysicalReceipt::new(
             WGPU_RESIDENT_EXECUTOR,
-            TWO_BOUND_FIRST_PAGE_OP,
+            TWO_BOUND_BUDGETED_OP,
         ));
         Self::write_outcome(outcome, step.effects_mut());
         Some(step)
@@ -1037,7 +1035,7 @@ mod tests {
         let native = family.native_outcome(&states, &limits);
         let device = family
             .device_outcome(&states, &limits)
-            .expect("an admitted two-bound first-page cohort routes");
+            .expect("an admitted two-bound cohort routes");
 
         // Bag-identical results — in fact order-identical: the stable device
         // prefix is the interval prefix the Native interpreter consumes.
@@ -1063,12 +1061,12 @@ mod tests {
         // The physical hook commits the same outcome with a placement.
         assert!(family.try_step_physical(&states, batch(&limits)).is_some());
         assert_eq!(WGPU_RESIDENT_EXECUTOR, "wgpu-resident");
-        assert_eq!(TWO_BOUND_FIRST_PAGE_OP, "two-bound-transition/first-page");
+        assert_eq!(TWO_BOUND_BUDGETED_OP, "two-bound-transition/budgeted");
     }
 
     #[test]
     #[ignore = "requires a native WGPU adapter"]
-    fn resumed_cohorts_and_capability_misses_decline_to_native() {
+    fn resumed_cohorts_page_on_device_and_capability_misses_decline() {
         let (archive, entities, attributes) = fixture();
         let resident = WgpuSuccinctArchive::new(archive).unwrap();
         let program = QueryProgram::compile(
@@ -1114,42 +1112,55 @@ mod tests {
             .unwrap();
         assert!(family.device_outcome(&mixed, &limits).is_none());
 
-        // A resumed state in the cohort declines the start-clamping kernel;
-        // Native owns the continuation and the pages drain the exact whole.
+        // A resumed cohort routes through the offset-aware kernel form and
+        // remains exactly interchangeable with the Native step: draining
+        // every input's device pages reproduces each unbudgeted interval.
         let first = family
             .device_outcome(&states, &limits)
             .expect("the fresh cohort routes");
-        let resumed_input = first
-            .pages
-            .iter()
-            .position(|page| page.resume.is_some())
-            .expect("the fixture clamps at least one input");
-        let mut second_states = states.clone();
-        second_states[resumed_input] = first.pages[resumed_input].resume.clone().unwrap();
         assert!(
-            family.device_outcome(&second_states, &limits).is_none(),
-            "a resumed cohort must not re-enter the start-clamping kernel"
+            first.pages.iter().any(|page| page.resume.is_some()),
+            "the fixture must clamp at least one input"
         );
-        assert!(family
-            .try_step_physical(&second_states, batch(&limits))
-            .is_none());
-
-        // Native completes the resumed input; first page + drained resumes
-        // reproduce the unbudgeted whole interval.
-        let oracle = interval_oracle(&program, &states[resumed_input]);
-        let mut consumed: Vec<RawInline> = first
-            .accepted
-            .iter()
-            .filter(|(input, _)| *input as usize == resumed_input)
-            .map(|(_, value)| *value)
-            .collect();
-        let mut cursor = Some(second_states[resumed_input].clone());
-        while let Some(current) = cursor.take() {
-            let outcome =
-                family.native_outcome(std::slice::from_ref(&current), &[limits[resumed_input]]);
-            consumed.extend(outcome.accepted.iter().map(|(_, value)| *value));
-            cursor = outcome.pages.into_iter().next().unwrap().resume;
+        let mut consumed: Vec<Vec<RawInline>> = vec![Vec::new(); states.len()];
+        for (input, value) in &first.accepted {
+            consumed[*input as usize].push(*value);
         }
-        assert_eq!(consumed, oracle);
+        let mut cursors: Vec<Option<SuccinctFrontierState>> = first
+            .pages
+            .into_iter()
+            .map(|page| page.resume)
+            .collect();
+        while cursors.iter().any(|cursor| cursor.is_some()) {
+            // Mixed cohorts: still-resumable states page on the device while
+            // exhausted inputs are simply absent from the follow-up cohort.
+            let live: Vec<usize> = (0..states.len())
+                .filter(|&input| cursors[input].is_some())
+                .collect();
+            let cohort: Vec<SuccinctFrontierState> = live
+                .iter()
+                .map(|&input| cursors[input].clone().unwrap())
+                .collect();
+            let cohort_limits: Vec<usize> = live.iter().map(|&input| limits[input]).collect();
+            let outcome = family
+                .device_outcome(&cohort, &cohort_limits)
+                .expect("a resumed cohort rides the offset-aware kernel");
+            // Native produces the identical page from the same states.
+            let native = family.native_outcome(&cohort, &cohort_limits);
+            assert_eq!(outcome.accepted, native.accepted);
+            for (input, value) in &outcome.accepted {
+                consumed[live[*input as usize]].push(*value);
+            }
+            for (position, page) in outcome.pages.into_iter().enumerate() {
+                cursors[live[position]] = page.resume;
+            }
+        }
+        for (input, state) in states.iter().enumerate() {
+            assert_eq!(
+                consumed[input],
+                interval_oracle(&program, state),
+                "input {input} pages concatenate into the unbudgeted whole"
+            );
+        }
     }
 }

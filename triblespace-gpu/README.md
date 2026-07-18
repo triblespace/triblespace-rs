@@ -270,11 +270,14 @@ variable (unset/`0`/unparsable = disabled; a positive integer = the minimum
 cohort row count that may route), read once at family construction. Admission
 is decided post-cohort-formation from cohort size, kernel capability, and the
 hard law that ready/latency-priority work never waits for an accelerator; the
-exercised kernel covers first-page (offset-zero), schema-uniform two-bound
-cohorts, and every decline or recoverable device failure falls back to the
-exact Native step with the batch intact. Resumed states never re-enter the
-start-clamping kernel; Native owns every continuation until the offset-aware
-kernel form lands.
+exercised kernel covers schema-uniform two-bound cohorts, and every decline
+or recoverable device failure falls back to the exact Native step with the
+batch intact. Resumed states ride the offset-aware kernel form
+(`transition_on_budgeted_from`): per-input resume bases upload with the
+grants, candidate positions shift to `range_start + base + local`, and a
+clamped input's cursor returns the absolute `base + examined`, so successive
+budgeted pages concatenate into the exact unbudgeted transition on either
+executor.
 
 The production rollup type is
 `triblespace_core::repo::index_home::AcceleratedSuccinctRollup<WgpuWaveletFreeze>`:
