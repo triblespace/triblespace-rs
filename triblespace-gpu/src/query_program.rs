@@ -1270,6 +1270,33 @@ impl<'a, U: Universe> QueryProgram<'a, U> {
         }
     }
 
+    /// The exact canonical AEV interval owned by one resolved `(E, A)` pair.
+    ///
+    /// This is a pure archive-local function of the two codes — two
+    /// `select1`s and two ranks — so a typed Program family may compute it
+    /// once at seed time and carry the checked interval inside its canonical
+    /// state: progress becomes O(1) and Native pages become direct `aev_c`
+    /// accesses over `start + offset ..`. An `(E, A)` pair without
+    /// occurrences yields an empty interval.
+    pub fn fixed_ea_value_interval(
+        &self,
+        entity: ArchiveCode,
+        attribute: ArchiveCode,
+    ) -> Result<Range<usize>, QueryProgramError> {
+        for code in [entity, attribute] {
+            if code.index() >= self.archive.domain.len() {
+                return Err(QueryProgramError::CodeOutOfBounds(code));
+            }
+        }
+        let entity_range = base_range_code(&self.archive.e_a, entity);
+        Ok(restrict_range_code(
+            &self.archive.a_a,
+            &self.archive.eva_c,
+            attribute,
+            &entity_range,
+        ))
+    }
+
     fn fixed_ea_value_range(
         &self,
         pattern: ProgramPattern,

@@ -271,50 +271,52 @@ where
     /// computed once from `changed_e_a` one-runs at wrap time so per-program
     /// compilation never rescans the pair boundaries.
     max_ea_fanout: usize,
-    /// Nonblocking dispatch lease for the resident Program executor.
+    /// Nonblocking per-snapshot busy-mutex for resident Program dispatch.
     program_lease: DeviceLease,
     min_rank_batch: usize,
     stats: QueryStats,
 }
 
-/// Nonblocking lease over one resident snapshot's Program executor.
+/// Nonblocking busy-mutex over one resident snapshot's Program dispatch.
 ///
-/// The typed-Program hard law says ready/latency-priority work never waits
-/// for an accelerator, so physical dispatch may proceed only through a
-/// successful [`DeviceLease::try_acquire`]: `Busy` (another cohort holds the
-/// lease) and `Failed` (a previous dispatch hit a device error) both fall
-/// through to Native immediately, without blocking. A `Preparing` state is
-/// reserved for future asynchronous residency setup; today construction is
-/// synchronous, so a freshly wrapped archive is born `Ready`.
+/// The typed-Program hard law says ready work never *waits* for an
+/// accelerator, so physical dispatch may proceed only through a successful
+/// [`DeviceLease::try_acquire`]: `Busy` (another cohort of this snapshot is
+/// mid-dispatch) and `Failed` (a previous dispatch hit a device error) both
+/// fall through to Native immediately, without blocking.
+///
+/// Honest scope: this is exactly a per-snapshot mutual-exclusion flag, not
+/// a device-readiness signal. `Idle` does **not** promise a prewarmed
+/// backend — resident buffer writes are enqueued asynchronously at wrap
+/// time and CubeCL compiles pipelines lazily on first launch, so the first
+/// leased dispatch may still pay preparation cost inside its own wall; nor
+/// does the lease cover other snapshots, rank batches, or wavelet freezes
+/// sharing the global device service. A genuine preparation/readiness seam
+/// is future work; until it exists, admission defaults stay off.
 pub struct DeviceLease {
-    /// 0 = Ready, 1 = Busy, 2 = Failed.
+    /// 0 = Idle, 1 = Busy, 2 = Failed.
     state: AtomicU8,
 }
 
-const LEASE_READY: u8 = 0;
+const LEASE_IDLE: u8 = 0;
 const LEASE_BUSY: u8 = 1;
 const LEASE_FAILED: u8 = 2;
 
 impl DeviceLease {
     fn new() -> Self {
         Self {
-            state: AtomicU8::new(LEASE_READY),
+            state: AtomicU8::new(LEASE_IDLE),
         }
     }
 
     /// Attempts to take the lease without waiting.
     ///
-    /// Returns `None` when the executor is busy or failed; the caller must
-    /// then run Native. Dropping the guard returns the lease to `Ready`
-    /// unless the holder recorded a device failure.
+    /// Returns `None` when this snapshot's dispatch is busy or failed; the
+    /// caller must then run Native. Dropping the guard returns the lease to
+    /// `Idle` unless the holder recorded a device failure.
     pub fn try_acquire(&self) -> Option<DeviceLeaseGuard<'_>> {
         self.state
-            .compare_exchange(
-                LEASE_READY,
-                LEASE_BUSY,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            )
+            .compare_exchange(LEASE_IDLE, LEASE_BUSY, Ordering::Acquire, Ordering::Relaxed)
             .ok()
             .map(|_| DeviceLeaseGuard { lease: self })
     }
@@ -344,7 +346,7 @@ impl Drop for DeviceLeaseGuard<'_> {
     fn drop(&mut self) {
         let _ = self.lease.state.compare_exchange(
             LEASE_BUSY,
-            LEASE_READY,
+            LEASE_IDLE,
             Ordering::Release,
             Ordering::Relaxed,
         );
@@ -554,8 +556,8 @@ where
         self.max_ea_fanout
     }
 
-    /// Returns the nonblocking dispatch lease of this snapshot's resident
-    /// Program executor.
+    /// Returns the nonblocking per-snapshot busy-mutex gating resident
+    /// Program dispatch.
     pub fn program_lease(&self) -> &DeviceLease {
         &self.program_lease
     }

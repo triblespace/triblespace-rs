@@ -7,7 +7,6 @@ use crate::inline::encodings::genid::GenId;
 use crate::query::*;
 use jerky::bit_vector::Select;
 
-#[derive(Clone, Copy)]
 pub struct SuccinctArchiveConstraint<'a, U>
 where
     U: Universe,
@@ -18,6 +17,20 @@ where
     archive: &'a SuccinctArchive<U>,
     ring_batch: Option<&'a dyn RingBatchQuery>,
 }
+
+// Manual impls: every field is `Copy` (terms and shared borrows), so the
+// constraint is `Copy` for every universe — the derive would demand the
+// spurious bound `U: Copy` although `U` only appears behind a reference.
+impl<U> Clone for SuccinctArchiveConstraint<'_, U>
+where
+    U: Universe,
+{
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<U> Copy for SuccinctArchiveConstraint<'_, U> where U: Universe {}
 
 impl<'a, U> SuccinctArchiveConstraint<'a, U>
 where
