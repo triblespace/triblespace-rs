@@ -299,25 +299,30 @@ for label in C M P B; do
     done
 done
 
+seal_closure() {
+    (
+        cd "$output_root"
+        find STATUS protocol.env cargo-version.txt rustc-version.txt \
+            source-manifest.tsv build-manifest.tsv source-archives binaries \
+            build-logs run-logs profiles -type f -print \
+            | LC_ALL=C sort \
+            | while IFS= read -r artifact; do
+                $shasum_bin -a 256 "$artifact"
+            done
+    ) > "$output_root/closure.sha256"
+}
+
 for label in B P M C; do
     for cell in "${cells[@]}"; do
         if ! cmp -s "$output_root/profiles/forward-$label-$cell.txt" \
             "$output_root/profiles/reverse-$label-$cell.txt"; then
             echo "INCONCLUSIVE: allocation counts changed for $label/$cell" \
                 | tee "$output_root/STATUS" >&2
+            seal_closure
             exit 2
         fi
     done
 done
 
 echo "ALLOC_PROFILE_REPEATS_EXACT" > "$output_root/STATUS"
-(
-    cd "$output_root"
-    find STATUS protocol.env cargo-version.txt rustc-version.txt \
-        source-manifest.tsv build-manifest.tsv source-archives binaries \
-        build-logs run-logs profiles -type f -print \
-        | LC_ALL=C sort \
-        | while IFS= read -r artifact; do
-            $shasum_bin -a 256 "$artifact"
-        done
-) > "$output_root/closure.sha256"
+seal_closure
