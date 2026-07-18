@@ -294,11 +294,23 @@ Placement is `ValueRouteAdmission::Off` by default and does not even construct
 the resident Program arm. `Force` exists for parity and acceptance probes.
 `WarmM4` is an explicitly experimental, prewarmed-machine calibration using
 `exact_page_work + 8 * parent_rows >= 98_304`; it is not a universal policy.
+
+`WgpuSuccinctArchive::prepare_value_route` is the explicit snapshot-local
+preparation seam. On a nonempty snapshot it selects one real `(E,A)` pair and
+synchronously executes one parent with grant one through the same resident
+kernel, lease, exact receipt validation, decoding, and accounting as a public
+Force route. Before committing `ValueRouteReadiness::Prepared`, it also checks
+the complete result against the canonical Native pager while the lease remains
+held; the answer itself is discarded. Errors and panics default the snapshot
+to `Failed`, repeated success returns `AlreadyPrepared`, and an empty snapshot
+returns `EmptySnapshot` while remaining `Cold`.
+
 The `TRIBLESPACE_GPU_VALUE_ROUTE=auto` spelling is deliberately rejected:
-the current per-snapshot lease can decline busy or poisoned work without
-waiting, but cannot prove that uploads and CubeCL pipelines are already warm
-or that unrelated device producers are idle. Until that readiness seam exists,
-automatic placement would make a latency claim the runtime cannot uphold.
+explicit preparation proves this snapshot's exact path, and its lease can
+decline busy or poisoned work without waiting, but neither can prove that
+unrelated snapshots, rank batches, or wavelet freezes are absent from the
+shared device service. Until a device-wide cooperative submission gate exists,
+automatic placement would still make a latency claim the runtime cannot uphold.
 
 The public parallel entry preserves the query's selected residual lowering,
 so fresh queries retain full formula and transition-Program lowering through

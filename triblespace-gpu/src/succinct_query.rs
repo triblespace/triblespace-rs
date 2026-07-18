@@ -275,6 +275,8 @@ where
     max_ea_fanout: OnceLock<usize>,
     /// Nonblocking per-snapshot busy-mutex for resident Program dispatch.
     program_lease: DeviceLease,
+    /// Snapshot-local preparation state for the public resident value route.
+    pub(crate) value_route_readiness: crate::value_route::ValueRouteReadinessCell,
     min_rank_batch: usize,
     stats: QueryStats,
 }
@@ -305,8 +307,9 @@ where
 /// compiles pipelines lazily on first launch (a launch can also spin on a
 /// full submission channel), and the lease covers neither other snapshots
 /// nor rank batches or wavelet freezes sharing the global device service.
-/// A genuine preparation/readiness seam is future work; until it exists,
-/// admission defaults stay off.
+/// Explicit value-route preparation can prove this snapshot's exact path, but
+/// it still cannot establish global device idleness; admission therefore
+/// defaults to off.
 pub struct DeviceLease {
     /// 0 = Idle, 1 = Busy, 2 = Failed.
     state: AtomicU8,
@@ -560,6 +563,7 @@ where
             aev_c,
             max_ea_fanout: OnceLock::new(),
             program_lease: DeviceLease::new(),
+            value_route_readiness: crate::value_route::ValueRouteReadinessCell::new(),
             min_rank_batch: DEFAULT_MIN_RANK_BATCH,
             stats: QueryStats::new(),
         })
