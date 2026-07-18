@@ -4472,6 +4472,7 @@ impl DeltaScheduler {
                 state,
                 tasks,
                 &dispatch.task_limits,
+                ProgramPlacementIntent::Latency,
                 direct_terminal_full,
                 stable,
                 stable_interner,
@@ -4592,7 +4593,16 @@ impl DeltaScheduler {
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
     ) -> DeltaStepOutcome {
-        self.step_bounded(root, plan, width, None, stable, stable_interner, stats)
+        self.step_bounded(
+            root,
+            plan,
+            width,
+            ProgramPlacementIntent::Latency,
+            None,
+            stable,
+            stable_interner,
+            stats,
+        )
     }
 
     pub(super) fn step_bounded<'a>(
@@ -4600,6 +4610,7 @@ impl DeltaScheduler {
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
         search_width: usize,
+        placement_intent: ProgramPlacementIntent,
         direct_terminal_publication_full: Option<VariableSet>,
         stable: &mut Worklist,
         stable_interner: &mut StateInterner,
@@ -4616,6 +4627,7 @@ impl DeltaScheduler {
                 state,
                 tasks,
                 &dispatch.task_limits,
+                placement_intent,
                 direct_terminal_publication_full,
                 stable,
                 stable_interner,
@@ -4922,6 +4934,7 @@ impl DeltaScheduler {
         state: DeltaStateId,
         tasks: Vec<ProgramTask>,
         limits: &[usize],
+        placement_intent: ProgramPlacementIntent,
         direct_terminal_full: Option<VariableSet>,
         stable: &mut Worklist,
         stable_interner: &mut StateInterner,
@@ -4975,6 +4988,7 @@ impl DeltaScheduler {
                 .expect("typed program state lost its runtime"),
             ProgramBatch {
                 stratum: address.stratum,
+                placement_intent,
                 view,
                 candidate_sets: &candidate_sets,
                 activations: &activations,
@@ -5503,6 +5517,7 @@ impl Clone for DeltaScheduler {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex;
 
     use rand::{rngs::StdRng, Rng, SeedableRng};
 
@@ -6627,6 +6642,7 @@ mod tests {
             &root,
             &plan,
             4,
+            ProgramPlacementIntent::Latency,
             Some(full),
             &mut stable,
             &mut stable_interner,
@@ -7502,6 +7518,9 @@ mod tests {
     struct OneShotConfirmProgram {
         novelty_drops: Arc<AtomicUsize>,
         physical: bool,
+        decline_latency: bool,
+        placement_intents: Arc<Mutex<Vec<ProgramPlacementIntent>>>,
+        native_steps: Arc<AtomicUsize>,
     }
 
     impl OneShotConfirmProgram {
@@ -7574,6 +7593,7 @@ mod tests {
             batch: TypedProgramBatch<'_>,
             effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
+            self.native_steps.fetch_add(1, Ordering::Relaxed);
             self.fill_step(&states, batch, effects);
         }
 
@@ -7582,7 +7602,14 @@ mod tests {
             states: &[Self::State],
             batch: TypedProgramBatch<'_>,
         ) -> Option<TypedPhysicalStep<Self::State, Self::NoveltyKey>> {
-            if !self.physical {
+            self.placement_intents
+                .lock()
+                .unwrap()
+                .push(batch.placement_intent);
+            if !self.physical
+                || (self.decline_latency
+                    && batch.placement_intent == ProgramPlacementIntent::Latency)
+            {
                 return None;
             }
             let mut step = TypedPhysicalStep::new(ProgramPhysicalReceipt::new(
@@ -7641,6 +7668,9 @@ mod tests {
         let root = OneShotConfirmProgram {
             novelty_drops: Arc::clone(&novelty_drops),
             physical: false,
+            decline_latency: false,
+            placement_intents: Arc::new(Mutex::new(Vec::new())),
+            native_steps: Arc::new(AtomicUsize::new(0)),
         };
         let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
         let relevant = ChildSet::empty(plan.len()).with_inserted(0);
@@ -7694,6 +7724,7 @@ mod tests {
             &root,
             &plan,
             8,
+            ProgramPlacementIntent::Latency,
             None,
             &mut stable,
             &mut stable_interner,
@@ -7752,6 +7783,9 @@ mod tests {
         let root = OneShotConfirmProgram {
             novelty_drops,
             physical: true,
+            decline_latency: false,
+            placement_intents: Arc::new(Mutex::new(Vec::new())),
+            native_steps: Arc::new(AtomicUsize::new(0)),
         };
         let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
         let relevant = ChildSet::empty(plan.len()).with_inserted(0);
@@ -7795,6 +7829,7 @@ mod tests {
             &root,
             &plan,
             8,
+            ProgramPlacementIntent::Latency,
             None,
             &mut stable,
             &mut stable_interner,
@@ -7807,6 +7842,127 @@ mod tests {
         assert_eq!(stats.delta_program_physical_granted_work, 8);
         assert_eq!(stats.max_delta_program_physical_cohort, 2);
         assert_eq!(stats.max_delta_program_physical_granted_work, 8);
+    }
+
+    fn one_shot_placement_case(
+        active_path: bool,
+        placement_intent: ProgramPlacementIntent,
+    ) -> (
+        Vec<ProgramPlacementIntent>,
+        usize,
+        Vec<RawInline>,
+        ResidualStateStats,
+    ) {
+        let placement_intents = Arc::new(Mutex::new(Vec::new()));
+        let native_steps = Arc::new(AtomicUsize::new(0));
+        let root = OneShotConfirmProgram {
+            novelty_drops: Arc::new(AtomicUsize::new(0)),
+            physical: true,
+            decline_latency: true,
+            placement_intents: Arc::clone(&placement_intents),
+            native_steps: Arc::clone(&native_steps),
+        };
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let relevant = ChildSet::empty(plan.len()).with_inserted(0);
+        let successor = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Candidate {
+                variable: 0,
+                relevant: relevant.clone(),
+                checked: relevant,
+            },
+        };
+        let request = ProgramRequest {
+            action: ProgramAction::Confirm(0),
+            bound: VariableSet::new_empty(),
+        };
+        let spec = root.residual_program().unwrap();
+        let route = spec.route(request).unwrap();
+        let mut scheduler = DeltaScheduler::new();
+        let active = scheduler
+            .seed_program_confirms(
+                spec,
+                DeltaDesc::leaf(0, 0),
+                request,
+                route,
+                successor,
+                CandidateBatch {
+                    parents: RowBatch {
+                        rows: Vec::new(),
+                        row_count: 1,
+                    },
+                    candidates: CandidatePayload::Tagged(vec![(0, value(7))]),
+                },
+            )
+            .expect("the Confirm parent must seed one live Program root");
+
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let outcome = if active_path {
+            scheduler
+                .step_active_bounded(
+                    &root,
+                    &plan,
+                    active,
+                    8,
+                    None,
+                    &mut stable,
+                    &mut stable_interner,
+                    &mut stats,
+                )
+                .outcome
+        } else {
+            scheduler.step_bounded(
+                &root,
+                &plan,
+                8,
+                placement_intent,
+                None,
+                &mut stable,
+                &mut stable_interner,
+                &mut stats,
+            )
+        };
+        assert_eq!(outcome.completed_activations, 1);
+
+        let mut values = Vec::new();
+        for bucket in stable.values().flat_map(|level| level.values()) {
+            let StateBucket::Candidates(batch) = bucket else {
+                panic!("Confirm completion returned the wrong stable payload")
+            };
+            values.extend(
+                batch
+                    .candidates
+                    .tagged_snapshot()
+                    .into_iter()
+                    .map(|(_, value)| value),
+            );
+        }
+        values.sort_unstable();
+        let observed = placement_intents.lock().unwrap().clone();
+        let native = native_steps.load(Ordering::Relaxed);
+        (observed, native, values, stats)
+    }
+
+    #[test]
+    fn engine_owned_placement_intent_distinguishes_active_latency_from_cold_throughput() {
+        let (latency_intents, latency_native, latency_values, latency_stats) =
+            one_shot_placement_case(true, ProgramPlacementIntent::Throughput);
+        let (throughput_intents, throughput_native, throughput_values, throughput_stats) =
+            one_shot_placement_case(false, ProgramPlacementIntent::Throughput);
+
+        assert_eq!(latency_intents, [ProgramPlacementIntent::Latency]);
+        assert_eq!(throughput_intents, [ProgramPlacementIntent::Throughput]);
+        assert_eq!(latency_native, 1, "declined latency work must fall back");
+        assert_eq!(
+            throughput_native, 0,
+            "accepted throughput work stays physical"
+        );
+        assert_eq!(latency_values, throughput_values);
+        assert_eq!(latency_values, [value(7)]);
+        assert_eq!(latency_stats.delta_program_physical_cohorts, 0);
+        assert_eq!(throughput_stats.delta_program_physical_cohorts, 1);
     }
 
     #[test]

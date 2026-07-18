@@ -49,6 +49,22 @@ pub enum ProgramPacing {
     Activation,
 }
 
+/// Engine-owned reason for offering one cohort to a physical executor.
+///
+/// Unlike [`ProgramPacing`], which selects each continuation's work-budget
+/// source, this intent describes the scheduler path that formed the cohort.
+/// Program families may use it to decline latency-critical placement without
+/// changing logical execution: `None` immediately falls back to the retained
+/// typed states on the native path.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProgramPlacementIntent {
+    /// The current pull is waiting for this cohort to advance.
+    Latency,
+    /// Cold/background work is being advanced to expose parallelism.
+    Throughput,
+}
+
 /// Generational reference to one stored, family-private continuation.
 #[doc(hidden)]
 #[derive(Clone, Debug)]
@@ -242,6 +258,7 @@ pub struct ProgramSeedEffects {
 #[derive(Clone, Copy, Debug)]
 pub struct ProgramBatch<'v> {
     pub stratum: ProgramStratum,
+    pub placement_intent: ProgramPlacementIntent,
     pub view: RowsView<'v>,
     pub candidate_sets: &'v [Option<&'v [RawInline]>],
     pub activations: &'v [ProgramActivation],
@@ -384,6 +401,7 @@ impl<State, NoveltyKey> TypedSeedSink<State, NoveltyKey> {
 #[derive(Clone, Copy, Debug)]
 pub struct TypedProgramBatch<'v> {
     pub stratum: ProgramStratum,
+    pub placement_intent: ProgramPlacementIntent,
     pub view: RowsView<'v>,
     pub candidate_sets: &'v [Option<&'v [RawInline]>],
     pub activations: &'v [ProgramActivation],
@@ -585,6 +603,8 @@ pub trait TypedProgramSpec {
     /// canonical state. Inputs remain borrowed so `None` can immediately move
     /// the exact retained states into [`Self::step_typed`]. A successful result
     /// is still uncommitted and passes through the ordinary adapter checks.
+    /// [`TypedProgramBatch::placement_intent`] is the engine-owned placement
+    /// signal; [`Self::pacing`] remains only a work-budget classification.
     /// Implementations must return `None` rather than wait when their backend
     /// is unsupported, unavailable, still preparing, or fails recoverably.
     fn try_step_physical(
@@ -998,6 +1018,7 @@ where
 
         let typed_batch = TypedProgramBatch {
             stratum: batch.stratum,
+            placement_intent: batch.placement_intent,
             view: batch.view,
             candidate_sets: batch.candidate_sets,
             activations: batch.activations,
@@ -1916,6 +1937,7 @@ mod tests {
             &mut runtime,
             ProgramBatch {
                 stratum: route.stratum,
+                placement_intent: ProgramPlacementIntent::Latency,
                 view,
                 candidate_sets: &candidate_sets,
                 activations: &activations,
@@ -2003,6 +2025,7 @@ mod tests {
                 &mut runtime,
                 ProgramBatch {
                     stratum: route.stratum,
+                    placement_intent: ProgramPlacementIntent::Latency,
                     view,
                     candidate_sets: &candidate_sets,
                     activations: &activations,
@@ -2090,6 +2113,7 @@ mod tests {
                 runtime,
                 ProgramBatch {
                     stratum: ProgramStratum::Finite,
+                    placement_intent: ProgramPlacementIntent::Latency,
                     view,
                     candidate_sets: &candidates,
                     activations: &activations,
@@ -2141,6 +2165,7 @@ mod tests {
                 &mut runtime,
                 ProgramBatch {
                     stratum: ProgramStratum::Finite,
+                    placement_intent: ProgramPlacementIntent::Latency,
                     view,
                     candidate_sets: &candidates,
                     activations: &crossed,
@@ -2186,6 +2211,7 @@ mod tests {
                 &mut runtime,
                 ProgramBatch {
                     stratum: route.stratum,
+                    placement_intent: ProgramPlacementIntent::Latency,
                     view,
                     candidate_sets: &[None],
                     activations: &activations,
@@ -2262,6 +2288,7 @@ mod tests {
                     &mut runtime,
                     ProgramBatch {
                         stratum: route.stratum,
+                        placement_intent: ProgramPlacementIntent::Latency,
                         view: RowsView::EMPTY,
                         candidate_sets: &[None],
                         activations: &activation,
@@ -2319,6 +2346,7 @@ mod tests {
                 &mut runtime,
                 ProgramBatch {
                     stratum: ProgramStratum::Finite,
+                    placement_intent: ProgramPlacementIntent::Latency,
                     view: RowsView::EMPTY,
                     candidate_sets: &[None],
                     activations: &[ProgramActivation(1)],

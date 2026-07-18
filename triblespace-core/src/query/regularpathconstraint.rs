@@ -3016,6 +3016,7 @@ mod seeded_frame_tests {
     use crate::query::ProgramActivation;
     use crate::query::ProgramBatch;
     use crate::query::ProgramBatchEffects;
+    use crate::query::ProgramPlacementIntent;
     use crate::query::ProgramSeedEffects;
     use crate::query::Query;
     use crate::trible::Trible;
@@ -3187,6 +3188,7 @@ mod seeded_frame_tests {
             &mut direct_runtime,
             ProgramBatch {
                 stratum: direct_route.stratum,
+                placement_intent: ProgramPlacementIntent::Latency,
                 view: direct_view,
                 candidate_sets: &candidates,
                 activations: &activations,

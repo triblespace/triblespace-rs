@@ -606,7 +606,7 @@ mod tests {
     use triblespace_core::inline::encodings::genid::GenId;
     use triblespace_core::inline::InlineEncoding;
     use triblespace_core::prelude::*;
-    use triblespace_core::query::{ProgramStratum, RowsView};
+    use triblespace_core::query::{ProgramPlacementIntent, ProgramStratum, RowsView};
 
     use crate::budgeted::{InputReceipt, PhysicalCursor};
     use crate::query_program::QueryPattern;
@@ -674,6 +674,7 @@ mod tests {
     fn batch<'v>(limits: &'v [usize]) -> TypedProgramBatch<'v> {
         TypedProgramBatch {
             stratum: ProgramStratum::Finite,
+            placement_intent: ProgramPlacementIntent::Latency,
             view: RowsView::new(&[], &[]),
             candidate_sets: &[],
             activations: &[],

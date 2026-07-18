@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Physical Program placement now receives engine-owned latency intent.**
+  Residual scheduler call sites label pull-critical active, readiness, and
+  deferred-terminal cohorts as latency work while parallel split negotiation
+  labels its cold frontier harvest as throughput work. The typed batch carries
+  this independently of Search/Activation pacing, so a physical family can
+  decline latency placement and immediately preserve results through Native
+  fallback.
 - **Typed Program cohorts separate physical compatibility from activation
   identity.** Program buckets now own one pacing-sensitive selection law:
   Search pages retain LIFO order and may mix physically identical reducer
