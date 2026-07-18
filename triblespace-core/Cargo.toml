@@ -80,7 +80,7 @@ wasm = ["dep:wasmi"]
 parallel = ["dep:rayon", "blake3/rayon"]
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(nightly)', 'cfg(kani)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(nightly)', 'cfg(kani)', 'cfg(engine_program_phase_probe)'] }
 
 [package.metadata.kani.flags]
 default-unwind = "1"

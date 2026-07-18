@@ -13,6 +13,74 @@ use ahash::AHashMap;
 
 use super::{RawInline, RowsView, VariableId, VariableSet};
 
+/// Aggregate operation counts for the generic typed-program adapter.
+///
+/// This source-only diagnostic is compiled solely by the mixed-query causal
+/// probe. Keeping the counters behind an explicit cfg leaves ordinary query
+/// binaries and their hot paths byte-for-byte unaffected.
+#[cfg(engine_program_phase_probe)]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProgramAdapterPhaseCounts {
+    pub batches: usize,
+    pub inputs: usize,
+    pub pages: usize,
+    pub resumes: usize,
+    pub children: usize,
+    pub novelty_children: usize,
+    pub novelty_input_groups: usize,
+    pub runtime_activation_hits: usize,
+    pub runtime_novelty_hits: usize,
+    pub batch_novelty_unique: usize,
+    pub batch_novelty_duplicates: usize,
+    pub commit_admit_calls: usize,
+    pub commit_admitted: usize,
+    pub commit_rejected: usize,
+    pub direct: usize,
+    pub accepted: usize,
+    pub supported: usize,
+}
+
+#[cfg(engine_program_phase_probe)]
+std::thread_local! {
+    static PROGRAM_ADAPTER_PHASE_COUNTS: std::cell::Cell<ProgramAdapterPhaseCounts> =
+        const { std::cell::Cell::new(ProgramAdapterPhaseCounts {
+            batches: 0,
+            inputs: 0,
+            pages: 0,
+            resumes: 0,
+            children: 0,
+            novelty_children: 0,
+            novelty_input_groups: 0,
+            runtime_activation_hits: 0,
+            runtime_novelty_hits: 0,
+            batch_novelty_unique: 0,
+            batch_novelty_duplicates: 0,
+            commit_admit_calls: 0,
+            commit_admitted: 0,
+            commit_rejected: 0,
+            direct: 0,
+            accepted: 0,
+            supported: 0,
+        }) };
+}
+
+#[cfg(engine_program_phase_probe)]
+fn record_program_adapter_phase_counts(update: impl FnOnce(&mut ProgramAdapterPhaseCounts)) {
+    PROGRAM_ADAPTER_PHASE_COUNTS.with(|counts| {
+        let mut next = counts.get();
+        update(&mut next);
+        counts.set(next);
+    });
+}
+
+/// Takes and clears the current thread's typed-program adapter probe counts.
+#[cfg(engine_program_phase_probe)]
+#[doc(hidden)]
+pub fn take_program_adapter_phase_counts() -> ProgramAdapterPhaseCounts {
+    PROGRAM_ADAPTER_PHASE_COUNTS.with(|counts| counts.take())
+}
+
 /// Query-local identity supplied to typed novelty admission.
 ///
 /// The numeric value is engine-owned and is never program continuation state.
@@ -1023,6 +1091,22 @@ where
                 (typed, None)
             }
         };
+        #[cfg(engine_program_phase_probe)]
+        let mut phase_counts = ProgramAdapterPhaseCounts {
+            batches: 1,
+            inputs: input_count,
+            pages: typed.pages.len(),
+            resumes: typed
+                .pages
+                .iter()
+                .filter(|page| page.resume.is_some())
+                .count(),
+            children: typed.children.len(),
+            direct: typed.direct.len(),
+            accepted: typed.accepted.len(),
+            supported: typed.supported.len(),
+            ..ProgramAdapterPhaseCounts::default()
+        };
         assert_eq!(
             typed.pages.len(),
             input_count,
@@ -1062,6 +1146,8 @@ where
         > = AHashMap::new();
         let mut child_physical = Vec::with_capacity(typed.children.len());
         let mut previous = 0u32;
+        #[cfg(engine_program_phase_probe)]
+        let mut previous_novelty_input = None;
         for (position, child) in typed.children.iter().enumerate() {
             assert!(
                 (child.input as usize) < input_count,
@@ -1086,12 +1172,25 @@ where
             child_physical.push((self.dispatch(&child.state), self.pacing(&child.state)));
 
             if let Some(novelty) = child.novelty.as_ref() {
-                let activation = batch.activations[child.input as usize];
-                if let Some(previous) = runtime
-                    .novelty
-                    .get(&activation)
-                    .and_then(|seen| seen.get(novelty))
+                #[cfg(engine_program_phase_probe)]
                 {
+                    phase_counts.novelty_children += 1;
+                    if previous_novelty_input != Some(child.input) {
+                        phase_counts.novelty_input_groups += 1;
+                        previous_novelty_input = Some(child.input);
+                    }
+                }
+                let activation = batch.activations[child.input as usize];
+                let runtime_seen = runtime.novelty.get(&activation);
+                #[cfg(engine_program_phase_probe)]
+                if runtime_seen.is_some() {
+                    phase_counts.runtime_activation_hits += 1;
+                }
+                if let Some(previous) = runtime_seen.and_then(|seen| seen.get(novelty)) {
+                    #[cfg(engine_program_phase_probe)]
+                    {
+                        phase_counts.runtime_novelty_hits += 1;
+                    }
                     assert_eq!(
                         *previous, child.accepted,
                         "one typed novelty key changed its endpoint observation"
@@ -1099,11 +1198,19 @@ where
                 }
                 let seen = batch_novelty.entry(activation).or_default();
                 if let Some(previous) = seen.get(novelty) {
+                    #[cfg(engine_program_phase_probe)]
+                    {
+                        phase_counts.batch_novelty_duplicates += 1;
+                    }
                     assert_eq!(
                         *previous, child.accepted,
                         "one typed novelty key changed its endpoint observation"
                     );
                 } else {
+                    #[cfg(engine_program_phase_probe)]
+                    {
+                        phase_counts.batch_novelty_unique += 1;
+                    }
                     seen.insert(novelty, child.accepted);
                 }
             }
@@ -1204,8 +1311,20 @@ where
         for (child, (dispatch, pacing)) in children.into_iter().zip(child_physical) {
             let activation = batch.activations[child.input as usize];
             if let Some(novelty) = child.novelty {
+                #[cfg(engine_program_phase_probe)]
+                {
+                    phase_counts.commit_admit_calls += 1;
+                }
                 if !runtime.admit(activation, novelty, child.accepted) {
+                    #[cfg(engine_program_phase_probe)]
+                    {
+                        phase_counts.commit_rejected += 1;
+                    }
                     continue;
+                }
+                #[cfg(engine_program_phase_probe)]
+                {
+                    phase_counts.commit_admitted += 1;
                 }
             }
             let work = ProgramWork {
@@ -1229,6 +1348,26 @@ where
         effects.transition_pages += transition_pages;
         effects.transition_examined += transition_examined;
         effects.placement = placement;
+        #[cfg(engine_program_phase_probe)]
+        record_program_adapter_phase_counts(|total| {
+            total.batches += phase_counts.batches;
+            total.inputs += phase_counts.inputs;
+            total.pages += phase_counts.pages;
+            total.resumes += phase_counts.resumes;
+            total.children += phase_counts.children;
+            total.novelty_children += phase_counts.novelty_children;
+            total.novelty_input_groups += phase_counts.novelty_input_groups;
+            total.runtime_activation_hits += phase_counts.runtime_activation_hits;
+            total.runtime_novelty_hits += phase_counts.runtime_novelty_hits;
+            total.batch_novelty_unique += phase_counts.batch_novelty_unique;
+            total.batch_novelty_duplicates += phase_counts.batch_novelty_duplicates;
+            total.commit_admit_calls += phase_counts.commit_admit_calls;
+            total.commit_admitted += phase_counts.commit_admitted;
+            total.commit_rejected += phase_counts.commit_rejected;
+            total.direct += phase_counts.direct;
+            total.accepted += phase_counts.accepted;
+            total.supported += phase_counts.supported;
+        });
     }
 
     fn complete_batch(

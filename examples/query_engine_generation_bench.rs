@@ -719,6 +719,8 @@ where
 {
     let expected = tally(expected.iter().copied());
     println!("profile cell={label:?} repetitions={repetitions}");
+    #[cfg(engine_program_phase_probe)]
+    let _ = triblespace::core::query::program::take_program_adapter_phase_counts();
     #[cfg(engine_allocation_probe)]
     allocation_probe::reset_peak_to_live();
     #[cfg(engine_allocation_probe)]
@@ -728,6 +730,11 @@ where
     }
     #[cfg(engine_allocation_probe)]
     allocation_probe::Snapshot::now().report_since(&before, label, repetitions);
+    #[cfg(engine_program_phase_probe)]
+    println!(
+        "program_adapter_phase_counts {:?}",
+        triblespace::core::query::program::take_program_adapter_phase_counts()
+    );
 }
 
 #[cfg(not(engine_prefix_checkpoints))]
