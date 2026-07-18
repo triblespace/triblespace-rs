@@ -281,6 +281,28 @@ pub struct ProgramChild {
     pub accepted: Option<RawInline>,
 }
 
+/// Diagnostic receipt naming the physical executor selected for one complete
+/// typed Program cohort.
+///
+/// Placement is never semantic input. The scheduler may aggregate these
+/// static labels in statistics, but route selection, novelty, affine
+/// replacement, and future cohort identity must not consult them.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProgramPhysicalReceipt {
+    pub executor: &'static str,
+    pub operation: &'static str,
+}
+
+impl ProgramPhysicalReceipt {
+    pub const fn new(executor: &'static str, operation: &'static str) -> Self {
+        Self {
+            executor,
+            operation,
+        }
+    }
+}
+
 /// Effects returned by one typed cohort call.
 #[doc(hidden)]
 #[derive(Default)]
@@ -306,6 +328,10 @@ pub struct ProgramBatchEffects {
     pub source_roots: usize,
     pub transition_pages: usize,
     pub transition_examined: usize,
+    /// Successful non-Native placement for this exact cohort. `None` denotes
+    /// the ordinary typed implementation, including immediate fallback after
+    /// a physical attempt declined or failed before effect commit.
+    pub placement: Option<ProgramPhysicalReceipt>,
 }
 
 struct TypedSeedWork<State, NoveltyKey> {
@@ -475,6 +501,35 @@ impl<State, NoveltyKey> TypedEffectSink<State, NoveltyKey> {
     }
 }
 
+/// Complete, still-uncommitted result of an optional physical Program step.
+///
+/// The owning family builds effects in this private transaction. Only after
+/// this value is returned does the erased adapter apply the same page, budget,
+/// rank, tag, novelty, and affine-handle checks as Native execution.
+#[doc(hidden)]
+#[must_use]
+pub struct TypedPhysicalStep<State, NoveltyKey> {
+    effects: TypedEffectSink<State, NoveltyKey>,
+    placement: ProgramPhysicalReceipt,
+}
+
+impl<State, NoveltyKey> TypedPhysicalStep<State, NoveltyKey> {
+    pub fn new(placement: ProgramPhysicalReceipt) -> Self {
+        Self {
+            effects: TypedEffectSink::default(),
+            placement,
+        }
+    }
+
+    pub fn effects_mut(&mut self) -> &mut TypedEffectSink<State, NoveltyKey> {
+        &mut self.effects
+    }
+
+    fn into_parts(self) -> (TypedEffectSink<State, NoveltyKey>, ProgramPhysicalReceipt) {
+        (self.effects, self.placement)
+    }
+}
+
 /// Family-typed residual program contract.
 ///
 /// Program code can emit only typed states and novelty keys. It cannot create
@@ -523,6 +578,22 @@ pub trait TypedProgramSpec {
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     );
+
+    /// Attempts one already-formed cohort on a family-owned physical backend.
+    ///
+    /// The adapter calls this only after affinely taking and revalidating every
+    /// canonical state. Inputs remain borrowed so `None` can immediately move
+    /// the exact retained states into [`Self::step_typed`]. A successful result
+    /// is still uncommitted and passes through the ordinary adapter checks.
+    /// Implementations must return `None` rather than wait when their backend
+    /// is unsupported, unavailable, still preparing, or fails recoverably.
+    fn try_step_physical(
+        &self,
+        _states: &[Self::State],
+        _batch: TypedProgramBatch<'_>,
+    ) -> Option<TypedPhysicalStep<Self::State, Self::NoveltyKey>> {
+        None
+    }
 
     /// Executes one complete action certified by the selected route.
     ///
@@ -884,6 +955,10 @@ where
         batch: ProgramBatch<'_>,
         effects: &mut ProgramBatchEffects,
     ) {
+        assert!(
+            effects.placement.is_none(),
+            "one ProgramBatchEffects sink received more than one physical placement"
+        );
         let input_count = batch.work.len();
         assert_eq!(batch.view.len(), input_count);
         assert_eq!(batch.candidate_sets.len(), input_count);
@@ -928,8 +1003,17 @@ where
             activations: batch.activations,
             limits: batch.limits,
         };
-        let mut typed = TypedEffectSink::default();
-        self.step_typed(states, typed_batch, &mut typed);
+        let (typed, placement) = match self.try_step_physical(&states, typed_batch) {
+            Some(physical) => {
+                let (effects, placement) = physical.into_parts();
+                (effects, Some(placement))
+            }
+            None => {
+                let mut typed = TypedEffectSink::default();
+                self.step_typed(states, typed_batch, &mut typed);
+                (typed, None)
+            }
+        };
         assert_eq!(
             typed.pages.len(),
             input_count,
@@ -1073,6 +1157,7 @@ where
         effects.source_roots += typed.source_roots;
         effects.transition_pages += typed.transition_pages;
         effects.transition_examined += typed.transition_examined;
+        effects.placement = placement;
     }
 
     fn complete_batch(
@@ -1226,6 +1311,113 @@ mod tests {
                 .push(states.iter().map(|state| state.exact_cursor).collect());
             for _ in states {
                 effects.page(1, None);
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum PhysicalProbeMode {
+        Decline,
+        Complete,
+        OverBudget,
+    }
+
+    struct PhysicalProbe {
+        mode: PhysicalProbeMode,
+        physical_states: Arc<Mutex<Vec<Vec<usize>>>>,
+        native_states: Arc<Mutex<Vec<Vec<usize>>>>,
+    }
+
+    impl PhysicalProbe {
+        fn new(mode: PhysicalProbeMode) -> Self {
+            Self {
+                mode,
+                physical_states: Arc::new(Mutex::new(Vec::new())),
+                native_states: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl TypedProgramSpec for PhysicalProbe {
+        type State = NonComparableState;
+        type NoveltyKey = Key;
+        type Rank = u64;
+
+        fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
+            Some(ProgramRoute {
+                key: ProgramKey::new(0),
+                variable: 0,
+                stratum: ProgramStratum::Finite,
+                grouping: ProgramGrouping::PageLocal,
+                completion: ProgramCompletion::PageableOnly,
+            })
+        }
+
+        fn dispatch(&self, _state: &Self::State) -> DispatchClass {
+            DispatchClass::new(12)
+        }
+
+        fn progress(&self, state: &Self::State) -> Self::Rank {
+            state.exact_cursor as u64
+        }
+
+        fn seed_typed(
+            &self,
+            batch: ProgramSeedBatch<'_>,
+            effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+        ) {
+            for parent in 0..batch.view.len() {
+                effects.finite_root(
+                    parent as u32,
+                    NonComparableState {
+                        exact_cursor: parent + 10,
+                    },
+                    None,
+                );
+            }
+        }
+
+        fn step_typed(
+            &self,
+            states: Vec<Self::State>,
+            _batch: TypedProgramBatch<'_>,
+            effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+        ) {
+            self.native_states
+                .lock()
+                .unwrap()
+                .push(states.iter().map(|state| state.exact_cursor).collect());
+            for _ in states {
+                effects.page(1, None);
+            }
+        }
+
+        fn try_step_physical(
+            &self,
+            states: &[Self::State],
+            batch: TypedProgramBatch<'_>,
+        ) -> Option<TypedPhysicalStep<Self::State, Self::NoveltyKey>> {
+            self.physical_states
+                .lock()
+                .unwrap()
+                .push(states.iter().map(|state| state.exact_cursor).collect());
+            match self.mode {
+                PhysicalProbeMode::Decline => None,
+                PhysicalProbeMode::Complete | PhysicalProbeMode::OverBudget => {
+                    let mut step = TypedPhysicalStep::new(ProgramPhysicalReceipt::new(
+                        "test-physical",
+                        "dense-page",
+                    ));
+                    for (input, _) in states.iter().enumerate() {
+                        let examined = match self.mode {
+                            PhysicalProbeMode::Complete => 1,
+                            PhysicalProbeMode::OverBudget => batch.limits[input] + 1,
+                            PhysicalProbeMode::Decline => unreachable!(),
+                        };
+                        step.effects_mut().page(examined, None);
+                    }
+                    Some(step)
+                }
             }
         }
     }
@@ -1603,6 +1795,83 @@ mod tests {
         assert!(!left.contains(&handle));
         assert!(right.contains(&handle));
         assert_eq!(right.take(activation, handle).exact_cursor, 11);
+    }
+
+    fn step_physical_probe(spec: &PhysicalProbe, limits: &[usize]) -> ProgramBatchEffects {
+        let program = ProgramRef::new(spec);
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(0),
+            bound: VariableSet::new_empty(),
+        };
+        let route = program.route(request).unwrap();
+        let activations: Vec<_> = (0..limits.len())
+            .map(|index| ProgramActivation(index as u64 + 1))
+            .collect();
+        let view = RowsView::new_with_row_count(&[], &[], activations.len());
+        let mut runtime = program.new_runtime();
+        let mut seeded = ProgramSeedEffects::default();
+        program.seed_batch(
+            &mut runtime,
+            ProgramSeedBatch {
+                request,
+                route,
+                view,
+                activations: &activations,
+            },
+            &mut seeded,
+        );
+        let work: Vec<_> = seeded.work.into_iter().map(|seed| seed.work).collect();
+        let candidate_sets: Vec<Option<&[RawInline]>> = vec![None; limits.len()];
+        let mut effects = ProgramBatchEffects::default();
+        program.step_batch(
+            &mut runtime,
+            ProgramBatch {
+                stratum: route.stratum,
+                view,
+                candidate_sets: &candidate_sets,
+                activations: &activations,
+                work: &work,
+                limits,
+            },
+            &mut effects,
+        );
+        effects
+    }
+
+    #[test]
+    fn declined_physical_step_falls_back_with_the_exact_retained_states() {
+        let spec = PhysicalProbe::new(PhysicalProbeMode::Decline);
+        let effects = step_physical_probe(&spec, &[1, 1]);
+
+        assert_eq!(*spec.physical_states.lock().unwrap(), vec![vec![10, 11]]);
+        assert_eq!(*spec.native_states.lock().unwrap(), vec![vec![10, 11]]);
+        assert_eq!(effects.pages.len(), 2);
+        assert_eq!(effects.placement, None);
+    }
+
+    #[test]
+    fn completed_physical_step_uses_the_shared_adapter_and_records_placement() {
+        let spec = PhysicalProbe::new(PhysicalProbeMode::Complete);
+        let effects = step_physical_probe(&spec, &[1, 1]);
+
+        assert_eq!(*spec.physical_states.lock().unwrap(), vec![vec![10, 11]]);
+        assert!(spec.native_states.lock().unwrap().is_empty());
+        assert_eq!(effects.pages.len(), 2);
+        assert_eq!(
+            effects.placement,
+            Some(ProgramPhysicalReceipt::new("test-physical", "dense-page"))
+        );
+    }
+
+    #[test]
+    fn physical_step_cannot_bypass_the_shared_budget_validation() {
+        let spec = PhysicalProbe::new(PhysicalProbeMode::OverBudget);
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            step_physical_probe(&spec, &[1])
+        }));
+        let message = panic_text(rejected.expect_err("over-budget physical receipt must fail"));
+        assert!(message.contains("exceeded one input's physical work budget"));
+        assert!(spec.native_states.lock().unwrap().is_empty());
     }
 
     #[test]
