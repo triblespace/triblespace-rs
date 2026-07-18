@@ -24,7 +24,7 @@ fi
 repository=$1
 output_root=$2
 lockfile=$3
-repetitions=${4:-3}
+repetitions=${4:-21}
 
 if [[ ! "$repetitions" =~ ^[0-9]+$ ]] || (( repetitions < 3 )); then
     echo "REPETITIONS must be an integer >= 3" >&2
@@ -92,6 +92,7 @@ cargo_home=${CARGO_HOME:-$HOME/.cargo}
 rustup_home=${RUSTUP_HOME:-$HOME/.rustup}
 
 mkdir -p "$output_root/sources" "$output_root/targets" \
+    "$output_root/source-archives" \
     "$output_root/binaries" "$output_root/build-logs" \
     "$output_root/run-logs" "$output_root/profiles" "$output_root/tmp"
 chmod 0700 "$output_root"
@@ -124,7 +125,7 @@ env -i HOME="$HOME" PATH="$sanitized_path" CARGO_HOME="$cargo_home" \
     RUSTUP_HOME="$rustup_home" "$rustc_toolchain_bin" --version --verbose \
     > "$output_root/rustc-version.txt"
 
-printf 'label\trevision\ttree\tbenchmark_sha256\tworkspace_manifest_sha256\tcargo_lock_sha256\n' \
+printf 'label\trevision\ttree\tarchive\tarchive_size\tarchive_sha256\tbenchmark_sha256\tworkspace_manifest_sha256\tcargo_lock_sha256\n' \
     > "$output_root/source-manifest.tsv"
 
 # Close every source and lock identity gate before the first build.
@@ -134,6 +135,7 @@ for index in "${!labels[@]}"; do
     expected_tree=${trees[$index]}
     source_dir="$output_root/sources/$label"
     target_dir="$output_root/targets/$label"
+    source_archive="$output_root/source-archives/$label.tar"
 
     actual_revision=$($git_bin -C "$repository" rev-parse "$revision^{commit}")
     actual_tree=$($git_bin -C "$repository" rev-parse "$revision^{tree}")
@@ -160,8 +162,23 @@ for index in "${!labels[@]}"; do
     fi
 
     mkdir -p "$source_dir" "$target_dir"
-    $git_bin -C "$repository" archive --format=tar "$revision" \
-        | $tar_bin -xf - -C "$source_dir"
+    $git_bin -C "$repository" archive --format=tar \
+        --output="$source_archive" "$revision"
+    archive_size=$($stat_bin -f '%z' "$source_archive")
+    archive_sha=$($shasum_bin -a 256 "$source_archive" | awk '{print $1}')
+    $tar_bin -xf "$source_archive" -C "$source_dir"
+    extracted_benchmark_sha=$(
+        $shasum_bin -a 256 "$source_dir/examples/query_engine_generation_bench.rs" \
+            | awk '{print $1}'
+    )
+    extracted_manifest_sha=$(
+        $shasum_bin -a 256 "$source_dir/Cargo.toml" | awk '{print $1}'
+    )
+    if [[ "$extracted_benchmark_sha" != "$benchmark_sha" \
+        || "$extracted_manifest_sha" != "$workspace_manifest_sha" ]]; then
+        echo "$label extracted source mismatch" >&2
+        exit 65
+    fi
     cp "$lockfile" "$source_dir/Cargo.lock"
     copied_lock_sha=$($shasum_bin -a 256 "$source_dir/Cargo.lock" | awk '{print $1}')
     if [[ "$copied_lock_sha" != "$lock_sha" ]]; then
@@ -169,11 +186,18 @@ for index in "${!labels[@]}"; do
         exit 65
     fi
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$label" "$revision" "$actual_tree" "$actual_benchmark_sha" \
-        "$actual_manifest_sha" "$copied_lock_sha" \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$label" "$revision" "$actual_tree" "$source_archive" \
+        "$archive_size" "$archive_sha" "$extracted_benchmark_sha" \
+        "$extracted_manifest_sha" "$copied_lock_sha" \
         >> "$output_root/source-manifest.tsv"
 done
+
+if [[ $($shasum_bin -a 256 "$cargo_toolchain_bin" | awk '{print $1}') != "$cargo_sha" \
+    || $($shasum_bin -a 256 "$rustc_toolchain_bin" | awk '{print $1}') != "$rustc_sha" ]]; then
+    echo "toolchain executables changed during source preflight" >&2
+    exit 65
+fi
 
 printf 'label\trevision\ttree\tbenchmark_sha256\tcargo_lock_sha256\tbinary\tsize\tsha256\n' \
     > "$output_root/build-manifest.tsv"
@@ -193,7 +217,7 @@ for index in "${!labels[@]}"; do
         RUSTFLAGS="--cfg engine_current_residual --cfg engine_allocation_probe" \
         ENGINE_REVISION="$revision" \
         "$cargo_toolchain_bin" build --manifest-path "$source_dir/Cargo.toml" \
-            --locked --release --example query_engine_generation_bench \
+            --frozen --release --example query_engine_generation_bench \
         > "$output_root/build-logs/$label.log" 2>&1
 
     binary="$output_root/binaries/${label}-${revision:0:8}-query_engine_generation_bench"
@@ -226,6 +250,14 @@ run_profile() {
     binary="$output_root/binaries/${label}-${revision:0:8}-query_engine_generation_bench"
     log="$output_root/run-logs/${pass}-${ordinal}-${label}-${cell}.log"
     profile="$output_root/profiles/${pass}-${label}-${cell}.txt"
+    expected_binary_sha=$(awk -F '\t' -v label="$label" \
+        '$1 == label { print $8 }' "$output_root/build-manifest.tsv")
+    actual_binary_sha=$($shasum_bin -a 256 "$binary" | awk '{print $1}')
+    if [[ ! "$expected_binary_sha" =~ ^[0-9a-f]{64}$ \
+        || "$actual_binary_sha" != "$expected_binary_sha" ]]; then
+        echo "$pass/$label/$cell frozen binary hash mismatch" >&2
+        exit 65
+    fi
 
     env -i HOME="$HOME" PATH="$sanitized_path" \
         ENGINE_PROFILE_CELL="$cell" \
@@ -278,4 +310,14 @@ for label in B P M C; do
     done
 done
 
-echo "ALLOCATION_COUNTS_EXACT" > "$output_root/STATUS"
+echo "ALLOC_PROFILE_REPEATS_EXACT" > "$output_root/STATUS"
+(
+    cd "$output_root"
+    find STATUS protocol.env cargo-version.txt rustc-version.txt \
+        source-manifest.tsv build-manifest.tsv source-archives binaries \
+        build-logs run-logs profiles -type f -print \
+        | LC_ALL=C sort \
+        | while IFS= read -r artifact; do
+            $shasum_bin -a 256 "$artifact"
+        done
+) > "$output_root/closure.sha256"
