@@ -3,7 +3,9 @@
 //! [`SuccinctProgramFamily`] implements the engine's `TypedProgramSpec`
 //! contract over a compiled [`QueryProgram`]: canonical typed states are
 //! archive-local frontier rows, the Native step is the exact CPU interpreter
-//! paginated by the scheduler's per-input grants, and `try_step_physical`
+//! paginated by the scheduler's per-input grants — complete rows become
+//! direct proposal occurrences, incomplete rows rank-decreasing finite
+//! children — and `try_step_physical`
 //! offers one already-formed cohort to the resident two-bound transition
 //! kernel through the budgeted dispatch contract
 //! ([`crate::budgeted`]).
@@ -196,7 +198,11 @@ struct InputPage {
 struct StepOutcome {
     pages: Vec<InputPage>,
     children: Vec<(u32, SuccinctFrontierState)>,
-    accepted: Vec<(u32, RawInline)>,
+    /// Terminal proposal rows as direct occurrences: the engine's Propose
+    /// semantics preserve order and multiplicity, which is exactly what the
+    /// transition's stable interval prefix produces. (`accept` is the
+    /// Confirm-side shape; routing Confirm is a later, separate narrowing.)
+    direct: Vec<(u32, RawInline)>,
 }
 
 /// The succinct typed Program family.
@@ -312,7 +318,7 @@ impl<'p, 'a, U: Universe> SuccinctProgramFamily<'p, 'a, U> {
         let mut outcome = StepOutcome {
             pages: Vec::with_capacity(states.len()),
             children: Vec::new(),
-            accepted: Vec::new(),
+            direct: Vec::new(),
         };
         for (input, (state, &limit)) in states.iter().zip(limits).enumerate() {
             let (full, target) = self.interval(state);
@@ -336,7 +342,8 @@ impl<'p, 'a, U: Universe> SuccinctProgramFamily<'p, 'a, U> {
         outcome
     }
 
-    /// Emits one consumed child-row range as accepted values or child states.
+    /// Emits one consumed child-row range as direct proposal occurrences
+    /// (complete rows) or child states (incomplete rows).
     fn emit_rows(
         &self,
         outcome: &mut StepOutcome,
@@ -358,7 +365,7 @@ impl<'p, 'a, U: Universe> SuccinctProgramFamily<'p, 'a, U> {
                     .program
                     .decode(values[target_column])
                     .expect("child codes decode within their own archive");
-                outcome.accepted.push((input, value));
+                outcome.direct.push((input, value));
             } else {
                 outcome.children.push((
                     input,
@@ -449,7 +456,7 @@ impl<'p, 'a, U: Universe> SuccinctProgramFamily<'p, 'a, U> {
         let mut outcome = StepOutcome {
             pages: Vec::with_capacity(states.len()),
             children: Vec::new(),
-            accepted: Vec::new(),
+            direct: Vec::new(),
         };
         // Law gate 3: child rows are consumed strictly in receipt/input
         // order; `consumed` is the only cursor into the child frontier.
@@ -502,8 +509,8 @@ impl<'p, 'a, U: Universe> SuccinctProgramFamily<'p, 'a, U> {
         for (input, state) in outcome.children {
             effects.finite_child(input, state, None);
         }
-        for (input, value) in outcome.accepted {
-            effects.accept(input, value);
+        for (input, value) in outcome.direct {
+            effects.direct(input, value);
         }
         for page in outcome.pages {
             effects.account_transition(page.examined);
@@ -744,7 +751,7 @@ mod tests {
     }
 
     #[test]
-    fn native_pagination_pages_accepts_and_resumes_exactly() {
+    fn native_pagination_emits_direct_occurrences_and_resumes_exactly() {
         let (archive, entities, attributes) = fixture();
         let program = QueryProgram::compile(
             &archive,
@@ -771,7 +778,7 @@ mod tests {
         assert!(first.children.is_empty());
 
         // Page one: exact clamped prefixes, resumes exactly where clamped.
-        let mut expected_accepted = Vec::new();
+        let mut expected_direct = Vec::new();
         for (input, ((page, oracle), (&limit, state))) in first
             .pages
             .iter()
@@ -782,7 +789,7 @@ mod tests {
             let take = limit.min(oracle.len());
             assert_eq!(page.examined, take);
             for value in &oracle[..take] {
-                expected_accepted.push((input as u32, *value));
+                expected_direct.push((input as u32, *value));
             }
             match &page.resume {
                 Some(resume) => {
@@ -795,7 +802,7 @@ mod tests {
                 None => assert!(oracle.len() <= limit),
             }
         }
-        assert_eq!(first.accepted, expected_accepted);
+        assert_eq!(first.direct, expected_direct);
 
         // Draining every resume page reproduces each oracle interval whole.
         for (input, (state, oracle)) in states.iter().zip(&oracles).enumerate() {
@@ -806,7 +813,7 @@ mod tests {
                     std::slice::from_ref(&current),
                     &[limits[input]],
                 );
-                consumed.extend(outcome.accepted.iter().map(|(_, value)| *value));
+                consumed.extend(outcome.direct.iter().map(|(_, value)| *value));
                 cursor = outcome.pages.into_iter().next().unwrap().resume;
             }
             assert_eq!(&consumed, oracle, "input {input}");
@@ -834,7 +841,7 @@ mod tests {
             )
             .unwrap();
         let outcome = family.native_outcome(std::slice::from_ref(&root), &[64]);
-        assert!(outcome.accepted.is_empty());
+        assert!(outcome.direct.is_empty());
         assert!(!outcome.children.is_empty());
         for (input, child) in &outcome.children {
             assert_eq!(*input, 0);
@@ -919,7 +926,7 @@ mod tests {
             .outcome_from_device(brand, &child, receipts, &states, &limits, target)
             .expect("lawful receipts segment");
         assert_eq!(
-            outcome.accepted.len(),
+            outcome.direct.len(),
             child.len(),
             "every child row lands in exactly one input's page"
         );
@@ -1039,7 +1046,7 @@ mod tests {
 
         // Bag-identical results — in fact order-identical: the stable device
         // prefix is the interval prefix the Native interpreter consumes.
-        assert_eq!(device.accepted, native.accepted);
+        assert_eq!(device.direct, native.direct);
         assert!(device.children.is_empty() && native.children.is_empty());
         assert_eq!(device.pages.len(), native.pages.len());
         let mut clamped = 0usize;
@@ -1123,7 +1130,7 @@ mod tests {
             "the fixture must clamp at least one input"
         );
         let mut consumed: Vec<Vec<RawInline>> = vec![Vec::new(); states.len()];
-        for (input, value) in &first.accepted {
+        for (input, value) in &first.direct {
             consumed[*input as usize].push(*value);
         }
         let mut cursors: Vec<Option<SuccinctFrontierState>> = first
@@ -1147,8 +1154,8 @@ mod tests {
                 .expect("a resumed cohort rides the offset-aware kernel");
             // Native produces the identical page from the same states.
             let native = family.native_outcome(&cohort, &cohort_limits);
-            assert_eq!(outcome.accepted, native.accepted);
-            for (input, value) in &outcome.accepted {
+            assert_eq!(outcome.direct, native.direct);
+            for (input, value) in &outcome.direct {
                 consumed[live[*input as usize]].push(*value);
             }
             for (position, page) in outcome.pages.into_iter().enumerate() {
