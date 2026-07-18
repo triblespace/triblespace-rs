@@ -7,6 +7,7 @@ use crate::id::ID_LEN;
 use crate::inline::encodings::genid::GenId;
 use crate::inline::IntoInline;
 use crate::inline::RawInline;
+use crate::patch::PATCHBoundedInfixes;
 use crate::query::confirm_per_row;
 use crate::query::intersectionconstraint::IntersectionConstraint;
 use crate::query::residual::FrameSeedRow;
@@ -39,7 +40,10 @@ use crate::query::Variable;
 use crate::query::VariableContext;
 use crate::query::VariableId;
 use crate::query::VariableSet;
+use crate::trible::EAVOrder;
 use crate::trible::TribleSet;
+use crate::trible::VAEOrder;
+use crate::trible::TRIBLE_LEN;
 
 // ── Path expression types ────────────────────────────────────────────────
 
@@ -379,11 +383,17 @@ impl ChainFrameReducer for ExistsEq {
 #[cfg(test)]
 std::thread_local! {
     static SEEDED_CHAIN_FRAME_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BULK_TRANSITION_COHORTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
 fn take_seeded_chain_frame_runs() -> usize {
     SEEDED_CHAIN_FRAME_RUNS.with(|runs| runs.replace(0))
+}
+
+#[cfg(test)]
+fn take_bulk_transition_cohorts() -> usize {
+    BULK_TRANSITION_COHORTS.with(|cohorts| cohorts.replace(0))
 }
 
 fn run_chain_frame<C, R>(root: C, seed: FrameSeedRow, mut reducer: R) -> R::Output
@@ -1285,6 +1295,36 @@ enum DeltaStep {
     InverseNotAttr(RawId),
 }
 
+enum PositiveDeltaInfixes<'a> {
+    Empty,
+    Attr(PATCHBoundedInfixes<'a, TRIBLE_LEN, { ID_LEN * 2 }, 32, EAVOrder, ()>),
+    InverseAttr(PATCHBoundedInfixes<'a, TRIBLE_LEN, { 32 + ID_LEN }, ID_LEN, VAEOrder, ()>),
+}
+
+impl PositiveDeltaInfixes<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Attr(infixes) => {
+                usize::try_from(infixes.len()).expect("bounded PATCH count must fit usize")
+            }
+            Self::InverseAttr(infixes) => {
+                usize::try_from(infixes.len()).expect("bounded PATCH count must fit usize")
+            }
+        }
+    }
+
+    fn for_each(self, mut for_each: impl FnMut(RawInline)) {
+        match self {
+            Self::Empty => {}
+            Self::Attr(infixes) => infixes.for_each(|value: &[u8; 32]| for_each(*value)),
+            Self::InverseAttr(infixes) => {
+                infixes.for_each(|entity: &[u8; ID_LEN]| for_each(id_into_value(entity)))
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct ThompsonState {
     epsilon: Vec<u32>,
@@ -2077,6 +2117,42 @@ impl RegularPathConstraint {
                 }?;
                 Some(id_into_value(&entity))
             }
+        }
+    }
+
+    /// Locates a complete positive transition branch only when it fits in the
+    /// remaining physical grant. Negated branches retain cursor paging because
+    /// their destination predicate makes raw and accepted fanout differ.
+    fn bounded_positive_delta_infixes<'a>(
+        &'a self,
+        step: DeltaStep,
+        source: &RawInline,
+        limit: usize,
+    ) -> Option<PositiveDeltaInfixes<'a>> {
+        let limit = u64::try_from(limit).unwrap_or(u64::MAX);
+        match step {
+            DeltaStep::Attr(attribute) => {
+                let Some(entity) = value_as_entity(source) else {
+                    return Some(PositiveDeltaInfixes::Empty);
+                };
+                let mut prefix = [0u8; ID_LEN * 2];
+                prefix[..ID_LEN].copy_from_slice(&entity);
+                prefix[ID_LEN..].copy_from_slice(&attribute);
+                self.set
+                    .eav
+                    .bounded_infixes(&prefix, limit)
+                    .map(PositiveDeltaInfixes::Attr)
+            }
+            DeltaStep::InverseAttr(attribute) => {
+                let mut prefix = [0u8; 32 + ID_LEN];
+                prefix[..32].copy_from_slice(source);
+                prefix[32..].copy_from_slice(&attribute);
+                self.set
+                    .vae
+                    .bounded_infixes(&prefix, limit)
+                    .map(PositiveDeltaInfixes::InverseAttr)
+            }
+            DeltaStep::NotAttr(_) | DeltaStep::InverseNotAttr(_) => None,
         }
     }
 
@@ -2961,6 +3037,106 @@ impl TypedProgramSpec for RegularPathConstraint {
             return;
         }
 
+        // A fresh transition cohort may consume PATCH's borrowed subtree walk
+        // only when every positive branch fits its input's exact physical
+        // grant. Planning is atomic across the cohort: one resumed cursor,
+        // negated branch, or oversized fanout discards the borrowed plans and
+        // preserves the ordinary affine pageable protocol for every input.
+        let mut plans = Vec::new();
+        let mut fanouts = Vec::with_capacity(states.len());
+        let mut all_fit = true;
+        'inputs: for (input, state) in states.iter().enumerate() {
+            let RpqStateKind::Transition {
+                variable,
+                node,
+                cursor,
+            } = state.kind()
+            else {
+                panic!("one typed RPQ transition cohort mixed continuation variants")
+            };
+            if *cursor != RpqExpandCursor::Start {
+                all_fit = false;
+                break;
+            }
+            let program = match self
+                .program_for_variable(*variable)
+                .expect("typed RPQ transition lost its program")
+            {
+                RpqRoute::BoundEndpoint { program, .. } | RpqRoute::SameVariable { program } => {
+                    program
+                }
+            };
+            let state = program.decode(node.pc);
+            if program.steps[state].is_empty() {
+                all_fit = false;
+                break;
+            }
+            let input = u32::try_from(input).expect("too many typed RPQ inputs in one cohort");
+            let limit = batch.limits[input as usize];
+            let mut fanout = 0usize;
+            for &(step, target) in &program.steps[state] {
+                debug_assert!(fanout <= limit);
+                let Some(infixes) =
+                    self.bounded_positive_delta_infixes(step, &node.value, limit - fanout)
+                else {
+                    all_fit = false;
+                    break 'inputs;
+                };
+                fanout += infixes.len();
+                plans.push((
+                    input,
+                    *node,
+                    program.encode(target),
+                    program.accepting[target as usize],
+                    infixes,
+                ));
+            }
+            fanouts.push(fanout);
+        }
+        if all_fit {
+            #[cfg(test)]
+            BULK_TRANSITION_COHORTS.with(|cohorts| cohorts.set(cohorts.get() + 1));
+            effects.reserve_children(fanouts.iter().sum());
+            for (input, node, pc, target_accepting, infixes) in plans {
+                infixes.for_each(|value| {
+                    let child = RpqNode {
+                        source: node.source,
+                        value,
+                        pc,
+                    };
+                    let state = RpqState::transition(
+                        match states[input as usize].kind() {
+                            RpqStateKind::Transition { variable, .. } => *variable,
+                            _ => unreachable!(),
+                        },
+                        child,
+                        RpqExpandCursor::Start,
+                    );
+                    let accepted = (target_accepting
+                        && node.source.is_none_or(|anchor| value == anchor))
+                    .then_some(value);
+                    match batch.stratum {
+                        ProgramStratum::Finite => effects.finite_child(input, state, accepted),
+                        ProgramStratum::Fixpoint => effects.fixpoint_child(
+                            input,
+                            state,
+                            RpqNoveltyKey {
+                                source: child.source,
+                                value: child.value,
+                                pc: child.pc,
+                            },
+                            accepted,
+                        ),
+                    }
+                });
+            }
+            for fanout in fanouts {
+                effects.account_transition(fanout);
+                effects.page(fanout, None);
+            }
+            return;
+        }
+
         for (input, state) in states.into_iter().enumerate() {
             let RpqStateKind::Transition {
                 variable,
@@ -3747,6 +3923,246 @@ mod seeded_frame_tests {
         assert_eq!(effects.children[0].accepted, Some(target));
         assert_eq!(effects.transition_pages, 1);
         assert_eq!(effects.transition_examined, 1);
+    }
+
+    fn one_support_transition_cohort(
+        path: &RegularPathConstraint,
+        rows: &[RawInline],
+        limits: &[usize],
+    ) -> (ProgramBatchEffects, usize) {
+        assert_eq!(rows.len(), limits.len() * 2);
+        let mut bound = VariableSet::new_singleton(path.start);
+        bound.set(path.end);
+        let request = ProgramRequest {
+            action: ProgramAction::Support,
+            bound,
+        };
+        let program = path.residual_program().unwrap();
+        let route = program.route(request).unwrap();
+        let vars = [path.start, path.end];
+        let view = RowsView::new(&vars, rows);
+        let activations: Vec<_> = (0..limits.len())
+            .map(|index| ProgramActivation(index as u64 + 1))
+            .collect();
+        let mut runtime = program.new_runtime();
+        let mut seed = ProgramSeedEffects::default();
+        program.seed_batch(
+            &mut runtime,
+            ProgramSeedBatch {
+                request,
+                route,
+                view,
+                activations: &activations,
+            },
+            &mut seed,
+        );
+        let work: Vec<_> = seed.work.into_iter().map(|seed| seed.work).collect();
+        assert_eq!(work.len(), limits.len());
+        let candidate_sets = vec![None; limits.len()];
+        let _ = take_bulk_transition_cohorts();
+        let mut effects = ProgramBatchEffects::default();
+        program.step_batch(
+            &mut runtime,
+            ProgramBatch {
+                stratum: route.stratum,
+                view,
+                candidate_sets: &candidate_sets,
+                activations: &activations,
+                work: &work,
+                limits,
+            },
+            &mut effects,
+        );
+        (effects, take_bulk_transition_cohorts())
+    }
+
+    #[test]
+    fn typed_bulk_transition_requires_every_fresh_frontier_to_fit_its_grant() {
+        let attribute = rngid();
+        let sources = [rngid(), rngid()];
+        let first_destinations: Vec<_> = (0..2).map(|_| id_into_value(&rngid().id.raw())).collect();
+        let second_destinations: Vec<_> =
+            (0..3).map(|_| id_into_value(&rngid().id.raw())).collect();
+        let mut set = TribleSet::new();
+        for destination in first_destinations.iter().copied() {
+            insert_edge(&mut set, &sources[0], &attribute, destination);
+        }
+        for destination in second_destinations.iter().copied() {
+            insert_edge(&mut set, &sources[1], &attribute, destination);
+        }
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let path = RegularPathConstraint::new(set, start, end, &[PathOp::Attr(attribute.id.raw())]);
+        // Two identical outer parents pin bag ownership independently of the
+        // product-state value. The third input has the larger exact fanout.
+        let rows = [
+            id_into_value(&sources[0].id.raw()),
+            first_destinations[0],
+            id_into_value(&sources[0].id.raw()),
+            first_destinations[0],
+            id_into_value(&sources[1].id.raw()),
+            second_destinations[0],
+        ];
+
+        let (complete, bulk_cohorts) = one_support_transition_cohort(&path, &rows, &[2, 2, 3]);
+        assert_eq!(bulk_cohorts, 1);
+        assert_eq!(
+            complete
+                .pages
+                .iter()
+                .map(|page| page.examined)
+                .collect::<Vec<_>>(),
+            vec![2, 2, 3],
+        );
+        assert!(complete.pages.iter().all(|page| page.resume.is_none()));
+        assert_eq!(
+            complete
+                .children
+                .iter()
+                .map(|child| child.input)
+                .collect::<Vec<_>>(),
+            vec![0, 0, 1, 1, 2, 2, 2],
+        );
+        assert_eq!(complete.transition_pages, 3);
+        assert_eq!(complete.transition_examined, 7);
+
+        // One undersized grant rejects the borrowed plans for the *whole*
+        // cohort before enumeration. Inputs zero and one still take the
+        // ordinary cursor path even though each would fit independently.
+        let (partial, bulk_cohorts) = one_support_transition_cohort(&path, &rows, &[2, 2, 2]);
+        assert_eq!(bulk_cohorts, 0);
+        assert_eq!(
+            partial
+                .pages
+                .iter()
+                .map(|page| page.examined)
+                .collect::<Vec<_>>(),
+            vec![2, 2, 2],
+        );
+        assert!(partial.pages[0].resume.is_none());
+        assert!(partial.pages[1].resume.is_none());
+        assert!(matches!(
+            partial.pages[2].resume,
+            Some(crate::query::ProgramResume::Immediate(_))
+        ));
+        assert_eq!(
+            partial
+                .children
+                .iter()
+                .map(|child| child.input)
+                .collect::<Vec<_>>(),
+            vec![0, 0, 1, 1, 2, 2],
+        );
+        assert_eq!(partial.transition_pages, 3);
+        assert_eq!(partial.transition_examined, 6);
+    }
+
+    #[test]
+    fn typed_bulk_transition_supports_inverse_but_not_negated_frontiers() {
+        let attribute = rngid();
+        let target = rngid();
+        let sources = [rngid(), rngid()];
+        let target_value = id_into_value(&target.id.raw());
+        let source_values: Vec<_> = sources
+            .iter()
+            .map(|source| id_into_value(&source.id.raw()))
+            .collect();
+        let mut inverse_set = TribleSet::new();
+        for source in &sources {
+            insert_edge(&mut inverse_set, source, &attribute, target_value);
+        }
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let inverse = RegularPathConstraint::new(
+            inverse_set,
+            start,
+            end,
+            &[PathOp::Attr(attribute.id.raw()), PathOp::Inverse],
+        );
+        let (inverse_effects, bulk_cohorts) =
+            one_support_transition_cohort(&inverse, &[target_value, source_values[0]], &[2]);
+        assert_eq!(bulk_cohorts, 1);
+        assert_eq!(inverse_effects.pages[0].examined, 2);
+        assert!(inverse_effects.pages[0].resume.is_none());
+        assert_eq!(inverse_effects.children.len(), 2);
+        assert_eq!(
+            inverse_effects
+                .children
+                .iter()
+                .filter_map(|child| child.accepted)
+                .collect::<Vec<_>>(),
+            vec![source_values[0]],
+        );
+
+        let excluded = rngid();
+        let other = rngid();
+        let forward_source = rngid();
+        let destinations: Vec<_> = (0..3).map(|_| id_into_value(&rngid().id.raw())).collect();
+        let mut forward_set = TribleSet::new();
+        insert_edge(
+            &mut forward_set,
+            &forward_source,
+            &excluded,
+            destinations[0],
+        );
+        insert_edge(&mut forward_set, &forward_source, &other, destinations[1]);
+        insert_edge(&mut forward_set, &forward_source, &other, destinations[2]);
+        let forward_negated = RegularPathConstraint::new(
+            forward_set,
+            start,
+            end,
+            &[PathOp::NotAttr(excluded.id.raw())],
+        );
+        let (forward_effects, bulk_cohorts) = one_support_transition_cohort(
+            &forward_negated,
+            &[id_into_value(&forward_source.id.raw()), destinations[1]],
+            &[3],
+        );
+        assert_eq!(bulk_cohorts, 0);
+        assert_eq!(forward_effects.pages[0].examined, 3);
+        assert!(forward_effects.pages[0].resume.is_none());
+        assert_eq!(forward_effects.children.len(), 2);
+
+        let inverse_target = rngid();
+        let inverse_target_value = id_into_value(&inverse_target.id.raw());
+        let inverse_sources = [rngid(), rngid(), rngid()];
+        let mut inverse_negated_set = TribleSet::new();
+        insert_edge(
+            &mut inverse_negated_set,
+            &inverse_sources[0],
+            &excluded,
+            inverse_target_value,
+        );
+        insert_edge(
+            &mut inverse_negated_set,
+            &inverse_sources[1],
+            &other,
+            inverse_target_value,
+        );
+        insert_edge(
+            &mut inverse_negated_set,
+            &inverse_sources[2],
+            &other,
+            inverse_target_value,
+        );
+        let inverse_negated = RegularPathConstraint::new(
+            inverse_negated_set,
+            start,
+            end,
+            &[PathOp::NotAttr(excluded.id.raw()), PathOp::Inverse],
+        );
+        let (inverse_effects, bulk_cohorts) = one_support_transition_cohort(
+            &inverse_negated,
+            &[
+                inverse_target_value,
+                id_into_value(&inverse_sources[1].id.raw()),
+            ],
+            &[3],
+        );
+        assert_eq!(bulk_cohorts, 0);
+        assert_eq!(inverse_effects.pages[0].examined, 3);
+        assert!(inverse_effects.pages[0].resume.is_none());
+        assert_eq!(inverse_effects.children.len(), 2);
     }
 
     #[test]

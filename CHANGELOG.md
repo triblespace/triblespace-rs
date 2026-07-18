@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Fresh positive typed RPQ cohorts use an exact-all-fit PATCH traversal.**
+  When every activation starts at its initial cursor, every frontier branch is
+  positive forward/inverse attribute traversal, and each exact fanout fits its
+  per-input physical grant, the whole cohort consumes borrowed bounded infixes
+  atomically; a resumed, negated, or oversized member preserves the existing
+  pageable path for everyone. This recovers 2.4–2.5x on the measured mixed
+  formula+RPQ cells without implying a general engine-wide speedup.
 - **Typed RPQ complete actions now drain the compiled product automaton
   directly.** Bound-endpoint proposal cohorts use a parent-local
   `(value, program-counter)` novelty set and direct PATCH transition pages for
