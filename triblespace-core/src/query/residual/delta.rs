@@ -7289,6 +7289,80 @@ mod tests {
     }
 
     #[test]
+    fn global_streaming_activation_program_cohort_crosses_activations_in_append_order() {
+        let mut scheduler = DeltaScheduler::new();
+        scheduler.activation_width = 1;
+        let state = test_program_state(&mut scheduler);
+        let first = scheduler.registry.open_program_activation(
+            DeltaReducer::StreamProposal,
+            stable_return(Vec::new()),
+            None,
+            None,
+        );
+        let second = scheduler.registry.open_program_activation(
+            DeltaReducer::StreamProposal,
+            stable_return(Vec::new()),
+            None,
+            None,
+        );
+        let mut first_tasks = install_program_tasks(
+            &mut scheduler.registry,
+            first,
+            0..3,
+            DispatchClass::new(0),
+            ProgramPacing::Activation,
+        )
+        .into_iter();
+        let mut second_tasks = install_program_tasks(
+            &mut scheduler.registry,
+            second,
+            3..5,
+            DispatchClass::new(0),
+            ProgramPacing::Activation,
+        )
+        .into_iter();
+        let a0 = first_tasks.next().unwrap();
+        let a1 = first_tasks.next().unwrap();
+        let a2 = first_tasks.next().unwrap();
+        let b0 = second_tasks.next().unwrap();
+        let b1 = second_tasks.next().unwrap();
+        let retained = a0.credit.key.nonce;
+        let expected = [
+            b0.credit.key.nonce,
+            a1.credit.key.nonce,
+            b1.credit.key.nonce,
+            a2.credit.key.nonce,
+        ];
+        assert_eq!(
+            ProgramCohortKey::of(&scheduler.registry, &a0),
+            ProgramCohortKey::of(&scheduler.registry, &b0),
+            "streaming activation identity must remain task payload"
+        );
+        let _ = scheduler.file_program_state(state, vec![a0, b0, a1, b1, a2]);
+
+        let (popped_state, tasks, dispatch) = scheduler.pop_program_bounded(4);
+        assert_eq!(popped_state, state);
+        assert_eq!(dispatch.kind, PhysicalDispatchKind::Program);
+        assert_eq!(dispatch.task_limits, [1, 1, 1, 1]);
+        assert!(dispatch.terminal_activations.is_empty());
+        assert_eq!(
+            tasks
+                .iter()
+                .map(|task| task.credit.key.nonce)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(scheduler.program_worklist[&state].tasks.len(), 1);
+        assert_eq!(
+            scheduler.program_worklist[&state].tasks[0]
+                .credit
+                .key
+                .nonce,
+            retained
+        );
+    }
+
+    #[test]
     fn global_quiescent_program_cohort_uses_append_order_and_activation_cap() {
         let mut scheduler = DeltaScheduler::new();
         scheduler.activation_width = 2;
