@@ -15,8 +15,8 @@ use triblespace_core::id::{ExclusiveId, Id};
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::InlineEncoding;
 use triblespace_core::macros::{id_hex, pattern};
-use triblespace_core::query::residual::ResidualLowering;
 use triblespace_core::query::find;
+use triblespace_core::query::residual::ResidualLowering;
 use triblespace_core::trible::{Trible, TribleSet};
 use triblespace_gpu::{ValueRouteAdmission, WgpuSuccinctArchive};
 
@@ -67,6 +67,42 @@ fn oracle_pairs(set: &TribleSet) -> Vec<(Id, Id)> {
 }
 
 #[test]
+fn declined_entity_route_keeps_the_delegated_width_one_pager() {
+    let set = fixture_set();
+    let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+    let resident = WgpuSuccinctArchive::new(archive).expect("resident wrap succeeds");
+    let route = resident.value_route_with(ValueRouteAdmission::Off);
+
+    let query = find!(
+        (e: Id, v: Id),
+        pattern!(&route, [{ ?e @ ns::fanout: ?v }])
+    );
+    let mut solve = query
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .cap(64)
+        .start_width(1)
+        .growth(2);
+
+    assert!(solve.next().is_some());
+
+    // The resident family owns only the two-bound value proposal. Its
+    // entity request is declined before activation, then delegated to the
+    // wrapped SuccinctArchive's bounded source pager. Reaching one result
+    // therefore records exactly one entity source page and one typed value
+    // source page before the first result; the former disappeared when merely
+    // exposing a Program incorrectly suppressed every legacy residual hook.
+    assert_eq!(
+        solve.stats().delta_source_pages,
+        2,
+        "the declined entity action fell through to eager execution: {:?}",
+        solve.stats()
+    );
+    assert_eq!(solve.stats().delta_source_candidates_examined, 2);
+    assert_eq!(solve.stats().candidates_proposed, 2);
+    assert_eq!(solve.stats().max_propose_candidates, 1);
+}
+
+#[test]
 fn serial_full_lowering_is_bag_identical_and_default_off_never_places() {
     let set = fixture_set();
     let expected = oracle_pairs(&set);
@@ -107,7 +143,10 @@ fn serial_full_lowering_is_bag_identical_and_default_off_never_places() {
     assert_eq!(counters.physical_cohorts, 0);
     assert_eq!(counters.declined_lease, 0);
     assert_eq!(counters.declined_contract, 0);
-    assert!(counters.declined_policy > 0, "cohorts were offered and declined");
+    assert!(
+        counters.declined_policy > 0,
+        "cohorts were offered and declined"
+    );
 }
 
 #[test]
