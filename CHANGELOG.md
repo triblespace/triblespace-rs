@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Typed Program novelty commits from one fully validated batch plan.** The
+  erased adapter now checks batch-local repetitions before consulting runtime
+  novelty, records first admissions in receipt order, and mutates runtime state
+  only after every page, tag, rank, budget, and raw-effect law succeeds. Existing
+  and repeated keys no longer pay a second admission lookup, while endpoint
+  stability, affine handle publication, and no-prefix failure remain exact.
 - **Fresh positive typed RPQ cohorts use an exact-all-fit PATCH traversal.**
   When every activation starts at its initial cursor, every frontier branch is
   positive forward/inverse attribute traversal, and each exact fanout fits its
