@@ -644,8 +644,11 @@ pub struct ProgramRuntime {
 /// Immutable residual-program family specification.
 ///
 /// Implementations downcast `runtime` once at the beginning of each seed or
-/// step call, then operate on a dense typed state vector. An implementation
-/// must never fall back to legacy residual hooks after returning a route.
+/// step call, then operate on a dense typed state vector. Returning `None`
+/// from `route` declines only that exact structural action, so the engine may
+/// still consult the constraint's legacy residual capabilities. After a route
+/// is returned, however, that action is owned by the Program and must never
+/// fall back to legacy residual hooks.
 trait ErasedProgramSpec {
     fn new_runtime(&self) -> ProgramRuntime;
 
