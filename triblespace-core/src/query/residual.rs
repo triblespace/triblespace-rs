@@ -1425,6 +1425,73 @@ impl PartialEq<ConstraintPath> for ResidualLeaf {
     }
 }
 
+/// One schema-level action in the strict constructed-Program probe.
+///
+/// Routes live in plan metadata rather than canonical state identity. Every
+/// row with `bound` therefore follows the same structural proposer and the
+/// same preorder confirmation suffix without consulting cardinality methods.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ConstructedProgramStep {
+    bound: VariableSet,
+    variable: VariableId,
+    relevant: ChildSet,
+    proposer: usize,
+    proposer_route: ProgramRoute,
+    confirmer_routes: Box<[(usize, ProgramRoute)]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ConstructedProgramPlan {
+    steps: Box<[ConstructedProgramStep]>,
+}
+
+impl ConstructedProgramPlan {
+    fn step(&self, bound: VariableSet) -> Option<&ConstructedProgramStep> {
+        self.steps
+            .get(bound.count())
+            .filter(|step| step.bound == bound)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ConstructedProgramError {
+    EmptyQuery,
+    FormulaOccurrence {
+        occurrence: usize,
+    },
+    ZeroVariableOccurrence {
+        occurrence: usize,
+    },
+    MissingProgram {
+        occurrence: usize,
+    },
+    MissingProposalRoute {
+        variable: VariableId,
+        bound: VariableSet,
+    },
+    MissingConfirmRoute {
+        occurrence: usize,
+        variable: VariableId,
+        bound: VariableSet,
+    },
+    RouteVariableMismatch {
+        occurrence: usize,
+        variable: VariableId,
+        routed: VariableId,
+        bound: VariableSet,
+    },
+    ParentAtomicConfirm {
+        occurrence: usize,
+        variable: VariableId,
+        bound: VariableSet,
+    },
+    NonPageLocalConfirm {
+        occurrence: usize,
+        variable: VariableId,
+        bound: VariableSet,
+    },
+}
+
 /// Borrow-free lowering plan safe to store beside its owned root.
 ///
 /// Occurrence identity is the path's preorder position, not the address or
@@ -1450,6 +1517,9 @@ struct ResidualPlan {
     /// The nontrivial exposed root is one formula occurrence. Whole-root
     /// identity shells around one opaque atom normalize to the flat plan.
     synthetic_root_formula: bool,
+    /// Strict schema-level construction used only by the private probe entry
+    /// point. Ordinary residual plans retain their adaptive planner.
+    constructed_program: Option<ConstructedProgramPlan>,
 }
 
 impl ResidualPlan {
@@ -1582,11 +1652,204 @@ impl ResidualPlan {
             transition_programs,
             grouped_delta_confirm_requirements,
             synthetic_root_formula,
+            constructed_program: None,
         }
+    }
+
+    /// Compiles one deterministic, estimate-free action chain for a flat
+    /// conjunction of typed Programs.
+    ///
+    /// Variables are committed in ascending ID order. For each schema, the
+    /// first preorder proposer whose remaining relevant occurrences all own a
+    /// page-local Confirm route wins. Rejecting parent-atomic confirmers keeps
+    /// pageable proposal output sound without introducing an eager
+    /// materialization phase into this deliberately narrow probe.
+    fn try_compile_constructed_program<'a>(
+        root: &dyn Constraint<'a>,
+    ) -> Result<(Self, VariableSet), ConstructedProgramError> {
+        let full = root.variables();
+        if full.is_empty() {
+            return Err(ConstructedProgramError::EmptyQuery);
+        }
+
+        let mut plan = Self::compile_mode(root, FormulaScope::OpaqueLeaves, true);
+        let mut leaf_variables = Vec::with_capacity(plan.len());
+        for occurrence in 0..plan.len() {
+            let constraint = plan.resolve(root, occurrence);
+            if constraint.residual_union_children().is_some() {
+                return Err(ConstructedProgramError::FormulaOccurrence { occurrence });
+            }
+            let variables = constraint.variables();
+            if variables.is_empty() {
+                return Err(ConstructedProgramError::ZeroVariableOccurrence { occurrence });
+            }
+            if constraint.residual_program().is_none() {
+                return Err(ConstructedProgramError::MissingProgram { occurrence });
+            }
+            leaf_variables.push(variables);
+        }
+
+        let mut bound = VariableSet::new_empty();
+        let mut steps = Vec::with_capacity(full.count());
+        for variable in full {
+            let relevant_occurrences: Vec<_> = leaf_variables
+                .iter()
+                .enumerate()
+                .filter_map(|(occurrence, variables)| {
+                    variables.is_set(variable).then_some(occurrence)
+                })
+                .collect();
+            let mut relevant = ChildSet::empty(plan.len());
+            for &occurrence in &relevant_occurrences {
+                relevant.insert(occurrence);
+            }
+
+            let mut first_rejection = None;
+            let mut selected = None;
+            for &proposer in &relevant_occurrences {
+                let program = plan
+                    .resolve(root, proposer)
+                    .residual_program()
+                    .expect("constructed Program disappeared during compilation");
+                let Some(proposer_route) = program.route(ProgramRequest {
+                    action: ProgramAction::Propose(variable),
+                    bound,
+                }) else {
+                    continue;
+                };
+                if proposer_route.variable != variable {
+                    first_rejection.get_or_insert(
+                        ConstructedProgramError::RouteVariableMismatch {
+                            occurrence: proposer,
+                            variable,
+                            routed: proposer_route.variable,
+                            bound,
+                        },
+                    );
+                    continue;
+                }
+
+                let mut confirmer_routes = Vec::with_capacity(relevant_occurrences.len() - 1);
+                let mut rejected = None;
+                for &confirmer in &relevant_occurrences {
+                    if confirmer == proposer {
+                        continue;
+                    }
+                    let program = plan
+                        .resolve(root, confirmer)
+                        .residual_program()
+                        .expect("constructed Program disappeared during compilation");
+                    let Some(route) = program.route(ProgramRequest {
+                        action: ProgramAction::Confirm(variable),
+                        bound,
+                    }) else {
+                        rejected = Some(ConstructedProgramError::MissingConfirmRoute {
+                            occurrence: confirmer,
+                            variable,
+                            bound,
+                        });
+                        break;
+                    };
+                    if route.variable != variable {
+                        rejected = Some(ConstructedProgramError::RouteVariableMismatch {
+                            occurrence: confirmer,
+                            variable,
+                            routed: route.variable,
+                            bound,
+                        });
+                        break;
+                    }
+                    if route.grouping == ProgramGrouping::ParentAtomic {
+                        rejected = Some(ConstructedProgramError::ParentAtomicConfirm {
+                            occurrence: confirmer,
+                            variable,
+                            bound,
+                        });
+                        break;
+                    }
+                    if !plan.page_local_confirms[confirmer] {
+                        rejected = Some(ConstructedProgramError::NonPageLocalConfirm {
+                            occurrence: confirmer,
+                            variable,
+                            bound,
+                        });
+                        break;
+                    }
+                    if grouped_delta_confirm_is_active(
+                        &plan.grouped_delta_confirm_requirements[confirmer],
+                        variable,
+                        bound,
+                    ) {
+                        rejected = Some(ConstructedProgramError::ParentAtomicConfirm {
+                            occurrence: confirmer,
+                            variable,
+                            bound,
+                        });
+                        break;
+                    }
+                    confirmer_routes.push((confirmer, route));
+                }
+                if let Some(rejected) = rejected {
+                    first_rejection.get_or_insert(rejected);
+                    continue;
+                }
+                selected = Some((proposer, proposer_route, confirmer_routes));
+                break;
+            }
+
+            let Some((proposer, proposer_route, confirmer_routes)) = selected else {
+                return Err(first_rejection.unwrap_or(
+                    ConstructedProgramError::MissingProposalRoute { variable, bound },
+                ));
+            };
+            steps.push(ConstructedProgramStep {
+                bound,
+                variable,
+                relevant,
+                proposer,
+                proposer_route,
+                confirmer_routes: confirmer_routes.into_boxed_slice(),
+            });
+            bound.set(variable);
+        }
+        debug_assert_eq!(bound, full);
+        plan.constructed_program = Some(ConstructedProgramPlan {
+            steps: steps.into_boxed_slice(),
+        });
+        Ok((plan, full))
     }
 
     fn len(&self) -> usize {
         self.leaves.len()
+    }
+
+    fn constructed_step(&self, bound: VariableSet) -> Option<&ConstructedProgramStep> {
+        self.constructed_program.as_ref()?.step(bound)
+    }
+
+    fn constructed_proposal_route(
+        &self,
+        bound: VariableSet,
+        variable: VariableId,
+        proposer: usize,
+    ) -> Option<ProgramRoute> {
+        let step = self.constructed_step(bound)?;
+        (step.variable == variable && step.proposer == proposer).then_some(step.proposer_route)
+    }
+
+    fn constructed_confirm_route(
+        &self,
+        bound: VariableSet,
+        variable: VariableId,
+        confirmer: usize,
+    ) -> Option<ProgramRoute> {
+        let step = self.constructed_step(bound)?;
+        if step.variable != variable {
+            return None;
+        }
+        step.confirmer_routes
+            .iter()
+            .find_map(|&(occurrence, route)| (occurrence == confirmer).then_some(route))
     }
 
     fn action_span(&self) -> usize {
@@ -6684,6 +6947,38 @@ fn confirm_leaf<'a>(
     plan.resolve(root, leaf).confirm(variable, view, candidates);
 }
 
+fn constructed_ready_plan_transition(
+    plan: &ResidualPlan,
+    desc: &StateDesc,
+    rows: RowBatch,
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+) -> ContinuationToken {
+    let step = plan
+        .constructed_step(desc.bound)
+        .expect("constructed Ready state left its compiled schema chain");
+    stats.ready_preferred_variable_groups += 1;
+    stats.ready_scheduled_variable_groups += 1;
+    stats.ready_proposal_groups += 1;
+    file_with_plan(
+        worklist,
+        interner,
+        plan,
+        StateDesc {
+            bound: desc.bound,
+            phase: ResidualPhase::Propose {
+                variable: step.variable,
+                relevant: step.relevant.clone(),
+                proposer: step.proposer,
+            },
+        },
+        StateBucket::Rows(rows),
+        stats,
+    )
+    .expect("constructed Ready planning filed an empty action")
+}
+
 fn ready_plan_transition<'a>(
     root: &dyn Constraint<'a>,
     plan: &ResidualPlan,
@@ -7027,6 +7322,58 @@ fn commit_candidates(
         StateBucket::Rows(rows),
         stats,
     )
+}
+
+fn constructed_candidate_plan_transition(
+    plan: &ResidualPlan,
+    desc: &StateDesc,
+    variable: VariableId,
+    relevant: &ChildSet,
+    checked: &ChildSet,
+    batch: CandidateBatch,
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+) -> ContinuationToken {
+    if relevant == checked {
+        return commit_candidates(plan, desc, variable, batch, worklist, interner, stats)
+            .expect("fully checked constructed candidates committed no rows");
+    }
+
+    let step = plan
+        .constructed_step(desc.bound)
+        .expect("constructed Candidate state left its compiled schema chain");
+    assert_eq!(
+        step.variable, variable,
+        "constructed Candidate changed its schema variable"
+    );
+    assert_eq!(
+        &step.relevant, relevant,
+        "constructed Candidate changed its relevant occurrence set"
+    );
+    let confirmer = step
+        .confirmer_routes
+        .iter()
+        .find_map(|&(occurrence, _)| (!checked.contains(occurrence)).then_some(occurrence))
+        .expect("constructed Candidate has no compiled unchecked confirmer");
+    stats.candidate_confirmation_groups += 1;
+    file_with_plan(
+        worklist,
+        interner,
+        plan,
+        StateDesc {
+            bound: desc.bound,
+            phase: ResidualPhase::Confirm {
+                variable,
+                relevant: relevant.clone(),
+                checked: checked.clone(),
+                confirmer,
+            },
+        },
+        StateBucket::Candidates(batch),
+        stats,
+    )
+    .expect("constructed Candidate planning filed an empty action")
 }
 
 fn candidate_plan_transition<'a>(
@@ -8278,18 +8625,22 @@ fn execute_task<'a>(
         }
         (ResidualPhase::Ready, StateBucket::Rows(rows)) => {
             stats.ready_plan_pops += 1;
-            let continuation = ready_plan_transition(
-                root,
-                plan,
-                &desc,
-                rows,
-                full,
-                influences,
-                base_estimates,
-                worklist,
-                interner,
-                stats,
-            );
+            let continuation = if plan.constructed_program.is_some() {
+                constructed_ready_plan_transition(plan, &desc, rows, worklist, interner, stats)
+            } else {
+                ready_plan_transition(
+                    root,
+                    plan,
+                    &desc,
+                    rows,
+                    full,
+                    influences,
+                    base_estimates,
+                    worklist,
+                    interner,
+                    stats,
+                )
+            };
             StepOutcome::Advanced(continuation)
         }
         (
@@ -8332,9 +8683,16 @@ fn execute_task<'a>(
             StateBucket::Candidates(batch),
         ) => {
             stats.candidate_plan_pops += 1;
-            let continuation = candidate_plan_transition(
-                root, plan, &desc, *variable, relevant, checked, batch, worklist, interner, stats,
-            );
+            let continuation = if plan.constructed_program.is_some() {
+                constructed_candidate_plan_transition(
+                    plan, &desc, *variable, relevant, checked, batch, worklist, interner, stats,
+                )
+            } else {
+                candidate_plan_transition(
+                    root, plan, &desc, *variable, relevant, checked, batch, worklist, interner,
+                    stats,
+                )
+            };
             StepOutcome::Advanced(continuation)
         }
         (
@@ -9454,6 +9812,10 @@ impl ResidualStateMachine {
         let mut checked = ChildSet::empty(plan.len());
         checked.insert(*proposer);
         if !plan.remaining_confirms_accept_pages(relevant, &checked, *variable, task.desc.bound) {
+            assert!(
+                plan.constructed_program.is_none(),
+                "constructed proposal escaped compile-time confirmation grouping checks"
+            );
             return Err(task);
         }
         let variable = *variable;
@@ -9479,9 +9841,19 @@ impl ResidualStateMachine {
         // declines this exact structural request before any activation has
         // opened, so the legacy paged/seed hooks below remain available.
         // Exclusivity begins only once the family returns a route.
-        let program = constraint
-            .residual_program()
-            .and_then(|spec| spec.route(program_request).map(|route| (spec, route)));
+        let program = if plan.constructed_program.is_some() {
+            let route = plan
+                .constructed_proposal_route(task.desc.bound, variable, proposer)
+                .expect("constructed proposal lost its compiled Program route");
+            let spec = constraint
+                .residual_program()
+                .expect("constructed proposal Program disappeared during execution");
+            Some((spec, route))
+        } else {
+            constraint
+                .residual_program()
+                .and_then(|spec| spec.route(program_request).map(|route| (spec, route)))
+        };
         let selected_parent_count = rows.row_count;
         let admitted_parent_count = if terminal_streaming {
             self.terminal_admission_width(task.state, selected_parent_count)
@@ -9491,6 +9863,7 @@ impl ResidualStateMachine {
         let complete_terminal_phase = terminal_streaming
             && admitted_parent_count > 1
             && self.uses_eager_terminal_phase()
+            && plan.constructed_program.is_none()
             && program.is_some_and(|(_, route)| {
                 route.completion == ProgramCompletion::CompleteActionEquivalent
             });
@@ -9684,9 +10057,19 @@ impl ResidualStateMachine {
             action: ProgramAction::Confirm(variable),
             bound: task.desc.bound,
         };
-        let program = constraint
-            .residual_program()
-            .and_then(|spec| spec.route(program_request).map(|route| (spec, route)));
+        let program = if plan.constructed_program.is_some() {
+            let route = plan
+                .constructed_confirm_route(task.desc.bound, variable, confirmer)
+                .expect("constructed confirmation lost its compiled Program route");
+            let spec = constraint
+                .residual_program()
+                .expect("constructed confirmation Program disappeared during execution");
+            Some((spec, route))
+        } else {
+            constraint
+                .residual_program()
+                .and_then(|spec| spec.route(program_request).map(|route| (spec, route)))
+        };
         if let Some((spec, route)) = program {
             if route.grouping == ProgramGrouping::ParentAtomic {
                 assert!(
@@ -11315,6 +11698,31 @@ where
         pull.disarm();
         item
     }
+}
+
+/// Private source probe for a planner constructed entirely from typed Program
+/// routes. It deliberately bypasses [`Query::new`], so no cardinality,
+/// influence, or seed-satisfaction protocol method participates in admission.
+#[cfg(test)]
+fn try_constructed_program_iter<'a, C, P, R>(
+    root: C,
+    postprocessing: P,
+) -> Result<ResidualStateIter<C, P, R>, ConstructedProgramError>
+where
+    C: Constraint<'a> + 'a,
+    P: Fn(&Binding) -> Option<R>,
+{
+    let (plan, full) = ResidualPlan::try_compile_constructed_program(&root)?;
+    let state = ResidualStateMachine::new_for_plan(full, &plan, Search::NextVariable);
+    Ok(ResidualStateIter {
+        root,
+        plan,
+        postprocessing,
+        influences: [VariableSet::new_empty(); 128],
+        base_estimates: [usize::MAX; 128],
+        state,
+        iteration_started: false,
+    })
 }
 
 fn solve<'a, P, R>(
@@ -19993,6 +20401,413 @@ mod tests {
         assert_eq!(counters.0.load(Ordering::Relaxed), 0);
         assert_eq!(counters.1.load(Ordering::Relaxed), 0);
         assert_eq!(counters.2.load(Ordering::Relaxed), 0);
+    }
+
+    struct ConstructedProtocolTrap {
+        inner: crate::query::regularpathconstraint::RegularPathConstraint,
+    }
+
+    impl Constraint<'static> for ConstructedProtocolTrap {
+        fn variables(&self) -> VariableSet {
+            self.inner.variables()
+        }
+
+        fn estimate(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _out: &mut EstimateSink<'_>,
+        ) -> bool {
+            panic!("constructed Program planner called ordinary estimate")
+        }
+
+        fn propose(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+            panic!("constructed Program planner called ordinary propose")
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+            panic!("constructed Program planner called ordinary confirm")
+        }
+
+        fn satisfied(&self, _view: &RowsView<'_>) -> bool {
+            panic!("constructed Program planner called ordinary satisfied")
+        }
+
+        fn influence(&self, _variable: VariableId) -> VariableSet {
+            panic!("constructed Program planner called ordinary influence")
+        }
+
+        fn residual_confirm_is_page_local(&self) -> bool {
+            self.inner.residual_confirm_is_page_local()
+        }
+
+        fn residual_program(&self) -> Option<ProgramRef<'_>> {
+            self.inner.residual_program()
+        }
+    }
+
+    struct ConstructedZeroVariable;
+
+    impl Constraint<'static> for ConstructedZeroVariable {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_empty()
+        }
+
+        fn estimate(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _out: &mut EstimateSink<'_>,
+        ) -> bool {
+            panic!("zero-variable rejection called estimate")
+        }
+
+        fn propose(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+            panic!("zero-variable rejection called propose")
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+            panic!("zero-variable rejection called confirm")
+        }
+
+        fn satisfied(&self, _view: &RowsView<'_>) -> bool {
+            panic!("zero-variable rejection called satisfied")
+        }
+
+        fn influence(&self, _variable: VariableId) -> VariableSet {
+            panic!("zero-variable rejection called influence")
+        }
+    }
+
+    struct ConstructedMissingProgram(VariableId);
+
+    impl Constraint<'static> for ConstructedMissingProgram {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(self.0)
+        }
+
+        fn estimate(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _out: &mut EstimateSink<'_>,
+        ) -> bool {
+            panic!("missing-Program rejection called estimate")
+        }
+
+        fn propose(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+            panic!("missing-Program rejection called propose")
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+            panic!("missing-Program rejection called confirm")
+        }
+
+        fn satisfied(&self, _view: &RowsView<'_>) -> bool {
+            panic!("missing-Program rejection called satisfied")
+        }
+
+        fn influence(&self, _variable: VariableId) -> VariableSet {
+            panic!("missing-Program rejection called influence")
+        }
+    }
+
+    fn constructed_program_graph() -> (crate::trible::TribleSet, crate::id::Id) {
+        use crate::id::{ExclusiveId, Id};
+        use crate::trible::{Trible, TribleSet};
+
+        let attribute = Id::new([171; crate::id::ID_LEN]).unwrap();
+        let nodes: Vec<_> = (172..=176)
+            .map(|byte| Id::new([byte; crate::id::ID_LEN]).unwrap())
+            .collect();
+        let mut graph = TribleSet::new();
+        for &(from, to) in &[(0, 1), (0, 2), (1, 3), (2, 3), (3, 4), (4, 0)] {
+            graph.insert(&Trible::new::<GenId>(
+                ExclusiveId::force_ref(&nodes[from]),
+                &attribute,
+                &nodes[to].to_inline(),
+            ));
+        }
+        (graph, attribute)
+    }
+
+    fn constructed_rpq(
+        graph: crate::trible::TribleSet,
+        attribute: &crate::id::Id,
+        repeated: bool,
+    ) -> crate::query::regularpathconstraint::RegularPathConstraint {
+        use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
+
+        let mut operations = vec![PathOp::Attr(attribute.raw())];
+        if repeated {
+            operations.push(PathOp::Plus);
+        }
+        RegularPathConstraint::new(
+            graph,
+            Variable::<GenId>::new(0),
+            Variable::<GenId>::new(1),
+            &operations,
+        )
+    }
+
+    fn constructed_pair(binding: &Binding) -> Option<(RawInline, RawInline)> {
+        Some((binding.get(0).copied()?, binding.get(1).copied()?))
+    }
+
+    fn constructed_unit(_binding: &Binding) -> Option<()> {
+        Some(())
+    }
+
+    fn take_constructed_error<C, P, R>(
+        result: Result<ResidualStateIter<C, P, R>, ConstructedProgramError>,
+    ) -> ConstructedProgramError
+    where
+        P: Fn(&Binding) -> Option<R>,
+    {
+        match result {
+            Ok(_) => panic!("strict constructed Program admission unexpectedly succeeded"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn constructed_program_bypasses_protocol_planning_and_matches_sequential_bag() {
+        let (graph, attribute) = constructed_program_graph();
+        let mut expected: Vec<_> = Query::new(
+            constructed_rpq(graph.clone(), &attribute, false),
+            constructed_pair,
+        )
+        .sequential()
+        .collect();
+        let root = Arc::new(ConstructedProtocolTrap {
+            inner: constructed_rpq(graph, &attribute, false),
+        });
+        let mut constructed: Vec<_> =
+            try_constructed_program_iter(root, constructed_pair)
+                .unwrap()
+                .collect();
+
+        expected.sort_unstable();
+        constructed.sort_unstable();
+        assert!(expected.len() > 1);
+        assert_eq!(constructed, expected);
+    }
+
+    #[test]
+    fn constructed_program_clone_preserves_the_exact_remainder() {
+        let (graph, attribute) = constructed_program_graph();
+        let mut expected: Vec<_> = Query::new(
+            constructed_rpq(graph.clone(), &attribute, false),
+            constructed_pair,
+        )
+        .sequential()
+        .collect();
+        let root = Arc::new(ConstructedProtocolTrap {
+            inner: constructed_rpq(graph, &attribute, false),
+        });
+        let mut iterator = try_constructed_program_iter(root, constructed_pair).unwrap();
+        let first = iterator.next().expect("constructed RPQ produced no row");
+        let clone = iterator.clone();
+        let mut left: Vec<_> = iterator.collect();
+        let mut right: Vec<_> = clone.collect();
+
+        left.sort_unstable();
+        right.sort_unstable();
+        assert_eq!(left, right);
+        left.push(first);
+        left.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(left, expected);
+    }
+
+    #[test]
+    fn constructed_program_keeps_shared_occurrences_distinct() {
+        let (graph, attribute) = constructed_program_graph();
+        let expected_leaf = Arc::new(constructed_rpq(graph.clone(), &attribute, false));
+        let oracle = IntersectionConstraint::new(vec![
+            Arc::clone(&expected_leaf),
+            Arc::clone(&expected_leaf),
+        ]);
+        let mut expected: Vec<_> = Query::new(oracle, constructed_pair)
+            .sequential()
+            .collect();
+
+        let shared = Arc::new(ConstructedProtocolTrap {
+            inner: constructed_rpq(graph, &attribute, false),
+        });
+        let root = Arc::new(IntersectionConstraint::new(vec![
+            Arc::clone(&shared),
+            Arc::clone(&shared),
+        ]));
+        let iterator = try_constructed_program_iter(root, constructed_pair).unwrap();
+        let constructed_plan = iterator.plan.constructed_program.as_ref().unwrap();
+        assert!(constructed_plan.steps.iter().all(|step| {
+            step.relevant.count() == 2 && step.confirmer_routes.len() == 1
+        }));
+        let mut constructed: Vec<_> = iterator.collect();
+
+        expected.sort_unstable();
+        constructed.sort_unstable();
+        assert_eq!(constructed, expected);
+    }
+
+    #[test]
+    fn constructed_program_plan_is_invariant_under_estimate_overrides() {
+        use crate::debug::query::EstimateOverrideConstraint;
+
+        let (graph, attribute) = constructed_program_graph();
+        let mut low = EstimateOverrideConstraint::new(ConstructedProtocolTrap {
+            inner: constructed_rpq(graph.clone(), &attribute, false),
+        });
+        low.set_estimate(0, 0);
+        low.set_estimate(1, usize::MAX);
+        let mut high = EstimateOverrideConstraint::new(ConstructedProtocolTrap {
+            inner: constructed_rpq(graph, &attribute, false),
+        });
+        high.set_estimate(0, usize::MAX);
+        high.set_estimate(1, 0);
+
+        let low = try_constructed_program_iter(Arc::new(low), constructed_pair).unwrap();
+        let high = try_constructed_program_iter(Arc::new(high), constructed_pair).unwrap();
+        assert_eq!(low.plan.constructed_program, high.plan.constructed_program);
+        let mut low_results: Vec<_> = low.collect();
+        let mut high_results: Vec<_> = high.collect();
+        low_results.sort_unstable();
+        high_results.sort_unstable();
+        assert_eq!(low_results, high_results);
+    }
+
+    #[test]
+    fn constructed_program_rejects_unsupported_shapes_without_fallback() {
+        assert_eq!(
+            take_constructed_error(try_constructed_program_iter(
+                ConstructedZeroVariable,
+                constructed_unit,
+            )),
+            ConstructedProgramError::EmptyQuery
+        );
+
+        let (graph, attribute) = constructed_program_graph();
+        let mixed = IntersectionConstraint::new(vec![
+            Box::new(ConstructedProtocolTrap {
+                inner: constructed_rpq(graph.clone(), &attribute, false),
+            }) as ShapeConstraint,
+            Box::new(ConstructedZeroVariable) as ShapeConstraint,
+        ]);
+        assert_eq!(
+            take_constructed_error(try_constructed_program_iter(mixed, constructed_unit)),
+            ConstructedProgramError::ZeroVariableOccurrence { occurrence: 1 }
+        );
+
+        assert_eq!(
+            take_constructed_error(try_constructed_program_iter(
+                ConstructedMissingProgram(0),
+                constructed_unit,
+            )),
+            ConstructedProgramError::MissingProgram { occurrence: 0 }
+        );
+
+        let left = Arc::new(ConstructedProtocolTrap {
+            inner: constructed_rpq(graph.clone(), &attribute, false),
+        });
+        let right = Arc::new(ConstructedProtocolTrap {
+            inner: constructed_rpq(graph.clone(), &attribute, false),
+        });
+        let formula = UnionConstraint::new(vec![left, right]);
+        assert_eq!(
+            take_constructed_error(try_constructed_program_iter(formula, constructed_pair)),
+            ConstructedProgramError::FormulaOccurrence { occurrence: 0 }
+        );
+
+        let route_hole = IntersectionConstraint::new(vec![
+            TerminalProgramLeaf {
+                variable: 0,
+                mode: TerminalProgramMode::Divergent,
+            },
+            TerminalProgramLeaf {
+                variable: 0,
+                mode: TerminalProgramMode::Divergent,
+            },
+        ]);
+        assert!(matches!(
+            take_constructed_error(try_constructed_program_iter(route_hole, constructed_unit)),
+            ConstructedProgramError::MissingConfirmRoute {
+                variable: 0,
+                bound,
+                ..
+            } if bound.is_empty()
+        ));
+
+        let repeated = Arc::new(ConstructedProtocolTrap {
+            inner: constructed_rpq(graph, &attribute, true),
+        });
+        let repeated = IntersectionConstraint::new(vec![
+            Arc::clone(&repeated),
+            Arc::clone(&repeated),
+        ]);
+        assert!(matches!(
+            take_constructed_error(try_constructed_program_iter(repeated, constructed_pair)),
+            ConstructedProgramError::ParentAtomicConfirm {
+                variable: 1,
+                bound,
+                ..
+            } if bound == VariableSet::new_singleton(0)
+        ));
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn constructed_program_parallel_source_matches_sequential_bag() {
+        let (graph, attribute) = constructed_program_graph();
+        let mut expected: Vec<_> = Query::new(
+            constructed_rpq(graph.clone(), &attribute, false),
+            constructed_pair,
+        )
+        .sequential()
+        .collect();
+        let root = Arc::new(ConstructedProtocolTrap {
+            inner: constructed_rpq(graph, &attribute, false),
+        });
+        let mut constructed: Vec<_> = with_parallel_workers(4, || {
+            try_constructed_program_iter(root, constructed_pair)
+                .unwrap()
+                .into_par_iter()
+                .collect()
+        });
+
+        expected.sort_unstable();
+        constructed.sort_unstable();
+        assert_eq!(constructed, expected);
     }
 
     fn preferred_fanout(
