@@ -846,6 +846,16 @@ where
         }
     }
 
+    /// Returns the first-occurrence markers for `(first, middle)` pairs in
+    /// `rotation`.
+    ///
+    /// The returned vector has one bit per Ring row. A set bit starts a new
+    /// pair in the sorted order named by `rotation`; its rank is therefore the
+    /// compact pair code used by one-peer resident navigation.
+    pub fn pair_changes(&self, rotation: SuccinctRotation) -> &BitVector<Rank9SelIndex> {
+        self.rotation_view(rotation).changed_pair
+    }
+
     /// A value-range constraint that proposes only V-position values
     /// in the inclusive byte-lexicographic range `[min, max]`.
     ///
@@ -1136,7 +1146,9 @@ pub enum SuccinctRotation {
 }
 
 impl SuccinctRotation {
-    const ALL: [Self; 6] = [
+    /// All rotations in their canonical serialization and accelerator-array
+    /// order.
+    pub const ALL: [Self; 6] = [
         Self::Eav,
         Self::Vea,
         Self::Ave,
@@ -1145,7 +1157,8 @@ impl SuccinctRotation {
         Self::Aev,
     ];
 
-    fn index(self) -> usize {
+    /// Returns this rotation's position in [`Self::ALL`].
+    pub const fn index(self) -> usize {
         match self {
             Self::Eav => 0,
             Self::Vea => 1,
@@ -3779,20 +3792,32 @@ mod tests {
         let set = varied_knights();
         let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
 
-        for rotation in [
-            SuccinctRotation::Eav,
-            SuccinctRotation::Vea,
-            SuccinctRotation::Ave,
-            SuccinctRotation::Vae,
-            SuccinctRotation::Eva,
-            SuccinctRotation::Aev,
-        ] {
+        for rotation in SuccinctRotation::ALL {
             let actual: Vec<_> = RotationCursor::new(&archive, rotation).collect();
             assert_eq!(
                 actual,
                 rotation_codes(&archive, &set, rotation),
                 "{rotation:?}"
             );
+        }
+    }
+
+    #[test]
+    fn pair_changes_follow_each_rotation_sorted_pair_runs() {
+        let set = varied_knights();
+        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+
+        for rotation in SuccinctRotation::ALL {
+            let rows = rotation_codes(&archive, &set, rotation);
+            let expected: Vec<_> = rows
+                .iter()
+                .enumerate()
+                .map(|(index, row)| index == 0 || row[..2] != rows[index - 1][..2])
+                .collect();
+            let actual: Vec<_> = (0..rows.len())
+                .map(|position| archive.pair_changes(rotation).access(position).unwrap())
+                .collect();
+            assert_eq!(actual, expected, "{rotation:?}");
         }
     }
 

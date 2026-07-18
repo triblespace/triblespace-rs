@@ -40,7 +40,7 @@ bytemuck = { version = "1.15.0", features = ["extern_crate_alloc"]}
 proptest = { version = "1.6.0", optional = true }
 hifitime = "4.1.2"
 f256 = "0.7.0"
-jerky = { version = "0.9.0", git = "https://github.com/triblespace/jerky.git", rev = "37160b8aa0384caab390852fd7be55c6f7282509" }
+jerky = { version = "0.9.0", git = "https://github.com/triblespace/jerky.git", rev = "aeb3ba0817c4e481723c23eda696dc3beeacaf69" }
 itertools = "0.14.0"
 sptr = "0.3.2"
 indxvec = "1.9.0"

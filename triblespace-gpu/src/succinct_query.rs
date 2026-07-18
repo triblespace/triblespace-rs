@@ -1,9 +1,11 @@
-//! WGPU-resident ring columns for [`SuccinctArchive`] query confirmation.
+//! WGPU-resident Ring columns and prefix data for [`SuccinctArchive`] queries.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use jerky::gpu::GpuWaveletMatrix;
+use jerky::bit_vector::rank9sel::Rank9SelIndex;
+use jerky::bit_vector::{BitVector, NumBits, Select};
+use jerky::gpu::{DeviceU32Buffer, GpuBitVector, GpuContext, GpuWaveletMatrix};
 use triblespace_core::blob::encodings::succinctarchive::{
     RingBatchQuery, SuccinctArchive, SuccinctArchiveConstraint, SuccinctRotation, Universe,
 };
@@ -17,12 +19,94 @@ use triblespace_core::query::{Term, TriblePattern};
 /// Jerky's wavelet matrix resident on the default CubeCL WGPU device.
 pub type WgpuWaveletMatrix = GpuWaveletMatrix<cubecl::wgpu::WgpuRuntime>;
 
+/// Jerky's shared compatibility domain on the default CubeCL WGPU device.
+pub type WgpuContext = GpuContext<cubecl::wgpu::WgpuRuntime>;
+
+/// Jerky's raw bit-vector data resident on the default CubeCL WGPU device.
+pub type WgpuBitVector = GpuBitVector<cubecl::wgpu::WgpuRuntime>;
+
 /// Default number of rank probes required before confirmation uses WGPU.
 ///
 /// Confirm emits two probes per candidate, so 8192 probes retains the
 /// historical 4096-candidate batching threshold while making the device
 /// boundary explicit in the unit actually dispatched.
 pub const DEFAULT_MIN_RANK_BATCH: usize = 8192;
+
+/// Structural identity of one resident snapshot, minted at wrap time.
+///
+/// Every [`WgpuSuccinctArchive`] carries a process-unique identity. Cohort
+/// submissions and receipts that reference resident state carry the identity
+/// of the snapshot they were formed against; a mismatch fails closed before
+/// any kernel launch. This replaces pointer comparison as the trust boundary:
+/// two wrappers over byte-identical archives are still distinct snapshots,
+/// because archive-local `u32` codes are meaningful only for the exact
+/// wrapped snapshot. Cross-snapshot monotonicity comparisons happen only in
+/// decoded `RawInline` space, never in code space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ArchiveIdentity(u64);
+
+impl ArchiveIdentity {
+    fn mint() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Mints a fresh brand for contract tests that need an identity without
+    /// constructing a resident wrapper.
+    #[cfg(test)]
+    pub(crate) fn test_brand() -> Self {
+        Self::mint()
+    }
+}
+
+/// Exact logical device-residency accounting for one [`WgpuSuccinctArchive`].
+///
+/// Byte counts are the logical `u32` payloads enqueued at construction,
+/// computed from Jerky's current 512-bit-block resident layout (padded bit
+/// words plus per-block rank counts). The backend's allocation granularity
+/// may reserve more. All buffers persist for the wrapper's lifetime; no
+/// per-query plane state exists on the device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResidencyReceipt {
+    /// Ring rows (tribles) in the wrapped snapshot.
+    pub tribles: usize,
+    /// The three axis-prefix bit vectors (`e_a`, `a_a`, `v_a`).
+    pub prefix_bytes: usize,
+    /// The six ordered-pair `(first, middle)` change vectors.
+    pub pair_change_bytes: usize,
+    /// The three derived ascending present-code lists.
+    pub present_code_bytes: usize,
+    /// The six Ring wavelet matrices.
+    pub wavelet_bytes: usize,
+}
+
+impl ResidencyReceipt {
+    /// Total logical bytes resident for the wrapper's lifetime.
+    pub fn total_bytes(&self) -> usize {
+        self.prefix_bytes + self.pair_change_bytes + self.present_code_bytes + self.wavelet_bytes
+    }
+}
+
+/// Padded words / rank-count entries of one resident bit-vector layer, in
+/// `u32` units, mirroring Jerky's `layer_layout`.
+fn resident_layer_units(len: usize) -> (usize, usize) {
+    let data_words = len.div_ceil(32);
+    let words_per_layer = (data_words + 1).div_ceil(16) * 16;
+    (words_per_layer, words_per_layer / 16)
+}
+
+/// Logical device bytes of one resident bit vector of `len` bits.
+fn resident_bit_vector_bytes(len: usize) -> usize {
+    let (words, counts) = resident_layer_units(len);
+    (words + counts) * core::mem::size_of::<u32>()
+}
+
+/// Logical device bytes of one resident wavelet matrix of `len` rows and
+/// `width` layers (packed layer stripes, rank counts, per-layer zero counts).
+fn resident_wavelet_bytes(len: usize, width: usize) -> usize {
+    let (words, counts) = resident_layer_units(len);
+    ((words * width).max(1) + (counts * width).max(1) + width) * core::mem::size_of::<u32>()
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RankRoute {
@@ -135,7 +219,9 @@ impl QueryStats {
     }
 }
 
-/// A [`SuccinctArchive`] with all six ring columns resident on WGPU.
+/// A [`SuccinctArchive`] with its three axis prefixes and present-code lists,
+/// all six ordered-pair change vectors, and all six ring columns resident on
+/// WGPU in one compatibility domain.
 ///
 /// Query planning, prefix navigation, proposals, and satisfaction checks use
 /// the wrapped CPU archive unchanged. Only the independent rank stream emitted
@@ -148,6 +234,27 @@ where
     U: Universe,
 {
     archive: SuccinctArchive<U>,
+    /// Process-unique snapshot brand minted at wrap time.
+    identity: ArchiveIdentity,
+    /// Logical bytes enqueued for this wrapper's lifetime.
+    residency: ResidencyReceipt,
+    /// Shared compatibility domain for every resident archive component.
+    context: WgpuContext,
+    /// Resident mirror of [`SuccinctArchive::e_a`].
+    e_a: WgpuBitVector,
+    /// Resident mirror of [`SuccinctArchive::a_a`].
+    a_a: WgpuBitVector,
+    /// Resident mirror of [`SuccinctArchive::v_a`].
+    v_a: WgpuBitVector,
+    /// Resident `(first, middle)` pair boundaries in canonical
+    /// [`SuccinctRotation`] order.
+    pair_changes: [WgpuBitVector; SuccinctRotation::ALL.len()],
+    /// Ascending compact codes that occur in the entity axis.
+    present_entities: DeviceU32Buffer<cubecl::wgpu::WgpuRuntime>,
+    /// Ascending compact codes that occur in the attribute axis.
+    present_attributes: DeviceU32Buffer<cubecl::wgpu::WgpuRuntime>,
+    /// Ascending compact codes that occur in the value axis.
+    present_values: DeviceU32Buffer<cubecl::wgpu::WgpuRuntime>,
     /// Resident mirror of [`SuccinctArchive::eav_c`].
     eav_c: WgpuWaveletMatrix,
     /// Resident mirror of [`SuccinctArchive::vea_c`].
@@ -233,21 +340,120 @@ impl<U> WgpuSuccinctArchive<U>
 where
     U: Universe,
 {
-    /// Prepares and enqueues all six ring wavelet matrices on the default
-    /// WGPU device.
+    /// Prepares and enqueues the three canonical prefix vectors, derived
+    /// present-code lists, all six ordered-pair change vectors, and all six
+    /// Ring wavelet matrices on the default WGPU device.
     ///
     /// CubeCL's buffer writes are asynchronous; the first rank query provides
-    /// the synchronization boundary. The archive itself remains on the CPU
-    /// for every non-rank operation.
+    /// the synchronization boundary. Existing query operations other than
+    /// accelerated confirmation ranks still use the canonical CPU archive.
+    ///
+    /// For `T` Ring rows, each pair vector's current Jerky payload is
+    /// `4 * (W + W / 16)` bytes, where
+    /// `W = 16 * ceil((ceil(T / 32) + 1) / 16)`. All six allocations persist
+    /// for this wrapper's lifetime; backend allocation granularity may add
+    /// further padding.
     pub fn new(archive: SuccinctArchive<U>) -> jerky::Result<Self> {
-        let eav_c = WgpuWaveletMatrix::on_wgpu(&archive.eav_c)?;
-        let vea_c = WgpuWaveletMatrix::on_wgpu(&archive.vea_c)?;
-        let ave_c = WgpuWaveletMatrix::on_wgpu(&archive.ave_c)?;
-        let vae_c = WgpuWaveletMatrix::on_wgpu(&archive.vae_c)?;
-        let eva_c = WgpuWaveletMatrix::on_wgpu(&archive.eva_c)?;
-        let aev_c = WgpuWaveletMatrix::on_wgpu(&archive.aev_c)?;
+        let domain_len = archive.domain.len();
+        let triple_count = archive.eav_c.len();
+        let present_entities = collect_present_codes(
+            &archive.e_a,
+            domain_len,
+            triple_count,
+            archive.entity_count,
+            "entity",
+        )?;
+        let present_attributes = collect_present_codes(
+            &archive.a_a,
+            domain_len,
+            triple_count,
+            archive.attribute_count,
+            "attribute",
+        )?;
+        let present_values = collect_present_codes(
+            &archive.v_a,
+            domain_len,
+            triple_count,
+            archive.value_count,
+            "value",
+        )?;
+        validate_pair_changes(&archive, triple_count)?;
+        let prefix_bytes = resident_bit_vector_bytes(archive.e_a.num_bits())
+            + resident_bit_vector_bytes(archive.a_a.num_bits())
+            + resident_bit_vector_bytes(archive.v_a.num_bits());
+        let pair_change_bytes = SuccinctRotation::ALL
+            .into_iter()
+            .map(|rotation| resident_bit_vector_bytes(archive.pair_changes(rotation).num_bits()))
+            .sum();
+        let present_code_bytes = (present_entities.len()
+            + present_attributes.len()
+            + present_values.len())
+            * core::mem::size_of::<u32>();
+        let wavelet_bytes = SuccinctRotation::ALL
+            .into_iter()
+            .map(|rotation| {
+                let ring = archive.ring_col(rotation);
+                resident_wavelet_bytes(ring.len(), ring.alph_width())
+            })
+            .sum();
+        let residency = ResidencyReceipt {
+            tribles: triple_count,
+            prefix_bytes,
+            pair_change_bytes,
+            present_code_bytes,
+            wavelet_bytes,
+        };
+        let context = WgpuContext::on_wgpu();
+        let present_entities = context.upload_u32(&present_entities)?;
+        let present_attributes = context.upload_u32(&present_attributes)?;
+        let present_values = context.upload_u32(&present_values)?;
+        let e_a = WgpuBitVector::with_context(context.clone(), &archive.e_a.data)?;
+        let a_a = WgpuBitVector::with_context(context.clone(), &archive.a_a.data)?;
+        let v_a = WgpuBitVector::with_context(context.clone(), &archive.v_a.data)?;
+        let pair_changes = [
+            WgpuBitVector::with_context(
+                context.clone(),
+                &archive.pair_changes(SuccinctRotation::Eav).data,
+            )?,
+            WgpuBitVector::with_context(
+                context.clone(),
+                &archive.pair_changes(SuccinctRotation::Vea).data,
+            )?,
+            WgpuBitVector::with_context(
+                context.clone(),
+                &archive.pair_changes(SuccinctRotation::Ave).data,
+            )?,
+            WgpuBitVector::with_context(
+                context.clone(),
+                &archive.pair_changes(SuccinctRotation::Vae).data,
+            )?,
+            WgpuBitVector::with_context(
+                context.clone(),
+                &archive.pair_changes(SuccinctRotation::Eva).data,
+            )?,
+            WgpuBitVector::with_context(
+                context.clone(),
+                &archive.pair_changes(SuccinctRotation::Aev).data,
+            )?,
+        ];
+        let eav_c = WgpuWaveletMatrix::with_context(context.clone(), &archive.eav_c)?;
+        let vea_c = WgpuWaveletMatrix::with_context(context.clone(), &archive.vea_c)?;
+        let ave_c = WgpuWaveletMatrix::with_context(context.clone(), &archive.ave_c)?;
+        let vae_c = WgpuWaveletMatrix::with_context(context.clone(), &archive.vae_c)?;
+        let eva_c = WgpuWaveletMatrix::with_context(context.clone(), &archive.eva_c)?;
+        let aev_c = WgpuWaveletMatrix::with_context(context.clone(), &archive.aev_c)?;
         Ok(Self {
             archive,
+            identity: ArchiveIdentity::mint(),
+            residency,
+            context,
+            e_a,
+            a_a,
+            v_a,
+            pair_changes,
+            present_entities,
+            present_attributes,
+            present_values,
             eav_c,
             vea_c,
             ave_c,
@@ -309,6 +515,79 @@ where
     /// Removes the resident adapter and returns its canonical CPU archive.
     pub fn into_archive(self) -> SuccinctArchive<U> {
         self.archive
+    }
+
+    /// Returns the compatibility domain shared by all resident components.
+    pub fn context(&self) -> &WgpuContext {
+        &self.context
+    }
+
+    /// Returns this wrapper's structural snapshot brand.
+    ///
+    /// Submissions and receipts formed against this wrapper's resident state
+    /// carry this identity; validation compares identities, never pointers,
+    /// so a rewrapped (even byte-identical) archive can never satisfy a stale
+    /// submission.
+    pub fn identity(&self) -> ArchiveIdentity {
+        self.identity
+    }
+
+    /// Returns the exact logical bytes enqueued for this wrapper's lifetime.
+    pub fn residency(&self) -> ResidencyReceipt {
+        self.residency
+    }
+
+    /// Returns the resident entity-axis prefix bit vector.
+    pub fn entity_prefix(&self) -> &WgpuBitVector {
+        &self.e_a
+    }
+
+    /// Returns the resident attribute-axis prefix bit vector.
+    pub fn attribute_prefix(&self) -> &WgpuBitVector {
+        &self.a_a
+    }
+
+    /// Returns the resident value-axis prefix bit vector.
+    pub fn value_prefix(&self) -> &WgpuBitVector {
+        &self.v_a
+    }
+
+    /// Returns the resident first-occurrence markers for `(first, middle)`
+    /// pairs in `rotation`.
+    ///
+    /// This mirrors [`SuccinctArchive::pair_changes`] in the same compatibility
+    /// domain as the prefix vectors and Ring columns. Jerky reserves
+    /// `u32::MAX` as its device miss sentinel, so construction validates every
+    /// vector before uploading any of them.
+    pub fn pair_changes(&self, rotation: SuccinctRotation) -> &WgpuBitVector {
+        &self.pair_changes[rotation.index()]
+    }
+
+    /// Returns the resident ascending compact codes present in the entity axis.
+    ///
+    /// This buffer is derived from the canonical CPU prefix at resident-wrapper
+    /// construction time. It is accelerator state in this wrapper's
+    /// compatibility domain, not a persisted archive sidecar.
+    pub fn present_entity_codes(&self) -> &DeviceU32Buffer<cubecl::wgpu::WgpuRuntime> {
+        &self.present_entities
+    }
+
+    /// Returns the resident ascending compact codes present in the attribute axis.
+    ///
+    /// This buffer is derived from the canonical CPU prefix at resident-wrapper
+    /// construction time. It is accelerator state in this wrapper's
+    /// compatibility domain, not a persisted archive sidecar.
+    pub fn present_attribute_codes(&self) -> &DeviceU32Buffer<cubecl::wgpu::WgpuRuntime> {
+        &self.present_attributes
+    }
+
+    /// Returns the resident ascending compact codes present in the value axis.
+    ///
+    /// This buffer is derived from the canonical CPU prefix at resident-wrapper
+    /// construction time. It is accelerator state in this wrapper's
+    /// compatibility domain, not a persisted archive sidecar.
+    pub fn present_value_codes(&self) -> &DeviceU32Buffer<cubecl::wgpu::WgpuRuntime> {
+        &self.present_values
     }
 
     /// Returns the resident last-column mirror of `rotation`.
@@ -376,6 +655,105 @@ where
         self.record_rank_route(route, positions.len());
         ranks
     }
+}
+
+fn validate_pair_changes<U>(archive: &SuccinctArchive<U>, triple_count: usize) -> jerky::Result<()>
+where
+    U: Universe,
+{
+    for rotation in SuccinctRotation::ALL {
+        let ring_len = archive.ring_col(rotation).len();
+        if ring_len != triple_count {
+            return Err(jerky::Error::invalid_argument(format!(
+                "{rotation:?} Ring length {ring_len} does not match the canonical EAV length {triple_count}"
+            )));
+        }
+        let changes = archive.pair_changes(rotation);
+        if changes.len() != ring_len {
+            return Err(jerky::Error::invalid_argument(format!(
+                "{rotation:?} pair-change length {} does not match its Ring length {ring_len}",
+                changes.len()
+            )));
+        }
+        if ring_len != 0 && changes.select1(0) != Some(0) {
+            return Err(jerky::Error::invalid_argument(format!(
+                "{rotation:?} pair changes do not mark the first Ring row"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn collect_present_codes(
+    prefix: &BitVector<Rank9SelIndex>,
+    domain_len: usize,
+    triple_count: usize,
+    expected_count: usize,
+    axis: &'static str,
+) -> jerky::Result<Vec<u32>> {
+    let expected_prefix_len = triple_count
+        .checked_add(domain_len)
+        .and_then(|len| len.checked_add(1))
+        .ok_or_else(|| jerky::Error::invalid_argument("prefix geometry overflow"))?;
+    let expected_delimiters = domain_len
+        .checked_add(1)
+        .ok_or_else(|| jerky::Error::invalid_argument("prefix delimiter count overflow"))?;
+    if domain_len >= u32::MAX as usize || expected_prefix_len >= u32::MAX as usize {
+        return Err(jerky::Error::invalid_argument(format!(
+            "{axis} prefix does not fit Jerky's resident u32 domain"
+        )));
+    }
+    if expected_count > domain_len {
+        return Err(jerky::Error::invalid_argument(format!(
+            "{axis} count {expected_count} exceeds the archive domain length {domain_len}"
+        )));
+    }
+    if prefix.len() != expected_prefix_len || prefix.num_ones() != expected_delimiters {
+        return Err(jerky::Error::invalid_argument(format!(
+            "{axis} prefix geometry does not match the archive domain and ring"
+        )));
+    }
+    let final_delimiter = expected_prefix_len - 1;
+    if prefix.select1(0) != Some(0) || prefix.select1(domain_len) != Some(final_delimiter) {
+        return Err(jerky::Error::invalid_argument(format!(
+            "{axis} prefix must start and end with canonical delimiters"
+        )));
+    }
+
+    let mut codes = Vec::with_capacity(expected_count);
+    for code in 0..domain_len {
+        let next = code + 1;
+        let start = prefix
+            .select1(code)
+            .and_then(|selected| selected.checked_sub(code));
+        let end = prefix
+            .select1(next)
+            .and_then(|selected| selected.checked_sub(next));
+        let (Some(start), Some(end)) = (start, end) else {
+            return Err(jerky::Error::invalid_argument(format!(
+                "{axis} prefix delimiter is invalid at compact code {code}"
+            )));
+        };
+        if start > end || end > triple_count {
+            return Err(jerky::Error::invalid_argument(format!(
+                "{axis} prefix range is invalid at compact code {code}"
+            )));
+        }
+        if start < end {
+            codes.push(u32::try_from(code).map_err(|_| {
+                jerky::Error::invalid_argument(format!(
+                    "{axis} compact code does not fit the resident u32 domain"
+                ))
+            })?);
+        }
+    }
+    if codes.len() != expected_count {
+        return Err(jerky::Error::invalid_argument(format!(
+            "{axis} prefix contains {} present codes but archive metadata declares {expected_count}",
+            codes.len()
+        )));
+    }
+    Ok(codes)
 }
 
 impl<U> RingBatchQuery for WgpuSuccinctArchive<U>
@@ -532,5 +910,76 @@ mod tests {
     fn observed_adapter_is_copy_send_and_sync_without_universe_copy() {
         fn assert_copy_send_sync<T: Copy + Send + Sync>() {}
         assert_copy_send_sync::<ObservedWgpuSuccinctArchive<'static, OrderedUniverse>>();
+    }
+
+    #[test]
+    fn residency_receipt_is_exact_and_rewrapping_mints_a_fresh_brand() {
+        use triblespace_core::id::{ExclusiveId, Id};
+        use triblespace_core::inline::encodings::genid::GenId;
+        use triblespace_core::inline::InlineEncoding;
+        use triblespace_core::trible::{Trible, TribleSet};
+
+        fn ordered_id(prefix: u8) -> Id {
+            let mut raw = [0u8; 16];
+            raw[0] = prefix;
+            Id::new(raw).expect("fixture IDs are non-zero")
+        }
+
+        let mut set = TribleSet::new();
+        for (e, a, v) in [(1, 20, 40), (1, 20, 41), (2, 21, 40), (3, 22, 42)] {
+            let entity = ordered_id(e);
+            set.insert(&Trible::new::<GenId>(
+                ExclusiveId::force_ref(&entity),
+                &ordered_id(a),
+                &GenId::inline_from(ordered_id(v)),
+            ));
+        }
+        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+        let triple_count = archive.eav_c.len();
+        let expected = ResidencyReceipt {
+            tribles: triple_count,
+            prefix_bytes: resident_bit_vector_bytes(archive.e_a.num_bits())
+                + resident_bit_vector_bytes(archive.a_a.num_bits())
+                + resident_bit_vector_bytes(archive.v_a.num_bits()),
+            pair_change_bytes: SuccinctRotation::ALL
+                .into_iter()
+                .map(|rotation| {
+                    resident_bit_vector_bytes(archive.pair_changes(rotation).num_bits())
+                })
+                .sum(),
+            present_code_bytes: (archive.entity_count
+                + archive.attribute_count
+                + archive.value_count)
+                * core::mem::size_of::<u32>(),
+            wavelet_bytes: SuccinctRotation::ALL
+                .into_iter()
+                .map(|rotation| {
+                    let ring = archive.ring_col(rotation);
+                    resident_wavelet_bytes(ring.len(), ring.alph_width())
+                })
+                .sum(),
+        };
+
+        let first = WgpuSuccinctArchive::new(archive).expect("resident wrap succeeds");
+        assert_eq!(first.residency(), expected);
+        assert_eq!(
+            expected.total_bytes(),
+            expected.prefix_bytes
+                + expected.pair_change_bytes
+                + expected.present_code_bytes
+                + expected.wavelet_bytes
+        );
+        assert!(expected.total_bytes() > 0);
+
+        let identity = first.identity();
+        assert_eq!(identity, first.identity(), "identity is stable per wrapper");
+        let rewrapped =
+            WgpuSuccinctArchive::new(first.into_archive()).expect("resident rewrap succeeds");
+        assert_ne!(
+            identity,
+            rewrapped.identity(),
+            "rewrapping the same snapshot must mint a fresh brand"
+        );
+        assert_eq!(rewrapped.residency(), expected);
     }
 }

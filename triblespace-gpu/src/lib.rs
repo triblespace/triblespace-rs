@@ -2,8 +2,22 @@
 
 use std::fmt;
 
+#[cfg(feature = "wgpu")]
+pub mod budgeted;
 #[cfg(any(feature = "wgpu", feature = "cuda"))]
 mod cubecl_backend;
+#[cfg(feature = "wgpu")]
+pub mod query_program;
+#[cfg(all(test, feature = "wgpu"))]
+mod resident_ordered_oracle;
+#[cfg(feature = "wgpu")]
+mod resident_program;
+#[cfg(feature = "wgpu")]
+mod resident_proposals;
+#[cfg(feature = "wgpu")]
+mod resident_round;
+#[cfg(feature = "wgpu")]
+mod resident_support;
 #[cfg(feature = "wgpu")]
 mod succinct_query;
 
@@ -14,9 +28,19 @@ pub use cubecl_backend::CudaWaveletFreeze;
 #[cfg(feature = "wgpu")]
 pub use cubecl_backend::WgpuWaveletFreeze;
 #[cfg(feature = "wgpu")]
+pub use resident_program::{ResidentTransitionError, WgpuQueryProgram};
+#[cfg(feature = "wgpu")]
+pub use resident_round::{
+    ResidentRoundArm, ResidentRoundError, ResidentRoundInputs, ResidentRoundMetadata,
+    ResidentRowChoice, ResidentRowChoices, ResidentRowPlanner, WgpuResidentRowPlanner,
+    RESIDENT_U32_SENTINEL,
+};
+#[cfg(feature = "wgpu")]
+pub use resident_support::{ResidentSupportError, WgpuResidentFrontier, WgpuResidentRound};
+#[cfg(feature = "wgpu")]
 pub use succinct_query::{
-    ObservedWgpuSuccinctArchive, WgpuQueryStats, WgpuSuccinctArchive, WgpuWaveletMatrix,
-    DEFAULT_MIN_RANK_BATCH,
+    ArchiveIdentity, ObservedWgpuSuccinctArchive, ResidencyReceipt, WgpuBitVector, WgpuContext,
+    WgpuQueryStats, WgpuSuccinctArchive, WgpuWaveletMatrix, DEFAULT_MIN_RANK_BATCH,
 };
 
 #[cfg(any(test, feature = "wgpu", feature = "cuda"))]
