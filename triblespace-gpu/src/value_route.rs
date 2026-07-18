@@ -346,7 +346,10 @@ struct ValueFamilyCore<'a, U: Universe> {
     value_pvar: ProgramVariable,
     device: Option<ValueDeviceArm<'a, U>>,
     admission: ValueRouteAdmission,
-    counters: ValueRouteCounters,
+    /// Shared with the creating [`ResidentValueRoute`] (and every clone of
+    /// this family), so placements stay observable after `pattern!` erases
+    /// the constraint and across parallel shard clones.
+    counters: Arc<ValueRouteCounters>,
 }
 
 struct ValueDeviceArm<'a, U: Universe> {
@@ -380,6 +383,7 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
         term_v: RawTerm,
         gpu: &'a WgpuSuccinctArchive<U>,
         admission: ValueRouteAdmission,
+        counters: Arc<ValueRouteCounters>,
     ) -> Option<Self> {
         let RawTerm::Var(value_variable) = term_v else {
             return None;
@@ -439,7 +443,7 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
                 value_pvar,
                 device,
                 admission,
-                counters: ValueRouteCounters::default(),
+                counters,
             }),
         })
     }
@@ -889,6 +893,18 @@ impl<'a, U: Universe> TypedProgramSpec for SuccinctValueFamily<'a, U> {
 pub struct ResidentValueRoute<'g, U: Universe> {
     gpu: &'g WgpuSuccinctArchive<U>,
     admission: ValueRouteAdmission,
+    /// Shared by every family this view creates. `pattern!` erases the
+    /// constraint behind `dyn Constraint`, so the view is the observable
+    /// handle onto routing decisions and placements.
+    counters: Arc<ValueRouteCounters>,
+}
+
+impl<U: Universe> ResidentValueRoute<'_, U> {
+    /// A relaxed snapshot of the decision counters shared by every pattern
+    /// created from this view.
+    pub fn counters(&self) -> ValueRouteCountersSnapshot {
+        self.counters.snapshot()
+    }
 }
 
 impl<U> WgpuSuccinctArchive<U>
@@ -907,6 +923,7 @@ where
         ResidentValueRoute {
             gpu: self,
             admission,
+            counters: Arc::new(ValueRouteCounters::default()),
         }
     }
 }
@@ -935,6 +952,7 @@ where
             v.erase(),
             self.gpu,
             self.admission,
+            Arc::clone(&self.counters),
         );
         ResidentValueConstraint {
             inner: SuccinctArchiveConstraint::with_ring_batch(
@@ -1215,6 +1233,7 @@ mod tests {
             RawTerm::Var(2),
             resident,
             admission,
+            Arc::new(ValueRouteCounters::default()),
         )
         .expect("the three-variable pattern lies on the narrow arm")
     }
@@ -1309,6 +1328,7 @@ mod tests {
             RawTerm::Var(0),
             &resident,
             ValueRouteAdmission::Off,
+            Arc::new(ValueRouteCounters::default()),
         )
         .expect("the constant-pair pattern lies on the narrow arm");
         assert!(constant
@@ -1325,6 +1345,7 @@ mod tests {
             RawTerm::Const(raw(entities[0])),
             &resident,
             ValueRouteAdmission::Off,
+            Arc::new(ValueRouteCounters::default()),
         )
         .is_none());
         assert!(SuccinctValueFamily::compile(
@@ -1333,6 +1354,7 @@ mod tests {
             RawTerm::Var(0),
             &resident,
             ValueRouteAdmission::Off,
+            Arc::new(ValueRouteCounters::default()),
         )
         .is_none());
         assert!(SuccinctValueFamily::compile(
@@ -1341,6 +1363,7 @@ mod tests {
             RawTerm::Var(2),
             &resident,
             ValueRouteAdmission::Off,
+            Arc::new(ValueRouteCounters::default()),
         )
         .is_none());
     }
