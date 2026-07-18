@@ -471,6 +471,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Bound-endpoint RPQ planning uses precompiled boundary statistics.**
+  Single-hop and union-arm estimates retain their historical local index
+  counts, including exact negated-attribute destinations. Composite arms use
+  the monotone value/entity output-domain statistic of each possible final
+  hop instead of opening a private WCO frame or recursively materializing a
+  depth-bounded closure. Query execution and result semantics are unchanged;
+  `rpq_bound_estimate_probe` covers nested-closure latency and skewed ordering
+  adversaries.
 - **Residual formula continuations use compact persistent arena records.**
   Canonical state descriptors now carry a four-byte query-local program-counter
   ID. Each arena record names its exact parent return edge and outer WCO resume

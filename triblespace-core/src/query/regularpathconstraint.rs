@@ -702,6 +702,7 @@ fn has_path(set: &TribleSet, expr: &PathExpr, from: &RawInline, to: &RawInline) 
 /// estimation). Five closure iterations is enough to distinguish dense
 /// from sparse expansion for variable-ordering purposes without paying
 /// the cost of full materialisation.
+#[cfg(test)]
 const RPQ_ESTIMATE_DEPTH: usize = 5;
 
 /// Like `eval_from` but caps closure (Plus/Star) iterations at
@@ -714,6 +715,7 @@ const RPQ_ESTIMATE_DEPTH: usize = 5;
 /// to `depth` steps for each of the outer Plus's `depth` steps, so
 /// total work is `O(depth^k)` for closure-nesting depth `k`. In
 /// practice path expressions rarely nest beyond one closure.
+#[cfg(test)]
 fn bounded_eval_from(
     set: &TribleSet,
     expr: &PathExpr,
@@ -774,6 +776,7 @@ fn bounded_eval_from(
 
 /// Shallow estimate: build the one-step constraint and ask it for the
 /// destination variable's cardinality with the start bound.
+#[cfg(test)]
 fn estimate_from(set: &TribleSet, expr: &PathExpr, start: &RawInline) -> usize {
     // Unwrap closure to get the body for estimation.
     let body = match expr {
@@ -882,6 +885,28 @@ enum FirstStep {
     AnyInv,
 }
 
+/// One index statistic in a bound-endpoint cardinality plan.
+///
+/// `Local` counts destinations adjacent to the bound endpoint. `Global`
+/// counts the possible output axis of a later path step without opening a
+/// private query frame. Both are monotone under insert-only fact growth.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BoundEstimateAtom {
+    Local(DeltaStep),
+    Global(BoundEstimateAxis),
+}
+
+/// The term domain exposed by the final hop of a composite path arm.
+///
+/// Forward hops end in arbitrary inline values, while inverse hops end in
+/// entity identifiers. The particular predicate is immaterial here: the
+/// historical private WCO frame exposed the complete projected axis too.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BoundEstimateAxis {
+    Values,
+    Entities,
+}
+
 /// Collect the FIRST set of the expression: every (attribute,
 /// direction) a non-empty path may begin with.
 fn first_steps(expr: &PathExpr, out: &mut Vec<FirstStep>) {
@@ -901,6 +926,66 @@ fn first_steps(expr: &PathExpr, out: &mut Vec<FirstStep>) {
             first_steps(r, out);
         }
         PathExpr::Star(b) | PathExpr::Plus(b) | PathExpr::Optional(b) => first_steps(b, out),
+    }
+}
+
+/// Add the projected index axis of every hop that may end a non-empty path.
+fn global_output_atoms(expr: &PathExpr, out: &mut Vec<BoundEstimateAtom>) {
+    match expr {
+        PathExpr::Attr(_) | PathExpr::NotAttr(_) => {
+            out.push(BoundEstimateAtom::Global(BoundEstimateAxis::Values))
+        }
+        PathExpr::InverseAttr(_) | PathExpr::InverseNotAttr(_) => {
+            out.push(BoundEstimateAtom::Global(BoundEstimateAxis::Entities))
+        }
+        PathExpr::Concat(left, right) => {
+            global_output_atoms(right, out);
+            if nullable(right) {
+                global_output_atoms(left, out);
+            }
+        }
+        PathExpr::Union(left, right) => {
+            global_output_atoms(left, out);
+            global_output_atoms(right, out);
+        }
+        PathExpr::Star(body) | PathExpr::Plus(body) | PathExpr::Optional(body) => {
+            global_output_atoms(body, out);
+        }
+    }
+}
+
+/// Compile the historical shallow-estimate policy into index statistics.
+///
+/// A single hop (or an outer closure over a single hop) uses its bound-local
+/// adjacency count. Union arms retain that decision independently. Composite
+/// arms use their LAST-step output domains, which is the same statistic the
+/// old temporary intersection exposed for closure-free chains and a cheap,
+/// conservative replacement for recursively materializing nested closures.
+fn compile_bound_estimate(expr: &PathExpr, out: &mut Vec<BoundEstimateAtom>) {
+    let body = match expr {
+        PathExpr::Star(inner) | PathExpr::Plus(inner) | PathExpr::Optional(inner) => inner.as_ref(),
+        other => other,
+    };
+    match body {
+        PathExpr::Attr(attribute) => {
+            out.push(BoundEstimateAtom::Local(DeltaStep::Attr(*attribute)));
+        }
+        PathExpr::InverseAttr(attribute) => {
+            out.push(BoundEstimateAtom::Local(DeltaStep::InverseAttr(*attribute)));
+        }
+        PathExpr::NotAttr(attribute) => {
+            out.push(BoundEstimateAtom::Local(DeltaStep::NotAttr(*attribute)));
+        }
+        PathExpr::InverseNotAttr(attribute) => {
+            out.push(BoundEstimateAtom::Local(DeltaStep::InverseNotAttr(
+                *attribute,
+            )));
+        }
+        PathExpr::Union(left, right) => {
+            compile_bound_estimate(left, out);
+            compile_bound_estimate(right, out);
+        }
+        composite => global_output_atoms(composite, out),
     }
 }
 
@@ -1177,6 +1262,8 @@ pub struct RegularPathConstraint {
     /// behind a per-candidate physical grant.
     first: Box<[FirstStep]>,
     inverse_first: Box<[FirstStep]>,
+    estimate: Box<[BoundEstimateAtom]>,
+    inverse_estimate: Box<[BoundEstimateAtom]>,
     nullable: bool,
     inverse_nullable: bool,
     /// Thompson-style transition programs for the forward and inverse
@@ -1623,6 +1710,10 @@ impl RegularPathConstraint {
         first_steps(&expr, &mut first);
         let mut inverse_first = Vec::new();
         first_steps(&inverse_expr, &mut inverse_first);
+        let mut estimate = Vec::new();
+        compile_bound_estimate(&expr, &mut estimate);
+        let mut inverse_estimate = Vec::new();
+        compile_bound_estimate(&inverse_expr, &mut inverse_estimate);
         let expr_nullable = nullable(&expr);
         let inverse_nullable = nullable(&inverse_expr);
         let delta_program = DeltaProgram::compile(&expr);
@@ -1641,6 +1732,8 @@ impl RegularPathConstraint {
             inverse_expr,
             first: first.into_boxed_slice(),
             inverse_first: inverse_first.into_boxed_slice(),
+            estimate: estimate.into_boxed_slice(),
+            inverse_estimate: inverse_estimate.into_boxed_slice(),
             nullable: expr_nullable,
             inverse_nullable,
             delta_program,
@@ -2151,6 +2244,60 @@ impl RegularPathConstraint {
 }
 
 impl RegularPathConstraint {
+    /// Evaluates one precompiled bound-endpoint statistic.
+    fn estimate_atom(&self, atom: BoundEstimateAtom, source: &RawInline) -> usize {
+        match atom {
+            BoundEstimateAtom::Local(DeltaStep::Attr(attribute)) => {
+                let Some(entity) = value_as_entity(source) else {
+                    return 0;
+                };
+                let mut prefix = [0u8; ID_LEN * 2];
+                prefix[..ID_LEN].copy_from_slice(&entity);
+                prefix[ID_LEN..].copy_from_slice(&attribute);
+                self.set.eav.segmented_len(&prefix) as usize
+            }
+            BoundEstimateAtom::Local(DeltaStep::InverseAttr(attribute)) => {
+                let mut prefix = [0u8; 32 + ID_LEN];
+                prefix[..32].copy_from_slice(source);
+                prefix[32..].copy_from_slice(&attribute);
+                self.set.vae.segmented_len(&prefix) as usize
+            }
+            BoundEstimateAtom::Local(DeltaStep::NotAttr(excluded)) => {
+                let Some(entity) = value_as_entity(source) else {
+                    return 0;
+                };
+                let mut count = 0usize;
+                self.set
+                    .eva
+                    .infixes::<ID_LEN, 32, _>(&entity, |value: &[u8; 32]| {
+                        count += usize::from(self.has_forward_not_attr(&entity, value, &excluded));
+                    });
+                count
+            }
+            BoundEstimateAtom::Local(DeltaStep::InverseNotAttr(excluded)) => {
+                let mut count = 0usize;
+                self.set
+                    .vea
+                    .infixes::<32, ID_LEN, _>(source, |entity: &[u8; ID_LEN]| {
+                        count += usize::from(self.has_inverse_not_attr(source, entity, &excluded));
+                    });
+                count
+            }
+            BoundEstimateAtom::Global(BoundEstimateAxis::Values) => {
+                self.set.vea.segmented_len(&[]) as usize
+            }
+            BoundEstimateAtom::Global(BoundEstimateAxis::Entities) => {
+                self.set.eav.segmented_len(&[]) as usize
+            }
+        }
+    }
+
+    fn estimate_bound(&self, plan: &[BoundEstimateAtom], source: &RawInline) -> usize {
+        plan.iter().fold(0usize, |estimate, &atom| {
+            estimate.saturating_add(self.estimate_atom(atom, source))
+        })
+    }
+
     /// Candidate count for one row.
     fn estimate_row(
         &self,
@@ -2166,7 +2313,7 @@ impl RegularPathConstraint {
         }
         if variable == self.end {
             if let Some(start_val) = start_val {
-                return estimate_from(&self.set, &self.expr, start_val).max(1);
+                return self.estimate_bound(&self.estimate, start_val).max(1);
             }
             self.set.len()
         } else {
@@ -2175,7 +2322,7 @@ impl RegularPathConstraint {
                 // via the inverted expression from the bound end,
                 // giving a tight estimate instead of the
                 // conservative set-len fallback.
-                return estimate_from(&self.set, &self.inverse_expr, end_val).max(1);
+                return self.estimate_bound(&self.inverse_estimate, end_val).max(1);
             }
             self.set.len()
         }
@@ -3088,6 +3235,313 @@ mod delta_program_tests {
         assert_eq!(
             quotient.steps[entries[2].1 as usize],
             vec![(second, entries[2].1), (first, entries[2].1)]
+        );
+    }
+}
+
+#[cfg(test)]
+mod estimate_tests {
+    use super::*;
+    use crate::id::{rngid, ExclusiveId};
+    use crate::inline::Inline;
+    use crate::trible::Trible;
+
+    fn value(id: &ExclusiveId) -> RawInline {
+        id_into_value(&id.id.raw())
+    }
+
+    fn insert_edge(
+        set: &mut TribleSet,
+        from: &ExclusiveId,
+        attribute: &ExclusiveId,
+        to: &ExclusiveId,
+    ) {
+        set.insert(&Trible::new(
+            from,
+            attribute,
+            &Inline::<GenId>::new(value(to)),
+        ));
+    }
+
+    fn fixture() -> (
+        TribleSet,
+        Vec<ExclusiveId>,
+        ExclusiveId,
+        ExclusiveId,
+        ExclusiveId,
+    ) {
+        let nodes: Vec<_> = (0..12).map(|_| rngid()).collect();
+        let primary = rngid();
+        let secondary = rngid();
+        let tertiary = rngid();
+        let mut set = TribleSet::new();
+
+        for target in [1, 2] {
+            insert_edge(&mut set, &nodes[0], &primary, &nodes[target]);
+        }
+        // `nodes[1]` is reachable over both an included and the excluded
+        // predicate below, while `nodes[7]` is excluded-only. This pins the
+        // distinct-destination semantics of direct NotAttr estimates.
+        insert_edge(&mut set, &nodes[0], &tertiary, &nodes[1]);
+        for target in [3, 4, 5] {
+            insert_edge(&mut set, &nodes[1], &secondary, &nodes[target]);
+        }
+        // The same overlap in reverse: `nodes[1]` reaches `nodes[3]` over two
+        // predicates, while `nodes[8]` reaches it over `primary` alone.
+        insert_edge(&mut set, &nodes[1], &tertiary, &nodes[3]);
+        for target in [5, 6] {
+            insert_edge(&mut set, &nodes[2], &secondary, &nodes[target]);
+        }
+        insert_edge(&mut set, &nodes[0], &tertiary, &nodes[7]);
+        insert_edge(&mut set, &nodes[8], &primary, &nodes[3]);
+
+        (set, nodes, primary, secondary, tertiary)
+    }
+
+    #[test]
+    fn compiled_boundary_estimates_match_legacy_shallow_shapes() {
+        let (set, nodes, primary, secondary, tertiary) = fixture();
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let shapes = [
+            vec![PathOp::Attr(primary.id.raw())],
+            vec![PathOp::Attr(primary.id.raw()), PathOp::Plus],
+            vec![
+                PathOp::Attr(primary.id.raw()),
+                PathOp::Attr(secondary.id.raw()),
+                PathOp::Union,
+                PathOp::Plus,
+            ],
+            vec![
+                PathOp::Attr(primary.id.raw()),
+                PathOp::Attr(secondary.id.raw()),
+                PathOp::Concat,
+            ],
+            vec![
+                PathOp::Attr(primary.id.raw()),
+                PathOp::Attr(secondary.id.raw()),
+                PathOp::Concat,
+                PathOp::Attr(tertiary.id.raw()),
+                PathOp::Union,
+            ],
+            vec![PathOp::Attr(primary.id.raw()), PathOp::Inverse],
+            vec![PathOp::NotAttr(tertiary.id.raw())],
+            vec![PathOp::NotAttr(tertiary.id.raw()), PathOp::Plus],
+            vec![PathOp::NotAttr(primary.id.raw()), PathOp::Inverse],
+            vec![
+                PathOp::NotAttr(primary.id.raw()),
+                PathOp::Inverse,
+                PathOp::Plus,
+            ],
+            vec![PathOp::Attr(primary.id.raw()), PathOp::Optional],
+            vec![
+                PathOp::Attr(primary.id.raw()),
+                PathOp::Attr(secondary.id.raw()),
+                PathOp::Concat,
+                PathOp::Optional,
+            ],
+            vec![
+                PathOp::Attr(primary.id.raw()),
+                PathOp::Attr(secondary.id.raw()),
+                PathOp::Optional,
+                PathOp::Concat,
+            ],
+            vec![
+                PathOp::Attr(primary.id.raw()),
+                PathOp::Optional,
+                PathOp::Attr(secondary.id.raw()),
+                PathOp::Optional,
+                PathOp::Concat,
+            ],
+            vec![
+                PathOp::Attr(primary.id.raw()),
+                PathOp::Attr(secondary.id.raw()),
+                PathOp::Inverse,
+                PathOp::Concat,
+            ],
+        ];
+        let source = value(&nodes[0]);
+        let target = value(&nodes[3]);
+
+        for (shape, operations) in shapes.into_iter().enumerate() {
+            let path = RegularPathConstraint::new(set.clone(), start, end, &operations);
+            assert_eq!(
+                path.estimate_row(end.index, Some(&source), None),
+                estimate_from(&set, &path.expr, &source).max(1),
+                "forward estimate diverged for legacy shallow shape {shape}",
+            );
+            assert_eq!(
+                path.estimate_row(start.index, None, Some(&target)),
+                estimate_from(&set, &path.inverse_expr, &target).max(1),
+                "inverse estimate diverged for legacy shallow shape {shape}",
+            );
+        }
+    }
+
+    #[test]
+    fn compiled_boundary_estimates_are_monotone_under_fact_growth() {
+        let (small, nodes, primary, secondary, tertiary) = fixture();
+        let mut large = small.clone();
+        for target in 3..12 {
+            insert_edge(&mut large, &nodes[1], &secondary, &nodes[target]);
+        }
+        for source in 3..8 {
+            insert_edge(
+                &mut large,
+                &nodes[source],
+                &primary,
+                &nodes[(source + 1) % nodes.len()],
+            );
+            insert_edge(&mut large, &nodes[source], &tertiary, &nodes[11]);
+        }
+
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let source = value(&nodes[0]);
+        let target = value(&nodes[3]);
+        let shapes = [
+            vec![PathOp::Attr(primary.id.raw())],
+            vec![
+                PathOp::Attr(primary.id.raw()),
+                PathOp::Attr(secondary.id.raw()),
+                PathOp::Union,
+                PathOp::Plus,
+            ],
+            vec![
+                PathOp::Attr(primary.id.raw()),
+                PathOp::Attr(secondary.id.raw()),
+                PathOp::Concat,
+            ],
+            vec![
+                PathOp::Attr(primary.id.raw()),
+                PathOp::Plus,
+                PathOp::Attr(secondary.id.raw()),
+                PathOp::Concat,
+            ],
+            vec![PathOp::NotAttr(tertiary.id.raw())],
+        ];
+
+        for operations in shapes {
+            let before = RegularPathConstraint::new(small.clone(), start, end, &operations);
+            let after = RegularPathConstraint::new(large.clone(), start, end, &operations);
+            assert!(
+                before.estimate_row(end.index, Some(&source), None)
+                    <= after.estimate_row(end.index, Some(&source), None),
+                "forward estimate decreased after inserting facts",
+            );
+            assert!(
+                before.estimate_row(start.index, None, Some(&target))
+                    <= after.estimate_row(start.index, None, Some(&target)),
+                "inverse estimate decreased after inserting facts",
+            );
+        }
+    }
+
+    #[test]
+    fn composite_tail_statistic_preserves_skewed_chain_ordering_signal() {
+        let source = rngid();
+        let hub = rngid();
+        let primary = rngid();
+        let secondary = rngid();
+        let targets: Vec<_> = (0..64).map(|_| rngid()).collect();
+        let mut set = TribleSet::new();
+        insert_edge(&mut set, &source, &primary, &hub);
+        for target in &targets {
+            insert_edge(&mut set, &hub, &secondary, target);
+        }
+
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let chain = RegularPathConstraint::new(
+            set,
+            start,
+            end,
+            &[
+                PathOp::Attr(primary.id.raw()),
+                PathOp::Attr(secondary.id.raw()),
+                PathOp::Concat,
+            ],
+        );
+
+        assert_eq!(
+            chain.estimate.as_ref(),
+            &[BoundEstimateAtom::Global(BoundEstimateAxis::Values)],
+        );
+        assert_eq!(
+            chain.estimate_row(end.index, Some(&value(&source)), None),
+            65
+        );
+        assert!(
+            chain.estimate_row(end.index, Some(&value(&source)), None) > 2,
+            "a two-value sibling should remain the preferred proposer",
+        );
+    }
+
+    #[test]
+    fn composite_tail_plan_preserves_nullable_and_duplicate_arm_multiplicity() {
+        let (set, nodes, primary, secondary, tertiary) = fixture();
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let nullable_tail = RegularPathConstraint::new(
+            set.clone(),
+            start,
+            end,
+            &[
+                PathOp::Attr(primary.id.raw()),
+                PathOp::Attr(secondary.id.raw()),
+                PathOp::Optional,
+                PathOp::Concat,
+            ],
+        );
+        assert_eq!(
+            nullable_tail.estimate.as_ref(),
+            &[
+                BoundEstimateAtom::Local(DeltaStep::Attr(primary.id.raw())),
+                BoundEstimateAtom::Global(BoundEstimateAxis::Values),
+            ],
+        );
+
+        let duplicate_tail = RegularPathConstraint::new(
+            set.clone(),
+            start,
+            end,
+            &[
+                PathOp::Attr(primary.id.raw()),
+                PathOp::Attr(secondary.id.raw()),
+                PathOp::Concat,
+                PathOp::Attr(tertiary.id.raw()),
+                PathOp::Attr(secondary.id.raw()),
+                PathOp::Concat,
+                PathOp::Union,
+            ],
+        );
+        assert_eq!(
+            duplicate_tail.estimate.as_ref(),
+            &[
+                BoundEstimateAtom::Global(BoundEstimateAxis::Values),
+                BoundEstimateAtom::Global(BoundEstimateAxis::Values),
+            ],
+        );
+        let source = value(&nodes[0]);
+        assert_eq!(
+            duplicate_tail.estimate_row(end.index, Some(&source), None),
+            estimate_from(&set, &duplicate_tail.expr, &source).max(1),
+        );
+
+        let reverse_tail = RegularPathConstraint::new(
+            set,
+            start,
+            end,
+            &[
+                PathOp::Attr(primary.id.raw()),
+                PathOp::Attr(secondary.id.raw()),
+                PathOp::Inverse,
+                PathOp::Concat,
+            ],
+        );
+        assert_eq!(
+            reverse_tail.estimate.as_ref(),
+            &[BoundEstimateAtom::Global(BoundEstimateAxis::Entities)],
         );
     }
 }
