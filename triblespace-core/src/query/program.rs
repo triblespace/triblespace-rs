@@ -1029,49 +1029,31 @@ where
         );
         let mut raw_effects = vec![0usize; input_count];
 
-        effects
-            .pages
-            .extend(typed.pages.into_iter().enumerate().map(|(input, page)| {
-                let activation = batch.activations[input];
-                let resume = page.resume.map(|resume| match resume {
-                    TypedResume::Immediate(state) => {
-                        assert!(
-                            self.progress(&state) < input_ranks[input],
-                            "typed program resume did not strictly decrease its finite rank"
-                        );
-                        let dispatch = self.dispatch(&state);
-                        let pacing = self.pacing(&state);
-                        let work = ProgramWork {
-                            handle: runtime.insert(activation, state),
-                            dispatch,
-                            pacing,
-                        };
-                        ProgramResume::Immediate(work)
-                    }
-                    TypedResume::AfterChildren(state) => {
-                        assert!(
-                            self.progress(&state) < input_ranks[input],
-                            "typed program resume did not strictly decrease its finite rank"
-                        );
-                        let dispatch = self.dispatch(&state);
-                        let pacing = self.pacing(&state);
-                        let work = ProgramWork {
-                            handle: runtime.insert(activation, state),
-                            dispatch,
-                            pacing,
-                        };
-                        ProgramResume::AfterChildren(work)
-                    }
-                    TypedResume::AfterChildrenDone => ProgramResume::AfterChildrenDone,
-                });
-                ProgramPage {
-                    examined: page.examined,
-                    resume,
+        // Validate the entire typed receipt before publishing any replacement
+        // handle, novelty admission, or outward effect. A physical `Some`
+        // result is a transaction candidate, not permission to commit a valid
+        // prefix before a later malformed effect is discovered.
+        let mut resume_physical = Vec::with_capacity(input_count);
+        for (input, page) in typed.pages.iter().enumerate() {
+            match &page.resume {
+                Some(TypedResume::Immediate(state) | TypedResume::AfterChildren(state)) => {
+                    assert!(
+                        self.progress(state) < input_ranks[input],
+                        "typed program resume did not strictly decrease its finite rank"
+                    );
+                    resume_physical.push(Some((self.dispatch(state), self.pacing(state))));
                 }
-            }));
+                Some(TypedResume::AfterChildrenDone) | None => resume_physical.push(None),
+            }
+        }
 
+        let mut batch_novelty: AHashMap<
+            ProgramActivation,
+            AHashMap<&T::NoveltyKey, Option<RawInline>>,
+        > = AHashMap::new();
+        let mut child_physical = Vec::with_capacity(typed.children.len());
         let mut previous = 0u32;
-        for (position, child) in typed.children.into_iter().enumerate() {
+        for (position, child) in typed.children.iter().enumerate() {
             assert!(
                 (child.input as usize) < input_count,
                 "typed program child tag is out of range"
@@ -1092,14 +1074,131 @@ where
                     "typed program finite child did not strictly decrease its input rank"
                 );
             }
+            child_physical.push((self.dispatch(&child.state), self.pacing(&child.state)));
+
+            if let Some(novelty) = child.novelty.as_ref() {
+                let activation = batch.activations[child.input as usize];
+                if let Some(previous) = runtime
+                    .novelty
+                    .get(&activation)
+                    .and_then(|seen| seen.get(novelty))
+                {
+                    assert_eq!(
+                        *previous, child.accepted,
+                        "one typed novelty key changed its endpoint observation"
+                    );
+                }
+                let seen = batch_novelty.entry(activation).or_default();
+                if let Some(previous) = seen.get(novelty) {
+                    assert_eq!(
+                        *previous, child.accepted,
+                        "one typed novelty key changed its endpoint observation"
+                    );
+                } else {
+                    seen.insert(novelty, child.accepted);
+                }
+            }
+        }
+
+        let mut previous = 0u32;
+        for (position, (input, _)) in typed.direct.iter().enumerate() {
+            assert!((*input as usize) < input_count);
+            assert!(
+                position == 0 || *input >= previous,
+                "typed direct observations are not grouped in ascending order"
+            );
+            previous = *input;
+            raw_effects[*input as usize] += 1;
+        }
+        let mut previous = 0u32;
+        for (position, (input, _)) in typed.accepted.iter().enumerate() {
+            assert!((*input as usize) < input_count);
+            assert!(
+                position == 0 || *input >= previous,
+                "typed candidate observations are not grouped in ascending order"
+            );
+            previous = *input;
+            raw_effects[*input as usize] += 1;
+        }
+        let mut previous = 0u32;
+        for (position, (input, ())) in typed.supported.iter().enumerate() {
+            assert!((*input as usize) < input_count);
+            assert!(
+                position == 0 || *input >= previous,
+                "typed support observations are not grouped in ascending order"
+            );
+            previous = *input;
+            raw_effects[*input as usize] += 1;
+        }
+        assert!(
+            raw_effects
+                .iter()
+                .zip(&examined)
+                .all(|(&outputs, &spent)| outputs <= spent),
+            "typed program emitted more raw effects than its examined-work receipt"
+        );
+
+        drop(batch_novelty);
+        let TypedEffectSink {
+            pages,
+            children,
+            direct,
+            accepted,
+            supported,
+            source_pages,
+            source_examined,
+            source_roots,
+            transition_pages,
+            transition_examined,
+        } = typed;
+
+        // From here onward every family-derived value and every static receipt
+        // law has already been checked. Allocation failure, generation
+        // exhaustion, or another panic remains fatal and non-rollback, exactly
+        // like the affine input take above; recoverable backends return `None`
+        // before reaching this commit phase.
+        effects
+            .pages
+            .extend(pages.into_iter().zip(resume_physical).enumerate().map(
+                |(input, (page, physical))| {
+                    let activation = batch.activations[input];
+                    let resume = match (page.resume, physical) {
+                        (Some(TypedResume::Immediate(state)), Some((dispatch, pacing))) => {
+                            let work = ProgramWork {
+                                handle: runtime.insert(activation, state),
+                                dispatch,
+                                pacing,
+                            };
+                            Some(ProgramResume::Immediate(work))
+                        }
+                        (Some(TypedResume::AfterChildren(state)), Some((dispatch, pacing))) => {
+                            let work = ProgramWork {
+                                handle: runtime.insert(activation, state),
+                                dispatch,
+                                pacing,
+                            };
+                            Some(ProgramResume::AfterChildren(work))
+                        }
+                        (Some(TypedResume::AfterChildrenDone), None) => {
+                            Some(ProgramResume::AfterChildrenDone)
+                        }
+                        (None, None) => None,
+                        _ => unreachable!("typed Program resume preflight lost alignment"),
+                    };
+                    ProgramPage {
+                        examined: page.examined,
+                        resume,
+                    }
+                },
+            ));
+
+        for (child, (dispatch, pacing)) in children.into_iter().zip(child_physical) {
             let activation = batch.activations[child.input as usize];
             if let Some(novelty) = child.novelty {
                 if !runtime.admit(activation, novelty, child.accepted) {
                     continue;
                 }
             }
-            let dispatch = self.dispatch(&child.state);
-            let pacing = self.pacing(&child.state);
             let work = ProgramWork {
                 handle: runtime.insert(activation, child.state),
                 dispatch,
@@ -1112,51 +1211,14 @@ where
             });
         }
 
-        let mut previous = 0u32;
-        for (position, (input, value)) in typed.direct.into_iter().enumerate() {
-            assert!((input as usize) < input_count);
-            assert!(
-                position == 0 || input >= previous,
-                "typed direct observations are not grouped in ascending order"
-            );
-            previous = input;
-            raw_effects[input as usize] += 1;
-            effects.direct.push((input, value));
-        }
-        let mut previous = 0u32;
-        for (position, (input, value)) in typed.accepted.into_iter().enumerate() {
-            assert!((input as usize) < input_count);
-            assert!(
-                position == 0 || input >= previous,
-                "typed candidate observations are not grouped in ascending order"
-            );
-            previous = input;
-            raw_effects[input as usize] += 1;
-            effects.accepted.push((input, value));
-        }
-        let mut previous = 0u32;
-        for (position, (input, ())) in typed.supported.into_iter().enumerate() {
-            assert!((input as usize) < input_count);
-            assert!(
-                position == 0 || input >= previous,
-                "typed support observations are not grouped in ascending order"
-            );
-            previous = input;
-            raw_effects[input as usize] += 1;
-            effects.supported.push((input, ()));
-        }
-        assert!(
-            raw_effects
-                .iter()
-                .zip(&examined)
-                .all(|(&outputs, &spent)| outputs <= spent),
-            "typed program emitted more raw effects than its examined-work receipt"
-        );
-        effects.source_pages += typed.source_pages;
-        effects.source_examined += typed.source_examined;
-        effects.source_roots += typed.source_roots;
-        effects.transition_pages += typed.transition_pages;
-        effects.transition_examined += typed.transition_examined;
+        effects.direct.extend(direct);
+        effects.accepted.extend(accepted);
+        effects.supported.extend(supported);
+        effects.source_pages += source_pages;
+        effects.source_examined += source_examined;
+        effects.source_roots += source_roots;
+        effects.transition_pages += transition_pages;
+        effects.transition_examined += transition_examined;
         effects.placement = placement;
     }
 
@@ -1320,6 +1382,7 @@ mod tests {
         Decline,
         Complete,
         OverBudget,
+        LateRawAmplification,
     }
 
     struct PhysicalProbe {
@@ -1347,7 +1410,11 @@ mod tests {
             Some(ProgramRoute {
                 key: ProgramKey::new(0),
                 variable: 0,
-                stratum: ProgramStratum::Finite,
+                stratum: if matches!(self.mode, PhysicalProbeMode::LateRawAmplification) {
+                    ProgramStratum::Fixpoint
+                } else {
+                    ProgramStratum::Finite
+                },
                 grouping: ProgramGrouping::PageLocal,
                 completion: ProgramCompletion::PageableOnly,
             })
@@ -1367,13 +1434,14 @@ mod tests {
             effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
         ) {
             for parent in 0..batch.view.len() {
-                effects.finite_root(
-                    parent as u32,
-                    NonComparableState {
-                        exact_cursor: parent + 10,
-                    },
-                    None,
-                );
+                let state = NonComparableState {
+                    exact_cursor: parent + 10,
+                };
+                if matches!(self.mode, PhysicalProbeMode::LateRawAmplification) {
+                    effects.fixpoint_root(parent as u32, state, Key(parent as u8), None);
+                } else {
+                    effects.finite_root(parent as u32, state, None);
+                }
             }
         }
 
@@ -1403,18 +1471,39 @@ mod tests {
                 .push(states.iter().map(|state| state.exact_cursor).collect());
             match self.mode {
                 PhysicalProbeMode::Decline => None,
-                PhysicalProbeMode::Complete | PhysicalProbeMode::OverBudget => {
+                PhysicalProbeMode::Complete
+                | PhysicalProbeMode::OverBudget
+                | PhysicalProbeMode::LateRawAmplification => {
                     let mut step = TypedPhysicalStep::new(ProgramPhysicalReceipt::new(
                         "test-physical",
                         "dense-page",
                     ));
-                    for (input, _) in states.iter().enumerate() {
+                    for (input, state) in states.iter().enumerate() {
                         let examined = match self.mode {
                             PhysicalProbeMode::Complete => 1,
                             PhysicalProbeMode::OverBudget => batch.limits[input] + 1,
+                            PhysicalProbeMode::LateRawAmplification => 1,
                             PhysicalProbeMode::Decline => unreachable!(),
                         };
-                        step.effects_mut().page(examined, None);
+                        let resume = matches!(self.mode, PhysicalProbeMode::LateRawAmplification)
+                            .then(|| {
+                                TypedResume::Immediate(NonComparableState {
+                                    exact_cursor: state.exact_cursor - 1,
+                                })
+                            });
+                        step.effects_mut().page(examined, resume);
+                        if matches!(self.mode, PhysicalProbeMode::LateRawAmplification) {
+                            step.effects_mut().fixpoint_child(
+                                input as u32,
+                                NonComparableState {
+                                    exact_cursor: state.exact_cursor - 2,
+                                },
+                                Key(input as u8 + 64),
+                                None,
+                            );
+                            step.effects_mut()
+                                .direct(input as u32, RawInline::default());
+                        }
                     }
                     Some(step)
                 }
@@ -1867,10 +1956,91 @@ mod tests {
     fn physical_step_cannot_bypass_the_shared_budget_validation() {
         let spec = PhysicalProbe::new(PhysicalProbeMode::OverBudget);
         let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            step_physical_probe(&spec, &[1])
+            let _ = step_physical_probe(&spec, &[1]);
         }));
         let message = panic_text(rejected.expect_err("over-budget physical receipt must fail"));
         assert!(message.contains("exceeded one input's physical work budget"));
+        assert!(spec.native_states.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn late_invalid_physical_receipt_commits_no_output_prefix() {
+        let spec = PhysicalProbe::new(PhysicalProbeMode::LateRawAmplification);
+        let program = ProgramRef::new(&spec);
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(0),
+            bound: VariableSet::new_empty(),
+        };
+        let route = program.route(request).unwrap();
+        let activations = [ProgramActivation(1)];
+        let view = RowsView::new_with_row_count(&[], &[], 1);
+        let mut runtime = program.new_runtime();
+        let mut seeded = ProgramSeedEffects::default();
+        program.seed_batch(
+            &mut runtime,
+            ProgramSeedBatch {
+                request,
+                route,
+                view,
+                activations: &activations,
+            },
+            &mut seeded,
+        );
+        let work: Vec<_> = seeded.work.into_iter().map(|seed| seed.work).collect();
+        let novelty_before = runtime
+            .erased
+            .as_mut()
+            .as_any_mut()
+            .downcast_mut::<TypedProgramRuntime<NonComparableState, Key>>()
+            .unwrap()
+            .novelty
+            .clone();
+        let candidate_sets: [Option<&[RawInline]>; 1] = [None];
+        let mut effects = ProgramBatchEffects::default();
+
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            program.step_batch(
+                &mut runtime,
+                ProgramBatch {
+                    stratum: route.stratum,
+                    view,
+                    candidate_sets: &candidate_sets,
+                    activations: &activations,
+                    work: &work,
+                    limits: &[1],
+                },
+                &mut effects,
+            )
+        }));
+        let message = panic_text(rejected.expect_err("amplified physical receipt must fail"));
+        assert!(message.contains("more raw effects than its examined-work receipt"));
+
+        assert!(effects.pages.is_empty());
+        assert!(effects.children.is_empty());
+        assert!(effects.direct.is_empty());
+        assert!(effects.accepted.is_empty());
+        assert!(effects.supported.is_empty());
+        assert_eq!(effects.source_pages, 0);
+        assert_eq!(effects.source_examined, 0);
+        assert_eq!(effects.source_roots, 0);
+        assert_eq!(effects.transition_pages, 0);
+        assert_eq!(effects.transition_examined, 0);
+        assert_eq!(effects.placement, None);
+
+        let typed_runtime = runtime
+            .erased
+            .as_mut()
+            .as_any_mut()
+            .downcast_mut::<TypedProgramRuntime<NonComparableState, Key>>()
+            .unwrap();
+        assert!(
+            typed_runtime.slots.iter().all(|slot| slot.value.is_none()),
+            "late validation committed a resume or child handle"
+        );
+        assert!(
+            typed_runtime.novelty == novelty_before,
+            "late validation admitted an output novelty key"
+        );
         assert!(spec.native_states.lock().unwrap().is_empty());
     }
 
