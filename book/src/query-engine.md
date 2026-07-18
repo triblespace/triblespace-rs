@@ -434,14 +434,16 @@ or scheduling decisions in the execution they observe.
 
 The optional `triblespace-gpu::WgpuSuccinctArchive` exercises that seam without
 putting a device dependency in core. It wraps the canonical archive, keeps its
-six Jerky wavelet matrices resident, and routes tagged `confirm` rank streams
-through a device-neutral `RingBatchQuery`; estimates, proposals, prefix walks,
-domain lookups, satisfaction checks, and scalar sinks remain on CPU. GPU
-admission is per batch (8,192 rank probes by default), so affine sharding may
-still create CPU fallbacks. This is intentional: forcing every Rayon shard to
-emit synchronizing device work for every tiny rank batch is much slower than
-either executor, while fat batches amortize fixed dispatch/readback costs and
-use the device's rank throughput. `WgpuSuccinctArchive::stats` exposes
+six Jerky wavelet matrices resident, and routes every nonempty `confirm` rank
+stream through a device-neutral `RingBatchQuery`; estimates, proposals, prefix
+walks, domain lookups, and satisfaction checks remain on CPU. Candidate storage
+is not an execution capability: both a one-parent plain-values stream and a
+multi-parent tagged stream reach the backend. GPU admission is per batch (8,192
+rank probes by default), so either representation may still fall back to CPU.
+This is intentional: forcing every tiny rank batch to emit synchronizing device
+work is much slower than either executor, while fat batches amortize fixed
+dispatch/readback costs and use the device's rank throughput.
+`WgpuSuccinctArchive::stats` exposes
 dispatches, fallbacks, probe totals, and batch extrema so backend/scheduler
 economics are observable rather than hidden in a planner heuristic.
 `WgpuSuccinctArchive::observe_residual_actions()` returns a borrowing,
@@ -451,12 +453,13 @@ the full query lifetime. The direct `WgpuSuccinctArchive` pattern path remains
 structurally unobserved and performs no action-correlation lookup, clock read,
 or sample work.
 
-The adapter samples only tagged whole-frontier Succinct confirmation rank
-streams. It does not reinterpret all CPU work inside the action as archive
-work, and planning, proposal, scalar confirmation, domain lookup, and
-satisfaction remain unsampled. An empty rank stream records nothing; a
-nonempty call outside a current observed action executes normally without a
-sample. Exact work is `positions.len()` in `rank-probes`. Threshold fallbacks
+The adapter samples every nonempty Succinct confirmation rank stream offered to
+the backend, whether its candidates use the plain-values or tagged
+representation. It does not reinterpret all CPU work inside the action as
+archive work, and planning, proposal, domain lookup, and satisfaction remain
+unsampled. An empty rank stream records nothing; a nonempty call outside a
+current observed action executes normally without a sample. Exact work is
+`positions.len()` in `rank-probes`. Threshold fallbacks
 are labelled `cpu` / `wavelet-rank/threshold-fallback`, while admitted device
 calls are labelled `wgpu` / `wavelet-rank/gpu-round-trip`. These labels come
 from the private per-call route that actually executes rather than from the

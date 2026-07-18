@@ -34,9 +34,11 @@ six Ring wavelet matrices and implements the same `TriblePattern` interface as
 the wrapped CPU archive. Construction prepares the host data and enqueues the
 device transfers; the first rank query provides the synchronization boundary.
 The canonical archive, query planner, domain searches, prefix navigation,
-proposals, estimates, and satisfaction checks remain on the CPU. Only
-whole-frontier `confirm` rank streams use Jerky's resident
-`GpuWaveletMatrix::rank_batch`; scalar queries retain the ordinary CPU path.
+proposals, estimates, and satisfaction checks remain on the CPU. Every
+nonempty `confirm` rank stream is offered to Jerky's resident
+`GpuWaveletMatrix::rank_batch`, whether candidates use the one-parent `Values`
+or multi-parent tagged representation. The probe-count admission threshold,
+not the storage representation, decides CPU fallback versus WGPU execution.
 
 ```rust,no_run
 # use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
