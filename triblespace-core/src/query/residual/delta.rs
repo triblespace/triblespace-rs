@@ -5005,6 +5005,20 @@ impl DeltaScheduler {
         let supported_ranges =
             tagged_ranges(&receipt.supported, row_count, "program support observation");
 
+        // Placement is observation only. Static executor labels deliberately
+        // stay out of the ordinary hot-path aggregate and never feed dispatch.
+        if receipt.placement.is_some() {
+            let granted_work = limits.iter().sum();
+            stats.delta_program_physical_cohorts += 1;
+            stats.delta_program_physical_rows += row_count;
+            stats.delta_program_physical_granted_work += granted_work;
+            stats.max_delta_program_physical_cohort =
+                stats.max_delta_program_physical_cohort.max(row_count);
+            stats.max_delta_program_physical_granted_work = stats
+                .max_delta_program_physical_granted_work
+                .max(granted_work);
+        }
+
         // Source/transition naming remains family-reported telemetry; it is
         // never consulted for dispatch, novelty, or replacement semantics.
         stats.delta_source_pages += receipt.source_pages;
@@ -7487,6 +7501,30 @@ mod tests {
     #[derive(Clone)]
     struct OneShotConfirmProgram {
         novelty_drops: Arc<AtomicUsize>,
+        physical: bool,
+    }
+
+    impl OneShotConfirmProgram {
+        fn fill_step(
+            &self,
+            states: &[u8],
+            batch: TypedProgramBatch<'_>,
+            effects: &mut TypedEffectSink<u8, CoCompletionNovelty>,
+        ) {
+            assert_eq!(states.len(), batch.candidate_sets.len());
+            for (input, (&state, candidates)) in states
+                .iter()
+                .zip(batch.candidate_sets.iter().copied())
+                .enumerate()
+            {
+                assert_eq!(state, 1);
+                let candidates = candidates.expect("Confirm activation lost its source set");
+                assert_eq!(candidates.len(), 1);
+                effects.page(1, None);
+                effects.accept(input as u32, candidates[0]);
+                effects.account_transition(1);
+            }
+        }
     }
 
     impl TypedProgramSpec for OneShotConfirmProgram {
@@ -7536,19 +7574,23 @@ mod tests {
             batch: TypedProgramBatch<'_>,
             effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
-            assert_eq!(states.len(), batch.candidate_sets.len());
-            for (input, (state, candidates)) in states
-                .into_iter()
-                .zip(batch.candidate_sets.iter().copied())
-                .enumerate()
-            {
-                assert_eq!(state, 1);
-                let candidates = candidates.expect("Confirm activation lost its source set");
-                assert_eq!(candidates.len(), 1);
-                effects.page(1, None);
-                effects.accept(input as u32, candidates[0]);
-                effects.account_transition(1);
+            self.fill_step(&states, batch, effects);
+        }
+
+        fn try_step_physical(
+            &self,
+            states: &[Self::State],
+            batch: TypedProgramBatch<'_>,
+        ) -> Option<TypedPhysicalStep<Self::State, Self::NoveltyKey>> {
+            if !self.physical {
+                return None;
             }
+            let mut step = TypedPhysicalStep::new(ProgramPhysicalReceipt::new(
+                "test-physical",
+                "one-shot-confirm",
+            ));
+            self.fill_step(states, batch, step.effects_mut());
+            Some(step)
         }
     }
 
@@ -7598,6 +7640,7 @@ mod tests {
         let novelty_drops = Arc::new(AtomicUsize::new(0));
         let root = OneShotConfirmProgram {
             novelty_drops: Arc::clone(&novelty_drops),
+            physical: false,
         };
         let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
         let relevant = ChildSet::empty(plan.len()).with_inserted(0);
@@ -7696,6 +7739,74 @@ mod tests {
         assert_eq!(stats.delta_transition_cohorts, 1);
         assert_eq!(stats.max_delta_transition_cohort, 2);
         assert_eq!(stats.delta_transition_dead_pages, 0);
+        assert_eq!(stats.delta_program_physical_cohorts, 0);
+        assert_eq!(stats.delta_program_physical_rows, 0);
+        assert_eq!(stats.delta_program_physical_granted_work, 0);
+        assert_eq!(stats.max_delta_program_physical_cohort, 0);
+        assert_eq!(stats.max_delta_program_physical_granted_work, 0);
+    }
+
+    #[test]
+    fn physical_program_placement_stats_count_exact_cohort_geometry() {
+        let novelty_drops = Arc::new(AtomicUsize::new(0));
+        let root = OneShotConfirmProgram {
+            novelty_drops,
+            physical: true,
+        };
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let relevant = ChildSet::empty(plan.len()).with_inserted(0);
+        let successor = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Candidate {
+                variable: 0,
+                relevant: relevant.clone(),
+                checked: relevant,
+            },
+        };
+        let request = ProgramRequest {
+            action: ProgramAction::Confirm(0),
+            bound: VariableSet::new_empty(),
+        };
+        let spec = root.residual_program().unwrap();
+        let route = spec.route(request).unwrap();
+        let mut scheduler = DeltaScheduler::new();
+        scheduler.activation_width = 2;
+        scheduler
+            .seed_program_confirms(
+                spec,
+                DeltaDesc::leaf(0, 0),
+                request,
+                route,
+                successor,
+                CandidateBatch {
+                    parents: RowBatch {
+                        rows: Vec::new(),
+                        row_count: 2,
+                    },
+                    candidates: CandidatePayload::Tagged(vec![(0, value(7)), (1, value(8))]),
+                },
+            )
+            .expect("both Confirm parents must seed one live Program root");
+
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let outcome = scheduler.step_bounded(
+            &root,
+            &plan,
+            8,
+            None,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+
+        assert_eq!(outcome.completed_activations, 2);
+        assert_eq!(stats.delta_program_physical_cohorts, 1);
+        assert_eq!(stats.delta_program_physical_rows, 2);
+        assert_eq!(stats.delta_program_physical_granted_work, 8);
+        assert_eq!(stats.max_delta_program_physical_cohort, 2);
+        assert_eq!(stats.max_delta_program_physical_granted_work, 8);
     }
 
     #[test]
