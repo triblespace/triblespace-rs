@@ -7,6 +7,7 @@
 //! a query-local typed arena rather than boxes or engine-defined opcodes.
 
 use std::any::{type_name, Any, TypeId};
+use std::collections::hash_map::Entry;
 use std::hash::Hash;
 
 use ahash::AHashMap;
@@ -1056,10 +1057,13 @@ where
             }
         }
 
-        let mut batch_novelty: AHashMap<
-            ProgramActivation,
-            AHashMap<&T::NoveltyKey, Option<RawInline>>,
-        > = AHashMap::new();
+        let mut batch_novelty: AHashMap<(ProgramActivation, &T::NoveltyKey), Option<RawInline>> =
+            AHashMap::new();
+        // The bitmap is a receipt-local transaction plan. Repetitions consult
+        // the batch observation first, so only the first exact key reads the
+        // runtime. Neither map nor handles are mutated until every receipt law
+        // below has validated.
+        let mut child_admitted = Vec::with_capacity(typed.children.len());
         let mut child_physical = Vec::with_capacity(typed.children.len());
         let mut previous = 0u32;
         for (position, child) in typed.children.iter().enumerate() {
@@ -1085,28 +1089,40 @@ where
             }
             child_physical.push((self.dispatch(&child.state), self.pacing(&child.state)));
 
-            if let Some(novelty) = child.novelty.as_ref() {
+            let admitted = if let Some(novelty) = child.novelty.as_ref() {
                 let activation = batch.activations[child.input as usize];
-                if let Some(previous) = runtime
-                    .novelty
-                    .get(&activation)
-                    .and_then(|seen| seen.get(novelty))
-                {
-                    assert_eq!(
-                        *previous, child.accepted,
-                        "one typed novelty key changed its endpoint observation"
-                    );
+                match batch_novelty.entry((activation, novelty)) {
+                    Entry::Occupied(previous) => {
+                        assert_eq!(
+                            *previous.get(),
+                            child.accepted,
+                            "one typed novelty key changed its endpoint observation"
+                        );
+                        false
+                    }
+                    Entry::Vacant(first) => {
+                        let admitted = match runtime
+                            .novelty
+                            .get(&activation)
+                            .and_then(|seen| seen.get(novelty))
+                        {
+                            Some(previous) => {
+                                assert_eq!(
+                                    *previous, child.accepted,
+                                    "one typed novelty key changed its endpoint observation"
+                                );
+                                false
+                            }
+                            None => true,
+                        };
+                        first.insert(child.accepted);
+                        admitted
+                    }
                 }
-                let seen = batch_novelty.entry(activation).or_default();
-                if let Some(previous) = seen.get(novelty) {
-                    assert_eq!(
-                        *previous, child.accepted,
-                        "one typed novelty key changed its endpoint observation"
-                    );
-                } else {
-                    seen.insert(novelty, child.accepted);
-                }
-            }
+            } else {
+                true
+            };
+            child_admitted.push(admitted);
         }
 
         let mut previous = 0u32;
@@ -1201,12 +1217,23 @@ where
                 },
             ));
 
-        for (child, (dispatch, pacing)) in children.into_iter().zip(child_physical) {
+        for ((child, (dispatch, pacing)), admitted) in
+            children.into_iter().zip(child_physical).zip(child_admitted)
+        {
+            if !admitted {
+                continue;
+            }
             let activation = batch.activations[child.input as usize];
             if let Some(novelty) = child.novelty {
-                if !runtime.admit(activation, novelty, child.accepted) {
-                    continue;
-                }
+                let previous = runtime
+                    .novelty
+                    .entry(activation)
+                    .or_default()
+                    .insert(novelty, child.accepted);
+                assert!(
+                    previous.is_none(),
+                    "typed novelty preflight admitted an existing key"
+                );
             }
             let work = ProgramWork {
                 handle: runtime.insert(activation, child.state),
@@ -1517,6 +1544,84 @@ mod tests {
                     Some(step)
                 }
             }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum NoveltyBatchMode {
+        Stable,
+        ExistingConflict,
+        LocalConflict,
+    }
+
+    struct NoveltyBatchProbe {
+        mode: NoveltyBatchMode,
+    }
+
+    impl TypedProgramSpec for NoveltyBatchProbe {
+        type State = NonComparableState;
+        type NoveltyKey = Key;
+        type Rank = u64;
+
+        fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
+            Some(ProgramRoute {
+                key: ProgramKey::new(13),
+                variable: 0,
+                stratum: ProgramStratum::Fixpoint,
+                grouping: ProgramGrouping::PageLocal,
+                completion: ProgramCompletion::PageableOnly,
+            })
+        }
+
+        fn dispatch(&self, _state: &Self::State) -> DispatchClass {
+            DispatchClass::new(13)
+        }
+
+        fn progress(&self, state: &Self::State) -> Self::Rank {
+            state.exact_cursor as u64
+        }
+
+        fn seed_typed(
+            &self,
+            _batch: ProgramSeedBatch<'_>,
+            effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+        ) {
+            effects.fixpoint_root(0, NonComparableState { exact_cursor: 10 }, Key(1), None);
+        }
+
+        fn step_typed(
+            &self,
+            _states: Vec<Self::State>,
+            _batch: TypedProgramBatch<'_>,
+            effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+        ) {
+            let existing_endpoint =
+                matches!(self.mode, NoveltyBatchMode::ExistingConflict).then(RawInline::default);
+            let duplicate_endpoint = if matches!(self.mode, NoveltyBatchMode::LocalConflict) {
+                None
+            } else {
+                Some(RawInline::default())
+            };
+            effects.fixpoint_child(
+                0,
+                NonComparableState { exact_cursor: 11 },
+                Key(1),
+                existing_endpoint,
+            );
+            effects.fixpoint_child(
+                0,
+                NonComparableState { exact_cursor: 12 },
+                Key(2),
+                Some(RawInline::default()),
+            );
+            effects.fixpoint_child(
+                0,
+                NonComparableState { exact_cursor: 13 },
+                Key(2),
+                duplicate_endpoint,
+            );
+            effects.fixpoint_child(0, NonComparableState { exact_cursor: 14 }, Key(3), None);
+            effects.page(4, None);
         }
     }
 
@@ -1934,6 +2039,124 @@ mod tests {
             &mut effects,
         );
         effects
+    }
+
+    fn run_novelty_batch_probe(
+        mode: NoveltyBatchMode,
+    ) -> (
+        std::thread::Result<()>,
+        ProgramRuntime,
+        ProgramBatchEffects,
+        ProgramActivation,
+    ) {
+        let spec = NoveltyBatchProbe { mode };
+        let program = ProgramRef::new(&spec);
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(0),
+            bound: VariableSet::new_empty(),
+        };
+        let route = program.route(request).unwrap();
+        let activation = ProgramActivation(17);
+        let activations = [activation];
+        let view = RowsView::new_with_row_count(&[], &[], 1);
+        let mut runtime = program.new_runtime();
+        let mut seeded = ProgramSeedEffects::default();
+        program.seed_batch(
+            &mut runtime,
+            ProgramSeedBatch {
+                request,
+                route,
+                view,
+                activations: &activations,
+            },
+            &mut seeded,
+        );
+        let work: Vec<_> = seeded.work.into_iter().map(|seed| seed.work).collect();
+        let candidate_sets: [Option<&[RawInline]>; 1] = [None];
+        let mut effects = ProgramBatchEffects::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            program.step_batch(
+                &mut runtime,
+                ProgramBatch {
+                    stratum: route.stratum,
+                    view,
+                    candidate_sets: &candidate_sets,
+                    activations: &activations,
+                    work: &work,
+                    limits: &[4],
+                },
+                &mut effects,
+            );
+        }));
+        (result, runtime, effects, activation)
+    }
+
+    #[test]
+    fn novelty_batch_filters_existing_and_local_duplicates_in_first_admission_order() {
+        let (result, mut runtime, effects, activation) =
+            run_novelty_batch_probe(NoveltyBatchMode::Stable);
+        result.expect("stable novelty observations must commit");
+        assert_eq!(effects.pages.len(), 1);
+        assert_eq!(effects.children.len(), 2);
+        assert_eq!(
+            effects
+                .children
+                .iter()
+                .map(|child| child.accepted)
+                .collect::<Vec<_>>(),
+            [Some(RawInline::default()), None]
+        );
+
+        let typed_runtime = runtime
+            .erased
+            .as_mut()
+            .as_any_mut()
+            .downcast_mut::<TypedProgramRuntime<NonComparableState, Key>>()
+            .unwrap();
+        let cursors = effects
+            .children
+            .iter()
+            .map(|child| {
+                typed_runtime
+                    .take(activation, child.work.handle.clone())
+                    .exact_cursor
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(cursors, [12, 14]);
+        let seen = typed_runtime.novelty.get(&activation).unwrap();
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen.get(&Key(1)), Some(&None));
+        assert_eq!(seen.get(&Key(2)), Some(&Some(RawInline::default())));
+        assert_eq!(seen.get(&Key(3)), Some(&None));
+    }
+
+    #[test]
+    fn novelty_batch_endpoint_conflicts_commit_no_novelty_or_output_prefix() {
+        for mode in [
+            NoveltyBatchMode::ExistingConflict,
+            NoveltyBatchMode::LocalConflict,
+        ] {
+            let (result, mut runtime, effects, activation) = run_novelty_batch_probe(mode);
+            let message = panic_text(result.expect_err("endpoint conflicts must fail closed"));
+            assert!(message.contains("changed its endpoint observation"));
+            assert!(effects.pages.is_empty());
+            assert!(effects.children.is_empty());
+            assert!(effects.direct.is_empty());
+            assert!(effects.accepted.is_empty());
+            assert!(effects.supported.is_empty());
+            assert_eq!(effects.placement, None);
+
+            let typed_runtime = runtime
+                .erased
+                .as_mut()
+                .as_any_mut()
+                .downcast_mut::<TypedProgramRuntime<NonComparableState, Key>>()
+                .unwrap();
+            assert!(typed_runtime.slots.iter().all(|slot| slot.value.is_none()));
+            let seen = typed_runtime.novelty.get(&activation).unwrap();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen.get(&Key(1)), Some(&None));
+        }
     }
 
     #[test]
