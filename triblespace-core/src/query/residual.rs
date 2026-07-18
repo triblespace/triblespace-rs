@@ -96,6 +96,7 @@ use smallvec::SmallVec;
 use super::*;
 
 mod delta;
+mod materialize;
 use delta::{
     ActivationId as DeltaActivationId, ActiveDeltaContinuation, ActiveDeltaStatus, DeltaDesc,
     DeltaScheduler, DeltaSeedOutcome, DeltaStepOutcome, TerminalPublicationBatch,
