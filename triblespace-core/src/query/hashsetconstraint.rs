@@ -85,6 +85,10 @@ where
         }
     }
 
+    fn residual_confirm_is_page_local(&self) -> bool {
+        true
+    }
+
     /// Exact when the variable is bound: checks whether every row's bound
     /// value is a member of the set. Returns `true` optimistically while
     /// the variable is unbound.

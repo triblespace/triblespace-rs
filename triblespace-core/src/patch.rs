@@ -1578,6 +1578,27 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         }
     }
 
+    pub(crate) fn first_infix_range<const PREFIX_LEN: usize, const INFIX_LEN: usize>(
+        &self,
+        prefix: &[u8; PREFIX_LEN],
+        at_depth: usize,
+        min_infix: &[u8; INFIX_LEN],
+        max_infix: &[u8; INFIX_LEN],
+    ) -> Option<[u8; INFIX_LEN]> {
+        match self.body_ref() {
+            BodyRef::Leaf(leaf) => leaf.first_infix_range::<PREFIX_LEN, INFIX_LEN, O>(
+                prefix, at_depth, min_infix, max_infix,
+            ),
+            BodyRef::LocalLeaf(bytes) => {
+                leaf::key_ops::first_infix_range::<KEY_LEN, PREFIX_LEN, INFIX_LEN, O>(
+                    bytes, prefix, at_depth, min_infix, max_infix,
+                )
+            }
+            BodyRef::Branch(branch) => branch
+                .first_infix_range::<PREFIX_LEN, INFIX_LEN>(prefix, at_depth, min_infix, max_infix),
+        }
+    }
+
     pub(crate) fn count_range<const PREFIX_LEN: usize, const INFIX_LEN: usize>(
         &self,
         prefix: &[u8; PREFIX_LEN],
@@ -1672,6 +1693,61 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 leaf::key_ops::segmented_len::<KEY_LEN, PREFIX_LEN, O>(bytes, at_depth, prefix)
             }
             BodyRef::Branch(branch) => branch.segmented_len::<PREFIX_LEN>(at_depth, prefix),
+        }
+    }
+
+    /// Locate the shallowest subtree whose keys all share `prefix`.
+    ///
+    /// Unlike composing [`Self::segmented_len`] with [`Self::infixes`], this
+    /// returns the already-located head so a caller can inspect its cached
+    /// segment count and then enumerate that same subtree without descending
+    /// the fixed prefix a second time.
+    fn locate_prefix<const PREFIX_LEN: usize>(
+        &self,
+        at_depth: usize,
+        prefix: &[u8; PREFIX_LEN],
+    ) -> Option<&Self> {
+        let node_end_depth = self.end_depth();
+        let limit = std::cmp::min(PREFIX_LEN, node_end_depth);
+        if !leaf::key_ops::has_prefix::<KEY_LEN, O>(
+            self.childleaf_key(),
+            at_depth,
+            &prefix[..limit],
+        ) {
+            return None;
+        }
+        if PREFIX_LEN <= node_end_depth {
+            return Some(self);
+        }
+        let BodyRef::Branch(branch) = self.body_ref() else {
+            unreachable!("a leaf always covers the complete key");
+        };
+        branch
+            .child_table
+            .table_get(prefix[node_end_depth])
+            .and_then(|child| child.locate_prefix(node_end_depth, prefix))
+    }
+
+    /// Enumerate a whole infix segment after `prefix` has already been
+    /// matched for every key below this head.
+    fn infixes_from_matched_prefix<const PREFIX_LEN: usize, const INFIX_LEN: usize, F>(
+        &self,
+        for_each: &mut F,
+    ) where
+        F: FnMut(&[u8; INFIX_LEN]),
+    {
+        if PREFIX_LEN + INFIX_LEN <= self.end_depth() {
+            let infix: [u8; INFIX_LEN] =
+                core::array::from_fn(|i| self.childleaf_key()[O::TREE_TO_KEY[PREFIX_LEN + i]]);
+            for_each(&infix);
+            return;
+        }
+
+        let BodyRef::Branch(branch) = self.body_ref() else {
+            unreachable!("a leaf always covers the complete key");
+        };
+        for child in branch.child_table.iter().flatten() {
+            child.infixes_from_matched_prefix::<PREFIX_LEN, INFIX_LEN, F>(for_each);
         }
     }
 
@@ -1981,6 +2057,55 @@ where
     root: Option<Head<KEY_LEN, O, V>>,
 }
 
+/// A prefix-located PATCH infix traversal whose exact cardinality has already
+/// been proved to fit a caller-supplied bound.
+///
+/// The view borrows the located trie head, so [`Self::for_each`] starts at that
+/// same subtree and never repeats the fixed-prefix descent.
+#[must_use = "call for_each to enumerate the bounded infixes"]
+pub struct PATCHBoundedInfixes<
+    'a,
+    const KEY_LEN: usize,
+    const PREFIX_LEN: usize,
+    const INFIX_LEN: usize,
+    O: KeySchema<KEY_LEN>,
+    V,
+> {
+    located: Option<&'a Head<KEY_LEN, O, V>>,
+    count: u64,
+}
+
+impl<
+        'a,
+        const KEY_LEN: usize,
+        const PREFIX_LEN: usize,
+        const INFIX_LEN: usize,
+        O: KeySchema<KEY_LEN>,
+        V,
+    > PATCHBoundedInfixes<'a, KEY_LEN, PREFIX_LEN, INFIX_LEN, O, V>
+{
+    /// Exact number of distinct infixes this view will emit.
+    pub fn len(&self) -> u64 {
+        self.count
+    }
+
+    /// Whether this bounded traversal has no matching infixes.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Enumerate the already-located subtree in the same callback order as
+    /// [`PATCH::infixes`].
+    pub fn for_each<F>(self, mut for_each: F)
+    where
+        F: FnMut(&[u8; INFIX_LEN]),
+    {
+        if let Some(located) = self.located {
+            located.infixes_from_matched_prefix::<PREFIX_LEN, INFIX_LEN, F>(&mut for_each);
+        }
+    }
+}
+
 impl<const KEY_LEN: usize, O, V> Clone for PATCH<KEY_LEN, O, V>
 where
     O: KeySchema<KEY_LEN>,
@@ -2149,6 +2274,67 @@ where
         }
     }
 
+    /// Locate all distinct infixes for `prefix` only when their exact count is
+    /// at most `limit`.
+    ///
+    /// `Some(view)` is an all-or-nothing proof that [`PATCHBoundedInfixes::len`]
+    /// infixes fit the bound; [`PATCHBoundedInfixes::for_each`] then enumerates
+    /// every one from the already-located subtree. `None` means the cached
+    /// segment count exceeded `limit`. A missing prefix is a successful empty
+    /// view.
+    ///
+    /// Locating the view costs `O(prefix depth)`. Visiting it costs
+    /// `O(count)`, where `count <= limit`, so paged callers retain a hard
+    /// geometric work bound while reserving output storage from the exact
+    /// count before enumeration.
+    pub fn bounded_infixes<const PREFIX_LEN: usize, const INFIX_LEN: usize>(
+        &self,
+        prefix: &[u8; PREFIX_LEN],
+        limit: u64,
+    ) -> Option<PATCHBoundedInfixes<'_, KEY_LEN, PREFIX_LEN, INFIX_LEN, O, V>> {
+        const {
+            assert!(PREFIX_LEN + INFIX_LEN <= KEY_LEN);
+        }
+        assert!(
+            O::same_segment_tree(PREFIX_LEN, PREFIX_LEN + INFIX_LEN - 1)
+                && (PREFIX_LEN + INFIX_LEN == KEY_LEN
+                    || !O::same_segment_tree(PREFIX_LEN + INFIX_LEN - 1, PREFIX_LEN + INFIX_LEN)),
+            "INFIX_LEN must cover a whole segment"
+        );
+        const {
+            if PREFIX_LEN > 0 && PREFIX_LEN < KEY_LEN {
+                assert!(
+                    <O as KeySchema<KEY_LEN>>::Segmentation::SEGMENTS
+                        [O::TREE_TO_KEY[PREFIX_LEN - 1]]
+                        != <O as KeySchema<KEY_LEN>>::Segmentation::SEGMENTS
+                            [O::TREE_TO_KEY[PREFIX_LEN]],
+                    "PREFIX_LEN must align to segment boundary",
+                );
+            }
+        }
+
+        let Some(root) = &self.root else {
+            return Some(PATCHBoundedInfixes {
+                located: None,
+                count: 0,
+            });
+        };
+        let Some(located) = root.locate_prefix(0, prefix) else {
+            return Some(PATCHBoundedInfixes {
+                located: None,
+                count: 0,
+            });
+        };
+        let count = located.count_segment(PREFIX_LEN);
+        if count > limit {
+            return None;
+        }
+        Some(PATCHBoundedInfixes {
+            located: Some(located),
+            count,
+        })
+    }
+
     /// Like [`infixes`](Self::infixes) but only yields infixes in the
     /// byte range `[min_infix, max_infix]` (inclusive).
     ///
@@ -2176,6 +2362,65 @@ where
         if let Some(root) = &self.root {
             root.infixes_range(prefix, 0, min_infix, max_infix, &mut for_each);
         }
+    }
+
+    /// Return the lexicographically first distinct infix in the inclusive
+    /// range `[min_infix, max_infix]` for `prefix`.
+    ///
+    /// This performs ordered lower-bound descent through the PATCH trie. It
+    /// does not depend on the physical cuckoo-table order and does not
+    /// materialize or sort the matching infixes.
+    pub fn first_infix_range<const PREFIX_LEN: usize, const INFIX_LEN: usize>(
+        &self,
+        prefix: &[u8; PREFIX_LEN],
+        min_infix: &[u8; INFIX_LEN],
+        max_infix: &[u8; INFIX_LEN],
+    ) -> Option<[u8; INFIX_LEN]> {
+        const {
+            assert!(PREFIX_LEN + INFIX_LEN <= KEY_LEN);
+        }
+        assert!(
+            O::same_segment_tree(PREFIX_LEN, PREFIX_LEN + INFIX_LEN - 1)
+                && (PREFIX_LEN + INFIX_LEN == KEY_LEN
+                    || !O::same_segment_tree(PREFIX_LEN + INFIX_LEN - 1, PREFIX_LEN + INFIX_LEN)),
+            "INFIX_LEN must cover a whole segment"
+        );
+        if min_infix > max_infix {
+            return None;
+        }
+        self.root
+            .as_ref()
+            .and_then(|root| root.first_infix_range(prefix, 0, min_infix, max_infix))
+    }
+
+    /// Return the first distinct infix strictly after `after`, bounded above
+    /// by `max_infix` (inclusive).
+    ///
+    /// The successor is computed in lexicographic byte order and then passed
+    /// to [`Self::first_infix_range`]. `None` is returned when `after` is the
+    /// all-`0xff` value or when no later infix exists.
+    pub fn next_infix_after<const PREFIX_LEN: usize, const INFIX_LEN: usize>(
+        &self,
+        prefix: &[u8; PREFIX_LEN],
+        after: &[u8; INFIX_LEN],
+        max_infix: &[u8; INFIX_LEN],
+    ) -> Option<[u8; INFIX_LEN]> {
+        let mut lower = *after;
+        let mut cursor = INFIX_LEN;
+        loop {
+            if cursor == 0 {
+                return None;
+            }
+            cursor -= 1;
+            if lower[cursor] != u8::MAX {
+                lower[cursor] += 1;
+                for byte in &mut lower[cursor + 1..] {
+                    *byte = u8::MIN;
+                }
+                break;
+            }
+        }
+        self.first_infix_range(prefix, &lower, max_infix)
     }
 
     /// Count entries whose infix falls within [min_infix, max_infix].
@@ -2830,6 +3075,88 @@ mod tests {
         let entry = Entry::new(&[0; KEY_SIZE]);
         tree.insert(&entry);
         tree.insert(&entry);
+    }
+
+    #[test]
+    fn ordered_infix_bounds_include_all_zero_and_all_ff() {
+        let mut tree = PATCH::<4, IdentitySchema, ()>::new();
+        tree.insert(&Entry::new(&[0x00; 4]));
+        tree.insert(&Entry::new(&[0x80, 0x00, 0x00, 0x00]));
+        tree.insert(&Entry::new(&[0xff; 4]));
+
+        assert_eq!(
+            tree.first_infix_range(&[], &[0x00; 4], &[0xff; 4]),
+            Some([0x00; 4]),
+        );
+        assert_eq!(
+            tree.next_infix_after(&[], &[0x00; 4], &[0xff; 4]),
+            Some([0x80, 0x00, 0x00, 0x00]),
+        );
+        assert_eq!(
+            tree.first_infix_range(&[], &[0xff; 4], &[0xff; 4]),
+            Some([0xff; 4]),
+        );
+        assert_eq!(tree.next_infix_after(&[], &[0xff; 4], &[0xff; 4]), None,);
+        assert_eq!(tree.first_infix_range(&[], &[0xff; 4], &[0x00; 4]), None,);
+    }
+
+    #[test]
+    fn ordered_infix_descent_reads_local_leaves() {
+        #[repr(C, align(16))]
+        struct AlignedKey([u8; 16]);
+
+        let storage = std::sync::Arc::new([
+            AlignedKey([0x10; 16]),
+            AlignedKey([0x20; 16]),
+            AlignedKey([0xf0; 16]),
+        ]);
+        let owner: std::sync::Arc<dyn ArchiveOwner> = storage.clone();
+        let mut tree = PATCH::<16, IdentitySchema, ()>::new();
+        for key in storage.iter() {
+            let entry = unsafe { ArchiveEntry::new(NonNull::from(&key.0), &owner) };
+            tree.insert_archive(&entry);
+        }
+
+        assert!(tree.node_stats().3 > 0, "fixture must contain a LocalLeaf");
+        assert_eq!(
+            tree.first_infix_range(&[], &[0x11; 16], &[0xff; 16]),
+            Some([0x20; 16]),
+        );
+        assert_eq!(
+            tree.next_infix_after(&[], &[0x20; 16], &[0xff; 16]),
+            Some([0xf0; 16]),
+        );
+    }
+
+    #[test]
+    fn bounded_infixes_are_atomic_over_archive_local_leaves() {
+        #[repr(C, align(16))]
+        struct AlignedKey([u8; 16]);
+
+        let storage = std::sync::Arc::new([
+            AlignedKey([0x10; 16]),
+            AlignedKey([0x20; 16]),
+            AlignedKey([0xf0; 16]),
+        ]);
+        let owner: std::sync::Arc<dyn ArchiveOwner> = storage.clone();
+        let mut tree = PATCH::<16, IdentitySchema, ()>::new();
+        for key in storage.iter() {
+            let entry = unsafe { ArchiveEntry::new(NonNull::from(&key.0), &owner) };
+            tree.insert_archive(&entry);
+        }
+        assert!(tree.node_stats().3 > 0, "fixture must contain a LocalLeaf");
+
+        assert!(tree.bounded_infixes::<0, 16>(&[], 2).is_none());
+
+        let mut expected = Vec::new();
+        tree.infixes(&[], |value: &[u8; 16]| expected.push(*value));
+        let mut accepted = Vec::new();
+        let bounded = tree
+            .bounded_infixes::<0, 16>(&[], 3)
+            .expect("the exact count fits");
+        assert_eq!(bounded.len(), 3);
+        bounded.for_each(|value: &[u8; 16]| accepted.push(*value));
+        assert_eq!(accepted, expected);
     }
 
     #[test]

@@ -9,13 +9,13 @@ adapt to the values already found instead of being fixed before evaluation.
 
 The current protocol is **block-native**. Its unit of work is not necessarily
 one partial binding, but a block of partial bindings that have the same set of
-bound variables. The ordinary iterator structurally selects between a
-canonical residual-state worklist and the bound-variable-set DAG; the explicit
-[`Query::sequential`](triblespace::core::query::Query::sequential) path speaks
-the same protocol with blocks of one row. This shared interface is the
-important part of the design: a constraint has one implementation whether its
-probes are issued one at a time, fused into a CPU loop, or dispatched to a
-batch-oriented accelerator.
+bound variables. On the semantic full-switch probe, every live serial ordinary
+iterator uses the canonical residual-state worklist. The bound-variable-set
+DAG and [`Query::sequential`](triblespace::core::query::Query::sequential)
+remain explicit controls; the sequential path speaks the same protocol with
+blocks of one row. This shared interface is the important part of the design:
+a constraint has one implementation whether its probes are issued one at a
+time, fused into a CPU loop, or dispatched to a batch-oriented accelerator.
 
 ## Bindings as row blocks
 
@@ -142,11 +142,20 @@ there is no useful frontier to fuse.
 ## Canonical residual-state engine
 
 The residual engine keys a bucket by its **remaining computation**, not merely
-by the bindings or the route that produced it. It recursively flattens the
-maximal associative AND region exposed at the root into deterministic preorder
-leaf occurrences. Union, regular-path, and custom constraints remain opaque
-leaves unless they explicitly expose associative AND structure, so flattening
-never crosses a semantic boundary.
+by the bindings or the route that produced it. Its conservative explicit
+controls recursively flatten the maximal associative AND region exposed at the
+root into deterministic preorder leaf occurrences. Union, regular-path, and
+custom constraints remain opaque leaves unless a capability explicitly exposes
+more structure, so lowering never crosses an undeclared semantic boundary.
+
+Every live ordinary root runs as one finite formula after variable selection.
+Exposed AND/OR progress then becomes canonical formula state, and eligible
+cyclic regular paths run through the delta submachine. Unsupported path
+programs and custom atoms keep using their ordinary opaque `Constraint`
+actions. The `root_formula` capability currently subsumes finite-union exposure
+on this path; the ordinary policy nevertheless names both capabilities
+explicitly so they remain separate composable controls for other residual
+entry points.
 
 Each canonical descriptor includes the bound-variable schema and one of four
 phases:
@@ -173,21 +182,74 @@ occupancy/readiness policy harvests wider batches. This gives the state machine
 the same low-latency-to-throughput ramp as the DAG without requiring a complete
 intersection to run eagerly for one binding.
 
-The ordinary [`Query`](triblespace::core::query::Query) uses this engine only
-after exact seed settlement leaves a live search and the root exposes an AND
-with two flattened opaque leaf occurrences whose nonempty variable sets
-overlap. A shared variable is the cheap structural evidence that sibling
-proposer or confirmer work exists for residual states to canonicalize.
-Zero-variable constants are ignored by the gate; opaque roots, one-leaf ANDs,
-disjoint leaves, and seed-rejected queries retain the lazy DAG. An opaque Union
-or RPQ counts as one leaf, even when it contains its own internal state
-machine. This deliberately conservative selector follows measured evidence:
-forcing residual control states on arbitrary opaque or one-leaf roots can
-regress work and latency without opening a reconvergence opportunity.
+Regular-path product states apply that demand inside a node as well as across
+nodes. Positive, inverse, and negated attribute transitions expose an ordered
+frontier whose cursor is `(automaton branch, last value)`. A width-one pull can
+therefore inspect one distinct destination of a high-degree node, file both its
+affine expansion continuation and any novel child, and descend toward a result
+without first materializing the complete adjacency. Branch-qualified cursors
+keep distinct NFA futures separate even when they produce the same graph value.
+For `!p`, EVA pages distinct forward destinations and VEA pages distinct
+inverse subjects. The destination's attribute suffix then answers `exists a !=
+p`; because the current path algebra excludes one attribute, the exact inner
+test needs at most its first attribute and one strict successor. Destinations
+reachable only through `p` count against demand but produce no child. This
+keeps mixed positive/negated states under one global width without enlarging
+the activation-private cursor or relying on fixpoint deduplication. A
+transition page that produces no novel child, accepted endpoint, or stable
+continuation contributes negative feedback, so a rejected prefix grows from
+one to two to four destinations instead of remaining a width-one serial scan.
+An accepting initial product root is settled one step earlier. Activation
+creation records its endpoint in the same distinct accepted set used by later
+transition witnesses and returns a one-shot seed-effect receipt to the delta
+scheduler. A streaming proposal or fully-bound Boolean Support reducer files
+that receipt into the stable machine immediately, while the root's affine
+traversal credit remains live for non-epsilon paths. Grouped confirmation and
+non-linear formula proposal retain their existing quiescence barriers: seed
+acceptance is private reducer state there, not an illegally streamed result.
+This mechanism is generic to `ResidualDeltaOutput::accepted`, not an RPQ
+branch in the scheduler. It preserves NODES(G) gating, same-variable paths,
+duplicate outer parent bags, and clone/drop remainders. Seed publication
+consumes neither transition width nor a transition-page statistic, and the
+first later expansion cannot replay it. Conversely, an independently dead
+source or transition page still supplies geometric negative feedback even if
+the activation published an earlier seed effect.
+
+Paged product nodes under the same structural transition operator cross one
+block-native cohort seam. The batch carries row-aligned nodes, affine cursors,
+and ragged limits whose sum is the current global width; successors return with
+input-node tags. A constraint may page some rows while leaving other `Start`
+rows to the existing eager block expansion, so one negated fallback does not
+erase bounded positive work. The default lowers the cohort to scalar page
+calls, while storage or accelerator constraints can fuse it without changing
+canonical state or producer-credit semantics.
+
+Final-variable streaming activations use a second physical policy on that same
+seam. A directed hot continuation still advances exactly one activation: its
+source pager receives global search width `S`, while its transition pager
+receives the activation-local sparse quantum `t_a`, capped by `S`. Cold global
+harvesting may instead cohort compatible terminal activations. Source rows
+share one budget `B=S`; transition rows share
+`B=min(S, sum_a t_a)`, with ragged task limits that never spend more than one
+activation's `t_a` on its behalf. The backend call is shared, but feedback is
+not: an activation that publishes resets to one independently of a sibling
+whose live transition miss doubles its own quantum. Source misses leave every
+transition quantum unchanged. A negative transition cohort reaches outer
+search-width growth only after it saturates `S` and leaves terminal work live.
+
+The ordinary [`Query`](triblespace::core::query::Query) uses this engine whenever
+exact seed settlement leaves a live search. Opaque roots, one-leaf ANDs,
+disjoint conjunctions, finite Union roots, RPQ roots, and live zero-variable
+truths therefore all exercise the same residual substrate. A seed-rejected
+query starts no worklist at all. This is a semantic coverage experiment, not a
+claim that residual control overhead pays back for every shape; the explicit
+lazy DAG remains the comparison path.
 
 [`Query::residual_state_scheduler`](triblespace::core::query::Query::residual_state_scheduler)
 forces the residual cursor for any root and remains the completeness and
-comparison control. `solve_residual_state_lazy` exposes its width policy;
+comparison control with conservative opaque-composite lowering.
+`solve_residual_state_lazy` is the same conservative capability control and
+exposes its width policy;
 `solve_residual_state` is the eager saturated form, and
 `solve_residual_state_profiled` reports state, merge, action, and batch
 measurements. Fully drained variants preserve the result multiset, but may

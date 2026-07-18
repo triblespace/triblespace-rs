@@ -1,8 +1,19 @@
 /// Diagnostic wrappers for the query engine used in tests.
 pub mod query {
+    use crate::inline::RawInline;
     use crate::query::CandidateSink;
     use crate::query::Constraint;
     use crate::query::EstimateSink;
+    use crate::query::ProgramRef;
+    use crate::query::ResidualDeltaExpandBatch;
+    use crate::query::ResidualDeltaExpandCursor;
+    use crate::query::ResidualDeltaExpandPage;
+    use crate::query::ResidualDeltaNode;
+    use crate::query::ResidualDeltaOutput;
+    use crate::query::ResidualDeltaSeed;
+    use crate::query::ResidualDeltaSourceBatch;
+    use crate::query::ResidualDeltaSourceCursor;
+    use crate::query::ResidualDeltaSourcePage;
     use crate::query::RowsView;
     use crate::query::VariableId;
     use crate::query::VariableSet;
@@ -67,6 +78,11 @@ pub mod query {
     }
 
     /// Constraint wrapper that overrides cardinality estimates for selected variables.
+    ///
+    /// The wrapper stays structurally opaque so residual formula descent cannot
+    /// bypass its planner input. Optional execution capabilities remain
+    /// transparent because proposal, confirmation, and truth semantics are
+    /// delegated unchanged.
     pub struct EstimateOverrideConstraint<C> {
         /// The underlying constraint whose estimates may be overridden.
         pub constraint: C,
@@ -140,6 +156,122 @@ pub mod query {
 
         fn influence(&self, variable: VariableId) -> VariableSet {
             self.constraint.influence(variable)
+        }
+
+        // EstimateOverrideConstraint changes only the planner's cardinality
+        // input. Keep the wrapper structurally opaque so opening a composite
+        // child cannot bypass that override, but forward every optional
+        // execution capability whose semantics are identical to the delegated
+        // propose/confirm/satisfied verbs above.
+        fn residual_confirm_is_page_local(&self) -> bool {
+            self.constraint.residual_confirm_is_page_local()
+        }
+
+        fn residual_delta_confirm_grouping_requirements(
+            &self,
+            variable: VariableId,
+        ) -> Option<VariableSet> {
+            self.constraint
+                .residual_delta_confirm_grouping_requirements(variable)
+        }
+
+        fn residual_program(&self) -> Option<ProgramRef<'_>> {
+            self.constraint.residual_program()
+        }
+
+        fn residual_delta_source_is_paged(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+        ) -> bool {
+            self.constraint
+                .residual_delta_source_is_paged(variable, view)
+        }
+
+        fn residual_proposal_source_is_paged(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+        ) -> bool {
+            self.constraint
+                .residual_proposal_source_is_paged(variable, view)
+        }
+
+        fn residual_delta_source_page(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: Option<&[RawInline]>,
+            cursor: ResidualDeltaSourceCursor,
+            limit: usize,
+            roots: &mut Vec<ResidualDeltaOutput>,
+            accepted: &mut Vec<RawInline>,
+        ) -> Option<ResidualDeltaSourcePage> {
+            self.constraint.residual_delta_source_page(
+                variable, view, candidates, cursor, limit, roots, accepted,
+            )
+        }
+
+        fn residual_delta_source_pages(
+            &self,
+            variable: VariableId,
+            batch: ResidualDeltaSourceBatch<'_>,
+            pages: &mut Vec<ResidualDeltaSourcePage>,
+            roots: &mut Vec<(u32, ResidualDeltaOutput)>,
+            accepted: &mut Vec<(u32, RawInline)>,
+        ) -> bool {
+            self.constraint
+                .residual_delta_source_pages(variable, batch, pages, roots, accepted)
+        }
+
+        fn residual_delta_seeds(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            seeds: &mut Vec<ResidualDeltaSeed>,
+        ) -> bool {
+            self.constraint.residual_delta_seeds(variable, view, seeds)
+        }
+
+        fn residual_delta_support_seeds(
+            &self,
+            view: &RowsView<'_>,
+            seeds: &mut Vec<ResidualDeltaSeed>,
+        ) -> Option<VariableId> {
+            self.constraint.residual_delta_support_seeds(view, seeds)
+        }
+
+        fn residual_delta_expand_page(
+            &self,
+            variable: VariableId,
+            node: ResidualDeltaNode,
+            cursor: ResidualDeltaExpandCursor,
+            limit: usize,
+            successors: &mut Vec<ResidualDeltaOutput>,
+        ) -> Option<ResidualDeltaExpandPage> {
+            self.constraint
+                .residual_delta_expand_page(variable, node, cursor, limit, successors)
+        }
+
+        fn residual_delta_expand_pages(
+            &self,
+            variable: VariableId,
+            batch: ResidualDeltaExpandBatch<'_>,
+            pages: &mut Vec<Option<ResidualDeltaExpandPage>>,
+            successors: &mut Vec<(u32, ResidualDeltaOutput)>,
+        ) {
+            self.constraint
+                .residual_delta_expand_pages(variable, batch, pages, successors)
+        }
+
+        fn residual_delta_expand(
+            &self,
+            variable: VariableId,
+            nodes: &[ResidualDeltaNode],
+            successors: &mut Vec<(u32, ResidualDeltaOutput)>,
+        ) -> bool {
+            self.constraint
+                .residual_delta_expand(variable, nodes, successors)
         }
     }
 }

@@ -7,8 +7,282 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **External database comparisons no longer burden benchmark builds.**
+  Removed the Oxigraph and OxRDF development dependencies and comparison paths;
+  the retained JSON roundtrip and insertion benchmarks now measure TribleSpace
+  directly without pulling in RocksDB.
+
 ### Added
 
+- **Typed Program cohorts separate physical compatibility from activation
+  identity.** Program buckets now own one pacing-sensitive selection law:
+  Search pages retain LIFO order and may mix physically identical reducer
+  policies, Activation streaming pages preserve append order across all
+  compatible activations, quiescent pages cap distinct activations by the
+  geometric activation width, and terminal pages keep each activation's
+  sparse quantum aligned with its append-ordered task. Dispatch class, bound
+  schema, candidate shape, and terminal feedback class remain exact cohort
+  boundaries while affine activation identity stays row payload.
+- **Residual RPQs now execute through one typed affine program runtime.**
+  Occurrence-local program addresses erase each family once per dense cohort
+  while generational handles retain exact typed continuations, family-owned
+  novelty keys and finite ranks, and receipt-local `AfterChildren` joins.
+  Every RPQ Propose, Confirm, and Support shape—including inverse products,
+  same-variable duplicate bags, nullable graph-gated identities, and cyclic
+  fixpoints—uses this route without legacy transition-hook fallback. Generic
+  Search/Activation pacing keeps physical grants independent of family
+  telemetry; terminal cohorts allocate and advance sparse grants per affine
+  activation, so aggregate or truncated cohorts cannot manufacture widening.
+- **Demand-wide terminal RPQ admissions change execution regime without
+  disturbing live sparse traversals.** When completed-yield evidence admits
+  more than one new terminal parent in a turn, an action-specific Program route
+  certificate lets that fresh suffix run through the family's exact complete
+  proposal executor and publish full rows directly. The semantic certificate
+  is pure in the request and bound schema; the scheduler independently supplies
+  terminality, cohort width, and physical phase evidence. Per-parent receipts
+  are reserved only after the family call succeeds and share the delta
+  activation namespace without owning registry state or producer credit;
+  publication staging and immediate completion preserve exact zero-yield and
+  projected-yield accounting while existing activations remain sparse.
+- **Activation-indexed terminal delta buckets preserve affine cohort order
+  without rescanning mixed work.** Ordinary and formula transition buckets
+  remain contiguous vectors; terminal cohort selection lazily promotes only
+  the buckets that need append-order task slots, per-activation slot runs, and
+  an ordered tail index. Geometric tombstone compaction preserves the original
+  order of selected and retained work without a full scan per wide dispatch.
+- **Completed terminal yield drives exact parent admission.** For each
+  canonical proposer family, the scheduler estimates projected rows per
+  completed parent and admits only the cumulative parent deficit needed to
+  cover `produced + remaining-window` demand. Unseen, zero-yield, and known
+  multi-family workloads keep a one-parent floor until global demand has an
+  explicit cross-family partition; parent suffix slicing and eager seed-tag
+  rebasing preserve exact order and multiplicity without cutoff constants.
+- **Terminal demand learns only from completed projected-yield samples.** Each
+  admitted terminal parent now retains its exact delta activation through
+  direct-publication batching and projection. Per-proposer ledgers distinguish
+  cumulative admissions from live activations, close a sample only after both
+  affine quiescence and every staged projection attempt, and treat a caught
+  projection unwind as consumed but rejected. Exact seed and completion
+  receipts cover immediately quiescent activations; Rayon conservatively keeps
+  an admitted learner in one shard until cross-shard origin transfer exists.
+- **Terminal cyclic work shares physical cohorts without sharing feedback.**
+  Compatible final-variable source activations now use one block call with a
+  shared budget `B=S`. Transition activations use
+  `B=min(S, sum activation_quantum)` and ragged per-task limits whose total for
+  each activation cannot exceed its own sparse quantum. Publication resets and
+  live misses update those quanta independently; source misses never widen
+  them, and directed latency continuations remain exact-activation affine.
+- **All proven terminal activations publish directly.** Terminal rows now
+  bypass canonical Candidate/Ready/Emit states whether the activation is the
+  depth-first lease or globally scheduled cold work. The scheduler still
+  transfers exactly one affine parent per admission in this causal step.
+- **Terminal source search and graph-traversal effort are scheduled separately.**
+  Confirmed result windows may raise stable, nonterminal, and source-search
+  `S`, while a terminal transition activation widens its local examined-work
+  quantum only after a live no-publication dispatch and resets to one after
+  publication. Sub-`S` terminal traversal misses no longer double-charge the
+  outer geometric search width.
+- **Confirmed projected demand floors residual search width.** Exhausting a
+  projected-result window leaves search width unchanged until the caller pulls
+  again; that later pull doubles the result window and raises search `S` to at
+  least the confirmed demand. The floor is cap-bounded and counter-neutral when
+  search is already ahead, while `growth(1)` continues to disable only
+  negative-work growth. Raw emission alone remains outside the search-feedback
+  signal, while exhausting a staged projection suffix without satisfying the
+  public pull grows `S` as negative work without charging projected demand.
+- **Proven direct-terminal delta lanes publish final rows without stable-state
+  churn.** A selected singleton or retained affine lease may turn accepted
+  proposal pages directly into the ordinary projection buffer only when its
+  reducer and return payload already classify it as terminal. The path shares
+  the candidate-commit row builder, preserves source order, bag multiplicity,
+  and independent cyclic credits, and bypasses Candidate planning plus terminal
+  Ready pops. Cold cohorts and nonterminal leases remain unchanged; output does
+  not widen search `S`, and projected demand `q` is still charged only after a
+  successful public projection.
+- **The cross-generation query benchmark can diagnose live prefix costs.**
+  Its opt-in checkpoint mode separates cumulative time-to-N, fresh-query
+  time-to-N, and drop-at-N cancellation cost at 1/10/63/64/65/100/1,000 rows,
+  while preserving exact full-result oracle gates and reporting untimed prefix
+  order evidence plus FULL-residual scheduler snapshots.
+- **A source-identical benchmark compares query-engine generations.**
+  `query_engine_generation_bench` runs finite unions, recursive AND/OR,
+  cyclic regular paths, and mixed formula/path queries against independent
+  relational oracles on both TribleSet and SuccinctArchive. Compile-time
+  terminal adapters select the historical Binding/Vec DFS, today's scalar
+  block-of-one DFS, or the residual state scheduler while keeping fixtures
+  and query expressions byte-identical; the probe reports construction,
+  pull-to-first, geometric prefix, and full-drain throughput separately.
+- **Finite RPQ helper joins enter private seeded residual frames.** Closure-free
+  forward, existential, and same-variable fallback joins now import captured
+  endpoint values as a canonical one-row seed instead of starting a nested
+  `Query` with synthetic constant constraints. Each frame owns its local plan,
+  interner, ranks, and worklist; typed distinct-projection and existence
+  reducers execute it synchronously—distinct projection drains the frame while
+  existence may short-circuit and drop its private remainder—keeping local
+  residual states out of the caller's ordering domain.
+- **A test-only frame scheduler model pins the asynchronous cohosting laws.**
+  Focused executable receipts cover affine queued/in-flight credits,
+  activation-local reducers and cancellation, plan-local readiness, global
+  width sharing, and the ordering boundary between hot, full, frame, and cold
+  underfilled outer work without wiring dynamic frame calls into production.
+- **Estimate-only wrappers preserve native residual execution.**
+  `EstimateOverrideConstraint` remains a structural opaque leaf so its planner
+  cardinality overrides cannot be bypassed, while forwarding exact page-local
+  confirmation, bounded proposal sources, transition programs, and Boolean
+  Support to its inner constraint. `DebugConstraint` remains deliberately
+  opaque because native proposal execution would bypass its observation log.
+- **Built-in constraints gain an executable residual capability matrix.**
+  Constants, equality, inclusive ranges, sorted slices, hash-set and hash-map
+  membership, finite unions, diagnostic wrappers, and repeated projected
+  variables now have exact bag receipts across the scalar oracle,
+  eager DAG, conservative and full residual lowering, fixed width one,
+  geometric growth, and a cloned live remainder. Static capability assertions
+  and runtime counters distinguish native paging/formula execution from the
+  semantically exact opaque fallback.
+- **SuccinctArchive preserves equality for repeated pattern variables.**
+  Triple patterns that reuse one unbound variable across E/V, E/A, A/V, or
+  all three positions now estimate, propose, and confirm through exact Ring
+  membership filters instead of reaching an unreachable distinct-position
+  dispatch. Their strict distinct Ring drivers now page under geometric demand;
+  rejected equality candidates count as examined work and resume after the last
+  examined value. Normalized `UnionArchive` sources deliberately keep these
+  filtered shapes non-paged because their one-head merge requires rejection-free
+  shard pages.
+- **Succinct shard unions page one globally normalized source.** `UnionArchive`
+  now merges one ordered head per shard behind a single activation-local
+  `After(value)` cursor, preserving cross-shard deduplication without
+  materializing complete union arms. Generic `UnionConstraint` remains
+  unchanged, and schemas not admitted by every shard remain non-paged.
+- **Residual source pages dispatch as compatible affine cohorts.** Canonical
+  delta identity remains structural while the scheduler physically partitions
+  source activations by bound-row schema, candidate mode, and cursor family.
+  One block-native hook receives a same-schema row batch with ragged per-parent
+  limits and tagged outputs; its scalar default preserves existing constraints.
+  Page limits share the current global geometric budget instead of multiplying
+  it by cohort size.
+- **Residual transition pages expose one block-native cohort seam.** Live
+  product nodes under the same structural transition operator now pass their
+  activation-private nodes, cursors, and ragged page limits through one tagged
+  batch call. Mixed pageable and eager nodes retain exact fallback, while the
+  sum of page limits remains the scheduler's single geometric width.
+- **RPQ product-state transitions gain bounded affine pages.** Positive and
+  inverse attribute branches now advance by a branch-qualified lexical cursor,
+  so one high-degree automaton node consumes at most the residual scheduler's
+  current geometric demand before its continuation is refiled. Cursor state is
+  activation payload rather than canonical state identity; clones retain the
+  exact remainder, duplicate outer parents remain distinct bags, and accepted
+  endpoints keep their existing per-activation set semantics. Negated-property
+  branches page distinct destinations in EVA/VEA order with the same cursor,
+  then test the destination's attribute suffix for an exact non-excluded
+  witness. Excluded-only destinations consume demand without producing a
+  successor, so mixed positive/negated nodes obey one global width; pages with
+  no novel effect feed the same geometric negative-width ramp as dead source
+  pages.
+- **Accepting transition seeds publish without probing adjacency.** A delta
+  activation now returns its distinct accepting seed endpoints as an immediate
+  scheduler-owned effect receipt while retaining independent traversal
+  credits. Streaming proposals and fully-bound Boolean Support can therefore
+  yield nullable epsilon results before any transition page; grouped confirms
+  and non-linear formula proposals keep the same quiescent reducer barriers.
+  Seed effects consume no transition demand, preserve affine parent bags and
+  NODES(G) scope, and cannot replay during the first later expansion.
+- **Positive path publications retain their live affine traversal.** A cyclic
+  activation entered from a singleton stable continuation keeps its exact
+  physical token across accepted endpoints. The stable tail still runs first,
+  but a traversal that remains live resumes afterward instead of surrendering
+  locality to cold global harvesting. The token never enters canonical state
+  identity, result ordering, or bag ownership, and quiescence releases it
+  without moving scheduler work.
+- **Terminal cyclic publication uses confirmed demand rather than output
+  production.** Search width and projected-result demand are now independent:
+  raw `Emit` no longer widens search, and a `1, 2, 4, ...` result window grows
+  only when the caller pulls after consuming it. Only postprocessor-accepted
+  rows count. A final-variable `StreamProposal` is classified on activation
+  payload, admitted one parent at a time, and dispatched from source and
+  transition buckets through one exact activation. Its local examined-work
+  quantum resets to remaining confirmed demand on publication and doubles
+  toward the separate search width on sparse no-publication steps. Canonical
+  `StateDesc` and `DeltaDesc` identity remain unchanged. This causal probe is
+  bounded but not strongly fair across perpetually productive terminal
+  activations, so it remains an experimental branch rather than an integration
+  candidate until service-credit rotation is supplied.
+- **Ordered proposal sources can page direct candidate occurrences.** The
+  residual source cursor now distinguishes raw-value and native-ordinal
+  frontiers while preserving proposal order and multiplicity. Sorted slices
+  page their immutable native sequence by offset; standalone full-width and ID
+  PATCH constraints page strict lexical keys; and TribleSet patterns page all
+  twelve single-position E/A/V schemas plus bounded entity, attribute, and
+  value ranges through PATCH cursors. SuccinctArchive patterns page the same
+  twelve schemas by ordered-universe, distinct-pair, and fixed-pair wavelet
+  cursors, while Succinct value ranges seek directly into their bounded V-axis
+  domain. TribleSet patterns with one variable repeated across E/V, E/A, A/V,
+  or all three positions now page a strict ordered driver under the same
+  examined-candidate budget and apply the remaining equality as an exact
+  secondary filter; SuccinctArchive and shard-union repeated shapes retain
+  their eager fallback.
+- **Formula Support gains composed affine parity receipts.** End-to-end RPQ
+  tests now pin duplicate-parent bag multiplicity, nested AND/OR arm-order
+  invariance, monotone graph growth, live clone and Rayon worker parity, and
+  the parent-atomic barrier before page-local candidate confirmation.
+- **Fully-bound constraints can expose transition-backed support seeds.** The
+  hidden constraint protocol now exposes one structural expansion route for a
+  block of fully-bound boolean checks.
+  Regular paths reuse their forward Thompson program with the bound target as
+  an activation-private acceptance anchor, including exact NODES(G) scope for
+  nullable epsilon witnesses, without enumerating the graph-term universe.
+  Lowered formula guards reduce those roots per affine parent: the first
+  accepted endpoint publishes `true` exactly once, while only producer
+  quiescence publishes `false`; witnesses never enter a candidate stream.
+- **Residual shadow observation preserves native cyclic execution.** Direct
+  and observed iterators now instantiate one statically dispatched mixed
+  stable/delta pull and Rayon split loop, so source paging, fixpoint
+  quiescence, geometric handoffs, continuations, statistics, and exact affine
+  remainders cannot diverge behind the observer. Delta actions are observed
+  once at their native seed boundary; later canonical expansion cohorts remain
+  unattributed because they may combine activations from several action sites.
+- **Cyclic RPQ actions now execute inside lowered finite formulas.** Direct
+  path atoms under OR and OR-to-AND arms share the residual delta fixpoint for
+  both proposal and grouped confirmation while retaining an exact affine
+  formula continuation per parent. Formula proposals remain private until
+  quiescence, empty root sets resume as empty branch results, and structural
+  delta buckets may merge expansion work across distinct formula return masks.
+- **Cyclic same-variable RPQs gain bounded ordered source frontiers.**
+  The residual scheduler now pages NODES/FIRST sources at its geometric demand
+  width, suspends each cursor until every product-state lineage from the page
+  retires, and widens on pages that file no stable effect. Source cursors and
+  exact stable or formula returns remain activation payload rather than
+  canonical state identity, so equivalent expansion work still merges across
+  parents. Grouped confirmation ranges only over the distinct values in its
+  immutable candidate sequence, then restores original order and multiplicity
+  after the complete fixpoint quiesces.
+- **PATCH gains ordered infix lower-bound and successor descent.**
+  `first_infix_range` returns the first distinct infix in an inclusive range,
+  and `next_infix_after` advances a strict bounded cursor without materializing
+  matches or depending on cuckoo-table order. Both follow compressed trie paths
+  directly and support heap and archive-backed leaves.
+- **PATCH can retain one cardinality-bounded infix traversal.**
+  `bounded_infixes` locates a prefix once and returns an opaque borrowed view
+  only when the cached distinct-segment count fits the caller's limit. The view
+  exposes its exact count for reservation and enumerates from that same trie
+  head in ordinary `infixes` order; missing prefixes are successful empty
+  views, while over-limit prefixes expose no partial traversal. RPQ transition
+  cohorts use these retained views to prove every fresh positive branch fits
+  the geometric page budget before emitting, eliminating the former count
+  descent followed by a second enumeration descent.
+- **Residual lowering has six canonical, scheduler-independent forms.**
+  `ResidualLowering` crosses the `FormulaScope` chain (`OpaqueLeaves`,
+  `UnionLeaves`, `WholeRoot`) with one independent `transition_programs` axis;
+  whole-root lowering structurally absorbs union-leaf lowering. Scheduler
+  setters no longer rewrite lowering, and `Query::residual_lowering` selects it
+  independently. Whole-root scope keeps variable selection and the commit
+  barrier outside a canonical AND/OR program, flattens only the maximal exposed
+  root conjunction, and preserves opaque scope and group-reducer boundaries.
+  Root-AND confirmations retain candidate-occurrence paging once the exact
+  remaining suffix is page-local, including width-one and geometric
+  first-result traces. Ordinary live queries use `ResidualLowering::FULL`;
+  explicit residual probe solvers remain conservative by default.
 - **WGPU Succinct confirmation can opt into exact residual-action executor
   samples.** `WgpuSuccinctArchive::observe_residual_actions()` returns a
   borrowing, non-`Deref` `ObservedWgpuSuccinctArchive` whose pattern route
@@ -168,6 +442,100 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Residual formula continuations use compact persistent arena records.**
+  Canonical state descriptors now carry a four-byte query-local program-counter
+  ID. Each arena record names its exact parent return edge and outer WCO resume
+  by interned ID, so child selection, completion, resume, state hashing, and
+  rank lookup no longer clone or walk a boxed return stack. Compiler-derived
+  grades remain exact under adaptive child order, OR guard reconvergence,
+  delta suspension, query cloning, and independent Rayon shard execution.
+- **One-parent residual candidate payloads stay tagless.** Ordinary and lowered
+  formula actions now receive the scalar `Values` candidate sink whenever one
+  affine parent is live, while reconverged multi-parent work promotes to the
+  existing tagged COO representation. Splits, partitions, compaction, and
+  delta handoffs normalize back to values at singleton boundaries without
+  changing candidate order, multiplicity, OR deduplication, or canonical state
+  identity.
+- **Residual formula payloads retain only their required ordering.** Candidate
+  actions and confirmation handoffs now trust the protocol's ascending-parent
+  grouping instead of value-sorting every leaf result. OR accumulators still
+  sort after combining sibling arms, so their completion boundary can
+  deduplicate exactly without sorting the already-normalized output again.
+- **Residual state interning stores each canonical descriptor once.** An
+  insertion-ordered, AHash-backed index set now supplies both exact descriptor
+  identity and deterministic `StateId` lookup without a mirrored map and
+  vector.
+- **Canonical residual child sets keep one bitset word inline.** State
+  descriptor cloning and interning avoid heap allocation for the common
+  at-most-64-leaf formula while wider formulas transparently spill, preserving
+  exact identity, hashing, canonical remerging, and geometric scheduling.
+- **Singleton continuation-selected cyclic seeds retain physical focus.** The
+  residual scheduler follows the activation-local source/transition lineage it
+  just seeded until its first stable effect or quiescence; canonical delta
+  identity and affine work ownership remain unchanged.
+- **Whole-root lowering erases formula identity shells.** An opaque non-union
+  atom, including one wrapped only in unary exposed AND nodes, now enters the
+  flat residual action plan even when `FormulaScope::WholeRoot` is selected.
+  Multi-child conjunctions, unions, and scoped atomic boundaries retain the
+  finite formula machine. Native transition programs therefore publish
+  directly for a pure regular-path query instead of routing every accepted
+  page through an administrative formula payload and program counter.
+- **RPQ transition programs quotient equivalent residual kernels.** After
+  epsilon elimination, deterministic forward-bisimulation refinement merges
+  program counters with the same accepting bit and ordered labeled future.
+  Remapping retains the first occurrence of each distinct transition and drops
+  only copies that would recreate an identical product node already rejected
+  by activation novelty. Syntactic Thompson branches therefore no longer make
+  repeated unions traverse the same graph state once per equivalent counter;
+  regular-path set semantics and first-discovery order remain unchanged.
+- **Grouped transition confirmation is a predicate of canonical bound state.**
+  The former solve-wide Boolean capability is replaced by per-variable bound
+  prerequisites compiled into the residual plan. Candidate pages remain
+  independent while those prerequisites are absent and become parent-atomic
+  exactly when the state binds them. Repeated distinct-endpoint RPQs therefore
+  use page-local first-step confirmation while the opposite endpoint is free,
+  then retain their complete ordered candidate group when that endpoint is
+  bound and a real transition reducer can run; repeated same-endpoint paths
+  remain grouped unconditionally. This restores geometric descent through a
+  mixed finite-formula/path query without weakening quiescent fixpoint filters.
+- **Finite residual formulas avoid materializing administrative row copies.**
+  Uniform child selections now retain their complete affine batch, and mixed
+  selections partition on compact child ordinals before constructing canonical
+  continuation states. Quiescent formulas eagerly consume finite direct
+  proposal sources instead of registering paged affine activations; a distinct
+  structural capability keeps product-state root sources and heterogeneous
+  formula/path frontiers on the bounded transition substrate. Exact arm-local
+  bags and the normalization barrier remain unchanged.
+- **Delta scheduling retains native successor ranges and unordered registries.**
+  Transition cohorts now pass their contiguous tagged output slices directly
+  into activation replacement, allocating per-task successor vectors only for
+  constraints that use the legacy eager fallback. Internal interner, credit,
+  activation, novelty, and acceptance maps use fast unordered storage wherever
+  iteration order is semantically invisible, while cohort selection retains
+  its canonical ordering. Complete positive-transition batches reserve their
+  cached fanout before the bulk PATCH expansion kernel.
+- **Each delta activation owns one authoritative live-credit ledger.**
+  Activation-local `nonce -> kind` entries now prove traversal or generator
+  authority, replay safety, and quiescence directly. The redundant global
+  owner table and accumulated retired-nonce set are gone; retiring a producer
+  removes its sole live entry, so bookkeeping memory follows the active
+  frontier rather than every transition visited before fixpoint completion.
+  Registry brands and globally monotone nonces still seal credits across
+  registries, and deep clones rebuild exact affine handles from the live map.
+- **Residual RPQ scheduling separates fixpoint depth from parent breadth.**
+  Transition work that can publish endpoints immediately still batches across
+  activations. Quiescent formula, support, and grouped-confirm reducers instead
+  spend the ordinary geometric row budget within a bounded activation cohort;
+  that cohort grows independently after visible or terminal progress. Exact
+  transition-cohort handoffs remain hot as one appended stable tail, while
+  storage-oriented source-page batches retain the one-row latency probe.
+  Fully checked candidates that bind the final variable also keep their exact
+  output tail hot, so terminal rows are not stranded behind the cyclic
+  readiness barrier. Positive
+  transition cohorts whose complete fanouts fit their page limits now use
+  cached PATCH segment counts and the existing bulk expansion kernel, avoiding
+  per-successor trie descent and per-row scratch allocation without changing
+  resumable lexical pages.
 - **Residual action dispatch now preserves an affine executor task.** Eager and
   lazy residual execution both carry the selected interner state, canonical
   descriptor, and owned row/candidate payload through one internal dispatch
@@ -259,7 +627,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   least one variable. Nested ANDs flatten; zero-variable constants do not
   count; and opaque roots, one-leaf conjunctions, disjoint conjunctions, and
   queries rejected by exact seed settlement retain the lazy DAG. Union,
-  regular-path, and custom opaque wrappers remain single leaf
+  regular-path, and custom opaque wrappers remain single selector
   boundaries. This conservative selector avoids residual control-state cost
   where there is no sibling proposer/confirm work to canonicalize, while
   `residual_state_scheduler`, `lazy_dag_scheduler`, and `sequential` remain

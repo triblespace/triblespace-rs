@@ -32,11 +32,50 @@ use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::query::{
-    CandidateSink, Constraint, EstimateSink, RowsView, Variable, VariableId, VariableSet,
+    CandidateSink, Constraint, EstimateSink, ResidualDeltaOutput, ResidualDeltaSourceCursor,
+    ResidualDeltaSourcePage, RowsView, Variable, VariableId, VariableSet,
 };
 
 use crate::bm25::BM25Index;
 use crate::schemas::Embedding;
+
+/// Page one immutable, already-computed candidate sequence without changing
+/// its native order or occurrence multiplicity.
+///
+/// `Offset` is intentional: BM25 aggregation order and HNSW result order are
+/// implementation-owned and need not agree with raw-inline lexicographic
+/// order. The owning constraint never mutates the sequence after construction.
+fn cached_candidate_page(
+    entries: &[RawInline],
+    cursor: ResidualDeltaSourceCursor,
+    limit: usize,
+    accepted: &mut Vec<RawInline>,
+) -> ResidualDeltaSourcePage {
+    assert!(limit > 0, "residual source pages require positive demand");
+    let begin = match cursor {
+        ResidualDeltaSourceCursor::Start => 0,
+        ResidualDeltaSourceCursor::Offset(index) => {
+            usize::try_from(index).expect("cached search source cursor exceeds usize")
+        }
+        ResidualDeltaSourceCursor::After(_) => {
+            panic!("cached search source received a raw-value cursor")
+        }
+    };
+    assert!(
+        begin <= entries.len(),
+        "cached search source cursor exceeds the immutable frontier"
+    );
+    let end = begin.saturating_add(limit).min(entries.len());
+    accepted.extend_from_slice(&entries[begin..end]);
+    ResidualDeltaSourcePage {
+        next: (end < entries.len()).then(|| {
+            ResidualDeltaSourceCursor::Offset(
+                u64::try_from(end).expect("cached search source offset exceeds u64"),
+            )
+        }),
+        examined: end - begin,
+    }
+}
 
 /// Minimum surface a BM25 index must expose for the
 /// [`BM25Filter`] constraint to work against it. Implemented
@@ -362,6 +401,35 @@ where
         }
         let valid: HashSet<RawInline> = self.entries.iter().copied().collect();
         candidates.retain(|_, raw| valid.contains(raw));
+    }
+
+    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
+        variable == self.doc.index && view.col(variable).is_none()
+    }
+
+    fn residual_delta_source_page(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: Option<&[RawInline]>,
+        cursor: ResidualDeltaSourceCursor,
+        limit: usize,
+        _roots: &mut Vec<ResidualDeltaOutput>,
+        accepted: &mut Vec<RawInline>,
+    ) -> Option<ResidualDeltaSourcePage> {
+        if variable != self.doc.index
+            || view.len() != 1
+            || view.col(variable).is_some()
+            || candidates.is_some()
+        {
+            return None;
+        }
+        Some(cached_candidate_page(
+            &self.entries,
+            cursor,
+            limit,
+            accepted,
+        ))
     }
 
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
@@ -757,6 +825,35 @@ impl<'a> Constraint<'a> for SimilarTo {
         candidates.retain(|_, raw| allowed.contains(raw));
     }
 
+    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
+        variable == self.var.index && view.col(variable).is_none()
+    }
+
+    fn residual_delta_source_page(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: Option<&[RawInline]>,
+        cursor: ResidualDeltaSourceCursor,
+        limit: usize,
+        _roots: &mut Vec<ResidualDeltaOutput>,
+        accepted: &mut Vec<RawInline>,
+    ) -> Option<ResidualDeltaSourcePage> {
+        if variable != self.var.index
+            || view.len() != 1
+            || view.col(variable).is_some()
+            || candidates.is_some()
+        {
+            return None;
+        }
+        Some(cached_candidate_page(
+            &self.candidates,
+            cursor,
+            limit,
+            accepted,
+        ))
+    }
+
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match view.col(self.var.index) {
             Some(col) => view
@@ -775,7 +872,9 @@ mod tests {
     use triblespace_core::blob::MemoryBlobStore;
     use triblespace_core::id::Id;
     use triblespace_core::inline::{InlineEncoding, IntoInline};
-    use triblespace_core::query::Candidates;
+    use triblespace_core::query::hashsetconstraint::SetConstraint;
+    use triblespace_core::query::residual::ResidualLowering;
+    use triblespace_core::query::{Binding, Candidates, Query};
     use triblespace_core::repo::BlobStore;
 
     fn id(byte: u8) -> Id {
@@ -801,6 +900,18 @@ mod tests {
     /// `Id` → `GenId`-schema RawInline test helper.
     fn id_to_raw_value(id: Id) -> RawInline {
         GenId::inline_from(id).raw
+    }
+
+    fn project_first(binding: &Binding) -> Option<RawInline> {
+        binding.get(0).copied()
+    }
+
+    fn project_pair(binding: &Binding) -> Option<(RawInline, RawInline)> {
+        Some((*binding.get(0)?, *binding.get(1)?))
+    }
+
+    fn embedding_raw(byte: u8) -> RawInline {
+        Inline::<Handle<Embedding>>::new([byte; 32]).raw
     }
 
     fn sample_index() -> BM25Index {
@@ -1110,6 +1221,152 @@ mod tests {
         assert!(props.is_empty());
     }
 
+    #[test]
+    fn bm25_cached_candidates_page_exactly_across_affine_parents() {
+        let parent = Variable::<GenId>::new(0);
+        let doc = Variable::<GenId>::new(1);
+        // The repeated doc is deliberate: `from_entries` is public, and the
+        // direct-source contract must preserve proposal occurrences even
+        // though confirmation membership is set-like.
+        let entries = [
+            id_to_raw_value(id(3)),
+            id_to_raw_value(id(1)),
+            id_to_raw_value(id(1)),
+            id_to_raw_value(id(2)),
+        ];
+        let constraint = BM25Filter::from_entries(doc, entries);
+        assert!(constraint.residual_proposal_source_is_paged(doc.index, &RowsView::EMPTY));
+
+        let mut roots = Vec::new();
+        let mut direct = Vec::new();
+        let first = constraint
+            .residual_delta_source_page(
+                doc.index,
+                &RowsView::EMPTY,
+                None,
+                ResidualDeltaSourceCursor::Start,
+                2,
+                &mut roots,
+                &mut direct,
+            )
+            .expect("a cached BM25 answer is an immutable ordinal frontier");
+        assert!(roots.is_empty());
+        assert_eq!(direct, entries[..2]);
+        assert_eq!(first.examined, 2);
+        assert_eq!(first.next, Some(ResidualDeltaSourceCursor::Offset(2)));
+
+        direct.clear();
+        let second = constraint
+            .residual_delta_source_page(
+                doc.index,
+                &RowsView::EMPTY,
+                None,
+                first.next.unwrap(),
+                2,
+                &mut roots,
+                &mut direct,
+            )
+            .expect("the cursor resumes in cached aggregation order");
+        assert_eq!(direct, entries[2..]);
+        assert_eq!(second.examined, 2);
+        assert_eq!(second.next, None);
+
+        let parents: HashSet<Id> = [id(10), id(11)].into_iter().collect();
+        let parent_rows = [id_to_raw_value(id(10)), id_to_raw_value(id(11))];
+        let mut eager: Candidates = Vec::new();
+        constraint.propose(
+            doc.index,
+            &RowsView::new(&[parent.index], &parent_rows),
+            &mut CandidateSink::Tagged(&mut eager),
+        );
+        let mut eager_pairs: Vec<_> = eager
+            .iter()
+            .map(|&(row, value)| (parent_rows[row as usize], value))
+            .collect();
+
+        let make = || {
+            triblespace_core::and!(
+                SetConstraint::new(parent, &parents),
+                BM25Filter::from_entries(doc, entries),
+            )
+        };
+        let mut sequential: Vec<_> = Query::new(make(), project_pair).sequential().collect();
+        let mut residual = Query::new(make(), project_pair)
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .cap(1)
+            .start_width(1);
+        let mut full: Vec<_> = residual.by_ref().collect();
+        eager_pairs.sort_unstable();
+        sequential.sort_unstable();
+        full.sort_unstable();
+        assert_eq!(full, sequential);
+        assert_eq!(full, eager_pairs);
+        assert_eq!(full.len(), parents.len() * entries.len());
+        for parent_value in parent_rows {
+            assert_eq!(
+                full.iter()
+                    .filter(|(p, d)| *p == parent_value && *d == entries[1])
+                    .count(),
+                2,
+                "each affine parent retains both repeated doc occurrences",
+            );
+        }
+        assert_eq!(
+            residual.stats().delta_source_pages,
+            parents.len() * entries.len()
+        );
+        assert_eq!(
+            residual.stats().delta_source_candidates_examined,
+            parents.len() * entries.len()
+        );
+        assert_eq!(
+            residual.stats().delta_source_direct_candidates,
+            parents.len() * entries.len()
+        );
+        assert_eq!(residual.stats().delta_source_roots, 0);
+
+        let mut first_only = Query::new(
+            BM25Filter::from_entries(Variable::<GenId>::new(0), entries),
+            project_first,
+        )
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .cap(1)
+        .start_width(1);
+        assert_eq!(first_only.next(), Some(entries[0]));
+        assert_eq!(first_only.stats().delta_source_pages, 1);
+        assert_eq!(first_only.stats().delta_source_candidates_examined, 1);
+        assert_eq!(first_only.stats().delta_source_direct_candidates, 1);
+        drop(first_only);
+
+        let base = entries[..3].to_vec();
+        let mut before: Vec<_> = Query::new(
+            BM25Filter::from_entries(Variable::<GenId>::new(0), base),
+            project_first,
+        )
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .cap(1)
+        .start_width(1)
+        .collect();
+        let mut after: Vec<_> = Query::new(
+            BM25Filter::from_entries(Variable::<GenId>::new(0), entries),
+            project_first,
+        )
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .cap(1)
+        .start_width(1)
+        .collect();
+        before.sort_unstable();
+        after.sort_unstable();
+        for old in before {
+            let position = after
+                .iter()
+                .position(|candidate| *candidate == old)
+                .expect("growing an immutable candidate snapshot removed an occurrence");
+            after.remove(position);
+        }
+        assert_eq!(after, [entries[3]]);
+    }
+
     // ── Similar (binary-relation similarity) ──────────────────
 
     /// Build a 3-doc corpus where doc 1 = [1,0,0], doc 2 = [0,1,0],
@@ -1141,6 +1398,149 @@ mod tests {
             hnsw.insert(handles[i], v.clone()).unwrap();
         }
         (flat.build(), hnsw.build_naive(), store, handles)
+    }
+
+    #[test]
+    fn binary_similarity_restart_only_backends_do_not_claim_a_paged_source() {
+        let (flat, hnsw, mut store, handles) = sample_sim();
+        let reader = store.reader().unwrap();
+        let a = Variable::<Handle<Embedding>>::new(0);
+        let b = Variable::<Handle<Embedding>>::new(1);
+        let vars = [a.index];
+        let row = [handles[0].raw];
+        let bound_pivot = RowsView::new(&vars, &row);
+
+        let flat_view = flat.attach(&reader);
+        let flat_constraint = flat_view.similar(a, b, 0.8);
+        assert!(
+            !flat_constraint.residual_proposal_source_is_paged(b.index, &bound_pivot),
+            "flat search currently has no failure-atomic resumable page API",
+        );
+
+        let hnsw_view = hnsw.attach(&reader);
+        let hnsw_constraint = hnsw_view.similar(a, b, 0.8);
+        assert!(
+            !hnsw_constraint.residual_proposal_source_is_paged(b.index, &bound_pivot),
+            "naive HNSW exposes only a completed search Vec, not its heap/visited continuation",
+        );
+
+        #[cfg(feature = "succinct")]
+        {
+            let succinct = crate::succinct::SuccinctHNSWIndex::from_naive(&hnsw).unwrap();
+            let succinct_view = succinct.attach(&reader);
+            let succinct_constraint = succinct_view.similar(a, b, 0.8);
+            assert!(
+                !succinct_constraint.residual_proposal_source_is_paged(b.index, &bound_pivot),
+                "succinct HNSW also exposes only a completed search Vec",
+            );
+        }
+    }
+
+    #[test]
+    fn similar_to_cached_candidates_preserve_order_multiplicity_and_affinity() {
+        let parent = Variable::<GenId>::new(0);
+        let neighbour = Variable::<Handle<Embedding>>::new(1);
+        let candidates = vec![
+            embedding_raw(3),
+            embedding_raw(1),
+            embedding_raw(1),
+            embedding_raw(2),
+        ];
+        let constraint = SimilarTo::from_candidates(neighbour, candidates.clone());
+        assert!(constraint.residual_proposal_source_is_paged(neighbour.index, &RowsView::EMPTY));
+
+        let mut roots = Vec::new();
+        let mut direct = Vec::new();
+        let first = constraint
+            .residual_delta_source_page(
+                neighbour.index,
+                &RowsView::EMPTY,
+                None,
+                ResidualDeltaSourceCursor::Start,
+                1,
+                &mut roots,
+                &mut direct,
+            )
+            .expect("a cached similarity answer is an immutable ordinal frontier");
+        assert!(roots.is_empty());
+        assert_eq!(direct, candidates[..1]);
+        assert_eq!(first.examined, 1);
+        assert_eq!(first.next, Some(ResidualDeltaSourceCursor::Offset(1)));
+
+        direct.clear();
+        let rest = constraint
+            .residual_delta_source_page(
+                neighbour.index,
+                &RowsView::EMPTY,
+                None,
+                first.next.unwrap(),
+                candidates.len(),
+                &mut roots,
+                &mut direct,
+            )
+            .expect("the cursor resumes in the cached HNSW/flat result order");
+        assert_eq!(direct, candidates[1..]);
+        assert_eq!(rest.examined, candidates.len() - 1);
+        assert_eq!(rest.next, None);
+
+        let parents: HashSet<Id> = [id(10), id(11)].into_iter().collect();
+        let parent_rows = [id_to_raw_value(id(10)), id_to_raw_value(id(11))];
+        let mut eager: Candidates = Vec::new();
+        constraint.propose(
+            neighbour.index,
+            &RowsView::new(&[parent.index], &parent_rows),
+            &mut CandidateSink::Tagged(&mut eager),
+        );
+        let mut eager_pairs: Vec<_> = eager
+            .iter()
+            .map(|&(row, value)| (parent_rows[row as usize], value))
+            .collect();
+
+        let make = || {
+            triblespace_core::and!(
+                SetConstraint::new(parent, &parents),
+                SimilarTo::from_candidates(neighbour, candidates.clone()),
+            )
+        };
+        let mut sequential: Vec<_> = Query::new(make(), project_pair).sequential().collect();
+        let mut residual = Query::new(make(), project_pair)
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .cap(1)
+            .start_width(1);
+        let mut full: Vec<_> = residual.by_ref().collect();
+        eager_pairs.sort_unstable();
+        sequential.sort_unstable();
+        full.sort_unstable();
+        assert_eq!(full, sequential);
+        assert_eq!(full, eager_pairs);
+        assert_eq!(full.len(), parents.len() * candidates.len());
+        for parent_value in parent_rows {
+            assert_eq!(
+                full.iter()
+                    .filter(|(p, candidate)| { *p == parent_value && *candidate == candidates[1] })
+                    .count(),
+                2,
+                "each affine parent retains both repeated handle occurrences",
+            );
+        }
+        assert_eq!(
+            residual.stats().delta_source_direct_candidates,
+            parents.len() * candidates.len()
+        );
+        assert_eq!(residual.stats().delta_source_roots, 0);
+
+        let mut first_only = Query::new(
+            SimilarTo::from_candidates(Variable::<Handle<Embedding>>::new(0), candidates.clone()),
+            project_first,
+        )
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .cap(1)
+        .start_width(1);
+        assert_eq!(first_only.next(), Some(candidates[0]));
+        assert_eq!(first_only.stats().delta_source_pages, 1);
+        assert_eq!(first_only.stats().delta_source_candidates_examined, 1);
+        assert_eq!(first_only.stats().delta_source_direct_candidates, 1);
+        drop(first_only);
     }
 
     #[test]

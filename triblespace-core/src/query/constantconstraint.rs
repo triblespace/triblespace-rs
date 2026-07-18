@@ -69,6 +69,10 @@ impl<'a> Constraint<'a> for ConstantConstraint {
         }
     }
 
+    fn residual_confirm_is_page_local(&self) -> bool {
+        true
+    }
+
     /// Returns `false` when any row binds the variable to another value.
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match view.col(self.variable) {

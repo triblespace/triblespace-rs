@@ -96,6 +96,10 @@ where
         }
     }
 
+    fn residual_confirm_is_page_local(&self) -> bool {
+        true
+    }
+
     /// Exact when the variable is bound: checks whether every row's bound
     /// value is a key of the map. Returns `true` optimistically while the
     /// variable is unbound.

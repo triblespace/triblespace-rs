@@ -90,6 +90,10 @@ impl<'c> Constraint<'c> for EqualityConstraint {
         candidates.retain(|row, v| *v == view.row(row as usize)[col]);
     }
 
+    fn residual_confirm_is_page_local(&self) -> bool {
+        true
+    }
+
     /// Returns `false` when any row binds the pair to different values.
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match (view.col(self.a), view.col(self.b)) {

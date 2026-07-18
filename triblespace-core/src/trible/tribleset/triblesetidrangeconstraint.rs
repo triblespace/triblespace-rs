@@ -4,14 +4,21 @@ use crate::id::Id;
 use crate::id::RawId;
 use crate::id::ID_LEN;
 use crate::inline::encodings::genid::GenId;
+use crate::inline::RawInline;
 use crate::query::CandidateSink;
 use crate::query::Constraint;
 use crate::query::EstimateSink;
+use crate::query::ResidualDeltaOutput;
+use crate::query::ResidualDeltaSourceCursor;
+use crate::query::ResidualDeltaSourcePage;
 use crate::query::RowsView;
 use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
 use crate::trible::TribleSet;
+
+use super::triblesetconstraint::direct_source_page;
+use super::triblesetconstraint::next_id_source_in_range;
 
 /// An entity-range-aware constraint that uses the TribleSet's EAV index
 /// to propose only entity IDs in a byte-lexicographic range.
@@ -98,6 +105,36 @@ impl<'a> Constraint<'a> for EntityRangeConstraint {
                 id >= self.min && id <= self.max
             });
         }
+    }
+
+    fn residual_confirm_is_page_local(&self) -> bool {
+        true
+    }
+
+    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
+        variable == self.variable_e && view.col(variable).is_none()
+    }
+
+    fn residual_delta_source_page(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: Option<&[RawInline]>,
+        cursor: ResidualDeltaSourceCursor,
+        limit: usize,
+        _roots: &mut Vec<ResidualDeltaOutput>,
+        accepted: &mut Vec<RawInline>,
+    ) -> Option<ResidualDeltaSourcePage> {
+        if variable != self.variable_e
+            || view.len() != 1
+            || view.col(variable).is_some()
+            || candidates.is_some()
+        {
+            return None;
+        }
+        Some(direct_source_page(cursor, limit, accepted, |after| {
+            next_id_source_in_range(&self.set.eav, &[], &self.min, &self.max, after)
+        }))
     }
 
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
@@ -200,6 +237,36 @@ impl<'a> Constraint<'a> for AttributeRangeConstraint {
         }
     }
 
+    fn residual_confirm_is_page_local(&self) -> bool {
+        true
+    }
+
+    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
+        variable == self.variable_a && view.col(variable).is_none()
+    }
+
+    fn residual_delta_source_page(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: Option<&[RawInline]>,
+        cursor: ResidualDeltaSourceCursor,
+        limit: usize,
+        _roots: &mut Vec<ResidualDeltaOutput>,
+        accepted: &mut Vec<RawInline>,
+    ) -> Option<ResidualDeltaSourcePage> {
+        if variable != self.variable_a
+            || view.len() != 1
+            || view.col(variable).is_some()
+            || candidates.is_some()
+        {
+            return None;
+        }
+        Some(direct_source_page(cursor, limit, accepted, |after| {
+            next_id_source_in_range(&self.set.aev, &[], &self.min, &self.max, after)
+        }))
+    }
+
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match view.col(self.variable_a) {
             Some(col) => view.iter().all(|row| {
@@ -215,8 +282,19 @@ impl<'a> Constraint<'a> for AttributeRangeConstraint {
 
 #[cfg(test)]
 mod tests {
+    use crate::id::id_into_value;
+    use crate::inline::encodings::genid::GenId;
+    use crate::inline::RawInline;
     use crate::prelude::inlineencodings::R256BE;
     use crate::prelude::*;
+    use crate::query::residual::ResidualLowering;
+    use crate::query::Binding;
+    use crate::query::Constraint;
+    use crate::query::Query;
+    use crate::query::ResidualDeltaSourceCursor;
+    use crate::query::RowsView;
+    use crate::query::VariableContext;
+    use crate::query::VariableId;
 
     attributes! {
         "CC00000000000000CC00000000000000" as id_range_test_score: R256BE;
@@ -310,5 +388,144 @@ mod tests {
         .collect();
         assert_eq!(exact2.len(), 1);
         assert_eq!(exact2[0], id2);
+    }
+
+    fn deterministic_id(byte: u8) -> Id {
+        Id::new([byte; 16]).expect("nonzero test id")
+    }
+
+    fn project(variable: VariableId, binding: &Binding) -> Option<RawInline> {
+        binding.get(variable).copied()
+    }
+
+    #[test]
+    fn entity_and_attribute_ranges_page_strict_patch_frontiers() {
+        let entity_ids = [
+            deterministic_id(1),
+            deterministic_id(2),
+            deterministic_id(3),
+            deterministic_id(4),
+        ];
+        let entities = entity_ids.map(ExclusiveId::force);
+        let attributes = [
+            deterministic_id(0x11),
+            deterministic_id(0x12),
+            deterministic_id(0x13),
+            deterministic_id(0x14),
+        ];
+        let values: [Inline<R256BE>; 4] = [
+            10i128.to_inline(),
+            20i128.to_inline(),
+            30i128.to_inline(),
+            40i128.to_inline(),
+        ];
+        let mut data = TribleSet::new();
+        for ((entity, attribute), value) in
+            entities.iter().zip(attributes.iter()).zip(values.iter())
+        {
+            data.insert(&Trible::new(entity, attribute, value));
+        }
+
+        let mut context = VariableContext::new();
+        let entity = context.next_variable::<GenId>();
+        let attribute = context.next_variable::<GenId>();
+        let entity_range = data.entity_in_range(entity, entity_ids[1], entity_ids[2]);
+        let attribute_range = data.attribute_in_range(attribute, attributes[1], attributes[2]);
+
+        for (variable, constraint, expected) in [
+            (
+                entity.index,
+                &entity_range as &dyn Constraint<'_>,
+                [
+                    id_into_value(&entity_ids[1].raw()),
+                    id_into_value(&entity_ids[2].raw()),
+                ],
+            ),
+            (
+                attribute.index,
+                &attribute_range as &dyn Constraint<'_>,
+                [
+                    id_into_value(&attributes[1].raw()),
+                    id_into_value(&attributes[2].raw()),
+                ],
+            ),
+        ] {
+            assert!(constraint.residual_proposal_source_is_paged(variable, &RowsView::EMPTY));
+            let mut roots = Vec::new();
+            let mut direct = Vec::new();
+            let first = constraint
+                .residual_delta_source_page(
+                    variable,
+                    &RowsView::EMPTY,
+                    None,
+                    ResidualDeltaSourceCursor::Start,
+                    1,
+                    &mut roots,
+                    &mut direct,
+                )
+                .expect("id ranges expose their PATCH frontier directly");
+            assert!(roots.is_empty());
+            assert_eq!(direct, expected[..1]);
+            assert_eq!(first.examined, 1);
+            assert_eq!(
+                first.next,
+                Some(ResidualDeltaSourceCursor::After(expected[0]))
+            );
+
+            let second = constraint
+                .residual_delta_source_page(
+                    variable,
+                    &RowsView::EMPTY,
+                    None,
+                    first.next.unwrap(),
+                    1,
+                    &mut roots,
+                    &mut direct,
+                )
+                .expect("the strict id cursor resumes the same range");
+            assert_eq!(direct, expected);
+            assert_eq!(second.examined, 1);
+            assert_eq!(second.next, None);
+        }
+
+        let mut entity_query = Query::new(
+            data.entity_in_range(entity, entity_ids[1], entity_ids[2]),
+            move |binding| project(entity.index, binding),
+        )
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .cap(1)
+        .start_width(1);
+        assert_eq!(
+            entity_query.next(),
+            Some(id_into_value(&entity_ids[1].raw()))
+        );
+        assert_eq!(entity_query.stats().delta_source_candidates_examined, 1);
+        assert_eq!(entity_query.stats().delta_source_direct_candidates, 1);
+        drop(entity_query);
+
+        let mut expected: Vec<_> = Query::new(
+            data.attribute_in_range(attribute, attributes[1], attributes[2]),
+            move |binding| project(attribute.index, binding),
+        )
+        .sequential()
+        .collect();
+        let mut actual: Vec<_> = Query::new(
+            data.attribute_in_range(attribute, attributes[1], attributes[2]),
+            move |binding| project(attribute.index, binding),
+        )
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .cap(1)
+        .start_width(1)
+        .collect();
+        expected.sort_unstable();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            actual,
+            [
+                id_into_value(&attributes[1].raw()),
+                id_into_value(&attributes[2].raw())
+            ]
+        );
     }
 }

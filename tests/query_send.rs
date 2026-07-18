@@ -23,7 +23,7 @@ fn ordinary_query_with_non_send_output_is_send() {
 
     assert_send(query);
 
-    // Starting the shape-selected default scheduler must not change the query
+    // Starting the full-switch default scheduler must not change the query
     // type's auto traits: projected values are postprocessed on demand, never
     // stored in either worklist.
     let mut context = VariableContext::new();
@@ -67,7 +67,7 @@ fn ordinary_query_uses_residual_for_exposed_overlapping_and() {
 }
 
 #[test]
-fn ordinary_query_keeps_lazy_dag_for_disjoint_and_leaves() {
+fn ordinary_query_uses_residual_for_disjoint_and_leaves() {
     let mut context = VariableContext::new();
     let left = context.next_variable::<U256BE>();
     let right = context.next_variable::<U256BE>();
@@ -79,46 +79,37 @@ fn ordinary_query_keeps_lazy_dag_for_disjoint_and_leaves() {
 
     assert_eq!(query.next(), Some(()));
     let state = format!("{query:?}");
-    assert!(state.contains("scheduler: LazyDag"), "{state}");
-    assert!(state.contains("residual_started: false"), "{state}");
-    assert!(state.contains("dag_started: true"), "{state}");
+    assert!(state.contains("scheduler: ResidualState"), "{state}");
+    assert!(state.contains("residual_started: true"), "{state}");
+    assert!(state.contains("dag_started: false"), "{state}");
 }
 
 #[test]
-fn ordinary_query_keeps_lazy_dag_for_opaque_root() {
-    let _stats_guard = DAG_STATS_TEST_LOCK.lock().unwrap();
+fn ordinary_query_uses_residual_for_opaque_root() {
     let mut context = VariableContext::new();
     let variable = context.next_variable::<U256BE>();
     let constraint = variable.is(U256BE::inline_from(1u64));
+    let mut query = Query::new(constraint, |_| Some(()));
 
-    dag_stats::reset();
-    dag_stats::set_enabled(true);
-    let rows = Query::new(constraint, |_| Some(())).count();
-    let pops = dag_stats::pops();
-    dag_stats::set_enabled(false);
-
-    assert_eq!(rows, 1);
-    assert!(
-        pops > 0,
-        "ordinary Query iteration did not run the DAG worklist"
-    );
+    assert_eq!(query.next(), Some(()));
+    let state = format!("{query:?}");
+    assert!(state.contains("scheduler: ResidualState"), "{state}");
+    assert!(state.contains("residual_started: true"), "{state}");
+    assert!(state.contains("dag_started: false"), "{state}");
 }
 
 #[test]
-fn ordinary_query_keeps_lazy_dag_for_exposed_one_leaf_and() {
-    let _stats_guard = DAG_STATS_TEST_LOCK.lock().unwrap();
+fn ordinary_query_uses_residual_for_exposed_one_leaf_and() {
     let mut context = VariableContext::new();
     let variable = context.next_variable::<U256BE>();
     let constraint = and!(variable.is(U256BE::inline_from(1u64)));
+    let mut query = Query::new(constraint, |_| Some(()));
 
-    dag_stats::reset();
-    dag_stats::set_enabled(true);
-    let rows = Query::new(constraint, |_| Some(())).count();
-    let pops = dag_stats::pops();
-    dag_stats::set_enabled(false);
-
-    assert_eq!(rows, 1);
-    assert!(pops > 0, "one-leaf AND did not retain the lazy DAG");
+    assert_eq!(query.next(), Some(()));
+    let state = format!("{query:?}");
+    assert!(state.contains("scheduler: ResidualState"), "{state}");
+    assert!(state.contains("residual_started: true"), "{state}");
+    assert!(state.contains("dag_started: false"), "{state}");
 }
 
 #[test]

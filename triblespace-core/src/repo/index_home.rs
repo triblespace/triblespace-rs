@@ -14,7 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
 use crate::blob::encodings::succinctarchive::{
     merge_ordered_archives, merge_ordered_archives_with_backend, OrderedUniverse, SuccinctArchive,
-    SuccinctArchiveBlob, SuccinctArchiveRank9IndexBlob, Universe, WaveletMatrixFreezeBackend,
+    SuccinctArchiveBlob, SuccinctArchiveConstraint, SuccinctArchiveRank9IndexBlob, Universe,
+    WaveletMatrixFreezeBackend,
 };
 use crate::blob::Blob;
 use crate::find;
@@ -22,11 +23,15 @@ use crate::id::{ExclusiveId, Id};
 use crate::inline::encodings::genid::GenId;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::encodings::iu256::U256BE;
-use crate::inline::{Inline, InlineEncoding};
+use crate::inline::{Inline, InlineEncoding, RawInline};
 use crate::metadata;
 use crate::prelude::{attributes, entity, pattern};
 use crate::query::unionconstraint::UnionConstraint;
-use crate::query::{Term, TriblePattern};
+use crate::query::{
+    CandidateSink, Constraint, ConstraintChildren, EstimateSink, RawTerm, ResidualDeltaOutput,
+    ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, Term, TriblePattern, VariableId,
+    VariableSet,
+};
 use crate::repo::index_range::{
     convex_union, is_ancestor, validate_exact_frontier_cover, RangeRecord, RangeRecordError,
     RangeValidationError, StoredCommitDag,
@@ -1269,12 +1274,196 @@ impl<'a, U> UnionArchive<'a, U> {
     }
 }
 
+/// Atomic normalized union over one finite set of Succinct archive shards.
+///
+/// Ordinary constraint verbs retain [`UnionConstraint`]'s per-row set-union
+/// semantics. Proposal paging is specialized because every Succinct shard
+/// exposes the same strictly ordered raw-value cursor: one head per shard is
+/// enough to emit the global minimum once, and `After(value)` skips that
+/// normalized value in every shard on resume. The constraint deliberately
+/// stays structurally opaque so formula lowering cannot split the normalized
+/// source back into independently materialized union arms.
+pub struct UnionArchiveConstraint<'a, U>
+where
+    U: Universe,
+{
+    union: UnionConstraint<SuccinctArchiveConstraint<'a, U>>,
+    terms: [RawTerm; 3],
+}
+
+impl<'a, U> UnionArchiveConstraint<'a, U>
+where
+    U: Universe,
+{
+    fn new(
+        constraints: Vec<SuccinctArchiveConstraint<'a, U>>,
+        term_e: RawTerm,
+        term_a: RawTerm,
+        term_v: RawTerm,
+    ) -> Self {
+        Self {
+            union: UnionConstraint::new(constraints),
+            terms: [term_e, term_a, term_v],
+        }
+    }
+}
+
+impl<'a, U> Constraint<'a> for UnionArchiveConstraint<'a, U>
+where
+    U: Universe,
+{
+    fn variables(&self) -> VariableSet {
+        self.union.variables()
+    }
+
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        self.union.estimate(variable, view, out)
+    }
+
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.union.propose(variable, view, candidates)
+    }
+
+    fn confirm(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.union.confirm(variable, view, candidates)
+    }
+
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        self.union.satisfied(view)
+    }
+
+    fn influence(&self, variable: VariableId) -> VariableSet {
+        self.union.influence(variable)
+    }
+
+    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
+        view.col(variable).is_none()
+            // The shard merge consumes one emitted head per examined value.
+            // Repeated-position Succinct sources may reject driver values, so
+            // they need a different bounded per-shard head-discovery proof.
+            && self
+                .terms
+                .iter()
+                .filter(|term| term.is_var(variable))
+                .count()
+                == 1
+            && (0..self.union.len()).all(|shard| {
+                self.union
+                    .child(shard)
+                    .residual_proposal_source_is_paged(variable, view)
+            })
+    }
+
+    fn residual_delta_source_page(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: Option<&[RawInline]>,
+        mut cursor: ResidualDeltaSourceCursor,
+        limit: usize,
+        _roots: &mut Vec<ResidualDeltaOutput>,
+        accepted: &mut Vec<RawInline>,
+    ) -> Option<ResidualDeltaSourcePage> {
+        if candidates.is_some()
+            || view.len() != 1
+            || !self.residual_proposal_source_is_paged(variable, view)
+        {
+            return None;
+        }
+        assert!(limit > 0, "residual source pages require positive demand");
+        if matches!(cursor, ResidualDeltaSourceCursor::Offset(_)) {
+            panic!("UnionArchive source received an ordinal cursor");
+        }
+
+        let accepted_base = accepted.len();
+        let mut next = None;
+        let mut heads = Vec::with_capacity(self.union.len());
+        let mut shard_roots = Vec::new();
+        let mut shard_accepted = Vec::new();
+        while accepted.len() - accepted_base < limit {
+            heads.clear();
+            for shard in 0..self.union.len() {
+                shard_roots.clear();
+                shard_accepted.clear();
+                let page = self
+                    .union
+                    .child(shard)
+                    .residual_delta_source_page(
+                        variable,
+                        view,
+                        None,
+                        cursor,
+                        1,
+                        &mut shard_roots,
+                        &mut shard_accepted,
+                    )
+                    .expect("an admitted Succinct shard source became unsupported");
+                assert!(
+                    shard_roots.is_empty(),
+                    "a Succinct proposal source returned transition roots"
+                );
+                assert_eq!(
+                    shard_accepted.len(),
+                    page.examined,
+                    "a Succinct proposal source rejected its own candidate"
+                );
+                assert!(
+                    shard_accepted.len() <= 1,
+                    "a Succinct shard exceeded one-head demand"
+                );
+                if let Some(value) = shard_accepted.pop() {
+                    heads.push((value, page.next.is_some()));
+                } else {
+                    assert!(
+                        page.next.is_none(),
+                        "an empty Succinct shard page retained hidden work"
+                    );
+                }
+            }
+
+            let Some(value) = heads.iter().map(|(value, _)| *value).min() else {
+                next = None;
+                break;
+            };
+            accepted.push(value);
+            cursor = ResidualDeltaSourceCursor::After(value);
+            let has_more = heads
+                .iter()
+                .any(|(head, local_more)| *head > value || (*head == value && *local_more));
+            next = has_more.then_some(cursor);
+            if !has_more {
+                break;
+            }
+        }
+
+        Some(ResidualDeltaSourcePage {
+            next,
+            examined: accepted.len() - accepted_base,
+        })
+    }
+}
+
 impl<'a, U> TriblePattern for UnionArchive<'a, U>
 where
     U: Universe + Send + Sync,
 {
     type PatternConstraint<'p>
-        = UnionConstraint<<SuccinctArchive<U> as TriblePattern>::PatternConstraint<'p>>
+        = UnionArchiveConstraint<'p, U>
     where
         Self: 'p;
 
@@ -1287,11 +1476,14 @@ where
         let e: Term<GenId> = e.into();
         let a: Term<GenId> = a.into();
         let v: Term<V> = v.into();
-        UnionConstraint::new(
+        UnionArchiveConstraint::new(
             self.segments
                 .iter()
                 .map(|segment| segment.pattern(e, a, v))
                 .collect(),
+            e.erase(),
+            a.erase(),
+            v.erase(),
         )
     }
 }

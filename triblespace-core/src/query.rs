@@ -28,6 +28,8 @@ pub mod hashsetconstraint;
 pub mod intersectionconstraint;
 /// [`PatchValueConstraint`](patchconstraint::PatchValueConstraint) and [`PatchIdConstraint`](patchconstraint::PatchIdConstraint) — constrains variables to PATCH entries.
 pub mod patchconstraint;
+#[doc(hidden)]
+pub mod program;
 /// [`InlineRange`](rangeconstraint::InlineRange) — restricts a variable to a byte-lexicographic range.
 pub mod rangeconstraint;
 /// [`RegularPathConstraint`] — regular path expressions over graphs.
@@ -55,6 +57,15 @@ use crate::inline::Inline;
 use crate::inline::InlineEncoding;
 use crate::inline::RawInline;
 
+#[doc(hidden)]
+pub use program::{
+    DispatchClass, ProgramAction, ProgramActivation, ProgramBatch, ProgramBatchEffects,
+    ProgramChild, ProgramCompleteBatch, ProgramCompleteEffects, ProgramCompletion, ProgramGrouping,
+    ProgramKey, ProgramPacing, ProgramPage, ProgramRef, ProgramRequest, ProgramResume,
+    ProgramRoute, ProgramRuntime, ProgramSeedBatch, ProgramSeedEffects, ProgramSeedWork,
+    ProgramStratum, ProgramWork, ProgramWorkHandle, TypedCompleteSink, TypedEffectSink,
+    TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink,
+};
 /// Re-export of [`PathOp`].
 pub use regularpathconstraint::PathOp;
 /// Re-export of [`RegularPathConstraint`].
@@ -738,6 +749,139 @@ pub enum ConstraintShape<'s, 'a> {
     And(&'s dyn ConstraintChildren<'a>),
 }
 
+/// One engine-owned node in a residual transition program.
+///
+/// `value` is the current data-plane term, `source` is an optional fixed
+/// acceptance anchor carried through the traversal, and `continuation` is a
+/// constraint-defined program point. A same-variable traversal anchors its
+/// speculative root; a fully-bound support traversal may instead anchor its
+/// required target. Novelty is over the complete node: the same current term
+/// reached with different anchors or under different residual programs may
+/// have different future computation.
+///
+/// None of these fields participates in the scheduler's canonical structural
+/// state identifier. Nodes are activation-private payload batched under the
+/// structural transition operator selected by that identifier.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ResidualDeltaNode {
+    pub source: Option<RawInline>,
+    pub value: RawInline,
+    pub continuation: u32,
+}
+
+/// One transition work item plus its endpoint effect.
+///
+/// `accepted` is not part of work identity. A well-formed constraint must
+/// report it consistently for every occurrence of the same node.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidualDeltaOutput {
+    pub node: ResidualDeltaNode,
+    pub accepted: bool,
+}
+
+/// One affine producer root seeded from a parent row.
+///
+/// Several seeds may name the same parent. They become distinct affine root
+/// credits inside one parent-scoped activation, sharing that activation's
+/// novelty and reducer. `parent` selects the immutable outer row copied into
+/// the activation. Seeds must be grouped by ascending parent tag.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidualDeltaSeed {
+    pub parent: u32,
+    pub output: ResidualDeltaOutput,
+}
+
+/// Borrow-free cursor for a constraint-owned residual source frontier.
+///
+/// The cursor is activation payload, never part of the canonical residual or
+/// delta state identifier. A source must choose one cursor family and retain it
+/// for the activation. `After(value)` resumes strictly after `value` in
+/// raw-inline lexicographic order. `Offset(index)` resumes at a strictly later
+/// ordinal position in an immutable constraint-owned sequence whose native
+/// order need not agree with raw-inline order.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ResidualDeltaSourceCursor {
+    Start,
+    After(RawInline),
+    Offset(u64),
+}
+
+/// Result metadata for one bounded residual source page.
+///
+/// `examined` counts source candidates consumed from the ordered source
+/// frontier, including candidates rejected by an exact secondary filter. It
+/// must not exceed the requested page limit. `next == None` proves source
+/// exhaustion; otherwise the returned cursor resumes strictly after every
+/// candidate examined by this page.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidualDeltaSourcePage {
+    pub next: Option<ResidualDeltaSourceCursor>,
+    pub examined: usize,
+}
+
+/// One physically compatible cohort of affine residual source activations.
+///
+/// The rows share one bound-variable schema. `candidate_sets`, `cursors`, and
+/// `limits` are row-aligned; candidate sets are either present for every row
+/// or absent for every row, and every cursor belongs to the same family. The
+/// per-row limits are positive and their sum is bounded by the scheduler's
+/// current global geometric width. None of these physical dispatch details is
+/// part of canonical residual or delta state identity.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct ResidualDeltaSourceBatch<'v> {
+    pub view: RowsView<'v>,
+    pub candidate_sets: &'v [Option<&'v [RawInline]>],
+    pub cursors: &'v [ResidualDeltaSourceCursor],
+    pub limits: &'v [usize],
+}
+
+/// Borrow-free cursor for one node's ordered transition frontier.
+///
+/// `branch` identifies one constraint-defined outgoing transition from the
+/// node's current program point. `After` resumes strictly after `value` within
+/// that branch. Branches are visited in increasing order, so the pair
+/// `(branch, value)` advances monotonically even when two branches produce the
+/// same value or lead to different program points.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ResidualDeltaExpandCursor {
+    Start,
+    After { branch: u32, value: RawInline },
+}
+
+/// Result metadata for one bounded transition-expansion page.
+///
+/// `examined` counts constraint-owned transition candidates consumed from the
+/// node frontier and must not exceed the requested limit. `next == None`
+/// proves that this node has no remaining outgoing transition work.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidualDeltaExpandPage {
+    pub next: Option<ResidualDeltaExpandCursor>,
+    pub examined: usize,
+}
+
+/// One physical cohort of affine transition-node pages.
+///
+/// Every node belongs to the same structural transition operator. `nodes`,
+/// `cursors`, and `limits` are row-aligned, every limit is positive, and their
+/// sum is bounded by the scheduler's current global geometric width. Nodes and
+/// cursors remain activation payload; the batch is a dispatch shape, never a
+/// canonical state identity.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct ResidualDeltaExpandBatch<'v> {
+    pub nodes: &'v [ResidualDeltaNode],
+    pub cursors: &'v [ResidualDeltaExpandCursor],
+    pub limits: &'v [usize],
+}
+
 /// Object-safe child access for a structural constraint shape.
 #[doc(hidden)]
 pub trait ConstraintChildren<'a> {
@@ -965,16 +1109,28 @@ pub trait Constraint<'a> {
     ///
     /// The default keeps the constraint opaque. Implementations must expose
     /// only structure whose flattening preserves the ordinary protocol's
-    /// semantics; wrappers that change scope, multiplicity, or evaluation
+    /// semantics. Wrappers that change scope, multiplicity, or evaluation
     /// meaning should retain the default. The exposed shape must be a finite,
     /// acyclic tree. Its variants, child counts, and child order are structural
-    /// facts and MUST remain stable for the entire query execution. A
-    /// path-based engine may resolve the plan repeatedly, so changing shape
-    /// through interior mutability can silently select a different constraint
-    /// occurrence even when every individual borrow is memory-safe.
+    /// facts and MUST remain stable for the entire query execution. A path-based
+    /// engine may resolve the plan repeatedly, so changing shape through
+    /// interior mutability can silently select a different constraint occurrence
+    /// even when every individual borrow is memory-safe.
     #[doc(hidden)]
     fn residual_shape(&self) -> ConstraintShape<'_, 'a> {
         ConstraintShape::Opaque
+    }
+
+    /// Exposes the finite arms of an otherwise opaque logical union.
+    ///
+    /// [`residual::FormulaScope::OpaqueLeaves`] deliberately ignores this
+    /// capability, so a union retains its existing indivisible [`Constraint`]
+    /// semantics. `UnionLeaves` and `WholeRoot` expose it to canonical formula
+    /// control. The child count and order are structural facts and must remain
+    /// stable for the solve.
+    #[doc(hidden)]
+    fn residual_union_children(&self) -> Option<&dyn ConstraintChildren<'a>> {
+        None
     }
 
     /// Reports whether residual execution may partition one parent's ordered
@@ -1002,6 +1158,304 @@ pub trait Constraint<'a> {
     /// suffix. The answer is structural and must remain stable for the solve.
     #[doc(hidden)]
     fn residual_confirm_is_page_local(&self) -> bool {
+        false
+    }
+
+    /// Bound-variable prerequisites for a grouped transition confirmation.
+    ///
+    /// `Some(required)` means that confirming `variable` through a supported
+    /// residual transition program needs the complete ordered candidate group
+    /// exactly when every variable in `required` is already bound. `None`
+    /// means that this confirmation never needs a grouped reducer. When the
+    /// prerequisites are not met, the constraint must either decline residual
+    /// transition seeds or provide a page-local transition confirmation.
+    ///
+    /// This is separate from `residual_confirm_is_page_local`: the ordinary
+    /// confirmation may be elementwise while the lowered implementation
+    /// intentionally traverses once and filters the immutable original group.
+    /// The conservative default declines grouped transition lowering. The
+    /// answer is structural and must remain stable for the solve.
+    #[doc(hidden)]
+    fn residual_delta_confirm_grouping_requirements(
+        &self,
+        _variable: VariableId,
+    ) -> Option<VariableSet> {
+        None
+    }
+
+    /// Exposes one immutable typed residual-program family.
+    ///
+    /// Occurrence identity and query-local runtime state are owned by the
+    /// residual lowering engine; sharing one constraint object at several
+    /// structural paths must therefore still produce isolated runtimes.
+    #[doc(hidden)]
+    fn residual_program(&self) -> Option<ProgramRef<'_>> {
+        None
+    }
+
+    /// Whether this action owns an ordered, page-producing source frontier.
+    ///
+    /// Returning `true` replaces eager [`Self::residual_delta_seeds`] for the
+    /// exact action. The residual engine creates one affine activation per
+    /// parent row and asks [`Self::residual_delta_source_page`] for bounded
+    /// pages only as scheduler demand grows. The answer is structural for the
+    /// supplied bound schema and must remain stable for the solve.
+    #[doc(hidden)]
+    fn residual_delta_source_is_paged(&self, _variable: VariableId, _view: &RowsView<'_>) -> bool {
+        false
+    }
+
+    /// Whether this proposal can expose an ordered direct-candidate source
+    /// frontier without first materializing its complete output.
+    ///
+    /// Unlike `residual_delta_source_is_paged`, this capability is consulted
+    /// only for Propose. A direct candidate returned by the page hook is
+    /// already a proposal candidate and owns no transition lineage.
+    #[doc(hidden)]
+    fn residual_proposal_source_is_paged(
+        &self,
+        _variable: VariableId,
+        _view: &RowsView<'_>,
+    ) -> bool {
+        false
+    }
+
+    /// Whether a paged proposal source emits product-state roots rather than
+    /// only finished direct candidates.
+    ///
+    /// Direct candidate pages may be materialized eagerly when a surrounding
+    /// finite-formula reducer is quiescent. A root-producing page must retain
+    /// the transition substrate: its source page is merely the beginning of a
+    /// resumable automaton traversal. This answer is structural for the
+    /// supplied bound schema and must remain stable for the solve.
+    #[doc(hidden)]
+    fn residual_proposal_source_has_transition_roots(
+        &self,
+        _variable: VariableId,
+        _view: &RowsView<'_>,
+    ) -> bool {
+        false
+    }
+
+    /// Consume at most `limit` entries from one activation's ordered source
+    /// frontier.
+    ///
+    /// `view` contains exactly one immutable parent row. During grouped
+    /// confirmation, `candidates` is the sorted, deduplicated set of values in
+    /// that parent's immutable original candidate sequence; proposal actions
+    /// pass `None`. Appended roots belong to this one activation and therefore
+    /// carry no parent tags. Appended `accepted` values are direct candidate
+    /// occurrences that need no transition expansion; their order and
+    /// multiplicity are preserved exactly, unlike transition witnesses that
+    /// reduce to distinct accepted endpoints. Returning `Some` declares
+    /// support and must satisfy `page.examined <= limit` plus
+    /// `roots_added + accepted_added <= page.examined`.
+    /// `page.next` is suspended until every root lineage from this page has
+    /// retired. The conservative default is unsupported.
+    #[doc(hidden)]
+    fn residual_delta_source_page(
+        &self,
+        _variable: VariableId,
+        _view: &RowsView<'_>,
+        _candidates: Option<&[RawInline]>,
+        _cursor: ResidualDeltaSourceCursor,
+        _limit: usize,
+        _roots: &mut Vec<ResidualDeltaOutput>,
+        _accepted: &mut Vec<RawInline>,
+    ) -> Option<ResidualDeltaSourcePage> {
+        None
+    }
+
+    /// Consume one physically compatible cohort of affine source pages.
+    ///
+    /// `pages` receives exactly one row-aligned page descriptor. Roots and
+    /// direct accepted occurrences carry in-range input-row tags grouped in
+    /// ascending order, just like [`Self::residual_delta_expand`] successors.
+    /// Returning `false` declares the complete cohort unsupported and must
+    /// leave all three output vectors unchanged. Once the corresponding source
+    /// capability admitted these activations, changing that answer is an
+    /// engine error and the scheduler panics rather than falling back after
+    /// consuming affine credits. An implementation may override this hook with
+    /// a native batched kernel. The default preserves compatibility by invoking
+    /// [`Self::residual_delta_source_page`] once per row and rolling back every
+    /// output if any row reports unsupported.
+    #[doc(hidden)]
+    fn residual_delta_source_pages(
+        &self,
+        variable: VariableId,
+        batch: ResidualDeltaSourceBatch<'_>,
+        pages: &mut Vec<ResidualDeltaSourcePage>,
+        roots: &mut Vec<(u32, ResidualDeltaOutput)>,
+        accepted: &mut Vec<(u32, RawInline)>,
+    ) -> bool {
+        let row_count = batch.view.len();
+        assert_eq!(batch.candidate_sets.len(), row_count);
+        assert_eq!(batch.cursors.len(), row_count);
+        assert_eq!(batch.limits.len(), row_count);
+
+        let page_base = pages.len();
+        let root_base = roots.len();
+        let accepted_base = accepted.len();
+        for row in 0..row_count {
+            let mut row_roots = Vec::new();
+            let mut row_accepted = Vec::new();
+            let Some(page) = self.residual_delta_source_page(
+                variable,
+                &batch.view.row_view(row),
+                batch.candidate_sets[row],
+                batch.cursors[row],
+                batch.limits[row],
+                &mut row_roots,
+                &mut row_accepted,
+            ) else {
+                pages.truncate(page_base);
+                roots.truncate(root_base);
+                accepted.truncate(accepted_base);
+                return false;
+            };
+            let tag = u32::try_from(row).expect("residual source cohort exceeds u32 tags");
+            pages.push(page);
+            roots.extend(row_roots.into_iter().map(|root| (tag, root)));
+            accepted.extend(row_accepted.into_iter().map(|value| (tag, value)));
+        }
+        true
+    }
+
+    /// Seeds zero or more engine-owned transition programs for each parent row.
+    ///
+    /// Returning `true` opts this exact `(constraint, variable, bound schema)`
+    /// proposal or confirm action into residual delta execution. Every
+    /// appended seed carries an in-range parent-row tag and tags are grouped in
+    /// ascending order. Proposal actions may append zero or more seeds per
+    /// parent; repeated tags denote distinct affine producer roots inside one
+    /// parent activation. That activation streams proposal effects but does not
+    /// reduce a confirmation until every root lineage quiesces. A page-local
+    /// finite confirmation owns only its disjoint candidate page; a grouped
+    /// confirmation owns the complete parent sequence. In both cases the
+    /// immutable sequence supplies exact order and multiplicity. A nullable
+    /// program may mark its seed accepted without adding it to work novelty;
+    /// the scheduler records that endpoint at activation creation and may
+    /// publish a streaming proposal or Support witness before expanding the
+    /// seed's independent transition credit. Seed acceptance consumes no
+    /// transition-page demand.
+    /// Returning `true` with no seeds for a parent is an exact empty result for
+    /// that parent. The conservative default retains the ordinary constraint
+    /// protocol.
+    #[doc(hidden)]
+    fn residual_delta_seeds(
+        &self,
+        _variable: VariableId,
+        _view: &RowsView<'_>,
+        _seeds: &mut Vec<ResidualDeltaSeed>,
+    ) -> bool {
+        false
+    }
+
+    /// Seeds a transition-backed boolean test for fully-bound parent rows.
+    ///
+    /// Returning `Some(variable)` declares support and selects the structural
+    /// route subsequently passed to [`Self::residual_delta_expand`]. Every
+    /// constraint variable must already be present in `view`. Appended seeds
+    /// follow the same ascending parent-tag law as
+    /// [`Self::residual_delta_seeds`], but accepted outputs are boolean
+    /// witnesses rather than proposed values. Returning `Some` with no seed
+    /// for a parent is an exact false result for that parent. Returning `None`
+    /// must leave `seeds` untouched.
+    ///
+    /// The route must depend only on the constraint and bound schema, never on
+    /// row values, so every seeded node remains valid under one canonical
+    /// structural transition operator.
+    #[doc(hidden)]
+    fn residual_delta_support_seeds(
+        &self,
+        _view: &RowsView<'_>,
+        _seeds: &mut Vec<ResidualDeltaSeed>,
+    ) -> Option<VariableId> {
+        None
+    }
+
+    /// Expands at most `limit` entries from one transition node's ordered
+    /// outgoing frontier.
+    ///
+    /// Returning `Some` opts this exact node into affine transition paging.
+    /// Appended outputs belong to the supplied node and therefore carry no
+    /// input tags. Their count must not exceed `page.examined`, which in turn
+    /// must not exceed `limit`. A nonterminal page resumes strictly after its
+    /// previous cursor in the same `(branch, value)` order. Returning `None`
+    /// from `Start` retains block-native [`Self::residual_delta_expand`]; a
+    /// node that has returned a nonterminal page must continue to support every
+    /// cursor it produced.
+    #[doc(hidden)]
+    fn residual_delta_expand_page(
+        &self,
+        _variable: VariableId,
+        _node: ResidualDeltaNode,
+        _cursor: ResidualDeltaExpandCursor,
+        _limit: usize,
+        _successors: &mut Vec<ResidualDeltaOutput>,
+    ) -> Option<ResidualDeltaExpandPage> {
+        None
+    }
+
+    /// Expands one physical cohort of bounded transition-node pages.
+    ///
+    /// `pages` receives one row-aligned entry per input node. `Some(page)`
+    /// follows [`Self::residual_delta_expand_page`]; `None` leaves that row for
+    /// the block-native eager fallback and is valid only from `Start`.
+    /// Successors from supported pages are tagged by input-node index and
+    /// grouped in ascending tag order. The default preserves scalar page
+    /// implementations while giving block-native constraints one stable seam
+    /// for fused CPU or accelerator execution.
+    #[doc(hidden)]
+    fn residual_delta_expand_pages(
+        &self,
+        variable: VariableId,
+        batch: ResidualDeltaExpandBatch<'_>,
+        pages: &mut Vec<Option<ResidualDeltaExpandPage>>,
+        successors: &mut Vec<(u32, ResidualDeltaOutput)>,
+    ) {
+        assert_eq!(batch.nodes.len(), batch.cursors.len());
+        assert_eq!(batch.nodes.len(), batch.limits.len());
+        for (row, ((&node, &cursor), &limit)) in batch
+            .nodes
+            .iter()
+            .zip(batch.cursors)
+            .zip(batch.limits)
+            .enumerate()
+        {
+            let mut row_successors = Vec::new();
+            let page =
+                self.residual_delta_expand_page(variable, node, cursor, limit, &mut row_successors);
+            if page.is_none() {
+                assert_eq!(
+                    cursor,
+                    ResidualDeltaExpandCursor::Start,
+                    "paged delta expansion became unsupported after suspension"
+                );
+                assert!(
+                    row_successors.is_empty(),
+                    "unsupported delta expansion page mutated its output"
+                );
+            } else {
+                let row = u32::try_from(row).expect("too many transition pages in one cohort");
+                successors.extend(row_successors.into_iter().map(|output| (row, output)));
+            }
+            pages.push(page);
+        }
+    }
+
+    /// Expands one block of engine-owned transition-program nodes.
+    ///
+    /// Successors are tagged by input-node index and grouped in ascending tag
+    /// order. A constraint that returned `true` from `residual_delta_seeds`
+    /// for an action must return `true` here for the same action.
+    #[doc(hidden)]
+    fn residual_delta_expand(
+        &self,
+        _variable: VariableId,
+        _nodes: &[ResidualDeltaNode],
+        _successors: &mut Vec<(u32, ResidualDeltaOutput)>,
+    ) -> bool {
         false
     }
 }
@@ -1057,9 +1511,124 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.residual_shape()
     }
 
+    fn residual_union_children(&self) -> Option<&dyn ConstraintChildren<'a>> {
+        let inner: &T = self;
+        inner.residual_union_children()
+    }
+
     fn residual_confirm_is_page_local(&self) -> bool {
         let inner: &T = self;
         inner.residual_confirm_is_page_local()
+    }
+
+    fn residual_delta_confirm_grouping_requirements(
+        &self,
+        variable: VariableId,
+    ) -> Option<VariableSet> {
+        let inner: &T = self;
+        inner.residual_delta_confirm_grouping_requirements(variable)
+    }
+
+    fn residual_program(&self) -> Option<ProgramRef<'_>> {
+        let inner: &T = self;
+        inner.residual_program()
+    }
+
+    fn residual_delta_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
+        let inner: &T = self;
+        inner.residual_delta_source_is_paged(variable, view)
+    }
+
+    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
+        let inner: &T = self;
+        inner.residual_proposal_source_is_paged(variable, view)
+    }
+
+    fn residual_proposal_source_has_transition_roots(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+    ) -> bool {
+        let inner: &T = self;
+        inner.residual_proposal_source_has_transition_roots(variable, view)
+    }
+
+    fn residual_delta_source_page(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: Option<&[RawInline]>,
+        cursor: ResidualDeltaSourceCursor,
+        limit: usize,
+        roots: &mut Vec<ResidualDeltaOutput>,
+        accepted: &mut Vec<RawInline>,
+    ) -> Option<ResidualDeltaSourcePage> {
+        let inner: &T = self;
+        inner.residual_delta_source_page(variable, view, candidates, cursor, limit, roots, accepted)
+    }
+
+    fn residual_delta_source_pages(
+        &self,
+        variable: VariableId,
+        batch: ResidualDeltaSourceBatch<'_>,
+        pages: &mut Vec<ResidualDeltaSourcePage>,
+        roots: &mut Vec<(u32, ResidualDeltaOutput)>,
+        accepted: &mut Vec<(u32, RawInline)>,
+    ) -> bool {
+        let inner: &T = self;
+        inner.residual_delta_source_pages(variable, batch, pages, roots, accepted)
+    }
+
+    fn residual_delta_seeds(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        seeds: &mut Vec<ResidualDeltaSeed>,
+    ) -> bool {
+        let inner: &T = self;
+        inner.residual_delta_seeds(variable, view, seeds)
+    }
+
+    fn residual_delta_support_seeds(
+        &self,
+        view: &RowsView<'_>,
+        seeds: &mut Vec<ResidualDeltaSeed>,
+    ) -> Option<VariableId> {
+        let inner: &T = self;
+        inner.residual_delta_support_seeds(view, seeds)
+    }
+
+    fn residual_delta_expand_page(
+        &self,
+        variable: VariableId,
+        node: ResidualDeltaNode,
+        cursor: ResidualDeltaExpandCursor,
+        limit: usize,
+        successors: &mut Vec<ResidualDeltaOutput>,
+    ) -> Option<ResidualDeltaExpandPage> {
+        let inner: &T = self;
+        inner.residual_delta_expand_page(variable, node, cursor, limit, successors)
+    }
+
+    fn residual_delta_expand_pages(
+        &self,
+        variable: VariableId,
+        batch: ResidualDeltaExpandBatch<'_>,
+        pages: &mut Vec<Option<ResidualDeltaExpandPage>>,
+        successors: &mut Vec<(u32, ResidualDeltaOutput)>,
+    ) {
+        let inner: &T = self;
+        inner.residual_delta_expand_pages(variable, batch, pages, successors)
+    }
+
+    fn residual_delta_expand(
+        &self,
+        variable: VariableId,
+        nodes: &[ResidualDeltaNode],
+        successors: &mut Vec<(u32, ResidualDeltaOutput)>,
+    ) -> bool {
+        let inner: &T = self;
+        inner.residual_delta_expand(variable, nodes, successors)
     }
 }
 
@@ -1114,9 +1683,124 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
         inner.residual_shape()
     }
 
+    fn residual_union_children(&self) -> Option<&dyn ConstraintChildren<'a>> {
+        let inner: &T = self;
+        inner.residual_union_children()
+    }
+
     fn residual_confirm_is_page_local(&self) -> bool {
         let inner: &T = self;
         inner.residual_confirm_is_page_local()
+    }
+
+    fn residual_delta_confirm_grouping_requirements(
+        &self,
+        variable: VariableId,
+    ) -> Option<VariableSet> {
+        let inner: &T = self;
+        inner.residual_delta_confirm_grouping_requirements(variable)
+    }
+
+    fn residual_program(&self) -> Option<ProgramRef<'_>> {
+        let inner: &T = self;
+        inner.residual_program()
+    }
+
+    fn residual_delta_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
+        let inner: &T = self;
+        inner.residual_delta_source_is_paged(variable, view)
+    }
+
+    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
+        let inner: &T = self;
+        inner.residual_proposal_source_is_paged(variable, view)
+    }
+
+    fn residual_proposal_source_has_transition_roots(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+    ) -> bool {
+        let inner: &T = self;
+        inner.residual_proposal_source_has_transition_roots(variable, view)
+    }
+
+    fn residual_delta_source_page(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: Option<&[RawInline]>,
+        cursor: ResidualDeltaSourceCursor,
+        limit: usize,
+        roots: &mut Vec<ResidualDeltaOutput>,
+        accepted: &mut Vec<RawInline>,
+    ) -> Option<ResidualDeltaSourcePage> {
+        let inner: &T = self;
+        inner.residual_delta_source_page(variable, view, candidates, cursor, limit, roots, accepted)
+    }
+
+    fn residual_delta_source_pages(
+        &self,
+        variable: VariableId,
+        batch: ResidualDeltaSourceBatch<'_>,
+        pages: &mut Vec<ResidualDeltaSourcePage>,
+        roots: &mut Vec<(u32, ResidualDeltaOutput)>,
+        accepted: &mut Vec<(u32, RawInline)>,
+    ) -> bool {
+        let inner: &T = self;
+        inner.residual_delta_source_pages(variable, batch, pages, roots, accepted)
+    }
+
+    fn residual_delta_seeds(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        seeds: &mut Vec<ResidualDeltaSeed>,
+    ) -> bool {
+        let inner: &T = self;
+        inner.residual_delta_seeds(variable, view, seeds)
+    }
+
+    fn residual_delta_support_seeds(
+        &self,
+        view: &RowsView<'_>,
+        seeds: &mut Vec<ResidualDeltaSeed>,
+    ) -> Option<VariableId> {
+        let inner: &T = self;
+        inner.residual_delta_support_seeds(view, seeds)
+    }
+
+    fn residual_delta_expand_page(
+        &self,
+        variable: VariableId,
+        node: ResidualDeltaNode,
+        cursor: ResidualDeltaExpandCursor,
+        limit: usize,
+        successors: &mut Vec<ResidualDeltaOutput>,
+    ) -> Option<ResidualDeltaExpandPage> {
+        let inner: &T = self;
+        inner.residual_delta_expand_page(variable, node, cursor, limit, successors)
+    }
+
+    fn residual_delta_expand_pages(
+        &self,
+        variable: VariableId,
+        batch: ResidualDeltaExpandBatch<'_>,
+        pages: &mut Vec<Option<ResidualDeltaExpandPage>>,
+        successors: &mut Vec<(u32, ResidualDeltaOutput)>,
+    ) {
+        let inner: &T = self;
+        inner.residual_delta_expand_pages(variable, batch, pages, successors)
+    }
+
+    fn residual_delta_expand(
+        &self,
+        variable: VariableId,
+        nodes: &[ResidualDeltaNode],
+        successors: &mut Vec<(u32, ResidualDeltaOutput)>,
+    ) -> bool {
+        let inner: &T = self;
+        inner.residual_delta_expand(variable, nodes, successors)
     }
 }
 
@@ -1130,16 +1814,19 @@ enum QueryScheduler {
 /// A query is an iterator over the results of a query.
 /// It takes a constraint and a post-processing function as input,
 /// and returns the results of the query as a stream of values.
-/// The ordinary iterator selects canonical residual states for a live exposed
-/// conjunction only when two flattened opaque leaf occurrences share a
-/// variable. It starts with narrow, depth-first action cohorts and widens as
-/// the consumer keeps pulling, while histories with identical future
-/// computation can reconverge under one state identity. Opaque, one-leaf,
-/// disjoint, and seed-rejected roots retain the lazy DAG, where residual
-/// control-state overhead has no structural opportunity to pay back. Use
-/// [`Query::residual_state_scheduler`] or
-/// [`Query::lazy_dag_scheduler`] to override that structural default, and
-/// [`Query::sequential`] for the scalar depth-first specialization.
+/// On this full-switch probe, every live fresh ordinary iterator uses canonical
+/// residual states. It starts with narrow, depth-first action cohorts and
+/// widens as the consumer keeps pulling, while histories with identical future
+/// computation can reconverge under one state identity. Its root runs as one
+/// finite AND/OR formula and eligible regular-path transition programs execute
+/// inside that formula; unsupported custom programs remain ordinary opaque
+/// constraint actions. Seed-rejected queries start no runtime. Use
+/// [`Query::lazy_dag_scheduler`] for the bound-variable-set DAG control and
+/// [`Query::sequential`] for the scalar depth-first specialization. The
+/// Scheduler selection and structural lowering are independent controls; use
+/// [`Query::residual_lowering`] to select a conservative or intermediate
+/// lowering without changing the scheduler. Fully drained scheduler results
+/// are compared as multisets; their iteration order may differ.
 /// The query engine is designed to be simple and efficient, providing low, consistent,
 /// and predictable latency, skew resistance, and no required (or possible) tuning.
 /// The query engine is designed to be used in combination with the [Constraint] trait,
@@ -1154,6 +1841,8 @@ pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
     constraint: C,
     postprocessing: P,
     scheduler: QueryScheduler,
+    /// Structural lowering selected independently from the physical scheduler.
+    residual_lowering: residual::ResidualLowering,
     mode: Search,
     /// Whether [`Iterator::next`] has ever been called on this query.
     ///
@@ -1219,6 +1908,7 @@ where
             constraint: self.constraint.clone(),
             postprocessing: self.postprocessing.clone(),
             scheduler: self.scheduler,
+            residual_lowering: self.residual_lowering,
             mode: self.mode,
             iteration_started: self.iteration_started,
             influences: self.influences,
@@ -1393,7 +2083,10 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// conjunctions with shared-variable leaf work. This override preserves
     /// arbitrary-root completeness for opaque, one-leaf, disjoint, and
     /// seed-rejected constraints, and is useful for scheduler comparison. The
-    /// runtime cursor remains behind `Query::next`, so cloning a started query
+    /// override preserves the query's structural lowering. Use
+    /// [`Query::residual_lowering`] before this method to choose another of the
+    /// six canonical lowering forms. The runtime cursor remains behind
+    /// `Query::next`, so cloning a started query
     /// snapshots its exact raw remainder. Ordinary Rayon conversion of an
     /// unstarted query still uses the established scalar splitter; use
     /// `Query::into_par_residual_state_iter` (with the `parallel` feature) to
@@ -1409,6 +2102,26 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             "cannot select the residual-state query scheduler after iteration has started"
         );
         self.scheduler = QueryScheduler::ResidualState;
+        self
+    }
+
+    /// Select structural lowering independently from the physical scheduler.
+    ///
+    /// Ordinary live queries start with [`residual::ResidualLowering::FULL`].
+    /// Explicit scheduler comparisons can request
+    /// [`residual::ResidualLowering::CONSERVATIVE`] or any intermediate form
+    /// without changing their scheduler.
+    ///
+    /// # Panics
+    ///
+    /// Panics if iteration has already started. Lowering must be selected
+    /// before the first call to [`Iterator::next`].
+    pub fn residual_lowering(mut self, lowering: residual::ResidualLowering) -> Self {
+        assert!(
+            !self.iteration_started && self.dag.is_none() && self.residual.is_none(),
+            "cannot select residual lowering after iteration has started"
+        );
+        self.residual_lowering = lowering;
         self
     }
 
@@ -1492,18 +2205,16 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         } else {
             Search::Done
         };
-        let scheduler = if matches!(mode, Search::NextVariable)
-            && residual::useful_default_shape(&constraint)
-        {
+        let scheduler = if matches!(mode, Search::NextVariable) {
             QueryScheduler::ResidualState
         } else {
             QueryScheduler::LazyDag
         };
-
         Query {
             constraint,
             postprocessing,
             scheduler,
+            residual_lowering: residual::ResidualLowering::FULL,
             mode,
             iteration_started: false,
             influences,
@@ -3301,6 +4012,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
                 .insert(Box::new(residual::ResidualQueryState::new(
                     &self.constraint,
                     self.mode,
+                    self.residual_lowering,
                 )));
             return state.pull(
                 &self.constraint,
@@ -3909,6 +4621,38 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+
+    #[test]
+    fn scheduler_and_residual_lowering_are_orthogonal_controls() {
+        let mut context = VariableContext::new();
+        let variable = context.next_variable::<U256BE>();
+        let ordinary = Query::new(variable.is(U256BE::inline_from(1u64)), |_| Some(()));
+        assert_eq!(ordinary.scheduler, QueryScheduler::ResidualState);
+        assert_eq!(ordinary.residual_lowering, residual::ResidualLowering::FULL);
+
+        let conservative = ordinary
+            .residual_lowering(residual::ResidualLowering::CONSERVATIVE)
+            .residual_state_scheduler();
+        assert_eq!(conservative.scheduler, QueryScheduler::ResidualState);
+        assert_eq!(
+            conservative.residual_lowering,
+            residual::ResidualLowering::CONSERVATIVE,
+            "selecting a scheduler must not rewrite structural lowering"
+        );
+
+        let mut context = VariableContext::new();
+        let variable = context.next_variable::<U256BE>();
+        let intermediate =
+            residual::ResidualLowering::new(residual::FormulaScope::UnionLeaves, true);
+        let dag = Query::new(variable.is(U256BE::inline_from(1u64)), |_| Some(()))
+            .lazy_dag_scheduler()
+            .residual_lowering(intermediate);
+        assert_eq!(dag.scheduler, QueryScheduler::LazyDag);
+        assert_eq!(
+            dag.residual_lowering, intermediate,
+            "selecting lowering must not rewrite the physical scheduler"
+        );
+    }
 
     #[test]
     fn rows_view_preserves_explicit_zero_width_row_multiplicity() {
