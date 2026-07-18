@@ -12,9 +12,12 @@ use triblespace_core::query::residual::{
 };
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
-    Binding, CandidateSink, Constraint, EstimateSink, Query, ResidualDeltaNode,
-    ResidualDeltaOutput, ResidualDeltaSeed, ResidualDeltaSourceBatch, ResidualDeltaSourceCursor,
-    ResidualDeltaSourcePage, RowsView, Variable, VariableId, VariableSet,
+    Binding, CandidateSink, Constraint, DispatchClass, EstimateSink, ProgramAction,
+    ProgramCompletion, ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef, ProgramRequest,
+    ProgramRoute, ProgramSeedBatch, ProgramStratum, Query, ResidualDeltaNode, ResidualDeltaOutput,
+    ResidualDeltaSeed, ResidualDeltaSourceBatch, ResidualDeltaSourceCursor,
+    ResidualDeltaSourcePage, RowsView, TypedEffectSink, TypedProgramBatch, TypedProgramSpec,
+    TypedResume, TypedSeedSink, Variable, VariableId, VariableSet,
 };
 
 const START: VariableId = 0;
@@ -38,6 +41,33 @@ struct DeltaEvidence {
     support_seeded_roots: AtomicUsize,
     support_expanded_nodes: AtomicUsize,
     support_witnesses: AtomicUsize,
+    program_support_pages: Mutex<Vec<ProgramSupportPageTrace>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum ProgramSupportPhase {
+    Red,
+    Blue,
+}
+
+impl ProgramSupportPhase {
+    fn next(self) -> Self {
+        match self {
+            Self::Red => Self::Blue,
+            Self::Blue => Self::Red,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProgramSupportPageTrace {
+    phase: ProgramSupportPhase,
+    value: RawInline,
+    offset: usize,
+    limit: usize,
+    examined: usize,
+    children: usize,
+    supported: bool,
 }
 
 /// A deliberately non-RPQ relation: `(red, blue)+` over two in-memory edge
@@ -279,6 +309,229 @@ impl<'a> Constraint<'a> for AlternatingClosure {
     }
 }
 
+/// The same non-RPQ relation with its Boolean traversal expressed through the
+/// generic typed Program contract. The ordinary relation remains the oracle;
+/// only a fully-bound Formula Support action is claimed by the Program.
+struct ProgramAlternatingClosure(AlternatingClosure);
+
+#[derive(Clone, Debug)]
+struct ProgramSupportState {
+    target: RawInline,
+    value: RawInline,
+    phase: ProgramSupportPhase,
+    offset: usize,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ProgramSupportNovelty {
+    target: RawInline,
+    value: RawInline,
+    phase: ProgramSupportPhase,
+}
+
+impl TypedProgramSpec for ProgramAlternatingClosure {
+    type State = ProgramSupportState;
+    type NoveltyKey = ProgramSupportNovelty;
+    type Rank = u64;
+
+    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+        (request.action == ProgramAction::Support
+            && request.bound.is_set(START)
+            && request.bound.is_set(END))
+        .then_some(ProgramRoute {
+            key: ProgramKey::new(0),
+            variable: END,
+            stratum: ProgramStratum::Fixpoint,
+            grouping: ProgramGrouping::ParentAtomic,
+            completion: ProgramCompletion::PageableOnly,
+        })
+    }
+
+    fn dispatch(&self, state: &Self::State) -> DispatchClass {
+        match state.phase {
+            ProgramSupportPhase::Red => DispatchClass::new(0),
+            ProgramSupportPhase::Blue => DispatchClass::new(1),
+        }
+    }
+
+    fn pacing(&self, _state: &Self::State) -> ProgramPacing {
+        ProgramPacing::Activation
+    }
+
+    fn progress(&self, state: &Self::State) -> Self::Rank {
+        u64::MAX - u64::try_from(state.offset).expect("custom Program cursor exceeds its rank limb")
+    }
+
+    fn seed_typed(
+        &self,
+        batch: ProgramSeedBatch<'_>,
+        effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+    ) {
+        assert_eq!(batch.request.action, ProgramAction::Support);
+        let start = batch
+            .view
+            .col(START)
+            .expect("custom Program Support lost its start column");
+        let end = batch
+            .view
+            .col(END)
+            .expect("custom Program Support lost its target column");
+        self.0
+            .evidence
+            .support_seeded_roots
+            .fetch_add(batch.view.len(), Ordering::Relaxed);
+        for (parent, row) in batch.view.iter().enumerate() {
+            let state = ProgramSupportState {
+                target: row[end],
+                value: row[start],
+                phase: ProgramSupportPhase::Red,
+                offset: 0,
+            };
+            let novelty = ProgramSupportNovelty {
+                target: state.target,
+                value: state.value,
+                phase: state.phase,
+            };
+            effects.fixpoint_root(
+                u32::try_from(parent).expect("too many custom Program Support parents"),
+                state,
+                novelty,
+                None,
+            );
+        }
+    }
+
+    fn step_typed(
+        &self,
+        states: Vec<Self::State>,
+        batch: TypedProgramBatch<'_>,
+        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+    ) {
+        assert_eq!(states.len(), batch.view.len());
+        self.0
+            .evidence
+            .support_expanded_nodes
+            .fetch_add(states.len(), Ordering::Relaxed);
+
+        for (input, state) in states.into_iter().enumerate() {
+            let edges = match state.phase {
+                ProgramSupportPhase::Red => &self.0.red,
+                ProgramSupportPhase::Blue => &self.0.blue,
+            };
+            assert!(
+                state.offset <= edges.len(),
+                "custom Program cursor escaped its edge table"
+            );
+            let limit = batch.limits[input];
+            let page_end = state.offset.saturating_add(limit).min(edges.len());
+            let mut examined = 0;
+            let mut children = 0;
+            let mut supported = false;
+            let input_tag =
+                u32::try_from(input).expect("too many custom Program inputs in one cohort");
+
+            for &(source, target) in &edges[state.offset..page_end] {
+                examined += 1;
+                if source != state.value {
+                    continue;
+                }
+                if state.phase == ProgramSupportPhase::Blue && target == state.target {
+                    effects.support(input_tag);
+                    self.0
+                        .evidence
+                        .support_witnesses
+                        .fetch_add(1, Ordering::Relaxed);
+                    supported = true;
+                    break;
+                }
+
+                let child = ProgramSupportState {
+                    target: state.target,
+                    value: target,
+                    phase: state.phase.next(),
+                    offset: 0,
+                };
+                let novelty = ProgramSupportNovelty {
+                    target: child.target,
+                    value: child.value,
+                    phase: child.phase,
+                };
+                effects.fixpoint_child(input_tag, child, novelty, None);
+                children += 1;
+            }
+
+            let next_offset = state.offset + examined;
+            let resume = (!supported && next_offset < edges.len()).then(|| {
+                TypedResume::Immediate(ProgramSupportState {
+                    offset: next_offset,
+                    ..state.clone()
+                })
+            });
+            effects.account_transition(examined);
+            effects.page(examined, resume);
+            self.0
+                .evidence
+                .program_support_pages
+                .lock()
+                .expect("custom Program Support trace poisoned")
+                .push(ProgramSupportPageTrace {
+                    phase: state.phase,
+                    value: state.value,
+                    offset: state.offset,
+                    limit,
+                    examined,
+                    children,
+                    supported,
+                });
+        }
+    }
+}
+
+impl<'a> Constraint<'a> for ProgramAlternatingClosure {
+    fn variables(&self) -> VariableSet {
+        self.0.variables()
+    }
+
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        self.0.estimate(variable, view, out)
+    }
+
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.0.propose(variable, view, candidates);
+    }
+
+    fn confirm(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.0.confirm(variable, view, candidates);
+    }
+
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        self.0.satisfied(view)
+    }
+
+    fn residual_confirm_is_page_local(&self) -> bool {
+        true
+    }
+
+    fn residual_program(&self) -> Option<ProgramRef<'_>> {
+        Some(ProgramRef::new(self))
+    }
+}
+
 fn alternating_closure(evidence: Arc<DeltaEvidence>) -> AlternatingClosure {
     alternating_closure_with_terminal(evidence, false)
 }
@@ -312,6 +565,35 @@ fn alternating_closure_with_terminal(
         blue,
         evidence,
     }
+}
+
+fn program_alternating_closure_with_terminal(
+    evidence: Arc<DeltaEvidence>,
+    include_terminal: bool,
+    disconnected_prefix: usize,
+) -> ProgramAlternatingClosure {
+    assert!(disconnected_prefix <= 32);
+    let mut inner = alternating_closure_with_terminal(evidence, include_terminal);
+
+    // These edges are real but disconnected from every accepted `(red, blue)+`
+    // path: red destinations have no blue successors, while blue sources have
+    // no red predecessors. Keeping them before the core component forces the
+    // typed continuation to expose bounded negative pages without changing the
+    // finite relation used by the ordinary oracle.
+    let mut red = Vec::with_capacity(disconnected_prefix + inner.red.len());
+    red.extend(
+        (0..disconnected_prefix).map(|index| (raw(100 + index as u8), raw(140 + index as u8))),
+    );
+    red.append(&mut inner.red);
+    inner.red = red;
+
+    let mut blue = Vec::with_capacity(disconnected_prefix + inner.blue.len());
+    blue.extend(
+        (0..disconnected_prefix).map(|index| (raw(180 + index as u8), raw(220 + index as u8))),
+    );
+    blue.append(&mut inner.blue);
+    inner.blue = blue;
+    ProgramAlternatingClosure(inner)
 }
 
 #[derive(Clone)]
@@ -789,6 +1071,63 @@ fn recursive_support_fixture(
     ]))
 }
 
+fn program_recursive_support_fixture(
+    evidence: Arc<DeltaEvidence>,
+    include_terminal: bool,
+    disconnected_prefix: usize,
+    parent_count: usize,
+    guarded_value: RawInline,
+    sibling_value: RawInline,
+) -> Root {
+    assert!(parent_count > 0);
+    let target = raw(7);
+    let start = Variable::<UnknownInline>::new(START);
+    let end = Variable::<UnknownInline>::new(END);
+    let impossible = Box::new(IntersectionConstraint::new(vec![
+        Box::new(start.is(Inline::<UnknownInline>::new(raw(250)))) as DynConstraint,
+        Box::new(end.is(Inline::<UnknownInline>::new(raw(251)))) as DynConstraint,
+    ])) as DynConstraint;
+    let inner_or = Box::new(UnionConstraint::new(vec![
+        Box::new(program_alternating_closure_with_terminal(
+            evidence,
+            include_terminal,
+            disconnected_prefix,
+        )) as DynConstraint,
+        impossible,
+    ])) as DynConstraint;
+    let guarded = Box::new(IntersectionConstraint::new(vec![
+        inner_or,
+        Box::new(PageLocalDomain {
+            variable: OUTER,
+            estimate: 32,
+            values: Arc::new(vec![guarded_value]),
+        }) as DynConstraint,
+    ])) as DynConstraint;
+    let sibling = Box::new(IntersectionConstraint::new(vec![
+        Box::new(start.is(Inline::<UnknownInline>::new(raw(0)))) as DynConstraint,
+        Box::new(end.is(Inline::<UnknownInline>::new(target))) as DynConstraint,
+        Box::new(PageLocalDomain {
+            variable: OUTER,
+            estimate: 64,
+            values: Arc::new(vec![sibling_value]),
+        }) as DynConstraint,
+    ])) as DynConstraint;
+    let parents = (0..parent_count)
+        .map(|parent| raw(20 + parent as u8))
+        .collect();
+
+    Arc::new(IntersectionConstraint::new(vec![
+        Box::new(start.is(Inline::<UnknownInline>::new(raw(0)))) as DynConstraint,
+        Box::new(end.is(Inline::<UnknownInline>::new(target))) as DynConstraint,
+        Box::new(PageLocalDomain {
+            variable: PARENT,
+            estimate: parent_count,
+            values: Arc::new(parents),
+        }) as DynConstraint,
+        Box::new(UnionConstraint::new(vec![guarded, sibling])) as DynConstraint,
+    ]))
+}
+
 fn project_end(binding: &Binding) -> Option<RawInline> {
     binding.get(END).copied()
 }
@@ -931,6 +1270,215 @@ fn custom_support_recursive_formula_is_affine_and_monotone() {
         extension_only.remove(position);
     }
     assert_eq!(extension_only, vec![raw(10), raw(10)]);
+}
+
+fn assert_program_support_case(
+    include_terminal: bool,
+    parent_count: usize,
+    disconnected_prefix: usize,
+) -> Vec<RawInline> {
+    let guarded_value = raw(10);
+    let sibling_value = raw(11);
+    let mut expected = vec![sibling_value; parent_count];
+    if include_terminal {
+        expected.extend(std::iter::repeat_n(guarded_value, parent_count));
+    }
+    expected.sort_unstable();
+
+    let oracle_evidence = Arc::new(DeltaEvidence::default());
+    let oracle = sorted(
+        Query::new(
+            program_recursive_support_fixture(
+                Arc::clone(&oracle_evidence),
+                include_terminal,
+                disconnected_prefix,
+                parent_count,
+                guarded_value,
+                sibling_value,
+            ),
+            project_outer,
+        )
+        .sequential()
+        .collect(),
+    );
+    assert_eq!(oracle, expected);
+    assert!(
+        oracle_evidence
+            .fully_bound_satisfied_calls
+            .load(Ordering::Relaxed)
+            > 0,
+        "the finite oracle must use the ordinary relation"
+    );
+    assert_eq!(
+        oracle_evidence.support_seeded_roots.load(Ordering::Relaxed),
+        0
+    );
+
+    let residual_evidence = Arc::new(DeltaEvidence::default());
+    let residual = Query::new(
+        program_recursive_support_fixture(
+            Arc::clone(&residual_evidence),
+            include_terminal,
+            disconnected_prefix,
+            parent_count,
+            guarded_value,
+            sibling_value,
+        ),
+        project_outer,
+    )
+    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .cap(32)
+    .start_width(1)
+    .collect_profiled();
+    let actual = sorted(residual.results);
+    assert_eq!(actual, oracle);
+    assert_eq!(actual, expected);
+    assert_eq!(
+        residual_evidence
+            .fully_bound_satisfied_calls
+            .load(Ordering::Relaxed),
+        0,
+        "typed Program Support must replace the synchronous fully-bound oracle"
+    );
+    assert_eq!(
+        residual_evidence
+            .support_seeded_roots
+            .load(Ordering::Relaxed),
+        parent_count,
+        "each duplicate outer parent needs an independent Program activation"
+    );
+    assert_eq!(
+        residual_evidence.support_witnesses.load(Ordering::Relaxed),
+        if include_terminal { parent_count } else { 0 }
+    );
+    assert!(residual.stats.support_action_pops > 0);
+    assert!(residual.stats.delta_transition_pages > 0);
+    assert!(residual.stats.delta_transition_candidates_examined > 0);
+
+    let pages = residual_evidence
+        .program_support_pages
+        .lock()
+        .expect("custom Program Support trace poisoned");
+    assert!(!pages.is_empty());
+    assert!(pages.iter().all(|page| page.examined <= page.limit));
+    assert!(
+        pages.iter().any(|page| page.offset > 0),
+        "the typed traversal never retained a live page cursor"
+    );
+    assert!(
+        pages.iter().any(|page| page.limit > 1),
+        "negative Program pages never received geometric work growth"
+    );
+    assert!(
+        pages.iter().any(|page| page.children > 0),
+        "the Program never emitted an affine transition child"
+    );
+    if include_terminal {
+        assert!(pages.iter().any(|page| page.supported));
+    } else {
+        assert!(pages.iter().all(|page| !page.supported));
+        assert!(residual.stats.width_increases > 0);
+    }
+    actual
+}
+
+#[test]
+fn generic_program_support_is_affine_monotone_and_geometrically_paged() {
+    let parent_count = 4;
+    let inherited = assert_program_support_case(false, parent_count, 15);
+    let mut extension = assert_program_support_case(true, parent_count, 15);
+    for value in inherited {
+        let position = extension
+            .iter()
+            .position(|candidate| *candidate == value)
+            .expect("monotone graph growth removed an inherited affine occurrence");
+        extension.remove(position);
+    }
+    assert_eq!(extension, vec![raw(10); parent_count]);
+}
+
+#[test]
+fn live_program_support_clone_is_exact_and_matches_rayon_workers() {
+    let parent_count = 16;
+    let guarded_value = raw(10);
+    let sibling_value = raw(11);
+    let mut expected = vec![guarded_value; parent_count];
+    expected.extend(std::iter::repeat_n(sibling_value, parent_count));
+    expected.sort_unstable();
+
+    let evidence = Arc::new(DeltaEvidence::default());
+    let mut query = Query::new(
+        program_recursive_support_fixture(
+            Arc::clone(&evidence),
+            true,
+            7,
+            parent_count,
+            guarded_value,
+            sibling_value,
+        ),
+        project_outer,
+    )
+    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .cap(1)
+    .start_width(1);
+    let first = query
+        .next()
+        .expect("the positive Program formula has a nonempty affine bag");
+    assert!(query.stats().delta_transition_pages > 0);
+    assert!(
+        evidence.support_seeded_roots.load(Ordering::Relaxed) > 0,
+        "the clone point preceded typed Program admission"
+    );
+    assert!(
+        evidence.support_witnesses.load(Ordering::Relaxed) < parent_count,
+        "the clone point no longer retained a live Program Support remainder"
+    );
+
+    let clone = query.clone();
+    let remainder: Vec<_> = query.collect();
+    let cloned_remainder: Vec<_> = clone.collect();
+    assert_eq!(
+        cloned_remainder, remainder,
+        "cloning live typed Support changed the exact affine remainder"
+    );
+    let mut reconstructed: Vec<_> = std::iter::once(first).chain(remainder).collect();
+    reconstructed.sort_unstable();
+    assert_eq!(reconstructed, expected);
+
+    #[cfg(feature = "parallel")]
+    for workers in [1, 4] {
+        let evidence = Arc::new(DeltaEvidence::default());
+        let query = Query::new(
+            program_recursive_support_fixture(
+                Arc::clone(&evidence),
+                true,
+                7,
+                parent_count,
+                guarded_value,
+                sibling_value,
+            ),
+            project_outer,
+        )
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .cap(2)
+        .start_width(1);
+        let mut actual = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()
+            .unwrap()
+            .install(|| query.into_par_iter().collect::<Vec<_>>());
+        actual.sort_unstable();
+        assert_eq!(actual, expected, "workers={workers}");
+        assert_eq!(
+            evidence.support_seeded_roots.load(Ordering::Relaxed),
+            parent_count,
+            "workers={workers}"
+        );
+        assert!(
+            evidence.support_expanded_nodes.load(Ordering::Relaxed) > 0,
+            "workers={workers}"
+        );
+    }
 }
 
 #[test]
