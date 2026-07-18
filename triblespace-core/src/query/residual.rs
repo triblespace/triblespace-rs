@@ -89,6 +89,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use ahash::AHashMap;
+use im::{OrdSet, Vector};
 use indexmap::IndexSet;
 use smallvec::SmallVec;
 
@@ -3996,6 +3997,7 @@ impl DeferredCandidateCursor {
             }
         }
     }
+
 }
 
 impl std::fmt::Debug for DeferredCandidateCursor {
@@ -4679,6 +4681,15 @@ impl CandidatePayload {
         *self = Self::Deferred(DeferredCandidates::from_payload(payload, parent_count));
     }
 
+    /// Opens a clone-cheap cursor over an already-shared payload.
+    fn shared_cursor(&self, parent_count: usize) -> DeferredCandidateCursor {
+        let Self::Deferred(candidates) = self else {
+            panic!("affine candidate cursor requires shared deferred storage")
+        };
+        assert_eq!(candidates.parent_count, parent_count);
+        candidates.cursor()
+    }
+
     /// Opens a clone-cheap cursor over an already-shared one-parent payload.
     ///
     /// This is deliberately distinct from [`Self::one_parent_values`].  The
@@ -4687,14 +4698,7 @@ impl CandidatePayload {
     /// single backing slice.  Affine reducer finalization must always use this
     /// structural cursor instead.
     fn shared_one_parent_cursor(&self) -> DeferredCandidateCursor {
-        let Self::Deferred(candidates) = self else {
-            panic!("affine candidate cursor requires shared deferred storage")
-        };
-        assert_eq!(
-            candidates.parent_count, 1,
-            "affine candidate cursor requires one parent"
-        );
-        candidates.cursor()
+        self.shared_cursor(1)
     }
 
     /// Crosses the existing unbudgeted planner/action-opening boundary.
@@ -4869,16 +4873,15 @@ impl CandidatePayload {
     }
 
     /// Appends candidates that already share the same affine parent domain.
-    /// Formula OR reduction uses this operation; unlike bucket reconvergence,
-    /// the right-hand row coordinates must not be shifted.
+    /// Unlike bucket reconvergence, the right-hand row coordinates must not be
+    /// shifted.
     fn extend_same_domain(&mut self, mut other: Self, parent_count: usize) {
         self.debug_assert_valid_for(parent_count);
         other.debug_assert_valid_for(parent_count);
-        // Multi-parent OR reduction sorts immediately and therefore already
-        // crosses a whole-group materialization boundary. Keeping deferred
-        // same-domain concat exclusive to one parent makes every deferred
-        // multi-parent rope globally grouped, so structural parent cuts need
-        // only cached boundary tags.
+        // Pageable Formula OR reducers operate on singleton parent domains.
+        // For any remaining multi-parent caller, keep every deferred rope
+        // globally grouped so structural parent cuts need only cached boundary
+        // tags.
         if parent_count != 1
             && (matches!(self, Self::Deferred(_)) || matches!(&other, Self::Deferred(_)))
         {
@@ -4906,32 +4909,6 @@ impl CandidatePayload {
                 unreachable!("deferred append returned above")
             }
             _ => unreachable!("same parent domain selected incompatible candidate shapes"),
-        }
-    }
-
-    fn sort_unstable(&mut self) {
-        self.materialize_for_planning_or_action_opening();
-        match self {
-            Self::Values(values) => values.sort_unstable(),
-            Self::Tagged(pairs) => pairs.sort_unstable(),
-            Self::Deferred(_) => unreachable!("candidate sort requires materialized storage"),
-        }
-    }
-
-    fn is_sorted(&self) -> bool {
-        match self {
-            Self::Values(values) => values.is_sorted(),
-            Self::Tagged(pairs) => pairs.is_sorted(),
-            Self::Deferred(candidates) => candidates.iter().is_sorted(),
-        }
-    }
-
-    fn dedup(&mut self) {
-        self.materialize_for_planning_or_action_opening();
-        match self {
-            Self::Values(values) => values.dedup(),
-            Self::Tagged(pairs) => pairs.dedup(),
-            Self::Deferred(_) => unreachable!("candidate dedup requires materialized storage"),
         }
     }
 
@@ -5339,15 +5316,85 @@ fn debug_assert_candidates_grouped(candidates: &CandidatePayload, parent_count: 
     candidates.debug_assert_valid_for(parent_count);
 }
 
+/// Persistent set-valued output owned by one live Formula OR frame.
+///
+/// The outer vector follows affine parent order.  Each parent owns an
+/// independent ordered set, so equal values in different parents remain
+/// distinct while clones, planning partitions, and bucket reconvergence share
+/// the immutable tree roots.  `unique_len` is a scheduling/empty fast path;
+/// neither it nor the set roots participate in Formula PC identity.
+#[derive(Clone, Debug)]
+struct FormulaOrAccumulator {
+    sets: Vector<OrdSet<RawInline>>,
+    unique_len: usize,
+}
+
+impl FormulaOrAccumulator {
+    fn empty(parent_count: usize) -> Self {
+        Self {
+            sets: std::iter::repeat_with(OrdSet::new)
+                .take(parent_count)
+                .collect(),
+            unique_len: 0,
+        }
+    }
+
+    fn insert(&mut self, parent: u32, value: RawInline) {
+        let parent = parent as usize;
+        let set = self
+            .sets
+            .get_mut(parent)
+            .expect("Formula OR admission named an unknown parent");
+        if set.insert(value).is_none() {
+            self.unique_len = self
+                .unique_len
+                .checked_add(1)
+                .expect("Formula OR unique candidate count overflow");
+        }
+    }
+
+    fn append(&mut self, other: Self) {
+        self.unique_len = self
+            .unique_len
+            .checked_add(other.unique_len)
+            .expect("Formula OR unique candidate count overflow");
+        self.sets.append(other.sets);
+    }
+
+    fn take_tail(&mut self, first: usize) -> Self {
+        assert!(first > 0 && first < self.sets.len());
+        let sets = self.sets.split_off(first);
+        let unique_len = sets.iter().map(OrdSet::len).sum();
+        self.unique_len = self
+            .unique_len
+            .checked_sub(unique_len)
+            .expect("Formula OR tail contained too many unique values");
+        Self { sets, unique_len }
+    }
+
+    fn push_parent_set(&mut self, set: OrdSet<RawInline>) {
+        self.unique_len = self
+            .unique_len
+            .checked_add(set.len())
+            .expect("Formula OR unique candidate count overflow");
+        self.sets.push_back(set);
+    }
+
+    fn singleton_set(&self) -> OrdSet<RawInline> {
+        assert_eq!(self.sets.len(), 1, "Formula reducer requires one parent");
+        self.sets[0].clone()
+    }
+}
+
 #[derive(Clone, Debug)]
 enum FormulaPayloadFrame {
-    /// Every OR child reads the same immutable source and appends its result
-    /// to one activation-private union accumulator. `source` follows the
-    /// protocol's ascending-parent grouping; `output` is fully sorted after
-    /// every child accumulation so frame completion can deduplicate in place.
+    /// Every OR child reads the same immutable source and admits its result
+    /// into one activation-private persistent ordered-set shell. Admission and
+    /// later ordered emission are engine Program phases, never synchronous
+    /// whole-group normalization at this frame boundary.
     Or {
         source: CandidatePayload,
-        output: CandidatePayload,
+        accumulator: FormulaOrAccumulator,
     },
     /// AND threads one ascending-parent-grouped candidate stream through its
     /// selected proposer and remaining confirmers. Empty current streams
@@ -5360,7 +5407,7 @@ impl FormulaPayloadFrame {
         match self {
             Self::Or { .. } => Self::Or {
                 source: CandidatePayload::empty(parent_count),
-                output: CandidatePayload::empty(parent_count),
+                accumulator: FormulaOrAccumulator::empty(parent_count),
             },
             Self::And { .. } => Self::And {
                 current: CandidatePayload::empty(parent_count),
@@ -5370,16 +5417,9 @@ impl FormulaPayloadFrame {
 
     fn result(self, parent_count: usize) -> CandidatePayload {
         match self {
-            Self::Or { mut output, .. } => {
-                // OR is a set-valued reducer. Normalize at this frame's own
-                // completion boundary so an enclosing AND never observes
-                // duplicate candidates produced by sibling histories. Every
-                // accumulation already sorted the complete output.
-                output.debug_assert_valid_for(parent_count);
-                debug_assert!(output.is_sorted());
-                output.dedup();
-                output
-            }
+            Self::Or { .. } => panic!(
+                "Formula OR result crossed its pageable ordered-emission boundary"
+            ),
             Self::And { current } => {
                 current.debug_assert_valid_for(parent_count);
                 current
@@ -5398,17 +5438,30 @@ struct FormulaBatch {
     frames: Vec<FormulaPayloadFrame>,
 }
 
+#[derive(Clone, Debug)]
+enum FormulaFrameDestination {
+    Root(CandidatePayload),
+    ParentAnd,
+    ParentOr(CandidatePayload),
+}
+
 impl FormulaBatch {
     fn root_frame(
         kind: &FiniteFormulaNodeKind,
-        source: CandidatePayload,
+        mut source: CandidatePayload,
         parent_count: usize,
     ) -> FormulaPayloadFrame {
         match kind {
-            FiniteFormulaNodeKind::Or { .. } => FormulaPayloadFrame::Or {
-                source,
-                output: CandidatePayload::empty(parent_count),
-            },
+            FiniteFormulaNodeKind::Or { .. } => {
+                // OR source is immutable from frame entry onward. Freezing it
+                // here makes machine clones and every arm selection share the
+                // occurrence storage even before the first child is chosen.
+                source.defer_for_shared_activation(parent_count);
+                FormulaPayloadFrame::Or {
+                    source,
+                    accumulator: FormulaOrAccumulator::empty(parent_count),
+                }
+            }
             // A root Atom uses the same single-stream payload as a one-child
             // conjunction. Nested atoms continue to operate directly on
             // their enclosing connective frame.
@@ -5482,6 +5535,70 @@ impl FormulaBatch {
         }
     }
 
+    fn current_frame_is_or(&self) -> bool {
+        matches!(self.frames.last(), Some(FormulaPayloadFrame::Or { .. }))
+    }
+
+    fn parent_frame_is_or(&self) -> bool {
+        self.frames
+            .len()
+            .checked_sub(2)
+            .and_then(|parent| self.frames.get(parent))
+            .is_some_and(|frame| matches!(frame, FormulaPayloadFrame::Or { .. }))
+    }
+
+    fn admit_current_or_value(&mut self, parent: u32, value: RawInline) {
+        let FormulaPayloadFrame::Or { accumulator, .. } = self
+            .frames
+            .last_mut()
+            .expect("Formula OR admission lost its reducer frame")
+        else {
+            panic!("Formula OR admission resumed into a non-OR frame")
+        };
+        accumulator.insert(parent, value);
+    }
+
+    fn current_or_set(&self) -> OrdSet<RawInline> {
+        let FormulaPayloadFrame::Or { accumulator, .. } = self
+            .frames
+            .last()
+            .expect("Formula OR emission lost its reducer frame")
+        else {
+            panic!("Formula OR emission resumed from a non-OR frame")
+        };
+        accumulator.singleton_set()
+    }
+
+    /// Pops a completed non-OR child before its result enters an enclosing
+    /// OR.  The exact child PC remains private reducer payload until admission
+    /// reaches EOF, so canonical control cannot observe a partial union.
+    fn take_child_result_for_or(&mut self) -> CandidatePayload {
+        assert!(self.parent_frame_is_or());
+        self.frames
+            .pop()
+            .expect("returning Formula child lost its payload frame")
+            .result(self.parents.row_count)
+    }
+
+    /// Installs an already ordered/distinct OR result after its emission
+    /// receipt reaches EOF.  A parent OR receives the result through a second
+    /// admission receipt; a parent AND may consume it immediately, and a root
+    /// result waits for the ordinary outer candidate continuation.
+    fn return_emitted_or(&mut self, result: CandidatePayload) -> FormulaFrameDestination {
+        assert!(self.current_frame_is_or());
+        self.frames
+            .pop()
+            .expect("emitted Formula OR lost its payload frame");
+        match self.frames.last_mut() {
+            None => FormulaFrameDestination::Root(result),
+            Some(FormulaPayloadFrame::And { current }) => {
+                *current = result;
+                FormulaFrameDestination::ParentAnd
+            }
+            Some(FormulaPayloadFrame::Or { .. }) => FormulaFrameDestination::ParentOr(result),
+        }
+    }
+
     /// Freezes the exact candidate occurrence bag at the cyclic action-opening
     /// boundary and returns a shared reducer copy. Legacy graph expansion can
     /// retain a segmented input; the later affine finalizer always walks the
@@ -5502,13 +5619,12 @@ impl FormulaBatch {
         self.shared_confirm_original()
     }
 
-    /// V1 can hand a formula Confirm to the pageable finalizer only while the
-    /// complete live reducer ancestry is conjunctive.  An OR frame still owns
-    /// eager sort/dedup work and therefore keeps the old atomic finish path.
+    /// Every live Formula candidate frame now has a pageable completion path:
+    /// AND installs the result directly, while OR admits it through its own
+    /// engine reducer.  Confirm finalization therefore has no connective-shape
+    /// exception left at this boundary.
     fn confirm_finalizer_capable(&self) -> bool {
-        self.frames
-            .iter()
-            .all(|frame| matches!(frame, FormulaPayloadFrame::And { .. }))
+        !self.frames.is_empty()
     }
 
     fn action_candidate_count(&self, stage: FormulaStage) -> usize {
@@ -5518,10 +5634,8 @@ impl FormulaBatch {
         }
     }
 
-    /// Applies one complete Atom action result to the focused reducer frame.
-    /// Ordinary protocol execution and quiescent cyclic execution share this
-    /// exact boundary so AND replaces its working stream while OR accumulates
-    /// one independently evaluated arm.
+    /// Applies one complete Atom action result to an AND frame. OR results
+    /// must first cross the pageable admission receipt.
     fn apply_action_result(&mut self, stage: FormulaStage, result: CandidatePayload) {
         assert_ne!(
             stage,
@@ -5529,16 +5643,13 @@ impl FormulaBatch {
             "Boolean support never enters a candidate reducer frame"
         );
         // Both protocol verbs preserve ascending parent groups. AND needs
-        // only that grouping; OR sorts once after combining sibling arms.
+        // only that grouping; OR is deliberately rejected below.
         debug_assert_candidates_grouped(&result, self.parents.row_count);
         match (self.frames.last_mut().unwrap(), stage) {
             (
-                FormulaPayloadFrame::Or { output, .. },
+                FormulaPayloadFrame::Or { .. },
                 FormulaStage::Propose | FormulaStage::Confirm,
-            ) => {
-                output.extend_same_domain(result, self.parents.row_count);
-                output.sort_unstable();
-            }
+            ) => panic!("Formula OR action bypassed pageable admission"),
             (FormulaPayloadFrame::And { current }, FormulaStage::Propose) => {
                 assert!(current.is_empty(), "an AND ran two proposers");
                 *current = result;
@@ -5553,9 +5664,14 @@ impl FormulaBatch {
     fn validate_tags(&self) {
         assert!(
             self.frames.iter().all(|frame| match frame {
-                FormulaPayloadFrame::Or { source, output } => {
+                FormulaPayloadFrame::Or {
+                    source,
+                    accumulator,
+                } => {
                     source.all_parents_in(self.parents.row_count)
-                        && output.all_parents_in(self.parents.row_count)
+                        && accumulator.sets.len() == self.parents.row_count
+                        && accumulator.unique_len
+                            == accumulator.sets.iter().map(OrdSet::len).sum()
                 }
                 FormulaPayloadFrame::And { current } => {
                     current.all_parents_in(self.parents.row_count)
@@ -5566,18 +5682,26 @@ impl FormulaBatch {
     }
 
     fn enter(&mut self, kind: &FiniteFormulaNodeKind, stage: FormulaStage) {
+        let parent_count = self.parents.row_count;
         let input = match stage {
             FormulaStage::Support => {
                 panic!("Boolean support does not allocate candidate reducer frames")
             }
-            FormulaStage::Propose => CandidatePayload::empty(self.parents.row_count),
-            FormulaStage::Confirm => self.input().clone(),
+            FormulaStage::Propose => CandidatePayload::empty(parent_count),
+            FormulaStage::Confirm => {
+                // Every OR arm reads one immutable source. Freeze it before
+                // cloning a nested frame so arm selection shares an Arc root
+                // instead of copying an O(n) Values/Tagged bag per arm.
+                self.input_mut()
+                    .defer_for_shared_activation(parent_count);
+                self.input().clone()
+            }
         };
         self.frames.push(match kind {
             FiniteFormulaNodeKind::And { .. } => FormulaPayloadFrame::And { current: input },
             FiniteFormulaNodeKind::Or { .. } => FormulaPayloadFrame::Or {
                 source: input,
-                output: CandidatePayload::empty(self.parents.row_count),
+                accumulator: FormulaOrAccumulator::empty(parent_count),
             },
             FiniteFormulaNodeKind::Atom => panic!("an Atom cannot own a formula payload frame"),
         });
@@ -5598,9 +5722,8 @@ impl FormulaBatch {
             .last_mut()
             .expect("a returning formula node has a parent frame")
         {
-            FormulaPayloadFrame::Or { output, .. } => {
-                output.extend_same_domain(result, self.parents.row_count);
-                output.sort_unstable();
+            FormulaPayloadFrame::Or { .. } => {
+                panic!("Formula child bypassed pageable OR admission")
             }
             FormulaPayloadFrame::And { current } => *current = result,
         }
@@ -5631,15 +5754,15 @@ impl FormulaBatch {
                 (
                     FormulaPayloadFrame::Or {
                         source: left_source,
-                        output: left_output,
+                        accumulator: left_accumulator,
                     },
                     FormulaPayloadFrame::Or {
                         source: right_source,
-                        output: right_output,
+                        accumulator: right_accumulator,
                     },
                 ) => {
                     left_source.append_disjoint(right_source, left_parents, right_parents);
-                    left_output.append_disjoint(right_output, left_parents, right_parents);
+                    left_accumulator.append(right_accumulator);
                 }
                 (
                     FormulaPayloadFrame::And {
@@ -5685,9 +5808,12 @@ impl FormulaBatch {
             .frames
             .iter_mut()
             .map(|frame| match frame {
-                FormulaPayloadFrame::Or { source, output } => FormulaPayloadFrame::Or {
+                FormulaPayloadFrame::Or {
+                    source,
+                    accumulator,
+                } => FormulaPayloadFrame::Or {
                     source: source.take_parent_tail(first, old_parent_count),
-                    output: output.take_parent_tail(first, old_parent_count),
+                    accumulator: accumulator.take_tail(first),
                 },
                 FormulaPayloadFrame::And { current } => FormulaPayloadFrame::And {
                     current: current.take_parent_tail(first, old_parent_count),
@@ -5836,9 +5962,6 @@ impl FormulaBatch {
                     (FormulaPayloadFrame::Or { source, .. }, 0) => {
                         source.as_tagged_mut().push((remap[parent], value))
                     }
-                    (FormulaPayloadFrame::Or { output, .. }, 1) => {
-                        output.as_tagged_mut().push((remap[parent], value))
-                    }
                     (FormulaPayloadFrame::And { current }, 0) => {
                         current.as_tagged_mut().push((remap[parent], value))
                     }
@@ -5848,9 +5971,23 @@ impl FormulaBatch {
         }
         for (frame, payload) in self.frames.into_iter().enumerate() {
             match payload {
-                FormulaPayloadFrame::Or { source, output } => {
+                FormulaPayloadFrame::Or {
+                    source,
+                    accumulator,
+                } => {
                     partition_values(source, assignment, &remap, &mut groups, frame, 0);
-                    partition_values(output, assignment, &remap, &mut groups, frame, 1);
+                    assert_eq!(accumulator.sets.len(), row_count);
+                    for (parent, set) in accumulator.sets.into_iter().enumerate() {
+                        let target = groups
+                            .get_mut(&assignment[parent])
+                            .expect("every Formula assignment created its group");
+                        let FormulaPayloadFrame::Or { accumulator, .. } =
+                            &mut target.frames[frame]
+                        else {
+                            panic!("Formula accumulator disagrees with its structural frame")
+                        };
+                        accumulator.push_parent_set(set);
+                    }
                 }
                 FormulaPayloadFrame::And { current } => {
                     partition_values(current, assignment, &remap, &mut groups, frame, 0);
@@ -5861,9 +5998,9 @@ impl FormulaBatch {
             let parent_count = group.parents.row_count;
             for frame in &mut group.frames {
                 match frame {
-                    FormulaPayloadFrame::Or { source, output } => {
+                    FormulaPayloadFrame::Or { source, .. } => {
                         source.normalize_for(parent_count);
-                        output.normalize_for(parent_count);
+                        source.defer_for_shared_activation(parent_count);
                     }
                     FormulaPayloadFrame::And { current } => {
                         current.normalize_for(parent_count);
@@ -5885,6 +6022,59 @@ impl FormulaBatch {
         groups.into_values().collect()
     }
 
+    fn defer_all_frame_candidates(&mut self) {
+        let parent_count = self.parents.row_count;
+        for frame in &mut self.frames {
+            match frame {
+                FormulaPayloadFrame::Or { source, .. } => {
+                    source.defer_for_shared_activation(parent_count)
+                }
+                FormulaPayloadFrame::And { current } => {
+                    current.defer_for_shared_activation(parent_count)
+                }
+            }
+        }
+    }
+
+    /// Splits reducer payload by parent using persistent parent-domain cuts.
+    /// Unlike nonuniform planning, this path must not materialize candidate
+    /// occurrences merely to mint one affine Program credit per parent.
+    fn into_structural_singletons(mut self, stride: usize) -> Vec<Self> {
+        let parent_count = self.parents.row_count;
+        assert!(parent_count > 0, "Formula reducer seed has no affine parent");
+        self.defer_all_frame_candidates();
+        let mut reversed = Vec::with_capacity(parent_count);
+        while self.parents.row_count > 1 {
+            reversed.push(self.take_tail(stride, 1));
+        }
+        reversed.push(self);
+        reversed.reverse();
+        reversed
+    }
+
+    fn into_structural_singletons_with_input(
+        mut self,
+        stride: usize,
+        mut input: CandidatePayload,
+    ) -> Vec<(Self, CandidatePayload)> {
+        let parent_count = self.parents.row_count;
+        assert!(parent_count > 0, "Formula reducer seed has no affine parent");
+        self.defer_all_frame_candidates();
+        input.debug_assert_valid_for(parent_count);
+        input.defer_for_shared_activation(parent_count);
+        let mut reversed = Vec::with_capacity(parent_count);
+        while self.parents.row_count > 1 {
+            let first = self.parents.row_count - 1;
+            let old_parent_count = self.parents.row_count;
+            let tail_input = input.take_parent_tail(first, old_parent_count);
+            let tail_batch = self.take_tail(stride, 1);
+            reversed.push((tail_batch, tail_input));
+        }
+        reversed.push((self, input));
+        reversed.reverse();
+        reversed
+    }
+
     fn finish(mut self) -> CandidateBatch {
         assert_eq!(self.frames.len(), 1);
         let root = self.frames.pop().unwrap();
@@ -5893,6 +6083,48 @@ impl FormulaBatch {
             candidates: root.result(self.activations.len()),
         }
     }
+
+    fn finish_with_emitted_root(self, candidates: CandidatePayload) -> CandidateBatch {
+        assert!(self.frames.is_empty());
+        candidates.debug_assert_valid_for(self.parents.row_count);
+        CandidateBatch {
+            parents: self.parents,
+            candidates,
+        }
+    }
+}
+
+/// Exact canonical Formula control to resume only after one private reducer
+/// reaches EOF. `Complete` retains the pre-completion Action/child PC;
+/// `Continue` retains a parent PC whose child was already completed by ordered
+/// emission but whose union result is still being admitted.
+#[derive(Clone, Copy, Debug)]
+enum FormulaReducerContinuation {
+    Complete(FormulaPcId),
+    Continue(FormulaPcId),
+}
+
+#[derive(Clone, Debug)]
+struct FormulaOrAdmissionSeed {
+    bound: VariableSet,
+    batch: FormulaBatch,
+    input: CandidatePayload,
+    continuation: FormulaReducerContinuation,
+}
+
+#[derive(Clone, Debug)]
+struct FormulaOrEmissionSeed {
+    bound: VariableSet,
+    batch: FormulaBatch,
+    /// Exact complete-Plan PC. The OR node does not advance to its parent
+    /// until ordered emission reaches EOF.
+    counter: FormulaPcId,
+}
+
+#[derive(Clone, Debug)]
+enum FormulaReducerSeed {
+    Admit(FormulaOrAdmissionSeed),
+    Emit(FormulaOrEmissionSeed),
 }
 
 #[derive(Clone, Debug)]
@@ -6984,6 +7216,21 @@ fn finish_formula_transition(
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
 ) -> Option<ContinuationToken> {
+    let candidate = batch.finish();
+    finish_formula_candidate_transition(
+        plan, desc, resume, candidate, worklist, interner, stats,
+    )
+}
+
+fn finish_formula_candidate_transition(
+    plan: &ResidualPlan,
+    desc: &StateDesc,
+    resume: &FormulaOuterResume,
+    candidate: CandidateBatch,
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+) -> Option<ContinuationToken> {
     let leaf_count = plan.len();
     let (relevant, checked) = match &resume.verb {
         UnionVerb::Propose { relevant } => {
@@ -6996,7 +7243,7 @@ fn finish_formula_transition(
         }
     };
     let stride = desc.bound.count();
-    let candidate = batch.finish().compact(stride)?;
+    let candidate = candidate.compact(stride)?;
     file_with_plan(
         worklist,
         interner,
@@ -7027,6 +7274,7 @@ fn propagate_formula_support(
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
+    reducer_seeds: &mut Vec<FormulaReducerSeed>,
 ) -> Option<ContinuationToken> {
     assert!(matches!(
         interner.formula(completed).focus,
@@ -7063,7 +7311,15 @@ fn propagate_formula_support(
                     truth,
                 );
                 return propagate_formula_support(
-                    plan, desc, completed, truth, batch, worklist, interner, stats,
+                    plan,
+                    desc,
+                    completed,
+                    truth,
+                    batch,
+                    worklist,
+                    interner,
+                    stats,
+                    reducer_seeds,
                 );
             }
             if done_count
@@ -7074,7 +7330,15 @@ fn propagate_formula_support(
             {
                 let completed = interner.formula_pcs.complete(&plan.finite_formula, parent);
                 return propagate_formula_support(
-                    plan, desc, completed, identity, batch, worklist, interner, stats,
+                    plan,
+                    desc,
+                    completed,
+                    identity,
+                    batch,
+                    worklist,
+                    interner,
+                    stats,
+                    reducer_seeds,
                 );
             }
             file_with_plan(
@@ -7107,7 +7371,16 @@ fn propagate_formula_support(
                     &mut batch,
                 );
             }
-            continue_formula_transition(plan, desc, next, batch, worklist, interner, stats)
+            continue_formula_transition(
+                plan,
+                desc,
+                next,
+                batch,
+                worklist,
+                interner,
+                stats,
+                reducer_seeds,
+            )
         }
         Err(_) => {
             unreachable!("support traversal escaped without an OR guard")
@@ -7123,6 +7396,7 @@ fn continue_formula_transition(
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
+    reducer_seeds: &mut Vec<FormulaReducerSeed>,
 ) -> Option<ContinuationToken> {
     let support_complete = match &interner.formula(counter).focus {
         FormulaFocus::Plan {
@@ -7141,7 +7415,15 @@ fn continue_formula_transition(
             let truth = matches!(formula_node.kind, FiniteFormulaNodeKind::And { .. });
             let completed = interner.formula_pcs.complete(&plan.finite_formula, counter);
             return propagate_formula_support(
-                plan, desc, completed, truth, batch, worklist, interner, stats,
+                plan,
+                desc,
+                completed,
+                truth,
+                batch,
+                worklist,
+                interner,
+                stats,
+                reducer_seeds,
             );
         }
     }
@@ -7167,7 +7449,14 @@ fn continue_formula_transition(
                     prefer_continuation(
                         &mut continuation,
                         continue_formula_transition(
-                            plan, desc, counter, batch, worklist, interner, stats,
+                            plan,
+                            desc,
+                            counter,
+                            batch,
+                            worklist,
+                            interner,
+                            stats,
+                            reducer_seeds,
                         ),
                     );
                 }
@@ -7227,6 +7516,33 @@ fn continue_formula_transition(
         );
     }
 
+    let complete_node = match &interner.formula(counter).focus {
+        FormulaFocus::Plan { node, .. } => *node,
+        _ => unreachable!("only a complete Plan reaches Formula reduction"),
+    };
+    if matches!(
+        plan.finite_formula.node(complete_node).kind,
+        FiniteFormulaNodeKind::Or { .. }
+    ) {
+        reducer_seeds.push(FormulaReducerSeed::Emit(FormulaOrEmissionSeed {
+            bound: desc.bound,
+            batch,
+            counter,
+        }));
+        return None;
+    }
+    if batch.parent_frame_is_or() {
+        let mut batch = batch;
+        let input = batch.take_child_result_for_or();
+        reducer_seeds.push(FormulaReducerSeed::Admit(FormulaOrAdmissionSeed {
+            bound: desc.bound,
+            batch,
+            input,
+            continuation: FormulaReducerContinuation::Complete(counter),
+        }));
+        return None;
+    }
+
     let completed = interner.formula_pcs.complete(&plan.finite_formula, counter);
     match interner
         .formula_pcs
@@ -7235,13 +7551,153 @@ fn continue_formula_transition(
         Ok(InternedFormulaSuccessor::Formula(next)) => {
             let mut batch = batch;
             batch.return_frame();
-            continue_formula_transition(plan, desc, next, batch, worklist, interner, stats)
+            continue_formula_transition(
+                plan,
+                desc,
+                next,
+                batch,
+                worklist,
+                interner,
+                stats,
+                reducer_seeds,
+            )
         }
         Ok(InternedFormulaSuccessor::Guard { .. }) => {
             unreachable!("ordinary formula completion returned through a support guard")
         }
         Err(resume) => {
             finish_formula_transition(plan, desc, &resume, batch, worklist, interner, stats)
+        }
+    }
+}
+
+/// Resumes the exact Formula control saved by an OR admission receipt.  The
+/// reducer has already updated the private persistent accumulator; only EOF is
+/// allowed to complete the old Action/child PC or expose a previously emitted
+/// child result to its parent Plan.
+fn finish_formula_or_admission(
+    plan: &ResidualPlan,
+    bound: VariableSet,
+    batch: FormulaBatch,
+    continuation: FormulaReducerContinuation,
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+    reducer_seeds: &mut Vec<FormulaReducerSeed>,
+) -> Option<ContinuationToken> {
+    batch.validate_tags();
+    match continuation {
+        FormulaReducerContinuation::Complete(counter) => {
+            let completed = interner.formula_pcs.complete(&plan.finite_formula, counter);
+            let desc = StateDesc {
+                bound,
+                phase: ResidualPhase::Formula { counter },
+            };
+            match interner
+                .formula_pcs
+                .resume_completed(&plan.finite_formula, completed)
+            {
+                Ok(InternedFormulaSuccessor::Formula(next)) => continue_formula_transition(
+                    plan,
+                    &desc,
+                    next,
+                    batch,
+                    worklist,
+                    interner,
+                    stats,
+                    reducer_seeds,
+                ),
+                Ok(InternedFormulaSuccessor::Guard { .. }) => {
+                    unreachable!("candidate reducer returned through a support guard")
+                }
+                Err(resume) => finish_formula_transition(
+                    plan, &desc, &resume, batch, worklist, interner, stats,
+                ),
+            }
+        }
+        FormulaReducerContinuation::Continue(counter) => {
+            let desc = StateDesc {
+                bound,
+                phase: ResidualPhase::Formula { counter },
+            };
+            continue_formula_transition(
+                plan,
+                &desc,
+                counter,
+                batch,
+                worklist,
+                interner,
+                stats,
+                reducer_seeds,
+            )
+        }
+    }
+}
+
+/// Installs one ordered/distinct OR output only after its emission Program
+/// reaches EOF. A nested parent OR receives a fresh admission receipt; an AND
+/// or the outer candidate continuation observes the completed payload
+/// directly.
+fn finish_formula_or_emission(
+    plan: &ResidualPlan,
+    bound: VariableSet,
+    counter: FormulaPcId,
+    mut batch: FormulaBatch,
+    result: CandidatePayload,
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+    reducer_seeds: &mut Vec<FormulaReducerSeed>,
+) -> Option<ContinuationToken> {
+    result.debug_assert_valid_for(batch.parents.row_count);
+    let completed = interner.formula_pcs.complete(&plan.finite_formula, counter);
+    let successor = interner
+        .formula_pcs
+        .resume_completed(&plan.finite_formula, completed);
+    let destination = batch.return_emitted_or(result);
+    let desc = StateDesc {
+        bound,
+        phase: ResidualPhase::Formula { counter },
+    };
+    match (successor, destination) {
+        (
+            Ok(InternedFormulaSuccessor::Formula(next)),
+            FormulaFrameDestination::ParentAnd,
+        ) => continue_formula_transition(
+            plan,
+            &desc,
+            next,
+            batch,
+            worklist,
+            interner,
+            stats,
+            reducer_seeds,
+        ),
+        (
+            Ok(InternedFormulaSuccessor::Formula(next)),
+            FormulaFrameDestination::ParentOr(input),
+        ) => {
+            reducer_seeds.push(FormulaReducerSeed::Admit(FormulaOrAdmissionSeed {
+                bound,
+                batch,
+                input,
+                continuation: FormulaReducerContinuation::Continue(next),
+            }));
+            None
+        }
+        (Err(resume), FormulaFrameDestination::Root(result)) => {
+            let candidate = batch.finish_with_emitted_root(result);
+            finish_formula_candidate_transition(
+                plan, &desc, &resume, candidate, worklist, interner, stats,
+            )
+        }
+        (Ok(InternedFormulaSuccessor::Guard { .. }), _) => {
+            unreachable!("candidate OR returned through a support guard")
+        }
+        (Ok(InternedFormulaSuccessor::Formula(_)), FormulaFrameDestination::Root(_))
+        | (Err(_), FormulaFrameDestination::ParentAnd)
+        | (Err(_), FormulaFrameDestination::ParentOr(_)) => {
+            panic!("Formula frame stack disagrees with its exact return PC")
         }
     }
 }
@@ -7256,6 +7712,7 @@ fn formula_plan_transition<'a>(
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
+    reducer_seeds: &mut Vec<FormulaReducerSeed>,
 ) -> Option<ContinuationToken> {
     let (node, stage) = match &interner.formula(counter).focus {
         FormulaFocus::Plan { node, stage, .. } => (*node, *stage),
@@ -7263,15 +7720,40 @@ fn formula_plan_transition<'a>(
     };
     if stage == FormulaStage::Support {
         return formula_support_plan_transition(
-            plan, desc, counter, batch, worklist, interner, stats,
+            plan,
+            desc,
+            counter,
+            batch,
+            worklist,
+            interner,
+            stats,
+            reducer_seeds,
         );
     }
     match &plan.finite_formula.node(node).kind {
         FiniteFormulaNodeKind::Or { children } => formula_or_plan_transition(
-            root, plan, desc, counter, children, batch, worklist, interner, stats,
+            root,
+            plan,
+            desc,
+            counter,
+            children,
+            batch,
+            worklist,
+            interner,
+            stats,
+            reducer_seeds,
         ),
         FiniteFormulaNodeKind::And { children } => formula_and_plan_transition(
-            root, plan, desc, counter, children, batch, worklist, interner, stats,
+            root,
+            plan,
+            desc,
+            counter,
+            children,
+            batch,
+            worklist,
+            interner,
+            stats,
+            reducer_seeds,
         ),
         FiniteFormulaNodeKind::Atom => panic!("a formula Plan named an Atom"),
     }
@@ -7286,6 +7768,7 @@ fn formula_support_plan_transition(
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
+    reducer_seeds: &mut Vec<FormulaReducerSeed>,
 ) -> Option<ContinuationToken> {
     let (node, done) = match &interner.formula(counter).focus {
         FormulaFocus::Plan {
@@ -7302,7 +7785,16 @@ fn formula_support_plan_transition(
         .expect("a support Plan named an Atom");
     assert!(done.is_valid_for(children.len()));
     let Some(child) = (0..children.len()).find(|&child| !done.contains(child)) else {
-        return continue_formula_transition(plan, desc, counter, batch, worklist, interner, stats);
+        return continue_formula_transition(
+            plan,
+            desc,
+            counter,
+            batch,
+            worklist,
+            interner,
+            stats,
+            reducer_seeds,
+        );
     };
     let next = select_interned_formula_child(
         &plan.finite_formula,
@@ -7311,7 +7803,16 @@ fn formula_support_plan_transition(
         children,
         child,
     );
-    continue_formula_transition(plan, desc, next, batch, worklist, interner, stats)
+    continue_formula_transition(
+        plan,
+        desc,
+        next,
+        batch,
+        worklist,
+        interner,
+        stats,
+        reducer_seeds,
+    )
 }
 
 fn select_interned_formula_child(
@@ -7350,6 +7851,7 @@ fn formula_or_plan_transition<'a>(
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
+    reducer_seeds: &mut Vec<FormulaReducerSeed>,
 ) -> Option<ContinuationToken> {
     let resume = interner.formula_resume(counter);
     let (done, occurrence, variable) = match &interner.formula(counter).focus {
@@ -7409,7 +7911,16 @@ fn formula_or_plan_transition<'a>(
             .guard_child(&plan.finite_formula, counter, child);
         prefer_continuation(
             &mut continuation,
-            continue_formula_transition(plan, desc, next, batch, worklist, interner, stats),
+            continue_formula_transition(
+                plan,
+                desc,
+                next,
+                batch,
+                worklist,
+                interner,
+                stats,
+                reducer_seeds,
+            ),
         );
     }
     continuation
@@ -7426,6 +7937,7 @@ fn formula_and_plan_transition<'a>(
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
+    reducer_seeds: &mut Vec<FormulaReducerSeed>,
 ) -> Option<ContinuationToken> {
     let resume = interner.formula_resume(counter);
     let (done, occurrence, variable) = match &interner.formula(counter).focus {
@@ -7473,7 +7985,16 @@ fn formula_and_plan_transition<'a>(
         _ => unreachable!("AND relevance planning preserves a Plan"),
     };
     if done_count == children.len() {
-        return continue_formula_transition(plan, desc, next, batch, worklist, interner, stats);
+        return continue_formula_transition(
+            plan,
+            desc,
+            next,
+            batch,
+            worklist,
+            interner,
+            stats,
+            reducer_seeds,
+        );
     }
     let first = estimates_by_child
         .first()
@@ -7502,7 +8023,16 @@ fn formula_and_plan_transition<'a>(
         enter_selected_formula_frame(&plan.finite_formula, interner.formula(selected), &mut batch);
         prefer_continuation(
             &mut continuation,
-            continue_formula_transition(plan, desc, selected, batch, worklist, interner, stats),
+            continue_formula_transition(
+                plan,
+                desc,
+                selected,
+                batch,
+                worklist,
+                interner,
+                stats,
+                reducer_seeds,
+            ),
         );
     }
     continuation
@@ -7518,11 +8048,22 @@ fn finish_formula_action_result(
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
+    reducer_seeds: &mut Vec<FormulaReducerSeed>,
 ) -> Option<ContinuationToken> {
     let stage = match &interner.formula(counter).focus {
         FormulaFocus::Action { stage, .. } => *stage,
         _ => panic!("formula result received a planning continuation"),
     };
+    if batch.current_frame_is_or() {
+        result.debug_assert_valid_for(batch.parents.row_count);
+        reducer_seeds.push(FormulaReducerSeed::Admit(FormulaOrAdmissionSeed {
+            bound,
+            batch,
+            input: result,
+            continuation: FormulaReducerContinuation::Complete(counter),
+        }));
+        return None;
+    }
     batch.apply_action_result(stage, result);
     batch.validate_tags();
 
@@ -7536,7 +8077,16 @@ fn finish_formula_action_result(
         .resume_completed(&plan.finite_formula, completed)
     {
         Ok(InternedFormulaSuccessor::Formula(next)) => {
-            continue_formula_transition(plan, &desc, next, batch, worklist, interner, stats)
+            continue_formula_transition(
+                plan,
+                &desc,
+                next,
+                batch,
+                worklist,
+                interner,
+                stats,
+                reducer_seeds,
+            )
         }
         Ok(InternedFormulaSuccessor::Guard { .. }) => {
             unreachable!("candidate action returned through a support guard")
@@ -7553,10 +8103,11 @@ fn formula_action_transition<'a>(
     plan: &ResidualPlan,
     desc: &StateDesc,
     counter: FormulaPcId,
-    batch: FormulaBatch,
+    mut batch: FormulaBatch,
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
+    reducer_seeds: &mut Vec<FormulaReducerSeed>,
 ) -> Option<ContinuationToken> {
     let resume = interner.formula_resume(counter);
     let (node, stage, occurrence, variable) = match &interner.formula(counter).focus {
@@ -7581,7 +8132,15 @@ fn formula_action_transition<'a>(
             prefer_continuation(
                 &mut continuation,
                 propagate_formula_support(
-                    plan, desc, completed, truth, batch, worklist, interner, stats,
+                    plan,
+                    desc,
+                    completed,
+                    truth,
+                    batch,
+                    worklist,
+                    interner,
+                    stats,
+                    reducer_seeds,
                 ),
             );
         }
@@ -7591,7 +8150,13 @@ fn formula_action_transition<'a>(
     let mut result = match stage {
         FormulaStage::Support => unreachable!("support returned above"),
         FormulaStage::Propose => CandidatePayload::empty(batch.parents.row_count),
-        FormulaStage::Confirm => batch.input().clone(),
+        FormulaStage::Confirm => {
+            let parent_count = batch.parents.row_count;
+            batch
+                .input_mut()
+                .defer_for_shared_activation(parent_count);
+            batch.input().clone()
+        }
     };
     let candidates_before = result.len();
     match stage {
@@ -7621,7 +8186,15 @@ fn formula_action_transition<'a>(
         }
     }
     finish_formula_action_result(
-        plan, desc.bound, counter, batch, result, worklist, interner, stats,
+        plan,
+        desc.bound,
+        counter,
+        batch,
+        result,
+        worklist,
+        interner,
+        stats,
+        reducer_seeds,
     )
 }
 
@@ -7635,6 +8208,12 @@ enum StepOutcome {
     Dead,
     /// Full-bound rows are ready for projection.
     Emit(RowBatch),
+}
+
+#[derive(Debug)]
+struct TaskExecution {
+    stable: StepOutcome,
+    reducer_seeds: Vec<FormulaReducerSeed>,
 }
 
 /// One pull of the mixed stable/delta machine. Delta seeding may immediately
@@ -7685,13 +8264,14 @@ fn execute_task<'a>(
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
     next_activation: &mut u64,
-) -> StepOutcome {
+) -> TaskExecution {
     let SelectedResidualTask {
         state: _,
         desc,
         bucket,
     } = task;
-    match (&desc.phase, bucket) {
+    let mut reducer_seeds = Vec::new();
+    let stable = match (&desc.phase, bucket) {
         (ResidualPhase::Ready, StateBucket::Rows(rows)) if desc.bound == full => {
             stats.emit_pops += 1;
             StepOutcome::Emit(rows)
@@ -7802,7 +8382,15 @@ fn execute_task<'a>(
             let is_action = action_stage.is_some();
             let continuation = match action_stage {
                 None => formula_plan_transition(
-                    root, plan, &desc, counter, batch, worklist, interner, stats,
+                    root,
+                    plan,
+                    &desc,
+                    counter,
+                    batch,
+                    worklist,
+                    interner,
+                    stats,
+                    &mut reducer_seeds,
                 ),
                 Some(stage) => {
                     match stage {
@@ -7811,20 +8399,32 @@ fn execute_task<'a>(
                         FormulaStage::Confirm => stats.confirm_action_pops += 1,
                     }
                     formula_action_transition(
-                        root, plan, &desc, counter, batch, worklist, interner, stats,
+                        root,
+                        plan,
+                        &desc,
+                        counter,
+                        batch,
+                        worklist,
+                        interner,
+                        stats,
+                        &mut reducer_seeds,
                     )
                 }
             };
             if let Some(continuation) = continuation {
                 StepOutcome::Advanced(continuation)
             } else {
-                if is_action {
+                if is_action && reducer_seeds.is_empty() {
                     stats.dead_action_pops += 1;
                 }
                 StepOutcome::Dead
             }
         }
         _ => panic!("canonical residual state received the wrong payload shape"),
+    };
+    TaskExecution {
+        stable,
+        reducer_seeds,
     }
 }
 
@@ -7954,7 +8554,7 @@ fn execute_state<'a>(
     stats: &mut ResidualStateStats,
 ) -> StepOutcome {
     let mut next_activation = 0;
-    execute_task(
+    let execution = execute_task(
         root,
         plan,
         SelectedResidualTask {
@@ -7972,7 +8572,12 @@ fn execute_state<'a>(
         interner,
         stats,
         &mut next_activation,
-    )
+    );
+    assert!(
+        execution.reducer_seeds.is_empty(),
+        "direct state-transition helper cannot own a Formula reducer"
+    );
+    execution.stable
 }
 
 #[derive(Clone, Debug, Default)]
@@ -9512,7 +10117,7 @@ impl ResidualStateMachine {
             Err(task) => task,
         };
         let emit_bound = task.desc.bound;
-        let outcome = execute_task(
+        let execution = execute_task(
             root,
             plan,
             task,
@@ -9524,11 +10129,39 @@ impl ResidualStateMachine {
             &mut self.stats,
             &mut self.next_activation,
         );
-        if matches!(&outcome, StepOutcome::Emit(_)) {
+        if matches!(&execution.stable, StepOutcome::Emit(_)) {
             self.emit_vars.clear();
             self.emit_vars.extend(emit_bound);
         }
-        MachineStep::Stable(outcome)
+        if execution.reducer_seeds.is_empty() {
+            return MachineStep::Stable(execution.stable);
+        }
+        let mut stable_continuation = match execution.stable {
+            StepOutcome::Advanced(continuation) => Some(continuation),
+            StepOutcome::Dead => None,
+            StepOutcome::Emit(_) => {
+                panic!("Formula reducer seed was produced beside terminal rows")
+            }
+        };
+        let mut seeded = self.delta.seed_formula_reducers(
+            execution.reducer_seeds,
+            plan,
+            &mut self.worklist,
+            &mut self.interner,
+            &mut self.stats,
+        );
+        if let Some(continuation) = seeded.continuation.take() {
+            prefer_continuation(&mut stable_continuation, continuation);
+        }
+        MachineStep::DeltaSeeded {
+            continuation: stable_continuation,
+            publication: seeded.publication,
+            active: seeded.active,
+            seeded_parents: seeded.seeded_parents,
+            terminal_family: seeded.terminal_family,
+            terminal_activations: seeded.terminal_activations,
+            completed_activation_ids: seeded.completed_activation_ids,
+        }
     }
 
     fn pop_once_with_dispatch<'a>(
@@ -10735,7 +11368,7 @@ where
             let emit_bound = desc.bound;
             stats.state_pops += 1;
             stats.readiness_pops += 1;
-            match execute_task(
+            let execution = execute_task(
                 root,
                 &plan,
                 SelectedResidualTask {
@@ -10750,7 +11383,12 @@ where
                 &mut interner,
                 &mut stats,
                 &mut next_activation,
-            ) {
+            );
+            assert!(
+                execution.reducer_seeds.is_empty(),
+                "the opaque eager solver unexpectedly produced a pageable Formula reducer"
+            );
+            match execution.stable {
                 StepOutcome::Advanced(_) | StepOutcome::Dead => {}
                 StepOutcome::Emit(rows) => {
                     let vars: Vec<VariableId> = emit_bound.into_iter().collect();
@@ -15649,7 +16287,7 @@ mod tests {
     }
 
     #[test]
-    fn formula_payload_normalizes_a_local_or_before_returning_to_and() {
+    fn formula_payload_installs_ordered_local_or_emission_into_and() {
         let mut batch = FormulaBatch {
             activations: vec![ActivationId(0)],
             parents: RowBatch {
@@ -15662,16 +16300,21 @@ mod tests {
                 },
                 FormulaPayloadFrame::Or {
                     source: CandidatePayload::Values(vec![raw(9)]),
-                    output: CandidatePayload::Values(Vec::new()),
+                    accumulator: FormulaOrAccumulator::empty(1),
                 },
             ],
         };
 
-        batch.apply_action_result(
-            FormulaStage::Propose,
-            CandidatePayload::Values(vec![raw(2), raw(1), raw(2)]),
+        batch.admit_current_or_value(0, raw(2));
+        batch.admit_current_or_value(0, raw(1));
+        batch.admit_current_or_value(0, raw(2));
+        let emitted = CandidatePayload::Values(
+            batch.current_or_set().iter().copied().collect(),
         );
-        batch.return_frame();
+        assert!(matches!(
+            batch.return_emitted_or(emitted),
+            FormulaFrameDestination::ParentAnd
+        ));
         assert_eq!(batch.frames.len(), 1);
         let FormulaPayloadFrame::And { current } = &batch.frames[0] else {
             panic!("local OR returned into the wrong parent-frame shape")
@@ -15742,24 +16385,110 @@ mod tests {
     }
 
     #[test]
+    fn formula_confirm_frame_entry_shares_the_immutable_or_source_root() {
+        let mut batch = FormulaBatch::from_confirmation(
+            CandidateBatch {
+                parents: RowBatch {
+                    rows: vec![raw(10), raw(11)],
+                    row_count: 2,
+                },
+                candidates: candidate_payload(
+                    2,
+                    vec![(0, raw(1)), (0, raw(2)), (1, raw(3))],
+                ),
+            },
+            vec![ActivationId(0), ActivationId(1)],
+            &FiniteFormulaNodeKind::Or {
+                children: Vec::new().into_boxed_slice(),
+            },
+        );
+
+        batch.enter(
+            &FiniteFormulaNodeKind::And {
+                children: Vec::new().into_boxed_slice(),
+            },
+            FormulaStage::Confirm,
+        );
+        let [
+            FormulaPayloadFrame::Or {
+                source: CandidatePayload::Deferred(source),
+                ..
+            },
+            FormulaPayloadFrame::And {
+                current: CandidatePayload::Deferred(child),
+            },
+        ] = batch.frames.as_slice()
+        else {
+            panic!("Confirm frame entry did not preserve shared deferred storage")
+        };
+        assert!(Arc::ptr_eq(
+            &source.root.as_ref().unwrap().node,
+            &child.root.as_ref().unwrap().node,
+        ));
+    }
+
+    #[test]
     fn formula_or_deduplicates_within_an_affine_parent_but_not_across_parents() {
         let candidate = raw(7);
-        let result = FormulaPayloadFrame::Or {
-            source: candidate_payload(2, Vec::new()),
-            output: candidate_payload(
-                2,
-                vec![
-                    (0, candidate),
-                    (0, candidate),
-                    (1, candidate),
-                    (1, candidate),
-                ],
-            ),
-        }
-        .result(2);
+        let mut accumulator = FormulaOrAccumulator::empty(2);
+        accumulator.insert(0, candidate);
+        accumulator.insert(0, candidate);
+        accumulator.insert(1, candidate);
+        accumulator.insert(1, candidate);
 
-        assert_eq!(result, [(0, candidate), (1, candidate)]);
-        assert!(!result.is_values());
+        assert_eq!(accumulator.unique_len, 2);
+        assert_eq!(accumulator.sets.len(), 2);
+        assert_eq!(accumulator.sets[0].iter().copied().collect::<Vec<_>>(), [candidate]);
+        assert_eq!(accumulator.sets[1].iter().copied().collect::<Vec<_>>(), [candidate]);
+    }
+
+    #[test]
+    fn formula_or_structural_singletons_preserve_parent_order_and_persistent_sets() {
+        let mut batch = FormulaBatch::from_confirmation(
+            CandidateBatch {
+                parents: RowBatch {
+                    rows: vec![raw(10), raw(11), raw(12)],
+                    row_count: 3,
+                },
+                candidates: candidate_payload(
+                    3,
+                    vec![(0, raw(20)), (1, raw(21)), (2, raw(22))],
+                ),
+            },
+            vec![ActivationId(0), ActivationId(1), ActivationId(2)],
+            &FiniteFormulaNodeKind::Or {
+                children: Vec::new().into_boxed_slice(),
+            },
+        );
+        batch.admit_current_or_value(0, raw(2));
+        batch.admit_current_or_value(0, raw(1));
+        batch.admit_current_or_value(1, raw(4));
+        batch.admit_current_or_value(2, raw(3));
+
+        let singletons = batch.into_structural_singletons(1);
+        assert_eq!(singletons.len(), 3);
+        for (parent, batch) in singletons.iter().enumerate() {
+            assert_eq!(batch.parents.rows, [raw(10 + parent as u8)]);
+            assert_eq!(batch.parents.row_count, 1);
+            let FormulaPayloadFrame::Or {
+                source: CandidatePayload::Deferred(source),
+                accumulator,
+            } = &batch.frames[0]
+            else {
+                panic!("Formula reducer singleton materialized its OR source")
+            };
+            assert_eq!(source.parent_count, 1);
+            let expected = match parent {
+                0 => vec![raw(1), raw(2)],
+                1 => vec![raw(4)],
+                2 => vec![raw(3)],
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                accumulator.singleton_set().iter().copied().collect::<Vec<_>>(),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -15831,7 +16560,11 @@ mod tests {
             frames: vec![
                 FormulaPayloadFrame::Or {
                     source: candidate_payload(3, vec![(0, raw(20)), (2, raw(21))]),
-                    output: candidate_payload(3, vec![(1, raw(22))]),
+                    accumulator: {
+                        let mut accumulator = FormulaOrAccumulator::empty(3);
+                        accumulator.insert(1, raw(22));
+                        accumulator
+                    },
                 },
                 FormulaPayloadFrame::And {
                     current: candidate_payload(3, vec![(0, raw(30)), (1, raw(31)), (2, raw(32))]),
@@ -15847,13 +16580,17 @@ mod tests {
         );
         assert_eq!(group.parents.rows, [1, 2, 3, 4, 5, 6].map(raw));
         assert_eq!(group.parents.row_count, 3);
-        let [FormulaPayloadFrame::Or { source, output }, FormulaPayloadFrame::And { current }] =
-            group.frames.as_slice()
+        let [FormulaPayloadFrame::Or {
+            source,
+            accumulator,
+        }, FormulaPayloadFrame::And { current }] = group.frames.as_slice()
         else {
             panic!("uniform partition changed formula frame shapes")
         };
         assert_eq!(source, &vec![(0, raw(20)), (2, raw(21))]);
-        assert_eq!(output, &vec![(1, raw(22))]);
+        assert!(accumulator.sets[0].is_empty());
+        assert_eq!(accumulator.sets[1].iter().copied().collect::<Vec<_>>(), [raw(22)]);
+        assert!(accumulator.sets[2].is_empty());
         assert_eq!(current, &vec![(0, raw(30)), (1, raw(31)), (2, raw(32))]);
 
         let empty = FormulaBatch {

@@ -14,6 +14,7 @@ repository = "https://github.com/triblespace/triblespace-rs"
 [dependencies]
 ahash = "0.8"
 indexmap = "2.10"
+im.workspace = true
 memmap2 = "0.9.5"
 json-event-parser = "0.2.2"
 winnow = "0.7.13"

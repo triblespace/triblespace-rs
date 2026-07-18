@@ -4,7 +4,7 @@
 //! producer credits, and parent rows remain payload, so unrelated traversals
 //! can share one expansion cohort without becoming semantically conflated.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ahash::{AHashMap, AHashSet};
@@ -88,6 +88,12 @@ pub(super) enum ProgramAddress {
     /// the source graph descriptor here would prevent identical futures from
     /// sharing a physical Program cohort.
     ConfirmFinalize,
+    /// Engine-owned persistent Formula OR admission. The accumulator root,
+    /// input cursor, parent row, and exact return PC remain affine payload.
+    FormulaOrAdmit,
+    /// Engine-owned ordered Formula OR emission. Pacing is resolved from the
+    /// typed state and deliberately remains outside this semantic address.
+    FormulaOrEmit,
 }
 
 impl ProgramAddress {
@@ -110,18 +116,25 @@ impl ProgramAddress {
                 .residual_program()
                 .expect("constructed typed program disappeared during execution"),
             Self::ConfirmFinalize => ProgramRef::new(&CONFIRM_FINALIZER_PROGRAM),
+            Self::FormulaOrAdmit => ProgramRef::new(&FORMULA_OR_ADMISSION_PROGRAM),
+            Self::FormulaOrEmit => ProgramRef::new(&FORMULA_OR_EMISSION_PROGRAM),
         }
     }
 
     fn stratum(&self) -> ProgramStratum {
         match self {
             Self::Constraint { stratum, .. } => *stratum,
-            Self::ConfirmFinalize => ProgramStratum::Finite,
+            Self::ConfirmFinalize | Self::FormulaOrAdmit | Self::FormulaOrEmit => {
+                ProgramStratum::Finite
+            }
         }
     }
 
-    fn is_confirm_finalizer(&self) -> bool {
-        matches!(self, Self::ConfirmFinalize)
+    fn has_private_direct_effects(&self) -> bool {
+        matches!(
+            self,
+            Self::ConfirmFinalize | Self::FormulaOrAdmit | Self::FormulaOrEmit
+        )
     }
 }
 
@@ -196,6 +209,165 @@ impl TypedProgramSpec for ConfirmFinalizerProgram {
             assert!(examined > 0, "a nonempty Confirm finalizer made no progress");
             let resume = (state.original.remaining > 0).then_some(TypedResume::Immediate(state));
             effects.page(examined, resume);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct FormulaOrAdmissionState {
+    input: DeferredCandidateCursor,
+}
+
+struct FormulaOrAdmissionProgram;
+
+static FORMULA_OR_ADMISSION_PROGRAM: FormulaOrAdmissionProgram = FormulaOrAdmissionProgram;
+
+impl TypedProgramSpec for FormulaOrAdmissionProgram {
+    type State = FormulaOrAdmissionState;
+    type NoveltyKey = ();
+    type Rank = usize;
+
+    fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
+        None
+    }
+
+    fn dispatch(&self, _state: &Self::State) -> DispatchClass {
+        DispatchClass::new(0)
+    }
+
+    fn pacing(&self, _state: &Self::State) -> ProgramPacing {
+        ProgramPacing::Search
+    }
+
+    fn progress(&self, state: &Self::State) -> Self::Rank {
+        state.input.remaining
+    }
+
+    fn seed_typed(
+        &self,
+        _batch: ProgramSeedBatch<'_>,
+        _effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+    ) {
+        panic!("engine Formula OR admission was seeded through a Constraint route")
+    }
+
+    fn step_typed(
+        &self,
+        states: Vec<Self::State>,
+        batch: TypedProgramBatch<'_>,
+        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+    ) {
+        assert_eq!(states.len(), batch.limits.len());
+        assert_eq!(states.len(), batch.view.len());
+        assert!(batch.candidate_sets.iter().all(Option::is_none));
+        for (input, (mut state, &limit)) in states.into_iter().zip(batch.limits).enumerate() {
+            let mut examined = 0usize;
+            while examined < limit {
+                let Some((parent, value)) = state.input.next() else {
+                    break;
+                };
+                assert_eq!(parent, 0, "one-parent Formula admission changed domains");
+                examined += 1;
+                effects.direct(
+                    u32::try_from(input).expect("too many Formula admission inputs"),
+                    value,
+                );
+            }
+            assert!(examined > 0, "a nonempty Formula admission made no progress");
+            let resume =
+                (state.input.remaining > 0).then_some(TypedResume::Immediate(state));
+            effects.page(examined, resume);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct FormulaOrEmissionState {
+    set: OrdSet<RawInline>,
+    emitted_count: usize,
+    last_emitted: Option<RawInline>,
+}
+
+struct FormulaOrEmissionProgram;
+
+static FORMULA_OR_EMISSION_PROGRAM: FormulaOrEmissionProgram = FormulaOrEmissionProgram;
+
+impl TypedProgramSpec for FormulaOrEmissionProgram {
+    type State = FormulaOrEmissionState;
+    type NoveltyKey = ();
+    type Rank = usize;
+
+    fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
+        None
+    }
+
+    fn dispatch(&self, _state: &Self::State) -> DispatchClass {
+        DispatchClass::new(0)
+    }
+
+    fn pacing(&self, _state: &Self::State) -> ProgramPacing {
+        ProgramPacing::Search
+    }
+
+    fn progress(&self, state: &Self::State) -> Self::Rank {
+        state
+            .set
+            .len()
+            .checked_sub(state.emitted_count)
+            .expect("Formula emission count exceeded its ordered set")
+    }
+
+    fn seed_typed(
+        &self,
+        _batch: ProgramSeedBatch<'_>,
+        _effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+    ) {
+        panic!("engine Formula OR emission was seeded through a Constraint route")
+    }
+
+    fn step_typed(
+        &self,
+        states: Vec<Self::State>,
+        batch: TypedProgramBatch<'_>,
+        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+    ) {
+        use std::ops::Bound::{Excluded, Unbounded};
+
+        assert_eq!(states.len(), batch.limits.len());
+        assert_eq!(states.len(), batch.view.len());
+        assert!(batch.candidate_sets.iter().all(Option::is_none));
+        for (input, (mut state, &limit)) in states.into_iter().zip(batch.limits).enumerate() {
+            // "Singleton emission" is one affine parent/credit, not one
+            // value per receipt.  One Search page may move at most its grant
+            // into one new rope leaf.
+            let values: Vec<_> = match state.last_emitted {
+                Some(last) => state
+                    .set
+                    .range((Excluded(last), Unbounded))
+                    .take(limit)
+                    .copied()
+                    .collect(),
+                None => state.set.iter().take(limit).copied().collect(),
+            };
+            assert!(!values.is_empty(), "a nonempty Formula emission made no progress");
+            for &value in &values {
+                effects.direct(
+                    u32::try_from(input).expect("too many Formula emission inputs"),
+                    value,
+                );
+            }
+            state.emitted_count = state
+                .emitted_count
+                .checked_add(values.len())
+                .expect("Formula emission count overflow");
+            state.last_emitted = values.last().copied();
+            let remaining = state
+                .set
+                .len()
+                .checked_sub(state.emitted_count)
+                .expect("Formula emission count exceeded its ordered set");
+            let resume = (remaining > 0).then_some(TypedResume::Immediate(state));
+            effects.page(values.len(), resume);
         }
     }
 }
@@ -366,6 +538,12 @@ enum DeltaReducer {
     FinalizingConfirm {
         output: CandidatePayload,
     },
+    /// One Search-paced pass inserts occurrence values into the persistent OR
+    /// accumulator stored in the activation's exact Formula return payload.
+    FormulaOrAdmit,
+    /// One Search-paced pass emits an ordered set into the persistent
+    /// candidate rope consumed by the ordinary Formula continuation.
+    FormulaOrEmit { output: CandidatePayload },
 }
 
 impl DeltaReducer {
@@ -389,6 +567,16 @@ enum DeltaReturn {
         bound: VariableSet,
         counter: FormulaPcId,
         batch: FormulaBatch,
+    },
+    FormulaOrAdmit {
+        bound: VariableSet,
+        batch: FormulaBatch,
+        continuation: FormulaReducerContinuation,
+    },
+    FormulaOrEmit {
+        bound: VariableSet,
+        batch: FormulaBatch,
+        counter: FormulaPcId,
     },
 }
 
@@ -552,6 +740,9 @@ enum DeltaCompletion {
     Candidates(CandidatePayload),
     /// Boolean support proved only at the reducer boundary.
     Support(bool),
+    /// Admission mutated the private persistent accumulator directly; EOF
+    /// releases only its exact saved Formula control.
+    FormulaOrAdmitted,
 }
 
 impl PartialEq for DeltaCompletion {
@@ -559,6 +750,7 @@ impl PartialEq for DeltaCompletion {
         match (self, other) {
             (Self::Cleanup, Self::Cleanup) => true,
             (Self::Support(left), Self::Support(right)) => left == right,
+            (Self::FormulaOrAdmitted, Self::FormulaOrAdmitted) => true,
             (Self::Candidates(left), Self::Candidates(right)) => {
                 left.iter().eq(right.iter())
             }
@@ -613,6 +805,20 @@ struct DeltaStableEffects {
     /// buffer. This is a physical publication receipt, never a canonical
     /// delta or stable state.
     publication: Option<TerminalPublicationBatch>,
+}
+
+#[derive(Default)]
+struct FormulaReducerDrain {
+    continuation: Option<ContinuationToken>,
+    active: Option<ActiveDeltaContinuation>,
+}
+
+struct DeltaStreamingRelease {
+    stable: DeltaStableEffects,
+    /// A first streaming support witness may release Formula control into a
+    /// fresh private reducer while the old activation remains globally live
+    /// only to retire its cleanup credits.
+    active: Option<ActiveDeltaContinuation>,
 }
 
 impl DeltaStableEffects {
@@ -1114,7 +1320,9 @@ impl ProducerRegistry {
                 DeltaReducer::StreamProposal | DeltaReducer::StreamFormulaProposal => {}
                 DeltaReducer::Support { .. }
                 | DeltaReducer::Confirm { .. }
-                | DeltaReducer::FinalizingConfirm { .. } => assert!(
+                | DeltaReducer::FinalizingConfirm { .. }
+                | DeltaReducer::FormulaOrAdmit
+                | DeltaReducer::FormulaOrEmit { .. } => assert!(
                     accepted.is_empty(),
                     "a non-proposal reducer received direct source candidates"
                 ),
@@ -1358,14 +1566,17 @@ impl ProducerRegistry {
                 .activations
                 .get_mut(&activation_id)
                 .expect("unknown program activation");
-            match &mut activation.reducer {
-                DeltaReducer::QuiescentProposal => {
+            match (&mut activation.reducer, &mut activation.return_to) {
+                (DeltaReducer::QuiescentProposal, _) => {
                     activation.direct_candidates.extend_from_slice(&direct)
                 }
-                DeltaReducer::StreamProposal | DeltaReducer::StreamFormulaProposal => {
+                (
+                    DeltaReducer::StreamProposal | DeltaReducer::StreamFormulaProposal,
+                    _,
+                ) => {
                     accepted.extend_from_slice(&direct)
                 }
-                DeltaReducer::FinalizingConfirm { output } => {
+                (DeltaReducer::FinalizingConfirm { output }, _) => {
                     assert!(
                         observed.is_empty() && children.is_empty() && !reported_support,
                         "engine Confirm finalizer reported graph effects"
@@ -1380,8 +1591,45 @@ impl ProducerRegistry {
                         output.extend_same_domain(page, 1);
                     }
                 }
-                DeltaReducer::Support { .. }
-                | DeltaReducer::Confirm { .. } => assert!(
+                (
+                    DeltaReducer::FormulaOrAdmit,
+                    DeltaReturn::FormulaOrAdmit { batch, .. },
+                ) => {
+                    assert!(
+                        observed.is_empty() && children.is_empty() && !reported_support,
+                        "engine Formula OR admission reported graph effects"
+                    );
+                    assert!(
+                        activation.accepted.is_empty(),
+                        "Formula OR admission acquired graph Accepted state"
+                    );
+                    for value in direct.drain(..) {
+                        batch.admit_current_or_value(0, value);
+                    }
+                }
+                (
+                    DeltaReducer::FormulaOrEmit { output },
+                    DeltaReturn::FormulaOrEmit { .. },
+                ) => {
+                    assert!(
+                        observed.is_empty() && children.is_empty() && !reported_support,
+                        "engine Formula OR emission reported graph effects"
+                    );
+                    assert!(
+                        activation.accepted.is_empty(),
+                        "Formula OR emission acquired graph Accepted state"
+                    );
+                    if !direct.is_empty() {
+                        let mut page = CandidatePayload::Values(std::mem::take(&mut direct));
+                        page.defer_for_shared_activation(1);
+                        output.extend_same_domain(page, 1);
+                    }
+                }
+                (DeltaReducer::FormulaOrAdmit, _)
+                | (DeltaReducer::FormulaOrEmit { .. }, _) => {
+                    panic!("Formula OR reducer lost its exact affine return payload")
+                }
+                (DeltaReducer::Support { .. } | DeltaReducer::Confirm { .. }, _) => assert!(
                     direct.is_empty(),
                     "a non-proposal program reducer observed direct candidates"
                 ),
@@ -1411,7 +1659,9 @@ impl ProducerRegistry {
                 }
                 DeltaReducer::QuiescentProposal
                 | DeltaReducer::Confirm { .. }
-                | DeltaReducer::FinalizingConfirm { .. } => false,
+                | DeltaReducer::FinalizingConfirm { .. }
+                | DeltaReducer::FormulaOrAdmit
+                | DeltaReducer::FormulaOrEmit { .. } => false,
             }
         };
         if publishes_stable_effect {
@@ -1613,7 +1863,9 @@ impl ProducerRegistry {
             .expect("unknown delta activation");
         let (bound, parent) = match &activation.return_to {
             DeltaReturn::Stable { desc, parent } => (desc.bound, parent.as_ref()),
-            DeltaReturn::Formula { bound, batch, .. } => {
+            DeltaReturn::Formula { bound, batch, .. }
+            | DeltaReturn::FormulaOrAdmit { bound, batch, .. }
+            | DeltaReturn::FormulaOrEmit { bound, batch, .. } => {
                 assert_eq!(batch.parents.row_count, 1);
                 (*bound, batch.parents.rows.as_slice())
             }
@@ -1638,7 +1890,9 @@ impl ProducerRegistry {
             .expect("unknown delta activation");
         let bound = match &activation.return_to {
             DeltaReturn::Stable { desc, .. } => desc.bound,
-            DeltaReturn::Formula { bound, .. } => *bound,
+            DeltaReturn::Formula { bound, .. }
+            | DeltaReturn::FormulaOrAdmit { bound, .. }
+            | DeltaReturn::FormulaOrEmit { bound, .. } => *bound,
         };
         (bound, Self::activation_candidates(activation).is_some())
     }
@@ -1754,7 +2008,9 @@ impl ProducerRegistry {
             DeltaReducer::Support { .. }
             | DeltaReducer::QuiescentProposal
             | DeltaReducer::Confirm { .. }
-            | DeltaReducer::FinalizingConfirm { .. } => return None,
+            | DeltaReducer::FinalizingConfirm { .. }
+            | DeltaReducer::FormulaOrAdmit
+            | DeltaReducer::FormulaOrEmit { .. } => return None,
         };
         Some(DeltaStreamingReturn {
             return_to: activation.return_to.clone(),
@@ -1845,6 +2101,30 @@ impl ProducerRegistry {
                 );
                 DeltaCompletion::Candidates(output)
             }
+            DeltaReducer::FormulaOrAdmit => {
+                assert!(activation.direct_candidates.is_empty());
+                assert!(
+                    activation.accepted.is_empty(),
+                    "Formula OR admission retained graph Accepted state"
+                );
+                assert!(matches!(
+                    &activation.return_to,
+                    DeltaReturn::FormulaOrAdmit { .. }
+                ));
+                DeltaCompletion::FormulaOrAdmitted
+            }
+            DeltaReducer::FormulaOrEmit { output } => {
+                assert!(activation.direct_candidates.is_empty());
+                assert!(
+                    activation.accepted.is_empty(),
+                    "Formula OR emission retained graph Accepted state"
+                );
+                assert!(matches!(
+                    &activation.return_to,
+                    DeltaReturn::FormulaOrEmit { .. }
+                ));
+                DeltaCompletion::Candidates(output)
+            }
         };
         CompletedActivation {
             activation: proof.activation,
@@ -1856,9 +2136,10 @@ impl ProducerRegistry {
     /// Settles one graph/reducer quiescence boundary without hiding whole-bag
     /// work inside the affine receipt.
     ///
-    /// Stable Confirm and formula Confirm under an all-AND live frame ancestry
-    /// transfer to the Search-paced engine Program. Formula OR keeps the
-    /// existing eager reducer path until its sort/dedup boundary is pageable.
+    /// Stable and finite-formula Confirm activations transfer to the
+    /// Search-paced engine Program whenever their live candidate frame can be
+    /// finalized independently. Engine-owned Formula OR reducers settle
+    /// directly through their own pageable Program families.
     fn settle_quiescence(&mut self, proof: QuiescenceProof) -> RegistrySettlement {
         let (eligible, original_empty) = {
             let activation = self
@@ -1871,6 +2152,7 @@ impl ProducerRegistry {
             let eligible_return = match &activation.return_to {
                 DeltaReturn::Stable { .. } => true,
                 DeltaReturn::Formula { batch, .. } => batch.confirm_finalizer_capable(),
+                DeltaReturn::FormulaOrAdmit { .. } | DeltaReturn::FormulaOrEmit { .. } => false,
             };
             match &activation.reducer {
                 DeltaReducer::Confirm { original } => (eligible_return, original.is_empty()),
@@ -3318,6 +3600,24 @@ impl DeltaScheduler {
         state
     }
 
+    fn prepare_formula_or_admission(&mut self) -> DeltaStateId {
+        let address = ProgramAddress::FormulaOrAdmit;
+        let state = self.interner.intern_program(address);
+        self.program_runtimes.entry(state).or_insert_with(|| {
+            ProgramRef::new(&FORMULA_OR_ADMISSION_PROGRAM).new_runtime()
+        });
+        state
+    }
+
+    fn prepare_formula_or_emission(&mut self) -> DeltaStateId {
+        let address = ProgramAddress::FormulaOrEmit;
+        let state = self.interner.intern_program(address);
+        self.program_runtimes.entry(state).or_insert_with(|| {
+            ProgramRef::new(&FORMULA_OR_EMISSION_PROGRAM).new_runtime()
+        });
+        state
+    }
+
     /// Central scheduler half of graph quiescence settlement.
     ///
     /// Registry settlement owns the reducer's semantic capability gate and
@@ -3430,7 +3730,7 @@ impl DeltaScheduler {
                     .registry
                     .take_streaming_return(activation)
                     .expect("typed streaming proposal rejected accepting seed effects");
-                effects.absorb(Self::release_streaming(
+                let released = self.release_streaming(
                     activation,
                     streamed,
                     installed.initial_accepted,
@@ -3439,7 +3739,12 @@ impl DeltaScheduler {
                     stable,
                     stable_interner,
                     stats,
-                ));
+                );
+                assert!(
+                    released.active.is_none(),
+                    "ordinary typed proposal seed opened a Formula reducer"
+                );
+                effects.absorb(released.stable);
             }
             tasks.extend(
                 installed
@@ -3645,7 +3950,7 @@ impl DeltaScheduler {
                 .install_program_roots(activation, seeded.work[range].iter().cloned());
             if !installed.initial_accepted.is_empty() {
                 if let Some(streamed) = self.registry.take_streaming_return(activation) {
-                    let released = Self::release_streaming(
+                    let released = self.release_streaming(
                         activation,
                         streamed,
                         installed.initial_accepted,
@@ -3655,8 +3960,14 @@ impl DeltaScheduler {
                         stable_interner,
                         stats,
                     );
-                    debug_assert!(released.publication.is_none());
-                    prefer_continuation(&mut continuation, released.continuation);
+                    debug_assert!(released.stable.publication.is_none());
+                    prefer_continuation(
+                        &mut continuation,
+                        released.stable.continuation,
+                    );
+                    if released.active.is_some() {
+                        finalizer_active = released.active;
+                    }
                 }
             }
             tasks.extend(
@@ -3680,12 +3991,22 @@ impl DeltaScheduler {
             }
         }
         let graph_active = self.file_program_state(state, tasks);
-        let active = finalizer_active.or(graph_active);
+        let mut active = finalizer_active.or(graph_active);
         for completed in completed {
+            let released = self.release_completion(
+                completed,
+                plan,
+                stable,
+                stable_interner,
+                stats,
+            );
             prefer_continuation(
                 &mut continuation,
-                Self::release_completion(completed, plan, stable, stable_interner, stats),
+                released.continuation,
             );
+            if released.active.is_some() {
+                active = released.active;
+            }
         }
         if !retired.is_empty() {
             spec.retire_activations(
@@ -3780,7 +4101,7 @@ impl DeltaScheduler {
                     .registry
                     .take_streaming_return(started.activation)
                     .expect("a streaming proposal rejected its accepting seed receipt");
-                effects.absorb(Self::release_streaming(
+                let released = self.release_streaming(
                     started.activation,
                     streamed,
                     started.initial_accepted,
@@ -3789,7 +4110,12 @@ impl DeltaScheduler {
                     stable,
                     stable_interner,
                     stats,
-                ));
+                );
+                assert!(
+                    released.active.is_none(),
+                    "ordinary proposal seed opened a Formula reducer"
+                );
+                effects.absorb(released.stable);
             }
             tasks.extend(started.roots.into_iter().map(|(node, credit)| DeltaTask {
                 activation: started.activation,
@@ -4015,7 +4341,7 @@ impl DeltaScheduler {
             );
             if !started.initial_accepted.is_empty() {
                 if let Some(streamed) = self.registry.take_streaming_return(started.activation) {
-                    let released = Self::release_streaming(
+                    let released = self.release_streaming(
                         started.activation,
                         streamed,
                         started.initial_accepted,
@@ -4025,8 +4351,14 @@ impl DeltaScheduler {
                         stable_interner,
                         stats,
                     );
-                    debug_assert!(released.publication.is_none());
-                    prefer_continuation(&mut continuation, released.continuation);
+                    debug_assert!(released.stable.publication.is_none());
+                    prefer_continuation(
+                        &mut continuation,
+                        released.stable.continuation,
+                    );
+                    if released.active.is_some() {
+                        finalizer_active = released.active;
+                    }
                 }
             }
             tasks.extend(started.roots.into_iter().map(|(node, credit)| DeltaTask {
@@ -4045,13 +4377,23 @@ impl DeltaScheduler {
             }
         }
         let graph_active = self.file(desc, tasks);
-        let active = finalizer_active.or(graph_active);
+        let mut active = finalizer_active.or(graph_active);
 
         for completed in completed {
+            let released = self.release_completion(
+                completed,
+                plan,
+                stable,
+                stable_interner,
+                stats,
+            );
             prefer_continuation(
                 &mut continuation,
-                Self::release_completion(completed, plan, stable, stable_interner, stats),
+                released.continuation,
             );
+            if released.active.is_some() {
+                active = released.active;
+            }
         }
         DeltaSeedOutcome {
             continuation,
@@ -4116,58 +4458,278 @@ impl DeltaScheduler {
         self.file_source(desc, tasks)
     }
 
+    /// Drains engine-owned Formula reducer seeds without manufacturing a
+    /// graph descriptor. Multi-parent payloads are first split by persistent
+    /// parent-domain cuts; each nonempty singleton then owns exactly one
+    /// affine Program credit. Zero-rank reducers advance synchronously and
+    /// put any recursively generated reducer at the front of this same queue,
+    /// preserving the hot depth-first lineage without a sentinel task.
+    #[allow(clippy::too_many_arguments)]
+    fn drain_formula_reducer_seeds(
+        &mut self,
+        seeds: Vec<FormulaReducerSeed>,
+        plan: &ResidualPlan,
+        stable: &mut Worklist,
+        stable_interner: &mut StateInterner,
+        stats: &mut ResidualStateStats,
+    ) -> FormulaReducerDrain {
+        let mut queue: VecDeque<_> = seeds.into();
+        let mut drained = FormulaReducerDrain::default();
+        while let Some(seed) = queue.pop_front() {
+            match seed {
+                FormulaReducerSeed::Admit(seed) if seed.batch.parents.row_count > 1 => {
+                    let singletons = seed.batch.into_structural_singletons_with_input(
+                        seed.bound.count(),
+                        seed.input,
+                    );
+                    for (batch, input) in singletons.into_iter().rev() {
+                        queue.push_front(FormulaReducerSeed::Admit(FormulaOrAdmissionSeed {
+                            bound: seed.bound,
+                            batch,
+                            input,
+                            continuation: seed.continuation,
+                        }));
+                    }
+                }
+                FormulaReducerSeed::Admit(mut seed) => {
+                    assert_eq!(
+                        seed.batch.parents.row_count, 1,
+                        "Formula OR admission requires one affine parent"
+                    );
+                    seed.input.debug_assert_valid_for(1);
+                    if seed.input.is_empty() {
+                        let mut generated = Vec::new();
+                        prefer_continuation(
+                            &mut drained.continuation,
+                            finish_formula_or_admission(
+                                plan,
+                                seed.bound,
+                                seed.batch,
+                                seed.continuation,
+                                stable,
+                                stable_interner,
+                                stats,
+                                &mut generated,
+                            ),
+                        );
+                        for seed in generated.into_iter().rev() {
+                            queue.push_front(seed);
+                        }
+                        continue;
+                    }
+
+                    seed.input.defer_for_shared_activation(1);
+                    let input = seed.input.shared_one_parent_cursor();
+                    let state = self.prepare_formula_or_admission();
+                    let activation = self.registry.open_program_activation(
+                        DeltaReducer::FormulaOrAdmit,
+                        DeltaReturn::FormulaOrAdmit {
+                            bound: seed.bound,
+                            batch: seed.batch,
+                            continuation: seed.continuation,
+                        },
+                        None,
+                        None,
+                    );
+                    let credit = self
+                        .registry
+                        .issue_credit(activation, CreditKind::Program { join: None });
+                    let work = insert_engine_program_state(
+                        &FORMULA_OR_ADMISSION_PROGRAM,
+                        self.program_runtimes
+                            .get_mut(&state)
+                            .expect("prepared Formula OR admission lost its runtime"),
+                        ProgramActivation(activation.0),
+                        FormulaOrAdmissionState { input },
+                    );
+                    drained.active = self.file_program_state(
+                        state,
+                        vec![ProgramTask {
+                            activation,
+                            credit,
+                            work,
+                        }],
+                    );
+                }
+                FormulaReducerSeed::Emit(seed) if seed.batch.parents.row_count > 1 => {
+                    let singletons = seed
+                        .batch
+                        .into_structural_singletons(seed.bound.count());
+                    for batch in singletons.into_iter().rev() {
+                        queue.push_front(FormulaReducerSeed::Emit(FormulaOrEmissionSeed {
+                            bound: seed.bound,
+                            batch,
+                            counter: seed.counter,
+                        }));
+                    }
+                }
+                FormulaReducerSeed::Emit(seed) => {
+                    assert_eq!(
+                        seed.batch.parents.row_count, 1,
+                        "Formula OR emission requires one affine parent"
+                    );
+                    let set = seed.batch.current_or_set();
+                    if set.is_empty() {
+                        let mut result = CandidatePayload::empty(1);
+                        result.defer_for_shared_activation(1);
+                        let mut generated = Vec::new();
+                        prefer_continuation(
+                            &mut drained.continuation,
+                            finish_formula_or_emission(
+                                plan,
+                                seed.bound,
+                                seed.counter,
+                                seed.batch,
+                                result,
+                                stable,
+                                stable_interner,
+                                stats,
+                                &mut generated,
+                            ),
+                        );
+                        for seed in generated.into_iter().rev() {
+                            queue.push_front(seed);
+                        }
+                        continue;
+                    }
+
+                    let mut output = CandidatePayload::empty(1);
+                    output.defer_for_shared_activation(1);
+                    let state = self.prepare_formula_or_emission();
+                    let activation = self.registry.open_program_activation(
+                        DeltaReducer::FormulaOrEmit { output },
+                        DeltaReturn::FormulaOrEmit {
+                            bound: seed.bound,
+                            batch: seed.batch,
+                            counter: seed.counter,
+                        },
+                        None,
+                        None,
+                    );
+                    let credit = self
+                        .registry
+                        .issue_credit(activation, CreditKind::Program { join: None });
+                    let work = insert_engine_program_state(
+                        &FORMULA_OR_EMISSION_PROGRAM,
+                        self.program_runtimes
+                            .get_mut(&state)
+                            .expect("prepared Formula OR emission lost its runtime"),
+                        ProgramActivation(activation.0),
+                        FormulaOrEmissionState {
+                            set,
+                            emitted_count: 0,
+                            last_emitted: None,
+                        },
+                    );
+                    drained.active = self.file_program_state(
+                        state,
+                        vec![ProgramTask {
+                            activation,
+                            credit,
+                            work,
+                        }],
+                    );
+                }
+            }
+        }
+        drained
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn seed_formula_reducers(
+        &mut self,
+        seeds: Vec<FormulaReducerSeed>,
+        plan: &ResidualPlan,
+        stable: &mut Worklist,
+        stable_interner: &mut StateInterner,
+        stats: &mut ResidualStateStats,
+    ) -> DeltaSeedOutcome {
+        let seeded_parents = seeds
+            .iter()
+            .map(|seed| match seed {
+                FormulaReducerSeed::Admit(seed) => seed.batch.parents.row_count,
+                FormulaReducerSeed::Emit(seed) => seed.batch.parents.row_count,
+            })
+            .sum();
+        let drained = self.drain_formula_reducer_seeds(
+            seeds,
+            plan,
+            stable,
+            stable_interner,
+            stats,
+        );
+        DeltaSeedOutcome {
+            continuation: drained.continuation,
+            publication: None,
+            active: drained.active,
+            terminal_activations: Vec::new(),
+            completed_activation_ids: Vec::new(),
+            terminal_family: None,
+            seeded_parents,
+        }
+    }
+
     fn release_completion(
+        &mut self,
         completed: CompletedActivation,
         plan: &ResidualPlan,
         stable: &mut Worklist,
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
-    ) -> Option<ContinuationToken> {
-        let result = match completed.effect {
-            DeltaCompletion::Cleanup => {
+    ) -> FormulaReducerDrain {
+        let CompletedActivation {
+            activation: _,
+            return_to,
+            effect,
+        } = completed;
+        match (return_to, effect) {
+            (_, DeltaCompletion::Cleanup) => {
                 // A streaming activation has already resumed one affine copy
                 // of its continuation per semantic effect. Quiescence only
                 // retires producer credits; replaying the template here would
                 // duplicate publication.
-                return None;
+                FormulaReducerDrain::default()
             }
-            DeltaCompletion::Support(truth) => {
-                return Self::release_support(
-                    completed.return_to,
-                    truth,
-                    plan,
-                    stable,
-                    stable_interner,
-                    stats,
-                );
-            }
-            DeltaCompletion::Candidates(result) => result,
-        };
-        match completed.return_to {
-            DeltaReturn::Stable { desc, parent } => {
-                if result.is_empty() {
-                    return None;
+            (return_to, DeltaCompletion::Support(truth)) => self.release_support(
+                return_to,
+                truth,
+                plan,
+                stable,
+                stable_interner,
+                stats,
+            ),
+            (DeltaReturn::Stable { desc, parent }, DeltaCompletion::Candidates(result)) => {
+                let continuation = if result.is_empty() {
+                    None
+                } else {
+                    file_with_plan(
+                        stable,
+                        stable_interner,
+                        plan,
+                        desc,
+                        StateBucket::Candidates(CandidateBatch {
+                            parents: RowBatch {
+                                rows: parent.into_vec(),
+                                row_count: 1,
+                            },
+                            candidates: result,
+                        }),
+                        stats,
+                    )
+                };
+                FormulaReducerDrain {
+                    continuation,
+                    active: None,
                 }
-                file_with_plan(
-                    stable,
-                    stable_interner,
-                    plan,
-                    desc,
-                    StateBucket::Candidates(CandidateBatch {
-                        parents: RowBatch {
-                            rows: parent.into_vec(),
-                            row_count: 1,
-                        },
-                        candidates: result,
-                    }),
-                    stats,
-                )
             }
-            DeltaReturn::Formula {
-                bound,
-                counter,
-                batch,
-            } => {
+            (
+                DeltaReturn::Formula {
+                    bound,
+                    counter,
+                    batch,
+                },
+                DeltaCompletion::Candidates(result),
+            ) => {
                 if matches!(
                     &stable_interner.formula(counter).focus,
                     FormulaFocus::Action {
@@ -4178,7 +4740,8 @@ impl DeltaScheduler {
                     stats.candidates_proposed += result.len();
                     stats.max_propose_candidates = stats.max_propose_candidates.max(result.len());
                 }
-                finish_formula_action_result(
+                let mut seeds = Vec::new();
+                let continuation = finish_formula_action_result(
                     plan,
                     bound,
                     counter,
@@ -4187,13 +4750,90 @@ impl DeltaScheduler {
                     stable,
                     stable_interner,
                     stats,
-                )
+                    &mut seeds,
+                );
+                let mut drained = self.drain_formula_reducer_seeds(
+                    seeds,
+                    plan,
+                    stable,
+                    stable_interner,
+                    stats,
+                );
+                prefer_continuation(&mut drained.continuation, continuation);
+                drained
+            }
+            (
+                DeltaReturn::FormulaOrAdmit {
+                    bound,
+                    batch,
+                    continuation: formula_continuation,
+                },
+                DeltaCompletion::FormulaOrAdmitted,
+            ) => {
+                let mut seeds = Vec::new();
+                let continuation = finish_formula_or_admission(
+                    plan,
+                    bound,
+                    batch,
+                    formula_continuation,
+                    stable,
+                    stable_interner,
+                    stats,
+                    &mut seeds,
+                );
+                let mut drained = self.drain_formula_reducer_seeds(
+                    seeds,
+                    plan,
+                    stable,
+                    stable_interner,
+                    stats,
+                );
+                prefer_continuation(&mut drained.continuation, continuation);
+                drained
+            }
+            (
+                DeltaReturn::FormulaOrEmit {
+                    bound,
+                    batch,
+                    counter,
+                },
+                DeltaCompletion::Candidates(result),
+            ) => {
+                let mut seeds = Vec::new();
+                let continuation = finish_formula_or_emission(
+                    plan,
+                    bound,
+                    counter,
+                    batch,
+                    result,
+                    stable,
+                    stable_interner,
+                    stats,
+                    &mut seeds,
+                );
+                let mut drained = self.drain_formula_reducer_seeds(
+                    seeds,
+                    plan,
+                    stable,
+                    stable_interner,
+                    stats,
+                );
+                prefer_continuation(&mut drained.continuation, continuation);
+                drained
+            }
+            (DeltaReturn::FormulaOrAdmit { .. }, effect)
+            | (DeltaReturn::FormulaOrEmit { .. }, effect) => {
+                panic!("Formula OR reducer completed with incompatible effect: {effect:?}")
+            }
+            (DeltaReturn::Stable { .. } | DeltaReturn::Formula { .. }, effect) => {
+                panic!("ordinary delta reducer completed with incompatible effect: {effect:?}")
             }
         }
     }
 
     #[allow(clippy::too_many_arguments)]
     fn release_streaming(
+        &mut self,
         activation: ActivationId,
         streamed: DeltaStreamingReturn,
         accepted: Vec<RawInline>,
@@ -4202,18 +4842,22 @@ impl DeltaScheduler {
         stable: &mut Worklist,
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
-    ) -> DeltaStableEffects {
+    ) -> DeltaStreamingRelease {
         if streamed.effect == DeltaStreamingEffect::Support {
-            return DeltaStableEffects {
-                continuation: Self::release_support(
-                    streamed.return_to,
-                    true,
-                    plan,
-                    stable,
-                    stable_interner,
-                    stats,
-                ),
-                publication: None,
+            let released = self.release_support(
+                streamed.return_to,
+                true,
+                plan,
+                stable,
+                stable_interner,
+                stats,
+            );
+            return DeltaStreamingRelease {
+                stable: DeltaStableEffects {
+                    continuation: released.continuation,
+                    publication: None,
+                },
+                active: released.active,
             };
         }
         debug_assert!(!accepted.is_empty());
@@ -4251,11 +4895,15 @@ impl DeltaScheduler {
                 committed, full,
                 "a direct-terminal publication did not bind the full result schema"
             );
-            return DeltaStableEffects {
-                continuation: None,
-                publication: Some(TerminalPublicationBatch::new(activation, rows)),
+            return DeltaStreamingRelease {
+                stable: DeltaStableEffects {
+                    continuation: None,
+                    publication: Some(TerminalPublicationBatch::new(activation, rows)),
+                },
+                active: None,
             };
         }
+        let mut reducer_seeds = Vec::new();
         let continuation = match streamed.return_to {
             DeltaReturn::Stable { desc, parent } => file_with_plan(
                 stable,
@@ -4284,23 +4932,35 @@ impl DeltaScheduler {
                 stable,
                 stable_interner,
                 stats,
+                &mut reducer_seeds,
             ),
+            DeltaReturn::FormulaOrAdmit { .. } | DeltaReturn::FormulaOrEmit { .. } => {
+                panic!("a Formula OR reducer attempted streaming publication")
+            }
         };
-        DeltaStableEffects {
-            continuation,
-            publication: None,
+        assert!(
+            reducer_seeds.is_empty(),
+            "a certified streaming Formula proposal reached an OR reducer"
+        );
+        DeltaStreamingRelease {
+            stable: DeltaStableEffects {
+                continuation,
+                publication: None,
+            },
+            active: None,
         }
     }
 
     #[allow(clippy::too_many_arguments)]
     fn release_support(
+        &mut self,
         return_to: DeltaReturn,
         truth: bool,
         plan: &ResidualPlan,
         stable: &mut Worklist,
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
-    ) -> Option<ContinuationToken> {
+    ) -> FormulaReducerDrain {
         let DeltaReturn::Formula {
             bound,
             counter,
@@ -4323,7 +4983,8 @@ impl DeltaScheduler {
             bound,
             phase: ResidualPhase::Formula { counter },
         };
-        propagate_formula_support(
+        let mut reducer_seeds = Vec::new();
+        let continuation = propagate_formula_support(
             plan,
             &desc,
             completed,
@@ -4332,7 +4993,17 @@ impl DeltaScheduler {
             stable,
             stable_interner,
             stats,
-        )
+            &mut reducer_seeds,
+        );
+        let mut drained = self.drain_formula_reducer_seeds(
+            reducer_seeds,
+            plan,
+            stable,
+            stable_interner,
+            stats,
+        );
+        prefer_continuation(&mut drained.continuation, continuation);
+        drained
     }
 
     fn file(&mut self, desc: DeltaDesc, tasks: Vec<DeltaTask>) -> Option<ActiveDeltaContinuation> {
@@ -4870,10 +5541,15 @@ impl DeltaScheduler {
         let yielded = outcome.has_stable_effect();
         let live = self.registry.is_live(active.activation);
         let settled = outcome.retargeted.get(&active.activation).copied();
-        let resume = live.then_some(settled.unwrap_or(active));
+        // A completed graph/action activation may transfer its affine lineage
+        // to a fresh engine reducer activation.  The explicit old -> new
+        // receipt remains authoritative even though the old registry entry
+        // has already been removed; queue liveness must not be used to infer
+        // or discard that handoff.
+        let resume = settled.or_else(|| live.then_some(active));
         let status = if yielded {
             ActiveDeltaStatus::Yielded
-        } else if live {
+        } else if resume.is_some() {
             ActiveDeltaStatus::Pending
         } else {
             ActiveDeltaStatus::Quiescent
@@ -5160,7 +5836,7 @@ impl DeltaScheduler {
                         == DeltaPhysicalClass::TerminalStreaming
                 });
                 if let Some(streamed) = self.registry.take_streaming_return(task.activation) {
-                    task_effects.absorb(Self::release_streaming(
+                    let released = self.release_streaming(
                         task.activation,
                         streamed,
                         outcome.accepted,
@@ -5169,7 +5845,11 @@ impl DeltaScheduler {
                         stable,
                         stable_interner,
                         stats,
-                    ));
+                    );
+                    task_effects.absorb(released.stable);
+                    if let Some(active) = released.active {
+                        assert!(retargeted.insert(task.activation, active).is_none());
+                    }
                 }
             }
             if let Some(proof) = outcome.quiescence {
@@ -5180,18 +5860,24 @@ impl DeltaScheduler {
                         assert!(retargeted.insert(task.activation, active).is_none());
                     }
                     DeltaSettlement::Completed(completed) => {
-                        completed_activations += 1;
-                        completed_activation_ids.push(completed.activation);
+                        let old_activation = completed.activation;
+                        let released = self.release_completion(
+                            completed,
+                            plan,
+                            stable,
+                            stable_interner,
+                            stats,
+                        );
                         prefer_continuation(
                             &mut task_effects.continuation,
-                            Self::release_completion(
-                                completed,
-                                plan,
-                                stable,
-                                stable_interner,
-                                stats,
-                            ),
+                            released.continuation,
                         );
+                        if let Some(active) = released.active {
+                            assert!(retargeted.insert(old_activation, active).is_none());
+                        } else if !retargeted.contains_key(&old_activation) {
+                            completed_activations += 1;
+                            completed_activation_ids.push(old_activation);
+                        }
                     }
                 }
             }
@@ -5258,7 +5944,7 @@ impl DeltaScheduler {
             .cloned()
             .expect("typed program task was scheduled under a legacy delta state");
         let spec = address.resolve(root, plan);
-        let confirm_finalizer = address.is_confirm_finalizer();
+        let private_direct = address.has_private_direct_effects();
         let cohort_key = ProgramCohortKey::of(&self.registry, &tasks[0]);
         assert!(
             tasks
@@ -5346,7 +6032,7 @@ impl DeltaScheduler {
         stats.delta_source_pages += receipt.source_pages;
         stats.delta_source_candidates_examined += receipt.source_examined;
         stats.delta_source_roots += receipt.source_roots;
-        if !confirm_finalizer {
+        if !private_direct {
             stats.delta_source_direct_candidates += receipt.direct.len();
         }
         if receipt.source_pages > 0 {
@@ -5406,7 +6092,7 @@ impl DeltaScheduler {
                 "one typed input page reported Boolean support more than once"
             );
             let page_had_program_effect = !child_range.is_empty()
-                || (!confirm_finalizer && !direct_range.is_empty())
+                || (!private_direct && !direct_range.is_empty())
                 || !accepted_range.is_empty()
                 || !supported_range.is_empty();
             let outcome = self.registry.replace_program(
@@ -5441,7 +6127,7 @@ impl DeltaScheduler {
                     "one typed page mixed Boolean support with candidate acceptance"
                 );
                 if let Some(streamed) = self.registry.take_program_support_return(activation) {
-                    task_effects.absorb(Self::release_streaming(
+                    let released = self.release_streaming(
                         activation,
                         streamed,
                         Vec::new(),
@@ -5450,13 +6136,17 @@ impl DeltaScheduler {
                         stable,
                         stable_interner,
                         stats,
-                    ));
+                    );
+                    task_effects.absorb(released.stable);
+                    if let Some(active) = released.active {
+                        assert!(retargeted.insert(activation, active).is_none());
+                    }
                 }
             }
             if !outcome.accepted.is_empty() {
                 let direct_terminal = direct_terminal_full.filter(|_| terminal);
                 if let Some(streamed) = self.registry.take_streaming_return(activation) {
-                    task_effects.absorb(Self::release_streaming(
+                    let released = self.release_streaming(
                         activation,
                         streamed,
                         outcome.accepted,
@@ -5465,7 +6155,11 @@ impl DeltaScheduler {
                         stable,
                         stable_interner,
                         stats,
-                    ));
+                    );
+                    task_effects.absorb(released.stable);
+                    if let Some(active) = released.active {
+                        assert!(retargeted.insert(activation, active).is_none());
+                    }
                 }
             }
             if let Some(proof) = outcome.quiescence {
@@ -5476,18 +6170,24 @@ impl DeltaScheduler {
                         assert!(retargeted.insert(activation, active).is_none());
                     }
                     DeltaSettlement::Completed(completed) => {
-                        completed_activations += 1;
-                        completed_activation_ids.push(completed.activation);
+                        let old_activation = completed.activation;
+                        let released = self.release_completion(
+                            completed,
+                            plan,
+                            stable,
+                            stable_interner,
+                            stats,
+                        );
                         prefer_continuation(
                             &mut task_effects.continuation,
-                            Self::release_completion(
-                                completed,
-                                plan,
-                                stable,
-                                stable_interner,
-                                stats,
-                            ),
+                            released.continuation,
                         );
+                        if let Some(active) = released.active {
+                            assert!(retargeted.insert(old_activation, active).is_none());
+                        } else if !retargeted.contains_key(&old_activation) {
+                            completed_activations += 1;
+                            completed_activation_ids.push(old_activation);
+                        }
                     }
                 }
                 // Whether this proof removed the activation or transferred it
@@ -5506,7 +6206,7 @@ impl DeltaScheduler {
                 dead_pages += usize::from(!within_search_page);
                 if source_telemetry_cohort {
                     source_dead_pages += 1;
-                } else if !confirm_finalizer {
+                } else if !private_direct {
                     transition_dead_pages += 1;
                 }
             }
@@ -5717,7 +6417,7 @@ impl DeltaScheduler {
                         == DeltaPhysicalClass::TerminalStreaming
                 });
                 if let Some(streamed) = self.registry.take_streaming_return(task.activation) {
-                    task_effects.absorb(Self::release_streaming(
+                    let released = self.release_streaming(
                         task.activation,
                         streamed,
                         outcome.accepted,
@@ -5726,7 +6426,11 @@ impl DeltaScheduler {
                         stable,
                         stable_interner,
                         stats,
-                    ));
+                    );
+                    task_effects.absorb(released.stable);
+                    if let Some(active) = released.active {
+                        assert!(retargeted.insert(task.activation, active).is_none());
+                    }
                 }
             }
             if let Some(proof) = outcome.quiescence {
@@ -5737,18 +6441,24 @@ impl DeltaScheduler {
                         assert!(retargeted.insert(task.activation, active).is_none());
                     }
                     DeltaSettlement::Completed(completed) => {
-                        completed_activations += 1;
-                        completed_activation_ids.push(completed.activation);
+                        let old_activation = completed.activation;
+                        let released = self.release_completion(
+                            completed,
+                            plan,
+                            stable,
+                            stable_interner,
+                            stats,
+                        );
                         prefer_continuation(
                             &mut task_effects.continuation,
-                            Self::release_completion(
-                                completed,
-                                plan,
-                                stable,
-                                stable_interner,
-                                stats,
-                            ),
+                            released.continuation,
                         );
+                        if let Some(active) = released.active {
+                            assert!(retargeted.insert(old_activation, active).is_none());
+                        } else if !retargeted.contains_key(&old_activation) {
+                            completed_activations += 1;
+                            completed_activation_ids.push(old_activation);
+                        }
                     }
                 }
             }
@@ -5942,6 +6652,105 @@ mod tests {
             _candidates: &mut CandidateSink<'_>,
         ) {
             panic!("typed program unexpectedly fell back to ordinary propose")
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn residual_program(&self) -> Option<ProgramRef<'_>> {
+            Some(ProgramRef::new(self))
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct OneShotSupportState {
+        keep_cleanup_live: bool,
+    }
+
+    #[derive(Clone, Copy)]
+    struct OneShotSupportProgram;
+
+    impl TypedProgramSpec for OneShotSupportProgram {
+        type State = OneShotSupportState;
+        type NoveltyKey = ();
+        type Rank = u8;
+
+        fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+            matches!(request.action, ProgramAction::Support).then_some(ProgramRoute {
+                key: ProgramKey::new(0),
+                variable: 0,
+                stratum: ProgramStratum::Finite,
+                grouping: ProgramGrouping::PageLocal,
+                completion: ProgramCompletion::PageableOnly,
+            })
+        }
+
+        fn dispatch(&self, _state: &Self::State) -> DispatchClass {
+            DispatchClass::new(0)
+        }
+
+        fn pacing(&self, _state: &Self::State) -> ProgramPacing {
+            ProgramPacing::Search
+        }
+
+        fn progress(&self, state: &Self::State) -> Self::Rank {
+            1 + u8::from(state.keep_cleanup_live)
+        }
+
+        fn seed_typed(
+            &self,
+            _batch: ProgramSeedBatch<'_>,
+            _effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+        ) {
+            panic!("test support Program is installed through the private runtime seam")
+        }
+
+        fn step_typed(
+            &self,
+            states: Vec<Self::State>,
+            batch: TypedProgramBatch<'_>,
+            effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+        ) {
+            assert_eq!(states.len(), batch.limits.len());
+            for (input, state) in states.into_iter().enumerate() {
+                effects.support(u32::try_from(input).unwrap());
+                effects.page(
+                    1,
+                    state.keep_cleanup_live.then_some(TypedResume::Immediate(
+                        OneShotSupportState {
+                            keep_cleanup_live: false,
+                        },
+                    )),
+                );
+            }
+        }
+    }
+
+    impl Constraint<'static> for OneShotSupportProgram {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_empty()
+        }
+
+        fn estimate(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _out: &mut EstimateSink<'_>,
+        ) -> bool {
+            false
+        }
+
+        fn propose(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
         }
 
         fn confirm(
@@ -6418,6 +7227,438 @@ mod tests {
                 },
             },
             parent: parent.into_boxed_slice(),
+        }
+    }
+
+    fn formula_or_reducer_batch(values: &[u8]) -> FormulaBatch {
+        let mut batch = FormulaBatch::from_proposal(
+            RowBatch::seed(),
+            vec![super::super::ActivationId(11)],
+            &FiniteFormulaNodeKind::Or {
+                children: Box::new([]),
+            },
+        );
+        for &candidate in values {
+            batch.admit_current_or_value(0, value(candidate));
+        }
+        batch
+    }
+
+    #[test]
+    fn formula_or_admission_is_pageable_duplicate_safe_and_clone_independent() {
+        let root = MixedExpansion;
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let mut scheduler = DeltaScheduler::new();
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let seeded = scheduler.seed_formula_reducers(
+            vec![FormulaReducerSeed::Admit(FormulaOrAdmissionSeed {
+                bound: VariableSet::new_empty(),
+                batch: formula_or_reducer_batch(&[]),
+                input: CandidatePayload::Values(vec![
+                    value(2),
+                    value(2),
+                    value(1),
+                    value(3),
+                ]),
+                // The test deliberately stops before EOF; this exact saved
+                // PC must remain opaque to every intermediate page.
+                continuation: FormulaReducerContinuation::Complete(FormulaPcId(u32::MAX)),
+            })],
+            &plan,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        let active = seeded.active.expect("nonempty admission opened one Program");
+        assert_eq!(seeded.seeded_parents, 1);
+        assert_eq!(
+            scheduler.interner.program(active.state),
+            Some(&ProgramAddress::FormulaOrAdmit)
+        );
+
+        let admitted = |scheduler: &DeltaScheduler| {
+            let activation = scheduler
+                .registry
+                .state
+                .activations
+                .get(&active.activation)
+                .expect("live Formula admission activation");
+            let DeltaReturn::FormulaOrAdmit { batch, .. } = &activation.return_to else {
+                panic!("Formula admission lost its accumulator payload")
+            };
+            batch.current_or_set().iter().copied().collect::<Vec<_>>()
+        };
+
+        let first = scheduler.step_active(
+            &root,
+            &plan,
+            active,
+            1,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert_eq!(first.status, ActiveDeltaStatus::Pending);
+        assert_eq!(first.outcome.dead_pages, 1);
+        assert_eq!(admitted(&scheduler), [value(2)]);
+        let resume = first.resume.unwrap();
+        let cloned = scheduler.clone();
+
+        let duplicate = scheduler.step_active(
+            &root,
+            &plan,
+            resume,
+            1,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert_eq!(duplicate.status, ActiveDeltaStatus::Pending);
+        assert_eq!(duplicate.outcome.dead_pages, 1);
+        assert_eq!(admitted(&scheduler), [value(2)]);
+        assert_eq!(admitted(&cloned), [value(2)]);
+
+        let third = scheduler.step_active(
+            &root,
+            &plan,
+            duplicate.resume.unwrap(),
+            1,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert_eq!(third.status, ActiveDeltaStatus::Pending);
+        assert_eq!(admitted(&scheduler), [value(1), value(2)]);
+        assert_eq!(admitted(&cloned), [value(2)]);
+        assert!(stable.is_empty());
+    }
+
+    #[test]
+    fn formula_or_emission_moves_grant_sized_ordered_pages_without_graph_telemetry() {
+        let root = MixedExpansion;
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let mut scheduler = DeltaScheduler::new();
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let seeded = scheduler.seed_formula_reducers(
+            vec![FormulaReducerSeed::Emit(FormulaOrEmissionSeed {
+                bound: VariableSet::new_empty(),
+                batch: formula_or_reducer_batch(&[7, 3, 1, 6, 2, 5, 4, 8]),
+                // Seven values are emitted by the tested 1 -> 2 -> 4 pages,
+                // so EOF never observes this deliberately opaque PC.
+                counter: FormulaPcId(u32::MAX),
+            })],
+            &plan,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        let active = seeded.active.expect("nonempty emission opened one Program");
+        assert_eq!(
+            scheduler.interner.program(active.state),
+            Some(&ProgramAddress::FormulaOrEmit)
+        );
+
+        let output = |scheduler: &DeltaScheduler| {
+            let activation = scheduler
+                .registry
+                .state
+                .activations
+                .get(&active.activation)
+                .expect("live Formula emission activation");
+            let DeltaReducer::FormulaOrEmit { output } = &activation.reducer else {
+                panic!("Formula emission lost its output rope")
+            };
+            output.iter().collect::<Vec<_>>()
+        };
+        let output_root = |scheduler: &DeltaScheduler| {
+            let activation = scheduler
+                .registry
+                .state
+                .activations
+                .get(&active.activation)
+                .expect("live Formula emission activation");
+            let DeltaReducer::FormulaOrEmit {
+                output: CandidatePayload::Deferred(output),
+            } = &activation.reducer
+            else {
+                panic!("Formula emission output was not deferred")
+            };
+            output.root.as_ref().unwrap().node.clone()
+        };
+
+        let first = scheduler.step_active(
+            &root,
+            &plan,
+            active,
+            1,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert_eq!(first.status, ActiveDeltaStatus::Pending);
+        assert_eq!(first.outcome.dead_pages, 1);
+        assert!(first.outcome.allows_global_width_growth);
+        assert_eq!(output(&scheduler), [(0, value(1))]);
+        let cloned = scheduler.clone();
+        assert!(Arc::ptr_eq(
+            &output_root(&scheduler),
+            &output_root(&cloned),
+        ));
+
+        let second = scheduler.step_active(
+            &root,
+            &plan,
+            first.resume.unwrap(),
+            2,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert_eq!(second.status, ActiveDeltaStatus::Pending);
+        assert_eq!(second.outcome.dead_pages, 1);
+        assert!(second.outcome.allows_global_width_growth);
+        assert_eq!(
+            output(&scheduler),
+            [(0, value(1)), (0, value(2)), (0, value(3))]
+        );
+        assert_eq!(output(&cloned), [(0, value(1))]);
+
+        let third = scheduler.step_active(
+            &root,
+            &plan,
+            second.resume.unwrap(),
+            4,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert_eq!(third.status, ActiveDeltaStatus::Pending);
+        assert_eq!(third.outcome.dead_pages, 1);
+        assert!(third.outcome.allows_global_width_growth);
+        assert_eq!(
+            output(&scheduler),
+            (1..=7).map(|byte| (0, value(byte))).collect::<Vec<_>>()
+        );
+        assert_eq!(output(&cloned), [(0, value(1))]);
+        assert!(stable.is_empty());
+        assert_eq!(stats.delta_source_direct_candidates, 0);
+        assert_eq!(stats.delta_source_candidates_examined, 0);
+        assert_eq!(stats.delta_transition_candidates_examined, 0);
+        assert_eq!(stats.delta_source_pages, 0);
+        assert_eq!(stats.delta_transition_pages, 0);
+        assert_eq!(stats.delta_program_physical_cohorts, 0);
+    }
+
+    #[test]
+    fn empty_formula_or_reducers_drain_admission_and_emission_synchronously() {
+        // A one-arm union retains a real OR frame but lets one empty admission
+        // complete its child and immediately discover the empty root emission.
+        // Neither zero-rank reducer may manufacture a sentinel Program task.
+        let root = UnionConstraint::new(vec![MixedExpansion]);
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let formula_root = plan
+            .finite_formula
+            .root(0)
+            .expect("the union root has a formula program");
+        let FiniteFormulaNodeKind::Or { children } = &plan.finite_formula.node(formula_root).kind
+        else {
+            panic!("the union root did not compile as OR")
+        };
+
+        let mut scheduler = DeltaScheduler::new();
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let relevant = ChildSet::empty(plan.len()).with_inserted(0);
+        let parent = stable_interner.start_formula(
+            &plan.finite_formula,
+            0,
+            0,
+            UnionVerb::Propose { relevant },
+        );
+        let action = stable_interner.formula_pcs.select_child_with(
+            &plan.finite_formula,
+            parent,
+            0,
+            FormulaReturnKind::Child,
+            FormulaStage::Propose,
+            true,
+        );
+        assert_eq!(children.len(), 1);
+
+        let seeded = scheduler.seed_formula_reducers(
+            vec![FormulaReducerSeed::Admit(FormulaOrAdmissionSeed {
+                bound: VariableSet::new_empty(),
+                batch: FormulaBatch::from_proposal(
+                    RowBatch::seed(),
+                    vec![super::super::ActivationId(11)],
+                    &plan.finite_formula.node(formula_root).kind,
+                ),
+                input: CandidatePayload::Values(Vec::new()),
+                continuation: FormulaReducerContinuation::Complete(action),
+            })],
+            &plan,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+
+        assert_eq!(seeded.seeded_parents, 1);
+        assert!(seeded.active.is_none());
+        assert!(seeded.continuation.is_none());
+        assert!(seeded.completed_activation_ids.is_empty());
+        assert!(scheduler.is_empty());
+        assert!(scheduler.registry.state.activations.is_empty());
+        assert!(stable.is_empty());
+    }
+
+    #[test]
+    fn streaming_support_retargets_to_fresh_formula_or_admission_before_old_cleanup() {
+        type AnyConstraint = Box<dyn Constraint<'static>>;
+
+        let root = UnionConstraint::new(vec![
+            Box::new(
+                crate::query::intersectionconstraint::IntersectionConstraint::<AnyConstraint>::new(
+                    Vec::new(),
+                ),
+            ) as AnyConstraint,
+            Box::new(OneShotSupportProgram) as AnyConstraint,
+        ]);
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let formula_root = plan
+            .finite_formula
+            .root(0)
+            .expect("the union root has a formula program");
+        let FiniteFormulaNodeKind::Or { children } = &plan.finite_formula.node(formula_root).kind
+        else {
+            panic!("the union root did not compile as OR")
+        };
+        assert_eq!(children.len(), 2);
+
+        for keep_cleanup_live in [false, true] {
+            let mut scheduler = DeltaScheduler::new();
+            let mut stable = Worklist::new();
+            let mut stable_interner = StateInterner::default();
+            let mut stats = ResidualStateStats::default();
+            let relevant = ChildSet::empty(plan.len()).with_inserted(0);
+            let parent = stable_interner.start_formula(
+                &plan.finite_formula,
+                0,
+                0,
+                UnionVerb::Confirm {
+                    relevant,
+                    checked: ChildSet::empty(plan.len()),
+                },
+            );
+            // Force the empty AND arm's Support action. A true witness selects
+            // that arm, whose complete Confirm frame immediately contributes
+            // the immutable root candidate to a fresh OR admission reducer.
+            let support_action = stable_interner.formula_pcs.select_child_with(
+                &plan.finite_formula,
+                parent,
+                0,
+                FormulaReturnKind::Guard,
+                FormulaStage::Support,
+                true,
+            );
+            let batch = FormulaBatch::from_confirmation(
+                CandidateBatch {
+                    parents: RowBatch::seed(),
+                    candidates: CandidatePayload::Values(vec![value(7)]),
+                },
+                vec![super::super::ActivationId(11)],
+                &plan.finite_formula.node(formula_root).kind,
+            );
+
+            let request = ProgramRequest {
+                action: ProgramAction::Support,
+                bound: VariableSet::new_empty(),
+            };
+            // This is deliberately a white-box lineage fixture: the Program
+            // address supplies one finite Support receipt, while the affine
+            // return payload names the empty composite arm above. Production
+            // descendants use the same address/return separation; the
+            // scheduler must not recover semantic control from the address.
+            let desc = DeltaDesc::formula(0, 0, children[1]);
+            let spec = plan
+                .resolve_formula_node(&root, 0, children[1])
+                .residual_program()
+                .expect("the support arm exposes its typed Program");
+            let route = spec
+                .route(request)
+                .expect("the support arm accepts a Support route");
+            let state = scheduler.prepare_program(desc, route, spec);
+            let old_activation = scheduler.registry.open_program_activation(
+                DeltaReducer::Support { published: false },
+                DeltaReturn::Formula {
+                    bound: VariableSet::new_empty(),
+                    counter: support_action,
+                    batch,
+                },
+                None,
+                None,
+            );
+            let credit = scheduler
+                .registry
+                .issue_credit(old_activation, CreditKind::Program { join: None });
+            let work = insert_engine_program_state(
+                &OneShotSupportProgram,
+                scheduler
+                    .program_runtimes
+                    .get_mut(&state)
+                    .expect("prepared support Program lost its runtime"),
+                ProgramActivation(old_activation.0),
+                OneShotSupportState { keep_cleanup_live },
+            );
+            let active = scheduler
+                .file_program_state(
+                    state,
+                    vec![ProgramTask {
+                        activation: old_activation,
+                        credit,
+                        work,
+                    }],
+                )
+                .expect("the support Program filed one affine task");
+
+            let stepped = scheduler.step_active(
+                &root,
+                &plan,
+                active,
+                1,
+                &mut stable,
+                &mut stable_interner,
+                &mut stats,
+            );
+            let fresh = stepped
+                .resume
+                .expect("the support witness returned its fresh reducer lineage");
+            assert_eq!(stepped.status, ActiveDeltaStatus::Pending);
+            assert_ne!(fresh.activation, old_activation);
+            assert_eq!(
+                scheduler.interner.program(fresh.state),
+                Some(&ProgramAddress::FormulaOrAdmit)
+            );
+            assert_eq!(
+                stepped.outcome.retargeted.get(&old_activation),
+                Some(&fresh)
+            );
+            assert!(stepped.outcome.completed_activation_ids.is_empty());
+            assert_eq!(scheduler.registry.is_live(old_activation), keep_cleanup_live);
+            assert_eq!(
+                scheduler.has_active_program(ActiveDeltaContinuation {
+                    state,
+                    activation: old_activation,
+                }),
+                keep_cleanup_live
+            );
+            assert!(scheduler.registry.is_live(fresh.activation));
+            assert!(scheduler.has_active_program(fresh));
+            assert!(stable.is_empty());
         }
     }
 
@@ -8465,7 +9706,7 @@ mod tests {
     }
 
     #[test]
-    fn formula_confirm_finalizer_requires_an_all_and_live_frame_ancestry() {
+    fn formula_confirm_finalizer_accepts_or_ancestry_now_that_admission_is_pageable() {
         fn formula_batch(original: &CandidatePayload, with_or: bool) -> FormulaBatch {
             let mut frames = vec![FormulaPayloadFrame::And {
                 current: original.clone(),
@@ -8473,7 +9714,7 @@ mod tests {
             if with_or {
                 frames.push(FormulaPayloadFrame::Or {
                     source: original.clone(),
-                    output: CandidatePayload::empty(1),
+                    accumulator: FormulaOrAccumulator::empty(1),
                 });
             } else {
                 frames.push(FormulaPayloadFrame::And {
@@ -8522,15 +9763,11 @@ mod tests {
         let mut with_or = ProducerRegistry::new();
         let proof = quiescent_formula(&mut with_or, original, true);
         let activation = proof.activation;
-        let RegistrySettlement::Completed(completed) = with_or.settle_quiescence(proof) else {
-            panic!("Formula OR ancestry incorrectly entered the affine finalizer")
+        let RegistrySettlement::ConfirmFinalizer(seed) = with_or.settle_quiescence(proof) else {
+            panic!("Formula OR ancestry did not enter the pageable Confirm finalizer")
         };
-        assert_eq!(completed.activation, activation);
-        assert_eq!(
-            completed.effect,
-            DeltaCompletion::Candidates(CandidatePayload::Values(vec![value(7), value(7)]))
-        );
-        assert!(!with_or.is_live(activation));
+        assert_eq!(seed.activation, activation);
+        assert!(with_or.is_live(activation));
 
         let empty_original = shared_one_parent_candidates(Vec::new());
         let empty_batch = formula_batch(&empty_original, false);
@@ -9891,7 +11128,7 @@ mod tests {
             .registry
             .take_streaming_return(live_activation)
             .expect("an accepting formula seed has a streaming return");
-        let seed_continuation = DeltaScheduler::release_streaming(
+        let seed_continuation = scheduler.release_streaming(
             live_activation,
             streamed,
             live.initial_accepted,
@@ -9901,8 +11138,9 @@ mod tests {
             &mut stable_interner,
             &mut stats,
         );
-        assert!(seed_continuation.continuation.is_some());
-        assert!(seed_continuation.publication.is_none());
+        assert!(seed_continuation.stable.continuation.is_some());
+        assert!(seed_continuation.stable.publication.is_none());
+        assert!(seed_continuation.active.is_none());
 
         let _ = scheduler.file(
             desc,
