@@ -64,9 +64,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::{error::Error, fmt};
 
-use triblespace_core::blob::encodings::succinctarchive::{
-    SuccinctArchiveConstraint, Universe,
-};
+use triblespace_core::blob::encodings::succinctarchive::{SuccinctArchiveConstraint, Universe};
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::{InlineEncoding, RawInline};
 use triblespace_core::query::{
@@ -134,7 +132,9 @@ impl fmt::Display for ValueRouteConfigError {
             ),
             Self::AutoNotReady => write!(
                 f,
-                "{VALUE_ROUTE_ENV}=auto is not available: no readiness seam proves automatic                  placement would never wait or compile; use the explicitly experimental warm-m4                  calibration or force"
+                "{VALUE_ROUTE_ENV}=auto is not available: no readiness seam proves \
+                 automatic placement would never wait or compile; use the explicitly \
+                 experimental warm-m4 calibration or force"
             ),
         }
     }
@@ -150,11 +150,10 @@ impl Error for ValueRouteConfigError {}
 ///
 /// This first route admits **by geometry only**: an explicitly enabled
 /// policy weighs cohort rows and exact page work, never a QoS class.
-/// Consumer-owned placement intent (serial pulls latency-priority, explicit
-/// parallel iterators marking their shards throughput, Program steps
-/// inheriting the shard's intent) returns as a later, measured second
-/// policy arm once the engine's intent seam lands; the nonblocking lease
-/// stays the hard never-wait boundary either way.
+/// Consumer-owned QoS may later select among separately calibrated executor
+/// profiles, but it is not categorical authorization: an immediately ready
+/// device can itself be the lower-latency executor. The nonblocking lease
+/// remains the hard never-wait boundary either way.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ValueRouteAdmission {
     /// Never route; every cohort steps Native. This is the default.
@@ -240,12 +239,13 @@ impl Default for ValueRouteAdmission {
     }
 }
 
-/// Shared decision counters for one value-route constraint.
+/// Shared decision counters for one value-route view.
 ///
-/// Parallel residual shards clone the root constraint but share these
-/// counters through the family's `Arc`, so physical placements remain
-/// observable even though parallel collection discards per-shard
-/// `ResidualStateStats`. Relaxed atomics: exact after the solve completes.
+/// Every pattern constraint and parallel residual shard created from the
+/// same [`ResidentValueRoute`] shares these counters through an `Arc`, so
+/// physical placements remain observable even though parallel collection
+/// discards per-shard `ResidualStateStats`. Relaxed atomics: exact after the
+/// solve completes.
 #[derive(Debug, Default)]
 pub struct ValueRouteCounters {
     physical_cohorts: AtomicU64,
@@ -270,7 +270,7 @@ pub struct ValueRouteCountersSnapshot {
     /// Grant ceilings (`sum(limits)`) across those cohorts. This bounds the
     /// work from above; `physical_page_work` is the exact figure.
     pub physical_granted_limits: u64,
-    /// Cohorts declined by the admission policy (intent arm included).
+    /// Cohorts declined by the admission policy.
     pub declined_policy: u64,
     /// Cohorts declined because the lease was busy or failed.
     pub declined_lease: u64,
@@ -436,7 +436,7 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
         // The device arm exists only under an explicitly enabled policy:
         // Off is honest — zero GPU-admission work, including the lazy
         // O(pairs) fanout scan the resident executor's construction would
-        // trigger. Force/Frontier pay that scan once as setup cost.
+        // trigger. Force/WarmM4 pay that scan once as setup cost.
         let device = if admission.routing_enabled() {
             WgpuQueryProgram::new(&program, gpu)
                 .ok()
@@ -533,11 +533,7 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
 
     /// Exact Native cohort step under the scheduler's per-input grants,
     /// paged through the native fixed-`(E,A)` value primitive.
-    fn native_outcome(
-        &self,
-        states: &[SuccinctValueState],
-        limits: &[usize],
-    ) -> ValueStepOutcome {
+    fn native_outcome(&self, states: &[SuccinctValueState], limits: &[usize]) -> ValueStepOutcome {
         assert_eq!(
             states.len(),
             limits.len(),
@@ -568,11 +564,11 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
             direct: Vec::new(),
         };
         let mut consumed = 0usize;
-        for (input, (receipt, (state, &limit))) in receipts
-            .iter()
-            .zip(states.iter().zip(limits))
-            .enumerate()
+        for (input, (receipt, (state, &limit))) in
+            receipts.iter().zip(states.iter().zip(limits)).enumerate()
         {
+            let input =
+                u32::try_from(input).expect("typed Program cohort input fits u32 occurrence tags");
             let examined = receipt.examined();
             // Interval-in-state law: the canonical state's interval must
             // reproduce the archive interval the pager recomputed.
@@ -586,7 +582,7 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
                     .program
                     .decode(child.row(row)[target_column])
                     .expect("child codes decode within their own archive");
-                outcome.direct.push((input as u32, value));
+                outcome.direct.push((input, value));
             }
             consumed += examined;
             let resume = receipt.next_offset().map(|next| {
@@ -670,9 +666,7 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
         // The hard boundary: only a nonblocking idle lease may dispatch; a
         // busy or poisoned lane falls through to Native instantly.
         let Some(lease) = arm.resident.program_lease().try_acquire() else {
-            core.counters
-                .declined_lease
-                .fetch_add(1, Ordering::Relaxed);
+            core.counters.declined_lease.fetch_add(1, Ordering::Relaxed);
             return None;
         };
 
@@ -748,6 +742,8 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
             .zip(states.iter().zip(limits))
             .enumerate()
         {
+            let input =
+                u32::try_from(input).expect("typed Program cohort input fits u32 occurrence tags");
             // On this fixed (E,A) -> V Propose arm the lawful receipt is
             // fully determined by the canonical state and the grant, so
             // every field is checked as an exact equality — mirroring the
@@ -755,9 +751,7 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
             // lying under-examining receipt (down to `(0, 0, None)`) would
             // otherwise silently drop the rest of the interval.
             let expected = state.remaining().min(limit as u64);
-            if u64::from(receipt.examined) != expected
-                || u64::from(receipt.produced) != expected
-            {
+            if u64::from(receipt.examined) != expected || u64::from(receipt.produced) != expected {
                 return DeviceAttempt::Failed;
             }
             let examined = expected as usize;
@@ -768,7 +762,7 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
                 let Ok(value) = core.program.decode(child.row(row)[target_column]) else {
                     return DeviceAttempt::Failed;
                 };
-                outcome.direct.push((input as u32, value));
+                outcome.direct.push((input, value));
             }
             consumed += examined;
             // Cursor law, also exact: the absolute resume offset exists iff
@@ -890,11 +884,13 @@ impl<'a, U: Universe> TypedProgramSpec for SuccinctValueFamily<'a, U> {
     ) {
         let core = &self.core;
         for parent in 0..batch.view.len() {
+            let parent_tag =
+                u32::try_from(parent).expect("typed Program seed parent fits u32 occurrence tags");
             let row = batch.view.row(parent);
             let entity_raw = Self::seed_value(&core.term_e, &batch.view, row);
             let attribute_raw = Self::seed_value(&core.term_a, &batch.view, row);
             if let Some(state) = self.seed_state(entity_raw, attribute_raw) {
-                effects.finite_root(parent as u32, state, None);
+                effects.finite_root(parent_tag, state, None);
             }
         }
     }
@@ -1125,11 +1121,7 @@ where
         self.inner.residual_delta_source_is_paged(variable, view)
     }
 
-    fn residual_proposal_source_is_paged(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-    ) -> bool {
+    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
         self.inner.residual_proposal_source_is_paged(variable, view)
     }
 
@@ -1214,7 +1206,8 @@ where
         nodes: &[ResidualDeltaNode],
         successors: &mut Vec<(u32, ResidualDeltaOutput)>,
     ) -> bool {
-        self.inner.residual_delta_expand(variable, nodes, successors)
+        self.inner
+            .residual_delta_expand(variable, nodes, successors)
     }
 }
 
@@ -1549,7 +1542,7 @@ mod tests {
         let native = family.native_outcome(&states, &limits);
         let device = family
             .device_outcome(&states, &batch(&limits))
-            .expect("a forced Throughput cohort routes");
+            .expect("a forced cohort routes");
         assert_eq!(device.direct, native.direct);
         assert_eq!(device.pages.len(), native.pages.len());
         let mut clamped = 0usize;
@@ -1638,7 +1631,10 @@ mod tests {
         assert!(!warm.admits(1, 98_295));
         assert!(warm.admits(12_288, 1));
         assert!(!warm.admits(12_287, 1));
-        assert!(warm.admits(usize::MAX, u64::MAX), "score math must not overflow");
+        assert!(
+            warm.admits(usize::MAX, u64::MAX),
+            "score math must not overflow"
+        );
         assert!(!warm.admits(0, u64::MAX));
         assert!(!warm.admits(usize::MAX, 0));
     }

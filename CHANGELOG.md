@@ -403,6 +403,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without comparing segment-local universe codes; joins and deduplication
   remain explicit caller responsibilities.
 
+- **Resident succinct value proposals have a real `pattern!` entry.**
+  `WgpuSuccinctArchive::value_route[_with]` wraps the canonical succinct
+  constraint and exposes a narrow typed Program for two-bound `(E,A) -> V`
+  proposals. Native paging and resident WGPU dispatch share exact ragged
+  grants, absolute continuations, branded receipts, and bag semantics; every
+  decline falls back on the untouched cohort. Placement is Off by default,
+  `Force` is a parity probe, and the explicitly experimental `WarmM4` score is
+  the only calibrated opt-in. Generic `auto` is rejected until a genuine
+  nonblocking readiness seam exists.
+
 ### Fixed
 
 - **Explicit parallel residual queries preserve their selected lowering.**

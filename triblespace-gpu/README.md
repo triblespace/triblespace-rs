@@ -279,6 +279,32 @@ clamped input's cursor returns the absolute `base + examined`, so successive
 budgeted pages concatenate into the exact unbudgeted transition on either
 executor.
 
+### Public resident value route
+
+`WgpuSuccinctArchive::value_route` and `value_route_with` are the first real
+`find!`/`pattern!` entry into that substrate. The returned pattern carrier
+delegates the ordinary constraint protocol unchanged and additionally lowers
+one narrow typed Program: a value proposal with entity and attribute already
+bound or constant. Each canonical state stores the checked `(E,A)` interval
+length and consumed offset; Native and WGPU pages independently re-derive the
+interval position, then must agree exactly on examined rows, produced rows,
+absolute continuation, order, and multiplicity.
+
+Placement is `ValueRouteAdmission::Off` by default and does not even construct
+the resident Program arm. `Force` exists for parity and acceptance probes.
+`WarmM4` is an explicitly experimental, prewarmed-machine calibration using
+`exact_page_work + 8 * parent_rows >= 98_304`; it is not a universal policy.
+The `TRIBLESPACE_GPU_VALUE_ROUTE=auto` spelling is deliberately rejected:
+the current per-snapshot lease can decline busy or poisoned work without
+waiting, but cannot prove that uploads and CubeCL pipelines are already warm
+or that unrelated device producers are idle. Until that readiness seam exists,
+automatic placement would make a latency claim the runtime cannot uphold.
+
+The public parallel entry preserves the query's selected residual lowering,
+so fresh queries retain full formula and transition-Program lowering through
+`Query::into_par_residual_state_iter`; an explicit conservative selection
+continues to use the ordinary constraint path.
+
 The production rollup type is
 `triblespace_core::repo::index_home::AcceleratedSuccinctRollup<WgpuWaveletFreeze>`:
 

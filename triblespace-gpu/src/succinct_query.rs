@@ -484,10 +484,9 @@ where
             .into_iter()
             .map(|rotation| resident_bit_vector_bytes(archive.pair_changes(rotation).num_bits()))
             .sum();
-        let present_code_bytes = (present_entities.len()
-            + present_attributes.len()
-            + present_values.len())
-            * core::mem::size_of::<u32>();
+        let present_code_bytes =
+            (present_entities.len() + present_attributes.len() + present_values.len())
+                * core::mem::size_of::<u32>();
         let wavelet_bytes = SuccinctRotation::ALL
             .into_iter()
             .map(|rotation| {
@@ -775,8 +774,8 @@ where
 
 /// Longest run of Ring rows between consecutive ones of `changed`: for
 /// `changed_e_a` this is the exact maximum `(E,A)` value fanout. O(pairs),
-/// which is why it runs once per resident wrap rather than per compiled
-/// program.
+/// which is why it runs lazily once per resident snapshot rather than per
+/// compiled program; rank-only users never invoke it.
 fn max_one_run<I>(changed: &BitVector<I>) -> usize
 where
     I: jerky::bit_vector::BitVectorIndex,
