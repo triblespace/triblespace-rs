@@ -50,6 +50,10 @@ required-features = ["wgpu"]
 name = "resident_eav_shapes"
 required-features = ["wgpu"]
 
+[[example]]
+name = "resident_value_page_2d"
+required-features = ["wgpu"]
+
 [[test]]
 name = "wgpu_parity"
 required-features = ["wgpu"]
