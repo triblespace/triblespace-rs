@@ -20805,6 +20805,151 @@ mod tests {
     }
 
     #[test]
+    fn constructed_program_pages_heterogeneous_succinctarchive_and_rpq_without_fallback() {
+        use crate::blob::encodings::succinctarchive::{
+            OrderedUniverse, SuccinctArchive, SuccinctArchiveConstraint,
+        };
+        use crate::id::{id_into_value, ExclusiveId, Id};
+        use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
+        use crate::trible::{Trible, TribleSet};
+
+        let activation_attribute = Id::new([201; crate::id::ID_LEN]).unwrap();
+        let candidate_attribute = Id::new([202; crate::id::ID_LEN]).unwrap();
+        let edge_attribute = Id::new([203; crate::id::ID_LEN]).unwrap();
+        let source = Id::new([211; crate::id::ID_LEN]).unwrap();
+        let rejected_source = Id::new([212; crate::id::ID_LEN]).unwrap();
+        let target = Id::new([221; crate::id::ID_LEN]).unwrap();
+        let rejected_target = Id::new([222; crate::id::ID_LEN]).unwrap();
+        let activations = [
+            Id::new([231; crate::id::ID_LEN]).unwrap(),
+            Id::new([232; crate::id::ID_LEN]).unwrap(),
+            Id::new([233; crate::id::ID_LEN]).unwrap(),
+        ];
+
+        let mut activation_set = TribleSet::new();
+        for (activation, value) in [
+            (&activations[0], &source),
+            (&activations[1], &source),
+            (&activations[2], &rejected_source),
+        ] {
+            activation_set.insert(&Trible::new::<GenId>(
+                ExclusiveId::force_ref(activation),
+                &activation_attribute,
+                &value.to_inline(),
+            ));
+        }
+        let mut candidate_set = TribleSet::new();
+        for (entity, value) in [
+            (&source, &target),
+            (&source, &rejected_target),
+            (&rejected_source, &target),
+        ] {
+            candidate_set.insert(&Trible::new::<GenId>(
+                ExclusiveId::force_ref(entity),
+                &candidate_attribute,
+                &value.to_inline(),
+            ));
+        }
+        let activation_archive: &'static SuccinctArchive<OrderedUniverse> =
+            Box::leak(Box::new((&activation_set).into()));
+        let candidate_archive: &'static SuccinctArchive<OrderedUniverse> =
+            Box::leak(Box::new((&candidate_set).into()));
+
+        let mut graph = TribleSet::new();
+        graph.insert(&Trible::new::<GenId>(
+            ExclusiveId::force_ref(&source),
+            &edge_attribute,
+            &target.to_inline(),
+        ));
+
+        let activation = Variable::<GenId>::new(0);
+        let source_variable = Variable::<GenId>::new(1);
+        let target_variable = Variable::<GenId>::new(2);
+        let activation_attribute = Inline::<GenId>::new(id_into_value(&activation_attribute));
+        let candidate_attribute = Inline::<GenId>::new(id_into_value(&candidate_attribute));
+        let path = [PathOp::Attr(edge_attribute.raw())];
+        let activation_constraint = || {
+            SuccinctArchiveConstraint::new(
+                activation,
+                activation_attribute,
+                source_variable,
+                activation_archive,
+            )
+        };
+        let candidate_constraint = || {
+            SuccinctArchiveConstraint::new(
+                source_variable,
+                candidate_attribute,
+                target_variable,
+                candidate_archive,
+            )
+        };
+
+        let oracle = IntersectionConstraint::new(vec![
+            Box::new(activation_constraint()) as ShapeConstraint,
+            Box::new(candidate_constraint()) as ShapeConstraint,
+            Box::new(RegularPathConstraint::new(
+                graph.clone(),
+                source_variable,
+                target_variable,
+                &path,
+            )) as ShapeConstraint,
+        ]);
+        let mut expected: Vec<_> =
+            Query::new(oracle, constructed_source_target).sequential().collect();
+
+        let root = Arc::new(IntersectionConstraint::new(vec![
+            Box::new(ConstructedProtocolTrap {
+                inner: activation_constraint(),
+            }) as ShapeConstraint,
+            Box::new(ConstructedProtocolTrap {
+                inner: candidate_constraint(),
+            }) as ShapeConstraint,
+            Box::new(ConstructedProtocolTrap {
+                inner: RegularPathConstraint::new(
+                    graph,
+                    source_variable,
+                    target_variable,
+                    &path,
+                ),
+            }) as ShapeConstraint,
+        ]));
+        let mut iterator = try_constructed_program_iter(root, constructed_source_target)
+            .unwrap()
+            .cap(1)
+            .start_width(1)
+            .growth(1);
+        let first = iterator
+            .next()
+            .expect("heterogeneous SuccinctArchive Programs produced no row");
+        let examined_before_remainder = iterator.stats().delta_source_candidates_examined;
+        let mirror = iterator.clone();
+        let mut remainder: Vec<_> = iterator.by_ref().collect();
+        let examined_after_remainder = iterator.stats().delta_source_candidates_examined;
+        let mut mirrored: Vec<_> = mirror.collect();
+
+        remainder.sort_unstable();
+        mirrored.sort_unstable();
+        assert_eq!(mirrored, remainder);
+        assert!(
+            examined_after_remainder > examined_before_remainder,
+            "the first result drained every ordered SuccinctArchive source"
+        );
+        remainder.push(first);
+        remainder.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(
+            expected,
+            vec![
+                (id_into_value(&source), id_into_value(&target)),
+                (id_into_value(&source), id_into_value(&target)),
+            ],
+            "the succinct oracle must expose duplicate parents and rejecting confirmers"
+        );
+        assert_eq!(remainder, expected);
+    }
+
+    #[test]
     fn constructed_program_keeps_shared_occurrences_distinct() {
         let (graph, attribute) = constructed_program_graph();
         let expected_leaf = Arc::new(constructed_rpq(graph.clone(), &attribute, false));
