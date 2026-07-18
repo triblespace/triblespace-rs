@@ -120,7 +120,7 @@ fn assert_page_parity(
 
 fn verify_resume_chain(
     program: &QueryProgram<'_, OrderedUniverse>,
-    gpu: &WgpuQueryProgram<'_, '_, OrderedUniverse>,
+    gpu: &WgpuQueryProgram<'_, OrderedUniverse>,
     identity: ArchiveIdentity,
     target: ProgramVariable,
     parent: &ProgramFrontier,
