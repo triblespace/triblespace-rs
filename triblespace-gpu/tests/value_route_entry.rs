@@ -1,5 +1,5 @@
-//! The real entry: actual `find!`/`pattern!` queries whose two-bound value
-//! proposals run through the resident value route inside the residual
+//! The real entry: actual `find!`/`pattern!` queries whose two-bound
+//! proposals run through the resident route inside the residual
 //! engine (`solve_residual_state_lazy_with(ResidualLowering::FULL)`).
 //!
 //! Serial and parallel solves are compared bag-for-bag against the
@@ -15,11 +15,11 @@ use triblespace_core::id::{ExclusiveId, Id};
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::InlineEncoding;
 use triblespace_core::macros::{id_hex, pattern};
-use triblespace_core::query::find;
 use triblespace_core::query::residual::ResidualLowering;
+use triblespace_core::query::{find, TriblePattern};
 use triblespace_core::trible::{Trible, TribleSet};
 use triblespace_gpu::{
-    PrepareValueRouteOutcome, ValueRouteAdmission, ValueRouteReadiness, WgpuSuccinctArchive,
+    PrepareValueRouteOutcome, TwoBoundRouteAdmission, ValueRouteReadiness, WgpuSuccinctArchive,
 };
 
 mod ns {
@@ -92,7 +92,7 @@ fn explicit_preparation_is_exact_idempotent_and_keeps_force_usable() {
 
     // Preparation released the same snapshot lease after exact validation;
     // the public Force route remains usable and bag-identical.
-    let route = resident.value_route_with(ValueRouteAdmission::Force);
+    let route = resident.two_bound_route_with(TwoBoundRouteAdmission::Force);
     let query = find!(
         (e: Id, v: Id),
         pattern!(&route, [{ ?e @ ns::fanout: ?v }])
@@ -126,7 +126,7 @@ fn declined_entity_route_keeps_the_delegated_width_one_pager() {
     let set = fixture_set();
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
     let resident = WgpuSuccinctArchive::new(archive).expect("resident wrap succeeds");
-    let route = resident.value_route_with(ValueRouteAdmission::Off);
+    let route = resident.two_bound_route_with(TwoBoundRouteAdmission::Off);
 
     let query = find!(
         (e: Id, v: Id),
@@ -140,12 +140,13 @@ fn declined_entity_route_keeps_the_delegated_width_one_pager() {
 
     assert!(solve.next().is_some());
 
-    // The resident family owns only the two-bound value proposal. Its
-    // entity request is declined before activation, then delegated to the
-    // wrapped SuccinctArchive's bounded source pager. Reaching one result
-    // therefore records exactly one entity source page and one typed value
-    // source page before the first result; the former disappeared when merely
-    // exposing a Program incorrectly suppressed every legacy residual hook.
+    // The resident family cannot yet own this entity proposal because its
+    // value peer is unbound. The action is declined before activation, then
+    // delegated to the wrapped SuccinctArchive's bounded source pager.
+    // Reaching one result therefore records exactly one delegated entity
+    // source page and one typed value source page before the first result; the
+    // former disappeared when merely exposing a Program incorrectly
+    // suppressed every legacy residual hook.
     assert_eq!(
         solve.stats().delta_source_pages,
         2,
@@ -166,9 +167,9 @@ fn serial_full_lowering_is_bag_identical_and_default_off_never_places() {
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
     let resident = WgpuSuccinctArchive::new(archive).expect("resident wrap succeeds");
     // Explicit Off keeps this test deterministic regardless of any ambient
-    // TRIBLESPACE_GPU_VALUE_ROUTE value; the env grammar itself is covered
+    // TRIBLESPACE_GPU_TWO_BOUND_ROUTE value; the env grammar itself is covered
     // by value-independent unit tests.
-    let route = resident.value_route_with(ValueRouteAdmission::Off);
+    let route = resident.two_bound_route_with(TwoBoundRouteAdmission::Off);
 
     let query = find!(
         (e: Id, v: Id),
@@ -186,7 +187,7 @@ fn serial_full_lowering_is_bag_identical_and_default_off_never_places() {
     // one-step propose-source pages surface in the delta source telemetry.
     assert!(
         solve.stats.delta_source_pages > 0,
-        "the value route's Program family never stepped: {:?}",
+        "the two-bound route's Program family never stepped: {:?}",
         solve.stats
     );
 
@@ -205,6 +206,142 @@ fn serial_full_lowering_is_bag_identical_and_default_off_never_places() {
 }
 
 #[test]
+fn public_off_route_executes_all_three_two_bound_actions_exactly() {
+    let set = fixture_set();
+    let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+    let resident = WgpuSuccinctArchive::new(archive).expect("resident wrap succeeds");
+    let route = resident.two_bound_route_with(TwoBoundRouteAdmission::Off);
+    let entity = fixture_id(1, 5);
+    let attribute = id_hex!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA01");
+    let value = fixture_id(3, 500);
+
+    let entities = find!(
+        (e: Id),
+        route.pattern::<GenId>(
+            e,
+            GenId::inline_from(attribute),
+            GenId::inline_from(value),
+        )
+    )
+    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .cap(1)
+    .start_width(1)
+    .growth(2)
+    .collect_profiled();
+    assert_eq!(entities.results, vec![(entity,)]);
+    assert!(entities.stats.delta_source_pages > 0);
+
+    let attributes = find!(
+        (a: Id),
+        route.pattern::<GenId>(
+            GenId::inline_from(entity),
+            a,
+            GenId::inline_from(value),
+        )
+    )
+    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .cap(1)
+    .start_width(1)
+    .growth(2)
+    .collect_profiled();
+    assert_eq!(attributes.results, vec![(attribute,)]);
+    assert!(attributes.stats.delta_source_pages > 0);
+
+    let values = find!(
+        (v: Id),
+        route.pattern::<GenId>(
+            GenId::inline_from(entity),
+            GenId::inline_from(attribute),
+            v,
+        )
+    )
+    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .cap(1)
+    .start_width(1)
+    .growth(2)
+    .collect_profiled();
+    let mut actual_values = values.results;
+    actual_values.sort();
+    let expected_values: Vec<_> = (0..5).map(|slot| (fixture_id(3, 500 + slot),)).collect();
+    assert_eq!(actual_values, expected_values);
+    assert!(values.stats.delta_source_pages >= 5);
+
+    let counters = route.counters();
+    assert_eq!(counters.physical_cohorts, 0);
+    assert_eq!(counters.declined_lease, 0);
+    assert_eq!(counters.declined_contract, 0);
+    assert!(counters.declined_policy >= 3);
+}
+
+#[test]
+#[ignore = "requires a native WGPU adapter"]
+fn public_force_route_places_all_three_two_bound_actions_without_preparation() {
+    let set = fixture_set();
+    let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+    let resident = WgpuSuccinctArchive::new(archive).expect("resident wrap succeeds");
+    let route = resident.two_bound_route_with(TwoBoundRouteAdmission::Force);
+    let entity = fixture_id(1, 5);
+    let attribute = id_hex!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA01");
+    let value = fixture_id(3, 500);
+
+    let entities = find!(
+        (e: Id),
+        route.pattern::<GenId>(
+            e,
+            GenId::inline_from(attribute),
+            GenId::inline_from(value),
+        )
+    )
+    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .start_width(1)
+    .collect_profiled();
+    assert_eq!(entities.results, vec![(entity,)]);
+    assert!(entities.stats.delta_program_physical_cohorts > 0);
+
+    let attributes = find!(
+        (a: Id),
+        route.pattern::<GenId>(
+            GenId::inline_from(entity),
+            a,
+            GenId::inline_from(value),
+        )
+    )
+    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .start_width(1)
+    .collect_profiled();
+    assert_eq!(attributes.results, vec![(attribute,)]);
+    assert!(attributes.stats.delta_program_physical_cohorts > 0);
+
+    let values = find!(
+        (v: Id),
+        route.pattern::<GenId>(
+            GenId::inline_from(entity),
+            GenId::inline_from(attribute),
+            v,
+        )
+    )
+    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .start_width(1)
+    .collect_profiled();
+    let mut actual_values = values.results;
+    actual_values.sort();
+    let expected_values: Vec<_> = (0..5).map(|slot| (fixture_id(3, 500 + slot),)).collect();
+    assert_eq!(actual_values, expected_values);
+    assert!(values.stats.delta_program_physical_cohorts > 0);
+
+    assert_eq!(
+        resident.value_route_readiness(),
+        ValueRouteReadiness::Cold,
+        "Force parity arms never claim the separately prepared value readiness"
+    );
+    let counters = route.counters();
+    assert!(counters.physical_cohorts >= 3);
+    assert_eq!(counters.declined_policy, 0);
+    assert_eq!(counters.declined_lease, 0);
+    assert_eq!(counters.declined_contract, 0);
+}
+
+#[test]
 #[ignore = "requires a native WGPU adapter"]
 fn serial_forced_routing_places_physically_and_stays_bag_identical() {
     let set = fixture_set();
@@ -212,7 +349,7 @@ fn serial_forced_routing_places_physically_and_stays_bag_identical() {
 
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
     let resident = WgpuSuccinctArchive::new(archive).expect("resident wrap succeeds");
-    let route = resident.value_route_with(ValueRouteAdmission::Force);
+    let route = resident.two_bound_route_with(TwoBoundRouteAdmission::Force);
 
     let query = find!(
         (e: Id, v: Id),
@@ -266,7 +403,7 @@ fn parallel_forced_routing_places_physically_and_stays_bag_identical() {
 
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
     let resident = WgpuSuccinctArchive::new(archive).expect("resident wrap succeeds");
-    let route = resident.value_route_with(ValueRouteAdmission::Force);
+    let route = resident.two_bound_route_with(TwoBoundRouteAdmission::Force);
 
     let query = find!(
         (e: Id, v: Id),

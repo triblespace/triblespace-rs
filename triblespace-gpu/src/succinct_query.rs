@@ -268,11 +268,11 @@ where
     eva_c: WgpuWaveletMatrix,
     /// Resident mirror of [`SuccinctArchive::aev_c`].
     aev_c: WgpuWaveletMatrix,
-    /// Exact maximum number of values under any canonical `(E,A)` pair,
-    /// computed lazily from `changed_e_a` one-runs on first use: Program
-    /// executors share one scan per snapshot while rank-only users never
-    /// pay the O(pairs) walk.
-    max_ea_fanout: OnceLock<usize>,
+    /// Exact maximum target fanout under each canonical ordered pair,
+    /// computed lazily from that rotation's pair-change one-runs. Program
+    /// executors share at most one scan per used rotation and rank-only users
+    /// never pay any O(pairs) walk.
+    max_pair_fanouts: [OnceLock<usize>; SuccinctRotation::ALL.len()],
     /// Nonblocking per-snapshot busy-mutex for resident Program dispatch.
     program_lease: DeviceLease,
     /// Snapshot-local preparation state for the public resident value route.
@@ -561,7 +561,7 @@ where
             vae_c,
             eva_c,
             aev_c,
-            max_ea_fanout: OnceLock::new(),
+            max_pair_fanouts: std::array::from_fn(|_| OnceLock::new()),
             program_lease: DeviceLease::new(),
             value_route_readiness: crate::value_route::ValueRouteReadinessCell::new(),
             min_rank_batch: DEFAULT_MIN_RANK_BATCH,
@@ -569,13 +569,11 @@ where
         })
     }
 
-    /// Returns the exact maximum number of values under any canonical
-    /// `(E,A)` pair, computed lazily (once per snapshot) from `changed_e_a`
-    /// one-runs.
-    pub fn max_ea_fanout(&self) -> usize {
-        *self
-            .max_ea_fanout
-            .get_or_init(|| max_one_run(&self.archive.changed_e_a))
+    /// Returns the exact maximum last-axis fanout under any `(first,middle)`
+    /// pair in `rotation`, computed lazily once per snapshot and rotation.
+    pub fn max_pair_fanout(&self, rotation: SuccinctRotation) -> usize {
+        *self.max_pair_fanouts[rotation.index()]
+            .get_or_init(|| max_one_run(self.archive.pair_changes(rotation)))
     }
 
     /// Returns the nonblocking per-snapshot busy-mutex gating resident

@@ -1,14 +1,16 @@
 use std::collections::{BTreeMap, HashSet};
 
 use jerky::bit_vector::NumBits;
+use triblespace_core::blob::encodings::succinctarchive::{
+    OrderedUniverse, SuccinctArchive, SuccinctRotation,
+};
+use triblespace_core::inline::encodings::genid::GenId;
+use triblespace_core::inline::RawInline;
+use triblespace_core::prelude::*;
 use triblespace_gpu::query_program::{
     ArchiveCode, ProgramFrontier, ProgramVariable, QueryPattern, QueryProgram, QueryProgramError,
     QueryTerm,
 };
-use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
-use triblespace_core::inline::encodings::genid::GenId;
-use triblespace_core::inline::RawInline;
-use triblespace_core::prelude::*;
 use triblespace_gpu::{ResidentTransitionError, WgpuQueryProgram, WgpuSuccinctArchive};
 
 const BLOCK: usize = 64;
@@ -167,7 +169,7 @@ fn resident_two_bound_transition_preserves_exact_cpu_order_and_capacity_contract
     let program =
         QueryProgram::compile(resident.archive(), 3, [QueryPattern::new(e, a, v)]).unwrap();
     let gpu = WgpuQueryProgram::new(&program, &resident).unwrap();
-    assert_eq!(gpu.max_ea_fanout(), 5);
+    assert_eq!(resident.max_pair_fanout(SuccinctRotation::Eav), 5);
 
     // Empty, singleton, and both sides of the resident scan block boundary.
     for rows in [0, 1, BLOCK - 1, BLOCK, BLOCK + 1] {
@@ -198,43 +200,64 @@ fn resident_two_bound_transition_preserves_exact_cpu_order_and_capacity_contract
         assert_eq!(whole, concatenate(&left, &right), "split at {split}");
     }
 
-    // Variable insertion is checked at the beginning, middle, and end of the
-    // canonical child row, with duplicate parents and non-unit fanout.
-    for target_index in 0..3 {
-        let target = ProgramVariable::new(target_index);
-        let (entity, attribute, parent_variables) = match target_index {
-            0 => (
-                ProgramVariable::new(1),
-                ProgramVariable::new(2),
-                vec![ProgramVariable::new(1), ProgramVariable::new(2)],
-            ),
-            1 => (
-                ProgramVariable::new(0),
-                ProgramVariable::new(2),
-                vec![ProgramVariable::new(0), ProgramVariable::new(2)],
-            ),
-            2 => (
-                ProgramVariable::new(0),
-                ProgramVariable::new(1),
-                vec![ProgramVariable::new(0), ProgramVariable::new(1)],
-            ),
-            _ => unreachable!(),
-        };
-        let insertion_program = QueryProgram::compile(
-            resident.archive(),
-            3,
-            [QueryPattern::new(entity, attribute, target)],
-        )
-        .unwrap();
-        let insertion_gpu = WgpuQueryProgram::new(&insertion_program, &resident).unwrap();
-        let rows = vec![
-            vec![entities[5], attributes[0]],
-            vec![entities[5], attributes[0]],
-            vec![entities[2], attributes[0]],
-            vec![entities[0], attributes[0]],
-        ];
-        let parent = frontier(&insertion_program, parent_variables, rows);
-        assert_exact_parity(&insertion_gpu, &insertion_program, target, &parent);
+    // Every semantic target axis is checked with the target column inserted at
+    // the beginning, middle, and end, plus duplicate and empty peer rows.
+    let peer_rows = [
+        vec![
+            [entities[0], attributes[0], values[0]],
+            [entities[0], attributes[0], values[5]],
+            [entities[0], attributes[0], values[0]],
+            [entities[0], attributes[1], values[7]],
+        ],
+        vec![
+            [entities[8], attributes[0], values[0]],
+            [entities[5], attributes[0], values[0]],
+            [entities[8], attributes[0], values[0]],
+            [entities[0], attributes[0], values[7]],
+        ],
+        vec![
+            [entities[5], attributes[0], values[0]],
+            [entities[5], attributes[0], values[0]],
+            [entities[2], attributes[0], values[0]],
+            [entities[0], attributes[0], values[0]],
+        ],
+    ];
+    for (target_axis, target_peer_rows) in peer_rows.iter().enumerate() {
+        for target_index in 0..3 {
+            let target = ProgramVariable::new(target_index);
+            let mut axis_variables = [target; 3];
+            let mut peers = (0..3).filter(|&index| index != target_index);
+            for (axis, variable) in axis_variables.iter_mut().enumerate() {
+                if axis != target_axis {
+                    *variable = ProgramVariable::new(peers.next().unwrap());
+                }
+            }
+            let insertion_program = QueryProgram::compile(
+                resident.archive(),
+                3,
+                [QueryPattern::new(
+                    axis_variables[0],
+                    axis_variables[1],
+                    axis_variables[2],
+                )],
+            )
+            .unwrap();
+            let insertion_gpu = WgpuQueryProgram::new(&insertion_program, &resident).unwrap();
+            let mut parent_axes: Vec<_> = (0..3)
+                .filter(|&axis| axis != target_axis)
+                .map(|axis| (axis_variables[axis], axis))
+                .collect();
+            parent_axes.sort_unstable_by_key(|&(variable, _)| variable);
+            let rows = target_peer_rows
+                .iter()
+                .map(|triple| parent_axes.iter().map(|&(_, axis)| triple[axis]).collect());
+            let parent = frontier(
+                &insertion_program,
+                parent_axes.iter().map(|&(variable, _)| variable).collect(),
+                rows,
+            );
+            assert_exact_parity(&insertion_gpu, &insertion_program, target, &parent);
+        }
     }
 
     // In a canonical TribleSet, AEV contains each (A,E,V) tuple once, so the
@@ -298,44 +321,59 @@ fn resident_two_bound_transition_preserves_exact_cpu_order_and_capacity_contract
     );
     assert_exact_parity(&gpu, &program, v, &wrong_axis);
 
-    // Constants use the same two-bound formulas, including zero-width parent
-    // rows and duplicate virtual parents.
-    let constant_program = QueryProgram::compile(
-        resident.archive(),
-        1,
-        [QueryPattern::new(
-            QueryTerm::Constant(raw(entities[5])),
-            QueryTerm::Constant(raw(attributes[0])),
-            ProgramVariable::new(0),
-        )],
-    )
-    .unwrap();
-    let constant_gpu = WgpuQueryProgram::new(&constant_program, &resident).unwrap();
-    let virtual_parents = ProgramFrontier::new(Vec::new(), Vec::new(), 3).unwrap();
-    assert_exact_parity(
-        &constant_gpu,
-        &constant_program,
-        ProgramVariable::new(0),
-        &virtual_parents,
-    );
+    // Constants use the same descriptor-selected formulas on every axis,
+    // including zero-width rows, duplicate virtual parents, and missing peers.
+    let witness = [entities[5], attributes[0], values[0]];
+    for target_axis in 0..3 {
+        let target = ProgramVariable::new(0);
+        let terms: [QueryTerm; 3] = std::array::from_fn(|axis| {
+            if axis == target_axis {
+                QueryTerm::Variable(target)
+            } else {
+                QueryTerm::Constant(raw(witness[axis]))
+            }
+        });
+        let constant_program = QueryProgram::compile(
+            resident.archive(),
+            1,
+            [QueryPattern::new(terms[0], terms[1], terms[2])],
+        )
+        .unwrap();
+        let constant_gpu = WgpuQueryProgram::new(&constant_program, &resident).unwrap();
+        assert_exact_parity(
+            &constant_gpu,
+            &constant_program,
+            target,
+            &ProgramFrontier::new(Vec::new(), Vec::new(), 3).unwrap(),
+        );
 
-    let missing_program = QueryProgram::compile(
-        resident.archive(),
-        1,
-        [QueryPattern::new(
-            QueryTerm::Constant(raw(fixture_id(9, 9))),
-            QueryTerm::Constant(raw(attributes[0])),
-            ProgramVariable::new(0),
-        )],
-    )
-    .unwrap();
-    let missing_gpu = WgpuQueryProgram::new(&missing_program, &resident).unwrap();
-    assert_exact_parity(
-        &missing_gpu,
-        &missing_program,
-        ProgramVariable::new(0),
-        &ProgramFrontier::seed(),
-    );
+        let missing_terms: [QueryTerm; 3] = std::array::from_fn(|axis| {
+            if axis == target_axis {
+                QueryTerm::Variable(target)
+            } else if axis == (target_axis + 1) % 3 {
+                QueryTerm::Constant(raw(fixture_id(9, target_axis)))
+            } else {
+                QueryTerm::Constant(raw(witness[axis]))
+            }
+        });
+        let missing_program = QueryProgram::compile(
+            resident.archive(),
+            1,
+            [QueryPattern::new(
+                missing_terms[0],
+                missing_terms[1],
+                missing_terms[2],
+            )],
+        )
+        .unwrap();
+        let missing_gpu = WgpuQueryProgram::new(&missing_program, &resident).unwrap();
+        assert_exact_parity(
+            &missing_gpu,
+            &missing_program,
+            target,
+            &ProgramFrontier::seed(),
+        );
+    }
 
     // Compact codes are archive-local. Even byte-identical archive clones are
     // rejected unless the program borrows this exact resident snapshot.
@@ -377,10 +415,7 @@ fn resident_two_bound_transition_preserves_exact_cpu_order_and_capacity_contract
         )],
     )
     .unwrap();
-    assert!(matches!(
-        WgpuQueryProgram::new(&constant_value, &resident),
-        Err(ResidentTransitionError::UnsupportedArm(_))
-    ));
+    assert!(WgpuQueryProgram::new(&constant_value, &resident).is_ok());
 
     let complete_row = frontier(
         &program,
@@ -393,10 +428,7 @@ fn resident_two_bound_transition_preserves_exact_cpu_order_and_capacity_contract
         1,
     )
     .unwrap();
-    assert!(matches!(
-        gpu.transition_on(e, &non_target_parent),
-        Err(ResidentTransitionError::UnsupportedArm(_))
-    ));
+    assert_exact_parity(&gpu, &program, e, &non_target_parent);
     assert!(matches!(
         gpu.transition_on(v, &complete_row),
         Err(ResidentTransitionError::Program(
@@ -576,6 +608,105 @@ fn resident_archive_extension_is_monotone_in_decoded_value_space() {
 
 #[test]
 #[ignore = "requires a native WGPU adapter"]
+fn budgeted_width_one_receipts_are_exact_for_every_two_bound_rotation() {
+    use triblespace_gpu::budgeted::CohortGrants;
+
+    let (archive, entities, attributes, values) = fixture();
+    let resident = WgpuSuccinctArchive::new(archive).unwrap();
+    let axes = [
+        ProgramVariable::new(0),
+        ProgramVariable::new(1),
+        ProgramVariable::new(2),
+    ];
+    let program = QueryProgram::compile(
+        resident.archive(),
+        3,
+        [QueryPattern::new(axes[0], axes[1], axes[2])],
+    )
+    .unwrap();
+    let gpu = WgpuQueryProgram::new(&program, &resident).unwrap();
+    let peer_rows = [
+        vec![
+            [entities[0], attributes[0], values[0]],
+            [entities[0], attributes[0], values[5]],
+            [entities[0], attributes[0], values[0]],
+            [entities[0], attributes[1], values[7]],
+        ],
+        vec![
+            [entities[8], attributes[0], values[0]],
+            [entities[5], attributes[0], values[0]],
+            [entities[8], attributes[0], values[0]],
+            [entities[0], attributes[0], values[7]],
+        ],
+        vec![
+            [entities[5], attributes[0], values[0]],
+            [entities[5], attributes[0], values[0]],
+            [entities[2], attributes[0], values[0]],
+            [entities[0], attributes[0], values[0]],
+        ],
+    ];
+
+    for target_axis in 0..3 {
+        let target = axes[target_axis];
+        let parent_axes: Vec<_> = (0..3).filter(|&axis| axis != target_axis).collect();
+        let parent = frontier(
+            &program,
+            parent_axes.iter().map(|&axis| axes[axis]).collect(),
+            peer_rows[target_axis]
+                .iter()
+                .map(|triple| parent_axes.iter().map(|&axis| triple[axis]).collect()),
+        );
+        let grants = CohortGrants::from_task_limits(&vec![1usize; parent.len()]).unwrap();
+        let (child, receipts) = gpu
+            .transition_on_budgeted(target, &parent, &grants)
+            .unwrap();
+        assert_eq!(receipts.archive(), resident.identity());
+        let receipts = receipts.into_receipts();
+
+        let mut expected_values = Vec::new();
+        let mut expected_rows = 0usize;
+        let mut observed_cursor = false;
+        for (input, receipt) in receipts.into_iter().enumerate() {
+            let single =
+                ProgramFrontier::new(parent.variables().to_vec(), parent.row(input).to_vec(), 1)
+                    .unwrap();
+            let full = program.transition_on(target, &single).unwrap();
+            let examined = full.len().min(1);
+            expected_values.extend_from_slice(&full.values()[..examined * full.variables().len()]);
+            expected_rows += examined;
+            assert_eq!(receipt.examined as usize, examined);
+            assert_eq!(receipt.produced as usize, examined);
+            match receipt.physical_cursor {
+                Some(cursor) => {
+                    observed_cursor = true;
+                    assert!(full.len() > 1);
+                    assert_eq!(cursor.into_typed_conversion_offset(), 1);
+                }
+                None => assert!(full.len() <= 1),
+            }
+        }
+        assert!(
+            observed_cursor,
+            "target axis {target_axis} needs a clamped pair"
+        );
+        assert_eq!(
+            child,
+            ProgramFrontier::new(
+                program
+                    .transition_on(target, &parent)
+                    .unwrap()
+                    .variables()
+                    .to_vec(),
+                expected_values,
+                expected_rows,
+            )
+            .unwrap(),
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a native WGPU adapter"]
 fn budgeted_transition_yields_stable_prefixes_and_lawful_receipts() {
     use triblespace_gpu::budgeted::{BudgetContractError, CohortGrants};
 
@@ -610,7 +741,7 @@ fn budgeted_transition_yields_stable_prefixes_and_lawful_receipts() {
         .collect();
     let full_counts: Vec<usize> = child_blocks.iter().map(|block| block.len()).collect();
     assert!(
-        full_counts.iter().any(|&count| count == 0),
+        full_counts.contains(&0),
         "the fixture must exercise a genuinely empty interval under a positive grant"
     );
     assert!(
@@ -664,12 +795,18 @@ fn budgeted_transition_yields_stable_prefixes_and_lawful_receipts() {
             Some(cursor) => {
                 assert!(full > limit, "a cursor requires a clamped interval");
                 observed_clamped += 1;
-                assert_eq!(cursor.into_typed_conversion_offset() as usize, expected_examined);
+                assert_eq!(
+                    cursor.into_typed_conversion_offset() as usize,
+                    expected_examined
+                );
             }
             None => assert!(full <= limit, "an exhausted interval carries no cursor"),
         }
     }
-    assert!(observed_clamped > 0, "the fixture must observe real clamping");
+    assert!(
+        observed_clamped > 0,
+        "the fixture must observe real clamping"
+    );
 
     // Grant-shape violations fail closed before any kernel launch.
     let short = CohortGrants::from_task_limits(&vec![1usize; rows - 1]).unwrap();
@@ -774,8 +911,7 @@ fn budgeted_transition_resumes_from_bases_into_the_exact_whole() {
         first_consumed += page_one.produced as usize;
         second_consumed += page_two.produced as usize;
     }
-    let merged =
-        ProgramFrontier::new(whole.variables().to_vec(), merged, merged_rows).unwrap();
+    let merged = ProgramFrontier::new(whole.variables().to_vec(), merged, merged_rows).unwrap();
     assert_eq!(merged, whole);
     assert_eq!(merged.len() * child_stride, whole.values().len());
 
