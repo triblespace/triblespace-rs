@@ -12,13 +12,29 @@ use crate::patch::KeySchema;
 use crate::patch::PATCH;
 use crate::query::CandidateSink;
 use crate::query::Constraint;
+use crate::query::DispatchClass;
 use crate::query::EstimateSink;
+use crate::query::ProgramAction;
+use crate::query::ProgramCompletion;
+use crate::query::ProgramGrouping;
+use crate::query::ProgramKey;
+use crate::query::ProgramPacing;
+use crate::query::ProgramRef;
+use crate::query::ProgramRequest;
+use crate::query::ProgramRoute;
+use crate::query::ProgramSeedBatch;
+use crate::query::ProgramStratum;
 use crate::query::RawTerm;
 use crate::query::ResidualDeltaOutput;
 use crate::query::ResidualDeltaSourceCursor;
 use crate::query::ResidualDeltaSourcePage;
 use crate::query::RowsView;
 use crate::query::Term;
+use crate::query::TypedEffectSink;
+use crate::query::TypedProgramBatch;
+use crate::query::TypedProgramSpec;
+use crate::query::TypedResume;
+use crate::query::TypedSeedSink;
 use crate::query::VariableId;
 use crate::query::VariableSet;
 use crate::trible::TribleSet;
@@ -254,6 +270,27 @@ struct Positions {
     pe: Option<Src>,
     pa: Option<Src>,
     pv: Option<Src>,
+}
+
+const TRIBLESET_PROPOSE_ROUTE: u32 = 1 << 8;
+const TRIBLESET_CONFIRM_ROUTE: u32 = 2 << 8;
+const TRIBLESET_SUPPORT_ROUTE: u32 = 3 << 8;
+
+const TRIBLESET_PROPOSE_DISPATCH: DispatchClass = DispatchClass::new(0);
+const TRIBLESET_CONFIRM_DISPATCH: DispatchClass = DispatchClass::new(1);
+const TRIBLESET_SUPPORT_DISPATCH: DispatchClass = DispatchClass::new(2);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TribleSetProgramState {
+    Propose {
+        variable: VariableId,
+        cursor: ResidualDeltaSourceCursor,
+    },
+    Confirm {
+        variable: VariableId,
+        offset: usize,
+    },
+    Support,
 }
 
 impl Positions {
@@ -792,6 +829,492 @@ impl TribleSetConstraint {
             _ => panic!("invalid trible constraint state"),
         }
     }
+
+    fn variable_position_mask(&self, variable: VariableId) -> u32 {
+        u32::from(self.term_e.is_var(variable))
+            | (u32::from(self.term_a.is_var(variable)) << 1)
+            | (u32::from(self.term_v.is_var(variable)) << 2)
+    }
+
+    fn bound_position_mask(&self, bound: VariableSet) -> u32 {
+        fn term_is_bound(term: &RawTerm, bound: VariableSet) -> bool {
+            match term {
+                RawTerm::Var(variable) => bound.is_set(*variable),
+                RawTerm::Const(_) => true,
+            }
+        }
+
+        u32::from(term_is_bound(&self.term_e, bound))
+            | (u32::from(term_is_bound(&self.term_a, bound)) << 1)
+            | (u32::from(term_is_bound(&self.term_v, bound)) << 2)
+    }
+
+    fn support_variable(&self) -> Option<VariableId> {
+        [&self.term_e, &self.term_a, &self.term_v]
+            .into_iter()
+            .find_map(|term| match term {
+                RawTerm::Var(variable) => Some(*variable),
+                RawTerm::Const(_) => None,
+            })
+    }
+
+    /// Pages the same ordered proposal source used by the legacy residual
+    /// hook, but for one already-selected parent row. Keeping this kernel on
+    /// the family preserves the six-index and repeated-position semantics;
+    /// the typed Program contributes only affine continuation state.
+    fn proposal_source_page_row(
+        &self,
+        p: &Positions,
+        row: &[RawInline],
+        cursor: ResidualDeltaSourceCursor,
+        limit: usize,
+        accepted: &mut Vec<RawInline>,
+    ) -> ResidualDeltaSourcePage {
+        let e_bound = match p.e(row) {
+            Some(value) => match id_from_value(value) {
+                Some(id) => Some(id),
+                None => {
+                    return ResidualDeltaSourcePage {
+                        next: None,
+                        examined: 0,
+                    };
+                }
+            },
+            None => None,
+        };
+        let a_bound = match p.a(row) {
+            Some(value) => match id_from_value(value) {
+                Some(id) => Some(id),
+                None => {
+                    return ResidualDeltaSourcePage {
+                        next: None,
+                        examined: 0,
+                    };
+                }
+            },
+            None => None,
+        };
+        let v_bound = p.v(row);
+
+        if p.e_var as usize + p.a_var as usize + p.v_var as usize > 1 {
+            return match (e_bound, a_bound, v_bound, p.e_var, p.a_var, p.v_var) {
+                (_, Some(a), _, true, false, true) => filtered_direct_source_page(
+                    cursor,
+                    limit,
+                    accepted,
+                    |after| next_id_source(&self.set.aev, &a, after),
+                    |value| self.confirm_value(p, e_bound, a_bound, v_bound.copied(), value),
+                ),
+                (_, None, _, true, false, true) => filtered_direct_source_page(
+                    cursor,
+                    limit,
+                    accepted,
+                    |after| next_id_source(&self.set.eav, &[0; 0], after),
+                    |value| self.confirm_value(p, e_bound, a_bound, v_bound.copied(), value),
+                ),
+                (_, _, Some(v), true, true, false) => filtered_direct_source_page(
+                    cursor,
+                    limit,
+                    accepted,
+                    |after| next_id_source(&self.set.vae, v, after),
+                    |value| self.confirm_value(p, e_bound, a_bound, v_bound.copied(), value),
+                ),
+                (_, _, None, true, true, false) => filtered_direct_source_page(
+                    cursor,
+                    limit,
+                    accepted,
+                    |after| next_id_source(&self.set.aev, &[0; 0], after),
+                    |value| self.confirm_value(p, e_bound, a_bound, v_bound.copied(), value),
+                ),
+                (Some(e), _, _, false, true, true) => filtered_direct_source_page(
+                    cursor,
+                    limit,
+                    accepted,
+                    |after| next_id_source(&self.set.eav, &e, after),
+                    |value| self.confirm_value(p, e_bound, a_bound, v_bound.copied(), value),
+                ),
+                (None, _, _, false, true, true) => filtered_direct_source_page(
+                    cursor,
+                    limit,
+                    accepted,
+                    |after| next_id_source(&self.set.aev, &[0; 0], after),
+                    |value| self.confirm_value(p, e_bound, a_bound, v_bound.copied(), value),
+                ),
+                (_, _, _, true, true, true) => filtered_direct_source_page(
+                    cursor,
+                    limit,
+                    accepted,
+                    |after| next_id_source(&self.set.eav, &[0; 0], after),
+                    |value| self.confirm_value(p, e_bound, a_bound, v_bound.copied(), value),
+                ),
+                _ => unreachable!("invalid repeated-position proposal source state"),
+            };
+        }
+
+        match (e_bound, a_bound, v_bound, p.e_var, p.a_var, p.v_var) {
+            (None, None, None, true, false, false) => {
+                direct_source_page(cursor, limit, accepted, |after| {
+                    next_id_source(&self.set.eav, &[], after)
+                })
+            }
+            (None, None, None, false, true, false) => {
+                direct_source_page(cursor, limit, accepted, |after| {
+                    next_id_source(&self.set.aev, &[], after)
+                })
+            }
+            (None, None, None, false, false, true) => {
+                direct_source_page(cursor, limit, accepted, |after| {
+                    next_inline_source(&self.set.vea, &[], after)
+                })
+            }
+            (Some(e), None, None, false, true, false) => {
+                direct_source_page(cursor, limit, accepted, |after| {
+                    next_id_source(&self.set.eav, &e, after)
+                })
+            }
+            (Some(e), None, None, false, false, true) => {
+                direct_source_page(cursor, limit, accepted, |after| {
+                    next_inline_source(&self.set.eva, &e, after)
+                })
+            }
+            (None, Some(a), None, true, false, false) => {
+                direct_source_page(cursor, limit, accepted, |after| {
+                    next_id_source(&self.set.aev, &a, after)
+                })
+            }
+            (None, Some(a), None, false, false, true) => {
+                direct_source_page(cursor, limit, accepted, |after| {
+                    next_inline_source(&self.set.ave, &a, after)
+                })
+            }
+            (None, None, Some(v), true, false, false) => {
+                direct_source_page(cursor, limit, accepted, |after| {
+                    next_id_source(&self.set.vea, v, after)
+                })
+            }
+            (None, None, Some(v), false, true, false) => {
+                direct_source_page(cursor, limit, accepted, |after| {
+                    next_id_source(&self.set.vae, v, after)
+                })
+            }
+            (None, Some(a), Some(v), true, false, false) => {
+                let mut prefix = [0u8; ID_LEN + INLINE_LEN];
+                prefix[..ID_LEN].copy_from_slice(&a);
+                prefix[ID_LEN..].copy_from_slice(v);
+                direct_source_page(cursor, limit, accepted, |after| {
+                    next_id_source(&self.set.ave, &prefix, after)
+                })
+            }
+            (Some(e), None, Some(v), false, true, false) => {
+                let mut prefix = [0u8; ID_LEN + INLINE_LEN];
+                prefix[..ID_LEN].copy_from_slice(&e);
+                prefix[ID_LEN..].copy_from_slice(v);
+                direct_source_page(cursor, limit, accepted, |after| {
+                    next_id_source(&self.set.eva, &prefix, after)
+                })
+            }
+            (Some(e), Some(a), None, false, false, true) => {
+                let mut prefix = [0u8; ID_LEN + ID_LEN];
+                prefix[..ID_LEN].copy_from_slice(&e);
+                prefix[ID_LEN..].copy_from_slice(&a);
+                direct_source_page(cursor, limit, accepted, |after| {
+                    next_inline_source(&self.set.eav, &prefix, after)
+                })
+            }
+            _ => unreachable!("a distinct-position proposal has one of twelve bound schemas"),
+        }
+    }
+
+    fn confirm_page_row(
+        &self,
+        p: &Positions,
+        row: &[RawInline],
+        candidates: &[RawInline],
+        offset: usize,
+        limit: usize,
+        mut accept: impl FnMut(RawInline),
+    ) -> usize {
+        assert!(offset <= candidates.len());
+        let end = offset.saturating_add(limit).min(candidates.len());
+        let e_bound = match p.e(row) {
+            Some(value) => match id_from_value(value) {
+                Some(id) => Some(id),
+                None => return end,
+            },
+            None => None,
+        };
+        let a_bound = match p.a(row) {
+            Some(value) => match id_from_value(value) {
+                Some(id) => Some(id),
+                None => return end,
+            },
+            None => None,
+        };
+        let v_bound = p.v(row).copied();
+        for &candidate in &candidates[offset..end] {
+            if self.confirm_value(p, e_bound, a_bound, v_bound, &candidate) {
+                accept(candidate);
+            }
+        }
+        end
+    }
+
+    fn support_row(&self, view: &RowsView<'_>, row: &[RawInline]) -> bool {
+        let (Some(se), Some(sa), Some(sv)) = (
+            term_src(&self.term_e, view),
+            term_src(&self.term_a, view),
+            term_src(&self.term_v, view),
+        ) else {
+            return true;
+        };
+        let Some(e) = id_from_value(se.get(row)) else {
+            return false;
+        };
+        let Some(a) = id_from_value(sa.get(row)) else {
+            return false;
+        };
+        let mut prefix = [0u8; ID_LEN + ID_LEN + INLINE_LEN];
+        prefix[..ID_LEN].copy_from_slice(&e);
+        prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&a);
+        prefix[ID_LEN + ID_LEN..].copy_from_slice(sv.get(row));
+        self.set.eav.has_prefix(&prefix)
+    }
+}
+
+impl TypedProgramSpec for TribleSetConstraint {
+    type State = TribleSetProgramState;
+    type NoveltyKey = ();
+    type Rank = [u64; 6];
+
+    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+        let bound_positions = self.bound_position_mask(request.bound);
+        let (key, variable) = match request.action {
+            ProgramAction::Propose(variable) | ProgramAction::Confirm(variable) => {
+                let target_positions = self.variable_position_mask(variable);
+                if request.bound.is_set(variable) || target_positions == 0 {
+                    return None;
+                }
+                debug_assert_eq!(bound_positions & target_positions, 0);
+                let action = if matches!(request.action, ProgramAction::Propose(_)) {
+                    TRIBLESET_PROPOSE_ROUTE
+                } else {
+                    TRIBLESET_CONFIRM_ROUTE
+                };
+                (
+                    ProgramKey::new(action | (target_positions << 3) | bound_positions),
+                    variable,
+                )
+            }
+            ProgramAction::Support => (
+                ProgramKey::new(TRIBLESET_SUPPORT_ROUTE | bound_positions),
+                self.support_variable()?,
+            ),
+        };
+        Some(ProgramRoute {
+            key,
+            variable,
+            stratum: ProgramStratum::Finite,
+            grouping: ProgramGrouping::PageLocal,
+            completion: ProgramCompletion::PageableOnly,
+        })
+    }
+
+    fn dispatch(&self, state: &Self::State) -> DispatchClass {
+        match state {
+            TribleSetProgramState::Propose { .. } => TRIBLESET_PROPOSE_DISPATCH,
+            TribleSetProgramState::Confirm { .. } => TRIBLESET_CONFIRM_DISPATCH,
+            TribleSetProgramState::Support => TRIBLESET_SUPPORT_DISPATCH,
+        }
+    }
+
+    fn pacing(&self, _state: &Self::State) -> ProgramPacing {
+        ProgramPacing::Search
+    }
+
+    fn progress(&self, state: &Self::State) -> Self::Rank {
+        fn complemented_value_words(value: &RawInline) -> [u64; 4] {
+            std::array::from_fn(|word| {
+                let begin = word * 8;
+                !u64::from_be_bytes(value[begin..begin + 8].try_into().unwrap())
+            })
+        }
+
+        let mut rank = [0u64; 6];
+        match state {
+            TribleSetProgramState::Support => rank[0] = 1,
+            TribleSetProgramState::Confirm { offset, .. } => {
+                rank[0] = 2;
+                rank[1] = u64::MAX
+                    - u64::try_from(*offset)
+                        .expect("TribleSet candidate offset exceeds rank limb");
+            }
+            TribleSetProgramState::Propose { cursor, .. } => {
+                rank[0] = 3;
+                match cursor {
+                    ResidualDeltaSourceCursor::Start => rank[1] = u64::MAX,
+                    ResidualDeltaSourceCursor::After(value) => {
+                        rank[1] = u64::MAX - 1;
+                        rank[2..].copy_from_slice(&complemented_value_words(value));
+                    }
+                    ResidualDeltaSourceCursor::Offset(_) => {
+                        panic!("ordinal cursor crossed into a typed TribleSet source")
+                    }
+                }
+            }
+        }
+        rank
+    }
+
+    fn seed_typed(
+        &self,
+        batch: ProgramSeedBatch<'_>,
+        effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+    ) {
+        assert_eq!(batch.route.stratum, ProgramStratum::Finite);
+        assert_eq!(batch.route.grouping, ProgramGrouping::PageLocal);
+        assert_eq!(batch.route.completion, ProgramCompletion::PageableOnly);
+        let state = match batch.request.action {
+            ProgramAction::Propose(variable) => {
+                assert_eq!(batch.route.variable, variable);
+                assert!(!batch.request.bound.is_set(variable));
+                assert_ne!(self.variable_position_mask(variable), 0);
+                TribleSetProgramState::Propose {
+                    variable,
+                    cursor: ResidualDeltaSourceCursor::Start,
+                }
+            }
+            ProgramAction::Confirm(variable) => {
+                assert_eq!(batch.route.variable, variable);
+                assert!(!batch.request.bound.is_set(variable));
+                assert_ne!(self.variable_position_mask(variable), 0);
+                TribleSetProgramState::Confirm { variable, offset: 0 }
+            }
+            ProgramAction::Support => {
+                assert_eq!(Some(batch.route.variable), self.support_variable());
+                TribleSetProgramState::Support
+            }
+        };
+        for parent in 0..batch.view.len() {
+            effects.finite_root(
+                u32::try_from(parent).expect("too many typed TribleSet parents"),
+                state.clone(),
+                None,
+            );
+        }
+    }
+
+    fn step_typed(
+        &self,
+        states: Vec<Self::State>,
+        batch: TypedProgramBatch<'_>,
+        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+    ) {
+        assert_eq!(states.len(), batch.view.len());
+        assert_eq!(states.len(), batch.candidate_sets.len());
+        assert_eq!(states.len(), batch.limits.len());
+        let Some(first) = states.first() else {
+            return;
+        };
+        match first {
+            TribleSetProgramState::Propose { variable, .. } => {
+                let variable = *variable;
+                let positions = self.positions(variable, &batch.view);
+                for (input, state) in states.into_iter().enumerate() {
+                    let TribleSetProgramState::Propose {
+                        variable: state_variable,
+                        cursor,
+                    } = state
+                    else {
+                        panic!("one typed TribleSet proposal cohort mixed action variants")
+                    };
+                    assert_eq!(state_variable, variable);
+                    assert!(
+                        batch.candidate_sets[input].is_none(),
+                        "typed TribleSet proposal received a candidate group"
+                    );
+                    let mut direct = Vec::new();
+                    let page = self.proposal_source_page_row(
+                        &positions,
+                        batch.view.row(input),
+                        cursor,
+                        batch.limits[input],
+                        &mut direct,
+                    );
+                    let input =
+                        u32::try_from(input).expect("too many typed TribleSet inputs in one cohort");
+                    for value in direct {
+                        effects.direct(input, value);
+                    }
+                    assert!(
+                        page.next.is_none() || page.examined > 0,
+                        "typed TribleSet proposal resumed without examining its source"
+                    );
+                    let resume = page.next.map(|cursor| {
+                        TypedResume::Immediate(TribleSetProgramState::Propose {
+                            variable,
+                            cursor,
+                        })
+                    });
+                    effects.account_source(page.examined, 0);
+                    effects.page(page.examined, resume);
+                }
+            }
+            TribleSetProgramState::Confirm { variable, .. } => {
+                let variable = *variable;
+                let positions = self.positions(variable, &batch.view);
+                for (input, state) in states.into_iter().enumerate() {
+                    let TribleSetProgramState::Confirm {
+                        variable: state_variable,
+                        offset,
+                    } = state
+                    else {
+                        panic!("one typed TribleSet confirmation cohort mixed action variants")
+                    };
+                    assert_eq!(state_variable, variable);
+                    let candidates = batch.candidate_sets[input]
+                        .expect("typed TribleSet confirmation lost its immutable candidate group");
+                    let input_tag =
+                        u32::try_from(input).expect("too many typed TribleSet inputs in one cohort");
+                    let end = self.confirm_page_row(
+                        &positions,
+                        batch.view.row(input),
+                        candidates,
+                        offset,
+                        batch.limits[input],
+                        |value| effects.accept(input_tag, value),
+                    );
+                    let examined = end - offset;
+                    assert!(
+                        end == candidates.len() || examined > 0,
+                        "typed TribleSet confirmation resumed without examining a candidate"
+                    );
+                    let resume = (end < candidates.len()).then(|| {
+                        TypedResume::Immediate(TribleSetProgramState::Confirm {
+                            variable,
+                            offset: end,
+                        })
+                    });
+                    effects.page(examined, resume);
+                }
+            }
+            TribleSetProgramState::Support => {
+                for (input, state) in states.into_iter().enumerate() {
+                    assert_eq!(state, TribleSetProgramState::Support);
+                    assert!(
+                        batch.candidate_sets[input].is_none(),
+                        "typed TribleSet support received a candidate group"
+                    );
+                    if self.support_row(&batch.view, batch.view.row(input)) {
+                        effects.support(
+                            u32::try_from(input)
+                                .expect("too many typed TribleSet inputs in one cohort"),
+                        );
+                    }
+                    effects.page(1, None);
+                }
+            }
+        }
+    }
 }
 
 impl<'a> Constraint<'a> for TribleSetConstraint {
@@ -908,6 +1431,10 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
         true
     }
 
+    fn residual_program(&self) -> Option<ProgramRef<'_>> {
+        Some(ProgramRef::new(self))
+    }
+
     fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
         if view.col(variable).is_some() {
             return false;
@@ -940,188 +1467,14 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
             return None;
         }
         let p = self.positions(variable, view);
-        let row = view.row(0);
-        let e_bound = match p.e(row) {
-            Some(value) => match id_from_value(value) {
-                Some(id) => Some(id),
-                None => {
-                    return Some(ResidualDeltaSourcePage {
-                        next: None,
-                        examined: 0,
-                    });
-                }
-            },
-            None => None,
-        };
-        let a_bound = match p.a(row) {
-            Some(value) => match id_from_value(value) {
-                Some(id) => Some(id),
-                None => {
-                    return Some(ResidualDeltaSourcePage {
-                        next: None,
-                        examined: 0,
-                    });
-                }
-            },
-            None => None,
-        };
-        let v_bound = p.v(row);
-
-        if p.e_var as usize + p.a_var as usize + p.v_var as usize > 1 {
-            let page = match (e_bound, a_bound, v_bound, p.e_var, p.a_var, p.v_var) {
-                (_, Some(a), _, true, false, true) => filtered_direct_source_page(
-                    cursor,
-                    limit,
-                    accepted,
-                    |after| next_id_source(&self.set.aev, &a, after),
-                    |value| self.confirm_value(&p, e_bound, a_bound, v_bound.copied(), value),
-                ),
-                (_, None, _, true, false, true) => filtered_direct_source_page(
-                    cursor,
-                    limit,
-                    accepted,
-                    |after| next_id_source(&self.set.eav, &[0; 0], after),
-                    |value| self.confirm_value(&p, e_bound, a_bound, v_bound.copied(), value),
-                ),
-                (_, _, Some(v), true, true, false) => filtered_direct_source_page(
-                    cursor,
-                    limit,
-                    accepted,
-                    |after| next_id_source(&self.set.vae, v, after),
-                    |value| self.confirm_value(&p, e_bound, a_bound, v_bound.copied(), value),
-                ),
-                (_, _, None, true, true, false) => filtered_direct_source_page(
-                    cursor,
-                    limit,
-                    accepted,
-                    |after| next_id_source(&self.set.aev, &[0; 0], after),
-                    |value| self.confirm_value(&p, e_bound, a_bound, v_bound.copied(), value),
-                ),
-                (Some(e), _, _, false, true, true) => filtered_direct_source_page(
-                    cursor,
-                    limit,
-                    accepted,
-                    |after| next_id_source(&self.set.eav, &e, after),
-                    |value| self.confirm_value(&p, e_bound, a_bound, v_bound.copied(), value),
-                ),
-                (None, _, _, false, true, true) => filtered_direct_source_page(
-                    cursor,
-                    limit,
-                    accepted,
-                    |after| next_id_source(&self.set.aev, &[0; 0], after),
-                    |value| self.confirm_value(&p, e_bound, a_bound, v_bound.copied(), value),
-                ),
-                (_, _, _, true, true, true) => filtered_direct_source_page(
-                    cursor,
-                    limit,
-                    accepted,
-                    |after| next_id_source(&self.set.eav, &[0; 0], after),
-                    |value| self.confirm_value(&p, e_bound, a_bound, v_bound.copied(), value),
-                ),
-                _ => unreachable!("invalid repeated-position proposal source state"),
-            };
-            return Some(page);
-        }
-
-        let page = match (e_bound, a_bound, v_bound, p.e_var, p.a_var, p.v_var) {
-            (None, None, None, true, false, false) => {
-                direct_source_page(cursor, limit, accepted, |after| {
-                    next_id_source(&self.set.eav, &[], after)
-                })
-            }
-            (None, None, None, false, true, false) => {
-                direct_source_page(cursor, limit, accepted, |after| {
-                    next_id_source(&self.set.aev, &[], after)
-                })
-            }
-            (None, None, None, false, false, true) => {
-                direct_source_page(cursor, limit, accepted, |after| {
-                    next_inline_source(&self.set.vea, &[], after)
-                })
-            }
-            (Some(e), None, None, false, true, false) => {
-                direct_source_page(cursor, limit, accepted, |after| {
-                    next_id_source(&self.set.eav, &e, after)
-                })
-            }
-            (Some(e), None, None, false, false, true) => {
-                direct_source_page(cursor, limit, accepted, |after| {
-                    next_inline_source(&self.set.eva, &e, after)
-                })
-            }
-            (None, Some(a), None, true, false, false) => {
-                direct_source_page(cursor, limit, accepted, |after| {
-                    next_id_source(&self.set.aev, &a, after)
-                })
-            }
-            (None, Some(a), None, false, false, true) => {
-                direct_source_page(cursor, limit, accepted, |after| {
-                    next_inline_source(&self.set.ave, &a, after)
-                })
-            }
-            (None, None, Some(v), true, false, false) => {
-                direct_source_page(cursor, limit, accepted, |after| {
-                    next_id_source(&self.set.vea, v, after)
-                })
-            }
-            (None, None, Some(v), false, true, false) => {
-                direct_source_page(cursor, limit, accepted, |after| {
-                    next_id_source(&self.set.vae, v, after)
-                })
-            }
-            (None, Some(a), Some(v), true, false, false) => {
-                let mut prefix = [0u8; ID_LEN + INLINE_LEN];
-                prefix[..ID_LEN].copy_from_slice(&a);
-                prefix[ID_LEN..].copy_from_slice(v);
-                direct_source_page(cursor, limit, accepted, |after| {
-                    next_id_source(&self.set.ave, &prefix, after)
-                })
-            }
-            (Some(e), None, Some(v), false, true, false) => {
-                let mut prefix = [0u8; ID_LEN + INLINE_LEN];
-                prefix[..ID_LEN].copy_from_slice(&e);
-                prefix[ID_LEN..].copy_from_slice(v);
-                direct_source_page(cursor, limit, accepted, |after| {
-                    next_id_source(&self.set.eva, &prefix, after)
-                })
-            }
-            (Some(e), Some(a), None, false, false, true) => {
-                let mut prefix = [0u8; ID_LEN + ID_LEN];
-                prefix[..ID_LEN].copy_from_slice(&e);
-                prefix[ID_LEN..].copy_from_slice(&a);
-                direct_source_page(cursor, limit, accepted, |after| {
-                    next_inline_source(&self.set.eav, &prefix, after)
-                })
-            }
-            _ => unreachable!("a distinct-position proposal has one of twelve bound schemas"),
-        };
-        Some(page)
+        Some(self.proposal_source_page_row(&p, view.row(0), cursor, limit, accepted))
     }
 
     /// When all three positions have values (bound or constant), checks
     /// whether each row's triple exists in the EAV index. Returns `true`
     /// optimistically when any position is still unbound.
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
-        match (
-            term_src(&self.term_e, view),
-            term_src(&self.term_a, view),
-            term_src(&self.term_v, view),
-        ) {
-            (Some(se), Some(sa), Some(sv)) => view.iter().all(|row| {
-                let Some(e) = id_from_value(se.get(row)) else {
-                    return false;
-                };
-                let Some(a) = id_from_value(sa.get(row)) else {
-                    return false;
-                };
-                let mut prefix = [0u8; ID_LEN + ID_LEN + INLINE_LEN];
-                prefix[0..ID_LEN].copy_from_slice(&e);
-                prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&a);
-                prefix[ID_LEN + ID_LEN..].copy_from_slice(sv.get(row));
-                self.set.eav.has_prefix(&prefix)
-            }),
-            _ => true,
-        }
+        view.iter().all(|row| self.support_row(view, row))
     }
 }
 
@@ -1176,6 +1529,244 @@ mod tests {
                 .map(|attribute| id_into_value(attribute)),
             values,
         )
+    }
+
+    fn one_program_step(
+        constraint: &TribleSetConstraint,
+        request: ProgramRequest,
+        view: RowsView<'_>,
+        candidate_sets: &[Option<&[RawInline]>],
+        limits: &[usize],
+    ) -> crate::query::ProgramBatchEffects {
+        let spec = constraint
+            .residual_program()
+            .expect("TribleSet exposes its typed Program");
+        let route = spec
+            .route(request)
+            .expect("test request has a total TribleSet route");
+        let activations: Vec<_> = (0..view.len())
+            .map(|activation| crate::query::ProgramActivation(activation as u64 + 1))
+            .collect();
+        let mut runtime = spec.new_runtime();
+        let mut seeded = crate::query::ProgramSeedEffects::default();
+        spec.seed_batch(
+            &mut runtime,
+            ProgramSeedBatch {
+                request,
+                route,
+                view,
+                activations: &activations,
+            },
+            &mut seeded,
+        );
+        assert_eq!(seeded.work.len(), view.len());
+        let work: Vec<_> = seeded.work.into_iter().map(|seed| seed.work).collect();
+        let mut effects = crate::query::ProgramBatchEffects::default();
+        spec.step_batch(
+            &mut runtime,
+            crate::query::ProgramBatch {
+                stratum: route.stratum,
+                view,
+                candidate_sets,
+                activations: &activations,
+                work: &work,
+                limits,
+            },
+            &mut effects,
+        );
+        effects
+    }
+
+    #[test]
+    fn typed_routes_are_action_and_relevant_schema_specific() {
+        let (set, _, _, _) = direct_fixture();
+        let e = Variable::<GenId>::new(0);
+        let a = Variable::<GenId>::new(1);
+        let v = Variable::<UnknownInline>::new(2);
+        let constraint = TribleSetConstraint::new(e, a, v, set);
+        let program = constraint.residual_program().unwrap();
+        let empty = VariableSet::new_empty();
+        let propose = program
+            .route(ProgramRequest {
+                action: ProgramAction::Propose(0),
+                bound: empty,
+            })
+            .unwrap();
+        let confirm = program
+            .route(ProgramRequest {
+                action: ProgramAction::Confirm(0),
+                bound: empty,
+            })
+            .unwrap();
+        let mut attribute_bound = empty;
+        attribute_bound.set(1);
+        let bound_propose = program
+            .route(ProgramRequest {
+                action: ProgramAction::Propose(0),
+                bound: attribute_bound,
+            })
+            .unwrap();
+
+        assert_ne!(propose.key, confirm.key);
+        assert_ne!(propose.key, bound_propose.key);
+        assert_eq!(propose.stratum, ProgramStratum::Finite);
+        assert_eq!(propose.grouping, ProgramGrouping::PageLocal);
+        assert_eq!(propose.completion, ProgramCompletion::PageableOnly);
+        assert!(program
+            .route(ProgramRequest {
+                action: ProgramAction::Propose(0),
+                bound: VariableSet::new_singleton(0),
+            })
+            .is_none());
+        assert!(program
+            .route(ProgramRequest {
+                action: ProgramAction::Confirm(9),
+                bound: empty,
+            })
+            .is_none());
+    }
+
+    #[test]
+    fn typed_support_is_row_local_optimistic_partial_and_exact_when_bound() {
+        let entity = rngid();
+        let other_entity = rngid();
+        let attribute = rngid();
+        let value = Inline::<UnknownInline>::new([0x41; INLINE_LEN]);
+        let mut set = TribleSet::new();
+        set.insert(&Trible::new(&entity, &attribute, &value));
+        let e = Variable::<GenId>::new(0);
+        let a = Variable::<GenId>::new(1);
+        let v = Variable::<UnknownInline>::new(2);
+        let constraint = TribleSetConstraint::new(e, a, v, set.clone());
+
+        let vars = [0, 1, 2];
+        let rows = [
+            id_into_value(&entity),
+            id_into_value(&attribute),
+            value.raw,
+            id_into_value(&other_entity),
+            id_into_value(&attribute),
+            value.raw,
+        ];
+        let exact = one_program_step(
+            &constraint,
+            ProgramRequest {
+                action: ProgramAction::Support,
+                bound: VariableSet::new_singleton(0)
+                    .union(VariableSet::new_singleton(1))
+                    .union(VariableSet::new_singleton(2)),
+            },
+            RowsView::new(&vars, &rows),
+            &[None, None],
+            &[1, 1],
+        );
+        assert_eq!(exact.supported, vec![(0, ())]);
+        assert!(exact.pages.iter().all(|page| page.examined == 1));
+
+        // Bound schema is a physical cohort key, so partial rows form their
+        // own cohort. Both are optimistic, matching ordinary `satisfied`.
+        let partial_vars = [0];
+        let partial_rows = [id_into_value(&entity), id_into_value(&other_entity)];
+        let partial = one_program_step(
+            &constraint,
+            ProgramRequest {
+                action: ProgramAction::Support,
+                bound: VariableSet::new_singleton(0),
+            },
+            RowsView::new(&partial_vars, &partial_rows),
+            &[None, None],
+            &[1, 1],
+        );
+        assert_eq!(partial.supported, vec![(0, ()), (1, ())]);
+
+        let true_constant = TribleSetConstraint::new(
+            Inline::<GenId>::new(id_into_value(&entity)),
+            Inline::<GenId>::new(id_into_value(&attribute)),
+            value,
+            set.clone(),
+        );
+        let false_constant = TribleSetConstraint::new(
+            Inline::<GenId>::new(id_into_value(&other_entity)),
+            Inline::<GenId>::new(id_into_value(&attribute)),
+            value,
+            set,
+        );
+        let constant_request = ProgramRequest {
+            action: ProgramAction::Support,
+            bound: VariableSet::new_empty(),
+        };
+        assert!(true_constant.route(constant_request).is_none());
+        assert!(false_constant.route(constant_request).is_none());
+        assert!(true_constant.satisfied(&RowsView::EMPTY));
+        assert!(!false_constant.satisfied(&RowsView::EMPTY));
+    }
+
+    #[test]
+    fn typed_confirm_unit_pages_preserve_passing_occurrences_and_rejections() {
+        let entity = rngid();
+        let rejected = rngid();
+        let attribute = rngid();
+        let value = Inline::<UnknownInline>::new([0x51; INLINE_LEN]);
+        let mut set = TribleSet::new();
+        set.insert(&Trible::new(&entity, &attribute, &value));
+        let candidate = id_into_value(&entity);
+        let candidates = [candidate, id_into_value(&rejected), candidate];
+        let constraint = TribleSetConstraint::new(
+            Variable::<GenId>::new(0),
+            Inline::<GenId>::new(id_into_value(&attribute)),
+            value,
+            set,
+        );
+        let request = ProgramRequest {
+            action: ProgramAction::Confirm(0),
+            bound: VariableSet::new_empty(),
+        };
+        let spec = constraint.residual_program().unwrap();
+        let route = spec.route(request).unwrap();
+        let activation = crate::query::ProgramActivation(1);
+        let activations = [activation];
+        let mut runtime = spec.new_runtime();
+        let mut seeded = crate::query::ProgramSeedEffects::default();
+        spec.seed_batch(
+            &mut runtime,
+            ProgramSeedBatch {
+                request,
+                route,
+                view: RowsView::EMPTY,
+                activations: &activations,
+            },
+            &mut seeded,
+        );
+        let mut work = seeded.work.pop().unwrap().work;
+        assert!(seeded.work.is_empty());
+        let candidate_sets = [Some(candidates.as_slice())];
+        let limits = [1];
+        let mut accepted = Vec::new();
+        loop {
+            let mut effects = crate::query::ProgramBatchEffects::default();
+            spec.step_batch(
+                &mut runtime,
+                crate::query::ProgramBatch {
+                    stratum: route.stratum,
+                    view: RowsView::EMPTY,
+                    candidate_sets: &candidate_sets,
+                    activations: &activations,
+                    work: std::slice::from_ref(&work),
+                    limits: &limits,
+                },
+                &mut effects,
+            );
+            accepted.extend(effects.accepted);
+            assert_eq!(effects.pages.len(), 1);
+            assert_eq!(effects.pages[0].examined, 1);
+            work = match effects.pages.pop().unwrap().resume {
+                Some(crate::query::ProgramResume::Immediate(next)) => next,
+                None => break,
+                Some(_) => panic!("TribleSet confirm used a non-immediate continuation"),
+            };
+        }
+
+        assert_eq!(accepted, vec![(0, candidate), (0, candidate)]);
     }
 
     fn eager_proposal(
