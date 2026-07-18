@@ -75,9 +75,15 @@ with `Candidates([])` and no dead-search receipt closes it.
 ## Provisional classification
 
 The residual is a physical-feedback attribution mismatch, not a semantic RPQ
-or quiescence correctness failure. It does have a small scheduling consequence
-today—the false transition-negative promotes width from 512 to 1024—so
-production should eventually distinguish finite structural Program work from
-source/transition search feedback. Whether to repair that now or let the
-planned Program-effects refactor erase the ambiguous fallback is deliberately
-left to the post-lane counter receipt.
+or quiescence correctness failure. The generic dead-page disposition and its
+transition label must be kept separate: `account_delta_feedback` grows global
+width from `dead_pages`, while `source_dead_pages` and
+`transition_dead_pages` only select diagnostic negative counters. A finite
+candidate filter that actually examines a page and admits nothing can be a
+valid dead structural page even though calling it a transition page is false.
+Consequently, merely repairing the attribution would not remove the observed
+512-to-1024 promotion, and the static evidence does not justify changing that
+geometric scheduling law. Production should eventually distinguish finite
+structural Program work from source/transition search telemetry; whether to do
+that now or let the planned Program-effects refactor erase the ambiguous label
+is deliberately left to the post-lane counter receipt.
