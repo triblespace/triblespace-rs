@@ -374,7 +374,10 @@ whole-group confirmer keeps each parent's ragged candidate sequence intact.
 Every shard retains canonical state merging locally. As with the DAG splitter,
 cross-shard reconvergence is traded for concurrency, state is moved rather
 than duplicated, and the constraint/postprocessor pair is cloned only when a
-real sibling shard is created.
+real sibling shard is created. This entry point preserves the query's selected
+residual lowering: fresh queries use full formula and transition-program
+lowering, while an explicit `Query::residual_lowering` override remains in
+force.
 
 ### Opt-in residual action observation
 

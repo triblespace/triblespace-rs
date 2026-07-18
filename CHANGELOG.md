@@ -405,6 +405,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Explicit parallel residual queries preserve their selected lowering.**
+  `Query::into_par_residual_state_iter` now carries the query's default full
+  formula and transition-program lowering into its affine shards, while still
+  honoring an explicit conservative or intermediate `residual_lowering`
+  selection.
 - **The query-engine guide now describes the agglomerator's actual hub set.**
   Agglomeration starts from nonempty exact-choice groups and only absorbs a
   complete active group into another active target; it does not open a variable

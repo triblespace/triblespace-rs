@@ -9980,12 +9980,17 @@ mod parallel {
         /// confirmer page-local, candidate occurrences themselves become
         /// independent shard atoms.
         ///
+        /// The iterator preserves the query's selected [`ResidualLowering`].
+        /// Fresh queries use [`ResidualLowering::FULL`] by default; an explicit
+        /// [`Query::residual_lowering`] override remains in force.
+        ///
         /// # Panics
         ///
         /// Panics if the query has already been pulled, like the serial
         /// residual entry points.
         pub fn into_par_residual_state_iter(self) -> ResidualStateParIter<C, P, R> {
-            let mut residual = self.solve_residual_state_lazy();
+            let lowering = self.residual_lowering;
+            let mut residual = self.solve_residual_state_lazy_with(lowering);
             residual.state.width = residual.state.cap;
             residual.into_par_iter()
         }
@@ -17213,6 +17218,7 @@ mod tests {
         ordinary_propose: Arc<AtomicUsize>,
         ordinary_confirm: Arc<AtomicUsize>,
         ordinary_support: Arc<AtomicUsize>,
+        allow_ordinary_fallback: bool,
     }
 
     impl Constraint<'static> for ProgramOnlyRpq {
@@ -17231,22 +17237,30 @@ mod tests {
 
         fn propose(
             &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-            _candidates: &mut CandidateSink<'_>,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
         ) {
             self.ordinary_propose.fetch_add(1, Ordering::Relaxed);
-            panic!("ordinary RPQ propose fallback")
+            assert!(
+                self.allow_ordinary_fallback,
+                "ordinary RPQ propose fallback"
+            );
+            self.inner.propose(variable, view, candidates);
         }
 
         fn confirm(
             &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-            _candidates: &mut CandidateSink<'_>,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
         ) {
             self.ordinary_confirm.fetch_add(1, Ordering::Relaxed);
-            panic!("ordinary RPQ confirm fallback")
+            assert!(
+                self.allow_ordinary_fallback,
+                "ordinary RPQ confirm fallback"
+            );
+            self.inner.confirm(variable, view, candidates);
         }
 
         fn residual_confirm_is_page_local(&self) -> bool {
@@ -17264,7 +17278,10 @@ mod tests {
                 .all(|variable| view.col(variable).is_some());
             if fully_bound {
                 self.ordinary_support.fetch_add(1, Ordering::Relaxed);
-                panic!("ordinary fully-bound RPQ support fallback")
+                assert!(
+                    self.allow_ordinary_fallback,
+                    "ordinary fully-bound RPQ support fallback"
+                );
             }
             self.inner.satisfied(view)
         }
@@ -17289,6 +17306,20 @@ mod tests {
             ordinary_propose: Arc::clone(&counters.0),
             ordinary_confirm: Arc::clone(&counters.1),
             ordinary_support: Arc::clone(&counters.2),
+            allow_ordinary_fallback: false,
+        }
+    }
+
+    fn program_fallback_rpq(
+        inner: crate::query::regularpathconstraint::RegularPathConstraint,
+        counters: &ProgramFallbackCounters,
+    ) -> ProgramOnlyRpq {
+        ProgramOnlyRpq {
+            inner,
+            ordinary_propose: Arc::clone(&counters.0),
+            ordinary_confirm: Arc::clone(&counters.1),
+            ordinary_support: Arc::clone(&counters.2),
+            allow_ordinary_fallback: true,
         }
     }
 
@@ -19449,6 +19480,92 @@ mod tests {
 
     #[cfg(feature = "parallel")]
     #[test]
+    fn explicit_parallel_residual_preserves_transition_program_lowering() {
+        use crate::id::{id_into_value, ExclusiveId, Id};
+        use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
+        use crate::trible::{Trible, TribleSet};
+
+        let attribute = Id::new([201; crate::id::ID_LEN]).unwrap();
+        let sources: Vec<_> = (202..=209)
+            .map(|byte| Id::new([byte; crate::id::ID_LEN]).unwrap())
+            .collect();
+        let targets: Vec<_> = (210..=217)
+            .map(|byte| Id::new([byte; crate::id::ID_LEN]).unwrap())
+            .collect();
+        let mut graph = TribleSet::new();
+        for (source, target) in sources.iter().zip(&targets) {
+            graph.insert(&Trible::new::<GenId>(
+                ExclusiveId::force_ref(source),
+                &attribute,
+                &target.to_inline(),
+            ));
+        }
+
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let operations = [PathOp::Attr(attribute.raw())];
+        let source_values = Arc::new(
+            sources
+                .iter()
+                .map(|source| id_into_value(&source.raw()))
+                .collect::<Vec<_>>(),
+        );
+        let make = |counters: &ProgramFallbackCounters, allow_ordinary_fallback| {
+            let path = RegularPathConstraint::new(graph.clone(), start, end, &operations);
+            let path = if allow_ordinary_fallback {
+                program_fallback_rpq(path, counters)
+            } else {
+                program_only_rpq(path, counters)
+            };
+            Arc::new(IntersectionConstraint::new(vec![
+                parallel_shape(FanoutLeaf {
+                    variable: start.index,
+                    values: Arc::clone(&source_values),
+                }),
+                parallel_shape(path),
+            ]))
+        };
+        let project = |binding: &Binding| {
+            Some((
+                binding.get(start.index).copied()?,
+                binding.get(end.index).copied()?,
+            ))
+        };
+
+        let full_counters = program_fallback_counters();
+        let mut full: Vec<_> = with_parallel_workers(4, || {
+            Query::new(make(&full_counters, false), project)
+                .into_par_residual_state_iter()
+                .collect()
+        });
+        assert_program_fallbacks_unused(&full_counters);
+
+        let conservative_counters = program_fallback_counters();
+        let mut conservative: Vec<_> = with_parallel_workers(4, || {
+            Query::new(make(&conservative_counters, true), project)
+                .residual_lowering(ResidualLowering::CONSERVATIVE)
+                .into_par_residual_state_iter()
+                .collect()
+        });
+        assert!(
+            conservative_counters.0.load(Ordering::Relaxed) > 0,
+            "conservative lowering must use the ordinary RPQ proposal path"
+        );
+
+        let mut expected: Vec<_> = sources
+            .iter()
+            .zip(&targets)
+            .map(|(source, target)| (id_into_value(&source.raw()), id_into_value(&target.raw())))
+            .collect();
+        full.sort_unstable();
+        conservative.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(full, expected);
+        assert_eq!(conservative, expected);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
     fn recursive_formula_parallel_split_preserves_deep_affine_frame_stack() {
         let make = || {
             let leaf = |estimate| VerbLeaf {
@@ -19540,6 +19657,7 @@ mod tests {
 
         let mut one_worker = with_parallel_workers(1, || {
             Query::new(make(), project)
+                .residual_lowering(ResidualLowering::CONSERVATIVE)
                 .into_par_residual_state_iter()
                 .collect::<Vec<_>>()
         });
@@ -19550,6 +19668,7 @@ mod tests {
         calls.lock().unwrap().clear();
         let mut four_workers = with_parallel_workers(4, || {
             Query::new(make(), project)
+                .residual_lowering(ResidualLowering::CONSERVATIVE)
                 .into_par_residual_state_iter()
                 .collect::<Vec<_>>()
         });
@@ -19739,6 +19858,7 @@ mod tests {
         let project = |binding: &Binding| binding.get(0).copied();
         let mut custom = with_parallel_workers(4, || {
             Query::new(custom_root, project)
+                .residual_lowering(ResidualLowering::CONSERVATIVE)
                 .into_par_residual_state_iter()
                 .collect::<Vec<_>>()
         });
@@ -19781,6 +19901,7 @@ mod tests {
         ]));
         let mut union_results = with_parallel_workers(4, || {
             Query::new(union_root, project)
+                .residual_lowering(ResidualLowering::CONSERVATIVE)
                 .into_par_residual_state_iter()
                 .collect::<Vec<_>>()
         });
