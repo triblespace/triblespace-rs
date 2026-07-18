@@ -1,6 +1,7 @@
 //! WGPU-resident Ring columns and prefix data for [`SuccinctArchive`] queries.
 
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use jerky::bit_vector::rank9sel::Rank9SelIndex;
@@ -268,9 +269,10 @@ where
     /// Resident mirror of [`SuccinctArchive::aev_c`].
     aev_c: WgpuWaveletMatrix,
     /// Exact maximum number of values under any canonical `(E,A)` pair,
-    /// computed once from `changed_e_a` one-runs at wrap time so per-program
-    /// compilation never rescans the pair boundaries.
-    max_ea_fanout: usize,
+    /// computed lazily from `changed_e_a` one-runs on first use: Program
+    /// executors share one scan per snapshot while rank-only users never
+    /// pay the O(pairs) walk.
+    max_ea_fanout: OnceLock<usize>,
     /// Nonblocking per-snapshot busy-mutex for resident Program dispatch.
     program_lease: DeviceLease,
     min_rank_batch: usize,
@@ -282,17 +284,29 @@ where
 /// The typed-Program hard law says ready work never *waits* for an
 /// accelerator, so physical dispatch may proceed only through a successful
 /// [`DeviceLease::try_acquire`]: `Busy` (another cohort of this snapshot is
-/// mid-dispatch) and `Failed` (a previous dispatch hit a device error) both
+/// mid-dispatch) and `Failed` (a previous dispatch did not commit) both
 /// fall through to Native immediately, without blocking.
 ///
-/// Honest scope: this is exactly a per-snapshot mutual-exclusion flag, not
-/// a device-readiness signal. `Idle` does **not** promise a prewarmed
-/// backend — resident buffer writes are enqueued asynchronously at wrap
-/// time and CubeCL compiles pipelines lazily on first launch, so the first
-/// leased dispatch may still pay preparation cost inside its own wall; nor
-/// does the lease cover other snapshots, rank batches, or wavelet freezes
-/// sharing the global device service. A genuine preparation/readiness seam
-/// is future work; until it exists, admission defaults stay off.
+/// The guard carries **default-poison semantics**: the holder keeps it
+/// through the complete synchronous dispatch — launch, readback, and
+/// receipt validation — and only an explicit
+/// [`DeviceLeaseGuard::commit_success`] returns the lane to `Idle`. Every
+/// other exit — device error, receipt-law violation, panic, unwind — drops
+/// the guard and poisons the lane to `Failed`, so a dispatch lane that
+/// ever produced an unvalidated outcome is never leased again. Callers
+/// therefore run all pure preflight (capability, admission, grant/base
+/// conversion, frontier assembly) *before* acquiring, so an ordinary
+/// decline never touches the lease.
+///
+/// Honest scope: this is a narrow cooperative lane serializing one
+/// snapshot's Program families against each other — nothing more. `Idle`
+/// does **not** signal global device idleness or a prewarmed backend:
+/// resident buffer writes are enqueued asynchronously at wrap time, CubeCL
+/// compiles pipelines lazily on first launch (a launch can also spin on a
+/// full submission channel), and the lease covers neither other snapshots
+/// nor rank batches or wavelet freezes sharing the global device service.
+/// A genuine preparation/readiness seam is future work; until it exists,
+/// admission defaults stay off.
 pub struct DeviceLease {
     /// 0 = Idle, 1 = Busy, 2 = Failed.
     state: AtomicU8,
@@ -311,9 +325,10 @@ impl DeviceLease {
 
     /// Attempts to take the lease without waiting.
     ///
-    /// Returns `None` when this snapshot's dispatch is busy or failed; the
-    /// caller must then run Native. Dropping the guard returns the lease to
-    /// `Idle` unless the holder recorded a device failure.
+    /// Returns `None` when this snapshot's dispatch lane is busy or failed;
+    /// the caller must then run Native. The acquired guard is
+    /// default-poison: only [`DeviceLeaseGuard::commit_success`] restores
+    /// `Idle`, any other exit fails the lane permanently.
     pub fn try_acquire(&self) -> Option<DeviceLeaseGuard<'_>> {
         self.state
             .compare_exchange(LEASE_IDLE, LEASE_BUSY, Ordering::Acquire, Ordering::Relaxed)
@@ -321,35 +336,37 @@ impl DeviceLease {
             .map(|_| DeviceLeaseGuard { lease: self })
     }
 
-    /// Whether a previous holder recorded a permanent device failure.
+    /// Whether this lane was poisoned by a non-committed dispatch.
     pub fn is_failed(&self) -> bool {
         self.state.load(Ordering::Relaxed) == LEASE_FAILED
     }
 }
 
-/// Held lease over the resident Program executor.
-#[must_use = "dropping the guard releases the lease"]
+/// Held default-poison lease over one snapshot's Program dispatch lane.
+///
+/// Hold it through the complete synchronous dispatch — launch, readback,
+/// and receipt validation — then call
+/// [`commit_success`](Self::commit_success). Dropping it on any other path
+/// (error return, invariant failure, panic unwind) poisons the lane.
+#[must_use = "dropping the guard poisons the dispatch lane; call commit_success after validation"]
 pub struct DeviceLeaseGuard<'l> {
     lease: &'l DeviceLease,
 }
 
 impl DeviceLeaseGuard<'_> {
-    /// Marks the executor permanently failed; every later
-    /// [`DeviceLease::try_acquire`] declines nonblockingly.
-    pub fn fail(self) {
-        self.lease.state.store(LEASE_FAILED, Ordering::Release);
+    /// Records one fully validated dispatch, returning the lane to `Idle`.
+    pub fn commit_success(self) {
+        self.lease.state.store(LEASE_IDLE, Ordering::Release);
         std::mem::forget(self);
     }
 }
 
 impl Drop for DeviceLeaseGuard<'_> {
     fn drop(&mut self) {
-        let _ = self.lease.state.compare_exchange(
-            LEASE_BUSY,
-            LEASE_IDLE,
-            Ordering::Release,
-            Ordering::Relaxed,
-        );
+        // Default-poison: reaching Drop means the dispatch did not commit —
+        // an error, a receipt-law violation, or an unwind mid-dispatch. The
+        // lane is no longer trusted.
+        self.lease.state.store(LEASE_FAILED, Ordering::Release);
     }
 }
 
@@ -460,7 +477,6 @@ where
             "value",
         )?;
         validate_pair_changes(&archive, triple_count)?;
-        let max_ea_fanout = max_one_run(&archive.changed_e_a);
         let prefix_bytes = resident_bit_vector_bytes(archive.e_a.num_bits())
             + resident_bit_vector_bytes(archive.a_a.num_bits())
             + resident_bit_vector_bytes(archive.v_a.num_bits());
@@ -543,7 +559,7 @@ where
             vae_c,
             eva_c,
             aev_c,
-            max_ea_fanout,
+            max_ea_fanout: OnceLock::new(),
             program_lease: DeviceLease::new(),
             min_rank_batch: DEFAULT_MIN_RANK_BATCH,
             stats: QueryStats::new(),
@@ -551,9 +567,12 @@ where
     }
 
     /// Returns the exact maximum number of values under any canonical
-    /// `(E,A)` pair, computed once at wrap time from `changed_e_a` one-runs.
+    /// `(E,A)` pair, computed lazily (once per snapshot) from `changed_e_a`
+    /// one-runs.
     pub fn max_ea_fanout(&self) -> usize {
-        self.max_ea_fanout
+        *self
+            .max_ea_fanout
+            .get_or_init(|| max_one_run(&self.archive.changed_e_a))
     }
 
     /// Returns the nonblocking per-snapshot busy-mutex gating resident

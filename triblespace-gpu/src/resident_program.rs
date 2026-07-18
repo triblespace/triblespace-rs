@@ -156,7 +156,7 @@ where
     pattern: ProgramPattern,
     target: ProgramVariable,
     /// Cached from [`WgpuSuccinctArchive::max_ea_fanout`]; the O(pairs)
-    /// one-run scan runs once per resident wrap, never per compilation.
+    /// one-run scan runs lazily once per snapshot, never per compilation.
     max_ea_fanout: usize,
 }
 
@@ -247,7 +247,7 @@ where
     }
 
     /// Returns the exact maximum number of values under any canonical `(E,A)`
-    /// pair, cached once per resident wrap from `changed_e_a` one-runs.
+    /// pair, cached lazily once per snapshot from `changed_e_a` one-runs.
     pub fn max_ea_fanout(&self) -> usize {
         self.max_ea_fanout
     }

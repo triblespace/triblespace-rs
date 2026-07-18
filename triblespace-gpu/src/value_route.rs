@@ -45,9 +45,11 @@
 //! Even when routing is enabled, dispatch passes through two independent
 //! gates:
 //!
-//! 1. **The nonblocking lease** ([`crate::DeviceLease`]): a busy or failed
-//!    Program executor falls through to Native instantly — a dispatching
-//!    cohort never waits on another cohort's device round trip.
+//! 1. **The nonblocking lease** ([`crate::DeviceLease`]): a busy or
+//!    poisoned dispatch lane falls through to Native instantly — a cohort
+//!    never waits on another cohort's device round trip, and a lane whose
+//!    dispatch ever exited without validating is never leased again. All
+//!    pure preflight runs before acquisition, so declines cannot poison.
 //! 2. **The geometry frontier** ([`ValueRouteAdmission`]): an explicitly
 //!    enabled policy admits by cohort rows and exact page work. QoS
 //!    placement intent (consumer-owned, shard-inherited) is deliberately
@@ -79,7 +81,7 @@ use crate::budgeted::CohortGrants;
 use crate::query_program::{
     ArchiveCode, ProgramFrontier, ProgramVariable, QueryPattern, QueryProgram, QueryTerm,
 };
-use crate::resident_program::{ResidentTransitionError, WgpuQueryProgram};
+use crate::resident_program::WgpuQueryProgram;
 use crate::succinct_query::WgpuSuccinctArchive;
 use crate::typed_program::WGPU_RESIDENT_EXECUTOR;
 
@@ -425,12 +427,20 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
             )],
         )
         .ok()?;
-        let device = WgpuQueryProgram::new(&program, gpu)
-            .ok()
-            .map(|resident_program| ValueDeviceArm {
-                resident: gpu,
-                gpu: resident_program,
-            });
+        // The device arm exists only under an explicitly enabled policy:
+        // Off is honest — zero GPU-admission work, including the lazy
+        // O(pairs) fanout scan the resident executor's construction would
+        // trigger. Force/Frontier pay that scan once as setup cost.
+        let device = if admission.routing_enabled() {
+            WgpuQueryProgram::new(&program, gpu)
+                .ok()
+                .map(|resident_program| ValueDeviceArm {
+                    resident: gpu,
+                    gpu: resident_program,
+                })
+        } else {
+            None
+        };
         Some(Self {
             core: Arc::new(ValueFamilyCore {
                 program,
@@ -596,17 +606,23 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
 
     /// Offers one already-formed cohort to the resident budgeted kernel.
     ///
-    /// Every decline and every recoverable failure returns `None`; the
-    /// typed adapter then runs the exact Native step on the untouched
-    /// batch. A device error additionally fails the lease so later cohorts
-    /// decline nonblockingly.
+    /// Every preflight decline returns `None` without touching the lease;
+    /// the typed adapter then runs the exact Native step on the untouched
+    /// batch. Once the lease is acquired it is held through launch,
+    /// readback, and receipt validation: only a fully validated outcome
+    /// commits it back to idle, every other exit poisons the lane so later
+    /// cohorts decline nonblockingly.
     fn device_outcome(
         &self,
         states: &[SuccinctValueState],
         batch: &TypedProgramBatch<'_>,
     ) -> Option<ValueStepOutcome> {
         let core = &self.core;
-        let arm = core.device.as_ref()?;
+
+        // Pure preflight: admission, capability, and every grant-shape
+        // conversion happen before the lease so a harmless decline can
+        // never poison the dispatch lane. The policy is consulted first so
+        // its decline counter stays exact even when no device arm exists.
         let limits = batch.limits;
         if limits.len() != states.len() {
             return None;
@@ -622,8 +638,31 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
                 .fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        // The hard boundary: only a nonblocking Ready/idle lease may
-        // dispatch. Preparing/Busy/Failed fall through to Native instantly.
+        let arm = core.device.as_ref()?;
+        // Law gate: the scheduler grants in usize; any grant or resume base
+        // beyond the device u32 lane declines to Native instead of erring.
+        let Ok(grants) = CohortGrants::from_task_limits(limits) else {
+            core.counters
+                .declined_contract
+                .fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        let mut bases = Vec::with_capacity(states.len());
+        for state in states {
+            match u32::try_from(state.offset) {
+                Ok(base) => bases.push(base),
+                Err(_) => {
+                    core.counters
+                        .declined_contract
+                        .fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+            }
+        }
+        let frontier = self.cohort_frontier(states);
+
+        // The hard boundary: only a nonblocking idle lease may dispatch; a
+        // busy or poisoned lane falls through to Native instantly.
         let Some(lease) = arm.resident.program_lease().try_acquire() else {
             core.counters
                 .declined_lease
@@ -631,9 +670,10 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
             return None;
         };
 
-        let outcome = self.device_outcome_leased(arm, states, limits);
-        match outcome {
+        match self.device_outcome_leased(arm, states, limits, &grants, &bases, &frontier) {
             DeviceAttempt::Committed(outcome) => {
+                // The complete dispatch validated; release the lane.
+                lease.commit_success();
                 let granted: u64 = limits.iter().map(|&limit| limit as u64).sum();
                 core.counters
                     .physical_cohorts
@@ -649,18 +689,14 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
                     .fetch_add(granted, Ordering::Relaxed);
                 Some(outcome)
             }
-            DeviceAttempt::Declined => {
+            DeviceAttempt::Failed => {
+                // Dropping the guard poisons the lane: a device error or a
+                // receipt-law violation mid-dispatch is never retried.
+                drop(lease);
                 core.counters
                     .declined_contract
                     .fetch_add(1, Ordering::Relaxed);
                 None
-            }
-            DeviceAttempt::DeviceFailed => {
-                core.counters
-                    .declined_contract
-                    .fetch_add(1, Ordering::Relaxed);
-                lease.fail();
-                return None;
             }
         }
     }
@@ -670,38 +706,25 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
         arm: &ValueDeviceArm<'a, U>,
         states: &[SuccinctValueState],
         limits: &[usize],
+        grants: &CohortGrants,
+        bases: &[u32],
+        frontier: &ProgramFrontier,
     ) -> DeviceAttempt {
         let core = &self.core;
-        // Law gate: the scheduler grants in usize; any grant or resume base
-        // beyond the device u32 lane declines to Native instead of erring.
-        let Ok(grants) = CohortGrants::from_task_limits(limits) else {
-            return DeviceAttempt::Declined;
+        let Ok((child, receipts)) =
+            arm.gpu
+                .transition_on_budgeted_from(core.value_pvar, frontier, grants, bases)
+        else {
+            return DeviceAttempt::Failed;
         };
-        let mut bases = Vec::with_capacity(states.len());
-        for state in states {
-            match u32::try_from(state.offset) {
-                Ok(base) => bases.push(base),
-                Err(_) => return DeviceAttempt::Declined,
-            }
-        }
-        let frontier = self.cohort_frontier(states);
-        let (child, receipts) =
-            match arm
-                .gpu
-                .transition_on_budgeted_from(core.value_pvar, &frontier, &grants, &bases)
-            {
-                Ok(result) => result,
-                Err(ResidentTransitionError::Device(_)) => return DeviceAttempt::DeviceFailed,
-                Err(_) => return DeviceAttempt::Declined,
-            };
 
         // Receipt laws, re-checked fail-closed before trusting any row.
         if receipts.archive() != arm.resident.identity() {
-            return DeviceAttempt::Declined;
+            return DeviceAttempt::Failed;
         }
         let receipts = receipts.into_receipts();
         if receipts.len() != states.len() {
-            return DeviceAttempt::Declined;
+            return DeviceAttempt::Failed;
         }
         let target_column = child
             .variables()
@@ -719,49 +742,59 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
             .zip(states.iter().zip(limits))
             .enumerate()
         {
-            // An amplifying receipt fails closed.
-            if receipt.produced > receipt.examined {
-                return DeviceAttempt::Declined;
+            // On this fixed (E,A) -> V Propose arm the lawful receipt is
+            // fully determined by the canonical state and the grant, so
+            // every field is checked as an exact equality — mirroring the
+            // Native pager — before any row is decoded or committed. A
+            // lying under-examining receipt (down to `(0, 0, None)`) would
+            // otherwise silently drop the rest of the interval.
+            let expected = state.remaining().min(limit as u64);
+            if u64::from(receipt.examined) != expected
+                || u64::from(receipt.produced) != expected
+            {
+                return DeviceAttempt::Failed;
             }
-            if receipt.examined as usize > limit {
-                return DeviceAttempt::Declined;
+            let examined = expected as usize;
+            if consumed + examined > child.len() {
+                return DeviceAttempt::Failed;
             }
-            let produced = receipt.produced as usize;
-            if consumed + produced > child.len() {
-                return DeviceAttempt::Declined;
-            }
-            for row in consumed..consumed + produced {
+            for row in consumed..consumed + examined {
                 let Ok(value) = core.program.decode(child.row(row)[target_column]) else {
-                    return DeviceAttempt::Declined;
+                    return DeviceAttempt::Failed;
                 };
                 outcome.direct.push((input as u32, value));
             }
-            consumed += produced;
-            let mut resume = None;
-            if let Some(cursor) = receipt.physical_cursor {
-                // The sole legal cursor consumer: the absolute interval
-                // offset becomes canonical typed state. A cursor that does
-                // not strictly progress inside the checked interval is a
-                // corrupted continuation and fails closed (the typed
-                // adapter would panic on it; declining re-runs Native).
-                let offset = u64::from(cursor.into_typed_conversion_offset());
-                if offset <= state.offset || offset >= state.len {
-                    return DeviceAttempt::Declined;
+            consumed += examined;
+            // Cursor law, also exact: the absolute resume offset exists iff
+            // the interval is not exhausted, and then equals precisely the
+            // consumed prefix. This conversion is the cursor's sole legal
+            // consumer.
+            let expected_next = state.offset + expected;
+            let resume = match receipt.physical_cursor {
+                Some(cursor) => {
+                    if expected_next >= state.len
+                        || u64::from(cursor.into_typed_conversion_offset()) != expected_next
+                    {
+                        return DeviceAttempt::Failed;
+                    }
+                    Some(SuccinctValueState {
+                        offset: expected_next,
+                        ..state.clone()
+                    })
                 }
-                resume = Some(SuccinctValueState {
-                    offset,
-                    ..state.clone()
-                });
-            }
-            outcome.pages.push(ValuePage {
-                examined: receipt.examined as usize,
-                resume,
-            });
+                None => {
+                    if expected_next < state.len {
+                        return DeviceAttempt::Failed;
+                    }
+                    None
+                }
+            };
+            outcome.pages.push(ValuePage { examined, resume });
         }
         // The child frontier must segment exactly: every device row belongs
         // to exactly one input's receipt.
         if consumed != child.len() {
-            return DeviceAttempt::Declined;
+            return DeviceAttempt::Failed;
         }
         DeviceAttempt::Committed(outcome)
     }
@@ -786,9 +819,11 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
 }
 
 enum DeviceAttempt {
+    /// Launch, readback, and every receipt law validated.
     Committed(ValueStepOutcome),
-    Declined,
-    DeviceFailed,
+    /// The dispatch did not commit — device error or receipt-law
+    /// violation. The caller poisons the lane and steps Native.
+    Failed,
 }
 
 impl<'a, U: Universe> TypedProgramSpec for SuccinctValueFamily<'a, U> {
@@ -1485,13 +1520,20 @@ mod tests {
         assert_eq!(selective.counters().declined_policy, 1);
 
         // A held lease declines nonblockingly, before any kernel launch:
-        // busy and failed executors fall through to Native instantly.
+        // a busy lane falls through to Native instantly.
         let forced = var_family(&resident, ValueRouteAdmission::Force);
         let guard = resident.program_lease().try_acquire().unwrap();
         assert!(forced.try_step_physical(&states, batch(&limits)).is_none());
         assert_eq!(forced.counters().declined_lease, 1);
+
+        // Default-poison: dropping the guard without an explicit commit
+        // fails the lane permanently — a dispatch that never validated is
+        // never trusted again.
         drop(guard);
-        assert!(resident.program_lease().try_acquire().is_some());
+        assert!(resident.program_lease().is_failed());
+        assert!(resident.program_lease().try_acquire().is_none());
+        assert!(forced.try_step_physical(&states, batch(&limits)).is_none());
+        assert_eq!(forced.counters().declined_lease, 2);
     }
 
     #[test]

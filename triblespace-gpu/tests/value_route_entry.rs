@@ -74,7 +74,10 @@ fn serial_full_lowering_is_bag_identical_and_default_off_never_places() {
 
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
     let resident = WgpuSuccinctArchive::new(archive).expect("resident wrap succeeds");
-    let route = resident.value_route().expect("an unset environment is the off policy");
+    // Explicit Off keeps this test deterministic regardless of any ambient
+    // TRIBLESPACE_GPU_VALUE_ROUTE value; the env grammar itself is covered
+    // by value-independent unit tests.
+    let route = resident.value_route_with(ValueRouteAdmission::Off);
 
     let query = find!(
         (e: Id, v: Id),
@@ -175,10 +178,9 @@ fn parallel_forced_routing_places_physically_and_stays_bag_identical() {
         (e: Id, v: Id),
         pattern!(&route, [{ ?e @ ns::fanout: ?v }])
     );
-    let mut results: Vec<(Id, Id)> = query
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
-        .into_par_iter()
-        .collect();
+    // The public parallel residual entry preserves the query's selected
+    // lowering (FULL by default), so typed Programs stay reachable.
+    let mut results: Vec<(Id, Id)> = query.into_par_residual_state_iter().collect();
 
     results.sort();
     assert_eq!(results, expected);
