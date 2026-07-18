@@ -30,6 +30,136 @@ compile_error!("select exactly one benchmark engine");
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
+#[cfg(engine_allocation_probe)]
+mod allocation_probe {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct CountingAllocator;
+
+    static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+    static DEALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+    static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
+    static DEALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
+    static LIVE_BYTES: AtomicU64 = AtomicU64::new(0);
+    static PEAK_LIVE_BYTES: AtomicU64 = AtomicU64::new(0);
+    const LIMITS: [usize; 12] = [
+        32,
+        64,
+        128,
+        256,
+        512,
+        1024,
+        4096,
+        16384,
+        65536,
+        262144,
+        1048576,
+        usize::MAX,
+    ];
+    static BINS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+    static BIN_BYTES: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+
+    fn record_allocation(size: usize) {
+        let bytes = size as u64;
+        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        ALLOCATED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+        let live = LIVE_BYTES.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        PEAK_LIVE_BYTES.fetch_max(live, Ordering::Relaxed);
+        let bin = LIMITS.partition_point(|&limit| limit < size);
+        BINS[bin].fetch_add(1, Ordering::Relaxed);
+        BIN_BYTES[bin].fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn record_deallocation(size: usize) {
+        let bytes = size as u64;
+        DEALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        DEALLOCATED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+        LIVE_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+    }
+
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let ptr = unsafe { System.alloc(layout) };
+            if !ptr.is_null() {
+                record_allocation(layout.size());
+            }
+            ptr
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            record_deallocation(layout.size());
+            unsafe { System.dealloc(ptr, layout) };
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, old: Layout, new_size: usize) -> *mut u8 {
+            let new_ptr = unsafe { System.realloc(ptr, old, new_size) };
+            if !new_ptr.is_null() {
+                record_deallocation(old.size());
+                record_allocation(new_size);
+            }
+            new_ptr
+        }
+    }
+
+    #[global_allocator]
+    static GLOBAL: CountingAllocator = CountingAllocator;
+
+    pub struct Snapshot {
+        allocations: u64,
+        deallocations: u64,
+        allocated_bytes: u64,
+        deallocated_bytes: u64,
+        live_bytes: u64,
+        peak_live_bytes: u64,
+        bins: [u64; 12],
+        bin_bytes: [u64; 12],
+    }
+
+    impl Snapshot {
+        pub fn now() -> Self {
+            Self {
+                allocations: ALLOCATIONS.load(Ordering::Relaxed),
+                deallocations: DEALLOCATIONS.load(Ordering::Relaxed),
+                allocated_bytes: ALLOCATED_BYTES.load(Ordering::Relaxed),
+                deallocated_bytes: DEALLOCATED_BYTES.load(Ordering::Relaxed),
+                live_bytes: LIVE_BYTES.load(Ordering::Relaxed),
+                peak_live_bytes: PEAK_LIVE_BYTES.load(Ordering::Relaxed),
+                bins: std::array::from_fn(|i| BINS[i].load(Ordering::Relaxed)),
+                bin_bytes: std::array::from_fn(|i| BIN_BYTES[i].load(Ordering::Relaxed)),
+            }
+        }
+
+        pub fn report_since(&self, before: &Self, label: &str, repetitions: usize) {
+            println!(
+                "alloc_profile cell={label:?} repetitions={repetitions} calls={} frees={} \
+                 allocated_bytes={} deallocated_bytes={} live_delta={} peak_above_baseline={}",
+                self.allocations - before.allocations,
+                self.deallocations - before.deallocations,
+                self.allocated_bytes - before.allocated_bytes,
+                self.deallocated_bytes - before.deallocated_bytes,
+                self.live_bytes as i128 - before.live_bytes as i128,
+                self.peak_live_bytes.saturating_sub(before.live_bytes),
+            );
+            for index in 0..LIMITS.len() {
+                let count = self.bins[index] - before.bins[index];
+                if count != 0 {
+                    println!(
+                        "alloc_bin upper={} count={} bytes={}",
+                        LIMITS[index],
+                        count,
+                        self.bin_bytes[index] - before.bin_bytes[index],
+                    );
+                }
+            }
+        }
+    }
+
+    pub fn reset_peak_to_live() {
+        PEAK_LIVE_BYTES.store(LIVE_BYTES.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+}
+
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use triblespace::core::query::TriblePattern;
 use triblespace::core::trible::TribleSet;
@@ -582,6 +712,25 @@ fn parse_arg(position: usize, default: usize) -> usize {
 }
 
 #[cfg(not(engine_prefix_checkpoints))]
+fn profile_cell<I, F>(label: &str, expected: &[Pair], repetitions: usize, mut make: F)
+where
+    I: Iterator<Item = Pair>,
+    F: FnMut() -> I,
+{
+    let expected = tally(expected.iter().copied());
+    println!("profile cell={label:?} repetitions={repetitions}");
+    #[cfg(engine_allocation_probe)]
+    allocation_probe::reset_peak_to_live();
+    #[cfg(engine_allocation_probe)]
+    let before = allocation_probe::Snapshot::now();
+    for _ in 0..repetitions {
+        assert_eq!(black_box(tally(make())), expected);
+    }
+    #[cfg(engine_allocation_probe)]
+    allocation_probe::Snapshot::now().report_since(&before, label, repetitions);
+}
+
+#[cfg(not(engine_prefix_checkpoints))]
 fn main() {
     let component_count = parse_arg(1, 32);
     let ring_size = parse_arg(2, 64);
@@ -655,6 +804,34 @@ fn main() {
         "SuccinctArchive sibling",
     );
     println!("oracle parity: all seven query/backend cells exact");
+
+    if let Ok(cell) = std::env::var("ENGINE_PROFILE_CELL") {
+        match cell.as_str() {
+            "finite-trible" => profile_cell(&cell, &finite_expected, repetitions, || {
+                finite_union_query!(&fixture.graph, &fixture)
+            }),
+            "finite-succinct" => profile_cell(&cell, &finite_expected, repetitions, || {
+                finite_union_query!(&archive, &fixture)
+            }),
+            "formula-trible" => profile_cell(&cell, &nested_expected, repetitions, || {
+                nested_formula_query!(&fixture.graph, &fixture)
+            }),
+            "formula-succinct" => profile_cell(&cell, &nested_expected, repetitions, || {
+                nested_formula_query!(&archive, &fixture)
+            }),
+            "cyclic-trible" => profile_cell(&cell, &rpq_expected, repetitions, || {
+                cyclic_rpq_query!(&fixture)
+            }),
+            "mixed-trible" => profile_cell(&cell, &mixed_expected, repetitions, || {
+                mixed_formula_rpq_query!(&fixture.graph, &fixture)
+            }),
+            "mixed-succinct" => profile_cell(&cell, &mixed_expected, repetitions, || {
+                mixed_formula_rpq_query!(&archive, &fixture)
+            }),
+            _ => panic!("unknown ENGINE_PROFILE_CELL {cell:?}"),
+        }
+        return;
+    }
 
     bench_case(
         "finite OR-of-AND",
@@ -1007,6 +1184,15 @@ where
             checkpoint_index += 1;
         }
     }
+
+    for _ in query.by_ref() {
+        rows += 1;
+    }
+    let (current_width, stats) = snapshot(&query);
+    println!(
+        "residual_stats cell={label:?} checkpoint=full rows={rows} current_width={current_width} \
+         stats={stats}",
+    );
 }
 
 #[cfg(engine_prefix_checkpoints)]
