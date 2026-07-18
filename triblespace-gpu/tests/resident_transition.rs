@@ -113,7 +113,7 @@ fn concatenate(left: &ProgramFrontier, right: &ProgramFrontier) -> ProgramFronti
 }
 
 fn assert_exact_parity(
-    resident_program: &WgpuQueryProgram<'_, '_, OrderedUniverse>,
+    resident_program: &WgpuQueryProgram<'_, OrderedUniverse>,
     program: &QueryProgram<'_, OrderedUniverse>,
     target: ProgramVariable,
     parent: &ProgramFrontier,

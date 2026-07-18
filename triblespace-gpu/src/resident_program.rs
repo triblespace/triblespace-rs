@@ -27,13 +27,14 @@ use std::error::Error;
 use std::fmt;
 
 use cubecl::prelude::*;
-use jerky::bit_vector::{NumBits, Select};
+use jerky::bit_vector::NumBits;
 use jerky::gpu::DeviceU32Buffer;
 use crate::budgeted::{
     BudgetContractError, CohortGrants, CohortReceipts, InputReceipt, PhysicalCursor,
 };
 use crate::query_program::{
-    ProgramFrontier, ProgramPattern, ProgramTerm, ProgramVariable, QueryProgram, QueryProgramError,
+    ArchiveCode, ProgramFrontier, ProgramPattern, ProgramTerm, ProgramVariable, QueryProgram,
+    QueryProgramError,
 };
 use triblespace_core::blob::encodings::succinctarchive::{SuccinctRotation, Universe};
 
@@ -141,14 +142,21 @@ impl From<jerky::Error> for ResidentTransitionError {
 /// resident, and read one packed buffer only at their public result boundary.
 /// General proposer selection, sibling confirmation, and unrelated fully
 /// bound pattern viability remain outside this specialization.
-pub struct WgpuQueryProgram<'program, 'archive, U>
+pub struct WgpuQueryProgram<'archive, U>
 where
     U: Universe,
 {
-    program: &'program QueryProgram<'archive, U>,
+    /// The resident snapshot every buffer and code in this executor is
+    /// meaningful against. The compiled [`QueryProgram`] is *not* borrowed:
+    /// its tiny admitted metadata (variable count, the single pattern, the
+    /// target variable) is copied at construction so an owning scheduler can
+    /// hold the program and this executor side by side.
     resident: &'archive WgpuSuccinctArchive<U>,
+    variable_count: usize,
     pattern: ProgramPattern,
     target: ProgramVariable,
+    /// Cached from [`WgpuSuccinctArchive::max_ea_fanout`]; the O(pairs)
+    /// one-run scan runs once per resident wrap, never per compilation.
     max_ea_fanout: usize,
 }
 
@@ -192,7 +200,7 @@ struct EavGeometry {
     value_rows: usize,
 }
 
-impl<'program, 'archive, U> WgpuQueryProgram<'program, 'archive, U>
+impl<'archive, U> WgpuQueryProgram<'archive, U>
 where
     U: Universe,
 {
@@ -204,8 +212,12 @@ where
     /// or row-viability obligations. Pointer identity is checked even for
     /// byte-identical archives because compact codes are snapshot-local and
     /// Jerky buffers from separate contexts must never compose.
+    ///
+    /// Only the program's admitted metadata is retained; the borrow ends with
+    /// this call, so a caller may own the compiled [`QueryProgram`] and this
+    /// executor in one struct.
     pub fn new(
-        program: &'program QueryProgram<'archive, U>,
+        program: &QueryProgram<'archive, U>,
         resident: &'archive WgpuSuccinctArchive<U>,
     ) -> Result<Self, ResidentTransitionError> {
         let [pattern] = program.patterns() else {
@@ -224,19 +236,18 @@ where
             return Err(ResidentTransitionError::ArchiveMismatch);
         }
         validate_archive_geometry(archive)?;
-        let max_ea_fanout = max_one_run(&archive.changed_e_a);
 
         Ok(Self {
-            program,
             resident,
+            variable_count: program.variable_count(),
             pattern: *pattern,
             target,
-            max_ea_fanout,
+            max_ea_fanout: resident.max_ea_fanout(),
         })
     }
 
     /// Returns the exact maximum number of values under any canonical `(E,A)`
-    /// pair, cached during resident setup from `changed_e_a` one-runs.
+    /// pair, cached once per resident wrap from `changed_e_a` one-runs.
     pub fn max_ea_fanout(&self) -> usize {
         self.max_ea_fanout
     }
@@ -260,7 +271,7 @@ where
         seed_rows: usize,
     ) -> Result<ProgramFrontier, ResidentTransitionError> {
         let admission = self.validate_eav_admission()?;
-        let geometry = eav_geometry(self.program.archive(), seed_rows)?;
+        let geometry = eav_geometry(self.resident.archive(), seed_rows)?;
         let context = self.resident.context();
         let mut status = context.upload_u32(&[STATUS_OK, geometry.value_rows as u32])?;
 
@@ -724,15 +735,48 @@ where
             (None, None) => None,
             _ => return Err(ResidentTransitionError::DeviceInvariant),
         };
-        let child = self
-            .program
-            .frontier_from_indices(
-                child_variables,
-                packed[HEADER_WORDS..used_words].to_vec(),
-                observed_rows,
-            )
-            .map_err(ResidentTransitionError::Program)?;
+        let child = self.checked_frontier(
+            child_variables,
+            &packed[HEADER_WORDS..used_words],
+            observed_rows,
+        )?;
         Ok((child, receipts))
+    }
+
+    /// Reifies one packed device code buffer against the owned metadata.
+    ///
+    /// This matches `QueryProgram::frontier_from_indices` for the admitted
+    /// arm: `ProgramFrontier::new` performs the shape and variable checks and
+    /// every code is checked against the exact resident snapshot's domain.
+    fn checked_frontier(
+        &self,
+        variables: Vec<ProgramVariable>,
+        values: &[u32],
+        row_count: usize,
+    ) -> Result<ProgramFrontier, ResidentTransitionError> {
+        let domain_len = self.resident.archive().domain.len();
+        let mut codes = Vec::with_capacity(values.len());
+        for &value in values {
+            let code = ArchiveCode::from_backend(value);
+            if code.index() >= domain_len {
+                return Err(ResidentTransitionError::Program(
+                    QueryProgramError::CodeOutOfBounds(code),
+                ));
+            }
+            codes.push(code);
+        }
+        for &variable in &variables {
+            if variable.index() >= self.variable_count {
+                return Err(ResidentTransitionError::Program(
+                    QueryProgramError::VariableOutOfBounds {
+                        variable,
+                        variable_count: self.variable_count,
+                    },
+                ));
+            }
+        }
+        ProgramFrontier::new(variables, codes, row_count)
+            .map_err(ResidentTransitionError::Program)
     }
 
     /// All-inputs-exhausted receipts for legs that perform no device work
@@ -814,7 +858,7 @@ where
                 "execute_eav requires one all-variable pattern",
             ));
         };
-        if self.program.variable_count() != 3 {
+        if self.variable_count != 3 {
             return Err(ResidentTransitionError::UnsupportedArm(
                 "execute_eav requires exactly three program variables",
             ));
@@ -1293,13 +1337,7 @@ where
             ProgramVariable::new(1),
             ProgramVariable::new(2),
         ];
-        self.program
-            .frontier_from_indices(
-                variables,
-                packed[HEADER_WORDS..].to_vec(),
-                geometry.value_rows,
-            )
-            .map_err(ResidentTransitionError::Program)
+        self.checked_frontier(variables, &packed[HEADER_WORDS..], geometry.value_rows)
     }
 
     fn validate_transition(
@@ -1307,11 +1345,11 @@ where
         variable: ProgramVariable,
         frontier: &ProgramFrontier,
     ) -> Result<AdmittedTransition, ResidentTransitionError> {
-        if variable.index() >= self.program.variable_count() {
+        if variable.index() >= self.variable_count {
             return Err(ResidentTransitionError::Program(
                 QueryProgramError::VariableOutOfBounds {
                     variable,
-                    variable_count: self.program.variable_count(),
+                    variable_count: self.variable_count,
                 },
             ));
         }
@@ -1325,23 +1363,23 @@ where
                 "only the pattern's value variable is resident",
             ));
         }
-        if frontier.variables().len() + 1 != self.program.variable_count() {
+        if frontier.variables().len() + 1 != self.variable_count {
             return Err(ResidentTransitionError::UnsupportedArm(
                 "every non-target program variable must already be bound",
             ));
         }
         for &bound in frontier.variables() {
-            if bound.index() >= self.program.variable_count() {
+            if bound.index() >= self.variable_count {
                 return Err(ResidentTransitionError::Program(
                     QueryProgramError::VariableOutOfBounds {
                         variable: bound,
-                        variable_count: self.program.variable_count(),
+                        variable_count: self.variable_count,
                     },
                 ));
             }
         }
         for &code in frontier.values() {
-            if code.index() >= self.program.archive().domain.len() {
+            if code.index() >= self.resident.archive().domain.len() {
                 return Err(ResidentTransitionError::Program(
                     QueryProgramError::CodeOutOfBounds(code),
                 ));
@@ -1420,28 +1458,6 @@ fn child_variables(frontier: &ProgramFrontier, variable: ProgramVariable) -> Vec
     let mut variables = frontier.variables().to_vec();
     variables.insert(insertion, variable);
     variables
-}
-
-fn max_one_run<I>(changed: &jerky::bit_vector::BitVector<I>) -> usize
-where
-    I: jerky::bit_vector::BitVectorIndex,
-{
-    let ones = changed.num_ones();
-    let mut maximum = 0usize;
-    for rank in 0..ones {
-        let start = changed
-            .select1(rank)
-            .expect("valid changed-pair bit vector has every advertised one");
-        let end = if rank + 1 < ones {
-            changed
-                .select1(rank + 1)
-                .expect("valid changed-pair bit vector has every advertised one")
-        } else {
-            changed.num_bits()
-        };
-        maximum = maximum.max(end - start);
-    }
-    maximum
 }
 
 fn eav_geometry<U: Universe>(

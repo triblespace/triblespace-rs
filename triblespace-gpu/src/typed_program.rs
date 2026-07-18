@@ -213,13 +213,13 @@ struct StepOutcome {
 /// the Native interpreter.
 pub struct SuccinctProgramFamily<'p, 'a, U: Universe> {
     program: &'p QueryProgram<'a, U>,
-    device: Option<DeviceArm<'p, 'a, U>>,
+    device: Option<DeviceArm<'a, U>>,
     admission: BackendAdmissionPolicy,
 }
 
-struct DeviceArm<'p, 'a, U: Universe> {
+struct DeviceArm<'a, U: Universe> {
     resident: &'a WgpuSuccinctArchive<U>,
-    gpu: WgpuQueryProgram<'p, 'a, U>,
+    gpu: WgpuQueryProgram<'a, U>,
 }
 
 impl<'p, 'a, U: Universe> SuccinctProgramFamily<'p, 'a, U> {

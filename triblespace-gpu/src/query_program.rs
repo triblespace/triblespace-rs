@@ -71,6 +71,15 @@ impl ArchiveCode {
     fn from_index(index: usize) -> Self {
         Self(u32::try_from(index).expect("archive size was validated at compilation"))
     }
+
+    /// Reifies one backend `u32` lane value as an archive-local code.
+    ///
+    /// Crate-internal: the caller must have validated the value against the
+    /// exact owning snapshot's domain, exactly as
+    /// [`QueryProgram::frontier_from_indices`] does.
+    pub(crate) const fn from_backend(value: u32) -> Self {
+        Self(value)
+    }
 }
 
 /// One source-level triple-pattern term supplied to [`QueryProgram::compile`].

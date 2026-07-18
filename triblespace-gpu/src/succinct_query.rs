@@ -1,6 +1,6 @@
 //! WGPU-resident Ring columns and prefix data for [`SuccinctArchive`] queries.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::time::Instant;
 
 use jerky::bit_vector::rank9sel::Rank9SelIndex;
@@ -267,8 +267,88 @@ where
     eva_c: WgpuWaveletMatrix,
     /// Resident mirror of [`SuccinctArchive::aev_c`].
     aev_c: WgpuWaveletMatrix,
+    /// Exact maximum number of values under any canonical `(E,A)` pair,
+    /// computed once from `changed_e_a` one-runs at wrap time so per-program
+    /// compilation never rescans the pair boundaries.
+    max_ea_fanout: usize,
+    /// Nonblocking dispatch lease for the resident Program executor.
+    program_lease: DeviceLease,
     min_rank_batch: usize,
     stats: QueryStats,
+}
+
+/// Nonblocking lease over one resident snapshot's Program executor.
+///
+/// The typed-Program hard law says ready/latency-priority work never waits
+/// for an accelerator, so physical dispatch may proceed only through a
+/// successful [`DeviceLease::try_acquire`]: `Busy` (another cohort holds the
+/// lease) and `Failed` (a previous dispatch hit a device error) both fall
+/// through to Native immediately, without blocking. A `Preparing` state is
+/// reserved for future asynchronous residency setup; today construction is
+/// synchronous, so a freshly wrapped archive is born `Ready`.
+pub struct DeviceLease {
+    /// 0 = Ready, 1 = Busy, 2 = Failed.
+    state: AtomicU8,
+}
+
+const LEASE_READY: u8 = 0;
+const LEASE_BUSY: u8 = 1;
+const LEASE_FAILED: u8 = 2;
+
+impl DeviceLease {
+    fn new() -> Self {
+        Self {
+            state: AtomicU8::new(LEASE_READY),
+        }
+    }
+
+    /// Attempts to take the lease without waiting.
+    ///
+    /// Returns `None` when the executor is busy or failed; the caller must
+    /// then run Native. Dropping the guard returns the lease to `Ready`
+    /// unless the holder recorded a device failure.
+    pub fn try_acquire(&self) -> Option<DeviceLeaseGuard<'_>> {
+        self.state
+            .compare_exchange(
+                LEASE_READY,
+                LEASE_BUSY,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .ok()
+            .map(|_| DeviceLeaseGuard { lease: self })
+    }
+
+    /// Whether a previous holder recorded a permanent device failure.
+    pub fn is_failed(&self) -> bool {
+        self.state.load(Ordering::Relaxed) == LEASE_FAILED
+    }
+}
+
+/// Held lease over the resident Program executor.
+#[must_use = "dropping the guard releases the lease"]
+pub struct DeviceLeaseGuard<'l> {
+    lease: &'l DeviceLease,
+}
+
+impl DeviceLeaseGuard<'_> {
+    /// Marks the executor permanently failed; every later
+    /// [`DeviceLease::try_acquire`] declines nonblockingly.
+    pub fn fail(self) {
+        self.lease.state.store(LEASE_FAILED, Ordering::Release);
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for DeviceLeaseGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.lease.state.compare_exchange(
+            LEASE_BUSY,
+            LEASE_READY,
+            Ordering::Release,
+            Ordering::Relaxed,
+        );
+    }
 }
 
 /// Opt-in residual-action observation view over a [`WgpuSuccinctArchive`].
@@ -378,6 +458,7 @@ where
             "value",
         )?;
         validate_pair_changes(&archive, triple_count)?;
+        let max_ea_fanout = max_one_run(&archive.changed_e_a);
         let prefix_bytes = resident_bit_vector_bytes(archive.e_a.num_bits())
             + resident_bit_vector_bytes(archive.a_a.num_bits())
             + resident_bit_vector_bytes(archive.v_a.num_bits());
@@ -460,9 +541,23 @@ where
             vae_c,
             eva_c,
             aev_c,
+            max_ea_fanout,
+            program_lease: DeviceLease::new(),
             min_rank_batch: DEFAULT_MIN_RANK_BATCH,
             stats: QueryStats::new(),
         })
+    }
+
+    /// Returns the exact maximum number of values under any canonical
+    /// `(E,A)` pair, computed once at wrap time from `changed_e_a` one-runs.
+    pub fn max_ea_fanout(&self) -> usize {
+        self.max_ea_fanout
+    }
+
+    /// Returns the nonblocking dispatch lease of this snapshot's resident
+    /// Program executor.
+    pub fn program_lease(&self) -> &DeviceLease {
+        &self.program_lease
     }
 
     /// Sets the minimum non-empty rank stream dispatched to WGPU.
@@ -655,6 +750,32 @@ where
         self.record_rank_route(route, positions.len());
         ranks
     }
+}
+
+/// Longest run of Ring rows between consecutive ones of `changed`: for
+/// `changed_e_a` this is the exact maximum `(E,A)` value fanout. O(pairs),
+/// which is why it runs once per resident wrap rather than per compiled
+/// program.
+fn max_one_run<I>(changed: &BitVector<I>) -> usize
+where
+    I: jerky::bit_vector::BitVectorIndex,
+{
+    let ones = changed.num_ones();
+    let mut maximum = 0usize;
+    for rank in 0..ones {
+        let start = changed
+            .select1(rank)
+            .expect("valid changed-pair bit vector has every advertised one");
+        let end = if rank + 1 < ones {
+            changed
+                .select1(rank + 1)
+                .expect("valid changed-pair bit vector has every advertised one")
+        } else {
+            changed.num_bits()
+        };
+        maximum = maximum.max(end - start);
+    }
+    maximum
 }
 
 fn validate_pair_changes<U>(archive: &SuccinctArchive<U>, triple_count: usize) -> jerky::Result<()>
