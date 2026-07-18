@@ -83,7 +83,7 @@ fn assert_every_slice_matches_transition(
         for offset in 0..=full.len() {
             for limit in 1..=full.len() + 2 {
                 let page = program
-                    .transition_on_value_page(target, &singleton, &[offset], &[limit])
+                    .transition_on_two_bound_page(target, &singleton, &[offset], &[limit])
                     .unwrap()
                     .expect("fixture uses the admitted one-pattern value arm");
                 let examined = limit.min(full.len() - offset);
@@ -119,7 +119,7 @@ fn assert_batched_pages_reconstruct_transition(
             .map(|input| 1 + (round + input * 2) % 4)
             .collect();
         let page = program
-            .transition_on_value_page(target, parent, &offsets, &limits)
+            .transition_on_two_bound_page(target, parent, &offsets, &limits)
             .unwrap()
             .expect("fixture uses the admitted one-pattern value arm");
         let mut child_row = 0usize;
@@ -148,91 +148,145 @@ fn assert_batched_pages_reconstruct_transition(
 }
 
 #[test]
-fn variable_peer_pages_are_exact_for_every_offset_limit_and_target_column() {
+fn variable_peer_pages_are_exact_for_all_axes_schemas_and_target_columns() {
     let (archive, entities, attributes, values) = fixture();
-    let rows = vec![
-        vec![entities[3], attributes[0]],
-        vec![entities[1], attributes[0]],
-        vec![entities[3], attributes[0]], // duplicate parent occurrence
-        vec![entities[0], attributes[0]], // real E/A pair with no values
-        vec![values[5], attributes[0]],   // domain-valid but absent entity peer
-        vec![entities[3], values[5]],     // domain-valid but absent attribute peer
+    let peer_rows = [
+        // (A,V) -> E, including a duplicate and a domain-valid empty pair.
+        vec![
+            [entities[0], attributes[0], values[0]],
+            [entities[0], attributes[0], values[5]],
+            [entities[0], attributes[0], values[0]],
+            [entities[0], attributes[1], values[0]],
+        ],
+        // (E,V) -> A, including a two-attribute pair and an empty pair.
+        vec![
+            [entities[3], attributes[0], values[4]],
+            [entities[3], attributes[0], values[0]],
+            [entities[3], attributes[0], values[4]],
+            [entities[0], attributes[0], values[0]],
+        ],
+        // (E,A) -> V, including duplicate, empty, and wrong-axis peers.
+        vec![
+            [entities[3], attributes[0], values[0]],
+            [entities[1], attributes[0], values[0]],
+            [entities[3], attributes[0], values[0]],
+            [entities[0], attributes[0], values[0]],
+            [values[5], attributes[0], values[0]],
+            [entities[3], values[5], values[0]],
+        ],
     ];
 
-    for (target_index, entity_index, attribute_index) in [(0, 1, 2), (1, 0, 2), (2, 0, 1)] {
-        let target = ProgramVariable::new(target_index);
-        let entity = ProgramVariable::new(entity_index);
-        let attribute = ProgramVariable::new(attribute_index);
-        let program =
-            QueryProgram::compile(&archive, 3, [QueryPattern::new(entity, attribute, target)])
-                .unwrap();
-        let mut parent_variables = vec![entity, attribute];
-        parent_variables.sort_unstable();
-        let parent = frontier(&program, parent_variables, rows.clone());
+    for (target_axis, target_peer_rows) in peer_rows.iter().enumerate() {
+        for target_index in 0..3 {
+            let target = ProgramVariable::new(target_index);
+            let mut axis_variables = [target; 3];
+            let mut peer_indices = (0..3).filter(|&index| index != target_index);
+            for (axis, variable) in axis_variables.iter_mut().enumerate() {
+                if axis != target_axis {
+                    *variable = ProgramVariable::new(peer_indices.next().unwrap());
+                }
+            }
+            let program = QueryProgram::compile(
+                &archive,
+                3,
+                [QueryPattern::new(
+                    axis_variables[0],
+                    axis_variables[1],
+                    axis_variables[2],
+                )],
+            )
+            .unwrap();
+            let mut parent_axes: Vec<_> = (0..3)
+                .filter(|&axis| axis != target_axis)
+                .map(|axis| (axis_variables[axis], axis))
+                .collect();
+            parent_axes.sort_unstable_by_key(|&(variable, _)| variable);
+            let parent_variables = parent_axes.iter().map(|&(variable, _)| variable).collect();
+            let rows = target_peer_rows
+                .iter()
+                .map(|triple| parent_axes.iter().map(|&(_, axis)| triple[axis]).collect());
+            let parent = frontier(&program, parent_variables, rows);
 
-        assert_every_slice_matches_transition(&program, target, &parent);
-        assert_batched_pages_reconstruct_transition(&program, target, &parent);
+            assert_every_slice_matches_transition(&program, target, &parent);
+            assert_batched_pages_reconstruct_transition(&program, target, &parent);
 
-        let empty_parent =
-            ProgramFrontier::new(parent.variables().to_vec(), Vec::new(), 0).unwrap();
-        let empty_page = program
-            .transition_on_value_page(target, &empty_parent, &[], &[])
-            .unwrap()
-            .expect("an empty batch retains the admitted schema");
-        assert_eq!(
-            empty_page.child(),
-            &program.transition_on(target, &empty_parent).unwrap()
-        );
-        assert!(empty_page.receipts().is_empty());
+            let empty_parent =
+                ProgramFrontier::new(parent.variables().to_vec(), Vec::new(), 0).unwrap();
+            let empty_page = program
+                .transition_on_two_bound_page(target, &empty_parent, &[], &[])
+                .unwrap()
+                .expect("an empty batch retains the admitted two-bound schema");
+            assert_eq!(
+                empty_page.child(),
+                &program.transition_on(target, &empty_parent).unwrap()
+            );
+            assert!(empty_page.receipts().is_empty());
+        }
     }
 }
 
 #[test]
-fn constant_and_missing_peer_pages_match_the_reference_and_preserve_seed_multiplicity() {
-    let (archive, entities, attributes, _values) = fixture();
-    let target = ProgramVariable::new(0);
-    let constants = QueryProgram::compile(
-        &archive,
-        1,
-        [QueryPattern::new(
-            QueryTerm::Constant(raw(entities[3])),
-            QueryTerm::Constant(raw(attributes[0])),
-            target,
-        )],
-    )
-    .unwrap();
-    let virtual_parents = ProgramFrontier::new(Vec::new(), Vec::new(), 3).unwrap();
-    assert_every_slice_matches_transition(&constants, target, &virtual_parents);
-    assert_batched_pages_reconstruct_transition(&constants, target, &virtual_parents);
+fn constant_and_missing_peer_pages_cover_all_axes_and_preserve_seed_multiplicity() {
+    let (archive, entities, attributes, values) = fixture();
+    let witness = [entities[3], attributes[0], values[0]];
 
-    let missing = QueryProgram::compile(
-        &archive,
-        1,
-        [QueryPattern::new(
-            QueryTerm::Constant(raw(fixture_id(9, 0))),
-            QueryTerm::Constant(raw(attributes[0])),
-            target,
-        )],
-    )
-    .unwrap();
-    let page = missing
-        .transition_on_value_page(target, &ProgramFrontier::seed(), &[0], &[7])
-        .unwrap()
-        .expect("a missing peer is an admitted empty interval");
-    assert!(page.child().is_empty());
-    assert_eq!(page.receipts()[0].examined(), 0);
-    assert_eq!(page.receipts()[0].next_offset(), None);
-    assert_eq!(
-        page.child(),
-        &missing
-            .transition_on(target, &ProgramFrontier::seed())
+    for target_axis in 0..3 {
+        let target = ProgramVariable::new(0);
+        let terms: [QueryTerm; 3] = std::array::from_fn(|axis| {
+            if axis == target_axis {
+                QueryTerm::Variable(target)
+            } else {
+                QueryTerm::Constant(raw(witness[axis]))
+            }
+        });
+        let constants = QueryProgram::compile(
+            &archive,
+            1,
+            [QueryPattern::new(terms[0], terms[1], terms[2])],
+        )
+        .unwrap();
+        let virtual_parents = ProgramFrontier::new(Vec::new(), Vec::new(), 3).unwrap();
+        assert_every_slice_matches_transition(&constants, target, &virtual_parents);
+        assert_batched_pages_reconstruct_transition(&constants, target, &virtual_parents);
+
+        let missing_terms: [QueryTerm; 3] = std::array::from_fn(|axis| {
+            if axis == target_axis {
+                QueryTerm::Variable(target)
+            } else if axis == (target_axis + 1) % 3 {
+                QueryTerm::Constant(raw(fixture_id(9, target_axis)))
+            } else {
+                QueryTerm::Constant(raw(witness[axis]))
+            }
+        });
+        let missing = QueryProgram::compile(
+            &archive,
+            1,
+            [QueryPattern::new(
+                missing_terms[0],
+                missing_terms[1],
+                missing_terms[2],
+            )],
+        )
+        .unwrap();
+        let page = missing
+            .transition_on_two_bound_page(target, &ProgramFrontier::seed(), &[0], &[7])
             .unwrap()
-    );
+            .expect("a missing peer is an admitted empty interval");
+        assert!(page.child().is_empty());
+        assert_eq!(page.receipts()[0].examined(), 0);
+        assert_eq!(page.receipts()[0].next_offset(), None);
+        assert_eq!(
+            page.child(),
+            &missing
+                .transition_on(target, &ProgramFrontier::seed())
+                .unwrap()
+        );
+    }
 }
 
 #[test]
 fn page_contract_fails_closed_and_declines_every_nonresident_shape() {
-    let (archive, entities, attributes, values) = fixture();
+    let (archive, entities, attributes, _values) = fixture();
     let e = ProgramVariable::new(0);
     let a = ProgramVariable::new(1);
     let v = ProgramVariable::new(2);
@@ -242,9 +296,9 @@ fn page_contract_fails_closed_and_declines_every_nonresident_shape() {
 
     assert_eq!(
         program
-            .transition_on_value_page(v, &parent, &[], &[1])
+            .transition_on_two_bound_page(v, &parent, &[], &[1])
             .unwrap_err(),
-        QueryProgramError::ValuePageShape {
+        QueryProgramError::TwoBoundPageShape {
             rows: 1,
             offsets: 0,
             limits: 1,
@@ -252,15 +306,15 @@ fn page_contract_fails_closed_and_declines_every_nonresident_shape() {
     );
     assert_eq!(
         program
-            .transition_on_value_page(v, &parent, &[0], &[0])
+            .transition_on_two_bound_page(v, &parent, &[0], &[0])
             .unwrap_err(),
-        QueryProgramError::ZeroValuePageLimit { input: 0 }
+        QueryProgramError::ZeroTwoBoundPageLimit { input: 0 }
     );
     assert_eq!(
         program
-            .transition_on_value_page(v, &parent, &[interval + 1], &[1])
+            .transition_on_two_bound_page(v, &parent, &[interval + 1], &[1])
             .unwrap_err(),
-        QueryProgramError::ValuePageOffsetBeyondInterval {
+        QueryProgramError::TwoBoundPageOffsetBeyondInterval {
             input: 0,
             offset: interval + 1,
             interval,
@@ -269,7 +323,7 @@ fn page_contract_fails_closed_and_declines_every_nonresident_shape() {
 
     let peer_unbound = frontier(&program, vec![e], [vec![entities[3]]]);
     assert!(program
-        .transition_on_value_page(v, &peer_unbound, &[0], &[1])
+        .transition_on_two_bound_page(v, &peer_unbound, &[0], &[1])
         .unwrap()
         .is_none());
 
@@ -281,19 +335,7 @@ fn page_contract_fails_closed_and_declines_every_nonresident_shape() {
     .unwrap();
     let multi_parent = frontier(&multi, vec![e, a], [vec![entities[3], attributes[0]]]);
     assert!(multi
-        .transition_on_value_page(v, &multi_parent, &[0], &[1])
-        .unwrap()
-        .is_none());
-
-    let constant_value = QueryProgram::compile(
-        &archive,
-        2,
-        [QueryPattern::new(e, a, QueryTerm::Constant(raw(values[0])))],
-    )
-    .unwrap();
-    let constant_parent = frontier(&constant_value, vec![a], [vec![attributes[0]]]);
-    assert!(constant_value
-        .transition_on_value_page(e, &constant_parent, &[0], &[1])
+        .transition_on_two_bound_page(v, &multi_parent, &[0], &[1])
         .unwrap()
         .is_none());
 }

@@ -1,20 +1,17 @@
 //! First archive-resident Ring pipelines for one [`QueryProgram`] pattern.
 //!
-//! This module deliberately specializes one honest, useful Ring arm:
-//! `transition_on(V)` for a single pattern whose entity and attribute terms
-//! are already bound (or constants). The specialization is explicit because a
+//! This module deliberately specializes one honest Ring family:
+//! `transition_on(target)` for a single pattern whose other two terms are
+//! already bound (or constants). The specialization is explicit because a
 //! general program must additionally reproduce per-row proposer selection,
 //! sibling confirmation, and unrelated fully-bound pattern viability.
 //!
-//! For each parent row the device evaluates the canonical two-bound Ring
-//! formulas `e0 = select1(e_a, e) - e`,
-//! `e1 = select1(e_a, e + 1) - (e + 1)`, then
-//! `rank(eva_c, e1, a) - rank(eva_c, e0, a)`. The resulting rank interval is
-//! translated by `select1(a_a, a) - a` and accessed through `aev_c`. A
-//! canonical `TribleSet` stores each `(E,A,V)` once, so the CPU oracle's
-//! first-occurrence `.unique()` is a no-op for this exact interval. Stable
-//! parent scans and contiguous AEV access therefore preserve CPU order and
-//! duplicate parent rows without a global deduplication stage.
+//! A typed rotation descriptor selects the first/last axis prefixes, the Ring
+//! that ranks the last peer inside the first-peer range, and the Ring that
+//! exposes the target. A canonical `TribleSet` stores each `(E,A,V)` once, so
+//! the CPU oracle's first-occurrence `.unique()` is a no-op for this exact
+//! interval. Stable parent scans and contiguous target access therefore
+//! preserve CPU order and duplicate parent rows without global deduplication.
 //!
 //! [`WgpuQueryProgram::execute_eav`] additionally admits one all-variable
 //! pattern (including every permutation of variable IDs across the axes) and
@@ -26,16 +23,16 @@
 use std::error::Error;
 use std::fmt;
 
-use cubecl::prelude::*;
-use jerky::bit_vector::NumBits;
-use jerky::gpu::DeviceU32Buffer;
 use crate::budgeted::{
     BudgetContractError, CohortGrants, CohortReceipts, InputReceipt, PhysicalCursor,
 };
 use crate::query_program::{
-    ArchiveCode, ProgramFrontier, ProgramPattern, ProgramTerm, ProgramVariable, QueryProgram,
-    QueryProgramError,
+    ArchiveCode, ProgramAxis, ProgramFrontier, ProgramPattern, ProgramTerm, ProgramVariable,
+    QueryProgram, QueryProgramError, TwoBoundRotation,
 };
+use cubecl::prelude::*;
+use jerky::bit_vector::NumBits;
+use jerky::gpu::DeviceU32Buffer;
 use triblespace_core::blob::encodings::succinctarchive::{SuccinctRotation, Universe};
 
 use crate::succinct_query::{WgpuContext, WgpuSuccinctArchive};
@@ -135,7 +132,7 @@ impl From<jerky::Error> for ResidentTransitionError {
 
 /// WGPU-resident executor for two deliberately narrow single-pattern paths.
 ///
-/// [`Self::transition_on`] implements the two-bound `(E,A) -> V` arm.
+/// [`Self::transition_on`] implements any one-pattern two-bound target arm.
 /// [`Self::execute_eav`] implements a forced all-variable `E -> A -> V` chain.
 /// Both borrow the compatibility domain already owned by
 /// [`WgpuSuccinctArchive`], keep intermediate navigation and scatter state
@@ -148,16 +145,12 @@ where
 {
     /// The resident snapshot every buffer and code in this executor is
     /// meaningful against. The compiled [`QueryProgram`] is *not* borrowed:
-    /// its tiny admitted metadata (variable count, the single pattern, the
-    /// target variable) is copied at construction so an owning scheduler can
+    /// its tiny admitted metadata (variable count and the single pattern) is
+    /// copied at construction so an owning scheduler can
     /// hold the program and this executor side by side.
     resident: &'archive WgpuSuccinctArchive<U>,
     variable_count: usize,
     pattern: ProgramPattern,
-    target: ProgramVariable,
-    /// Cached from [`WgpuSuccinctArchive::max_ea_fanout`]; the O(pairs)
-    /// one-run scan runs lazily once per snapshot, never per compilation.
-    max_ea_fanout: usize,
 }
 
 /// Private physical frontier passed between the first two resident stages.
@@ -206,8 +199,9 @@ where
 {
     /// Compiles against an already resident archive snapshot.
     ///
-    /// The program must contain exactly one pattern and its value term must be
-    /// a variable. This fail-closed admission rule prevents this first probe
+    /// The program must contain exactly one pattern. Transition admission later
+    /// requires the host-selected variable to occupy one axis and the other two
+    /// terms to be resolved. This fail-closed rule prevents the specialization
     /// from silently skipping the general interpreter's proposer, confirmer,
     /// or row-viability obligations. Pointer identity is checked even for
     /// byte-identical archives because compact codes are snapshot-local and
@@ -225,12 +219,6 @@ where
                 "exactly one pattern is required",
             ));
         };
-        let ProgramTerm::Variable(target) = pattern.value else {
-            return Err(ResidentTransitionError::UnsupportedArm(
-                "the selected resident arm must bind the value term",
-            ));
-        };
-
         let archive = program.archive();
         if !std::ptr::eq(archive, resident.archive()) {
             return Err(ResidentTransitionError::ArchiveMismatch);
@@ -241,15 +229,7 @@ where
             resident,
             variable_count: program.variable_count(),
             pattern: *pattern,
-            target,
-            max_ea_fanout: resident.max_ea_fanout(),
         })
-    }
-
-    /// Returns the exact maximum number of values under any canonical `(E,A)`
-    /// pair, cached lazily once per snapshot from `changed_e_a` one-runs.
-    pub fn max_ea_fanout(&self) -> usize {
-        self.max_ea_fanout
     }
 
     /// Executes one all-variable pattern through a forced resident
@@ -287,13 +267,15 @@ where
     }
 
     /// Executes the admitted two-bound transition with a checked no-readback
-    /// capacity bound of `frontier.len() * max_ea_fanout()`.
+    /// capacity bound from this target's exact pair rotation.
     pub fn transition_on(
         &self,
         variable: ProgramVariable,
         frontier: &ProgramFrontier,
     ) -> Result<ProgramFrontier, ResidentTransitionError> {
-        let capacity = frontier.len().checked_mul(self.max_ea_fanout).ok_or(
+        let admitted = self.validate_transition(variable, frontier)?;
+        let max_fanout = self.resident.max_pair_fanout(admitted.rotation.pair);
+        let capacity = frontier.len().checked_mul(max_fanout).ok_or(
             ResidentTransitionError::GeometryOverflow("child-row capacity"),
         )?;
         self.transition_on_with_capacity(variable, frontier, capacity)
@@ -311,7 +293,8 @@ where
         frontier: &ProgramFrontier,
         child_capacity: usize,
     ) -> Result<ProgramFrontier, ResidentTransitionError> {
-        let (child, _receipts) = self.transition_with_grants(variable, frontier, child_capacity, None)?;
+        let (child, _receipts) =
+            self.transition_with_grants(variable, frontier, child_capacity, None)?;
         Ok(child)
     }
 
@@ -375,9 +358,9 @@ where
             ));
         }
         if let Some(input) = grants.as_slice().iter().position(|&limit| limit == 0) {
-            return Err(ResidentTransitionError::Budget(BudgetContractError::ZeroGrant {
-                input,
-            }));
+            return Err(ResidentTransitionError::Budget(
+                BudgetContractError::ZeroGrant { input },
+            ));
         }
         let mut granted: usize = 0;
         for &limit in grants.as_slice() {
@@ -385,16 +368,14 @@ where
                 ResidentTransitionError::GeometryOverflow("granted child capacity"),
             )?;
         }
-        let envelope = frontier.len().checked_mul(self.max_ea_fanout).ok_or(
+        let admitted = self.validate_transition(variable, frontier)?;
+        let max_fanout = self.resident.max_pair_fanout(admitted.rotation.pair);
+        let envelope = frontier.len().checked_mul(max_fanout).ok_or(
             ResidentTransitionError::GeometryOverflow("child-row capacity"),
         )?;
         let child_capacity = granted.min(envelope);
-        let (child, receipts) = self.transition_with_grants(
-            variable,
-            frontier,
-            child_capacity,
-            Some((grants, bases)),
-        )?;
+        let (child, receipts) =
+            self.transition_with_grants(variable, frontier, child_capacity, Some((grants, bases)))?;
         let receipts = receipts.ok_or(ResidentTransitionError::DeviceInvariant)?;
         Ok((child, receipts))
     }
@@ -407,6 +388,7 @@ where
         grants: Option<(&CohortGrants, &[u32])>,
     ) -> Result<(ProgramFrontier, Option<CohortReceipts>), ResidentTransitionError> {
         let admitted = self.validate_transition(variable, frontier)?;
+        let max_fanout = self.resident.max_pair_fanout(admitted.rotation.pair);
         let child_variables = child_variables(frontier, variable);
         if frontier.is_empty() || admitted.missing {
             let child = ProgramFrontier::new(child_variables, Vec::new(), 0)
@@ -434,13 +416,15 @@ where
         let parent_stride = frontier.variables().len();
         let child_stride = child_variables.len();
         let context = self.resident.context();
-        let entity_prefix = self.resident.entity_prefix();
-        let attribute_prefix = self.resident.attribute_prefix();
-        let eva_c = self.resident.ring_col(SuccinctRotation::Eva);
-        let aev_c = self.resident.ring_col(SuccinctRotation::Aev);
-        let safe_capacity = rows.checked_mul(self.max_ea_fanout).ok_or(
-            ResidentTransitionError::GeometryOverflow("child-row capacity"),
-        )?;
+        let first_prefix = resident_axis_prefix(self.resident, admitted.rotation.first);
+        let last_prefix = resident_axis_prefix(self.resident, admitted.rotation.last);
+        let navigation = self.resident.ring_col(admitted.rotation.navigation);
+        let output = self.resident.ring_col(admitted.rotation.output);
+        let safe_capacity =
+            rows.checked_mul(max_fanout)
+                .ok_or(ResidentTransitionError::GeometryOverflow(
+                    "child-row capacity",
+                ))?;
         validate_capacity_geometry(rows, parent_stride, child_stride, safe_capacity)?;
         if safe_capacity == 0 {
             let child = ProgramFrontier::new(child_variables, Vec::new(), 0)
@@ -464,7 +448,7 @@ where
         }
         if child_capacity > safe_capacity {
             return Err(ResidentTransitionError::GeometryOverflow(
-                "caller capacity exceeds the validated E/A fanout bound",
+                "caller capacity exceeds the validated fixed-pair fanout bound",
             ));
         }
         validate_capacity_geometry(rows, parent_stride, child_stride, child_capacity)?;
@@ -478,8 +462,8 @@ where
             .ok_or(ResidentTransitionError::GeometryOverflow(
                 "two-probe row batch",
             ))?;
-        let mut entity_select_queries = context.empty_u32(double_rows)?;
-        let mut attribute_select_queries = context.empty_u32(rows)?;
+        let mut first_select_queries = context.empty_u32(double_rows)?;
+        let mut last_select_queries = context.empty_u32(rows)?;
         let mut rank_values = context.empty_u32(double_rows)?;
         unsafe {
             prepare_two_bound::launch_unchecked::<WgpuRuntime>(
@@ -487,47 +471,47 @@ where
                 row_dispatch.cube_count(),
                 row_dispatch.cube_dim(),
                 parent_rows.input_arg(),
-                entity_select_queries.output_arg(),
-                attribute_select_queries.output_arg(),
+                first_select_queries.output_arg(),
+                last_select_queries.output_arg(),
                 rank_values.output_arg(),
                 rows as u32,
                 parent_stride as u32,
-                admitted.entity.column,
-                admitted.attribute.column,
-                admitted.entity.constant,
-                admitted.attribute.constant,
-                admitted.entity.is_constant,
-                admitted.attribute.is_constant,
+                admitted.first.column,
+                admitted.last.column,
+                admitted.first.constant,
+                admitted.last.constant,
+                admitted.first.is_constant,
+                admitted.last.is_constant,
             );
         }
 
-        let mut entity_selected = context.empty_u32(double_rows)?;
-        entity_prefix.select1_batch_into(&entity_select_queries, &mut entity_selected)?;
-        let mut attribute_selected = context.empty_u32(rows)?;
-        attribute_prefix.select1_batch_into(&attribute_select_queries, &mut attribute_selected)?;
+        let mut first_selected = context.empty_u32(double_rows)?;
+        first_prefix.select1_batch_into(&first_select_queries, &mut first_selected)?;
+        let mut last_selected = context.empty_u32(rows)?;
+        last_prefix.select1_batch_into(&last_select_queries, &mut last_selected)?;
 
         let mut rank_positions = context.empty_u32(double_rows)?;
-        let mut attribute_bases = context.empty_u32(rows)?;
+        let mut last_bases = context.empty_u32(rows)?;
         let mut row_errors = context.empty_u32(rows)?;
         unsafe {
             prepare_rank_ranges::launch_unchecked::<WgpuRuntime>(
                 context.client(),
                 row_dispatch.cube_count(),
                 row_dispatch.cube_dim(),
-                entity_select_queries.input_arg(),
-                entity_selected.input_arg(),
-                attribute_select_queries.input_arg(),
-                attribute_selected.input_arg(),
+                first_select_queries.input_arg(),
+                first_selected.input_arg(),
+                last_select_queries.input_arg(),
+                last_selected.input_arg(),
                 rank_positions.output_arg(),
-                attribute_bases.output_arg(),
+                last_bases.output_arg(),
                 row_errors.output_arg(),
                 rows as u32,
-                eva_c.len() as u32,
+                navigation.len() as u32,
             );
         }
 
         let mut ranks = context.empty_u32(double_rows)?;
-        eva_c.rank_batch_into(&rank_positions, &rank_values, &mut ranks)?;
+        navigation.rank_batch_into(&rank_positions, &rank_values, &mut ranks)?;
 
         let mut range_starts = context.empty_u32(rows)?;
         let mut counts = context.empty_u32(rows)?;
@@ -537,13 +521,13 @@ where
                 row_dispatch.cube_count(),
                 row_dispatch.cube_dim(),
                 ranks.input_arg(),
-                attribute_bases.input_arg(),
+                last_bases.input_arg(),
                 range_starts.output_arg(),
                 counts.output_arg(),
                 row_errors.output_arg(),
                 rows as u32,
-                aev_c.len() as u32,
-                self.max_ea_fanout as u32,
+                output.len() as u32,
+                max_fanout as u32,
             );
         }
 
@@ -644,7 +628,7 @@ where
         }
 
         let mut candidate_codes = context.empty_u32(child_capacity)?;
-        aev_c.access_batch_into_dynamic(
+        output.access_batch_into_dynamic(
             &candidate_positions,
             &mut candidate_codes,
             &candidate_meta,
@@ -775,8 +759,7 @@ where
                 ));
             }
         }
-        ProgramFrontier::new(variables, codes, row_count)
-            .map_err(ResidentTransitionError::Program)
+        ProgramFrontier::new(variables, codes, row_count).map_err(ResidentTransitionError::Program)
     }
 
     /// All-inputs-exhausted receipts for legs that perform no device work
@@ -1178,7 +1161,7 @@ where
                 row_errors.output_arg(),
                 pairs.rows as u32,
                 aev_c.len() as u32,
-                self.max_ea_fanout as u32,
+                self.resident.max_pair_fanout(SuccinctRotation::Eav) as u32,
             );
         }
         let (local_offsets, block_offsets) = enqueue_exact_scan(
@@ -1358,11 +1341,11 @@ where
                 QueryProgramError::VariableAlreadyBound(variable),
             ));
         }
-        if variable != self.target {
+        let Some(target) = pattern_target_axis(self.pattern, variable) else {
             return Err(ResidentTransitionError::UnsupportedArm(
-                "only the pattern's value variable is resident",
+                "the selected variable must occupy one axis of the pattern",
             ));
-        }
+        };
         if frontier.variables().len() + 1 != self.variable_count {
             return Err(ResidentTransitionError::UnsupportedArm(
                 "every non-target program variable must already be bound",
@@ -1386,12 +1369,14 @@ where
             }
         }
 
-        let entity = resolve_peer(self.pattern.entity, frontier)?;
-        let attribute = resolve_peer(self.pattern.attribute, frontier)?;
+        let rotation = TwoBoundRotation::for_target(target);
+        let first = resolve_peer(self.pattern.term(rotation.first), frontier)?;
+        let last = resolve_peer(self.pattern.term(rotation.last), frontier)?;
         Ok(AdmittedTransition {
-            missing: entity.missing || attribute.missing,
-            entity,
-            attribute,
+            missing: first.missing || last.missing,
+            rotation,
+            first,
+            last,
             insertion: frontier
                 .variables()
                 .partition_point(|&bound| bound < variable),
@@ -1408,8 +1393,9 @@ struct PeerSource {
 }
 
 struct AdmittedTransition {
-    entity: PeerSource,
-    attribute: PeerSource,
+    rotation: TwoBoundRotation,
+    first: PeerSource,
+    last: PeerSource,
     insertion: usize,
     missing: bool,
 }
@@ -1426,7 +1412,7 @@ fn resolve_peer(
                 .position(|&bound| bound == variable)
             else {
                 return Err(ResidentTransitionError::UnsupportedArm(
-                    "entity and attribute variables must already be bound",
+                    "both non-target variables must already be bound",
                 ));
             };
             Ok(PeerSource {
@@ -1448,6 +1434,29 @@ fn resolve_peer(
             is_constant: 1,
             missing: true,
         }),
+    }
+}
+
+fn pattern_target_axis(pattern: ProgramPattern, variable: ProgramVariable) -> Option<ProgramAxis> {
+    if pattern.entity == ProgramTerm::Variable(variable) {
+        Some(ProgramAxis::Entity)
+    } else if pattern.attribute == ProgramTerm::Variable(variable) {
+        Some(ProgramAxis::Attribute)
+    } else if pattern.value == ProgramTerm::Variable(variable) {
+        Some(ProgramAxis::Value)
+    } else {
+        None
+    }
+}
+
+fn resident_axis_prefix<U: Universe>(
+    resident: &WgpuSuccinctArchive<U>,
+    axis: ProgramAxis,
+) -> &crate::succinct_query::WgpuBitVector {
+    match axis {
+        ProgramAxis::Entity => resident.entity_prefix(),
+        ProgramAxis::Attribute => resident.attribute_prefix(),
+        ProgramAxis::Value => resident.value_prefix(),
     }
 }
 
@@ -1647,14 +1656,19 @@ fn validate_archive_geometry<U: Universe>(
         ("entity prefix bits", archive.e_a.num_bits()),
         ("attribute prefix bits", archive.a_a.num_bits()),
         ("value prefix bits", archive.v_a.num_bits()),
-        ("changed E/A bits", archive.changed_e_a.num_bits()),
-        ("EAV Ring length", archive.eav_c.len()),
-        ("VEA Ring length", archive.vea_c.len()),
-        ("EVA Ring length", archive.eva_c.len()),
-        ("AEV Ring length", archive.aev_c.len()),
     ] {
         if len >= u32::MAX as usize {
             return Err(ResidentTransitionError::GeometryOverflow(name));
+        }
+    }
+    for rotation in SuccinctRotation::ALL {
+        if archive.pair_changes(rotation).num_bits() >= u32::MAX as usize {
+            return Err(ResidentTransitionError::GeometryOverflow(
+                "pair-change vector bits",
+            ));
+        }
+        if archive.ring_col(rotation).len() >= u32::MAX as usize {
+            return Err(ResidentTransitionError::GeometryOverflow("Ring length"));
         }
     }
     Ok(())
@@ -2035,47 +2049,47 @@ fn scatter_canonical_eav(
 #[allow(clippy::too_many_arguments)]
 fn prepare_two_bound(
     frontier: &Array<u32>,
-    entity_select_queries: &mut Array<u32>,
-    attribute_select_queries: &mut Array<u32>,
+    first_select_queries: &mut Array<u32>,
+    last_select_queries: &mut Array<u32>,
     rank_values: &mut Array<u32>,
     rows: u32,
     stride: u32,
-    entity_column: u32,
-    attribute_column: u32,
-    entity_constant: u32,
-    attribute_constant: u32,
-    entity_is_constant: u32,
-    attribute_is_constant: u32,
+    first_column: u32,
+    last_column: u32,
+    first_constant: u32,
+    last_constant: u32,
+    first_is_constant: u32,
+    last_is_constant: u32,
 ) {
     let row = ABSOLUTE_POS;
     if row < rows as usize {
         let base = row * stride as usize;
-        let mut entity = entity_constant;
-        if entity_is_constant == 0 {
-            entity = frontier[base + entity_column as usize];
+        let mut first = first_constant;
+        if first_is_constant == 0 {
+            first = frontier[base + first_column as usize];
         }
-        let mut attribute = attribute_constant;
-        if attribute_is_constant == 0 {
-            attribute = frontier[base + attribute_column as usize];
+        let mut last = last_constant;
+        if last_is_constant == 0 {
+            last = frontier[base + last_column as usize];
         }
         let pair = row * 2usize;
-        entity_select_queries[pair] = entity;
-        entity_select_queries[pair + 1usize] = entity + 1u32;
-        attribute_select_queries[row] = attribute;
-        rank_values[pair] = attribute;
-        rank_values[pair + 1usize] = attribute;
+        first_select_queries[pair] = first;
+        first_select_queries[pair + 1usize] = first + 1u32;
+        last_select_queries[row] = last;
+        rank_values[pair] = last;
+        rank_values[pair + 1usize] = last;
     }
 }
 
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 fn prepare_rank_ranges(
-    entity_select_queries: &Array<u32>,
-    entity_selected: &Array<u32>,
-    attribute_select_queries: &Array<u32>,
-    attribute_selected: &Array<u32>,
+    first_select_queries: &Array<u32>,
+    first_selected: &Array<u32>,
+    last_select_queries: &Array<u32>,
+    last_selected: &Array<u32>,
     rank_positions: &mut Array<u32>,
-    attribute_bases: &mut Array<u32>,
+    last_bases: &mut Array<u32>,
     row_errors: &mut Array<u32>,
     rows: u32,
     ring_len: u32,
@@ -2083,36 +2097,36 @@ fn prepare_rank_ranges(
     let row = ABSOLUTE_POS;
     if row < rows as usize {
         let pair = row * 2usize;
-        let e0_selected = entity_selected[pair];
-        let e1_selected = entity_selected[pair + 1usize];
-        let e0_query = entity_select_queries[pair];
-        let e1_query = entity_select_queries[pair + 1usize];
-        let a_selected = attribute_selected[row];
-        let a_query = attribute_select_queries[row];
+        let f0_selected = first_selected[pair];
+        let f1_selected = first_selected[pair + 1usize];
+        let f0_query = first_select_queries[pair];
+        let f1_query = first_select_queries[pair + 1usize];
+        let l_selected = last_selected[row];
+        let l_query = last_select_queries[row];
         let mut invalid = 0u32;
-        if e0_selected == 0xFFFF_FFFFu32
-            || e1_selected == 0xFFFF_FFFFu32
-            || a_selected == 0xFFFF_FFFFu32
-            || e0_selected < e0_query
-            || e1_selected < e1_query
-            || a_selected < a_query
+        if f0_selected == 0xFFFF_FFFFu32
+            || f1_selected == 0xFFFF_FFFFu32
+            || l_selected == 0xFFFF_FFFFu32
+            || f0_selected < f0_query
+            || f1_selected < f1_query
+            || l_selected < l_query
         {
             invalid = 1u32;
         }
-        let mut e0 = 0u32;
-        let mut e1 = 0u32;
-        let mut a_base = 0u32;
+        let mut f0 = 0u32;
+        let mut f1 = 0u32;
+        let mut l_base = 0u32;
         if invalid == 0 {
-            e0 = e0_selected - e0_query;
-            e1 = e1_selected - e1_query;
-            a_base = a_selected - a_query;
-            if e0 > e1 || e1 > ring_len {
+            f0 = f0_selected - f0_query;
+            f1 = f1_selected - f1_query;
+            l_base = l_selected - l_query;
+            if f0 > f1 || f1 > ring_len {
                 invalid = 1u32;
             }
         }
-        rank_positions[pair] = e0;
-        rank_positions[pair + 1usize] = e1;
-        attribute_bases[row] = a_base;
+        rank_positions[pair] = f0;
+        rank_positions[pair + 1usize] = f1;
+        last_bases[row] = l_base;
         row_errors[row] = invalid;
     }
 }
@@ -2120,7 +2134,7 @@ fn prepare_rank_ranges(
 #[cube(launch_unchecked)]
 fn finish_proposal_ranges(
     ranks: &Array<u32>,
-    attribute_bases: &Array<u32>,
+    last_bases: &Array<u32>,
     range_starts: &mut Array<u32>,
     counts: &mut Array<u32>,
     row_errors: &mut Array<u32>,
@@ -2133,7 +2147,7 @@ fn finish_proposal_ranges(
         let pair = row * 2usize;
         let rank0 = ranks[pair];
         let rank1 = ranks[pair + 1usize];
-        let base = attribute_bases[row];
+        let base = last_bases[row];
         let mut invalid = row_errors[row];
         if rank0 == 0xFFFF_FFFFu32 || rank1 == 0xFFFF_FFFFu32 || rank0 > rank1 {
             invalid = 1u32;

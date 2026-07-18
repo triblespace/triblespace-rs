@@ -10,13 +10,15 @@ use std::env;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
+use triblespace_core::blob::encodings::succinctarchive::{
+    OrderedUniverse, SuccinctArchive, SuccinctRotation,
+};
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::RawInline;
 use triblespace_core::prelude::*;
 use triblespace_gpu::budgeted::{CohortGrants, CohortReceipts};
 use triblespace_gpu::query_program::{
-    ProgramFrontier, ProgramValuePage, ProgramVariable, QueryPattern, QueryProgram,
+    ProgramFrontier, ProgramTwoBoundPage, ProgramVariable, QueryPattern, QueryProgram,
 };
 use triblespace_gpu::{ArchiveIdentity, WgpuQueryProgram, WgpuSuccinctArchive};
 
@@ -69,15 +71,15 @@ fn cpu_page<'archive>(
     parent: &ProgramFrontier,
     offsets: &[usize],
     limits: &[usize],
-) -> ProgramValuePage {
+) -> ProgramTwoBoundPage {
     program
-        .transition_on_value_page(target, parent, offsets, limits)
+        .transition_on_two_bound_page(target, parent, offsets, limits)
         .expect("valid native value-page request")
         .expect("the fixed one-pattern E/A->V arm is admitted")
 }
 
 fn assert_page_parity(
-    cpu: &ProgramValuePage,
+    cpu: &ProgramTwoBoundPage,
     gpu_child: &ProgramFrontier,
     gpu_receipts: CohortReceipts,
     identity: ArchiveIdentity,
@@ -227,7 +229,7 @@ fn main() {
     let admission_started = Instant::now();
     let gpu = WgpuQueryProgram::new(&program, &resident).expect("resident program admission");
     let gpu_admission = admission_started.elapsed();
-    assert_eq!(gpu.max_ea_fanout(), fanout);
+    assert_eq!(resident.max_pair_fanout(SuccinctRotation::Eav), fanout);
 
     let mut parent_codes = Vec::with_capacity(max_rows * 2);
     for &entity in &entities {

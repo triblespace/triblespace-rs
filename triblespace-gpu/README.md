@@ -154,11 +154,11 @@ addition to executing the query.
 
 `WgpuQueryProgram` is the first path that uses the shared prefixes and Ring
 columns as one resident query operation. Its admission contract is narrow and
-fail-closed: the program has exactly one pattern, the caller selects its value
-variable, and entity plus attribute are already bound in every parent row or
-are constants. A different target, an unbound peer, a sibling pattern, or a
-program over another archive snapshot is rejected rather than silently falling
-back or skipping work.
+fail-closed: the program has exactly one pattern, the caller selects one of its
+E/A/V variables, and the other two axes are already bound in every parent row
+or are constants. A target outside the pattern, an unbound peer, a sibling
+pattern, or a program over another archive snapshot is rejected rather than
+silently falling back or skipping work.
 
 ```rust,no_run
 # #[cfg(feature = "wgpu")]
@@ -186,24 +186,25 @@ let backend = WgpuQueryProgram::new(&program, &resident).expect("admit resident 
 ```
 
 One transition uploads the affine parent codes once as its only bulk input.
-Small dispatch/control records are also created per call. Entity/attribute select,
-EVA rank, stable count scan, indirect candidate generation, AEV access, and
-canonical child scatter remain on the device. The output canary is filled on
-device, avoiding a full poison-buffer upload. One packed child buffer is the
-only synchronization/readback, but that read covers all
+Small dispatch/control records are also created per call. Descriptor-selected
+peer-prefix selects, Ring ranks, the stable count scan, indirect candidate
+generation, target access, and canonical child scatter remain on the device.
+The output canary is filled on device, avoiding a full poison-buffer upload.
+One packed child buffer is the only synchronization/readback, but that read covers all
 `2 + child_capacity * child_stride` allocated words—including the poison
 tail—not only the logical child prefix: the logical row count is inside the
-same buffer and is not known before synchronization. The default allocation is a checked
-`parent_rows * max_EA_fanout` bound derived during setup. An explicit smaller
-capacity reports the exact required row count after that same readback; it
-never returns a truncated prefix. All additions and dimensions are checked in
-the host admission path and guarded again in device range/scan kernels.
+same buffer and is not known before synchronization. The default allocation is
+a checked `parent_rows * max_pair_fanout(rotation)` bound, whose exact fanout is
+scanned lazily once per snapshot and used rotation. An explicit smaller capacity
+reports the exact required row count after that same readback; it never returns
+a truncated prefix. All additions and dimensions are checked in the host
+admission path and guarded again in device range/scan kernels.
 
-The canonical AEV interval contains each `(A,E,V)` tuple once, so the CPU
-oracle's per-parent `.unique()` is a no-op. The device therefore preserves the
-CPU's first-occurrence candidate order directly. Its stable scan also preserves
-parent order and parent multiplicity: duplicate parent rows produce duplicate
-child runs, with no global deduplication.
+Every canonical fixed-pair output interval contains each target once, so the
+CPU oracle's per-parent `.unique()` is a no-op. The device therefore preserves
+the CPU's first-occurrence candidate order directly. Its stable scan also
+preserves parent order and parent multiplicity: duplicate parent rows produce
+duplicate child runs, with no global deduplication.
 
 The `resident_transition` probe separates archive fixture time, asynchronous
 resident enqueue, and the first synchronizing transition from warm treatments.
@@ -279,21 +280,24 @@ clamped input's cursor returns the absolute `base + examined`, so successive
 budgeted pages concatenate into the exact unbudgeted transition on either
 executor.
 
-### Public resident value route
+### Public resident two-bound route
 
-`WgpuSuccinctArchive::value_route` and `value_route_with` are the first real
-`find!`/`pattern!` entry into that substrate. The returned pattern carrier
-delegates the ordinary constraint protocol unchanged and additionally lowers
-one narrow typed Program: a value proposal with entity and attribute already
-bound or constant. Each canonical state stores the checked `(E,A)` interval
-length and consumed offset; Native and WGPU pages independently re-derive the
-interval position, then must agree exactly on examined rows, produced rows,
-absolute continuation, order, and multiplicity.
+`WgpuSuccinctArchive::two_bound_route` and `two_bound_route_with` are the first
+real `find!`/`pattern!` entry into that substrate. The returned pattern carrier
+delegates the ordinary constraint protocol unchanged and lowers exactly three
+typed Propose actions when the other two axes are bound or constant:
+`(A,V) -> E`, `(E,V) -> A`, and `(E,A) -> V`. One descriptor shared by the
+Native and physical paths selects the peer order, fanout rotation, navigation
+Ring, and output Ring. Canonical state stores that descriptor, both peer codes,
+the checked interval length, and consumed offset; both executors independently
+re-derive the interval position and must agree exactly on examined rows,
+produced rows, absolute continuation, order, and multiplicity.
 
-Placement is `ValueRouteAdmission::Off` by default and does not even construct
-the resident Program arm. `Force` exists for parity and acceptance probes.
-`WarmM4` is an explicitly experimental, prewarmed-machine calibration using
-`exact_page_work + 8 * parent_rows >= 98_304`; it is not a universal policy.
+Placement is `TwoBoundRouteAdmission::Off` by default and does not construct
+the resident Program arm. `Force` exists for parity and acceptance probes on
+all three targets. `WarmM4` is an explicitly experimental, prewarmed-machine
+calibration using `exact_page_work + 8 * parent_rows >= 98_304` for `(E,A) -> V`
+only; entity and attribute targets decline Native until separately measured.
 
 `WgpuSuccinctArchive::prepare_value_route` is the explicit snapshot-local
 preparation seam. On a nonempty snapshot it selects one real `(E,A)` pair and
@@ -305,7 +309,7 @@ held; the answer itself is discarded. Errors and panics default the snapshot
 to `Failed`, repeated success returns `AlreadyPrepared`, and an empty snapshot
 returns `EmptySnapshot` while remaining `Cold`.
 
-The `TRIBLESPACE_GPU_VALUE_ROUTE=auto` spelling is deliberately rejected:
+The `TRIBLESPACE_GPU_TWO_BOUND_ROUTE=auto` spelling is deliberately rejected:
 explicit preparation proves this snapshot's exact path, and its lease can
 decline busy or poisoned work without waiting, but neither can prove that
 unrelated snapshots, rank batches, or wavelet freezes are absent from the

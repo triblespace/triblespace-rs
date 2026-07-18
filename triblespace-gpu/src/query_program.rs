@@ -24,7 +24,9 @@ use jerky::bit_vector::rank9sel::Rank9SelIndex;
 use jerky::bit_vector::{BitVector, NumBits, Rank, Select};
 use jerky::char_sequences::WaveletMatrix;
 
-use triblespace_core::blob::encodings::succinctarchive::{SuccinctArchive, Universe};
+use triblespace_core::blob::encodings::succinctarchive::{
+    SuccinctArchive, SuccinctRotation, Universe,
+};
 use triblespace_core::inline::RawInline;
 
 const MAX_VARIABLES: usize = 128;
@@ -163,6 +165,85 @@ impl ProgramPattern {
             .into_iter()
             .any(|term| term == ProgramTerm::Variable(variable))
     }
+
+    pub(crate) const fn term(self, axis: ProgramAxis) -> ProgramTerm {
+        match axis {
+            ProgramAxis::Entity => self.entity,
+            ProgramAxis::Attribute => self.attribute,
+            ProgramAxis::Value => self.value,
+        }
+    }
+}
+
+/// One semantic position of an E/A/V pattern.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProgramAxis {
+    Entity,
+    Attribute,
+    Value,
+}
+
+impl ProgramAxis {
+    pub(crate) const ALL: [Self; 3] = [Self::Entity, Self::Attribute, Self::Value];
+
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::Entity => 0,
+            Self::Attribute => 1,
+            Self::Value => 2,
+        }
+    }
+}
+
+/// The canonical physical Ring orientation for one two-bound proposal.
+///
+/// A host action chooses only `target`. The remaining two axes have one
+/// canonical orientation `(first, target, last)`: `first_prefix` opens the
+/// first-peer range, `navigation` ranks the last peer within it, and `output`
+/// enumerates the target from the resulting `(last, first)` range. `pair`
+/// names the `(first, last, target)` order whose change vector bounds fanout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TwoBoundRotation {
+    pub(crate) target: ProgramAxis,
+    pub(crate) first: ProgramAxis,
+    pub(crate) last: ProgramAxis,
+    pub(crate) pair: SuccinctRotation,
+    pub(crate) navigation: SuccinctRotation,
+    pub(crate) output: SuccinctRotation,
+}
+
+impl TwoBoundRotation {
+    pub(crate) const fn for_target(target: ProgramAxis) -> Self {
+        match target {
+            // A -> E -> V: fix (A,V), enumerate E.
+            ProgramAxis::Entity => Self {
+                target,
+                first: ProgramAxis::Attribute,
+                last: ProgramAxis::Value,
+                pair: SuccinctRotation::Ave,
+                navigation: SuccinctRotation::Aev,
+                output: SuccinctRotation::Vae,
+            },
+            // E -> A -> V: fix (E,V), enumerate A.
+            ProgramAxis::Attribute => Self {
+                target,
+                first: ProgramAxis::Entity,
+                last: ProgramAxis::Value,
+                pair: SuccinctRotation::Eva,
+                navigation: SuccinctRotation::Eav,
+                output: SuccinctRotation::Vea,
+            },
+            // E -> V -> A: fix (E,A), enumerate V.
+            ProgramAxis::Value => Self {
+                target,
+                first: ProgramAxis::Entity,
+                last: ProgramAxis::Attribute,
+                pair: SuccinctRotation::Eav,
+                navigation: SuccinctRotation::Eva,
+                output: SuccinctRotation::Aev,
+            },
+        }
+    }
 }
 
 /// A row-major affine frontier: every row binds the same ascending variables.
@@ -179,7 +260,7 @@ pub struct ProgramFrontier {
     bound_mask: u128,
 }
 
-/// One input's exact receipt from a native fixed-`(E,A) -> V` page.
+/// One input's exact receipt from a native fixed-pair proposal page.
 ///
 /// `examined` is also the number of child rows produced for this narrow arm:
 /// a compiled page contains exactly one pattern, so there are no sibling
@@ -187,12 +268,12 @@ pub struct ProgramFrontier {
 /// absolute ordinal at which the same parent row resumes, or `None` when its
 /// candidate interval is exhausted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ProgramValuePageReceipt {
+pub struct ProgramTwoBoundPageReceipt {
     examined: usize,
     next_offset: Option<usize>,
 }
 
-impl ProgramValuePageReceipt {
+impl ProgramTwoBoundPageReceipt {
     /// Number of candidates examined and child rows produced for this input.
     pub const fn examined(self) -> usize {
         self.examined
@@ -204,29 +285,29 @@ impl ProgramValuePageReceipt {
     }
 }
 
-/// One stable native page over a batch of fixed-`(E,A) -> V` parent rows.
+/// One stable native page over a batch of fixed-pair parent rows.
 ///
 /// Child rows are grouped in parent-input order and retain the canonical Ring
 /// order within each input. `receipts[i]` describes exactly parent row `i`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProgramValuePage {
+pub struct ProgramTwoBoundPage {
     child: ProgramFrontier,
-    receipts: Vec<ProgramValuePageReceipt>,
+    receipts: Vec<ProgramTwoBoundPageReceipt>,
 }
 
-impl ProgramValuePage {
+impl ProgramTwoBoundPage {
     /// The stable concatenation of this page's per-input child rows.
     pub fn child(&self) -> &ProgramFrontier {
         &self.child
     }
 
     /// One exact receipt per parent input, in input order.
-    pub fn receipts(&self) -> &[ProgramValuePageReceipt] {
+    pub fn receipts(&self) -> &[ProgramTwoBoundPageReceipt] {
         &self.receipts
     }
 
     /// Consumes the page into its child frontier and per-input receipts.
-    pub fn into_parts(self) -> (ProgramFrontier, Vec<ProgramValuePageReceipt>) {
+    pub fn into_parts(self) -> (ProgramFrontier, Vec<ProgramTwoBoundPageReceipt>) {
         (self.child, self.receipts)
     }
 }
@@ -384,8 +465,8 @@ pub enum QueryProgramError {
     },
     /// A frontier contains a code outside the borrowed archive's universe.
     CodeOutOfBounds(ArchiveCode),
-    /// Native value-page offsets or limits do not match the parent row count.
-    ValuePageShape {
+    /// Native two-bound-page offsets or limits do not match the parent row count.
+    TwoBoundPageShape {
         /// Parent rows submitted to the page primitive.
         rows: usize,
         /// Resume offsets supplied by the caller.
@@ -393,13 +474,13 @@ pub enum QueryProgramError {
         /// Per-input limits supplied by the caller.
         limits: usize,
     },
-    /// A native value-page input carries no progress budget.
-    ZeroValuePageLimit {
+    /// A native two-bound-page input carries no progress budget.
+    ZeroTwoBoundPageLimit {
         /// Zero-based parent input.
         input: usize,
     },
-    /// A native value-page resume offset lies beyond its candidate interval.
-    ValuePageOffsetBeyondInterval {
+    /// A native two-bound-page resume offset lies beyond its candidate interval.
+    TwoBoundPageOffsetBeyondInterval {
         /// Zero-based parent input.
         input: usize,
         /// Absolute resume ordinal supplied by the caller.
@@ -468,24 +549,27 @@ impl fmt::Display for QueryProgramError {
                     code.index()
                 )
             }
-            Self::ValuePageShape {
+            Self::TwoBoundPageShape {
                 rows,
                 offsets,
                 limits,
             } => write!(
                 f,
-                "native value page submitted {rows} parent rows with {offsets} offsets and {limits} limits"
+                "native two-bound page submitted {rows} parent rows with {offsets} offsets and {limits} limits"
             ),
-            Self::ZeroValuePageLimit { input } => {
-                write!(f, "native value-page input {input} carries no work limit")
+            Self::ZeroTwoBoundPageLimit { input } => {
+                write!(
+                    f,
+                    "native two-bound-page input {input} carries no work limit"
+                )
             }
-            Self::ValuePageOffsetBeyondInterval {
+            Self::TwoBoundPageOffsetBeyondInterval {
                 input,
                 offset,
                 interval,
             } => write!(
                 f,
-                "native value-page input {input} resumes at {offset} beyond interval length {interval}"
+                "native two-bound-page input {input} resumes at {offset} beyond interval length {interval}"
             ),
         }
     }
@@ -774,14 +858,15 @@ impl<'a, U: Universe> QueryProgram<'a, U> {
         ProgramFrontier::new(variables, values, rows)
     }
 
-    /// Pages the resident-compatible fixed-`(E,A) -> V` transition natively.
+    /// Pages one resident-compatible fixed-pair transition natively.
     ///
     /// This is a deliberately narrower primitive than [`Self::transition_on`].
     /// It returns `Ok(None)` unless the program has exactly one pattern, that
-    /// pattern's value term is `variable`, and every other program variable is
-    /// already bound by `frontier` (entity and attribute constants are also
-    /// admitted). Those are exactly the semantic conditions of the first
-    /// resident transition arm: no sibling pattern is silently skipped.
+    /// pattern contains `variable` in exactly one E/A/V position, and every
+    /// other program variable is already bound by `frontier` (constants are
+    /// also admitted). Those are exactly the semantic conditions of a
+    /// two-bound resident transition arm: no sibling pattern is silently
+    /// skipped.
     ///
     /// `offsets[i]` and `limits[i]` apply only to parent row `i`; work is never
     /// pooled between inputs. A positive limit is required even for an already
@@ -793,16 +878,16 @@ impl<'a, U: Universe> QueryProgram<'a, U> {
     ///
     /// Every receipt's `examined` count equals its number of produced child
     /// rows. The canonical archive contains each `(E,A,V)` trible once, so a
-    /// fixed `(E,A)` Ring range has no duplicate values; the defensive
+    /// fixed-pair Ring range has no duplicate target values; the defensive
     /// `.unique()` in the general reference transition is therefore a no-op on
     /// this admitted arm.
-    pub fn transition_on_value_page(
+    pub fn transition_on_two_bound_page(
         &self,
         variable: ProgramVariable,
         frontier: &ProgramFrontier,
         offsets: &[usize],
         limits: &[usize],
-    ) -> Result<Option<ProgramValuePage>, QueryProgramError> {
+    ) -> Result<Option<ProgramTwoBoundPage>, QueryProgramError> {
         self.validate_frontier(frontier)?;
         if variable.index() >= self.variable_count() {
             return Err(QueryProgramError::VariableOutOfBounds {
@@ -817,22 +902,24 @@ impl<'a, U: Universe> QueryProgram<'a, U> {
         let [pattern] = self.patterns.as_ref() else {
             return Ok(None);
         };
-        if pattern.value != ProgramTerm::Variable(variable)
-            || frontier.variables.len() + 1 != self.variable_count()
-            || !peer_is_resolved(pattern.entity, frontier)
-            || !peer_is_resolved(pattern.attribute, frontier)
+        if !pattern.contains(variable) || frontier.variables.len() + 1 != self.variable_count() {
+            return Ok(None);
+        }
+        let rotation = TwoBoundRotation::for_target(pattern_axis(*pattern, variable));
+        if !peer_is_resolved(pattern.term(rotation.first), frontier)
+            || !peer_is_resolved(pattern.term(rotation.last), frontier)
         {
             return Ok(None);
         }
         if offsets.len() != frontier.len() || limits.len() != frontier.len() {
-            return Err(QueryProgramError::ValuePageShape {
+            return Err(QueryProgramError::TwoBoundPageShape {
                 rows: frontier.len(),
                 offsets: offsets.len(),
                 limits: limits.len(),
             });
         }
         if let Some(input) = limits.iter().position(|&limit| limit == 0) {
-            return Err(QueryProgramError::ZeroValuePageLimit { input });
+            return Err(QueryProgramError::ZeroTwoBoundPageLimit { input });
         }
 
         let insertion = frontier
@@ -846,11 +933,12 @@ impl<'a, U: Universe> QueryProgram<'a, U> {
 
         for input in 0..frontier.len() {
             let row = frontier.row(input);
-            let interval = self.fixed_ea_value_range(*pattern, frontier, row);
+            let state = self.pattern_state(*pattern, frontier, row);
+            let interval = self.fixed_two_bound_range(rotation, state);
             let interval_len = interval.len();
             let offset = offsets[input];
             if offset > interval_len {
-                return Err(QueryProgramError::ValuePageOffsetBeyondInterval {
+                return Err(QueryProgramError::TwoBoundPageOffsetBeyondInterval {
                     input,
                     offset,
                     interval: interval_len,
@@ -860,9 +948,9 @@ impl<'a, U: Universe> QueryProgram<'a, U> {
             for position in interval.start + offset..interval.start + offset + examined {
                 let value = ArchiveCode::from_index(
                     self.archive
-                        .aev_c
+                        .ring_col(rotation.output)
                         .access(position)
-                        .expect("a canonical fixed-E/A range stays inside the AEV column"),
+                        .expect("a canonical fixed-pair range stays inside its output Ring"),
                 );
                 child_values.extend_from_slice(&row[..insertion]);
                 child_values.push(value);
@@ -870,14 +958,14 @@ impl<'a, U: Universe> QueryProgram<'a, U> {
                 child_rows += 1;
             }
             let consumed = offset + examined;
-            receipts.push(ProgramValuePageReceipt {
+            receipts.push(ProgramTwoBoundPageReceipt {
                 examined,
                 next_offset: (consumed < interval_len).then_some(consumed),
             });
         }
 
         let child = ProgramFrontier::new(child_variables, child_values, child_rows)?;
-        Ok(Some(ProgramValuePage { child, receipts }))
+        Ok(Some(ProgramTwoBoundPage { child, receipts }))
     }
 
     /// Runs the CPU reference interpreter to a complete canonical frontier.
@@ -1031,7 +1119,7 @@ impl<'a, U: Universe> QueryProgram<'a, U> {
         }
         let axis = pattern_axis(pattern, variable);
         match axis {
-            Axis::Entity => match (state.attribute.code(), state.value.code()) {
+            ProgramAxis::Entity => match (state.attribute.code(), state.value.code()) {
                 (None, None) => self.archive.entity_count,
                 (Some(attribute), None) => {
                     let range = base_range_code(&self.archive.a_a, attribute);
@@ -1046,7 +1134,7 @@ impl<'a, U: Universe> QueryProgram<'a, U> {
                     restrict_len_code(&self.archive.aev_c, value, &range)
                 }
             },
-            Axis::Attribute => match (state.entity.code(), state.value.code()) {
+            ProgramAxis::Attribute => match (state.entity.code(), state.value.code()) {
                 (None, None) => self.archive.attribute_count,
                 (Some(entity), None) => {
                     let range = base_range_code(&self.archive.e_a, entity);
@@ -1061,7 +1149,7 @@ impl<'a, U: Universe> QueryProgram<'a, U> {
                     restrict_len_code(&self.archive.eav_c, value, &range)
                 }
             },
-            Axis::Value => match (state.entity.code(), state.attribute.code()) {
+            ProgramAxis::Value => match (state.entity.code(), state.attribute.code()) {
                 (None, None) => self.archive.value_count,
                 (Some(entity), None) => {
                     let range = base_range_code(&self.archive.e_a, entity);
@@ -1091,9 +1179,11 @@ impl<'a, U: Universe> QueryProgram<'a, U> {
             return Vec::new();
         }
         match pattern_axis(pattern, variable) {
-            Axis::Entity => self.propose_entity(state.attribute.code(), state.value.code()),
-            Axis::Attribute => self.propose_attribute(state.entity.code(), state.value.code()),
-            Axis::Value => self.propose_value(state.entity.code(), state.attribute.code()),
+            ProgramAxis::Entity => self.propose_entity(state.attribute.code(), state.value.code()),
+            ProgramAxis::Attribute => {
+                self.propose_attribute(state.entity.code(), state.value.code())
+            }
+            ProgramAxis::Value => self.propose_value(state.entity.code(), state.attribute.code()),
         }
     }
 
@@ -1107,9 +1197,9 @@ impl<'a, U: Universe> QueryProgram<'a, U> {
     ) -> bool {
         let mut state = self.pattern_state(pattern, frontier, row);
         match pattern_axis(pattern, variable) {
-            Axis::Entity => state.entity = ResolvedTerm::Bound(candidate),
-            Axis::Attribute => state.attribute = ResolvedTerm::Bound(candidate),
-            Axis::Value => state.value = ResolvedTerm::Bound(candidate),
+            ProgramAxis::Entity => state.entity = ResolvedTerm::Bound(candidate),
+            ProgramAxis::Attribute => state.attribute = ResolvedTerm::Bound(candidate),
+            ProgramAxis::Value => state.value = ResolvedTerm::Bound(candidate),
         }
         !state.has_missing() && self.state_has_support(state)
     }
@@ -1270,50 +1360,49 @@ impl<'a, U: Universe> QueryProgram<'a, U> {
         }
     }
 
-    /// The exact canonical AEV interval owned by one resolved `(E, A)` pair.
+    /// The exact canonical output interval owned by one resolved physical pair.
     ///
-    /// This is a pure archive-local function of the two codes — two
-    /// `select1`s and two ranks — so a typed Program family may derive and
-    /// validate its canonical interval at seed time. The resident value
+    /// This is a pure archive-local function of the descriptor and two codes —
+    /// two `select1`s and two ranks — so a typed Program family may derive and
+    /// validate its canonical interval at seed time. The resident two-bound
     /// route stores the checked length for O(1) progress and exact-work
     /// admission, while each executor independently re-derives the position
-    /// before paging. An `(E, A)` pair without occurrences yields an empty
-    /// interval.
-    pub fn fixed_ea_value_interval(
+    /// before paging. A pair without occurrences yields an empty interval.
+    pub(crate) fn fixed_two_bound_interval(
         &self,
-        entity: ArchiveCode,
-        attribute: ArchiveCode,
+        rotation: TwoBoundRotation,
+        first: ArchiveCode,
+        last: ArchiveCode,
     ) -> Result<Range<usize>, QueryProgramError> {
-        for code in [entity, attribute] {
+        for code in [first, last] {
             if code.index() >= self.archive.domain.len() {
                 return Err(QueryProgramError::CodeOutOfBounds(code));
             }
         }
-        let entity_range = base_range_code(&self.archive.e_a, entity);
+        let first_range = base_range_code(axis_prefix(self.archive, rotation.first), first);
         Ok(restrict_range_code(
-            &self.archive.a_a,
-            &self.archive.eva_c,
-            attribute,
-            &entity_range,
+            axis_prefix(self.archive, rotation.last),
+            self.archive.ring_col(rotation.navigation),
+            last,
+            &first_range,
         ))
     }
 
-    fn fixed_ea_value_range(
+    fn fixed_two_bound_range(
         &self,
-        pattern: ProgramPattern,
-        frontier: &ProgramFrontier,
-        row: &[ArchiveCode],
+        rotation: TwoBoundRotation,
+        state: PatternState,
     ) -> Range<usize> {
-        let state = self.pattern_state(pattern, frontier, row);
-        let (Some(entity), Some(attribute)) = (state.entity.code(), state.attribute.code()) else {
+        let (Some(first), Some(last)) = (state.code(rotation.first), state.code(rotation.last))
+        else {
             return 0..0;
         };
-        let entity_range = base_range_code(&self.archive.e_a, entity);
+        let first_range = base_range_code(axis_prefix(self.archive, rotation.first), first);
         restrict_range_code(
-            &self.archive.a_a,
-            &self.archive.eva_c,
-            attribute,
-            &entity_range,
+            axis_prefix(self.archive, rotation.last),
+            self.archive.ring_col(rotation.navigation),
+            last,
+            &first_range,
         )
     }
 }
@@ -1353,6 +1442,14 @@ impl PatternState {
             && matches!(self.attribute, ResolvedTerm::Bound(_))
             && matches!(self.value, ResolvedTerm::Bound(_))
     }
+
+    fn code(self, axis: ProgramAxis) -> Option<ArchiveCode> {
+        match axis {
+            ProgramAxis::Entity => self.entity.code(),
+            ProgramAxis::Attribute => self.attribute.code(),
+            ProgramAxis::Value => self.value.code(),
+        }
+    }
 }
 
 fn resolve_term(
@@ -1378,22 +1475,26 @@ fn peer_is_resolved(term: ProgramTerm, frontier: &ProgramFrontier) -> bool {
     }
 }
 
-#[derive(Clone, Copy)]
-enum Axis {
-    Entity,
-    Attribute,
-    Value,
-}
-
-fn pattern_axis(pattern: ProgramPattern, variable: ProgramVariable) -> Axis {
+fn pattern_axis(pattern: ProgramPattern, variable: ProgramVariable) -> ProgramAxis {
     if pattern.entity == ProgramTerm::Variable(variable) {
-        Axis::Entity
+        ProgramAxis::Entity
     } else if pattern.attribute == ProgramTerm::Variable(variable) {
-        Axis::Attribute
+        ProgramAxis::Attribute
     } else if pattern.value == ProgramTerm::Variable(variable) {
-        Axis::Value
+        ProgramAxis::Value
     } else {
         unreachable!("caller only asks patterns which contain the variable")
+    }
+}
+
+fn axis_prefix<U: Universe>(
+    archive: &SuccinctArchive<U>,
+    axis: ProgramAxis,
+) -> &BitVector<Rank9SelIndex> {
+    match axis {
+        ProgramAxis::Entity => &archive.e_a,
+        ProgramAxis::Attribute => &archive.a_a,
+        ProgramAxis::Value => &archive.v_a,
     }
 }
 

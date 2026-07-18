@@ -410,14 +410,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without comparing segment-local universe codes; joins and deduplication
   remain explicit caller responsibilities.
 
-- **Resident succinct value proposals have a real `pattern!` entry.**
-  `WgpuSuccinctArchive::value_route[_with]` wraps the canonical succinct
-  constraint and exposes a narrow typed Program for two-bound `(E,A) -> V`
-  proposals. Native paging and resident WGPU dispatch share exact ragged
-  grants, absolute continuations, branded receipts, and bag semantics; every
-  decline falls back on the untouched cohort. Placement is Off by default,
-  `Force` is a parity probe, and the explicitly experimental `WarmM4` score is
-  the only calibrated opt-in.
+- **Resident succinct two-bound proposals have a real `pattern!` entry.**
+  `WgpuSuccinctArchive::two_bound_route[_with]` wraps the canonical succinct
+  constraint and exposes one typed Program for `(A,V) -> E`, `(E,V) -> A`, and
+  `(E,A) -> V` proposals. One immutable rotation descriptor drives both Native
+  paging and resident WGPU dispatch with exact ragged grants, absolute
+  continuations, branded receipts, and bag semantics; every declined action
+  falls back on the untouched cohort. Placement is Off by default and `Force`
+  is the all-target parity probe. The experimental `WarmM4` score remains
+  calibrated only for `(E,A) -> V`; E/A targets decline Native until measured.
 - **Resident value routes expose honest snapshot-local preparation.**
   `WgpuSuccinctArchive::prepare_value_route` synchronously runs one real
   nonempty `(E,A) -> V` parent with grant one through the exact production
@@ -436,7 +437,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through that same constraint's paged source and seed capabilities instead
   of dropping directly to eager ordinary execution. Once a Program route is
   returned it remains exclusive. This preserves geometric lazy latency for
-  heterogeneous wrappers such as the resident succinct value route.
+  heterogeneous wrappers such as the resident succinct two-bound route.
 - **Explicit parallel residual queries preserve their selected lowering.**
   `Query::into_par_residual_state_iter` now carries the query's default full
   formula and transition-program lowering into its affine shards, while still

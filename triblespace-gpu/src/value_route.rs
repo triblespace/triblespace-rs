@@ -1,33 +1,29 @@
-//! The narrow resident value route: a real `find!`/`pattern!` entry whose
-//! two-bound `(E,A) -> V` value proposals may execute on the resident device.
+//! The resident two-bound route: a real `find!`/`pattern!` entry whose
+//! `(A,V) -> E`, `(E,V) -> A`, and `(E,A) -> V` proposals share one typed
+//! Native/resident execution seam.
 //!
-//! [`ResidentValueRoute`] is a [`TriblePattern`] carrier over one
-//! [`WgpuSuccinctArchive`]. Its [`ResidentValueConstraint`] delegates every
+//! [`ResidentTwoBoundRoute`] is a [`TriblePattern`] carrier over one
+//! [`WgpuSuccinctArchive`]. Its [`ResidentTwoBoundConstraint`] delegates every
 //! ordinary [`Constraint`] method and hook to the canonical
 //! [`SuccinctArchiveConstraint`] unchanged, and additionally exposes one
-//! typed residual-Program family ([`SuccinctValueFamily`]) whose route is
-//! deliberately narrow:
+//! typed residual-Program family ([`SuccinctTwoBoundFamily`]) with exactly
+//! three action-local routes:
 //!
-//! - **Only** `ProgramAction::Propose(value_variable)` for the one E/A/V
-//!   pattern, and only when every non-value variable of the pattern is
-//!   already bound or constant (the two-bound arm).
-//! - `None` for entity/attribute proposals and for every Confirm/Support
-//!   request; those actions return to the ordinary constraint protocol.
+//! - `ProgramAction::Propose(target)` when the other two axes of the one E/A/V
+//!   pattern are already bound or constant.
+//! - `None` for every insufficiently bound Propose and every Confirm/Support;
+//!   those actions return to the ordinary constraint protocol unchanged.
 //!
 //! # Interval-in-state
 //!
-//! Each seeded state carries the checked length of the canonical AEV
-//! interval of its resolved `(E,A)` pair
-//! ([`QueryProgram::fixed_ea_value_interval`], a pure archive-local function
-//! — hence canonical state, not scheduler metadata), with parents owning an
-//! empty interval omitted at seed time. Progress is therefore O(1)
-//! (`len - offset`), backend admission computes the exact page work
-//! `sum(min(remaining, grant))` in examined outputs without touching the
-//! archive, and the Native step pages through
-//! [`QueryProgram::transition_on_value_page`] — O(inputs + page) direct
-//! `aev_c` accesses, re-deriving each interval's position by rank/select
-//! from the codes. Physical execution likewise revalidates ranges on the
-//! device and fails closed.
+//! A typed rotation descriptor selects the target, the ordered physical peer
+//! pair, its fanout rotation, the navigation Ring, and the output Ring. Each
+//! seeded state carries that descriptor, the two resolved codes, and the
+//! checked interval length. Empty intervals are omitted. Progress is O(1)
+//! (`len - offset`), exact page work is known without touching the archive,
+//! and [`QueryProgram::transition_on_two_bound_page`] re-derives the interval
+//! position by rank/select in O(inputs + page). Physical execution independently
+//! revalidates the same descriptor-selected range and fails closed.
 //!
 //! Terminal proposal rows publish through `TypedEffectSink::direct` — the
 //! engine's order- and multiplicity-preserving Propose semantics — never
@@ -35,10 +31,10 @@
 //!
 //! # Routing is OFF by default
 //!
-//! The default admission is [`ValueRouteAdmission::Off`]: every cohort steps
+//! The default admission is [`TwoBoundRouteAdmission::Off`]: every cohort steps
 //! Native and the module is a zero-behavior-change wrapper. Activation is an
-//! explicit builder call ([`WgpuSuccinctArchive::value_route_with`]) or the
-//! typed environment variable [`VALUE_ROUTE_ENV`], read once at construction
+//! explicit builder call ([`WgpuSuccinctArchive::two_bound_route_with`]) or the
+//! typed environment variable [`TWO_BOUND_ROUTE_ENV`], read once at construction
 //! with invalid values reported as a configuration error, never silently
 //! coerced.
 //!
@@ -50,15 +46,13 @@
 //!    never waits on another cohort's device round trip, and a lane whose
 //!    dispatch ever exited without validating is never leased again. All
 //!    pure preflight runs before acquisition, so declines cannot poison.
-//! 2. **The admission geometry** ([`ValueRouteAdmission`]): an explicitly
-//!    enabled policy admits by cohort rows and exact page work — `Force`
-//!    for parity/acceptance probes, or the explicitly experimental
-//!    calibrated `WarmM4` dominance score. There is deliberately **no
-//!    `Auto`**: explicit preparation proves only this snapshot's exact value
-//!    path, while no device-wide cooperative submission gate can yet prove
-//!    that automatic placement will not wait behind unrelated work. QoS placement intent
-//!    (consumer-owned, shard-inherited) is likewise absent from this first
-//!    route and returns as a later, measured second policy arm.
+//! 2. **The admission geometry** ([`TwoBoundRouteAdmission`]): an explicitly
+//!    enabled policy admits by target, cohort rows, and exact page work.
+//!    `Force` is the all-target parity arm. The experimental `WarmM4` score is
+//!    calibrated only for `(E,A) -> V`; E/A targets decline Native until they
+//!    have target-local measurements. There is deliberately **no `Auto`**:
+//!    value-path preparation is snapshot-local, while no device-wide
+//!    cooperative gate can prove unrelated work absent.
 
 use std::env;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -81,28 +75,33 @@ use triblespace_core::query::{
 
 use crate::budgeted::CohortGrants;
 use crate::query_program::{
-    ArchiveCode, ProgramFrontier, ProgramVariable, QueryPattern, QueryProgram, QueryTerm,
+    ArchiveCode, ProgramAxis, ProgramFrontier, ProgramVariable, QueryPattern, QueryProgram,
+    QueryTerm, TwoBoundRotation,
 };
 use crate::resident_program::WgpuQueryProgram;
 use crate::succinct_query::WgpuSuccinctArchive;
 use crate::typed_program::WGPU_RESIDENT_EXECUTOR;
 
-/// Environment variable that configures the value-route admission policy.
+/// Environment variable that configures the two-bound admission policy.
 ///
-/// Read exactly once, at [`WgpuSuccinctArchive::value_route`] construction:
+/// Read exactly once, at [`WgpuSuccinctArchive::two_bound_route`] construction:
 ///
-/// - unset or empty: [`ValueRouteAdmission::Off`] (the default),
-/// - `off` or `0`: [`ValueRouteAdmission::Off`],
-/// - `force`: [`ValueRouteAdmission::Force`],
-/// - `warm-m4`: [`ValueRouteAdmission::WarmM4`] (explicitly experimental),
-/// - `auto`: **rejected** ([`ValueRouteConfigError::AutoNotReady`]) — explicit
+/// - unset or empty: [`TwoBoundRouteAdmission::Off`] (the default),
+/// - `off` or `0`: [`TwoBoundRouteAdmission::Off`],
+/// - `force`: [`TwoBoundRouteAdmission::Force`],
+/// - `warm-m4`: [`TwoBoundRouteAdmission::WarmM4`] (explicitly experimental),
+/// - `auto`: **rejected** ([`TwoBoundRouteConfigError::AutoNotReady`]) — explicit
 ///   preparation is snapshot-local, and no device-wide cooperative gate can
 ///   yet prove that automatic placement will not wait behind unrelated work,
-/// - anything else: a [`ValueRouteConfigError`] — never a silent fallback.
-pub const VALUE_ROUTE_ENV: &str = "TRIBLESPACE_GPU_VALUE_ROUTE";
+/// - anything else: a [`TwoBoundRouteConfigError`] — never a silent fallback.
+pub const TWO_BOUND_ROUTE_ENV: &str = "TRIBLESPACE_GPU_TWO_BOUND_ROUTE";
 
-/// Static operation label carried by successful value-route placements.
-pub const TWO_BOUND_VALUE_OP: &str = "two-bound-transition/value-route";
+/// Static operation label for `(A,V) -> E` placements.
+pub const TWO_BOUND_ENTITY_ROUTE_OP: &str = "two-bound-transition/entity-route";
+/// Static operation label for `(E,V) -> A` placements.
+pub const TWO_BOUND_ATTRIBUTE_ROUTE_OP: &str = "two-bound-transition/attribute-route";
+/// Static operation label for `(E,A) -> V` placements.
+pub const TWO_BOUND_VALUE_ROUTE_OP: &str = "two-bound-transition/value-route";
 
 /// Snapshot-local readiness of the public resident value route.
 ///
@@ -245,13 +244,13 @@ impl Drop for ValueRoutePreparationGuard<'_> {
     }
 }
 
-/// An invalid [`VALUE_ROUTE_ENV`] value.
+/// An invalid [`TWO_BOUND_ROUTE_ENV`] value.
 ///
 /// Misconfiguration is an error, not a silent policy: an unparsable
 /// activation request must never quietly run with a different admission
 /// than the operator asked for.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ValueRouteConfigError {
+pub enum TwoBoundRouteConfigError {
     /// The value is outside the grammar.
     Invalid {
         /// The rejected value.
@@ -264,16 +263,16 @@ pub enum ValueRouteConfigError {
     AutoNotReady,
 }
 
-impl fmt::Display for ValueRouteConfigError {
+impl fmt::Display for TwoBoundRouteConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Invalid { value } => write!(
                 f,
-                "invalid {VALUE_ROUTE_ENV} value {value:?}: expected unset, off, 0, force, or warm-m4"
+                "invalid {TWO_BOUND_ROUTE_ENV} value {value:?}: expected unset, off, 0, force, or warm-m4"
             ),
             Self::AutoNotReady => write!(
                 f,
-                "{VALUE_ROUTE_ENV}=auto is not available: snapshot-local preparation cannot prove \
+                "{TWO_BOUND_ROUTE_ENV}=auto is not available: snapshot-local preparation cannot prove \
                  the shared device is ready now; use the explicitly \
                  experimental warm-m4 calibration or force"
             ),
@@ -281,9 +280,9 @@ impl fmt::Display for ValueRouteConfigError {
     }
 }
 
-impl Error for ValueRouteConfigError {}
+impl Error for TwoBoundRouteConfigError {}
 
-/// Post-cohort-formation admission policy for the resident value route.
+/// Post-cohort-formation admission policy for the resident two-bound route.
 ///
 /// The decision weighs the cohort's row count and its exact page work
 /// `sum(min(remaining, grant))` in examined outputs. The default is
@@ -295,17 +294,20 @@ impl Error for ValueRouteConfigError {}
 /// profiles, but it is not categorical authorization: an immediately ready
 /// device can itself be the lower-latency executor. The nonblocking lease
 /// remains the hard never-wait boundary either way.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ValueRouteAdmission {
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TwoBoundRouteAdmission {
     /// Never route; every cohort steps Native. This is the default.
+    #[default]
     Off,
     /// The documented opt-in: route every capability-admitted cohort
     /// regardless of size. Intended for parity runs and acceptance probes,
     /// not as a measured production policy.
     Force,
-    /// The **explicitly experimental** warm-M4 dominance score: route
-    /// cohorts whose `native_work_score = exact_page_work + 8 * rows`
-    /// reaches [`WARM_M4_ELIGIBLE_SCORE`].
+    /// The **explicitly experimental** warm-M4 dominance score for the
+    /// measured `(E,A) -> V` operation. `(A,V) -> E` and `(E,V) -> A` always
+    /// decline to Native under this policy until they have their own
+    /// target-local calibration; [`Force`](Self::Force) remains available for
+    /// parity probes on all three operations.
     ///
     /// Calibrated from the expanded rows × fanout matrix on one warm Apple
     /// M4 — resident buffers live, pipelines already compiled. It is *not*
@@ -320,23 +322,23 @@ pub enum ValueRouteAdmission {
 /// Native-work weight of one parent row in the warm-M4 dominance score.
 ///
 /// Experimental calibration (warm Apple M4, resident and compiled); see
-/// [`ValueRouteAdmission::WarmM4`].
+/// [`TwoBoundRouteAdmission::WarmM4`].
 pub const WARM_M4_ROW_WORK: u128 = 8;
 
 /// Minimum `exact_page_work + 8 * rows` score at which the warm-M4 matrix
 /// observed device dominance.
 ///
 /// Experimental calibration (warm Apple M4, resident and compiled); see
-/// [`ValueRouteAdmission::WarmM4`].
+/// [`TwoBoundRouteAdmission::WarmM4`].
 pub const WARM_M4_ELIGIBLE_SCORE: u128 = 98_304;
 
-impl ValueRouteAdmission {
-    /// Reads [`VALUE_ROUTE_ENV`] once; see the constant for the grammar.
-    pub fn from_env() -> Result<Self, ValueRouteConfigError> {
-        Self::from_env_value(env::var(VALUE_ROUTE_ENV).ok().as_deref())
+impl TwoBoundRouteAdmission {
+    /// Reads [`TWO_BOUND_ROUTE_ENV`] once; see the constant for the grammar.
+    pub fn from_env() -> Result<Self, TwoBoundRouteConfigError> {
+        Self::from_env_value(env::var(TWO_BOUND_ROUTE_ENV).ok().as_deref())
     }
 
-    fn from_env_value(value: Option<&str>) -> Result<Self, ValueRouteConfigError> {
+    fn from_env_value(value: Option<&str>) -> Result<Self, TwoBoundRouteConfigError> {
         let Some(text) = value else {
             return Ok(Self::Off);
         };
@@ -345,8 +347,8 @@ impl ValueRouteAdmission {
             "" | "off" | "0" => Ok(Self::Off),
             "force" => Ok(Self::Force),
             "warm-m4" => Ok(Self::WarmM4),
-            "auto" => Err(ValueRouteConfigError::AutoNotReady),
-            other => Err(ValueRouteConfigError::Invalid {
+            "auto" => Err(TwoBoundRouteConfigError::AutoNotReady),
+            other => Err(TwoBoundRouteConfigError::Invalid {
                 value: other.to_owned(),
             }),
         }
@@ -357,37 +359,38 @@ impl ValueRouteAdmission {
         !matches!(self, Self::Off)
     }
 
-    /// The complete admission decision for one already-formed cohort.
+    /// The measured `(E,A) -> V` admission decision for one already-formed
+    /// cohort. This public score surface is intentionally value-local; the
+    /// route additionally enforces the target-axis calibration boundary.
     pub fn admits(&self, rows: usize, page_work: u64) -> bool {
+        self.admits_target(ProgramAxis::Value, rows, page_work)
+    }
+
+    fn admits_target(&self, target: ProgramAxis, rows: usize, page_work: u64) -> bool {
         if rows == 0 || page_work == 0 {
             return false;
         }
         match self {
             Self::Off => false,
             Self::Force => true,
-            Self::WarmM4 => {
+            Self::WarmM4 if target == ProgramAxis::Value => {
                 let score = page_work as u128 + WARM_M4_ROW_WORK * rows as u128;
                 score >= WARM_M4_ELIGIBLE_SCORE
             }
+            Self::WarmM4 => false,
         }
     }
 }
 
-impl Default for ValueRouteAdmission {
-    fn default() -> Self {
-        Self::Off
-    }
-}
-
-/// Shared decision counters for one value-route view.
+/// Shared decision counters for one two-bound route view.
 ///
 /// Every pattern constraint and parallel residual shard created from the
-/// same [`ResidentValueRoute`] shares these counters through an `Arc`, so
+/// same [`ResidentTwoBoundRoute`] shares these counters through an `Arc`, so
 /// physical placements remain observable even though parallel collection
 /// discards per-shard `ResidualStateStats`. Relaxed atomics: exact after the
 /// solve completes.
 #[derive(Debug, Default)]
-pub struct ValueRouteCounters {
+pub struct TwoBoundRouteCounters {
     physical_cohorts: AtomicU64,
     physical_rows: AtomicU64,
     physical_page_work: AtomicU64,
@@ -397,9 +400,9 @@ pub struct ValueRouteCounters {
     declined_contract: AtomicU64,
 }
 
-/// One relaxed snapshot of [`ValueRouteCounters`].
+/// One relaxed snapshot of [`TwoBoundRouteCounters`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ValueRouteCountersSnapshot {
+pub struct TwoBoundRouteCountersSnapshot {
     /// Cohorts committed with a physical placement.
     pub physical_cohorts: u64,
     /// Input rows across those cohorts.
@@ -418,9 +421,9 @@ pub struct ValueRouteCountersSnapshot {
     pub declined_contract: u64,
 }
 
-impl ValueRouteCounters {
-    fn snapshot(&self) -> ValueRouteCountersSnapshot {
-        ValueRouteCountersSnapshot {
+impl TwoBoundRouteCounters {
+    fn snapshot(&self) -> TwoBoundRouteCountersSnapshot {
+        TwoBoundRouteCountersSnapshot {
             physical_cohorts: self.physical_cohorts.load(Ordering::Relaxed),
             physical_rows: self.physical_rows.load(Ordering::Relaxed),
             physical_page_work: self.physical_page_work.load(Ordering::Relaxed),
@@ -432,8 +435,8 @@ impl ValueRouteCounters {
     }
 }
 
-/// One canonical typed state of the value route: a resolved `(E,A)` pair,
-/// the checked length of its canonical AEV interval, and the candidates
+/// One canonical typed state of a two-bound route: the selected rotation,
+/// its resolved physical pair, the checked interval length, and the candidates
 /// already consumed.
 ///
 /// The interval length is a pure archive-local function of the two codes,
@@ -445,16 +448,17 @@ impl ValueRouteCounters {
 /// and validates the range on its own plane), so a stored start would be an
 /// unread duplicate to keep consistent.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SuccinctValueState {
-    entity: ArchiveCode,
-    attribute: ArchiveCode,
+pub struct SuccinctTwoBoundState {
+    rotation: TwoBoundRotation,
+    first: ArchiveCode,
+    last: ArchiveCode,
     /// Checked interval length.
     len: u64,
     /// Candidates of the interval consumed by earlier pages.
     offset: u64,
 }
 
-impl SuccinctValueState {
+impl SuccinctTwoBoundState {
     /// Candidates not yet consumed.
     pub fn remaining(&self) -> u64 {
         self.len - self.offset
@@ -469,53 +473,48 @@ impl SuccinctValueState {
 /// One input's page in a family-internal step outcome, shared by the Native
 /// and the device path so their equivalence is a direct comparison.
 #[derive(Debug, Eq, PartialEq)]
-struct ValuePage {
+struct TwoBoundPage {
     examined: usize,
-    resume: Option<SuccinctValueState>,
+    resume: Option<SuccinctTwoBoundState>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
-struct ValueStepOutcome {
-    pages: Vec<ValuePage>,
+struct TwoBoundStepOutcome {
+    pages: Vec<TwoBoundPage>,
     /// Terminal proposal rows as direct occurrences (order- and
     /// multiplicity-preserving Propose semantics) — never `accept`.
     direct: Vec<(u32, RawInline)>,
 }
 
-struct ValueFamilyCore<'a, U: Universe> {
+struct TwoBoundFamilyCore<'a, U: Universe> {
     program: QueryProgram<'a, U>,
-    /// Engine variable proposed by the narrow route.
-    value_variable: VariableId,
-    /// Engine variables that must be bound before the route activates.
-    required_bound: VariableSet,
-    term_e: RawTerm,
-    term_a: RawTerm,
-    /// Non-value program variables in canonical ascending order.
-    bound_pvars: Vec<ProgramVariable>,
-    entity_pvar: Option<ProgramVariable>,
-    value_pvar: ProgramVariable,
-    device: Option<ValueDeviceArm<'a, U>>,
-    admission: ValueRouteAdmission,
-    /// Shared with the creating [`ResidentValueRoute`] (and every clone of
+    terms: [RawTerm; 3],
+    engine_variables: [Option<VariableId>; 3],
+    program_variables: [Option<ProgramVariable>; 3],
+    /// Engine variables required for each target axis.
+    required_bound: [VariableSet; 3],
+    device: Option<TwoBoundDeviceArm<'a, U>>,
+    admission: TwoBoundRouteAdmission,
+    /// Shared with the creating [`ResidentTwoBoundRoute`] (and every clone of
     /// this family), so placements stay observable after `pattern!` erases
     /// the constraint and across parallel shard clones.
-    counters: Arc<ValueRouteCounters>,
+    counters: Arc<TwoBoundRouteCounters>,
 }
 
-struct ValueDeviceArm<'a, U: Universe> {
+struct TwoBoundDeviceArm<'a, U: Universe> {
     resident: &'a WgpuSuccinctArchive<U>,
     gpu: WgpuQueryProgram<'a, U>,
 }
 
-/// The typed residual-Program family of the resident value route.
+/// The typed residual-Program family of the resident two-bound route.
 ///
 /// Cloning is cheap and shares the compiled core (and its decision
 /// counters), which is exactly what parallel residual shards need.
-pub struct SuccinctValueFamily<'a, U: Universe> {
-    core: Arc<ValueFamilyCore<'a, U>>,
+pub struct SuccinctTwoBoundFamily<'a, U: Universe> {
+    core: Arc<TwoBoundFamilyCore<'a, U>>,
 }
 
-impl<U: Universe> Clone for SuccinctValueFamily<'_, U> {
+impl<U: Universe> Clone for SuccinctTwoBoundFamily<'_, U> {
     fn clone(&self) -> Self {
         Self {
             core: Arc::clone(&self.core),
@@ -523,66 +522,73 @@ impl<U: Universe> Clone for SuccinctValueFamily<'_, U> {
     }
 }
 
-impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
-    /// Compiles the narrow two-bound arm for one E/A/V pattern, or `None`
-    /// when the pattern is outside it (value term not a variable, repeated
-    /// variables, or an inadmissible program).
+impl<'a, U: Universe> SuccinctTwoBoundFamily<'a, U> {
+    /// Compiles every available two-bound arm for one E/A/V pattern, or
+    /// `None` when the pattern has no variable, repeats a variable between
+    /// axes, or is otherwise inadmissible to the compact Program.
     fn compile(
         term_e: RawTerm,
         term_a: RawTerm,
         term_v: RawTerm,
         gpu: &'a WgpuSuccinctArchive<U>,
-        admission: ValueRouteAdmission,
-        counters: Arc<ValueRouteCounters>,
+        admission: TwoBoundRouteAdmission,
+        counters: Arc<TwoBoundRouteCounters>,
     ) -> Option<Self> {
-        let RawTerm::Var(value_variable) = term_v else {
-            return None;
-        };
-        if term_e.is_var(value_variable) || term_a.is_var(value_variable) {
-            return None;
-        }
-        if let (RawTerm::Var(entity), RawTerm::Var(attribute)) = (term_e, term_a) {
-            if entity == attribute {
+        let terms = [term_e, term_a, term_v];
+        for right in 0..terms.len() {
+            let RawTerm::Var(variable) = terms[right] else {
+                continue;
+            };
+            if terms[..right].iter().any(|term| term.is_var(variable)) {
                 return None;
             }
         }
 
         let mut next = 0u8;
-        let mut required_bound = VariableSet::new_empty();
-        let mut bound_pvars = Vec::new();
-        let mut lower = |term: RawTerm| match term {
-            RawTerm::Var(variable) => {
-                let pvar = ProgramVariable::new(next);
-                next += 1;
-                required_bound.set(variable);
-                bound_pvars.push(pvar);
-                (Some(pvar), QueryTerm::Variable(pvar))
+        let mut lower =
+            |term: RawTerm| -> (Option<VariableId>, Option<ProgramVariable>, QueryTerm) {
+                match term {
+                    RawTerm::Var(variable) => {
+                        let pvar = ProgramVariable::new(next);
+                        next += 1;
+                        (Some(variable), Some(pvar), QueryTerm::Variable(pvar))
+                    }
+                    RawTerm::Const(constant) => (None, None, QueryTerm::Constant(constant)),
+                }
+            };
+        let (entity_variable, entity_pvar, entity_term) = lower(term_e);
+        let (attribute_variable, attribute_pvar, attribute_term) = lower(term_a);
+        let (value_variable, value_pvar, value_term) = lower(term_v);
+        if next == 0 {
+            return None;
+        }
+        let engine_variables = [entity_variable, attribute_variable, value_variable];
+        let program_variables = [entity_pvar, attribute_pvar, value_pvar];
+        let mut required_bound = [VariableSet::new_empty(); 3];
+        for target in ProgramAxis::ALL {
+            for peer in ProgramAxis::ALL {
+                if peer != target {
+                    if let Some(variable) = engine_variables[peer.index()] {
+                        required_bound[target.index()].set(variable);
+                    }
+                }
             }
-            RawTerm::Const(constant) => (None, QueryTerm::Constant(constant)),
-        };
-        let (entity_pvar, entity_term) = lower(term_e);
-        let (_attribute_pvar, attribute_term) = lower(term_a);
-        let value_pvar = ProgramVariable::new(next);
-        let variable_count = next as usize + 1;
+        }
 
         let program = QueryProgram::compile(
             gpu.archive(),
-            variable_count,
-            [QueryPattern::new(
-                entity_term,
-                attribute_term,
-                QueryTerm::Variable(value_pvar),
-            )],
+            next as usize,
+            [QueryPattern::new(entity_term, attribute_term, value_term)],
         )
         .ok()?;
         // The device arm exists only under an explicitly enabled policy:
-        // Off is honest — zero GPU-admission work, including the lazy
-        // O(pairs) fanout scan the resident executor's construction would
-        // trigger. Force/WarmM4 pay that scan once as setup cost.
+        // Off is honest — zero resident Program construction or dispatch
+        // work. Enabled policies construct only the metadata executor here;
+        // each rotation's O(pairs) fanout scan remains action-lazy.
         let device = if admission.routing_enabled() {
             WgpuQueryProgram::new(&program, gpu)
                 .ok()
-                .map(|resident_program| ValueDeviceArm {
+                .map(|resident_program| TwoBoundDeviceArm {
                     resident: gpu,
                     gpu: resident_program,
                 })
@@ -590,15 +596,12 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
             None
         };
         Some(Self {
-            core: Arc::new(ValueFamilyCore {
+            core: Arc::new(TwoBoundFamilyCore {
                 program,
-                value_variable,
+                terms,
+                engine_variables,
+                program_variables,
                 required_bound,
-                term_e,
-                term_a,
-                bound_pvars,
-                entity_pvar,
-                value_pvar,
                 device,
                 admission,
                 counters,
@@ -607,32 +610,34 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
     }
 
     /// A relaxed snapshot of this route's shared decision counters.
-    pub fn counters(&self) -> ValueRouteCountersSnapshot {
+    pub fn counters(&self) -> TwoBoundRouteCountersSnapshot {
         self.core.counters.snapshot()
     }
 
-    /// Constructs the canonical state for one resolved `(E, A)` parent, or
+    /// Constructs the canonical state for one resolved physical pair, or
     /// `None` when the parent owns an empty interval (including raw values
     /// absent from the archive domain) — an exact empty result that seeds
     /// nothing.
     fn seed_state(
         &self,
-        entity_raw: &RawInline,
-        attribute_raw: &RawInline,
-    ) -> Option<SuccinctValueState> {
+        rotation: TwoBoundRotation,
+        first_raw: &RawInline,
+        last_raw: &RawInline,
+    ) -> Option<SuccinctTwoBoundState> {
         let core = &self.core;
-        let entity = core.program.encode(entity_raw)?;
-        let attribute = core.program.encode(attribute_raw)?;
+        let first = core.program.encode(first_raw)?;
+        let last = core.program.encode(last_raw)?;
         let interval = core
             .program
-            .fixed_ea_value_interval(entity, attribute)
+            .fixed_two_bound_interval(rotation, first, last)
             .expect("encoded codes lie within their own archive domain");
         if interval.is_empty() {
             return None;
         }
-        Some(SuccinctValueState {
-            entity,
-            attribute,
+        Some(SuccinctTwoBoundState {
+            rotation,
+            first,
+            last,
             len: interval.len() as u64,
             offset: 0,
         })
@@ -649,39 +654,86 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
             RawTerm::Var(variable) => {
                 let column = view
                     .col(*variable)
-                    .expect("the value route requires its non-value variables bound");
+                    .expect("the two-bound route requires both peer variables bound");
                 &row[column]
             }
             RawTerm::Const(constant) => constant,
         }
     }
 
-    /// The cohort's shared `(E,A)` parent frontier in program code space.
-    fn cohort_frontier(&self, states: &[SuccinctValueState]) -> ProgramFrontier {
+    fn route_axis(key: ProgramKey) -> Option<ProgramAxis> {
+        ProgramAxis::ALL
+            .into_iter()
+            .find(|&axis| key == Self::route_key(axis))
+    }
+
+    fn route_key(axis: ProgramAxis) -> ProgramKey {
+        ProgramKey::new(axis.index() as u32)
+    }
+
+    fn target_pvar(&self, axis: ProgramAxis) -> ProgramVariable {
+        self.core.program_variables[axis.index()]
+            .expect("a routed target axis is a program variable")
+    }
+
+    fn state_code(state: &SuccinctTwoBoundState, axis: ProgramAxis) -> ArchiveCode {
+        if axis == state.rotation.first {
+            state.first
+        } else if axis == state.rotation.last {
+            state.last
+        } else {
+            unreachable!("a two-bound state does not bind its target axis")
+        }
+    }
+
+    /// The cohort's shared physical-pair frontier in program code space.
+    fn cohort_frontier(&self, states: &[SuccinctTwoBoundState]) -> ProgramFrontier {
         let core = &self.core;
-        let mut values = Vec::with_capacity(states.len() * core.bound_pvars.len());
+        let rotation = states
+            .first()
+            .expect("the scheduler never forms an empty Program cohort")
+            .rotation;
+        assert!(
+            states.iter().all(|state| state.rotation == rotation),
+            "dispatch classes must not mix two-bound rotations"
+        );
+        let bound: Vec<_> = ProgramAxis::ALL
+            .into_iter()
+            .filter(|&axis| axis != rotation.target)
+            .filter_map(|axis| core.program_variables[axis.index()].map(|pvar| (pvar, axis)))
+            .collect();
+        let mut values = Vec::with_capacity(states.len() * bound.len());
         for state in states {
-            for &pvar in &core.bound_pvars {
-                values.push(if Some(pvar) == core.entity_pvar {
-                    state.entity
-                } else {
-                    state.attribute
-                });
+            for &(_, axis) in &bound {
+                values.push(Self::state_code(state, axis));
             }
         }
-        ProgramFrontier::new(core.bound_pvars.clone(), values, states.len())
-            .expect("family states hold validated archive codes")
+        ProgramFrontier::new(
+            bound.iter().map(|&(pvar, _)| pvar).collect(),
+            values,
+            states.len(),
+        )
+        .expect("family states hold validated archive codes")
     }
 
     /// Exact Native cohort step under the scheduler's per-input grants,
-    /// paged through the native fixed-`(E,A)` value primitive.
-    fn native_outcome(&self, states: &[SuccinctValueState], limits: &[usize]) -> ValueStepOutcome {
+    /// paged through the descriptor-selected fixed-pair primitive.
+    fn native_outcome(
+        &self,
+        states: &[SuccinctTwoBoundState],
+        limits: &[usize],
+    ) -> TwoBoundStepOutcome {
         assert_eq!(
             states.len(),
             limits.len(),
-            "value cohort arrived with mismatched grant count"
+            "two-bound cohort arrived with mismatched grant count"
         );
         let core = &self.core;
+        let rotation = states
+            .first()
+            .expect("the scheduler never forms an empty Program cohort")
+            .rotation;
+        let target_pvar = self.target_pvar(rotation.target);
         let frontier = self.cohort_frontier(states);
         let offsets: Vec<usize> = states
             .iter()
@@ -691,17 +743,17 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
             .collect();
         let page = core
             .program
-            .transition_on_value_page(core.value_pvar, &frontier, &offsets, limits)
+            .transition_on_two_bound_page(target_pvar, &frontier, &offsets, limits)
             .expect("family states page within their own program")
-            .expect("the compiled value route is the admitted fixed-(E,A) arm");
+            .expect("the compiled route is an admitted two-bound arm");
         let (child, receipts) = page.into_parts();
         let target_column = child
             .variables()
             .iter()
-            .position(|&variable| variable == core.value_pvar)
-            .expect("the value page inserted its target into the child schema");
+            .position(|&variable| variable == target_pvar)
+            .expect("the two-bound page inserted its target into the child schema");
 
-        let mut outcome = ValueStepOutcome {
+        let mut outcome = TwoBoundStepOutcome {
             pages: Vec::with_capacity(states.len()),
             direct: Vec::new(),
         };
@@ -731,14 +783,14 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
                 assert_eq!(
                     next as u64,
                     state.offset + examined as u64,
-                    "native value page resumed off its consumed prefix"
+                    "native two-bound page resumed off its consumed prefix"
                 );
-                SuccinctValueState {
+                SuccinctTwoBoundState {
                     offset: next as u64,
                     ..state.clone()
                 }
             });
-            outcome.pages.push(ValuePage { examined, resume });
+            outcome.pages.push(TwoBoundPage { examined, resume });
         }
         assert_eq!(
             consumed,
@@ -758,9 +810,9 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
     /// cohorts decline nonblockingly.
     fn device_outcome(
         &self,
-        states: &[SuccinctValueState],
+        states: &[SuccinctTwoBoundState],
         batch: &TypedProgramBatch<'_>,
-    ) -> Option<ValueStepOutcome> {
+    ) -> Option<TwoBoundStepOutcome> {
         self.device_outcome_validated(states, batch, |_| true)
     }
 
@@ -772,10 +824,10 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
     /// mismatch therefore poisons the lane instead of publishing readiness.
     fn device_outcome_validated(
         &self,
-        states: &[SuccinctValueState],
+        states: &[SuccinctTwoBoundState],
         batch: &TypedProgramBatch<'_>,
-        validate_commit: impl FnOnce(&ValueStepOutcome) -> bool,
-    ) -> Option<ValueStepOutcome> {
+        validate_commit: impl FnOnce(&TwoBoundStepOutcome) -> bool,
+    ) -> Option<TwoBoundStepOutcome> {
         let core = &self.core;
 
         // Pure preflight: admission, capability, and every grant-shape
@@ -791,7 +843,15 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
             .zip(limits)
             .map(|(state, &limit)| state.remaining().min(limit as u64))
             .sum();
-        if !core.admission.admits(states.len(), page_work) {
+        let target = states
+            .first()
+            .expect("the scheduler never forms an empty Program cohort")
+            .rotation
+            .target;
+        if !core
+            .admission
+            .admits_target(target, states.len(), page_work)
+        {
             core.counters
                 .declined_policy
                 .fetch_add(1, Ordering::Relaxed);
@@ -870,17 +930,22 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
 
     fn device_outcome_leased(
         &self,
-        arm: &ValueDeviceArm<'a, U>,
-        states: &[SuccinctValueState],
+        arm: &TwoBoundDeviceArm<'a, U>,
+        states: &[SuccinctTwoBoundState],
         limits: &[usize],
         grants: &CohortGrants,
         bases: &[u32],
         frontier: &ProgramFrontier,
     ) -> DeviceAttempt {
         let core = &self.core;
+        let rotation = states
+            .first()
+            .expect("the scheduler never forms an empty Program cohort")
+            .rotation;
+        let target_pvar = self.target_pvar(rotation.target);
         let Ok((child, receipts)) =
             arm.gpu
-                .transition_on_budgeted_from(core.value_pvar, frontier, grants, bases)
+                .transition_on_budgeted_from(target_pvar, frontier, grants, bases)
         else {
             return DeviceAttempt::Failed;
         };
@@ -896,10 +961,10 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
         let target_column = child
             .variables()
             .iter()
-            .position(|&variable| variable == core.value_pvar)
+            .position(|&variable| variable == target_pvar)
             .expect("the budgeted transition inserted its target into the child schema");
 
-        let mut outcome = ValueStepOutcome {
+        let mut outcome = TwoBoundStepOutcome {
             pages: Vec::with_capacity(states.len()),
             direct: Vec::new(),
         };
@@ -911,7 +976,7 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
         {
             let input =
                 u32::try_from(input).expect("typed Program cohort input fits u32 occurrence tags");
-            // On this fixed (E,A) -> V Propose arm the lawful receipt is
+            // On every fixed-pair Propose arm the lawful receipt is
             // fully determined by the canonical state and the grant, so
             // every field is checked as an exact equality — mirroring the
             // Native pager — before any row is decoded or committed. A
@@ -944,7 +1009,7 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
                     {
                         return DeviceAttempt::Failed;
                     }
-                    Some(SuccinctValueState {
+                    Some(SuccinctTwoBoundState {
                         offset: expected_next,
                         ..state.clone()
                     })
@@ -956,7 +1021,7 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
                     None
                 }
             };
-            outcome.pages.push(ValuePage { examined, resume });
+            outcome.pages.push(TwoBoundPage { examined, resume });
         }
         // The child frontier must segment exactly: every device row belongs
         // to exactly one input's receipt.
@@ -969,14 +1034,14 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
     /// Writes one family step outcome through the typed effect sink,
     /// identically for the Native and the physical path.
     fn write_outcome(
-        outcome: ValueStepOutcome,
-        effects: &mut TypedEffectSink<SuccinctValueState, ()>,
+        outcome: TwoBoundStepOutcome,
+        effects: &mut TypedEffectSink<SuccinctTwoBoundState, ()>,
     ) {
         for (input, value) in outcome.direct {
             effects.direct(input, value);
         }
         for page in outcome.pages {
-            // The value route is a one-step propose *source*: each page
+            // A two-bound route is a one-step propose *source*: each page
             // consumes its interval directly, expanding no transition
             // lineage, so its telemetry is a source page with zero roots.
             effects.account_source(page.examined, 0);
@@ -987,37 +1052,38 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
 
 enum DeviceAttempt {
     /// Launch, readback, and every receipt law validated.
-    Committed(ValueStepOutcome),
+    Committed(TwoBoundStepOutcome),
     /// The dispatch did not commit — device error or receipt-law
     /// violation. The caller poisons the lane and steps Native.
     Failed,
 }
 
-impl<'a, U: Universe> TypedProgramSpec for SuccinctValueFamily<'a, U> {
-    type State = SuccinctValueState;
+impl<'a, U: Universe> TypedProgramSpec for SuccinctTwoBoundFamily<'a, U> {
+    type State = SuccinctTwoBoundState;
     type NoveltyKey = ();
     /// Remaining interval candidates. Seeding omits empty intervals and
     /// every resume strictly consumes, so this is a well-founded finite
     /// measure; the route never emits children.
     type Rank = u64;
 
-    /// The narrow route: only `Propose(value_variable)` with every required
-    /// non-value variable bound. Everything else — entity/attribute
-    /// proposals, every Confirm, every Support — returns to the ordinary
-    /// constraint protocol.
+    /// Selects exactly one of the three semantic two-bound Propose actions.
+    /// Every Confirm, Support, already-bound target, or insufficiently bound
+    /// peer schema returns to the ordinary constraint protocol.
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
         let core = &self.core;
         let ProgramAction::Propose(variable) = request.action else {
             return None;
         };
-        if variable != core.value_variable
-            || request.bound.is_set(core.value_variable)
-            || !core.required_bound.is_subset_of(&request.bound)
+        let target = ProgramAxis::ALL
+            .into_iter()
+            .find(|&axis| core.engine_variables[axis.index()] == Some(variable))?;
+        if request.bound.is_set(variable)
+            || !core.required_bound[target.index()].is_subset_of(&request.bound)
         {
             return None;
         }
         Some(ProgramRoute {
-            key: ProgramKey::new(0),
+            key: Self::route_key(target),
             variable,
             stratum: ProgramStratum::Finite,
             grouping: ProgramGrouping::PageLocal,
@@ -1025,9 +1091,10 @@ impl<'a, U: Universe> TypedProgramSpec for SuccinctValueFamily<'a, U> {
         })
     }
 
-    fn dispatch(&self, _state: &Self::State) -> DispatchClass {
-        // Every value state shares one schema and one kernel arm.
-        DispatchClass::new(0x00EA_2BD0)
+    fn dispatch(&self, state: &Self::State) -> DispatchClass {
+        // Keep target-local physical cohorts; all three reuse the same typed
+        // executor seam while selecting distinct immutable descriptors.
+        DispatchClass::new(0x02BD_0000 + state.rotation.target.index() as u32)
     }
 
     /// Whole-frontier pageable domain discovery: every state draws the
@@ -1040,23 +1107,33 @@ impl<'a, U: Universe> TypedProgramSpec for SuccinctValueFamily<'a, U> {
         state.remaining()
     }
 
-    /// Seeds one state per parent from the bound E/A columns or constants,
-    /// carrying the exact canonical AEV interval; parents whose interval is
-    /// empty (including E/A values absent from the archive domain) are an
-    /// exact empty result and seed nothing.
+    /// Seeds one state per parent from the target route's two bound peer
+    /// columns or constants. Empty intervals are exact empty results and seed
+    /// nothing; repeated parent rows remain repeated roots.
     fn seed_typed(
         &self,
         batch: ProgramSeedBatch<'_>,
         effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
     ) {
         let core = &self.core;
+        let target = Self::route_axis(batch.route.key)
+            .expect("the scheduler seeds only a route returned by this family");
+        let rotation = TwoBoundRotation::for_target(target);
+        assert_eq!(
+            batch.route.variable,
+            core.engine_variables[target.index()].unwrap()
+        );
+        assert_eq!(
+            batch.request.action,
+            ProgramAction::Propose(batch.route.variable)
+        );
         for parent in 0..batch.view.len() {
             let parent_tag =
                 u32::try_from(parent).expect("typed Program seed parent fits u32 occurrence tags");
             let row = batch.view.row(parent);
-            let entity_raw = Self::seed_value(&core.term_e, &batch.view, row);
-            let attribute_raw = Self::seed_value(&core.term_a, &batch.view, row);
-            if let Some(state) = self.seed_state(entity_raw, attribute_raw) {
+            let first_raw = Self::seed_value(&core.terms[rotation.first.index()], &batch.view, row);
+            let last_raw = Self::seed_value(&core.terms[rotation.last.index()], &batch.view, row);
+            if let Some(state) = self.seed_state(rotation, first_raw, last_raw) {
                 effects.finite_root(parent_tag, state, None);
             }
         }
@@ -1078,35 +1155,45 @@ impl<'a, U: Universe> TypedProgramSpec for SuccinctValueFamily<'a, U> {
         batch: TypedProgramBatch<'_>,
     ) -> Option<TypedPhysicalStep<Self::State, Self::NoveltyKey>> {
         let outcome = self.device_outcome(states, &batch)?;
+        let target = states
+            .first()
+            .expect("the scheduler never forms an empty Program cohort")
+            .rotation
+            .target;
+        let operation = match target {
+            ProgramAxis::Entity => TWO_BOUND_ENTITY_ROUTE_OP,
+            ProgramAxis::Attribute => TWO_BOUND_ATTRIBUTE_ROUTE_OP,
+            ProgramAxis::Value => TWO_BOUND_VALUE_ROUTE_OP,
+        };
         let mut step = TypedPhysicalStep::new(ProgramPhysicalReceipt::new(
             WGPU_RESIDENT_EXECUTOR,
-            TWO_BOUND_VALUE_OP,
+            operation,
         ));
         Self::write_outcome(outcome, step.effects_mut());
         Some(step)
     }
 }
 
-/// [`TriblePattern`] carrier for the resident value route.
+/// [`TriblePattern`] carrier for the resident two-bound route.
 ///
-/// Construct through [`WgpuSuccinctArchive::value_route`] (admission from
-/// [`VALUE_ROUTE_ENV`], invalid values are a configuration error) or
-/// [`WgpuSuccinctArchive::value_route_with`] (explicit admission). Bind it
+/// Construct through [`WgpuSuccinctArchive::two_bound_route`] (admission from
+/// [`TWO_BOUND_ROUTE_ENV`], invalid values are a configuration error) or
+/// [`WgpuSuccinctArchive::two_bound_route_with`] (explicit admission). Bind it
 /// to a local before building a `pattern!` so the constraint's GAT can
 /// borrow it for the query lifetime.
-pub struct ResidentValueRoute<'g, U: Universe> {
+pub struct ResidentTwoBoundRoute<'g, U: Universe> {
     gpu: &'g WgpuSuccinctArchive<U>,
-    admission: ValueRouteAdmission,
+    admission: TwoBoundRouteAdmission,
     /// Shared by every family this view creates. `pattern!` erases the
     /// constraint behind `dyn Constraint`, so the view is the observable
     /// handle onto routing decisions and placements.
-    counters: Arc<ValueRouteCounters>,
+    counters: Arc<TwoBoundRouteCounters>,
 }
 
-impl<U: Universe> ResidentValueRoute<'_, U> {
+impl<U: Universe> ResidentTwoBoundRoute<'_, U> {
     /// A relaxed snapshot of the decision counters shared by every pattern
     /// created from this view.
-    pub fn counters(&self) -> ValueRouteCountersSnapshot {
+    pub fn counters(&self) -> TwoBoundRouteCountersSnapshot {
         self.counters.snapshot()
     }
 }
@@ -1169,17 +1256,21 @@ where
             }
         };
 
-        let family = SuccinctValueFamily::compile(
+        let family = SuccinctTwoBoundFamily::compile(
             RawTerm::Const(entity),
             RawTerm::Const(attribute),
             RawTerm::Var(0),
             self,
-            ValueRouteAdmission::Force,
-            Arc::new(ValueRouteCounters::default()),
+            TwoBoundRouteAdmission::Force,
+            Arc::new(TwoBoundRouteCounters::default()),
         )
         .ok_or(PrepareValueRouteError::Failed)?;
         let state = family
-            .seed_state(&entity, &attribute)
+            .seed_state(
+                TwoBoundRotation::for_target(ProgramAxis::Value),
+                &entity,
+                &attribute,
+            )
             .ok_or(PrepareValueRouteError::Failed)?;
         let states = [state];
         let limits = [1usize];
@@ -1201,29 +1292,34 @@ where
         Ok(PrepareValueRouteOutcome::Prepared)
     }
 
-    /// The value-route view with admission read once from
-    /// [`VALUE_ROUTE_ENV`]; unset keeps routing off.
-    pub fn value_route(&self) -> Result<ResidentValueRoute<'_, U>, ValueRouteConfigError> {
-        Ok(self.value_route_with(ValueRouteAdmission::from_env()?))
+    /// The two-bound route view with admission read once from
+    /// [`TWO_BOUND_ROUTE_ENV`]; unset keeps routing off.
+    pub fn two_bound_route(
+        &self,
+    ) -> Result<ResidentTwoBoundRoute<'_, U>, TwoBoundRouteConfigError> {
+        Ok(self.two_bound_route_with(TwoBoundRouteAdmission::from_env()?))
     }
 
-    /// The value-route view with an explicit admission policy (the
+    /// The two-bound route view with an explicit admission policy (the
     /// documented builder activation).
-    pub fn value_route_with(&self, admission: ValueRouteAdmission) -> ResidentValueRoute<'_, U> {
-        ResidentValueRoute {
+    pub fn two_bound_route_with(
+        &self,
+        admission: TwoBoundRouteAdmission,
+    ) -> ResidentTwoBoundRoute<'_, U> {
+        ResidentTwoBoundRoute {
             gpu: self,
             admission,
-            counters: Arc::new(ValueRouteCounters::default()),
+            counters: Arc::new(TwoBoundRouteCounters::default()),
         }
     }
 }
 
-impl<U> TriblePattern for ResidentValueRoute<'_, U>
+impl<U> TriblePattern for ResidentTwoBoundRoute<'_, U>
 where
     U: Universe + Send + Sync,
 {
     type PatternConstraint<'a>
-        = ResidentValueConstraint<'a, U>
+        = ResidentTwoBoundConstraint<'a, U>
     where
         Self: 'a;
 
@@ -1236,7 +1332,7 @@ where
         let e: Term<GenId> = e.into();
         let a: Term<GenId> = a.into();
         let v: Term<V> = v.into();
-        let family = SuccinctValueFamily::compile(
+        let family = SuccinctTwoBoundFamily::compile(
             e.erase(),
             a.erase(),
             v.erase(),
@@ -1244,7 +1340,7 @@ where
             self.admission,
             Arc::clone(&self.counters),
         );
-        ResidentValueConstraint {
+        ResidentTwoBoundConstraint {
             inner: SuccinctArchiveConstraint::with_ring_batch(
                 e,
                 a,
@@ -1257,23 +1353,23 @@ where
     }
 }
 
-/// Owning wrapper constraint of the resident value route.
+/// Owning wrapper constraint of the resident two-bound route.
 ///
 /// Every ordinary [`Constraint`] method and hook delegates verbatim to the
 /// canonical [`SuccinctArchiveConstraint`]; the only addition is the
 /// [`residual_program`](Constraint::residual_program) capability exposing
-/// [`SuccinctValueFamily`]. Patterns outside the narrow arm (value term not
-/// a variable, repeated variables) carry no family and behave exactly like
-/// the canonical constraint.
-pub struct ResidentValueConstraint<'a, U>
+/// [`SuccinctTwoBoundFamily`]. Patterns without a variable or with a variable
+/// repeated across axes carry no family and behave exactly like the canonical
+/// constraint.
+pub struct ResidentTwoBoundConstraint<'a, U>
 where
     U: Universe,
 {
     inner: SuccinctArchiveConstraint<'a, U>,
-    family: Option<SuccinctValueFamily<'a, U>>,
+    family: Option<SuccinctTwoBoundFamily<'a, U>>,
 }
 
-impl<U: Universe> Clone for ResidentValueConstraint<'_, U> {
+impl<U: Universe> Clone for ResidentTwoBoundConstraint<'_, U> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner,
@@ -1282,26 +1378,26 @@ impl<U: Universe> Clone for ResidentValueConstraint<'_, U> {
     }
 }
 
-impl<'a, U> ResidentValueConstraint<'a, U>
+impl<'a, U> ResidentTwoBoundConstraint<'a, U>
 where
     U: Universe,
 {
-    /// The typed family of this pattern, when it lies on the narrow arm.
-    pub fn family(&self) -> Option<&SuccinctValueFamily<'a, U>> {
+    /// The typed family of this pattern, when it has a two-bound action arm.
+    pub fn family(&self) -> Option<&SuccinctTwoBoundFamily<'a, U>> {
         self.family.as_ref()
     }
 
     /// A relaxed snapshot of the route's shared decision counters, or the
     /// zero snapshot when this pattern carries no family.
-    pub fn route_counters(&self) -> ValueRouteCountersSnapshot {
+    pub fn route_counters(&self) -> TwoBoundRouteCountersSnapshot {
         self.family
             .as_ref()
-            .map(SuccinctValueFamily::counters)
+            .map(SuccinctTwoBoundFamily::counters)
             .unwrap_or_default()
     }
 }
 
-impl<'a, U> Constraint<'a> for ResidentValueConstraint<'a, U>
+impl<'a, U> Constraint<'a> for ResidentTwoBoundConstraint<'a, U>
 where
     U: Universe,
 {
@@ -1364,8 +1460,8 @@ where
             .residual_delta_confirm_grouping_requirements(variable)
     }
 
-    /// The one addition over the canonical constraint: the typed value
-    /// family, when the pattern lies on the narrow two-bound arm.
+    /// The one addition over the canonical constraint: the typed two-bound
+    /// family, when the pattern has at least one variable and no repeated one.
     fn residual_program(&self) -> Option<ProgramRef<'_>> {
         self.family.as_ref().map(ProgramRef::new)
     }
@@ -1468,7 +1564,9 @@ where
 mod tests {
     use super::*;
 
-    use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
+    use triblespace_core::blob::encodings::succinctarchive::{
+        OrderedUniverse, SuccinctArchive, SuccinctRotation,
+    };
     use triblespace_core::id::{ExclusiveId, Id};
     use triblespace_core::inline::encodings::genid::GenId;
     use triblespace_core::inline::InlineEncoding;
@@ -1512,47 +1610,66 @@ mod tests {
 
     fn var_family<'a>(
         resident: &'a WgpuSuccinctArchive<OrderedUniverse>,
-        admission: ValueRouteAdmission,
-    ) -> SuccinctValueFamily<'a, OrderedUniverse> {
-        SuccinctValueFamily::compile(
+        admission: TwoBoundRouteAdmission,
+    ) -> SuccinctTwoBoundFamily<'a, OrderedUniverse> {
+        SuccinctTwoBoundFamily::compile(
             RawTerm::Var(0),
             RawTerm::Var(1),
             RawTerm::Var(2),
             resident,
             admission,
-            Arc::new(ValueRouteCounters::default()),
+            Arc::new(TwoBoundRouteCounters::default()),
         )
         .expect("the three-variable pattern lies on the narrow arm")
     }
 
     fn ea_states(
-        family: &SuccinctValueFamily<'_, OrderedUniverse>,
+        family: &SuccinctTwoBoundFamily<'_, OrderedUniverse>,
         entities: &[Id],
         attribute: Id,
         count: usize,
-    ) -> Vec<SuccinctValueState> {
+    ) -> Vec<SuccinctTwoBoundState> {
         (0..count)
             .filter_map(|row| {
                 let entity = entities[(row * 17 + row / 3) % entities.len()];
-                family.seed_state(&raw(entity), &raw(attribute))
+                family.seed_state(
+                    TwoBoundRotation::for_target(ProgramAxis::Value),
+                    &raw(entity),
+                    &raw(attribute),
+                )
             })
             .collect()
     }
 
+    fn repeated_pair_states(
+        family: &SuccinctTwoBoundFamily<'_, OrderedUniverse>,
+        target: ProgramAxis,
+        first: Id,
+        last: Id,
+        count: usize,
+    ) -> Vec<SuccinctTwoBoundState> {
+        let state = family
+            .seed_state(
+                TwoBoundRotation::for_target(target),
+                &raw(first),
+                &raw(last),
+            )
+            .expect("the fixture pair has a nonempty interval");
+        vec![state; count]
+    }
+
     fn interval_oracle(
-        family: &SuccinctValueFamily<'_, OrderedUniverse>,
-        state: &SuccinctValueState,
+        family: &SuccinctTwoBoundFamily<'_, OrderedUniverse>,
+        state: &SuccinctTwoBoundState,
     ) -> Vec<RawInline> {
         let core = &family.core;
+        let target = family.target_pvar(state.rotation.target);
         let frontier = family.cohort_frontier(std::slice::from_ref(state));
-        let full = core
-            .program
-            .transition_on(core.value_pvar, &frontier)
-            .unwrap();
+        let full = core.program.transition_on(target, &frontier).unwrap();
         let column = full
             .variables()
             .iter()
-            .position(|&variable| variable == core.value_pvar)
+            .position(|&variable| variable == target)
             .unwrap();
         (0..full.len())
             .map(|row| core.program.decode(full.row(row)[column]).unwrap())
@@ -1590,6 +1707,30 @@ mod tests {
     }
 
     #[test]
+    fn two_bound_rotation_table_is_canonical() {
+        let entity = TwoBoundRotation::for_target(ProgramAxis::Entity);
+        assert_eq!(entity.first, ProgramAxis::Attribute);
+        assert_eq!(entity.last, ProgramAxis::Value);
+        assert_eq!(entity.pair, SuccinctRotation::Ave);
+        assert_eq!(entity.navigation, SuccinctRotation::Aev);
+        assert_eq!(entity.output, SuccinctRotation::Vae);
+
+        let attribute = TwoBoundRotation::for_target(ProgramAxis::Attribute);
+        assert_eq!(attribute.first, ProgramAxis::Entity);
+        assert_eq!(attribute.last, ProgramAxis::Value);
+        assert_eq!(attribute.pair, SuccinctRotation::Eva);
+        assert_eq!(attribute.navigation, SuccinctRotation::Eav);
+        assert_eq!(attribute.output, SuccinctRotation::Vea);
+
+        let value = TwoBoundRotation::for_target(ProgramAxis::Value);
+        assert_eq!(value.first, ProgramAxis::Entity);
+        assert_eq!(value.last, ProgramAxis::Attribute);
+        assert_eq!(value.pair, SuccinctRotation::Eav);
+        assert_eq!(value.navigation, SuccinctRotation::Eva);
+        assert_eq!(value.output, SuccinctRotation::Aev);
+    }
+
+    #[test]
     fn readiness_cell_defaults_fail_on_error_and_panic_paths() {
         let dropped = ValueRouteReadinessCell::new();
         drop(dropped.begin().expect("Cold begins preparation"));
@@ -1606,10 +1747,10 @@ mod tests {
     }
 
     #[test]
-    fn narrow_route_matrix_is_exact() {
+    fn two_bound_route_matrix_is_exact_and_target_local() {
         let (archive, _, _) = fixture();
         let resident = WgpuSuccinctArchive::new(archive).unwrap();
-        let family = var_family(&resident, ValueRouteAdmission::Off);
+        let family = var_family(&resident, TwoBoundRouteAdmission::Off);
 
         let bound = |ids: &[VariableId]| {
             let mut set = VariableSet::new_empty();
@@ -1625,33 +1766,41 @@ mod tests {
             })
         };
 
-        // The two-bound arm routes, also under an enriched ambient schema.
-        let admitted = route(ProgramAction::Propose(2), &[0, 1]).unwrap();
-        assert_eq!(admitted.variable, 2);
-        assert_eq!(admitted.stratum, ProgramStratum::Finite);
-        assert_eq!(admitted.grouping, ProgramGrouping::PageLocal);
-        assert_eq!(admitted.completion, ProgramCompletion::PageableOnly);
-        assert!(route(ProgramAction::Propose(2), &[0, 1, 7]).is_some());
+        // Exactly the three semantic two-bound arms route, including under
+        // enriched ambient schemas; each owns a distinct local key.
+        let mut keys = Vec::new();
+        for (target, peers) in [(0, [1, 2]), (1, [0, 2]), (2, [0, 1])] {
+            let admitted = route(ProgramAction::Propose(target), &peers).unwrap();
+            assert_eq!(admitted.variable, target);
+            assert_eq!(admitted.stratum, ProgramStratum::Finite);
+            assert_eq!(admitted.grouping, ProgramGrouping::PageLocal);
+            assert_eq!(admitted.completion, ProgramCompletion::PageableOnly);
+            keys.push(admitted.key);
+            assert!(route(ProgramAction::Propose(target), &[peers[0], peers[1], 7]).is_some());
+        }
+        assert_ne!(keys[0], keys[1]);
+        assert_ne!(keys[1], keys[2]);
+        assert_ne!(keys[0], keys[2]);
 
         // Everything else returns to the ordinary constraint protocol.
         assert!(route(ProgramAction::Propose(2), &[0]).is_none());
         assert!(route(ProgramAction::Propose(2), &[1]).is_none());
         assert!(route(ProgramAction::Propose(2), &[0, 1, 2]).is_none());
-        assert!(route(ProgramAction::Propose(0), &[1, 2]).is_none());
-        assert!(route(ProgramAction::Propose(1), &[0, 2]).is_none());
+        assert!(route(ProgramAction::Propose(0), &[1]).is_none());
+        assert!(route(ProgramAction::Propose(1), &[2]).is_none());
         assert!(route(ProgramAction::Confirm(2), &[0, 1]).is_none());
         assert!(route(ProgramAction::Confirm(0), &[1, 2]).is_none());
         assert!(route(ProgramAction::Support, &[0, 1, 2]).is_none());
 
         // Constant entity and attribute: the route needs no bound variables.
         let (_, entities, attributes) = fixture();
-        let constant = SuccinctValueFamily::compile(
+        let constant = SuccinctTwoBoundFamily::compile(
             RawTerm::Const(raw(entities[7])),
             RawTerm::Const(raw(attributes[0])),
             RawTerm::Var(0),
             &resident,
-            ValueRouteAdmission::Off,
-            Arc::new(ValueRouteCounters::default()),
+            TwoBoundRouteAdmission::Off,
+            Arc::new(TwoBoundRouteCounters::default()),
         )
         .expect("the constant-pair pattern lies on the narrow arm");
         assert!(constant
@@ -1661,32 +1810,33 @@ mod tests {
             })
             .is_some());
 
-        // Outside the narrow arm no family compiles at all.
-        assert!(SuccinctValueFamily::compile(
+        // A constant target still leaves the other variable axes available.
+        assert!(SuccinctTwoBoundFamily::compile(
             RawTerm::Var(0),
             RawTerm::Var(1),
             RawTerm::Const(raw(entities[0])),
             &resident,
-            ValueRouteAdmission::Off,
-            Arc::new(ValueRouteCounters::default()),
+            TwoBoundRouteAdmission::Off,
+            Arc::new(TwoBoundRouteCounters::default()),
         )
-        .is_none());
-        assert!(SuccinctValueFamily::compile(
+        .is_some());
+        // Outside the arm no family compiles at all.
+        assert!(SuccinctTwoBoundFamily::compile(
             RawTerm::Var(0),
             RawTerm::Var(1),
             RawTerm::Var(0),
             &resident,
-            ValueRouteAdmission::Off,
-            Arc::new(ValueRouteCounters::default()),
+            TwoBoundRouteAdmission::Off,
+            Arc::new(TwoBoundRouteCounters::default()),
         )
         .is_none());
-        assert!(SuccinctValueFamily::compile(
+        assert!(SuccinctTwoBoundFamily::compile(
             RawTerm::Var(0),
             RawTerm::Var(0),
             RawTerm::Var(2),
             &resident,
-            ValueRouteAdmission::Off,
-            Arc::new(ValueRouteCounters::default()),
+            TwoBoundRouteAdmission::Off,
+            Arc::new(TwoBoundRouteCounters::default()),
         )
         .is_none());
     }
@@ -1695,20 +1845,32 @@ mod tests {
     fn seed_states_carry_exact_intervals_and_omit_empty_roots() {
         let (archive, entities, attributes) = fixture();
         let resident = WgpuSuccinctArchive::new(archive).unwrap();
-        let family = var_family(&resident, ValueRouteAdmission::Off);
+        let family = var_family(&resident, TwoBoundRouteAdmission::Off);
 
         // Parent 0 owns no values under attributes[0]: an exact empty
         // result, so no root exists to schedule.
         assert!(family
-            .seed_state(&raw(entities[0]), &raw(attributes[0]))
+            .seed_state(
+                TwoBoundRotation::for_target(ProgramAxis::Value),
+                &raw(entities[0]),
+                &raw(attributes[0]),
+            )
             .is_none());
         // A raw value outside the archive domain is the same empty result.
         assert!(family
-            .seed_state(&raw(fixture_id(9, 9)), &raw(attributes[0]))
+            .seed_state(
+                TwoBoundRotation::for_target(ProgramAxis::Value),
+                &raw(fixture_id(9, 9)),
+                &raw(attributes[0]),
+            )
             .is_none());
 
-        for parent in 1..entities.len() {
-            let state = family.seed_state(&raw(entities[parent]), &raw(attributes[0]));
+        for (parent, entity) in entities.iter().enumerate().skip(1) {
+            let state = family.seed_state(
+                TwoBoundRotation::for_target(ProgramAxis::Value),
+                &raw(*entity),
+                &raw(attributes[0]),
+            );
             let fanout = parent % 6;
             match state {
                 None => assert_eq!(fanout, 0, "parent {parent}"),
@@ -1730,7 +1892,7 @@ mod tests {
     fn native_pages_reproduce_each_interval_exactly() {
         let (archive, entities, attributes) = fixture();
         let resident = WgpuSuccinctArchive::new(archive).unwrap();
-        let family = var_family(&resident, ValueRouteAdmission::Off);
+        let family = var_family(&resident, TwoBoundRouteAdmission::Off);
         let states = ea_states(&family, &entities, attributes[0], 12);
         assert!(states.len() > 2, "the fixture seeds live states");
         let oracles: Vec<Vec<RawInline>> = states
@@ -1782,13 +1944,53 @@ mod tests {
     }
 
     #[test]
+    fn native_width_one_pages_are_exact_for_every_rotation_and_duplicate_parent() {
+        let (archive, entities, attributes) = fixture();
+        let resident = WgpuSuccinctArchive::new(archive).unwrap();
+        let family = var_family(&resident, TwoBoundRouteAdmission::Off);
+        let value_zero = fixture_id(3, 0);
+        let cases = [
+            (ProgramAxis::Entity, attributes[0], value_zero),
+            (ProgramAxis::Attribute, entities[8], value_zero),
+            (ProgramAxis::Value, entities[5], attributes[0]),
+        ];
+
+        let mut dispatches = Vec::new();
+        for (target, first, last) in cases {
+            let states = repeated_pair_states(&family, target, first, last, 2);
+            let outcome = family.native_outcome(&states, &[1, 1]);
+            let oracle = interval_oracle(&family, &states[0]);
+            assert!(
+                oracle.len() > 1,
+                "target {target:?} must clamp at width one"
+            );
+            assert_eq!(
+                outcome.direct,
+                vec![(0, oracle[0]), (1, oracle[0])],
+                "duplicate parents preserve occurrence multiplicity for {target:?}"
+            );
+            assert!(outcome.pages.iter().all(|page| {
+                page.examined == 1
+                    && page.resume.as_ref().is_some_and(|resume| {
+                        resume.rotation.target == target && resume.offset == 1
+                    })
+            }));
+            dispatches.push(family.dispatch(&states[0]));
+        }
+        assert_ne!(dispatches[0], dispatches[1]);
+        assert_ne!(dispatches[1], dispatches[2]);
+        assert_ne!(dispatches[0], dispatches[2]);
+    }
+
+    #[test]
     fn disabled_policies_and_a_held_lease_never_route() {
         let (archive, entities, attributes) = fixture();
         let resident = WgpuSuccinctArchive::new(archive).unwrap();
         assert_eq!(resident.value_route_readiness(), ValueRouteReadiness::Cold);
 
         // The default policy declines every cohort.
-        let off = var_family(&resident, ValueRouteAdmission::Off);
+        let off = var_family(&resident, TwoBoundRouteAdmission::Off);
+        assert!(off.core.device.is_none(), "Off constructs no device arm");
         let states = ea_states(&off, &entities, attributes[0], 8);
         let limits = vec![8usize; states.len()];
         assert!(off.try_step_physical(&states, batch(&limits)).is_none());
@@ -1802,7 +2004,7 @@ mod tests {
 
         // A small cohort sits far below the warm-M4 dominance score and
         // declines by geometry.
-        let selective = var_family(&resident, ValueRouteAdmission::WarmM4);
+        let selective = var_family(&resident, TwoBoundRouteAdmission::WarmM4);
         assert!(selective
             .try_step_physical(&states, batch(&limits))
             .is_none());
@@ -1810,7 +2012,7 @@ mod tests {
 
         // A held lease declines nonblockingly, before any kernel launch:
         // a busy lane falls through to Native instantly.
-        let forced = var_family(&resident, ValueRouteAdmission::Force);
+        let forced = var_family(&resident, TwoBoundRouteAdmission::Force);
         let guard = resident.program_lease().try_acquire().unwrap();
         assert!(forced.try_step_physical(&states, batch(&limits)).is_none());
         assert_eq!(forced.counters().declined_lease, 1);
@@ -1846,7 +2048,21 @@ mod tests {
     fn forced_cohorts_match_native_with_lawful_receipts() {
         let (archive, entities, attributes) = fixture();
         let resident = WgpuSuccinctArchive::new(archive).unwrap();
-        let family = var_family(&resident, ValueRouteAdmission::Force);
+        let family = var_family(&resident, TwoBoundRouteAdmission::Force);
+        let value_zero = fixture_id(3, 0);
+        for (target, first, last) in [
+            (ProgramAxis::Entity, attributes[0], value_zero),
+            (ProgramAxis::Attribute, entities[8], value_zero),
+        ] {
+            let rotation_states = repeated_pair_states(&family, target, first, last, 3);
+            let rotation_limits = [1, 2, 1];
+            let native = family.native_outcome(&rotation_states, &rotation_limits);
+            let device = family
+                .device_outcome(&rotation_states, &batch(&rotation_limits))
+                .expect("Force admits every two-bound target");
+            assert_eq!(device, native, "target {target:?}");
+            assert!(device.pages.iter().any(|page| page.resume.is_some()));
+        }
         let states = ea_states(&family, &entities, attributes[0], 60);
         let limits: Vec<usize> = (0..states.len()).map(|row| (row % 3) + 1).collect();
 
@@ -1881,13 +2097,13 @@ mod tests {
         for (input, value) in &device.direct {
             consumed[*input as usize].push(*value);
         }
-        let mut cursors: Vec<Option<SuccinctValueState>> =
+        let mut cursors: Vec<Option<SuccinctTwoBoundState>> =
             device.pages.into_iter().map(|page| page.resume).collect();
         while cursors.iter().any(|cursor| cursor.is_some()) {
             let live: Vec<usize> = (0..states.len())
                 .filter(|&input| cursors[input].is_some())
                 .collect();
-            let cohort: Vec<SuccinctValueState> = live
+            let cohort: Vec<SuccinctTwoBoundState> = live
                 .iter()
                 .map(|&input| cursors[input].clone().unwrap())
                 .collect();
@@ -1919,16 +2135,16 @@ mod tests {
 
         // The typed hook commits the same outcome with a placement receipt.
         assert!(family.try_step_physical(&states, batch(&limits)).is_some());
-        assert_eq!(TWO_BOUND_VALUE_OP, "two-bound-transition/value-route");
+        assert_eq!(TWO_BOUND_VALUE_ROUTE_OP, "two-bound-transition/value-route");
     }
 
     #[test]
     fn admission_policy_arms_are_exact() {
-        let off = ValueRouteAdmission::Off;
+        let off = TwoBoundRouteAdmission::Off;
         assert!(!off.routing_enabled());
         assert!(!off.admits(usize::MAX, u64::MAX));
 
-        let force = ValueRouteAdmission::Force;
+        let force = TwoBoundRouteAdmission::Force;
         assert!(force.routing_enabled());
         assert!(force.admits(1, 1));
         assert!(!force.admits(1, 0));
@@ -1936,7 +2152,7 @@ mod tests {
 
         // The experimental warm-M4 score is exact at its boundary:
         // page_work + 8 * rows >= 98_304.
-        let warm = ValueRouteAdmission::WarmM4;
+        let warm = TwoBoundRouteAdmission::WarmM4;
         assert!(warm.routing_enabled());
         assert!(warm.admits(1, 98_296));
         assert!(!warm.admits(1, 98_295));
@@ -1948,44 +2164,48 @@ mod tests {
         );
         assert!(!warm.admits(0, u64::MAX));
         assert!(!warm.admits(usize::MAX, 0));
+        assert!(warm.admits_target(ProgramAxis::Value, 1, 98_296));
+        assert!(!warm.admits_target(ProgramAxis::Entity, usize::MAX, u64::MAX));
+        assert!(!warm.admits_target(ProgramAxis::Attribute, usize::MAX, u64::MAX));
     }
 
     #[test]
     fn env_grammar_is_typed_and_invalid_values_are_config_errors() {
+        assert_eq!(TWO_BOUND_ROUTE_ENV, "TRIBLESPACE_GPU_TWO_BOUND_ROUTE");
         assert_eq!(
-            ValueRouteAdmission::from_env_value(None),
-            Ok(ValueRouteAdmission::Off)
+            TwoBoundRouteAdmission::from_env_value(None),
+            Ok(TwoBoundRouteAdmission::Off)
         );
         assert_eq!(
-            ValueRouteAdmission::from_env_value(Some("")),
-            Ok(ValueRouteAdmission::Off)
+            TwoBoundRouteAdmission::from_env_value(Some("")),
+            Ok(TwoBoundRouteAdmission::Off)
         );
         assert_eq!(
-            ValueRouteAdmission::from_env_value(Some("off")),
-            Ok(ValueRouteAdmission::Off)
+            TwoBoundRouteAdmission::from_env_value(Some("off")),
+            Ok(TwoBoundRouteAdmission::Off)
         );
         assert_eq!(
-            ValueRouteAdmission::from_env_value(Some("0")),
-            Ok(ValueRouteAdmission::Off)
+            TwoBoundRouteAdmission::from_env_value(Some("0")),
+            Ok(TwoBoundRouteAdmission::Off)
         );
         assert_eq!(
-            ValueRouteAdmission::from_env_value(Some(" force ")),
-            Ok(ValueRouteAdmission::Force)
+            TwoBoundRouteAdmission::from_env_value(Some(" force ")),
+            Ok(TwoBoundRouteAdmission::Force)
         );
         assert_eq!(
-            ValueRouteAdmission::from_env_value(Some("warm-m4")),
-            Ok(ValueRouteAdmission::WarmM4)
+            TwoBoundRouteAdmission::from_env_value(Some("warm-m4")),
+            Ok(TwoBoundRouteAdmission::WarmM4)
         );
         // `auto` is rejected as not-ready, never silently coerced:
         // snapshot-local preparation cannot prove global device idleness.
         assert_eq!(
-            ValueRouteAdmission::from_env_value(Some("auto")),
-            Err(ValueRouteConfigError::AutoNotReady)
+            TwoBoundRouteAdmission::from_env_value(Some("auto")),
+            Err(TwoBoundRouteConfigError::AutoNotReady)
         );
         for invalid in ["on", "1", "frontier:64:512", "warm_m4", "FORCE"] {
             assert_eq!(
-                ValueRouteAdmission::from_env_value(Some(invalid)),
-                Err(ValueRouteConfigError::Invalid {
+                TwoBoundRouteAdmission::from_env_value(Some(invalid)),
+                Err(TwoBoundRouteConfigError::Invalid {
                     value: invalid.to_owned(),
                 }),
                 "{invalid:?} must be a configuration error"
