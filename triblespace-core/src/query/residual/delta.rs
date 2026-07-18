@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ahash::{AHashMap, AHashSet};
 
+use crate::query::program::insert_engine_program_state;
+
 use super::*;
 
 static NEXT_REGISTRY_BRAND: AtomicU64 = AtomicU64::new(1);
