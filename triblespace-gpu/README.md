@@ -69,10 +69,12 @@ let solve = query
 
 The adapter intentionally has no `Deref` implementation: using `gpu.pattern`
 remains the direct, unobserved path and performs no residual-action TLS lookup,
-clock read, or sample work. The adapter observes only tagged whole-frontier
-Succinct `confirm` rank streams, not planning, proposals, scalar sinks, domain
-lookups, or unrelated CPU work. Outside a current observed action it executes
-normally without a sample, and an empty rank stream likewise attaches none.
+clock read, or sample work. The adapter observes only non-empty Succinct
+`confirm` rank streams, not planning, proposals, domain lookups, or unrelated
+CPU work. Candidate storage (`Values` for one parent or tagged COO for several)
+is not an execution capability; the probe-count threshold decides CPU versus
+WGPU. Outside a current observed action it executes normally without a sample,
+and an empty rank stream likewise attaches none.
 
 Each nonempty invocation records its exact probe count in `rank-probes`. A
 batch below the immutable admission threshold is labelled

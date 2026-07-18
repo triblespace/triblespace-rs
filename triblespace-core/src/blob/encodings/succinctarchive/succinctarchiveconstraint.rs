@@ -1250,13 +1250,13 @@ where
             }
         });
 
-        // A tagged sink is a whole frontier and can amortize an external
-        // batch backend. The sequential engine's plain-value sink remains on
-        // the CPU even when an accelerator is attached.
-        let ranks = match (&*candidates, self.ring_batch) {
-            (CandidateSink::Tagged(_), Some(ring_batch)) => {
-                ring_batch.rank_batch(rotation, &probe_pos, &probe_val)
-            }
+        // Candidate storage is a physical representation, not an execution
+        // capability. In particular, the residual engine normalizes a
+        // one-parent frontier to plain values even when it contains enough
+        // candidates to amortize a batch backend. Let the attached backend's
+        // own admission threshold decide where every rank stream executes.
+        let ranks = match self.ring_batch {
+            Some(ring_batch) => ring_batch.rank_batch(rotation, &probe_pos, &probe_val),
             _ => {
                 let wm = archive.ring_col(rotation);
                 probe_pos

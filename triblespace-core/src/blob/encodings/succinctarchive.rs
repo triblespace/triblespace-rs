@@ -3358,8 +3358,9 @@ mod tests {
             SuccinctRotation::Aev,
         );
 
-        // Plain value sinks are the scalar executor's path and deliberately
-        // remain on CPU even when a batch backend is attached.
+        // A one-parent residual frontier is normalized to plain values, but
+        // storage shape must not bypass an attached batch backend. Its own
+        // probe-count policy decides whether this stream stays on CPU.
         backend.calls.lock().unwrap().clear();
         let vars = [e.index];
         let rows = [entities[0]];
@@ -3377,7 +3378,11 @@ mod tests {
             &mut CandidateSink::Values(&mut actual_values),
         );
         assert_eq!(actual_values, expected_values);
-        assert!(backend.calls.lock().unwrap().is_empty());
+        let calls = backend.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, SuccinctRotation::Eav);
+        assert_eq!(calls[0].1.len(), calls[0].2.len());
+        assert!(!calls[0].1.is_empty());
     }
 
     pub mod knights {

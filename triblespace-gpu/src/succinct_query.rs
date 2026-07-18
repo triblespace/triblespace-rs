@@ -139,9 +139,10 @@ impl QueryStats {
 ///
 /// Query planning, prefix navigation, proposals, and satisfaction checks use
 /// the wrapped CPU archive unchanged. Only the independent rank stream emitted
-/// by whole-frontier `confirm` calls is dispatched to the resident wavelet
-/// matrix selected by the canonical constraint. Sequential single-row calls
-/// remain on the CPU and do not appear in this wrapper's counters.
+/// by `confirm` calls is offered to the resident wavelet matrix selected by
+/// the canonical constraint. The wrapper's probe-count threshold, rather than
+/// the candidate storage representation, decides whether each non-empty
+/// stream runs on WGPU or the CPU fallback.
 pub struct WgpuSuccinctArchive<U>
 where
     U: Universe,
@@ -165,11 +166,11 @@ where
 
 /// Opt-in residual-action observation view over a [`WgpuSuccinctArchive`].
 ///
-/// Only tagged whole-frontier Succinct `confirm` rank streams pass through
-/// this adapter. The canonical archive still performs planning, proposals,
-/// scalar confirmation, and every other CPU operation without executor
-/// samples. If the adapter is used outside an observed residual action, it
-/// executes exactly like the direct WGPU wrapper and records no sample.
+/// Only non-empty Succinct `confirm` rank streams pass through this adapter.
+/// The canonical archive still performs planning, proposals, and every other
+/// CPU operation without executor samples. If the adapter is used outside an
+/// observed residual action, it executes exactly like the direct WGPU wrapper
+/// and records no sample.
 ///
 /// This is a borrowing adapter and intentionally does not implement `Deref`:
 /// bind it before constructing a pattern so the pattern constraint's GAT can
