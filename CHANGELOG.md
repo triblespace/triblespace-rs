@@ -16,6 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Typed Program cohorts separate physical compatibility from activation
+  identity.** Program buckets now own one pacing-sensitive selection law:
+  Search pages retain LIFO order and may mix physically identical reducer
+  policies, Activation streaming pages preserve append order across all
+  compatible activations, quiescent pages cap distinct activations by the
+  geometric activation width, and terminal pages keep each activation's
+  sparse quantum aligned with its append-ordered task. Dispatch class, bound
+  schema, candidate shape, and terminal feedback class remain exact cohort
+  boundaries while affine activation identity stays row payload.
 - **Residual RPQs now execute through one typed affine program runtime.**
   Occurrence-local program addresses erase each family once per dense cohort
   while generational handles retain exact typed continuations, family-owned
