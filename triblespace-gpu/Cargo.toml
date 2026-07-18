@@ -17,12 +17,13 @@ features = ["wgpu", "cuda"]
 
 [features]
 default = ["wgpu"]
-wgpu = ["dep:cubecl", "cubecl/wgpu", "dep:jerky"]
+wgpu = ["dep:cubecl", "cubecl/wgpu", "dep:jerky", "dep:itertools"]
 cuda = ["dep:cubecl", "cubecl/cuda"]
 
 [dependencies]
 cubecl = { version = "=0.10.0", default-features = false, features = ["std"], optional = true }
-jerky = { version = "0.9.0", git = "https://github.com/triblespace/jerky.git", rev = "37160b8aa0384caab390852fd7be55c6f7282509", default-features = false, features = ["gpu"], optional = true }
+itertools = { version = "0.14.0", optional = true }
+jerky = { version = "0.9.0", git = "https://github.com/triblespace/jerky.git", rev = "aeb3ba0817c4e481723c23eda696dc3beeacaf69", default-features = false, features = ["gpu"], optional = true }
 triblespace-core = { version = "0.47.0", path = "../triblespace-core", default-features = false }
 
 [dev-dependencies]
@@ -33,6 +34,34 @@ triblespace-core = { version = "0.47.0", path = "../triblespace-core", default-f
 name = "archive_merge"
 required-features = ["wgpu"]
 
+[[example]]
+name = "frontier_program"
+required-features = ["wgpu"]
+
+[[example]]
+name = "resident_transition"
+required-features = ["wgpu"]
+
+[[example]]
+name = "resident_eav_chain"
+required-features = ["wgpu"]
+
+[[example]]
+name = "resident_eav_shapes"
+required-features = ["wgpu"]
+
 [[test]]
 name = "wgpu_parity"
+required-features = ["wgpu"]
+
+[[test]]
+name = "resident_transition"
+required-features = ["wgpu"]
+
+[[test]]
+name = "resident_row_planner"
+required-features = ["wgpu"]
+
+[[test]]
+name = "resident_support_estimates"
 required-features = ["wgpu"]

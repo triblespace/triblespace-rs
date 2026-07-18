@@ -270,8 +270,14 @@ impl<R: Runtime> CubeClWaveletFreeze<R> {
             client: R::client(device),
             #[cfg(all(feature = "wgpu", target_os = "macos"))]
             sequence_arena: std::sync::Mutex::new(None),
+            // The ordinary upload path is the default: the registered-arena
+            // seam was found unsound (arena reuse violates the fork's
+            // handle-lifetime immutability because registrations are never
+            // released) and is reverted on `main` (`4900615f`). This branch
+            // predates the revert; integration rebases onto it. Nothing on
+            // this branch selects the registered path.
             #[cfg(all(feature = "wgpu", target_os = "macos"))]
-            upload_sequences: false,
+            upload_sequences: true,
         }
     }
 
