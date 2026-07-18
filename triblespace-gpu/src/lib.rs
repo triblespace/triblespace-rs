@@ -20,6 +20,8 @@ mod resident_round;
 mod resident_support;
 #[cfg(feature = "wgpu")]
 mod succinct_query;
+#[cfg(feature = "wgpu")]
+pub mod typed_program;
 
 #[cfg(any(feature = "wgpu", feature = "cuda"))]
 pub use cubecl_backend::CubeClWaveletFreeze;

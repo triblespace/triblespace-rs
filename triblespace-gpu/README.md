@@ -319,6 +319,32 @@ backend still uploads a newly materialized `u32` rotation and reads the packed
 planes back; merely selecting the fork does not make that transient path
 zero-copy.
 
+### Typed Program family and budgeted routing
+
+`typed_program::SuccinctProgramFamily` implements the engine's typed Program
+contract over a compiled `QueryProgram`: the Native step is the exact CPU
+interpreter paginated by the scheduler's per-input grants, and
+`try_step_physical` offers admitted cohorts to the resident two-bound kernel
+through the budgeted dispatch contract (`budgeted`). Grants adopt the
+scheduler's `task_limits` verbatim, receipts come back validated and branded
+with the resident `ArchiveIdentity`, and a clamped input's `PhysicalCursor`
+becomes canonical typed state only through
+`into_typed_conversion_offset`.
+
+Routing is **off by default**: `BackendAdmissionPolicy::disabled()` never
+routes, so attaching a device is a zero-behavior-change no-op. Routing
+activates only explicitly — `with_admission(BackendAdmissionPolicy::
+route_from(n))` in code, or the `TRIBLESPACE_GPU_PROGRAM_ROUTING` environment
+variable (unset/`0`/unparsable = disabled; a positive integer = the minimum
+cohort row count that may route), read once at family construction. Admission
+is decided post-cohort-formation from cohort size, kernel capability, and the
+hard law that ready/latency-priority work never waits for an accelerator; the
+exercised kernel covers first-page (offset-zero), schema-uniform two-bound
+cohorts, and every decline or recoverable device failure falls back to the
+exact Native step with the batch intact. Resumed states never re-enter the
+start-clamping kernel; Native owns every continuation until the offset-aware
+kernel form lands.
+
 The production rollup type is
 `triblespace_core::repo::index_home::AcceleratedSuccinctRollup<WgpuWaveletFreeze>`:
 
