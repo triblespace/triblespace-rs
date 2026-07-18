@@ -543,10 +543,13 @@ pub type Candidates = Vec<(u32, RawInline)>;
 /// - [`Tagged`](Self::Tagged) lends a [`Candidates`] pair buffer — the
 ///   blocked engines' ragged COO frontier, `(row, value)` grouped by
 ///   ascending row index.
-/// - [`Values`](Self::Values) lends a plain `Vec<RawInline>` — the
-///   sequential engine's block-of-1 proposal buffer. The row index is
-///   statically 0 and **no `u32` tag is ever materialized**; callers
-///   must pass single-row views (`view.len() == 1`).
+/// - [`Values`](Self::Values) lends a plain `Vec<RawInline>` for any
+///   single-parent frontier. The sequential cursor and one-parent blocked /
+///   residual frontiers use this compact representation. The row index is
+///   statically 0 and **no `u32` tag is ever materialized**; callers must pass
+///   single-row views (`view.len() == 1`). Storage shape does not select an
+///   execution backend: a constraint may batch the values through the same
+///   CPU or accelerator operation used for tagged candidates.
 ///
 /// A trait with generic verbs would say the same thing, but the protocol
 /// must stay object-safe (`and!`/`or!` compose `Box<dyn Constraint>`
@@ -558,7 +561,7 @@ pub type Candidates = Vec<(u32, RawInline)>;
 pub enum CandidateSink<'s> {
     /// `(row, value)` pairs, grouped by ascending row — blocked engines.
     Tagged(&'s mut Candidates),
-    /// Plain values for a single-row view — the sequential cursor.
+    /// Plain values for any single-parent view, with implicit row index zero.
     Values(&'s mut Vec<RawInline>),
 }
 
@@ -905,12 +908,12 @@ pub trait ConstraintChildren<'a> {
 /// [`RowsView`] — a block of sibling partial bindings that share the same
 /// bound-variable set — and candidates travel through a representation-
 /// generic [`CandidateSink`]. One binding at a time is simply the one-row
-/// special case (the sequential engine passes single-row views with a
-/// plain-value [`CandidateSink::Values`] sink, paying no row tags); whole-
-/// frontier batches are the general case (the blocked/DAG solvers pass
-/// thousands of rows with a [`CandidateSink::Tagged`] pair sink), so
-/// constraints with batchable probe streams evaluate them in one pass —
-/// cache-friendly on the CPU and suitable for accelerator backends.
+/// special case (the sequential engine and one-parent blocked/residual
+/// frontiers pass single-row views with a plain-value
+/// [`CandidateSink::Values`] sink, paying no row tags); multi-parent frontiers
+/// use a [`CandidateSink::Tagged`] pair sink. Constraints with batchable probe
+/// streams may evaluate either representation in one pass — cache-friendly on
+/// the CPU and suitable for accelerator backends.
 ///
 /// # The protocol
 ///
