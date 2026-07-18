@@ -143,13 +143,16 @@ fn compile_grouped_delta_confirm_requirements<'a>(
             if let Some(program) = constraint.residual_program() {
                 let mut required = variables;
                 required.unset(variable);
-                return program
-                    .route(ProgramRequest {
-                        action: ProgramAction::Confirm(variable),
-                        bound: required,
-                    })
-                    .filter(|route| route.grouping == ProgramGrouping::ParentAtomic)
-                    .map(|_| (variable, required));
+                if let Some(route) = program.route(ProgramRequest {
+                    action: ProgramAction::Confirm(variable),
+                    bound: required,
+                }) {
+                    // A returned route owns this exact confirmation action,
+                    // including its grouping law. A declined route opens no
+                    // Program state, so legacy grouping remains eligible.
+                    return (route.grouping == ProgramGrouping::ParentAtomic)
+                        .then_some((variable, required));
+                }
             }
             constraint
                 .residual_delta_confirm_grouping_requirements(variable)
@@ -7895,17 +7898,14 @@ impl ResidualStateMachine {
             action: ProgramAction::Propose(variable),
             bound: task.desc.bound,
         };
-        let program = if let Some(spec) = constraint.residual_program() {
-            let Some(route) = spec.route(program_request) else {
-                // Owning the typed family excludes all legacy residual hooks.
-                // An unsupported structural action returns to the ordinary
-                // constraint protocol instead.
-                return Err(task);
-            };
-            Some((spec, route))
-        } else {
-            None
-        };
+        // A Program family is an action-level capability, not blanket
+        // ownership of every residual surface on the constraint. `None`
+        // declines this exact structural request before any activation has
+        // opened, so the legacy paged/seed hooks below remain available.
+        // Exclusivity begins only once the family returns a route.
+        let program = constraint
+            .residual_program()
+            .and_then(|spec| spec.route(program_request).map(|route| (spec, route)));
         let selected_parent_count = rows.row_count;
         let admitted_parent_count = if terminal_streaming {
             self.terminal_admission_width(task.state, selected_parent_count)
@@ -8108,10 +8108,10 @@ impl ResidualStateMachine {
             action: ProgramAction::Confirm(variable),
             bound: task.desc.bound,
         };
-        if let Some(spec) = constraint.residual_program() {
-            let Some(route) = spec.route(program_request) else {
-                return Err(task);
-            };
+        let program = constraint
+            .residual_program()
+            .and_then(|spec| spec.route(program_request).map(|route| (spec, route)));
+        if let Some((spec, route)) = program {
             if route.grouping == ProgramGrouping::ParentAtomic {
                 assert!(
                     !task
@@ -8316,10 +8316,10 @@ impl ResidualStateMachine {
             },
             bound: task.desc.bound,
         };
-        let program = if let Some(spec) = constraint.residual_program() {
-            let Some(route) = spec.route(program_request) else {
-                return Err(task);
-            };
+        let program = if let Some((spec, route)) = constraint
+            .residual_program()
+            .and_then(|spec| spec.route(program_request).map(|route| (spec, route)))
+        {
             if stage == FormulaStage::Confirm && route.grouping == ProgramGrouping::ParentAtomic {
                 assert!(
                     !task
@@ -10829,6 +10829,417 @@ mod tests {
                 examined: end - offset,
             })
         }
+    }
+
+    #[derive(Clone, Copy)]
+    struct DecliningProgram;
+
+    static DECLINING_PROGRAM: DecliningProgram = DecliningProgram;
+
+    impl TypedProgramSpec for DecliningProgram {
+        type State = ();
+        type NoveltyKey = ();
+        type Rank = ();
+
+        fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
+            None
+        }
+
+        fn dispatch(&self, _state: &Self::State) -> DispatchClass {
+            unreachable!("a declining Program never owns work")
+        }
+
+        fn progress(&self, _state: &Self::State) -> Self::Rank {
+            unreachable!("a declining Program never owns work")
+        }
+
+        fn seed_typed(
+            &self,
+            _batch: ProgramSeedBatch<'_>,
+            _effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+        ) {
+            unreachable!("a declining Program is never seeded")
+        }
+
+        fn step_typed(
+            &self,
+            _states: Vec<Self::State>,
+            _batch: TypedProgramBatch<'_>,
+            _effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+        ) {
+            unreachable!("a declining Program is never stepped")
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct DecliningProgramGroupedCapabilityLeaf(GroupedCapabilityLeaf);
+
+    impl Constraint<'static> for DecliningProgramGroupedCapabilityLeaf {
+        fn variables(&self) -> VariableSet {
+            self.0.variables()
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            self.0.estimate(variable, view, out)
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            self.0.propose(variable, view, candidates)
+        }
+
+        fn confirm(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            self.0.confirm(variable, view, candidates)
+        }
+
+        fn residual_confirm_is_page_local(&self) -> bool {
+            self.0.residual_confirm_is_page_local()
+        }
+
+        fn residual_program(&self) -> Option<ProgramRef<'_>> {
+            Some(ProgramRef::new(&DECLINING_PROGRAM))
+        }
+
+        fn residual_delta_confirm_grouping_requirements(
+            &self,
+            variable: VariableId,
+        ) -> Option<VariableSet> {
+            self.0
+                .residual_delta_confirm_grouping_requirements(variable)
+        }
+    }
+
+    #[derive(Clone)]
+    struct DecliningProgramPagedProposalLeaf(PagedProposalLeaf);
+
+    impl Constraint<'static> for DecliningProgramPagedProposalLeaf {
+        fn variables(&self) -> VariableSet {
+            self.0.variables()
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            self.0.estimate(variable, view, out)
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            self.0.propose(variable, view, candidates)
+        }
+
+        fn confirm(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            self.0.confirm(variable, view, candidates)
+        }
+
+        fn residual_program(&self) -> Option<ProgramRef<'_>> {
+            Some(ProgramRef::new(&DECLINING_PROGRAM))
+        }
+
+        fn residual_delta_source_is_paged(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+        ) -> bool {
+            self.0.residual_delta_source_is_paged(variable, view)
+        }
+
+        fn residual_proposal_source_is_paged(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+        ) -> bool {
+            self.0.residual_proposal_source_is_paged(variable, view)
+        }
+
+        fn residual_proposal_source_has_transition_roots(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+        ) -> bool {
+            self.0
+                .residual_proposal_source_has_transition_roots(variable, view)
+        }
+
+        fn residual_delta_source_page(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: Option<&[RawInline]>,
+            cursor: ResidualDeltaSourceCursor,
+            limit: usize,
+            roots: &mut Vec<ResidualDeltaOutput>,
+            accepted: &mut Vec<RawInline>,
+        ) -> Option<ResidualDeltaSourcePage> {
+            self.0.residual_delta_source_page(
+                variable, view, candidates, cursor, limit, roots, accepted,
+            )
+        }
+    }
+
+    #[derive(Clone)]
+    struct DecliningProgramPagedConfirmLeaf {
+        variable: VariableId,
+        accepted: RawInline,
+        ordinary_confirms: Arc<AtomicUsize>,
+        pages: Arc<AtomicUsize>,
+    }
+
+    impl Constraint<'static> for DecliningProgramPagedConfirmLeaf {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(self.variable)
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != self.variable {
+                return false;
+            }
+            out.fill(usize::MAX / 2, view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+            panic!("the high-estimate confirmer became the proposer")
+        }
+
+        fn confirm(
+            &self,
+            variable: VariableId,
+            _view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            assert_eq!(variable, self.variable);
+            self.ordinary_confirms.fetch_add(1, Ordering::Relaxed);
+            let accepted = self.accepted;
+            candidates.retain(|_, value| *value == accepted);
+        }
+
+        fn residual_confirm_is_page_local(&self) -> bool {
+            true
+        }
+
+        fn residual_program(&self) -> Option<ProgramRef<'_>> {
+            Some(ProgramRef::new(&DECLINING_PROGRAM))
+        }
+
+        fn residual_delta_source_is_paged(
+            &self,
+            variable: VariableId,
+            _view: &RowsView<'_>,
+        ) -> bool {
+            variable == self.variable
+        }
+
+        fn residual_delta_source_page(
+            &self,
+            variable: VariableId,
+            _view: &RowsView<'_>,
+            candidates: Option<&[RawInline]>,
+            cursor: ResidualDeltaSourceCursor,
+            limit: usize,
+            roots: &mut Vec<ResidualDeltaOutput>,
+            accepted: &mut Vec<RawInline>,
+        ) -> Option<ResidualDeltaSourcePage> {
+            assert_eq!(variable, self.variable);
+            assert!(roots.is_empty());
+            let candidates = candidates.expect("a paged confirmer lost its candidate set");
+            self.pages.fetch_add(1, Ordering::Relaxed);
+            let offset = match cursor {
+                ResidualDeltaSourceCursor::Start => 0,
+                ResidualDeltaSourceCursor::Offset(offset) => {
+                    usize::try_from(offset).expect("test confirmer cursor exceeds usize")
+                }
+                ResidualDeltaSourceCursor::After(_) => {
+                    panic!("test confirmer uses ordinal cursors")
+                }
+            };
+            let end = offset.saturating_add(limit).min(candidates.len());
+            assert!(accepted.is_empty());
+            roots.extend(
+                candidates[offset..end]
+                    .iter()
+                    .copied()
+                    .filter(|value| *value == self.accepted)
+                    .map(|value| ResidualDeltaOutput {
+                        node: ResidualDeltaNode {
+                            source: None,
+                            value,
+                            continuation: 0,
+                        },
+                        accepted: true,
+                    }),
+            );
+            Some(ResidualDeltaSourcePage {
+                next: (end < candidates.len()).then_some(ResidualDeltaSourceCursor::Offset(
+                    u64::try_from(end).expect("test confirmer cursor exceeds u64"),
+                )),
+                examined: end - offset,
+            })
+        }
+
+        fn residual_delta_expand_page(
+            &self,
+            variable: VariableId,
+            node: ResidualDeltaNode,
+            cursor: ResidualDeltaExpandCursor,
+            _limit: usize,
+            successors: &mut Vec<ResidualDeltaOutput>,
+        ) -> Option<ResidualDeltaExpandPage> {
+            assert_eq!(variable, self.variable);
+            assert_eq!(node.continuation, 0);
+            assert_eq!(cursor, ResidualDeltaExpandCursor::Start);
+            assert!(successors.is_empty());
+            Some(ResidualDeltaExpandPage {
+                next: None,
+                examined: 0,
+            })
+        }
+    }
+
+    #[test]
+    fn declined_program_route_preserves_opaque_paged_proposals() {
+        let proposes = Arc::new(AtomicUsize::new(0));
+        let pages = Arc::new(AtomicUsize::new(0));
+        let leaf = DecliningProgramPagedProposalLeaf(PagedProposalLeaf {
+            variable: 0,
+            values: Arc::new((1..=8).map(raw).collect()),
+            transition_source: false,
+            proposes: Arc::clone(&proposes),
+            pages: Arc::clone(&pages),
+        });
+        let mut solve = Query::new(leaf, |binding: &Binding| binding.get(0).copied())
+            .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::OpaqueLeaves, true))
+            .cap(8)
+            .start_width(1)
+            .growth(2);
+
+        assert_eq!(solve.next(), Some(raw(1)));
+        assert_eq!(proposes.load(Ordering::Relaxed), 0);
+        assert!(pages.load(Ordering::Relaxed) > 0);
+
+        let mut actual = vec![raw(1)];
+        actual.extend(solve);
+        actual.sort_unstable();
+        assert_eq!(actual, (1..=8).map(raw).collect::<Vec<_>>());
+        assert_eq!(
+            proposes.load(Ordering::Relaxed),
+            0,
+            "declining the Program route must not discard source paging"
+        );
+    }
+
+    #[test]
+    fn declined_program_route_preserves_paged_confirmation() {
+        let ordinary_confirms = Arc::new(AtomicUsize::new(0));
+        let pages = Arc::new(AtomicUsize::new(0));
+        let root = IntersectionConstraint::new(vec![
+            Box::new(FanoutLeaf {
+                variable: 0,
+                values: Arc::new((1..=8).map(raw).collect()),
+            }) as ShapeConstraint,
+            Box::new(DecliningProgramPagedConfirmLeaf {
+                variable: 0,
+                accepted: raw(5),
+                ordinary_confirms: Arc::clone(&ordinary_confirms),
+                pages: Arc::clone(&pages),
+            }) as ShapeConstraint,
+        ]);
+        let profiled = Query::new(root, |binding: &Binding| binding.get(0).copied())
+            .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::OpaqueLeaves, true))
+            .cap(8)
+            .start_width(1)
+            .growth(2)
+            .collect_profiled();
+
+        assert_eq!(profiled.results, [raw(5)]);
+        assert_eq!(ordinary_confirms.load(Ordering::Relaxed), 0);
+        assert!(pages.load(Ordering::Relaxed) > 0);
+        assert!(profiled.stats.confirm_action_pops > 0);
+        assert!(profiled.stats.delta_source_pages > 0);
+    }
+
+    #[test]
+    fn declined_program_route_preserves_formula_source_paging() {
+        let proposes = Arc::new(AtomicUsize::new(0));
+        let pages = Arc::new(AtomicUsize::new(0));
+        let leaf = |values| {
+            DecliningProgramPagedProposalLeaf(PagedProposalLeaf {
+                variable: 0,
+                values: Arc::new(values),
+                // A root-producing source cannot be eagerly replaced by the
+                // formula reducer, so this pins the Program-decline -> legacy
+                // paged-source edge inside seed_delta_formula itself.
+                transition_source: true,
+                proposes: Arc::clone(&proposes),
+                pages: Arc::clone(&pages),
+            })
+        };
+        let root = UnionConstraint::new(vec![
+            leaf(vec![raw(1), raw(2), raw(2)]),
+            leaf(vec![raw(2), raw(3)]),
+        ]);
+        let mut profiled = Query::new(root, |binding: &Binding| binding.get(0).copied())
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .cap(4)
+            .start_width(1)
+            .growth(2)
+            .collect_profiled();
+
+        profiled.results.sort_unstable();
+        assert_eq!(profiled.results, [raw(1), raw(2), raw(3)]);
+        assert_eq!(proposes.load(Ordering::Relaxed), 0);
+        assert!(pages.load(Ordering::Relaxed) > 0);
+        assert!(profiled.stats.delta_source_pages > 0);
+    }
+
+    #[test]
+    fn declined_program_route_preserves_grouped_confirm_capability() {
+        let leaf = DecliningProgramGroupedCapabilityLeaf(GroupedCapabilityLeaf(CapabilityLeaf {
+            variable: 0,
+            page_local: true,
+        }));
+
+        assert_eq!(
+            compile_grouped_delta_confirm_requirements(&leaf, true).as_ref(),
+            &[(0, VariableSet::new_empty())],
+            "declining Confirm must leave the legacy grouping contract visible"
+        );
     }
 
     #[test]

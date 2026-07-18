@@ -415,6 +415,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Declined typed Program actions retain residual paging.** A constraint may
+  expose a typed Program for only some structural actions. When its family
+  returns no route for the current request, the residual engine now continues
+  through that same constraint's paged source and seed capabilities instead
+  of dropping directly to eager ordinary execution. Once a Program route is
+  returned it remains exclusive. This preserves geometric lazy latency for
+  heterogeneous wrappers such as the resident succinct value route.
 - **Explicit parallel residual queries preserve their selected lowering.**
   `Query::into_par_residual_state_iter` now carries the query's default full
   formula and transition-program lowering into its affine shards, while still
