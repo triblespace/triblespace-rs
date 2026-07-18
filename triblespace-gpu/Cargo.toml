@@ -16,7 +16,7 @@ no-default-features = true
 features = ["wgpu", "cuda"]
 
 [features]
-default = []
+default = ["wgpu"]
 wgpu = ["dep:cubecl", "cubecl/wgpu", "dep:jerky"]
 cuda = ["dep:cubecl", "cubecl/cuda"]
 
