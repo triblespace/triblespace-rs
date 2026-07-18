@@ -280,8 +280,9 @@ const TRIBLESET_PROPOSE_DISPATCH: DispatchClass = DispatchClass::new(0);
 const TRIBLESET_CONFIRM_DISPATCH: DispatchClass = DispatchClass::new(1);
 const TRIBLESET_SUPPORT_DISPATCH: DispatchClass = DispatchClass::new(2);
 
+#[doc(hidden)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum TribleSetProgramState {
+pub enum TribleSetProgramState {
     Propose {
         variable: VariableId,
         cursor: ResidualDeltaSourceCursor,

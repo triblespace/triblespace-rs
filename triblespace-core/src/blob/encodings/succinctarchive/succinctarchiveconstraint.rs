@@ -184,6 +184,28 @@ struct Positions {
     pv: Option<Src>,
 }
 
+const SUCCINCT_PROPOSE_ROUTE: u32 = 1 << 8;
+const SUCCINCT_CONFIRM_ROUTE: u32 = 2 << 8;
+const SUCCINCT_SUPPORT_ROUTE: u32 = 3 << 8;
+
+const SUCCINCT_PROPOSE_DISPATCH: DispatchClass = DispatchClass::new(0);
+const SUCCINCT_CONFIRM_DISPATCH: DispatchClass = DispatchClass::new(1);
+const SUCCINCT_SUPPORT_DISPATCH: DispatchClass = DispatchClass::new(2);
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SuccinctArchiveProgramState {
+    Propose {
+        variable: VariableId,
+        cursor: ResidualDeltaSourceCursor,
+    },
+    Confirm {
+        variable: VariableId,
+        offset: usize,
+    },
+    Support,
+}
+
 impl Positions {
     #[inline]
     fn e<'r>(&'r self, row: &'r [RawInline]) -> Option<&'r RawInline> {
@@ -467,6 +489,52 @@ where
             pa: term_src(&self.term_a, view),
             pv: term_src(&self.term_v, view),
         }
+    }
+
+    fn variable_position_mask(&self, variable: VariableId) -> u32 {
+        u32::from(self.term_e.is_var(variable))
+            | (u32::from(self.term_a.is_var(variable)) << 1)
+            | (u32::from(self.term_v.is_var(variable)) << 2)
+    }
+
+    /// Positions whose values are structurally available for this route.
+    /// Constants are resolved from construction; variables are resolved by the
+    /// row schema carried in the request. Values deliberately do not enter the
+    /// key, so every row with the same schema shares one immutable route.
+    fn resolved_position_mask(&self, bound: VariableSet) -> u32 {
+        fn term_is_resolved(term: &RawTerm, bound: VariableSet) -> bool {
+            match term {
+                RawTerm::Var(variable) => bound.is_set(*variable),
+                RawTerm::Const(_) => true,
+            }
+        }
+
+        u32::from(term_is_resolved(&self.term_e, bound))
+            | (u32::from(term_is_resolved(&self.term_a, bound)) << 1)
+            | (u32::from(term_is_resolved(&self.term_v, bound)) << 2)
+    }
+
+    fn support_variable(&self) -> Option<VariableId> {
+        [&self.term_e, &self.term_a, &self.term_v]
+            .into_iter()
+            .find_map(|term| match term {
+                RawTerm::Var(variable) => Some(*variable),
+                RawTerm::Const(_) => None,
+            })
+    }
+
+    /// Row-local Boolean support. Partial schemas are optimistic, matching the
+    /// ordinary constraint law; a fully resolved row performs exact Ring
+    /// membership including entity/attribute inline-id validation.
+    fn support_row(&self, view: &RowsView<'_>, row: &[RawInline]) -> bool {
+        let (Some(se), Some(sa), Some(sv)) = (
+            term_src(&self.term_e, view),
+            term_src(&self.term_a, view),
+            term_src(&self.term_v, view),
+        ) else {
+            return true;
+        };
+        self.contains_trible(se.get(row), sa.get(row), sv.get(row))
     }
 
     /// Exact E/A/V membership in the Ring. Entity and attribute positions
@@ -1035,6 +1103,272 @@ where
     }
 }
 
+impl<U> TypedProgramSpec for SuccinctArchiveConstraint<'_, U>
+where
+    U: Universe,
+{
+    type State = SuccinctArchiveProgramState;
+    type NoveltyKey = ();
+    type Rank = [u64; 6];
+
+    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+        let resolved_positions = self.resolved_position_mask(request.bound);
+        let (key, variable) = match request.action {
+            ProgramAction::Propose(variable) | ProgramAction::Confirm(variable) => {
+                let target_positions = self.variable_position_mask(variable);
+                if request.bound.is_set(variable) || target_positions == 0 {
+                    return None;
+                }
+                debug_assert_eq!(resolved_positions & target_positions, 0);
+                let action = if matches!(request.action, ProgramAction::Propose(_)) {
+                    SUCCINCT_PROPOSE_ROUTE
+                } else {
+                    SUCCINCT_CONFIRM_ROUTE
+                };
+                (
+                    ProgramKey::new(action | (target_positions << 3) | resolved_positions),
+                    variable,
+                )
+            }
+            ProgramAction::Support => (
+                ProgramKey::new(SUCCINCT_SUPPORT_ROUTE | resolved_positions),
+                self.support_variable()?,
+            ),
+        };
+        Some(ProgramRoute {
+            key,
+            variable,
+            stratum: ProgramStratum::Finite,
+            grouping: ProgramGrouping::PageLocal,
+            completion: ProgramCompletion::PageableOnly,
+        })
+    }
+
+    fn dispatch(&self, state: &Self::State) -> DispatchClass {
+        match state {
+            SuccinctArchiveProgramState::Propose { .. } => SUCCINCT_PROPOSE_DISPATCH,
+            SuccinctArchiveProgramState::Confirm { .. } => SUCCINCT_CONFIRM_DISPATCH,
+            SuccinctArchiveProgramState::Support => SUCCINCT_SUPPORT_DISPATCH,
+        }
+    }
+
+    fn pacing(&self, _state: &Self::State) -> ProgramPacing {
+        ProgramPacing::Search
+    }
+
+    fn progress(&self, state: &Self::State) -> Self::Rank {
+        fn complemented_value_words(value: &RawInline) -> [u64; 4] {
+            std::array::from_fn(|word| {
+                let begin = word * 8;
+                !u64::from_be_bytes(value[begin..begin + 8].try_into().unwrap())
+            })
+        }
+
+        let mut rank = [0u64; 6];
+        match state {
+            SuccinctArchiveProgramState::Support => rank[0] = 1,
+            SuccinctArchiveProgramState::Confirm { offset, .. } => {
+                rank[0] = 2;
+                rank[1] = u64::MAX
+                    - u64::try_from(*offset)
+                        .expect("SuccinctArchive candidate offset exceeds rank limb");
+            }
+            SuccinctArchiveProgramState::Propose { cursor, .. } => {
+                rank[0] = 3;
+                match cursor {
+                    ResidualDeltaSourceCursor::Start => rank[1] = u64::MAX,
+                    ResidualDeltaSourceCursor::After(value) => {
+                        rank[1] = u64::MAX - 1;
+                        rank[2..].copy_from_slice(&complemented_value_words(value));
+                    }
+                    ResidualDeltaSourceCursor::Offset(_) => {
+                        panic!("ordinal cursor crossed into a typed SuccinctArchive source")
+                    }
+                }
+            }
+        }
+        rank
+    }
+
+    fn seed_typed(
+        &self,
+        batch: ProgramSeedBatch<'_>,
+        effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+    ) {
+        assert_eq!(batch.route.stratum, ProgramStratum::Finite);
+        assert_eq!(batch.route.grouping, ProgramGrouping::PageLocal);
+        assert_eq!(batch.route.completion, ProgramCompletion::PageableOnly);
+        let state = match batch.request.action {
+            ProgramAction::Propose(variable) => {
+                assert_eq!(batch.route.variable, variable);
+                assert!(!batch.request.bound.is_set(variable));
+                assert_ne!(self.variable_position_mask(variable), 0);
+                SuccinctArchiveProgramState::Propose {
+                    variable,
+                    cursor: ResidualDeltaSourceCursor::Start,
+                }
+            }
+            ProgramAction::Confirm(variable) => {
+                assert_eq!(batch.route.variable, variable);
+                assert!(!batch.request.bound.is_set(variable));
+                assert_ne!(self.variable_position_mask(variable), 0);
+                SuccinctArchiveProgramState::Confirm {
+                    variable,
+                    offset: 0,
+                }
+            }
+            ProgramAction::Support => {
+                assert_eq!(Some(batch.route.variable), self.support_variable());
+                SuccinctArchiveProgramState::Support
+            }
+        };
+        for parent in 0..batch.view.len() {
+            effects.finite_root(
+                u32::try_from(parent).expect("too many typed SuccinctArchive parents"),
+                state.clone(),
+                None,
+            );
+        }
+    }
+
+    fn step_typed(
+        &self,
+        states: Vec<Self::State>,
+        batch: TypedProgramBatch<'_>,
+        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+    ) {
+        assert_eq!(batch.stratum, ProgramStratum::Finite);
+        assert_eq!(states.len(), batch.view.len());
+        assert_eq!(states.len(), batch.candidate_sets.len());
+        assert_eq!(states.len(), batch.limits.len());
+        let Some(first) = states.first() else {
+            return;
+        };
+        match first {
+            SuccinctArchiveProgramState::Propose { variable, .. } => {
+                let variable = *variable;
+                let positions = self.positions(variable, &batch.view);
+                for (input, state) in states.into_iter().enumerate() {
+                    let SuccinctArchiveProgramState::Propose {
+                        variable: state_variable,
+                        cursor,
+                    } = state
+                    else {
+                        panic!("one typed SuccinctArchive proposal cohort mixed action variants")
+                    };
+                    assert_eq!(state_variable, variable);
+                    assert!(
+                        batch.candidate_sets[input].is_none(),
+                        "typed SuccinctArchive proposal received a candidate group"
+                    );
+                    let mut direct = Vec::new();
+                    let page = self.proposal_source_page_row(
+                        &positions,
+                        batch.view.row(input),
+                        cursor,
+                        batch.limits[input],
+                        &mut direct,
+                    );
+                    let input = u32::try_from(input)
+                        .expect("too many typed SuccinctArchive inputs in one cohort");
+                    for value in direct {
+                        effects.direct(input, value);
+                    }
+                    assert!(
+                        page.next.is_none() || page.examined > 0,
+                        "typed SuccinctArchive proposal resumed without examining its source"
+                    );
+                    let resume = page.next.map(|cursor| {
+                        TypedResume::Immediate(SuccinctArchiveProgramState::Propose {
+                            variable,
+                            cursor,
+                        })
+                    });
+                    effects.account_source(page.examined, 0);
+                    effects.page(page.examined, resume);
+                }
+            }
+            SuccinctArchiveProgramState::Confirm { variable, .. } => {
+                let variable = *variable;
+                let mut tagged = Candidates::new();
+                let mut pages = Vec::with_capacity(states.len());
+                for (input, state) in states.into_iter().enumerate() {
+                    let SuccinctArchiveProgramState::Confirm {
+                        variable: state_variable,
+                        offset,
+                    } = state
+                    else {
+                        panic!("one typed SuccinctArchive confirmation cohort mixed action variants")
+                    };
+                    assert_eq!(state_variable, variable);
+                    let candidates = batch.candidate_sets[input].expect(
+                        "typed SuccinctArchive confirmation lost its immutable candidate group",
+                    );
+                    assert!(offset <= candidates.len());
+                    let end = offset
+                        .saturating_add(batch.limits[input])
+                        .min(candidates.len());
+                    let input_tag = u32::try_from(input)
+                        .expect("too many typed SuccinctArchive inputs in one cohort");
+                    tagged.extend(
+                        candidates[offset..end]
+                            .iter()
+                            .copied()
+                            .map(|value| (input_tag, value)),
+                    );
+                    pages.push((offset, end, candidates.len()));
+                }
+
+                // Preserve the canonical whole-frontier implementation: all
+                // input pages become one row-tagged Ring probe stream, so an
+                // attached `RingBatchQuery` sees the same cohort-wide batch as
+                // ordinary blocked confirmation. This is deliberately not a
+                // per-candidate membership adapter.
+                if !tagged.is_empty() {
+                    self.confirm(
+                        variable,
+                        &batch.view,
+                        &mut CandidateSink::Tagged(&mut tagged),
+                    );
+                }
+                for (input, value) in tagged {
+                    effects.accept(input, value);
+                }
+                for (offset, end, candidate_len) in pages {
+                    let examined = end - offset;
+                    assert!(
+                        end == candidate_len || examined > 0,
+                        "typed SuccinctArchive confirmation resumed without examining a candidate"
+                    );
+                    let resume = (end < candidate_len).then(|| {
+                        TypedResume::Immediate(SuccinctArchiveProgramState::Confirm {
+                            variable,
+                            offset: end,
+                        })
+                    });
+                    effects.page(examined, resume);
+                }
+            }
+            SuccinctArchiveProgramState::Support => {
+                for (input, state) in states.into_iter().enumerate() {
+                    assert_eq!(state, SuccinctArchiveProgramState::Support);
+                    assert!(
+                        batch.candidate_sets[input].is_none(),
+                        "typed SuccinctArchive support received a candidate group"
+                    );
+                    if self.support_row(&batch.view, batch.view.row(input)) {
+                        effects.support(
+                            u32::try_from(input)
+                                .expect("too many typed SuccinctArchive inputs in one cohort"),
+                        );
+                    }
+                    effects.page(1, None);
+                }
+            }
+        }
+    }
+}
+
 impl<'a, U> Constraint<'a> for SuccinctArchiveConstraint<'a, U>
 where
     U: Universe,
@@ -1305,6 +1639,18 @@ where
         true
     }
 
+    /// Exposes the canonical CPU/Ring family as a finite typed Program.
+    ///
+    /// This capability belongs to `SuccinctArchiveConstraint` itself. External
+    /// wrappers that override `residual_program` do not inherit it through
+    /// ordinary `Constraint` delegation. In particular, composing this family
+    /// with the GPU crate's `ResidentTwoBoundConstraint` route remains a
+    /// separate wrapper-level decision; this core tranche neither shadows nor
+    /// replaces that accelerator family.
+    fn residual_program(&self) -> Option<ProgramRef<'_>> {
+        Some(ProgramRef::new(self))
+    }
+
     fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
         if view.col(variable).is_some() {
             return false;
@@ -1359,5 +1705,450 @@ where
             }),
             _ => true,
         }
+    }
+}
+
+#[cfg(test)]
+mod typed_program_tests {
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::inline::encodings::UnknownInline;
+    use crate::inline::Inline;
+    use crate::query::{ProgramActivation, ProgramBatch, ProgramBatchEffects, ProgramResume};
+    use crate::trible::{Trible, TribleSet};
+
+    fn id_value(byte: u8) -> RawInline {
+        let mut value = [0; 32];
+        value[16..].fill(byte);
+        value
+    }
+
+    fn inline_value(byte: u8) -> RawInline {
+        [byte; 32]
+    }
+
+    fn trible(entity: u8, attribute: u8, value: RawInline) -> Trible {
+        let mut data = [0; 64];
+        data[..16].fill(entity);
+        data[16..32].fill(attribute);
+        data[32..].copy_from_slice(&value);
+        Trible { data }
+    }
+
+    fn one_program_step<U>(
+        constraint: &SuccinctArchiveConstraint<'_, U>,
+        request: ProgramRequest,
+        view: RowsView<'_>,
+        candidate_sets: &[Option<&[RawInline]>],
+        limits: &[usize],
+    ) -> ProgramBatchEffects
+    where
+        U: Universe,
+    {
+        let program = constraint
+            .residual_program()
+            .expect("SuccinctArchive exposes its core finite Program");
+        let route = program
+            .route(request)
+            .expect("test request has a total SuccinctArchive route");
+        let activations: Vec<_> = (0..view.len())
+            .map(|activation| ProgramActivation(activation as u64 + 1))
+            .collect();
+        let mut runtime = program.new_runtime();
+        let mut seeded = crate::query::ProgramSeedEffects::default();
+        program.seed_batch(
+            &mut runtime,
+            ProgramSeedBatch {
+                request,
+                route,
+                view,
+                activations: &activations,
+            },
+            &mut seeded,
+        );
+        assert_eq!(seeded.work.len(), view.len());
+        let work: Vec<_> = seeded.work.into_iter().map(|seed| seed.work).collect();
+        let mut effects = ProgramBatchEffects::default();
+        program.step_batch(
+            &mut runtime,
+            ProgramBatch {
+                stratum: route.stratum,
+                view,
+                candidate_sets,
+                activations: &activations,
+                work: &work,
+                limits,
+            },
+            &mut effects,
+        );
+        effects
+    }
+
+    fn drain_unit_proposal<U>(
+        constraint: &SuccinctArchiveConstraint<'_, U>,
+        variable: VariableId,
+        bound: VariableSet,
+        view: RowsView<'_>,
+    ) -> (Vec<RawInline>, Vec<usize>)
+    where
+        U: Universe,
+    {
+        assert_eq!(view.len(), 1);
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(variable),
+            bound,
+        };
+        let program = constraint.residual_program().unwrap();
+        let route = program.route(request).unwrap();
+        let activations = [ProgramActivation(1)];
+        let mut runtime = program.new_runtime();
+        let mut seeded = crate::query::ProgramSeedEffects::default();
+        program.seed_batch(
+            &mut runtime,
+            ProgramSeedBatch {
+                request,
+                route,
+                view,
+                activations: &activations,
+            },
+            &mut seeded,
+        );
+        let mut work = seeded.work.pop().unwrap().work;
+        assert!(seeded.work.is_empty());
+        let candidate_sets = [None];
+        let limits = [1];
+        let mut values = Vec::new();
+        let mut examined = Vec::new();
+        loop {
+            let mut effects = ProgramBatchEffects::default();
+            program.step_batch(
+                &mut runtime,
+                ProgramBatch {
+                    stratum: route.stratum,
+                    view,
+                    candidate_sets: &candidate_sets,
+                    activations: &activations,
+                    work: std::slice::from_ref(&work),
+                    limits: &limits,
+                },
+                &mut effects,
+            );
+            assert!(effects.accepted.is_empty());
+            assert!(effects.supported.is_empty());
+            values.extend(effects.direct.into_iter().map(|(input, value)| {
+                assert_eq!(input, 0);
+                value
+            }));
+            assert_eq!(effects.pages.len(), 1);
+            let page = effects.pages.pop().unwrap();
+            examined.push(page.examined);
+            work = match page.resume {
+                Some(ProgramResume::Immediate(next)) => {
+                    assert!(page.examined > 0);
+                    next
+                }
+                None => break,
+                Some(_) => panic!("SuccinctArchive proposal used a non-immediate continuation"),
+            };
+        }
+        (values, examined)
+    }
+
+    struct RecordingRingBatch<'a> {
+        archive: &'a SuccinctArchive<OrderedUniverse>,
+        calls: Mutex<Vec<(SuccinctRotation, Vec<usize>, Vec<usize>)>>,
+    }
+
+    impl RingBatchQuery for RecordingRingBatch<'_> {
+        fn rank_batch(
+            &self,
+            rotation: SuccinctRotation,
+            positions: &[usize],
+            values: &[usize],
+        ) -> Vec<usize> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((rotation, positions.to_vec(), values.to_vec()));
+            let column = self.archive.ring_col(rotation);
+            positions
+                .iter()
+                .zip(values)
+                .map(|(&position, &value)| column.rank(position, value).unwrap())
+                .collect()
+        }
+    }
+
+    #[test]
+    fn typed_routes_encode_action_target_and_resolved_positions() {
+        let set: TribleSet = [trible(1, 11, inline_value(21))].into_iter().collect();
+        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+        let e = Variable::<GenId>::new(0);
+        let a = Variable::<GenId>::new(1);
+        let v = Variable::<UnknownInline>::new(2);
+        let constraint = SuccinctArchiveConstraint::new(e, a, v, &archive);
+        let program = constraint.residual_program().unwrap();
+        let empty = VariableSet::new_empty();
+        let propose = program
+            .route(ProgramRequest {
+                action: ProgramAction::Propose(e.index),
+                bound: empty,
+            })
+            .unwrap();
+        let confirm = program
+            .route(ProgramRequest {
+                action: ProgramAction::Confirm(e.index),
+                bound: empty,
+            })
+            .unwrap();
+        let mut attribute_bound = empty;
+        attribute_bound.set(a.index);
+        let resolved = program
+            .route(ProgramRequest {
+                action: ProgramAction::Propose(e.index),
+                bound: attribute_bound,
+            })
+            .unwrap();
+        let mut irrelevant_bound = empty;
+        irrelevant_bound.set(9);
+        let irrelevant = program
+            .route(ProgramRequest {
+                action: ProgramAction::Propose(e.index),
+                bound: irrelevant_bound,
+            })
+            .unwrap();
+        let constant_attribute = SuccinctArchiveConstraint::new(
+            e,
+            Inline::<GenId>::new(id_value(11)),
+            v,
+            &archive,
+        );
+        let constant_resolved = constant_attribute
+            .residual_program()
+            .unwrap()
+            .route(ProgramRequest {
+                action: ProgramAction::Propose(e.index),
+                bound: empty,
+            })
+            .unwrap();
+        let repeated = SuccinctArchiveConstraint::new(
+            e,
+            Inline::<GenId>::new(id_value(11)),
+            e,
+            &archive,
+        );
+        let repeated_target = repeated
+            .residual_program()
+            .unwrap()
+            .route(ProgramRequest {
+                action: ProgramAction::Propose(e.index),
+                bound: empty,
+            })
+            .unwrap();
+
+        assert_ne!(propose.key, confirm.key);
+        assert_ne!(propose.key, resolved.key);
+        assert_eq!(propose.key, irrelevant.key);
+        assert_eq!(resolved.key, constant_resolved.key);
+        assert_ne!(constant_resolved.key, repeated_target.key);
+        assert_eq!(propose.stratum, ProgramStratum::Finite);
+        assert_eq!(propose.grouping, ProgramGrouping::PageLocal);
+        assert_eq!(propose.completion, ProgramCompletion::PageableOnly);
+        assert!(program
+            .route(ProgramRequest {
+                action: ProgramAction::Propose(e.index),
+                bound: VariableSet::new_singleton(e.index),
+            })
+            .is_none());
+        assert!(program
+            .route(ProgramRequest {
+                action: ProgramAction::Confirm(9),
+                bound: empty,
+            })
+            .is_none());
+    }
+
+    #[test]
+    fn typed_unit_proposals_preserve_ring_order_and_count_repeated_rejections() {
+        let set: TribleSet = [
+            trible(1, 11, inline_value(21)),
+            trible(1, 11, inline_value(22)),
+            trible(2, 11, inline_value(23)),
+        ]
+        .into_iter()
+        .collect();
+        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+        let value = Variable::<UnknownInline>::new(0);
+        let constraint = SuccinctArchiveConstraint::new(
+            Inline::<GenId>::new(id_value(1)),
+            Inline::<GenId>::new(id_value(11)),
+            value,
+            &archive,
+        );
+        let (values, examined) = drain_unit_proposal(
+            &constraint,
+            value.index,
+            VariableSet::new_empty(),
+            RowsView::EMPTY,
+        );
+        assert_eq!(values, vec![inline_value(21), inline_value(22)]);
+        assert!(examined.iter().all(|&page| page == 1));
+
+        let repeated_set: TribleSet = [
+            trible(1, 11, id_value(1)),
+            trible(2, 11, id_value(3)),
+            trible(4, 11, id_value(4)),
+        ]
+        .into_iter()
+        .collect();
+        let repeated_archive: SuccinctArchive<OrderedUniverse> = (&repeated_set).into();
+        let x = Variable::<GenId>::new(0);
+        let repeated = SuccinctArchiveConstraint::new(
+            x,
+            Inline::<GenId>::new(id_value(11)),
+            x,
+            &repeated_archive,
+        );
+        let (values, examined) = drain_unit_proposal(
+            &repeated,
+            x.index,
+            VariableSet::new_empty(),
+            RowsView::EMPTY,
+        );
+        assert_eq!(values, vec![id_value(1), id_value(4)]);
+        assert_eq!(examined, vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn typed_confirm_pages_one_tagged_ring_batch_and_preserves_occurrences() {
+        let value = inline_value(31);
+        let set: TribleSet = [trible(1, 11, value), trible(2, 12, value)]
+            .into_iter()
+            .collect();
+        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+        let backend = RecordingRingBatch {
+            archive: &archive,
+            calls: Mutex::new(Vec::new()),
+        };
+        let e = Variable::<GenId>::new(0);
+        let a = Variable::<GenId>::new(1);
+        let constraint = SuccinctArchiveConstraint::with_ring_batch(
+            e,
+            a,
+            Inline::<UnknownInline>::new(value),
+            &archive,
+            &backend,
+        );
+        // This is the core family's optional Ring executor, not the GPU
+        // crate's `ResidentTwoBoundConstraint` wrapper. That wrapper overrides
+        // `residual_program` and intentionally remains outside this proof.
+        assert!(constraint.residual_program().is_some());
+        let vars = [e.index];
+        let rows = [id_value(1), id_value(2)];
+        let row_zero = [id_value(11), id_value(12), id_value(11)];
+        let row_one = [id_value(11), id_value(12), id_value(12)];
+        let candidate_sets = [Some(row_zero.as_slice()), Some(row_one.as_slice())];
+        let effects = one_program_step(
+            &constraint,
+            ProgramRequest {
+                action: ProgramAction::Confirm(a.index),
+                bound: VariableSet::new_singleton(e.index),
+            },
+            RowsView::new(&vars, &rows),
+            &candidate_sets,
+            &[3, 3],
+        );
+
+        assert_eq!(
+            effects.accepted,
+            vec![
+                (0, id_value(11)),
+                (0, id_value(11)),
+                (1, id_value(12)),
+                (1, id_value(12)),
+            ]
+        );
+        assert!(effects.pages.iter().all(|page| {
+            page.examined == 3 && page.resume.is_none()
+        }));
+        let calls = backend.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, SuccinctRotation::Vea);
+        assert_eq!(calls[0].1.len(), 12);
+        assert_eq!(calls[0].1.len(), calls[0].2.len());
+    }
+
+    #[test]
+    fn typed_support_is_row_local_optimistic_partial_and_exact_when_resolved() {
+        let value = inline_value(41);
+        let set: TribleSet = [trible(1, 11, value)].into_iter().collect();
+        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+        let e = Variable::<GenId>::new(0);
+        let a = Variable::<GenId>::new(1);
+        let v = Variable::<UnknownInline>::new(2);
+        let constraint = SuccinctArchiveConstraint::new(e, a, v, &archive);
+        let vars = [e.index, a.index, v.index];
+        let rows = [
+            id_value(1),
+            id_value(11),
+            value,
+            id_value(2),
+            id_value(11),
+            value,
+            [0xff; 32],
+            id_value(11),
+            value,
+        ];
+        let all_bound = VariableSet::new_singleton(e.index)
+            .union(VariableSet::new_singleton(a.index))
+            .union(VariableSet::new_singleton(v.index));
+        let exact = one_program_step(
+            &constraint,
+            ProgramRequest {
+                action: ProgramAction::Support,
+                bound: all_bound,
+            },
+            RowsView::new(&vars, &rows),
+            &[None, None, None],
+            &[1, 1, 1],
+        );
+        assert_eq!(exact.supported, vec![(0, ())]);
+        assert!(exact.pages.iter().all(|page| page.examined == 1));
+
+        let partial_vars = [e.index];
+        let partial_rows = [id_value(1), [0xff; 32]];
+        let partial = one_program_step(
+            &constraint,
+            ProgramRequest {
+                action: ProgramAction::Support,
+                bound: VariableSet::new_singleton(e.index),
+            },
+            RowsView::new(&partial_vars, &partial_rows),
+            &[None, None],
+            &[1, 1],
+        );
+        assert_eq!(partial.supported, vec![(0, ()), (1, ())]);
+
+        let true_constant = SuccinctArchiveConstraint::new(
+            Inline::<GenId>::new(id_value(1)),
+            Inline::<GenId>::new(id_value(11)),
+            Inline::<UnknownInline>::new(value),
+            &archive,
+        );
+        let false_constant = SuccinctArchiveConstraint::new(
+            Inline::<GenId>::new(id_value(2)),
+            Inline::<GenId>::new(id_value(11)),
+            Inline::<UnknownInline>::new(value),
+            &archive,
+        );
+        let constant_request = ProgramRequest {
+            action: ProgramAction::Support,
+            bound: VariableSet::new_empty(),
+        };
+        assert!(TypedProgramSpec::route(&true_constant, constant_request).is_none());
+        assert!(TypedProgramSpec::route(&false_constant, constant_request).is_none());
+        assert!(true_constant.satisfied(&RowsView::EMPTY));
+        assert!(!false_constant.satisfied(&RowsView::EMPTY));
     }
 }
