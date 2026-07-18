@@ -4,8 +4,6 @@ use std::sync::{Arc, Mutex};
 
 use rayon::prelude::*;
 use triblespace_core::and;
-#[cfg(target_os = "macos")]
-use triblespace_core::blob::encodings::succinctarchive::WaveletMatrixFreezeBackend;
 use triblespace_core::blob::encodings::succinctarchive::{
     merge_ordered_archives, merge_ordered_archives_with_backend, OrderedUniverse, RingBatchQuery,
     SuccinctArchive, SuccinctArchiveConstraint, SuccinctRotation, Universe,
@@ -293,87 +291,6 @@ fn wgpu_merge_is_byte_identical_to_canonical_cpu_merge() {
         );
         assert_eq!(TribleSet::from(&gpu), TribleSet::from(&cpu));
     }
-}
-
-/// On Apple silicon the freeze backend registers its host sequence arena as an
-/// external buffer instead of uploading the rotation. This gate freezes the
-/// same inputs through the registered path (the macOS default) and the forced
-/// upload path on one long-lived backend each, so arena reuse, shrink (stale
-/// tail bytes beyond a shorter pass's logical length), and growth
-/// re-registration are all exercised, then byte-compares the packed planes.
-#[cfg(target_os = "macos")]
-#[test]
-#[ignore = "requires a native WGPU adapter"]
-fn wgpu_registered_sequence_input_matches_upload_path() {
-    let registered = WgpuWaveletFreeze::new(&Default::default());
-    let uploaded = WgpuWaveletFreeze::new(&Default::default()).with_uploaded_sequences(true);
-
-    // 4,096 u32 codes are exactly one 16 KiB host page: the lengths straddle
-    // the arena's page granularity, and 100,000 -> 33 shrinks into a larger
-    // resident registration before 65,536 reuses it near capacity.
-    for (round, len) in [1usize, 4_095, 4_096, 4_097, 100_000, 33, 65_536]
-        .into_iter()
-        .enumerate()
-    {
-        for alphabet_size in [1usize, 2, 257, 300] {
-            let mut state = ((round as u64) << 32) | alphabet_size as u64;
-            let sequence: Vec<u32> = (0..len)
-                .map(|_| {
-                    state ^= state >> 12;
-                    state ^= state << 25;
-                    state ^= state >> 27;
-                    (state.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 33) as u32
-                        % alphabet_size as u32
-                })
-                .collect();
-            let width = (usize::BITS - alphabet_size.leading_zeros()).max(1) as usize;
-            let words = len.div_ceil(64);
-            let mut registered_planes = vec![vec![0xAAAA_AAAA_AAAA_AAAAu64; words]; width];
-            let mut uploaded_planes = vec![vec![0x5555_5555_5555_5555u64; words]; width];
-            let mut refs: Vec<&mut [u64]> = registered_planes
-                .iter_mut()
-                .map(|plane| plane.as_mut_slice())
-                .collect();
-            registered
-                .freeze_rotation(SuccinctRotation::Eav, alphabet_size, &sequence, &mut refs)
-                .unwrap();
-            let mut refs: Vec<&mut [u64]> = uploaded_planes
-                .iter_mut()
-                .map(|plane| plane.as_mut_slice())
-                .collect();
-            uploaded
-                .freeze_rotation(SuccinctRotation::Eav, alphabet_size, &sequence, &mut refs)
-                .unwrap();
-            assert_eq!(
-                registered_planes, uploaded_planes,
-                "len={len} alphabet_size={alphabet_size}"
-            );
-        }
-    }
-
-    // Archive-level: after all that reuse, both input paths must still merge
-    // byte-identically to the canonical CPU builder.
-    let mut left = TribleSet::new();
-    let mut right = TribleSet::new();
-    for ordinal in 0..2_048 {
-        let trible = trible(0x4E61_B000, ordinal);
-        if ordinal % 3 == 0 {
-            left.insert(&trible);
-        } else {
-            right.insert(&trible);
-        }
-        if ordinal % 13 == 0 {
-            left.insert(&trible);
-            right.insert(&trible);
-        }
-    }
-    let archives: Vec<SuccinctArchive<OrderedUniverse>> =
-        [&left, &right].into_iter().map(Into::into).collect();
-    let cpu = merge_ordered_archives(&archives);
-    let via_registered = merge_ordered_archives_with_backend(&archives, &registered).unwrap();
-    let via_upload = merge_ordered_archives_with_backend(&archives, &uploaded).unwrap();
-    assert_eq!(via_registered.bytes.as_ref(), cpu.bytes.as_ref());
-    assert_eq!(via_upload.bytes.as_ref(), cpu.bytes.as_ref());
 }
 
 #[test]

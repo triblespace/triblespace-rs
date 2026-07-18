@@ -136,66 +136,10 @@ addition to executing the query.
 Repository builds patch CubeCL 0.10's runtime and WGPU crates to the project's
 fork, which exposes immutable external-buffer registration for mmap-to-Metal
 aliasing. Cargo patches are root-local, so application workspaces that need the
-aliasing seam must select the same fork themselves. On macOS the compaction
-backend uses that seam for its input: instead of uploading the materialized
-`u32` rotation, it copies the codes into a reusable page-aligned host arena and
-registers the arena once as an immutable external buffer the GPU reads in place
-through unified memory. This is deliberately the cheap seam level — the
-rotation is still materialized on the host and the packed planes still read
-back; aliasing the mmap'd pile planes themselves is a separate, deeper
-restructure.
-
-### Registered sequence input (Apple silicon)
-
-The registration site (`register_arena` in `cubecl_backend.rs`) is judged
-against four properties, guaranteed as follows:
-
-- **Alignment.** The arena is allocated 16 KiB-aligned with a 16 KiB-multiple
-  length, exactly what Metal's `newBufferWithBytesNoCopy:` requires (Apple
-  silicon pages are 16 KiB; the granularity is also a multiple of 4 KiB pages).
-  The registration covers the allocation at offset 0.
-- **Immutability during kernel execution.** A freeze pass takes the arena
-  entry out of the backend's shared slot for exclusive use and rewrites it
-  strictly before its first launch. Entries return to the slot only after the
-  pass's explicit `client.sync()` succeeds — i.e. after every submission that
-  read the arena has drained — so no host write ever overlaps a kernel read.
-  The whole page range is the arena's own allocation; no foreign heap data
-  shares it. The buffer is used only as a kernel input: the runtime pins
-  external handles `can_mut() == false`, and the backend swaps a fresh device
-  buffer into the ping-pong pair after layer 0 so the registered handle can
-  never become the layer-1 scatter destination.
-- **Lifetime beyond the command submission.** The registration's keepalive
-  `Arc` (the arena's owner) is held by the runtime's storage until the device
-  itself drops, so the host pages outlive every submission that can reference
-  the handle even if the backend errors, panics, or is dropped mid-flight.
-- **Coherency.** The buffer is `StorageModeShared` on unified memory: CPU
-  writes issued before a command buffer commits are visible to the GPU, which
-  our single-threaded write-then-launch order plus the sync-before-reuse rule
-  provides. The GPU never writes the arena, so no reverse obligation exists.
-
-The packed-planes **readback stays a device-to-host copy**: the fork's only
-registration surface at the pinned rev is immutable by contract (host region
-must not change while the handle lives, external handles are pinned
-`can_mut() == false` so they are never picked as kernel destinations), and the
-`layers` buffer is written by every `block_count_pack` dispatch. There is no
-mutable or import-for-write registration variant, so the explicit
-synchronize-then-`read_one` error discipline is unchanged.
-
-The arena is retained and reused across merges, growing geometrically when a
-pass needs more capacity. Registrations cannot be individually released at the
-pinned rev, so a superseded (smaller) arena's pages stay pinned by their
-keepalive until the device drops; geometric growth bounds that retention to
-less than the final arena's size, and the steady state is a single arena of
-roughly peak-rotation size (4 bytes per input row). Everything else is
-unchanged: the `min_input_rows` admission threshold, the canonical CPU retry
-and circuit breaker in `AcceleratedSuccinctRollup`, core's plane-shape
-validation, and the error paths. On non-macOS targets, non-WGPU runtimes, or
-via `with_uploaded_sequences(true)` (a validation knob), the backend uses the
-previous upload path; the
-`wgpu_registered_sequence_input_matches_upload_path` parity gate freezes the
-same fixtures through both paths on long-lived backends — covering arena
-reuse, shrink, and growth re-registration — and byte-compares the packed
-planes and merged archives.
+aliasing seam must select the same fork themselves. The current compaction
+backend still uploads a newly materialized `u32` rotation and reads the packed
+planes back; merely selecting the fork does not make that transient path
+zero-copy.
 
 The production rollup type is
 `triblespace_core::repo::index_home::AcceleratedSuccinctRollup<WgpuWaveletFreeze>`:
