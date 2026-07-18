@@ -2092,12 +2092,13 @@ impl RegularPathConstraint {
     /// Exhausts one bound-endpoint product traversal for the eager Program
     /// complete-action route.
     ///
-    /// The sparse route keeps this same `(value, pc)` novelty domain in an
-    /// activation-local registry. A complete action has no activation, so it
-    /// owns the equivalent set and work queue directly. Endpoint acceptance is
-    /// still distinct per parent: convergent graph or automaton histories prove
-    /// one proposal occurrence, while separate parent rows run independent
-    /// drains and retain their outer bag multiplicity.
+    /// Repeated sparse routes keep this `(value, pc)` novelty domain in an
+    /// activation-local registry; finite sparse routes instead terminate by
+    /// descending program rank. A complete action has no activation, so it
+    /// owns the equivalent set and work queue directly. Collapsing convergent
+    /// finite histories is valid because proposals denote distinct endpoints.
+    /// Separate parent rows still run independent drains and retain their outer
+    /// bag multiplicity.
     fn complete_bound_endpoint(
         &self,
         program: &DeltaProgram,
