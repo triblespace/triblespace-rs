@@ -18,7 +18,9 @@ use triblespace_core::macros::{id_hex, pattern};
 use triblespace_core::query::find;
 use triblespace_core::query::residual::ResidualLowering;
 use triblespace_core::trible::{Trible, TribleSet};
-use triblespace_gpu::{ValueRouteAdmission, WgpuSuccinctArchive};
+use triblespace_gpu::{
+    PrepareValueRouteOutcome, ValueRouteAdmission, ValueRouteReadiness, WgpuSuccinctArchive,
+};
 
 mod ns {
     use triblespace_core::macros::attributes;
@@ -64,6 +66,59 @@ fn oracle_pairs(set: &TribleSet) -> Vec<(Id, Id)> {
     .collect();
     pairs.sort();
     pairs
+}
+
+#[test]
+#[ignore = "requires a native WGPU adapter"]
+fn explicit_preparation_is_exact_idempotent_and_keeps_force_usable() {
+    let set = fixture_set();
+    let expected = oracle_pairs(&set);
+    let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+    let resident = WgpuSuccinctArchive::new(archive).expect("resident wrap succeeds");
+
+    assert_eq!(resident.value_route_readiness(), ValueRouteReadiness::Cold);
+    assert_eq!(
+        resident.prepare_value_route(),
+        Ok(PrepareValueRouteOutcome::Prepared)
+    );
+    assert_eq!(
+        resident.value_route_readiness(),
+        ValueRouteReadiness::Prepared
+    );
+    assert_eq!(
+        resident.prepare_value_route(),
+        Ok(PrepareValueRouteOutcome::AlreadyPrepared)
+    );
+
+    // Preparation released the same snapshot lease after exact validation;
+    // the public Force route remains usable and bag-identical.
+    let route = resident.value_route_with(ValueRouteAdmission::Force);
+    let query = find!(
+        (e: Id, v: Id),
+        pattern!(&route, [{ ?e @ ns::fanout: ?v }])
+    );
+    let mut actual = query
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .collect::<Vec<_>>();
+    actual.sort();
+    assert_eq!(actual, expected);
+    assert!(route.counters().physical_cohorts > 0);
+}
+
+#[test]
+#[ignore = "requires a native WGPU adapter"]
+fn empty_snapshot_preparation_is_repeatable_and_remains_cold() {
+    let set = TribleSet::new();
+    let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+    let resident = WgpuSuccinctArchive::new(archive).expect("resident wrap succeeds");
+
+    for _ in 0..2 {
+        assert_eq!(
+            resident.prepare_value_route(),
+            Ok(PrepareValueRouteOutcome::EmptySnapshot)
+        );
+        assert_eq!(resident.value_route_readiness(), ValueRouteReadiness::Cold);
+    }
 }
 
 #[test]

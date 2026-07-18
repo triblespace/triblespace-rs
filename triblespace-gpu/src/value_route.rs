@@ -54,13 +54,14 @@
 //!    enabled policy admits by cohort rows and exact page work — `Force`
 //!    for parity/acceptance probes, or the explicitly experimental
 //!    calibrated `WarmM4` dominance score. There is deliberately **no
-//!    `Auto`**: the lease is not a readiness signal, and automatic
-//!    placement must never wait or compile. QoS placement intent
+//!    `Auto`**: explicit preparation proves only this snapshot's exact value
+//!    path, while no device-wide cooperative submission gate can yet prove
+//!    that automatic placement will not wait behind unrelated work. QoS placement intent
 //!    (consumer-owned, shard-inherited) is likewise absent from this first
 //!    route and returns as a later, measured second policy arm.
 
 use std::env;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::{error::Error, fmt};
 
@@ -94,15 +95,155 @@ use crate::typed_program::WGPU_RESIDENT_EXECUTOR;
 /// - `off` or `0`: [`ValueRouteAdmission::Off`],
 /// - `force`: [`ValueRouteAdmission::Force`],
 /// - `warm-m4`: [`ValueRouteAdmission::WarmM4`] (explicitly experimental),
-/// - `auto`: **rejected** ([`ValueRouteConfigError::AutoNotReady`]) — no
-///   universal automatic policy exists yet, because the per-snapshot lease
-///   is not a readiness signal and automatic placement must never wait or
-///   compile,
+/// - `auto`: **rejected** ([`ValueRouteConfigError::AutoNotReady`]) — explicit
+///   preparation is snapshot-local, and no device-wide cooperative gate can
+///   yet prove that automatic placement will not wait behind unrelated work,
 /// - anything else: a [`ValueRouteConfigError`] — never a silent fallback.
 pub const VALUE_ROUTE_ENV: &str = "TRIBLESPACE_GPU_VALUE_ROUTE";
 
 /// Static operation label carried by successful value-route placements.
 pub const TWO_BOUND_VALUE_OP: &str = "two-bound-transition/value-route";
+
+/// Snapshot-local readiness of the public resident value route.
+///
+/// [`Prepared`](Self::Prepared) is deliberately narrow evidence: this exact
+/// resident snapshot has completed and validated a real fixed-`(E,A) -> V`
+/// dispatch. It is not a claim that the shared device service is globally
+/// idle, so it does not enable a universal automatic admission policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ValueRouteReadiness {
+    /// No explicit preparation has begun.
+    Cold,
+    /// One caller owns the synchronous preparation attempt.
+    Preparing,
+    /// The exact production value path completed and validated.
+    Prepared,
+    /// A preparation attempt exited without a validated commit.
+    Failed,
+}
+
+const READINESS_COLD: u8 = 0;
+const READINESS_PREPARING: u8 = 1;
+const READINESS_PREPARED: u8 = 2;
+const READINESS_FAILED: u8 = 3;
+
+impl ValueRouteReadiness {
+    fn from_raw(raw: u8) -> Self {
+        match raw {
+            READINESS_COLD => Self::Cold,
+            READINESS_PREPARING => Self::Preparing,
+            READINESS_PREPARED => Self::Prepared,
+            READINESS_FAILED => Self::Failed,
+            _ => unreachable!("value-route readiness stores only declared states"),
+        }
+    }
+
+    fn as_raw(self) -> u8 {
+        match self {
+            Self::Cold => READINESS_COLD,
+            Self::Preparing => READINESS_PREPARING,
+            Self::Prepared => READINESS_PREPARED,
+            Self::Failed => READINESS_FAILED,
+        }
+    }
+}
+
+/// Successful result of [`WgpuSuccinctArchive::prepare_value_route`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrepareValueRouteOutcome {
+    /// This call executed and validated the preparation dispatch.
+    Prepared,
+    /// This snapshot had already committed a successful preparation.
+    AlreadyPrepared,
+    /// The canonical snapshot contains no tribles and therefore no real
+    /// `(E,A)` pair with which to exercise the production path.
+    EmptySnapshot,
+}
+
+/// A synchronous value-route preparation could not commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrepareValueRouteError {
+    /// Another caller currently owns this snapshot's preparation attempt.
+    InProgress,
+    /// This or an earlier attempt exited without a validated commit.
+    Failed,
+}
+
+impl fmt::Display for PrepareValueRouteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InProgress => {
+                write!(f, "resident value-route preparation is already in progress")
+            }
+            Self::Failed => write!(
+                f,
+                "resident value-route preparation did not commit a validated dispatch"
+            ),
+        }
+    }
+}
+
+impl Error for PrepareValueRouteError {}
+
+/// Atomic snapshot-local readiness cell owned by [`WgpuSuccinctArchive`].
+pub(crate) struct ValueRouteReadinessCell {
+    state: AtomicU8,
+}
+
+impl ValueRouteReadinessCell {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: AtomicU8::new(READINESS_COLD),
+        }
+    }
+
+    fn load(&self) -> ValueRouteReadiness {
+        ValueRouteReadiness::from_raw(self.state.load(Ordering::Acquire))
+    }
+
+    fn begin(&self) -> Result<ValueRoutePreparationGuard<'_>, ValueRouteReadiness> {
+        self.state
+            .compare_exchange(
+                READINESS_COLD,
+                READINESS_PREPARING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ValueRoutePreparationGuard {
+                readiness: self,
+                armed: true,
+            })
+            .map_err(ValueRouteReadiness::from_raw)
+    }
+}
+
+/// Default-fail ownership of one preparation attempt.
+///
+/// Only an explicit commit may publish `Prepared`; every error return and
+/// panic unwinds through `Drop` and publishes `Failed`.
+struct ValueRoutePreparationGuard<'a> {
+    readiness: &'a ValueRouteReadinessCell,
+    armed: bool,
+}
+
+impl ValueRoutePreparationGuard<'_> {
+    fn commit(mut self) {
+        self.readiness
+            .state
+            .store(ValueRouteReadiness::Prepared.as_raw(), Ordering::Release);
+        self.armed = false;
+    }
+}
+
+impl Drop for ValueRoutePreparationGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.readiness
+                .state
+                .store(ValueRouteReadiness::Failed.as_raw(), Ordering::Release);
+        }
+    }
+}
 
 /// An invalid [`VALUE_ROUTE_ENV`] value.
 ///
@@ -116,10 +257,10 @@ pub enum ValueRouteConfigError {
         /// The rejected value.
         value: String,
     },
-    /// `auto` is deliberately not accepted: until a genuine backend
-    /// readiness seam exists, the per-snapshot lease cannot prove that
-    /// automatic placement would never wait or compile, so no policy may
-    /// present itself as a universal automatic default.
+    /// `auto` is deliberately not accepted: explicit preparation proves one
+    /// snapshot's value path, but no device-wide cooperative submission gate
+    /// can prove that automatic placement would not wait behind unrelated
+    /// work, so no policy may present itself as a universal automatic default.
     AutoNotReady,
 }
 
@@ -132,8 +273,8 @@ impl fmt::Display for ValueRouteConfigError {
             ),
             Self::AutoNotReady => write!(
                 f,
-                "{VALUE_ROUTE_ENV}=auto is not available: no readiness seam proves \
-                 automatic placement would never wait or compile; use the explicitly \
+                "{VALUE_ROUTE_ENV}=auto is not available: snapshot-local preparation cannot prove \
+                 the shared device is ready now; use the explicitly \
                  experimental warm-m4 calibration or force"
             ),
         }
@@ -168,12 +309,11 @@ pub enum ValueRouteAdmission {
     ///
     /// Calibrated from the expanded rows × fanout matrix on one warm Apple
     /// M4 — resident buffers live, pipelines already compiled. It is *not*
-    /// a universal `Auto`: the per-snapshot Idle lease is a busy-mutex, not
-    /// a ready-now/prewarmed signal, so a first-launch cohort admitted by
-    /// this score could still pay compile or preparation cost. Automatic
-    /// placement must never wait or compile; until a genuine readiness
-    /// seam exists this policy stays opt-in and the env grammar rejects
-    /// `auto` outright.
+    /// a universal `Auto`: explicit preparation can warm one snapshot's
+    /// value path, but the per-snapshot Idle lease cannot prove global device
+    /// idleness. Automatic placement must never wait behind unrelated work;
+    /// until a device-wide cooperative gate exists this policy stays opt-in
+    /// and the env grammar rejects `auto` outright.
     WarmM4,
 }
 
@@ -328,11 +468,13 @@ impl SuccinctValueState {
 
 /// One input's page in a family-internal step outcome, shared by the Native
 /// and the device path so their equivalence is a direct comparison.
+#[derive(Debug, Eq, PartialEq)]
 struct ValuePage {
     examined: usize,
     resume: Option<SuccinctValueState>,
 }
 
+#[derive(Debug, Eq, PartialEq)]
 struct ValueStepOutcome {
     pages: Vec<ValuePage>,
     /// Terminal proposal rows as direct occurrences (order- and
@@ -619,6 +761,21 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
         states: &[SuccinctValueState],
         batch: &TypedProgramBatch<'_>,
     ) -> Option<ValueStepOutcome> {
+        self.device_outcome_validated(states, batch, |_| true)
+    }
+
+    /// The production physical path with one additional commit predicate.
+    ///
+    /// Ordinary routed cohorts accept the already exact device receipt
+    /// validation. Explicit preparation also compares the complete outcome
+    /// against the canonical Native pager while the lease is still held; a
+    /// mismatch therefore poisons the lane instead of publishing readiness.
+    fn device_outcome_validated(
+        &self,
+        states: &[SuccinctValueState],
+        batch: &TypedProgramBatch<'_>,
+        validate_commit: impl FnOnce(&ValueStepOutcome) -> bool,
+    ) -> Option<ValueStepOutcome> {
         let core = &self.core;
 
         // Pure preflight: admission, capability, and every grant-shape
@@ -672,6 +829,16 @@ impl<'a, U: Universe> SuccinctValueFamily<'a, U> {
 
         match self.device_outcome_leased(arm, states, limits, &grants, &bases, &frontier) {
             DeviceAttempt::Committed(outcome) => {
+                if !validate_commit(&outcome) {
+                    // Dropping the still-held lease poisons this snapshot's
+                    // Program lane: validation beyond the physical receipt
+                    // did not commit.
+                    drop(lease);
+                    core.counters
+                        .declined_contract
+                        .fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
                 // The complete dispatch validated; release the lane.
                 lease.commit_success();
                 let granted: u64 = limits.iter().map(|&limit| limit as u64).sum();
@@ -948,6 +1115,92 @@ impl<U> WgpuSuccinctArchive<U>
 where
     U: Universe,
 {
+    /// Returns this resident snapshot's explicit value-route readiness.
+    ///
+    /// `Prepared` proves that [`prepare_value_route`](Self::prepare_value_route)
+    /// completed the exact production fixed-`(E,A) -> V` path for this
+    /// snapshot. It does not claim that the process-wide device service is
+    /// currently idle.
+    pub fn value_route_readiness(&self) -> ValueRouteReadiness {
+        self.value_route_readiness.load()
+    }
+
+    /// Synchronously prepares this snapshot's resident value route.
+    ///
+    /// The method selects a real nonempty `(E,A)` pair from the canonical
+    /// archive, compiles the same one-pattern resident family used by public
+    /// `pattern!` queries, and runs one parent with grant one through the exact
+    /// production physical path. The device receipt/readback checks run
+    /// unchanged, then the complete outcome is compared with the Native pager
+    /// before the still-held snapshot lease may commit. The answer is discarded.
+    ///
+    /// Preparation is idempotent after success. An empty snapshot returns
+    /// [`PrepareValueRouteOutcome::EmptySnapshot`] and remains cold. Once a
+    /// nonempty attempt begins, every error return and panic publishes
+    /// [`ValueRouteReadiness::Failed`]; only the fully validated path can
+    /// publish [`ValueRouteReadiness::Prepared`].
+    ///
+    /// This is an explicit synchronous operation and may perform uploads,
+    /// compilation, dispatch, and readback. It does not enable `auto`, because
+    /// no device-wide cooperative submission gate exists yet.
+    pub fn prepare_value_route(&self) -> Result<PrepareValueRouteOutcome, PrepareValueRouteError> {
+        // Choose the witness before acquiring either readiness ownership or
+        // the Program lease. Empty snapshots perform no preparation work and
+        // remain honestly Cold.
+        let Some(witness) = self.archive().iter().next() else {
+            return Ok(PrepareValueRouteOutcome::EmptySnapshot);
+        };
+        let entity = GenId::inline_from(*witness.e()).raw;
+        let attribute = GenId::inline_from(*witness.a()).raw;
+
+        let preparation = match self.value_route_readiness.begin() {
+            Ok(preparation) => preparation,
+            Err(ValueRouteReadiness::Prepared) => {
+                return Ok(PrepareValueRouteOutcome::AlreadyPrepared);
+            }
+            Err(ValueRouteReadiness::Preparing) => {
+                return Err(PrepareValueRouteError::InProgress);
+            }
+            Err(ValueRouteReadiness::Failed) => {
+                return Err(PrepareValueRouteError::Failed);
+            }
+            Err(ValueRouteReadiness::Cold) => {
+                unreachable!("a strong Cold compare-exchange cannot fail with Cold")
+            }
+        };
+
+        let family = SuccinctValueFamily::compile(
+            RawTerm::Const(entity),
+            RawTerm::Const(attribute),
+            RawTerm::Var(0),
+            self,
+            ValueRouteAdmission::Force,
+            Arc::new(ValueRouteCounters::default()),
+        )
+        .ok_or(PrepareValueRouteError::Failed)?;
+        let state = family
+            .seed_state(&entity, &attribute)
+            .ok_or(PrepareValueRouteError::Failed)?;
+        let states = [state];
+        let limits = [1usize];
+        let native = family.native_outcome(&states, &limits);
+        let batch = TypedProgramBatch {
+            stratum: ProgramStratum::Finite,
+            view: RowsView::new(&[], &[]),
+            candidate_sets: &[],
+            activations: &[],
+            limits: &limits,
+        };
+        let physical = family
+            .device_outcome_validated(&states, &batch, |outcome| outcome == &native)
+            .ok_or(PrepareValueRouteError::Failed)?;
+        debug_assert_eq!(physical, native);
+        drop(physical);
+
+        preparation.commit();
+        Ok(PrepareValueRouteOutcome::Prepared)
+    }
+
     /// The value-route view with admission read once from
     /// [`VALUE_ROUTE_ENV`]; unset keeps routing off.
     pub fn value_route(&self) -> Result<ResidentValueRoute<'_, U>, ValueRouteConfigError> {
@@ -1317,6 +1570,42 @@ mod tests {
     }
 
     #[test]
+    fn readiness_cell_commits_only_an_explicit_success() {
+        let readiness = ValueRouteReadinessCell::new();
+        assert_eq!(readiness.load(), ValueRouteReadiness::Cold);
+
+        let preparation = readiness.begin().expect("Cold begins preparation");
+        assert_eq!(readiness.load(), ValueRouteReadiness::Preparing);
+        assert!(matches!(
+            readiness.begin(),
+            Err(ValueRouteReadiness::Preparing)
+        ));
+
+        preparation.commit();
+        assert_eq!(readiness.load(), ValueRouteReadiness::Prepared);
+        assert!(matches!(
+            readiness.begin(),
+            Err(ValueRouteReadiness::Prepared)
+        ));
+    }
+
+    #[test]
+    fn readiness_cell_defaults_fail_on_error_and_panic_paths() {
+        let dropped = ValueRouteReadinessCell::new();
+        drop(dropped.begin().expect("Cold begins preparation"));
+        assert_eq!(dropped.load(), ValueRouteReadiness::Failed);
+        assert!(matches!(dropped.begin(), Err(ValueRouteReadiness::Failed)));
+
+        let unwound = ValueRouteReadinessCell::new();
+        let panic = std::panic::catch_unwind(|| {
+            let _preparation = unwound.begin().expect("Cold begins preparation");
+            panic!("synthetic preparation unwind");
+        });
+        assert!(panic.is_err());
+        assert_eq!(unwound.load(), ValueRouteReadiness::Failed);
+    }
+
+    #[test]
     fn narrow_route_matrix_is_exact() {
         let (archive, _, _) = fixture();
         let resident = WgpuSuccinctArchive::new(archive).unwrap();
@@ -1496,6 +1785,7 @@ mod tests {
     fn disabled_policies_and_a_held_lease_never_route() {
         let (archive, entities, attributes) = fixture();
         let resident = WgpuSuccinctArchive::new(archive).unwrap();
+        assert_eq!(resident.value_route_readiness(), ValueRouteReadiness::Cold);
 
         // The default policy declines every cohort.
         let off = var_family(&resident, ValueRouteAdmission::Off);
@@ -1504,6 +1794,11 @@ mod tests {
         assert!(off.try_step_physical(&states, batch(&limits)).is_none());
         assert_eq!(off.counters().physical_cohorts, 0);
         assert_eq!(off.counters().declined_policy, 1);
+        assert_eq!(
+            resident.value_route_readiness(),
+            ValueRouteReadiness::Cold,
+            "Off must not implicitly prepare or dispatch"
+        );
 
         // A small cohort sits far below the warm-M4 dominance score and
         // declines by geometry.
@@ -1528,6 +1823,22 @@ mod tests {
         assert!(resident.program_lease().try_acquire().is_none());
         assert!(forced.try_step_physical(&states, batch(&limits)).is_none());
         assert_eq!(forced.counters().declined_lease, 2);
+
+        // An explicit preparation against the already-failed lane defaults
+        // the independent readiness state to Failed and stays idempotently
+        // failed on later calls; it can never claim Prepared.
+        assert_eq!(
+            resident.prepare_value_route(),
+            Err(PrepareValueRouteError::Failed)
+        );
+        assert_eq!(
+            resident.value_route_readiness(),
+            ValueRouteReadiness::Failed
+        );
+        assert_eq!(
+            resident.prepare_value_route(),
+            Err(PrepareValueRouteError::Failed)
+        );
     }
 
     #[test]
@@ -1665,9 +1976,8 @@ mod tests {
             ValueRouteAdmission::from_env_value(Some("warm-m4")),
             Ok(ValueRouteAdmission::WarmM4)
         );
-        // `auto` is rejected as not-ready, never silently coerced: no
-        // readiness seam proves automatic placement would not wait or
-        // compile.
+        // `auto` is rejected as not-ready, never silently coerced:
+        // snapshot-local preparation cannot prove global device idleness.
         assert_eq!(
             ValueRouteAdmission::from_env_value(Some("auto")),
             Err(ValueRouteConfigError::AutoNotReady)

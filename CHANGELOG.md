@@ -417,8 +417,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   grants, absolute continuations, branded receipts, and bag semantics; every
   decline falls back on the untouched cohort. Placement is Off by default,
   `Force` is a parity probe, and the explicitly experimental `WarmM4` score is
-  the only calibrated opt-in. Generic `auto` is rejected until a genuine
-  nonblocking readiness seam exists.
+  the only calibrated opt-in.
+- **Resident value routes expose honest snapshot-local preparation.**
+  `WgpuSuccinctArchive::prepare_value_route` synchronously runs one real
+  nonempty `(E,A) -> V` parent with grant one through the exact production
+  resident path, checks its receipt/readback against the canonical Native
+  pager while the snapshot lease remains held, and only then commits
+  `ValueRouteReadiness::Prepared`. A default-fail guard makes errors and
+  panics publish `Failed`; empty snapshots remain `Cold`, and successful
+  preparation is idempotent. Generic `auto` remains rejected because this
+  snapshot-local proof is not a device-wide cooperative idleness gate.
 
 ### Fixed
 
