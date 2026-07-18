@@ -4679,6 +4679,24 @@ impl CandidatePayload {
         *self = Self::Deferred(DeferredCandidates::from_payload(payload, parent_count));
     }
 
+    /// Opens a clone-cheap cursor over an already-shared one-parent payload.
+    ///
+    /// This is deliberately distinct from [`Self::one_parent_values`].  The
+    /// latter is a temporary slice-borrow seam for the untouched contiguous
+    /// action-opening leaf; after paging or rope concatenation there may be no
+    /// single backing slice.  Affine reducer finalization must always use this
+    /// structural cursor instead.
+    fn shared_one_parent_cursor(&self) -> DeferredCandidateCursor {
+        let Self::Deferred(candidates) = self else {
+            panic!("affine candidate cursor requires shared deferred storage")
+        };
+        assert_eq!(
+            candidates.parent_count, 1,
+            "affine candidate cursor requires one parent"
+        );
+        candidates.cursor()
+    }
+
     /// Crosses the existing unbudgeted planner/action-opening boundary.
     ///
     /// Affine reducer completion and Worklist reconvergence must never call
@@ -5453,6 +5471,46 @@ impl FormulaBatch {
         }
     }
 
+    fn input_mut(&mut self) -> &mut CandidatePayload {
+        match self
+            .frames
+            .last_mut()
+            .expect("formula payload has no root frame")
+        {
+            FormulaPayloadFrame::Or { source, .. } => source,
+            FormulaPayloadFrame::And { current } => current,
+        }
+    }
+
+    /// Freezes the exact candidate occurrence bag at the cyclic action-opening
+    /// boundary and returns a shared reducer copy. Legacy graph expansion can
+    /// retain a segmented input; the later affine finalizer always walks the
+    /// shared root with a structural cursor.
+    fn shared_confirm_original(&mut self) -> CandidatePayload {
+        self.input_mut().defer_for_shared_activation(1);
+        self.input().clone()
+    }
+
+    /// Freezes a Confirm input that must also cross the old slice-based graph
+    /// seam. Constructed Programs and delta sources borrow the complete input
+    /// from `source_context`; a preceding pageable Confirm may have left it as
+    /// a segmented rope, so their action opening explicitly recoalesces it.
+    fn shared_contiguous_confirm_original(&mut self) -> CandidatePayload {
+        let input = self.input_mut();
+        input.materialize_for_planning_or_action_opening();
+        input.normalize_for(1);
+        self.shared_confirm_original()
+    }
+
+    /// V1 can hand a formula Confirm to the pageable finalizer only while the
+    /// complete live reducer ancestry is conjunctive.  An OR frame still owns
+    /// eager sort/dedup work and therefore keeps the old atomic finish path.
+    fn confirm_finalizer_capable(&self) -> bool {
+        self.frames
+            .iter()
+            .all(|frame| matches!(frame, FormulaPayloadFrame::And { .. }))
+    }
+
     fn action_candidate_count(&self, stage: FormulaStage) -> usize {
         match stage {
             FormulaStage::Support | FormulaStage::Propose => 0,
@@ -5819,23 +5877,7 @@ impl FormulaBatch {
     /// Moves every affine parent, including its complete reducer-frame stack,
     /// into a one-parent payload suitable for activation-local cyclic work.
     /// Candidate tags are normalized to zero by the ordinary partition path.
-    fn into_singletons(mut self, stride: usize) -> Vec<Self> {
-        // Activation-local constraint APIs still borrow contiguous candidate
-        // slices. Materialize here, at the exact action-opening boundary,
-        // before immutable Formula batches enter the cyclic registry. A
-        // deferred Worklist result remains segmented through every scheduler
-        // merge and width cut leading up to this point.
-        for frame in &mut self.frames {
-            match frame {
-                FormulaPayloadFrame::Or { source, output } => {
-                    source.materialize_for_planning_or_action_opening();
-                    output.materialize_for_planning_or_action_opening();
-                }
-                FormulaPayloadFrame::And { current } => {
-                    current.materialize_for_planning_or_action_opening();
-                }
-            }
-        }
+    fn into_singletons(self, stride: usize) -> Vec<Self> {
         let parent_count = self.parents.row_count;
         let assignment: Vec<_> = (0..parent_count).collect();
         let groups = self.partition(stride, &assignment);
@@ -9909,7 +9951,11 @@ impl ResidualStateMachine {
                         ActiveDeltaStatus::Pending => {
                             debug_assert!(focused.outcome.completed_activation_ids.is_empty());
                             self.account_delta_feedback(&focused.outcome);
-                            self.active_delta = Some(active);
+                            self.active_delta = Some(
+                                focused
+                                    .resume
+                                    .expect("a pending affine activation has an exact continuation"),
+                            );
                         }
                         ActiveDeltaStatus::Quiescent => {
                             // Quiescence carries the exact activation receipt
@@ -15632,6 +15678,67 @@ mod tests {
         };
         assert!(current.is_values());
         assert_eq!(current.one_parent_values(), [raw(1), raw(2)]);
+    }
+
+    #[test]
+    fn formula_confirm_opening_keeps_legacy_ropes_structural_but_recoalesces_slice_consumers() {
+        let mut segmented = deferred_candidate_payload(1, vec![(0, raw(1)), (0, raw(2))]);
+        segmented.extend_same_domain(
+            deferred_candidate_payload(1, vec![(0, raw(1)), (0, raw(3))]),
+            1,
+        );
+        let CandidatePayload::Deferred(deferred) = &segmented else {
+            panic!("test Confirm input was not deferred")
+        };
+        assert!(matches!(
+            deferred.root.as_ref().map(|root| &root.node.kind),
+            Some(DeferredCandidateNodeKind::Concat { .. })
+        ));
+
+        let batch = FormulaBatch {
+            activations: vec![ActivationId(0)],
+            parents: RowBatch::seed(),
+            frames: vec![FormulaPayloadFrame::And { current: segmented }],
+        };
+        let mut singletons = batch.into_singletons(0);
+        assert_eq!(singletons.len(), 1);
+        let batch = singletons.pop().unwrap();
+
+        let mut legacy = batch.clone();
+        let structural = legacy.shared_confirm_original();
+        assert_eq!(
+            structural.iter().collect::<Vec<_>>(),
+            [(0, raw(1)), (0, raw(2)), (0, raw(1)), (0, raw(3))]
+        );
+        let (
+            CandidatePayload::Deferred(legacy_input),
+            CandidatePayload::Deferred(structural),
+        ) = (legacy.input(), &structural)
+        else {
+            panic!("legacy Confirm opening materialized its shared rope")
+        };
+        assert!(Arc::ptr_eq(
+            &legacy_input.root.as_ref().unwrap().node,
+            &structural.root.as_ref().unwrap().node,
+        ));
+
+        let mut slice_consumer = batch;
+        let contiguous = slice_consumer.shared_contiguous_confirm_original();
+        assert_eq!(
+            contiguous.one_parent_values(),
+            [raw(1), raw(2), raw(1), raw(3)]
+        );
+        assert_eq!(
+            slice_consumer.input().one_parent_values(),
+            [raw(1), raw(2), raw(1), raw(3)]
+        );
+        let CandidatePayload::Deferred(contiguous) = contiguous else {
+            panic!("slice-consuming Confirm input was not re-shared")
+        };
+        assert!(matches!(
+            contiguous.root.as_ref().map(|root| &root.node.kind),
+            Some(DeferredCandidateNodeKind::Values { .. })
+        ));
     }
 
     #[test]
@@ -22487,6 +22594,7 @@ mod tests {
             continuation: Some(token),
             publication: None,
             completed_activation_ids: Vec::new(),
+            retargeted: Default::default(),
             dead_pages: 2,
             source_dead_pages: 2,
             transition_dead_pages: 0,
@@ -22505,6 +22613,7 @@ mod tests {
             continuation: Some(token),
             publication: None,
             completed_activation_ids: Vec::new(),
+            retargeted: Default::default(),
             dead_pages: 0,
             source_dead_pages: 0,
             transition_dead_pages: 0,
@@ -22536,6 +22645,7 @@ mod tests {
             continuation: Some(terminal),
             publication: None,
             completed_activation_ids: Vec::new(),
+            retargeted: Default::default(),
             dead_pages: 0,
             source_dead_pages: 0,
             transition_dead_pages: 0,
@@ -22553,6 +22663,7 @@ mod tests {
             continuation: None,
             publication: None,
             completed_activation_ids: Vec::new(),
+            retargeted: Default::default(),
             dead_pages: 2,
             source_dead_pages: 2,
             transition_dead_pages: 0,
@@ -22568,6 +22679,7 @@ mod tests {
             continuation: None,
             publication: None,
             completed_activation_ids: Vec::new(),
+            retargeted: Default::default(),
             dead_pages: 1,
             source_dead_pages: 0,
             transition_dead_pages: 1,
@@ -22585,6 +22697,7 @@ mod tests {
             continuation: None,
             publication: None,
             completed_activation_ids: Vec::new(),
+            retargeted: Default::default(),
             dead_pages: 0,
             source_dead_pages: 0,
             transition_dead_pages: 0,

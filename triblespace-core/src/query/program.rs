@@ -884,6 +884,47 @@ where
     }
 }
 
+/// Opens one engine-owned typed continuation in an existing private runtime.
+///
+/// Ordinary constraints can create states only through [`TypedSeedSink`] and
+/// [`TypedEffectSink`].  The residual engine additionally needs to transfer a
+/// closed affine reducer into one of its own finite Program states without
+/// pretending that the enclosing constraint seeded a second activation.  This
+/// crate-private seam preserves the same typed arena, handle generation,
+/// dispatch, and pacing checks while keeping that transfer unavailable to
+/// public [`TypedProgramSpec`] implementations.
+pub(crate) fn insert_engine_program_state<T>(
+    spec: &T,
+    runtime: &mut ProgramRuntime,
+    activation: ProgramActivation,
+    state: T::State,
+) -> ProgramWork
+where
+    T: TypedProgramSpec,
+{
+    assert_eq!(
+        runtime.family,
+        TypeId::of::<TypedProgramRuntime<T::State, T::NoveltyKey>>(),
+        "engine Program state expected family {}, received {}",
+        type_name::<TypedProgramRuntime<T::State, T::NoveltyKey>>(),
+        runtime.family_name
+    );
+    let dispatch = spec.dispatch(&state);
+    let pacing = spec.pacing(&state);
+    let runtime = runtime
+        .erased
+        .as_mut()
+        .as_any_mut()
+        .downcast_mut::<TypedProgramRuntime<T::State, T::NoveltyKey>>()
+        .expect("engine Program state received another family's runtime");
+    let handle = runtime.insert(activation, state);
+    ProgramWork {
+        handle,
+        dispatch,
+        pacing,
+    }
+}
+
 impl<T> ErasedProgramSpec for T
 where
     T: TypedProgramSpec,

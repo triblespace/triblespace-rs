@@ -71,10 +71,21 @@ impl DeltaDesc {
 /// the family-local key distinguishes routes of that occurrence without a
 /// query-global program catalog.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(super) struct ProgramAddress {
-    desc: DeltaDesc,
-    key: ProgramKey,
-    stratum: ProgramStratum,
+pub(super) enum ProgramAddress {
+    /// A route owned by one structural constraint occurrence.
+    Constraint {
+        desc: DeltaDesc,
+        key: ProgramKey,
+        stratum: ProgramStratum,
+    },
+    /// The engine-owned finite reducer that filters an immutable occurrence
+    /// bag after graph Confirm quiescence.
+    ///
+    /// This address is intentionally a singleton. Bound schema, return PC,
+    /// original cursor, and accepted set are activation payload, so carrying
+    /// the source graph descriptor here would prevent identical futures from
+    /// sharing a physical Program cohort.
+    ConfirmFinalize,
 }
 
 impl ProgramAddress {
@@ -83,7 +94,7 @@ impl ProgramAddress {
             desc.variable, route.variable,
             "constructed program route changed its structural variable"
         );
-        Self {
+        Self::Constraint {
             desc,
             key: route.key,
             stratum: route.stratum,
@@ -91,10 +102,99 @@ impl ProgramAddress {
     }
 
     fn resolve<'r, 'a>(&self, root: &'r dyn Constraint<'a>, plan: &ResidualPlan) -> ProgramRef<'r> {
-        self.desc
-            .resolve(root, plan)
-            .residual_program()
-            .expect("constructed typed program disappeared during execution")
+        match self {
+            Self::Constraint { desc, .. } => desc
+                .resolve(root, plan)
+                .residual_program()
+                .expect("constructed typed program disappeared during execution"),
+            Self::ConfirmFinalize => ProgramRef::new(&CONFIRM_FINALIZER_PROGRAM),
+        }
+    }
+
+    fn stratum(&self) -> ProgramStratum {
+        match self {
+            Self::Constraint { stratum, .. } => *stratum,
+            Self::ConfirmFinalize => ProgramStratum::Finite,
+        }
+    }
+
+    fn is_confirm_finalizer(&self) -> bool {
+        matches!(self, Self::ConfirmFinalize)
+    }
+}
+
+#[derive(Clone)]
+struct ConfirmFinalizerState {
+    original: DeferredCandidateCursor,
+    accepted: Arc<AHashSet<RawInline>>,
+}
+
+struct ConfirmFinalizerProgram;
+
+static CONFIRM_FINALIZER_PROGRAM: ConfirmFinalizerProgram = ConfirmFinalizerProgram;
+
+impl TypedProgramSpec for ConfirmFinalizerProgram {
+    type State = ConfirmFinalizerState;
+    type NoveltyKey = ();
+    type Rank = usize;
+
+    fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
+        // Engine-owned reducer states are opened only through the private
+        // runtime seam; they are never routes offered by a Constraint.
+        None
+    }
+
+    fn dispatch(&self, _state: &Self::State) -> DispatchClass {
+        DispatchClass::new(0)
+    }
+
+    fn pacing(&self, _state: &Self::State) -> ProgramPacing {
+        ProgramPacing::Search
+    }
+
+    fn progress(&self, state: &Self::State) -> Self::Rank {
+        state.original.remaining
+    }
+
+    fn seed_typed(
+        &self,
+        _batch: ProgramSeedBatch<'_>,
+        _effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+    ) {
+        panic!("engine Confirm finalizer was seeded through a Constraint route")
+    }
+
+    fn step_typed(
+        &self,
+        states: Vec<Self::State>,
+        batch: TypedProgramBatch<'_>,
+        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+    ) {
+        assert_eq!(states.len(), batch.limits.len());
+        assert_eq!(states.len(), batch.view.len());
+        assert!(
+            batch.candidate_sets.iter().all(|candidates| candidates.is_none()),
+            "Confirm finalizer unexpectedly borrowed a graph candidate slice"
+        );
+        for (input, (mut state, &limit)) in states.into_iter().zip(batch.limits).enumerate() {
+            let mut examined = 0usize;
+            while examined < limit {
+                let Some((parent, candidate)) = state.original.next() else {
+                    break;
+                };
+                assert_eq!(parent, 0, "one-parent finalizer cursor changed domains");
+                examined += 1;
+                if state.accepted.contains(&candidate) {
+                    effects.direct(
+                        u32::try_from(input).expect("too many Confirm finalizer inputs"),
+                        candidate,
+                    );
+                }
+            }
+            assert!(examined > 0, "a nonempty Confirm finalizer made no progress");
+            let resume = (state.original.remaining > 0).then_some(TypedResume::Immediate(state));
+            effects.page(examined, resume);
+        }
     }
 }
 
@@ -113,12 +213,17 @@ pub(super) struct ActiveDeltaContinuation {
     activation: ActivationId,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DeltaStateEntry {
+    Legacy(DeltaDesc),
+    Program(ProgramAddress),
+}
+
 #[derive(Clone, Default)]
 struct DeltaInterner {
     by_desc: AHashMap<DeltaDesc, DeltaStateId>,
     by_program: AHashMap<ProgramAddress, DeltaStateId>,
-    descs: Vec<DeltaDesc>,
-    programs: Vec<Option<ProgramAddress>>,
+    entries: Vec<DeltaStateEntry>,
 }
 
 impl DeltaInterner {
@@ -126,9 +231,8 @@ impl DeltaInterner {
         if let Some(&id) = self.by_desc.get(&desc) {
             return id;
         }
-        let id = DeltaStateId(u32::try_from(self.descs.len()).expect("too many delta states"));
-        self.descs.push(desc.clone());
-        self.programs.push(None);
+        let id = DeltaStateId(u32::try_from(self.entries.len()).expect("too many delta states"));
+        self.entries.push(DeltaStateEntry::Legacy(desc.clone()));
         self.by_desc.insert(desc, id);
         id
     }
@@ -137,19 +241,26 @@ impl DeltaInterner {
         if let Some(&id) = self.by_program.get(&address) {
             return id;
         }
-        let id = DeltaStateId(u32::try_from(self.descs.len()).expect("too many program states"));
-        self.descs.push(address.desc.clone());
-        self.programs.push(Some(address.clone()));
+        let id = DeltaStateId(u32::try_from(self.entries.len()).expect("too many program states"));
+        self.entries.push(DeltaStateEntry::Program(address.clone()));
         self.by_program.insert(address, id);
         id
     }
 
     fn get(&self, id: DeltaStateId) -> &DeltaDesc {
-        &self.descs[id.0 as usize]
+        match &self.entries[id.0 as usize] {
+            DeltaStateEntry::Legacy(desc) => desc,
+            DeltaStateEntry::Program(_) => {
+                panic!("typed Program state was resolved as a legacy delta descriptor")
+            }
+        }
     }
 
     fn program(&self, id: DeltaStateId) -> Option<&ProgramAddress> {
-        self.programs[id.0 as usize].as_ref()
+        match &self.entries[id.0 as usize] {
+            DeltaStateEntry::Legacy(_) => None,
+            DeltaStateEntry::Program(address) => Some(address),
+        }
     }
 }
 
@@ -242,12 +353,17 @@ enum DeltaReducer {
         published: bool,
     },
     Confirm {
-        original: Box<[RawInline]>,
+        /// Immutable one-parent occurrence bag frozen at action opening.
+        /// During graph execution this remains one contiguous Deferred leaf,
+        /// so typed constraint Programs may borrow it through their existing
+        /// slice API. Finalization always switches to its structural cursor.
+        original: CandidatePayload,
     },
-    /// Formula confirmation reads its immutable original stream directly
-    /// from the activation's owned return frame, avoiding a second candidate
-    /// allocation solely for reducer finalization.
-    FormulaConfirm,
+    /// Graph discovery has quiesced and transferred its sole affine credit to
+    /// the engine-owned Search-paced occurrence scanner.
+    FinalizingConfirm {
+        output: CandidatePayload,
+    },
 }
 
 impl DeltaReducer {
@@ -415,15 +531,41 @@ struct CompletedActivation {
     effect: DeltaCompletion,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+struct ConfirmFinalizerSeed {
+    activation: ActivationId,
+    state: ConfirmFinalizerState,
+    credit: ProducerCredit,
+}
+
+enum RegistrySettlement {
+    Completed(CompletedActivation),
+    ConfirmFinalizer(ConfirmFinalizerSeed),
+}
+
+#[derive(Debug)]
 enum DeltaCompletion {
     /// Every semantic effect was released before quiescence.
     Cleanup,
     /// Complete quiescent candidate action result.
-    Candidates(Vec<RawInline>),
+    Candidates(CandidatePayload),
     /// Boolean support proved only at the reducer boundary.
     Support(bool),
 }
+
+impl PartialEq for DeltaCompletion {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Cleanup, Self::Cleanup) => true,
+            (Self::Support(left), Self::Support(right)) => left == right,
+            (Self::Candidates(left), Self::Candidates(right)) => {
+                left.iter().eq(right.iter())
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for DeltaCompletion {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DeltaStreamingEffect {
@@ -970,7 +1112,7 @@ impl ProducerRegistry {
                 DeltaReducer::StreamProposal | DeltaReducer::StreamFormulaProposal => {}
                 DeltaReducer::Support { .. }
                 | DeltaReducer::Confirm { .. }
-                | DeltaReducer::FormulaConfirm => assert!(
+                | DeltaReducer::FinalizingConfirm { .. } => assert!(
                     accepted.is_empty(),
                     "a non-proposal reducer received direct source candidates"
                 ),
@@ -1206,7 +1348,7 @@ impl ProducerRegistry {
         };
 
         let observed: Vec<_> = observed.into_iter().collect();
-        let direct: Vec<_> = direct.into_iter().collect();
+        let mut direct: Vec<_> = direct.into_iter().collect();
         let mut accepted = Vec::new();
         {
             let activation = self
@@ -1214,16 +1356,30 @@ impl ProducerRegistry {
                 .activations
                 .get_mut(&activation_id)
                 .expect("unknown program activation");
-            match &activation.reducer {
+            match &mut activation.reducer {
                 DeltaReducer::QuiescentProposal => {
                     activation.direct_candidates.extend_from_slice(&direct)
                 }
                 DeltaReducer::StreamProposal | DeltaReducer::StreamFormulaProposal => {
                     accepted.extend_from_slice(&direct)
                 }
+                DeltaReducer::FinalizingConfirm { output } => {
+                    assert!(
+                        observed.is_empty() && children.is_empty() && !reported_support,
+                        "engine Confirm finalizer reported graph effects"
+                    );
+                    assert!(
+                        activation.accepted.is_empty(),
+                        "Confirm finalizer reacquired mutable graph Accepted state"
+                    );
+                    if !direct.is_empty() {
+                        let mut page = CandidatePayload::Values(std::mem::take(&mut direct));
+                        page.defer_for_shared_activation(1);
+                        output.extend_same_domain(page, 1);
+                    }
+                }
                 DeltaReducer::Support { .. }
-                | DeltaReducer::Confirm { .. }
-                | DeltaReducer::FormulaConfirm => assert!(
+                | DeltaReducer::Confirm { .. } => assert!(
                     direct.is_empty(),
                     "a non-proposal program reducer observed direct candidates"
                 ),
@@ -1253,7 +1409,7 @@ impl ProducerRegistry {
                 }
                 DeltaReducer::QuiescentProposal
                 | DeltaReducer::Confirm { .. }
-                | DeltaReducer::FormulaConfirm => false,
+                | DeltaReducer::FinalizingConfirm { .. } => false,
             }
         };
         if publishes_stable_effect {
@@ -1465,14 +1621,8 @@ impl ProducerRegistry {
 
     fn activation_candidates(activation: &Activation) -> Option<&[RawInline]> {
         activation.source_candidates.as_deref().or_else(|| {
-            match (&activation.reducer, &activation.return_to) {
-                (DeltaReducer::Confirm { original }, _) => Some(original.as_ref()),
-                (DeltaReducer::FormulaConfirm, DeltaReturn::Formula { batch, .. }) => {
-                    Some(batch.input().one_parent_values())
-                }
-                (DeltaReducer::FormulaConfirm, DeltaReturn::Stable { .. }) => {
-                    panic!("formula confirmation returned to a stable continuation")
-                }
+            match &activation.reducer {
+                DeltaReducer::Confirm { original } => Some(original.one_parent_values()),
                 _ => None,
             }
         })
@@ -1602,7 +1752,7 @@ impl ProducerRegistry {
             DeltaReducer::Support { .. }
             | DeltaReducer::QuiescentProposal
             | DeltaReducer::Confirm { .. }
-            | DeltaReducer::FormulaConfirm => return None,
+            | DeltaReducer::FinalizingConfirm { .. } => return None,
         };
         Some(DeltaStreamingReturn {
             return_to: activation.return_to.clone(),
@@ -1637,8 +1787,11 @@ impl ProducerRegistry {
         })
     }
 
-    /// Consumes the unique quiescence proof and releases the exact affine
-    /// continuation that was suspended when this activation was seeded.
+    /// Consumes a quiescence proof through the eager completion path.
+    ///
+    /// Proposal-only callers use this directly. Confirm-capable callers go
+    /// through [`Self::settle_quiescence`], which either delegates here or
+    /// reopens the same activation as the finite occurrence finalizer.
     fn finish(&mut self, proof: QuiescenceProof) -> CompletedActivation {
         let activation = self
             .state
@@ -1657,7 +1810,7 @@ impl ProducerRegistry {
                 let mut result = activation.accepted.into_iter().collect::<Vec<_>>();
                 result.extend(activation.direct_candidates);
                 result.sort_unstable();
-                DeltaCompletion::Candidates(result)
+                DeltaCompletion::Candidates(CandidatePayload::Values(result))
             }
             DeltaReducer::Support { published: true } => {
                 assert!(activation.direct_candidates.is_empty());
@@ -1673,28 +1826,22 @@ impl ProducerRegistry {
             }
             DeltaReducer::Confirm { original } => {
                 assert!(activation.direct_candidates.is_empty());
-                DeltaCompletion::Candidates(
-                    original
-                        .iter()
-                        .filter(|candidate| activation.accepted.contains(*candidate))
-                        .copied()
-                        .collect(),
-                )
+                let result = original
+                    .iter()
+                    .filter_map(|(parent, candidate)| {
+                        assert_eq!(parent, 0, "one-parent Confirm changed domains");
+                        activation.accepted.contains(&candidate).then_some(candidate)
+                    })
+                    .collect();
+                DeltaCompletion::Candidates(CandidatePayload::Values(result))
             }
-            DeltaReducer::FormulaConfirm => {
+            DeltaReducer::FinalizingConfirm { output } => {
                 assert!(activation.direct_candidates.is_empty());
-                let DeltaReturn::Formula { batch, .. } = &activation.return_to else {
-                    panic!("formula confirmation returned to a stable continuation")
-                };
-                DeltaCompletion::Candidates(
-                    batch
-                        .input()
-                        .one_parent_values()
-                        .iter()
-                        .filter(|candidate| activation.accepted.contains(*candidate))
-                        .copied()
-                        .collect(),
-                )
+                assert!(
+                    activation.accepted.is_empty(),
+                    "Confirm finalizer retained the mutable graph accepted set"
+                );
+                DeltaCompletion::Candidates(output)
             }
         };
         CompletedActivation {
@@ -1702,6 +1849,80 @@ impl ProducerRegistry {
             return_to: activation.return_to,
             effect,
         }
+    }
+
+    /// Settles one graph/reducer quiescence boundary without hiding whole-bag
+    /// work inside the affine receipt.
+    ///
+    /// Stable Confirm and formula Confirm under an all-AND live frame ancestry
+    /// transfer to the Search-paced engine Program. Formula OR keeps the
+    /// existing eager reducer path until its sort/dedup boundary is pageable.
+    fn settle_quiescence(&mut self, proof: QuiescenceProof) -> RegistrySettlement {
+        let (eligible, original_empty) = {
+            let activation = self
+                .state
+                .activations
+                .get(&proof.activation)
+                .expect("unknown delta activation");
+            assert_eq!(activation.status, ActivationStatus::Quiescent);
+            assert!(activation.live.is_empty());
+            let eligible_return = match &activation.return_to {
+                DeltaReturn::Stable { .. } => true,
+                DeltaReturn::Formula { batch, .. } => batch.confirm_finalizer_capable(),
+            };
+            match &activation.reducer {
+                DeltaReducer::Confirm { original } => (eligible_return, original.is_empty()),
+                _ => (false, false),
+            }
+        };
+        if !eligible || original_empty {
+            return RegistrySettlement::Completed(self.finish(proof));
+        }
+
+        let state = {
+            let activation = self
+                .state
+                .activations
+                .get_mut(&proof.activation)
+                .expect("unknown delta activation");
+            assert!(activation.direct_candidates.is_empty());
+            assert!(
+                activation.program_joins.is_empty(),
+                "Confirm graph quiesced behind a live Program join"
+            );
+            assert!(
+                activation.suspended_source_page.is_none(),
+                "Confirm graph quiesced with a suspended source page"
+            );
+            let mut output = CandidatePayload::empty(1);
+            output.defer_for_shared_activation(1);
+            let reducer = std::mem::replace(
+                &mut activation.reducer,
+                DeltaReducer::FinalizingConfirm { output },
+            );
+            let DeltaReducer::Confirm { original } = reducer else {
+                unreachable!("Confirm finalizer settlement lost its reducer")
+            };
+            let original = original.shared_one_parent_cursor();
+            let accepted = Arc::new(std::mem::take(&mut activation.accepted));
+            // Drop graph-only allocation capacity at the handoff, rather than
+            // merely making it unreachable behind the finalizer state.
+            activation.seen = AHashMap::new();
+            activation.program_joins = AHashMap::new();
+            activation.source_candidates = None;
+            activation.direct_candidates = Vec::new();
+            activation.status = ActivationStatus::Open;
+            ConfirmFinalizerState { original, accepted }
+        };
+        let credit = self.issue_credit(
+            proof.activation,
+            CreditKind::Program { join: None },
+        );
+        RegistrySettlement::ConfirmFinalizer(ConfirmFinalizerSeed {
+            activation: proof.activation,
+            state,
+            credit,
+        })
     }
 
     fn deep_clone(&self) -> (Self, BTreeMap<CreditKey, ProducerCredit>) {
@@ -1727,6 +1948,12 @@ fn take_monotonic(counter: &mut u64, kind: &str) -> u64 {
         .checked_add(1)
         .unwrap_or_else(|| panic!("delta {kind} identifier space exhausted"));
     current
+}
+
+fn shared_one_parent_candidates(values: Vec<RawInline>) -> CandidatePayload {
+    let mut payload = CandidatePayload::Values(values);
+    payload.defer_for_shared_activation(1);
+    payload
 }
 
 fn validate_seed_tags(seeds: &[ResidualDeltaSeed], parent_count: usize) {
@@ -2385,6 +2612,11 @@ struct DeltaPhysicalOutcome {
     retired_search_receipt: bool,
 }
 
+enum DeltaSettlement {
+    Completed(CompletedActivation),
+    Retargeted(ActiveDeltaContinuation),
+}
+
 /// Insertion-ordered activation membership with an allocation-free singleton
 /// lookup. Physical cohorts observe activation order while repeated feedback
 /// checks need set rather than quadratic vector membership.
@@ -2515,6 +2747,10 @@ pub(super) struct DeltaStepOutcome {
     pub(super) continuation: Option<ContinuationToken>,
     pub(super) publication: Option<TerminalPublicationBatch>,
     pub(super) completed_activation_ids: Vec<ActivationId>,
+    /// Exact Program continuation installed by quiescence settlement, keyed
+    /// by the affine activation because one physical cohort may transfer more
+    /// than one reducer. Queue layout is not a continuation receipt.
+    pub(super) retargeted: AHashMap<ActivationId, ActiveDeltaContinuation>,
     pub(super) dead_pages: usize,
     pub(super) source_dead_pages: usize,
     pub(super) transition_dead_pages: usize,
@@ -2570,9 +2806,9 @@ pub(super) enum ActiveDeltaStatus {
 pub(super) struct ActiveDeltaStepOutcome {
     pub(super) outcome: DeltaStepOutcome,
     pub(super) status: ActiveDeltaStatus,
-    /// The same affine activation may be resumed after the yielded stable
-    /// continuation runs. Publishing one accepted value and retaining cyclic
-    /// traversal work are independent facts.
+    /// Exact canonical state to install whenever the affine activation stays
+    /// live. Most steps retain their input state; a graph-quiescence handoff
+    /// carries the explicitly settled engine-Program state instead.
     pub(super) resume: Option<ActiveDeltaContinuation>,
 }
 
@@ -3071,6 +3307,49 @@ impl DeltaScheduler {
         state
     }
 
+    fn prepare_confirm_finalizer(&mut self) -> DeltaStateId {
+        let address = ProgramAddress::ConfirmFinalize;
+        let state = self.interner.intern_program(address);
+        self.program_runtimes.entry(state).or_insert_with(|| {
+            ProgramRef::new(&CONFIRM_FINALIZER_PROGRAM).new_runtime()
+        });
+        state
+    }
+
+    /// Central scheduler half of graph quiescence settlement.
+    ///
+    /// Registry settlement owns the reducer's semantic capability gate and
+    /// same-activation Q->Open transition. This half installs the one private
+    /// typed handle and files its one affine Program task, returning the exact
+    /// canonical state as an explicit continuation receipt.
+    fn settle_quiescence(&mut self, proof: QuiescenceProof) -> DeltaSettlement {
+        match self.registry.settle_quiescence(proof) {
+            RegistrySettlement::Completed(completed) => DeltaSettlement::Completed(completed),
+            RegistrySettlement::ConfirmFinalizer(seed) => {
+                let state = self.prepare_confirm_finalizer();
+                let work = insert_engine_program_state(
+                    &CONFIRM_FINALIZER_PROGRAM,
+                    self.program_runtimes
+                        .get_mut(&state)
+                        .expect("prepared Confirm finalizer lost its runtime"),
+                    ProgramActivation(seed.activation.0),
+                    seed.state,
+                );
+                let active = self
+                    .file_program_state(
+                        state,
+                        vec![ProgramTask {
+                            activation: seed.activation,
+                            credit: seed.credit,
+                            work,
+                        }],
+                    )
+                    .expect("Confirm finalizer filed one affine task");
+                DeltaSettlement::Retargeted(active)
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn seed_program_proposals_with_full(
         &mut self,
@@ -3220,7 +3499,7 @@ impl DeltaScheduler {
             let parent = parents.rows[start..start + stride]
                 .to_vec()
                 .into_boxed_slice();
-            let original = original.into_boxed_slice();
+            let original = shared_one_parent_candidates(original);
             activations.push(self.registry.open_program_activation(
                 DeltaReducer::Confirm { original },
                 DeltaReturn::Stable {
@@ -3253,6 +3532,7 @@ impl DeltaScheduler {
         let ranges = program_seed_ranges(&seeded.work, parent_count);
         let mut tasks = Vec::with_capacity(seeded.work.len());
         let mut retired = Vec::new();
+        let mut finalizer_active = None;
         for (activation, range) in activations.into_iter().zip(ranges) {
             let installed = self
                 .registry
@@ -3268,9 +3548,14 @@ impl DeltaScheduler {
                     }),
             );
             if let Some(proof) = installed.quiescence {
-                let completed = self.registry.finish(proof);
-                assert_eq!(completed.effect, DeltaCompletion::Candidates(Vec::new()));
-                retired.push(ProgramActivation(completed.activation.0));
+                match self.settle_quiescence(proof) {
+                    DeltaSettlement::Completed(completed) => assert!(matches!(
+                        completed.effect,
+                        DeltaCompletion::Candidates(ref candidates) if candidates.is_empty()
+                    )),
+                    DeltaSettlement::Retargeted(active) => finalizer_active = Some(active),
+                }
+                retired.push(ProgramActivation(activation.0));
             }
         }
         if !retired.is_empty() {
@@ -3281,7 +3566,8 @@ impl DeltaScheduler {
                 &retired,
             );
         }
-        self.file_program_state(state, tasks)
+        let graph_active = self.file_program_state(state, tasks);
+        finalizer_active.or(graph_active)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3306,12 +3592,14 @@ impl DeltaScheduler {
         let singletons = batch.into_singletons(bound.count());
         let state = self.prepare_program(desc, route, spec);
         let mut activations = Vec::with_capacity(singletons.len());
-        for batch in singletons {
+        for mut batch in singletons {
             let reducer = match stage {
                 FormulaStage::Support => DeltaReducer::Support { published: false },
                 FormulaStage::Propose if stream_proposal => DeltaReducer::StreamFormulaProposal,
                 FormulaStage::Propose => DeltaReducer::QuiescentProposal,
-                FormulaStage::Confirm => DeltaReducer::FormulaConfirm,
+                FormulaStage::Confirm => DeltaReducer::Confirm {
+                    original: batch.shared_contiguous_confirm_original(),
+                },
             };
             activations.push(self.registry.open_program_activation(
                 reducer,
@@ -3348,6 +3636,7 @@ impl DeltaScheduler {
         let mut completed = Vec::new();
         let mut retired = Vec::new();
         let mut continuation = None;
+        let mut finalizer_active = None;
         for (activation, range) in activations.into_iter().zip(ranges) {
             let installed = self
                 .registry
@@ -3379,12 +3668,17 @@ impl DeltaScheduler {
                     }),
             );
             if let Some(proof) = installed.quiescence {
-                let completed_activation = self.registry.finish(proof);
-                retired.push(ProgramActivation(completed_activation.activation.0));
-                completed.push(completed_activation);
+                match self.settle_quiescence(proof) {
+                    DeltaSettlement::Completed(completed_activation) => {
+                        completed.push(completed_activation)
+                    }
+                    DeltaSettlement::Retargeted(active) => finalizer_active = Some(active),
+                }
+                retired.push(ProgramActivation(activation.0));
             }
         }
-        let active = self.file_program_state(state, tasks);
+        let graph_active = self.file_program_state(state, tasks);
+        let active = finalizer_active.or(graph_active);
         for completed in completed {
             prefer_continuation(
                 &mut continuation,
@@ -3595,6 +3889,7 @@ impl DeltaScheduler {
         let (parents, candidate_groups) = batch.into_parent_candidates();
 
         let mut tasks = Vec::with_capacity(seeds.len());
+        let mut finalizer_active = None;
         for ((row, seed_range), original) in
             seed_ranges.into_iter().enumerate().zip(candidate_groups)
         {
@@ -3602,7 +3897,7 @@ impl DeltaScheduler {
             let parent = parents.rows[start..start + stride]
                 .to_vec()
                 .into_boxed_slice();
-            let original = original.into_boxed_slice();
+            let original = shared_one_parent_candidates(original);
             let started = self.registry.start_many(
                 DeltaReducer::Confirm { original },
                 DeltaReturn::Stable {
@@ -3618,12 +3913,20 @@ impl DeltaScheduler {
                 cursor: ResidualDeltaExpandCursor::Start,
             }));
             if let Some(proof) = started.quiescence {
-                let completed = self.registry.finish(proof);
-                assert_eq!(completed.effect, DeltaCompletion::Candidates(Vec::new()));
-                assert!(matches!(completed.return_to, DeltaReturn::Stable { .. }));
+                match self.settle_quiescence(proof) {
+                    DeltaSettlement::Completed(completed) => {
+                        assert!(matches!(completed.return_to, DeltaReturn::Stable { .. }));
+                        assert!(matches!(
+                            completed.effect,
+                            DeltaCompletion::Candidates(ref candidates) if candidates.is_empty()
+                        ));
+                    }
+                    DeltaSettlement::Retargeted(active) => finalizer_active = Some(active),
+                }
             }
         }
-        self.file(desc, tasks)
+        let graph_active = self.file(desc, tasks);
+        finalizer_active.or(graph_active)
     }
 
     pub(super) fn seed_source_confirms(
@@ -3642,10 +3945,10 @@ impl DeltaScheduler {
             let parent = parents.rows[start..start + stride]
                 .to_vec()
                 .into_boxed_slice();
-            let original = original.into_boxed_slice();
-            let mut source_candidates = original.to_vec();
+            let mut source_candidates = original.clone();
             source_candidates.sort_unstable();
             source_candidates.dedup();
+            let original = shared_one_parent_candidates(original);
             let (activation, credit) = self.registry.start_source(
                 DeltaReducer::Confirm { original },
                 DeltaReturn::Stable {
@@ -3689,17 +3992,14 @@ impl DeltaScheduler {
         let mut tasks = Vec::with_capacity(seeds.len());
         let mut completed = Vec::new();
         let mut continuation = None;
-        for (batch, range) in singletons.into_iter().zip(ranges) {
+        let mut finalizer_active = None;
+        for (mut batch, range) in singletons.into_iter().zip(ranges) {
             let reducer = match stage {
                 FormulaStage::Support => DeltaReducer::Support { published: false },
                 FormulaStage::Propose if stream_proposal => DeltaReducer::StreamFormulaProposal,
                 FormulaStage::Propose => DeltaReducer::QuiescentProposal,
                 FormulaStage::Confirm => DeltaReducer::Confirm {
-                    original: batch
-                        .input()
-                        .one_parent_values()
-                        .to_vec()
-                        .into_boxed_slice(),
+                    original: batch.shared_confirm_original(),
                 },
             };
             let started = self.registry.start_many(
@@ -3734,10 +4034,16 @@ impl DeltaScheduler {
                 cursor: ResidualDeltaExpandCursor::Start,
             }));
             if let Some(proof) = started.quiescence {
-                completed.push(self.registry.finish(proof));
+                match self.settle_quiescence(proof) {
+                    DeltaSettlement::Completed(completed_activation) => {
+                        completed.push(completed_activation)
+                    }
+                    DeltaSettlement::Retargeted(active) => finalizer_active = Some(active),
+                }
             }
         }
-        let active = self.file(desc, tasks);
+        let graph_active = self.file(desc, tasks);
+        let active = finalizer_active.or(graph_active);
 
         for completed in completed {
             prefer_continuation(
@@ -3770,7 +4076,7 @@ impl DeltaScheduler {
     ) -> Option<ActiveDeltaContinuation> {
         let singletons = batch.into_singletons(bound.count());
         let mut tasks = Vec::with_capacity(singletons.len());
-        for batch in singletons {
+        for mut batch in singletons {
             let (reducer, source_candidates) = match stage {
                 FormulaStage::Support => {
                     unreachable!("support has no delta source reducer")
@@ -3780,12 +4086,8 @@ impl DeltaScheduler {
                 }
                 FormulaStage::Propose => (DeltaReducer::QuiescentProposal, None),
                 FormulaStage::Confirm => {
-                    let original = batch
-                        .input()
-                        .one_parent_values()
-                        .to_vec()
-                        .into_boxed_slice();
-                    let mut source_candidates = original.to_vec();
+                    let original = batch.shared_contiguous_confirm_original();
+                    let mut source_candidates = original.one_parent_values().to_vec();
                     source_candidates.sort_unstable();
                     source_candidates.dedup();
                     (
@@ -3854,7 +4156,7 @@ impl DeltaScheduler {
                             rows: parent.into_vec(),
                             row_count: 1,
                         },
-                        candidates: CandidatePayload::Values(result),
+                        candidates: result,
                     }),
                     stats,
                 )
@@ -3879,7 +4181,7 @@ impl DeltaScheduler {
                     bound,
                     counter,
                     batch,
-                    CandidatePayload::Values(result),
+                    result,
                     stable,
                     stable_interner,
                     stats,
@@ -4564,10 +4866,12 @@ impl DeltaScheduler {
             outcome
         };
         let yielded = outcome.has_stable_effect();
-        let resume = (yielded && self.registry.is_live(active.activation)).then_some(active);
+        let live = self.registry.is_live(active.activation);
+        let settled = outcome.retargeted.get(&active.activation).copied();
+        let resume = live.then_some(settled.unwrap_or(active));
         let status = if yielded {
             ActiveDeltaStatus::Yielded
-        } else if self.registry.is_live(active.activation) {
+        } else if live {
             ActiveDeltaStatus::Pending
         } else {
             ActiveDeltaStatus::Quiescent
@@ -4793,6 +5097,7 @@ impl DeltaScheduler {
         let mut resumed_sources = Vec::new();
         let mut effects = DeltaStableEffects::default();
         let mut completed_activation_ids = Vec::new();
+        let mut retargeted = AHashMap::new();
         let mut dead_pages = 0usize;
         let mut source_dead_pages = 0usize;
         let mut transition_dead_pages = 0usize;
@@ -4867,13 +5172,26 @@ impl DeltaScheduler {
             }
             if let Some(proof) = outcome.quiescence {
                 assert_eq!(proof.activation, task.activation);
-                completed_activations += 1;
-                let completed = self.registry.finish(proof);
-                completed_activation_ids.push(completed.activation);
-                prefer_continuation(
-                    &mut task_effects.continuation,
-                    Self::release_completion(completed, plan, stable, stable_interner, stats),
-                );
+                match self.settle_quiescence(proof) {
+                    DeltaSettlement::Retargeted(active) => {
+                        assert_eq!(active.activation, task.activation);
+                        assert!(retargeted.insert(task.activation, active).is_none());
+                    }
+                    DeltaSettlement::Completed(completed) => {
+                        completed_activations += 1;
+                        completed_activation_ids.push(completed.activation);
+                        prefer_continuation(
+                            &mut task_effects.continuation,
+                            Self::release_completion(
+                                completed,
+                                plan,
+                                stable,
+                                stable_interner,
+                                stats,
+                            ),
+                        );
+                    }
+                }
             }
             let source_page_dead = retired_source_page.is_some_and(|page| !page.had_stable_effect)
                 && !task_effects.has_effect();
@@ -4898,6 +5216,7 @@ impl DeltaScheduler {
                 continuation: effects.continuation,
                 publication: effects.publication,
                 completed_activation_ids,
+                retargeted,
                 dead_pages,
                 source_dead_pages,
                 transition_dead_pages,
@@ -4937,6 +5256,7 @@ impl DeltaScheduler {
             .cloned()
             .expect("typed program task was scheduled under a legacy delta state");
         let spec = address.resolve(root, plan);
+        let confirm_finalizer = address.is_confirm_finalizer();
         let cohort_key = ProgramCohortKey::of(&self.registry, &tasks[0]);
         assert!(
             tasks
@@ -4974,7 +5294,7 @@ impl DeltaScheduler {
                 .get_mut(&state)
                 .expect("typed program state lost its runtime"),
             ProgramBatch {
-                stratum: address.stratum,
+                stratum: address.stratum(),
                 view,
                 candidate_sets: &candidate_sets,
                 activations: &activations,
@@ -5024,7 +5344,9 @@ impl DeltaScheduler {
         stats.delta_source_pages += receipt.source_pages;
         stats.delta_source_candidates_examined += receipt.source_examined;
         stats.delta_source_roots += receipt.source_roots;
-        stats.delta_source_direct_candidates += receipt.direct.len();
+        if !confirm_finalizer {
+            stats.delta_source_direct_candidates += receipt.direct.len();
+        }
         if receipt.source_pages > 0 {
             stats.delta_source_cohorts += 1;
             stats.max_delta_source_cohort = stats.max_delta_source_cohort.max(receipt.source_pages);
@@ -5046,6 +5368,7 @@ impl DeltaScheduler {
         let mut scheduled = Vec::new();
         let mut effects = DeltaStableEffects::default();
         let mut completed_activation_ids = Vec::new();
+        let mut retargeted = AHashMap::new();
         let mut retired_activations = Vec::new();
         let mut dead_pages = 0usize;
         let mut source_dead_pages = 0usize;
@@ -5081,7 +5404,7 @@ impl DeltaScheduler {
                 "one typed input page reported Boolean support more than once"
             );
             let page_had_program_effect = !child_range.is_empty()
-                || !direct_range.is_empty()
+                || (!confirm_finalizer && !direct_range.is_empty())
                 || !accepted_range.is_empty()
                 || !supported_range.is_empty();
             let outcome = self.registry.replace_program(
@@ -5145,14 +5468,30 @@ impl DeltaScheduler {
             }
             if let Some(proof) = outcome.quiescence {
                 assert_eq!(proof.activation, activation);
-                completed_activations += 1;
-                let completed = self.registry.finish(proof);
-                completed_activation_ids.push(completed.activation);
-                retired_activations.push(ProgramActivation(completed.activation.0));
-                prefer_continuation(
-                    &mut task_effects.continuation,
-                    Self::release_completion(completed, plan, stable, stable_interner, stats),
-                );
+                match self.settle_quiescence(proof) {
+                    DeltaSettlement::Retargeted(active) => {
+                        assert_eq!(active.activation, activation);
+                        assert!(retargeted.insert(activation, active).is_none());
+                    }
+                    DeltaSettlement::Completed(completed) => {
+                        completed_activations += 1;
+                        completed_activation_ids.push(completed.activation);
+                        prefer_continuation(
+                            &mut task_effects.continuation,
+                            Self::release_completion(
+                                completed,
+                                plan,
+                                stable,
+                                stable_interner,
+                                stats,
+                            ),
+                        );
+                    }
+                }
+                // Whether this proof removed the activation or transferred it
+                // to the engine finalizer, the just-drained Program family's
+                // activation-local arena is dead at this boundary.
+                retired_activations.push(ProgramActivation(activation.0));
             }
 
             let page_dead = !page_had_program_effect && !task_effects.has_effect();
@@ -5165,7 +5504,7 @@ impl DeltaScheduler {
                 dead_pages += usize::from(!within_search_page);
                 if source_telemetry_cohort {
                     source_dead_pages += 1;
-                } else {
+                } else if !confirm_finalizer {
                     transition_dead_pages += 1;
                 }
             }
@@ -5205,6 +5544,7 @@ impl DeltaScheduler {
                 continuation: effects.continuation,
                 publication: effects.publication,
                 completed_activation_ids,
+                retargeted,
                 dead_pages,
                 source_dead_pages,
                 transition_dead_pages,
@@ -5322,6 +5662,7 @@ impl DeltaScheduler {
         stats.delta_source_pages += row_count;
         let mut effects = DeltaStableEffects::default();
         let mut completed_activation_ids = Vec::new();
+        let mut retargeted = AHashMap::new();
         let mut traversal = Vec::new();
         let mut resumed_sources = Vec::new();
         let mut dead_pages = 0usize;
@@ -5388,13 +5729,26 @@ impl DeltaScheduler {
             }
             if let Some(proof) = outcome.quiescence {
                 assert_eq!(proof.activation, task.activation);
-                completed_activations += 1;
-                let completed = self.registry.finish(proof);
-                completed_activation_ids.push(completed.activation);
-                prefer_continuation(
-                    &mut task_effects.continuation,
-                    Self::release_completion(completed, plan, stable, stable_interner, stats),
-                );
+                match self.settle_quiescence(proof) {
+                    DeltaSettlement::Retargeted(active) => {
+                        assert_eq!(active.activation, task.activation);
+                        assert!(retargeted.insert(task.activation, active).is_none());
+                    }
+                    DeltaSettlement::Completed(completed) => {
+                        completed_activations += 1;
+                        completed_activation_ids.push(completed.activation);
+                        prefer_continuation(
+                            &mut task_effects.continuation,
+                            Self::release_completion(
+                                completed,
+                                plan,
+                                stable,
+                                stable_interner,
+                                stats,
+                            ),
+                        );
+                    }
+                }
             }
             if retired_source_page.is_some_and(|page| !page.had_stable_effect)
                 && !task_effects.has_effect()
@@ -5414,6 +5768,7 @@ impl DeltaScheduler {
                 continuation: effects.continuation,
                 publication: effects.publication,
                 completed_activation_ids,
+                retargeted,
                 dead_pages,
                 source_dead_pages: dead_pages,
                 transition_dead_pages: 0,
@@ -6134,7 +6489,7 @@ mod tests {
             }))
             .collect();
         let _ = scheduler.file(desc.clone(), tasks);
-        assert_eq!(scheduler.interner.descs, [desc]);
+        assert_eq!(scheduler.interner.entries, [DeltaStateEntry::Legacy(desc)]);
         assert_eq!(scheduler.worklist.len(), 1);
     }
 
@@ -7002,8 +7357,8 @@ mod tests {
         let candidates: Vec<_> = (0..4096)
             .map(|ordinal| value((ordinal % 251) as u8))
             .collect();
-        let original = candidates.into_boxed_slice();
-        let original_ptr = original.as_ptr();
+        let original_ptr = candidates.as_ptr();
+        let original = shared_one_parent_candidates(candidates);
         let activation = registry.open_program_activation(
             DeltaReducer::Confirm { original },
             stable_return(Vec::new()),
@@ -7022,7 +7377,7 @@ mod tests {
             .map(|ordinal| value((ordinal % 239) as u8))
             .collect();
         let formula_ptr = formula_values.as_ptr();
-        let formula_batch = FormulaBatch::from_confirmation(
+        let mut formula_batch = FormulaBatch::from_confirmation(
             CandidateBatch {
                 parents: RowBatch::seed(),
                 candidates: CandidatePayload::Values(formula_values),
@@ -7030,8 +7385,11 @@ mod tests {
             vec![super::super::ActivationId(9)],
             &FiniteFormulaNodeKind::Atom,
         );
+        let formula_original = formula_batch.shared_contiguous_confirm_original();
         let formula = registry.open_program_activation(
-            DeltaReducer::FormulaConfirm,
+            DeltaReducer::Confirm {
+                original: formula_original,
+            },
             DeltaReturn::Formula {
                 bound: VariableSet::new_empty(),
                 counter: FormulaPcId(0),
@@ -7636,7 +7994,7 @@ mod tests {
     }
 
     #[test]
-    fn global_quiescent_program_co_completes_and_retires_real_confirm_activations() {
+    fn global_quiescent_program_co_transfers_then_finalizes_real_confirm_activations() {
         let novelty_drops = Arc::new(AtomicUsize::new(0));
         let root = OneShotConfirmProgram {
             novelty_drops: Arc::clone(&novelty_drops),
@@ -7690,7 +8048,7 @@ mod tests {
         let mut stable = Worklist::new();
         let mut stable_interner = StateInterner::default();
         let mut stats = ResidualStateStats::default();
-        let outcome = scheduler.step_bounded(
+        let graph = scheduler.step_bounded(
             &root,
             &plan,
             8,
@@ -7700,11 +8058,51 @@ mod tests {
             &mut stats,
         );
 
+        assert!(graph.completed_activation_ids.is_empty());
+        assert_eq!(graph.completed_activations, 0);
+        assert!(!graph.completed_transition_cohort);
+        assert!(graph.continuation.is_none());
+        assert_eq!(graph.retargeted.len(), 2);
+        assert!(activation_ids.iter().all(|activation| {
+            graph
+                .retargeted
+                .get(activation)
+                .is_some_and(|active| active.activation == *activation)
+        }));
+        let finalizer_states: BTreeSet<_> = graph
+            .retargeted
+            .values()
+            .map(|active| active.state)
+            .collect();
+        assert_eq!(finalizer_states.len(), 1);
+        let finalizer_state = *finalizer_states.iter().next().unwrap();
+        assert_eq!(
+            scheduler.interner.program(finalizer_state),
+            Some(&ProgramAddress::ConfirmFinalize)
+        );
+        assert!(activation_ids
+            .iter()
+            .all(|activation| scheduler.registry.is_live(*activation)));
+        assert_eq!(
+            novelty_drops.load(Ordering::Relaxed),
+            drops_before_step + 2,
+            "graph-family retirement must precede finalizer execution"
+        );
+
+        let outcome = scheduler.step_bounded(
+            &root,
+            &plan,
+            8,
+            None,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
         let mut completed_ids = outcome.completed_activation_ids.clone();
         completed_ids.sort_unstable();
         assert_eq!(completed_ids, activation_ids);
         assert_eq!(outcome.completed_activations, 2);
-        assert!(outcome.completed_transition_cohort);
+        assert!(!outcome.completed_transition_cohort);
         assert!(outcome.continuation.is_some());
         assert!(scheduler.program_worklist.is_empty());
         assert!(activation_ids
@@ -7744,6 +8142,511 @@ mod tests {
         assert_eq!(stats.delta_program_physical_granted_work, 0);
         assert_eq!(stats.max_delta_program_physical_cohort, 0);
         assert_eq!(stats.max_delta_program_physical_granted_work, 0);
+    }
+
+    #[test]
+    fn stable_confirm_finalizer_pages_occurrences_without_graph_telemetry() {
+        let root = MixedExpansion;
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let a = value(1);
+        let b = value(2);
+        let rejected = value(9);
+
+        let mut original = shared_one_parent_candidates(vec![b, a]);
+        original.extend_same_domain(
+            shared_one_parent_candidates(vec![rejected, a, b]),
+            1,
+        );
+        let mut scheduler = DeltaScheduler::new();
+        let started = scheduler.registry.start_many(
+            DeltaReducer::Confirm { original },
+            candidate_return(Vec::new()),
+            [output(1, 0, true), output(2, 0, true)],
+        );
+        let activation = started.activation;
+        {
+            let graph = scheduler
+                .registry
+                .state
+                .activations
+                .get_mut(&activation)
+                .expect("live Confirm graph activation");
+            graph.seen.insert(
+                ResidualDeltaNode {
+                    source: None,
+                    value: value(42),
+                    continuation: 7,
+                },
+                false,
+            );
+            graph.program_joins.reserve(8);
+            graph.source_candidates = Some(vec![a, b, rejected].into_boxed_slice());
+            graph.direct_candidates.reserve(8);
+        }
+        let mut proof = None;
+        for (_, credit) in started.roots {
+            if let Some(quiescence) = scheduler.registry.replace_traversal(credit, []).quiescence {
+                assert!(proof.replace(quiescence).is_none());
+            }
+        }
+        let DeltaSettlement::Retargeted(active) =
+            scheduler.settle_quiescence(proof.expect("Confirm graph quiesced"))
+        else {
+            panic!("nonempty Confirm did not open its finalizer")
+        };
+        assert_eq!(active.activation, activation);
+        assert_eq!(
+            scheduler.interner.program(active.state),
+            Some(&ProgramAddress::ConfirmFinalize)
+        );
+        {
+            let finalizing = scheduler
+                .registry
+                .state
+                .activations
+                .get(&activation)
+                .expect("Confirm finalizer retained its activation");
+            assert_eq!(finalizing.status, ActivationStatus::Open);
+            assert!(finalizing.seen.is_empty());
+            assert_eq!(finalizing.seen.capacity(), 0);
+            assert!(finalizing.program_joins.is_empty());
+            assert_eq!(finalizing.program_joins.capacity(), 0);
+            assert!(finalizing.source_candidates.is_none());
+            assert!(finalizing.direct_candidates.is_empty());
+            assert_eq!(finalizing.direct_candidates.capacity(), 0);
+            assert!(finalizing.accepted.is_empty());
+            assert_eq!(finalizing.accepted.capacity(), 0);
+            assert_eq!(
+                finalizing.live.values().copied().collect::<Vec<_>>(),
+                [CreditKind::Program { join: None }]
+            );
+            assert!(matches!(
+                &finalizing.reducer,
+                DeltaReducer::FinalizingConfirm { .. }
+            ));
+        }
+
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let graph_telemetry = |stats: &ResidualStateStats| {
+            [
+                stats.delta_source_pages,
+                stats.delta_source_cohorts,
+                stats.delta_source_candidates_examined,
+                stats.delta_source_roots,
+                stats.delta_source_direct_candidates,
+                stats.delta_source_dead_pages,
+                stats.delta_transition_pages,
+                stats.delta_transition_cohorts,
+                stats.delta_transition_candidates_examined,
+                stats.delta_transition_dead_pages,
+            ]
+        };
+        let telemetry_before = graph_telemetry(&stats);
+
+        let first = scheduler.step_active(
+            &root,
+            &plan,
+            active,
+            2,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert_eq!(first.status, ActiveDeltaStatus::Pending);
+        assert_eq!(first.resume, Some(active));
+        assert_eq!(first.outcome.dead_pages, 1);
+        assert_eq!(first.outcome.source_dead_pages, 0);
+        assert_eq!(first.outcome.transition_dead_pages, 0);
+        assert!(first.outcome.continuation.is_none());
+        assert!(first.outcome.publication.is_none());
+        assert_eq!(graph_telemetry(&stats), telemetry_before);
+        assert!(stable.is_empty());
+
+        let resume = first.resume.unwrap();
+        let mut cloned = scheduler.clone();
+        let output_root = |scheduler: &DeltaScheduler| {
+            let activation = scheduler
+                .registry
+                .state
+                .activations
+                .get(&active.activation)
+                .expect("live cloned Confirm finalizer");
+            let DeltaReducer::FinalizingConfirm {
+                output: CandidatePayload::Deferred(output),
+            } = &activation.reducer
+            else {
+                panic!("live Confirm clone lost its deferred reducer output")
+            };
+            output.root.as_ref().unwrap().node.clone()
+        };
+        assert!(Arc::ptr_eq(&output_root(&scheduler), &output_root(&cloned)));
+        let original_brand = scheduler.program_worklist[&resume.state]
+            .tasks
+            .iter()
+            .find(|task| task.activation == activation)
+            .unwrap()
+            .credit
+            .brand;
+        let cloned_brand = cloned.program_worklist[&resume.state]
+            .tasks
+            .iter()
+            .find(|task| task.activation == activation)
+            .unwrap()
+            .credit
+            .brand;
+        assert_ne!(original_brand, cloned_brand);
+
+        let second = scheduler.step_active(
+            &root,
+            &plan,
+            resume,
+            2,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert_eq!(second.status, ActiveDeltaStatus::Pending);
+        assert_eq!(second.resume, Some(active));
+        assert_eq!(second.outcome.dead_pages, 1);
+        assert_eq!(second.outcome.source_dead_pages, 0);
+        assert_eq!(second.outcome.transition_dead_pages, 0);
+        assert!(second.outcome.continuation.is_none());
+        assert_eq!(graph_telemetry(&stats), telemetry_before);
+        assert!(stable.is_empty());
+
+        let eof = scheduler.step_active(
+            &root,
+            &plan,
+            second.resume.unwrap(),
+            2,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert_eq!(eof.status, ActiveDeltaStatus::Yielded);
+        assert!(eof.resume.is_none());
+        assert_eq!(eof.outcome.completed_activation_ids, [activation]);
+        assert_eq!(eof.outcome.completed_activations, 1);
+        assert_eq!(eof.outcome.dead_pages, 0);
+        assert!(eof.outcome.continuation.is_some());
+        assert_eq!(graph_telemetry(&stats), telemetry_before);
+        assert!(!scheduler.registry.is_live(activation));
+        assert!(cloned.registry.is_live(activation));
+        let cloned_partial_len = match &cloned
+            .registry
+            .state
+            .activations
+            .get(&activation)
+            .unwrap()
+            .reducer
+        {
+            DeltaReducer::FinalizingConfirm { output } => output.len(),
+            _ => panic!("cloned finalizer changed reducer state"),
+        };
+        assert_eq!(
+            cloned_partial_len, 2,
+            "finishing the original mutated the clone's shared prefix"
+        );
+
+        let stable_batches: Vec<_> = stable.values().flat_map(|level| level.values()).collect();
+        assert_eq!(stable_batches.len(), 1);
+        let StateBucket::Candidates(batch) = stable_batches[0] else {
+            panic!("Confirm finalizer returned the wrong stable payload")
+        };
+        let CandidatePayload::Deferred(deferred) = &batch.candidates else {
+            panic!("Confirm finalizer materialized its pageable output at EOF")
+        };
+        assert!(matches!(
+            deferred.root.as_ref().map(|root| &root.node.kind),
+            Some(DeferredCandidateNodeKind::Concat { .. })
+        ));
+        assert_eq!(
+            batch.candidates.iter().collect::<Vec<_>>(),
+            [(0, b), (0, a), (0, a), (0, b)]
+        );
+
+        let mut cloned_stable = Worklist::new();
+        let mut cloned_interner = StateInterner::default();
+        let mut cloned_stats = ResidualStateStats::default();
+        let cloned_second = cloned.step_active(
+            &root,
+            &plan,
+            resume,
+            2,
+            &mut cloned_stable,
+            &mut cloned_interner,
+            &mut cloned_stats,
+        );
+        assert_eq!(cloned_second.status, ActiveDeltaStatus::Pending);
+        let cloned_eof = cloned.step_active(
+            &root,
+            &plan,
+            cloned_second.resume.unwrap(),
+            2,
+            &mut cloned_stable,
+            &mut cloned_interner,
+            &mut cloned_stats,
+        );
+        assert_eq!(cloned_eof.status, ActiveDeltaStatus::Yielded);
+        let cloned_batches: Vec<_> = cloned_stable
+            .values()
+            .flat_map(|level| level.values())
+            .collect();
+        assert_eq!(cloned_batches.len(), 1);
+        let StateBucket::Candidates(cloned_batch) = cloned_batches[0] else {
+            panic!("cloned finalizer returned the wrong stable payload")
+        };
+        assert_eq!(
+            cloned_batch.candidates.iter().collect::<Vec<_>>(),
+            [(0, b), (0, a), (0, a), (0, b)]
+        );
+    }
+
+    #[test]
+    fn confirm_finalizer_keeps_empty_original_eager_and_all_rejected_pageable() {
+        let mut empty = DeltaScheduler::new();
+        let started = empty.registry.start_many(
+            DeltaReducer::Confirm {
+                original: shared_one_parent_candidates(Vec::new()),
+            },
+            candidate_return(Vec::new()),
+            std::iter::empty::<ResidualDeltaOutput>(),
+        );
+        let DeltaSettlement::Completed(completed) =
+            empty.settle_quiescence(started.quiescence.unwrap())
+        else {
+            panic!("empty Confirm opened a finalizer task")
+        };
+        assert!(matches!(
+            completed.effect,
+            DeltaCompletion::Candidates(ref candidates) if candidates.is_empty()
+        ));
+        assert!(empty.program_worklist.is_empty());
+        assert!(!empty.registry.is_live(started.activation));
+
+        let root = MixedExpansion;
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let mut rejected = DeltaScheduler::new();
+        let started = rejected.registry.start_many(
+            DeltaReducer::Confirm {
+                original: shared_one_parent_candidates(vec![value(1), value(2)]),
+            },
+            candidate_return(Vec::new()),
+            std::iter::empty::<ResidualDeltaOutput>(),
+        );
+        let DeltaSettlement::Retargeted(active) =
+            rejected.settle_quiescence(started.quiescence.unwrap())
+        else {
+            panic!("nonempty rejected bag was not scheduled for scanning")
+        };
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let eof = rejected.step_active(
+            &root,
+            &plan,
+            active,
+            8,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert_eq!(eof.status, ActiveDeltaStatus::Quiescent);
+        assert!(eof.resume.is_none());
+        assert_eq!(eof.outcome.completed_activation_ids, [started.activation]);
+        assert_eq!(eof.outcome.dead_pages, 1);
+        assert!(eof.outcome.continuation.is_none());
+        assert!(stable.is_empty());
+        assert!(rejected.is_empty());
+    }
+
+    #[test]
+    fn formula_confirm_finalizer_requires_an_all_and_live_frame_ancestry() {
+        fn formula_batch(original: &CandidatePayload, with_or: bool) -> FormulaBatch {
+            let mut frames = vec![FormulaPayloadFrame::And {
+                current: original.clone(),
+            }];
+            if with_or {
+                frames.push(FormulaPayloadFrame::Or {
+                    source: original.clone(),
+                    output: CandidatePayload::empty(1),
+                });
+            } else {
+                frames.push(FormulaPayloadFrame::And {
+                    current: original.clone(),
+                });
+            }
+            FormulaBatch {
+                activations: vec![super::super::ActivationId(11)],
+                parents: RowBatch::seed(),
+                frames,
+            }
+        }
+
+        fn quiescent_formula(
+            registry: &mut ProducerRegistry,
+            original: CandidatePayload,
+            with_or: bool,
+        ) -> QuiescenceProof {
+            let batch = formula_batch(&original, with_or);
+            let started = registry.start_many(
+                DeltaReducer::Confirm { original },
+                DeltaReturn::Formula {
+                    bound: VariableSet::new_empty(),
+                    counter: FormulaPcId(0),
+                    batch,
+                },
+                [output(7, 0, true)],
+            );
+            let (_, credit) = started.roots.into_iter().next().unwrap();
+            registry
+                .replace_traversal(credit, [])
+                .quiescence
+                .expect("one-root Formula Confirm quiesced")
+        }
+
+        let original = shared_one_parent_candidates(vec![value(7), value(8), value(7)]);
+        let mut all_and = ProducerRegistry::new();
+        let proof = quiescent_formula(&mut all_and, original.clone(), false);
+        let activation = proof.activation;
+        let RegistrySettlement::ConfirmFinalizer(seed) = all_and.settle_quiescence(proof) else {
+            panic!("all-AND Formula Confirm did not enter the pageable finalizer")
+        };
+        assert_eq!(seed.activation, activation);
+        assert!(all_and.is_live(activation));
+
+        let mut with_or = ProducerRegistry::new();
+        let proof = quiescent_formula(&mut with_or, original, true);
+        let activation = proof.activation;
+        let RegistrySettlement::Completed(completed) = with_or.settle_quiescence(proof) else {
+            panic!("Formula OR ancestry incorrectly entered the affine finalizer")
+        };
+        assert_eq!(completed.activation, activation);
+        assert_eq!(
+            completed.effect,
+            DeltaCompletion::Candidates(CandidatePayload::Values(vec![value(7), value(7)]))
+        );
+        assert!(!with_or.is_live(activation));
+
+        let empty_original = shared_one_parent_candidates(Vec::new());
+        let empty_batch = formula_batch(&empty_original, false);
+        let mut empty = ProducerRegistry::new();
+        let started = empty.start_many(
+            DeltaReducer::Confirm {
+                original: empty_original,
+            },
+            DeltaReturn::Formula {
+                bound: VariableSet::new_empty(),
+                counter: FormulaPcId(0),
+                batch: empty_batch,
+            },
+            std::iter::empty::<ResidualDeltaOutput>(),
+        );
+        let RegistrySettlement::Completed(completed) =
+            empty.settle_quiescence(started.quiescence.unwrap())
+        else {
+            panic!("empty all-AND Formula Confirm opened a finalizer task")
+        };
+        assert!(matches!(completed.return_to, DeltaReturn::Formula { .. }));
+        assert!(matches!(
+            completed.effect,
+            DeltaCompletion::Candidates(ref candidates) if candidates.is_empty()
+        ));
+    }
+
+    #[test]
+    fn active_program_confirm_retargets_exactly_to_the_engine_finalizer() {
+        let novelty_drops = Arc::new(AtomicUsize::new(0));
+        let root = OneShotConfirmProgram {
+            novelty_drops,
+            physical: false,
+        };
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let relevant = ChildSet::empty(plan.len()).with_inserted(0);
+        let successor = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Candidate {
+                variable: 0,
+                relevant: relevant.clone(),
+                checked: relevant,
+            },
+        };
+        let request = ProgramRequest {
+            action: ProgramAction::Confirm(0),
+            bound: VariableSet::new_empty(),
+        };
+        let spec = root.residual_program().unwrap();
+        let route = spec.route(request).unwrap();
+        let mut scheduler = DeltaScheduler::new();
+        let old = scheduler
+            .seed_program_confirms(
+                spec,
+                DeltaDesc::leaf(0, 0),
+                request,
+                route,
+                successor,
+                CandidateBatch {
+                    parents: RowBatch::seed(),
+                    candidates: CandidatePayload::Values(vec![value(7)]),
+                },
+            )
+            .expect("Confirm Program seeded one graph task");
+
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let graph = scheduler.step_active(
+            &root,
+            &plan,
+            old,
+            1,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert_eq!(graph.status, ActiveDeltaStatus::Pending);
+        assert!(graph.outcome.continuation.is_none());
+        let retargeted = graph.resume.expect("live Confirm has an exact new state");
+        assert_eq!(retargeted.activation, old.activation);
+        assert_ne!(retargeted.state, old.state);
+        assert_eq!(
+            scheduler.interner.program(retargeted.state),
+            Some(&ProgramAddress::ConfirmFinalize)
+        );
+        assert!(!scheduler.has_active_program(old));
+        assert!(scheduler.has_active_program(retargeted));
+        assert!(stable.is_empty());
+        let graph_telemetry = (
+            stats.delta_source_pages,
+            stats.delta_source_candidates_examined,
+            stats.delta_transition_pages,
+            stats.delta_transition_candidates_examined,
+        );
+
+        let finalized = scheduler.step_active(
+            &root,
+            &plan,
+            retargeted,
+            1,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert_eq!(finalized.status, ActiveDeltaStatus::Yielded);
+        assert!(finalized.resume.is_none());
+        assert_eq!(finalized.outcome.completed_activation_ids, [old.activation]);
+        assert_eq!(
+            (
+                stats.delta_source_pages,
+                stats.delta_source_candidates_examined,
+                stats.delta_transition_pages,
+                stats.delta_transition_candidates_examined,
+            ),
+            graph_telemetry
+        );
+        assert!(!scheduler.registry.is_live(old.activation));
     }
 
     #[test]
@@ -7791,7 +8694,7 @@ mod tests {
         let mut stable = Worklist::new();
         let mut stable_interner = StateInterner::default();
         let mut stats = ResidualStateStats::default();
-        let outcome = scheduler.step_bounded(
+        let graph = scheduler.step_bounded(
             &root,
             &plan,
             8,
@@ -7801,12 +8704,26 @@ mod tests {
             &mut stats,
         );
 
-        assert_eq!(outcome.completed_activations, 2);
+        assert_eq!(graph.completed_activations, 0);
         assert_eq!(stats.delta_program_physical_cohorts, 1);
         assert_eq!(stats.delta_program_physical_rows, 2);
         assert_eq!(stats.delta_program_physical_granted_work, 8);
         assert_eq!(stats.max_delta_program_physical_cohort, 2);
         assert_eq!(stats.max_delta_program_physical_granted_work, 8);
+
+        let finalized = scheduler.step_bounded(
+            &root,
+            &plan,
+            8,
+            None,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert_eq!(finalized.completed_activations, 2);
+        assert_eq!(stats.delta_program_physical_cohorts, 1);
+        assert_eq!(stats.delta_program_physical_rows, 2);
+        assert_eq!(stats.delta_program_physical_granted_work, 8);
     }
 
     #[test]
@@ -8225,7 +9142,7 @@ mod tests {
         assert_eq!(active.activation, first_activation);
         assert_eq!(scheduler.interner.get(active.state), &desc);
         assert!(scheduler.file(desc, Vec::new()).is_none());
-        assert_eq!(scheduler.interner.descs.len(), 1);
+        assert_eq!(scheduler.interner.entries.len(), 1);
 
         let (_, selected) = scheduler.pop_active_transition(active, 2);
         assert_eq!(
@@ -8754,7 +9671,7 @@ mod tests {
             &mut stats,
         );
         assert_eq!(source.status, ActiveDeltaStatus::Pending);
-        assert!(source.resume.is_none());
+        assert_eq!(source.resume, Some(active));
         assert_eq!(stats.delta_source_pages, 1);
         assert!(scheduler.has_active_transition(active));
 
@@ -8768,7 +9685,7 @@ mod tests {
             &mut stats,
         );
         assert_eq!(transition.status, ActiveDeltaStatus::Pending);
-        assert!(transition.resume.is_none());
+        assert_eq!(transition.resume, Some(active));
         assert!(scheduler.has_active_source(active));
 
         let terminal_source = scheduler.step_active(
@@ -9103,7 +10020,7 @@ mod tests {
         let mut registry = ProducerRegistry::new();
         let started = registry.start_many(
             DeltaReducer::Confirm {
-                original: vec![candidate, candidate].into_boxed_slice(),
+                original: shared_one_parent_candidates(vec![candidate, candidate]),
             },
             stable_return(Vec::new()),
             [output(7, 0, true), output(7, 0, true)],
@@ -9124,7 +10041,7 @@ mod tests {
         let completed = registry.finish(proof);
         assert_eq!(
             completed.effect,
-            DeltaCompletion::Candidates(vec![candidate, candidate])
+            DeltaCompletion::Candidates(CandidatePayload::Values(vec![candidate, candidate]))
         );
     }
 
@@ -9137,7 +10054,9 @@ mod tests {
         let mut registry = ProducerRegistry::new();
         let started = registry.start_many(
             DeltaReducer::Confirm {
-                original: vec![second, seed, first, rejected, second].into_boxed_slice(),
+                original: shared_one_parent_candidates(vec![
+                    second, seed, first, rejected, second,
+                ]),
             },
             stable_return(vec![value(9)]),
             [output(1, 0, false), output(5, 0, false)],
@@ -9175,7 +10094,7 @@ mod tests {
         assert_eq!(parent.as_ref(), &[value(9)]);
         assert_eq!(
             completed.effect,
-            DeltaCompletion::Candidates(vec![second, first, second])
+            DeltaCompletion::Candidates(CandidatePayload::Values(vec![second, first, second]))
         );
     }
 
@@ -9295,7 +10214,7 @@ mod tests {
         let mut registry = ProducerRegistry::new();
         let (activation, generator) = registry.start_source(
             DeltaReducer::Confirm {
-                original: vec![second, first, rejected, first].into_boxed_slice(),
+                original: shared_one_parent_candidates(vec![second, first, rejected, first]),
             },
             stable_return(Vec::new()),
             Some(vec![first, second, rejected].into_boxed_slice()),
@@ -9332,7 +10251,7 @@ mod tests {
         assert_eq!(proof.activation, activation);
         assert_eq!(
             registry.finish(proof).effect,
-            DeltaCompletion::Candidates(vec![second, first, first])
+            DeltaCompletion::Candidates(CandidatePayload::Values(vec![second, first, first]))
         );
     }
 
@@ -9367,7 +10286,7 @@ mod tests {
             }],
         );
 
-        assert_eq!(scheduler.interner.descs.len(), 1);
+        assert_eq!(scheduler.interner.entries.len(), 1);
         assert_eq!(scheduler.source_worklist.len(), 1);
         let tasks = &scheduler
             .source_worklist
@@ -9458,7 +10377,7 @@ mod tests {
                                parent: RawInline| {
             let reducer = if candidates.is_some() {
                 DeltaReducer::Confirm {
-                    original: Box::new([]),
+                    original: shared_one_parent_candidates(Vec::new()),
                 }
             } else {
                 DeltaReducer::StreamProposal
@@ -9495,7 +10414,7 @@ mod tests {
             source_task(schema_a, None, ResidualDeltaSourceCursor::Start, value(5)),
         ];
         let _ = scheduler.file_source(desc.clone(), tasks);
-        assert_eq!(scheduler.interner.descs, [desc]);
+        assert_eq!(scheduler.interner.entries, [DeltaStateEntry::Legacy(desc)]);
         assert_eq!(scheduler.source_worklist.len(), 1);
 
         let (_, compatible) = scheduler.pop_source(8);
@@ -9526,7 +10445,7 @@ mod tests {
             schema_b
         );
         assert!(scheduler.source_worklist.is_empty());
-        assert_eq!(scheduler.interner.descs.len(), 1);
+        assert_eq!(scheduler.interner.entries.len(), 1);
     }
 
     #[test]
@@ -9571,7 +10490,7 @@ mod tests {
         for completed in [original.finish(original_proof), cloned.finish(cloned_proof)] {
             assert_eq!(
                 completed.effect,
-                DeltaCompletion::Candidates(vec![value(7)])
+                DeltaCompletion::Candidates(CandidatePayload::Values(vec![value(7)]))
             );
             let DeltaReturn::Formula {
                 bound: returned_bound,
@@ -9659,7 +10578,11 @@ mod tests {
         ] {
             assert_eq!(
                 completed.effect,
-                DeltaCompletion::Candidates(vec![value(3), value(3), value(7)])
+                DeltaCompletion::Candidates(CandidatePayload::Values(vec![
+                    value(3),
+                    value(3),
+                    value(7),
+                ]))
             );
             let DeltaReturn::Formula {
                 bound: returned_bound,
@@ -9760,7 +10683,7 @@ mod tests {
             let _ = scheduler.file(desc.clone(), tasks);
         }
 
-        assert_eq!(scheduler.interner.descs, vec![desc]);
+        assert_eq!(scheduler.interner.entries, vec![DeltaStateEntry::Legacy(desc)]);
         assert_eq!(scheduler.worklist.len(), 1);
         let bucket = scheduler.worklist.values().next().unwrap();
         assert_eq!(bucket.len(), 2);
