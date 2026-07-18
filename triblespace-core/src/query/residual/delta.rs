@@ -1973,9 +1973,7 @@ impl ProgramBucket {
     }
 
     fn contains_activation(&self, activation: ActivationId) -> bool {
-        self.tasks
-            .iter()
-            .any(|task| task.activation == activation)
+        self.tasks.iter().any(|task| task.activation == activation)
     }
 
     /// Takes the newest matching tasks, preserving either physical LIFO order
@@ -2141,9 +2139,9 @@ impl ProgramBucket {
             let selection = (ProgramCohortKey::of(registry, &task) == key)
                 .then(|| terminal_selection_slots.get(&task.activation).copied())
                 .flatten();
-            if let Some(slot) = selection
-                .filter(|&slot| terminal_selections[slot].selected < terminal_selections[slot].budget)
-            {
+            if let Some(slot) = selection.filter(|&slot| {
+                terminal_selections[slot].selected < terminal_selections[slot].budget
+            }) {
                 terminal_selections[slot].selected += 1;
                 selected.push(task);
             } else {
@@ -2156,8 +2154,7 @@ impl ProgramBucket {
 
         let mut limits = Vec::with_capacity(selected.len());
         for task in &selected {
-            let selection =
-                &mut terminal_selections[terminal_selection_slots[&task.activation]];
+            let selection = &mut terminal_selections[terminal_selection_slots[&task.activation]];
             debug_assert!(selection.selected > 0);
             let quotient = selection.budget / selection.selected;
             let remainder = selection.budget % selection.selected;
@@ -4075,7 +4072,6 @@ impl DeltaScheduler {
         self.program_worklist
             .entry(state)
             .or_default()
-            .tasks
             .append(&mut tasks);
         Some(ActiveDeltaContinuation { state, activation })
     }
@@ -4100,12 +4096,7 @@ impl DeltaScheduler {
     fn has_active_program(&self, active: ActiveDeltaContinuation) -> bool {
         self.program_worklist
             .get(&active.state)
-            .is_some_and(|bucket| {
-                bucket
-                    .tasks
-                    .iter()
-                    .any(|task| task.activation == active.activation)
-            })
+            .is_some_and(|bucket| bucket.contains_activation(active.activation))
     }
 
     fn allows_global_width_growth(
@@ -4228,49 +4219,32 @@ impl DeltaScheduler {
         &mut self,
         active: ActiveDeltaContinuation,
         search_width: usize,
-    ) -> (DeltaStateId, Vec<ProgramTask>, ProgramPacing) {
-        let (tasks, empty, pacing) = {
-            let registry = &self.registry;
+    ) -> (DeltaStateId, Vec<ProgramTask>, PhysicalDispatch) {
+        let (selection, empty, remainder_tasks) = {
             let bucket = self
                 .program_worklist
                 .get_mut(&active.state)
                 .expect("active typed program state remains live");
-            let key = bucket
-                .tasks
-                .iter()
-                .rev()
-                .find(|task| task.activation == active.activation)
-                .map(|task| ProgramDispatchKey::of(registry, task))
-                .expect("active typed program lost its affine task");
-            let width = match key.pacing {
-                ProgramPacing::Search => {
-                    registry.source_dispatch_width(active.activation, search_width)
-                }
-                ProgramPacing::Activation => {
-                    registry.transition_dispatch_width(active.activation, search_width)
-                }
-            };
-            let mut selected = Vec::new();
-            let mut retained = Vec::with_capacity(bucket.tasks.len());
-            for task in std::mem::take(&mut bucket.tasks).into_iter().rev() {
-                if selected.len() < width
-                    && task.activation == active.activation
-                    && ProgramDispatchKey::of(registry, &task) == key
-                {
-                    selected.push(task);
-                } else {
-                    retained.push(task);
-                }
-            }
-            retained.reverse();
-            bucket.tasks = retained;
-            (selected, bucket.tasks.is_empty(), key.pacing)
+            let selection = bucket.take_active(&self.registry, active.activation, search_width);
+            (selection, bucket.is_empty(), bucket.len())
         };
-        assert!(!tasks.is_empty(), "active typed program pop was empty");
         if empty {
             self.program_worklist.remove(&active.state);
         }
-        (active.state, tasks, pacing)
+        let ProgramSelection { key, tasks, limits } = selection;
+        let kind = match key.class.pacing() {
+            ProgramPacing::Search => PhysicalDispatchKind::Source,
+            ProgramPacing::Activation => PhysicalDispatchKind::Program,
+        };
+        let dispatch = PhysicalDispatch::new(
+            &self.registry,
+            kind,
+            search_width,
+            tasks.iter().map(|task| task.activation),
+            limits,
+            remainder_tasks,
+        );
+        (active.state, tasks, dispatch)
     }
 
     fn pop_program_bounded(
@@ -4282,120 +4256,25 @@ impl DeltaScheduler {
             .last_key_value()
             .expect("typed program pop requires live work")
             .0;
-        let hot = self
-            .program_worklist
-            .get(&id)
-            .and_then(|bucket| bucket.tasks.last())
-            .expect("typed program bucket is nonempty");
-        let hot_key = ProgramDispatchKey::of(&self.registry, hot);
-        let terminal_activation_cohort = hot_key.pacing == ProgramPacing::Activation
-            && hot_key.publication == TransitionDispatchKey::TerminalStreaming;
-        let width = if terminal_activation_cohort {
-            search_width.max(1)
-        } else {
-            match hot_key.pacing {
-                ProgramPacing::Search => self
-                    .registry
-                    .source_dispatch_width(hot.activation, search_width),
-                ProgramPacing::Activation => self
-                    .registry
-                    .transition_dispatch_width(hot.activation, search_width),
-            }
-        };
-        let (tasks, task_limits, empty, remainder_tasks) = {
-            let registry = &self.registry;
-            let selection_slots = &mut self.terminal_selection_slots;
-            let selections = &mut self.terminal_selections;
+        let (selection, empty, remainder_tasks) = {
             let bucket = self
                 .program_worklist
                 .get_mut(&id)
                 .expect("selected typed program state");
-            let key = ProgramDispatchKey::of(
-                registry,
-                bucket
-                    .tasks
-                    .last()
-                    .expect("typed program bucket is nonempty"),
+            let selection = bucket.take_global(
+                &self.registry,
+                search_width,
+                self.activation_width,
+                &mut self.terminal_selection_slots,
+                &mut self.terminal_selections,
             );
-            let tasks = std::mem::take(&mut bucket.tasks);
-            let (selected, limits, retained) = if terminal_activation_cohort {
-                let mut remaining = width;
-                selection_slots.clear();
-                selections.clear();
-                for task in tasks.iter().rev() {
-                    if ProgramDispatchKey::of(registry, task) != key
-                        || selection_slots.contains_key(&task.activation)
-                    {
-                        continue;
-                    }
-                    let budget = registry
-                        .transition_dispatch_width(task.activation, search_width)
-                        .min(remaining);
-                    let slot = selections.len();
-                    selections.push(TerminalActivationSelection {
-                        activation: task.activation,
-                        budget,
-                        selected: 0,
-                        ordinal: 0,
-                    });
-                    selection_slots.insert(task.activation, slot);
-                    remaining -= budget;
-                    if remaining == 0 {
-                        break;
-                    }
-                }
-
-                let mut selected = Vec::new();
-                let mut retained = Vec::with_capacity(tasks.len());
-                for task in tasks.into_iter().rev() {
-                    let selection = (ProgramDispatchKey::of(registry, &task) == key)
-                        .then(|| selection_slots.get(&task.activation).copied())
-                        .flatten();
-                    if let Some(slot) = selection
-                        .filter(|&slot| selections[slot].selected < selections[slot].budget)
-                    {
-                        selections[slot].selected += 1;
-                        selected.push(task);
-                    } else {
-                        retained.push(task);
-                    }
-                }
-                retained.reverse();
-                let mut limits = Vec::with_capacity(selected.len());
-                for task in &selected {
-                    let selection = &mut selections[selection_slots[&task.activation]];
-                    let quotient = selection.budget / selection.selected;
-                    let remainder = selection.budget % selection.selected;
-                    limits.push(quotient + usize::from(selection.ordinal < remainder));
-                    selection.ordinal += 1;
-                }
-                (selected, limits, retained)
-            } else {
-                let mut selected = Vec::new();
-                let mut retained = Vec::with_capacity(tasks.len());
-                for task in tasks.into_iter().rev() {
-                    if selected.len() < width && ProgramDispatchKey::of(registry, &task) == key {
-                        selected.push(task);
-                    } else {
-                        retained.push(task);
-                    }
-                }
-                retained.reverse();
-                let limits = even_limits(width, selected.len());
-                (selected, limits, retained)
-            };
-            bucket.tasks = retained;
-            (
-                selected,
-                limits,
-                bucket.tasks.is_empty(),
-                bucket.tasks.len(),
-            )
+            (selection, bucket.is_empty(), bucket.len())
         };
         if empty {
             self.program_worklist.remove(&id);
         }
-        let kind = match hot_key.pacing {
+        let ProgramSelection { key, tasks, limits } = selection;
+        let kind = match key.class.pacing() {
             ProgramPacing::Search => PhysicalDispatchKind::Source,
             ProgramPacing::Activation => PhysicalDispatchKind::Program,
         };
@@ -4404,7 +4283,7 @@ impl DeltaScheduler {
             kind,
             search_width,
             tasks.iter().map(|task| task.activation),
-            task_limits,
+            limits,
             remainder_tasks,
         );
         (id, tasks, dispatch)
@@ -4586,35 +4465,7 @@ impl DeltaScheduler {
             .delta_source_candidates_examined
             .saturating_add(stats.delta_transition_candidates_examined);
         let outcome = if has_program {
-            let (state, tasks, pacing) = self.pop_active_program(active, search_width);
-            let task_count = tasks.len();
-            let remainder_tasks = self
-                .program_worklist
-                .get(&active.state)
-                .map_or(0, |bucket| bucket.tasks.len());
-            let kind = match pacing {
-                ProgramPacing::Search => PhysicalDispatchKind::Source,
-                ProgramPacing::Activation => PhysicalDispatchKind::Program,
-            };
-            let task_limits = even_limits(
-                match pacing {
-                    ProgramPacing::Search => self
-                        .registry
-                        .source_dispatch_width(active.activation, search_width),
-                    ProgramPacing::Activation => self
-                        .registry
-                        .transition_dispatch_width(active.activation, search_width),
-                },
-                task_count,
-            );
-            let dispatch = PhysicalDispatch::new(
-                &self.registry,
-                kind,
-                search_width,
-                tasks.iter().map(|task| task.activation),
-                task_limits,
-                remainder_tasks,
-            );
+            let (state, tasks, dispatch) = self.pop_active_program(active, search_width);
             let physical = self.step_program(
                 root,
                 plan,
@@ -5086,11 +4937,11 @@ impl DeltaScheduler {
             .cloned()
             .expect("typed program task was scheduled under a legacy delta state");
         let spec = address.resolve(root, plan);
-        let dispatch_key = ProgramDispatchKey::of(&self.registry, &tasks[0]);
+        let cohort_key = ProgramCohortKey::of(&self.registry, &tasks[0]);
         assert!(
             tasks
                 .iter()
-                .all(|task| ProgramDispatchKey::of(&self.registry, task) == dispatch_key),
+                .all(|task| ProgramCohortKey::of(&self.registry, task) == cohort_key),
             "one typed program cohort mixed incompatible physical dispatch shapes"
         );
 
@@ -5100,12 +4951,12 @@ impl DeltaScheduler {
         for task in &tasks {
             assert_eq!(task.activation, task.credit.key.activation);
             let (bound, parent, candidates) = self.registry.source_context(task.activation);
-            assert_eq!(bound, dispatch_key.bound);
-            assert_eq!(candidates.is_some(), dispatch_key.has_candidates);
+            assert_eq!(bound, cohort_key.bound);
+            assert_eq!(candidates.is_some(), cohort_key.has_candidates);
             parents.extend_from_slice(parent);
             candidate_sets.push(candidates);
         }
-        let vars: Vec<_> = dispatch_key.bound.into_iter().collect();
+        let vars: Vec<_> = cohort_key.bound.into_iter().collect();
         let view = rows_view(&vars, &parents, row_count);
         let activations: Vec<_> = tasks
             .iter()
@@ -5176,7 +5027,7 @@ impl DeltaScheduler {
         // Physical pacing is revalidated by the typed adapter from canonical
         // state before this receipt is produced. Family-reported source and
         // transition counts remain telemetry only.
-        let search_cohort = dispatch_key.pacing == ProgramPacing::Search;
+        let search_cohort = cohort_key.class.pacing() == ProgramPacing::Search;
         let source_telemetry_cohort = receipt.source_pages > 0 && receipt.transition_pages == 0;
         let mut scheduled = Vec::new();
         let mut effects = DeltaStableEffects::default();
@@ -7249,9 +7100,9 @@ mod tests {
 
         assert_eq!(scheduler.program_worklist.len(), 1);
         assert_eq!(scheduler.program_worklist[&state].tasks.len(), 2);
-        let (popped_state, hot, pacing) = scheduler.pop_active_program(active, 1);
+        let (popped_state, hot, dispatch) = scheduler.pop_active_program(active, 1);
         assert_eq!(popped_state, state);
-        assert_eq!(pacing, ProgramPacing::Activation);
+        assert_eq!(dispatch.kind, PhysicalDispatchKind::Program);
         assert_eq!(hot.len(), 1);
         assert_eq!(hot[0].activation, first);
         assert_eq!(scheduler.program_worklist[&state].tasks.len(), 1);
