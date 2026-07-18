@@ -376,11 +376,24 @@ impl ChainFrameReducer for ExistsEq {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static SEEDED_CHAIN_FRAME_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn take_seeded_chain_frame_runs() -> usize {
+    SEEDED_CHAIN_FRAME_RUNS.with(|runs| runs.replace(0))
+}
+
 fn run_chain_frame<C, R>(root: C, seed: FrameSeedRow, mut reducer: R) -> R::Output
 where
     C: Constraint<'static> + 'static,
     R: ChainFrameReducer,
 {
+    #[cfg(test)]
+    SEEDED_CHAIN_FRAME_RUNS.with(|runs| runs.set(runs.get() + 1));
+
     let mut frame = SeededResidualFrame::new(root, seed, ResidualLowering::FULL);
     while let Some(binding) = frame.next_binding() {
         if !reducer.observe(&binding) {
@@ -2075,6 +2088,65 @@ impl RegularPathConstraint {
         .then_some(resume);
         Some(RpqExpandPage { next, examined })
     }
+
+    /// Exhausts one bound-endpoint product traversal for the eager Program
+    /// complete-action route.
+    ///
+    /// The sparse route keeps this same `(value, pc)` novelty domain in an
+    /// activation-local registry. A complete action has no activation, so it
+    /// owns the equivalent set and work queue directly. Endpoint acceptance is
+    /// still distinct per parent: convergent graph or automaton histories prove
+    /// one proposal occurrence, while separate parent rows run independent
+    /// drains and retain their outer bag multiplicity.
+    fn complete_bound_endpoint(
+        &self,
+        program: &DeltaProgram,
+        source: RawInline,
+    ) -> HashSet<RawInline> {
+        let root = RpqNode {
+            source: None,
+            value: source,
+            pc: program.encode(program.start),
+        };
+        let mut seen = HashSet::new();
+        let mut pending = VecDeque::new();
+        let mut accepted = HashSet::new();
+        let mut successors = Vec::new();
+
+        seen.insert((root.value, root.pc));
+        pending.push_back(root);
+        if program.accepting[program.start as usize] && is_graph_term(&self.set, &source) {
+            accepted.insert(source);
+        }
+
+        while let Some(node) = pending.pop_front() {
+            successors.clear();
+            if let Some(page) = self.expand_delta_program_page(
+                program,
+                node,
+                RpqExpandCursor::Start,
+                usize::MAX,
+                &mut successors,
+            ) {
+                assert!(
+                    page.next.is_none(),
+                    "an eager RPQ product drain did not exhaust a transition frontier"
+                );
+            }
+            for output in successors.drain(..) {
+                let key = (output.node.value, output.node.pc);
+                if !seen.insert(key) {
+                    continue;
+                }
+                if output.accepted {
+                    accepted.insert(output.node.value);
+                }
+                pending.push_back(output.node);
+            }
+        }
+
+        accepted
+    }
 }
 
 impl RegularPathConstraint {
@@ -2206,10 +2278,10 @@ impl RegularPathConstraint {
     /// Enumerates the exact parent-grouped proposal occurrence bag for a row
     /// block.
     ///
-    /// Both the ordinary Constraint protocol and the Program complete-action
-    /// route use this one family-owned implementation, pinning their identity.
-    /// Equivalence with the independently pageable Program route is covered by
-    /// the cross-regime RPQ oracle tests.
+    /// The ordinary Constraint protocol deliberately retains its historical
+    /// evaluator. Typed complete actions instead drain the compiled product
+    /// program directly, so eager typed execution cannot open a nested WCO
+    /// frame.
     fn for_each_proposal_row(
         &self,
         variable: VariableId,
@@ -2394,9 +2466,23 @@ impl TypedProgramSpec for RegularPathConstraint {
     }
 
     fn complete_typed(&self, batch: ProgramCompleteBatch<'_>, effects: &mut TypedCompleteSink) {
-        self.for_each_proposal_row(batch.route.variable, &batch.view, |parent, values| {
-            effects.extend_parent(parent, values.iter().copied());
-        });
+        let ProgramAction::Propose(variable) = batch.request.action else {
+            panic!("RPQ complete actions support only proposals")
+        };
+        assert_eq!(variable, batch.route.variable);
+        let Some(RpqRoute::BoundEndpoint { source, program }) = self.program_for_variable(variable)
+        else {
+            panic!("RPQ complete action was not a distinct bound-endpoint route")
+        };
+        let source_column = batch
+            .view
+            .col(source)
+            .expect("RPQ complete action omitted its opposite bound endpoint");
+
+        for (parent, row) in batch.view.iter().enumerate() {
+            let accepted = self.complete_bound_endpoint(program, row[source_column]);
+            effects.extend_parent(parent as u32, accepted);
+        }
     }
 
     fn dispatch(&self, state: &Self::State) -> DispatchClass {
@@ -3016,6 +3102,7 @@ mod seeded_frame_tests {
     use crate::query::ProgramActivation;
     use crate::query::ProgramBatch;
     use crate::query::ProgramBatchEffects;
+    use crate::query::ProgramCompleteEffects;
     use crate::query::ProgramSeedEffects;
     use crate::query::Query;
     use crate::trible::Trible;
@@ -3342,6 +3429,148 @@ mod seeded_frame_tests {
         to: RawInline,
     ) {
         set.insert(&Trible::new(from, attribute, &Inline::<GenId>::new(to)));
+    }
+
+    fn complete_bound_proposals(
+        path: &RegularPathConstraint,
+        variable: VariableId,
+        bound: VariableId,
+        rows: &[RawInline],
+    ) -> Vec<(u32, RawInline)> {
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(variable),
+            bound: VariableSet::new_singleton(bound),
+        };
+        let route = TypedProgramSpec::route(path, request)
+            .expect("a bound RPQ endpoint must expose a typed Program route");
+        assert_eq!(
+            route.completion,
+            ProgramCompletion::CompleteActionEquivalent
+        );
+        let vars = [bound];
+        let mut effects = ProgramCompleteEffects::default();
+        path.residual_program().unwrap().complete_batch(
+            ProgramCompleteBatch {
+                request,
+                route,
+                view: RowsView::new(&vars, rows),
+            },
+            &mut effects,
+        );
+        effects.occurrences
+    }
+
+    #[test]
+    fn complete_product_drain_deduplicates_finite_convergent_witnesses_per_parent() {
+        let graph = GraphFixture::new();
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let path = RegularPathConstraint::new(
+            graph.set,
+            start,
+            end,
+            &[
+                PathOp::Attr(graph.primary),
+                PathOp::Attr(graph.secondary),
+                PathOp::Concat,
+            ],
+        );
+
+        // Both 0-primary-1-secondary-{0,2} and
+        // 0-primary-3-secondary-{0,2} prove the same two endpoints. The
+        // complete action emits each endpoint once for each duplicate parent.
+        let _ = take_seeded_chain_frame_runs();
+        let mut actual = complete_bound_proposals(
+            &path,
+            end.index,
+            start.index,
+            &[graph.nodes[0], graph.nodes[0]],
+        );
+        assert_eq!(
+            take_seeded_chain_frame_runs(),
+            0,
+            "typed complete actions must not open a seeded nested WCO frame"
+        );
+        actual.sort_unstable();
+        let mut expected = vec![
+            (0, graph.nodes[0]),
+            (0, graph.nodes[2]),
+            (1, graph.nodes[0]),
+            (1, graph.nodes[2]),
+        ];
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn complete_product_drain_computes_nullable_fixpoint_with_graph_term_gate() {
+        let graph = GraphFixture::new();
+        let absent = id_into_value(&rngid().id.raw());
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let path = RegularPathConstraint::new(
+            graph.set,
+            start,
+            end,
+            &[PathOp::Attr(graph.primary), PathOp::Star],
+        );
+
+        let mut actual = complete_bound_proposals(
+            &path,
+            end.index,
+            start.index,
+            &[graph.nodes[0], graph.nodes[0], graph.nodes[7], absent],
+        );
+        actual.sort_unstable();
+        let mut expected = Vec::new();
+        for parent in 0..2 {
+            for &value in &graph.nodes[..4] {
+                expected.push((parent, value));
+            }
+        }
+        // Node 7 occurs in the graph but has no outgoing primary edge, so
+        // this result can only come from the accepting epsilon root.
+        expected.push((2, graph.nodes[7]));
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+        assert!(actual.iter().all(|(parent, _)| *parent != 3));
+    }
+
+    #[test]
+    fn complete_product_drain_walks_inverse_program_from_a_bound_literal() {
+        let attribute = rngid();
+        let other_attribute = rngid();
+        let sources = [rngid(), rngid()];
+        let unrelated = rngid();
+        let literal = [0xA5; 32];
+        let mut set = TribleSet::new();
+        for source in &sources {
+            set.insert(&Trible::new(
+                source,
+                &attribute,
+                &Inline::<UnknownInline>::new(literal),
+            ));
+        }
+        set.insert(&Trible::new(
+            &unrelated,
+            &other_attribute,
+            &Inline::<UnknownInline>::new(literal),
+        ));
+
+        let start = Variable::<UnknownInline>::new(0);
+        let end = Variable::<UnknownInline>::new(1);
+        let path = RegularPathConstraint::new(set, start, end, &[PathOp::Attr(attribute.id.raw())]);
+        let mut actual =
+            complete_bound_proposals(&path, start.index, end.index, &[literal, literal]);
+        actual.sort_unstable();
+        let mut expected = Vec::new();
+        for parent in 0..2 {
+            for source in &sources {
+                expected.push((parent, id_into_value(&source.id.raw())));
+            }
+        }
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
     }
 
     /// The historical import boundary: capture the outer value by adding a

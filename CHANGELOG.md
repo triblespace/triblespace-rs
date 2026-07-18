@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Typed RPQ complete actions now drain the compiled product automaton
+  directly.** Bound-endpoint proposal cohorts use a parent-local
+  `(value, program-counter)` novelty set and direct PATCH transition pages for
+  finite and fixpoint paths, preserving nullable graph-term gating, inverse
+  traversal, endpoint distinctness, and duplicate outer parents without
+  opening a nested WCO frame. The conservative ordinary constraint evaluator
+  remains unchanged.
 - **Typed Program cohorts separate physical compatibility from activation
   identity.** Program buckets now own one pacing-sensitive selection law:
   Search pages retain LIFO order and may mix physically identical reducer
