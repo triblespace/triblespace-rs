@@ -1454,38 +1454,62 @@ impl ConstructedProgramPlan {
     }
 }
 
+/// Structural reason an owned query was not admitted to the strict
+/// constructed-Program engine.
+///
+/// Admission inspects only declared shape and typed [`ProgramRef`] routes. It
+/// never calls ordinary cardinality, influence, satisfaction, proposal, or
+/// confirmation methods.
+#[doc(hidden)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum ConstructedProgramError {
+pub enum ConstructedProgramError {
+    /// The root is not an exposed conjunction.
+    RootNotFlatAnd,
+    /// The exposed root conjunction has no direct children.
+    EmptyAnd,
+    /// A direct child exposes another conjunction instead of one opaque leaf.
+    NestedAndOccurrence {
+        occurrence: usize,
+    },
+    /// The root conjunction binds no query variable.
     EmptyQuery,
+    /// A leaf exposes finite formula children.
     FormulaOccurrence {
         occurrence: usize,
     },
+    /// One direct leaf binds no query variable.
     ZeroVariableOccurrence {
         occurrence: usize,
     },
+    /// One direct leaf exposes no typed Program family.
     MissingProgram {
         occurrence: usize,
     },
+    /// No leaf can propose the next ascending variable under this schema.
     MissingProposalRoute {
         variable: VariableId,
         bound: VariableSet,
     },
+    /// A relevant non-proposer has no confirmation route.
     MissingConfirmRoute {
         occurrence: usize,
         variable: VariableId,
         bound: VariableSet,
     },
+    /// A returned route names a different variable from its request.
     RouteVariableMismatch {
         occurrence: usize,
         variable: VariableId,
         routed: VariableId,
         bound: VariableSet,
     },
+    /// Confirmation requires one complete parent candidate bag.
     ParentAtomicConfirm {
         occurrence: usize,
         variable: VariableId,
         bound: VariableSet,
     },
+    /// A relevant confirmation cannot operate on independent candidate pages.
     NonPageLocalConfirm {
         occurrence: usize,
         variable: VariableId,
@@ -1668,12 +1692,26 @@ impl ResidualPlan {
     fn try_compile_constructed_program<'a>(
         root: &dyn Constraint<'a>,
     ) -> Result<(Self, VariableSet), ConstructedProgramError> {
+        let children = match root.residual_shape() {
+            ConstraintShape::And(children) => children,
+            _ => return Err(ConstructedProgramError::RootNotFlatAnd),
+        };
+        if children.len() == 0 {
+            return Err(ConstructedProgramError::EmptyAnd);
+        }
+        for occurrence in 0..children.len() {
+            if !matches!(children.child(occurrence).residual_shape(), ConstraintShape::Opaque) {
+                return Err(ConstructedProgramError::NestedAndOccurrence { occurrence });
+            }
+        }
+
         let full = root.variables();
         if full.is_empty() {
             return Err(ConstructedProgramError::EmptyQuery);
         }
 
         let mut plan = Self::compile_mode(root, FormulaScope::OpaqueLeaves, true);
+        debug_assert_eq!(plan.len(), children.len());
         let mut leaf_variables = Vec::with_capacity(plan.len());
         for occurrence in 0..plan.len() {
             let constraint = plan.resolve(root, occurrence);
@@ -11410,6 +11448,16 @@ impl ResidualStateMachine {
     }
 }
 
+/// Planning discipline frozen into one residual iterator.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResidualPlannerKind {
+    /// Ordinary estimate-driven residual planning.
+    Adaptive,
+    /// Complete schema chain compiled from typed Program routes at admission.
+    ConstructedProgram,
+}
+
 /// Demand-driven canonical residual-state execution for any root constraint.
 ///
 /// The iterator begins with a narrow desired actionable width, so full
@@ -11561,6 +11609,25 @@ impl<C, P: Fn(&Binding) -> Option<R>, R> ResidualShadowIter<C, P, R> {
 }
 
 impl<C, P: Fn(&Binding) -> Option<R>, R> ResidualStateIter<C, P, R> {
+    /// Identifies the planning discipline frozen into this iterator.
+    #[doc(hidden)]
+    pub fn planner_kind(&self) -> ResidualPlannerKind {
+        if self.plan.constructed_program.is_some() {
+            ResidualPlannerKind::ConstructedProgram
+        } else {
+            ResidualPlannerKind::Adaptive
+        }
+    }
+
+    /// Number of schema-level actions frozen by constructed admission.
+    #[doc(hidden)]
+    pub fn constructed_program_step_count(&self) -> Option<usize> {
+        self.plan
+            .constructed_program
+            .as_ref()
+            .map(|program| program.steps.len())
+    }
+
     /// Overrides the initial chunk width, clamped to `1..=cap`.
     pub fn start_width(mut self, width: usize) -> Self {
         self.state.width = width.clamp(1, self.state.cap);
@@ -11701,19 +11768,79 @@ where
     }
 }
 
-/// Private source probe for a planner constructed entirely from typed Program
-/// routes. It deliberately bypasses [`Query::new`], so no cardinality,
-/// influence, or seed-satisfaction protocol method participates in admission.
-#[cfg(test)]
-fn try_constructed_program_iter<'a, C, P, R>(
+/// Owned rejection from [`try_constructed_program_query`].
+///
+/// Keeping both inputs here makes fallback an explicit caller decision. In
+/// particular, [`Query::new`] is not constructed speculatively before typed
+/// admission has rejected the structural shape.
+#[doc(hidden)]
+#[must_use]
+pub struct ConstructedProgramQueryRejection<C, P> {
     root: C,
     postprocessing: P,
-) -> Result<ResidualStateIter<C, P, R>, ConstructedProgramError>
+    reason: ConstructedProgramError,
+}
+
+impl<C, P> std::fmt::Debug for ConstructedProgramQueryRejection<C, P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConstructedProgramQueryRejection")
+            .field("reason", &self.reason)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<C, P> ConstructedProgramQueryRejection<C, P> {
+    /// Returns the structural admission failure without consuming the inputs.
+    pub fn reason(&self) -> &ConstructedProgramError {
+        &self.reason
+    }
+
+    /// Recovers both owned inputs and the structural admission failure.
+    pub fn into_inputs(self) -> (C, P, ConstructedProgramError) {
+        (self.root, self.postprocessing, self.reason)
+    }
+
+    /// Constructs the ordinary query only after explicit rejection.
+    pub fn into_query<'a, R>(self) -> Query<C, P, R>
+    where
+        C: Constraint<'a> + 'a,
+        P: Fn(&Binding) -> Option<R>,
+    {
+        Query::new(self.root, self.postprocessing)
+    }
+}
+
+/// Attempts an estimate-free residual query constructed entirely from typed
+/// [`ProgramRef`] routes.
+///
+/// This is an explicit production-admission probe, not an ordinary scheduler
+/// default. It accepts only a nonempty flat AND with at least one variable,
+/// compiles the complete ascending-variable Propose/Confirm route chain while
+/// `root` is still borrowed, and moves the owned inputs only after that
+/// borrow-free plan is complete. Accepted execution cannot call
+/// [`Query::new`], reconstruct routes, or fall back to ordinary constraint
+/// verbs after affine work begins. A rejection returns both owned inputs
+/// and its structural reason; callers may then deliberately construct an
+/// ordinary query with [`ConstructedProgramQueryRejection::into_query`].
+#[doc(hidden)]
+pub fn try_constructed_program_query<'a, C, P, R>(
+    root: C,
+    postprocessing: P,
+) -> Result<ResidualStateIter<C, P, R>, ConstructedProgramQueryRejection<C, P>>
 where
     C: Constraint<'a> + 'a,
     P: Fn(&Binding) -> Option<R>,
 {
-    let (plan, full) = ResidualPlan::try_compile_constructed_program(&root)?;
+    let (plan, full) = match ResidualPlan::try_compile_constructed_program(&root) {
+        Ok(compiled) => compiled,
+        Err(reason) => {
+            return Err(ConstructedProgramQueryRejection {
+                root,
+                postprocessing,
+                reason,
+            });
+        }
+    };
     let state = ResidualStateMachine::new_for_plan(full, &plan, Search::NextVariable);
     Ok(ResidualStateIter {
         root,
@@ -20554,6 +20681,56 @@ mod tests {
         }
     }
 
+    struct ConstructedFallbackProbe {
+        planning_calls: Arc<AtomicUsize>,
+    }
+
+    impl Constraint<'static> for ConstructedFallbackProbe {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(0)
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            self.planning_calls.fetch_add(1, Ordering::Relaxed);
+            if variable != 0 {
+                return false;
+            }
+            out.fill(1, view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn satisfied(&self, _view: &RowsView<'_>) -> bool {
+            self.planning_calls.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+
+        fn influence(&self, variable: VariableId) -> VariableSet {
+            self.planning_calls.fetch_add(1, Ordering::Relaxed);
+            VariableSet::new_singleton(variable)
+        }
+    }
+
     fn constructed_program_graph() -> (crate::trible::TribleSet, crate::id::Id) {
         use crate::id::{ExclusiveId, Id};
         use crate::trible::{Trible, TribleSet};
@@ -20605,14 +20782,14 @@ mod tests {
     }
 
     fn take_constructed_error<C, P, R>(
-        result: Result<ResidualStateIter<C, P, R>, ConstructedProgramError>,
+        result: Result<ResidualStateIter<C, P, R>, ConstructedProgramQueryRejection<C, P>>,
     ) -> ConstructedProgramError
     where
         P: Fn(&Binding) -> Option<R>,
     {
         match result {
             Ok(_) => panic!("strict constructed Program admission unexpectedly succeeded"),
-            Err(error) => error,
+            Err(rejection) => rejection.into_inputs().2,
         }
     }
 
@@ -20625,13 +20802,18 @@ mod tests {
         )
         .sequential()
         .collect();
-        let root = Arc::new(ConstructedProtocolTrap {
-            inner: constructed_rpq(graph, &attribute, false),
-        });
-        let mut constructed: Vec<_> =
-            try_constructed_program_iter(root, constructed_pair)
-                .unwrap()
-                .collect();
+        let root = Arc::new(IntersectionConstraint::new(vec![Arc::new(
+            ConstructedProtocolTrap {
+                inner: constructed_rpq(graph, &attribute, false),
+            },
+        )]));
+        let iterator = try_constructed_program_query(root, constructed_pair).unwrap();
+        assert_eq!(
+            iterator.planner_kind(),
+            ResidualPlannerKind::ConstructedProgram
+        );
+        assert_eq!(iterator.constructed_program_step_count(), Some(2));
+        let mut constructed: Vec<_> = iterator.collect();
 
         expected.sort_unstable();
         constructed.sort_unstable();
@@ -20648,10 +20830,12 @@ mod tests {
         )
         .sequential()
         .collect();
-        let root = Arc::new(ConstructedProtocolTrap {
-            inner: constructed_rpq(graph, &attribute, false),
-        });
-        let mut iterator = try_constructed_program_iter(root, constructed_pair).unwrap();
+        let root = Arc::new(IntersectionConstraint::new(vec![Arc::new(
+            ConstructedProtocolTrap {
+                inner: constructed_rpq(graph, &attribute, false),
+            },
+        )]));
+        let mut iterator = try_constructed_program_query(root, constructed_pair).unwrap();
         let first = iterator.next().expect("constructed RPQ produced no row");
         let clone = iterator.clone();
         let mut left: Vec<_> = iterator.collect();
@@ -20769,7 +20953,7 @@ mod tests {
                 ),
             }) as ShapeConstraint,
         ]));
-        let mut iterator = try_constructed_program_iter(root, constructed_source_target)
+        let mut iterator = try_constructed_program_query(root, constructed_source_target)
             .unwrap()
             .cap(1)
             .start_width(1)
@@ -20914,7 +21098,7 @@ mod tests {
                 ),
             }) as ShapeConstraint,
         ]));
-        let mut iterator = try_constructed_program_iter(root, constructed_source_target)
+        let mut iterator = try_constructed_program_query(root, constructed_source_target)
             .unwrap()
             .cap(1)
             .start_width(1)
@@ -20968,7 +21152,7 @@ mod tests {
             Arc::clone(&shared),
             Arc::clone(&shared),
         ]));
-        let iterator = try_constructed_program_iter(root, constructed_pair).unwrap();
+        let iterator = try_constructed_program_query(root, constructed_pair).unwrap();
         let constructed_plan = iterator.plan.constructed_program.as_ref().unwrap();
         assert!(constructed_plan.steps.iter().all(|step| {
             step.relevant.count() == 2 && step.confirmer_routes.len() == 1
@@ -20996,8 +21180,16 @@ mod tests {
         high.set_estimate(0, usize::MAX);
         high.set_estimate(1, 0);
 
-        let low = try_constructed_program_iter(Arc::new(low), constructed_pair).unwrap();
-        let high = try_constructed_program_iter(Arc::new(high), constructed_pair).unwrap();
+        let low = try_constructed_program_query(
+            Arc::new(IntersectionConstraint::new(vec![Arc::new(low)])),
+            constructed_pair,
+        )
+        .unwrap();
+        let high = try_constructed_program_query(
+            Arc::new(IntersectionConstraint::new(vec![Arc::new(high)])),
+            constructed_pair,
+        )
+        .unwrap();
         assert_eq!(low.plan.constructed_program, high.plan.constructed_program);
         let mut low_results: Vec<_> = low.collect();
         let mut high_results: Vec<_> = high.collect();
@@ -21008,9 +21200,38 @@ mod tests {
 
     #[test]
     fn constructed_program_rejects_unsupported_shapes_without_fallback() {
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let rejection = match try_constructed_program_query(
+            ConstructedFallbackProbe {
+                planning_calls: Arc::clone(&fallback_calls),
+            },
+            constructed_unit,
+        ) {
+            Ok(_) => panic!("a non-AND root was admitted"),
+            Err(rejection) => rejection,
+        };
+        assert_eq!(rejection.reason(), &ConstructedProgramError::RootNotFlatAnd);
+        assert_eq!(fallback_calls.load(Ordering::Relaxed), 0);
+        let _fallback: Query<_, _, ()> = rejection.into_query();
+        assert!(fallback_calls.load(Ordering::Relaxed) > 0);
+
         assert_eq!(
-            take_constructed_error(try_constructed_program_iter(
+            take_constructed_error(try_constructed_program_query(
                 ConstructedZeroVariable,
+                constructed_unit,
+            )),
+            ConstructedProgramError::RootNotFlatAnd
+        );
+        assert_eq!(
+            take_constructed_error(try_constructed_program_query(
+                IntersectionConstraint::<ConstructedZeroVariable>::new(Vec::new()),
+                constructed_unit,
+            )),
+            ConstructedProgramError::EmptyAnd
+        );
+        assert_eq!(
+            take_constructed_error(try_constructed_program_query(
+                IntersectionConstraint::new(vec![ConstructedZeroVariable]),
                 constructed_unit,
             )),
             ConstructedProgramError::EmptyQuery
@@ -21024,16 +21245,24 @@ mod tests {
             Box::new(ConstructedZeroVariable) as ShapeConstraint,
         ]);
         assert_eq!(
-            take_constructed_error(try_constructed_program_iter(mixed, constructed_unit)),
+            take_constructed_error(try_constructed_program_query(mixed, constructed_unit)),
             ConstructedProgramError::ZeroVariableOccurrence { occurrence: 1 }
         );
 
         assert_eq!(
-            take_constructed_error(try_constructed_program_iter(
-                ConstructedMissingProgram(0),
+            take_constructed_error(try_constructed_program_query(
+                IntersectionConstraint::new(vec![ConstructedMissingProgram(0)]),
                 constructed_unit,
             )),
             ConstructedProgramError::MissingProgram { occurrence: 0 }
+        );
+
+        let nested = IntersectionConstraint::new(vec![IntersectionConstraint::new(vec![
+            ConstructedMissingProgram(0),
+        ])]);
+        assert_eq!(
+            take_constructed_error(try_constructed_program_query(nested, constructed_unit)),
+            ConstructedProgramError::NestedAndOccurrence { occurrence: 0 }
         );
 
         let left = Arc::new(ConstructedProtocolTrap {
@@ -21042,9 +21271,9 @@ mod tests {
         let right = Arc::new(ConstructedProtocolTrap {
             inner: constructed_rpq(graph.clone(), &attribute, false),
         });
-        let formula = UnionConstraint::new(vec![left, right]);
+        let formula = IntersectionConstraint::new(vec![UnionConstraint::new(vec![left, right])]);
         assert_eq!(
-            take_constructed_error(try_constructed_program_iter(formula, constructed_pair)),
+            take_constructed_error(try_constructed_program_query(formula, constructed_pair)),
             ConstructedProgramError::FormulaOccurrence { occurrence: 0 }
         );
 
@@ -21059,7 +21288,7 @@ mod tests {
             },
         ]);
         assert!(matches!(
-            take_constructed_error(try_constructed_program_iter(route_hole, constructed_unit)),
+            take_constructed_error(try_constructed_program_query(route_hole, constructed_unit)),
             ConstructedProgramError::MissingConfirmRoute {
                 variable: 0,
                 bound,
@@ -21075,7 +21304,7 @@ mod tests {
             Arc::clone(&repeated),
         ]);
         assert!(matches!(
-            take_constructed_error(try_constructed_program_iter(repeated, constructed_pair)),
+            take_constructed_error(try_constructed_program_query(repeated, constructed_pair)),
             ConstructedProgramError::ParentAtomicConfirm {
                 variable: 1,
                 bound,
@@ -21094,11 +21323,13 @@ mod tests {
         )
         .sequential()
         .collect();
-        let root = Arc::new(ConstructedProtocolTrap {
-            inner: constructed_rpq(graph, &attribute, false),
-        });
+        let root = Arc::new(IntersectionConstraint::new(vec![Arc::new(
+            ConstructedProtocolTrap {
+                inner: constructed_rpq(graph, &attribute, false),
+            },
+        )]));
         let mut constructed: Vec<_> = with_parallel_workers(4, || {
-            try_constructed_program_iter(root, constructed_pair)
+            try_constructed_program_query(root, constructed_pair)
                 .unwrap()
                 .into_par_iter()
                 .collect()
