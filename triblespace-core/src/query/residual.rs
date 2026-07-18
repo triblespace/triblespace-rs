@@ -3796,22 +3796,660 @@ impl RowBatch {
 enum CandidatePayload {
     Values(Vec<RawInline>),
     Tagged(Candidates),
+    /// Immutable occurrence rope produced by affine reducer pages.
+    ///
+    /// Leaves own the same `Vec` buffers that a contiguous payload would
+    /// own.  Cloning, page concatenation, and equal-state Worklist merging
+    /// therefore move or clone only `Arc` roots; they never copy an existing
+    /// candidate prefix.  A later protocol/planning operation may explicitly
+    /// cross [`CandidatePayload::materialize_for_planning_or_action_opening`]
+    /// when its pre-existing API requires mutable contiguous storage.  That
+    /// is the already-unbudgeted action-opening boundary, not reducer work.
+    Deferred(DeferredCandidates),
 }
 
-#[cfg(test)]
+/// Persistent ordered candidate rope with lazy parent-tag offsets.
+///
+/// `Values` leaves have one local parent (tag zero); `Tagged` leaves retain
+/// their local tags. Shared range views make scheduler splits structural;
+/// shifts rebase a whole subtree without rewriting occurrences.
+struct DeferredCandidateNode {
+    len: usize,
+    first_parent: u32,
+    last_parent: u32,
+    grouped: bool,
+    kind: DeferredCandidateNodeKind,
+}
+
+enum DeferredCandidateNodeKind {
+    Values {
+        values: Arc<Vec<RawInline>>,
+        range: std::ops::Range<usize>,
+    },
+    Tagged {
+        pairs: Arc<Candidates>,
+        range: std::ops::Range<usize>,
+    },
+    Shift {
+        inner: Arc<DeferredCandidateNode>,
+        parent_delta: i64,
+    },
+    Concat {
+        left: Arc<DeferredCandidateNode>,
+        right: Arc<DeferredCandidateNode>,
+    },
+}
+
+impl std::fmt::Debug for DeferredCandidateNode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match &self.kind {
+            DeferredCandidateNodeKind::Values { .. } => "Values",
+            DeferredCandidateNodeKind::Tagged { .. } => "Tagged",
+            DeferredCandidateNodeKind::Shift { .. } => "Shift",
+            DeferredCandidateNodeKind::Concat { .. } => "Concat",
+        };
+        formatter
+            .debug_struct("DeferredCandidateNode")
+            .field("kind", &kind)
+            .field("len", &self.len)
+            .field("first_parent", &self.first_parent)
+            .field("last_parent", &self.last_parent)
+            .field("grouped", &self.grouped)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+struct DeferredCandidates {
+    root: Option<Arc<DeferredCandidateNode>>,
+    len: usize,
+    parent_count: usize,
+}
+
+impl std::fmt::Debug for DeferredCandidates {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeferredCandidates")
+            .field("len", &self.len)
+            .field("parent_count", &self.parent_count)
+            .field("storage", &self.root.as_ref().map(|_| "shared-rope"))
+            .finish()
+    }
+}
+
+enum DeferredLeafIter<'a> {
+    Values {
+        values: std::slice::Iter<'a, RawInline>,
+        parent_delta: i64,
+    },
+    Tagged {
+        pairs: std::slice::Iter<'a, (u32, RawInline)>,
+        parent_delta: i64,
+    },
+}
+
+struct DeferredCandidateIter<'a> {
+    stack: Vec<(&'a DeferredCandidateNode, i64)>,
+    leaf: Option<DeferredLeafIter<'a>>,
+    remaining: usize,
+}
+
+/// Clone-cheap owned cursor through an immutable candidate rope.
+///
+/// The pending DFS stack is itself persistent: cloning a suspended Program
+/// state clones only two `Arc` roots plus scalar indices.  Traversal expands
+/// concat/offset nodes incrementally and never revisits an occurrence already
+/// charged to an earlier reducer receipt.
+#[derive(Clone)]
+struct DeferredCandidateCursor {
+    pending: Option<Arc<DeferredCursorFrame>>,
+    leaf: Option<DeferredLeafCursor>,
+    remaining: usize,
+}
+
+struct DeferredCursorFrame {
+    node: Arc<DeferredCandidateNode>,
+    parent_delta: i64,
+    next: Option<Arc<DeferredCursorFrame>>,
+}
+
+#[derive(Clone)]
+struct DeferredLeafCursor {
+    node: Arc<DeferredCandidateNode>,
+    parent_delta: i64,
+    index: usize,
+}
+
+impl DeferredCandidateCursor {
+    fn push(
+        pending: Option<Arc<DeferredCursorFrame>>,
+        node: Arc<DeferredCandidateNode>,
+        parent_delta: i64,
+    ) -> Option<Arc<DeferredCursorFrame>> {
+        Some(Arc::new(DeferredCursorFrame {
+            node,
+            parent_delta,
+            next: pending,
+        }))
+    }
+
+    fn next(&mut self) -> Option<(u32, RawInline)> {
+        loop {
+            if let Some(leaf) = &mut self.leaf {
+                let next = match &leaf.node.kind {
+                    DeferredCandidateNodeKind::Values { values, range } => range
+                        .clone()
+                        .nth(leaf.index)
+                        .and_then(|index| values.get(index))
+                        .map(|value| (shift_candidate_parent(0, leaf.parent_delta), *value)),
+                    DeferredCandidateNodeKind::Tagged { pairs, range } => range
+                        .clone()
+                        .nth(leaf.index)
+                        .and_then(|index| pairs.get(index))
+                        .map(|(parent, value)| {
+                            (shift_candidate_parent(*parent, leaf.parent_delta), *value)
+                        }),
+                    DeferredCandidateNodeKind::Shift { .. }
+                    | DeferredCandidateNodeKind::Concat { .. } => {
+                        unreachable!("deferred leaf cursor named an internal rope node")
+                    }
+                };
+                if let Some(next) = next {
+                    leaf.index += 1;
+                    self.remaining -= 1;
+                    return Some(next);
+                }
+                self.leaf = None;
+            }
+
+            let frame = self.pending.take()?;
+            self.pending = frame.next.clone();
+            match &frame.node.kind {
+                DeferredCandidateNodeKind::Values { .. }
+                | DeferredCandidateNodeKind::Tagged { .. } => {
+                    self.leaf = Some(DeferredLeafCursor {
+                        node: frame.node.clone(),
+                        parent_delta: frame.parent_delta,
+                        index: 0,
+                    });
+                }
+                DeferredCandidateNodeKind::Shift {
+                    inner,
+                    parent_delta,
+                } => {
+                    self.pending = Self::push(
+                        self.pending.take(),
+                        inner.clone(),
+                        frame
+                            .parent_delta
+                            .checked_add(*parent_delta)
+                            .expect("candidate parent offset overflow"),
+                    );
+                }
+                DeferredCandidateNodeKind::Concat { left, right } => {
+                    // Push right first so the persistent LIFO stack visits
+                    // the exact left occurrence stream before the right.
+                    self.pending = Self::push(
+                        self.pending.take(),
+                        right.clone(),
+                        frame.parent_delta,
+                    );
+                    self.pending =
+                        Self::push(self.pending.take(), left.clone(), frame.parent_delta);
+                }
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for DeferredCandidateCursor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeferredCandidateCursor")
+            .field("remaining", &self.remaining)
+            .field("has_leaf", &self.leaf.is_some())
+            .field("has_pending", &self.pending.is_some())
+            .finish()
+    }
+}
+
+fn shift_candidate_parent(parent: u32, delta: i64) -> u32 {
+    let shifted = i64::from(parent)
+        .checked_add(delta)
+        .expect("candidate parent offset overflow");
+    u32::try_from(shifted).expect("candidate parent offset left the valid domain")
+}
+
+impl DeferredCandidateNode {
+    fn values(values: Vec<RawInline>) -> Option<Arc<Self>> {
+        let len = values.len();
+        if len == 0 {
+            return None;
+        }
+        Some(Arc::new(Self {
+            len,
+            first_parent: 0,
+            last_parent: 0,
+            grouped: true,
+            kind: DeferredCandidateNodeKind::Values {
+                values: Arc::new(values),
+                range: 0..len,
+            },
+        }))
+    }
+
+    fn tagged(pairs: Candidates) -> Option<Arc<Self>> {
+        let len = pairs.len();
+        if len == 0 {
+            return None;
+        }
+        let first_parent = pairs[0].0;
+        let last_parent = pairs[len - 1].0;
+        Some(Arc::new(Self {
+            len,
+            first_parent,
+            last_parent,
+            // The contiguous protocol boundary established grouping before
+            // deferral; moving its Vec buffer must remain O(1).
+            grouped: true,
+            kind: DeferredCandidateNodeKind::Tagged {
+                pairs: Arc::new(pairs),
+                range: 0..len,
+            },
+        }))
+    }
+
+    fn value_view(
+        values: Arc<Vec<RawInline>>,
+        range: std::ops::Range<usize>,
+    ) -> Option<Arc<Self>> {
+        if range.is_empty() {
+            return None;
+        }
+        Some(Arc::new(Self {
+            len: range.len(),
+            first_parent: 0,
+            last_parent: 0,
+            grouped: true,
+            kind: DeferredCandidateNodeKind::Values { values, range },
+        }))
+    }
+
+    fn tagged_view(
+        pairs: Arc<Candidates>,
+        range: std::ops::Range<usize>,
+    ) -> Option<Arc<Self>> {
+        if range.is_empty() {
+            return None;
+        }
+        let first_parent = pairs[range.start].0;
+        let last_parent = pairs[range.end - 1].0;
+        Some(Arc::new(Self {
+            len: range.len(),
+            first_parent,
+            last_parent,
+            grouped: true,
+            kind: DeferredCandidateNodeKind::Tagged { pairs, range },
+        }))
+    }
+
+    fn shift(node: Arc<Self>, parent_delta: i64) -> Arc<Self> {
+        if parent_delta == 0 {
+            return node;
+        }
+        Arc::new(Self {
+            len: node.len,
+            first_parent: shift_candidate_parent(node.first_parent, parent_delta),
+            last_parent: shift_candidate_parent(node.last_parent, parent_delta),
+            grouped: node.grouped,
+            kind: DeferredCandidateNodeKind::Shift {
+                inner: node,
+                parent_delta,
+            },
+        })
+    }
+
+    fn concat(left: Option<Arc<Self>>, right: Option<Arc<Self>>) -> Option<Arc<Self>> {
+        match (left, right) {
+            (None, None) => None,
+            (Some(node), None) | (None, Some(node)) => Some(node),
+            (Some(left), Some(right)) => Some(Arc::new(Self {
+                len: left
+                    .len
+                    .checked_add(right.len)
+                    .expect("candidate occurrence count overflow"),
+                first_parent: left.first_parent,
+                last_parent: right.last_parent,
+                grouped: left.grouped
+                    && right.grouped
+                    && left.last_parent <= right.first_parent,
+                kind: DeferredCandidateNodeKind::Concat { left, right },
+            })),
+        }
+    }
+
+    fn split_occurrences(
+        node: Arc<Self>,
+        cut: usize,
+    ) -> (Option<Arc<Self>>, Option<Arc<Self>>) {
+        if cut == 0 {
+            return (None, Some(node));
+        }
+        if cut == node.len {
+            return (Some(node), None);
+        }
+        assert!(cut < node.len, "candidate occurrence split out of range");
+        match &node.kind {
+            DeferredCandidateNodeKind::Values { values, range } => (
+                Self::value_view(values.clone(), range.start..range.start + cut),
+                Self::value_view(values.clone(), range.start + cut..range.end),
+            ),
+            DeferredCandidateNodeKind::Tagged { pairs, range } => (
+                Self::tagged_view(pairs.clone(), range.start..range.start + cut),
+                Self::tagged_view(pairs.clone(), range.start + cut..range.end),
+            ),
+            DeferredCandidateNodeKind::Shift {
+                inner,
+                parent_delta,
+            } => {
+                let (left, right) = Self::split_occurrences(inner.clone(), cut);
+                (
+                    left.map(|node| Self::shift(node, *parent_delta)),
+                    right.map(|node| Self::shift(node, *parent_delta)),
+                )
+            }
+            DeferredCandidateNodeKind::Concat { left, right } => {
+                if cut < left.len {
+                    let (prefix, middle) = Self::split_occurrences(left.clone(), cut);
+                    (prefix, Self::concat(middle, Some(right.clone())))
+                } else if cut == left.len {
+                    (Some(left.clone()), Some(right.clone()))
+                } else {
+                    let (middle, tail) = Self::split_occurrences(right.clone(), cut - left.len);
+                    (Self::concat(Some(left.clone()), middle), tail)
+                }
+            }
+        }
+    }
+
+    fn split_parents(
+        node: Arc<Self>,
+        first_tail_parent: u32,
+    ) -> (Option<Arc<Self>>, Option<Arc<Self>>) {
+        assert!(node.grouped, "parent split requires grouped candidate tags");
+        if node.last_parent < first_tail_parent {
+            return (Some(node), None);
+        }
+        if node.first_parent >= first_tail_parent {
+            return (
+                None,
+                Some(Self::shift(node, -i64::from(first_tail_parent))),
+            );
+        }
+        match &node.kind {
+            DeferredCandidateNodeKind::Values { .. } => {
+                unreachable!("one-parent leaf cannot straddle a parent boundary")
+            }
+            DeferredCandidateNodeKind::Tagged { pairs, range } => {
+                let cut = pairs[range.clone()]
+                    .partition_point(|(parent, _)| *parent < first_tail_parent);
+                let cut = range.start + cut;
+                let prefix = Self::tagged_view(pairs.clone(), range.start..cut);
+                let tail = Self::tagged_view(pairs.clone(), cut..range.end)
+                    .map(|node| Self::shift(node, -i64::from(first_tail_parent)));
+                (prefix, tail)
+            }
+            DeferredCandidateNodeKind::Shift {
+                inner,
+                parent_delta,
+            } => {
+                let inner_boundary = i64::from(first_tail_parent)
+                    .checked_sub(*parent_delta)
+                    .expect("candidate parent offset overflow");
+                let inner_boundary = u32::try_from(inner_boundary)
+                    .expect("shifted parent split left the valid domain");
+                let (prefix, tail) = Self::split_parents(inner.clone(), inner_boundary);
+                (
+                    prefix.map(|node| Self::shift(node, *parent_delta)),
+                    // The recursive tail is already rebased by the translated
+                    // boundary, exactly cancelling the outer shift.
+                    tail,
+                )
+            }
+            DeferredCandidateNodeKind::Concat { left, right } => {
+                let (left_prefix, left_tail) =
+                    Self::split_parents(left.clone(), first_tail_parent);
+                let (right_prefix, right_tail) =
+                    Self::split_parents(right.clone(), first_tail_parent);
+                (
+                    Self::concat(left_prefix, right_prefix),
+                    Self::concat(left_tail, right_tail),
+                )
+            }
+        }
+    }
+}
+
+impl<'a> DeferredCandidateIter<'a> {
+    fn new(candidates: &'a DeferredCandidates) -> Self {
+        let mut stack = Vec::new();
+        if let Some(root) = candidates.root.as_deref() {
+            stack.push((root, 0));
+        }
+        Self {
+            stack,
+            leaf: None,
+            remaining: candidates.len,
+        }
+    }
+}
+
+impl Iterator for DeferredCandidateIter<'_> {
+    type Item = (u32, RawInline);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(leaf) = &mut self.leaf {
+                let next = match leaf {
+                    DeferredLeafIter::Values {
+                        values,
+                        parent_delta,
+                    } => values
+                        .next()
+                        .map(|value| (shift_candidate_parent(0, *parent_delta), *value)),
+                    DeferredLeafIter::Tagged {
+                        pairs,
+                        parent_delta,
+                    } => pairs.next().map(|(parent, value)| {
+                        (shift_candidate_parent(*parent, *parent_delta), *value)
+                    }),
+                };
+                if let Some(next) = next {
+                    self.remaining -= 1;
+                    return Some(next);
+                }
+                self.leaf = None;
+            }
+
+            let (node, parent_delta) = self.stack.pop()?;
+            match &node.kind {
+                DeferredCandidateNodeKind::Values { values, range } => {
+                    self.leaf = Some(DeferredLeafIter::Values {
+                        values: values[range.clone()].iter(),
+                        parent_delta,
+                    });
+                }
+                DeferredCandidateNodeKind::Tagged { pairs, range } => {
+                    self.leaf = Some(DeferredLeafIter::Tagged {
+                        pairs: pairs[range.clone()].iter(),
+                        parent_delta,
+                    });
+                }
+                DeferredCandidateNodeKind::Shift {
+                    inner,
+                    parent_delta: shift,
+                } => self.stack.push((
+                    inner,
+                    parent_delta
+                        .checked_add(*shift)
+                        .expect("candidate parent offset overflow"),
+                )),
+                DeferredCandidateNodeKind::Concat { left, right } => {
+                    // LIFO traversal visits the left occurrence stream first.
+                    self.stack.push((right, parent_delta));
+                    self.stack.push((left, parent_delta));
+                }
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for DeferredCandidateIter<'_> {}
+
+impl DeferredCandidates {
+    fn from_payload(payload: CandidatePayload, parent_count: usize) -> Self {
+        match payload {
+            CandidatePayload::Values(values) => {
+                assert_eq!(parent_count, 1, "plain candidates require one parent");
+                let len = values.len();
+                Self {
+                    root: DeferredCandidateNode::values(values),
+                    len,
+                    parent_count,
+                }
+            }
+            CandidatePayload::Tagged(pairs) => {
+                let len = pairs.len();
+                Self {
+                    root: DeferredCandidateNode::tagged(pairs),
+                    len,
+                    parent_count,
+                }
+            }
+            CandidatePayload::Deferred(candidates) => {
+                assert_eq!(candidates.parent_count, parent_count);
+                candidates
+            }
+        }
+    }
+
+    fn concat(left: Self, right: Self, right_parent_offset: usize, parent_count: usize) -> Self {
+        let right_parent_offset =
+            u32::try_from(right_parent_offset).expect("too many candidate parents");
+        let shifted_right = right
+            .root
+            .map(|right| DeferredCandidateNode::shift(right, i64::from(right_parent_offset)));
+        let root = DeferredCandidateNode::concat(left.root, shifted_right);
+        Self {
+            root,
+            len: left
+                .len
+                .checked_add(right.len)
+                .expect("candidate occurrence count overflow"),
+            parent_count,
+        }
+    }
+
+    fn iter(&self) -> DeferredCandidateIter<'_> {
+        DeferredCandidateIter::new(self)
+    }
+
+    fn cursor(&self) -> DeferredCandidateCursor {
+        DeferredCandidateCursor {
+            pending: self.root.as_ref().map(|root| {
+                Arc::new(DeferredCursorFrame {
+                    node: root.clone(),
+                    parent_delta: 0,
+                    next: None,
+                })
+            }),
+            leaf: None,
+            remaining: self.len,
+        }
+    }
+
+    fn take_parent_tail(&mut self, first: usize) -> Self {
+        assert!(first > 0 && first < self.parent_count);
+        let first_tag = u32::try_from(first).expect("too many candidate parents");
+        let (prefix, tail) = match self.root.take() {
+            Some(root) => DeferredCandidateNode::split_parents(root, first_tag),
+            None => (None, None),
+        };
+        let old_parent_count = self.parent_count;
+        self.root = prefix;
+        self.len = self.root.as_ref().map_or(0, |node| node.len);
+        self.parent_count = first;
+        Self {
+            len: tail.as_ref().map_or(0, |node| node.len),
+            root: tail,
+            parent_count: old_parent_count - first,
+        }
+    }
+
+    fn take_occurrence_tail(&mut self, take: usize) -> (Self, usize, usize) {
+        assert!(take > 0 && take < self.len);
+        let cut = self.len - take;
+        let root = self
+            .root
+            .take()
+            .expect("nonempty deferred payload lost its root");
+        let (prefix, tail) = DeferredCandidateNode::split_occurrences(root, cut);
+        let tail = tail.expect("candidate occurrence split lost its tail");
+        let first_tail_parent = tail.first_parent as usize;
+        let prefix_parent_count = prefix
+            .as_ref()
+            .map_or(0, |node| node.last_parent as usize + 1);
+        let old_parent_count = self.parent_count;
+        let tail_first = tail.first_parent;
+        let tail = DeferredCandidateNode::shift(tail, -i64::from(tail_first));
+        self.root = prefix;
+        self.len = cut;
+        self.parent_count = prefix_parent_count;
+        (
+            Self {
+                root: Some(tail),
+                len: take,
+                parent_count: old_parent_count - first_tail_parent,
+            },
+            first_tail_parent,
+            prefix_parent_count,
+        )
+    }
+
+    fn into_contiguous(self) -> CandidatePayload {
+        if self.parent_count == 1 {
+            let mut values = Vec::with_capacity(self.len);
+            values.extend(self.iter().map(|(parent, value)| {
+                assert_eq!(parent, 0, "one-parent deferred candidate had a nonzero tag");
+                value
+            }));
+            CandidatePayload::Values(values)
+        } else {
+            let mut pairs = Vec::with_capacity(self.len);
+            pairs.extend(self.iter());
+            CandidatePayload::Tagged(pairs)
+        }
+    }
+}
+
 enum CandidatePayloadIter<'a> {
     Values(std::slice::Iter<'a, RawInline>),
     Tagged(std::slice::Iter<'a, (u32, RawInline)>),
+    Deferred(DeferredCandidateIter<'a>),
 }
 
-#[cfg(test)]
-impl<'a> Iterator for CandidatePayloadIter<'a> {
-    type Item = (u32, &'a RawInline);
+impl Iterator for CandidatePayloadIter<'_> {
+    type Item = (u32, RawInline);
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            Self::Values(values) => values.next().map(|value| (0, value)),
-            Self::Tagged(pairs) => pairs.next().map(|(parent, value)| (*parent, value)),
+            Self::Values(values) => values.next().map(|value| (0, *value)),
+            Self::Tagged(pairs) => pairs.next().map(|(parent, value)| (*parent, *value)),
+            Self::Deferred(candidates) => candidates.next(),
         }
     }
 
@@ -3819,9 +4457,12 @@ impl<'a> Iterator for CandidatePayloadIter<'a> {
         match self {
             Self::Values(values) => values.size_hint(),
             Self::Tagged(pairs) => pairs.size_hint(),
+            Self::Deferred(candidates) => candidates.size_hint(),
         }
     }
 }
+
+impl ExactSizeIterator for CandidatePayloadIter<'_> {}
 
 impl CandidatePayload {
     fn empty(parent_count: usize) -> Self {
@@ -3849,6 +4490,10 @@ impl CandidatePayload {
     }
 
     fn normalize_for(&mut self, parent_count: usize) {
+        if matches!(self, Self::Deferred(candidates) if candidates.parent_count == parent_count) {
+            return;
+        }
+        self.materialize_for_planning_or_action_opening();
         let payload = std::mem::replace(self, Self::Tagged(Vec::new()));
         *self = match (payload, parent_count) {
             (Self::Values(values), 1) => Self::Values(values),
@@ -3870,6 +4515,9 @@ impl CandidatePayload {
                 pairs.extend(values.into_iter().map(|value| (0, value)));
                 Self::Tagged(pairs)
             }
+            (Self::Deferred(_), _) => {
+                unreachable!("deferred candidates were materialized above")
+            }
         };
     }
 
@@ -3877,6 +4525,7 @@ impl CandidatePayload {
         match self {
             Self::Values(values) => values.len(),
             Self::Tagged(pairs) => pairs.len(),
+            Self::Deferred(candidates) => candidates.len,
         }
     }
 
@@ -3884,15 +4533,49 @@ impl CandidatePayload {
         self.len() == 0
     }
 
-    #[cfg(test)]
     fn iter(&self) -> CandidatePayloadIter<'_> {
         match self {
             Self::Values(values) => CandidatePayloadIter::Values(values.iter()),
             Self::Tagged(pairs) => CandidatePayloadIter::Tagged(pairs.iter()),
+            Self::Deferred(candidates) => CandidatePayloadIter::Deferred(candidates.iter()),
         }
     }
 
+    /// Moves a contiguous payload behind an immutable shared root without
+    /// copying occurrences. Cyclic action opening uses this immediately
+    /// before cloning one parent input into an activation-local reducer.
+    fn defer_for_shared_activation(&mut self, parent_count: usize) {
+        self.debug_assert_valid_for(parent_count);
+        if matches!(self, Self::Deferred(_)) {
+            return;
+        }
+        let payload = std::mem::replace(self, Self::Tagged(Vec::new()));
+        *self = Self::Deferred(DeferredCandidates::from_payload(payload, parent_count));
+    }
+
+    /// Crosses the existing unbudgeted planner/action-opening boundary.
+    ///
+    /// Affine reducer completion and Worklist reconvergence must never call
+    /// this method: they retain [`CandidatePayload::Deferred`] exactly.  It is
+    /// reserved for old protocol operations whose signatures require a
+    /// mutable contiguous `CandidateSink`, or for planning/splitting code that
+    /// already drains a complete candidate atom.  Centralizing the conversion
+    /// keeps that remaining unbounded work visible instead of charging it to
+    /// a bounded reducer receipt.
+    fn materialize_for_planning_or_action_opening(&mut self) {
+        let Self::Deferred(_) = self else {
+            return;
+        };
+        let Self::Deferred(candidates) =
+            std::mem::replace(self, Self::Tagged(Vec::new()))
+        else {
+            unreachable!()
+        };
+        *self = candidates.into_contiguous();
+    }
+
     fn sink(&mut self, parent_count: usize) -> CandidateSink<'_> {
+        self.materialize_for_planning_or_action_opening();
         self.debug_assert_valid_for(parent_count);
         match self {
             Self::Values(values) => {
@@ -3900,20 +4583,36 @@ impl CandidatePayload {
                 CandidateSink::Values(values)
             }
             Self::Tagged(pairs) => CandidateSink::Tagged(pairs),
+            Self::Deferred(_) => unreachable!("candidate sink requires materialized storage"),
         }
     }
 
     fn as_tagged_mut(&mut self) -> &mut Candidates {
+        self.materialize_for_planning_or_action_opening();
         match self {
             Self::Tagged(pairs) => pairs,
-            Self::Values(_) => panic!("tagged candidate payload required"),
+            Self::Values(_) | Self::Deferred(_) => {
+                panic!("tagged candidate payload required")
+            }
         }
     }
 
     fn one_parent_values(&self) -> &[RawInline] {
         match self {
             Self::Values(values) => values,
-            Self::Tagged(_) => panic!("one-parent payload was not normalized to plain values"),
+            Self::Deferred(candidates) => match candidates.root.as_deref() {
+                None => &[],
+                Some(DeferredCandidateNode {
+                    kind: DeferredCandidateNodeKind::Values { values, range },
+                    ..
+                }) => &values[range.clone()],
+                Some(_) => panic!(
+                    "one-parent activation input was segmented before cyclic opening"
+                ),
+            },
+            Self::Tagged(_) => {
+                panic!("one-parent payload was not normalized to plain values")
+            }
         }
     }
 
@@ -3924,19 +4623,41 @@ impl CandidatePayload {
             Self::Tagged(pairs) => pairs
                 .iter()
                 .all(|(parent, _)| (*parent as usize) < parent_count),
+            Self::Deferred(candidates) => {
+                candidates.parent_count == parent_count
+                    && candidates.root.as_ref().map_or(true, |root| {
+                        root.grouped && (root.last_parent as usize) < parent_count
+                    })
+            }
         }
     }
 
     #[inline]
     fn mark_live_parents(&self, live: &mut [bool]) {
+        self.debug_assert_valid_for(live.len());
+        // Formula Confirm finalizers and other singleton action results can
+        // answer liveness from the cached payload length.  Do not walk a
+        // deferred occurrence stream merely to learn whether it is empty.
+        if live.len() == 1 {
+            live[0] = !self.is_empty();
+            return;
+        }
         match self {
-            Self::Values(values) => {
-                assert_eq!(live.len(), 1, "plain candidates require one parent");
-                live[0] = !values.is_empty();
+            Self::Values(_) => {
+                panic!(
+                    "plain candidates require one parent (received {})",
+                    live.len()
+                );
             }
             Self::Tagged(pairs) => {
                 for (parent, _) in pairs {
                     live[*parent as usize] = true;
+                }
+            }
+            Self::Deferred(candidates) => {
+                assert_eq!(candidates.parent_count, live.len());
+                for (parent, _) in candidates.iter() {
+                    live[parent as usize] = true;
                 }
             }
         }
@@ -3946,6 +4667,22 @@ impl CandidatePayload {
         assert!(left_parents > 0 && right_parents > 0);
         self.debug_assert_valid_for(left_parents);
         other.debug_assert_valid_for(right_parents);
+        if matches!(self, Self::Deferred(_)) || matches!(&other, Self::Deferred(_)) {
+            let left = DeferredCandidates::from_payload(
+                std::mem::replace(self, Self::Tagged(Vec::new())),
+                left_parents,
+            );
+            let right = DeferredCandidates::from_payload(other, right_parents);
+            *self = Self::Deferred(DeferredCandidates::concat(
+                left,
+                right,
+                left_parents,
+                left_parents
+                    .checked_add(right_parents)
+                    .expect("candidate parent count overflow"),
+            ));
+            return;
+        }
         let offset = u32::try_from(left_parents).expect("too many candidate parents");
         let left = std::mem::replace(self, Self::Tagged(Vec::new()));
         *self = match (left, other) {
@@ -3979,26 +4716,59 @@ impl CandidatePayload {
                 }));
                 Self::Tagged(left)
             }
+            (Self::Deferred(_), _) | (_, Self::Deferred(_)) => {
+                unreachable!("deferred append returned above")
+            }
         };
     }
 
     /// Appends candidates that already share the same affine parent domain.
     /// Formula OR reduction uses this operation; unlike bucket reconvergence,
     /// the right-hand row coordinates must not be shifted.
-    fn extend_same_domain(&mut self, other: Self, parent_count: usize) {
+    fn extend_same_domain(&mut self, mut other: Self, parent_count: usize) {
         self.debug_assert_valid_for(parent_count);
         other.debug_assert_valid_for(parent_count);
+        // Multi-parent OR reduction sorts immediately and therefore already
+        // crosses a whole-group materialization boundary. Keeping deferred
+        // same-domain concat exclusive to one parent makes every deferred
+        // multi-parent rope globally grouped, so structural parent cuts need
+        // only cached boundary tags.
+        if parent_count != 1
+            && (matches!(self, Self::Deferred(_)) || matches!(&other, Self::Deferred(_)))
+        {
+            self.materialize_for_planning_or_action_opening();
+            other.materialize_for_planning_or_action_opening();
+        }
+        if matches!(self, Self::Deferred(_)) || matches!(&other, Self::Deferred(_)) {
+            let left = DeferredCandidates::from_payload(
+                std::mem::replace(self, Self::Tagged(Vec::new())),
+                parent_count,
+            );
+            let right = DeferredCandidates::from_payload(other, parent_count);
+            *self = Self::Deferred(DeferredCandidates::concat(
+                left,
+                right,
+                0,
+                parent_count,
+            ));
+            return;
+        }
         match (self, other) {
             (Self::Values(left), Self::Values(mut right)) => left.append(&mut right),
             (Self::Tagged(left), Self::Tagged(mut right)) => left.append(&mut right),
+            (Self::Deferred(_), _) | (_, Self::Deferred(_)) => {
+                unreachable!("deferred append returned above")
+            }
             _ => unreachable!("same parent domain selected incompatible candidate shapes"),
         }
     }
 
     fn sort_unstable(&mut self) {
+        self.materialize_for_planning_or_action_opening();
         match self {
             Self::Values(values) => values.sort_unstable(),
             Self::Tagged(pairs) => pairs.sort_unstable(),
+            Self::Deferred(_) => unreachable!("candidate sort requires materialized storage"),
         }
     }
 
@@ -4006,19 +4776,25 @@ impl CandidatePayload {
         match self {
             Self::Values(values) => values.is_sorted(),
             Self::Tagged(pairs) => pairs.is_sorted(),
+            Self::Deferred(candidates) => candidates.iter().is_sorted(),
         }
     }
 
     fn dedup(&mut self) {
+        self.materialize_for_planning_or_action_opening();
         match self {
             Self::Values(values) => values.dedup(),
             Self::Tagged(pairs) => pairs.dedup(),
+            Self::Deferred(_) => unreachable!("candidate dedup requires materialized storage"),
         }
     }
 
     fn take_parent_tail(&mut self, first: usize, parent_count: usize) -> Self {
         assert!(first > 0 && first < parent_count);
         self.debug_assert_valid_for(parent_count);
+        if let Self::Deferred(candidates) = self {
+            return Self::Deferred(candidates.take_parent_tail(first));
+        }
         let Self::Tagged(pairs) = self else {
             unreachable!("a partial parent split requires tagged candidates")
         };
@@ -4040,6 +4816,15 @@ impl CandidatePayload {
     fn take_candidate_tail(&mut self, parent_count: usize, take: usize) -> (Self, usize, usize) {
         assert!(take > 0 && take < self.len());
         self.debug_assert_valid_for(parent_count);
+        if let Self::Deferred(candidates) = self {
+            let (tail, first_tail_parent, prefix_parent_count) =
+                candidates.take_occurrence_tail(take);
+            return (
+                Self::Deferred(tail),
+                first_tail_parent,
+                prefix_parent_count,
+            );
+        }
         let cut = self.len() - take;
         match self {
             Self::Values(values) => {
@@ -4066,6 +4851,9 @@ impl CandidatePayload {
                     prefix_parent_count,
                 )
             }
+            Self::Deferred(_) => {
+                unreachable!("candidate split requires materialized storage")
+            }
         }
     }
 
@@ -4082,19 +4870,24 @@ impl CandidatePayload {
                     .iter()
                     .all(|(parent, _)| (*parent as usize) < parent_count));
             }
+            Self::Deferred(candidates) => {
+                debug_assert_eq!(candidates.parent_count, parent_count);
+                debug_assert!(candidates.root.as_ref().map_or(true, |root| {
+                    root.grouped && (root.last_parent as usize) < parent_count
+                }));
+            }
         }
     }
 
     #[cfg(test)]
     fn is_values(&self) -> bool {
         matches!(self, Self::Values(_))
+            || matches!(self, Self::Deferred(candidates) if candidates.parent_count == 1)
     }
 
     #[cfg(test)]
     fn tagged_snapshot(&self) -> Candidates {
-        self.iter()
-            .map(|(parent, value)| (parent, *value))
-            .collect()
+        self.iter().collect()
     }
 }
 
@@ -4107,7 +4900,7 @@ where
         self.iter().eq(other
             .as_ref()
             .iter()
-            .map(|(parent, value)| (*parent, value)))
+            .map(|(parent, value)| (*parent, *value)))
     }
 }
 
@@ -4162,30 +4955,16 @@ impl CandidateBatch {
 
         let first = self.parents.row_count - take;
         let tail_rows = self.parents.rows.split_off(first * stride);
+        let parent_count = self.parents.row_count;
+        let candidates = self.candidates.take_parent_tail(first, parent_count);
         self.parents.row_count = first;
-
-        let CandidatePayload::Tagged(pairs) = &mut self.candidates else {
-            unreachable!("a partial parent split requires tagged candidates")
-        };
-        let candidate_cut = pairs.partition_point(|(row, _)| (*row as usize) < first);
-        let mut candidates = pairs.split_off(candidate_cut);
-        let first = u32::try_from(first).expect("too many candidate parents");
-        for (row, _) in &mut candidates {
-            *row = row
-                .checked_sub(first)
-                .expect("candidate tail contained a prefix row");
-        }
-
-        self.candidates.normalize_for(self.parents.row_count);
-        let mut tail = Self {
+        Self {
             parents: RowBatch {
                 rows: tail_rows,
                 row_count: take,
             },
-            candidates: CandidatePayload::Tagged(candidates),
-        };
-        tail.candidates.normalize_for(tail.parents.row_count);
-        tail
+            candidates,
+        }
     }
 
     /// Takes at most `width` candidate occurrences from the tail, allowing a
@@ -4210,21 +4989,9 @@ impl CandidateBatch {
             };
         }
 
-        let cut = self.candidate_count() - take;
-        if let CandidatePayload::Values(values) = &mut self.candidates {
-            assert_eq!(self.parents.row_count, 1);
-            let tail_candidates = values.split_off(cut);
-            return Self {
-                parents: self.parents.clone(),
-                candidates: CandidatePayload::Values(tail_candidates),
-            };
-        }
-        let CandidatePayload::Tagged(pairs) = &mut self.candidates else {
-            unreachable!()
-        };
-        let mut tail_candidates = pairs.split_off(cut);
-        let first_tail_parent = tail_candidates[0].0 as usize;
-        let prefix_parent_count = pairs.last().unwrap().0 as usize + 1;
+        let parent_count = self.parents.row_count;
+        let (tail_candidates, first_tail_parent, prefix_parent_count) =
+            self.candidates.take_candidate_tail(parent_count, take);
         assert!(
             first_tail_parent < self.parents.row_count,
             "constraint emitted an invalid candidate row tag"
@@ -4239,35 +5006,33 @@ impl CandidateBatch {
         // the one binding duplicated when the cut bisects a parent group.
         let tail_rows = self.parents.rows[first_tail_parent * stride..].to_vec();
         let tail_parent_count = self.parents.row_count - first_tail_parent;
-        let first_tail_parent = u32::try_from(first_tail_parent).expect("too many parents");
-        for (parent, _) in &mut tail_candidates {
-            *parent = parent
-                .checked_sub(first_tail_parent)
-                .expect("candidate tail contained an earlier parent");
-        }
         self.parents.rows.truncate(prefix_parent_count * stride);
         self.parents.row_count = prefix_parent_count;
-        self.candidates.normalize_for(prefix_parent_count);
 
-        let mut tail = Self {
+        Self {
             parents: RowBatch {
                 rows: tail_rows,
                 row_count: tail_parent_count,
             },
-            candidates: CandidatePayload::Tagged(tail_candidates),
-        };
-        tail.candidates.normalize_for(tail_parent_count);
-        tail
+            candidates: tail_candidates,
+        }
     }
 
     /// Stable-partitions parents and their ragged candidate groups in one
     /// pass according to a per-parent leaf-occurrence assignment.
-    fn partition<K>(self, stride: usize, assignment: &[K]) -> BTreeMap<K, Self>
+    fn partition<K>(mut self, stride: usize, assignment: &[K]) -> BTreeMap<K, Self>
     where
         K: Clone + Ord,
     {
+        assert_eq!(assignment.len(), self.parents.row_count);
+        if let Some(first) = assignment.first() {
+            if assignment.iter().all(|child| child == first) {
+                return BTreeMap::from([(first.clone(), self)]);
+            }
+        }
+        self.candidates
+            .materialize_for_planning_or_action_opening();
         let RowBatch { rows, row_count } = self.parents;
-        assert_eq!(assignment.len(), row_count);
         let mut remap = vec![u32::MAX; row_count];
         let mut groups: BTreeMap<K, Self> = BTreeMap::new();
 
@@ -4312,6 +5077,9 @@ impl CandidateBatch {
                         .push((remap[parent], value));
                 }
             }
+            CandidatePayload::Deferred(_) => {
+                unreachable!("candidate partition requires materialized storage")
+            }
         }
         for group in groups.values_mut() {
             group.candidates.normalize_for(group.parents.row_count);
@@ -4326,10 +5094,12 @@ impl CandidateBatch {
         if self.candidates.is_empty() {
             return None;
         }
-        if matches!(self.candidates, CandidatePayload::Values(_)) {
+        if self.parents.row_count == 1 {
             assert_eq!(self.parents.row_count, 1);
             return Some(self);
         }
+        self.candidates
+            .materialize_for_planning_or_action_opening();
         let CandidatePayload::Tagged(pairs) = &mut self.candidates else {
             unreachable!()
         };
@@ -4376,8 +5146,10 @@ impl CandidateBatch {
         Some(self)
     }
 
-    fn into_parent_candidates(self) -> (RowBatch, Vec<Vec<RawInline>>) {
+    fn into_parent_candidates(mut self) -> (RowBatch, Vec<Vec<RawInline>>) {
         let parent_count = self.parents.row_count;
+        self.candidates
+            .materialize_for_planning_or_action_opening();
         let groups = match self.candidates {
             CandidatePayload::Values(values) => {
                 assert_eq!(parent_count, 1);
@@ -4394,6 +5166,9 @@ impl CandidateBatch {
                     groups[parent].push(value);
                 }
                 groups
+            }
+            CandidatePayload::Deferred(_) => {
+                unreachable!("candidate grouping requires materialized storage")
             }
         };
         assert!(
@@ -4849,7 +5624,7 @@ impl FormulaBatch {
         }
 
         fn partition_values<K>(
-            values: CandidatePayload,
+            mut values: CandidatePayload,
             assignment: &[K],
             remap: &[u32],
             groups: &mut BTreeMap<K, FormulaBatch>,
@@ -4858,6 +5633,11 @@ impl FormulaBatch {
         ) where
             K: Clone + Ord,
         {
+            // Non-uniform planning already visits every occurrence to assign
+            // it to a new parent domain. This is an explicit existing
+            // planner-opening boundary, not reducer completion or scheduler
+            // width selection.
+            values.materialize_for_planning_or_action_opening();
             let CandidatePayload::Tagged(pairs) = values else {
                 unreachable!("a non-uniform formula partition requires multiple parents")
             };
@@ -4911,7 +5691,23 @@ impl FormulaBatch {
     /// Moves every affine parent, including its complete reducer-frame stack,
     /// into a one-parent payload suitable for activation-local cyclic work.
     /// Candidate tags are normalized to zero by the ordinary partition path.
-    fn into_singletons(self, stride: usize) -> Vec<Self> {
+    fn into_singletons(mut self, stride: usize) -> Vec<Self> {
+        // Activation-local constraint APIs still borrow contiguous candidate
+        // slices. Materialize here, at the exact action-opening boundary,
+        // before immutable Formula batches enter the cyclic registry. A
+        // deferred Worklist result remains segmented through every scheduler
+        // merge and width cut leading up to this point.
+        for frame in &mut self.frames {
+            match frame {
+                FormulaPayloadFrame::Or { source, output } => {
+                    source.materialize_for_planning_or_action_opening();
+                    output.materialize_for_planning_or_action_opening();
+                }
+                FormulaPayloadFrame::And { current } => {
+                    current.materialize_for_planning_or_action_opening();
+                }
+            }
+        }
         let parent_count = self.parents.row_count;
         let assignment: Vec<_> = (0..parent_count).collect();
         let groups = self.partition(stride, &assignment);
@@ -5776,6 +6572,11 @@ fn committed_candidate_rows_mapped(
         }
         CandidatePayload::Tagged(pairs) => {
             for (parent, candidate) in pairs {
+                commit_one(parent as usize, candidate);
+            }
+        }
+        CandidatePayload::Deferred(candidates) => {
+            for (parent, candidate) in candidates.iter() {
                 commit_one(parent as usize, candidate);
             }
         }
@@ -13577,6 +14378,15 @@ mod tests {
         CandidatePayload::from_tagged(candidates, parent_count)
     }
 
+    fn deferred_candidate_payload(
+        parent_count: usize,
+        candidates: Candidates,
+    ) -> CandidatePayload {
+        let mut payload = candidate_payload(parent_count, candidates);
+        payload.defer_for_shared_activation(parent_count);
+        payload
+    }
+
     fn ready_desc(bound_count: usize) -> StateDesc {
         let mut bound = VariableSet::new_empty();
         for variable in 0..bound_count {
@@ -15508,6 +16318,213 @@ mod tests {
     }
 
     #[test]
+    fn deferred_candidate_clone_and_cursor_share_the_immutable_root() {
+        let payload = deferred_candidate_payload(
+            1,
+            vec![(0, raw(1)), (0, raw(1)), (0, raw(2)), (0, raw(3))],
+        );
+        let cloned = payload.clone();
+        let (CandidatePayload::Deferred(original), CandidatePayload::Deferred(copy)) =
+            (&payload, &cloned)
+        else {
+            panic!("deferral did not produce a shared candidate root")
+        };
+        assert!(Arc::ptr_eq(
+            original.root.as_ref().expect("nonempty payload has a root"),
+            copy.root.as_ref().expect("cloned payload has a root")
+        ));
+
+        let mut cursor = original.cursor();
+        let mut cursor_copy = cursor.clone();
+        assert_eq!(cursor.next(), Some((0, raw(1))));
+        assert_eq!(cursor.next(), Some((0, raw(1))));
+        assert_eq!(cursor_copy.next(), Some((0, raw(1))));
+        assert_eq!(cursor_copy.remaining, 3);
+        assert_eq!(cursor.remaining, 2);
+
+        let debug = format!("{payload:?}");
+        assert!(debug.contains("shared-rope"));
+        assert!(!debug.contains("DeferredCandidateNode"));
+    }
+
+    #[test]
+    fn deferred_same_parent_concat_preserves_duplicates_and_constant_time_liveness() {
+        let mut payload = deferred_candidate_payload(
+            1,
+            vec![(0, raw(3)), (0, raw(1)), (0, raw(3))],
+        );
+        payload.extend_same_domain(
+            candidate_payload(1, vec![(0, raw(2)), (0, raw(2))]),
+            1,
+        );
+        assert!(matches!(&payload, CandidatePayload::Deferred(_)));
+        assert_eq!(
+            payload.tagged_snapshot(),
+            [(0, raw(3)), (0, raw(1)), (0, raw(3)), (0, raw(2)), (0, raw(2))]
+        );
+
+        let mut live = [false];
+        payload.mark_live_parents(&mut live);
+        assert_eq!(live, [true]);
+
+        let mut empty = deferred_candidate_payload(1, Vec::new());
+        empty.mark_live_parents(&mut live);
+        assert_eq!(live, [false]);
+        empty.materialize_for_planning_or_action_opening();
+        assert!(empty.is_values());
+    }
+
+    #[test]
+    fn deferred_disjoint_concat_splits_parents_and_occurrences_structurally() {
+        let mut payload = deferred_candidate_payload(
+            2,
+            vec![(0, raw(10)), (0, raw(11)), (1, raw(12))],
+        );
+        payload.append_disjoint(
+            candidate_payload(2, vec![(0, raw(20)), (0, raw(20)), (1, raw(21))]),
+            2,
+            2,
+        );
+        assert!(matches!(&payload, CandidatePayload::Deferred(_)));
+        assert_eq!(
+            payload.tagged_snapshot(),
+            [
+                (0, raw(10)),
+                (0, raw(11)),
+                (1, raw(12)),
+                (2, raw(20)),
+                (2, raw(20)),
+                (3, raw(21)),
+            ]
+        );
+
+        let mut parent_prefix = payload.clone();
+        let parent_tail = parent_prefix.take_parent_tail(2, 4);
+        assert!(matches!(&parent_prefix, CandidatePayload::Deferred(_)));
+        assert!(matches!(&parent_tail, CandidatePayload::Deferred(_)));
+        assert_eq!(
+            parent_prefix.tagged_snapshot(),
+            [(0, raw(10)), (0, raw(11)), (1, raw(12))]
+        );
+        assert_eq!(
+            parent_tail.tagged_snapshot(),
+            [(0, raw(20)), (0, raw(20)), (1, raw(21))]
+        );
+
+        let mut occurrence_prefix = CandidateBatch {
+            parents: RowBatch {
+                rows: vec![raw(30), raw(31), raw(32), raw(33)],
+                row_count: 4,
+            },
+            candidates: payload,
+        };
+        // The cut lands between the two occurrences of old parent 2. Its
+        // affine parent row must therefore be present in both result pages.
+        let occurrence_tail = occurrence_prefix.take_candidate_tail(1, 2);
+        assert_eq!(
+            occurrence_prefix.parents.rows,
+            [raw(30), raw(31), raw(32)]
+        );
+        assert_eq!(occurrence_tail.parents.rows, [raw(32), raw(33)]);
+        assert!(matches!(
+            &occurrence_prefix.candidates,
+            CandidatePayload::Deferred(_)
+        ));
+        assert!(matches!(
+            &occurrence_tail.candidates,
+            CandidatePayload::Deferred(_)
+        ));
+        assert_eq!(
+            occurrence_prefix.candidates.tagged_snapshot(),
+            [(0, raw(10)), (0, raw(11)), (1, raw(12)), (2, raw(20))]
+        );
+        assert_eq!(
+            occurrence_tail.candidates.tagged_snapshot(),
+            [(0, raw(20)), (1, raw(21))]
+        );
+
+        fn tagged_leaf_buffers(node: &Arc<DeferredCandidateNode>, buffers: &mut Vec<usize>) {
+            match &node.kind {
+                DeferredCandidateNodeKind::Tagged { pairs, .. } => {
+                    buffers.push(Arc::as_ptr(pairs) as usize)
+                }
+                DeferredCandidateNodeKind::Shift { inner, .. } => {
+                    tagged_leaf_buffers(inner, buffers)
+                }
+                DeferredCandidateNodeKind::Concat { left, right } => {
+                    tagged_leaf_buffers(left, buffers);
+                    tagged_leaf_buffers(right, buffers);
+                }
+                DeferredCandidateNodeKind::Values { .. } => {}
+            }
+        }
+        let CandidatePayload::Deferred(prefix_deferred) = &occurrence_prefix.candidates else {
+            unreachable!()
+        };
+        let CandidatePayload::Deferred(tail_deferred) = &occurrence_tail.candidates else {
+            unreachable!()
+        };
+        let mut prefix_buffers = Vec::new();
+        let mut tail_buffers = Vec::new();
+        tagged_leaf_buffers(
+            prefix_deferred.root.as_ref().expect("prefix has candidates"),
+            &mut prefix_buffers,
+        );
+        tagged_leaf_buffers(
+            tail_deferred.root.as_ref().expect("tail has candidates"),
+            &mut tail_buffers,
+        );
+        assert!(prefix_buffers
+            .iter()
+            .any(|buffer| tail_buffers.contains(buffer)));
+
+        let mut contiguous = occurrence_tail.candidates.clone();
+        contiguous.materialize_for_planning_or_action_opening();
+        assert!(matches!(&contiguous, CandidatePayload::Tagged(_)));
+        assert_eq!(
+            contiguous.tagged_snapshot(),
+            occurrence_tail.candidates.tagged_snapshot()
+        );
+    }
+
+    #[test]
+    fn uniform_candidate_partition_retains_the_deferred_root() {
+        let payload = deferred_candidate_payload(
+            3,
+            vec![(0, raw(1)), (1, raw(2)), (1, raw(2)), (2, raw(3))],
+        );
+        let CandidatePayload::Deferred(deferred) = &payload else {
+            panic!("test payload was not deferred")
+        };
+        let root = deferred
+            .root
+            .as_ref()
+            .expect("nonempty payload has a root")
+            .clone();
+        let batch = CandidateBatch {
+            parents: RowBatch {
+                rows: vec![raw(10), raw(11), raw(12)],
+                row_count: 3,
+            },
+            candidates: payload,
+        };
+
+        let mut groups = batch.partition(1, &[7u8, 7, 7]);
+        let group = groups.remove(&7).expect("uniform partition has one group");
+        let CandidatePayload::Deferred(deferred) = &group.candidates else {
+            panic!("uniform partition materialized the candidate rope")
+        };
+        assert!(Arc::ptr_eq(
+            &root,
+            deferred.root.as_ref().expect("partition retained its root")
+        ));
+        assert_eq!(
+            group.candidates.tagged_snapshot(),
+            [(0, raw(1)), (1, raw(2)), (1, raw(2)), (2, raw(3))]
+        );
+    }
+
+    #[test]
     fn candidate_partition_and_compaction_demote_single_parent_groups() {
         let mut empty_shell = CandidatePayload::Values(Vec::new());
         empty_shell.normalize_for(0);
@@ -15547,7 +16564,7 @@ mod tests {
             batch
                 .candidates
                 .iter()
-                .map(|(parent, candidate)| (batch.parents.rows[parent as usize], *candidate))
+                .map(|(parent, candidate)| (batch.parents.rows[parent as usize], candidate))
                 .collect()
         }
 
@@ -15604,7 +16621,7 @@ mod tests {
                     let start = parent * stride;
                     (
                         batch.parents.rows[start..start + stride].to_vec(),
-                        *candidate,
+                        candidate,
                     )
                 })
                 .collect()
