@@ -50,11 +50,14 @@
 //!    never waits on another cohort's device round trip, and a lane whose
 //!    dispatch ever exited without validating is never leased again. All
 //!    pure preflight runs before acquisition, so declines cannot poison.
-//! 2. **The geometry frontier** ([`ValueRouteAdmission`]): an explicitly
-//!    enabled policy admits by cohort rows and exact page work. QoS
-//!    placement intent (consumer-owned, shard-inherited) is deliberately
-//!    absent from this first route and returns as a later, measured second
-//!    policy arm.
+//! 2. **The admission geometry** ([`ValueRouteAdmission`]): an explicitly
+//!    enabled policy admits by cohort rows and exact page work — `Force`
+//!    for parity/acceptance probes, or the explicitly experimental
+//!    calibrated `WarmM4` dominance score. There is deliberately **no
+//!    `Auto`**: the lease is not a readiness signal, and automatic
+//!    placement must never wait or compile. QoS placement intent
+//!    (consumer-owned, shard-inherited) is likewise absent from this first
+//!    route and returns as a later, measured second policy arm.
 
 use std::env;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -89,13 +92,14 @@ use crate::typed_program::WGPU_RESIDENT_EXECUTOR;
 ///
 /// Read exactly once, at [`WgpuSuccinctArchive::value_route`] construction:
 ///
-/// - unset or empty: [`ValueRouteAdmission::Off`] (the deliverable default —
-///   flipping the default to `auto` is a later, engine-owner decision),
+/// - unset or empty: [`ValueRouteAdmission::Off`] (the default),
 /// - `off` or `0`: [`ValueRouteAdmission::Off`],
-/// - `auto`: [`ValueRouteAdmission::AUTO_FRONTIER`],
 /// - `force`: [`ValueRouteAdmission::Force`],
-/// - `frontier:R:W`: [`ValueRouteAdmission::Frontier`] with `min_rows = R`
-///   and `min_page_work = W`,
+/// - `warm-m4`: [`ValueRouteAdmission::WarmM4`] (explicitly experimental),
+/// - `auto`: **rejected** ([`ValueRouteConfigError::AutoNotReady`]) — no
+///   universal automatic policy exists yet, because the per-snapshot lease
+///   is not a readiness signal and automatic placement must never wait or
+///   compile,
 /// - anything else: a [`ValueRouteConfigError`] — never a silent fallback.
 pub const VALUE_ROUTE_ENV: &str = "TRIBLESPACE_GPU_VALUE_ROUTE";
 
@@ -108,17 +112,31 @@ pub const TWO_BOUND_VALUE_OP: &str = "two-bound-transition/value-route";
 /// activation request must never quietly run with a different admission
 /// than the operator asked for.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ValueRouteConfigError {
-    value: String,
+pub enum ValueRouteConfigError {
+    /// The value is outside the grammar.
+    Invalid {
+        /// The rejected value.
+        value: String,
+    },
+    /// `auto` is deliberately not accepted: until a genuine backend
+    /// readiness seam exists, the per-snapshot lease cannot prove that
+    /// automatic placement would never wait or compile, so no policy may
+    /// present itself as a universal automatic default.
+    AutoNotReady,
 }
 
 impl fmt::Display for ValueRouteConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "invalid {VALUE_ROUTE_ENV} value {:?}: expected unset, off, 0, auto, force, or frontier:R:W",
-            self.value
-        )
+        match self {
+            Self::Invalid { value } => write!(
+                f,
+                "invalid {VALUE_ROUTE_ENV} value {value:?}: expected unset, off, 0, force, or warm-m4"
+            ),
+            Self::AutoNotReady => write!(
+                f,
+                "{VALUE_ROUTE_ENV}=auto is not available: no readiness seam proves automatic                  placement would never wait or compile; use the explicitly experimental warm-m4                  calibration or force"
+            ),
+        }
     }
 }
 
@@ -129,6 +147,14 @@ impl Error for ValueRouteConfigError {}
 /// The decision weighs the cohort's row count and its exact page work
 /// `sum(min(remaining, grant))` in examined outputs. The default is
 /// [`Off`](Self::Off): never route.
+///
+/// This first route admits **by geometry only**: an explicitly enabled
+/// policy weighs cohort rows and exact page work, never a QoS class.
+/// Consumer-owned placement intent (serial pulls latency-priority, explicit
+/// parallel iterators marking their shards throughput, Program steps
+/// inheriting the shard's intent) returns as a later, measured second
+/// policy arm once the engine's intent seam lands; the nonblocking lease
+/// stays the hard never-wait boundary either way.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ValueRouteAdmission {
     /// Never route; every cohort steps Native. This is the default.
@@ -137,34 +163,35 @@ pub enum ValueRouteAdmission {
     /// regardless of size. Intended for parity runs and acceptance probes,
     /// not as a measured production policy.
     Force,
-    /// Route cohorts at or above the conservative dominance frontier: at
-    /// least `min_rows` input rows *and* at least `min_page_work` exact
-    /// examined outputs.
-    Frontier {
-        /// Minimum cohort input rows.
-        min_rows: usize,
-        /// Minimum exact page work, in examined outputs.
-        min_page_work: u64,
-    },
+    /// The **explicitly experimental** warm-M4 dominance score: route
+    /// cohorts whose `native_work_score = exact_page_work + 8 * rows`
+    /// reaches [`WARM_M4_ELIGIBLE_SCORE`].
+    ///
+    /// Calibrated from the expanded rows × fanout matrix on one warm Apple
+    /// M4 — resident buffers live, pipelines already compiled. It is *not*
+    /// a universal `Auto`: the per-snapshot Idle lease is a busy-mutex, not
+    /// a ready-now/prewarmed signal, so a first-launch cohort admitted by
+    /// this score could still pay compile or preparation cost. Automatic
+    /// placement must never wait or compile; until a genuine readiness
+    /// seam exists this policy stays opt-in and the env grammar rejects
+    /// `auto` outright.
+    WarmM4,
 }
 
-impl ValueRouteAdmission {
-    /// The conservative dominance frontier: cohorts of at least 2048 rows
-    /// carrying at least 8192 examined outputs. The crossover is expressed
-    /// in examined outputs, not cohort row count alone.
-    ///
-    /// These constants are **placeholders pending the 2D rows × fanout
-    /// benchmark**: the historical measurements behind them compared the
-    /// device against the old full-frontier CPU path, while the Native
-    /// fallback here is the O(inputs + page)
-    /// [`QueryProgram::transition_on_value_page`], which may shift the
-    /// crossover substantially. They are deliberately conservative, not
-    /// measured production values.
-    pub const AUTO_FRONTIER: Self = Self::Frontier {
-        min_rows: 2048,
-        min_page_work: 8192,
-    };
+/// Native-work weight of one parent row in the warm-M4 dominance score.
+///
+/// Experimental calibration (warm Apple M4, resident and compiled); see
+/// [`ValueRouteAdmission::WarmM4`].
+pub const WARM_M4_ROW_WORK: u128 = 8;
 
+/// Minimum `exact_page_work + 8 * rows` score at which the warm-M4 matrix
+/// observed device dominance.
+///
+/// Experimental calibration (warm Apple M4, resident and compiled); see
+/// [`ValueRouteAdmission::WarmM4`].
+pub const WARM_M4_ELIGIBLE_SCORE: u128 = 98_304;
+
+impl ValueRouteAdmission {
     /// Reads [`VALUE_ROUTE_ENV`] once; see the constant for the grammar.
     pub fn from_env() -> Result<Self, ValueRouteConfigError> {
         Self::from_env_value(env::var(VALUE_ROUTE_ENV).ok().as_deref())
@@ -177,20 +204,12 @@ impl ValueRouteAdmission {
         let text = text.trim();
         match text {
             "" | "off" | "0" => Ok(Self::Off),
-            "auto" => Ok(Self::AUTO_FRONTIER),
             "force" => Ok(Self::Force),
-            other => other
-                .strip_prefix("frontier:")
-                .and_then(|rest| {
-                    let (rows, work) = rest.split_once(':')?;
-                    Some(Self::Frontier {
-                        min_rows: rows.parse().ok()?,
-                        min_page_work: work.parse().ok()?,
-                    })
-                })
-                .ok_or_else(|| ValueRouteConfigError {
-                    value: text.to_owned(),
-                }),
+            "warm-m4" => Ok(Self::WarmM4),
+            "auto" => Err(ValueRouteConfigError::AutoNotReady),
+            other => Err(ValueRouteConfigError::Invalid {
+                value: other.to_owned(),
+            }),
         }
     }
 
@@ -199,32 +218,19 @@ impl ValueRouteAdmission {
         !matches!(self, Self::Off)
     }
 
-    /// The `(min_rows, min_page_work)` frontier admitting a cohort, or
-    /// `None` to decline every cohort.
-    ///
-    /// This first route admits **by geometry only**: an explicitly enabled
-    /// policy weighs cohort rows and exact page work, never a QoS class.
-    /// Consumer-owned placement intent (serial pulls latency-priority,
-    /// explicit parallel iterators marking their shards throughput, Program
-    /// steps inheriting the shard's intent) returns as a later, measured
-    /// second policy arm once the engine's intent seam lands; the
-    /// nonblocking lease stays the hard never-wait boundary either way.
-    fn frontier(&self) -> Option<(usize, u64)> {
-        match self {
-            Self::Off => None,
-            Self::Force => Some((1, 1)),
-            Self::Frontier {
-                min_rows,
-                min_page_work,
-            } => Some((*min_rows, *min_page_work)),
-        }
-    }
-
     /// The complete admission decision for one already-formed cohort.
     pub fn admits(&self, rows: usize, page_work: u64) -> bool {
-        self.frontier().is_some_and(|(min_rows, min_page_work)| {
-            rows >= min_rows && page_work >= min_page_work && rows > 0
-        })
+        if rows == 0 || page_work == 0 {
+            return false;
+        }
+        match self {
+            Self::Off => false,
+            Self::Force => true,
+            Self::WarmM4 => {
+                let score = page_work as u128 + WARM_M4_ROW_WORK * rows as u128;
+                score >= WARM_M4_ELIGIBLE_SCORE
+            }
+        }
     }
 }
 
@@ -1506,14 +1512,9 @@ mod tests {
         assert_eq!(off.counters().physical_cohorts, 0);
         assert_eq!(off.counters().declined_policy, 1);
 
-        // A cohort below the geometry frontier declines.
-        let selective = var_family(
-            &resident,
-            ValueRouteAdmission::Frontier {
-                min_rows: states.len() + 1,
-                min_page_work: 1,
-            },
-        );
+        // A small cohort sits far below the warm-M4 dominance score and
+        // declines by geometry.
+        let selective = var_family(&resident, ValueRouteAdmission::WarmM4);
         assert!(selective
             .try_step_physical(&states, batch(&limits))
             .is_none());
@@ -1629,11 +1630,17 @@ mod tests {
         assert!(!force.admits(1, 0));
         assert!(!force.admits(0, 1));
 
-        let auto = ValueRouteAdmission::AUTO_FRONTIER;
-        assert!(auto.routing_enabled());
-        assert!(auto.admits(2048, 8192));
-        assert!(!auto.admits(2047, 8192));
-        assert!(!auto.admits(2048, 8191));
+        // The experimental warm-M4 score is exact at its boundary:
+        // page_work + 8 * rows >= 98_304.
+        let warm = ValueRouteAdmission::WarmM4;
+        assert!(warm.routing_enabled());
+        assert!(warm.admits(1, 98_296));
+        assert!(!warm.admits(1, 98_295));
+        assert!(warm.admits(12_288, 1));
+        assert!(!warm.admits(12_287, 1));
+        assert!(warm.admits(usize::MAX, u64::MAX), "score math must not overflow");
+        assert!(!warm.admits(0, u64::MAX));
+        assert!(!warm.admits(usize::MAX, 0));
     }
 
     #[test]
@@ -1655,23 +1662,26 @@ mod tests {
             Ok(ValueRouteAdmission::Off)
         );
         assert_eq!(
-            ValueRouteAdmission::from_env_value(Some("auto")),
-            Ok(ValueRouteAdmission::AUTO_FRONTIER)
-        );
-        assert_eq!(
             ValueRouteAdmission::from_env_value(Some(" force ")),
             Ok(ValueRouteAdmission::Force)
         );
         assert_eq!(
-            ValueRouteAdmission::from_env_value(Some("frontier:64:512")),
-            Ok(ValueRouteAdmission::Frontier {
-                min_rows: 64,
-                min_page_work: 512,
-            })
+            ValueRouteAdmission::from_env_value(Some("warm-m4")),
+            Ok(ValueRouteAdmission::WarmM4)
         );
-        for invalid in ["on", "1", "frontier:64", "frontier:x:y", "FORCE"] {
-            assert!(
-                ValueRouteAdmission::from_env_value(Some(invalid)).is_err(),
+        // `auto` is rejected as not-ready, never silently coerced: no
+        // readiness seam proves automatic placement would not wait or
+        // compile.
+        assert_eq!(
+            ValueRouteAdmission::from_env_value(Some("auto")),
+            Err(ValueRouteConfigError::AutoNotReady)
+        );
+        for invalid in ["on", "1", "frontier:64:512", "warm_m4", "FORCE"] {
+            assert_eq!(
+                ValueRouteAdmission::from_env_value(Some(invalid)),
+                Err(ValueRouteConfigError::Invalid {
+                    value: invalid.to_owned(),
+                }),
                 "{invalid:?} must be a configuration error"
             );
         }

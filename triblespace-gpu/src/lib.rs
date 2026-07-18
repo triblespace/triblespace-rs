@@ -51,7 +51,7 @@ pub use succinct_query::{
 pub use value_route::{
     ResidentValueConstraint, ResidentValueRoute, SuccinctValueFamily, SuccinctValueState,
     ValueRouteAdmission, ValueRouteConfigError, ValueRouteCounters, ValueRouteCountersSnapshot,
-    TWO_BOUND_VALUE_OP, VALUE_ROUTE_ENV,
+    TWO_BOUND_VALUE_OP, VALUE_ROUTE_ENV, WARM_M4_ELIGIBLE_SCORE, WARM_M4_ROW_WORK,
 };
 
 #[cfg(any(test, feature = "wgpu", feature = "cuda"))]
