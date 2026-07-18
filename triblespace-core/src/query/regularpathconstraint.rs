@@ -384,6 +384,7 @@ impl ChainFrameReducer for ExistsEq {
 std::thread_local! {
     static SEEDED_CHAIN_FRAME_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static BULK_TRANSITION_COHORTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PAGEABLE_TRANSITION_PAGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -394,6 +395,11 @@ fn take_seeded_chain_frame_runs() -> usize {
 #[cfg(test)]
 fn take_bulk_transition_cohorts() -> usize {
     BULK_TRANSITION_COHORTS.with(|cohorts| cohorts.replace(0))
+}
+
+#[cfg(test)]
+fn take_pageable_transition_pages() -> usize {
+    PAGEABLE_TRANSITION_PAGES.with(|pages| pages.replace(0))
 }
 
 fn run_chain_frame<C, R>(root: C, seed: FrameSeedRow, mut reducer: R) -> R::Output
@@ -2211,6 +2217,8 @@ impl RegularPathConstraint {
         limit: usize,
         successors: &mut Vec<RpqOutput>,
     ) -> Option<RpqExpandPage> {
+        #[cfg(test)]
+        PAGEABLE_TRANSITION_PAGES.with(|pages| pages.set(pages.get() + 1));
         assert!(
             limit > 0,
             "residual transition pages require positive demand"
@@ -2258,6 +2266,70 @@ impl RegularPathConstraint {
         Some(RpqExpandPage { next, examined })
     }
 
+    /// Expands one compiled-product node for a certified complete action.
+    ///
+    /// A complete action cannot suspend, so an affine successor cursor has no
+    /// ownership role here. Positive branches therefore consume PATCH's
+    /// family-native borrowed subtree walk, while negated branches reuse their
+    /// complete set evaluators. The pageable lower-bound descent above remains
+    /// exclusively the representation of resumable transition work.
+    fn for_each_complete_delta_successor(
+        &self,
+        program: &DeltaProgram,
+        node: RpqNode,
+        mut emit: impl FnMut(RpqOutput),
+    ) {
+        let state = program.decode(node.pc);
+        for &(step, target) in &program.steps[state] {
+            let pc = program.encode(target);
+            let target_accepting = program.accepting[target as usize];
+            let mut emit_value = |value| {
+                emit(RpqOutput {
+                    node: RpqNode {
+                        source: node.source,
+                        value,
+                        pc,
+                    },
+                    accepted: target_accepting
+                        && node.source.is_none_or(|anchor| value == anchor),
+                });
+            };
+            match step {
+                DeltaStep::Attr(attribute) => {
+                    let Some(entity) = value_as_entity(&node.value) else {
+                        continue;
+                    };
+                    let mut prefix = [0u8; ID_LEN * 2];
+                    prefix[..ID_LEN].copy_from_slice(&entity);
+                    prefix[ID_LEN..].copy_from_slice(&attribute);
+                    self.set.eav.infixes::<{ ID_LEN * 2 }, 32, _>(
+                        &prefix,
+                        |value: &[u8; 32]| emit_value(*value),
+                    );
+                }
+                DeltaStep::InverseAttr(attribute) => {
+                    let mut prefix = [0u8; 32 + ID_LEN];
+                    prefix[..32].copy_from_slice(&node.value);
+                    prefix[32..].copy_from_slice(&attribute);
+                    self.set.vae.infixes::<{ 32 + ID_LEN }, ID_LEN, _>(
+                        &prefix,
+                        |entity: &[u8; ID_LEN]| emit_value(id_into_value(entity)),
+                    );
+                }
+                DeltaStep::NotAttr(excluded) => {
+                    for value in eval_not_attr(&self.set, &excluded, &node.value) {
+                        emit_value(value);
+                    }
+                }
+                DeltaStep::InverseNotAttr(excluded) => {
+                    for value in eval_not_attr_inverse(&self.set, &excluded, &node.value) {
+                        emit_value(value);
+                    }
+                }
+            }
+        }
+    }
+
     /// Exhausts one bound-endpoint product traversal for the eager Program
     /// complete-action route.
     ///
@@ -2281,7 +2353,6 @@ impl RegularPathConstraint {
         let mut seen = HashSet::new();
         let mut pending = VecDeque::new();
         let mut accepted = HashSet::new();
-        let mut successors = Vec::new();
 
         seen.insert((root.value, root.pc));
         pending.push_back(root);
@@ -2290,29 +2361,16 @@ impl RegularPathConstraint {
         }
 
         while let Some(node) = pending.pop_front() {
-            successors.clear();
-            if let Some(page) = self.expand_delta_program_page(
-                program,
-                node,
-                RpqExpandCursor::Start,
-                usize::MAX,
-                &mut successors,
-            ) {
-                assert!(
-                    page.next.is_none(),
-                    "an eager RPQ product drain did not exhaust a transition frontier"
-                );
-            }
-            for output in successors.drain(..) {
+            self.for_each_complete_delta_successor(program, node, |output| {
                 let key = (output.node.value, output.node.pc);
                 if !seen.insert(key) {
-                    continue;
+                    return;
                 }
                 if output.accepted {
                     accepted.insert(output.node.value);
                 }
                 pending.push_back(output.node);
-            }
+            });
         }
 
         accepted
@@ -4329,6 +4387,78 @@ mod seeded_frame_tests {
             &mut effects,
         );
         effects.occurrences
+    }
+
+    #[test]
+    fn complete_product_expands_every_delta_family_without_pageable_cursors() {
+        let excluded = rngid();
+        let other = rngid();
+        let nodes: Vec<_> = (0..4).map(|_| rngid()).collect();
+        let values: Vec<_> = nodes
+            .iter()
+            .map(|node| id_into_value(&node.id.raw()))
+            .collect();
+        let literal = [0xA5; 32];
+        let absent = [0xC7; 32];
+        let mut set = TribleSet::new();
+        insert_edge(&mut set, &nodes[0], &excluded, values[1]);
+        insert_edge(&mut set, &nodes[0], &other, values[2]);
+        set.insert(&Trible::new(
+            &nodes[0],
+            &other,
+            &Inline::<UnknownInline>::new(literal),
+        ));
+        insert_edge(&mut set, &nodes[1], &other, values[0]);
+        insert_edge(&mut set, &nodes[2], &excluded, values[0]);
+        insert_edge(&mut set, &nodes[3], &other, values[0]);
+
+        let start = Variable::<UnknownInline>::new(0);
+        let end = Variable::<UnknownInline>::new(1);
+        // Repeating the union of the excluded predicate and its complement
+        // forces the forward product through Attr + NotAttr and the inverse
+        // product through InverseAttr + InverseNotAttr. Cycles and convergent
+        // witnesses exercise the complete action's local novelty ownership.
+        let path = RegularPathConstraint::new(
+            set,
+            start,
+            end,
+            &[
+                PathOp::Attr(excluded.id.raw()),
+                PathOp::NotAttr(excluded.id.raw()),
+                PathOp::Union,
+                PathOp::Plus,
+            ],
+        );
+        let rows = [values[0], values[0], values[3], literal, absent];
+
+        let _ = take_pageable_transition_pages();
+        for (variable, bound, expr) in [
+            (end.index, start.index, &path.expr),
+            (start.index, end.index, &path.inverse_expr),
+        ] {
+            let actual = complete_bound_proposals(&path, variable, bound, &rows);
+            for (parent, source) in rows.iter().copied().enumerate() {
+                let occurrences: Vec<_> = actual
+                    .iter()
+                    .filter_map(|&(actual_parent, value)| {
+                        (actual_parent as usize == parent).then_some(value)
+                    })
+                    .collect();
+                let actual: HashSet<_> = occurrences.iter().copied().collect();
+                let expected = eval_from(&path.set, expr, &source);
+                assert_eq!(actual, expected, "parent {parent} disagreed");
+                assert_eq!(
+                    occurrences.len(),
+                    expected.len(),
+                    "parent {parent} lost per-parent endpoint novelty"
+                );
+            }
+        }
+        assert_eq!(
+            take_pageable_transition_pages(),
+            0,
+            "certified complete work must not acquire an affine transition cursor"
+        );
     }
 
     #[test]
