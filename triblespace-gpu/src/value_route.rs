@@ -56,9 +56,15 @@
 //!    calibrated `WarmM4` dominance score. There is deliberately **no
 //!    `Auto`**: explicit preparation proves only this snapshot's exact value
 //!    path, while no device-wide cooperative submission gate can yet prove
-//!    that automatic placement will not wait behind unrelated work. QoS placement intent
-//!    (consumer-owned, shard-inherited) is likewise absent from this first
-//!    route and returns as a later, measured second policy arm.
+//!    that automatic placement will not wait behind unrelated work. The
+//!    missing ownership boundary is CubeCL's shared server/device service,
+//!    not a `GpuContext` or archive: construction uploads, rank offload,
+//!    resident programs/planners/proposals, wavelet freezing, and callers of
+//!    the public raw client can all submit through independent client clones.
+//!    A gate above that service would therefore be partial evidence and must
+//!    not enable `Auto`. QoS placement intent (consumer-owned,
+//!    shard-inherited) is likewise absent from this first route and returns as
+//!    a later, measured second policy arm.
 
 use std::env;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
