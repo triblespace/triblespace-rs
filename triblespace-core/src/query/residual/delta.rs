@@ -4914,6 +4914,25 @@ impl DeltaScheduler {
                 "typed program exceeded one input's physical work budget"
             );
         }
+        #[cfg(engine_program_effect_probe)]
+        let probe_zero_telemetry = receipt.source_pages == 0 && receipt.transition_pages == 0;
+        #[cfg(engine_program_effect_probe)]
+        let probe_finite = address.stratum == ProgramStratum::Finite;
+        #[cfg(engine_program_effect_probe)]
+        let probe_cohort_raw_effect = !receipt.children.is_empty()
+            || !receipt.direct.is_empty()
+            || !receipt.accepted.is_empty()
+            || !receipt.supported.is_empty();
+        #[cfg(engine_program_effect_probe)]
+        {
+            let probe = &mut stats.program_effect_probe;
+            probe.cohorts += 1;
+            probe.finite_cohorts += usize::from(probe_finite);
+            probe.zero_telemetry_cohorts += usize::from(probe_zero_telemetry);
+            probe.zero_telemetry_finite_cohorts +=
+                usize::from(probe_zero_telemetry && probe_finite);
+            probe.cohorts_with_raw_effect += usize::from(probe_cohort_raw_effect);
+        }
         let child_ranges = program_child_ranges(&receipt.children, row_count);
         let direct_ranges = tagged_ranges(&receipt.direct, row_count, "program direct effect");
         let accepted_ranges = tagged_ranges(
@@ -4958,6 +4977,12 @@ impl DeltaScheduler {
         let mut retired_search_receipts = 0usize;
         let mut completed_activations = 0usize;
         let mut terminal_publications = OrderedActivationSet::default();
+        #[cfg(engine_program_effect_probe)]
+        let mut probe_cohort_quiescence = false;
+        #[cfg(engine_program_effect_probe)]
+        let mut probe_cohort_local_dead = false;
+        #[cfg(engine_program_effect_probe)]
+        let mut probe_cohort_dead_search_receipt = false;
 
         for (
             input,
@@ -4989,6 +5014,24 @@ impl DeltaScheduler {
                 || !direct_range.is_empty()
                 || !accepted_range.is_empty()
                 || !supported_range.is_empty();
+            #[cfg(engine_program_effect_probe)]
+            {
+                let zero_examined_no_raw_no_resume =
+                    page.examined == 0 && !page_had_program_effect && page.resume.is_none();
+                let probe = &mut stats.program_effect_probe;
+                probe.inputs += 1;
+                probe.inputs_with_raw_effect += usize::from(page_had_program_effect);
+                probe.inputs_within_search_page += usize::from(within_search_page);
+                probe.zero_examined_no_raw_no_resume_inputs +=
+                    usize::from(zero_examined_no_raw_no_resume);
+                if probe_zero_telemetry && probe_finite {
+                    probe.zero_telemetry_finite_inputs += 1;
+                    probe.zero_telemetry_finite_inputs_with_raw_effect +=
+                        usize::from(page_had_program_effect);
+                    probe.zero_telemetry_finite_zero_examined_no_raw_no_resume_inputs +=
+                        usize::from(zero_examined_no_raw_no_resume);
+                }
+            }
             let outcome = self.registry.replace_program(
                 credit,
                 state,
@@ -5052,6 +5095,28 @@ impl DeltaScheduler {
                 assert_eq!(proof.activation, activation);
                 completed_activations += 1;
                 let completed = self.registry.finish(proof);
+                #[cfg(engine_program_effect_probe)]
+                {
+                    probe_cohort_quiescence = true;
+                    let probe = &mut stats.program_effect_probe;
+                    probe.inputs_with_quiescence += 1;
+                    if probe_zero_telemetry && probe_finite {
+                        probe.zero_telemetry_finite_inputs_with_quiescence += 1;
+                    }
+                    match &completed.effect {
+                        DeltaCompletion::Cleanup => probe.completions_cleanup += 1,
+                        DeltaCompletion::Candidates(values) if values.is_empty() => {
+                            probe.completions_candidates_empty += 1
+                        }
+                        DeltaCompletion::Candidates(_) => {
+                            probe.completions_candidates_nonempty += 1
+                        }
+                        DeltaCompletion::Support(false) => probe.completions_support_false += 1,
+                        DeltaCompletion::Support(true) => {
+                            unreachable!("support true is released before Program quiescence")
+                        }
+                    }
+                }
                 completed_activation_ids.push(completed.activation);
                 retired_activations.push(ProgramActivation(completed.activation.0));
                 prefer_continuation(
@@ -5061,6 +5126,37 @@ impl DeltaScheduler {
             }
 
             let page_dead = !page_had_program_effect && !task_effects.has_effect();
+            #[cfg(engine_program_effect_probe)]
+            {
+                let task_had_stable_effect = task_effects.has_effect();
+                let probe = &mut stats.program_effect_probe;
+                probe.inputs_with_stable_effect += usize::from(task_had_stable_effect);
+                if probe_zero_telemetry && probe_finite {
+                    probe.zero_telemetry_finite_inputs_with_stable_effect +=
+                        usize::from(task_had_stable_effect);
+                }
+                if page_dead {
+                    probe_cohort_local_dead = true;
+                    probe.inputs_local_dead += 1;
+                    probe.inputs_local_dead_counted_global += usize::from(!within_search_page);
+                    if probe_zero_telemetry && probe_finite {
+                        probe.zero_telemetry_finite_inputs_local_dead += 1;
+                        probe.zero_telemetry_finite_inputs_local_dead_counted_global +=
+                            usize::from(!within_search_page);
+                    }
+                }
+                if outcome.dead_search_pages > 0 {
+                    probe_cohort_dead_search_receipt = true;
+                    probe.inputs_with_dead_search_receipt += 1;
+                    probe.dead_search_pages_reported += outcome.dead_search_pages;
+                    if task_had_stable_effect {
+                        probe.dead_search_pages_rescued_by_stable_effect +=
+                            outcome.dead_search_pages;
+                    } else {
+                        probe.dead_search_pages_applied += outcome.dead_search_pages;
+                    }
+                }
+            }
             if page_dead {
                 // A child nested below an AfterChildren source receipt is
                 // local work for that one source page. Preserve its exact
@@ -5102,6 +5198,14 @@ impl DeltaScheduler {
                     .expect("typed program state lost its runtime during retirement"),
                 &retired_activations,
             );
+        }
+        #[cfg(engine_program_effect_probe)]
+        {
+            let probe = &mut stats.program_effect_probe;
+            probe.cohorts_with_stable_effect += usize::from(effects.has_effect());
+            probe.cohorts_with_quiescence += usize::from(probe_cohort_quiescence);
+            probe.cohorts_with_local_dead += usize::from(probe_cohort_local_dead);
+            probe.cohorts_with_dead_search_receipt += usize::from(probe_cohort_dead_search_receipt);
         }
         stats.delta_source_dead_pages += source_dead_pages;
         stats.delta_transition_dead_pages += transition_dead_pages;

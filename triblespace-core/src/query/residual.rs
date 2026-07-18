@@ -80,6 +80,8 @@
 //! canonical descriptor and its stored paths a total description of the future
 //! computation while row values remain payload.
 
+#![allow(unexpected_cfgs)]
+
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
@@ -1939,7 +1941,48 @@ impl ResidualLowering {
     }
 }
 
+/// Probe-only decomposition of typed Program effects. These counters are
+/// observational: the scheduler never reads them.
+#[allow(unexpected_cfgs)]
+#[cfg(engine_program_effect_probe)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ProgramEffectProbeStats {
+    cohorts: usize,
+    finite_cohorts: usize,
+    zero_telemetry_cohorts: usize,
+    zero_telemetry_finite_cohorts: usize,
+    cohorts_with_raw_effect: usize,
+    cohorts_with_stable_effect: usize,
+    cohorts_with_quiescence: usize,
+    cohorts_with_local_dead: usize,
+    cohorts_with_dead_search_receipt: usize,
+    inputs: usize,
+    inputs_with_raw_effect: usize,
+    inputs_with_stable_effect: usize,
+    inputs_with_quiescence: usize,
+    inputs_within_search_page: usize,
+    inputs_local_dead: usize,
+    inputs_local_dead_counted_global: usize,
+    inputs_with_dead_search_receipt: usize,
+    dead_search_pages_reported: usize,
+    dead_search_pages_rescued_by_stable_effect: usize,
+    dead_search_pages_applied: usize,
+    completions_cleanup: usize,
+    completions_candidates_empty: usize,
+    completions_candidates_nonempty: usize,
+    completions_support_false: usize,
+    zero_examined_no_raw_no_resume_inputs: usize,
+    zero_telemetry_finite_inputs: usize,
+    zero_telemetry_finite_inputs_with_raw_effect: usize,
+    zero_telemetry_finite_inputs_with_stable_effect: usize,
+    zero_telemetry_finite_inputs_with_quiescence: usize,
+    zero_telemetry_finite_inputs_local_dead: usize,
+    zero_telemetry_finite_inputs_local_dead_counted_global: usize,
+    zero_telemetry_finite_zero_examined_no_raw_no_resume_inputs: usize,
+}
+
 /// Measurements from one residual-state solve.
+#[allow(unexpected_cfgs)]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct ResidualStateStats {
@@ -2164,6 +2207,8 @@ pub struct ResidualStateStats {
     /// Rows accepted by the query postprocessor and charged to confirmed
     /// terminal demand. Raw bindings rejected by projection are excluded.
     pub terminal_demand_projected_rows: usize,
+    #[cfg(engine_program_effect_probe)]
+    program_effect_probe: ProgramEffectProbeStats,
 }
 
 /// Results and measurements from [`Query::solve_residual_state_profiled`].
