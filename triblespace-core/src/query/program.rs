@@ -1625,6 +1625,72 @@ mod tests {
         }
     }
 
+    struct NoveltyScopeProbe {
+        endpoints: Vec<Option<RawInline>>,
+    }
+
+    impl TypedProgramSpec for NoveltyScopeProbe {
+        type State = NonComparableState;
+        type NoveltyKey = Key;
+        type Rank = u64;
+
+        fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
+            Some(ProgramRoute {
+                key: ProgramKey::new(14),
+                variable: 0,
+                stratum: ProgramStratum::Fixpoint,
+                grouping: ProgramGrouping::PageLocal,
+                completion: ProgramCompletion::PageableOnly,
+            })
+        }
+
+        fn dispatch(&self, _state: &Self::State) -> DispatchClass {
+            DispatchClass::new(14)
+        }
+
+        fn progress(&self, state: &Self::State) -> Self::Rank {
+            state.exact_cursor as u64
+        }
+
+        fn seed_typed(
+            &self,
+            batch: ProgramSeedBatch<'_>,
+            effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+        ) {
+            assert_eq!(batch.view.len(), self.endpoints.len());
+            for parent in 0..batch.view.len() {
+                effects.fixpoint_root(
+                    parent as u32,
+                    NonComparableState {
+                        exact_cursor: parent + 10,
+                    },
+                    Key(parent as u8 + 64),
+                    None,
+                );
+            }
+        }
+
+        fn step_typed(
+            &self,
+            states: Vec<Self::State>,
+            _batch: TypedProgramBatch<'_>,
+            effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+        ) {
+            assert_eq!(states.len(), self.endpoints.len());
+            for (input, accepted) in self.endpoints.iter().copied().enumerate() {
+                effects.fixpoint_child(
+                    input as u32,
+                    NonComparableState {
+                        exact_cursor: input + 100,
+                    },
+                    Key(7),
+                    accepted,
+                );
+                effects.page(1, None);
+            }
+        }
+    }
+
     struct FiniteNovelty;
 
     impl TypedProgramSpec for FiniteNovelty {
@@ -2091,6 +2157,51 @@ mod tests {
         (result, runtime, effects, activation)
     }
 
+    fn run_novelty_scope_probe(
+        activations: &[ProgramActivation],
+        endpoints: Vec<Option<RawInline>>,
+    ) -> (ProgramRuntime, ProgramBatchEffects) {
+        assert_eq!(activations.len(), endpoints.len());
+        let spec = NoveltyScopeProbe { endpoints };
+        let program = ProgramRef::new(&spec);
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(0),
+            bound: VariableSet::new_empty(),
+        };
+        let route = program.route(request).unwrap();
+        let view = RowsView::new_with_row_count(&[], &[], activations.len());
+        let mut runtime = program.new_runtime();
+        let mut seeded = ProgramSeedEffects::default();
+        program.seed_batch(
+            &mut runtime,
+            ProgramSeedBatch {
+                request,
+                route,
+                view,
+                activations,
+            },
+            &mut seeded,
+        );
+        assert_eq!(seeded.work.len(), activations.len());
+        let work: Vec<_> = seeded.work.into_iter().map(|seed| seed.work).collect();
+        let candidate_sets = vec![None; activations.len()];
+        let limits = vec![1; activations.len()];
+        let mut effects = ProgramBatchEffects::default();
+        program.step_batch(
+            &mut runtime,
+            ProgramBatch {
+                stratum: route.stratum,
+                view,
+                candidate_sets: &candidate_sets,
+                activations,
+                work: &work,
+                limits: &limits,
+            },
+            &mut effects,
+        );
+        (runtime, effects)
+    }
+
     #[test]
     fn novelty_batch_filters_existing_and_local_duplicates_in_first_admission_order() {
         let (result, mut runtime, effects, activation) =
@@ -2156,6 +2267,75 @@ mod tests {
             let seen = typed_runtime.novelty.get(&activation).unwrap();
             assert_eq!(seen.len(), 1);
             assert_eq!(seen.get(&Key(1)), Some(&None));
+        }
+    }
+
+    #[test]
+    fn novelty_transaction_keeps_first_receipt_across_input_tags_of_one_activation() {
+        let activation = ProgramActivation(23);
+        let activations = [activation, activation];
+        let endpoint = Some([0xA1; 32]);
+        let (mut runtime, effects) =
+            run_novelty_scope_probe(&activations, vec![endpoint, endpoint]);
+
+        assert_eq!(effects.pages.len(), 2);
+        assert_eq!(effects.children.len(), 1);
+        assert_eq!(effects.children[0].input, 0);
+        assert_eq!(effects.children[0].accepted, endpoint);
+
+        let typed_runtime = runtime
+            .erased
+            .as_mut()
+            .as_any_mut()
+            .downcast_mut::<TypedProgramRuntime<NonComparableState, Key>>()
+            .unwrap();
+        assert_eq!(
+            typed_runtime
+                .take(activation, effects.children[0].work.handle.clone())
+                .exact_cursor,
+            100,
+            "the first receipt, rather than its later equal input, must own the handle"
+        );
+        assert_eq!(
+            typed_runtime.novelty[&activation].get(&Key(7)),
+            Some(&endpoint)
+        );
+    }
+
+    #[test]
+    fn novelty_transaction_scopes_equal_key_bytes_by_activation() {
+        let activations = [ProgramActivation(23), ProgramActivation(24)];
+        let endpoints = [Some([0xA1; 32]), None];
+        let (mut runtime, effects) =
+            run_novelty_scope_probe(&activations, endpoints.to_vec());
+
+        assert_eq!(effects.pages.len(), 2);
+        assert_eq!(
+            effects
+                .children
+                .iter()
+                .map(|child| (child.input, child.accepted))
+                .collect::<Vec<_>>(),
+            vec![(0, endpoints[0]), (1, endpoints[1])]
+        );
+
+        let typed_runtime = runtime
+            .erased
+            .as_mut()
+            .as_any_mut()
+            .downcast_mut::<TypedProgramRuntime<NonComparableState, Key>>()
+            .unwrap();
+        for (input, child) in effects.children.iter().enumerate() {
+            assert_eq!(
+                typed_runtime
+                    .take(activations[input], child.work.handle.clone())
+                    .exact_cursor,
+                input + 100
+            );
+            assert_eq!(
+                typed_runtime.novelty[&activations[input]].get(&Key(7)),
+                Some(&endpoints[input])
+            );
         }
     }
 
