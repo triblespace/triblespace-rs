@@ -18342,13 +18342,22 @@ mod tests {
         assert!(cold_first_stats.propose_rows > focused_first_stats.propose_rows);
         assert!(cold_first_stats.max_delta_transition_cohort > 1);
         assert!(
-            cold_first_stats.support_action_pops
-                + cold_first_stats.propose_action_pops
-                + cold_first_stats.confirm_action_pops
-                > focused_first_stats.support_action_pops
-                    + focused_first_stats.propose_action_pops
-                    + focused_first_stats.confirm_action_pops,
-            "without physical focus wider cold work runs before target confirmation"
+            focused_first_stats.support_action_pops
+                + focused_first_stats.propose_action_pops
+                + focused_first_stats.confirm_action_pops
+                <= cold_first_stats.support_action_pops
+                    + cold_first_stats.propose_action_pops
+                    + cold_first_stats.confirm_action_pops,
+            "physical focus must not require more scheduler actions than cold traversal"
+        );
+        assert!(
+            cold_first_stats.delta_transition_pages > focused_first_stats.delta_transition_pages,
+            "without physical focus wider cold transition work runs before target confirmation"
+        );
+        assert!(
+            cold_first_stats.delta_transition_candidates_examined
+                > focused_first_stats.delta_transition_candidates_examined,
+            "cold traversal must examine more physical adjacency before its first result"
         );
 
         let mut focused_bag: Vec<_> = std::iter::once(focused_first)

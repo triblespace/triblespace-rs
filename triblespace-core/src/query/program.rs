@@ -447,6 +447,12 @@ impl<State, NoveltyKey> Default for TypedEffectSink<State, NoveltyKey> {
 }
 
 impl<State, NoveltyKey> TypedEffectSink<State, NoveltyKey> {
+    /// Reserves family-known child capacity without exposing the private
+    /// effect representation or committing any receipt prefix.
+    pub fn reserve_children(&mut self, additional: usize) {
+        self.children.reserve(additional);
+    }
+
     pub fn page(&mut self, examined: usize, resume: Option<TypedResume<State>>) {
         self.pages.push(TypedPage { examined, resume });
     }
