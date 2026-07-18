@@ -5015,6 +5015,14 @@ impl DeltaScheduler {
                 || !accepted_range.is_empty()
                 || !supported_range.is_empty();
             #[cfg(engine_program_effect_probe)]
+            let probe_page_examined = page.examined;
+            #[cfg(engine_program_effect_probe)]
+            let probe_page_limit = limits[input];
+            #[cfg(engine_program_effect_probe)]
+            let probe_page_has_resume = page.resume.is_some();
+            #[cfg(engine_program_effect_probe)]
+            let probe_page_saturated = probe_page_examined == probe_page_limit;
+            #[cfg(engine_program_effect_probe)]
             {
                 let zero_examined_no_raw_no_resume =
                     page.examined == 0 && !page_had_program_effect && page.resume.is_none();
@@ -5028,6 +5036,14 @@ impl DeltaScheduler {
                     probe.zero_telemetry_finite_inputs += 1;
                     probe.zero_telemetry_finite_inputs_with_raw_effect +=
                         usize::from(page_had_program_effect);
+                    probe.zero_telemetry_finite_examined_sum += probe_page_examined;
+                    probe.zero_telemetry_finite_assigned_limit_sum += probe_page_limit;
+                    probe.zero_telemetry_finite_inputs_with_resume +=
+                        usize::from(probe_page_has_resume);
+                    probe.zero_telemetry_finite_inputs_saturated +=
+                        usize::from(probe_page_saturated);
+                    probe.zero_telemetry_finite_inputs_nonzero_examined +=
+                        usize::from(probe_page_examined > 0);
                     probe.zero_telemetry_finite_zero_examined_no_raw_no_resume_inputs +=
                         usize::from(zero_examined_no_raw_no_resume);
                 }
@@ -5143,6 +5159,15 @@ impl DeltaScheduler {
                         probe.zero_telemetry_finite_inputs_local_dead += 1;
                         probe.zero_telemetry_finite_inputs_local_dead_counted_global +=
                             usize::from(!within_search_page);
+                        probe.zero_telemetry_finite_local_dead_examined_sum += probe_page_examined;
+                        probe.zero_telemetry_finite_local_dead_assigned_limit_sum +=
+                            probe_page_limit;
+                        probe.zero_telemetry_finite_local_dead_inputs_with_resume +=
+                            usize::from(probe_page_has_resume);
+                        probe.zero_telemetry_finite_local_dead_inputs_saturated +=
+                            usize::from(probe_page_saturated);
+                        probe.zero_telemetry_finite_local_dead_inputs_nonzero_examined +=
+                            usize::from(probe_page_examined > 0);
                     }
                 }
                 if outcome.dead_search_pages > 0 {

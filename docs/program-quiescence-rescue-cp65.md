@@ -87,3 +87,17 @@ geometric scheduling law. Production should eventually distinguish finite
 structural Program work from source/transition search telemetry; whether to do
 that now or let the planned Program-effects refactor erase the ambiguous label
 is deliberately left to the post-lane counter receipt.
+
+The final counter therefore measures two independent questions. Completion
+kind plus zero source/transition telemetry decides the attribution question.
+For the same finite local-dead inputs, examined-work sum, assigned-limit sum,
+resume presence, nonzero-examined count, and `examined == limit` count decide
+what kind of geometric evidence the generic page carried:
+
+| observed local-dead page | interpretation |
+| --- | --- |
+| nonzero, saturated, resume present | spent live quantum; strongest evidence that widening was earned |
+| nonzero, saturated, no resume | real physical miss ending exactly at its quantum |
+| nonzero, below limit, no resume | exhausted structural domain; real work, but a separate generic widening-policy question |
+| zero, no resume | bookkeeping-only completion; widening was not backed by physical work |
+| below limit, resume present | contradicts the expected adapter page contract and reopens the implementation audit |

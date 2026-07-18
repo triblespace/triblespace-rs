@@ -1976,8 +1976,18 @@ struct ProgramEffectProbeStats {
     zero_telemetry_finite_inputs_with_raw_effect: usize,
     zero_telemetry_finite_inputs_with_stable_effect: usize,
     zero_telemetry_finite_inputs_with_quiescence: usize,
+    zero_telemetry_finite_examined_sum: usize,
+    zero_telemetry_finite_assigned_limit_sum: usize,
+    zero_telemetry_finite_inputs_with_resume: usize,
+    zero_telemetry_finite_inputs_saturated: usize,
+    zero_telemetry_finite_inputs_nonzero_examined: usize,
     zero_telemetry_finite_inputs_local_dead: usize,
     zero_telemetry_finite_inputs_local_dead_counted_global: usize,
+    zero_telemetry_finite_local_dead_examined_sum: usize,
+    zero_telemetry_finite_local_dead_assigned_limit_sum: usize,
+    zero_telemetry_finite_local_dead_inputs_with_resume: usize,
+    zero_telemetry_finite_local_dead_inputs_saturated: usize,
+    zero_telemetry_finite_local_dead_inputs_nonzero_examined: usize,
     zero_telemetry_finite_zero_examined_no_raw_no_resume_inputs: usize,
 }
 
