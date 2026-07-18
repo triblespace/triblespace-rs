@@ -65,3 +65,7 @@ required-features = ["wgpu"]
 [[test]]
 name = "resident_support_estimates"
 required-features = ["wgpu"]
+
+[[test]]
+name = "query_program_value_page"
+required-features = ["wgpu"]

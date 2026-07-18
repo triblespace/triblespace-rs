@@ -170,6 +170,58 @@ pub struct ProgramFrontier {
     bound_mask: u128,
 }
 
+/// One input's exact receipt from a native fixed-`(E,A) -> V` page.
+///
+/// `examined` is also the number of child rows produced for this narrow arm:
+/// a compiled page contains exactly one pattern, so there are no sibling
+/// confirmations which could reject a candidate. `next_offset` is the
+/// absolute ordinal at which the same parent row resumes, or `None` when its
+/// candidate interval is exhausted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProgramValuePageReceipt {
+    examined: usize,
+    next_offset: Option<usize>,
+}
+
+impl ProgramValuePageReceipt {
+    /// Number of candidates examined and child rows produced for this input.
+    pub const fn examined(self) -> usize {
+        self.examined
+    }
+
+    /// Absolute resume ordinal, or `None` when the input interval is exhausted.
+    pub const fn next_offset(self) -> Option<usize> {
+        self.next_offset
+    }
+}
+
+/// One stable native page over a batch of fixed-`(E,A) -> V` parent rows.
+///
+/// Child rows are grouped in parent-input order and retain the canonical Ring
+/// order within each input. `receipts[i]` describes exactly parent row `i`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProgramValuePage {
+    child: ProgramFrontier,
+    receipts: Vec<ProgramValuePageReceipt>,
+}
+
+impl ProgramValuePage {
+    /// The stable concatenation of this page's per-input child rows.
+    pub fn child(&self) -> &ProgramFrontier {
+        &self.child
+    }
+
+    /// One exact receipt per parent input, in input order.
+    pub fn receipts(&self) -> &[ProgramValuePageReceipt] {
+        &self.receipts
+    }
+
+    /// Consumes the page into its child frontier and per-input receipts.
+    pub fn into_parts(self) -> (ProgramFrontier, Vec<ProgramValuePageReceipt>) {
+        (self.child, self.receipts)
+    }
+}
+
 impl ProgramFrontier {
     /// Creates a validated row-major frontier.
     pub fn new(
@@ -323,6 +375,29 @@ pub enum QueryProgramError {
     },
     /// A frontier contains a code outside the borrowed archive's universe.
     CodeOutOfBounds(ArchiveCode),
+    /// Native value-page offsets or limits do not match the parent row count.
+    ValuePageShape {
+        /// Parent rows submitted to the page primitive.
+        rows: usize,
+        /// Resume offsets supplied by the caller.
+        offsets: usize,
+        /// Per-input limits supplied by the caller.
+        limits: usize,
+    },
+    /// A native value-page input carries no progress budget.
+    ZeroValuePageLimit {
+        /// Zero-based parent input.
+        input: usize,
+    },
+    /// A native value-page resume offset lies beyond its candidate interval.
+    ValuePageOffsetBeyondInterval {
+        /// Zero-based parent input.
+        input: usize,
+        /// Absolute resume ordinal supplied by the caller.
+        offset: usize,
+        /// Exact candidate interval length for the parent input.
+        interval: usize,
+    },
 }
 
 impl fmt::Display for QueryProgramError {
@@ -384,6 +459,25 @@ impl fmt::Display for QueryProgramError {
                     code.index()
                 )
             }
+            Self::ValuePageShape {
+                rows,
+                offsets,
+                limits,
+            } => write!(
+                f,
+                "native value page submitted {rows} parent rows with {offsets} offsets and {limits} limits"
+            ),
+            Self::ZeroValuePageLimit { input } => {
+                write!(f, "native value-page input {input} carries no work limit")
+            }
+            Self::ValuePageOffsetBeyondInterval {
+                input,
+                offset,
+                interval,
+            } => write!(
+                f,
+                "native value-page input {input} resumes at {offset} beyond interval length {interval}"
+            ),
         }
     }
 }
@@ -669,6 +763,112 @@ impl<'a, U: Universe> QueryProgram<'a, U> {
             }
         }
         ProgramFrontier::new(variables, values, rows)
+    }
+
+    /// Pages the resident-compatible fixed-`(E,A) -> V` transition natively.
+    ///
+    /// This is a deliberately narrower primitive than [`Self::transition_on`].
+    /// It returns `Ok(None)` unless the program has exactly one pattern, that
+    /// pattern's value term is `variable`, and every other program variable is
+    /// already bound by `frontier` (entity and attribute constants are also
+    /// admitted). Those are exactly the semantic conditions of the first
+    /// resident transition arm: no sibling pattern is silently skipped.
+    ///
+    /// `offsets[i]` and `limits[i]` apply only to parent row `i`; work is never
+    /// pooled between inputs. A positive limit is required even for an already
+    /// exhausted interval, matching the scheduler/physical grant law. Child
+    /// rows are the stable interval slice for each input, concatenated in input
+    /// order. Seeking is direct rank/select navigation plus an ordinal shift,
+    /// so the method is O(parent rows + produced page rows), independent of
+    /// skipped prefix length and of the unconsumed interval suffix.
+    ///
+    /// Every receipt's `examined` count equals its number of produced child
+    /// rows. The canonical archive contains each `(E,A,V)` trible once, so a
+    /// fixed `(E,A)` Ring range has no duplicate values; the defensive
+    /// `.unique()` in the general reference transition is therefore a no-op on
+    /// this admitted arm.
+    pub fn transition_on_value_page(
+        &self,
+        variable: ProgramVariable,
+        frontier: &ProgramFrontier,
+        offsets: &[usize],
+        limits: &[usize],
+    ) -> Result<Option<ProgramValuePage>, QueryProgramError> {
+        self.validate_frontier(frontier)?;
+        if variable.index() >= self.variable_count() {
+            return Err(QueryProgramError::VariableOutOfBounds {
+                variable,
+                variable_count: self.variable_count(),
+            });
+        }
+        if frontier.column(variable).is_some() {
+            return Err(QueryProgramError::VariableAlreadyBound(variable));
+        }
+
+        let [pattern] = self.patterns.as_ref() else {
+            return Ok(None);
+        };
+        if pattern.value != ProgramTerm::Variable(variable)
+            || frontier.variables.len() + 1 != self.variable_count()
+            || !peer_is_resolved(pattern.entity, frontier)
+            || !peer_is_resolved(pattern.attribute, frontier)
+        {
+            return Ok(None);
+        }
+        if offsets.len() != frontier.len() || limits.len() != frontier.len() {
+            return Err(QueryProgramError::ValuePageShape {
+                rows: frontier.len(),
+                offsets: offsets.len(),
+                limits: limits.len(),
+            });
+        }
+        if let Some(input) = limits.iter().position(|&limit| limit == 0) {
+            return Err(QueryProgramError::ZeroValuePageLimit { input });
+        }
+
+        let insertion = frontier
+            .variables
+            .partition_point(|&bound| bound < variable);
+        let mut child_variables = frontier.variables.clone();
+        child_variables.insert(insertion, variable);
+        let mut child_values = Vec::new();
+        let mut child_rows = 0usize;
+        let mut receipts = Vec::with_capacity(frontier.len());
+
+        for input in 0..frontier.len() {
+            let row = frontier.row(input);
+            let interval = self.fixed_ea_value_range(*pattern, frontier, row);
+            let interval_len = interval.len();
+            let offset = offsets[input];
+            if offset > interval_len {
+                return Err(QueryProgramError::ValuePageOffsetBeyondInterval {
+                    input,
+                    offset,
+                    interval: interval_len,
+                });
+            }
+            let examined = limits[input].min(interval_len - offset);
+            for position in interval.start + offset..interval.start + offset + examined {
+                let value = ArchiveCode::from_index(
+                    self.archive
+                        .aev_c
+                        .access(position)
+                        .expect("a canonical fixed-E/A range stays inside the AEV column"),
+                );
+                child_values.extend_from_slice(&row[..insertion]);
+                child_values.push(value);
+                child_values.extend_from_slice(&row[insertion..]);
+                child_rows += 1;
+            }
+            let consumed = offset + examined;
+            receipts.push(ProgramValuePageReceipt {
+                examined,
+                next_offset: (consumed < interval_len).then_some(consumed),
+            });
+        }
+
+        let child = ProgramFrontier::new(child_variables, child_values, child_rows)?;
+        Ok(Some(ProgramValuePage { child, receipts }))
     }
 
     /// Runs the CPU reference interpreter to a complete canonical frontier.
@@ -1060,6 +1260,25 @@ impl<'a, U: Universe> QueryProgram<'a, U> {
             }
         }
     }
+
+    fn fixed_ea_value_range(
+        &self,
+        pattern: ProgramPattern,
+        frontier: &ProgramFrontier,
+        row: &[ArchiveCode],
+    ) -> Range<usize> {
+        let state = self.pattern_state(pattern, frontier, row);
+        let (Some(entity), Some(attribute)) = (state.entity.code(), state.attribute.code()) else {
+            return 0..0;
+        };
+        let entity_range = base_range_code(&self.archive.e_a, entity);
+        restrict_range_code(
+            &self.archive.a_a,
+            &self.archive.eva_c,
+            attribute,
+            &entity_range,
+        )
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1112,6 +1331,13 @@ fn resolve_term(
             }),
         ProgramTerm::Constant(code) => ResolvedTerm::Bound(code),
         ProgramTerm::MissingConstant => ResolvedTerm::Missing,
+    }
+}
+
+fn peer_is_resolved(term: ProgramTerm, frontier: &ProgramFrontier) -> bool {
+    match term {
+        ProgramTerm::Variable(variable) => frontier.column(variable).is_some(),
+        ProgramTerm::Constant(_) | ProgramTerm::MissingConstant => true,
     }
 }
 
