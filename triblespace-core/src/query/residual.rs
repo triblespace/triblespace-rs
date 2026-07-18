@@ -3818,7 +3818,21 @@ struct DeferredCandidateNode {
     first_parent: u32,
     last_parent: u32,
     grouped: bool,
+    /// AVL height. Leaves have height one; every concat keeps its children
+    /// within one level so cursor descent, structural splitting, and final
+    /// owner destruction are logarithmic in the number of segments.
+    height: usize,
     kind: DeferredCandidateNodeKind,
+}
+
+/// A shared rope node plus the parent-coordinate translation at its incoming
+/// edge. Keeping the translation outside the node makes rebasing O(1) without
+/// allocating `Shift` wrappers: repeated shifts fuse into this scalar and can
+/// never deepen the rope.
+#[derive(Clone)]
+struct DeferredCandidateSubtree {
+    node: Arc<DeferredCandidateNode>,
+    parent_delta: i64,
 }
 
 enum DeferredCandidateNodeKind {
@@ -3830,13 +3844,9 @@ enum DeferredCandidateNodeKind {
         pairs: Arc<Candidates>,
         range: std::ops::Range<usize>,
     },
-    Shift {
-        inner: Arc<DeferredCandidateNode>,
-        parent_delta: i64,
-    },
     Concat {
-        left: Arc<DeferredCandidateNode>,
-        right: Arc<DeferredCandidateNode>,
+        left: DeferredCandidateSubtree,
+        right: DeferredCandidateSubtree,
     },
 }
 
@@ -3845,7 +3855,6 @@ impl std::fmt::Debug for DeferredCandidateNode {
         let kind = match &self.kind {
             DeferredCandidateNodeKind::Values { .. } => "Values",
             DeferredCandidateNodeKind::Tagged { .. } => "Tagged",
-            DeferredCandidateNodeKind::Shift { .. } => "Shift",
             DeferredCandidateNodeKind::Concat { .. } => "Concat",
         };
         formatter
@@ -3855,13 +3864,14 @@ impl std::fmt::Debug for DeferredCandidateNode {
             .field("first_parent", &self.first_parent)
             .field("last_parent", &self.last_parent)
             .field("grouped", &self.grouped)
+            .field("height", &self.height)
             .finish()
     }
 }
 
 #[derive(Clone)]
 struct DeferredCandidates {
-    root: Option<Arc<DeferredCandidateNode>>,
+    root: Option<DeferredCandidateSubtree>,
     len: usize,
     parent_count: usize,
 }
@@ -3898,8 +3908,8 @@ struct DeferredCandidateIter<'a> {
 ///
 /// The pending DFS stack is itself persistent: cloning a suspended Program
 /// state clones only two `Arc` roots plus scalar indices.  Traversal expands
-/// concat/offset nodes incrementally and never revisits an occurrence already
-/// charged to an earlier reducer receipt.
+/// concat nodes and their edge offsets incrementally and never revisits an
+/// occurrence already charged to an earlier reducer receipt.
 #[derive(Clone)]
 struct DeferredCandidateCursor {
     pending: Option<Arc<DeferredCursorFrame>>,
@@ -3908,8 +3918,7 @@ struct DeferredCandidateCursor {
 }
 
 struct DeferredCursorFrame {
-    node: Arc<DeferredCandidateNode>,
-    parent_delta: i64,
+    subtree: DeferredCandidateSubtree,
     next: Option<Arc<DeferredCursorFrame>>,
 }
 
@@ -3923,12 +3932,10 @@ struct DeferredLeafCursor {
 impl DeferredCandidateCursor {
     fn push(
         pending: Option<Arc<DeferredCursorFrame>>,
-        node: Arc<DeferredCandidateNode>,
-        parent_delta: i64,
+        subtree: DeferredCandidateSubtree,
     ) -> Option<Arc<DeferredCursorFrame>> {
         Some(Arc::new(DeferredCursorFrame {
-            node,
-            parent_delta,
+            subtree,
             next: pending,
         }))
     }
@@ -3938,19 +3945,20 @@ impl DeferredCandidateCursor {
             if let Some(leaf) = &mut self.leaf {
                 let next = match &leaf.node.kind {
                     DeferredCandidateNodeKind::Values { values, range } => range
-                        .clone()
-                        .nth(leaf.index)
+                        .start
+                        .checked_add(leaf.index)
+                        .filter(|index| *index < range.end)
                         .and_then(|index| values.get(index))
                         .map(|value| (shift_candidate_parent(0, leaf.parent_delta), *value)),
                     DeferredCandidateNodeKind::Tagged { pairs, range } => range
-                        .clone()
-                        .nth(leaf.index)
+                        .start
+                        .checked_add(leaf.index)
+                        .filter(|index| *index < range.end)
                         .and_then(|index| pairs.get(index))
                         .map(|(parent, value)| {
                             (shift_candidate_parent(*parent, leaf.parent_delta), *value)
                         }),
-                    DeferredCandidateNodeKind::Shift { .. }
-                    | DeferredCandidateNodeKind::Concat { .. } => {
+                    DeferredCandidateNodeKind::Concat { .. } => {
                         unreachable!("deferred leaf cursor named an internal rope node")
                     }
                 };
@@ -3964,38 +3972,26 @@ impl DeferredCandidateCursor {
 
             let frame = self.pending.take()?;
             self.pending = frame.next.clone();
-            match &frame.node.kind {
+            match &frame.subtree.node.kind {
                 DeferredCandidateNodeKind::Values { .. }
                 | DeferredCandidateNodeKind::Tagged { .. } => {
                     self.leaf = Some(DeferredLeafCursor {
-                        node: frame.node.clone(),
-                        parent_delta: frame.parent_delta,
+                        node: frame.subtree.node.clone(),
+                        parent_delta: frame.subtree.parent_delta,
                         index: 0,
                     });
-                }
-                DeferredCandidateNodeKind::Shift {
-                    inner,
-                    parent_delta,
-                } => {
-                    self.pending = Self::push(
-                        self.pending.take(),
-                        inner.clone(),
-                        frame
-                            .parent_delta
-                            .checked_add(*parent_delta)
-                            .expect("candidate parent offset overflow"),
-                    );
                 }
                 DeferredCandidateNodeKind::Concat { left, right } => {
                     // Push right first so the persistent LIFO stack visits
                     // the exact left occurrence stream before the right.
                     self.pending = Self::push(
                         self.pending.take(),
-                        right.clone(),
-                        frame.parent_delta,
+                        right.clone().shifted(frame.subtree.parent_delta),
                     );
-                    self.pending =
-                        Self::push(self.pending.take(), left.clone(), frame.parent_delta);
+                    self.pending = Self::push(
+                        self.pending.take(),
+                        left.clone().shifted(frame.subtree.parent_delta),
+                    );
                 }
             }
         }
@@ -4020,207 +4016,337 @@ fn shift_candidate_parent(parent: u32, delta: i64) -> u32 {
     u32::try_from(shifted).expect("candidate parent offset left the valid domain")
 }
 
+fn unshift_candidate_parent(parent: u32, delta: i64) -> u32 {
+    let unshifted = i64::from(parent)
+        .checked_sub(delta)
+        .expect("candidate parent offset overflow");
+    u32::try_from(unshifted).expect("candidate parent boundary left the local domain")
+}
+
+impl DeferredCandidateSubtree {
+    fn new(node: Arc<DeferredCandidateNode>) -> Self {
+        Self {
+            node,
+            parent_delta: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.node.len
+    }
+
+    fn height(&self) -> usize {
+        self.node.height
+    }
+
+    fn first_parent(&self) -> u32 {
+        shift_candidate_parent(self.node.first_parent, self.parent_delta)
+    }
+
+    fn last_parent(&self) -> u32 {
+        shift_candidate_parent(self.node.last_parent, self.parent_delta)
+    }
+
+    fn grouped(&self) -> bool {
+        self.node.grouped
+    }
+
+    /// Adds an incoming parent-coordinate translation without allocating a
+    /// node. Validation happens here, at the wrapper boundary, so every
+    /// subtree's effective cached endpoints remain representable as `u32`.
+    fn shifted(mut self, parent_delta: i64) -> Self {
+        if parent_delta == 0 {
+            return self;
+        }
+        self.parent_delta = self
+            .parent_delta
+            .checked_add(parent_delta)
+            .expect("candidate parent offset overflow");
+        let _ = self.first_parent();
+        let _ = self.last_parent();
+        self
+    }
+
+    /// Returns concat children in this subtree's effective coordinate system.
+    /// The outer edge translation is pushed only into the two visited child
+    /// wrappers; their shared nodes remain untouched.
+    fn children(&self) -> Option<(Self, Self)> {
+        let DeferredCandidateNodeKind::Concat { left, right } = &self.node.kind else {
+            return None;
+        };
+        Some((
+            left.clone().shifted(self.parent_delta),
+            right.clone().shifted(self.parent_delta),
+        ))
+    }
+}
+
 impl DeferredCandidateNode {
-    fn values(values: Vec<RawInline>) -> Option<Arc<Self>> {
+    fn values(values: Vec<RawInline>) -> Option<DeferredCandidateSubtree> {
         let len = values.len();
         if len == 0 {
             return None;
         }
-        Some(Arc::new(Self {
+        Some(DeferredCandidateSubtree::new(Arc::new(Self {
             len,
             first_parent: 0,
             last_parent: 0,
             grouped: true,
+            height: 1,
             kind: DeferredCandidateNodeKind::Values {
                 values: Arc::new(values),
                 range: 0..len,
             },
-        }))
+        })))
     }
 
-    fn tagged(pairs: Candidates) -> Option<Arc<Self>> {
+    fn tagged(pairs: Candidates) -> Option<DeferredCandidateSubtree> {
         let len = pairs.len();
         if len == 0 {
             return None;
         }
         let first_parent = pairs[0].0;
         let last_parent = pairs[len - 1].0;
-        Some(Arc::new(Self {
+        Some(DeferredCandidateSubtree::new(Arc::new(Self {
             len,
             first_parent,
             last_parent,
             // The contiguous protocol boundary established grouping before
             // deferral; moving its Vec buffer must remain O(1).
             grouped: true,
+            height: 1,
             kind: DeferredCandidateNodeKind::Tagged {
                 pairs: Arc::new(pairs),
                 range: 0..len,
             },
-        }))
+        })))
     }
 
     fn value_view(
         values: Arc<Vec<RawInline>>,
         range: std::ops::Range<usize>,
-    ) -> Option<Arc<Self>> {
+    ) -> Option<DeferredCandidateSubtree> {
         if range.is_empty() {
             return None;
         }
-        Some(Arc::new(Self {
+        Some(DeferredCandidateSubtree::new(Arc::new(Self {
             len: range.len(),
             first_parent: 0,
             last_parent: 0,
             grouped: true,
+            height: 1,
             kind: DeferredCandidateNodeKind::Values { values, range },
-        }))
+        })))
     }
 
     fn tagged_view(
         pairs: Arc<Candidates>,
         range: std::ops::Range<usize>,
-    ) -> Option<Arc<Self>> {
+    ) -> Option<DeferredCandidateSubtree> {
         if range.is_empty() {
             return None;
         }
         let first_parent = pairs[range.start].0;
         let last_parent = pairs[range.end - 1].0;
-        Some(Arc::new(Self {
+        Some(DeferredCandidateSubtree::new(Arc::new(Self {
             len: range.len(),
             first_parent,
             last_parent,
             grouped: true,
+            height: 1,
             kind: DeferredCandidateNodeKind::Tagged { pairs, range },
+        })))
+    }
+
+    fn branch(
+        left: DeferredCandidateSubtree,
+        right: DeferredCandidateSubtree,
+    ) -> DeferredCandidateSubtree {
+        debug_assert!(left.height().abs_diff(right.height()) <= 1);
+        DeferredCandidateSubtree::new(Arc::new(Self {
+            len: left
+                .len()
+                .checked_add(right.len())
+                .expect("candidate occurrence count overflow"),
+            first_parent: left.first_parent(),
+            last_parent: right.last_parent(),
+            grouped: left.grouped()
+                && right.grouped()
+                && left.last_parent() <= right.first_parent(),
+            height: 1 + left.height().max(right.height()),
+            kind: DeferredCandidateNodeKind::Concat { left, right },
         }))
     }
 
-    fn shift(node: Arc<Self>, parent_delta: i64) -> Arc<Self> {
-        if parent_delta == 0 {
-            return node;
+    /// Restores the AVL invariant after one height-directed join step. The
+    /// recursive join can make the rebuilt edge differ by at most two levels;
+    /// the single or double rotation below shares every untouched subtree.
+    fn balance(
+        left: DeferredCandidateSubtree,
+        right: DeferredCandidateSubtree,
+    ) -> DeferredCandidateSubtree {
+        let left_height = left.height();
+        let right_height = right.height();
+        if left_height.abs_diff(right_height) <= 1 {
+            return Self::branch(left, right);
         }
-        Arc::new(Self {
-            len: node.len,
-            first_parent: shift_candidate_parent(node.first_parent, parent_delta),
-            last_parent: shift_candidate_parent(node.last_parent, parent_delta),
-            grouped: node.grouped,
-            kind: DeferredCandidateNodeKind::Shift {
-                inner: node,
-                parent_delta,
-            },
-        })
+        assert_eq!(left_height.abs_diff(right_height), 2);
+        if left_height > right_height {
+            let (left_left, left_right) = left
+                .children()
+                .expect("an imbalanced AVL subtree cannot be a leaf");
+            if left_left.height() >= left_right.height() {
+                return Self::branch(
+                    left_left,
+                    Self::branch(left_right, right),
+                );
+            }
+            let (middle_left, middle_right) = left_right
+                .children()
+                .expect("the taller inner AVL subtree cannot be a leaf");
+            return Self::branch(
+                Self::branch(left_left, middle_left),
+                Self::branch(middle_right, right),
+            );
+        }
+
+        let (right_left, right_right) = right
+            .children()
+            .expect("an imbalanced AVL subtree cannot be a leaf");
+        if right_right.height() >= right_left.height() {
+            return Self::branch(
+                Self::branch(left, right_left),
+                right_right,
+            );
+        }
+        let (middle_left, middle_right) = right_left
+            .children()
+            .expect("the taller inner AVL subtree cannot be a leaf");
+        Self::branch(
+            Self::branch(left, middle_left),
+            Self::branch(middle_right, right_right),
+        )
     }
 
-    fn concat(left: Option<Arc<Self>>, right: Option<Arc<Self>>) -> Option<Arc<Self>> {
+    /// Persistent AVL join. It descends only the taller outer spine, rebuilds
+    /// that shared path, and preserves the exact left-then-right occurrence
+    /// order for arbitrary unequal-height operands.
+    fn join(
+        left: DeferredCandidateSubtree,
+        right: DeferredCandidateSubtree,
+    ) -> DeferredCandidateSubtree {
+        if left.height() > right.height().saturating_add(1) {
+            let (left_left, left_right) = left
+                .children()
+                .expect("a taller AVL subtree cannot be a leaf");
+            let joined_right = Self::join(left_right, right);
+            return Self::balance(left_left, joined_right);
+        }
+        if right.height() > left.height().saturating_add(1) {
+            let (right_left, right_right) = right
+                .children()
+                .expect("a taller AVL subtree cannot be a leaf");
+            let joined_left = Self::join(left, right_left);
+            return Self::balance(joined_left, right_right);
+        }
+        Self::branch(left, right)
+    }
+
+    fn concat(
+        left: Option<DeferredCandidateSubtree>,
+        right: Option<DeferredCandidateSubtree>,
+    ) -> Option<DeferredCandidateSubtree> {
         match (left, right) {
             (None, None) => None,
             (Some(node), None) | (None, Some(node)) => Some(node),
-            (Some(left), Some(right)) => Some(Arc::new(Self {
-                len: left
-                    .len
-                    .checked_add(right.len)
-                    .expect("candidate occurrence count overflow"),
-                first_parent: left.first_parent,
-                last_parent: right.last_parent,
-                grouped: left.grouped
-                    && right.grouped
-                    && left.last_parent <= right.first_parent,
-                kind: DeferredCandidateNodeKind::Concat { left, right },
-            })),
+            (Some(left), Some(right)) => Some(Self::join(left, right)),
         }
     }
 
     fn split_occurrences(
-        node: Arc<Self>,
+        node: DeferredCandidateSubtree,
         cut: usize,
-    ) -> (Option<Arc<Self>>, Option<Arc<Self>>) {
+    ) -> (
+        Option<DeferredCandidateSubtree>,
+        Option<DeferredCandidateSubtree>,
+    ) {
         if cut == 0 {
             return (None, Some(node));
         }
-        if cut == node.len {
+        if cut == node.len() {
             return (Some(node), None);
         }
-        assert!(cut < node.len, "candidate occurrence split out of range");
-        match &node.kind {
+        assert!(cut < node.len(), "candidate occurrence split out of range");
+        match &node.node.kind {
             DeferredCandidateNodeKind::Values { values, range } => (
-                Self::value_view(values.clone(), range.start..range.start + cut),
-                Self::value_view(values.clone(), range.start + cut..range.end),
+                Self::value_view(values.clone(), range.start..range.start + cut)
+                    .map(|view| view.shifted(node.parent_delta)),
+                Self::value_view(values.clone(), range.start + cut..range.end)
+                    .map(|view| view.shifted(node.parent_delta)),
             ),
             DeferredCandidateNodeKind::Tagged { pairs, range } => (
-                Self::tagged_view(pairs.clone(), range.start..range.start + cut),
-                Self::tagged_view(pairs.clone(), range.start + cut..range.end),
+                Self::tagged_view(pairs.clone(), range.start..range.start + cut)
+                    .map(|view| view.shifted(node.parent_delta)),
+                Self::tagged_view(pairs.clone(), range.start + cut..range.end)
+                    .map(|view| view.shifted(node.parent_delta)),
             ),
-            DeferredCandidateNodeKind::Shift {
-                inner,
-                parent_delta,
-            } => {
-                let (left, right) = Self::split_occurrences(inner.clone(), cut);
-                (
-                    left.map(|node| Self::shift(node, *parent_delta)),
-                    right.map(|node| Self::shift(node, *parent_delta)),
-                )
-            }
             DeferredCandidateNodeKind::Concat { left, right } => {
-                if cut < left.len {
-                    let (prefix, middle) = Self::split_occurrences(left.clone(), cut);
-                    (prefix, Self::concat(middle, Some(right.clone())))
-                } else if cut == left.len {
-                    (Some(left.clone()), Some(right.clone()))
+                let left = left.clone().shifted(node.parent_delta);
+                let right = right.clone().shifted(node.parent_delta);
+                if cut < left.len() {
+                    let (prefix, middle) = Self::split_occurrences(left, cut);
+                    (prefix, Self::concat(middle, Some(right)))
+                } else if cut == left.len() {
+                    (Some(left), Some(right))
                 } else {
-                    let (middle, tail) = Self::split_occurrences(right.clone(), cut - left.len);
-                    (Self::concat(Some(left.clone()), middle), tail)
+                    let left_len = left.len();
+                    let (middle, tail) = Self::split_occurrences(right, cut - left_len);
+                    (Self::concat(Some(left), middle), tail)
                 }
             }
         }
     }
 
     fn split_parents(
-        node: Arc<Self>,
+        node: DeferredCandidateSubtree,
         first_tail_parent: u32,
-    ) -> (Option<Arc<Self>>, Option<Arc<Self>>) {
-        assert!(node.grouped, "parent split requires grouped candidate tags");
-        if node.last_parent < first_tail_parent {
+    ) -> (
+        Option<DeferredCandidateSubtree>,
+        Option<DeferredCandidateSubtree>,
+    ) {
+        assert!(node.grouped(), "parent split requires grouped candidate tags");
+        if node.last_parent() < first_tail_parent {
             return (Some(node), None);
         }
-        if node.first_parent >= first_tail_parent {
-            return (
-                None,
-                Some(Self::shift(node, -i64::from(first_tail_parent))),
-            );
+        if node.first_parent() >= first_tail_parent {
+            return (None, Some(node.shifted(-i64::from(first_tail_parent))));
         }
-        match &node.kind {
+        match &node.node.kind {
             DeferredCandidateNodeKind::Values { .. } => {
                 unreachable!("one-parent leaf cannot straddle a parent boundary")
             }
             DeferredCandidateNodeKind::Tagged { pairs, range } => {
+                let local_boundary =
+                    unshift_candidate_parent(first_tail_parent, node.parent_delta);
                 let cut = pairs[range.clone()]
-                    .partition_point(|(parent, _)| *parent < first_tail_parent);
+                    .partition_point(|(parent, _)| *parent < local_boundary);
                 let cut = range.start + cut;
-                let prefix = Self::tagged_view(pairs.clone(), range.start..cut);
+                let prefix = Self::tagged_view(pairs.clone(), range.start..cut)
+                    .map(|view| view.shifted(node.parent_delta));
                 let tail = Self::tagged_view(pairs.clone(), cut..range.end)
-                    .map(|node| Self::shift(node, -i64::from(first_tail_parent)));
+                    .map(|view| {
+                        view.shifted(node.parent_delta)
+                            .shifted(-i64::from(first_tail_parent))
+                    });
                 (prefix, tail)
             }
-            DeferredCandidateNodeKind::Shift {
-                inner,
-                parent_delta,
-            } => {
-                let inner_boundary = i64::from(first_tail_parent)
-                    .checked_sub(*parent_delta)
-                    .expect("candidate parent offset overflow");
-                let inner_boundary = u32::try_from(inner_boundary)
-                    .expect("shifted parent split left the valid domain");
-                let (prefix, tail) = Self::split_parents(inner.clone(), inner_boundary);
-                (
-                    prefix.map(|node| Self::shift(node, *parent_delta)),
-                    // The recursive tail is already rebased by the translated
-                    // boundary, exactly cancelling the outer shift.
-                    tail,
-                )
-            }
             DeferredCandidateNodeKind::Concat { left, right } => {
+                let left = left.clone().shifted(node.parent_delta);
+                let right = right.clone().shifted(node.parent_delta);
                 let (left_prefix, left_tail) =
-                    Self::split_parents(left.clone(), first_tail_parent);
+                    Self::split_parents(left, first_tail_parent);
                 let (right_prefix, right_tail) =
-                    Self::split_parents(right.clone(), first_tail_parent);
+                    Self::split_parents(right, first_tail_parent);
                 (
                     Self::concat(left_prefix, right_prefix),
                     Self::concat(left_tail, right_tail),
@@ -4233,8 +4359,8 @@ impl DeferredCandidateNode {
 impl<'a> DeferredCandidateIter<'a> {
     fn new(candidates: &'a DeferredCandidates) -> Self {
         let mut stack = Vec::new();
-        if let Some(root) = candidates.root.as_deref() {
-            stack.push((root, 0));
+        if let Some(root) = &candidates.root {
+            stack.push((root.node.as_ref(), root.parent_delta));
         }
         Self {
             stack,
@@ -4285,19 +4411,20 @@ impl Iterator for DeferredCandidateIter<'_> {
                         parent_delta,
                     });
                 }
-                DeferredCandidateNodeKind::Shift {
-                    inner,
-                    parent_delta: shift,
-                } => self.stack.push((
-                    inner,
-                    parent_delta
-                        .checked_add(*shift)
-                        .expect("candidate parent offset overflow"),
-                )),
                 DeferredCandidateNodeKind::Concat { left, right } => {
                     // LIFO traversal visits the left occurrence stream first.
-                    self.stack.push((right, parent_delta));
-                    self.stack.push((left, parent_delta));
+                    self.stack.push((
+                        right.node.as_ref(),
+                        parent_delta
+                            .checked_add(right.parent_delta)
+                            .expect("candidate parent offset overflow"),
+                    ));
+                    self.stack.push((
+                        left.node.as_ref(),
+                        parent_delta
+                            .checked_add(left.parent_delta)
+                            .expect("candidate parent offset overflow"),
+                    ));
                 }
             }
         }
@@ -4342,7 +4469,7 @@ impl DeferredCandidates {
             u32::try_from(right_parent_offset).expect("too many candidate parents");
         let shifted_right = right
             .root
-            .map(|right| DeferredCandidateNode::shift(right, i64::from(right_parent_offset)));
+            .map(|right| right.shifted(i64::from(right_parent_offset)));
         let root = DeferredCandidateNode::concat(left.root, shifted_right);
         Self {
             root,
@@ -4362,8 +4489,7 @@ impl DeferredCandidates {
         DeferredCandidateCursor {
             pending: self.root.as_ref().map(|root| {
                 Arc::new(DeferredCursorFrame {
-                    node: root.clone(),
-                    parent_delta: 0,
+                    subtree: root.clone(),
                     next: None,
                 })
             }),
@@ -4381,10 +4507,10 @@ impl DeferredCandidates {
         };
         let old_parent_count = self.parent_count;
         self.root = prefix;
-        self.len = self.root.as_ref().map_or(0, |node| node.len);
+        self.len = self.root.as_ref().map_or(0, DeferredCandidateSubtree::len);
         self.parent_count = first;
         Self {
-            len: tail.as_ref().map_or(0, |node| node.len),
+            len: tail.as_ref().map_or(0, DeferredCandidateSubtree::len),
             root: tail,
             parent_count: old_parent_count - first,
         }
@@ -4399,13 +4525,13 @@ impl DeferredCandidates {
             .expect("nonempty deferred payload lost its root");
         let (prefix, tail) = DeferredCandidateNode::split_occurrences(root, cut);
         let tail = tail.expect("candidate occurrence split lost its tail");
-        let first_tail_parent = tail.first_parent as usize;
+        let first_tail_parent = tail.first_parent() as usize;
         let prefix_parent_count = prefix
             .as_ref()
-            .map_or(0, |node| node.last_parent as usize + 1);
+            .map_or(0, |node| node.last_parent() as usize + 1);
         let old_parent_count = self.parent_count;
-        let tail_first = tail.first_parent;
-        let tail = DeferredCandidateNode::shift(tail, -i64::from(tail_first));
+        let tail_first = tail.first_parent();
+        let tail = tail.shifted(-i64::from(tail_first));
         self.root = prefix;
         self.len = cut;
         self.parent_count = prefix_parent_count;
@@ -4600,15 +4726,17 @@ impl CandidatePayload {
     fn one_parent_values(&self) -> &[RawInline] {
         match self {
             Self::Values(values) => values,
-            Self::Deferred(candidates) => match candidates.root.as_deref() {
+            Self::Deferred(candidates) => match &candidates.root {
                 None => &[],
-                Some(DeferredCandidateNode {
-                    kind: DeferredCandidateNodeKind::Values { values, range },
-                    ..
-                }) => &values[range.clone()],
-                Some(_) => panic!(
-                    "one-parent activation input was segmented before cyclic opening"
-                ),
+                Some(root) => match &root.node.kind {
+                    DeferredCandidateNodeKind::Values { values, range } => {
+                        assert_eq!(root.first_parent(), 0);
+                        &values[range.clone()]
+                    }
+                    _ => panic!(
+                        "one-parent activation input was segmented before cyclic opening"
+                    ),
+                },
             },
             Self::Tagged(_) => {
                 panic!("one-parent payload was not normalized to plain values")
@@ -4626,7 +4754,7 @@ impl CandidatePayload {
             Self::Deferred(candidates) => {
                 candidates.parent_count == parent_count
                     && candidates.root.as_ref().map_or(true, |root| {
-                        root.grouped && (root.last_parent as usize) < parent_count
+                        root.grouped() && (root.last_parent() as usize) < parent_count
                     })
             }
         }
@@ -4873,7 +5001,7 @@ impl CandidatePayload {
             Self::Deferred(candidates) => {
                 debug_assert_eq!(candidates.parent_count, parent_count);
                 debug_assert!(candidates.root.as_ref().map_or(true, |root| {
-                    root.grouped && (root.last_parent as usize) < parent_count
+                    root.grouped() && (root.last_parent() as usize) < parent_count
                 }));
             }
         }
@@ -14387,6 +14515,79 @@ mod tests {
         payload
     }
 
+    fn assert_deferred_candidate_avl(subtree: &DeferredCandidateSubtree) -> (usize, usize) {
+        // Validate in the node's local coordinate system. The incoming edge
+        // delta is intentionally irrelevant to shape, while calling the
+        // effective endpoint accessors also checks translation overflow.
+        let _ = subtree.first_parent();
+        let _ = subtree.last_parent();
+        match &subtree.node.kind {
+            DeferredCandidateNodeKind::Values { range, .. }
+            | DeferredCandidateNodeKind::Tagged { range, .. } => {
+                assert_eq!(subtree.node.height, 1);
+                assert_eq!(subtree.node.len, range.len());
+                (1, 1)
+            }
+            DeferredCandidateNodeKind::Concat { left, right } => {
+                let (left_height, left_leaves) = assert_deferred_candidate_avl(left);
+                let (right_height, right_leaves) = assert_deferred_candidate_avl(right);
+                assert!(left_height.abs_diff(right_height) <= 1);
+                assert_eq!(subtree.node.height, 1 + left_height.max(right_height));
+                assert_eq!(subtree.node.len, left.node.len + right.node.len);
+                assert_eq!(subtree.node.first_parent, left.first_parent());
+                assert_eq!(subtree.node.last_parent, right.last_parent());
+                assert_eq!(
+                    subtree.node.grouped,
+                    left.grouped()
+                        && right.grouped()
+                        && left.last_parent() <= right.first_parent()
+                );
+                (
+                    subtree.node.height,
+                    left_leaves
+                        .checked_add(right_leaves)
+                        .expect("test rope leaf count overflow"),
+                )
+            }
+        }
+    }
+
+    fn minimum_avl_leaves(height: usize) -> usize {
+        match height {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            _ => {
+                // An AVL node of height h has children of at least h-1 and
+                // h-2. This exact recurrence is the logarithmic depth bound;
+                // it avoids an implementation-specific segment cutoff.
+                let mut shorter = 1usize;
+                let mut taller = 2usize;
+                for _ in 3..=height {
+                    let next = shorter
+                        .checked_add(taller)
+                        .expect("test AVL leaf bound overflow");
+                    shorter = taller;
+                    taller = next;
+                }
+                taller
+            }
+        }
+    }
+
+    fn deferred_snapshot(root: Option<DeferredCandidateSubtree>) -> Vec<(u32, RawInline)> {
+        let len = root.as_ref().map_or(0, DeferredCandidateSubtree::len);
+        DeferredCandidates {
+            root,
+            len,
+            // Iteration does not consult the shell width; this helper only
+            // observes the structurally split occurrence stream.
+            parent_count: usize::MAX,
+        }
+        .iter()
+        .collect()
+    }
+
     fn ready_desc(bound_count: usize) -> StateDesc {
         let mut bound = VariableSet::new_empty();
         for variable in 0..bound_count {
@@ -16330,8 +16531,16 @@ mod tests {
             panic!("deferral did not produce a shared candidate root")
         };
         assert!(Arc::ptr_eq(
-            original.root.as_ref().expect("nonempty payload has a root"),
-            copy.root.as_ref().expect("cloned payload has a root")
+            &original
+                .root
+                .as_ref()
+                .expect("nonempty payload has a root")
+                .node,
+            &copy
+                .root
+                .as_ref()
+                .expect("cloned payload has a root")
+                .node,
         ));
 
         let mut cursor = original.cursor();
@@ -16345,6 +16554,187 @@ mod tests {
         let debug = format!("{payload:?}");
         assert!(debug.contains("shared-rope"));
         assert!(!debug.contains("DeferredCandidateNode"));
+    }
+
+    #[test]
+    fn deferred_avl_bounds_thousands_of_tiny_pages_and_first_cursor_descent() {
+        const SEGMENTS: usize = 4_096;
+        let mut payload = deferred_candidate_payload(1, vec![(0, raw(0))]);
+        for segment in 1..SEGMENTS {
+            payload.extend_same_domain(
+                CandidatePayload::Values(vec![raw((segment % 251) as u8)]),
+                1,
+            );
+        }
+
+        let CandidatePayload::Deferred(candidates) = &payload else {
+            panic!("tiny affine pages did not remain persistent")
+        };
+        let root = candidates.root.as_ref().expect("pages produced a root");
+        let (height, leaves) = assert_deferred_candidate_avl(root);
+        assert_eq!(leaves, SEGMENTS);
+        assert!(
+            leaves >= minimum_avl_leaves(height),
+            "AVL height {height} requires at least {} leaves, found {leaves}",
+            minimum_avl_leaves(height)
+        );
+
+        let mut cursor = candidates.cursor();
+        assert_eq!(cursor.next(), Some((0, raw(0))));
+        let mut pending_depth = 0usize;
+        let mut pending = cursor.pending.as_deref();
+        while let Some(frame) = pending {
+            pending_depth += 1;
+            pending = frame.next.as_deref();
+        }
+        assert!(
+            pending_depth < height,
+            "first cursor descent retained {pending_depth} siblings at AVL height {height}"
+        );
+        let cloned = payload.clone();
+        let CandidatePayload::Deferred(cloned_candidates) = &cloned else {
+            unreachable!()
+        };
+        assert!(Arc::ptr_eq(
+            &root.node,
+            &cloned_candidates
+                .root
+                .as_ref()
+                .expect("clone retained a root")
+                .node,
+        ));
+        drop(cloned);
+        for segment in 1..SEGMENTS {
+            assert_eq!(
+                cursor.next(),
+                Some((0, raw((segment % 251) as u8))),
+                "cursor changed occurrence order at segment {segment}"
+            );
+        }
+        assert_eq!(cursor.next(), None);
+        let debug = format!("{payload:?}");
+        assert!(!debug.contains("Concat"));
+        assert!(!debug.contains("Values"));
+
+        // Dropping the final owner still recursively releases Arc children,
+        // but the validated AVL height bounds that recursion logarithmically.
+        let last_owner = payload;
+        drop(last_owner);
+    }
+
+    #[test]
+    fn deferred_avl_preserves_shifted_pages_across_arbitrary_splits() {
+        const PARENTS: usize = 2_048;
+        let mut payload = deferred_candidate_payload(1, vec![(0, raw(0))]);
+        for parent in 1..PARENTS {
+            payload.append_disjoint(
+                CandidatePayload::Values(vec![raw((parent % 251) as u8)]),
+                parent,
+                1,
+            );
+        }
+        let CandidatePayload::Deferred(candidates) = &payload else {
+            panic!("shifted pages did not remain persistent")
+        };
+        let root = candidates.root.as_ref().expect("pages produced a root");
+        let (height, leaves) = assert_deferred_candidate_avl(root);
+        assert_eq!(leaves, PARENTS);
+        assert!(leaves >= minimum_avl_leaves(height));
+
+        let expected = candidates.iter().collect::<Vec<_>>();
+        for (parent, &(tag, value)) in expected.iter().enumerate() {
+            assert_eq!(tag as usize, parent);
+            assert_eq!(value, raw((parent % 251) as u8));
+        }
+
+        for cut in [1, 2, 3, 31, 255, 1_023, 1_024, PARENTS - 1] {
+            let (prefix, tail) =
+                DeferredCandidateNode::split_occurrences(root.clone(), cut);
+            if let Some(prefix) = &prefix {
+                assert_deferred_candidate_avl(prefix);
+            }
+            if let Some(tail) = &tail {
+                assert_deferred_candidate_avl(tail);
+            }
+            assert_eq!(deferred_snapshot(prefix), expected[..cut]);
+            assert_eq!(deferred_snapshot(tail), expected[cut..]);
+        }
+
+        for first_tail_parent in [1, 2, 17, 511, 1_024, PARENTS - 1] {
+            let (prefix, tail) = DeferredCandidateNode::split_parents(
+                root.clone(),
+                first_tail_parent as u32,
+            );
+            if let Some(prefix) = &prefix {
+                assert_deferred_candidate_avl(prefix);
+            }
+            if let Some(tail) = &tail {
+                assert_deferred_candidate_avl(tail);
+            }
+            assert_eq!(
+                deferred_snapshot(prefix),
+                expected[..first_tail_parent]
+            );
+            let rebased_tail = expected[first_tail_parent..]
+                .iter()
+                .map(|(parent, value)| (*parent - first_tail_parent as u32, *value))
+                .collect::<Vec<_>>();
+            assert_eq!(deferred_snapshot(tail), rebased_tail);
+        }
+    }
+
+    #[test]
+    fn deferred_avl_joins_adversarial_unequal_heights_in_both_orders() {
+        fn tiny_pages(start: usize, count: usize) -> DeferredCandidates {
+            let mut payload = deferred_candidate_payload(
+                1,
+                vec![(0, raw((start % 251) as u8))],
+            );
+            for offset in 1..count {
+                payload.extend_same_domain(
+                    CandidatePayload::Values(vec![raw(((start + offset) % 251) as u8)]),
+                    1,
+                );
+            }
+            let CandidatePayload::Deferred(candidates) = payload else {
+                unreachable!()
+            };
+            candidates
+        }
+
+        let tall = tiny_pages(0, 4_096);
+        let short = tiny_pages(4_096, 3);
+        let tall_snapshot = tall.iter().collect::<Vec<_>>();
+        let short_snapshot = short.iter().collect::<Vec<_>>();
+
+        let tall_then_short = DeferredCandidates::concat(tall.clone(), short.clone(), 0, 1);
+        let short_then_tall = DeferredCandidates::concat(short, tall, 0, 1);
+        let (height, leaves) = assert_deferred_candidate_avl(
+            tall_then_short
+                .root
+                .as_ref()
+                .expect("unequal join produced a root"),
+        );
+        assert_eq!(leaves, 4_099);
+        assert!(leaves >= minimum_avl_leaves(height));
+        let (reverse_height, reverse_leaves) = assert_deferred_candidate_avl(
+            short_then_tall
+                .root
+                .as_ref()
+                .expect("reverse unequal join produced a root"),
+        );
+        assert_eq!(reverse_leaves, 4_099);
+        assert!(reverse_leaves >= minimum_avl_leaves(reverse_height));
+
+        let mut expected = tall_snapshot.clone();
+        expected.extend(short_snapshot.iter().copied());
+        assert_eq!(tall_then_short.iter().collect::<Vec<_>>(), expected);
+        let mut reverse_expected = short_snapshot;
+        reverse_expected.extend(tall_snapshot);
+        assert_eq!(
+            short_then_tall.iter().collect::<Vec<_>>(),
+            reverse_expected
+        );
     }
 
     #[test]
@@ -16443,13 +16833,13 @@ mod tests {
             [(0, raw(20)), (1, raw(21))]
         );
 
-        fn tagged_leaf_buffers(node: &Arc<DeferredCandidateNode>, buffers: &mut Vec<usize>) {
-            match &node.kind {
+        fn tagged_leaf_buffers(
+            subtree: &DeferredCandidateSubtree,
+            buffers: &mut Vec<usize>,
+        ) {
+            match &subtree.node.kind {
                 DeferredCandidateNodeKind::Tagged { pairs, .. } => {
                     buffers.push(Arc::as_ptr(pairs) as usize)
-                }
-                DeferredCandidateNodeKind::Shift { inner, .. } => {
-                    tagged_leaf_buffers(inner, buffers)
                 }
                 DeferredCandidateNodeKind::Concat { left, right } => {
                     tagged_leaf_buffers(left, buffers);
@@ -16515,8 +16905,12 @@ mod tests {
             panic!("uniform partition materialized the candidate rope")
         };
         assert!(Arc::ptr_eq(
-            &root,
-            deferred.root.as_ref().expect("partition retained its root")
+            &root.node,
+            &deferred
+                .root
+                .as_ref()
+                .expect("partition retained its root")
+                .node,
         ));
         assert_eq!(
             group.candidates.tagged_snapshot(),
