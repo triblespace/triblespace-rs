@@ -722,6 +722,27 @@ impl<'v> RowsView<'v> {
 /// protocol through [`CandidateSink::Tagged`].
 pub type Candidates = Vec<(u32, RawInline)>;
 
+/// Collapses an action's occurrence bag to its SET support while preserving
+/// the order in which a tail-popping consumer would first encounter values.
+///
+/// The returned length is the raw occurrence count. Callers charge proposal
+/// work from that count before using the normalized action frontier. `seen` is
+/// cleared on return but retains its allocation for the next action.
+fn admit_reverse_stable_set<T>(occurrences: &mut Vec<T>, seen: &mut AHashSet<T>) -> usize
+where
+    T: Copy + Eq + std::hash::Hash,
+{
+    let raw_len = occurrences.len();
+    seen.clear();
+    if raw_len > 1 {
+        occurrences.reverse();
+        occurrences.retain(|occurrence| seen.insert(*occurrence));
+        occurrences.reverse();
+    }
+    seen.clear();
+    raw_len
+}
+
 /// The output sink of [`Constraint::propose`] / [`Constraint::confirm`] —
 /// the representation-generic seam that lets one protocol serve both
 /// engine families with zero ceremony on either side:
@@ -2197,6 +2218,9 @@ pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
     /// cursor is a block of one, so the row index is statically 0
     /// ([`CandidateSink::Values`]).
     values: ArrayVec<Option<Vec<RawInline>>, 128>,
+    /// Reused scratch for admitting one scalar proposal action to SET
+    /// support without allocating on every depth-first branch.
+    value_admission: AHashSet<RawInline>,
     /// Emit-only scratch: filled from the cursor when a full row is
     /// postprocessed. The only place a [`Binding`] still exists.
     binding: Binding,
@@ -2222,6 +2246,7 @@ where
         // Both cursor forms contain only raw bindings, never projected `R`s,
         // so a clone snapshots the exact remaining search without requiring
         // the output type itself to implement `Clone`.
+        debug_assert!(self.value_admission.is_empty());
         Self {
             constraint: self.constraint.clone(),
             postprocessing: self.postprocessing.clone(),
@@ -2240,6 +2265,10 @@ where
             bound: self.bound,
             unbound: self.unbound.clone(),
             values: self.values.clone(),
+            // Action admission never spans a cursor boundary. Do not clone an
+            // empty scratch table whose retained capacity may match a very
+            // large root proposal (especially on Rayon's first split).
+            value_admission: AHashSet::new(),
             binding: self.binding.clone(),
             dag: self.dag.clone(),
             residual: self.residual.clone(),
@@ -2300,6 +2329,10 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             &RowsView::new_indexed(&self.stack, &self.row, &self.cols),
             &mut CandidateSink::Values(values),
         );
+        // `values` is a tail-popped action stack. Keep each value's last
+        // stored occurrence so the first-seen DFS order remains unchanged:
+        // `[a, b, a] -> [b, a]`, then pop yields `a, b`.
+        admit_reverse_stable_set(values, &mut self.value_admission);
         self.cols[variable] = self.stack.len() as u8;
         self.stack.push(variable);
         self.row.push([0; 32]);
@@ -2550,6 +2583,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             bound: VariableSet::new_empty(),
             unbound,
             values: ArrayVec::from([const { None }; 128]),
+            value_admission: AHashSet::new(),
             binding: Binding::default(),
             dag: None,
             residual: None,
@@ -3407,6 +3441,9 @@ struct DagScratch {
     work: Vec<RawInline>,
     /// Candidate frontier, reused across groups and pops.
     pairs: Candidates,
+    /// Reused scratch for SET-admitting `(parent, value)` actions. Including
+    /// the parent tag preserves equal values belonging to distinct rows.
+    pair_admission: AHashSet<(u32, RawInline)>,
     /// Variable→column index for the popped layout
     /// ([`RowsView::new_indexed`]), refilled once per pop — every verb
     /// call of every constraint at this level then locates its columns in
@@ -3427,6 +3464,7 @@ impl Default for DagScratch {
             part: Vec::new(),
             work: Vec::new(),
             pairs: Vec::new(),
+            pair_admission: AHashSet::new(),
             cols: [COL_UNBOUND; 128],
         }
     }
@@ -3800,13 +3838,15 @@ impl DagState {
                 &view,
                 &mut CandidateSink::Tagged(&mut scratch.pairs),
             );
+            let raw_pairs =
+                admit_reverse_stable_set(&mut scratch.pairs, &mut scratch.pair_admission);
             if stats {
                 blocked_stats::record_level(blocked_stats::LevelRecord {
                     depth: stride,
                     rows: c_rows,
                     chunk_width: width,
                     group_sizes: vec![c_rows],
-                    batch_sizes: vec![scratch.pairs.len()],
+                    batch_sizes: vec![raw_pairs],
                 });
             }
             dag_file(
@@ -3915,9 +3955,11 @@ impl DagState {
                 &RowsView::new_indexed(&scratch.parent_vars, g_rows, &scratch.cols),
                 &mut CandidateSink::Tagged(&mut scratch.pairs),
             );
+            let raw_pairs =
+                admit_reverse_stable_set(&mut scratch.pairs, &mut scratch.pair_admission);
             if stats {
                 group_sizes_rec.push(g_count);
-                batch_sizes_rec.push(scratch.pairs.len());
+                batch_sizes_rec.push(raw_pairs);
             }
             dag_file(
                 &mut self.buckets,
@@ -5141,6 +5183,377 @@ mod tests {
         )
     }
 
+    #[derive(Clone)]
+    struct ScalarSetAdmissionProbe {
+        descendants: std::sync::Arc<std::sync::Mutex<Vec<RawInline>>>,
+    }
+
+    impl ScalarSetAdmissionProbe {
+        const ROOT: VariableId = 0;
+        const LEAF: VariableId = 1;
+        const A: RawInline = [4; 32];
+        const B: RawInline = [5; 32];
+        const LEAF_VALUE: RawInline = [6; 32];
+    }
+
+    impl Constraint<'static> for ScalarSetAdmissionProbe {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(Self::ROOT).union(VariableSet::new_singleton(Self::LEAF))
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            match variable {
+                Self::ROOT => out.fill(1, view.len()),
+                Self::LEAF => out.fill(2, view.len()),
+                _ => return false,
+            }
+            true
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            match variable {
+                Self::ROOT => {
+                    for row in 0..view.len() {
+                        candidates.extend_row(row as u32, [Self::A, Self::B, Self::A]);
+                    }
+                }
+                Self::LEAF => {
+                    let root = view.col(Self::ROOT).expect("root is bound first");
+                    let mut descendants = self.descendants.lock().unwrap();
+                    for (row_index, row) in view.iter().enumerate() {
+                        descendants.push(row[root]);
+                        candidates.push(row_index as u32, Self::LEAF_VALUE);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+    }
+
+    #[test]
+    fn scalar_action_admission_is_reverse_stable_before_descending() {
+        let descendants = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rows: Vec<_> = Query::new(
+            ScalarSetAdmissionProbe {
+                descendants: descendants.clone(),
+            },
+            |binding: &Binding| {
+                Some((
+                    *binding.get(ScalarSetAdmissionProbe::ROOT)?,
+                    *binding.get(ScalarSetAdmissionProbe::LEAF)?,
+                ))
+            },
+        )
+        .sequential()
+        .collect();
+
+        assert_eq!(
+            rows,
+            [
+                (
+                    ScalarSetAdmissionProbe::A,
+                    ScalarSetAdmissionProbe::LEAF_VALUE,
+                ),
+                (
+                    ScalarSetAdmissionProbe::B,
+                    ScalarSetAdmissionProbe::LEAF_VALUE,
+                ),
+            ]
+        );
+        assert_eq!(
+            *descendants.lock().unwrap(),
+            [ScalarSetAdmissionProbe::A, ScalarSetAdmissionProbe::B],
+            "the duplicate tail occurrence must disappear before the next action"
+        );
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn scalar_action_admission_precedes_rayon_splitting() {
+        use rayon::prelude::*;
+
+        let descendants = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut rows: Vec<_> = Query::new(
+            ScalarSetAdmissionProbe {
+                descendants: descendants.clone(),
+            },
+            |binding: &Binding| {
+                Some((
+                    *binding.get(ScalarSetAdmissionProbe::ROOT)?,
+                    *binding.get(ScalarSetAdmissionProbe::LEAF)?,
+                ))
+            },
+        )
+        .sequential()
+        .into_par_iter()
+        .collect();
+        rows.sort_unstable();
+
+        let mut observed = descendants.lock().unwrap().clone();
+        observed.sort_unstable();
+        assert_eq!(
+            rows,
+            [
+                (
+                    ScalarSetAdmissionProbe::A,
+                    ScalarSetAdmissionProbe::LEAF_VALUE,
+                ),
+                (
+                    ScalarSetAdmissionProbe::B,
+                    ScalarSetAdmissionProbe::LEAF_VALUE,
+                ),
+            ]
+        );
+        assert_eq!(
+            observed,
+            [ScalarSetAdmissionProbe::A, ScalarSetAdmissionProbe::B],
+            "Rayon shards must inherit the already SET-admitted proposal stack"
+        );
+    }
+
+    #[derive(Clone)]
+    struct DagSetAdmissionProbe {
+        descendants: std::sync::Arc<std::sync::Mutex<Vec<(RawInline, RawInline)>>>,
+    }
+
+    impl DagSetAdmissionProbe {
+        const PARENT: VariableId = 0;
+        const VALUE: VariableId = 1;
+        const LEAF: VariableId = 2;
+        const P0: RawInline = [7; 32];
+        const P1: RawInline = [8; 32];
+        const SHARED_VALUE: RawInline = [9; 32];
+        const LEAF_VALUE: RawInline = [10; 32];
+    }
+
+    impl Constraint<'static> for DagSetAdmissionProbe {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(Self::PARENT)
+                .union(VariableSet::new_singleton(Self::VALUE))
+                .union(VariableSet::new_singleton(Self::LEAF))
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            match variable {
+                Self::PARENT => out.fill(1, view.len()),
+                Self::VALUE => out.fill(2, view.len()),
+                Self::LEAF => out.fill(4, view.len()),
+                _ => return false,
+            }
+            true
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            match variable {
+                Self::PARENT => {
+                    for row in 0..view.len() {
+                        candidates.extend_row(row as u32, [Self::P0, Self::P1]);
+                    }
+                }
+                Self::VALUE => {
+                    let parent = view.col(Self::PARENT).expect("parent is bound first");
+                    for (row_index, row) in view.iter().enumerate() {
+                        let copies = if row[parent] == Self::P0 { 2 } else { 1 };
+                        candidates.extend_row(
+                            row_index as u32,
+                            std::iter::repeat_n(Self::SHARED_VALUE, copies),
+                        );
+                    }
+                }
+                Self::LEAF => {
+                    let parent = view.col(Self::PARENT).expect("parent is bound");
+                    let value = view.col(Self::VALUE).expect("value is bound");
+                    let mut descendants = self.descendants.lock().unwrap();
+                    for (row_index, row) in view.iter().enumerate() {
+                        descendants.push((row[parent], row[value]));
+                        candidates.push(row_index as u32, Self::LEAF_VALUE);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+    }
+
+    #[test]
+    fn dag_action_admission_is_parent_scoped_before_filing() {
+        let descendants = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rows: Vec<_> = Query::new(
+            DagSetAdmissionProbe {
+                descendants: descendants.clone(),
+            },
+            |binding: &Binding| {
+                Some((
+                    *binding.get(DagSetAdmissionProbe::PARENT)?,
+                    *binding.get(DagSetAdmissionProbe::VALUE)?,
+                    *binding.get(DagSetAdmissionProbe::LEAF)?,
+                ))
+            },
+        )
+        .solve_dag_lazy()
+        .start_width(usize::MAX)
+        .growth(1)
+        .collect();
+
+        assert_eq!(
+            rows,
+            [
+                (
+                    DagSetAdmissionProbe::P0,
+                    DagSetAdmissionProbe::SHARED_VALUE,
+                    DagSetAdmissionProbe::LEAF_VALUE,
+                ),
+                (
+                    DagSetAdmissionProbe::P1,
+                    DagSetAdmissionProbe::SHARED_VALUE,
+                    DagSetAdmissionProbe::LEAF_VALUE,
+                ),
+            ]
+        );
+        assert_eq!(
+            *descendants.lock().unwrap(),
+            [
+                (
+                    DagSetAdmissionProbe::P0,
+                    DagSetAdmissionProbe::SHARED_VALUE,
+                ),
+                (
+                    DagSetAdmissionProbe::P1,
+                    DagSetAdmissionProbe::SHARED_VALUE,
+                ),
+            ],
+            "an intra-parent duplicate must vanish while an equal value under another parent survives"
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    struct DagTerminalSetAdmissionProbe;
+
+    impl Constraint<'static> for DagTerminalSetAdmissionProbe {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(DagSetAdmissionProbe::PARENT)
+                .union(VariableSet::new_singleton(DagSetAdmissionProbe::VALUE))
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if self.variables().is_set(variable) {
+                out.fill(1, view.len());
+                true
+            } else {
+                false
+            }
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            if variable != DagSetAdmissionProbe::VALUE {
+                return;
+            }
+            let parent = view
+                .col(DagSetAdmissionProbe::PARENT)
+                .expect("parent is already bound");
+            for (row_index, row) in view.iter().enumerate() {
+                let copies = if row[parent] == DagSetAdmissionProbe::P0 {
+                    2
+                } else {
+                    1
+                };
+                candidates.extend_row(
+                    row_index as u32,
+                    std::iter::repeat_n(DagSetAdmissionProbe::SHARED_VALUE, copies),
+                );
+            }
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+    }
+
+    #[test]
+    fn dag_single_unbound_fast_path_admits_before_filing() {
+        let full = DagTerminalSetAdmissionProbe.variables();
+        let mut parent_set = VariableSet::new_empty();
+        parent_set.set(DagSetAdmissionProbe::PARENT);
+        let mut state = DagState::new(full);
+        state.buckets = vec![DagBucket {
+            set: parent_set,
+            vars: vec![DagSetAdmissionProbe::PARENT],
+            rows: vec![DagSetAdmissionProbe::P0, DagSetAdmissionProbe::P1],
+            writer: 0,
+            pending: 0,
+        }];
+
+        state.pop_once(
+            &DagTerminalSetAdmissionProbe,
+            &[VariableSet::new_empty(); 128],
+            &[1; 128],
+            usize::MAX,
+        );
+
+        assert_eq!(state.buckets.len(), 1);
+        let child = &state.buckets[0];
+        assert_eq!(child.set, full);
+        assert_eq!(
+            RowsView::new(&child.vars, &child.rows)
+                .iter()
+                .map(|row| (row[0], row[1]))
+                .collect::<Vec<_>>(),
+            [
+                (DagSetAdmissionProbe::P0, DagSetAdmissionProbe::SHARED_VALUE,),
+                (DagSetAdmissionProbe::P1, DagSetAdmissionProbe::SHARED_VALUE,),
+            ]
+        );
+    }
+
     #[test]
     fn scheduler_width_and_equal_key_ties_preserve_semantic_variable_actions() {
         let constraint = VariableOrderBagConstraint {
@@ -5185,7 +5598,6 @@ mod tests {
                 true,
                 vec![
                     row(VariableOrderBagConstraint::P0),
-                    row(VariableOrderBagConstraint::P1),
                     row(VariableOrderBagConstraint::P1),
                 ],
             ),
