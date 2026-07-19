@@ -73,7 +73,7 @@ where
     };
 
     assert_engine("sequential", make_query().sequential().collect());
-    assert_engine("ordinary shape-selected", make_query().collect());
+    assert_engine("ordinary residual-default", make_query().collect());
     assert_engine("lazy DAG", make_query().solve_dag_lazy().collect());
 
     let mut lazy = make_query().solve_dag_lazy();

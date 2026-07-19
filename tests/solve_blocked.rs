@@ -1,9 +1,9 @@
 //! PROBE semantics gate for the frontier-batched solver
 //! (`Query::solve_blocked`): every query must yield the same result
 //! **multiset** as the sequential iterator, on both the TribleSet backend
-//! (default blocked impls) and the SuccinctArchive backend (batched
-//! `confirm_blocked` override), across point/star/filter/intersect/chain
-//! join shapes plus edge cases.
+//! (per-row block-native operations) and the SuccinctArchive backend (batched
+//! `propose`/`confirm` operations), across point/star/filter/intersect/chain join
+//! shapes plus edge cases.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -114,12 +114,6 @@ macro_rules! gate {
         assert_eq!(
             sequential, blocked,
             "solve_blocked diverged from the sequential engine on {}",
-            $name
-        );
-        let grouped = multiset($q.solve_blocked_grouped());
-        assert_eq!(
-            sequential, grouped,
-            "solve_blocked_grouped diverged from the sequential engine on {}",
             $name
         );
         let dag = multiset($q.solve_dag());
@@ -345,9 +339,8 @@ fn probe_solvers_refuse_started_query() {
 }
 
 /// PROBE (group-by-ordering) skew world: two sub-populations whose rows
-/// genuinely prefer **different** next variables after `?e` is bound, so
-/// blocked-v1's single per-level choice (first row's estimates) is wrong
-/// for half the block.
+/// genuinely prefer **different** next variables after `?e` is bound. The
+/// block-native engines must retain those exact row-local actions.
 ///
 /// Query: `?e p ?x . ?e q ?y . ?x r ?y` — one result per person.
 ///
@@ -753,8 +746,6 @@ fn blocked_no_variables_yields_one_unit_row() {
     let a = ctx.next_variable::<I256BE>();
     let rows = find!((), a.is(I256BE::inline_from(42))).solve_blocked();
     assert_eq!(rows, vec![()]);
-    let rows = find!((), a.is(I256BE::inline_from(42))).solve_blocked_grouped();
-    assert_eq!(rows, vec![()]);
     let rows: Vec<()> = find!((), a.is(I256BE::inline_from(42)))
         .solve_dag_lazy()
         .collect();
@@ -791,30 +782,6 @@ fn gate_partial<S: TriblePattern>(kb: &S, human: Id) {
     }
     let sequential = multiset(star3!().sequential());
     assert!(!sequential.is_empty(), "partial gate is vacuous");
-
-    let hybrid = multiset(
-        star3!()
-            .solve_dag_lazy()
-            .start_width(1)
-            .growth(2)
-            .trivial_partition_at_width(256),
-    );
-    assert_eq!(
-        hybrid, sequential,
-        "switching partitions at a width threshold changed the full multiset"
-    );
-
-    let agglomerated = multiset(
-        star3!()
-            .solve_dag_lazy()
-            .start_width(1)
-            .growth(2)
-            .agglomerative_partition(),
-    );
-    assert_eq!(
-        agglomerated, sequential,
-        "agglomerative bucketing changed the full multiset"
-    );
 
     // take(1) — first-result path, narrow sprint width only.
     let one = multiset(star3!().solve_dag_lazy().take(1));

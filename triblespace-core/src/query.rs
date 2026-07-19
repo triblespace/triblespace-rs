@@ -15,7 +15,6 @@
 //! For a tour of the language see the "Query Language" chapter in the book.
 //! Conceptual background on schemas and join strategy appears in the
 //! "Query Engine" and "Atreides Join" chapters.
-mod agglomerative;
 /// [`ConstantConstraint`] — pins a variable to a single value.
 pub mod constantconstraint;
 /// [`EqualityConstraint`](equalityconstraint::EqualityConstraint) — constrains two variables to have the same value.
@@ -46,9 +45,6 @@ use std::fmt;
 use std::iter::FromIterator;
 use std::marker::PhantomData;
 
-use agglomerative::plan_agglomerative_partition;
-#[cfg(test)]
-use agglomerative::AgglomerativePlan;
 use arrayvec::ArrayVec;
 use constantconstraint::*;
 
@@ -967,6 +963,17 @@ pub trait ConstraintChildren<'a> {
 /// feed back into any estimate, candidate, confirmation, or satisfaction
 /// answer.
 ///
+/// # Action identity and occurrence bags
+///
+/// Once planning selects a variable and proposing constraint occurrence for a
+/// row, that pair is the row's semantic action. [`propose`](Constraint::propose)
+/// owns the candidate occurrence bag, including duplicates; estimates only
+/// order the choice. Row homomorphism permits batching the **same** action
+/// across rows, but it does not imply that different variables commute or that
+/// two proposer occurrences yield interchangeable bags. A physical scheduler
+/// must therefore preserve the selected action rather than reassigning a row to
+/// an estimate-similar variable or proposer.
+///
 /// # Composability
 ///
 /// Constraints combine via [`IntersectionConstraint`](crate::query::intersectionconstraint::IntersectionConstraint)
@@ -1002,10 +1009,11 @@ pub trait Constraint<'a> {
     ///
     /// Returns `false` (leaving `out` untouched) when `variable` is not
     /// constrained by this constraint — a structural answer, uniform
-    /// across the block. Estimates need not be exact: they guide variable
-    /// ordering, not correctness. Tighter estimates lead to better search
-    /// pruning; see the [Atreides join](crate) family for how estimate
-    /// fidelity affects performance.
+    /// across the block. Estimates need not equal the eventual candidate
+    /// count: they guide adaptive action ordering, while the selected
+    /// `propose`/`confirm` path defines the occurrence bag. Tighter estimates
+    /// lead to better search pruning; see the [Atreides join](crate) family for
+    /// how estimate fidelity affects performance.
     fn estimate(
         &self,
         variable: VariableId,
@@ -1886,9 +1894,9 @@ pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
     /// Emit-only scratch: filled from the cursor when a full row is
     /// postprocessed. The only place a [`Binding`] still exists.
     binding: Binding,
-    /// Lazily initialized lazy-DAG state for the structural fallback or an
-    /// explicit override. Keeping the worklist in a box avoids growing the
-    /// already-large sequential cursor copied by rayon's DFS splitter.
+    /// Lazily initialized lazy-DAG state for an explicit scheduler override.
+    /// Keeping the worklist in a box avoids growing the already-large
+    /// sequential cursor copied by rayon's DFS splitter.
     dag: Option<Box<DagState>>,
     /// Lazily initialized canonical residual-state cursor. The box owns only
     /// a borrow-free lowering plan plus raw machine state; `constraint` and
@@ -1963,7 +1971,8 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
                 self.estimates[v] = estimate;
             }
             self.unbound.sort_unstable_by_key(|v| {
-                variable_order_key(
+                variable_choice_key(
+                    *v,
                     self.estimates[*v],
                     self.base_estimates[*v],
                     self.influences[*v].count(),
@@ -1999,9 +2008,8 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         (self.postprocessing)(&self.binding)
     }
 
-    /// PROBE: frontier-batched (block-at-a-time) solver — the **trivial
-    /// partition** configuration of the worklist core (ungrouped,
-    /// unmerged, saturated width).
+    /// PROBE: frontier-batched (block-at-a-time) solver — the exact-grouped,
+    /// unmerged, saturated-width configuration of the worklist core.
     ///
     /// The scalar [`sequential`](Self::sequential) scheduler descends one
     /// binding at a time, so on star or filter shapes every sibling branch
@@ -2012,60 +2020,25 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// and hands whole frontiers of `(row, candidate)` pairs to the
     /// constraints ([`Constraint::propose`] / [`Constraint::confirm`]
     /// over multi-row [`RowsView`]s): one ragged batch per
-    /// (constraint, level) instead of one call per branch. The next
-    /// variable is chosen **once per block** from the first row's
-    /// estimates — cheap, but wrong for every row that would have
-    /// preferred a different variable (the ordering-quality loss the
-    /// grouped configuration repairs).
+    /// (constraint, level) instead of one call per branch. Each row retains
+    /// the same adaptive next-variable choice as scalar execution, and rows
+    /// batch only when that semantic action agrees.
     ///
     /// Semantics: yields the same result **multiset** as the iterator;
     /// row order may differ (block order instead of DFS order).
     pub fn solve_blocked(self) -> Vec<R> {
         let mut it = self.solve_dag_lazy().start_width(usize::MAX);
         it.state.merge = false;
-        it.state.grouped = false;
-        it.state.agglomerative_partition = false;
-        it.collect()
-    }
-
-    /// PROBE (group-by-ordering): frontier-batched solver with **per-row**
-    /// variable choice — the grouped, unmerged configuration of the
-    /// worklist core at saturated width.
-    ///
-    /// [`solve_blocked`](Self::solve_blocked) picks one next variable per
-    /// level from the *first row's* estimates. This configuration batches
-    /// the *estimation* too ([`Constraint::estimate`]: one estimate column
-    /// per unbound variable over the whole block), computes each row's
-    /// preferred next variable (argmax of the same [`variable_order_key`]
-    /// the sequential engine sorts by), **partitions** the block by
-    /// preferred variable (stable counting sort), and descends each group
-    /// with *its* variable. Per-branch ordering quality is restored while
-    /// batches stay level-wide within groups; fragmentation is bounded by
-    /// `|unbound|` groups per level.
-    ///
-    /// With merging off, filings are lineage-keyed (a fresh bucket per
-    /// filing) — this is **the same configuration as**
-    /// [`solve_dag_unmerged`](Self::solve_dag_unmerged); both names are
-    /// kept because they gate different probe histories.
-    ///
-    /// Semantics: same result **multiset** as the sequential iterator;
-    /// row order may differ.
-    pub fn solve_blocked_grouped(self) -> Vec<R> {
-        let mut it = self
-            .solve_dag_lazy()
-            .grouped_partition()
-            .start_width(usize::MAX);
-        it.state.merge = false;
         it.collect()
     }
 
     /// Use the scalar depth-first scheduler for this query.
     ///
-    /// The ordinary iterator structurally selects residual states for a live
-    /// exposed conjunction with overlapping leaf variable sets, and the lazy
-    /// DAG otherwise. The scalar scheduler remains useful for tiny queries,
-    /// strict frontier-memory bounds, and as the block-of-one specialization
-    /// of the same block-native constraint protocol.
+    /// Every live fresh ordinary iterator uses residual states. The scalar
+    /// scheduler remains useful for tiny queries, strict frontier-memory
+    /// bounds, and as the block-of-one specialization of the same block-native
+    /// constraint protocol; [`Query::lazy_dag_scheduler`] selects the explicit
+    /// bound-variable-set worklist control.
     ///
     /// # Panics
     ///
@@ -2083,11 +2056,11 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// Force canonical residual-state execution through the ordinary
     /// resumable [`Query`] iterator.
     ///
-    /// Ordinary iteration already selects residual states for live exposed
-    /// conjunctions with shared-variable leaf work. This override preserves
-    /// arbitrary-root completeness for opaque, one-leaf, disjoint, and
-    /// seed-rejected constraints, and is useful for scheduler comparison. The
-    /// override preserves the query's structural lowering. Use
+    /// Ordinary live iteration already selects residual states for every root.
+    /// This explicit selector can restore that scheduler after another builder
+    /// choice and remains useful as a completeness/comparison control. A
+    /// seed-rejected query still starts no worklist. The selector preserves the
+    /// query's structural lowering. Use
     /// [`Query::residual_lowering`] before this method to choose another of the
     /// six canonical lowering forms. The runtime cursor remains behind
     /// `Query::next`, so cloning a started query
@@ -2133,7 +2106,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// [`Query`] iterator.
     ///
     /// This is a diagnostic and behavioral control for comparing the DAG
-    /// worklist with the shape-selected ordinary scheduler. It keeps its raw
+    /// worklist with the residual-default ordinary scheduler. It keeps its raw
     /// resumable worklist behind `Query::next`, so cloning a started query
     /// snapshots the exact remainder. Converting an unstarted selected query
     /// through ordinary Rayon iteration still uses the established scalar
@@ -2190,7 +2163,12 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         let base_estimates = estimates;
         let mut unbound = ArrayVec::from_iter(variables);
         unbound.sort_unstable_by_key(|v| {
-            variable_order_key(estimates[*v], base_estimates[*v], influences[*v].count())
+            variable_choice_key(
+                *v,
+                estimates[*v],
+                base_estimates[*v],
+                influences[*v].count(),
+            )
         });
 
         // Constraints whose variables are all constant [`Term`]s (e.g. a
@@ -2334,6 +2312,21 @@ fn variable_order_key(
     }
 }
 
+/// Total ordering for a row's adaptive variable action. Lower variable IDs win
+/// exact ordering-key ties, so scalar sort/pop and block-native scans select the
+/// same semantic action without relying on unstable-sort tie behavior.
+#[inline]
+fn variable_choice_key(
+    variable: VariableId,
+    estimate: usize,
+    base_estimate: usize,
+    influence_count: usize,
+) -> (u64, u64, u64, std::cmp::Reverse<VariableId>) {
+    let (first, second, third) =
+        variable_order_key(estimate, base_estimate, influence_count);
+    (first, second, third, std::cmp::Reverse(variable))
+}
+
 #[inline]
 fn estimate_magnitude(estimate: usize) -> u64 {
     estimate.checked_ilog2().map(|m| m + 1).unwrap_or(0) as u64
@@ -2342,9 +2335,8 @@ fn estimate_magnitude(estimate: usize) -> u64 {
 /// PROBE (order-key experiment): cheap realized-variable-order trace. Off
 /// by default; harnesses enable it around an untimed run. Each pick of a
 /// next variable records `(depth, variable, weight)` — weight 1 per
-/// branch in the sequential engine and per block in `solve_blocked`, and
-/// the group's row count in `solve_blocked_grouped` (per-row preference
-/// mass). [`report`](order_trace::report) aggregates counts per
+/// branch in the sequential engine and the exact group's row count in the
+/// block-native engines. [`report`](order_trace::report) aggregates counts per
 /// `(depth, variable)` so "which variable did the engine actually bind at
 /// each level, how often" is visible per query.
 pub mod order_trace {
@@ -2442,24 +2434,10 @@ pub mod blocked_stats {
         pub rows: usize,
         /// Slow-start chunk width in force for this pop.
         pub chunk_width: usize,
-        /// Per-group row counts (the v1 solver always reports one group).
+        /// Per-exact-variable-group row counts.
         pub group_sizes: Vec<usize>,
         /// Frontier size (candidate pairs) produced per group's propose.
         pub batch_sizes: Vec<usize>,
-        /// Sum of candidate-count estimates under each row's preferred
-        /// variable. Present when the grouped scheduler computed the full
-        /// estimate matrix.
-        pub preferred_estimate_sum: Option<u128>,
-        /// Number of exact per-row preferred-variable groups before any
-        /// coalescing. The scheduled count is `group_sizes.len()`.
-        pub preferred_group_count: Option<usize>,
-        /// Estimate sum under the scheduled assignment. Equals the preferred
-        /// sum when no agglomerative plan ran or no merge was admissible.
-        pub scheduled_estimate_sum: Option<u128>,
-        /// Actual maximum pointwise estimate inflation in the scheduled plan,
-        /// rounded up. `None` means the planner was disabled/ineligible; `1`
-        /// means it ran but no row was assigned above its preferred estimate.
-        pub row_inflation: Option<usize>,
     }
 
     static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -2513,8 +2491,7 @@ pub mod blocked_stats {
         MATERIALIZED.fetch_add(rows as u64, Ordering::Relaxed);
     }
 
-    /// Total intermediate rows materialized into child blocks — the
-    /// blocked-v1 vs grouped "intermediate block size" comparison number.
+    /// Total intermediate rows materialized into child blocks.
     pub fn materialized_rows() -> u64 {
         MATERIALIZED.load(Ordering::Relaxed)
     }
@@ -2522,51 +2499,6 @@ pub mod blocked_stats {
     /// Raw per-level records, for benches that want full distributions.
     pub fn records() -> Vec<LevelRecord> {
         RECORDS.lock().unwrap().clone()
-    }
-
-    /// Per-pop exact-grouping → scheduled-grouping decisions. Unlike the old
-    /// endpoint report, this includes successful one-group collapses.
-    pub fn bucketing_report() -> String {
-        use std::fmt::Write;
-        let records = RECORDS.lock().unwrap();
-        let mut out = String::new();
-        for record in records.iter() {
-            let (Some(preferred), Some(preferred_groups), Some(scheduled), Some(inflation)) = (
-                record.preferred_estimate_sum,
-                record.preferred_group_count,
-                record.scheduled_estimate_sum,
-                record.row_inflation,
-            ) else {
-                continue;
-            };
-            if preferred_groups <= 1 {
-                continue;
-            }
-            if !out.is_empty() {
-                let _ = write!(out, "; ");
-            }
-            let ratio = if preferred == 0 {
-                if scheduled == 0 {
-                    1.0
-                } else {
-                    f64::INFINITY
-                }
-            } else {
-                scheduled as f64 / preferred as f64
-            };
-            let _ = write!(
-                out,
-                "d{} w{} rows{} groups{}→{} {:.3}x rho{}",
-                record.depth,
-                record.chunk_width,
-                record.rows,
-                preferred_groups,
-                record.group_sizes.len(),
-                ratio,
-                inflation,
-            );
-        }
-        out
     }
 
     /// Terse per-depth aggregate: calls, rows, group count/sizes, batch
@@ -2599,34 +2531,10 @@ pub mod blocked_stats {
                     batches.iter().sum(),
                 )
             };
-            let planned: Vec<&LevelRecord> = recs
-                .iter()
-                .copied()
-                .filter(|r| r.preferred_group_count.is_some())
-                .collect();
-            let preferred_estimate_sum: u128 = planned
-                .iter()
-                .filter_map(|r| r.preferred_estimate_sum)
-                .sum();
-            let scheduled_estimate_sum: u128 = planned
-                .iter()
-                .filter_map(|r| r.scheduled_estimate_sum)
-                .sum();
-            let preferred_groups: usize =
-                planned.iter().filter_map(|r| r.preferred_group_count).sum();
-            let scheduled_groups: usize = planned.iter().map(|r| r.group_sizes.len()).sum();
-            let partition_cost = if preferred_estimate_sum == 0 {
-                String::new()
-            } else {
-                format!(
-                    " exact→scheduled groups {preferred_groups}→{scheduled_groups}, predicted {:.3}x;",
-                    scheduled_estimate_sum as f64 / preferred_estimate_sum as f64
-                )
-            };
             let _ = write!(
                 out,
                 "d{d}: {calls} calls / {rows} rows / {groups} groups (max {max_groups}/call), \
-                 batches n={} tot={btot} [min {bmin} / med {bmed} / max {bmax}];{partition_cost} ",
+                 batches n={} tot={btot} [min {bmin} / med {bmed} / max {bmax}]; ",
                 batches.len(),
             );
         }
@@ -2638,32 +2546,6 @@ pub mod blocked_stats {
         );
         out
     }
-}
-
-/// Chooses the next variable for a block from a single row's estimates —
-/// the same `(magnitude, influence-count)` key the sequential engine
-/// sorts by, applied once per block instead of once per branch. Returns
-/// the index into `unbound`.
-fn choose_variable<'a, C: Constraint<'a>>(
-    constraint: &C,
-    unbound: &[VariableId],
-    first: RowsView<'_>,
-    influences: &[VariableSet; 128],
-    base_estimates: &[usize; 128],
-) -> usize {
-    let mut best: Option<(usize, (u64, u64, u64))> = None;
-    for (ui, &v) in unbound.iter().enumerate() {
-        let mut est = 0usize;
-        assert!(
-            constraint.estimate(v, &first, &mut EstimateSink::Scalar(&mut est)),
-            "unconstrained variable in query"
-        );
-        let key = variable_order_key(est, base_estimates[v], influences[v].count());
-        if best.is_none_or(|(_, bk)| key > bk) {
-            best = Some((ui, key));
-        }
-    }
-    best.expect("non-empty unbound").0
 }
 
 /// PROBE (dag-frontier): counters specific to the bucket-worklist solver
@@ -2898,9 +2780,8 @@ fn dag_gate_rebuild(buckets: &mut [DagBucket]) {
 
 impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// PROBE (dag-frontier): bucket-worklist solver — the tree-becomes-DAG
-    /// upgrade of [`solve_blocked_grouped`](Self::solve_blocked_grouped),
-    /// i.e. the worklist core in its default configuration (grouped,
-    /// **merged**), drained eagerly at saturated width.
+    /// upgrade of [`solve_blocked`](Self::solve_blocked), i.e. the exact-grouped
+    /// worklist with merging enabled, drained eagerly at saturated width.
     ///
     /// Evaluation state is a worklist of **buckets keyed by
     /// bound-variable-set** instead of a recursion stack. Pop a bucket,
@@ -2932,10 +2813,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// (each row still value-partitions its region of the search space;
     /// merging is co-location only). Row order differs.
     pub fn solve_dag(self) -> Vec<R> {
-        self.solve_dag_lazy()
-            .grouped_partition()
-            .start_width(usize::MAX)
-            .collect()
+        self.solve_dag_lazy().start_width(usize::MAX).collect()
     }
 
     /// PROBE (dag-frontier): [`solve_dag`](Self::solve_dag) with merging
@@ -2946,12 +2824,9 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// merging there is nothing to hold buckets *for*, so the readiness
     /// gate is off and scheduling is strict deepest-first (DFS-like) —
     /// which also makes this configuration identical to
-    /// [`solve_blocked_grouped`](Self::solve_blocked_grouped).
+    /// [`solve_blocked`](Self::solve_blocked).
     pub fn solve_dag_unmerged(self) -> Vec<R> {
-        let mut it = self
-            .solve_dag_lazy()
-            .grouped_partition()
-            .start_width(usize::MAX);
+        let mut it = self.solve_dag_lazy().start_width(usize::MAX);
         it.state.merge = false;
         it.collect()
     }
@@ -2978,9 +2853,11 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// Narrow pops keep first-result latency sequential-class; sustained
     /// pulling widens to full harvest batches.
     ///
-    /// **Scheduling — sprint vs harvest.** Width, pop order, and group
-    /// assignments are correctness-free (any valid next-variable choice and
-    /// pop order yields the same result multiset), but they interact: a
+    /// **Scheduling — sprint vs harvest.** Width and pop order are physical,
+    /// but each row's adaptive next-variable assignment is semantic because
+    /// the selected proposer owns its occurrence bag. The engine therefore
+    /// preserves exact per-row assignments while width and pop order interact:
+    /// a
     /// partially drained bucket's remainder is a strict subset of its own
     /// children, so the eager engine's readiness gate would refuse to
     /// descend past it and partial pops would degenerate to level-drain —
@@ -2994,24 +2871,17 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// computation is the eager [`solve_dag`](Self::solve_dag) algorithm
     /// on the remaining state.
     ///
-    /// **Agglomerative grouping.** Whenever a popped block genuinely splits
-    /// across per-row preferred variables, exact-choice groups are the leaves
-    /// of a merge hierarchy. A complete source group may move to target `v`
-    /// only when every row's binary estimate-magnitude regret fits the bit
-    /// length of `{v} ∪ (influence(v) ∩ unbound)`. At each level, the
-    /// compatible absorption with the least resulting candidate estimate is
-    /// chosen; merging continues to the coarsest admissible level of that
-    /// hierarchy. A one-row chunk is naturally ineligible because it cannot
-    /// split, and no width or fixed-inflation cutoff is involved. Estimates
-    /// affect scheduling only; exact proposal/confirmation semantics are
-    /// unchanged.
+    /// **Exact grouping.** A popped block is partitioned by each row's exact
+    /// preferred variable. The DAG cohorts those exact-variable groups and
+    /// delegates row-local proposer choice to the root constraint's
+    /// block-native [`Constraint::propose`]. Exposed residual planning instead
+    /// cohorts explicit `(variable, proposer occurrence)` actions. Neither path
+    /// reassigns either choice: an estimate-similar action is not
+    /// interchangeable because [`Constraint`] supplies no cross-action
+    /// occurrence-bag equivalence law.
     ///
-    /// For `R` rows and `V ≤ 128` unbound variables, planning takes
-    /// `O(RV + V³)` time and the scheduler uses `O(RV + V²)` reusable scratch
-    /// space in total. The `RV` estimate matrix already belongs to exact
-    /// per-row grouping; agglomeration adds `O(R + V²)` scratch beyond it.
-    /// The planner builds row/group compatibility once, then rescans the
-    /// active directed edges for at most `V - 1` absorptions.
+    /// For `R` rows and `V ≤ 128` unbound variables, planning takes `O(RV)`
+    /// time and uses `O(RV + V)` reusable scratch space.
     ///
     /// Semantics: fully drained, the same result **multiset** as the
     /// sequential iterator and the eager DAG solver; row order differs.
@@ -3033,8 +2903,8 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
                 && self.touched_variables.is_empty()
                 && matches!(self.mode, Search::NextVariable | Search::Done),
             "cannot probe-solve a Query mid-iteration: Iterator::next has already \
-             been called; probe solvers (solve_blocked/solve_blocked_grouped/\
-             solve_dag/solve_dag_unmerged/solve_dag_lazy) restart from the seed \
+             been called; probe solvers (solve_blocked/solve_dag/\
+             solve_dag_unmerged/solve_dag_lazy) restart from the seed \
              block and require a fresh query"
         );
         let Query {
@@ -3117,46 +2987,6 @@ impl<C, P: Fn(&Binding) -> Option<R>, R> DagIter<C, P, R> {
         self
     }
 
-    /// PROBE: switches from per-row preferred-variable partitioning to the
-    /// trivial one-variable-per-block partition once a resumption reaches
-    /// `width` rows.
-    ///
-    /// This replaces the ordinary agglomerative grouping policy with an
-    /// unconditional transition. A threshold above the start width keeps the
-    /// width-one first-result sprint unchanged. This changes only search order
-    /// and batching; fully drained result multisets are unchanged.
-    pub fn trivial_partition_at_width(mut self, width: usize) -> Self {
-        self.state.grouped = true;
-        self.state.agglomerative_partition = false;
-        self.state.trivial_partition_width = Some(width.max(1));
-        self
-    }
-
-    /// PROBE: selects the topology-scaled agglomerative partition policy.
-    /// Starting from exact per-row preferred-variable groups, the planner
-    /// repeatedly absorbs the least-work compatible complete group and returns
-    /// the coarsest admissible level of the resulting hierarchy.
-    ///
-    /// This is a scheduling and batching choice only; it cannot add or remove
-    /// solutions. A one-row chunk has only one preferred group naturally, so
-    /// eligibility follows from the split itself rather than scheduler width.
-    pub fn agglomerative_partition(mut self) -> Self {
-        self.state.grouped = true;
-        self.state.trivial_partition_width = None;
-        self.state.agglomerative_partition = true;
-        self
-    }
-
-    /// PROBE: pins per-row preferred-variable grouping for every pop. This is
-    /// the control behind the eager/grouped solvers and disables both
-    /// agglomeration and unconditional whole-block partition transitions.
-    pub fn grouped_partition(mut self) -> Self {
-        self.state.grouped = true;
-        self.state.trivial_partition_width = None;
-        self.state.agglomerative_partition = false;
-        self
-    }
-
     /// Overrides the width saturation cap (default [`block_row_cap`]).
     /// Tests use a tiny cap to force the *harvest* regime (gated
     /// scheduling at saturated width), which real workloads only reach
@@ -3203,23 +3033,10 @@ pub(crate) struct DagState {
     /// batches re-fatten. Off: lineage-keyed filing (a fresh bucket per
     /// filing), the tree-shaped control.
     merge: bool,
-    /// Per-row variable choice + partition (group-by-ordering). Off: one
-    /// variable per pop from the first row's estimates (blocked-v1's
-    /// trivial partition).
-    grouped: bool,
-    /// Experimental width at which later resumptions use the trivial
-    /// partition. `None` preserves grouped scheduling throughout.
-    trivial_partition_width: Option<usize>,
-    /// Per-pop topology-scaled agglomerative batching policy. Unlike
-    /// `trivial_partition_width`, this never disables grouped ordering
-    /// permanently: every eligible pop computes its own merge hierarchy.
-    agglomerative_partition: bool,
     /// Pooled per-pop scratch — the worklist loop is allocation-free in
     /// steady state (bucket row stores and their `vars` are the only
     /// per-pop allocations left, and those are the product, not scratch).
     scratch: DagScratch,
-    #[cfg(test)]
-    coalesced_pops: usize,
 }
 
 /// Per-pop scratch buffers for [`DagState::pop_once`], pooled across pops
@@ -3235,14 +3052,6 @@ struct DagScratch {
     est: Vec<usize>,
     /// Per-row preferred-variable index (into `unbound`).
     preferred: Vec<u32>,
-    /// Current group owners and retained row assignment.
-    group_owners: Vec<u32>,
-    group_assignment: Vec<u32>,
-    /// Current-group × target-variable estimate sums and compatibility.
-    group_estimate_sums: Vec<u128>,
-    group_compatible: Vec<bool>,
-    /// Active groups in the agglomerative hierarchy.
-    group_active: Vec<bool>,
     /// Rows per group.
     group_counts: Vec<usize>,
     /// Group start offsets (rows).
@@ -3269,11 +3078,6 @@ impl Default for DagScratch {
             parent_vars: Vec::new(),
             est: Vec::new(),
             preferred: Vec::new(),
-            group_owners: Vec::new(),
-            group_assignment: Vec::new(),
-            group_estimate_sums: Vec::new(),
-            group_compatible: Vec::new(),
-            group_active: Vec::new(),
             group_counts: Vec::new(),
             starts: Vec::new(),
             cursors: Vec::new(),
@@ -3307,12 +3111,7 @@ impl DagState {
             growth: lazy_growth(),
             cap,
             merge: true,
-            grouped: true,
-            trivial_partition_width: None,
-            agglomerative_partition: true,
             scratch: DagScratch::default(),
-            #[cfg(test)]
-            coalesced_pops: 0,
         }
     }
 }
@@ -3335,12 +3134,7 @@ impl DagState {
             growth: self.growth,
             cap: self.cap,
             merge: self.merge,
-            grouped: self.grouped,
-            trivial_partition_width: self.trivial_partition_width,
-            agglomerative_partition: self.agglomerative_partition,
             scratch: DagScratch::default(),
-            #[cfg(test)]
-            coalesced_pops: 0,
         }
     }
 
@@ -3536,10 +3330,10 @@ impl DagState {
     /// One pop: choose a bucket (sprint: strict deepest; harvest:
     /// deepest-ready per the counting gate), take at most `width` rows off
     /// its tail (the seed bucket is one virtual row, always consumed
-    /// whole), and either stage full-bound rows for emission or expand —
-    /// grouped (estimate → prefer → partition → propose
-    /// per group) or ungrouped (first-row choice, one propose over the
-    /// whole block) — then file into child buckets.
+    /// whole), and either stage full-bound rows for emission or expand by
+    /// estimating every row, stable-partitioning by its exact preferred
+    /// variable, proposing once per exact-variable group, and filing the
+    /// resulting child rows.
     fn pop_once<'a, C: Constraint<'a>>(
         &mut self,
         constraint: &C,
@@ -3652,29 +3446,10 @@ impl DagState {
         // no partition to build — skip the estimate pass entirely and
         // propose over the whole block. This is every query's deepest
         // level, which at sprint widths is also the most-popped one.
-        let single = n_unbound == 1;
-        if single || !self.grouped {
-            // Trivial partition: one group, next variable chosen once per
-            // block from the first row's estimates (blocked-v1), or the
-            // only variable left.
-            let ui = if single {
-                0
-            } else {
-                choose_variable(
-                    constraint,
-                    &scratch.unbound,
-                    view.row_view(0),
-                    influences,
-                    base_estimates,
-                )
-            };
-            let variable = scratch.unbound[ui];
+        if n_unbound == 1 {
+            let variable = scratch.unbound[0];
             if order_trace::enabled() {
-                order_trace::record(
-                    stride,
-                    variable,
-                    if self.grouped { c_rows as u64 } else { 1 },
-                );
+                order_trace::record(stride, variable, c_rows as u64);
             }
             scratch.pairs.clear();
             constraint.propose(
@@ -3689,10 +3464,6 @@ impl DagState {
                     chunk_width: width,
                     group_sizes: vec![c_rows],
                     batch_sizes: vec![scratch.pairs.len()],
-                    preferred_estimate_sum: None,
-                    preferred_group_count: None,
-                    scheduled_estimate_sum: None,
-                    row_inflation: None,
                 });
             }
             dag_file(
@@ -3723,18 +3494,17 @@ impl DagState {
         debug_assert_eq!(scratch.est.len(), n_unbound * c_rows);
 
         // 2. Per-row preferred variable: argmax of the engine's ordering
-        //    key over the row's matrix entries. Any genuinely split block is
-        //    eligible for agglomeration; blocks of one are naturally uniform.
-        let agglomerative = self.agglomerative_partition;
+        //    key over the row's matrix entries. This assignment is semantic:
+        //    the chosen proposer owns the occurrence bag.
         scratch.preferred.clear();
         scratch.group_counts.clear();
         scratch.group_counts.resize(n_unbound, 0);
-        let mut preferred_sum = 0u128;
         for i in 0..c_rows {
-            let mut preferred: Option<(usize, (u64, u64, u64))> = None;
+            let mut preferred = None;
             for j in 0..n_unbound {
                 let estimate = scratch.est[j * c_rows + i];
-                let key = variable_order_key(
+                let key = variable_choice_key(
+                    scratch.unbound[j],
                     estimate,
                     base_estimates[scratch.unbound[j]],
                     influences[scratch.unbound[j]].count(),
@@ -3746,68 +3516,10 @@ impl DagState {
             let preferred = preferred.expect("non-empty unbound").0;
             scratch.preferred.push(preferred as u32);
             scratch.group_counts[preferred] += 1;
-            if stats {
-                preferred_sum =
-                    preferred_sum.saturating_add(scratch.est[preferred * c_rows + i] as u128);
-            }
         }
-        let preferred_groups = scratch.group_counts.iter().filter(|&&c| c > 0).count();
-        let mut n_groups = preferred_groups;
-        let mut scheduled_sum = preferred_sum;
-        let mut row_inflation = None;
+        let n_groups = scratch.group_counts.iter().filter(|&&count| count > 0).count();
 
-        // 3. Agglomerate complete exact-choice groups along compatible,
-        //    minimum-work directed absorptions. Eligibility is the existence
-        //    of a split, not scheduler width or a fixed ratio guard.
-        if agglomerative && preferred_groups > 1 {
-            let plan = plan_agglomerative_partition(
-                &scratch.est,
-                c_rows,
-                &scratch.unbound,
-                influences,
-                &scratch.preferred,
-                &scratch.group_counts,
-                &mut scratch.group_owners,
-                &mut scratch.group_assignment,
-                &mut scratch.group_estimate_sums,
-                &mut scratch.group_compatible,
-                &mut scratch.group_active,
-            );
-            debug_assert_eq!(plan.preferred_groups, preferred_groups);
-            if stats {
-                debug_assert_eq!(plan.preferred_estimate_sum, preferred_sum);
-            } else {
-                preferred_sum = plan.preferred_estimate_sum;
-            }
-            #[cfg(test)]
-            if plan.scheduled_groups < plan.preferred_groups {
-                self.coalesced_pops += 1;
-            }
-            scratch.preferred.clear();
-            scratch
-                .preferred
-                .extend_from_slice(&scratch.group_assignment);
-            scratch.group_counts.fill(0);
-            for &variable in &scratch.preferred {
-                scratch.group_counts[variable as usize] += 1;
-            }
-            n_groups = plan.scheduled_groups;
-            scheduled_sum = plan.scheduled_estimate_sum;
-            row_inflation = Some(plan.row_inflation);
-        }
-        let (preferred_estimate_sum, preferred_group_count, scheduled_estimate_sum, row_inflation) =
-            if stats {
-                (
-                    Some(preferred_sum),
-                    Some(preferred_groups),
-                    Some(scheduled_sum),
-                    row_inflation,
-                )
-            } else {
-                (None, None, None, None)
-            };
-
-        // 4. Partition (stable counting sort); a single group borrows the
+        // 3. Partition (stable counting sort); a single group borrows the
         //    popped rows directly.
         scratch.starts.clear();
         let mut acc = 0usize;
@@ -3832,7 +3544,8 @@ impl DagState {
             }
         }
 
-        // 5. One batched propose per group; file into child buckets.
+        // 4. One batched propose per exact-variable group; file into child
+        //    buckets.
         let mut group_sizes_rec: Vec<usize> = Vec::new();
         let mut batch_sizes_rec: Vec<usize> = Vec::new();
         for j in 0..n_unbound {
@@ -3880,10 +3593,6 @@ impl DagState {
                 chunk_width: width,
                 group_sizes: group_sizes_rec,
                 batch_sizes: batch_sizes_rec,
-                preferred_estimate_sum,
-                preferred_group_count,
-                scheduled_estimate_sum,
-                row_inflation,
             });
             blocked_stats::cells_sub(work.len());
         }
@@ -3928,12 +3637,6 @@ impl DagState {
                 return None;
             }
             let width = self.width;
-            if self
-                .trivial_partition_width
-                .is_some_and(|threshold| width >= threshold)
-            {
-                self.grouped = false;
-            }
             if dag_stats::enabled() {
                 dag_stats::record_width(width);
             }
@@ -4026,11 +3729,10 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
             );
         }
 
-        // The lazy DAG handles the structural opaque/one-leaf fallback as well
-        // as explicit diagnostic selection. Rayon partitions a fresh ordinary
-        // query by advancing the scalar cursor before its leaves call `next`;
-        // those partial cursors deliberately stay on the sequential path
-        // instead of restarting from a worklist.
+        // The lazy DAG is an explicit diagnostic selection. Rayon partitions a
+        // fresh ordinary query by advancing the scalar cursor before its leaves
+        // call `next`; those partial cursors deliberately stay on the
+        // sequential path instead of restarting from a worklist.
         if self.scheduler == QueryScheduler::LazyDag
             && fresh
             && matches!(self.mode, Search::NextVariable)
@@ -4694,16 +4396,6 @@ mod tests {
         }
     }
 
-    mod soft_world {
-        use crate::prelude::*;
-
-        attributes! {
-            "FDD49F6E08AC2CCB79EE6C8B1256AD02" as p: inlineencodings::GenId;
-            "A4D08AA59273B336F5B977CE1511D141" as q: inlineencodings::GenId;
-            "27791B9EFCFADF397CFDBCDEE0B1FB22" as r: inlineencodings::GenId;
-        }
-    }
-
     #[test]
     fn and_set() {
         let mut books = HashSet::<String>::new();
@@ -4893,349 +4585,246 @@ mod tests {
         assert_eq!(&*record.borrow(), &[b.index, a.index]);
     }
 
-    fn agglomerative_matrix_plan(
-        est: &[usize],
-        rows: usize,
-        variables: usize,
-        preferred: &[u32],
-    ) -> (AgglomerativePlan, Vec<u32>) {
-        let mut influences = [VariableSet::new_empty(); 128];
-        for variable in 0..variables {
-            for influenced in 0..variables {
-                if variable != influenced {
-                    influences[variable].set(influenced);
+    /// A lawful row-homomorphic constraint whose occurrence bag depends on
+    /// which adaptive variable is proposed first. The support relation is the
+    /// same along every path; only duplicate proposal occurrences differ.
+    #[derive(Clone, Copy)]
+    struct VariableOrderBagConstraint {
+        tie_children: bool,
+    }
+
+    impl VariableOrderBagConstraint {
+        const PARENT: VariableId = 0;
+        const LEFT: VariableId = 1;
+        const RIGHT: VariableId = 2;
+        const P0: RawInline = [0; 32];
+        const P1: RawInline = [1; 32];
+        const LEFT_VALUE: RawInline = [2; 32];
+        const RIGHT_VALUE: RawInline = [3; 32];
+
+        fn allowed(variable: VariableId, value: &RawInline) -> bool {
+            match variable {
+                Self::PARENT => *value == Self::P0 || *value == Self::P1,
+                Self::LEFT => *value == Self::LEFT_VALUE,
+                Self::RIGHT => *value == Self::RIGHT_VALUE,
+                _ => false,
+            }
+        }
+
+        fn row_valid_so_far(view: &RowsView<'_>, row: &[RawInline]) -> bool {
+            [Self::PARENT, Self::LEFT, Self::RIGHT]
+                .into_iter()
+                .all(|variable| {
+                    view.col(variable)
+                        .is_none_or(|column| Self::allowed(variable, &row[column]))
+                })
+        }
+    }
+
+    impl Constraint<'static> for VariableOrderBagConstraint {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(Self::PARENT)
+                .union(VariableSet::new_singleton(Self::LEFT))
+                .union(VariableSet::new_singleton(Self::RIGHT))
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            match variable {
+                Self::PARENT => out.fill(2, view.len()),
+                Self::LEFT | Self::RIGHT => {
+                    let Some(parent) = view.col(Self::PARENT) else {
+                        out.fill(8, view.len());
+                        return true;
+                    };
+                    let other = if variable == Self::LEFT {
+                        Self::RIGHT
+                    } else {
+                        Self::LEFT
+                    };
+                    if view.col(other).is_some() {
+                        out.fill(1, view.len());
+                    } else if self.tie_children {
+                        out.fill(1, view.len());
+                    } else {
+                        out.extend(view.iter().map(|row| {
+                            let even_parent = row[parent][0] & 1 == 0;
+                            usize::from(
+                                (variable == Self::RIGHT && even_parent)
+                                    || (variable == Self::LEFT && !even_parent),
+                            ) + 1
+                        }));
+                    }
                 }
+                _ => return false,
             }
+            true
         }
-        agglomerative_matrix_plan_with_influences(est, rows, variables, preferred, &influences)
-    }
 
-    fn agglomerative_matrix_plan_with_influences(
-        est: &[usize],
-        rows: usize,
-        variables: usize,
-        preferred: &[u32],
-        influences: &[VariableSet; 128],
-    ) -> (AgglomerativePlan, Vec<u32>) {
-        let unbound: Vec<VariableId> = (0..variables).collect();
-        let mut preferred_counts = vec![0usize; variables];
-        for &variable in preferred {
-            preferred_counts[variable as usize] += 1;
-        }
-        let mut owners = Vec::new();
-        let mut best_assignment = Vec::new();
-        let mut group_sums = Vec::new();
-        let mut compatible = Vec::new();
-        let mut active = Vec::new();
-        let plan = plan_agglomerative_partition(
-            est,
-            rows,
-            &unbound,
-            influences,
-            preferred,
-            &preferred_counts,
-            &mut owners,
-            &mut best_assignment,
-            &mut group_sums,
-            &mut compatible,
-            &mut active,
-        );
-        (plan, best_assignment)
-    }
-
-    #[test]
-    fn agglomeration_tolerance_comes_from_target_influence_topology() {
-        let est = [1, 800, 5, 100];
-        let preferred = [0, 1];
-
-        let disconnected = [VariableSet::new_empty(); 128];
-        let (exact, exact_assignment) =
-            agglomerative_matrix_plan_with_influences(&est, 2, 2, &preferred, &disconnected);
-        assert_eq!(exact.scheduled_groups, 2);
-        assert_eq!(exact_assignment, preferred);
-
-        let mut connected = disconnected;
-        connected[1].set(0);
-        let (merged, merged_assignment) =
-            agglomerative_matrix_plan_with_influences(&est, 2, 2, &preferred, &connected);
-        assert_eq!(merged.scheduled_groups, 1);
-        assert_eq!(merged_assignment, [1, 1]);
-    }
-
-    #[test]
-    fn agglomeration_ignores_influence_neighbors_that_are_already_bound() {
-        // Moving group A to B costs two estimate-magnitude bits. An influence
-        // edge from B to already-bound variable 7 must not widen B's allowance;
-        // adding the still-unbound A edge does widen it and admits the merge.
-        let est = [1, 16, 4, 1];
-        let preferred = [0, 1];
-        let mut influences = [VariableSet::new_empty(); 128];
-        influences[1].set(7);
-
-        let (exact, exact_assignment) =
-            agglomerative_matrix_plan_with_influences(&est, 2, 2, &preferred, &influences);
-        assert_eq!(exact.scheduled_groups, 2);
-        assert_eq!(exact_assignment, preferred);
-
-        influences[1].set(0);
-        let (merged, merged_assignment) =
-            agglomerative_matrix_plan_with_influences(&est, 2, 2, &preferred, &influences);
-        assert_eq!(merged.scheduled_groups, 1);
-        assert_eq!(merged_assignment, [1, 1]);
-    }
-
-    #[test]
-    fn agglomeration_coalesces_near_skew_but_preserves_far_skew() {
-        let (near, near_assignment) =
-            agglomerative_matrix_plan(&[8, 8, 12, 12, 12, 12, 8, 8], 4, 2, &[0, 0, 1, 1]);
-        assert_eq!(near.scheduled_groups, 1);
-        assert!(near_assignment.iter().all(|&variable| variable == 0));
-        assert_eq!(near.scheduled_estimate_sum, 40);
-        assert_eq!(near.row_inflation, 2);
-
-        let (far, far_assignment) = agglomerative_matrix_plan(&[1, 64, 64, 1], 2, 2, &[0, 1]);
-        assert_eq!(far.scheduled_groups, 2);
-        assert_eq!(far_assignment, [0, 1]);
-    }
-
-    #[test]
-    fn agglomeration_accepts_uniform_topology_scaled_regret() {
-        // Three rows prefer A, but B wins the expensive fourth row. Moving
-        // all rows to B raises the first three estimates 5× while increasing
-        // aggregate work only from 103 to 115; one batch beats two.
-        let (plan, assignment) =
-            agglomerative_matrix_plan(&[1, 1, 1, 800, 5, 5, 5, 100], 4, 2, &[0, 0, 0, 1]);
-        assert_eq!(assignment, [1, 1, 1, 1]);
-        assert_eq!(plan.scheduled_groups, 1);
-        assert_eq!(plan.scheduled_estimate_sum, 115);
-        assert_eq!(plan.row_inflation, 5);
-    }
-
-    #[test]
-    fn agglomeration_breaks_equal_work_toward_lower_target_id() {
-        let (plan, assignment) = agglomerative_matrix_plan(&[1, 2, 2, 1], 2, 2, &[0, 1]);
-        assert_eq!(assignment, [0, 0]);
-        assert_eq!(plan.scheduled_groups, 1);
-        assert_eq!(plan.scheduled_estimate_sum, 3);
-        assert_eq!(plan.row_inflation, 2);
-    }
-
-    #[test]
-    fn agglomeration_continues_through_the_compatible_merge_hierarchy() {
-        // Every off-diagonal estimate stays within the topology-derived
-        // magnitude allowance, so the three exact groups contract to one.
-        let (plan, assignment) =
-            agglomerative_matrix_plan(&[34, 93, 94, 94, 33, 93, 94, 93, 33], 3, 3, &[0, 1, 2]);
-        assert_eq!(assignment, [2, 2, 2]);
-        assert_eq!(plan.scheduled_groups, 1);
-        assert_eq!(plan.scheduled_estimate_sum, 220);
-    }
-
-    #[test]
-    fn agglomeration_does_not_hide_rare_catastrophic_rows() {
-        let (plan, assignment) =
-            agglomerative_matrix_plan(&[1, 1, 1, 400, 64, 64, 64, 1], 4, 2, &[0, 0, 0, 1]);
-        assert_eq!(plan.scheduled_groups, 2);
-        assert_eq!(assignment, [0, 0, 0, 1]);
-    }
-
-    #[test]
-    fn agglomeration_handles_zero_and_max_estimates_without_overflow() {
-        let (zero, zero_assignment) = agglomerative_matrix_plan(&[0, 1, 1, 0], 2, 2, &[0, 1]);
-        assert_eq!(zero.scheduled_groups, 2);
-        assert_eq!(zero_assignment, [0, 1]);
-
-        let (max, max_assignment) =
-            agglomerative_matrix_plan(&[usize::MAX, 1, 1, usize::MAX], 2, 2, &[1, 0]);
-        assert_eq!(max.scheduled_groups, 2);
-        assert_eq!(max_assignment, [1, 0]);
-
-        let (all_zero, all_zero_assignment) =
-            agglomerative_matrix_plan(&[0, 0, 0, 0], 2, 2, &[0, 1]);
-        assert_eq!(all_zero.scheduled_groups, 1);
-        assert_eq!(all_zero_assignment, [0, 0]);
-    }
-
-    #[test]
-    fn agglomeration_reuses_scratch_across_different_matrix_shapes() {
-        let mut influences = [VariableSet::new_empty(); 128];
-        for variable in 0..3 {
-            for influenced in 0..3 {
-                if variable != influenced {
-                    influences[variable].set(influenced);
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            if variable == Self::PARENT {
+                for (row_index, row) in view.iter().enumerate() {
+                    if Self::row_valid_so_far(view, row) {
+                        candidates.extend_row(row_index as u32, [Self::P0, Self::P1]);
+                    }
                 }
+                return;
             }
-        }
 
-        // Seed every buffer with stale data, then alternate R=4,V=2 and
-        // R=3,V=3 plans through the same storage. This exercises clear/resize,
-        // the owner/row-assignment swap, and accumulated group-cost reset.
-        let mut owners = vec![u32::MAX; 7];
-        let mut assignment = vec![u32::MAX; 11];
-        let mut group_sums = vec![u128::MAX; 13];
-        let mut compatible = vec![false; 17];
-        let mut active = vec![true; 19];
-
-        let near_est = [8, 8, 12, 12, 12, 12, 8, 8];
-        let near_preferred = [0, 0, 1, 1];
-        let first = plan_agglomerative_partition(
-            &near_est,
-            4,
-            &[0, 1],
-            &influences,
-            &near_preferred,
-            &[2, 2],
-            &mut owners,
-            &mut assignment,
-            &mut group_sums,
-            &mut compatible,
-            &mut active,
-        );
-        let first_assignment = assignment.clone();
-        assert_eq!(first.scheduled_estimate_sum, 40);
-        assert_eq!(first_assignment, [0, 0, 0, 0]);
-
-        let hierarchy_est = [34, 93, 94, 94, 33, 93, 94, 93, 33];
-        let hierarchy_preferred = [0, 1, 2];
-        let hierarchy = plan_agglomerative_partition(
-            &hierarchy_est,
-            3,
-            &[0, 1, 2],
-            &influences,
-            &hierarchy_preferred,
-            &[1, 1, 1],
-            &mut owners,
-            &mut assignment,
-            &mut group_sums,
-            &mut compatible,
-            &mut active,
-        );
-        assert_eq!(hierarchy.scheduled_estimate_sum, 220);
-        assert_eq!(assignment, [2, 2, 2]);
-
-        let repeated = plan_agglomerative_partition(
-            &near_est,
-            4,
-            &[0, 1],
-            &influences,
-            &near_preferred,
-            &[2, 2],
-            &mut owners,
-            &mut assignment,
-            &mut group_sums,
-            &mut compatible,
-            &mut active,
-        );
-        assert_eq!(repeated, first);
-        assert_eq!(assignment, first_assignment);
-    }
-
-    #[test]
-    fn lazy_dag_applies_nontrivial_agglomeration_end_to_end() {
-        let mut kb = TribleSet::new();
-        let junk_sink = ufoid();
-        let n_per_population = 8usize;
-        for _ in 0..n_per_population {
-            let e = ufoid();
-            let x = ufoid();
-            let ys = [ufoid(), ufoid()];
-            kb += entity! { &e @ soft_world::p: &x };
-            for y in &ys {
-                kb += entity! { &e @ soft_world::q: y };
-            }
-            kb += entity! { &x @ soft_world::r: &ys[0] };
-            let dummy = ufoid();
-            kb += entity! { &dummy @ soft_world::r: &ys[1] };
-
-            let e = ufoid();
-            let y = ufoid();
-            let xs = [ufoid(), ufoid()];
-            kb += entity! { &e @ soft_world::q: &y };
-            for x in &xs {
-                kb += entity! { &e @ soft_world::p: x };
-            }
-            kb += entity! { &xs[0] @ soft_world::r: &y };
-            kb += entity! { &xs[1] @ soft_world::r: &junk_sink };
-        }
-
-        macro_rules! near_query {
-            () => {
-                find!(
-                    (e: Inline<_>, x: Inline<_>, y: Inline<_>),
-                    pattern!(&kb, [
-                        { ?e @ soft_world::p: ?x, soft_world::q: ?y },
-                        { ?x @ soft_world::r: ?y }
-                    ])
-                )
+            let value = match variable {
+                Self::LEFT => Self::LEFT_VALUE,
+                Self::RIGHT => Self::RIGHT_VALUE,
+                _ => return,
             };
+            let Some(parent) = view.col(Self::PARENT) else {
+                for (row_index, row) in view.iter().enumerate() {
+                    if Self::row_valid_so_far(view, row) {
+                        candidates.push(row_index as u32, value);
+                    }
+                }
+                return;
+            };
+            let other = if variable == Self::LEFT {
+                Self::RIGHT
+            } else {
+                Self::LEFT
+            };
+            let other_is_bound = view.col(other).is_some();
+            for (row_index, row) in view.iter().enumerate() {
+                if !Self::row_valid_so_far(view, row) {
+                    continue;
+                }
+                let even_parent = row[parent][0] & 1 == 0;
+                let duplicates = !other_is_bound
+                    && ((variable == Self::RIGHT && even_parent)
+                        || (variable == Self::LEFT && !even_parent));
+                candidates.extend_row(
+                    row_index as u32,
+                    std::iter::repeat_n(value, usize::from(duplicates) + 1),
+                );
+            }
         }
 
-        let mut narrow = near_query!()
-            .solve_dag_lazy()
-            .start_width(1)
-            .growth(1)
-            .agglomerative_partition();
-        assert_eq!(narrow.by_ref().count(), 2 * n_per_population);
-        assert_eq!(
-            narrow.state.coalesced_pops, 0,
-            "one-row chunks cannot contain multiple preferred groups"
-        );
+        fn confirm(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            candidates.retain(|row, value| {
+                Self::allowed(variable, value)
+                    && Self::row_valid_so_far(view, view.row(row as usize))
+            });
+        }
 
-        let mut iter = near_query!()
-            .solve_dag_lazy()
-            .start_width(usize::MAX)
-            .growth(1)
-            .agglomerative_partition();
-        assert_eq!(iter.by_ref().count(), 2 * n_per_population);
-        assert!(
-            iter.state.coalesced_pops > 0,
-            "the near-skew block must exercise a real groups→fewer-groups decision"
-        );
+        fn satisfied(&self, view: &RowsView<'_>) -> bool {
+            view.iter()
+                .all(|row| Self::row_valid_so_far(view, row))
+        }
+    }
+
+    fn variable_order_bag_query(tie_children: bool) -> Query<
+        VariableOrderBagConstraint,
+        impl Fn(&Binding) -> Option<(RawInline, RawInline, RawInline)>,
+        (RawInline, RawInline, RawInline),
+    > {
+        Query::new(
+            VariableOrderBagConstraint { tie_children },
+            |binding: &Binding| {
+                Some((
+                    *binding.get(VariableOrderBagConstraint::PARENT)?,
+                    *binding.get(VariableOrderBagConstraint::LEFT)?,
+                    *binding.get(VariableOrderBagConstraint::RIGHT)?,
+                ))
+            },
+        )
     }
 
     #[test]
-    fn lazy_trivial_partition_switches_at_configured_width() {
-        let mut context = VariableContext::new();
-        let variable = context.next_variable::<U256BE>();
-        let values = [1u64, 2, 3, 4].map(U256BE::inline_from);
-        let constraint = or!(
-            variable.is(values[0]),
-            variable.is(values[1]),
-            variable.is(values[2]),
-            variable.is(values[3])
+    fn scheduler_width_and_equal_key_ties_preserve_semantic_variable_actions() {
+        let constraint = VariableOrderBagConstraint {
+            tie_children: false,
+        };
+        let invalid: RawInline = [9; 32];
+        let invalid_vars = [VariableOrderBagConstraint::PARENT];
+        let invalid_rows = [invalid];
+        let invalid_view = RowsView::new(&invalid_vars, &invalid_rows);
+        assert!(!constraint.satisfied(&invalid_view));
+        let mut proposed = Vec::new();
+        constraint.propose(
+            VariableOrderBagConstraint::LEFT,
+            &invalid_view,
+            &mut CandidateSink::Tagged(&mut proposed),
         );
-        let mut switched = Query::new(constraint, |_| Some(()))
-            .solve_dag_lazy()
-            .start_width(1)
-            .growth(2)
-            .trivial_partition_at_width(2);
-        assert!(switched.state.grouped);
-        assert_eq!(switched.next(), Some(()));
-        assert!(
-            switched.state.grouped,
-            "the width-one first-result sprint must remain grouped"
+        assert!(proposed.is_empty());
+        let mut confirmed = vec![(0, VariableOrderBagConstraint::RIGHT_VALUE)];
+        constraint.confirm(
+            VariableOrderBagConstraint::RIGHT,
+            &invalid_view,
+            &mut CandidateSink::Tagged(&mut confirmed),
         );
-        assert_eq!(switched.current_width(), 2);
-        assert_eq!(switched.next(), Some(()));
-        assert!(
-            !switched.state.grouped,
-            "the threshold-width resumption must use the trivial partition"
-        );
+        assert!(confirmed.is_empty());
 
-        let mut context = VariableContext::new();
-        let variable = context.next_variable::<U256BE>();
-        let constraint = or!(
-            variable.is(values[0]),
-            variable.is(values[1]),
-            variable.is(values[2]),
-            variable.is(values[3])
-        );
-        let mut default = Query::new(constraint, |_| Some(())).solve_dag_lazy();
-        assert_eq!(default.next(), Some(()));
-        assert_eq!(default.next(), Some(()));
-        assert!(
-            default.state.grouped,
-            "the experimental builder must not change default scheduling"
-        );
+        let row = |parent| {
+            (
+                parent,
+                VariableOrderBagConstraint::LEFT_VALUE,
+                VariableOrderBagConstraint::RIGHT_VALUE,
+            )
+        };
+        for (tie_children, mut expected) in [
+            (false, vec![row(VariableOrderBagConstraint::P0), row(VariableOrderBagConstraint::P1)]),
+            (true, vec![row(VariableOrderBagConstraint::P0), row(VariableOrderBagConstraint::P1), row(VariableOrderBagConstraint::P1)]),
+        ] {
+            expected.sort_unstable();
+
+            let mut sequential: Vec<_> = variable_order_bag_query(tie_children)
+                .sequential()
+                .collect();
+            let mut residual_narrow: Vec<_> = variable_order_bag_query(tie_children)
+                .solve_residual_state_lazy_with(residual::ResidualLowering::FULL)
+                .cap(1)
+                .start_width(1)
+                .growth(1)
+                .collect();
+            let mut residual_wide: Vec<_> = variable_order_bag_query(tie_children)
+                .solve_residual_state_lazy_with(residual::ResidualLowering::FULL)
+                .cap(8)
+                .start_width(8)
+                .growth(1)
+                .collect();
+            let mut dag_narrow: Vec<_> = variable_order_bag_query(tie_children)
+                .solve_dag_lazy()
+                .cap(1)
+                .start_width(1)
+                .growth(1)
+                .collect();
+            let mut dag_wide: Vec<_> = variable_order_bag_query(tie_children)
+                .solve_dag_lazy()
+                .cap(8)
+                .start_width(8)
+                .growth(1)
+                .collect();
+
+            for bag in [
+                &mut sequential,
+                &mut residual_narrow,
+                &mut residual_wide,
+                &mut dag_narrow,
+                &mut dag_wide,
+            ] {
+                bag.sort_unstable();
+                assert_eq!(bag, &expected);
+            }
+        }
     }
 }

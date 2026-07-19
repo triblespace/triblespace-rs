@@ -10,9 +10,9 @@
 //!
 //! The CubeCL kernel contains no WGPU-specific operations. The first public
 //! wrapper uses WGPU because that is the resident backend available today, but
-//! the planner itself is generic over a CubeCL [`Runtime`]. It performs no
-//! agglomeration and has no heuristic cutoffs: rows are independent, so every
-//! consecutive split is observationally identical after concatenation.
+//! the planner itself is generic over a CubeCL [`Runtime`]. It selects every
+//! row's exact semantic action without heuristic cutoffs, so every consecutive
+//! split is observationally identical after concatenation.
 //!
 //! Proposal counts stay exact in `u32`: the resident Jerky archive admission
 //! rule requires every searchable ring length to be strictly below

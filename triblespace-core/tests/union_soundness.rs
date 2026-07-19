@@ -499,7 +499,6 @@ fn union_of_intersections(
         or!(and!(s1.has(x), s2.has(x)), and!(s3.has(x), s4.has(x)))
     )
     .solve_dag_lazy()
-    .agglomerative_partition()
     .map(|x: Inline<ShortString>| x.raw)
     .collect()
 }

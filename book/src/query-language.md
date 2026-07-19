@@ -460,10 +460,10 @@ the block-native protocol can participate in `find!`. The six core methods are:
 
 The explicit `Query::sequential()` scheduler calls these methods with a one-row
 [`RowsView`](triblespace::core::query::RowsView) and scalar/plain-value sinks;
-the ordinary iterator shape-selects between canonical residual states for an
-exposed conjunction with shared-variable leaf work and a lazy-DAG fallback for
-opaque, one-leaf, or disjoint roots. Both blocked engines call the same methods
-with row blocks and tagged candidate frontiers. Implementations without a
+every live fresh ordinary iterator uses canonical residual states, while
+`Query::lazy_dag_scheduler()` selects the bound-variable-set DAG explicitly for
+comparison. Both block-native engines call the same methods with row blocks and
+tagged candidate frontiers. Implementations without a
 specialized batch operation can loop over the rows, use
 `CandidateSink::extend_row`, and use the `confirm_per_row` adapter.
 

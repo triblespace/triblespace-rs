@@ -107,11 +107,9 @@ An expansion still performs the familiar Atreides negotiation:
 2. Choose the preferred next variable. In a multi-row block this decision is
    made per row, because different bound values can imply different
    cardinalities.
-3. If rows prefer more than one variable, start with the nonempty exact-choice
-   groups as active hubs. Repeatedly absorb one complete active source group
-   into the compatible active target that yields the least total candidate
-   estimate, then partition by the retained scheduled variable with a stable
-   counting sort. Variables preferred by no row are not opened as new hubs.
+3. Stable-partition the rows by their exact preferred variable. This preserves
+   each row's selected occurrence bag while still batching rows whose preferred
+   variable agrees; no row is reassigned to an estimate-similar variable.
 4. For each group, propose that variable. The DAG asks the root constraint; an
    intersection chooses its tightest child per row and runs the remaining
    children as whole-frontier confirmation passes. The residual engine makes
@@ -246,10 +244,10 @@ claim that residual control overhead pays back for every shape; the explicit
 lazy DAG remains the comparison path.
 
 [`Query::residual_state_scheduler`](triblespace::core::query::Query::residual_state_scheduler)
-forces the residual cursor for any root and remains the completeness and
-comparison control with conservative opaque-composite lowering.
-`solve_residual_state_lazy` is the same conservative capability control and
-exposes its width policy;
+selects the residual cursor for any root while preserving the query's chosen
+lowering (`FULL` by default; `Query::residual_lowering` may change it).
+`solve_residual_state_lazy` is the separate conservative-lowering capability
+control and exposes its width policy;
 `solve_residual_state` is the eager saturated form, and
 `solve_residual_state_profiled` reports state, merge, action, and batch
 measurements. Fully drained variants preserve the result multiset, but may
@@ -292,43 +290,32 @@ after its first parent filed into it. The tradeoff is explicit: highly
 reconvergent queries can retain a broader frontier and use more memory in
 exchange for larger batches.
 
-The ordinary [`Query`](triblespace::core::query::Query) uses this worklist as
-its structural fallback, and
+The ordinary [`Query`](triblespace::core::query::Query) uses residual states for
+every live seed;
 [`Query::lazy_dag_scheduler`](triblespace::core::query::Query::lazy_dag_scheduler)
-forces it for comparison. Demand-adaptive chunk width starts at one row and
-grows geometrically whenever the consumer asks the engine to resume. Before
+selects this worklist explicitly for comparison. Demand-adaptive chunk width
+starts at one row and grows geometrically whenever the consumer asks the engine
+to resume. Before
 the width cap is reached, scheduling is strict deepest-first, preserving
 sequential-class first-result behavior; after saturation, the readiness gate
 turns on and the remaining computation enters the batch-harvesting regime. An
 `exists!` or `take(1)` consumer can therefore discard the worklist after the
 first match instead of paying for full enumeration.
 
-Partition economics are decided by the split itself, not by chunk width. When
-rows genuinely prefer more than one next variable, those exact-choice groups
-become the leaves of an agglomerative merge hierarchy. A complete source group
-may be absorbed by an active target variable `v` only when every source row's
-binary estimate-magnitude regret fits the bit length of
-`{v} ∪ (influence(v) ∩ unbound)`. Binding a variable that can refresh a larger
-still-relevant downstream neighborhood can therefore justify a wider local cardinality bucket; an
-isolated variable cannot. Rows whose preferred estimate is zero remain
-compatible only with zero estimated work.
+Variable grouping preserves the exact adaptive action selected for each row.
+The selected variable and proposer occurrence own that row's candidate
+occurrence bag, including duplicates; row-homomorphic execution only proves
+that identical actions may be chunked and rejoined. It does not make different
+variables commute. The DAG partitions by exact preferred variable and delegates
+row-local proposer choice to the root constraint's block-native `propose`; the
+residual engine cohorts explicit `(variable, proposer occurrence)` actions.
+Neither path moves a row to an estimate-compatible action. Exact ordering-key
+ties choose the lower variable ID in every planner. Chunk width and pop order
+remain physical choices.
 
-Among compatible directed absorptions the engine chooses the one with the
-smallest resulting total candidate estimate, merges the groups, and repeats.
-Compatibility is conjoined as groups merge, so one incompatible row keeps its
-entire exact group separate. The planner returns the coarsest admissible level
-of that greedy hierarchy; it does not globally score intermediate levels.
-Exact grouping is the literal starting partition and remains the result when no
-complete group fits. A one-row chunk is naturally uniform. There is no
-independent width cutoff or fixed inflation factor. The choice affects order
-and batching only: `propose` and `confirm` still determine the exact solutions.
-
-For `R` rows and `V ≤ 128` unbound variables, planning is
-`O(RV + V³)` time and the scheduler uses `O(RV + V²)` reusable scratch space
-in total. The `RV` estimate matrix is already required by exact per-row
-grouping; agglomeration adds `O(R + V²)` scratch beyond it. It builds the
-row/group compatibility table once, then rescans the active directed edges for
-at most `V - 1` absorptions.
+For `R` rows and `V ≤ 128` unbound variables, this planning is `O(RV)` time and
+uses `O(RV + V)` reusable scratch space, dominated by the per-row estimate
+matrix and stable counting partition.
 
 Both block-native engines keep fully-bound rows in raw inline form until the
 consumer pulls them. Neither worklist stores projected result values, so a
@@ -338,8 +325,8 @@ requiring the result type to implement `Clone`.
 
 [`Query::solve_dag_lazy`](triblespace::core::query::Query::solve_dag_lazy)
 exposes the same scheduler as a configurable iterator with explicit starting
-width, growth, cap, and partition-policy controls. The eager/grouped probe
-solvers pin grouping explicitly so they remain stable DAG controls.
+width, growth, and cap controls. Exact per-row action grouping is an invariant,
+not a selectable physical policy.
 
 [`Query::solve_dag`](triblespace::core::query::Query::solve_dag) is the eager,
 saturated-width form. Fully drained schedulers produce the same result
@@ -351,7 +338,7 @@ With the `parallel` feature, ordinary `IntoParallelIterator` consumption keeps
 the established scalar DFS proposal splitter. This remains the CPU-oriented
 default: inexpensive one-row probes can outperform the bookkeeping and wider
 batches of either worklist. An unstarted ordinary query uses this scalar path
-even when its serial shape selector would choose residual states.
+even though its serial default uses residual states.
 
 [`Query::into_par_dag_iter`](triblespace::core::query::Query::into_par_dag_iter)
 is the explicit block-native alternative. It partitions a fresh query's affine
@@ -517,13 +504,13 @@ The query engine uses the Atreides family of worst-case optimal join
 algorithms. These algorithms leverage the same cardinality estimates surfaced
 through `Constraint::estimate` to guide variable choice over partial bindings,
 providing skew-resistant and predictable performance. The sequential scheduler
-explores those choices depth-first; the DAG begins from the same per-row
-choices, may softly coalesce compatible complete preference groups, and files
-the results by bound-variable set. The residual engine also chooses the exact
-proposer occurrence and represents the remaining confirmer set in its
-canonical state. Because every path refreshes estimates during evaluation,
-binding order adapts whenever a constraint updates its influence set—there is
-no separate planning artifact to maintain.
+explores those choices depth-first; the DAG stable-partitions the same exact
+per-row variable choices and files their results by bound-variable set, so
+histories may reconverge only after their selected actions run. The residual
+engine additionally makes the exact proposer occurrence and remaining
+confirmer set part of canonical state. Because every path refreshes estimates
+during evaluation, binding order adapts whenever a constraint updates its
+influence set—there is no separate planning artifact to maintain.
 For a detailed discussion, see the [Atreides Join](atreides-join.md) chapter.
 
 ## Query Languages

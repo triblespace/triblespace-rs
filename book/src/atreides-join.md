@@ -153,17 +153,16 @@ depth-first traversal from thrashing through unrelated values.
   one-row `RowsView`; `Binding` is now only reconstructed at the
   result-projection boundary. A `touched_variables` set marks which estimates
   need refreshing before the next decision point.
-- The ordinary iterator lifts the same negotiation to blocks of sibling rows.
-  For exposed conjunctions with overlapping leaf variable sets, canonical
-  residual states key future work by bound schema, planned action, and checked
-  leaf occurrences. Opaque, one-leaf, and disjoint roots use the lazy DAG,
-  whose buckets are keyed by bound-variable set. Whenever the DAG's exact row
-  choices split, it builds a merge hierarchy over complete preference groups.
-  A source group may move to target `v` only when every row's binary
-  estimate-magnitude regret fits the bit length of
-  `{v} ∪ (influence(v) ∩ unbound)`; compatible edges are chosen by minimum
-  total candidate work. Both worklists can therefore reconverge histories into
-  larger downstream batches without changing the result multiset.
+- The ordinary iterator lifts the same negotiation to blocks of sibling rows
+  through canonical residual states for every live root. Those states key
+  future work by bound schema, planned action, and checked leaf occurrences.
+  The explicit lazy-DAG comparison instead keys buckets by bound-variable set,
+  stable-partitions rows by their exact adaptive variable, and lets the root
+  constraint preserve each row's proposer occurrence; residual planning makes
+  both choices explicit in its action state. Both worklists may reconverge
+  histories into larger downstream batches only after those actions run. They
+  never enlarge a batch by moving a row to another variable or proposer
+  occurrence.
 - Highly skewed data still behaves predictably: even if one attribute dominates
   the dataset, the other constraints continue to bound the search space tightly
   and prevent runaway exploration.

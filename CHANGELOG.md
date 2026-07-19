@@ -7,8 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Variable grouping no longer changes a row's semantic proposal action.**
+  The residual engine and the explicit lazy-DAG control retain each row's exact
+  adaptive next variable instead of reassigning estimate-compatible groups.
+  Since the selected proposer owns occurrence multiplicity, the old physical
+  coalescing could make full result bags depend on scheduler width despite the
+  constraint protocol supplying no cross-variable bag-equivalence law. Equal
+  ordering keys now use an explicit lower-variable-ID tie break in every
+  planner instead of inheriting unstable-sort behavior. Within an
+  intersection, equal child estimates likewise choose the lower child
+  occurrence consistently across scalar, blocked, and residual execution.
+
 ### Removed
 
+- **Unsafe variable-reassignment scheduler probes have been removed.**
+  `solve_blocked` is now the single exact-grouped unmerged block solver, and
+  the redundant `solve_blocked_grouped`, `grouped_partition`,
+  `trivial_partition_at_width`, and `agglomerative_partition` controls are
+  gone. Chunk width and reconvergence remain physical controls; a row's chosen
+  variable and proposer occurrence do not.
 - **External database comparisons no longer burden benchmark builds.**
   Removed the Oxigraph and OxRDF development dependencies and comparison paths;
   the retained JSON roundtrip and insertion benchmarks now measure TribleSpace
@@ -361,11 +380,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not a total-work estimate. Exact descriptors remain interned so early states
   can safely reopen when later histories reach them. Full drains preserve the
   eager solver's result bag; partial consumers may drop the remaining affine
-  frontier after the first useful result. Ready planning now passes its exact
-  row-local variable preferences through the DAG engine's topology-scaled
-  agglomerative planner before selecting each scheduled row's exact proposing
-  leaf. This coalesces compatible variable routes without weakening constraint
-  semantics or introducing another cutoff policy.
+  frontier after the first useful result. Ready planning retains each row's
+  exact adaptive variable and proposing leaf, then cohorts only rows with the
+  same action.
 - **Index homes use typed artifacts over exact commit-DAG ranges.** Recipe
   descriptors are self-marked, losslessly retained manifest headers with a
   repeated maximal certified frontier. Inclusive range records carry one LSM
@@ -450,10 +467,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   formula and transition-program lowering into its affine shards, while still
   honoring an explicit conservative or intermediate `residual_lowering`
   selection.
-- **The query-engine guide now describes the agglomerator's actual hub set.**
-  Agglomeration starts from nonempty exact-choice groups and only absorbs a
-  complete active group into another active target; it does not open a variable
-  preferred by no row as a new hub.
 - **BM25 tokenization preserves non-ASCII symbols and emoji.**
   `hash_tokens` previously discarded every token without an alphanumeric
   character, making standalone emoji queries produce an empty term list.
@@ -674,36 +687,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `satisfied` is exact whenever all relevant variables are bound. The latter
   includes constant, zero-variable constraints and lets unions reject dead arms
   while negotiating variables owned by another arm.
-- **The ordinary `Query` iterator now selects a block-native scheduler from
-  exposed query shape.** A live root-level associative AND uses canonical
-  residual states only when two flattened opaque leaf occurrences share at
-  least one variable. Nested ANDs flatten; zero-variable constants do not
-  count; and opaque roots, one-leaf conjunctions, disjoint conjunctions, and
-  queries rejected by exact seed settlement retain the lazy DAG. Union,
-  regular-path, and custom opaque wrappers remain single selector
-  boundaries. This conservative selector avoids residual control-state cost
-  where there is no sibling proposer/confirm work to canonicalize, while
-  `residual_state_scheduler`, `lazy_dag_scheduler`, and `sequential` remain
-  explicit controls.
-  The DAG fallback evaluates row buckets keyed by bound-variable set,
+- **The ordinary `Query` iterator now runs every live seed through canonical
+  residual states.** Opaque roots, one-leaf and disjoint conjunctions, finite
+  unions, regular paths, and custom wrappers all exercise the same residual
+  substrate; exact seed rejection starts no worklist. This is a full semantic
+  coverage switch, not a claim that residual control overhead pays back for
+  every shape. `residual_state_scheduler`, `lazy_dag_scheduler`, and
+  `sequential` remain explicit controls, and structural lowering remains an
+  independent choice.
+  The explicit DAG comparison evaluates row buckets keyed by bound-variable set,
   partitions each block by its per-row preferred next variable, and merges
   routes that reconverge on the same set. Demand-adaptive chunk width starts
   with depth-first, first-result-oriented execution and grows into
-  readiness-gated batch harvesting. Whenever a block's exact per-row choices
-  split, those complete groups become the leaves of an agglomerative merge
-  hierarchy. A source group may move to active target `v` only when every
-  row's binary estimate-magnitude regret fits the bit length of
-  `{v} ∪ (influence(v) ∩ unbound)`; zero-estimate rows require zero work. At
-  each hierarchy level the compatible absorption with the least resulting
-  candidate estimate wins. Merging continues to the coarsest admissible level,
-  and compatibility is conjoined after each merge so one outlier preserves its
-  complete exact group.
-  This removes both the old 256-row eligibility cutoff and the fixed 8× guard:
-  batching tolerance now comes from the scheduler's existing logarithmic
-  cardinality resolution and the query's influence topology. The configurable
-  probe is `agglomerative_partition()`. Total reusable scheduler scratch is
-  `O(RV + V²)` for `R` rows and `V` unbound variables; the agglomerator adds
-  `O(R + V²)` beyond the existing per-row estimate matrix.
+  readiness-gated batch harvesting. The DAG cohorts exact-variable groups and
+  delegates row-local proposer choice to the root constraint; residual
+  planning cohorts explicit `(variable, proposer occurrence)` actions. Neither
+  path reassigns a row's choice, because that action owns candidate
+  multiplicity. Planning is
+  `O(RV)` with `O(RV + V)` reusable scratch for `R` rows and `V` unbound
+  variables.
   `Query::sequential()` explicitly selects the scalar block-of-one DFS
   specialization, and ordinary fresh rayon iteration retains its established
   scalar DFS splitter. The new explicit `Query::into_par_dag_iter()` path

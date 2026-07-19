@@ -24,10 +24,6 @@
 //!         [archive_cache=/tmp/wd_10m.nt.succinctarchive] [reps=5] \
 //!         [majority=20000] [fan=64] [minority=majority]
 //!
-//! Set `TRIBLES_PAIRED_STAR3_REPS=21` to skip the broad matrix and run a
-//! warm, alternating whole-block-versus-agglomerative star3 drain comparison with
-//! paired median delta and MAD, followed by one untimed work-graph report.
-
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -258,251 +254,13 @@ macro_rules! measure {
         drop(it);
         println!("  first-match stats: {}", dag_stats::report());
         println!("  first-match work:  {}", blocked_stats::report());
-        let partition_costs = blocked_stats::bucketing_report();
-        if !partition_costs.is_empty() {
-            println!("  first-match bucketing: {partition_costs}");
-        }
         blocked_stats::reset();
         dag_stats::reset();
         black_box($q.solve_dag_lazy().count());
         println!("  drain stats:       {}", dag_stats::report());
         println!("  drain work:        {}", blocked_stats::report());
-        let partition_costs = blocked_stats::bucketing_report();
-        if !partition_costs.is_empty() {
-            println!("  drain bucketing: {partition_costs}");
-        }
         blocked_stats::set_enabled(false);
         dag_stats::set_enabled(false);
-    }};
-}
-
-/// Runs four partition policies on one continuously consumed
-/// iterator per repetition. Every checkpoint is therefore a true prefix of
-/// the same execution, unlike independent `take(k)` probes.
-macro_rules! checkpoint_matrix {
-    ($label:expr, $reps:expr, $q:expr) => {{
-        const CHECKPOINTS: [usize; 5] = [1, 10, 100, 1_000, 10_000];
-        const POLICIES: [(&str, Option<usize>, bool); 4] = [
-            ("grouped", None, false),
-            ("trivial@1", Some(1), false),
-            ("trivial@256", Some(256), false),
-            ("agglomerative", None, true),
-        ];
-
-        let sequential = tally($q.sequential());
-        assert!(
-            sequential.0 >= *CHECKPOINTS.last().unwrap(),
-            "{} has too few rows for the checkpoint matrix",
-            $label
-        );
-        for &(policy, width, agglomerative) in &POLICIES {
-            let mut it = $q.solve_dag_lazy().start_width(1).growth(2);
-            if agglomerative {
-                it = it.agglomerative_partition();
-            } else if let Some(width) = width {
-                it = it.trivial_partition_at_width(width);
-            } else {
-                it = it.grouped_partition();
-            }
-            let actual = tally(it);
-            assert_eq!(
-                sequential, actual,
-                "checkpoint policy parity failed for {} under {}",
-                $label, policy
-            );
-        }
-
-        // Warm every policy before timing. Rotate the starting policy each
-        // repetition so no configuration owns a fixed thermal/cache slot.
-        for &(_, width, agglomerative) in &POLICIES {
-            let mut it = $q.solve_dag_lazy().start_width(1).growth(2);
-            if agglomerative {
-                it = it.agglomerative_partition();
-            } else if let Some(width) = width {
-                it = it.trivial_partition_at_width(width);
-            } else {
-                it = it.grouped_partition();
-            }
-            black_box(it.count());
-        }
-
-        let reps: usize = $reps;
-        let mut samples: Vec<Vec<Vec<f64>>> = POLICIES
-            .iter()
-            .map(|_| (0..=CHECKPOINTS.len()).map(|_| Vec::new()).collect())
-            .collect();
-        for rep in 0..reps {
-            for offset in 0..POLICIES.len() {
-                let ci = (rep + offset) % POLICIES.len();
-                let (_, width, agglomerative) = POLICIES[ci];
-                let mut it = $q.solve_dag_lazy().start_width(1).growth(2);
-                if agglomerative {
-                    it = it.agglomerative_partition();
-                } else if let Some(width) = width {
-                    it = it.trivial_partition_at_width(width);
-                } else {
-                    it = it.grouped_partition();
-                }
-                let started = Instant::now();
-                let mut rows = 0usize;
-                let mut checkpoint = 0usize;
-                while let Some(item) = it.next() {
-                    black_box(item);
-                    rows += 1;
-                    if checkpoint < CHECKPOINTS.len() && rows == CHECKPOINTS[checkpoint] {
-                        samples[ci][checkpoint].push(ms(started));
-                        checkpoint += 1;
-                    }
-                }
-                samples[ci][CHECKPOINTS.len()].push(ms(started));
-                assert_eq!(rows, sequential.0, "{} row count changed", $label);
-                assert_eq!(
-                    checkpoint,
-                    CHECKPOINTS.len(),
-                    "{} missed a timing checkpoint",
-                    $label
-                );
-            }
-        }
-
-        println!(
-            "=== {} continuous checkpoint matrix (rows {}) ===",
-            $label, sequential.0
-        );
-        for (ci, &(policy, width, agglomerative)) in POLICIES.iter().enumerate() {
-            println!(
-                "  {policy:>15}: K1 {:>8.3} | K10 {:>8.3} | K100 {:>8.3} | K1k {:>8.3} | K10k {:>8.3} | drain {:>8.3} ms",
-                median(samples[ci][0].clone()),
-                median(samples[ci][1].clone()),
-                median(samples[ci][2].clone()),
-                median(samples[ci][3].clone()),
-                median(samples[ci][4].clone()),
-                median(samples[ci][5].clone()),
-            );
-
-            blocked_stats::set_enabled(true);
-            blocked_stats::reset();
-            dag_stats::set_enabled(true);
-            dag_stats::reset();
-            let mut it = $q.solve_dag_lazy().start_width(1).growth(2);
-            if agglomerative {
-                it = it.agglomerative_partition();
-            } else if let Some(width) = width {
-                it = it.trivial_partition_at_width(width);
-            } else {
-                it = it.grouped_partition();
-            }
-            let rows = black_box(it.count());
-            assert_eq!(rows, sequential.0);
-            println!("    DAG: {}", dag_stats::report());
-            println!("    work: {}", blocked_stats::report());
-            let partition_costs = blocked_stats::bucketing_report();
-            if !partition_costs.is_empty() {
-                println!("    bucketing: {partition_costs}");
-            }
-            blocked_stats::set_enabled(false);
-            dag_stats::set_enabled(false);
-        }
-    }};
-}
-
-/// Compares grouped, whole-block, and agglomerative partitions on
-/// workloads that may have fewer than 10k results. Configuration order rotates
-/// across repetitions so cache and thermal position do not belong to one
-/// policy. The instrumented pass makes changes in work visible even when wall
-/// time is noisy.
-macro_rules! drain_partition_matrix {
-    ($label:expr, $reps:expr, $q:expr) => {{
-        const POLICIES: [(&str, Option<usize>, bool); 4] = [
-            ("grouped", None, false),
-            ("trivial@1", Some(1), false),
-            ("trivial@256", Some(256), false),
-            ("agglomerative", None, true),
-        ];
-
-        let sequential = tally($q.sequential());
-        for &(policy, width, agglomerative) in &POLICIES {
-            let mut it = $q.solve_dag_lazy().start_width(1).growth(2);
-            if agglomerative {
-                it = it.agglomerative_partition();
-            } else if let Some(width) = width {
-                it = it.trivial_partition_at_width(width);
-            } else {
-                it = it.grouped_partition();
-            }
-            assert_eq!(
-                sequential,
-                tally(it),
-                "drain partition policy parity failed for {} under {}",
-                $label,
-                policy
-            );
-        }
-
-        for &(_, width, agglomerative) in &POLICIES {
-            let mut it = $q.solve_dag_lazy().start_width(1).growth(2);
-            if agglomerative {
-                it = it.agglomerative_partition();
-            } else if let Some(width) = width {
-                it = it.trivial_partition_at_width(width);
-            } else {
-                it = it.grouped_partition();
-            }
-            black_box(it.count());
-        }
-
-        let reps: usize = $reps;
-        let mut samples: Vec<Vec<f64>> = POLICIES.iter().map(|_| Vec::new()).collect();
-        for rep in 0..reps {
-            for offset in 0..POLICIES.len() {
-                let ci = (rep + offset) % POLICIES.len();
-                let (_, width, agglomerative) = POLICIES[ci];
-                let mut it = $q.solve_dag_lazy().start_width(1).growth(2);
-                if agglomerative {
-                    it = it.agglomerative_partition();
-                } else if let Some(width) = width {
-                    it = it.trivial_partition_at_width(width);
-                } else {
-                    it = it.grouped_partition();
-                }
-                let started = Instant::now();
-                black_box(it.count());
-                samples[ci].push(ms(started));
-            }
-        }
-
-        println!(
-            "=== {} drain partition matrix (rows {}) ===",
-            $label, sequential.0
-        );
-        for (ci, &(policy, width, agglomerative)) in POLICIES.iter().enumerate() {
-            println!(
-                "  {policy:>15}: drain {:>9.3} ms",
-                median(samples[ci].clone()),
-            );
-
-            blocked_stats::set_enabled(true);
-            blocked_stats::reset();
-            dag_stats::set_enabled(true);
-            dag_stats::reset();
-            let mut it = $q.solve_dag_lazy().start_width(1).growth(2);
-            if agglomerative {
-                it = it.agglomerative_partition();
-            } else if let Some(width) = width {
-                it = it.trivial_partition_at_width(width);
-            } else {
-                it = it.grouped_partition();
-            }
-            assert_eq!(black_box(it.count()), sequential.0);
-            println!("    DAG: {}", dag_stats::report());
-            println!("    work: {}", blocked_stats::report());
-            let partition_costs = blocked_stats::bucketing_report();
-            if !partition_costs.is_empty() {
-                println!("    bucketing: {partition_costs}");
-            }
-            blocked_stats::set_enabled(false);
-            dag_stats::set_enabled(false);
-        }
     }};
 }
 
@@ -571,23 +329,7 @@ fn run_skew(majority: usize, minority: usize, fan: usize, reps: usize) {
             pattern!(&kb, [{ ?e @ world::p: ?x, world::q: ?y }, { ?x @ world::r: ?y }])
         )
     );
-    drain_partition_matrix!(
-        "skew ?e p ?x . q ?y . ?x r ?y (tribleset)",
-        reps,
-        find!(
-            (e: Inline<_>, x: Inline<_>, y: Inline<_>),
-            pattern!(&kb, [{ ?e @ world::p: ?x, world::q: ?y }, { ?x @ world::r: ?y }])
-        )
-    );
     measure!(
-        "skew ?e p ?x . q ?y . ?x r ?y (archive)",
-        reps,
-        find!(
-            (e: Inline<_>, x: Inline<_>, y: Inline<_>),
-            pattern!(&archive, [{ ?e @ world::p: ?x, world::q: ?y }, { ?x @ world::r: ?y }])
-        )
-    );
-    drain_partition_matrix!(
         "skew ?e p ?x . q ?y . ?x r ?y (archive)",
         reps,
         find!(
@@ -622,115 +364,6 @@ fn run_wd(cache: &str, reps: usize) {
     let p27 = wd_predicate("P27");
     let q5 = wd_entity("Q5");
 
-    if let Some(pairs) = std::env::var("TRIBLES_PAIRED_STAR3_REPS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|&value| value > 0)
-    {
-        macro_rules! star3 {
-            () => {
-                find!(
-                    (e: Inline<GenId>, g: Inline<GenId>, c: Inline<GenId>),
-                    pattern!(&wd, [{ ?e @ &p31: q5, &p21: ?g, &p27: ?c }])
-                )
-            };
-        }
-        #[derive(Clone, Copy)]
-        enum StarPolicy {
-            Trivial1,
-            Trivial256,
-            Agglomerative,
-        }
-        const POLICIES: [(&str, StarPolicy); 3] = [
-            ("trivial@1", StarPolicy::Trivial1),
-            ("trivial@256", StarPolicy::Trivial256),
-            ("agglomerative", StarPolicy::Agglomerative),
-        ];
-        let run = |policy: StarPolicy| {
-            let mut iter = star3!().solve_dag_lazy().start_width(1).growth(2);
-            iter = match policy {
-                StarPolicy::Trivial1 => iter.trivial_partition_at_width(1),
-                StarPolicy::Trivial256 => iter.trivial_partition_at_width(256),
-                StarPolicy::Agglomerative => iter.agglomerative_partition(),
-            };
-            let started = Instant::now();
-            let signature = tally(iter);
-            (signature, ms(started))
-        };
-
-        // Warm every path before counterbalanced timing.
-        let expected = run(StarPolicy::Trivial1).0;
-        for &(_, policy) in &POLICIES[1..] {
-            assert_eq!(run(policy).0, expected);
-        }
-        let mut policy_times: [Vec<f64>; 3] = std::array::from_fn(|_| Vec::with_capacity(pairs));
-        let mut agglomerative_minus_trivial1 = Vec::with_capacity(pairs);
-        let mut agglomerative_minus_trivial256 = Vec::with_capacity(pairs);
-        let orders = [
-            [0usize, 1, 2],
-            [0usize, 2, 1],
-            [1usize, 0, 2],
-            [1usize, 2, 0],
-            [2usize, 0, 1],
-            [2usize, 1, 0],
-        ];
-        for round in 0..pairs {
-            let mut round_times = [0.0f64; 3];
-            for &policy_index in &orders[round % orders.len()] {
-                let (signature, elapsed) = run(POLICIES[policy_index].1);
-                assert_eq!(signature, expected);
-                round_times[policy_index] = elapsed;
-                policy_times[policy_index].push(elapsed);
-            }
-            agglomerative_minus_trivial1.push(round_times[2] - round_times[0]);
-            agglomerative_minus_trivial256.push(round_times[2] - round_times[1]);
-        }
-        let summarize = |samples: &[f64]| {
-            let center = median(samples.to_vec());
-            let mad = median(
-                samples
-                    .iter()
-                    .map(|sample| (sample - center).abs())
-                    .collect(),
-            );
-            (center, mad)
-        };
-        let (delta1, mad1) = summarize(&agglomerative_minus_trivial1);
-        let (delta256, mad256) = summarize(&agglomerative_minus_trivial256);
-        println!(
-            "=== counterbalanced star3 drain ({pairs} triplets, rows {}) ===",
-            expected.0
-        );
-        println!(
-            "  trivial@1 {:>9.3} ms | trivial@256 {:>9.3} ms | agglomerative {:>9.3} ms",
-            median(policy_times[0].clone()),
-            median(policy_times[1].clone()),
-            median(policy_times[2].clone()),
-        );
-        println!(
-            "  agglomerative-trivial@1 delta {:>+9.3} ms (MAD {:>8.3}) | agglomerative-trivial@256 delta {:>+9.3} ms (MAD {:>8.3})",
-            delta1, mad1, delta256, mad256,
-        );
-
-        for &(label, policy) in &POLICIES {
-            blocked_stats::set_enabled(true);
-            blocked_stats::reset();
-            dag_stats::set_enabled(true);
-            dag_stats::reset();
-            let (signature, _) = run(policy);
-            assert_eq!(signature, expected);
-            println!("  {label} DAG: {}", dag_stats::report());
-            println!("  {label} work: {}", blocked_stats::report());
-            let bucketing = blocked_stats::bucketing_report();
-            if !bucketing.is_empty() {
-                println!("  {label} bucketing: {bucketing}");
-            }
-            blocked_stats::set_enabled(false);
-            dag_stats::set_enabled(false);
-        }
-        return;
-    }
-
     // A subject that certainly exists: any P31 subject from the archive.
     let (subj, _c) = find!((e: Id, c: Id), pattern!(&wd, [{ ?e @ &p31: ?c }]))
         .next()
@@ -754,23 +387,6 @@ fn run_wd(cache: &str, reps: usize) {
         )
     );
     measure!(
-        "wd star3 ?e P31 Q5 . P21 ?g . P27 ?c",
-        reps,
-        find!(
-            (e: Inline<GenId>, g: Inline<GenId>, c: Inline<GenId>),
-            pattern!(&wd, [{ ?e @ &p31: q5, &p21: ?g, &p27: ?c }])
-        )
-    );
-
-    checkpoint_matrix!(
-        "wd filter ?e P31 Q5 . ?e P106 ?o",
-        reps,
-        find!(
-            (e: Inline<GenId>, o: Inline<GenId>),
-            pattern!(&wd, [{ ?e @ &p31: q5, &p106: ?o }])
-        )
-    );
-    checkpoint_matrix!(
         "wd star3 ?e P31 Q5 . P21 ?g . P27 ?c",
         reps,
         find!(

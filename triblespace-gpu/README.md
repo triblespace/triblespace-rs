@@ -237,7 +237,7 @@ host/device boundary at its parent and full-capacity child allocation; a
 skewed archive whose global maximum fanout is much larger than most parents can
 therefore over-allocate and over-read substantially. Only `(E,A) -> V` is
 implemented, scan hierarchy is intentionally simple, and multi-pattern
-viability/confirmation plus agglomerative scheduling remain outside this
+viability/confirmation plus adaptive variable planning remain outside this
 backend. The native WGPU gate locks exact frontier parity at 0/1/63/64/65 rows,
 every split of a 65-row frontier, duplicate parents, all child-column insertion
 positions, exact/one-short/zero capacities, constant and missing peers,
