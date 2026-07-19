@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Scalar and lazy-DAG proposal actions now enter the search as SETs.** The
+  scalar cursor reverse-stably removes duplicate proposed values before DFS or
+  Rayon splitting, and the DAG does the same for `(parent, value)` pairs before
+  filing child rows. Tail-pop order and equal values under distinct parents
+  remain intact, while proposal telemetry continues to report raw occurrence
+  counts.
 - **Breaking: query heads now have relational SET semantics.** `find!` emits
   each distinct ordered tuple of raw projected inline values once, collapsing
   assignments that differ only in hidden witnesses. The empty head therefore

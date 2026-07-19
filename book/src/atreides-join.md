@@ -151,10 +151,11 @@ depth-first traversal from thrashing through unrelated values.
 - The explicit `Query::sequential()` scheduler keeps a stack of bound variables
   and a parallel row of values. It presents that cursor to constraints as a
   one-row `RowsView`; `Binding` is now only reconstructed at the
-  result-projection boundary. The terminal gate preserves one result per
-  distinct ordered raw query head; internal proposal occurrences remain bags
-  until that boundary. A `touched_variables` set marks which estimates need
-  refreshing before the next decision point.
+  result-projection boundary. Each selected scalar proposal action is
+  reverse-stably admitted to SET support before descent or Rayon splitting.
+  The terminal gate remains the universal final guard and preserves one result
+  per distinct ordered raw query head. A `touched_variables` set marks which
+  estimates need refreshing before the next decision point.
 - The ordinary iterator lifts the same negotiation to blocks of sibling rows
   through canonical residual states for every live root. Those states key
   future work by bound schema, planned action, and checked leaf occurrences.
@@ -164,7 +165,11 @@ depth-first traversal from thrashing through unrelated values.
   both choices explicit in its action state. Both worklists may reconverge
   histories into larger downstream batches only after those actions run. They
   never enlarge a batch by moving a row to another variable or proposer
-  occurrence.
+  occurrence. Before filing a DAG proposal, the engine admits its
+  `(parent row, value)` pairs to SET support, so an intra-parent duplicate
+  vanishes while equal values under distinct parents remain independent.
+  Residual payloads still carry occurrence bags through their explicit action
+  states until the corresponding residual admission slice is applied.
 - Highly skewed data still behaves predictably: even if one attribute dominates
   the dataset, the other constraints continue to bound the search space tightly
   and prevent runaway exploration.

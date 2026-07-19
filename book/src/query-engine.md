@@ -304,15 +304,19 @@ turns on and the remaining computation enters the batch-harvesting regime. An
 first match instead of paying for full enumeration.
 
 Variable grouping preserves the exact adaptive action selected for each row.
-The selected variable and proposer occurrence own that row's candidate
-occurrence bag, including duplicates; row-homomorphic execution only proves
-that identical actions may be chunked and rejoined. It does not make different
-variables commute. The DAG partitions by exact preferred variable and delegates
-row-local proposer choice to the root constraint's block-native `propose`; the
-residual engine cohorts explicit `(variable, proposer occurrence)` actions.
-Neither path moves a row to an estimate-compatible action. Exact ordering-key
-ties choose the lower variable ID in every planner. Chunk width and pop order
-remain physical choices.
+The selected variable and proposer occurrence own that row's candidate action;
+row-homomorphic execution only proves that identical actions may be chunked and
+rejoined. It does not make different variables commute. The scalar scheduler
+reverse-stably SET-admits a proposal's values before descending or splitting
+the cursor. The DAG partitions by exact preferred variable, delegates
+row-local proposer choice to the root constraint's block-native `propose`, and
+then SET-admits `(parent row, value)` before filing children. Consequently an
+intra-parent duplicate disappears while equal values under distinct parents
+remain independent. The residual engine cohorts explicit
+`(variable, proposer occurrence)` actions and still carries their occurrence
+payloads. Neither path moves a row to an estimate-compatible action. Exact
+ordering-key ties choose the lower variable ID in every planner. Chunk width
+and pop order remain physical choices.
 
 For `R` rows and `V ≤ 128` unbound variables, this planning is `O(RV)` time and
 uses `O(RV + V)` reusable scratch space, dominated by the per-row estimate
@@ -336,12 +340,14 @@ row order.
 
 ## Terminal projection and SET identity
 
-Schedulers deliberately preserve internal row and candidate occurrences until
-a full binding reaches the terminal projection gate. The gate derives an
-ordered key from the raw inline bytes of the declared `find!` head and claims
-that key before running `TryFromInline` conversion or user mapper code. A
-second full binding with the same projected key is discarded, even when its
-hidden witness or route through an `or!` differs.
+The terminal projection gate is the universal final SET guard. Scalar and DAG
+schedulers already remove duplicates within each selected proposal action,
+while residual worklists may still carry internal row and candidate
+occurrences. When a full binding reaches the gate, it derives an ordered key
+from the raw inline bytes of the declared `find!` head and claims that key
+before running `TryFromInline` conversion or user mapper code. A second full
+binding with the same projected key is discarded, even when its hidden witness
+or route through an `or!` differs.
 
 This ordering gives projection ordinary relational SET semantics while keeping
 conversion outside the relational identity. Two distinct raw keys may convert
