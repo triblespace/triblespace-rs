@@ -10829,6 +10829,16 @@ impl ResidualStateMachine {
             self.retire_staged_projection_receipts();
             return None;
         }
+        // Do not interpret a pull after proven scheduler exhaustion as demand
+        // for a wider terminal window. This matters for an elided zero-variable
+        // full head: its single semantic seed needs no claim table, and after
+        // that seed is consumed there is no remaining work to promote.
+        if self.emit_next >= self.emit_count
+            && self.worklist.is_empty()
+            && self.delta.is_empty()
+        {
+            return None;
+        }
         self.confirm_terminal_demand();
         loop {
             let draining_unprojected_emit = self.emit_next < self.emit_count;

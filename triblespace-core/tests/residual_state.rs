@@ -1704,8 +1704,8 @@ fn zero_variable_intersections_emit_the_empty_binding_iff_true() {
     assert_eq!(lazy_true.stats().width_increases, 0);
     assert_eq!(lazy_true.stats().terminal_demand_width_promotions, 0);
     assert_eq!(lazy_true.next(), None);
-    // The empty full head has one possible public key. Once that key was
-    // claimed, a later pull terminates before opening another demand window.
+    // The empty full head has one semantic seed. Once it is consumed, a later
+    // pull proves scheduler exhaustion before opening another demand window.
     assert_eq!(lazy_true.current_width(), 1);
     assert_eq!(lazy_true.stats().width_increases, 0);
     assert_eq!(lazy_true.stats().terminal_demand_width_promotions, 0);
