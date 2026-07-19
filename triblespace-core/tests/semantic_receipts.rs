@@ -795,6 +795,58 @@ fn dynamic_equality_root() -> IntersectionConstraint<DynConstraint> {
     ])
 }
 
+fn assert_missing_source_at_construction<T>(construct: impl FnOnce() -> T) {
+    let payload = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(construct)) {
+        Ok(_) => panic!("source-less certified query constructed successfully"),
+        Err(payload) => payload,
+    };
+    let message = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload");
+    assert!(
+        message.contains("fixed-denotation query state has no covering proposal source"),
+        "unexpected construction panic: {message}"
+    );
+}
+
+#[test]
+fn source_less_certified_roots_fail_at_query_construction() {
+    assert_missing_source_at_construction(|| Query::new(EqualityConstraint::new(X, Y), project_xy));
+
+    let x = Variable::<UnknownInline>::new(X);
+    assert_missing_source_at_construction(|| {
+        Query::new(
+            InlineRange::new(x, Inline::new([0x20; 32]), Inline::new([0x40; 32])),
+            project_x,
+        )
+    });
+
+    assert_missing_source_at_construction(|| {
+        Query::new(
+            UnionConstraint::new(vec![
+                boxed(true, ProposalCoverage::Exact),
+                boxed(true, ProposalCoverage::None),
+            ]),
+            project_x,
+        )
+    });
+}
+
+#[test]
+fn a_seed_proven_false_needs_no_proposal_source() {
+    let make = || OptimisticExposedAnd {
+        inner: IntersectionConstraint::new(vec![
+            Box::new(ClosedFalse) as DynConstraint,
+            boxed(true, ProposalCoverage::None),
+        ]),
+    };
+    for results in unary_scheduler_results(make) {
+        assert!(results.is_empty());
+    }
+}
+
 #[test]
 fn equality_becomes_a_source_only_after_its_peer_is_bound() {
     let mut result_sets = vec![

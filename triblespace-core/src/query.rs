@@ -2047,6 +2047,13 @@ fn source_quote_column<'a, C: Constraint<'a> + ?Sized>(
     }
 }
 
+/// Stable diagnostic for a certified frontier that cannot enumerate any
+/// remaining variable. A source may become available after another variable
+/// is bound (Equality is the canonical example), so callers must apply this
+/// only to the exact bound schema they are about to execute.
+pub(super) const CERTIFIED_SOURCE_FRONTIER_ERROR: &str =
+    "a non-full fixed-denotation query state has no covering proposal source; filter-only and peer-dependent constraints require an enumerable source";
+
 impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
     fn variables(&self) -> VariableSet {
         let inner: &T = self;
@@ -2675,7 +2682,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
                 }
             }
             let (index, coverage, estimate, _) =
-                best.expect("a non-full certified query has no covering proposal source");
+                best.unwrap_or_else(|| panic!("{CERTIFIED_SOURCE_FRONTIER_ERROR}"));
             (self.unbound.remove(index), coverage, estimate)
         } else {
             let mut stale_estimates = VariableSet::new_empty();
@@ -2881,6 +2888,13 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// retry it.
     ///
     /// This method is usually not called directly, but rather through the [find!] macro,
+    ///
+    /// # Panics
+    ///
+    /// Panics when a non-empty fixed-denotation root survives its exact seed
+    /// check but no variable has a covering proposal source at the empty
+    /// binding. Confirmation-only and peer-dependent constraints must be
+    /// paired with an enumerable source.
     pub fn new(constraint: C, postprocessing: P) -> Self {
         let variables = constraint.variables();
         let projection = ProjectionGate::full(variables);
@@ -2920,16 +2934,18 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
                 VariableSet::new_empty()
             }
         });
+        let mut has_initial_source = false;
         let estimates = std::array::from_fn(|v| {
             if variables.is_set(v) {
-                source_quote_scalar(
+                let quote = source_quote_scalar(
                     &constraint,
                     certified_denotation,
                     v,
                     VariableSet::new_empty(),
                     &RowsView::EMPTY,
-                )
-                .map_or_else(
+                );
+                has_initial_source |= quote.is_some();
+                quote.map_or_else(
                     || {
                         assert!(certified_denotation, "unconstrained variable in query");
                         usize::MAX
@@ -2970,6 +2986,9 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             } else {
                 Search::Done
             };
+        if certified_denotation && matches!(mode, Search::NextVariable) && !variables.is_empty() {
+            assert!(has_initial_source, "{CERTIFIED_SOURCE_FRONTIER_ERROR}");
+        }
         let scheduler = if matches!(mode, Search::NextVariable) {
             QueryScheduler::ResidualState
         } else {
@@ -4243,7 +4262,7 @@ impl DagState {
             });
             assert!(
                 !scratch.unbound.is_empty(),
-                "a non-full certified DAG state has no covering proposal source"
+                "{CERTIFIED_SOURCE_FRONTIER_ERROR}"
             );
         }
         let n_unbound = scratch.unbound.len();

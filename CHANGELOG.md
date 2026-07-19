@@ -78,6 +78,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   child that row-local planning may select as a covering source. A route proved
   Exact therefore enters its outer candidate continuation already checked;
   Covering routes retain the mandatory self-confirmation.
+
+- **Source-less certified queries now fail at construction.** A surviving,
+  non-full fixed-denotation seed must expose a covering proposal source for at
+  least one variable, so scalar, DAG, and residual execution no longer fail at
+  different late planning sites for filter-only roots. Seeds already proven
+  false remain valid empty queries, and peer-dependent sources such as
+  Equality remain eligible after another constraint binds their peer.
+
 - **The residual delta handoff regression now constructs a reachable Formula
   state.** Its streaming proposal runs through a certified linear AND suffix
   with the irrelevant sibling already skipped, rather than manually placing a

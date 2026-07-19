@@ -7363,10 +7363,7 @@ fn ready_plan_transition<'a>(
         });
     }
 
-    assert!(
-        !plans.is_empty(),
-        "a non-full certified residual state has no covering proposal source"
-    );
+    assert!(!plans.is_empty(), "{CERTIFIED_SOURCE_FRONTIER_ERROR}");
 
     let mut preferred = Vec::with_capacity(rows.row_count);
     let mut preferred_counts = vec![0; plans.len()];

@@ -772,7 +772,7 @@ fn top_level_regular_path_root_preserves_graph_semantics() {
 }
 
 #[test]
-fn top_level_constant_root_and_confirm_only_range_api_are_supported() {
+fn top_level_constant_root_and_sourced_range_api_are_supported() {
     let constant = Inline::<UnknownInline>::new(encoded(b'k', 7));
     assert_arbitrary_root_equivalent(
         || Variable::<UnknownInline>::new(P).is(constant),
@@ -783,11 +783,20 @@ fn top_level_constant_root_and_confirm_only_range_api_are_supported() {
     let min = Inline::<UnknownInline>::new(encoded(b'r', 1));
     let max = Inline::<UnknownInline>::new(encoded(b'r', 3));
     // InlineRange deliberately cannot propose, so by itself it is not a
-    // complete executable query. It can nevertheless be the API's concrete
-    // root type; the following test exercises its semantics when paired with
-    // a proposer behind one opaque root boundary.
-    let range = InlineRange::new(Variable::<UnknownInline>::new(P), min, max);
-    drop(Query::new(range, project_parent).solve_residual_state_lazy());
+    // complete executable query. Source-less certified roots are rejected at
+    // construction; the following test exercises the same concrete root type
+    // when an opaque boundary also supplies an enumerable domain.
+    let range_values: Vec<_> = (0..5).map(|i| encoded(b'r', i)).collect();
+    let (domain, _) = finite_domain(P, range_values, 5);
+    let rooted_range = Opaque(IntersectionConstraint::new(vec![
+        Box::new(domain) as OwnedConstraint,
+        Box::new(InlineRange::new(
+            Variable::<UnknownInline>::new(P),
+            min,
+            max,
+        )),
+    ]));
+    drop(Query::new(rooted_range, project_parent).solve_residual_state_lazy());
 }
 
 #[test]
