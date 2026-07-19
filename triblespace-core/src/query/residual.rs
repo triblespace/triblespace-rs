@@ -1749,7 +1749,21 @@ impl ResidualPlan {
         bound: VariableSet,
     ) -> ProposalCoverage {
         let ordinary = constraint.proposal_coverage(variable, bound);
-        if !self.transition_programs {
+        self.execution_proposal_coverage_from_ordinary(constraint, variable, bound, ordinary)
+    }
+
+    /// Strengthens one already-computed ordinary receipt through the selected
+    /// typed Program route. `Exact` is the top of the receipt lattice, so it
+    /// cannot be strengthened and must not pay a second virtual capability
+    /// walk merely to prove `max(Exact, _) == Exact`.
+    fn execution_proposal_coverage_from_ordinary<'a>(
+        &self,
+        constraint: &dyn Constraint<'a>,
+        variable: VariableId,
+        bound: VariableSet,
+        ordinary: ProposalCoverage,
+    ) -> ProposalCoverage {
+        if !self.transition_programs || ordinary == ProposalCoverage::Exact {
             return ordinary;
         }
         let request = ProgramRequest {
@@ -1786,7 +1800,12 @@ impl ResidualPlan {
         if ordinary < ProposalCoverage::Covering {
             ordinary
         } else {
-            self.execution_proposal_coverage(constraint, variable, bound)
+            self.execution_proposal_coverage_from_ordinary(
+                constraint,
+                variable,
+                bound,
+                ordinary,
+            )
         }
     }
 
@@ -1878,6 +1897,74 @@ impl ResidualPlan {
             variable,
             bound,
         )
+    }
+
+    /// Receipt guaranteed by the compiled formula proposal route, rather than
+    /// by treating the composite constraint as one opaque protocol action.
+    ///
+    /// An AND proposal chooses one covering child row-locally and confirms the
+    /// other target validators. It is therefore Exact precisely when every
+    /// child that may be chosen as its source has an Exact compiled route. An
+    /// OR visits every potentially live arm, so its route receipt is the meet
+    /// of the arm receipts. This compositional proof lets an already-validated
+    /// formula result skip the otherwise redundant outer self-confirmation.
+    fn formula_execution_proposal_coverage<'a>(
+        &self,
+        root: &dyn Constraint<'a>,
+        occurrence: usize,
+        node: FormulaNodeId,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> ProposalCoverage {
+        match &self.finite_formula.node(node).kind {
+            FiniteFormulaNodeKind::Atom => {
+                self.formula_node_proposal_coverage(root, occurrence, node, variable, bound)
+            }
+            FiniteFormulaNodeKind::Or { children } => children
+                .iter()
+                .map(|&child| {
+                    self.formula_execution_proposal_coverage(
+                        root, occurrence, child, variable, bound,
+                    )
+                })
+                .min()
+                .unwrap_or(ProposalCoverage::None),
+            FiniteFormulaNodeKind::And { children } => {
+                let mut receipt: Option<ProposalCoverage> = None;
+                for &child in children.iter() {
+                    let constraint = self.resolve_formula_node(root, occurrence, child);
+                    if !constraint.variables().is_set(variable)
+                        || self.formula_node_proposal_coverage(
+                            root, occurrence, child, variable, bound,
+                        ) < ProposalCoverage::Covering
+                    {
+                        continue;
+                    }
+                    let child_receipt = self.formula_execution_proposal_coverage(
+                        root, occurrence, child, variable, bound,
+                    );
+                    receipt = Some(match receipt {
+                        Some(receipt) => receipt.min(child_receipt),
+                        None => child_receipt,
+                    });
+                }
+                receipt.unwrap_or(ProposalCoverage::None)
+            }
+        }
+    }
+
+    fn formula_proposer_starts_checked<'a>(
+        &self,
+        root: &dyn Constraint<'a>,
+        occurrence: usize,
+        node: FormulaNodeId,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> bool {
+        !self.certified_denotation
+            || self.formula_execution_proposal_coverage(
+                root, occurrence, node, variable, bound,
+            ) == ProposalCoverage::Exact
     }
 
     /// Whether any concrete leaf in this plan owns a true transition source
@@ -7370,17 +7457,19 @@ fn propose_action_transition<'a>(
     stats: &mut ResidualStateStats,
 ) -> Option<ContinuationToken> {
     let leaf_count = plan.len();
-    // Reaching the stable executor means no typed proposal route was seeded.
-    // Its checked status must therefore describe the ordinary action, even if
-    // an available Program would have published a narrower Exact stream.
-    let proposer_checked =
-        plan.ordinary_proposer_starts_checked(root, proposer, variable, desc.bound);
     if plan.has_finite_formula(proposer) {
         let activations = allocate_activations(next_activation, rows.row_count);
         let formula_root = plan
             .finite_formula
             .root(proposer)
             .expect("a lowered formula has a root");
+        let proposer_checked = plan.formula_proposer_starts_checked(
+            root,
+            proposer,
+            formula_root,
+            variable,
+            desc.bound,
+        );
         let counter = interner.start_formula_with_proposer_checked(
             &plan.finite_formula,
             variable,
@@ -7406,6 +7495,11 @@ fn propose_action_transition<'a>(
             stats,
         );
     }
+    // Reaching the stable opaque executor means no typed proposal route was
+    // seeded. Its checked status must therefore describe the ordinary action,
+    // even if an available Program would publish a narrower Exact stream.
+    let proposer_checked =
+        plan.ordinary_proposer_starts_checked(root, proposer, variable, desc.bound);
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
     let view = rows_view(&vars, &rows.rows, rows.row_count);
     let mut candidates = CandidatePayload::empty(rows.row_count);
@@ -12826,6 +12920,63 @@ mod tests {
     }
 
     #[derive(Clone, Copy)]
+    struct ReceiptLeaf {
+        variable: VariableId,
+        coverage: ProposalCoverage,
+    }
+
+    impl Constraint<'static> for ReceiptLeaf {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(self.variable)
+        }
+
+        fn fixed_denotation(&self) -> bool {
+            true
+        }
+
+        fn proposal_coverage(
+            &self,
+            variable: VariableId,
+            bound: VariableSet,
+        ) -> ProposalCoverage {
+            if variable == self.variable && !bound.is_set(variable) {
+                self.coverage
+            } else {
+                ProposalCoverage::None
+            }
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != self.variable {
+                return false;
+            }
+            out.fill(1, view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+    }
+
+    #[derive(Clone, Copy)]
     struct CapabilityLeaf {
         variable: VariableId,
         page_local: bool,
@@ -16613,6 +16764,115 @@ mod tests {
         assert_ne!(
             program.node(children[0]).path,
             program.node(children[1]).path
+        );
+    }
+
+    #[test]
+    fn compiled_formula_receipts_discharge_only_fully_exact_proposal_routes() {
+        let leaf = |coverage| {
+            Box::new(ReceiptLeaf {
+                variable: 0,
+                coverage,
+            }) as ShapeConstraint
+        };
+        let arm = |left, right| {
+            Box::new(IntersectionConstraint::new(vec![leaf(left), leaf(right)]))
+                as ShapeConstraint
+        };
+        let exact_root = UnionConstraint::new(vec![
+            arm(ProposalCoverage::Exact, ProposalCoverage::Exact),
+            arm(ProposalCoverage::Exact, ProposalCoverage::Exact),
+        ]);
+        let exact_plan = ResidualPlan::compile_lowering(
+            &exact_root,
+            ResidualLowering::new(FormulaScope::WholeRoot, false),
+        );
+        let exact_formula_root = exact_plan.finite_formula.root(0).unwrap();
+        assert_eq!(
+            exact_plan.formula_execution_proposal_coverage(
+                &exact_root,
+                0,
+                exact_formula_root,
+                0,
+                VariableSet::new_empty(),
+            ),
+            ProposalCoverage::Exact
+        );
+
+        let desc = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Propose {
+                variable: 0,
+                relevant: ChildSet::empty(1).with_inserted(0),
+                proposer: 0,
+            },
+        };
+        let mut next_activation = 0;
+        let mut worklist = Worklist::new();
+        let mut interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let token = propose_action_transition(
+            &exact_root,
+            &exact_plan,
+            &desc,
+            0,
+            &ChildSet::empty(1).with_inserted(0),
+            0,
+            RowBatch {
+                rows: Vec::new(),
+                row_count: 1,
+            },
+            &mut next_activation,
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+        )
+        .expect("the exact formula proposal was filed");
+        let ResidualPhase::Formula { counter } = &interner.get(token.state).phase else {
+            panic!("a finite formula proposal did not enter its compiled program")
+        };
+        assert!(interner.formula_resume(*counter).proposer_checked);
+
+        let covering_root = UnionConstraint::new(vec![
+            arm(ProposalCoverage::Exact, ProposalCoverage::Exact),
+            arm(ProposalCoverage::Exact, ProposalCoverage::Covering),
+        ]);
+        let covering_plan = ResidualPlan::compile_lowering(
+            &covering_root,
+            ResidualLowering::new(FormulaScope::WholeRoot, false),
+        );
+        let covering_formula_root = covering_plan.finite_formula.root(0).unwrap();
+        assert_eq!(
+            covering_plan.formula_execution_proposal_coverage(
+                &covering_root,
+                0,
+                covering_formula_root,
+                0,
+                VariableSet::new_empty(),
+            ),
+            ProposalCoverage::Covering,
+            "one potentially selected Covering source keeps the outer self-check"
+        );
+
+        let exact_with_validator = IntersectionConstraint::new(vec![
+            leaf(ProposalCoverage::Exact),
+            leaf(ProposalCoverage::None),
+        ]);
+        let validator_plan = ResidualPlan::compile_lowering(
+            &exact_with_validator,
+            ResidualLowering::new(FormulaScope::WholeRoot, false),
+        );
+        let validator_root = validator_plan.finite_formula.root(0).unwrap();
+        assert_eq!(
+            validator_plan.formula_execution_proposal_coverage(
+                &exact_with_validator,
+                0,
+                validator_root,
+                0,
+                VariableSet::new_empty(),
+            ),
+            ProposalCoverage::Exact,
+            "a non-source validator is already run by the AND proposal route"
         );
     }
 

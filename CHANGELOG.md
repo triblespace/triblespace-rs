@@ -67,6 +67,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Exact compiled Formula proposals no longer confirm the whole Formula
+  twice.** The residual planner derives the execution receipt recursively: OR
+  takes the meet of its arm receipts, while AND takes the meet across every
+  child that row-local planning may select as a covering source. A route proved
+  Exact therefore enters its outer candidate continuation already checked;
+  Covering routes retain the mandatory self-confirmation.
 - **The residual delta handoff regression now constructs a reachable Formula
   state.** Its streaming proposal runs through a certified linear AND suffix
   with the irrelevant sibling already skipped, rather than manually placing a
