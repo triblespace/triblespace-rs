@@ -1628,9 +1628,10 @@ pub trait Constraint<'a> {
     /// stronger receipt. This is useful for a traversal which exposes eager
     /// covering seeds but publishes only witnessed endpoints from its typed
     /// fixpoint. The receipt is consulted only after
-    /// [`Self::residual_program`] accepts the exact `Propose(variable)` request,
-    /// and must be structural in `bound` and identical across typed CPU and
-    /// physical execution.
+    /// [`Self::residual_program`] accepts the exact `Propose(variable)` request
+    /// and the selected [`residual::ProgramScope`] admits that route. It must
+    /// be structural in `bound` and identical across typed CPU and physical
+    /// execution.
     #[doc(hidden)]
     fn residual_program_proposal_coverage(
         &self,
