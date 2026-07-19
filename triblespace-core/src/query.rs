@@ -537,10 +537,7 @@ impl ProjectionGate {
     }
 
     #[cfg(feature = "parallel")]
-    fn attach_shared(
-        &mut self,
-        claims: Option<Arc<Mutex<AHashSet<ProjectionKey>>>>,
-    ) {
+    fn attach_shared(&mut self, claims: Option<Arc<Mutex<AHashSet<ProjectionKey>>>>) {
         if let Some(claims) = claims {
             self.claims = ProjectionClaims::Shared(claims);
         } else {
@@ -745,6 +742,18 @@ impl<'v> RowsView<'v> {
         let rows = self.rows;
         let len = self.n_rows;
         (0..len).map(move |i| &rows[i * stride..(i + 1) * stride])
+    }
+
+    /// Bound-variable schema shared by every row in this block.
+    #[inline]
+    pub(crate) fn bound(&self) -> VariableSet {
+        self.vars
+            .iter()
+            .copied()
+            .fold(VariableSet::new_empty(), |mut bound, variable| {
+                bound.set(variable);
+                bound
+            })
     }
 }
 
@@ -1130,8 +1139,11 @@ pub struct ResidualDeltaExpandBatch<'v> {
 /// For a constraint occurrence `C`, target variable `x`, bound-variable
 /// schema `B`, and one row `b`, let `F_C(x | b)` be the set of values that
 /// extend `b` to at least one complete solution of `C`. Coverage compares
-/// that existential fiber with the **support** of `C.propose(x, b)`; proposal
-/// occurrence multiplicity is deliberately not part of the receipt.
+/// that existential fiber with the **support** of
+/// `C.propose_certified(x, b)` under a completely certified root; proposal
+/// occurrence multiplicity is deliberately not part of the receipt. Legacy
+/// action-defined execution ignores this receipt and continues to call
+/// `C.propose(x, b)`.
 ///
 /// The variants form the proof-strength order
 /// [`None`](Self::None) < [`Covering`](Self::Covering) <
@@ -1205,10 +1217,12 @@ pub trait ConstraintChildren<'a> {
 /// unbound.
 ///
 /// [`fixed_denotation`](Constraint::fixed_denotation) and
-/// [`proposal_coverage`](Constraint::proposal_coverage) are inert semantic
-/// receipts. They do not alter the ordinary protocol by themselves; an
-/// optimizer may use them only after the complete constraint occurrence is
-/// certified.
+/// [`proposal_coverage`](Constraint::proposal_coverage) are semantic receipts.
+/// An engine activates them only when the complete root occurrence is
+/// certified: coverage then owns source eligibility, while a Covering source
+/// is confirmed before its candidates cross a relational boundary. A root
+/// containing any default-false occurrence retains the legacy action-defined
+/// protocol.
 ///
 /// # Statelessness
 ///
@@ -1219,11 +1233,15 @@ pub trait ConstraintChildren<'a> {
 ///
 /// # Structural relevance
 ///
-/// Whether a constraint has an opinion about a variable is **structural**:
-/// it depends only on the variable's identity (and which variables are
-/// bound), never on the bound *values*. [`estimate`](Constraint::estimate)
-/// therefore answers relevance once per block, and a constraint either
-/// estimates a variable for every row or for none.
+/// Whether a constraint has an opinion about a variable is **structural**: it
+/// depends only on the variable's identity and bound-variable schema, never on
+/// bound *values*. For a certified root, [`variables`](Constraint::variables)
+/// defines validator relevance and
+/// [`proposal_coverage`](Constraint::proposal_coverage) defines source
+/// eligibility. [`estimate`](Constraint::estimate) is then only an optional
+/// cost quote; returning `false` assigns unknown cost rather than erasing the
+/// occurrence. In legacy action-defined mode, `estimate == false` retains its
+/// historical second role as the relevance/source signal for the whole block.
 ///
 /// # Row homomorphism
 ///
@@ -1248,16 +1266,22 @@ pub trait ConstraintChildren<'a> {
 /// feed back into any estimate, candidate, confirmation, or satisfaction
 /// answer.
 ///
-/// # Action identity and occurrence bags
+/// # Action identity and SET admission
 ///
-/// Once planning selects a variable and proposing constraint occurrence for a
-/// row, that pair is the row's semantic action. [`propose`](Constraint::propose)
-/// owns the candidate occurrence bag, including duplicates; estimates only
-/// order the choice. Row homomorphism permits batching the **same** action
-/// across rows, but it does not imply that different variables commute or that
-/// two proposer occurrences yield interchangeable bags. A physical scheduler
-/// must therefore preserve the selected action rather than reassigning a row to
-/// an estimate-similar variable or proposer.
+/// For an uncertified root, once planning selects a variable and proposing
+/// constraint occurrence for a row, that pair remains the row's semantic
+/// action. [`propose`](Constraint::propose) owns the candidate support and its
+/// first-seen order; estimates only order the choice. Physical duplicate
+/// occurrences collapse at the engine's per-parent SET-admission boundary
+/// before descendants are filed. Row homomorphism permits batching the
+/// **same** action across rows, but does not make two proposer occurrences
+/// interchangeable: they may still expose different supports.
+///
+/// A certified root instead supplies one fixed relation. Receipt-aware engines
+/// may regroup rows among sound sources and collapse occurrence multiplicity at
+/// explicit SET boundaries, provided they preserve the same raw projected
+/// tuples. Estimates remain costs in both modes and never authorize a semantic
+/// rewrite by themselves.
 ///
 /// # Composability
 ///
@@ -1279,7 +1303,11 @@ pub trait ConstraintChildren<'a> {
 /// [`satisfied`](Constraint::satisfied) when the constraint can detect
 /// unsatisfiability early (e.g. a fully-bound triple lookup that found no
 /// match). Override [`influence`](Constraint::influence) when binding one
-/// variable changes the estimates for a non-obvious set of others.
+/// variable changes the estimates for a non-obvious set of others. To opt a
+/// complete query tree into relational SET planning, every occurrence must
+/// also uphold [`fixed_denotation`](Constraint::fixed_denotation), and every
+/// occurrence used as a source must publish an appropriate
+/// [`proposal_coverage`](Constraint::proposal_coverage) receipt.
 pub trait Constraint<'a> {
     /// Returns the set of variables this constraint touches.
     ///
@@ -1290,22 +1318,30 @@ pub trait Constraint<'a> {
 
     /// Certifies that this occurrence denotes one fixed set relation.
     ///
-    /// Returning `true` is a proof obligation over the whole occurrence and
-    /// every execution route it exposes. For the duration of one solve:
+    /// Returning `true` is a proof obligation over the occurrence's
+    /// relational-SET protocol and every accelerated route it exposes. That
+    /// protocol is activated only when **every occurrence in the complete
+    /// query root** returns `true`. For the duration of such a solve:
     ///
-    /// - ordinary, paged, typed-Program, and complete-equivalent routes must
-    ///   agree on the same relation over [`Self::variables`];
-    /// - `confirm(x, b, input)` must be a subbag of `input`, retain every
-    ///   occurrence whose value belongs to the existential fiber, and become
-    ///   exact once all occurrence variables other than `x` are bound;
+    /// - `propose_certified`, `confirm_certified`, paged, typed-Program, and
+    ///   complete-equivalent routes must agree on the same relation over
+    ///   [`Self::variables`];
+    /// - `confirm_certified(x, b, input)` must be a subbag of `input`, retain
+    ///   every occurrence whose value belongs to the existential fiber, and
+    ///   become exact once all occurrence variables other than `x` are bound;
     /// - `satisfied(b) == false` must prove that `b` has no completion, and
     ///   `satisfied` must be exact once all occurrence variables are bound;
     /// - estimates remain costs only and cannot change relevance, coverage,
     ///   or the denoted relation.
     ///
-    /// The default is conservative. It preserves the existing action-defined
-    /// scheduling behavior for custom constraints until they explicitly
-    /// certify these laws.
+    /// The certified action methods default to the ordinary action methods,
+    /// which is the right implementation for leaves. Logical composites may
+    /// override them while retaining their historical ordinary behavior below
+    /// an uncertified root. A transparent wrapper that forwards
+    /// `fixed_denotation` or `proposal_coverage` MUST also forward all three
+    /// certified action methods; otherwise it has made a false certificate.
+    /// The default `false` preserves action-defined scheduling for custom
+    /// constraints until they explicitly certify these laws.
     fn fixed_denotation(&self) -> bool {
         false
     }
@@ -1321,11 +1357,7 @@ pub trait Constraint<'a> {
     ///
     /// The default makes no source claim. A confirmation-only constraint can
     /// therefore certify a fixed denotation while retaining this default.
-    fn proposal_coverage(
-        &self,
-        _variable: VariableId,
-        _bound: VariableSet,
-    ) -> ProposalCoverage {
+    fn proposal_coverage(&self, _variable: VariableId, _bound: VariableSet) -> ProposalCoverage {
         ProposalCoverage::None
     }
 
@@ -1333,13 +1365,18 @@ pub trait Constraint<'a> {
     /// **every row** of the block, pushing one estimate per row into
     /// `out`.
     ///
-    /// Returns `false` (leaving `out` untouched) when `variable` is not
-    /// constrained by this constraint — a structural answer, uniform
-    /// across the block. Estimates need not equal the eventual candidate
-    /// count: they guide adaptive action ordering, while the selected
-    /// `propose`/`confirm` path defines the occurrence bag. Tighter estimates
-    /// lead to better search pruning; see the [Atreides join](crate) family for
-    /// how estimate fidelity affects performance.
+    /// Returns `false` leaving `out` untouched. In legacy action-defined mode
+    /// that means this occurrence does not constrain `variable`, uniformly
+    /// across the block. Under a completely certified root it means only that
+    /// no cost quote is available: structural relevance comes from
+    /// [`variables`](Constraint::variables), source eligibility comes from
+    /// [`proposal_coverage`](Constraint::proposal_coverage), and the engine
+    /// uses `usize::MAX` as the unknown cost.
+    ///
+    /// Estimates need not equal the eventual candidate count. Tighter quotes
+    /// improve adaptive ordering, but cannot change the denoted relation; see
+    /// the [Atreides join](crate) family for how estimate fidelity affects
+    /// performance.
     fn estimate(
         &self,
         variable: VariableId,
@@ -1394,6 +1431,55 @@ pub trait Constraint<'a> {
         view: &RowsView<'_>,
         candidates: &mut CandidateSink<'_>,
     );
+
+    /// Estimates through the relational-SET execution protocol.
+    ///
+    /// Engines may call this only after proving that the complete query root
+    /// has [`fixed_denotation`](Constraint::fixed_denotation). The default is
+    /// deliberately identical to [`estimate`](Constraint::estimate): leaves
+    /// need no second implementation. Logical composites override this entry
+    /// point so receipt-aware planning propagates through nested structure
+    /// without changing the ordinary, action-defined protocol when that same
+    /// composite appears below an uncertified root.
+    #[doc(hidden)]
+    fn estimate_certified(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        self.estimate(variable, view, out)
+    }
+
+    /// Proposes through the relational-SET execution protocol.
+    ///
+    /// This has the same whole-root activation rule as
+    /// [`estimate_certified`](Constraint::estimate_certified). The default
+    /// delegates to the ordinary leaf action.
+    #[doc(hidden)]
+    fn propose_certified(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.propose(variable, view, candidates)
+    }
+
+    /// Confirms through the relational-SET execution protocol.
+    ///
+    /// This has the same whole-root activation rule as
+    /// [`estimate_certified`](Constraint::estimate_certified). The default
+    /// delegates to the ordinary leaf action.
+    #[doc(hidden)]
+    fn confirm_certified(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.confirm(variable, view, candidates)
+    }
 
     /// Returns whether **every row** of the block is consistent with this
     /// constraint.
@@ -1529,6 +1615,29 @@ pub trait Constraint<'a> {
     #[doc(hidden)]
     fn residual_program(&self) -> Option<ProgramRef<'_>> {
         None
+    }
+
+    /// Proposal receipt for a typed residual Program route.
+    ///
+    /// The default inherits the ordinary proposal receipt. A Program may
+    /// only strengthen it: the returned value MUST be at least
+    /// [`proposal_coverage`](Constraint::proposal_coverage) in the proof order.
+    /// Its accepted support must still contain the complete existential fiber,
+    /// and `Exact` must equal that fiber. The accepted stream may therefore be
+    /// narrower than a conservative ordinary proposal bag while carrying a
+    /// stronger receipt. This is useful for a traversal which exposes eager
+    /// covering seeds but publishes only witnessed endpoints from its typed
+    /// fixpoint. The receipt is consulted only after
+    /// [`Self::residual_program`] accepts the exact `Propose(variable)` request,
+    /// and must be structural in `bound` and identical across typed CPU and
+    /// physical execution.
+    #[doc(hidden)]
+    fn residual_program_proposal_coverage(
+        &self,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> ProposalCoverage {
+        self.proposal_coverage(variable, bound)
     }
 
     /// Whether this action owns an ordered, page-producing source frontier.
@@ -1798,6 +1907,146 @@ pub trait Constraint<'a> {
     }
 }
 
+/// Dispatches one constraint action through the root-selected protocol.
+fn estimate_constraint<'a, C: Constraint<'a> + ?Sized>(
+    constraint: &C,
+    certified: bool,
+    variable: VariableId,
+    view: &RowsView<'_>,
+    out: &mut EstimateSink<'_>,
+) -> bool {
+    if certified {
+        constraint.estimate_certified(variable, view, out)
+    } else {
+        constraint.estimate(variable, view, out)
+    }
+}
+
+fn propose_constraint<'a, C: Constraint<'a> + ?Sized>(
+    constraint: &C,
+    certified: bool,
+    variable: VariableId,
+    view: &RowsView<'_>,
+    candidates: &mut CandidateSink<'_>,
+) {
+    if certified {
+        constraint.propose_certified(variable, view, candidates);
+    } else {
+        constraint.propose(variable, view, candidates);
+    }
+}
+
+fn confirm_constraint<'a, C: Constraint<'a> + ?Sized>(
+    constraint: &C,
+    certified: bool,
+    variable: VariableId,
+    view: &RowsView<'_>,
+    candidates: &mut CandidateSink<'_>,
+) {
+    if certified {
+        constraint.confirm_certified(variable, view, candidates);
+    } else {
+        constraint.confirm(variable, view, candidates);
+    }
+}
+
+/// Receipt-aware source quote for one scalar row.
+///
+/// In legacy action-defined mode an estimate is also the relevance/source
+/// signal. Once the complete root is certified, coverage owns source
+/// eligibility and a missing estimate is merely an unknown (`MAX`) cost.
+fn source_quote_scalar<'a, C: Constraint<'a> + ?Sized>(
+    constraint: &C,
+    certified: bool,
+    variable: VariableId,
+    bound: VariableSet,
+    view: &RowsView<'_>,
+) -> Option<(ProposalCoverage, usize)> {
+    let coverage = if certified {
+        let coverage = constraint.proposal_coverage(variable, bound);
+        if coverage == ProposalCoverage::None {
+            return None;
+        }
+        debug_assert!(constraint.fixed_denotation());
+        debug_assert!(constraint.variables().is_set(variable));
+        coverage
+    } else {
+        ProposalCoverage::Exact
+    };
+
+    let mut estimate = usize::MAX;
+    let quoted = estimate_constraint(
+        constraint,
+        certified,
+        variable,
+        view,
+        &mut EstimateSink::Scalar(&mut estimate),
+    );
+    if certified {
+        Some((coverage, estimate))
+    } else {
+        quoted.then_some((coverage, estimate))
+    }
+}
+
+/// Receipt-aware source quote column for a row block.
+///
+/// Returns the source coverage and appends exactly one cost per row. Certified
+/// sources without an estimate receive `usize::MAX`; legacy irrelevance leaves
+/// `out` untouched and returns `None`.
+fn source_quote_column<'a, C: Constraint<'a> + ?Sized>(
+    constraint: &C,
+    certified: bool,
+    variable: VariableId,
+    bound: VariableSet,
+    view: &RowsView<'_>,
+    out: &mut Vec<usize>,
+) -> Option<ProposalCoverage> {
+    let coverage = if certified {
+        let coverage = constraint.proposal_coverage(variable, bound);
+        if coverage == ProposalCoverage::None {
+            return None;
+        }
+        debug_assert!(constraint.fixed_denotation());
+        debug_assert!(constraint.variables().is_set(variable));
+        coverage
+    } else {
+        ProposalCoverage::Exact
+    };
+
+    let start = out.len();
+    let quoted = estimate_constraint(
+        constraint,
+        certified,
+        variable,
+        view,
+        &mut EstimateSink::Column(out),
+    );
+    if quoted {
+        assert_eq!(
+            out.len() - start,
+            view.len(),
+            "constraint estimate must append one value per row"
+        );
+        Some(coverage)
+    } else if certified {
+        assert_eq!(
+            out.len(),
+            start,
+            "missing constraint estimate must leave its sink untouched"
+        );
+        out.resize(start + view.len(), usize::MAX);
+        Some(coverage)
+    } else {
+        assert_eq!(
+            out.len(),
+            start,
+            "irrelevant constraint estimate must leave its sink untouched"
+        );
+        None
+    }
+}
+
 impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
     fn variables(&self) -> VariableSet {
         let inner: &T = self;
@@ -1809,11 +2058,7 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.fixed_denotation()
     }
 
-    fn proposal_coverage(
-        &self,
-        variable: VariableId,
-        bound: VariableSet,
-    ) -> ProposalCoverage {
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
         let inner: &T = self;
         inner.proposal_coverage(variable, bound)
     }
@@ -1846,6 +2091,36 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
     ) {
         let inner: &T = self;
         inner.confirm(variable, view, candidates)
+    }
+
+    fn estimate_certified(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        let inner: &T = self;
+        inner.estimate_certified(variable, view, out)
+    }
+
+    fn propose_certified(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        let inner: &T = self;
+        inner.propose_certified(variable, view, candidates)
+    }
+
+    fn confirm_certified(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        let inner: &T = self;
+        inner.confirm_certified(variable, view, candidates)
     }
 
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
@@ -1884,6 +2159,15 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
     fn residual_program(&self) -> Option<ProgramRef<'_>> {
         let inner: &T = self;
         inner.residual_program()
+    }
+
+    fn residual_program_proposal_coverage(
+        &self,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> ProposalCoverage {
+        let inner: &T = self;
+        inner.residual_program_proposal_coverage(variable, bound)
     }
 
     fn residual_delta_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
@@ -1995,11 +2279,7 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
         inner.fixed_denotation()
     }
 
-    fn proposal_coverage(
-        &self,
-        variable: VariableId,
-        bound: VariableSet,
-    ) -> ProposalCoverage {
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
         let inner: &T = self;
         inner.proposal_coverage(variable, bound)
     }
@@ -2032,6 +2312,36 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     ) {
         let inner: &T = self;
         inner.confirm(variable, view, candidates)
+    }
+
+    fn estimate_certified(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        let inner: &T = self;
+        inner.estimate_certified(variable, view, out)
+    }
+
+    fn propose_certified(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        let inner: &T = self;
+        inner.propose_certified(variable, view, candidates)
+    }
+
+    fn confirm_certified(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        let inner: &T = self;
+        inner.confirm_certified(variable, view, candidates)
     }
 
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
@@ -2070,6 +2380,15 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     fn residual_program(&self) -> Option<ProgramRef<'_>> {
         let inner: &T = self;
         inner.residual_program()
+    }
+
+    fn residual_program_proposal_coverage(
+        &self,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> ProposalCoverage {
+        let inner: &T = self;
+        inner.residual_program_proposal_coverage(variable, bound)
     }
 
     fn residual_delta_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
@@ -2217,6 +2536,10 @@ pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
     scheduler: QueryScheduler,
     /// Structural lowering selected independently from the physical scheduler.
     residual_lowering: residual::ResidualLowering,
+    /// The complete root certified one fixed denotation when this query was
+    /// constructed. Receipt-aware planning is all-or-nothing at this boundary;
+    /// default-false custom roots retain legacy action semantics.
+    certified_denotation: bool,
     mode: Search,
     /// Whether [`Iterator::next`] has ever been called on this query.
     ///
@@ -2288,6 +2611,7 @@ where
             projection: self.projection.clone(),
             scheduler: self.scheduler,
             residual_lowering: self.residual_lowering,
+            certified_denotation: self.certified_denotation,
             mode: self.mode,
             iteration_started: self.iteration_started,
             influences: self.influences,
@@ -2323,47 +2647,89 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// [`UnindexedProducer::split`](crate::query::QueryParIter) implementation
     /// — the "push + propose" dance is identical in both.
     fn push_next_variable(&mut self) {
-        let mut stale_estimates = VariableSet::new_empty();
-        while let Some(variable) = self.touched_variables.drain_next_ascending() {
-            stale_estimates = stale_estimates.union(self.influences[variable]);
-        }
-        // Bound variables can't be influenced by the unbound ones, so skip.
-        stale_estimates = stale_estimates.subtract(self.bound);
-
-        if !stale_estimates.is_empty() {
+        let (variable, coverage, estimate) = if self.certified_denotation {
+            // Coverage is structural in the complete bound schema and may be
+            // enabled by any newly bound peer (Equality is the smallest
+            // example). Recompute the at-most-128 source receipts rather than
+            // treating an estimate-influence cache as semantic eligibility.
             let view = RowsView::new_indexed(&self.stack, &self.row, &self.cols);
-            while let Some(v) = stale_estimates.drain_next_ascending() {
-                let mut estimate = 0usize;
-                assert!(
-                    self.constraint
-                        .estimate(v, &view, &mut EstimateSink::Scalar(&mut estimate)),
-                    "unconstrained variable in query"
-                );
+            self.touched_variables = VariableSet::new_empty();
+            let mut best = None;
+            for (index, &v) in self.unbound.iter().enumerate() {
+                let Some((coverage, estimate)) =
+                    source_quote_scalar(&self.constraint, true, v, self.bound, &view)
+                else {
+                    self.estimates[v] = usize::MAX;
+                    continue;
+                };
                 self.estimates[v] = estimate;
+                let key = variable_choice_key(
+                    v,
+                    estimate,
+                    self.base_estimates[v],
+                    self.influences[v].count(),
+                );
+                if best.is_none_or(|(_, _, _, best_key)| key > best_key) {
+                    best = Some((index, coverage, estimate, key));
+                }
             }
-            self.unbound.sort_unstable_by_key(|v| {
-                variable_choice_key(
-                    *v,
-                    self.estimates[*v],
-                    self.base_estimates[*v],
-                    self.influences[*v].count(),
-                )
-            });
-        }
+            let (index, coverage, estimate, _) =
+                best.expect("a non-full certified query has no covering proposal source");
+            (self.unbound.remove(index), coverage, estimate)
+        } else {
+            let mut stale_estimates = VariableSet::new_empty();
+            while let Some(variable) = self.touched_variables.drain_next_ascending() {
+                stale_estimates = stale_estimates.union(self.influences[variable]);
+            }
+            // Bound variables can't be influenced by the unbound ones, so skip.
+            stale_estimates = stale_estimates.subtract(self.bound);
 
-        let variable = self.unbound.pop().expect("non-empty unbound");
+            if !stale_estimates.is_empty() {
+                let view = RowsView::new_indexed(&self.stack, &self.row, &self.cols);
+                while let Some(v) = stale_estimates.drain_next_ascending() {
+                    let (_, estimate) =
+                        source_quote_scalar(&self.constraint, false, v, self.bound, &view)
+                            .expect("unconstrained variable in query");
+                    self.estimates[v] = estimate;
+                }
+                self.unbound.sort_unstable_by_key(|v| {
+                    variable_choice_key(
+                        *v,
+                        self.estimates[*v],
+                        self.base_estimates[*v],
+                        self.influences[*v].count(),
+                    )
+                });
+            }
+
+            let variable = self.unbound.pop().expect("non-empty unbound");
+            (variable, ProposalCoverage::Exact, self.estimates[variable])
+        };
         if order_trace::enabled() {
             order_trace::record(self.stack.len(), variable, 1);
         }
-        let estimate = self.estimates[variable];
         let values = self.values[variable].get_or_insert(Vec::new());
         values.clear();
-        values.reserve_exact(estimate.saturating_sub(values.capacity()));
-        self.constraint.propose(
+        if estimate != usize::MAX {
+            values.reserve_exact(estimate.saturating_sub(values.capacity()));
+        }
+        let view = RowsView::new_indexed(&self.stack, &self.row, &self.cols);
+        propose_constraint(
+            &self.constraint,
+            self.certified_denotation,
             variable,
-            &RowsView::new_indexed(&self.stack, &self.row, &self.cols),
+            &view,
             &mut CandidateSink::Values(values),
         );
+        if coverage == ProposalCoverage::Covering {
+            confirm_constraint(
+                &self.constraint,
+                true,
+                variable,
+                &view,
+                &mut CandidateSink::Values(values),
+            );
+        }
         // `values` is a tail-popped action stack. Keep each value's last
         // stored occurrence so the first-seen DFS order remains unchanged:
         // `[a, b, a] -> [b, a]`, then pop yields `a, b`.
@@ -2545,6 +2911,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         variables: VariableSet,
         projection: ProjectionGate,
     ) -> Self {
+        let certified_denotation = constraint.fixed_denotation();
         let influences = std::array::from_fn(|v| {
             if variables.is_set(v) {
                 constraint.influence(v)
@@ -2554,16 +2921,20 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         });
         let estimates = std::array::from_fn(|v| {
             if variables.is_set(v) {
-                let mut estimate = 0usize;
-                assert!(
-                    constraint.estimate(
-                        v,
-                        &RowsView::EMPTY,
-                        &mut EstimateSink::Scalar(&mut estimate)
-                    ),
-                    "unconstrained variable in query"
-                );
-                estimate
+                source_quote_scalar(
+                    &constraint,
+                    certified_denotation,
+                    v,
+                    VariableSet::new_empty(),
+                    &RowsView::EMPTY,
+                )
+                .map_or_else(
+                    || {
+                        assert!(certified_denotation, "unconstrained variable in query");
+                        usize::MAX
+                    },
+                    |(_, estimate)| estimate,
+                )
             } else {
                 usize::MAX
             }
@@ -2592,11 +2963,12 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         // `RowsView::EMPTY` is the seed block (a single zero-width row —
         // the empty binding), so this is the block-native form of the
         // empty-binding probe.
-        let mode = if constraint.satisfied(&RowsView::EMPTY) {
-            Search::NextVariable
-        } else {
-            Search::Done
-        };
+        let mode =
+            if residual::seed_survives(&constraint, VariableSet::new_empty(), &RowsView::EMPTY) {
+                Search::NextVariable
+            } else {
+                Search::Done
+            };
         let scheduler = if matches!(mode, Search::NextVariable) {
             QueryScheduler::ResidualState
         } else {
@@ -2608,6 +2980,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             projection,
             scheduler,
             residual_lowering: residual::ResidualLowering::FULL,
+            certified_denotation,
             mode,
             iteration_started: false,
             influences,
@@ -3266,8 +3639,8 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     ///
     /// **Scheduling — sprint vs harvest.** Width and pop order are physical,
     /// but each row's adaptive next-variable assignment is semantic because
-    /// the selected proposer owns its occurrence bag. The engine therefore
-    /// preserves exact per-row assignments while width and pop order interact:
+    /// the selected proposer owns its candidate support and order. The engine
+    /// therefore preserves exact per-row assignments while width and pop order interact:
     /// a
     /// partially drained bucket's remainder is a strict subset of its own
     /// children, so the eager engine's readiness gate would refuse to
@@ -3324,11 +3697,12 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             projection,
             influences,
             base_estimates,
+            certified_denotation,
             mode,
             ..
         } = self;
         let full = constraint.variables();
-        let mut state = DagState::new(full);
+        let mut state = DagState::new(full, certified_denotation);
         // [`Query::new`] settles zero-variable (fully-constant) constraints
         // with one exact `satisfied` probe against the seed block; when the
         // probe failed the query is already `Done`. The DAG worklist never
@@ -3427,6 +3801,8 @@ impl<C, P: Fn(&Binding) -> Option<R>, R> DagIter<C, P, R> {
 #[derive(Clone)]
 pub(crate) struct DagState {
     full: VariableSet,
+    /// Whole-root receipt captured when this worklist was constructed.
+    certified_denotation: bool,
     buckets: Vec<DagBucket>,
     pop_id: u64,
     binding: Binding,
@@ -3508,10 +3884,11 @@ impl Default for DagScratch {
 }
 
 impl DagState {
-    fn new(full: VariableSet) -> Self {
+    fn new(full: VariableSet, certified_denotation: bool) -> Self {
         let cap = block_row_cap();
         DagState {
             full,
+            certified_denotation,
             buckets: vec![DagBucket {
                 set: VariableSet::new_empty(),
                 vars: Vec::new(),
@@ -3541,6 +3918,7 @@ impl DagState {
     fn parallel_sibling(&self) -> Self {
         DagState {
             full: self.full,
+            certified_denotation: self.certified_denotation,
             buckets: Vec::new(),
             pop_id: self.pop_id,
             binding: Binding::default(),
@@ -3858,6 +4236,15 @@ impl DagState {
         let c_rows = take;
         scratch.unbound.clear();
         scratch.unbound.extend(self.full.subtract(parent_set));
+        if self.certified_denotation {
+            scratch.unbound.retain(|&variable| {
+                constraint.proposal_coverage(variable, parent_set) >= ProposalCoverage::Covering
+            });
+            assert!(
+                !scratch.unbound.is_empty(),
+                "a non-full certified DAG state has no covering proposal source"
+            );
+        }
         let n_unbound = scratch.unbound.len();
 
         // A single unbound variable means there is no choice to make and
@@ -3866,15 +4253,31 @@ impl DagState {
         // level, which at sprint widths is also the most-popped one.
         if n_unbound == 1 {
             let variable = scratch.unbound[0];
+            let coverage = if self.certified_denotation {
+                constraint.proposal_coverage(variable, parent_set)
+            } else {
+                ProposalCoverage::Exact
+            };
             if order_trace::enabled() {
                 order_trace::record(stride, variable, c_rows as u64);
             }
             scratch.pairs.clear();
-            constraint.propose(
+            propose_constraint(
+                constraint,
+                self.certified_denotation,
                 variable,
                 &view,
                 &mut CandidateSink::Tagged(&mut scratch.pairs),
             );
+            if coverage == ProposalCoverage::Covering {
+                confirm_constraint(
+                    constraint,
+                    true,
+                    variable,
+                    &view,
+                    &mut CandidateSink::Tagged(&mut scratch.pairs),
+                );
+            }
             let raw_pairs =
                 admit_reverse_stable_set(&mut scratch.pairs, &mut scratch.pair_admission);
             if stats {
@@ -3907,15 +4310,21 @@ impl DagState {
         //    variable — columns land contiguously because the sink appends.
         scratch.est.clear();
         for &v in scratch.unbound.iter() {
-            let relevant =
-                constraint.estimate(v, &view, &mut EstimateSink::Column(&mut scratch.est));
-            assert!(relevant, "unconstrained variable in query");
+            let _ = source_quote_column(
+                constraint,
+                self.certified_denotation,
+                v,
+                parent_set,
+                &view,
+                &mut scratch.est,
+            )
+            .expect("unconstrained variable in query");
         }
         debug_assert_eq!(scratch.est.len(), n_unbound * c_rows);
 
         // 2. Per-row preferred variable: argmax of the engine's ordering
         //    key over the row's matrix entries. This assignment is semantic:
-        //    the chosen proposer owns the occurrence bag.
+        //    the chosen proposer owns candidate support and first-seen order.
         scratch.preferred.clear();
         scratch.group_counts.clear();
         scratch.group_counts.resize(n_unbound, 0);
@@ -3987,11 +4396,24 @@ impl DagState {
                 order_trace::record(stride, variable, g_count as u64);
             }
             scratch.pairs.clear();
-            constraint.propose(
+            propose_constraint(
+                constraint,
+                self.certified_denotation,
                 variable,
                 &RowsView::new_indexed(&scratch.parent_vars, g_rows, &scratch.cols),
                 &mut CandidateSink::Tagged(&mut scratch.pairs),
             );
+            if self.certified_denotation
+                && constraint.proposal_coverage(variable, parent_set) == ProposalCoverage::Covering
+            {
+                confirm_constraint(
+                    constraint,
+                    true,
+                    variable,
+                    &RowsView::new_indexed(&scratch.parent_vars, g_rows, &scratch.cols),
+                    &mut CandidateSink::Tagged(&mut scratch.pairs),
+                );
+            }
             let raw_pairs =
                 admit_reverse_stable_set(&mut scratch.pairs, &mut scratch.pair_admission);
             if stats {
@@ -4181,9 +4603,10 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
             && self.bound.is_empty()
             && self.touched_variables.is_empty()
         {
-            let state = self
-                .dag
-                .insert(Box::new(DagState::new(self.constraint.variables())));
+            let state = self.dag.insert(Box::new(DagState::new(
+                self.constraint.variables(),
+                self.certified_denotation,
+            )));
             return state.pull(
                 &self.constraint,
                 &self.postprocessing,
@@ -4389,7 +4812,7 @@ mod parallel {
             );
 
             self.scheduler = QueryScheduler::LazyDag;
-            let mut state = DagState::new(self.constraint.variables());
+            let mut state = DagState::new(self.constraint.variables(), self.certified_denotation);
             // Full parallel enumeration is an explicit throughput request, so
             // do not repeat the ordinary iterator's first-result slow start in
             // every shard.
@@ -5685,7 +6108,7 @@ mod tests {
         let full = DagTerminalSetAdmissionProbe.variables();
         let mut parent_set = VariableSet::new_empty();
         parent_set.set(DagSetAdmissionProbe::PARENT);
-        let mut state = DagState::new(full);
+        let mut state = DagState::new(full, false);
         state.buckets = vec![DagBucket {
             set: parent_set,
             vars: vec![DagSetAdmissionProbe::PARENT],

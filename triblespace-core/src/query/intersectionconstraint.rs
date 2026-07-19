@@ -6,10 +6,13 @@ use smallvec::SmallVec;
 /// All children must agree on every variable binding. Built by the
 /// [`and!`](crate::and) macro or directly via [`new`](Self::new).
 ///
-/// The intersection delegates to its children using cardinality-aware
-/// ordering: per row, the child with the lowest
-/// [`estimate`](Constraint::estimate) proposes candidates, with lower child
-/// index breaking equal estimates, and the remaining children
+/// A certified fixed-denotation intersection uses semantic receipts to admit
+/// only covering children as sources; every target-containing child remains a
+/// validator, whether or not it supplies an estimate, and a covering proposer
+/// validates itself. An uncertified intersection retains the action-preserving
+/// legacy rule: per row, the child with the lowest
+/// [`estimate`](Constraint::estimate) proposes candidates. Lower child index
+/// breaks equal estimates, and the remaining children
 /// [`confirm`](Constraint::confirm) them — not per branch, but in
 /// whole-frontier passes, one per child. That deferral is
 /// what fuses the per-branch confirm trickle into one ragged batch per
@@ -30,6 +33,203 @@ where
     /// Creates an intersection over the given constraints.
     pub fn new(constraints: Vec<C>) -> Self {
         IntersectionConstraint { constraints }
+    }
+
+    fn target_validators(&self, variable: VariableId) -> SmallVec<[usize; 16]> {
+        self.constraints
+            .iter()
+            .enumerate()
+            .filter_map(|(index, constraint)| {
+                constraint.variables().is_set(variable).then_some(index)
+            })
+            .collect()
+    }
+
+    fn target_sources(
+        &self,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> SmallVec<[(usize, ProposalCoverage); 16]> {
+        self.constraints
+            .iter()
+            .enumerate()
+            .filter_map(|(index, constraint)| {
+                if !constraint.variables().is_set(variable) {
+                    return None;
+                }
+                let coverage = constraint.proposal_coverage(variable, bound);
+                (coverage >= ProposalCoverage::Covering).then_some((index, coverage))
+            })
+            .collect()
+    }
+
+    fn certified_estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        let sources = self.target_sources(variable, view.bound());
+        if sources.is_empty() {
+            return false;
+        }
+
+        match out {
+            EstimateSink::Scalar(slot) => {
+                let mut best = usize::MAX;
+                for &(index, _) in &sources {
+                    let mut estimate = usize::MAX;
+                    self.constraints[index].estimate_certified(
+                        variable,
+                        view,
+                        &mut EstimateSink::Scalar(&mut estimate),
+                    );
+                    best = best.min(estimate);
+                }
+                **slot = best;
+            }
+            EstimateSink::Column(out) => {
+                let base = out.len();
+                out.resize(base + view.len(), usize::MAX);
+                let mut scratch = Vec::new();
+                for &(index, _) in &sources {
+                    scratch.clear();
+                    if self.constraints[index].estimate_certified(
+                        variable,
+                        view,
+                        &mut EstimateSink::Column(&mut scratch),
+                    ) {
+                        debug_assert_eq!(scratch.len(), view.len());
+                        for (best, estimate) in out[base..].iter_mut().zip(scratch.iter().copied())
+                        {
+                            *best = (*best).min(estimate);
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn certified_validator_order(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        skip: Option<usize>,
+    ) -> SmallVec<[(usize, usize); 16]> {
+        let mut validators = SmallVec::new();
+        for index in self.target_validators(variable) {
+            if skip == Some(index) {
+                continue;
+            }
+            let mut estimate = usize::MAX;
+            self.constraints[index].estimate_certified(
+                variable,
+                view,
+                &mut EstimateSink::Scalar(&mut estimate),
+            );
+            validators.push((estimate, index));
+        }
+        validators.sort_unstable_by_key(|&(estimate, index)| (estimate, index));
+        validators
+    }
+
+    fn certified_propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        let sources = self.target_sources(variable, view.bound());
+        if sources.is_empty() || view.is_empty() {
+            return;
+        }
+
+        if matches!(candidates, CandidateSink::Values(_)) {
+            let &(proposer, coverage) = sources
+                .iter()
+                .min_by_key(|&&(index, _)| {
+                    let mut estimate = usize::MAX;
+                    self.constraints[index].estimate_certified(
+                        variable,
+                        view,
+                        &mut EstimateSink::Scalar(&mut estimate),
+                    );
+                    (estimate, index)
+                })
+                .expect("non-empty certified sources");
+            self.constraints[proposer].propose_certified(variable, view, candidates);
+            let skip = (coverage == ProposalCoverage::Exact).then_some(proposer);
+            for (_, index) in self.certified_validator_order(variable, view, skip) {
+                self.constraints[index].confirm_certified(variable, view, candidates);
+            }
+            return;
+        }
+
+        let n_rows = view.len();
+        let mut columns = Vec::with_capacity(sources.len() * n_rows);
+        for &(index, _) in &sources {
+            let base = columns.len();
+            if !self.constraints[index].estimate_certified(
+                variable,
+                view,
+                &mut EstimateSink::Column(&mut columns),
+            ) {
+                columns.resize(base + n_rows, usize::MAX);
+            } else {
+                debug_assert_eq!(columns.len(), base + n_rows);
+            }
+        }
+
+        let mut propose_counts: SmallVec<[usize; 16]> = SmallVec::from_elem(0, sources.len());
+        let mut proposers: SmallVec<[u32; 32]> = SmallVec::with_capacity(n_rows);
+        for row in 0..n_rows {
+            let source = (0..sources.len())
+                .min_by_key(|&source| (columns[source * n_rows + row], sources[source].0))
+                .expect("non-empty certified sources");
+            propose_counts[source] += 1;
+            proposers.push(source as u32);
+        }
+
+        let uniform = (0..sources.len()).find(|&source| propose_counts[source] == n_rows);
+        if let Some(source) = uniform {
+            self.constraints[sources[source].0].propose_certified(variable, view, candidates);
+        } else {
+            let mut scratch = Vec::new();
+            for (row, &source) in proposers.iter().enumerate() {
+                let row_view = view.row_view(row);
+                scratch.clear();
+                self.constraints[sources[source as usize].0].propose_certified(
+                    variable,
+                    &row_view,
+                    &mut CandidateSink::Values(&mut scratch),
+                );
+                candidates.extend_row(row as u32, scratch.iter().copied());
+            }
+        }
+
+        let skip = uniform.and_then(|source| {
+            (sources[source].1 == ProposalCoverage::Exact).then_some(sources[source].0)
+        });
+        let first = view.row_view(0);
+        for (_, index) in self.certified_validator_order(variable, &first, skip) {
+            self.constraints[index].confirm_certified(variable, view, candidates);
+        }
+    }
+
+    fn certified_confirm(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        if view.is_empty() {
+            return;
+        }
+        let first = view.row_view(0);
+        for (_, index) in self.certified_validator_order(variable, &first, None) {
+            self.constraints[index].confirm_certified(variable, view, candidates);
+        }
     }
 }
 
@@ -66,14 +266,8 @@ where
     /// the joint fiber is a subset of that child's fiber. A multi-child
     /// conjunction is not generally exact even when its source is exact,
     /// because the remaining children can eliminate proposed values.
-    fn proposal_coverage(
-        &self,
-        variable: VariableId,
-        bound: VariableSet,
-    ) -> ProposalCoverage {
-        if !self.fixed_denotation()
-            || bound.is_set(variable)
-            || !self.variables().is_set(variable)
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+        if !self.fixed_denotation() || bound.is_set(variable) || !self.variables().is_set(variable)
         {
             return ProposalCoverage::None;
         }
@@ -90,10 +284,10 @@ where
             .unwrap_or(ProposalCoverage::None)
     }
 
-    /// Pushes the elementwise **minimum** estimate across children that
-    /// constrain `variable`. The tightest child bounds the search per
-    /// row, reflecting the intersection semantics: every child must
-    /// agree, so the smallest candidate set dominates.
+    /// Pushes the elementwise **minimum** source estimate. For a certified
+    /// intersection, only covering children are sources and a missing quote is
+    /// represented by [`usize::MAX`]. The uncertified path retains the legacy
+    /// estimate-derived relevance rule.
     ///
     /// The scalar (single-row cursor) arm folds child estimates through
     /// stack slots — no column scratch is ever allocated on the
@@ -279,6 +473,33 @@ where
         }
     }
 
+    fn estimate_certified(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        self.certified_estimate(variable, view, out)
+    }
+
+    fn propose_certified(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.certified_propose(variable, view, candidates)
+    }
+
+    fn confirm_certified(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.certified_confirm(variable, view, candidates)
+    }
+
     /// Returns `true` only when **every** child is satisfied.
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         self.constraints.iter().all(|c| c.satisfied(view))
@@ -332,6 +553,289 @@ pub use and;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MEMBER: RawInline = [0x31; 32];
+    const OTHER: RawInline = [0x72; 32];
+    const FIRST_ROW: RawInline = [0x11; 32];
+    const SECOND_ROW: RawInline = [0x22; 32];
+    const NO_VALUES: &[RawInline] = &[];
+    const MEMBER_ONLY: &[RawInline] = &[MEMBER];
+    const MEMBER_TWICE: &[RawInline] = &[MEMBER, MEMBER];
+    const MEMBER_AND_OTHER: &[RawInline] = &[MEMBER, OTHER];
+
+    #[derive(Clone, Copy)]
+    struct CertifiedLeaf {
+        coverage: ProposalCoverage,
+        quote: Option<usize>,
+        proposals: &'static [RawInline],
+        accepted: &'static [RawInline],
+        panic_on_propose: bool,
+    }
+
+    impl Constraint<'static> for CertifiedLeaf {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(0)
+        }
+
+        fn fixed_denotation(&self) -> bool {
+            true
+        }
+
+        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+            if variable == 0 && !bound.is_set(variable) {
+                self.coverage
+            } else {
+                ProposalCoverage::None
+            }
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            let Some(quote) = self.quote.filter(|_| variable == 0) else {
+                return false;
+            };
+            out.fill(quote, view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            if variable != 0 {
+                return;
+            }
+            assert!(!self.panic_on_propose, "validator was used as a source");
+            for row in 0..view.len() as u32 {
+                candidates.extend_row(row, self.proposals.iter().copied());
+            }
+        }
+
+        fn confirm(
+            &self,
+            variable: VariableId,
+            _view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            if variable == 0 {
+                candidates.retain(|_, value| self.accepted.contains(value));
+            }
+        }
+
+        fn satisfied(&self, view: &RowsView<'_>) -> bool {
+            view.col(0)
+                .is_none_or(|column| view.iter().all(|row| self.accepted.contains(&row[column])))
+        }
+    }
+
+    fn certified_values(constraint: &IntersectionConstraint<CertifiedLeaf>) -> Vec<RawInline> {
+        let mut values = Vec::new();
+        constraint.propose_certified(0, &RowsView::EMPTY, &mut CandidateSink::Values(&mut values));
+        values
+    }
+
+    #[derive(Clone, Copy)]
+    struct RowAdaptiveSource {
+        cheap_on: RawInline,
+        occurrences: usize,
+    }
+
+    impl Constraint<'static> for RowAdaptiveSource {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(0).union(VariableSet::new_singleton(1))
+        }
+
+        fn fixed_denotation(&self) -> bool {
+            true
+        }
+
+        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+            if variable == 0 && !bound.is_set(variable) {
+                ProposalCoverage::Exact
+            } else {
+                ProposalCoverage::None
+            }
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != 0 {
+                return false;
+            }
+            let column = view.col(1).expect("row discriminator is bound");
+            out.extend(
+                view.iter()
+                    .map(|row| if row[column] == self.cheap_on { 1 } else { 9 }),
+            );
+            true
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            if variable == 0 {
+                for row in 0..view.len() as u32 {
+                    candidates.extend_row(row, std::iter::repeat_n(MEMBER, self.occurrences));
+                }
+            }
+        }
+
+        fn confirm(
+            &self,
+            variable: VariableId,
+            _view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            if variable == 0 {
+                candidates.retain(|_, value| *value == MEMBER);
+            }
+        }
+
+        fn satisfied(&self, _view: &RowsView<'_>) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn certified_intersection_never_promotes_a_low_quoted_none_validator() {
+        let constraint = IntersectionConstraint::new(vec![
+            CertifiedLeaf {
+                coverage: ProposalCoverage::None,
+                quote: Some(0),
+                proposals: NO_VALUES,
+                accepted: MEMBER_ONLY,
+                panic_on_propose: true,
+            },
+            CertifiedLeaf {
+                coverage: ProposalCoverage::Exact,
+                quote: Some(9),
+                proposals: MEMBER_ONLY,
+                accepted: MEMBER_ONLY,
+                panic_on_propose: false,
+            },
+        ]);
+
+        let mut estimate = 0;
+        assert!(constraint.estimate_certified(
+            0,
+            &RowsView::EMPTY,
+            &mut EstimateSink::Scalar(&mut estimate),
+        ));
+        assert_eq!(estimate, 9);
+        assert_eq!(certified_values(&constraint), vec![MEMBER]);
+    }
+
+    #[test]
+    fn certified_intersection_runs_an_unquoted_target_validator() {
+        let constraint = IntersectionConstraint::new(vec![
+            CertifiedLeaf {
+                coverage: ProposalCoverage::Exact,
+                quote: Some(1),
+                proposals: MEMBER_AND_OTHER,
+                accepted: MEMBER_AND_OTHER,
+                panic_on_propose: false,
+            },
+            CertifiedLeaf {
+                coverage: ProposalCoverage::None,
+                quote: None,
+                proposals: NO_VALUES,
+                accepted: MEMBER_ONLY,
+                panic_on_propose: true,
+            },
+        ]);
+
+        assert_eq!(certified_values(&constraint), vec![MEMBER]);
+    }
+
+    #[test]
+    fn certified_intersection_self_confirms_a_covering_source() {
+        let constraint = IntersectionConstraint::new(vec![CertifiedLeaf {
+            coverage: ProposalCoverage::Covering,
+            quote: Some(1),
+            proposals: MEMBER_AND_OTHER,
+            accepted: MEMBER_ONLY,
+            panic_on_propose: false,
+        }]);
+
+        assert_eq!(certified_values(&constraint), vec![MEMBER]);
+    }
+
+    #[test]
+    fn certified_intersection_prices_a_quote_less_source_at_max() {
+        let constraint = IntersectionConstraint::new(vec![
+            CertifiedLeaf {
+                coverage: ProposalCoverage::Exact,
+                quote: None,
+                proposals: MEMBER_TWICE,
+                accepted: MEMBER_ONLY,
+                panic_on_propose: false,
+            },
+            CertifiedLeaf {
+                coverage: ProposalCoverage::Exact,
+                quote: Some(usize::MAX - 1),
+                proposals: MEMBER_ONLY,
+                accepted: MEMBER_ONLY,
+                panic_on_propose: false,
+            },
+        ]);
+
+        let mut estimate = 0;
+        assert!(constraint.estimate_certified(
+            0,
+            &RowsView::EMPTY,
+            &mut EstimateSink::Scalar(&mut estimate),
+        ));
+        assert_eq!(estimate, usize::MAX - 1);
+        assert_eq!(certified_values(&constraint), vec![MEMBER]);
+
+        let quote_less = IntersectionConstraint::new(vec![CertifiedLeaf {
+            coverage: ProposalCoverage::Exact,
+            quote: None,
+            proposals: MEMBER_ONLY,
+            accepted: MEMBER_ONLY,
+            panic_on_propose: false,
+        }]);
+        assert!(quote_less.estimate_certified(
+            0,
+            &RowsView::EMPTY,
+            &mut EstimateSink::Scalar(&mut estimate),
+        ));
+        assert_eq!(estimate, usize::MAX);
+    }
+
+    #[test]
+    fn certified_intersection_selects_the_cheapest_source_per_row() {
+        let constraint = IntersectionConstraint::new(vec![
+            RowAdaptiveSource {
+                cheap_on: FIRST_ROW,
+                occurrences: 1,
+            },
+            RowAdaptiveSource {
+                cheap_on: SECOND_ROW,
+                occurrences: 2,
+            },
+        ]);
+        let rows = [FIRST_ROW, SECOND_ROW];
+        let view = RowsView::new(&[1], &rows);
+        let mut candidates = Vec::new();
+
+        constraint.propose_certified(0, &view, &mut CandidateSink::Tagged(&mut candidates));
+
+        assert_eq!(candidates, vec![(0, MEMBER), (1, MEMBER), (1, MEMBER)]);
+    }
 
     /// Two lawful intersection leaves with identical support and estimates,
     /// but different proposal multiplicity. Confirm only filters, so child

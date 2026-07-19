@@ -2291,8 +2291,7 @@ impl RegularPathConstraint {
                         value,
                         pc,
                     },
-                    accepted: target_accepting
-                        && node.source.is_none_or(|anchor| value == anchor),
+                    accepted: target_accepting && node.source.is_none_or(|anchor| value == anchor),
                 });
             };
             match step {
@@ -2303,19 +2302,21 @@ impl RegularPathConstraint {
                     let mut prefix = [0u8; ID_LEN * 2];
                     prefix[..ID_LEN].copy_from_slice(&entity);
                     prefix[ID_LEN..].copy_from_slice(&attribute);
-                    self.set.eav.infixes::<{ ID_LEN * 2 }, 32, _>(
-                        &prefix,
-                        |value: &[u8; 32]| emit_value(*value),
-                    );
+                    self.set
+                        .eav
+                        .infixes::<{ ID_LEN * 2 }, 32, _>(&prefix, |value: &[u8; 32]| {
+                            emit_value(*value)
+                        });
                 }
                 DeltaStep::InverseAttr(attribute) => {
                     let mut prefix = [0u8; 32 + ID_LEN];
                     prefix[..32].copy_from_slice(&node.value);
                     prefix[32..].copy_from_slice(&attribute);
-                    self.set.vae.infixes::<{ 32 + ID_LEN }, ID_LEN, _>(
-                        &prefix,
-                        |entity: &[u8; ID_LEN]| emit_value(id_into_value(entity)),
-                    );
+                    self.set
+                        .vae
+                        .infixes::<{ 32 + ID_LEN }, ID_LEN, _>(&prefix, |entity: &[u8; ID_LEN]| {
+                            emit_value(id_into_value(entity))
+                        });
                 }
                 DeltaStep::NotAttr(excluded) => {
                     for value in eval_not_attr(&self.set, &excluded, &node.value) {
@@ -3266,18 +3267,28 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         true
     }
 
-    /// A free endpoint proposal begins with graph-local transition seeds that
-    /// cover every successful path but can include starts which cannot finish
-    /// the remaining expression. Confirmation supplies the exact path test.
-    fn proposal_coverage(
-        &self,
-        variable: VariableId,
-        bound: VariableSet,
-    ) -> ProposalCoverage {
-        if !bound.is_set(variable) && (variable == self.start || variable == self.end) {
-            ProposalCoverage::Covering
+    /// With the opposite endpoint bound, ordinary proposal evaluates the full
+    /// path expression (inverting it for a free start) and therefore returns
+    /// the exact reachable endpoint set. When both distinct endpoints are
+    /// free, proposal begins with graph-local FIRST/LAST seeds which cover
+    /// every successful path but can include terms that cannot finish the
+    /// remaining expression. Direct eager same-variable proposal does perform
+    /// the exact self-loop test, but this ordinary occurrence receipt remains
+    /// conservatively `Covering`: residual source execution may first expose a
+    /// speculative FIRST/LAST root frontier before path witnesses settle. The
+    /// typed accepted stream publishes its stronger route-specific receipt
+    /// below.
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+        if bound.is_set(variable) || (variable != self.start && variable != self.end) {
+            return ProposalCoverage::None;
+        }
+        if self.start != self.end
+            && ((variable == self.start && bound.is_set(self.end))
+                || (variable == self.end && bound.is_set(self.start)))
+        {
+            ProposalCoverage::Exact
         } else {
-            ProposalCoverage::None
+            ProposalCoverage::Covering
         }
     }
 
@@ -3332,6 +3343,23 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
 
     fn residual_program(&self) -> Option<ProgramRef<'_>> {
         Some(ProgramRef::new(self))
+    }
+
+    /// The typed same-variable route publishes a source only after the graph
+    /// product has witnessed a path back to that source. Its accepted effects
+    /// are therefore Exact, strengthening the conservative route-wide ordinary
+    /// receipt even though eager `propose_row` also performs an exact final
+    /// self-loop filter.
+    fn residual_program_proposal_coverage(
+        &self,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> ProposalCoverage {
+        if self.start == self.end && variable == self.start && !bound.is_set(variable) {
+            ProposalCoverage::Exact
+        } else {
+            self.proposal_coverage(variable, bound)
+        }
     }
 
     /// Exact when both endpoints are bound: checks reachability from the

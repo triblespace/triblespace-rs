@@ -67,6 +67,149 @@ where
         }
         UnionConstraint { constraints }
     }
+
+    fn certified_estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        if !self.variables().is_set(variable) {
+            return false;
+        }
+
+        match out {
+            EstimateSink::Scalar(slot) => {
+                let mut total = 0usize;
+                for constraint in &self.constraints {
+                    if !constraint.satisfied(view) {
+                        continue;
+                    }
+                    let mut estimate = 0usize;
+                    if !constraint.estimate_certified(
+                        variable,
+                        view,
+                        &mut EstimateSink::Scalar(&mut estimate),
+                    ) {
+                        total = usize::MAX;
+                        break;
+                    }
+                    total = total.saturating_add(estimate);
+                }
+                **slot = total;
+            }
+            EstimateSink::Column(out) => {
+                let mut totals = vec![0usize; view.len()];
+                let mut scratch = Vec::new();
+                for constraint in &self.constraints {
+                    scratch.clear();
+                    let quoted = constraint.estimate_certified(
+                        variable,
+                        view,
+                        &mut EstimateSink::Column(&mut scratch),
+                    );
+                    if quoted {
+                        debug_assert_eq!(scratch.len(), view.len());
+                    }
+                    for (row, total) in totals.iter_mut().enumerate() {
+                        if !constraint.satisfied(&view.row_view(row)) {
+                            continue;
+                        }
+                        if quoted {
+                            *total = total.saturating_add(scratch[row]);
+                        } else {
+                            *total = usize::MAX;
+                        }
+                    }
+                }
+                out.extend(totals);
+            }
+        }
+        true
+    }
+
+    fn propose_with_mode(
+        &self,
+        certified: bool,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        debug_assert!(
+            candidates.is_empty(),
+            "propose expects an empty sink (see the Constraint::propose protocol law)"
+        );
+        let mut row_values: Vec<RawInline> = Vec::new();
+        let mut variant_values: Vec<RawInline> = Vec::new();
+        for (i, row) in view.iter().enumerate() {
+            let row_view = RowsView::new(view.vars, row);
+            row_values.clear();
+            self.constraints
+                .iter()
+                .filter(|constraint| constraint.satisfied(&row_view))
+                .for_each(|constraint| {
+                    if certified {
+                        constraint.propose_certified(
+                            variable,
+                            &row_view,
+                            &mut CandidateSink::Values(&mut variant_values),
+                        );
+                    } else {
+                        constraint.propose(
+                            variable,
+                            &row_view,
+                            &mut CandidateSink::Values(&mut variant_values),
+                        );
+                    }
+                    // `append` drains the buffer, leaving it empty for the
+                    // next variant.
+                    row_values.append(&mut variant_values);
+                });
+            row_values.sort_unstable();
+            row_values.dedup();
+            candidates.extend_row(i as u32, row_values.iter().copied());
+        }
+    }
+
+    fn confirm_with_mode(
+        &self,
+        certified: bool,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        confirm_per_row(view, candidates, |row, values| {
+            let row_view = RowsView::new(view.vars, row);
+            values.sort_unstable();
+
+            let union: Vec<RawInline> = self
+                .constraints
+                .iter()
+                .filter(|constraint| constraint.satisfied(&row_view))
+                .map(|constraint| {
+                    let mut survivors: Vec<RawInline> = values.clone();
+                    if certified {
+                        constraint.confirm_certified(
+                            variable,
+                            &row_view,
+                            &mut CandidateSink::Values(&mut survivors),
+                        );
+                    } else {
+                        constraint.confirm(
+                            variable,
+                            &row_view,
+                            &mut CandidateSink::Values(&mut survivors),
+                        );
+                    }
+                    survivors
+                })
+                .kmerge()
+                .dedup()
+                .collect();
+
+            _ = mem::replace(values, union);
+        });
+    }
 }
 
 impl<'a, C> Constraint<'a> for UnionConstraint<C>
@@ -88,14 +231,8 @@ where
     /// therefore the meet of its arm receipts: one `None` arm removes source
     /// eligibility, all-`Exact` remains exact, and every other complete mix is
     /// covering.
-    fn proposal_coverage(
-        &self,
-        variable: VariableId,
-        bound: VariableSet,
-    ) -> ProposalCoverage {
-        if !self.fixed_denotation()
-            || bound.is_set(variable)
-            || !self.variables().is_set(variable)
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+        if !self.fixed_denotation() || bound.is_set(variable) || !self.variables().is_set(variable)
         {
             return ProposalCoverage::None;
         }
@@ -106,9 +243,11 @@ where
             .unwrap_or(ProposalCoverage::None)
     }
 
-    /// Appends the elementwise **sum** of estimates across all variants.
-    /// A union can produce candidates from any branch, so the
-    /// cardinalities add.
+    /// Appends the elementwise **sum** of estimates across all potentially
+    /// live variants. For a certified union, any such arm without a quote
+    /// makes that row's cost unknown ([`usize::MAX`]); an arm may be omitted
+    /// only when [`satisfied`](Constraint::satisfied) proves it dead. The
+    /// uncertified path retains the legacy partial-sum behavior.
     fn estimate(
         &self,
         variable: VariableId,
@@ -174,32 +313,7 @@ where
         view: &RowsView<'_>,
         candidates: &mut CandidateSink<'_>,
     ) {
-        debug_assert!(
-            candidates.is_empty(),
-            "propose expects an empty sink (see the Constraint::propose protocol law)"
-        );
-        let mut row_values: Vec<RawInline> = Vec::new();
-        let mut variant_values: Vec<RawInline> = Vec::new();
-        for (i, row) in view.iter().enumerate() {
-            let row_view = RowsView::new(view.vars, row);
-            row_values.clear();
-            self.constraints
-                .iter()
-                .filter(|c| c.satisfied(&row_view))
-                .for_each(|c| {
-                    c.propose(
-                        variable,
-                        &row_view,
-                        &mut CandidateSink::Values(&mut variant_values),
-                    );
-                    // `append` drains the buffer, leaving it empty for the
-                    // next variant.
-                    row_values.append(&mut variant_values);
-                });
-            row_values.sort_unstable();
-            row_values.dedup();
-            candidates.extend_row(i as u32, row_values.iter().copied());
-        }
+        self.propose_with_mode(false, variable, view, candidates)
     }
 
     /// Confirms each row's candidate group against every *satisfied*
@@ -212,25 +326,34 @@ where
         view: &RowsView<'_>,
         candidates: &mut CandidateSink<'_>,
     ) {
-        confirm_per_row(view, candidates, |row, values| {
-            let row_view = RowsView::new(view.vars, row);
-            values.sort_unstable();
+        self.confirm_with_mode(false, variable, view, candidates)
+    }
 
-            let union: Vec<RawInline> = self
-                .constraints
-                .iter()
-                .filter(|c| c.satisfied(&row_view))
-                .map(|c| {
-                    let mut vs: Vec<RawInline> = values.clone();
-                    c.confirm(variable, &row_view, &mut CandidateSink::Values(&mut vs));
-                    vs
-                })
-                .kmerge()
-                .dedup()
-                .collect();
+    fn estimate_certified(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        self.certified_estimate(variable, view, out)
+    }
 
-            _ = mem::replace(values, union);
-        });
+    fn propose_certified(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.propose_with_mode(true, variable, view, candidates)
+    }
+
+    fn confirm_certified(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.confirm_with_mode(true, variable, view, candidates)
     }
 
     /// Returns `true` when **at least one** variant is satisfied for
@@ -296,6 +419,148 @@ pub use or;
 mod tests {
     use super::*;
     use crate::query::constantconstraint::ConstantConstraint;
+
+    const X: VariableId = 0;
+    const Y: VariableId = 1;
+    const DEAD: RawInline = [0x21; 32];
+    const LIVE: RawInline = [0x42; 32];
+
+    #[derive(Clone, Copy)]
+    enum Liveness {
+        Always,
+        Never,
+        WhenY(RawInline),
+    }
+
+    #[derive(Clone, Copy)]
+    struct EstimateArm {
+        fixed: bool,
+        quote: Option<usize>,
+        liveness: Liveness,
+    }
+
+    impl EstimateArm {
+        fn row_is_live(&self, view: &RowsView<'_>, row: &[RawInline]) -> bool {
+            match self.liveness {
+                Liveness::Always => true,
+                Liveness::Never => false,
+                Liveness::WhenY(value) => view.col(Y).is_none_or(|column| row[column] == value),
+            }
+        }
+    }
+
+    impl Constraint<'static> for EstimateArm {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(X).union(VariableSet::new_singleton(Y))
+        }
+
+        fn fixed_denotation(&self) -> bool {
+            self.fixed
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            let Some(quote) = self.quote.filter(|_| variable == X) else {
+                return false;
+            };
+            out.fill(quote, view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn satisfied(&self, view: &RowsView<'_>) -> bool {
+            view.iter().all(|row| self.row_is_live(view, row))
+        }
+    }
+
+    #[test]
+    fn certified_union_marks_only_rows_with_a_live_unquoted_arm_unknown() {
+        let constraint = UnionConstraint::new(vec![
+            EstimateArm {
+                fixed: true,
+                quote: Some(3),
+                liveness: Liveness::Always,
+            },
+            EstimateArm {
+                fixed: true,
+                quote: None,
+                liveness: Liveness::WhenY(LIVE),
+            },
+        ]);
+        let rows = [DEAD, LIVE];
+        let view = RowsView::new(&[Y], &rows);
+        let mut estimates = Vec::new();
+
+        assert!(constraint.estimate_certified(X, &view, &mut EstimateSink::Column(&mut estimates),));
+        assert_eq!(estimates, vec![3, usize::MAX]);
+    }
+
+    #[test]
+    fn certified_union_ignores_an_unquoted_arm_proven_dead() {
+        let constraint = UnionConstraint::new(vec![
+            EstimateArm {
+                fixed: true,
+                quote: Some(3),
+                liveness: Liveness::Always,
+            },
+            EstimateArm {
+                fixed: true,
+                quote: None,
+                liveness: Liveness::Never,
+            },
+        ]);
+        let mut estimate = 0;
+
+        assert!(constraint.estimate_certified(
+            X,
+            &RowsView::EMPTY,
+            &mut EstimateSink::Scalar(&mut estimate),
+        ));
+        assert_eq!(estimate, 3);
+    }
+
+    #[test]
+    fn uncertified_union_keeps_the_legacy_partial_sum_for_missing_quotes() {
+        let constraint = UnionConstraint::new(vec![
+            EstimateArm {
+                fixed: false,
+                quote: Some(3),
+                liveness: Liveness::Always,
+            },
+            EstimateArm {
+                fixed: false,
+                quote: None,
+                liveness: Liveness::Always,
+            },
+        ]);
+        let mut estimate = 0;
+
+        assert!(constraint.estimate(
+            X,
+            &RowsView::EMPTY,
+            &mut EstimateSink::Scalar(&mut estimate),
+        ));
+        assert_eq!(estimate, 3);
+    }
 
     #[test]
     #[should_panic(expected = "UnionConstraint requires at least one variant")]

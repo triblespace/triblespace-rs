@@ -20,8 +20,9 @@
 //! partition rows by their exact uniform semantic action, and file explicit
 //! Propose or Confirm descriptors without invoking either protocol verb. The
 //! action state is what calls one flattened leaf. Variable choice remains
-//! row-local because its proposer owns the occurrence bag; rows batch only when
-//! they selected the same variable and proposer. Occupancy scheduling
+//! row-local because its proposer owns candidate support and first-seen order;
+//! duplicate occurrences collapse at the per-parent SET boundary. Rows batch
+//! only when they selected the same variable and proposer. Occupancy scheduling
 //! chooses the deepest live bucket able to fill the desired actionable width;
 //! if none can, it drains the minimum-rank bucket through the strict readiness
 //! gate. When a full Propose or Confirm action advances to an underfilled
@@ -628,6 +629,7 @@ impl FiniteFormulaProgram {
                 variable,
                 occurrence,
                 verb,
+                proposer_checked: true,
             },
         }
     }
@@ -1316,6 +1318,10 @@ struct FormulaOuterResume {
     variable: VariableId,
     occurrence: usize,
     verb: UnionVerb,
+    /// Whether a proposal action's outer occurrence is already discharged.
+    /// Exact sources set this; Covering sources must later run the same
+    /// occurrence as a confirmer. Ignored for `UnionVerb::Confirm`.
+    proposer_checked: bool,
 }
 
 /// Defunctionalized structural continuation. Candidate values are deliberately
@@ -1433,6 +1439,10 @@ impl PartialEq<ConstraintPath> for ResidualLeaf {
 /// twice in an AND produces two independent residual occurrences.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ResidualPlan {
+    /// Whole-root receipt captured at compilation. Every leaf may use
+    /// denotational source/relevance rules only when this complete proof is
+    /// present; mixed/default-false trees retain legacy action semantics.
+    certified_denotation: bool,
     leaves: Vec<ResidualLeaf>,
     /// Structural finite-formula program below lowered Union occurrences.
     /// Runtime migration is intentionally separate from compilation.
@@ -1577,6 +1587,7 @@ impl ResidualPlan {
             synthetic_root_formula,
         );
         Self {
+            certified_denotation: root.fixed_denotation(),
             leaves,
             finite_formula,
             page_local_confirms,
@@ -1656,6 +1667,11 @@ impl ResidualPlan {
                 FormulaProposalStreamBarrier::NotProposalAction,
             );
         };
+        if !counter.resume.proposer_checked {
+            return FormulaProposalStreamability::Barrier(
+                FormulaProposalStreamBarrier::OuterContinuation,
+            );
+        }
         let checked = ChildSet::empty(self.len()).with_inserted(counter.resume.occurrence);
         if !self.remaining_confirms_accept_pages(relevant, &checked, counter.resume.variable, bound)
         {
@@ -1690,6 +1706,11 @@ impl ResidualPlan {
                 FormulaProposalStreamBarrier::NotProposalAction,
             );
         };
+        if !resume.proposer_checked {
+            return FormulaProposalStreamability::Barrier(
+                FormulaProposalStreamBarrier::OuterContinuation,
+            );
+        }
         let checked = ChildSet::empty(self.len()).with_inserted(resume.occurrence);
         if !self.remaining_confirms_accept_pages(relevant, &checked, resume.variable, bound) {
             return FormulaProposalStreamability::Barrier(
@@ -1716,6 +1737,110 @@ impl ResidualPlan {
         constraint
     }
 
+    /// Strongest proposal receipt guaranteed by the execution route this
+    /// plan will actually use. Typed Programs may publish a narrower accepted
+    /// stream than ordinary eager `propose`; that stronger receipt is active
+    /// only when transition lowering is enabled and the exact request is
+    /// structurally accepted by the Program family.
+    fn execution_proposal_coverage<'a>(
+        &self,
+        constraint: &dyn Constraint<'a>,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> ProposalCoverage {
+        let ordinary = constraint.proposal_coverage(variable, bound);
+        if !self.transition_programs {
+            return ordinary;
+        }
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(variable),
+            bound,
+        };
+        if constraint
+            .residual_program()
+            .is_some_and(|program| program.route(request).is_some())
+        {
+            ordinary.max(constraint.residual_program_proposal_coverage(variable, bound))
+        } else {
+            ordinary
+        }
+    }
+
+    /// Receipt usable while Ready is choosing an opaque proposal source.
+    ///
+    /// A typed Program may strengthen an already complete ordinary source,
+    /// because stable fallback can still execute that source and validate its
+    /// covering candidates. It cannot make an ordinary `None` source eligible
+    /// here: a later parent-atomic confirmer may prevent delta seeding, and the
+    /// eager fallback would then be incomplete. Formula atoms are different—
+    /// their selected Program route is guaranteed by `seed_delta_formula`—so
+    /// [`formula_node_proposal_coverage`](Self::formula_node_proposal_coverage)
+    /// may use the full execution receipt.
+    fn ready_proposal_coverage<'a>(
+        &self,
+        constraint: &dyn Constraint<'a>,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> ProposalCoverage {
+        let ordinary = constraint.proposal_coverage(variable, bound);
+        if ordinary < ProposalCoverage::Covering {
+            ordinary
+        } else {
+            self.execution_proposal_coverage(constraint, variable, bound)
+        }
+    }
+
+    fn ordinary_proposer_starts_checked<'a>(
+        &self,
+        root: &dyn Constraint<'a>,
+        occurrence: usize,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> bool {
+        !self.certified_denotation
+            || self
+                .resolve(root, occurrence)
+                .proposal_coverage(variable, bound)
+                == ProposalCoverage::Exact
+    }
+
+    /// Whether this proposal occurrence is discharged by construction.
+    /// Legacy actions preserve their historical implicit check; certified
+    /// Exact sources do likewise, while Covering sources enter Candidate with
+    /// the proposer still unchecked so ordinary confirmation validates it.
+    fn proposer_starts_checked<'a>(
+        &self,
+        root: &dyn Constraint<'a>,
+        occurrence: usize,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> bool {
+        if !self.certified_denotation {
+            return true;
+        }
+        match self.execution_proposal_coverage(self.resolve(root, occurrence), variable, bound) {
+            ProposalCoverage::Exact => true,
+            ProposalCoverage::Covering => false,
+            ProposalCoverage::None => {
+                panic!("residual proposal occurrence lost its covering source receipt")
+            }
+        }
+    }
+
+    fn initial_proposal_checked<'a>(
+        &self,
+        root: &dyn Constraint<'a>,
+        occurrence: usize,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> ChildSet {
+        let mut checked = ChildSet::empty(self.len());
+        if self.proposer_starts_checked(root, occurrence, variable, bound) {
+            checked.insert(occurrence);
+        }
+        checked
+    }
+
     fn resolve_formula_node<'r, 'a>(
         &self,
         root: &'r dyn Constraint<'a>,
@@ -1738,6 +1863,21 @@ impl ResidualPlan {
             };
         }
         constraint
+    }
+
+    fn formula_node_proposal_coverage<'a>(
+        &self,
+        root: &dyn Constraint<'a>,
+        occurrence: usize,
+        node: FormulaNodeId,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> ProposalCoverage {
+        self.execution_proposal_coverage(
+            self.resolve_formula_node(root, occurrence, node),
+            variable,
+            bound,
+        )
     }
 
     /// Whether any concrete leaf in this plan owns a true transition source
@@ -1916,6 +2056,81 @@ pub enum FormulaScope {
 pub struct ResidualLowering {
     formula_scope: FormulaScope,
     transition_programs: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SeedTruth {
+    False,
+    Unknown,
+    True,
+}
+
+/// Exact closure of the structurally exposed portion of a certified root.
+///
+/// A flattened residual plan never schedules a zero-variable atom, so root
+/// optimism alone can hide a closed false child beneath an otherwise-open
+/// wrapper. This three-valued walk settles exactly the atoms closed by the
+/// seed schema and preserves open alternatives as Unknown.
+fn certified_seed_truth<'a>(
+    constraint: &dyn Constraint<'a>,
+    bound: VariableSet,
+    view: &RowsView<'_>,
+) -> SeedTruth {
+    if !constraint.satisfied(view) {
+        return SeedTruth::False;
+    }
+    match constraint.residual_shape() {
+        ConstraintShape::And(children) => {
+            let mut all_true = true;
+            for child in 0..children.len() {
+                match certified_seed_truth(children.child(child), bound, view) {
+                    SeedTruth::False => return SeedTruth::False,
+                    SeedTruth::Unknown => all_true = false,
+                    SeedTruth::True => {}
+                }
+            }
+            if all_true {
+                SeedTruth::True
+            } else {
+                SeedTruth::Unknown
+            }
+        }
+        ConstraintShape::Opaque => {
+            if let Some(children) = constraint.residual_union_children() {
+                let mut all_false = true;
+                for child in 0..children.len() {
+                    match certified_seed_truth(children.child(child), bound, view) {
+                        SeedTruth::True => return SeedTruth::True,
+                        SeedTruth::Unknown => all_false = false,
+                        SeedTruth::False => {}
+                    }
+                }
+                if all_false {
+                    SeedTruth::False
+                } else {
+                    SeedTruth::Unknown
+                }
+            } else if constraint.variables().is_subset_of(&bound) {
+                // `satisfied == true` was checked above and is exact now that
+                // every variable of this atom is bound.
+                SeedTruth::True
+            } else {
+                SeedTruth::Unknown
+            }
+        }
+    }
+}
+
+pub(super) fn seed_survives<'a>(
+    root: &dyn Constraint<'a>,
+    bound: VariableSet,
+    view: &RowsView<'_>,
+) -> bool {
+    if !root.fixed_denotation() {
+        root.satisfied(view)
+    } else {
+        !matches!(certified_seed_truth(root, bound, view), SeedTruth::False)
+    }
 }
 
 impl ResidualLowering {
@@ -3253,6 +3468,17 @@ impl FormulaPcInterner {
         occurrence: usize,
         verb: UnionVerb,
     ) -> FormulaPcId {
+        self.start_with_proposer_checked(program, variable, occurrence, verb, true)
+    }
+
+    fn start_with_proposer_checked(
+        &mut self,
+        program: &FiniteFormulaProgram,
+        variable: VariableId,
+        occurrence: usize,
+        verb: UnionVerb,
+        proposer_checked: bool,
+    ) -> FormulaPcId {
         let root = program
             .root(occurrence)
             .expect("an opaque residual leaf has no finite formula program");
@@ -3264,6 +3490,7 @@ impl FormulaPcInterner {
             variable,
             occurrence,
             verb,
+            proposer_checked,
         });
         self.intern_record(
             FormulaPcRecord {
@@ -3273,6 +3500,30 @@ impl FormulaPcInterner {
             },
             1,
         )
+    }
+
+    /// Re-interns a root continuation with an exact-source discharge proof.
+    ///
+    /// A synthetic root AND starts conservatively unchecked because its
+    /// structural receipt is only Covering. Once row-local planning chooses
+    /// an Exact child as the proposer, the formula's confirmation suffix
+    /// validates every remaining target-containing child. That partition can
+    /// therefore return to the outer WCO continuation as already checked.
+    fn with_proposer_checked(&mut self, counter: FormulaPcId) -> FormulaPcId {
+        let (mut record, mut resume, grade) = {
+            let record = self.get(counter).clone();
+            (record, self.resume(counter).clone(), self.grade(counter))
+        };
+        assert!(
+            record.return_to.is_none(),
+            "only a formula root may discharge its outer proposer"
+        );
+        if resume.proposer_checked {
+            return counter;
+        }
+        resume.proposer_checked = true;
+        record.resume = self.intern_resume(resume);
+        self.intern_record(record, grade)
     }
 
     fn select_child(
@@ -3742,6 +3993,23 @@ impl StateInterner {
         verb: UnionVerb,
     ) -> FormulaPcId {
         self.formula_pcs.start(program, variable, occurrence, verb)
+    }
+
+    fn start_formula_with_proposer_checked(
+        &mut self,
+        program: &FiniteFormulaProgram,
+        variable: VariableId,
+        occurrence: usize,
+        verb: UnionVerb,
+        proposer_checked: bool,
+    ) -> FormulaPcId {
+        self.formula_pcs.start_with_proposer_checked(
+            program,
+            variable,
+            occurrence,
+            verb,
+            proposer_checked,
+        )
     }
 
     fn formula(&self, id: FormulaPcId) -> &FormulaPcRecord {
@@ -4366,8 +4634,7 @@ impl DeferredCandidateNode {
                 let cut = range.start + cut;
                 let prefix = Self::tagged_view(pairs.clone(), range.start..cut)
                     .map(|view| view.shifted(node.parent_delta));
-                let tail = Self::tagged_view(pairs.clone(), cut..range.end)
-                    .map(|view| {
+                let tail = Self::tagged_view(pairs.clone(), cut..range.end).map(|view| {
                         view.shifted(node.parent_delta)
                             .shifted(-i64::from(first_tail_parent))
                     });
@@ -6843,7 +7110,13 @@ fn estimate_leaf<'a>(
     view: &RowsView<'_>,
     out: &mut EstimateSink<'_>,
 ) -> bool {
-    plan.resolve(root, leaf).estimate(variable, view, out)
+    estimate_constraint(
+        plan.resolve(root, leaf),
+        plan.certified_denotation,
+        variable,
+        view,
+        out,
+    )
 }
 
 fn propose_leaf<'a>(
@@ -6854,7 +7127,13 @@ fn propose_leaf<'a>(
     view: &RowsView<'_>,
     candidates: &mut CandidateSink<'_>,
 ) {
-    plan.resolve(root, leaf).propose(variable, view, candidates);
+    propose_constraint(
+        plan.resolve(root, leaf),
+        plan.certified_denotation,
+        variable,
+        view,
+        candidates,
+    );
 }
 
 fn allocate_activations(next: &mut u64, count: usize) -> Vec<ActivationId> {
@@ -6875,7 +7154,13 @@ fn confirm_leaf<'a>(
     view: &RowsView<'_>,
     candidates: &mut CandidateSink<'_>,
 ) {
-    plan.resolve(root, leaf).confirm(variable, view, candidates);
+    confirm_constraint(
+        plan.resolve(root, leaf),
+        plan.certified_denotation,
+        variable,
+        view,
+        candidates,
+    );
 }
 
 fn ready_plan_transition<'a>(
@@ -6905,6 +7190,44 @@ fn ready_plan_transition<'a>(
         let estimates = &mut estimate_matrix[estimate_start..];
         let mut column = Vec::with_capacity(rows.row_count);
         for leaf in 0..leaf_count {
+            let constraint = plan.resolve(root, leaf);
+            if plan.certified_denotation {
+                if constraint.variables().is_set(variable) {
+                    relevant.insert(leaf);
+                }
+                let coverage = plan.ready_proposal_coverage(constraint, variable, desc.bound);
+                if coverage < ProposalCoverage::Covering {
+                    continue;
+                }
+                column.clear();
+                if estimate_leaf(
+                    root,
+                    plan,
+                    leaf,
+                    variable,
+                    &view,
+                    &mut EstimateSink::Column(&mut column),
+                ) {
+                    assert_eq!(
+                        column.len(),
+                        rows.row_count,
+                        "constraint estimate must append one value per row"
+                    );
+                } else {
+                    assert!(
+                        column.is_empty(),
+                        "missing constraint estimate must leave its sink untouched"
+                    );
+                    column.resize(rows.row_count, usize::MAX);
+                }
+                for row in 0..rows.row_count {
+                    if proposers[row] == usize::MAX || column[row] < estimates[row] {
+                        proposers[row] = leaf;
+                        estimates[row] = column[row];
+                    }
+                }
+                continue;
+            }
             column.clear();
             let is_relevant = estimate_leaf(
                 root,
@@ -6935,16 +7258,25 @@ fn ready_plan_transition<'a>(
                 );
             }
         }
+        if proposers.iter().any(|&child| child == usize::MAX) {
         assert!(
-            proposers.iter().all(|&child| child != usize::MAX),
+                plan.certified_denotation,
             "unconstrained variable in residual-state query"
         );
+            estimate_matrix.truncate(estimate_start);
+            continue;
+        }
         plans.push(VariablePlan {
             variable,
             relevant,
             proposers,
         });
     }
+
+    assert!(
+        !plans.is_empty(),
+        "a non-full certified residual state has no covering proposal source"
+    );
 
     let mut preferred = Vec::with_capacity(rows.row_count);
     let mut preferred_counts = vec![0; plans.len()];
@@ -6970,11 +7302,12 @@ fn ready_plan_transition<'a>(
     }
 
     let preferred_groups = preferred_counts.iter().filter(|&&count| count > 0).count();
-    // The chosen variable and proposer are semantic: `propose` owns the
-    // occurrence bag, and `Constraint` supplies no cross-variable bag
-    // equivalence law. Keep every row on its exact adaptive choice. Physical
-    // executors may still cohort equal actions after this boundary, but an
-    // estimate-compatible variable is not an interchangeable action.
+    // The chosen variable and proposer are semantic: `propose` owns candidate
+    // support and first-seen order, and `Constraint` supplies no
+    // cross-variable support-equivalence law. Keep every row on its exact
+    // adaptive choice. Physical executors may still cohort equal actions after
+    // this boundary, but an estimate-compatible variable is not an
+    // interchangeable action.
     stats.ready_preferred_variable_groups += preferred_groups;
 
     let mut groups: BTreeMap<ProposeAction, Vec<usize>> = BTreeMap::new();
@@ -7037,19 +7370,25 @@ fn propose_action_transition<'a>(
     stats: &mut ResidualStateStats,
 ) -> Option<ContinuationToken> {
     let leaf_count = plan.len();
+    // Reaching the stable executor means no typed proposal route was seeded.
+    // Its checked status must therefore describe the ordinary action, even if
+    // an available Program would have published a narrower Exact stream.
+    let proposer_checked =
+        plan.ordinary_proposer_starts_checked(root, proposer, variable, desc.bound);
     if plan.has_finite_formula(proposer) {
         let activations = allocate_activations(next_activation, rows.row_count);
         let formula_root = plan
             .finite_formula
             .root(proposer)
             .expect("a lowered formula has a root");
-        let counter = interner.start_formula(
+        let counter = interner.start_formula_with_proposer_checked(
             &plan.finite_formula,
             variable,
             proposer,
             UnionVerb::Propose {
                 relevant: relevant.clone(),
             },
+            proposer_checked,
         );
         return file_with_plan(
             worklist,
@@ -7085,7 +7424,9 @@ fn propose_action_transition<'a>(
     stats.max_propose_candidates = stats.max_propose_candidates.max(candidates.len());
 
     let mut checked = ChildSet::empty(leaf_count);
+    if proposer_checked {
     checked.insert(proposer);
+    }
     let successor = StateDesc {
         bound: desc.bound,
         phase: ResidualPhase::Candidate {
@@ -7245,6 +7586,13 @@ fn candidate_plan_transition<'a>(
             &view,
             &mut EstimateSink::Column(&mut column),
         );
+        if plan.certified_denotation && !is_relevant {
+            assert!(
+                column.is_empty(),
+                "missing constraint estimate must leave its sink untouched"
+            );
+            column.resize(batch.parents.row_count, usize::MAX);
+        } else {
         assert!(
             is_relevant,
             "a relevant child became irrelevant before the candidate was committed"
@@ -7254,6 +7602,7 @@ fn candidate_plan_transition<'a>(
             batch.parents.row_count,
             "constraint estimate must append one value per row"
         );
+        }
         for row in 0..batch.parents.row_count {
             if confirmers[row] == usize::MAX || column[row] < estimates[row] {
                 confirmers[row] = leaf;
@@ -7317,6 +7666,7 @@ fn confirm_action_transition<'a>(
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
+    reducer_seeds: &mut Vec<FormulaReducerSeed>,
 ) -> Option<ContinuationToken> {
     if plan.has_finite_formula(confirmer) {
         let activations = allocate_activations(next_activation, batch.parents.row_count);
@@ -7333,19 +7683,30 @@ fn confirm_action_transition<'a>(
                 checked: checked.clone(),
             },
         );
+        let successor = StateDesc {
+                bound: desc.bound,
+                phase: ResidualPhase::Formula { counter },
+        };
+        let mut formula_batch = FormulaBatch::from_confirmation(
+                batch,
+                activations,
+                &plan.finite_formula.node(formula_root).kind,
+        );
+        if crosses_candidate_set_boundary(desc, &successor, plan, &interner.formula_pcs)
+            && !formula_batch.admit_current_and_set_tail_stable()
+        {
+            reducer_seeds.push(FormulaReducerSeed::SetAdmit(SetAdmissionSeed {
+                successor,
+                destination: SetAdmissionDestination::Formula(formula_batch),
+            }));
+            return None;
+        }
         return file_with_plan(
             worklist,
             interner,
             plan,
-            StateDesc {
-                bound: desc.bound,
-                phase: ResidualPhase::Formula { counter },
-            },
-            StateBucket::Formula(FormulaBatch::from_confirmation(
-                batch,
-                activations,
-                &plan.finite_formula.node(formula_root).kind,
-            )),
+            successor,
+            StateBucket::Formula(formula_batch),
             stats,
         );
     }
@@ -7433,7 +7794,9 @@ fn finish_formula_candidate_transition(
     let (relevant, checked) = match &resume.verb {
         UnionVerb::Propose { relevant } => {
             let mut checked = ChildSet::empty(leaf_count);
+            if resume.proposer_checked {
             checked.insert(resume.occurrence);
+            }
             (relevant.clone(), checked)
         }
         UnionVerb::Confirm { relevant, checked } => {
@@ -7790,8 +8153,7 @@ fn continue_formula_transition(
         Ok(InternedFormulaSuccessor::Guard { .. }) => {
             unreachable!("ordinary formula completion returned through a support guard")
         }
-        Err(resume) => {
-            finish_formula_transition(
+        Err(resume) => finish_formula_transition(
                 plan,
                 desc,
                 &resume,
@@ -7800,8 +8162,7 @@ fn continue_formula_transition(
                 interner,
                 stats,
                 reducer_seeds,
-            )
-        }
+        ),
     }
 }
 
@@ -7901,10 +8262,8 @@ fn finish_formula_or_emission(
         phase: ResidualPhase::Formula { counter },
     };
     match (successor, destination) {
-        (
-            Ok(InternedFormulaSuccessor::Formula(next)),
-            FormulaFrameDestination::ParentAnd,
-        ) => continue_formula_transition(
+        (Ok(InternedFormulaSuccessor::Formula(next)), FormulaFrameDestination::ParentAnd) => {
+            continue_formula_transition(
             plan,
             &desc,
             next,
@@ -7913,11 +8272,9 @@ fn finish_formula_or_emission(
             interner,
             stats,
             reducer_seeds,
-        ),
-        (
-            Ok(InternedFormulaSuccessor::Formula(next)),
-            FormulaFrameDestination::ParentOr(input),
-        ) => {
+            )
+        }
+        (Ok(InternedFormulaSuccessor::Formula(next)), FormulaFrameDestination::ParentOr(input)) => {
             reducer_seeds.push(FormulaReducerSeed::Admit(FormulaOrAdmissionSeed {
                 bound,
                 batch,
@@ -8129,10 +8486,13 @@ fn formula_or_plan_transition<'a>(
             continue;
         }
         column.clear();
-        if plan
-            .resolve_formula_node(root, occurrence, children[child])
-            .estimate(variable, &view, &mut EstimateSink::Column(&mut column))
-        {
+        if estimate_constraint(
+            plan.resolve_formula_node(root, occurrence, children[child]),
+            plan.certified_denotation,
+            variable,
+            &view,
+            &mut EstimateSink::Column(&mut column),
+        ) {
             assert_eq!(
                 column.len(),
                 batch.parents.row_count,
@@ -8188,8 +8548,10 @@ fn formula_and_plan_transition<'a>(
     reducer_seeds: &mut Vec<FormulaReducerSeed>,
 ) -> Option<ContinuationToken> {
     let resume = interner.formula_resume(counter);
-    let (done, occurrence, variable) = match &interner.formula(counter).focus {
-        FormulaFocus::Plan { done, .. } => (done.clone(), resume.occurrence, resume.variable),
+    let (stage, done, occurrence, variable) = match &interner.formula(counter).focus {
+        FormulaFocus::Plan { stage, done, .. } => {
+            (*stage, done.clone(), resume.occurrence, resume.variable)
+        }
         _ => unreachable!("AND planning received an action continuation"),
     };
     assert!(matches!(
@@ -8206,11 +8568,59 @@ fn formula_and_plan_transition<'a>(
         if done.contains(child) {
             continue;
         }
-        let mut column = Vec::with_capacity(batch.parents.row_count);
-        if plan
-            .resolve_formula_node(root, occurrence, children[child])
-            .estimate(variable, &view, &mut EstimateSink::Column(&mut column))
+        let constraint = plan.resolve_formula_node(root, occurrence, children[child]);
+        if plan.certified_denotation {
+            if !constraint.variables().is_set(variable) {
+                next = interner
+                    .formula_pcs
+                    .skip_child(&plan.finite_formula, next, child);
+                continue;
+            }
+            if stage == FormulaStage::Propose
+                && plan.formula_node_proposal_coverage(
+                    root,
+                    occurrence,
+                    children[child],
+                    variable,
+                    desc.bound,
+                ) < ProposalCoverage::Covering
         {
+                // Not a source, but still an unfinished validator. The first
+                // selected source changes the AND stage to Confirm, where this
+                // child must run regardless of quote availability.
+                continue;
+            }
+            let mut column = Vec::with_capacity(batch.parents.row_count);
+            if estimate_constraint(
+                constraint,
+                true,
+                variable,
+                &view,
+                &mut EstimateSink::Column(&mut column),
+            ) {
+                assert_eq!(
+                    column.len(),
+                    batch.parents.row_count,
+                    "AND child estimate must append one value per row"
+                );
+            } else {
+                assert!(
+                    column.is_empty(),
+                    "missing AND child estimate must leave its sink untouched"
+                );
+                column.resize(batch.parents.row_count, usize::MAX);
+            }
+            estimates_by_child.push((child, column));
+            continue;
+        }
+        let mut column = Vec::with_capacity(batch.parents.row_count);
+        if estimate_constraint(
+            constraint,
+            false,
+            variable,
+            &view,
+            &mut EstimateSink::Column(&mut column),
+        ) {
             assert_eq!(
                 column.len(),
                 batch.parents.row_count,
@@ -8260,7 +8670,23 @@ fn formula_and_plan_transition<'a>(
     }
 
     let mut continuation = None;
+    let root_proposal =
+        stage == FormulaStage::Propose && interner.formula(next).return_to.is_none();
     for (child, mut batch) in batch.partition(vars.len(), &assignments) {
+        let next = if plan.certified_denotation
+            && root_proposal
+            && plan.formula_node_proposal_coverage(
+                root,
+                occurrence,
+                children[child],
+                variable,
+                desc.bound,
+            ) == ProposalCoverage::Exact
+        {
+            interner.formula_pcs.with_proposer_checked(next)
+        } else {
+            next
+        };
         let selected = select_interned_formula_child(
             &plan.finite_formula,
             &mut interner.formula_pcs,
@@ -8324,8 +8750,7 @@ fn finish_formula_action_result(
         .formula_pcs
         .resume_completed(&plan.finite_formula, completed)
     {
-        Ok(InternedFormulaSuccessor::Formula(next)) => {
-            continue_formula_transition(
+        Ok(InternedFormulaSuccessor::Formula(next)) => continue_formula_transition(
                 plan,
                 &desc,
                 next,
@@ -8334,13 +8759,11 @@ fn finish_formula_action_result(
                 interner,
                 stats,
                 reducer_seeds,
-            )
-        }
+        ),
         Ok(InternedFormulaSuccessor::Guard { .. }) => {
             unreachable!("candidate action returned through a support guard")
         }
-        Err(resume) => {
-            finish_formula_transition(
+        Err(resume) => finish_formula_transition(
                 plan,
                 &desc,
                 &resume,
@@ -8349,8 +8772,7 @@ fn finish_formula_action_result(
                 interner,
                 stats,
                 reducer_seeds,
-            )
-        }
+        ),
     }
 }
 
@@ -8419,12 +8841,24 @@ fn formula_action_transition<'a>(
     match stage {
         FormulaStage::Support => unreachable!("support returned above"),
         FormulaStage::Propose => {
-            constraint.propose(variable, &view, &mut result.sink(batch.parents.row_count));
+            propose_constraint(
+                constraint,
+                plan.certified_denotation,
+                variable,
+                &view,
+                &mut result.sink(batch.parents.row_count),
+            );
             stats.candidates_proposed += result.len();
             stats.max_propose_candidates = stats.max_propose_candidates.max(result.len());
         }
         FormulaStage::Confirm => {
-            constraint.confirm(variable, &view, &mut result.sink(batch.parents.row_count));
+            confirm_constraint(
+                constraint,
+                plan.certified_denotation,
+                variable,
+                &view,
+                &mut result.sink(batch.parents.row_count),
+            );
             stats.candidates_confirmed += candidates_before;
             stats.max_confirm_candidates = stats.max_confirm_candidates.max(candidates_before);
         }
@@ -8576,7 +9010,9 @@ fn execute_task<'a>(
             if let Some(continuation) = continuation {
                 StepOutcome::Advanced(continuation)
             } else {
+                if reducer_seeds.is_empty() {
                 stats.dead_action_pops += 1;
+                }
                 StepOutcome::Dead
             }
         }
@@ -8619,11 +9055,14 @@ fn execute_task<'a>(
                 worklist,
                 interner,
                 stats,
+                &mut reducer_seeds,
             );
             if let Some(continuation) = continuation {
                 StepOutcome::Advanced(continuation)
             } else {
+                if reducer_seeds.is_empty() {
                 stats.dead_action_pops += 1;
+                }
                 StepOutcome::Dead
             }
         }
@@ -9174,7 +9613,7 @@ where
         // Preserve the ordinary optimistic preflight for partial bindings.
         // Typed Support owns only an explicit residual action; it does not
         // perturb admission or exact zero-variable truth at this boundary.
-        let mode = if root.satisfied(&seed_view) {
+        let mode = if seed_survives(&root, seed.bound, &seed_view) {
             Search::NextVariable
         } else {
             Search::Done
@@ -9187,20 +9626,28 @@ where
                 VariableSet::new_empty()
             }
         });
+        let certified_denotation = root.fixed_denotation();
         let base_estimates = std::array::from_fn(|variable| {
             if !full.is_set(variable) {
                 return usize::MAX;
             }
-            let mut estimate = 0usize;
-            assert!(
-                root.estimate(
+            source_quote_scalar(
+                &root,
+                certified_denotation,
                     variable,
+                VariableSet::new_empty(),
                     &RowsView::EMPTY,
-                    &mut EstimateSink::Scalar(&mut estimate),
-                ),
+            )
+            .map_or_else(
+                || {
+                    assert!(
+                        certified_denotation,
                 "unconstrained variable in residual frame"
             );
-            estimate
+                    usize::MAX
+                },
+                |(_, estimate)| estimate,
+            )
         });
 
         let plan = ResidualPlan::compile_lowering(&root, lowering);
@@ -9249,8 +9696,7 @@ impl ResidualQueryState {
     where
         P: Fn(&Binding) -> Option<R>,
     {
-        self.machine
-            .pull(
+        self.machine.pull(
                 root,
                 &self.plan,
                 postprocessing,
@@ -9731,8 +10177,7 @@ impl ResidualStateMachine {
             return Err(task);
         }
 
-        let mut checked = ChildSet::empty(plan.len());
-        checked.insert(*proposer);
+        let checked = plan.initial_proposal_checked(root, *proposer, *variable, task.desc.bound);
         if !plan.remaining_confirms_accept_pages(relevant, &checked, *variable, task.desc.bound) {
             return Err(task);
         }
@@ -15585,6 +16030,7 @@ mod tests {
             variable: 0,
             occurrence: 0,
             verb: UnionVerb::Propose { relevant },
+            proposer_checked: true,
         });
         let parent = arena.intern_record(
             FormulaPcRecord {
@@ -15674,6 +16120,7 @@ mod tests {
                 verb: UnionVerb::Propose {
                     relevant: ChildSet::empty(2).with_inserted(0),
                 },
+                proposer_checked: true,
             },
         };
 
@@ -16870,15 +17317,12 @@ mod tests {
             },
             FormulaStage::Confirm,
         );
-        let [
-            FormulaPayloadFrame::Or {
+        let [FormulaPayloadFrame::Or {
                 source: CandidatePayload::Deferred(source),
                 ..
-            },
-            FormulaPayloadFrame::And {
+        }, FormulaPayloadFrame::And {
                 current: CandidatePayload::Deferred(child),
-            },
-        ] = batch.frames.as_slice()
+        }] = batch.frames.as_slice()
         else {
             panic!("Confirm frame entry did not preserve shared deferred storage")
         };
@@ -24993,6 +25437,7 @@ mod tests {
         let mut interner = StateInterner::default();
         let mut stats = ResidualStateStats::default();
         let mut next_activation = 0;
+        let mut reducer_seeds = Vec::new();
 
         let token = confirm_action_transition(
             &root,
@@ -25010,6 +25455,7 @@ mod tests {
             &mut worklist,
             &mut interner,
             &mut stats,
+            &mut reducer_seeds,
         )
         .expect("the confirmer files its admitted relation");
         let StateBucket::Candidates(batch) = worklist
@@ -25022,6 +25468,69 @@ mod tests {
 
         assert_eq!(batch.candidates, [(0, raw(2)), (0, raw(1))]);
         assert_eq!(stats.candidates_confirmed, 3, "raw work remains charged");
+    }
+
+    #[test]
+    fn formula_confirmation_set_admits_before_page_safe_filing() {
+        let root = IntersectionConstraint::new(vec![
+            CapabilityLeaf {
+                variable: 0,
+                page_local: true,
+            },
+            CapabilityLeaf {
+                variable: 0,
+                page_local: true,
+            },
+        ]);
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let relevant = ChildSet::empty(plan.len()).with_inserted(0);
+        let checked = ChildSet::empty(plan.len());
+        let desc = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Confirm {
+                variable: 0,
+                relevant: relevant.clone(),
+                checked: checked.clone(),
+                confirmer: 0,
+            },
+        };
+        let mut worklist = Worklist::new();
+        let mut interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let mut next_activation = 0;
+        let mut reducer_seeds = Vec::new();
+
+        let token = confirm_action_transition(
+            &root,
+            &plan,
+            &desc,
+            0,
+            &relevant,
+            &checked,
+            0,
+            CandidateBatch {
+                parents: RowBatch::seed(),
+                candidates: CandidatePayload::Values(vec![raw(1), raw(2), raw(1)]),
+            },
+            &mut next_activation,
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+            &mut reducer_seeds,
+        )
+        .expect("the admitted Formula confirmation remains live");
+        assert!(reducer_seeds.is_empty());
+        let StateBucket::Formula(batch) = worklist
+            .values()
+            .find_map(|level| level.get(&token.state))
+            .expect("the Formula confirmation successor remains live")
+        else {
+            panic!("the finite confirmer filed a non-Formula payload")
+        };
+        let CandidatePayload::Values(values) = batch.input() else {
+            panic!("the singleton Formula admission changed payload representation")
+        };
+        assert_eq!(values, &[raw(2), raw(1)]);
     }
 
     #[test]

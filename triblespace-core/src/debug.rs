@@ -45,11 +45,7 @@ pub mod query {
             self.constraint.fixed_denotation()
         }
 
-        fn proposal_coverage(
-            &self,
-            variable: VariableId,
-            bound: VariableSet,
-        ) -> ProposalCoverage {
+        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
             self.constraint.proposal_coverage(variable, bound)
         }
 
@@ -79,6 +75,36 @@ pub mod query {
             candidates: &mut CandidateSink<'_>,
         ) {
             self.constraint.confirm(variable, view, candidates);
+        }
+
+        fn estimate_certified(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            self.constraint.estimate_certified(variable, view, out)
+        }
+
+        fn propose_certified(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            self.record.borrow_mut().push(variable);
+            self.constraint
+                .propose_certified(variable, view, candidates);
+        }
+
+        fn confirm_certified(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            self.constraint
+                .confirm_certified(variable, view, candidates);
         }
 
         fn satisfied(&self, view: &RowsView<'_>) -> bool {
@@ -135,11 +161,7 @@ pub mod query {
             self.constraint.fixed_denotation()
         }
 
-        fn proposal_coverage(
-            &self,
-            variable: VariableId,
-            bound: VariableSet,
-        ) -> ProposalCoverage {
+        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
             self.constraint.proposal_coverage(variable, bound)
         }
 
@@ -175,6 +197,40 @@ pub mod query {
             self.constraint.confirm(variable, view, candidates);
         }
 
+        fn estimate_certified(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if let Some(estimate) = self.estimates[variable] {
+                out.fill(estimate, view.len());
+                true
+            } else {
+                self.constraint.estimate_certified(variable, view, out)
+            }
+        }
+
+        fn propose_certified(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            self.constraint
+                .propose_certified(variable, view, candidates);
+        }
+
+        fn confirm_certified(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            self.constraint
+                .confirm_certified(variable, view, candidates);
+        }
+
         fn satisfied(&self, view: &RowsView<'_>) -> bool {
             self.constraint.satisfied(view)
         }
@@ -202,6 +258,15 @@ pub mod query {
 
         fn residual_program(&self) -> Option<ProgramRef<'_>> {
             self.constraint.residual_program()
+        }
+
+        fn residual_program_proposal_coverage(
+            &self,
+            variable: VariableId,
+            bound: VariableSet,
+        ) -> ProposalCoverage {
+            self.constraint
+                .residual_program_proposal_coverage(variable, bound)
         }
 
         fn residual_delta_source_is_paged(

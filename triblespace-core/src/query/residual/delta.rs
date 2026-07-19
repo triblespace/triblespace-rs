@@ -13174,6 +13174,7 @@ mod tests {
             variable: 0,
             occurrence: 3,
             verb: UnionVerb::Propose { relevant },
+            proposer_checked: true,
         };
         let mut formula_pcs = FormulaPcInterner::default();
         let resume = formula_pcs.intern_resume(resume);
