@@ -288,7 +288,7 @@ fn built_in_capability_receipts_distinguish_native_paths_from_opaque_fallbacks()
             finite_union_arms: None,
             page_local_confirm: true,
             direct_proposal_source: true,
-            typed_program: false,
+            typed_program: true,
         },
         "EstimateOverrideConstraint keeps shape opaque but forwards exact execution capabilities"
     );
@@ -333,7 +333,14 @@ fn atomic_constraints_have_exact_sets_across_residual_widths() {
         )
     });
     assert_eq!(equality.conservative_geometric.delta_source_pages, 0);
-    assert_eq!(equality.full_geometric.delta_source_pages, 0);
+    assert!(
+        equality.full_geometric.delta_source_pages > 0,
+        "FULL lowering must route peer-bound equality through its typed proposal Program"
+    );
+    assert!(
+        equality.full_geometric.delta_source_direct_candidates > 0,
+        "the routed equality Program must publish its exact peer values as direct candidates"
+    );
 
     let domain = Arc::new(HashSet::from([a, b, c, d, value(5)]));
     let range = assert_scheduler_matrix("inclusive inline range", vec![b, c, d], || {
