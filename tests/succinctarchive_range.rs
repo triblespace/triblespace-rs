@@ -5,7 +5,11 @@
 
 use triblespace::core::blob::encodings::succinctarchive::OrderedUniverse;
 use triblespace::core::blob::encodings::succinctarchive::SuccinctArchive;
+use triblespace::core::inline::RawInline;
 use triblespace::core::query::Constraint;
+use triblespace::core::query::Binding;
+use triblespace::core::query::intersectionconstraint::IntersectionConstraint;
+use triblespace::core::query::residual::try_constructed_program_query;
 use triblespace::core::query::VariableContext;
 use triblespace::prelude::inlineencodings::R256BE;
 use triblespace::prelude::*;
@@ -157,4 +161,50 @@ fn estimate_is_universe_code_range_upper_bound() {
         3,
         "propose must yield exactly the V-position codes in range"
     );
+}
+
+fn project(variable: usize, binding: &Binding) -> Option<RawInline> {
+    binding.get(variable).copied()
+}
+
+#[test]
+fn value_range_is_a_strict_constructed_ordered_source_and_confirmer() {
+    let v10: Inline<R256BE> = 10i128.to_inline();
+    let v50: Inline<R256BE> = 50i128.to_inline();
+    let v90: Inline<R256BE> = 90i128.to_inline();
+    let v100: Inline<R256BE> = 100i128.to_inline();
+    let mut set = TribleSet::new();
+    set += entity! { &ufoid() @ range_test_score: v10 };
+    set += entity! { &ufoid() @ range_test_score: v50 };
+    set += entity! { &ufoid() @ range_test_score: v90 };
+    set += entity! { &ufoid() @ range_test_score: v100 };
+    let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+    let variable = Variable::<R256BE>::new(0);
+
+    let mut source: Vec<_> = try_constructed_program_query(
+        IntersectionConstraint::new(vec![archive.value_in_range(variable, v10, v90)]),
+        move |binding| project(variable.index, binding),
+    )
+    .expect("the succinct range source constructs without an opaque fallback")
+    .cap(1)
+    .start_width(1)
+    .growth(1)
+    .collect();
+    source.sort_unstable();
+    assert_eq!(source, [v10.raw, v50.raw, v90.raw]);
+
+    let mut confirmed: Vec<_> = try_constructed_program_query(
+        and!(
+            variable.is(v50),
+            archive.value_in_range(variable, v10, v90),
+        ),
+        move |binding| project(variable.index, binding),
+    )
+    .expect("the succinct range confirmer composes with another finite Program")
+    .cap(1)
+    .start_width(1)
+    .growth(1)
+    .collect();
+    confirmed.sort_unstable();
+    assert_eq!(confirmed, [v50.raw]);
 }

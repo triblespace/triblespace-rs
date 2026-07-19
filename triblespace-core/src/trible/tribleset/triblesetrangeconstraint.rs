@@ -4,11 +4,21 @@ use crate::inline::RawInline;
 use crate::inline::INLINE_LEN;
 use crate::query::CandidateSink;
 use crate::query::Constraint;
+use crate::query::DispatchClass;
 use crate::query::EstimateSink;
+use crate::query::ProgramPacing;
+use crate::query::ProgramRef;
+use crate::query::ProgramRequest;
+use crate::query::ProgramRoute;
+use crate::query::ProgramSeedBatch;
 use crate::query::ResidualDeltaOutput;
 use crate::query::ResidualDeltaSourceCursor;
 use crate::query::ResidualDeltaSourcePage;
 use crate::query::RowsView;
+use crate::query::TypedEffectSink;
+use crate::query::TypedProgramBatch;
+use crate::query::TypedProgramSpec;
+use crate::query::TypedSeedSink;
 use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
@@ -64,6 +74,66 @@ impl TribleSetRangeConstraint {
             set,
             cached_estimate,
         }
+    }
+
+    fn contains(&self, value: &RawInline) -> bool {
+        *value >= self.min && *value <= self.max
+    }
+}
+
+impl TypedProgramSpec for TribleSetRangeConstraint {
+    type State = crate::query::finiteunaryprogram::FiniteUnaryProgramState;
+    type NoveltyKey = ();
+    type Rank = [u64; 6];
+
+    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+        crate::query::finiteunaryprogram::route(self.variable_v, request)
+    }
+
+    fn dispatch(&self, state: &Self::State) -> DispatchClass {
+        crate::query::finiteunaryprogram::dispatch(state)
+    }
+
+    fn pacing(&self, state: &Self::State) -> ProgramPacing {
+        crate::query::finiteunaryprogram::pacing(state)
+    }
+
+    fn progress(&self, state: &Self::State) -> Self::Rank {
+        crate::query::finiteunaryprogram::progress(state)
+    }
+
+    fn seed_typed(
+        &self,
+        batch: ProgramSeedBatch<'_>,
+        effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+    ) {
+        crate::query::finiteunaryprogram::seed(self.variable_v, batch, effects)
+    }
+
+    fn step_typed(
+        &self,
+        states: Vec<Self::State>,
+        batch: TypedProgramBatch<'_>,
+        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+    ) {
+        crate::query::finiteunaryprogram::step(
+            self.variable_v,
+            states,
+            batch,
+            effects,
+            |_input, cursor, limit, accepted| {
+                direct_source_page(cursor, limit, accepted, |after| {
+                    next_inline_source_in_range(
+                        &self.set.vea,
+                        &[],
+                        &self.min,
+                        &self.max,
+                        after,
+                    )
+                })
+            },
+            |_input, value| self.contains(value),
+        )
     }
 }
 
@@ -122,6 +192,10 @@ impl<'a> Constraint<'a> for TribleSetRangeConstraint {
         true
     }
 
+    fn residual_program(&self) -> Option<ProgramRef<'_>> {
+        Some(ProgramRef::new(self))
+    }
+
     fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
         variable == self.variable_v && view.col(variable).is_none()
     }
@@ -164,13 +238,22 @@ mod tests {
     use crate::prelude::inlineencodings::R256BE;
     use crate::prelude::*;
     use crate::query::residual::ResidualLowering;
+    use crate::query::residual::try_constructed_program_query;
+    use crate::query::intersectionconstraint::IntersectionConstraint;
     use crate::query::Binding;
     use crate::query::Constraint;
+    use crate::query::ProgramAction;
+    use crate::query::ProgramCompletion;
+    use crate::query::ProgramGrouping;
+    use crate::query::ProgramRequest;
+    use crate::query::ProgramStratum;
     use crate::query::Query;
     use crate::query::ResidualDeltaSourceCursor;
     use crate::query::RowsView;
+    use crate::query::TypedProgramSpec;
     use crate::query::VariableContext;
     use crate::query::VariableId;
+    use crate::query::VariableSet;
 
     attributes! {
         "BB00000000000000BB00000000000000" as range_test_score: R256BE;
@@ -310,6 +393,28 @@ mod tests {
         let variable = context.next_variable::<R256BE>();
         let constraint = data.value_in_range(variable, v10, v90);
         assert!(constraint.residual_proposal_source_is_paged(variable.index, &RowsView::EMPTY));
+        let route = constraint
+            .residual_program()
+            .expect("value ranges expose a typed Program")
+            .route(ProgramRequest {
+                action: ProgramAction::Propose(variable.index),
+                bound: VariableSet::new_empty(),
+            })
+            .expect("the unbound range variable has an ordered source");
+        assert_eq!(route.stratum, ProgramStratum::Finite);
+        assert_eq!(route.grouping, ProgramGrouping::PageLocal);
+        assert_eq!(route.completion, ProgramCompletion::PageableOnly);
+        assert!(
+            constraint.progress(
+                &crate::query::finiteunaryprogram::FiniteUnaryProgramState::Propose {
+                    cursor: ResidualDeltaSourceCursor::Start,
+                }
+            ) > constraint.progress(
+                &crate::query::finiteunaryprogram::FiniteUnaryProgramState::Propose {
+                    cursor: ResidualDeltaSourceCursor::After(v10.raw),
+                }
+            )
+        );
 
         let mut roots = Vec::new();
         let mut direct = Vec::new();
@@ -364,6 +469,18 @@ mod tests {
         assert_eq!(query.stats().delta_source_candidates_examined, 3);
         assert_eq!(query.stats().delta_source_direct_candidates, 3);
         assert_eq!(query.stats().delta_source_roots, 0);
+
+        let mut constructed: Vec<_> = try_constructed_program_query(
+            IntersectionConstraint::new(vec![data.value_in_range(variable, v10, v90)]),
+            move |binding| project(variable.index, binding),
+        )
+        .expect("the range Program constructs without an opaque fallback")
+        .cap(1)
+        .start_width(1)
+        .growth(1)
+        .collect();
+        constructed.sort_unstable();
+        assert_eq!(constructed, expected);
 
         let mut first_only = Query::new(data.value_in_range(variable, v10, v90), move |binding| {
             project(variable.index, binding)

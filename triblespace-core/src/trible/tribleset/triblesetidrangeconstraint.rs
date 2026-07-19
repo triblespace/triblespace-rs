@@ -7,11 +7,21 @@ use crate::inline::encodings::genid::GenId;
 use crate::inline::RawInline;
 use crate::query::CandidateSink;
 use crate::query::Constraint;
+use crate::query::DispatchClass;
 use crate::query::EstimateSink;
+use crate::query::ProgramPacing;
+use crate::query::ProgramRef;
+use crate::query::ProgramRequest;
+use crate::query::ProgramRoute;
+use crate::query::ProgramSeedBatch;
 use crate::query::ResidualDeltaOutput;
 use crate::query::ResidualDeltaSourceCursor;
 use crate::query::ResidualDeltaSourcePage;
 use crate::query::RowsView;
+use crate::query::TypedEffectSink;
+use crate::query::TypedProgramBatch;
+use crate::query::TypedProgramSpec;
+use crate::query::TypedSeedSink;
 use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
@@ -48,6 +58,66 @@ impl EntityRangeConstraint {
             max: max.into(),
             set,
         }
+    }
+
+    fn contains(&self, value: &RawInline) -> bool {
+        id_from_value(value).is_some_and(|id| id >= self.min && id <= self.max)
+    }
+}
+
+impl TypedProgramSpec for EntityRangeConstraint {
+    type State = crate::query::finiteunaryprogram::FiniteUnaryProgramState;
+    type NoveltyKey = ();
+    type Rank = [u64; 6];
+
+    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+        crate::query::finiteunaryprogram::route(self.variable_e, request)
+    }
+
+    fn dispatch(&self, state: &Self::State) -> DispatchClass {
+        crate::query::finiteunaryprogram::dispatch(state)
+    }
+
+    fn pacing(&self, state: &Self::State) -> ProgramPacing {
+        crate::query::finiteunaryprogram::pacing(state)
+    }
+
+    fn progress(&self, state: &Self::State) -> Self::Rank {
+        crate::query::finiteunaryprogram::progress(state)
+    }
+
+    fn seed_typed(
+        &self,
+        batch: ProgramSeedBatch<'_>,
+        effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+    ) {
+        crate::query::finiteunaryprogram::seed(self.variable_e, batch, effects)
+    }
+
+    fn step_typed(
+        &self,
+        states: Vec<Self::State>,
+        batch: TypedProgramBatch<'_>,
+        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+    ) {
+        crate::query::finiteunaryprogram::step(
+            self.variable_e,
+            states,
+            batch,
+            effects,
+            |_input, cursor, limit, accepted| {
+                direct_source_page(cursor, limit, accepted, |after| {
+                    next_id_source_in_range(
+                        &self.set.eav,
+                        &[],
+                        &self.min,
+                        &self.max,
+                        after,
+                    )
+                })
+            },
+            |_input, value| self.contains(value),
+        )
     }
 }
 
@@ -109,6 +179,10 @@ impl<'a> Constraint<'a> for EntityRangeConstraint {
 
     fn residual_confirm_is_page_local(&self) -> bool {
         true
+    }
+
+    fn residual_program(&self) -> Option<ProgramRef<'_>> {
+        Some(ProgramRef::new(self))
     }
 
     fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
@@ -179,6 +253,66 @@ impl AttributeRangeConstraint {
             set,
         }
     }
+
+    fn contains(&self, value: &RawInline) -> bool {
+        id_from_value(value).is_some_and(|id| id >= self.min && id <= self.max)
+    }
+}
+
+impl TypedProgramSpec for AttributeRangeConstraint {
+    type State = crate::query::finiteunaryprogram::FiniteUnaryProgramState;
+    type NoveltyKey = ();
+    type Rank = [u64; 6];
+
+    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+        crate::query::finiteunaryprogram::route(self.variable_a, request)
+    }
+
+    fn dispatch(&self, state: &Self::State) -> DispatchClass {
+        crate::query::finiteunaryprogram::dispatch(state)
+    }
+
+    fn pacing(&self, state: &Self::State) -> ProgramPacing {
+        crate::query::finiteunaryprogram::pacing(state)
+    }
+
+    fn progress(&self, state: &Self::State) -> Self::Rank {
+        crate::query::finiteunaryprogram::progress(state)
+    }
+
+    fn seed_typed(
+        &self,
+        batch: ProgramSeedBatch<'_>,
+        effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+    ) {
+        crate::query::finiteunaryprogram::seed(self.variable_a, batch, effects)
+    }
+
+    fn step_typed(
+        &self,
+        states: Vec<Self::State>,
+        batch: TypedProgramBatch<'_>,
+        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+    ) {
+        crate::query::finiteunaryprogram::step(
+            self.variable_a,
+            states,
+            batch,
+            effects,
+            |_input, cursor, limit, accepted| {
+                direct_source_page(cursor, limit, accepted, |after| {
+                    next_id_source_in_range(
+                        &self.set.aev,
+                        &[],
+                        &self.min,
+                        &self.max,
+                        after,
+                    )
+                })
+            },
+            |_input, value| self.contains(value),
+        )
+    }
 }
 
 impl<'a> Constraint<'a> for AttributeRangeConstraint {
@@ -241,6 +375,10 @@ impl<'a> Constraint<'a> for AttributeRangeConstraint {
         true
     }
 
+    fn residual_program(&self) -> Option<ProgramRef<'_>> {
+        Some(ProgramRef::new(self))
+    }
+
     fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
         variable == self.variable_a && view.col(variable).is_none()
     }
@@ -287,6 +425,8 @@ mod tests {
     use crate::inline::RawInline;
     use crate::prelude::inlineencodings::R256BE;
     use crate::prelude::*;
+    use crate::query::intersectionconstraint::IntersectionConstraint;
+    use crate::query::residual::try_constructed_program_query;
     use crate::query::residual::ResidualLowering;
     use crate::query::Binding;
     use crate::query::Constraint;
@@ -451,6 +591,10 @@ mod tests {
             ),
         ] {
             assert!(constraint.residual_proposal_source_is_paged(variable, &RowsView::EMPTY));
+            assert!(
+                constraint.residual_program().is_some(),
+                "id ranges expose their ordered frontier as a typed Program"
+            );
             let mut roots = Vec::new();
             let mut direct = Vec::new();
             let first = constraint
@@ -503,6 +647,28 @@ mod tests {
         assert_eq!(entity_query.stats().delta_source_direct_candidates, 1);
         drop(entity_query);
 
+        let mut constructed_entities: Vec<_> = try_constructed_program_query(
+            IntersectionConstraint::new(vec![data.entity_in_range(
+                entity,
+                entity_ids[1],
+                entity_ids[2],
+            )]),
+            move |binding| project(entity.index, binding),
+        )
+        .expect("the entity-range Program constructs without an opaque fallback")
+        .cap(1)
+        .start_width(1)
+        .growth(1)
+        .collect();
+        constructed_entities.sort_unstable();
+        assert_eq!(
+            constructed_entities,
+            [
+                id_into_value(&entity_ids[1].raw()),
+                id_into_value(&entity_ids[2].raw())
+            ]
+        );
+
         let mut expected: Vec<_> = Query::new(
             data.attribute_in_range(attribute, attributes[1], attributes[2]),
             move |binding| project(attribute.index, binding),
@@ -527,5 +693,21 @@ mod tests {
                 id_into_value(&attributes[2].raw())
             ]
         );
+
+        let mut constructed_attributes: Vec<_> = try_constructed_program_query(
+            IntersectionConstraint::new(vec![data.attribute_in_range(
+                attribute,
+                attributes[1],
+                attributes[2],
+            )]),
+            move |binding| project(attribute.index, binding),
+        )
+        .expect("the attribute-range Program constructs without an opaque fallback")
+        .cap(1)
+        .start_width(1)
+        .growth(1)
+        .collect();
+        constructed_attributes.sort_unstable();
+        assert_eq!(constructed_attributes, actual);
     }
 }

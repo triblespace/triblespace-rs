@@ -4,11 +4,21 @@ use crate::inline::InlineEncoding;
 use crate::inline::RawInline;
 use crate::query::CandidateSink;
 use crate::query::Constraint;
+use crate::query::DispatchClass;
 use crate::query::EstimateSink;
+use crate::query::ProgramPacing;
+use crate::query::ProgramRef;
+use crate::query::ProgramRequest;
+use crate::query::ProgramRoute;
+use crate::query::ProgramSeedBatch;
 use crate::query::ResidualDeltaOutput;
 use crate::query::ResidualDeltaSourceCursor;
 use crate::query::ResidualDeltaSourcePage;
 use crate::query::RowsView;
+use crate::query::TypedEffectSink;
+use crate::query::TypedProgramBatch;
+use crate::query::TypedProgramSpec;
+use crate::query::TypedSeedSink;
 use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
@@ -78,6 +88,68 @@ where
             cached_estimate,
         }
     }
+
+    fn contains(&self, value: &RawInline) -> bool {
+        *value >= self.min && *value <= self.max
+    }
+}
+
+impl<U> TypedProgramSpec for SuccinctArchiveRangeConstraint<'_, U>
+where
+    U: Universe,
+{
+    type State = crate::query::finiteunaryprogram::FiniteUnaryProgramState;
+    type NoveltyKey = ();
+    type Rank = [u64; 6];
+
+    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+        crate::query::finiteunaryprogram::route(self.variable_v, request)
+    }
+
+    fn dispatch(&self, state: &Self::State) -> DispatchClass {
+        crate::query::finiteunaryprogram::dispatch(state)
+    }
+
+    fn pacing(&self, state: &Self::State) -> ProgramPacing {
+        crate::query::finiteunaryprogram::pacing(state)
+    }
+
+    fn progress(&self, state: &Self::State) -> Self::Rank {
+        crate::query::finiteunaryprogram::progress(state)
+    }
+
+    fn seed_typed(
+        &self,
+        batch: ProgramSeedBatch<'_>,
+        effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+    ) {
+        crate::query::finiteunaryprogram::seed(self.variable_v, batch, effects)
+    }
+
+    fn step_typed(
+        &self,
+        states: Vec<Self::State>,
+        batch: TypedProgramBatch<'_>,
+        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+    ) {
+        crate::query::finiteunaryprogram::step(
+            self.variable_v,
+            states,
+            batch,
+            effects,
+            |_input, cursor, limit, accepted| {
+                super::succinctarchiveconstraint::page_domain(
+                    self.archive,
+                    &self.archive.v_a,
+                    self.archive.domain.search_range(&self.min, &self.max),
+                    cursor,
+                    limit,
+                    accepted,
+                )
+            },
+            |_input, value| self.contains(value),
+        )
+    }
 }
 
 impl<'a, U> Constraint<'a> for SuccinctArchiveRangeConstraint<'a, U>
@@ -133,6 +205,10 @@ where
 
     fn residual_confirm_is_page_local(&self) -> bool {
         true
+    }
+
+    fn residual_program(&self) -> Option<ProgramRef<'_>> {
+        Some(ProgramRef::new(self))
     }
 
     fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
