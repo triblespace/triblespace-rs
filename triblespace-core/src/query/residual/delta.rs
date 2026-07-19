@@ -813,6 +813,9 @@ struct ProgramInstallOutcome {
 
 struct ProgramReplaceOutcome {
     scheduled: Vec<(DeltaStateId, ProgramWork, ProducerCredit)>,
+    /// Raw proposal occurrences reported by this typed page before
+    /// activation-local SET admission. This remains telemetry only.
+    raw_proposal_occurrences: usize,
     accepted: Vec<RawInline>,
     dead_search_pages: usize,
     dead_source_telemetry_pages: usize,
@@ -1680,6 +1683,29 @@ impl ProducerRegistry {
 
         let observed: Vec<_> = observed.into_iter().collect();
         let mut direct: Vec<_> = direct.into_iter().collect();
+        let raw_stream_occurrences = {
+            let activation = self
+                .state
+                .activations
+                .get(&activation_id)
+                .expect("unknown program activation");
+            if activation.reducer.streams() {
+                direct
+                    .len()
+                    .checked_add(observed.len())
+                    .and_then(|count| {
+                        count.checked_add(
+                            children
+                                .iter()
+                                .filter(|child| child.accepted.is_some())
+                                .count(),
+                        )
+                    })
+                    .expect("typed proposal occurrence count overflow")
+            } else {
+                0
+            }
+        };
         let mut accepted = Vec::new();
         {
             let activation = self
@@ -1693,7 +1719,11 @@ impl ProducerRegistry {
                     DeltaReducer::StreamProposal | DeltaReducer::StreamFormulaProposal,
                     _,
                 ) => {
-                    accepted.extend_from_slice(&direct)
+                    for value in direct.drain(..) {
+                        if activation.accepted.insert(value) {
+                            accepted.push(value);
+                        }
+                    }
                 }
                 (DeltaReducer::FinalizingConfirm { output }, _) => {
                     assert!(
@@ -1925,6 +1955,7 @@ impl ProducerRegistry {
         };
         ProgramReplaceOutcome {
             scheduled,
+            raw_proposal_occurrences: raw_stream_occurrences,
             accepted,
             dead_search_pages,
             dead_source_telemetry_pages,
@@ -6311,6 +6342,17 @@ impl DeltaScheduler {
                 source_telemetry_cohort,
                 page.resume,
             );
+            if outcome.raw_proposal_occurrences != 0 {
+                assert!(
+                    outcome.raw_proposal_occurrences >= outcome.accepted.len(),
+                    "typed SET admission manufactured proposal occurrences"
+                );
+                stats.candidates_proposed +=
+                    outcome.raw_proposal_occurrences - outcome.accepted.len();
+                stats.max_propose_candidates = stats
+                    .max_propose_candidates
+                    .max(outcome.raw_proposal_occurrences);
+            }
             for (scheduled_state, work, credit) in outcome.scheduled {
                 assert_eq!(
                     scheduled_state, state,
@@ -8875,6 +8917,95 @@ mod tests {
                 },
             ),
         }
+    }
+
+    #[test]
+    fn streaming_program_set_admission_is_activation_local_and_charges_raw_pages() {
+        let work = |slot| ProgramWork {
+            handle: ProgramWorkHandle::test(slot),
+            dispatch: DispatchClass::new(0),
+            pacing: ProgramPacing::Activation,
+        };
+        let mut registry = ProducerRegistry::new();
+        let activation = registry.open_program_activation(
+            DeltaReducer::StreamProposal,
+            candidate_return(Vec::new()),
+            None,
+            None,
+        );
+        let installed = registry.install_program_roots(
+            activation,
+            [0, 1].map(|slot| ProgramSeedWork {
+                parent: 0,
+                work: work(slot),
+                accepted: None,
+            }),
+        );
+        let mut roots = installed.roots.into_iter();
+        let (_, first_credit) = roots.next().unwrap();
+        let (_, second_credit) = roots.next().unwrap();
+
+        let first = registry.replace_program(
+            first_credit,
+            DeltaStateId(0),
+            &[],
+            [value(8), value(9), value(9)],
+            [value(7), value(7), value(8)],
+            false,
+            false,
+            false,
+            None,
+        );
+        assert_eq!(first.raw_proposal_occurrences, 6);
+        assert_eq!(first.accepted, [value(7), value(8), value(9)]);
+        assert!(first.quiescence.is_none());
+
+        let second = registry.replace_program(
+            second_credit,
+            DeltaStateId(0),
+            &[],
+            [value(7), value(11), value(11)],
+            [value(8), value(10), value(10)],
+            false,
+            false,
+            false,
+            None,
+        );
+        assert_eq!(second.raw_proposal_occurrences, 6);
+        assert_eq!(second.accepted, [value(10), value(11)]);
+        assert!(second.quiescence.is_some());
+
+        let sibling = registry.open_program_activation(
+            DeltaReducer::StreamProposal,
+            candidate_return(Vec::new()),
+            None,
+            None,
+        );
+        let (_, sibling_credit) = registry
+            .install_program_roots(
+                sibling,
+                [ProgramSeedWork {
+                    parent: 0,
+                    work: work(2),
+                    accepted: None,
+                }],
+            )
+            .roots
+            .pop()
+            .unwrap();
+        let sibling = registry.replace_program(
+            sibling_credit,
+            DeltaStateId(0),
+            &[],
+            std::iter::empty::<RawInline>(),
+            [value(7)],
+            false,
+            false,
+            false,
+            None,
+        );
+        assert_eq!(sibling.raw_proposal_occurrences, 1);
+        assert_eq!(sibling.accepted, [value(7)]);
     }
 
     #[test]

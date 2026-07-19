@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Streaming typed Program proposals now admit SET candidates per affine
+  activation.** Direct and observed proposal effects retain their raw receipt
+  counts for telemetry, then first-occurrence-stably collapse before each
+  stable handoff; later pages cannot replay an equal value for the same
+  parent, while independent parent activations remain independent.
 - **Scalar and lazy-DAG proposal actions now enter the search as SETs.** The
   scalar cursor reverse-stably removes duplicate proposed values before DFS or
   Rayon splitting, and the DAG does the same for `(parent, value)` pairs before
