@@ -1002,7 +1002,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_pages_preserve_duplicate_affine_parents() {
+    fn direct_pages_preserve_affine_parents_before_set_projection() {
         const PARENT: VariableId = 0;
         const MEMBER: VariableId = 1;
 
@@ -1022,6 +1022,51 @@ mod tests {
         };
         let project = |binding: &Binding| Some((*binding.get(PARENT)?, *binding.get(MEMBER)?));
 
+        let duplicate_domain = DuplicateDomain {
+            variable: parent.index,
+            value: parent_value,
+        };
+        let mut parent_occurrences = Vec::new();
+        duplicate_domain.propose(
+            parent.index,
+            &RowsView::EMPTY,
+            &mut CandidateSink::Values(&mut parent_occurrences),
+        );
+        assert_eq!(parent_occurrences, [parent_value, parent_value]);
+
+        let parent_variables = [parent.index];
+        let member_source = PatchIdConstraint::new(member, patch.clone());
+        let members = [
+            id_into_value(&id(1)),
+            id_into_value(&id(2)),
+            id_into_value(&id(3)),
+        ];
+        let mut one_parent_members = Vec::new();
+        member_source.propose(
+            member.index,
+            &RowsView::EMPTY,
+            &mut CandidateSink::Values(&mut one_parent_members),
+        );
+        let mut member_set = one_parent_members.clone();
+        member_set.sort_unstable();
+        assert_eq!(member_set, members);
+
+        let mut member_occurrences = Vec::new();
+        member_source.propose(
+            member.index,
+            &RowsView::new(&parent_variables, &parent_occurrences),
+            &mut CandidateSink::Tagged(&mut member_occurrences),
+        );
+        let expected_occurrences: Vec<_> = (0..2)
+            .flat_map(|row| {
+                one_parent_members
+                    .iter()
+                    .copied()
+                    .map(move |value| (row, value))
+            })
+            .collect();
+        assert_eq!(member_occurrences, expected_occurrences);
+
         let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
         let mut ordinary: Vec<_> = Query::new(make(), project).collect();
         let mut eager = Query::new(make(), project).solve_residual_state();
@@ -1033,7 +1078,11 @@ mod tests {
         for bag in [&mut sequential, &mut ordinary, &mut eager, &mut full] {
             bag.sort_unstable();
         }
-        assert_eq!(sequential.len(), 6);
+        let expected: Vec<_> = members
+            .into_iter()
+            .map(|member| (parent_value, member))
+            .collect();
+        assert_eq!(sequential, expected);
         assert!(sequential
             .iter()
             .all(|(parent, _member)| *parent == parent_value));

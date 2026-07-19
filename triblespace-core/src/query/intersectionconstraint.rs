@@ -410,7 +410,7 @@ mod tests {
         }
     }
 
-    fn equal_estimate_bag_query() -> Query<
+    fn equal_estimate_occurrence_query() -> Query<
         IntersectionConstraint<EqualEstimateBagLeaf>,
         impl Fn(&Binding) -> Option<RawInline>,
         RawInline,
@@ -425,11 +425,23 @@ mod tests {
     }
 
     #[test]
-    fn equal_estimate_proposer_tie_preserves_child_occurrence_bag() {
-        let expected = vec![EqualEstimateBagLeaf::VALUE; 2];
-        let sequential: Vec<_> = equal_estimate_bag_query().sequential().collect();
-        let blocked = equal_estimate_bag_query().solve_blocked();
-        let residual: Vec<_> = equal_estimate_bag_query()
+    fn equal_estimate_tie_preserves_child_occurrences_before_set_projection() {
+        let constraint = IntersectionConstraint::new(vec![
+            EqualEstimateBagLeaf { occurrences: 2 },
+            EqualEstimateBagLeaf { occurrences: 1 },
+        ]);
+        let mut proposed = Vec::new();
+        constraint.propose(
+            EqualEstimateBagLeaf::VARIABLE,
+            &RowsView::EMPTY,
+            &mut CandidateSink::Values(&mut proposed),
+        );
+        assert_eq!(proposed, vec![EqualEstimateBagLeaf::VALUE; 2]);
+
+        let expected = vec![EqualEstimateBagLeaf::VALUE];
+        let sequential: Vec<_> = equal_estimate_occurrence_query().sequential().collect();
+        let blocked = equal_estimate_occurrence_query().solve_blocked();
+        let residual: Vec<_> = equal_estimate_occurrence_query()
             .solve_residual_state_lazy_with(residual::ResidualLowering::FULL)
             .collect();
 

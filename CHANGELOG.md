@@ -31,6 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   values belonging to different parent rows remain independent. Segmented
   affine ropes are explicitly left for bounded reducer admission rather than
   being materialized merely to deduplicate them.
+- **Internal occurrence bags remain observable below public SET projection.**
+  Core source and scheduler regressions now assert both sides of that boundary:
+  PATCH, sorted-slice, TribleSet, attached-range, intersection, and archive
+  confirmation paths preserve raw affine multiplicity and order, while public
+  `Query` results expose each distinct raw head exactly once.
 
 ### Fixed
 
