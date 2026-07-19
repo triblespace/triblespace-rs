@@ -1674,10 +1674,9 @@ where
     ///
     /// This capability belongs to `SuccinctArchiveConstraint` itself. External
     /// wrappers that override `residual_program` do not inherit it through
-    /// ordinary `Constraint` delegation. In particular, composing this family
-    /// with the GPU crate's `ResidentTwoBoundConstraint` route remains a
-    /// separate wrapper-level decision; this core tranche neither shadows nor
-    /// replaces that accelerator family.
+    /// ordinary `Constraint` delegation, so heterogeneous wrappers compose it
+    /// explicitly as their semantic fallback rather than relying on hook
+    /// forwarding.
     fn residual_program(&self) -> Option<ProgramRef<'_>> {
         Some(ProgramRef::new(self))
     }

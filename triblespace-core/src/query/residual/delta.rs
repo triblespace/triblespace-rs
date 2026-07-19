@@ -138,6 +138,13 @@ impl ProgramAddress {
         }
     }
 
+    fn key(&self) -> ProgramKey {
+        match self {
+            Self::Constraint { key, .. } => *key,
+            Self::Engine(_) => ProgramKey::new(0),
+        }
+    }
+
     fn has_private_direct_effects(&self) -> bool {
         matches!(self, Self::Engine(_))
     }
@@ -3772,7 +3779,7 @@ impl DeltaScheduler {
             .intern_program(ProgramAddress::new(desc, route));
         self.program_runtimes
             .entry(state)
-            .or_insert_with(|| spec.new_runtime());
+            .or_insert_with(|| spec.new_runtime_for(route.key));
         state
     }
 
@@ -3960,6 +3967,7 @@ impl DeltaScheduler {
                 self.program_runtimes
                     .get_mut(&state)
                     .expect("prepared program lost its runtime"),
+                route.key,
                 &retired,
             );
         }
@@ -4059,6 +4067,7 @@ impl DeltaScheduler {
                 self.program_runtimes
                     .get_mut(&state)
                     .expect("prepared program lost its runtime"),
+                route.key,
                 &retired,
             );
         }
@@ -4202,6 +4211,7 @@ impl DeltaScheduler {
                 self.program_runtimes
                     .get_mut(&state)
                     .expect("prepared program lost its runtime"),
+                route.key,
                 &retired,
             );
         }
@@ -6134,6 +6144,7 @@ impl DeltaScheduler {
             .program(state)
             .cloned()
             .expect("typed program task was scheduled under a legacy delta state");
+        let address_key = address.key();
         let spec = address.resolve(root, plan);
         let private_direct = address.has_private_direct_effects();
         let cohort_key = ProgramCohortKey::of(&self.registry, &tasks[0]);
@@ -6168,10 +6179,11 @@ impl DeltaScheduler {
             work.push(task.work);
         }
         let mut receipt = ProgramBatchEffects::default();
-        spec.step_batch(
+        spec.step_batch_for(
             self.program_runtimes
                 .get_mut(&state)
                 .expect("typed program state lost its runtime"),
+            address_key,
             ProgramBatch {
                 stratum: address.stratum(),
                 view,
@@ -6427,6 +6439,7 @@ impl DeltaScheduler {
                 self.program_runtimes
                     .get_mut(&state)
                     .expect("typed program state lost its runtime during retirement"),
+                address_key,
                 &retired_activations,
             );
         }

@@ -122,7 +122,7 @@ fn empty_snapshot_preparation_is_repeatable_and_remains_cold() {
 }
 
 #[test]
-fn declined_entity_route_keeps_the_delegated_width_one_pager() {
+fn canonical_fallback_keeps_the_width_one_geometric_pager() {
     let set = fixture_set();
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
     let resident = WgpuSuccinctArchive::new(archive).expect("resident wrap succeeds");
@@ -140,22 +140,54 @@ fn declined_entity_route_keeps_the_delegated_width_one_pager() {
 
     assert!(solve.next().is_some());
 
-    // The resident family cannot yet own this entity proposal because its
-    // value peer is unbound. The action is declined before activation, then
-    // delegated to the wrapped SuccinctArchive's bounded source pager.
-    // Reaching one result therefore records exactly one delegated entity
-    // source page and one typed value source page before the first result; the
-    // former disappeared when merely exposing a Program incorrectly
-    // suppressed every legacy residual hook.
+    // The resident family cannot own this entity proposal because its value
+    // peer is unbound. Left-biased composition therefore seals the canonical
+    // Succinct Program arm before activation. Reaching one result records one
+    // canonical entity source page and one resident-family value source page
+    // while preserving the width-one geometric ramp.
     assert_eq!(
         solve.stats().delta_source_pages,
         2,
-        "the declined entity action fell through to eager execution: {:?}",
+        "the canonical fallback lost geometric paging: {:?}",
         solve.stats()
     );
     assert_eq!(solve.stats().delta_source_candidates_examined, 2);
     assert_eq!(solve.stats().candidates_proposed, 2);
     assert_eq!(solve.stats().max_propose_candidates, 1);
+}
+
+#[test]
+fn repeated_pattern_uses_the_canonical_program_without_a_resident_family() {
+    let attribute = id_hex!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA01");
+    let repeated = fixture_id(4, 0);
+    let other = fixture_id(4, 1);
+    let mut set = TribleSet::new();
+    set.insert(&Trible::new::<GenId>(
+        ExclusiveId::force_ref(&repeated),
+        &attribute,
+        &GenId::inline_from(repeated),
+    ));
+    set.insert(&Trible::new::<GenId>(
+        ExclusiveId::force_ref(&other),
+        &attribute,
+        &GenId::inline_from(repeated),
+    ));
+
+    let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+    let resident = WgpuSuccinctArchive::new(archive).expect("resident wrap succeeds");
+    let route = resident.two_bound_route_with(TwoBoundRouteAdmission::Off);
+    let result = find!(
+        (x: Id),
+        route.pattern::<GenId>(
+            x,
+            GenId::inline_from(attribute),
+            x,
+        )
+    )
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .collect::<Vec<_>>();
+    assert_eq!(result, vec![(repeated,)]);
+    assert_eq!(route.counters(), Default::default());
 }
 
 #[test]

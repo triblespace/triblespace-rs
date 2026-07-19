@@ -97,17 +97,54 @@ pub struct ProgramRequest {
     pub bound: VariableSet,
 }
 
+/// Private semantic arm of one family-local route key.
+///
+/// `Preferred` and `Fallback` are introduced only by [`PreferredProgram`].
+/// The arm is carried by the immutable occurrence-local address, so it is
+/// selected once before runtime construction and never rides an affine work
+/// handle or a family state. It is not a physical placement tag: Native and
+/// accelerated execution remain interchangeable inside the selected arm.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+enum ProgramRouteArm {
+    Direct,
+    Preferred,
+    Fallback,
+}
+
 /// Family-local immutable identity within one structural occurrence.
 ///
-/// The occurrence-local address carries this value directly; it is not a
-/// query-global catalog or a forwarding lookup key.
+/// The occurrence-local address carries both the route's local value and its
+/// private composition arm directly; it is not a query-global catalog or a
+/// forwarding lookup key.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ProgramKey(u32);
+pub struct ProgramKey {
+    local: u32,
+    arm: ProgramRouteArm,
+}
 
 impl ProgramKey {
     pub const fn new(value: u32) -> Self {
-        Self(value)
+        Self {
+            local: value,
+            arm: ProgramRouteArm::Direct,
+        }
+    }
+
+    fn in_arm(self, arm: ProgramRouteArm) -> Self {
+        assert_eq!(
+            self.arm,
+            ProgramRouteArm::Direct,
+            "a composed Program route attempted to wrap an already-armed key"
+        );
+        Self {
+            local: self.local,
+            arm,
+        }
+    }
+
+    fn direct(self) -> Self {
+        Self::new(self.local)
     }
 }
 
@@ -648,6 +685,43 @@ pub struct ProgramRuntime {
     family_name: &'static str,
 }
 
+/// Left-biased composition of two typed Program capabilities.
+///
+/// The preferred family owns an action whenever its `route` returns `Some`;
+/// only a structural decline consults the fallback family. The selected arm
+/// is sealed into [`ProgramKey`] before the occurrence-local runtime exists.
+/// Consequently each address constructs exactly one child-native runtime and
+/// every affine resume remains in that child's unchanged typed state arena.
+/// A physical decline therefore returns to the selected family's Native step,
+/// never across the composition boundary.
+///
+/// V1 deliberately composes two direct [`TypedProgramSpec`] implementations,
+/// not another `PreferredProgram`. A one-level arm tag is sufficient for this
+/// law and cannot silently truncate a nested composition path.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct PreferredProgram<Preferred, Fallback> {
+    preferred: Preferred,
+    fallback: Fallback,
+}
+
+impl<Preferred, Fallback> PreferredProgram<Preferred, Fallback> {
+    pub fn new(preferred: Preferred, fallback: Fallback) -> Self {
+        Self {
+            preferred,
+            fallback,
+        }
+    }
+
+    pub fn preferred(&self) -> &Preferred {
+        &self.preferred
+    }
+
+    pub fn fallback(&self) -> &Fallback {
+        &self.fallback
+    }
+}
+
 /// Immutable residual-program family specification.
 ///
 /// Implementations downcast `runtime` once at the beginning of each seed or
@@ -657,7 +731,7 @@ pub struct ProgramRuntime {
 /// is returned, however, that action is owned by the Program and must never
 /// fall back to legacy residual hooks.
 trait ErasedProgramSpec {
-    fn new_runtime(&self) -> ProgramRuntime;
+    fn new_runtime(&self, key: ProgramKey) -> ProgramRuntime;
 
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute>;
 
@@ -671,19 +745,27 @@ trait ErasedProgramSpec {
     fn step_batch(
         &self,
         runtime: &mut ProgramRuntime,
+        key: ProgramKey,
         batch: ProgramBatch<'_>,
         effects: &mut ProgramBatchEffects,
     );
 
     fn complete_batch(&self, batch: ProgramCompleteBatch<'_>, effects: &mut ProgramCompleteEffects);
 
-    fn retire_activations(&self, runtime: &mut ProgramRuntime, activations: &[ProgramActivation]);
+    fn retire_activations(
+        &self,
+        runtime: &mut ProgramRuntime,
+        key: ProgramKey,
+        activations: &[ProgramActivation],
+    );
 }
 
 /// Borrowed immutable typed program behind a private erased vtable.
 ///
-/// The only constructor accepts [`TypedProgramSpec`], so custom constraints
-/// cannot bypass typed sinks, activation ownership, or novelty admission.
+/// Direct construction accepts [`TypedProgramSpec`]. Left-biased construction
+/// accepts a [`PreferredProgram`] whose two children are themselves direct
+/// typed specs. Neither path lets custom constraints bypass typed sinks,
+/// activation ownership, or novelty admission.
 #[doc(hidden)]
 #[derive(Clone, Copy)]
 pub struct ProgramRef<'a> {
@@ -695,8 +777,22 @@ impl<'a> ProgramRef<'a> {
         Self { erased: spec }
     }
 
+    pub fn preferred<Preferred, Fallback>(
+        spec: &'a PreferredProgram<Preferred, Fallback>,
+    ) -> Self
+    where
+        Preferred: TypedProgramSpec,
+        Fallback: TypedProgramSpec,
+    {
+        Self { erased: spec }
+    }
+
     pub(crate) fn new_runtime(self) -> ProgramRuntime {
-        self.erased.new_runtime()
+        self.new_runtime_for(ProgramKey::new(0))
+    }
+
+    pub(crate) fn new_runtime_for(self, key: ProgramKey) -> ProgramRuntime {
+        self.erased.new_runtime(key)
     }
 
     pub(crate) fn route(self, request: ProgramRequest) -> Option<ProgramRoute> {
@@ -718,7 +814,17 @@ impl<'a> ProgramRef<'a> {
         batch: ProgramBatch<'_>,
         effects: &mut ProgramBatchEffects,
     ) {
-        self.erased.step_batch(runtime, batch, effects);
+        self.step_batch_for(runtime, ProgramKey::new(0), batch, effects);
+    }
+
+    pub(crate) fn step_batch_for(
+        self,
+        runtime: &mut ProgramRuntime,
+        key: ProgramKey,
+        batch: ProgramBatch<'_>,
+        effects: &mut ProgramBatchEffects,
+    ) {
+        self.erased.step_batch(runtime, key, batch, effects);
     }
 
     pub(crate) fn complete_batch(
@@ -732,9 +838,10 @@ impl<'a> ProgramRef<'a> {
     pub(crate) fn retire_activations(
         self,
         runtime: &mut ProgramRuntime,
+        key: ProgramKey,
         activations: &[ProgramActivation],
     ) {
-        self.erased.retire_activations(runtime, activations);
+        self.erased.retire_activations(runtime, key, activations);
     }
 }
 
@@ -925,11 +1032,114 @@ where
     }
 }
 
+impl<Preferred, Fallback> PreferredProgram<Preferred, Fallback>
+where
+    Preferred: TypedProgramSpec,
+    Fallback: TypedProgramSpec,
+{
+    fn selected(&self, key: ProgramKey) -> (&dyn ErasedProgramSpec, ProgramKey) {
+        match key.arm {
+            ProgramRouteArm::Preferred => (&self.preferred, key.direct()),
+            ProgramRouteArm::Fallback => (&self.fallback, key.direct()),
+            ProgramRouteArm::Direct => {
+                panic!("composed Program address lost its selected semantic arm")
+            }
+        }
+    }
+}
+
+impl<Preferred, Fallback> ErasedProgramSpec for PreferredProgram<Preferred, Fallback>
+where
+    Preferred: TypedProgramSpec,
+    Fallback: TypedProgramSpec,
+{
+    fn new_runtime(&self, key: ProgramKey) -> ProgramRuntime {
+        let (selected, child_key) = self.selected(key);
+        selected.new_runtime(child_key)
+    }
+
+    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+        if let Some(mut route) = TypedProgramSpec::route(&self.preferred, request) {
+            route.key = route.key.in_arm(ProgramRouteArm::Preferred);
+            Some(route)
+        } else {
+            TypedProgramSpec::route(&self.fallback, request).map(|mut route| {
+                route.key = route.key.in_arm(ProgramRouteArm::Fallback);
+                route
+            })
+        }
+    }
+
+    fn seed_batch(
+        &self,
+        runtime: &mut ProgramRuntime,
+        batch: ProgramSeedBatch<'_>,
+        effects: &mut ProgramSeedEffects,
+    ) {
+        let (selected, child_key) = self.selected(batch.route.key);
+        selected.seed_batch(
+            runtime,
+            ProgramSeedBatch {
+                route: ProgramRoute {
+                    key: child_key,
+                    ..batch.route
+                },
+                ..batch
+            },
+            effects,
+        );
+    }
+
+    fn step_batch(
+        &self,
+        runtime: &mut ProgramRuntime,
+        key: ProgramKey,
+        batch: ProgramBatch<'_>,
+        effects: &mut ProgramBatchEffects,
+    ) {
+        let (selected, child_key) = self.selected(key);
+        selected.step_batch(runtime, child_key, batch, effects);
+    }
+
+    fn complete_batch(
+        &self,
+        batch: ProgramCompleteBatch<'_>,
+        effects: &mut ProgramCompleteEffects,
+    ) {
+        let (selected, child_key) = self.selected(batch.route.key);
+        selected.complete_batch(
+            ProgramCompleteBatch {
+                route: ProgramRoute {
+                    key: child_key,
+                    ..batch.route
+                },
+                ..batch
+            },
+            effects,
+        );
+    }
+
+    fn retire_activations(
+        &self,
+        runtime: &mut ProgramRuntime,
+        key: ProgramKey,
+        activations: &[ProgramActivation],
+    ) {
+        let (selected, child_key) = self.selected(key);
+        selected.retire_activations(runtime, child_key, activations);
+    }
+}
+
 impl<T> ErasedProgramSpec for T
 where
     T: TypedProgramSpec,
 {
-    fn new_runtime(&self) -> ProgramRuntime {
+    fn new_runtime(&self, key: ProgramKey) -> ProgramRuntime {
+        assert_eq!(
+            key.arm,
+            ProgramRouteArm::Direct,
+            "a direct typed Program received a composed route arm"
+        );
         ProgramRuntime {
             erased: Box::new(TypedProgramRuntime::<T::State, T::NoveltyKey>::default()),
             family: TypeId::of::<TypedProgramRuntime<T::State, T::NoveltyKey>>(),
@@ -947,6 +1157,11 @@ where
         batch: ProgramSeedBatch<'_>,
         effects: &mut ProgramSeedEffects,
     ) {
+        assert_eq!(
+            batch.route.key.arm,
+            ProgramRouteArm::Direct,
+            "a direct typed Program seed received a composed route arm"
+        );
         assert_eq!(batch.activations.len(), batch.view.len());
         assert_eq!(
             runtime.family,
@@ -1003,9 +1218,15 @@ where
     fn step_batch(
         &self,
         runtime: &mut ProgramRuntime,
+        key: ProgramKey,
         batch: ProgramBatch<'_>,
         effects: &mut ProgramBatchEffects,
     ) {
+        assert_eq!(
+            key.arm,
+            ProgramRouteArm::Direct,
+            "a direct typed Program step received a composed route arm"
+        );
         assert!(
             effects.placement.is_none(),
             "one ProgramBatchEffects sink received more than one physical placement"
@@ -1304,6 +1525,11 @@ where
         batch: ProgramCompleteBatch<'_>,
         effects: &mut ProgramCompleteEffects,
     ) {
+        assert_eq!(
+            batch.route.key.arm,
+            ProgramRouteArm::Direct,
+            "a direct typed Program completion received a composed route arm"
+        );
         assert!(
             matches!(batch.request.action, ProgramAction::Propose(_)),
             "typed complete actions currently support only Propose"
@@ -1362,7 +1588,17 @@ where
         effects.occurrences.extend(typed.occurrences);
     }
 
-    fn retire_activations(&self, runtime: &mut ProgramRuntime, activations: &[ProgramActivation]) {
+    fn retire_activations(
+        &self,
+        runtime: &mut ProgramRuntime,
+        key: ProgramKey,
+        activations: &[ProgramActivation],
+    ) {
+        assert_eq!(
+            key.arm,
+            ProgramRouteArm::Direct,
+            "a direct typed Program retirement received a composed route arm"
+        );
         assert_eq!(
             runtime.family,
             TypeId::of::<TypedProgramRuntime<T::State, T::NoveltyKey>>(),
@@ -1584,6 +1820,162 @@ mod tests {
                     }
                     Some(step)
                 }
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct PreferredChoiceState;
+
+    #[derive(Clone)]
+    struct FallbackChoiceState;
+
+    #[derive(Clone, Eq, Hash, PartialEq)]
+    struct PreferredChoiceKey;
+
+    #[derive(Clone, Eq, Hash, PartialEq)]
+    struct FallbackChoiceKey;
+
+    #[derive(Default)]
+    struct ChoiceCalls {
+        preferred_physical: usize,
+        preferred_native: usize,
+        fallback_native: usize,
+        preferred_complete: usize,
+    }
+
+    struct PreferredChoiceProbe {
+        calls: Arc<Mutex<ChoiceCalls>>,
+    }
+
+    impl TypedProgramSpec for PreferredChoiceProbe {
+        type State = PreferredChoiceState;
+        type NoveltyKey = PreferredChoiceKey;
+        type Rank = u8;
+
+        fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+            let ProgramAction::Propose(variable) = request.action else {
+                return None;
+            };
+            if variable > 1 {
+                return None;
+            }
+            Some(ProgramRoute {
+                key: ProgramKey::new(7),
+                variable,
+                stratum: ProgramStratum::Finite,
+                grouping: ProgramGrouping::PageLocal,
+                completion: if variable == 1 {
+                    ProgramCompletion::CompleteActionEquivalent
+                } else {
+                    ProgramCompletion::PageableOnly
+                },
+            })
+        }
+
+        fn dispatch(&self, _state: &Self::State) -> DispatchClass {
+            DispatchClass::new(70)
+        }
+
+        fn progress(&self, _state: &Self::State) -> Self::Rank {
+            1
+        }
+
+        fn seed_typed(
+            &self,
+            batch: ProgramSeedBatch<'_>,
+            effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+        ) {
+            assert_eq!(batch.route.key, ProgramKey::new(7));
+            for parent in 0..batch.view.len() {
+                effects.finite_root(parent as u32, PreferredChoiceState, None);
+            }
+        }
+
+        fn step_typed(
+            &self,
+            states: Vec<Self::State>,
+            _batch: TypedProgramBatch<'_>,
+            effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+        ) {
+            self.calls.lock().unwrap().preferred_native += 1;
+            for _ in states {
+                effects.page(1, None);
+            }
+        }
+
+        fn try_step_physical(
+            &self,
+            _states: &[Self::State],
+            _batch: TypedProgramBatch<'_>,
+        ) -> Option<TypedPhysicalStep<Self::State, Self::NoveltyKey>> {
+            self.calls.lock().unwrap().preferred_physical += 1;
+            None
+        }
+
+        fn complete_typed(
+            &self,
+            batch: ProgramCompleteBatch<'_>,
+            effects: &mut TypedCompleteSink,
+        ) {
+            assert_eq!(batch.route.key, ProgramKey::new(7));
+            self.calls.lock().unwrap().preferred_complete += 1;
+            effects.push(0, RawInline::default());
+        }
+    }
+
+    struct FallbackChoiceProbe {
+        calls: Arc<Mutex<ChoiceCalls>>,
+    }
+
+    impl TypedProgramSpec for FallbackChoiceProbe {
+        type State = FallbackChoiceState;
+        type NoveltyKey = FallbackChoiceKey;
+        type Rank = u8;
+
+        fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+            let ProgramAction::Confirm(variable) = request.action else {
+                return None;
+            };
+            Some(ProgramRoute {
+                // Deliberately collides with the preferred family's local
+                // key. The private semantic arm keeps the addresses distinct.
+                key: ProgramKey::new(7),
+                variable,
+                stratum: ProgramStratum::Finite,
+                grouping: ProgramGrouping::PageLocal,
+                completion: ProgramCompletion::PageableOnly,
+            })
+        }
+
+        fn dispatch(&self, _state: &Self::State) -> DispatchClass {
+            DispatchClass::new(71)
+        }
+
+        fn progress(&self, _state: &Self::State) -> Self::Rank {
+            1
+        }
+
+        fn seed_typed(
+            &self,
+            batch: ProgramSeedBatch<'_>,
+            effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+        ) {
+            assert_eq!(batch.route.key, ProgramKey::new(7));
+            for parent in 0..batch.view.len() {
+                effects.finite_root(parent as u32, FallbackChoiceState, None);
+            }
+        }
+
+        fn step_typed(
+            &self,
+            states: Vec<Self::State>,
+            _batch: TypedProgramBatch<'_>,
+            effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+        ) {
+            self.calls.lock().unwrap().fallback_native += 1;
+            for _ in states {
+                effects.page(1, None);
             }
         }
     }
@@ -2209,6 +2601,143 @@ mod tests {
         assert_eq!(*spec.native_states.lock().unwrap(), vec![vec![10, 11]]);
         assert_eq!(effects.pages.len(), 2);
         assert_eq!(effects.placement, None);
+    }
+
+    #[test]
+    fn preferred_program_seals_route_arm_and_keeps_child_native_state() {
+        assert_eq!(
+            std::mem::size_of::<ProgramRef<'static>>(),
+            std::mem::size_of::<&'static dyn ErasedProgramSpec>(),
+            "Program composition must not widen every direct ProgramRef"
+        );
+        let calls = Arc::new(Mutex::new(ChoiceCalls::default()));
+        let choice = PreferredProgram::new(
+            PreferredChoiceProbe {
+                calls: Arc::clone(&calls),
+            },
+            FallbackChoiceProbe {
+                calls: Arc::clone(&calls),
+            },
+        );
+        let program = ProgramRef::preferred(&choice);
+        let view = RowsView::new_with_row_count(&[], &[], 1);
+        let activations = [ProgramActivation(41)];
+        let candidate = [RawInline::default()];
+
+        let preferred_request = ProgramRequest {
+            action: ProgramAction::Propose(0),
+            bound: VariableSet::new_empty(),
+        };
+        let preferred_route = program.route(preferred_request).unwrap();
+        assert_eq!(preferred_route.key.arm, ProgramRouteArm::Preferred);
+        let mut preferred_runtime = program.new_runtime_for(preferred_route.key);
+        let mut preferred_seed = ProgramSeedEffects::default();
+        program.seed_batch(
+            &mut preferred_runtime,
+            ProgramSeedBatch {
+                request: preferred_request,
+                route: preferred_route,
+                view,
+                activations: &activations,
+            },
+            &mut preferred_seed,
+        );
+        let preferred_work: Vec<_> = preferred_seed
+            .work
+            .into_iter()
+            .map(|seed| seed.work)
+            .collect();
+        let mut preferred_effects = ProgramBatchEffects::default();
+        program.step_batch_for(
+            &mut preferred_runtime,
+            preferred_route.key,
+            ProgramBatch {
+                stratum: preferred_route.stratum,
+                view,
+                candidate_sets: &[None],
+                activations: &activations,
+                work: &preferred_work,
+                limits: &[1],
+            },
+            &mut preferred_effects,
+        );
+        assert_eq!(preferred_effects.pages.len(), 1);
+        {
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.preferred_physical, 1);
+            assert_eq!(calls.preferred_native, 1);
+            assert_eq!(calls.fallback_native, 0);
+        }
+        program.retire_activations(
+            &mut preferred_runtime,
+            preferred_route.key,
+            &activations,
+        );
+
+        let fallback_request = ProgramRequest {
+            action: ProgramAction::Confirm(0),
+            bound: VariableSet::new_empty(),
+        };
+        let fallback_route = program.route(fallback_request).unwrap();
+        assert_eq!(fallback_route.key.arm, ProgramRouteArm::Fallback);
+        assert_eq!(preferred_route.key.local, fallback_route.key.local);
+        assert_ne!(preferred_route.key, fallback_route.key);
+        let mut fallback_runtime = program.new_runtime_for(fallback_route.key);
+        let mut fallback_seed = ProgramSeedEffects::default();
+        program.seed_batch(
+            &mut fallback_runtime,
+            ProgramSeedBatch {
+                request: fallback_request,
+                route: fallback_route,
+                view,
+                activations: &activations,
+            },
+            &mut fallback_seed,
+        );
+        let fallback_work: Vec<_> = fallback_seed
+            .work
+            .into_iter()
+            .map(|seed| seed.work)
+            .collect();
+        let mut fallback_effects = ProgramBatchEffects::default();
+        program.step_batch_for(
+            &mut fallback_runtime,
+            fallback_route.key,
+            ProgramBatch {
+                stratum: fallback_route.stratum,
+                view,
+                candidate_sets: &[Some(&candidate)],
+                activations: &activations,
+                work: &fallback_work,
+                limits: &[1],
+            },
+            &mut fallback_effects,
+        );
+        assert_eq!(fallback_effects.pages.len(), 1);
+        assert_eq!(calls.lock().unwrap().fallback_native, 1);
+        program.retire_activations(
+            &mut fallback_runtime,
+            fallback_route.key,
+            &activations,
+        );
+
+        let complete_request = ProgramRequest {
+            action: ProgramAction::Propose(1),
+            bound: VariableSet::new_empty(),
+        };
+        let complete_route = program.route(complete_request).unwrap();
+        assert_eq!(complete_route.key.arm, ProgramRouteArm::Preferred);
+        let mut complete = ProgramCompleteEffects::default();
+        program.complete_batch(
+            ProgramCompleteBatch {
+                request: complete_request,
+                route: complete_route,
+                view,
+            },
+            &mut complete,
+        );
+        assert_eq!(complete.occurrences, [(0, RawInline::default())]);
+        assert_eq!(calls.lock().unwrap().preferred_complete, 1);
     }
 
     #[test]

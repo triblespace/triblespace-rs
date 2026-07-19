@@ -16,6 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Typed Program capabilities compose by immutable semantic route arm.**
+  `PreferredProgram` chooses a preferred typed family only when that family
+  structurally owns an action, otherwise choosing a canonical typed fallback
+  before runtime construction. The private arm is part of the occurrence-local
+  Program address, while each selected child keeps its own state and novelty
+  arena unchanged. A physical backend decline therefore runs that same child's
+  Native step and never crosses into the semantic fallback. Direct programs
+  retain the original single-trait-object `ProgramRef` and unchanged runtime;
+  composition adds no state enum, handle tag, or per-row dispatch.
 - **Typed Program novelty commits from one fully validated batch plan.** The
   erased adapter now checks batch-local repetitions before consulting runtime
   novelty, records first admissions in receipt order, and mutates runtime state
@@ -428,10 +437,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   constraint and exposes one typed Program for `(A,V) -> E`, `(E,V) -> A`, and
   `(E,A) -> V` proposals. One immutable rotation descriptor drives both Native
   paging and resident WGPU dispatch with exact ragged grants, absolute
-  continuations, branded receipts, and bag semantics; every declined action
-  falls back on the untouched cohort. Placement is Off by default and `Force`
-  is the all-target parity probe. The experimental `WarmM4` score remains
-  calibrated only for `(E,A) -> V`; E/A targets decline Native until measured.
+  continuations, branded receipts, and bag semantics. Its typed capability is
+  now left-biased over the canonical Succinct Program: qualifying two-bound
+  proposals select the resident family, while insufficiently bound proposals,
+  Confirm, and Support select the canonical family before runtime construction.
+  Physical decline remains within the selected family. Placement is Off by
+  default and `Force` is the all-target parity probe. The experimental `WarmM4`
+  score remains calibrated only for `(E,A) -> V`; E/A targets decline Native
+  until measured.
 - **Resident value routes expose honest snapshot-local preparation.**
   `WgpuSuccinctArchive::prepare_value_route` synchronously runs one real
   nonempty `(E,A) -> V` parent with grant one through the exact production

@@ -12,7 +12,8 @@
 //! - `ProgramAction::Propose(target)` when the other two axes of the one E/A/V
 //!   pattern are already bound or constant.
 //! - `None` for every insufficiently bound Propose and every Confirm/Support;
-//!   those actions return to the ordinary constraint protocol unchanged.
+//!   the wrapper's left-biased composition assigns those actions to the
+//!   canonical [`SuccinctArchiveConstraint`] Program instead.
 //!
 //! # Interval-in-state
 //!
@@ -73,7 +74,7 @@ use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::{InlineEncoding, RawInline};
 use triblespace_core::query::{
     CandidateSink, Constraint, ConstraintChildren, ConstraintShape, DispatchClass, EstimateSink,
-    ProgramAction, ProgramCompletion, ProgramGrouping, ProgramKey, ProgramPacing,
+    PreferredProgram, ProgramAction, ProgramCompletion, ProgramGrouping, ProgramKey, ProgramPacing,
     ProgramPhysicalReceipt, ProgramRef, ProgramRequest, ProgramRoute, ProgramSeedBatch,
     ProgramStratum, RawTerm, ResidualDeltaExpandBatch, ResidualDeltaExpandCursor,
     ResidualDeltaExpandPage, ResidualDeltaNode, ResidualDeltaOutput, ResidualDeltaSeed,
@@ -1077,7 +1078,9 @@ impl<'a, U: Universe> TypedProgramSpec for SuccinctTwoBoundFamily<'a, U> {
 
     /// Selects exactly one of the three semantic two-bound Propose actions.
     /// Every Confirm, Support, already-bound target, or insufficiently bound
-    /// peer schema returns to the ordinary constraint protocol.
+    /// peer schema is structurally declined. The resident wrapper composes
+    /// this family over the canonical Succinct Program, which owns those
+    /// actions before execution begins.
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
         let core = &self.core;
         let ProgramAction::Propose(variable) = request.action else {
@@ -1349,15 +1352,73 @@ where
             self.admission,
             Arc::clone(&self.counters),
         );
-        ResidentTwoBoundConstraint {
-            inner: SuccinctArchiveConstraint::with_ring_batch(
-                e,
-                a,
-                v,
-                self.gpu.archive(),
-                self.gpu,
-            ),
-            family,
+        let canonical = SuccinctArchiveConstraint::with_ring_batch(
+            e,
+            a,
+            v,
+            self.gpu.archive(),
+            self.gpu,
+        );
+        let program = match family {
+            Some(preferred) => {
+                ResidentProgram::Preferred(PreferredProgram::new(preferred, canonical))
+            }
+            None => ResidentProgram::Canonical(canonical),
+        };
+        ResidentTwoBoundConstraint { program }
+    }
+}
+
+/// One stored semantic Program choice for the resident wrapper.
+///
+/// Keeping the canonical constraint inside the choice avoids duplicating it:
+/// ordinary [`Constraint`] delegation and typed fallback both borrow the same
+/// immutable value. The enum is selected when the pattern is constructed,
+/// never while a Program continuation is live.
+enum ResidentProgram<'a, U>
+where
+    U: Universe,
+{
+    Canonical(SuccinctArchiveConstraint<'a, U>),
+    Preferred(
+        PreferredProgram<SuccinctTwoBoundFamily<'a, U>, SuccinctArchiveConstraint<'a, U>>,
+    ),
+}
+
+impl<U> Clone for ResidentProgram<'_, U>
+where
+    U: Universe,
+{
+    fn clone(&self) -> Self {
+        match self {
+            Self::Canonical(canonical) => Self::Canonical(*canonical),
+            Self::Preferred(program) => Self::Preferred(program.clone()),
+        }
+    }
+}
+
+impl<'a, U> ResidentProgram<'a, U>
+where
+    U: Universe,
+{
+    fn canonical(&self) -> &SuccinctArchiveConstraint<'a, U> {
+        match self {
+            Self::Canonical(canonical) => canonical,
+            Self::Preferred(program) => program.fallback(),
+        }
+    }
+
+    fn preferred(&self) -> Option<&SuccinctTwoBoundFamily<'a, U>> {
+        match self {
+            Self::Canonical(_) => None,
+            Self::Preferred(program) => Some(program.preferred()),
+        }
+    }
+
+    fn program_ref(&self) -> ProgramRef<'_> {
+        match self {
+            Self::Canonical(canonical) => ProgramRef::new(canonical),
+            Self::Preferred(program) => ProgramRef::preferred(program),
         }
     }
 }
@@ -1365,24 +1426,22 @@ where
 /// Owning wrapper constraint of the resident two-bound route.
 ///
 /// Every ordinary [`Constraint`] method and hook delegates verbatim to the
-/// canonical [`SuccinctArchiveConstraint`]; the only addition is the
-/// [`residual_program`](Constraint::residual_program) capability exposing
-/// [`SuccinctTwoBoundFamily`]. Patterns without a variable or with a variable
-/// repeated across axes carry no family and behave exactly like the canonical
-/// constraint.
+/// canonical [`SuccinctArchiveConstraint`]. Its Program capability is a
+/// left-biased semantic choice: qualifying two-bound proposals use
+/// [`SuccinctTwoBoundFamily`], while every structurally declined action uses
+/// the canonical Succinct Program. Patterns without a variable or with a
+/// variable repeated across axes carry only the canonical program.
 pub struct ResidentTwoBoundConstraint<'a, U>
 where
     U: Universe,
 {
-    inner: SuccinctArchiveConstraint<'a, U>,
-    family: Option<SuccinctTwoBoundFamily<'a, U>>,
+    program: ResidentProgram<'a, U>,
 }
 
 impl<U: Universe> Clone for ResidentTwoBoundConstraint<'_, U> {
     fn clone(&self) -> Self {
         Self {
-            inner: self.inner,
-            family: self.family.clone(),
+            program: self.program.clone(),
         }
     }
 }
@@ -1393,14 +1452,14 @@ where
 {
     /// The typed family of this pattern, when it has a two-bound action arm.
     pub fn family(&self) -> Option<&SuccinctTwoBoundFamily<'a, U>> {
-        self.family.as_ref()
+        self.program.preferred()
     }
 
     /// A relaxed snapshot of the route's shared decision counters, or the
     /// zero snapshot when this pattern carries no family.
     pub fn route_counters(&self) -> TwoBoundRouteCountersSnapshot {
-        self.family
-            .as_ref()
+        self.program
+            .preferred()
             .map(SuccinctTwoBoundFamily::counters)
             .unwrap_or_default()
     }
@@ -1411,7 +1470,7 @@ where
     U: Universe,
 {
     fn variables(&self) -> VariableSet {
-        self.inner.variables()
+        self.program.canonical().variables()
     }
 
     fn estimate(
@@ -1420,7 +1479,7 @@ where
         view: &RowsView<'_>,
         out: &mut EstimateSink<'_>,
     ) -> bool {
-        self.inner.estimate(variable, view, out)
+        self.program.canonical().estimate(variable, view, out)
     }
 
     fn propose(
@@ -1429,7 +1488,7 @@ where
         view: &RowsView<'_>,
         candidates: &mut CandidateSink<'_>,
     ) {
-        self.inner.propose(variable, view, candidates)
+        self.program.canonical().propose(variable, view, candidates)
     }
 
     fn confirm(
@@ -1438,49 +1497,55 @@ where
         view: &RowsView<'_>,
         candidates: &mut CandidateSink<'_>,
     ) {
-        self.inner.confirm(variable, view, candidates)
+        self.program.canonical().confirm(variable, view, candidates)
     }
 
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
-        self.inner.satisfied(view)
+        self.program.canonical().satisfied(view)
     }
 
     fn influence(&self, variable: VariableId) -> VariableSet {
-        self.inner.influence(variable)
+        self.program.canonical().influence(variable)
     }
 
     fn residual_shape(&self) -> ConstraintShape<'_, 'a> {
-        self.inner.residual_shape()
+        self.program.canonical().residual_shape()
     }
 
     fn residual_union_children(&self) -> Option<&dyn ConstraintChildren<'a>> {
-        self.inner.residual_union_children()
+        self.program.canonical().residual_union_children()
     }
 
     fn residual_confirm_is_page_local(&self) -> bool {
-        self.inner.residual_confirm_is_page_local()
+        self.program.canonical().residual_confirm_is_page_local()
     }
 
     fn residual_delta_confirm_grouping_requirements(
         &self,
         variable: VariableId,
     ) -> Option<VariableSet> {
-        self.inner
+        self.program
+            .canonical()
             .residual_delta_confirm_grouping_requirements(variable)
     }
 
-    /// The one addition over the canonical constraint: the typed two-bound
-    /// family, when the pattern has at least one variable and no repeated one.
+    /// Qualifying two-bound proposals prefer the resident family. Every other
+    /// action is owned by the canonical Succinct Program before execution;
+    /// physical placement decline never changes that semantic choice.
     fn residual_program(&self) -> Option<ProgramRef<'_>> {
-        self.family.as_ref().map(ProgramRef::new)
+        Some(self.program.program_ref())
     }
 
     fn residual_delta_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
-        self.inner.residual_delta_source_is_paged(variable, view)
+        self.program
+            .canonical()
+            .residual_delta_source_is_paged(variable, view)
     }
 
     fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
-        self.inner.residual_proposal_source_is_paged(variable, view)
+        self.program
+            .canonical()
+            .residual_proposal_source_is_paged(variable, view)
     }
 
     fn residual_proposal_source_has_transition_roots(
@@ -1488,7 +1553,8 @@ where
         variable: VariableId,
         view: &RowsView<'_>,
     ) -> bool {
-        self.inner
+        self.program
+            .canonical()
             .residual_proposal_source_has_transition_roots(variable, view)
     }
 
@@ -1502,7 +1568,8 @@ where
         roots: &mut Vec<ResidualDeltaOutput>,
         accepted: &mut Vec<RawInline>,
     ) -> Option<ResidualDeltaSourcePage> {
-        self.inner
+        self.program
+            .canonical()
             .residual_delta_source_page(variable, view, candidates, cursor, limit, roots, accepted)
     }
 
@@ -1514,7 +1581,8 @@ where
         roots: &mut Vec<(u32, ResidualDeltaOutput)>,
         accepted: &mut Vec<(u32, RawInline)>,
     ) -> bool {
-        self.inner
+        self.program
+            .canonical()
             .residual_delta_source_pages(variable, batch, pages, roots, accepted)
     }
 
@@ -1524,7 +1592,9 @@ where
         view: &RowsView<'_>,
         seeds: &mut Vec<ResidualDeltaSeed>,
     ) -> bool {
-        self.inner.residual_delta_seeds(variable, view, seeds)
+        self.program
+            .canonical()
+            .residual_delta_seeds(variable, view, seeds)
     }
 
     fn residual_delta_support_seeds(
@@ -1532,7 +1602,9 @@ where
         view: &RowsView<'_>,
         seeds: &mut Vec<ResidualDeltaSeed>,
     ) -> Option<VariableId> {
-        self.inner.residual_delta_support_seeds(view, seeds)
+        self.program
+            .canonical()
+            .residual_delta_support_seeds(view, seeds)
     }
 
     fn residual_delta_expand_page(
@@ -1543,7 +1615,8 @@ where
         limit: usize,
         successors: &mut Vec<ResidualDeltaOutput>,
     ) -> Option<ResidualDeltaExpandPage> {
-        self.inner
+        self.program
+            .canonical()
             .residual_delta_expand_page(variable, node, cursor, limit, successors)
     }
 
@@ -1554,7 +1627,8 @@ where
         pages: &mut Vec<Option<ResidualDeltaExpandPage>>,
         successors: &mut Vec<(u32, ResidualDeltaOutput)>,
     ) {
-        self.inner
+        self.program
+            .canonical()
             .residual_delta_expand_pages(variable, batch, pages, successors)
     }
 
@@ -1564,7 +1638,8 @@ where
         nodes: &[ResidualDeltaNode],
         successors: &mut Vec<(u32, ResidualDeltaOutput)>,
     ) -> bool {
-        self.inner
+        self.program
+            .canonical()
             .residual_delta_expand(variable, nodes, successors)
     }
 }
@@ -1791,7 +1866,8 @@ mod tests {
         assert_ne!(keys[1], keys[2]);
         assert_ne!(keys[0], keys[2]);
 
-        // Everything else returns to the ordinary constraint protocol.
+        // The narrow family structurally declines everything else; the public
+        // wrapper assigns those requests to its canonical Succinct child.
         assert!(route(ProgramAction::Propose(2), &[0]).is_none());
         assert!(route(ProgramAction::Propose(2), &[1]).is_none());
         assert!(route(ProgramAction::Propose(2), &[0, 1, 2]).is_none());
