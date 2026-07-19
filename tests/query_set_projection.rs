@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use triblespace::core::inline::encodings::iu256::U256BE;
-use triblespace::core::inline::{Inline, TryFromInline};
+use triblespace::core::inline::{Inline, RawInline, TryFromInline};
 use triblespace::core::query::{
     CandidateSink, Constraint, EstimateSink, Query, RowsView, VariableContext, VariableId,
     VariableSet,
@@ -28,6 +28,65 @@ struct CountingHiddenFanout {
     witness: VariableId,
     tail: VariableId,
     tail_rows: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+struct LateUnaryFilter {
+    variable: VariableId,
+    accepted: RawInline,
+    rejected_seen: Arc<AtomicUsize>,
+    accepted_seen: Arc<AtomicUsize>,
+}
+
+impl Constraint<'_> for LateUnaryFilter {
+    fn variables(&self) -> VariableSet {
+        VariableSet::new_singleton(self.variable)
+    }
+
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        if variable != self.variable {
+            return false;
+        }
+        out.fill(usize::MAX, view.len());
+        true
+    }
+
+    fn propose(
+        &self,
+        variable: VariableId,
+        _view: &RowsView<'_>,
+        _candidates: &mut CandidateSink<'_>,
+    ) {
+        assert_ne!(variable, self.variable, "late filter became the proposer");
+    }
+
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        assert_eq!(variable, self.variable);
+        candidates.retain(|_, value| {
+            if *value == self.accepted {
+                self.accepted_seen.fetch_add(1, Ordering::SeqCst);
+                true
+            } else {
+                self.rejected_seen.fetch_add(1, Ordering::SeqCst);
+                false
+            }
+        });
+    }
+
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        view.col(self.variable)
+            .is_none_or(|column| view.iter().all(|row| row[column] == self.accepted))
+    }
 }
 
 impl Constraint<'_> for CountingHiddenFanout {
@@ -105,6 +164,72 @@ fn explicit_projection_is_distinct_across_serial_schedulers() {
     assert_eq!(make().solve_dag_lazy().count(), 1);
     assert_eq!(make().solve_residual_state_lazy().count(), 1);
     assert_eq!(make().solve_residual_state().len(), 1);
+}
+
+#[test]
+fn hidden_existential_claim_waits_for_a_complete_correlated_witness() {
+    let one = U256BE::inline_from(1u64);
+    let rejected = U256BE::inline_from(10u64);
+    let accepted = U256BE::inline_from(20u64);
+    let rejected_seen = Arc::new(AtomicUsize::new(0));
+    let accepted_seen = Arc::new(AtomicUsize::new(0));
+
+    let rows = find!(
+        x: Inline<U256BE>,
+        temp!((y), and!(
+            x.is(one),
+            or!(y.is(rejected), y.is(accepted)),
+            LateUnaryFilter {
+                variable: y.index,
+                accepted: accepted.raw,
+                rejected_seen: Arc::clone(&rejected_seen),
+                accepted_seen: Arc::clone(&accepted_seen),
+            }
+        ))
+    )
+    .collect::<Vec<_>>();
+
+    assert_eq!(rows, vec![one]);
+    assert!(
+        rejected_seen.load(Ordering::SeqCst) > 0,
+        "the rejected R witness must reach the correlated S filter"
+    );
+    assert!(
+        accepted_seen.load(Ordering::SeqCst) > 0,
+        "a later complete witness must remain able to claim the projected key"
+    );
+}
+
+#[test]
+fn projection_key_includes_every_visible_tail_across_hidden_witnesses() {
+    let x_value = U256BE::inline_from(1u64);
+    let y_left = U256BE::inline_from(10u64);
+    let y_right = U256BE::inline_from(20u64);
+    let z_left = U256BE::inline_from(100u64);
+    let z_right = U256BE::inline_from(200u64);
+    let make = || {
+        find!(
+            (x: Inline<U256BE>, z: Inline<U256BE>),
+            temp!((y), and!(
+                x.is(x_value),
+                or!(y.is(y_left), y.is(y_right)),
+                or!(
+                    and!(y.is(y_left), z.is(z_left)),
+                    and!(y.is(y_right), z.is(z_right))
+                )
+            ))
+        )
+    };
+    let expected = vec![(x_value, z_left), (x_value, z_right)];
+    let sorted = |mut rows: Vec<(Inline<U256BE>, Inline<U256BE>)>| {
+        rows.sort_unstable_by_key(|(_, z)| z.raw);
+        rows
+    };
+
+    assert_eq!(sorted(make().collect()), expected);
+    assert_eq!(sorted(make().sequential().collect()), expected);
+    assert_eq!(sorted(make().solve_dag_lazy().collect()), expected);
+    assert_eq!(sorted(make().solve_residual_state_lazy().collect()), expected);
 }
 
 #[test]
