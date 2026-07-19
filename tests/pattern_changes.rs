@@ -101,3 +101,37 @@ fn pattern_changes_multi_entity_delta_only_new_results() {
         "expected only new book, got: {results:?}"
     );
 }
+
+#[test]
+fn pattern_changes_set_identity_is_scoped_to_each_delta_invocation() {
+    let first = ufoid();
+    let second = ufoid();
+    let third = ufoid();
+
+    let mut first_delta = TribleSet::new();
+    first_delta += entity! { &first @ literature::title: "Shared" };
+    first_delta += entity! { &second @ literature::title: "Shared" };
+    let first_full = first_delta.clone();
+
+    let first_results = find!(
+        title: String,
+        pattern_changes!(&first_full, &first_delta, [
+            { _?book @ literature::title: ?title }
+        ])
+    )
+    .collect::<Vec<_>>();
+    assert_eq!(first_results, vec!["Shared".to_owned()]);
+
+    let mut second_delta = TribleSet::new();
+    second_delta += entity! { &third @ literature::title: "Shared" };
+    let second_full = first_full + second_delta.clone();
+
+    let second_results = find!(
+        title: String,
+        pattern_changes!(&second_full, &second_delta, [
+            { _?book @ literature::title: ?title }
+        ])
+    )
+    .collect::<Vec<_>>();
+    assert_eq!(second_results, vec!["Shared".to_owned()]);
+}

@@ -239,6 +239,20 @@ impl TryFromInline<'_, U256BE> for Collapsed {
     }
 }
 
+static FAILED_CONVERSIONS: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug)]
+struct AlwaysFails;
+
+impl TryFromInline<'_, U256BE> for AlwaysFails {
+    type Error = ();
+
+    fn try_from_inline(_: &Inline<U256BE>) -> Result<Self, Self::Error> {
+        FAILED_CONVERSIONS.fetch_add(1, Ordering::SeqCst);
+        Err(())
+    }
+}
+
 #[test]
 fn distinctness_uses_raw_head_bytes_not_converted_rust_equality() {
     let one = U256BE::inline_from(1u64);
@@ -246,6 +260,43 @@ fn distinctness_uses_raw_head_bytes_not_converted_rust_equality() {
     let rows = find!(value: Collapsed, or!(value.is(one), value.is(two))).collect::<Vec<_>>();
 
     assert_eq!(rows, vec![Collapsed, Collapsed]);
+}
+
+#[test]
+fn failed_conversion_consumes_the_raw_key_before_hidden_witnesses_retry_it() {
+    FAILED_CONVERSIONS.store(0, Ordering::SeqCst);
+
+    let one = U256BE::inline_from(1u64);
+    let left = U256BE::inline_from(10u64);
+    let right = U256BE::inline_from(20u64);
+    let rows = find!(
+        head: AlwaysFails,
+        temp!((witness), and!(
+            head.is(one),
+            or!(witness.is(left), witness.is(right))
+        ))
+    )
+    .collect::<Vec<_>>();
+
+    assert!(rows.is_empty());
+    assert_eq!(FAILED_CONVERSIONS.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn ordered_raw_head_tuples_do_not_collapse_swapped_values() {
+    let one = U256BE::inline_from(1u64);
+    let two = U256BE::inline_from(2u64);
+    let mut rows = find!(
+        (left: Inline<U256BE>, right: Inline<U256BE>),
+        or!(
+            and!(left.is(one), right.is(two)),
+            and!(left.is(two), right.is(one))
+        )
+    )
+    .collect::<Vec<_>>();
+    rows.sort_unstable_by_key(|(left, _)| left.raw);
+
+    assert_eq!(rows, vec![(one, two), (two, one)]);
 }
 
 #[test]
