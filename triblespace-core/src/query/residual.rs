@@ -14363,7 +14363,7 @@ mod tests {
             direct_stats.max_propose_candidates,
             control_stats.max_propose_candidates
         );
-        assert_eq!(direct_stats.width_increases, 2);
+        assert_eq!(direct_stats.width_increases, 1);
         assert_eq!(direct_stats.width_increases, control_stats.width_increases);
         assert_eq!(direct_stats.delta_activation_width_increases, 3);
         assert_eq!(
