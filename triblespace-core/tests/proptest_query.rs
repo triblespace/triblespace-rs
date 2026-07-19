@@ -1,8 +1,9 @@
 use proptest::collection::vec;
 use proptest::prelude::*;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use triblespace_core::id::rngid;
 use triblespace_core::inline::encodings::genid::GenId;
+use triblespace_core::inline::encodings::shortstring::ShortString;
 use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::prelude::*;
 use triblespace_core::query::regularpathconstraint::{PathOp, RegularPathConstraint};
@@ -475,44 +476,53 @@ proptest! {
     ) {
         let hub = rngid();
         let mut set = TribleSet::new();
+        let mut expected_full: BTreeSet<(Inline<GenId>, Inline<ShortString>)> =
+            BTreeSet::new();
         set += entity! { &hub @ test_ns::label: "hub" };
 
         for name in &names {
             let e = rngid();
+            expected_full.insert(((&e).to_inline(), name.as_str().to_inline()));
             set += entity! { &e @ test_ns::label: name.as_str(), test_ns::link: &hub };
         }
 
-        // Projecting the entity: get both name and entity
-        let full_results: Vec<(Inline<_>, String)> = find!(
-            (entity: Inline<_>, name: String),
+        // The full head preserves distinctions between entities carrying an
+        // equal label because the entity bytes remain part of the row key.
+        let full_results: Vec<(Inline<GenId>, Inline<ShortString>)> = find!(
+            (entity: Inline<GenId>, name: Inline<ShortString>),
             pattern!(&set, [
                 { ?entity @ test_ns::label: ?name, test_ns::link: _?target },
                 { _?target @ test_ns::label: "hub" }
             ])
         ).collect();
 
-        // With `_?entity`: get just name
-        let name_only: Vec<String> = find!(
-            name: String,
+        // With `_?entity`, equal raw labels witnessed by multiple entities
+        // collapse to one strict-head row.
+        let name_only: Vec<Inline<ShortString>> = find!(
+            name: Inline<ShortString>,
             pattern!(&set, [
                 { _?entity @ test_ns::label: ?name, test_ns::link: _?target },
                 { _?target @ test_ns::label: "hub" }
             ])
         ).collect();
 
-        // Both should find the same names
-        let mut full_names: Vec<String> = full_results.into_iter().map(|(_, n)| n).collect();
-        let mut names_only_sorted = name_only.clone();
-        full_names.sort();
-        names_only_sorted.sort();
-        prop_assert_eq!(full_names, names_only_sorted,
-            "hiding entity variable should not affect join results");
+        let actual_full: BTreeSet<_> = full_results.iter().cloned().collect();
+        let actual_names: BTreeSet<_> = name_only.iter().cloned().collect();
+        let projected_full_names: BTreeSet<_> =
+            full_results.iter().map(|(_, name)| *name).collect();
+        let expected_names: BTreeSet<Inline<ShortString>> = names
+            .iter()
+            .map(|name| name.as_str().to_inline())
+            .collect();
 
-        // And should find all expected names
-        for name in &names {
-            prop_assert!(name_only.contains(name),
-                "missing {:?}", name);
-        }
+        prop_assert_eq!(&actual_full, &expected_full);
+        prop_assert_eq!(full_results.len(), actual_full.len(),
+            "the full head must itself contain no duplicate raw tuples");
+        prop_assert_eq!(&actual_names, &expected_names);
+        prop_assert_eq!(name_only.len(), actual_names.len(),
+            "the strict head must emit each raw label once");
+        prop_assert_eq!(projected_full_names, actual_names,
+            "hiding the entity must preserve the joined label set");
     }
 
     // ── Intersect query equals and! of queries ─────────────────────────

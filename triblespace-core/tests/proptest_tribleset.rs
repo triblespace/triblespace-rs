@@ -1,5 +1,7 @@
 use proptest::collection::vec;
 use proptest::prelude::*;
+use std::collections::BTreeSet;
+use triblespace_core::inline::encodings::shortstring::ShortString;
 use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::prelude::*;
 use triblespace_core::query::TriblePattern;
@@ -392,20 +394,19 @@ proptest! {
         let delta = full.difference(&base);
 
         // pattern_changes with computed delta should return only the new labels
-        let mut changes: Vec<String> = find!(
-            label: String,
+        let changes: BTreeSet<Inline<ShortString>> = find!(
+            label: Inline<ShortString>,
             pattern_changes!(&full, &delta, [
                 { test_ns::label: ?label }
             ])
         ).collect();
-        changes.sort();
-
-        // Each delta entity with a label produces one result
-        let mut expected: Vec<String> = delta_labels.into_iter().collect();
-        expected.sort();
+        let expected: BTreeSet<Inline<ShortString>> = delta_labels
+            .iter()
+            .map(|label| label.as_str().to_inline())
+            .collect();
 
         prop_assert_eq!(changes, expected,
-            "pattern_changes via difference should yield exactly the new labels");
+            "pattern_changes via difference should yield the distinct new raw labels");
     }
 
     #[test]

@@ -2,7 +2,9 @@ use ed25519_dalek::SigningKey;
 use proptest::collection::vec;
 use proptest::prelude::*;
 use rand::rngs::OsRng;
+use std::collections::BTreeSet;
 use triblespace_core::id::rngid;
+use triblespace_core::inline::encodings::shortstring::ShortString;
 use triblespace_core::prelude::*;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::Repository;
@@ -44,13 +46,14 @@ proptest! {
             "checkout should contain all committed tribles");
 
         // Query should return all labels
-        let mut found: Vec<String> = find!(
-            label: String,
+        let found: BTreeSet<Inline<ShortString>> = find!(
+            label: Inline<ShortString>,
             pattern!(&checkout, [{ test_ns::label: ?label }])
         ).collect();
-        let mut expected: Vec<String> = labels.clone();
-        found.sort();
-        expected.sort();
+        let expected: BTreeSet<Inline<ShortString>> = labels
+            .iter()
+            .map(|label| label.as_str().to_inline())
+            .collect();
         prop_assert_eq!(found, expected);
     }
 
@@ -125,13 +128,14 @@ proptest! {
         let mut ws2 = repo.pull(*branch_id).expect("pull2");
         let checkout = ws2.checkout(..).expect("checkout");
 
-        let mut found: Vec<String> = find!(
-            label: String,
+        let found: BTreeSet<Inline<ShortString>> = find!(
+            label: Inline<ShortString>,
             pattern!(&checkout, [{ test_ns::label: ?label }])
         ).collect();
-        let mut expected: Vec<String> = labels;
-        found.sort();
-        expected.sort();
+        let expected: BTreeSet<Inline<ShortString>> = labels
+            .iter()
+            .map(|label| label.as_str().to_inline())
+            .collect();
         prop_assert_eq!(found, expected,
             "push then pull should preserve all data");
     }
@@ -178,28 +182,29 @@ proptest! {
         let mut ws2 = repo.pull(*branch_id).expect("pull");
         let delta = ws2.checkout(full.commits()..).expect("delta");
 
-        let delta_labels: Vec<String> = find!(
-            label: String,
+        let delta_labels: BTreeSet<Inline<ShortString>> = find!(
+            label: Inline<ShortString>,
             pattern!(&delta, [{ test_ns::label: ?label }])
         ).collect();
-
-        // Delta should contain batch2 labels
-        for label in &batch2 {
-            prop_assert!(delta_labels.contains(label),
-                "delta missing {:?}", label);
-        }
-        // Delta should NOT contain batch1 labels (unless they happen to
-        // also be in batch2 by coincidence — different entities though)
-        prop_assert_eq!(delta_labels.len(), batch2.len(),
-            "delta should have exactly batch2 count");
+        let expected_delta: BTreeSet<Inline<ShortString>> = batch2
+            .iter()
+            .map(|label| label.as_str().to_inline())
+            .collect();
+        prop_assert_eq!(&delta_labels, &expected_delta,
+            "the incremental checkout should project batch2's distinct raw labels");
 
         // Accumulate: full += &delta
         full += &delta;
-        let all_labels: Vec<String> = find!(
-            label: String,
+        let all_labels: BTreeSet<Inline<ShortString>> = find!(
+            label: Inline<ShortString>,
             pattern!(&full, [{ test_ns::label: ?label }])
         ).collect();
-        prop_assert_eq!(all_labels.len(), batch1.len() + batch2.len());
+        let expected_all: BTreeSet<Inline<ShortString>> = batch1
+            .iter()
+            .chain(batch2.iter())
+            .map(|label| label.as_str().to_inline())
+            .collect();
+        prop_assert_eq!(all_labels, expected_all);
     }
 
     // ── Workspace merge ────────────────────────────────────────────────
@@ -300,11 +305,16 @@ proptest! {
         combined += &checkout2;
 
         // Combined should have all labels
-        let found: Vec<String> = find!(
-            label: String,
+        let found: BTreeSet<Inline<ShortString>> = find!(
+            label: Inline<ShortString>,
             pattern!(&combined, [{ test_ns::label: ?label }])
         ).collect();
-        prop_assert_eq!(found.len(), batch1.len() + batch2.len());
+        let expected: BTreeSet<Inline<ShortString>> = batch1
+            .iter()
+            .chain(batch2.iter())
+            .map(|label| label.as_str().to_inline())
+            .collect();
+        prop_assert_eq!(found, expected);
 
         // Combined commits should cover both checkouts
         // A third incremental checkout should yield nothing new
