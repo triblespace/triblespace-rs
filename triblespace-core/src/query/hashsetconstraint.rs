@@ -14,6 +14,11 @@ use super::*;
 /// Proposals enumerate every element in the set; confirmations retain
 /// only proposals that the set contains. Accepts `&HashSet<T>`,
 /// `Rc<HashSet<T>>`, and `Arc<HashSet<T>>` as the backing store.
+///
+/// The typed residual Program owns pointwise Confirm and Support only.
+/// Propose deliberately stays on the ordinary eager path: `std::HashSet`
+/// exposes no owned resumable cursor, and materializing one during Program
+/// seeding would hide O(n) work outside the affine budget.
 pub struct SetConstraint<S: InlineEncoding, R, T>
 where
     R: Deref<Target = HashSet<T>>,
@@ -29,6 +34,75 @@ where
     /// Creates a constraint that restricts `variable` to values in `set`.
     pub fn new(variable: Variable<S>, set: R) -> Self {
         SetConstraint { variable, set }
+    }
+}
+
+impl<S: InlineEncoding, R, T> SetConstraint<S, R, T>
+where
+    T: std::cmp::Eq + std::hash::Hash + for<'b> TryFromInline<'b, S>,
+    R: Deref<Target = HashSet<T>>,
+{
+    fn contains_raw(&self, value: &RawInline) -> bool {
+        match TryFromInline::try_from_inline(Inline::<S>::as_transmute_raw(value)) {
+            Ok(value) => self.set.contains(&value),
+            Err(_) => false,
+        }
+    }
+}
+
+impl<S: InlineEncoding, R, T> TypedProgramSpec for SetConstraint<S, R, T>
+where
+    T: std::cmp::Eq + std::hash::Hash + for<'b> TryFromInline<'b, S>,
+    for<'b> &'b T: IntoInline<S>,
+    R: Deref<Target = HashSet<T>>,
+{
+    type State = finiteunaryprogram::FiniteUnaryProgramState;
+    type NoveltyKey = ();
+    type Rank = [u64; 6];
+
+    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+        finiteunaryprogram::route_filter_only(self.variable.index, request)
+    }
+
+    fn dispatch(&self, state: &Self::State) -> DispatchClass {
+        finiteunaryprogram::dispatch(state)
+    }
+
+    fn pacing(&self, state: &Self::State) -> ProgramPacing {
+        finiteunaryprogram::pacing(state)
+    }
+
+    fn progress(&self, state: &Self::State) -> Self::Rank {
+        finiteunaryprogram::progress(state)
+    }
+
+    fn seed_typed(
+        &self,
+        batch: ProgramSeedBatch<'_>,
+        effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+    ) {
+        if matches!(batch.request.action, ProgramAction::Propose(_)) {
+            panic!("filter-only hash-set Program admitted a proposal")
+        }
+        finiteunaryprogram::seed(self.variable.index, batch, effects);
+    }
+
+    fn step_typed(
+        &self,
+        states: Vec<Self::State>,
+        batch: TypedProgramBatch<'_>,
+        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+    ) {
+        finiteunaryprogram::step(
+            self.variable.index,
+            states,
+            batch,
+            effects,
+            |_input, _cursor, _limit, _accepted| {
+                panic!("filter-only hash-set Program entered an ordered proposal step")
+            },
+            |_input, value| self.contains_raw(value),
+        )
     }
 }
 
@@ -76,12 +150,7 @@ where
         candidates: &mut CandidateSink<'_>,
     ) {
         if self.variable.index == variable {
-            candidates.retain(|_, v| {
-                match TryFromInline::try_from_inline(Inline::<S>::as_transmute_raw(v)) {
-                    Ok(t) => self.set.contains(&t),
-                    Err(_) => false,
-                }
-            });
+            candidates.retain(|_, value| self.contains_raw(value));
         }
     }
 
@@ -89,17 +158,16 @@ where
         true
     }
 
+    fn residual_program(&self) -> Option<ProgramRef<'_>> {
+        Some(ProgramRef::new(self))
+    }
+
     /// Exact when the variable is bound: checks whether every row's bound
     /// value is a member of the set. Returns `true` optimistically while
     /// the variable is unbound.
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match view.col(self.variable.index) {
-            Some(c) => view.iter().all(|row| {
-                match TryFromInline::try_from_inline(Inline::<S>::as_transmute_raw(&row[c])) {
-                    Ok(t) => self.set.contains(&t),
-                    Err(_) => false,
-                }
-            }),
+            Some(c) => view.iter().all(|row| self.contains_raw(&row[c])),
             None => true,
         }
     }

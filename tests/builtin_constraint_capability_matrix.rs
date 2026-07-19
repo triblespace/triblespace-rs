@@ -13,7 +13,9 @@ use std::sync::Arc;
 
 use triblespace::core::debug::query::{DebugConstraint, EstimateOverrideConstraint};
 use triblespace::core::query::equalityconstraint::EqualityConstraint;
-use triblespace::core::query::residual::{ResidualLowering, ResidualStateStats};
+use triblespace::core::query::residual::{
+    try_constructed_program_query, ConstructedProgramError, ResidualLowering, ResidualStateStats,
+};
 use triblespace::core::query::{
     Binding, Constraint, ConstraintShape, Query, RowsView, Variable, VariableId,
 };
@@ -238,7 +240,7 @@ fn built_in_capability_receipts_distinguish_native_paths_from_opaque_fallbacks()
             finite_union_arms: None,
             page_local_confirm: true,
             direct_proposal_source: false,
-            typed_program: false,
+            typed_program: true,
         },
         "HashSet SetConstraint"
     );
@@ -249,7 +251,7 @@ fn built_in_capability_receipts_distinguish_native_paths_from_opaque_fallbacks()
             finite_union_arms: None,
             page_local_confirm: true,
             direct_proposal_source: false,
-            typed_program: false,
+            typed_program: true,
         },
         "HashMap KeysConstraint"
     );
@@ -380,7 +382,37 @@ fn membership_constraints_record_native_and_fallback_execution() {
         )
     });
     assert_eq!(set_profiles.conservative_geometric.delta_source_pages, 0);
-    assert_eq!(set_profiles.full_geometric.delta_source_pages, 0);
+    assert_eq!(
+        set_profiles.full_geometric.delta_source_pages, 0,
+        "HashSet has no honest budgeted proposal cursor"
+    );
+
+    let variable = Variable::<UnknownInline>::new(0);
+    let set_rejection = match try_constructed_program_query(
+        IntersectionConstraint::new(vec![set.clone().has(variable)]),
+        move |binding| binding.get(variable.index).copied(),
+    ) {
+        Ok(_) => panic!("a standalone HashSet source hid eager work in a typed route"),
+        Err(rejection) => rejection,
+    };
+    assert!(matches!(
+        set_rejection.reason(),
+        ConstructedProgramError::MissingProposalRoute { variable: 0, .. }
+    ));
+
+    let lawful_values = [a, b, c];
+    let lawful_source = SortedSlice::new(&lawful_values).unwrap();
+    let mut constructed_set: Vec<_> = try_constructed_program_query(
+        and!(lawful_source.has(variable), set.clone().has(variable)),
+        move |binding| binding.get(variable.index).copied(),
+    )
+    .expect("HashSet confirms pages from another lawful finite source")
+    .cap(1)
+    .start_width(1)
+    .growth(1)
+    .collect();
+    constructed_set.sort_unstable();
+    assert_eq!(constructed_set, [a, b, c].map(|value| value.raw));
 
     let map = Arc::new(HashMap::from([(a, 10_u8), (b, 20_u8), (c, 30_u8)]));
     let map_profiles = assert_scheduler_matrix("hash-map key membership", vec![a, b, c], || {
@@ -390,7 +422,34 @@ fn membership_constraints_record_native_and_fallback_execution() {
         )
     });
     assert_eq!(map_profiles.conservative_geometric.delta_source_pages, 0);
-    assert_eq!(map_profiles.full_geometric.delta_source_pages, 0);
+    assert_eq!(
+        map_profiles.full_geometric.delta_source_pages, 0,
+        "HashMap has no honest budgeted proposal cursor"
+    );
+
+    let map_rejection = match try_constructed_program_query(
+        IntersectionConstraint::new(vec![map.clone().has(variable)]),
+        move |binding| binding.get(variable.index).copied(),
+    ) {
+        Ok(_) => panic!("a standalone HashMap source hid eager work in a typed route"),
+        Err(rejection) => rejection,
+    };
+    assert!(matches!(
+        map_rejection.reason(),
+        ConstructedProgramError::MissingProposalRoute { variable: 0, .. }
+    ));
+
+    let mut constructed_map: Vec<_> = try_constructed_program_query(
+        and!(lawful_source.has(variable), map.clone().has(variable)),
+        move |binding| binding.get(variable.index).copied(),
+    )
+    .expect("HashMap confirms pages from another lawful finite source")
+    .cap(1)
+    .start_width(1)
+    .growth(1)
+    .collect();
+    constructed_map.sort_unstable();
+    assert_eq!(constructed_map, [a, b, c].map(|value| value.raw));
 }
 
 #[test]

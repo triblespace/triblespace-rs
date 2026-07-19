@@ -78,6 +78,20 @@ pub(crate) fn route(variable: VariableId, request: ProgramRequest) -> Option<Pro
     })
 }
 
+/// Routes only the pointwise half of a unary constraint.
+///
+/// Sources without a genuinely resumable cursor must decline Propose rather
+/// than hide eager materialization inside unbudgeted Program seeding.
+pub(crate) fn route_filter_only(
+    variable: VariableId,
+    request: ProgramRequest,
+) -> Option<ProgramRoute> {
+    if matches!(request.action, ProgramAction::Propose(_)) {
+        return None;
+    }
+    route(variable, request)
+}
+
 pub(crate) fn dispatch(state: &FiniteUnaryProgramState) -> DispatchClass {
     match state {
         FiniteUnaryProgramState::Propose { .. } => PROPOSE_DISPATCH,
