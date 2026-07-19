@@ -72,6 +72,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Typed `UnionArchive` proposals no longer re-scan every attached shard for
+  every emitted value.** The residual Program now keeps its current shard and
+  that shard's ordered cursor in affine continuation state, draining physical
+  shards in attachment order. Raw cross-shard duplicates remain visible to
+  work telemetry and collapse at the engine's existing parent-local SET
+  boundary. The legacy proposal-page capability retains its globally ordered,
+  duplicate-free stream.
+
 - **Exact compiled Formula proposals no longer confirm the whole Formula
   twice.** The residual planner derives the execution receipt recursively: OR
   takes the meet of its arm receipts, while AND takes the meet across every
@@ -319,11 +327,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   examined value. Normalized `UnionArchive` sources deliberately keep these
   filtered shapes non-paged because their one-head merge requires rejection-free
   shard pages.
-- **Succinct shard unions page one globally normalized source.** `UnionArchive`
-  now merges one ordered head per shard behind a single activation-local
-  `After(value)` cursor, preserving cross-shard deduplication without
-  materializing complete union arms. Generic `UnionConstraint` remains
-  unchanged, and schemas not admitted by every shard remain non-paged.
+- **Succinct shard unions page one globally normalized source.**
+  `UnionArchive`'s legacy proposal-page capability merges one ordered head per
+  shard behind a single activation-local `After(value)` cursor, preserving
+  cross-shard deduplication without materializing complete union arms. Generic
+  `UnionConstraint` remains unchanged, and schemas not admitted by every shard
+  remain non-paged.
 - **Residual source pages dispatch as compatible affine cohorts.** Canonical
   delta identity remains structural while the scheduler physically partitions
   source activations by bound-row schema, candidate mode, and cursor family.

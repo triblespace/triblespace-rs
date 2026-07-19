@@ -1275,6 +1275,14 @@ impl<'a, U> UnionArchive<'a, U> {
     pub fn new(segments: &'a [SuccinctArchive<U>]) -> Self {
         Self { segments }
     }
+
+    /// Number of physical Succinct shards behind this logical union.
+    ///
+    /// This is storage provenance, not a logical cardinality: compaction may
+    /// change it without changing the relation exposed by [`TriblePattern`].
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
 }
 
 #[doc(hidden)]
@@ -1282,6 +1290,7 @@ impl<'a, U> UnionArchive<'a, U> {
 pub enum UnionArchiveProgramState {
     Propose {
         variable: VariableId,
+        shard_index: usize,
         cursor: ResidualDeltaSourceCursor,
     },
     Confirm {
@@ -1305,12 +1314,15 @@ const UNION_ARCHIVE_SUPPORT_DISPATCH: DispatchClass = DispatchClass::new(2);
 /// per-row set-union semantics. Confirmation instead treats shard union as a
 /// physical representation detail: it filters the original candidate bag by
 /// OR-membership, preserving every surviving occurrence's tag, order, and
-/// multiplicity. Proposal paging is specialized because every Succinct shard
-/// exposes the same strictly ordered raw-value cursor: one head per shard is
-/// enough to emit the global minimum once, and `After(value)` skips that
-/// normalized value in every shard on resume. The constraint deliberately
-/// stays structurally opaque so formula lowering cannot split the normalized
-/// source back into independently materialized union arms.
+/// multiplicity. The legacy proposal-page capability preserves a globally
+/// ordered, duplicate-free stream by merging one head per shard. The typed
+/// Program instead drains each shard's ordered cursor in attachment order and
+/// emits raw occurrences: the residual engine's activation-local SET boundary
+/// removes cross-shard duplicates before stable publication. Keeping the
+/// shard index in typed continuation state avoids reprobing every shard for
+/// every emitted value without weakening the logical union. The constraint
+/// deliberately stays structurally opaque so formula lowering cannot split
+/// the normalized source back into independently materialized union arms.
 pub struct UnionArchiveConstraint<'a, U>
 where
     U: Universe,
@@ -1458,7 +1470,7 @@ where
 {
     type State = UnionArchiveProgramState;
     type NoveltyKey = ();
-    type Rank = [u64; 6];
+    type Rank = [u64; 7];
 
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
         let resolved_positions = self.resolved_position_mask(request.bound);
@@ -1518,7 +1530,7 @@ where
             })
         }
 
-        let mut rank = [0u64; 6];
+        let mut rank = [0u64; 7];
         match state {
             UnionArchiveProgramState::Support => rank[0] = 1,
             UnionArchiveProgramState::Confirm { offset, .. } => {
@@ -1527,13 +1539,24 @@ where
                     - u64::try_from(*offset)
                         .expect("UnionArchive candidate offset exceeds rank limb");
             }
-            UnionArchiveProgramState::Propose { cursor, .. } => {
+            UnionArchiveProgramState::Propose {
+                shard_index,
+                cursor,
+                ..
+            } => {
                 rank[0] = 3;
+                rank[1] = u64::try_from(
+                    self.shards
+                        .len()
+                        .checked_sub(*shard_index)
+                        .expect("typed UnionArchive proposal named a missing shard"),
+                )
+                .expect("UnionArchive shard count exceeds rank limb");
                 match cursor {
-                    ResidualDeltaSourceCursor::Start => rank[1] = u64::MAX,
+                    ResidualDeltaSourceCursor::Start => rank[2] = u64::MAX,
                     ResidualDeltaSourceCursor::After(value) => {
-                        rank[1] = u64::MAX - 1;
-                        rank[2..].copy_from_slice(&complemented_value_words(value));
+                        rank[2] = u64::MAX - 1;
+                        rank[3..].copy_from_slice(&complemented_value_words(value));
                     }
                     ResidualDeltaSourceCursor::Offset(_) => {
                         panic!("ordinal cursor crossed into a typed UnionArchive source")
@@ -1559,6 +1582,7 @@ where
                 assert_eq!(self.variable_position_mask(variable).count_ones(), 1);
                 UnionArchiveProgramState::Propose {
                     variable,
+                    shard_index: 0,
                     cursor: ResidualDeltaSourceCursor::Start,
                 }
             }
@@ -1604,7 +1628,8 @@ where
                 for (input, state) in states.into_iter().enumerate() {
                     let UnionArchiveProgramState::Propose {
                         variable: state_variable,
-                        cursor,
+                        mut shard_index,
+                        mut cursor,
                     } = state
                     else {
                         panic!("one typed UnionArchive proposal cohort mixed action variants")
@@ -1614,31 +1639,60 @@ where
                         batch.candidate_sets[input].is_none(),
                         "typed UnionArchive proposal received a candidate group"
                     );
-                    let mut direct = Vec::new();
-                    let page = self.proposal_source_page(
-                        variable,
-                        &batch.view.row_view(input),
-                        cursor,
-                        batch.limits[input],
-                        &mut direct,
+                    assert!(
+                        shard_index < self.shards.len(),
+                        "typed UnionArchive proposal resumed after its final shard"
                     );
+                    let view = batch.view.row_view(input);
+                    let limit = batch.limits[input];
+                    let mut direct = Vec::new();
+                    let mut examined = 0usize;
+                    while examined < limit && shard_index < self.shards.len() {
+                        let accepted_base = direct.len();
+                        let page = self.shards[shard_index].proposal_source_page_single(
+                            variable,
+                            &view,
+                            cursor,
+                            limit - examined,
+                            &mut direct,
+                        );
+                        assert_eq!(
+                            direct.len() - accepted_base,
+                            page.examined,
+                            "a one-target Succinct shard did not emit every examined value"
+                        );
+                        assert!(
+                            page.next.is_none() || page.examined > 0,
+                            "typed Succinct shard resumed without examining its source"
+                        );
+                        examined = examined
+                            .checked_add(page.examined)
+                            .expect("typed UnionArchive source work overflow");
+                        if let Some(next) = page.next {
+                            cursor = next;
+                        } else {
+                            shard_index += 1;
+                            cursor = ResidualDeltaSourceCursor::Start;
+                        }
+                    }
                     let input = u32::try_from(input)
                         .expect("too many typed UnionArchive inputs in one cohort");
                     for value in direct {
                         effects.direct(input, value);
                     }
+                    let resume = (shard_index < self.shards.len()).then_some(
+                        UnionArchiveProgramState::Propose {
+                            variable,
+                            shard_index,
+                            cursor,
+                        },
+                    );
                     assert!(
-                        page.next.is_none() || page.examined > 0,
+                        resume.is_none() || examined > 0,
                         "typed UnionArchive proposal resumed without examining its source"
                     );
-                    let resume = page.next.map(|cursor| {
-                        TypedResume::Immediate(UnionArchiveProgramState::Propose {
-                            variable,
-                            cursor,
-                        })
-                    });
-                    effects.account_source(page.examined, 0);
-                    effects.page(page.examined, resume);
+                    effects.account_source(examined, 0);
+                    effects.page(examined, resume.map(TypedResume::Immediate));
                 }
             }
             UnionArchiveProgramState::Confirm { variable, .. } => {
@@ -1968,6 +2022,18 @@ mod tests {
         (&facts).into()
     }
 
+    #[test]
+    fn union_archive_reports_its_physical_segment_count() {
+        let entity = Id::new([0x30; 16]).unwrap();
+        let attribute = Id::new([0x40; 16]).unwrap();
+        let archives = [
+            fixed_archive(&entity, &attribute, [1]),
+            fixed_archive(&entity, &attribute, [2]),
+        ];
+
+        assert_eq!(UnionArchive::new(&archives).segment_count(), 2);
+    }
+
     fn one_union_program_step<U>(
         constraint: &UnionArchiveConstraint<'_, U>,
         request: ProgramRequest,
@@ -2016,6 +2082,7 @@ mod tests {
     fn drain_union_proposal<U>(
         constraint: &UnionArchiveConstraint<'_, U>,
         variable: VariableId,
+        limit: usize,
     ) -> (Vec<RawInline>, Vec<usize>)
     where
         U: Universe,
@@ -2042,7 +2109,7 @@ mod tests {
         let mut work = seeded.work.pop().unwrap().work;
         assert!(seeded.work.is_empty());
         let candidate_sets = [None];
-        let limits = [1];
+        let limits = [limit];
         let mut values = Vec::new();
         let mut examined = Vec::new();
         loop {
@@ -2290,7 +2357,10 @@ mod tests {
     fn union_archive_program_routes_and_ranks_are_structural_and_strict() {
         let entity_id = Id::new([0x31; 16]).unwrap();
         let attribute_id = Id::new([0x41; 16]).unwrap();
-        let archives = [fixed_archive(&entity_id, &attribute_id, [1])];
+        let archives = [
+            fixed_archive(&entity_id, &attribute_id, [1]),
+            fixed_archive(&entity_id, &attribute_id, [2]),
+        ];
         let union_archive = UnionArchive::new(&archives);
         let entity = Variable::<GenId>::new(0);
         let attribute = Variable::<GenId>::new(1);
@@ -2379,14 +2449,22 @@ mod tests {
 
         let start = UnionArchiveProgramState::Propose {
             variable: entity.index,
+            shard_index: 0,
             cursor: ResidualDeltaSourceCursor::Start,
         };
         let after_one = UnionArchiveProgramState::Propose {
             variable: entity.index,
+            shard_index: 0,
             cursor: ResidualDeltaSourceCursor::After(raw_value(1)),
+        };
+        let next_shard = UnionArchiveProgramState::Propose {
+            variable: entity.index,
+            shard_index: 1,
+            cursor: ResidualDeltaSourceCursor::Start,
         };
         let after_two = UnionArchiveProgramState::Propose {
             variable: entity.index,
+            shard_index: 1,
             cursor: ResidualDeltaSourceCursor::After(raw_value(2)),
         };
         let confirm_zero = UnionArchiveProgramState::Confirm {
@@ -2398,7 +2476,8 @@ mod tests {
             offset: 1,
         };
         assert!(constraint.progress(&start) > constraint.progress(&after_one));
-        assert!(constraint.progress(&after_one) > constraint.progress(&after_two));
+        assert!(constraint.progress(&after_one) > constraint.progress(&next_shard));
+        assert!(constraint.progress(&next_shard) > constraint.progress(&after_two));
         assert!(constraint.progress(&confirm_zero) > constraint.progress(&confirm_one));
         assert!(constraint.progress(&after_two) > constraint.progress(&confirm_zero));
         assert!(
@@ -2408,7 +2487,7 @@ mod tests {
     }
 
     #[test]
-    fn union_archive_program_pages_one_ordered_unique_overlapping_shard_union() {
+    fn union_archive_program_streams_shards_and_leaves_duplicate_admission_to_the_engine() {
         let entity = Id::new([0x32; 16]).unwrap();
         let attribute = Id::new([0x42; 16]).unwrap();
         let archives = [
@@ -2421,10 +2500,47 @@ mod tests {
         let attribute: Inline<GenId> = attribute.to_inline();
         let constraint = union_archive.pattern(entity, attribute, value);
 
-        let (values, examined) = drain_union_proposal(&constraint, value.index);
+        let (values, examined) = drain_union_proposal(&constraint, value.index, 1);
 
-        assert_eq!(values, (1..=5).map(raw_value).collect::<Vec<_>>());
-        assert_eq!(examined, vec![1; 5]);
+        assert_eq!(
+            values,
+            [1, 3, 5, 2, 3, 4]
+                .into_iter()
+                .map(raw_value)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(examined, vec![1; 6]);
+
+        let (wide_values, wide_examined) =
+            drain_union_proposal(&constraint, value.index, 4);
+        assert_eq!(wide_values, values, "physical grants changed shard order");
+        assert_eq!(wide_examined, [4, 2]);
+
+        let mut admitted: Vec<_> = Query::new(constraint, project_first).collect();
+        admitted.sort_unstable();
+        assert_eq!(admitted, (1..=5).map(raw_value).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn union_archive_program_crosses_empty_shards_with_one_bounded_page() {
+        let entity = Id::new([0x38; 16]).unwrap();
+        let attribute = Id::new([0x48; 16]).unwrap();
+        let archives = [
+            fixed_archive(&entity, &attribute, []),
+            fixed_archive(&entity, &attribute, [1]),
+            fixed_archive(&entity, &attribute, []),
+            fixed_archive(&entity, &attribute, [2, 3]),
+        ];
+        let union_archive = UnionArchive::new(&archives);
+        let value = Variable::<UnknownInline>::new(0);
+        let entity: Inline<GenId> = entity.to_inline();
+        let attribute: Inline<GenId> = attribute.to_inline();
+        let constraint = union_archive.pattern(entity, attribute, value);
+
+        let (values, examined) = drain_union_proposal(&constraint, value.index, 4);
+
+        assert_eq!(values, (1..=3).map(raw_value).collect::<Vec<_>>());
+        assert_eq!(examined, [3]);
     }
 
     #[test]
