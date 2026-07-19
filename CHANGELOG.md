@@ -31,13 +31,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking: query heads now have relational SET semantics.** `find!` emits
   each distinct ordered tuple of raw projected inline values once, collapsing
   assignments that differ only in hidden witnesses. The empty head therefore
-  yields at most one `()` and stops searching once its singleton raw key is
-  claimed. Raw identity is claimed before conversion or mapper code, so a
-  filtered row or panic is not retried through another witness;
-  non-injective Rust conversions do not collapse distinct raw tuples. Direct
-  `Query::new` conservatively uses the complete constraint-variable binding as
-  its head. Iterator clones snapshot claims independently, while Rayon sibling
-  shards share one run-owned claim domain. There is no public bag mode.
+  yields at most one `()`. Strict projections claim raw identity before
+  conversion or mapper code, so a filtered row or panic is not retried through
+  another witness; non-injective Rust conversions do not collapse distinct raw
+  tuples. Complete heads are already injective over the engine's universally
+  SET-admitted bindings, so they elide the terminal claim table, projected-key
+  allocation, and Rayon claim mutex entirely. Direct `Query::new`
+  conservatively uses that complete constraint-variable head. Iterator clones
+  snapshot strict-head claims independently, while Rayon strict-head siblings
+  share one run-owned claim domain. There is no public bag mode.
 - **Certified complete Program proposals now cross the SET boundary before
   publication.** The adapter first validates the entire raw grouped occurrence
   bag, then admits each distinct `(parent, value)` in first-occurrence order.

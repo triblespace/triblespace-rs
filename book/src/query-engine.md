@@ -347,34 +347,44 @@ row order.
 
 ## Terminal projection and SET identity
 
-The terminal projection gate is the universal final SET guard. Scalar and DAG
-schedulers already remove duplicates within each selected proposal action,
-while residual worklists may still carry internal row and candidate
-occurrences. When a full binding reaches the gate, it derives an ordered key
-from the raw inline bytes of the declared `find!` head and claims that key
-before running `TryFromInline` conversion or user mapper code. A second full
-binding with the same projected key is discarded, even when its hidden witness
-or route through an `or!` differs.
+Every semantic action admits a SET before publishing successors. Scalar and
+DAG proposal actions remove duplicate values for each affine parent, and
+residual sources and transitions perform the same admission at their stable
+boundary. Internal probes may still carry occurrence bags before that boundary,
+but every complete raw binding is therefore unique when it reaches projection.
+
+For a strict `find!` head, projection is not injective: complete bindings that
+differ only in hidden witnesses can have the same public identity. The terminal
+projection gate derives an ordered key from the head's raw inline bytes and
+claims it before running `TryFromInline` conversion or user mapper code. A
+second binding with that projected key is discarded, even when its hidden
+witness or route through an `or!` differs. A complete head is injective over
+the already-unique bindings, so it elides the terminal claim table, key
+allocation, and parallel claim mutex.
 
 This ordering gives projection ordinary relational SET semantics while keeping
 conversion outside the relational identity. Two distinct raw keys may convert
 to Rust values that compare equal and are still emitted separately. In the
 other direction, a failed conversion, mapper returning `None`, or mapper panic
-consumes its raw key; another witness cannot retry user code for that key. The
-empty head has one possible key, so `find!((), constraint)` emits at most one
-unit value. Claiming that singleton key exhausts the public projection: the
-next pull stops before scheduler work, while `None` stops the claiming pull and
-a caught mapper panic leaves the next pull immediately exhausted.
+consumes a strict head's raw key; another witness cannot retry user code for
+that key. The empty head has one possible public key, so
+`find!((), constraint)` emits at most one unit value. When the constraint has
+variables, claiming that strict singleton key exhausts the public projection:
+the next pull stops before scheduler work, while `None` stops the claiming pull
+and a caught mapper panic leaves the next pull immediately exhausted. For a
+zero-variable query the empty head is also the complete head; its sole semantic
+seed provides the same at-most-once behavior without a claim table.
 
 The `find!` macro supplies its explicit ordered head. Direct `Query::new`
 construction uses every variable in the constraint as its conservative head,
 so it removes only byte-identical complete bindings. There is no public bag
 mode.
 
-Cloning a serial iterator copies both its remaining raw cursor and its claimed
-keys into an independent snapshot. Rayon sibling shards instead share one
-run-owned claim domain, ensuring that duplicates discovered by different
-workers are still emitted once.
+Cloning a serial iterator copies both its remaining raw cursor and, for a
+strict head, its claimed keys into an independent snapshot. Rayon strict-head
+sibling shards instead share one run-owned claim domain, ensuring that
+duplicates discovered by different workers are still emitted once. Full heads
+carry no claim state in either execution mode.
 
 ## Parallel execution
 
