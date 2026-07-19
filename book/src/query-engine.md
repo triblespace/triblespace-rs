@@ -168,10 +168,17 @@ phases:
 Planning phases only estimate, partition, and file work; protocol calls happen
 in the explicit action phases. The checked-leaf set is canonical, so histories
 that applied the same constraints in different orders can append to the same
-future state before its remaining work runs. Row and candidate payloads still
-carry every internal occurrence even when control states collapse. This
-occurrence-bag invariant belongs to the constraint protocol and scheduling
-worklists; the terminal query projection applies public SET semantics.
+future state before its remaining work runs. Candidate payloads remain
+occurrence bags while a whole-group action can still distinguish them. At the
+first state where a fully checked binding may commit or the remaining
+confirmers allow independent candidate pages, the engine reverse-stably admits
+one `(parent row, value)` occurrence. This preserves tail scheduling order and
+keeps equal values under different affine parents independent. Finite Formula
+AND continuations use the same boundary; Formula OR retains its own private
+ordered-set reducer, and segmented affine payloads cross through a bounded
+engine admission phase rather than synchronous materialization. The terminal
+projection remains the universal final SET guard across hidden witnesses and
+routes.
 
 Lazy residual execution begins with actionable width one. A surviving action
 keeps its newly filed continuation hot, allowing a successful path to descend

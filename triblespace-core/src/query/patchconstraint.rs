@@ -1002,7 +1002,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_pages_preserve_affine_parents_before_set_projection() {
+    fn direct_pages_preserve_raw_bags_then_see_set_admitted_formula_parents() {
         const PARENT: VariableId = 0;
         const MEMBER: VariableId = 1;
 
@@ -1066,6 +1066,11 @@ mod tests {
             })
             .collect();
         assert_eq!(member_occurrences, expected_occurrences);
+        assert_eq!(
+            member_occurrences.len(),
+            6,
+            "the raw protocol call still observes both duplicate parent occurrences",
+        );
 
         let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
         let mut ordinary: Vec<_> = Query::new(make(), project).collect();
@@ -1089,7 +1094,11 @@ mod tests {
         assert_eq!(ordinary, sequential);
         assert_eq!(eager, sequential);
         assert_eq!(full, sequential);
-        assert_eq!(full_query.stats().delta_source_direct_candidates, 6);
+        assert_eq!(
+            full_query.stats().delta_source_direct_candidates,
+            3,
+            "the Formula boundary admits byte-identical semantic parents before direct source work",
+        );
         assert_eq!(full_query.stats().delta_source_roots, 0);
     }
 
