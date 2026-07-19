@@ -53,6 +53,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Typed Program novelty activation scope has executable regression coverage.**
+  Equal novelty keys now have tests proving first-receipt ownership across
+  input tags of one activation while remaining independently admissible for
+  distinct activations.
 - **Typed Program capabilities compose by immutable semantic route arm.**
   `PreferredProgram` chooses a preferred typed family only when that family
   structurally owns an action, otherwise choosing a canonical typed fallback
