@@ -24,6 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bag, then admits each distinct `(parent, value)` in first-occurrence order.
   Proposal statistics continue to charge the raw bag, while terminal row and
   receipt accounting sees only the admitted per-parent relation.
+- **Internal occurrence bags remain observable below public SET projection.**
+  Core source and scheduler regressions now assert both sides of that boundary:
+  PATCH, sorted-slice, TribleSet, attached-range, intersection, and archive
+  confirmation paths preserve raw affine multiplicity and order, while public
+  `Query` results expose each distinct raw head exactly once.
 
 ### Fixed
 

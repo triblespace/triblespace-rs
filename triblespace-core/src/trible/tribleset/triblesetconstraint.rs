@@ -2433,7 +2433,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_source_activations_preserve_duplicate_affine_parents() {
+    fn direct_source_preserves_affine_parents_before_set_projection() {
         const PARENT: VariableId = 0;
         const ENTITY: VariableId = 1;
 
@@ -2442,9 +2442,13 @@ mod tests {
         let value = Inline::<UnknownInline>::new([0xa6; INLINE_LEN]);
         let parent_value = [0x44; INLINE_LEN];
         let mut set = TribleSet::new();
+        let mut entities = Vec::new();
         for _ in 0..4 {
-            set.insert(&Trible::new(&rngid(), &attribute, &value));
+            let entity = rngid();
+            entities.push(id_into_value(&entity));
+            set.insert(&Trible::new(&entity, &attribute, &value));
         }
+        entities.sort_unstable();
         let parent = Variable::<UnknownInline>::new(PARENT);
         let entity = Variable::<GenId>::new(ENTITY);
         let make = || {
@@ -2463,6 +2467,46 @@ mod tests {
         };
         let project = |binding: &Binding| Some((*binding.get(PARENT)?, *binding.get(ENTITY)?));
 
+        let duplicate_domain = DuplicateDomain {
+            variable: parent.index,
+            value: parent_value,
+        };
+        let mut parent_occurrences = Vec::new();
+        duplicate_domain.propose(
+            parent.index,
+            &RowsView::EMPTY,
+            &mut CandidateSink::Values(&mut parent_occurrences),
+        );
+        assert_eq!(parent_occurrences, [parent_value, parent_value]);
+
+        let parent_variables = [parent.index];
+        let direct_source = TribleSetConstraint::new(entity, attribute_inline, value, set.clone());
+        let mut one_parent_entities = Vec::new();
+        direct_source.propose(
+            entity.index,
+            &RowsView::EMPTY,
+            &mut CandidateSink::Values(&mut one_parent_entities),
+        );
+        let mut entity_set = one_parent_entities.clone();
+        entity_set.sort_unstable();
+        assert_eq!(entity_set, entities);
+
+        let mut entity_occurrences = Vec::new();
+        direct_source.propose(
+            entity.index,
+            &RowsView::new(&parent_variables, &parent_occurrences),
+            &mut CandidateSink::Tagged(&mut entity_occurrences),
+        );
+        let expected_occurrences: Vec<_> = (0..2)
+            .flat_map(|row| {
+                one_parent_entities
+                    .iter()
+                    .copied()
+                    .map(move |value| (row, value))
+            })
+            .collect();
+        assert_eq!(entity_occurrences, expected_occurrences);
+
         let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
         let mut ordinary: Vec<_> = Query::new(make(), project).collect();
         let mut residual: Vec<_> = Query::new(make(), project)
@@ -2474,7 +2518,11 @@ mod tests {
         ordinary.sort_unstable();
         residual.sort_unstable();
 
-        assert_eq!(sequential.len(), 8);
+        let expected: Vec<_> = entities
+            .into_iter()
+            .map(|entity| (parent_value, entity))
+            .collect();
+        assert_eq!(sequential, expected);
         assert!(sequential.iter().all(|(parent, _)| *parent == parent_value));
         assert_eq!(ordinary, sequential);
         assert_eq!(residual, sequential);
@@ -2617,15 +2665,17 @@ mod tests {
     }
 
     #[test]
-    fn repeated_source_preserves_duplicate_affine_parent_rows() {
+    fn repeated_source_preserves_affine_parents_before_set_projection() {
         const PARENT: VariableId = 0;
         const TARGET: VariableId = 1;
 
         let attribute = Id::new([0xa2; ID_LEN]).unwrap();
         let parent_value = [0x44; INLINE_LEN];
         let mut set = TribleSet::new();
+        let mut targets = Vec::new();
         for tag in 1..=3 {
             let entity = Id::new([tag; ID_LEN]).unwrap();
+            targets.push(id_into_value(&entity));
             set.insert(&Trible::force(
                 &entity,
                 &attribute,
@@ -2650,6 +2700,52 @@ mod tests {
             ])
         };
         let project = |binding: &Binding| Some((*binding.get(PARENT)?, *binding.get(TARGET)?));
+
+        let duplicate_domain = DuplicateDomain {
+            variable: parent.index,
+            value: parent_value,
+        };
+        let mut parent_occurrences = Vec::new();
+        duplicate_domain.propose(
+            parent.index,
+            &RowsView::EMPTY,
+            &mut CandidateSink::Values(&mut parent_occurrences),
+        );
+        assert_eq!(parent_occurrences, [parent_value, parent_value]);
+
+        let parent_variables = [parent.index];
+        let repeated_source = TribleSetConstraint::new(
+            target,
+            Inline::<GenId>::new(id_into_value(&attribute)),
+            target,
+            set.clone(),
+        );
+        let mut one_parent_targets = Vec::new();
+        repeated_source.propose(
+            target.index,
+            &RowsView::EMPTY,
+            &mut CandidateSink::Values(&mut one_parent_targets),
+        );
+        let mut target_set = one_parent_targets.clone();
+        target_set.sort_unstable();
+        assert_eq!(target_set, targets);
+
+        let mut target_occurrences = Vec::new();
+        repeated_source.propose(
+            target.index,
+            &RowsView::new(&parent_variables, &parent_occurrences),
+            &mut CandidateSink::Tagged(&mut target_occurrences),
+        );
+        let expected_occurrences: Vec<_> = (0..2)
+            .flat_map(|row| {
+                one_parent_targets
+                    .iter()
+                    .copied()
+                    .map(move |value| (row, value))
+            })
+            .collect();
+        assert_eq!(target_occurrences, expected_occurrences);
+
         let mut expected: Vec<_> = Query::new(make(), project).sequential().collect();
         let mut residual: Vec<_> = Query::new(make(), project)
             .solve_residual_state_lazy_with(ResidualLowering::FULL)
@@ -2658,7 +2754,11 @@ mod tests {
             .collect();
         expected.sort_unstable();
         residual.sort_unstable();
-        assert_eq!(expected.len(), 6);
+        let projected: Vec<_> = targets
+            .into_iter()
+            .map(|target| (parent_value, target))
+            .collect();
+        assert_eq!(expected, projected);
         assert!(expected.iter().all(|(parent, _)| *parent == parent_value));
         assert_eq!(residual, expected);
     }

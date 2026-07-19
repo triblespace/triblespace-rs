@@ -246,6 +246,7 @@ mod tests {
     use crate::prelude::*;
     use crate::query::residual::ResidualLowering;
     use crate::query::Binding;
+    use crate::query::CandidateSink;
     use crate::query::Constraint;
     use crate::query::ProgramAction;
     use crate::query::ProgramCompletion;
@@ -537,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn value_range_direct_source_preserves_affine_parent_bags_and_growth() {
+    fn value_range_source_preserves_affine_parents_before_set_projection() {
         let v10: Inline<R256BE> = 10i128.to_inline();
         let v50: Inline<R256BE> = 50i128.to_inline();
         let v70: Inline<R256BE> = 70i128.to_inline();
@@ -553,6 +554,45 @@ mod tests {
         let parent = context.next_variable::<R256BE>();
         let value = context.next_variable::<R256BE>();
         let duplicate_parents = [v10, v10];
+
+        let parent_source = SortedSlice::new(&duplicate_parents).unwrap().has(parent);
+        let mut parent_occurrences = Vec::new();
+        parent_source.propose(
+            parent.index,
+            &RowsView::EMPTY,
+            &mut CandidateSink::Values(&mut parent_occurrences),
+        );
+        assert_eq!(parent_occurrences, [v10.raw, v10.raw]);
+
+        let parent_variables = [parent.index];
+        let range_source = grown.value_in_range(value, v10, v90);
+        let range_values = [v10.raw, v50.raw, v70.raw, v90.raw];
+        let mut one_parent_values = Vec::new();
+        range_source.propose(
+            value.index,
+            &RowsView::EMPTY,
+            &mut CandidateSink::Values(&mut one_parent_values),
+        );
+        let mut value_set = one_parent_values.clone();
+        value_set.sort_unstable();
+        assert_eq!(value_set, range_values);
+
+        let mut value_occurrences = Vec::new();
+        range_source.propose(
+            value.index,
+            &RowsView::new(&parent_variables, &parent_occurrences),
+            &mut CandidateSink::Tagged(&mut value_occurrences),
+        );
+        let expected_occurrences: Vec<_> = (0..2)
+            .flat_map(|row| {
+                one_parent_values
+                    .iter()
+                    .copied()
+                    .map(move |value| (row, value))
+            })
+            .collect();
+        assert_eq!(value_occurrences, expected_occurrences);
+
         let constraint = and!(
             SortedSlice::new(&duplicate_parents).unwrap().has(parent),
             grown.value_in_range(value, v10, v90),
@@ -564,10 +604,7 @@ mod tests {
                 .start_width(1)
                 .collect();
         actual.sort_unstable();
-        assert_eq!(
-            actual,
-            [v10.raw, v10.raw, v50.raw, v50.raw, v70.raw, v70.raw, v90.raw, v90.raw]
-        );
+        assert_eq!(actual, range_values);
 
         let collect = |set: &TribleSet| {
             let mut values: Vec<_> =

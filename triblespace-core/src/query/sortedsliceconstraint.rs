@@ -519,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_pages_use_ordinal_cursors_and_preserve_duplicate_occurrences() {
+    fn ordinal_pages_preserve_occurrences_before_set_projection() {
         let values = [value(1), value(1), value(2), value(3)];
         let slice = SortedSlice::new(&values).unwrap();
         let variable = Variable::<UnknownInline>::new(0);
@@ -588,7 +588,7 @@ mod tests {
         expected.sort_unstable();
         actual.sort_unstable();
         assert_eq!(actual, expected);
-        assert_eq!(actual, [value(1).raw, value(1).raw, value(2).raw, value(3).raw]);
+        assert_eq!(actual, [value(1).raw, value(2).raw, value(3).raw]);
         assert_eq!(query.stats().propose_calls, 1);
         assert_eq!(query.stats().delta_source_pages, values.len());
         assert_eq!(query.stats().delta_source_candidates_examined, values.len());

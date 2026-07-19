@@ -2205,7 +2205,7 @@ mod tests {
         binding.get(0).copied()
     }
 
-    fn solve_candidate_bag<'a>(
+    fn solve_projected_candidates<'a>(
         constraint: Box<dyn Constraint<'a> + 'a>,
         values: &'a [RawInline],
         residual: bool,
@@ -2629,7 +2629,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_union_archive_confirm_matches_materialized_archive_candidate_bag() {
+    fn scheduled_union_archive_preserves_candidate_bag_before_set_projection() {
         let entity = Id::new([0x17; 16]).unwrap();
         let attribute = Id::new([0x25; 16]).unwrap();
         let archives = [
@@ -2648,23 +2648,41 @@ mod tests {
             raw_value(2),
             raw_value(1),
         ];
-        let mut expected = vec![
+        let expected_bag = vec![
             raw_value(3),
             raw_value(1),
             raw_value(3),
             raw_value(2),
             raw_value(1),
         ];
-        expected.sort_unstable();
+        let expected_set = vec![raw_value(1), raw_value(2), raw_value(3)];
+
+        let union_archive = UnionArchive::new(&archives);
+        let union = union_archive.pattern(entity, attribute, value);
+        let direct = materialized.pattern(entity, attribute, value);
+        let mut union_candidates = candidates.clone();
+        union.confirm(
+            value.index,
+            &RowsView::EMPTY,
+            &mut CandidateSink::Values(&mut union_candidates),
+        );
+        let mut direct_candidates = candidates.clone();
+        direct.confirm(
+            value.index,
+            &RowsView::EMPTY,
+            &mut CandidateSink::Values(&mut direct_candidates),
+        );
+        assert_eq!(union_candidates, expected_bag);
+        assert_eq!(direct_candidates, expected_bag);
 
         for residual in [false, true] {
             let union_archive = UnionArchive::new(&archives);
-            let mut union_results = solve_candidate_bag(
+            let mut union_results = solve_projected_candidates(
                 Box::new(union_archive.pattern(entity, attribute, value)),
                 &candidates,
                 residual,
             );
-            let mut materialized_results = solve_candidate_bag(
+            let mut materialized_results = solve_projected_candidates(
                 Box::new(materialized.pattern(entity, attribute, value)),
                 &candidates,
                 residual,
@@ -2673,7 +2691,7 @@ mod tests {
             materialized_results.sort_unstable();
 
             assert_eq!(union_results, materialized_results);
-            assert_eq!(union_results, expected);
+            assert_eq!(union_results, expected_set);
         }
     }
 
