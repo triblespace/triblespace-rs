@@ -160,7 +160,10 @@ fn boxed(fixed: bool, coverage: ProposalCoverage) -> DynConstraint {
     Box::new(ReceiptDomain::new(fixed, coverage))
 }
 
-fn proposed<'a>(constraint: &impl Constraint<'a>, variable: VariableId) -> Vec<RawInline> {
+fn proposed<'a, C>(constraint: &C, variable: VariableId) -> Vec<RawInline>
+where
+    C: Constraint<'a> + ?Sized,
+{
     let mut values = Vec::new();
     constraint.propose(
         variable,
@@ -361,7 +364,7 @@ fn finite_builtin_receipts_distinguish_sources_from_validators() {
 }
 
 #[test]
-fn indexed_patterns_are_exact_while_attached_ranges_stay_uncertified() {
+fn indexed_patterns_and_attached_ranges_publish_exact_support() {
     let entity_id = Id::new([0x11; 16]).unwrap();
     let attribute_id = Id::new([0x22; 16]).unwrap();
     let member = Inline::<UnknownInline>::new(MEMBER);
@@ -388,24 +391,28 @@ fn indexed_patterns_are_exact_while_attached_ranges_stay_uncertified() {
     );
     assert_eq!(proposed(&value_fiber, 2), vec![MEMBER]);
 
-    let value_range = set.value_in_range(value, Inline::new([0x10; 32]), Inline::new([0x20; 32]));
-    let min_id = Id::new([1; 16]).unwrap();
-    let max_id = Id::new([2; 16]).unwrap();
-    let entity_range = set.entity_in_range(entity, min_id, max_id);
-    let attribute_range = set.attribute_in_range(attribute, min_id, max_id);
-    for constraint in [
-        &value_range as &dyn Constraint<'static>,
-        &entity_range,
-        &attribute_range,
+    let value_range = set.value_in_range(value, Inline::new([0x30; 32]), Inline::new([0x40; 32]));
+    let entity_range = set.entity_in_range(
+        entity,
+        Id::new([0x10; 16]).unwrap(),
+        Id::new([0x12; 16]).unwrap(),
+    );
+    let attribute_range = set.attribute_in_range(
+        attribute,
+        Id::new([0x20; 16]).unwrap(),
+        Id::new([0x23; 16]).unwrap(),
+    );
+    for (constraint, variable, expected) in [
+        (&value_range as &dyn Constraint<'static>, 2, MEMBER),
+        (&entity_range, X, entity_constant.raw),
+        (&attribute_range, Y, attribute_constant.raw),
     ] {
-        assert!(!constraint.fixed_denotation());
+        assert!(constraint.fixed_denotation());
         assert_eq!(
-            constraint.proposal_coverage(
-                constraint.variables().find_first_set().unwrap(),
-                VariableSet::new_empty(),
-            ),
-            ProposalCoverage::None
+            constraint.proposal_coverage(variable, VariableSet::new_empty()),
+            ProposalCoverage::Exact
         );
+        assert_eq!(proposed(constraint, variable), vec![expected]);
     }
 
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
@@ -422,12 +429,13 @@ fn indexed_patterns_are_exact_while_attached_ranges_stay_uncertified() {
     );
     assert_eq!(proposed(&succinct_value_fiber, 2), vec![MEMBER]);
     let succinct_range =
-        archive.value_in_range(value, Inline::new([0x10; 32]), Inline::new([0x20; 32]));
-    assert!(!succinct_range.fixed_denotation());
+        archive.value_in_range(value, Inline::new([0x30; 32]), Inline::new([0x40; 32]));
+    assert!(succinct_range.fixed_denotation());
     assert_eq!(
         succinct_range.proposal_coverage(2, VariableSet::new_empty()),
-        ProposalCoverage::None
+        ProposalCoverage::Exact
     );
+    assert_eq!(proposed(&succinct_range, 2), vec![MEMBER]);
 }
 
 #[test]

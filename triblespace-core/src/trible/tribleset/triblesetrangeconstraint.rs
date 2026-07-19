@@ -11,6 +11,7 @@ use crate::query::ProgramRef;
 use crate::query::ProgramRequest;
 use crate::query::ProgramRoute;
 use crate::query::ProgramSeedBatch;
+use crate::query::ProposalCoverage;
 use crate::query::ResidualDeltaOutput;
 use crate::query::ResidualDeltaSourceCursor;
 use crate::query::ResidualDeltaSourcePage;
@@ -135,6 +136,18 @@ impl TypedProgramSpec for TribleSetRangeConstraint {
 impl<'a> Constraint<'a> for TribleSetRangeConstraint {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.variable_v)
+    }
+
+    fn fixed_denotation(&self) -> bool {
+        true
+    }
+
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+        if variable == self.variable_v && !bound.is_set(variable) {
+            ProposalCoverage::Exact
+        } else {
+            ProposalCoverage::None
+        }
     }
 
     fn estimate(

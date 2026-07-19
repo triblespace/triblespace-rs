@@ -67,9 +67,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exact proposal support. Both capabilities default conservatively, forward
   through transparent wrappers, and compose structurally through AND/OR;
   coherent finite, indexed, search, path, and resident-GPU constraints opt in.
-  No planner consumes the receipts yet, and approximate ANN remains
-  deliberately uncertified. Attached range families likewise remain
-  uncertified pending a dedicated audit.
+  Repaired attached range constraints certify their exact attached-axis-domain
+  intersections as well. No planner consumes the receipts yet, and approximate
+  ANN remains deliberately uncertified.
 - **Typed Program capabilities compose by immutable semantic route arm.**
   `PreferredProgram` chooses a preferred typed family only when that family
   structurally owns an action, otherwise choosing a canonical typed fallback
