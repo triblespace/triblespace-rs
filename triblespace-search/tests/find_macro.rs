@@ -180,15 +180,14 @@ fn find_matches_term_on_succinct() {
     assert!(set.contains(&id(3)));
 }
 
-/// The succinct HNSW view plugs into `find!` via the binary
-/// [`Similar`] relation. Declare two handle variables, pin the
-/// first to a known handle with `.is()`, let the engine
-/// enumerate the second from the HNSW walk, and cross-check
-/// against the direct `candidates_above` API.
+/// The succinct HNSW view plugs into `find!` via the unary
+/// [`SimilarTo`] snapshot. Pin the probe at construction, let the engine
+/// enumerate the frozen HNSW result bag, and cross-check against the direct
+/// `candidates_above` API.
 ///
-/// [`Similar`]: triblespace_search::constraint::Similar
+/// [`SimilarTo`]: triblespace_search::constraint::SimilarTo
 #[test]
-fn find_hnsw_similar_on_succinct() {
+fn find_hnsw_similar_to_on_succinct() {
     use triblespace_core::blob::MemoryBlobStore;
     use triblespace_core::repo::BlobStore;
     use triblespace_core::inline::encodings::hash::Handle;

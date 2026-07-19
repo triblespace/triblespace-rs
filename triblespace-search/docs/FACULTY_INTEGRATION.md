@@ -110,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // shared ?doc to pull the title back out of the KB at
             // the same time. We rescore each survivor via
             // `idx.score_text` afterwards for ranking — same
-            // pattern as HNSW's similar/recompute split.
+            // pattern as HNSW's similar_to/recompute split.
             use triblespace_core::inline::ToEncoded;
             let mut rows: Vec<(Id, f32, String)> = find!(
                 (doc: Id, title: String),
@@ -210,7 +210,7 @@ filters on a fixed `score_floor` parameter; callers recompute
 exact scores afterwards via `idx.score(&doc.to_inline(), terms)`
 (or `idx.score_text(&doc.to_inline(), text)` on a `WordHash`-keyed
 index, which tokenises internally). Same pattern as HNSW's
-`similar`/recompute-cosine split:
+`similar_to`/recompute-cosine split:
 
 ```rust,ignore
 use triblespace_core::inline::ToEncoded;

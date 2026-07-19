@@ -6,6 +6,20 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## Unreleased
 
+### Exact pair filtering is separate from ANN retrieval
+
+- Replaced the binding-history-dependent binary `Similar` / `.similar()` API
+  with `CosineAtLeast` / `.cosine_at_least()`, an exact symmetric,
+  filter-only predicate. It never enumerates a handle domain and now exposes a
+  finite page-local confirmer Program.
+- `SimilarTo` remains the explicit fixed-probe retrieval operator. Its
+  semantics are membership, native order, and duplicate multiplicity in one
+  frozen backend result: complete for Flat, approximate for HNSW and succinct
+  HNSW.
+- Pairwise cosine now divides by both vector norms, so exact filtering remains
+  truthful even for embedding blobs that bypass the crate's normalized-ingest
+  helper. Zero vectors retain similarity zero.
+
 ### Range-native typed search artifacts
 
 - Ported `Bm25Rollup` and `HnswRollup` to the fallible, range-native

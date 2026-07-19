@@ -7,14 +7,14 @@
 //! into the same blob store, then ask the engine for "books
 //! whose embedding is similar (cosine ≥ 0.8) to the query AND
 //! that are authored by the target author". The HNSW
-//! [`Similar`][s] constraint and the pattern! clause join
+//! [`SimilarTo`][s] constraint and the pattern! clause join
 //! through the shared embedding-handle variable.
 //!
 //! ```sh
 //! cargo run --example compose_hnsw_and_pattern
 //! ```
 //!
-//! [s]: triblespace_search::constraint::Similar
+//! [s]: triblespace_search::constraint::SimilarTo
 
 use triblespace_core::and;
 use triblespace_core::blob::MemoryBlobStore;
@@ -110,10 +110,7 @@ fn main() {
     }
     let idx = hb.build();
 
-    // Put the query vector into the store too — similarity is a
-    // binary relation over handles, so the query lives in the
-    // same address space as the corpus. Content-addressing makes
-    // repeats free.
+    // Put the fixed ANN probe into the same content-addressed store.
     let query_handle =
         put_embedding::<_>(&mut store, vec![1.0, 0.0, 0.0, 0.0]).unwrap();
     let reader = store.reader().unwrap();

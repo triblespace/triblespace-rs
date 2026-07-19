@@ -13,7 +13,7 @@
 //! ```
 //!
 //! Note: the walk logic is duplicated from
-//! `SuccinctHNSWIndex::similar` rather than refactored,
+//! `SuccinctHNSWIndex::candidates_above` rather than refactored,
 //! because this is a benchmark; refactoring the production
 //! types to parameterize over the graph backend can come
 //! next if the ring wins the trade.
@@ -423,7 +423,7 @@ fn bench(n: usize, dim: usize, k: usize, ef: usize, seed: u64) {
 fn main() {
     println!("End-to-end HNSW query latency: CSR vs ring backend.");
     println!("Distance eval goes through BlobCache<MemoryBlobStore, Embedding>");
-    println!("— the same code path SH25::similar would use in production.");
+    println!("— the same code path SH25::similar_to uses in production.");
 
     bench(1_000, 32, 10, 50, 0x1234);
     bench(10_000, 32, 10, 50, 0x5678);

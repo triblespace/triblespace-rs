@@ -160,24 +160,22 @@ Both the naive `BM25Index<D, T>` and the succinct
 constraints are generic over it — same constraint types, same
 `find!` integration, either backend.
 
-## HNSW as a `Constraint`
+## Embedding constraints
 
-### Binary relation: `similar(a, b, score_floor)`
+### Exact predicate: `cosine_at_least(a, b, score_floor)`
 
-Two variables (`a, b: Variable<Handle<Embedding>>`) and
-one fixed cosine threshold. Produced by the `similar` method on
-any attached view:
+Two variables (`a, b: Variable<Handle<Embedding>>`) and one fixed cosine
+threshold. Produced by `cosine_at_least` on any attached view:
 
 ```rust
-let c: Similar<'_, _> = view.similar(a, b, score_floor);
+let c: CosineAtLeast<'_, _> = view.cosine_at_least(a, b, score_floor);
 ```
 
-**Semantics:** `similar(a, b, floor)` holds iff both handles
-exist in the pile's blob store and `cosine(*a, *b) ≥ floor`.
-The relation is symmetric (cosine is symmetric). Operationally,
-at least one of `a` / `b` must be bound so the engine can walk
-the HNSW graph from that side; the other side then enumerates
-candidates above the floor.
+**Semantics:** the predicate holds iff both blobs resolve, have equal
+dimensions, and their true cosine is at least `floor`. It is symmetric and
+binding-history independent. It is deliberately filter-only: other
+constraints must source both handle domains. This separation prevents an
+approximate, directional HNSW walk from masquerading as an exact relation.
 
 ### Why threshold, not top-k
 
@@ -190,31 +188,21 @@ and slice.
 
 ### Why fixed score (not a variable)
 
-Score being free would force the index to report every visited
-node during ef-search with its cosine, and the engine would
-join on quantized scores. The caller almost never gets a
-meaningful `score` from somewhere else in the query — and if
-they want the exact similarity for a specific `(a, b)` pair,
-fetching both embedding blobs and computing cosine directly is
-one line and unaffected by u16 quantization.
+The caller almost never gets a meaningful `score` from somewhere else in the
+query. A fixed floor keeps the predicate boolean and avoids score
+quantization/bookkeeping inside joins.
 
 ### Cardinality
 
-- One side bound: exact — run the walk, return the candidate
-  count.
-- Neither side bound: `usize::MAX` — the engine should order
-  other constraints first. (Returning `None` would flag the
-  variable as unconstrained.)
+- Either variable: `usize::MAX`. Like `InlineRange`, this announces a valid
+  but non-enumerating confirmer and keeps genuine domain sources ahead of it.
 
-### Shared `SimilaritySearch` trait
+### Shared `CosineSimilarity` trait
 
 `AttachedHNSWIndex`, `AttachedFlatIndex`, and
-`AttachedSuccinctHNSWIndex` all implement `SimilaritySearch`
-with two methods: `neighbours_above(handle, floor)` and
-`cosine_between(a, b)`. Both are infallible at the trait
-boundary — fetch failures fail-open as "no match" (empty vec /
-`None`) because the engine's propose/confirm hooks have no
-error channel.
+`AttachedSuccinctHNSWIndex` implement `CosineSimilarity` with one exact
+`cosine_between(a, b)` operation. Fetch or decode failures become `None`
+(`no match`) because constraint hooks have no error channel.
 
 ### Convenience: `similar_to(probe, var, score_floor)`
 
@@ -222,20 +210,16 @@ error channel.
 let c: SimilarTo = view.similar_to(probe, var, score_floor);
 ```
 
-Unary sugar for the common "search from a known handle" case.
-Equivalent to
-`temp!((a), and!(a.is(probe), view.similar(a, var, floor)))`,
-but the probe is pinned on the call site — no temp variable
-allocation, no `.is()` dance. Walks the index once at
-construction and caches the above-threshold set; subsequent
-engine calls iterate the cache.
+This is a distinct directional retrieval operator, not sugar over the exact
+predicate. It runs the backend once at construction and freezes the returned
+occurrence bag; subsequent engine calls page that immutable bag without
+re-walking. Flat returns every indexed handle above the floor. HNSW and
+succinct HNSW are ef-bounded approximate searches and may omit qualifying
+handles. Native order and duplicate occurrences are preserved.
 
-Use when you already hold the query handle (which covers the
-vast majority of callers). Keep [`Similar`] for the cases
-where both sides are genuinely variables — multi-probe
-clustering, symmetric self-joins, etc.
-
-[`Similar`]: #binary-relation-similara-b-score_floor
+There is intentionally no binary ANN relation. A future dynamic-probe ANN
+operator needs an explicit direction and a failure-atomic resumable backend
+cursor before it can join the pageable engine honestly.
 
 ## Combinators callers actually write
 

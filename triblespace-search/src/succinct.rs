@@ -790,7 +790,7 @@ const _: () = assert!(
 /// the naive intermediate is a later optimization. Query the
 /// index by calling [`Self::attach`] with a blob-store reader
 /// and using [`AttachedSuccinctHNSWIndex::similar_to`] /
-/// [`AttachedSuccinctHNSWIndex::similar`] inside `find!`.
+/// [`AttachedSuccinctHNSWIndex::cosine_at_least`] inside `find!`.
 ///
 /// # Example
 ///
@@ -1064,25 +1064,21 @@ where
         self
     }
 
-    /// Build a symmetric similarity constraint over two handle
-    /// variables, gated by a fixed cosine `score_floor`. See
-    /// [`crate::constraint::Similar`] for semantics and the full
-    /// `find!` / `pattern!` integration.
-    pub fn similar(
+    /// Build an exact symmetric cosine predicate over two handle variables.
+    /// This is filter-only; [`Self::similar_to`] owns directional HNSW
+    /// retrieval.
+    pub fn cosine_at_least(
         &self,
         a: Variable<EmbHandle>,
         b: Variable<EmbHandle>,
         score_floor: f32,
-    ) -> crate::constraint::Similar<'_, Self> {
-        crate::constraint::Similar::new(self, a, b, score_floor)
+    ) -> crate::constraint::CosineAtLeast<'_, Self> {
+        crate::constraint::CosineAtLeast::new(self, a, b, score_floor)
     }
 
     /// Convenience wrapper for the common "search from a known
-    /// handle" case. Walks the graph once at construction from
-    /// `probe`, stores the above-threshold handles, and binds
-    /// `var` to them in the engine. Equivalent to
-    /// `temp!((a), and!(a.is(probe), self.similar(a, var, floor)))`
-    /// without the temp-variable ceremony; see
+    /// handle" case. Freezes one directional graph walk at construction
+    /// rather than pretending it is an exact binary predicate; see
     /// [`crate::constraint::SimilarTo`].
     pub fn similar_to(
         &self,
@@ -1097,8 +1093,7 @@ where
         crate::constraint::SimilarTo::from_candidates(var, candidates)
     }
 
-    /// Leaf graph-walk primitive used by [`Self::similar_to`]
-    /// and [`Self::similar`] under the hood. Surfaced for tests
+    /// Leaf graph-walk primitive used by [`Self::similar_to`]. Surfaced for tests
     /// (correctness oracles, cross-backend agreement checks) and
     /// benchmarks (timing the walk in isolation from engine
     /// overhead). **Production callers should use the engine
@@ -1278,18 +1273,10 @@ where
     }
 }
 
-impl<'a, B> crate::constraint::SimilaritySearch for AttachedSuccinctHNSWIndex<'a, B>
+impl<'a, B> crate::constraint::CosineSimilarity for AttachedSuccinctHNSWIndex<'a, B>
 where
     B: triblespace_core::repo::BlobStoreGet,
 {
-    fn neighbours_above(
-        &self,
-        from: Inline<EmbHandle>,
-        score_floor: f32,
-    ) -> Vec<Inline<EmbHandle>> {
-        self.candidates_above(from, score_floor).unwrap_or_default()
-    }
-
     fn cosine_between(
         &self,
         a: Inline<EmbHandle>,
@@ -1302,11 +1289,7 @@ where
         if a_slice.len() != b_slice.len() {
             return None;
         }
-        let mut sum = 0.0f32;
-        for (x, y) in a_slice.iter().zip(b_slice.iter()) {
-            sum += x * y;
-        }
-        Some(sum)
+        Some(crate::hnsw::cosine_similarity(a_slice, b_slice))
     }
 }
 

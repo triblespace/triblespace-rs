@@ -11,13 +11,13 @@
 //!
 //! The BM25 side binds `?paper` (entity id), the trible pattern
 //! joins each paper to its embedding handle, and the HNSW
-//! [`Similar`][s] constraint gates on cosine similarity.
+//! [`SimilarTo`][s] constraint gates on one frozen HNSW retrieval bag.
 //!
 //! ```sh
 //! cargo run --example hybrid_search
 //! ```
 //!
-//! [s]: triblespace_search::constraint::Similar
+//! [s]: triblespace_search::constraint::SimilarTo
 
 use triblespace_core::and;
 use triblespace_core::blob::MemoryBlobStore;
@@ -118,8 +118,7 @@ fn main() {
     let bm25 = bm25_b.build();
     let hnsw = hnsw_b.build();
 
-    // Put the query vector into the store too — similarity is a
-    // binary relation over embedding handles.
+    // Put the query vector into the store as the fixed ANN probe.
     let query_handle =
         put_embedding::<_>(&mut store, vec![1.0, 0.0, 0.0, 0.0]).unwrap();
     let reader = store.reader().unwrap();

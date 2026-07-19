@@ -98,12 +98,10 @@ impl TryFromInline<'_, F32LE> for f32 {
 /// ### Convention: L2-normalized
 ///
 /// Embeddings in this crate's indexes are **L2-normalized by
-/// the caller** at ingest time. `FlatIndex::similar` and
-/// `HNSWIndex::similar` both treat the query metric as
-/// cosine-similarity via a single dot product against the
-/// stored embedding. If a caller stores non-unit vectors,
-/// scores will be scaled by their magnitudes — still
-/// internally consistent, but not "cosine" anymore.
+/// the caller** at ingest time. Flat and HNSW retrieval use a single dot
+/// product against each stored embedding, so bypassing normalization scales
+/// ANN scores by vector magnitude. The exact `CosineAtLeast` predicate divides
+/// by both norms and does not rely on this convention.
 ///
 /// Use [`put_embedding`] to normalize + put in one step.
 ///

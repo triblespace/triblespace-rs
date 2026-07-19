@@ -44,17 +44,15 @@ remaining open items are perf/encoding refinements, not architecture.
   triblespace `Constraint`: `matches(doc, &terms, score_floor)`
   — binds `doc` only; score is a fixed parameter. Pair with
   `idx.score(&doc, terms)` to recompute precise scores after
-  the engine filters, same pattern as HNSW's
-  `similar`/recompute split.
+  the engine filters.
 * **`SuccinctBM25Index`**: jerky-backed zero-copy view — doc
   keys via `CompressedUniverse`, terms as a typed
   `View<[[u8; 32]]>` row table, doc-lengths + postings via
   `CompactVector`. The index *is* its blob: every section lives
   in one shared `anybytes::ByteArea`, so `ToBlob`/`TryFromBlob`
   are O(1) refcounted handovers.
-* **`FlatIndex`**: brute-force exact cosine baseline. Same
-  `similar(a, b, score_floor)` constraint as HNSW — useful for
-  ground truth and small corpora.
+* **`FlatIndex`**: brute-force exact cosine baseline, useful for
+  ground truth and small corpora. Its `similar_to` result is complete.
 * **`HNSWIndex`** (naive Malkov & Yashunin 2018) with
   deterministic level sampling, ef-search, byte serialization.
   Validated at 1 000 handles / 32-dim against `FlatIndex` at
@@ -64,14 +62,15 @@ remaining open items are perf/encoding refinements, not architecture.
   graph encoded as two `CompactVector`s, all in one canonical
   `Bytes`. Nodes IS the handle; the caller's doc → embedding
   mapping lives in their tribles, not here.
-* **Binary-relation similarity constraint** `similar(a, b,
-  score_floor)` produced by the `similar()` method on any
-  attached view. `a` and `b` are `Variable<Handle<  Embedding>>`; `score_floor` is a fixed cosine threshold.
-  Callers who need the exact score fetch both embeddings and
-  compute cosine directly — no u16 quantization.
-* **Shared constraint trait** `SimilaritySearch` (HNSW, Flat,
-  SuccinctHNSW) + `BM25Queryable` (naive + succinct BM25) — the
-  same constraints work against either backend.
+* **Exact pair predicate** `cosine_at_least(a, b, score_floor)` on
+  every attached view. It never invents a domain: other constraints source
+  both variables, then the predicate filters pairs symmetrically.
+* **Directional retrieval snapshot** `similar_to(probe, var,
+  score_floor)`. Flat is complete; HNSW and succinct HNSW are approximate.
+  Every backend freezes native order and duplicate occurrences at constraint
+  construction.
+* **Shared constraint traits** `CosineSimilarity` (HNSW, Flat,
+  SuccinctHNSW) + `BM25Queryable` (naive + succinct BM25).
 * **`matches_text(doc, text, floor)`** + **`score_text(doc, text)`**:
   word-hash-keyed sugar over `matches` and `score` — tokenises the
   query string with `hash_tokens` internally, available on indexes
@@ -104,8 +103,8 @@ remaining open items are perf/encoding refinements, not architecture.
   - `multi_term_bm25_search` — multi-term `matches` filter
     joined with a `pattern!` author filter, ranked by
     post-collect `idx.score`.
-  - `compose_hnsw_and_pattern` — similarity + `pattern!`
-    composition via the binary `Similar` relation.
+  - `compose_hnsw_and_pattern` — a fixed-probe `SimilarTo` snapshot
+    composed with `pattern!`.
   - `hybrid_search` — BM25 + similarity + `pattern!` in one
     `find!`; both filters active simultaneously.
   - `blob_sizes_at_scale` — naive vs. SB25 blob size + parallel

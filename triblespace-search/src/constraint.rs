@@ -1,6 +1,6 @@
 //! Triblespace query-engine integration.
 //!
-//! Two constraint shapes ship:
+//! Three constraint shapes ship:
 //!
 //! * [`BM25Filter`] — multi-term BM25 constraint produced by
 //!   [`BM25Index::matches`] / `SuccinctBM25Index::matches`.
@@ -8,20 +8,18 @@
 //!   summed BM25 score across the query terms is at least
 //!   `score_floor`. Score is not a bound variable: it's a fixed
 //!   parameter, set at construction time. Callers who need the
-//!   exact score recompute it via the `score` inherent helper
-//!   on the index — same pattern as [`Similar`] for HNSW.
-//! * [`Similar`] — a binary relation
-//!   `similar(a, b, score_floor)` over two
-//!   `Variable<Handle<Embedding>>` variables, produced
-//!   by the `similar()` method on
+//!   exact score recompute it via the `score` inherent helper.
+//! * [`CosineAtLeast`] — an exact, symmetric, filter-only predicate
+//!   `cosine_at_least(a, b, score_floor)` over two
+//!   `Variable<Handle<Embedding>>` variables, produced by the
+//!   `cosine_at_least()` method on
 //!   [`crate::hnsw::AttachedHNSWIndex`] /
 //!   [`crate::hnsw::AttachedFlatIndex`] /
-//!   [`crate::succinct::AttachedSuccinctHNSWIndex`]. The
-//!   relation is symmetric (cosine similarity), `a` and `b`
-//!   are both embedding handles, and `score_floor` is a fixed
-//!   cosine threshold — *not* a bound variable. Callers who
-//!   need the exact score fetch both embeddings and compute
-//!   it directly (no quantisation).
+//!   [`crate::succinct::AttachedSuccinctHNSWIndex`]. Other constraints
+//!   source both handle domains.
+//! * [`SimilarTo`] — a unary immutable occurrence bag produced by one
+//!   fixed-probe backend search. Flat retrieval is complete; HNSW and
+//!   succinct HNSW retrieval is approximate.
 //!
 //! See `docs/QUERY_ENGINE_INTEGRATION.md` for the long-form
 //! design.
@@ -32,10 +30,12 @@ use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::query::{
-    finiteunaryprogram, CandidateSink, Constraint, DispatchClass, EstimateSink, ProgramPacing,
-    ProgramRef, ProgramRequest, ProgramRoute, ProgramSeedBatch, ResidualDeltaOutput,
+    finiteunaryprogram, CandidateSink, Constraint, DispatchClass, EstimateSink, ProgramAction,
+    ProgramCompletion, ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef, ProgramRequest,
+    ProgramRoute, ProgramSeedBatch, ProgramStratum, ResidualDeltaOutput,
     ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, TypedEffectSink,
-    TypedProgramBatch, TypedProgramSpec, TypedSeedSink, Variable, VariableId, VariableSet,
+    TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink, Variable, VariableId,
+    VariableSet,
 };
 
 use crate::bm25::BM25Index;
@@ -130,10 +130,9 @@ impl<D: triblespace_core::inline::InlineEncoding, T: triblespace_core::inline::I
 ///
 /// Score is **not** a bound variable — it's a constraint
 /// parameter set at construction time. This mirrors how
-/// [`Similar`] handles HNSW similarity: filter on a fixed
-/// floor inside the engine, recompute the precise score
-/// afterwards via the `score` inherent helper if you need it
-/// for ranking. Two reasons:
+/// search filtering handles scores: filter on a fixed floor inside the
+/// engine, recompute the precise score afterwards via the `score` inherent
+/// helper if you need it for ranking. Two reasons:
 ///
 /// - Quantisation bookkeeping disappears. The lossy f32-on-disk
 ///   score lives only in the index storage; the engine sees
@@ -515,31 +514,16 @@ where
 
 // ── Similarity constraint ───────────────────────────────────────────
 
-/// Backing surface a similarity index must expose for the
-/// [`Similar`] binary-relation constraint. Implemented for the
+/// Backing surface an attached embedding store must expose for the
+/// [`CosineAtLeast`] exact binary predicate. Implemented for the
 /// three attached views:
 /// [`crate::hnsw::AttachedHNSWIndex`],
 /// [`crate::hnsw::AttachedFlatIndex`], and
 /// [`crate::succinct::AttachedSuccinctHNSWIndex`].
 ///
-/// Both methods are infallible at the trait boundary —
-/// implementations map storage / fetch failures to "no results"
-/// (empty [`Vec`] or [`None`]). The engine's `propose` / `confirm`
-/// / `satisfied` hooks have no error channel, so failing open
-/// with "no match" is the only engine-safe choice; debug-time
-/// diagnostics belong in the concrete attached view's inherent
-/// methods, not here.
-pub trait SimilaritySearch {
-    /// Return every handle `b` in the index such that the cosine
-    /// similarity `cos(*from, *b) ≥ score_floor`. `from` may or
-    /// may not be in the index (e.g. it could be a query vector
-    /// put into the pile for this one call).
-    fn neighbours_above(
-        &self,
-        from: Inline<Handle<Embedding>>,
-        score_floor: f32,
-    ) -> Vec<Inline<Handle<Embedding>>>;
-
+/// Fetch failures map to [`None`], which is exact "no match" behavior at the
+/// query boundary because constraint hooks have no error channel.
+pub trait CosineSimilarity {
     /// Exact cosine similarity between the two handles, or
     /// [`None`] if either blob can't be fetched / parsed.
     fn cosine_between(
@@ -549,14 +533,14 @@ pub trait SimilaritySearch {
     ) -> Option<f32>;
 }
 
-/// Binary similarity-relation constraint:
-/// `similar(a, b, score_floor)` holds iff `a` and `b` are both
+/// Exact binary cosine predicate:
+/// `cosine_at_least(a, b, score_floor)` holds iff `a` and `b` are both
 /// embedding handles with `cosine(*a, *b) ≥ score_floor`.
 ///
-/// Semantics are symmetric (cosine is symmetric). Operationally,
-/// at least one of `a` / `b` must be bound so the engine can walk
-/// the index from that side; when both are bound, the constraint
-/// fetches both embeddings and checks the threshold directly.
+/// Semantics are symmetric and binding-history independent. This is a
+/// filter-only predicate: other constraints must source both handle domains,
+/// and this constraint checks candidate pairs pointwise. Approximate
+/// directional retrieval is exposed separately by [`SimilarTo`].
 ///
 /// `score_floor` is fixed at constraint-construction — it's a
 /// query parameter, not a bound variable. Callers who need the
@@ -564,25 +548,23 @@ pub trait SimilaritySearch {
 /// compute it without the approximation / quantisation that a
 /// score-variable would bring in.
 ///
-/// Produced by the `similar` method on an
+/// Produced by the `cosine_at_least` method on an
 /// [`crate::hnsw::AttachedHNSWIndex`] /
 /// [`crate::hnsw::AttachedFlatIndex`] /
 /// [`crate::succinct::AttachedSuccinctHNSWIndex`].
 ///
 /// # Example
 ///
-/// Pin the probe handle via `anchor.is(probe)` inside a
-/// `temp!` scope, then let the engine enumerate neighbours
-/// that clear the cosine floor:
+/// Pin the probe and provide a genuine candidate domain, then let the exact
+/// predicate filter that domain:
 ///
 /// ```
 /// use std::collections::HashSet;
 /// use triblespace_core::and;
 /// use triblespace_core::blob::MemoryBlobStore;
 /// use triblespace_core::find;
-/// use triblespace_core::query::temp;
+/// use triblespace_core::query::{temp, ContainsConstraint};
 /// use triblespace_core::repo::BlobStore;
-/// use triblespace_core::inline::encodings::hash::Blake3;
 /// use triblespace_core::inline::Inline;
 /// use triblespace_search::hnsw::HNSWBuilder;
 /// use triblespace_search::schemas::{put_embedding, EmbHandle};
@@ -604,11 +586,16 @@ pub trait SimilaritySearch {
 /// let view = idx.attach(&reader);
 ///
 /// let probe = handles[0];
+/// let candidates: HashSet<_> = handles.iter().copied().collect();
 /// let rows: Vec<(Inline<EmbHandle>,)> = find!(
 ///     (neighbour: Inline<EmbHandle>),
 ///     temp!(
 ///         (anchor),
-///         and!(anchor.is(probe), view.similar(anchor, neighbour, 0.8))
+///         and!(
+///             anchor.is(probe),
+///             (&candidates).has(neighbour),
+///             view.cosine_at_least(anchor, neighbour, 0.8),
+///         )
 ///     )
 /// )
 /// .collect();
@@ -619,19 +606,32 @@ pub trait SimilaritySearch {
 /// assert!(!got.contains(&handles[2])); // below floor
 /// ```
 ///
-/// For the common single-probe case, [`SimilarTo`] is unary
-/// sugar over this constraint —
-/// `view.similar_to(probe, neighbour, floor)` collapses the
-/// `temp!` + `anchor.is(...)` ceremony.
-pub struct Similar<'a, I: SimilaritySearch + ?Sized> {
+/// For the common single-probe retrieval case use [`SimilarTo`], which owns
+/// one already-materialized backend search result instead of pretending an
+/// approximate graph walk is an exact binary relation.
+pub struct CosineAtLeast<'a, I: CosineSimilarity + ?Sized> {
     index: &'a I,
     a: Variable<Handle<Embedding>>,
     b: Variable<Handle<Embedding>>,
     score_floor: f32,
 }
 
-impl<'a, I: SimilaritySearch + ?Sized> Similar<'a, I> {
-    /// Build a constraint. Usually invoked through the `similar`
+/// Canonical finite continuation for [`CosineAtLeast`].
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CosineAtLeastProgramState {
+    Confirm { variable: VariableId, offset: usize },
+    Support,
+}
+
+const COSINE_CONFIRM_ROUTE: u32 = 1 << 4;
+const COSINE_SUPPORT_ROUTE: u32 = 2 << 4;
+
+const COSINE_CONFIRM_DISPATCH: DispatchClass = DispatchClass::new(0);
+const COSINE_SUPPORT_DISPATCH: DispatchClass = DispatchClass::new(1);
+
+impl<'a, I: CosineSimilarity + ?Sized> CosineAtLeast<'a, I> {
+    /// Build a constraint. Usually invoked through the `cosine_at_least`
     /// method on an attached index rather than directly.
     pub fn new(
         index: &'a I,
@@ -646,9 +646,212 @@ impl<'a, I: SimilaritySearch + ?Sized> Similar<'a, I> {
             score_floor,
         }
     }
+
+    fn variable_mask(&self, variable: VariableId) -> u32 {
+        u32::from(variable == self.a.index) | (u32::from(variable == self.b.index) << 1)
+    }
+
+    fn bound_mask(&self, bound: VariableSet) -> u32 {
+        u32::from(bound.is_set(self.a.index)) | (u32::from(bound.is_set(self.b.index)) << 1)
+    }
+
+    fn pair_matches(&self, a: RawInline, b: RawInline) -> bool {
+        self.index
+            .cosine_between(Inline::new(a), Inline::new(b))
+            .is_some_and(|score| score >= self.score_floor)
+    }
+
+    fn candidate_matches_or_is_unresolved(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        row: &[RawInline],
+        candidate: RawInline,
+    ) -> bool {
+        if self.a.index == self.b.index {
+            return variable == self.a.index && self.pair_matches(candidate, candidate);
+        }
+        if variable == self.a.index {
+            view.col(self.b.index)
+                .is_none_or(|column| self.pair_matches(candidate, row[column]))
+        } else if variable == self.b.index {
+            view.col(self.a.index)
+                .is_none_or(|column| self.pair_matches(row[column], candidate))
+        } else {
+            false
+        }
+    }
+
+    fn support_row(&self, view: &RowsView<'_>, row: &[RawInline]) -> bool {
+        match (view.col(self.a.index), view.col(self.b.index)) {
+            (Some(a), Some(b)) => self.pair_matches(row[a], row[b]),
+            _ => true,
+        }
+    }
 }
 
-impl<'a, I: SimilaritySearch + ?Sized + 'a> Constraint<'a> for Similar<'a, I> {
+impl<I: CosineSimilarity + ?Sized> TypedProgramSpec for CosineAtLeast<'_, I> {
+    type State = CosineAtLeastProgramState;
+    type NoveltyKey = ();
+    type Rank = [u64; 2];
+
+    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+        let bound_mask = self.bound_mask(request.bound);
+        let (key, variable) = match request.action {
+            ProgramAction::Propose(_) => return None,
+            ProgramAction::Confirm(variable) => {
+                let target_mask = self.variable_mask(variable);
+                if target_mask == 0 || request.bound.is_set(variable) {
+                    return None;
+                }
+                (
+                    COSINE_CONFIRM_ROUTE | (target_mask << 2) | bound_mask,
+                    variable,
+                )
+            }
+            ProgramAction::Support => (
+                COSINE_SUPPORT_ROUTE | bound_mask,
+                self.a.index,
+            ),
+        };
+        Some(ProgramRoute {
+            key: ProgramKey::new(key),
+            variable,
+            stratum: ProgramStratum::Finite,
+            grouping: ProgramGrouping::PageLocal,
+            completion: ProgramCompletion::PageableOnly,
+        })
+    }
+
+    fn dispatch(&self, state: &Self::State) -> DispatchClass {
+        match state {
+            CosineAtLeastProgramState::Confirm { .. } => COSINE_CONFIRM_DISPATCH,
+            CosineAtLeastProgramState::Support => COSINE_SUPPORT_DISPATCH,
+        }
+    }
+
+    fn pacing(&self, _state: &Self::State) -> ProgramPacing {
+        ProgramPacing::Search
+    }
+
+    fn progress(&self, state: &Self::State) -> Self::Rank {
+        match state {
+            CosineAtLeastProgramState::Support => [1, 0],
+            CosineAtLeastProgramState::Confirm { offset, .. } => [
+                2,
+                u64::MAX
+                    - u64::try_from(*offset).expect("cosine candidate offset exceeds rank limb"),
+            ],
+        }
+    }
+
+    fn seed_typed(
+        &self,
+        batch: ProgramSeedBatch<'_>,
+        effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+    ) {
+        assert_eq!(batch.route.stratum, ProgramStratum::Finite);
+        assert_eq!(batch.route.grouping, ProgramGrouping::PageLocal);
+        assert_eq!(batch.route.completion, ProgramCompletion::PageableOnly);
+        let state = match batch.request.action {
+            ProgramAction::Propose(_) => panic!("filter-only cosine Program admitted a proposal"),
+            ProgramAction::Confirm(variable) => {
+                assert_ne!(self.variable_mask(variable), 0);
+                assert!(!batch.request.bound.is_set(variable));
+                assert_eq!(batch.route.variable, variable);
+                CosineAtLeastProgramState::Confirm {
+                    variable,
+                    offset: 0,
+                }
+            }
+            ProgramAction::Support => CosineAtLeastProgramState::Support,
+        };
+        for parent in 0..batch.view.len() {
+            effects.finite_root(
+                u32::try_from(parent).expect("too many exact cosine parents"),
+                state.clone(),
+                None,
+            );
+        }
+    }
+
+    fn step_typed(
+        &self,
+        states: Vec<Self::State>,
+        batch: TypedProgramBatch<'_>,
+        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+    ) {
+        assert_eq!(batch.stratum, ProgramStratum::Finite);
+        assert_eq!(states.len(), batch.view.len());
+        assert_eq!(states.len(), batch.candidate_sets.len());
+        assert_eq!(states.len(), batch.limits.len());
+        let Some(first) = states.first() else {
+            return;
+        };
+        match first {
+            CosineAtLeastProgramState::Confirm { variable, .. } => {
+                let variable = *variable;
+                for (input, state) in states.into_iter().enumerate() {
+                    let CosineAtLeastProgramState::Confirm {
+                        variable: state_variable,
+                        offset,
+                    } = state
+                    else {
+                        panic!("one exact cosine cohort mixed action variants")
+                    };
+                    assert_eq!(state_variable, variable);
+                    let candidates = batch.candidate_sets[input]
+                        .expect("exact cosine confirmation lost its candidate group");
+                    assert!(offset <= candidates.len());
+                    let end = offset
+                        .saturating_add(batch.limits[input])
+                        .min(candidates.len());
+                    let input_tag =
+                        u32::try_from(input).expect("too many exact cosine inputs in one cohort");
+                    for &candidate in &candidates[offset..end] {
+                        if self.candidate_matches_or_is_unresolved(
+                            variable,
+                            &batch.view,
+                            batch.view.row(input),
+                            candidate,
+                        ) {
+                            effects.accept(input_tag, candidate);
+                        }
+                    }
+                    let examined = end - offset;
+                    assert!(
+                        end == candidates.len() || examined > 0,
+                        "exact cosine confirmation resumed without examining a candidate"
+                    );
+                    let resume = (end < candidates.len()).then(|| {
+                        TypedResume::Immediate(CosineAtLeastProgramState::Confirm {
+                            variable,
+                            offset: end,
+                        })
+                    });
+                    effects.page(examined, resume);
+                }
+            }
+            CosineAtLeastProgramState::Support => {
+                for (input, state) in states.into_iter().enumerate() {
+                    assert_eq!(state, CosineAtLeastProgramState::Support);
+                    assert!(
+                        batch.candidate_sets[input].is_none(),
+                        "exact cosine support received a candidate group"
+                    );
+                    if self.support_row(&batch.view, batch.view.row(input)) {
+                        effects.support(
+                            u32::try_from(input).expect("too many exact cosine inputs"),
+                        );
+                    }
+                    effects.page(1, None);
+                }
+            }
+        }
+    }
+}
+
+impl<'a, I: CosineSimilarity + ?Sized + 'a> Constraint<'a> for CosineAtLeast<'a, I> {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.a.index).union(VariableSet::new_singleton(self.b.index))
     }
@@ -662,56 +865,20 @@ impl<'a, I: SimilaritySearch + ?Sized + 'a> Constraint<'a> for Similar<'a, I> {
         if variable != self.a.index && variable != self.b.index {
             return false;
         }
-        let other = if variable == self.a.index {
-            self.b.index
-        } else {
-            self.a.index
-        };
-        match view.col(other) {
-            // Other side bound: count the candidates from the
-            // walk and report an exact cardinality, per row.
-            Some(col) => out.extend(view.iter().map(|row| {
-                self.index
-                    .neighbours_above(Inline::new(row[col]), self.score_floor)
-                    .len()
-            })),
-            // Other side unbound: the engine is still ordering
-            // the join — signal "expensive" so it picks a
-            // cheaper constraint first, rather than `false` which
-            // would flag the variable as unconstrained.
-            None => out.fill(usize::MAX, view.len()),
-        }
+        // This predicate owns no domain. Saturation keeps it behind every
+        // genuine source without falsely marking the variable unconstrained.
+        out.fill(usize::MAX, view.len());
         true
     }
 
     fn propose(
         &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
+        _variable: VariableId,
+        _view: &RowsView<'_>,
+        _candidates: &mut CandidateSink<'_>,
     ) {
-        if variable != self.a.index && variable != self.b.index {
-            return;
-        }
-        let other = if variable == self.a.index {
-            self.b.index
-        } else {
-            self.a.index
-        };
-        let Some(col) = view.col(other) else {
-            // Can't propose without a pivot; engine should pick
-            // another constraint first.
-            return;
-        };
-        for (i, row) in view.iter().enumerate() {
-            candidates.extend_row(
-                i as u32,
-                self.index
-                    .neighbours_above(Inline::new(row[col]), self.score_floor)
-                    .into_iter()
-                    .map(|h| h.raw),
-            );
-        }
+        // Intentionally empty: exact pairwise cosine is a predicate, not an
+        // ANN domain source. `SimilarTo` owns directional retrieval.
     }
 
     fn confirm(
@@ -723,72 +890,39 @@ impl<'a, I: SimilaritySearch + ?Sized + 'a> Constraint<'a> for Similar<'a, I> {
         if variable != self.a.index && variable != self.b.index {
             return;
         }
-        let other = if variable == self.a.index {
-            self.b.index
-        } else {
-            self.a.index
-        };
-        let Some(col) = view.col(other) else {
-            // With no pivot, we can only keep candidates that pair
-            // with *something* in the index above the floor. Keep
-            // them all — the engine will revisit once the other
-            // side is bound.
-            return;
-        };
-        let mut current_row: Option<u32> = None;
-        let mut allowed: HashSet<RawInline> = HashSet::new();
-        candidates.retain(|row_idx, raw| {
-            if current_row != Some(row_idx) {
-                current_row = Some(row_idx);
-                let from = view.row(row_idx as usize)[col];
-                allowed = self
-                    .index
-                    .neighbours_above(Inline::new(from), self.score_floor)
-                    .into_iter()
-                    .map(|h| h.raw)
-                    .collect();
-            }
-            allowed.contains(raw)
+        candidates.retain(|row, candidate| {
+            self.candidate_matches_or_is_unresolved(
+                variable,
+                view,
+                view.row(row as usize),
+                *candidate,
+            )
         });
     }
 
+    fn residual_confirm_is_page_local(&self) -> bool {
+        true
+    }
+
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
-        match (view.col(self.a.index), view.col(self.b.index)) {
-            (Some(ca), Some(cb)) => view.iter().all(|row| {
-                // Both bound: compute cosine directly. No engine
-                // reason to prefer the walk here — exact beats
-                // approximate once we've paid the two blob fetches.
-                match self
-                    .index
-                    .cosine_between(Inline::new(row[ca]), Inline::new(row[cb]))
-                {
-                    Some(sim) => sim >= self.score_floor,
-                    None => false,
-                }
-            }),
-            // Only one side bound: treated as trivially satisfied
-            // — the engine will exercise propose/confirm on the
-            // free side before binding it.
-            _ => true,
-        }
+        view.iter().all(|row| self.support_row(view, row))
+    }
+
+    fn residual_program(&self) -> Option<ProgramRef<'_>> {
+        Some(ProgramRef::new(self))
     }
 }
 
 /// Unary similarity constraint: `similar_to(probe, var, score_floor)`
-/// binds `var` to every handle whose cosine similarity to the
-/// pinned `probe` handle is ≥ `score_floor`.
+/// binds `var` to the immutable candidate occurrence bag returned by one
+/// backend search from `probe` at `score_floor`.
 ///
-/// Convenience over [`Similar`] for the common case where the
-/// caller already holds the query handle — collapses the
-/// `temp!((anchor), and!(anchor.is(probe), similar(anchor, var,
-/// floor)))` ceremony into a single method call. The binary
-/// [`Similar`] remains the primitive; this is sugar.
-///
-/// The candidate set is pre-materialised at construction: one
-/// walk from `probe` produces the complete above-threshold list,
-/// stored as raw bytes. `propose` / `confirm` / `satisfied`
-/// iterate the cached list — no re-walking the index per engine
-/// call.
+/// The candidate bag is pre-materialised at construction and retains the
+/// producer's native order and duplicate occurrences. Flat search produces
+/// every indexed handle above the threshold. HNSW and succinct HNSW are
+/// approximate and may omit qualifying handles. Once constructed, query
+/// semantics are exact membership in this frozen bag; no engine action
+/// re-walks the index.
 ///
 /// Produced by the `similar_to` method on an
 /// [`crate::hnsw::AttachedHNSWIndex`] /
@@ -802,7 +936,6 @@ impl<'a, I: SimilaritySearch + ?Sized + 'a> Constraint<'a> for Similar<'a, I> {
 /// use triblespace_core::blob::MemoryBlobStore;
 /// use triblespace_core::find;
 /// use triblespace_core::repo::BlobStore;
-/// use triblespace_core::inline::encodings::hash::Blake3;
 /// use triblespace_core::inline::Inline;
 /// use triblespace_search::hnsw::HNSWBuilder;
 /// use triblespace_search::schemas::{put_embedding, EmbHandle};
@@ -837,8 +970,7 @@ impl<'a, I: SimilaritySearch + ?Sized + 'a> Constraint<'a> for Similar<'a, I> {
 /// ```
 pub struct SimilarTo {
     var: Variable<Handle<Embedding>>,
-    /// Eagerly-computed above-threshold handle set from the one
-    /// walk at construction.
+    /// Eagerly-computed backend result bag from the one walk at construction.
     candidates: Vec<RawInline>,
     /// Set-shaped companion used by pointwise confirmation without changing
     /// the native proposal order or duplicate occurrence bag.
@@ -1013,7 +1145,7 @@ mod tests {
     use triblespace_core::query::hashsetconstraint::SetConstraint;
     use triblespace_core::query::residual::{try_constructed_program_query, ResidualLowering};
     use triblespace_core::query::{Binding, Candidates, Query};
-    use triblespace_core::repo::BlobStore;
+    use triblespace_core::repo::{BlobStore, BlobStorePut};
 
     fn id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
@@ -1505,7 +1637,7 @@ mod tests {
         assert_eq!(after, [entries[3]]);
     }
 
-    // ── Similar (binary-relation similarity) ──────────────────
+    // ── Exact pairwise cosine + directional retrieval ─────────
 
     /// Build a 3-doc corpus where doc 1 = [1,0,0], doc 2 = [0,1,0],
     /// doc 3 ≈ doc 1. Returns (flat_index, hnsw_index, store,
@@ -1539,7 +1671,7 @@ mod tests {
     }
 
     #[test]
-    fn binary_similarity_restart_only_backends_do_not_claim_a_paged_source() {
+    fn exact_cosine_is_a_program_confirmer_but_never_a_paged_source() {
         let (flat, hnsw, mut store, handles) = sample_sim();
         let reader = store.reader().unwrap();
         let a = Variable::<Handle<Embedding>>::new(0);
@@ -1549,39 +1681,39 @@ mod tests {
         let bound_pivot = RowsView::new(&vars, &row);
 
         let flat_view = flat.attach(&reader);
-        let flat_constraint = flat_view.similar(a, b, 0.8);
+        let flat_constraint = flat_view.cosine_at_least(a, b, 0.8);
         assert!(
             !flat_constraint.residual_proposal_source_is_paged(b.index, &bound_pivot),
-            "flat search currently has no failure-atomic resumable page API",
+            "exact cosine is deliberately filter-only",
         );
         assert!(
-            flat_constraint.residual_program().is_none(),
-            "a completed flat search must not be hidden inside unmetered Program seeding",
+            flat_constraint.residual_program().is_some(),
+            "exact cosine must expose its page-local confirmer Program",
         );
 
         let hnsw_view = hnsw.attach(&reader);
-        let hnsw_constraint = hnsw_view.similar(a, b, 0.8);
+        let hnsw_constraint = hnsw_view.cosine_at_least(a, b, 0.8);
         assert!(
             !hnsw_constraint.residual_proposal_source_is_paged(b.index, &bound_pivot),
-            "naive HNSW exposes only a completed search Vec, not its heap/visited continuation",
+            "an attached HNSW view does not turn exact cosine into ANN expansion",
         );
         assert!(
-            hnsw_constraint.residual_program().is_none(),
-            "a completed HNSW search must not masquerade as a resumable Program",
+            hnsw_constraint.residual_program().is_some(),
+            "HNSW attachment still supports exact pairwise confirmation",
         );
 
         #[cfg(feature = "succinct")]
         {
             let succinct = crate::succinct::SuccinctHNSWIndex::from_naive(&hnsw).unwrap();
             let succinct_view = succinct.attach(&reader);
-            let succinct_constraint = succinct_view.similar(a, b, 0.8);
+            let succinct_constraint = succinct_view.cosine_at_least(a, b, 0.8);
             assert!(
                 !succinct_constraint.residual_proposal_source_is_paged(b.index, &bound_pivot),
-                "succinct HNSW also exposes only a completed search Vec",
+                "succinct attachment keeps retrieval and exact filtering separate",
             );
             assert!(
-                succinct_constraint.residual_program().is_none(),
-                "succinct HNSW also lacks an owned search continuation",
+                succinct_constraint.residual_program().is_some(),
+                "succinct attachment supports exact pairwise confirmation",
             );
         }
     }
@@ -1743,7 +1875,7 @@ mod tests {
     }
 
     #[test]
-    fn flat_similar_proposes_candidates_above_floor() {
+    fn flat_cosine_filters_candidates_exactly_in_both_binding_orders() {
         let (flat, _hnsw, mut store, handles) = sample_sim();
         let reader = store.reader().unwrap();
         let view = flat.attach(&reader);
@@ -1751,50 +1883,47 @@ mod tests {
         let mut ctx = triblespace_core::query::VariableContext::new();
         let a: Variable<Handle<Embedding>> = ctx.next_variable();
         let b: Variable<Handle<Embedding>> = ctx.next_variable();
-        let c = view.similar(a, b, 0.8);
+        let c = view.cosine_at_least(a, b, 0.8);
 
-        let vars = [a.index];
-        let row = [handles[0].raw];
-
-        let mut props: Candidates = Vec::new();
+        let mut no_domain: Candidates = Vec::new();
         c.propose(
             b.index,
-            &RowsView::new(&vars, &row),
-            &mut CandidateSink::Tagged(&mut props),
+            &RowsView::new(&[a.index], &[handles[0].raw]),
+            &mut CandidateSink::Tagged(&mut no_domain),
         );
-        let got: HashSet<RawInline> = props.iter().map(|&(_, v)| v).collect();
-        assert!(got.contains(&handles[0].raw));
-        assert!(got.contains(&handles[2].raw));
-        assert!(!got.contains(&handles[1].raw));
-    }
+        assert!(no_domain.is_empty(), "exact cosine must never source an ANN domain");
 
-    #[test]
-    fn flat_similar_symmetric_bind_on_b() {
-        let (flat, _hnsw, mut store, handles) = sample_sim();
-        let reader = store.reader().unwrap();
-        let view = flat.attach(&reader);
+        let mut bind_b: Candidates = handles
+            .iter()
+            .map(|handle| (0, handle.raw))
+            .collect();
+        c.confirm(
+            b.index,
+            &RowsView::new(&[a.index], &[handles[0].raw]),
+            &mut CandidateSink::Tagged(&mut bind_b),
+        );
+        assert_eq!(
+            bind_b.iter().map(|&(_, value)| value).collect::<Vec<_>>(),
+            [handles[0].raw, handles[2].raw],
+        );
 
-        let mut ctx = triblespace_core::query::VariableContext::new();
-        let a: Variable<Handle<Embedding>> = ctx.next_variable();
-        let b: Variable<Handle<Embedding>> = ctx.next_variable();
-        let c = view.similar(a, b, 0.8);
-
-        let vars = [b.index];
-        let row = [handles[2].raw];
-
-        let mut props: Candidates = Vec::new();
-        c.propose(
+        let mut bind_a: Candidates = handles
+            .iter()
+            .map(|handle| (0, handle.raw))
+            .collect();
+        c.confirm(
             a.index,
-            &RowsView::new(&vars, &row),
-            &mut CandidateSink::Tagged(&mut props),
+            &RowsView::new(&[b.index], &[handles[2].raw]),
+            &mut CandidateSink::Tagged(&mut bind_a),
         );
-        let got: HashSet<RawInline> = props.iter().map(|&(_, v)| v).collect();
-        assert!(got.contains(&handles[0].raw));
-        assert!(got.contains(&handles[2].raw));
+        assert_eq!(
+            bind_a.iter().map(|&(_, value)| value).collect::<Vec<_>>(),
+            [handles[0].raw, handles[2].raw],
+        );
     }
 
     #[test]
-    fn flat_similar_satisfied_both_bound() {
+    fn flat_cosine_satisfied_checks_the_same_exact_predicate() {
         let (flat, _hnsw, mut store, handles) = sample_sim();
         let reader = store.reader().unwrap();
         let view = flat.attach(&reader);
@@ -1802,7 +1931,7 @@ mod tests {
         let mut ctx = triblespace_core::query::VariableContext::new();
         let a: Variable<Handle<Embedding>> = ctx.next_variable();
         let b: Variable<Handle<Embedding>> = ctx.next_variable();
-        let c = view.similar(a, b, 0.8);
+        let c = view.cosine_at_least(a, b, 0.8);
 
         let vars = [a.index, b.index];
         let good = [handles[0].raw, handles[2].raw];
@@ -1813,34 +1942,53 @@ mod tests {
     }
 
     #[test]
-    fn hnsw_similar_proposes_candidates_above_floor() {
+    fn hnsw_cosine_accepts_an_exact_match_outside_the_ann_index() {
         let (_flat, hnsw, mut store, handles) = sample_sim();
+        let outside =
+            crate::schemas::put_embedding::<_>(&mut store, vec![0.999, 0.001, 0.0]).unwrap();
         let reader = store.reader().unwrap();
         let view = hnsw.attach(&reader);
 
         let mut ctx = triblespace_core::query::VariableContext::new();
         let a: Variable<Handle<Embedding>> = ctx.next_variable();
         let b: Variable<Handle<Embedding>> = ctx.next_variable();
-        let c = view.similar(a, b, 0.8);
+        let c = view.cosine_at_least(a, b, 0.99);
 
-        let vars = [a.index];
-        let row = [handles[0].raw];
-
-        let mut props: Candidates = Vec::new();
-        c.propose(
+        let mut candidates: Candidates = vec![(0, outside.raw)];
+        c.confirm(
             b.index,
-            &RowsView::new(&vars, &row),
-            &mut CandidateSink::Tagged(&mut props),
+            &RowsView::new(&[a.index], &[handles[0].raw]),
+            &mut CandidateSink::Tagged(&mut candidates),
         );
-        let got: HashSet<RawInline> = props.iter().map(|&(_, v)| v).collect();
-        assert!(got.contains(&handles[0].raw));
-        assert!(got.contains(&handles[2].raw));
-        assert!(!got.contains(&handles[1].raw));
+        assert_eq!(candidates, [(0, outside.raw)]);
     }
 
     #[test]
-    fn similar_estimate_saturates_when_other_unbound() {
+    fn pairwise_cosine_divides_by_norms_for_raw_embedding_blobs() {
         let (flat, _hnsw, mut store, _handles) = sample_sim();
+        let a_handle = store
+            .put::<Embedding, _>(vec![2.0f32, 0.0, 0.0])
+            .unwrap();
+        let b_handle = store
+            .put::<Embedding, _>(vec![3.0f32, 0.0, 0.0])
+            .unwrap();
+        let reader = store.reader().unwrap();
+        let view = flat.attach(&reader);
+        let a = Variable::<Handle<Embedding>>::new(0);
+        let b = Variable::<Handle<Embedding>>::new(1);
+
+        let mut candidates: Candidates = vec![(0, b_handle.raw)];
+        view.cosine_at_least(a, b, 1.01).confirm(
+            b.index,
+            &RowsView::new(&[a.index], &[a_handle.raw]),
+            &mut CandidateSink::Tagged(&mut candidates),
+        );
+        assert!(candidates.is_empty(), "parallel vectors have cosine one, not dot six");
+    }
+
+    #[test]
+    fn cosine_estimate_saturates_even_when_the_peer_is_bound() {
+        let (flat, _hnsw, mut store, handles) = sample_sim();
         let reader = store.reader().unwrap();
         let view = flat.attach(&reader);
 
@@ -1848,10 +1996,87 @@ mod tests {
         let a: Variable<Handle<Embedding>> = ctx.next_variable();
         let b: Variable<Handle<Embedding>> = ctx.next_variable();
         let unrelated: Variable<GenId> = ctx.next_variable();
-        let c = view.similar(a, b, 0.8);
+        let c = view.cosine_at_least(a, b, 0.8);
 
         assert_eq!(est(&c, a.index, &RowsView::EMPTY), Some(usize::MAX));
         assert_eq!(est(&c, b.index, &RowsView::EMPTY), Some(usize::MAX));
+        assert_eq!(
+            est(
+                &c,
+                b.index,
+                &RowsView::new(&[a.index], &[handles[0].raw]),
+            ),
+            Some(usize::MAX),
+        );
         assert_eq!(est(&c, unrelated.index, &RowsView::EMPTY), None);
+    }
+
+    #[test]
+    fn repeated_cosine_variable_is_checked_during_confirmation() {
+        let (flat, _hnsw, mut store, handles) = sample_sim();
+        let reader = store.reader().unwrap();
+        let view = flat.attach(&reader);
+        let x = Variable::<Handle<Embedding>>::new(0);
+
+        let mut accepted: Candidates = vec![(0, handles[0].raw), (0, handles[1].raw)];
+        view.cosine_at_least(x, x, 0.99).confirm(
+            x.index,
+            &RowsView::EMPTY,
+            &mut CandidateSink::Tagged(&mut accepted),
+        );
+        assert_eq!(accepted.len(), 2);
+
+        let mut rejected: Candidates = vec![(0, handles[0].raw)];
+        view.cosine_at_least(x, x, 1.01).confirm(
+            x.index,
+            &RowsView::EMPTY,
+            &mut CandidateSink::Tagged(&mut rejected),
+        );
+        assert!(rejected.is_empty());
+    }
+
+    #[test]
+    fn exact_cosine_program_constructs_without_a_proposal_route() {
+        let (flat, _hnsw, mut store, handles) = sample_sim();
+        let reader = store.reader().unwrap();
+        let view = flat.attach(&reader);
+        let a = Variable::<Handle<Embedding>>::new(0);
+        let b = Variable::<Handle<Embedding>>::new(1);
+
+        let good = triblespace_core::and!(
+            a.is(handles[0]),
+            b.is(handles[2]),
+            view.cosine_at_least(a, b, 0.8),
+        );
+        let rows: Vec<_> = try_constructed_program_query(good, project_pair)
+            .expect("constant sources plus exact cosine must construct")
+            .cap(1)
+            .start_width(1)
+            .growth(1)
+            .collect();
+        assert_eq!(rows, [(handles[0].raw, handles[2].raw)]);
+
+        let bad = triblespace_core::and!(
+            a.is(handles[0]),
+            b.is(handles[1]),
+            view.cosine_at_least(a, b, 0.8),
+        );
+        assert!(
+            try_constructed_program_query(bad, project_pair)
+                .expect("the same exact cosine route must construct for a false pair")
+                .next()
+                .is_none()
+        );
+
+        let repeated = triblespace_core::and!(
+            a.is(handles[0]),
+            view.cosine_at_least(a, a, 1.01),
+        );
+        assert!(
+            try_constructed_program_query(repeated, project_first)
+                .expect("repeated-variable cosine must construct as a confirmer")
+                .next()
+                .is_none()
+        );
     }
 }

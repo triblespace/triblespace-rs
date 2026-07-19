@@ -30,9 +30,8 @@
 //! b.insert(h3);
 //! let idx = b.build();
 //!
-//! // The index exposes a symmetric `similar(a, b, floor)`
-//! // binary relation over embedding handles; see the
-//! // `constraint` module for the full query-engine integration.
+//! // Fixed-probe retrieval is explicit; exact pair filtering lives in the
+//! // separate `cosine_at_least(a, b, floor)` predicate.
 //! let reader = store.reader().unwrap();
 //! let view = idx.attach(&reader);
 //! let hits = view.candidates_above(h1, 0.8).unwrap();
@@ -589,29 +588,22 @@ where
         self
     }
 
-    /// Build a symmetric similarity constraint over two handle
-    /// variables, gated by a fixed cosine `score_floor`. Both
-    /// variables bind to `Handle<Embedding>` values —
-    /// callers typically get `a` from a trible pattern
-    /// (e.g. "embedding attached to this doc") and leave `b`
-    /// free for the engine to enumerate via the HNSW walk. See
-    /// [`crate::constraint::Similar`] for the full semantics.
-    pub fn similar(
+    /// Build an exact symmetric cosine predicate over two handle variables.
+    /// This is filter-only: other constraints source both domains. Use
+    /// [`Self::similar_to`] for directional HNSW retrieval.
+    pub fn cosine_at_least(
         &self,
         a: Variable<EmbHandle>,
         b: Variable<EmbHandle>,
         score_floor: f32,
-    ) -> crate::constraint::Similar<'_, Self> {
-        crate::constraint::Similar::new(self, a, b, score_floor)
+    ) -> crate::constraint::CosineAtLeast<'_, Self> {
+        crate::constraint::CosineAtLeast::new(self, a, b, score_floor)
     }
 
     /// Convenience wrapper for the common
-    /// "search from a known handle" case. Binds `var` to every
-    /// handle whose cosine similarity to `probe` clears
-    /// `score_floor`. Equivalent to
-    /// `temp!((a), and!(a.is(probe), self.similar(a, var, floor)))`
-    /// but without the temp-variable ceremony at the call site;
-    /// see [`crate::constraint::SimilarTo`].
+    /// "search from a known handle" case. Freezes one directional ANN walk
+    /// rather than pretending it is an exact binary predicate; see
+    /// [`crate::constraint::SimilarTo`].
     ///
     /// Walks the index once at construction and caches the
     /// result — subsequent engine `propose` / `confirm` calls
@@ -629,12 +621,11 @@ where
         crate::constraint::SimilarTo::from_candidates(var, candidates)
     }
 
-    /// Leaf graph-walk primitive used by [`Self::similar_to`]
-    /// and [`Self::similar`] under the hood. Surfaced for tests
+    /// Leaf graph-walk primitive used by [`Self::similar_to`]. Surfaced for tests
     /// (correctness oracles) and benchmarks (timing the walk in
     /// isolation from engine overhead). **Production callers
     /// should use the engine path** —
-    /// [`Self::similar_to`] / [`Self::similar`] inside a
+    /// [`Self::similar_to`] inside a
     /// `find!` / `pattern!` / `and!` query — so the result
     /// composes with other constraints (BM25, pattern, range)
     /// in one engine pass instead of materialising a Vec just
@@ -766,6 +757,33 @@ where
 /// Cosine distance = 1 - dot(a, b) for pre-normalized vectors.
 pub(crate) fn cosine_dist(a: &[f32], b: &[f32]) -> f32 {
     1.0 - dot(a, b)
+}
+
+/// True cosine similarity for arbitrary equal-length vectors.
+///
+/// Indexed embeddings follow the unit-vector convention, but the blob schema
+/// cannot enforce it. Pairwise predicates therefore divide by both norms
+/// instead of inheriting the ANN hot path's ingest-time assumption. A zero
+/// vector has similarity zero, matching the crate's existing zero-vector
+/// normalization convention.
+pub(crate) fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut dot = 0.0f64;
+    let mut norm_a = 0.0f64;
+    let mut norm_b = 0.0f64;
+    for (&a, &b) in a.iter().zip(b) {
+        let a = f64::from(a);
+        let b = f64::from(b);
+        dot += a * b;
+        norm_a += a * a;
+        norm_b += b * b;
+    }
+    let norm_product = norm_a * norm_b;
+    if norm_product == 0.0 {
+        0.0
+    } else {
+        (dot / norm_product.sqrt()) as f32
+    }
 }
 
 /// Min-heap wrapper: smaller distance = higher priority.
@@ -923,16 +941,13 @@ impl FlatBuilder {
 
 /// Brute-force k-NN index.
 ///
-/// Stores `(key, handle)` pairs — the embedding blobs live in
-/// the pile's blob store, content-addressed. `similar()`
-/// resolves handles through a caller-supplied
+/// Stores embedding handles — the blobs live in the pile's blob store,
+/// content-addressed. Attached query operations resolve handles through a caller-supplied
 /// [`BlobStoreGet`][g] at query time, so two indexes that
 /// embed the same entity share storage.
 ///
-/// Scores are cosine similarity in `[-1, 1]` **iff** the
-/// stored embeddings are L2-normalized (the convention — see
-/// [`Embedding`]'s docs). `similar()` L2-normalizes the query
-/// itself so the dot product reads back as cosine.
+/// ANN retrieval assumes stored embeddings are L2-normalized (the convention;
+/// see [`Embedding`]'s docs). The exact pair predicate divides by both norms.
 ///
 /// [g]: triblespace_core::repo::BlobStoreGet
 #[doc(hidden)]
@@ -1005,26 +1020,22 @@ where
         self.index
     }
 
-    /// Build a symmetric similarity constraint over two handle
-    /// variables, gated by a fixed cosine `score_floor`. Mirrors
-    /// [`AttachedHNSWIndex::similar`][a] for the brute-force
-    /// case — O(N) in the corpus. See [`crate::constraint::Similar`].
-    ///
-    /// [a]: crate::hnsw::AttachedHNSWIndex::similar
-    pub fn similar(
+    /// Build an exact symmetric cosine predicate over two handle variables.
+    /// This is filter-only; [`Self::similar_to`] owns brute-force retrieval.
+    pub fn cosine_at_least(
         &self,
         a: Variable<EmbHandle>,
         b: Variable<EmbHandle>,
         score_floor: f32,
-    ) -> crate::constraint::Similar<'_, Self> {
-        crate::constraint::Similar::new(self, a, b, score_floor)
+    ) -> crate::constraint::CosineAtLeast<'_, Self> {
+        crate::constraint::CosineAtLeast::new(self, a, b, score_floor)
     }
 
     /// Convenience wrapper for the common
     /// "search from a known handle" case. Mirrors
     /// [`AttachedHNSWIndex::similar_to`][a] for the brute-force
-    /// index — walks all handles once at construction, stores
-    /// the above-threshold set. See [`crate::constraint::SimilarTo`].
+    /// index — walks all handles once at construction and stores the native
+    /// result bag. See [`crate::constraint::SimilarTo`].
     ///
     /// [a]: crate::hnsw::AttachedHNSWIndex::similar_to
     pub fn similar_to(
@@ -1045,7 +1056,7 @@ where
     /// the corpus, returns every above-threshold handle (no
     /// approximation, no `ef_search` cap). Same expectation
     /// applies: production callers go through the engine via
-    /// [`Self::similar_to`] / [`Self::similar`] inside a
+    /// [`Self::similar_to`] inside a
     /// `find!`; this leaf is for tests and benchmarks.
     ///
     /// [a]: crate::hnsw::AttachedHNSWIndex::candidates_above
@@ -1084,18 +1095,10 @@ impl FlatIndex {
     }
 }
 
-impl<'a, B> crate::constraint::SimilaritySearch for AttachedHNSWIndex<'a, B>
+impl<'a, B> crate::constraint::CosineSimilarity for AttachedHNSWIndex<'a, B>
 where
     B: triblespace_core::repo::BlobStoreGet,
 {
-    fn neighbours_above(
-        &self,
-        from: Inline<Handle<Embedding>>,
-        score_floor: f32,
-    ) -> Vec<Inline<Handle<Embedding>>> {
-        self.candidates_above(from, score_floor).unwrap_or_default()
-    }
-
     fn cosine_between(
         &self,
         a: Inline<Handle<Embedding>>,
@@ -1108,22 +1111,14 @@ where
         if a_slice.len() != b_slice.len() {
             return None;
         }
-        Some(dot(a_slice, b_slice))
+        Some(cosine_similarity(a_slice, b_slice))
     }
 }
 
-impl<'a, B> crate::constraint::SimilaritySearch for AttachedFlatIndex<'a, B>
+impl<'a, B> crate::constraint::CosineSimilarity for AttachedFlatIndex<'a, B>
 where
     B: triblespace_core::repo::BlobStoreGet,
 {
-    fn neighbours_above(
-        &self,
-        from: Inline<Handle<Embedding>>,
-        score_floor: f32,
-    ) -> Vec<Inline<Handle<Embedding>>> {
-        self.candidates_above(from, score_floor).unwrap_or_default()
-    }
-
     fn cosine_between(
         &self,
         a: Inline<Handle<Embedding>>,
@@ -1136,7 +1131,7 @@ where
         if a_slice.len() != b_slice.len() {
             return None;
         }
-        Some(dot(a_slice, b_slice))
+        Some(cosine_similarity(a_slice, b_slice))
     }
 }
 
@@ -1146,7 +1141,12 @@ mod tests {
 
     use triblespace_core::blob::MemoryBlobStore;
     use triblespace_core::repo::BlobStore;
-    
+
+    #[test]
+    fn true_cosine_handles_extreme_f32_magnitudes() {
+        assert_eq!(cosine_similarity(&[1.0e20], &[1.0e20]), 1.0);
+        assert_eq!(cosine_similarity(&[1.0e-30], &[1.0e-30]), 1.0);
+    }
 
     /// Put `vec` into `store` as a normalized [`Embedding`] blob
     /// and return the handle.

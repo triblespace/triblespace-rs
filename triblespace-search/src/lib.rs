@@ -32,8 +32,8 @@
 //!
 //! # Query surface
 //!
-//! Two constraint shapes plug into `find!` / `and!` /
-//! `pattern!`. Both follow the same rule: scoring is *not* a
+//! Three constraint shapes plug into `find!` / `and!` /
+//! `pattern!`. They follow the same rule: scoring is *not* a
 //! bound variable. The constraint filters on a fixed
 //! `score_floor` parameter; callers recompute the precise
 //! score afterwards if they need it for ranking.
@@ -43,11 +43,9 @@
 //!   the query terms is `>= score_floor`. Pass `0.0` for
 //!   "any matching doc". Same method on [`SuccinctBM25Index`][sbm25].
 //!   Pair with [`BM25Index::score`][s] for ranking.
-//! - [`AttachedHNSWIndex::similar`][sh] — symmetric binary
-//!   similarity relation over two
-//!   [`EmbHandle`][emb]-typed variables with a fixed cosine
-//!   threshold. Same method on
-//!   [`AttachedFlatIndex`][sf] and
+//! - [`AttachedHNSWIndex::cosine_at_least`][sh] — exact symmetric,
+//!   filter-only predicate over two [`EmbHandle`][emb]-typed variables.
+//!   Same method on [`AttachedFlatIndex`][sf] and
 //!   [`AttachedSuccinctHNSWIndex`][ssh].
 //! - [`AttachedHNSWIndex::similar_to`][sth] — unary
 //!   convenience for the common "search from a known handle"
@@ -56,10 +54,10 @@
 //! [m]: bm25::BM25Index::matches
 //! [s]: bm25::BM25Index::score
 //! [sbm25]: succinct::SuccinctBM25Index
-//! [sh]: hnsw::AttachedHNSWIndex::similar
+//! [sh]: hnsw::AttachedHNSWIndex::cosine_at_least
 //! [sth]: hnsw::AttachedHNSWIndex::similar_to
-//! [sf]: hnsw::AttachedFlatIndex::similar
-//! [ssh]: succinct::AttachedSuccinctHNSWIndex::similar
+//! [sf]: hnsw::AttachedFlatIndex::cosine_at_least
+//! [ssh]: succinct::AttachedSuccinctHNSWIndex::cosine_at_least
 //! [emb]: schemas::EmbHandle
 //!
 //! # Quickstart

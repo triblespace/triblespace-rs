@@ -25,11 +25,10 @@ the same invariants:
      term BM25 filter. Binds `doc` to documents whose summed
      BM25 across `terms` is `>= score_floor`. Recompute exact
      scores via `idx.score(&doc, &terms)` for ranking.
-     `hnsw.similar(?a, ?b, score_floor: f32)` — symmetric
-     binary relation: `a` and `b` are
-     `Variable<Handle<Embedding>>`, `score_floor` is a
-     fixed cosine threshold. At least one of `a` / `b` must be
-     bound for the engine to walk.
+     `view.cosine_at_least(?a, ?b, score_floor: f32)` — exact,
+     symmetric, filter-only predicate over two handle variables.
+     `view.similar_to(probe, ?candidate, score_floor)` — one frozen
+     directional retrieval bag (complete for Flat, approximate for HNSW).
    Callers combine with `and!` / `or!` / filters in the normal
    query engine; ordering is done in Rust after `.collect()`.
 
@@ -331,11 +330,9 @@ let rows: Vec<(Id,)> = find!(
 
 BM25 binds `doc` only — `matches(doc, &terms, score_floor)` is
 a single-variable filter; ranking happens in Rust via
-`idx.score(&doc, terms)` after `.collect()`. HNSW similarity
-is a binary `similar(a, b, score_floor)` relation over
-`Inline<Handle<Embedding>>` variables (see
-`docs/QUERY_ENGINE_INTEGRATION.md`). Ordering is operational —
-callers collect the iterator and slice.
+`idx.score(&doc, terms)` after `.collect()`. Fixed-probe ANN retrieval uses
+`similar_to`; exact pairwise filtering over independently sourced handle
+variables uses `cosine_at_least` (see `docs/QUERY_ENGINE_INTEGRATION.md`).
 
 ## What lives where
 
