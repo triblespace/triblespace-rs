@@ -96,6 +96,7 @@ use super::*;
 
 mod delta;
 mod materialize;
+mod set_admit;
 use delta::{
     ActivationId as DeltaActivationId, ActiveDeltaContinuation, ActiveDeltaStatus, DeltaDesc,
     DeltaScheduler, DeltaSeedOutcome, DeltaStepOutcome, TerminalPublicationBatch,
@@ -5157,6 +5158,21 @@ impl CandidateBatch {
         }
     }
 
+    /// Moves every affine parent and its complete candidate group into a
+    /// one-parent payload without flattening a deferred rope.
+    fn into_structural_singletons(mut self, stride: usize) -> Vec<Self> {
+        let parent_count = self.parents.row_count;
+        assert!(parent_count > 0, "candidate reducer seed has no affine parent");
+        self.candidates.defer_for_shared_activation(parent_count);
+        let mut reversed = Vec::with_capacity(parent_count);
+        while self.parents.row_count > 1 {
+            reversed.push(self.take_tail(stride, 1));
+        }
+        reversed.push(self);
+        reversed.reverse();
+        reversed
+    }
+
     /// Takes at most `width` candidate occurrences from the tail, allowing a
     /// parent group to be bisected. Callers must establish that every
     /// remaining confirmer is page-local before using this operation.
@@ -6188,10 +6204,92 @@ struct FormulaOrEmissionSeed {
     counter: FormulaPcId,
 }
 
+/// Exact stable-machine payload to resume after parent-local candidate SET
+/// admission reaches EOF. The destination owns all non-candidate affine
+/// state while the engine Program temporarily owns its candidate stream.
+#[derive(Clone, Debug)]
+enum SetAdmissionDestination {
+    Formula(FormulaBatch),
+    Candidate(CandidateBatch),
+}
+
+impl SetAdmissionDestination {
+    fn parent_count(&self) -> usize {
+        match self {
+            Self::Formula(batch) => batch.parents.row_count,
+            Self::Candidate(batch) => batch.parents.row_count,
+        }
+    }
+
+    fn parent_rows(&self) -> &[RawInline] {
+        match self {
+            Self::Formula(batch) => &batch.parents.rows,
+            Self::Candidate(batch) => &batch.parents.rows,
+        }
+    }
+
+    fn into_structural_singletons(self, stride: usize) -> Vec<Self> {
+        match self {
+            Self::Formula(batch) => batch
+                .into_structural_singletons(stride)
+                .into_iter()
+                .map(Self::Formula)
+                .collect(),
+            Self::Candidate(batch) => batch
+                .into_structural_singletons(stride)
+                .into_iter()
+                .map(Self::Candidate)
+                .collect(),
+        }
+    }
+
+    fn take_candidates(&mut self) -> CandidatePayload {
+        assert_eq!(self.parent_count(), 1, "SET admission is parent-local");
+        match self {
+            Self::Formula(batch) => {
+                std::mem::replace(batch.input_mut(), CandidatePayload::empty(1))
+            }
+            Self::Candidate(batch) => {
+                std::mem::replace(&mut batch.candidates, CandidatePayload::empty(1))
+            }
+        }
+    }
+
+    fn install_candidates(&mut self, candidates: CandidatePayload) {
+        assert_eq!(self.parent_count(), 1, "SET admission is parent-local");
+        candidates.debug_assert_valid_for(1);
+        let destination = match self {
+            Self::Formula(batch) => batch.input_mut(),
+            Self::Candidate(batch) => &mut batch.candidates,
+        };
+        assert!(
+            destination.is_empty(),
+            "SET-admission destination retained its original candidates"
+        );
+        *destination = candidates;
+    }
+
+    fn into_live_bucket(self, stride: usize) -> Option<StateBucket> {
+        match self {
+            Self::Formula(batch) => Some(StateBucket::Formula(batch)),
+            Self::Candidate(batch) => batch
+                .compact(stride)
+                .map(StateBucket::Candidates),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SetAdmissionSeed {
+    successor: StateDesc,
+    destination: SetAdmissionDestination,
+}
+
 #[derive(Clone, Debug)]
 enum FormulaReducerSeed {
     Admit(FormulaOrAdmissionSeed),
     Emit(FormulaOrEmissionSeed),
+    SetAdmit(SetAdmissionSeed),
 }
 
 #[derive(Clone, Debug)]
@@ -9805,6 +9903,12 @@ impl ResidualStateMachine {
                     checked: checked.with_inserted(confirmer),
                 },
             };
+            let set_admit_result = crosses_candidate_set_boundary(
+                &desc,
+                &successor,
+                plan,
+                &self.interner.formula_pcs,
+            );
             let seeded_parents = batch.parents.row_count;
             let active = self.delta.seed_program_confirms(
                 spec,
@@ -9812,6 +9916,7 @@ impl ResidualStateMachine {
                 program_request,
                 route,
                 successor,
+                set_admit_result,
                 batch,
             );
             return Ok(DeltaSeedOutcome {
@@ -9849,10 +9954,17 @@ impl ResidualStateMachine {
                     checked: checked.with_inserted(confirmer),
                 },
             };
+            let set_admit_result = crosses_candidate_set_boundary(
+                &desc,
+                &successor,
+                plan,
+                &self.interner.formula_pcs,
+            );
             let seeded_parents = batch.parents.row_count;
             let active = self.delta.seed_source_confirms(
                 DeltaDesc::leaf(variable, confirmer),
                 successor,
+                set_admit_result,
                 batch,
             );
             return Ok(DeltaSeedOutcome {
@@ -9898,10 +10010,17 @@ impl ResidualStateMachine {
                 checked: checked.with_inserted(confirmer),
             },
         };
+        let set_admit_result = crosses_candidate_set_boundary(
+            &desc,
+            &successor,
+            plan,
+            &self.interner.formula_pcs,
+        );
         let seeded_parents = batch.parents.row_count;
         let active = self.delta.seed_confirms(
             DeltaDesc::leaf(variable, confirmer),
             successor,
+            set_admit_result,
             batch,
             seeds,
         );

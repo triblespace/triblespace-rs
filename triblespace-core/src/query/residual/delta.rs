@@ -14,6 +14,7 @@ use crate::query::program::insert_engine_program_state;
 use super::materialize::{
     ProposalMaterializePhaseKind, ProposalMaterializerState,
 };
+use super::set_admit::{SetAdmissionPhaseKind, SetAdmissionState};
 use super::*;
 
 static NEXT_REGISTRY_BRAND: AtomicU64 = AtomicU64::new(1);
@@ -95,6 +96,7 @@ pub(super) enum EngineProgramKind {
     FormulaOrAdmit,
     FormulaOrEmit,
     ProposalMaterialize,
+    SetAdmit,
 }
 
 impl EngineProgramKind {
@@ -104,6 +106,7 @@ impl EngineProgramKind {
             Self::FormulaOrAdmit => ProgramRef::new(&FORMULA_OR_ADMISSION_PROGRAM),
             Self::FormulaOrEmit => ProgramRef::new(&FORMULA_OR_EMISSION_PROGRAM),
             Self::ProposalMaterialize => ProgramRef::new(&PROPOSAL_MATERIALIZER_PROGRAM),
+            Self::SetAdmit => ProgramRef::new(&SET_ADMISSION_PROGRAM),
         }
     }
 }
@@ -221,6 +224,64 @@ impl TypedProgramSpec for ConfirmFinalizerProgram {
             assert!(examined > 0, "a nonempty Confirm finalizer made no progress");
             let resume = (state.original.remaining > 0).then_some(TypedResume::Immediate(state));
             effects.page(examined, resume);
+        }
+    }
+}
+
+struct SetAdmissionProgram;
+
+static SET_ADMISSION_PROGRAM: SetAdmissionProgram = SetAdmissionProgram;
+
+impl TypedProgramSpec for SetAdmissionProgram {
+    type State = SetAdmissionState;
+    type NoveltyKey = ();
+    type Rank = u128;
+
+    fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
+        None
+    }
+
+    fn dispatch(&self, state: &Self::State) -> DispatchClass {
+        DispatchClass::new(match state.phase_kind() {
+            SetAdmissionPhaseKind::Scan => 0,
+            SetAdmissionPhaseKind::Emit => 1,
+        })
+    }
+
+    fn pacing(&self, _state: &Self::State) -> ProgramPacing {
+        ProgramPacing::Search
+    }
+
+    fn progress(&self, state: &Self::State) -> Self::Rank {
+        state.rank()
+    }
+
+    fn seed_typed(
+        &self,
+        _batch: ProgramSeedBatch<'_>,
+        _effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+    ) {
+        panic!("engine SET admission was seeded through a Constraint route")
+    }
+
+    fn step_typed(
+        &self,
+        states: Vec<Self::State>,
+        batch: TypedProgramBatch<'_>,
+        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+    ) {
+        assert_eq!(states.len(), batch.limits.len());
+        assert_eq!(states.len(), batch.view.len());
+        assert!(batch.candidate_sets.iter().all(Option::is_none));
+        for (input, (state, &limit)) in states.into_iter().zip(batch.limits).enumerate() {
+            let page = state.advance(limit);
+            for value in page.emitted {
+                effects.direct(
+                    u32::try_from(input).expect("too many SET-admission inputs"),
+                    value,
+                );
+            }
+            effects.page(page.examined, page.next.map(TypedResume::Immediate));
         }
     }
 }
@@ -619,6 +680,11 @@ enum DeltaReducer {
     FinalizingProposal {
         output: CandidatePayload,
     },
+    /// A segmented candidate relation is being admitted by the engine-owned
+    /// bounded scan/emit Program before it re-enters the stable machine.
+    SetAdmit {
+        output: CandidatePayload,
+    },
     /// One Search-paced pass inserts occurrence values into the persistent OR
     /// accumulator stored in the activation's exact Formula return payload.
     FormulaOrAdmit,
@@ -670,6 +736,11 @@ enum DeltaReturn {
     Stable {
         desc: StateDesc,
         parent: Box<[RawInline]>,
+        /// The complete action result crosses from an occurrence bag into a
+        /// candidate continuation that may split or commit independently.
+        /// Cyclic Confirm computes this receipt with the shared stable-state
+        /// boundary predicate before opening graph traversal.
+        set_admit_result: bool,
     },
     Formula {
         bound: VariableSet,
@@ -685,6 +756,10 @@ enum DeltaReturn {
         bound: VariableSet,
         batch: FormulaBatch,
         counter: FormulaPcId,
+    },
+    SetAdmission {
+        successor: StateDesc,
+        destination: SetAdmissionDestination,
     },
 }
 
@@ -1458,6 +1533,7 @@ impl ProducerRegistry {
                 | DeltaReducer::Confirm { .. }
                 | DeltaReducer::FinalizingConfirm { .. }
                 | DeltaReducer::FinalizingProposal { .. }
+                | DeltaReducer::SetAdmit { .. }
                 | DeltaReducer::FormulaOrAdmit
                 | DeltaReducer::FormulaOrEmit { .. } => assert!(
                     direct.is_empty(),
@@ -1778,6 +1854,20 @@ impl ProducerRegistry {
                     append_one_parent_page(output, std::mem::take(&mut direct));
                 }
                 (
+                    DeltaReducer::SetAdmit { output },
+                    DeltaReturn::SetAdmission { .. },
+                ) => {
+                    assert!(
+                        observed.is_empty() && children.is_empty() && !reported_support,
+                        "engine SET admission reported graph effects"
+                    );
+                    assert!(
+                        activation.accepted.is_empty(),
+                        "SET admission acquired graph Accepted state"
+                    );
+                    append_one_parent_page(output, std::mem::take(&mut direct));
+                }
+                (
                     DeltaReducer::FormulaOrAdmit,
                     DeltaReturn::FormulaOrAdmit { batch, .. },
                 ) => {
@@ -1812,8 +1902,9 @@ impl ProducerRegistry {
                     }
                 }
                 (DeltaReducer::FormulaOrAdmit, _)
-                | (DeltaReducer::FormulaOrEmit { .. }, _) => {
-                    panic!("Formula OR reducer lost its exact affine return payload")
+                | (DeltaReducer::FormulaOrEmit { .. }, _)
+                | (DeltaReducer::SetAdmit { .. }, _) => {
+                    panic!("engine reducer lost its exact affine return payload")
                 }
                 (DeltaReducer::Support { .. } | DeltaReducer::Confirm { .. }, _) => {
                     assert!(
@@ -1854,6 +1945,7 @@ impl ProducerRegistry {
                 | DeltaReducer::Confirm { .. }
                 | DeltaReducer::FinalizingConfirm { .. }
                 | DeltaReducer::FinalizingProposal { .. }
+                | DeltaReducer::SetAdmit { .. }
                 | DeltaReducer::FormulaOrAdmit
                 | DeltaReducer::FormulaOrEmit { .. } => false,
             }
@@ -2057,12 +2149,19 @@ impl ProducerRegistry {
             .get(&activation)
             .expect("unknown delta activation");
         let (bound, parent) = match &activation.return_to {
-            DeltaReturn::Stable { desc, parent } => (desc.bound, parent.as_ref()),
+            DeltaReturn::Stable { desc, parent, .. } => (desc.bound, parent.as_ref()),
             DeltaReturn::Formula { bound, batch, .. }
             | DeltaReturn::FormulaOrAdmit { bound, batch, .. }
             | DeltaReturn::FormulaOrEmit { bound, batch, .. } => {
                 assert_eq!(batch.parents.row_count, 1);
                 (*bound, batch.parents.rows.as_slice())
+            }
+            DeltaReturn::SetAdmission {
+                successor,
+                destination,
+            } => {
+                assert_eq!(destination.parent_count(), 1);
+                (successor.bound, destination.parent_rows())
             }
         };
         (bound, parent, Self::activation_candidates(activation))
@@ -2088,6 +2187,7 @@ impl ProducerRegistry {
             DeltaReturn::Formula { bound, .. }
             | DeltaReturn::FormulaOrAdmit { bound, .. }
             | DeltaReturn::FormulaOrEmit { bound, .. } => *bound,
+            DeltaReturn::SetAdmission { successor, .. } => successor.bound,
         };
         (bound, Self::activation_candidates(activation).is_some())
     }
@@ -2205,6 +2305,7 @@ impl ProducerRegistry {
             | DeltaReducer::Confirm { .. }
             | DeltaReducer::FinalizingConfirm { .. }
             | DeltaReducer::FinalizingProposal { .. }
+            | DeltaReducer::SetAdmit { .. }
             | DeltaReducer::FormulaOrAdmit
             | DeltaReducer::FormulaOrEmit { .. } => return None,
         };
@@ -2298,6 +2399,17 @@ impl ProducerRegistry {
                 );
                 DeltaCompletion::Candidates(output)
             }
+            DeltaReducer::SetAdmit { output } => {
+                assert!(
+                    activation.accepted.is_empty(),
+                    "SET admission retained graph Accepted state"
+                );
+                assert!(matches!(
+                    &activation.return_to,
+                    DeltaReturn::SetAdmission { .. }
+                ));
+                DeltaCompletion::Candidates(output)
+            }
             DeltaReducer::FormulaOrAdmit => {
                 assert!(
                     activation.accepted.is_empty(),
@@ -2354,7 +2466,9 @@ impl ProducerRegistry {
             let eligible_return = match &activation.return_to {
                 DeltaReturn::Stable { .. } => true,
                 DeltaReturn::Formula { batch, .. } => batch.confirm_finalizer_capable(),
-                DeltaReturn::FormulaOrAdmit { .. } | DeltaReturn::FormulaOrEmit { .. } => false,
+                DeltaReturn::FormulaOrAdmit { .. }
+                | DeltaReturn::FormulaOrEmit { .. }
+                | DeltaReturn::SetAdmission { .. } => false,
             };
             match &activation.reducer {
                 DeltaReducer::QuiescentProposal { occurrences }
@@ -3936,6 +4050,7 @@ impl DeltaScheduler {
                 DeltaReturn::Stable {
                     desc: successor.clone(),
                     parent,
+                    set_admit_result: false,
                 },
                 None,
                 Some(full),
@@ -4048,6 +4163,7 @@ impl DeltaScheduler {
         request: ProgramRequest,
         route: ProgramRoute,
         successor: StateDesc,
+        set_admit_result: bool,
         batch: CandidateBatch,
     ) -> Option<ActiveDeltaContinuation> {
         let state = self.prepare_program(desc, route, spec);
@@ -4066,6 +4182,7 @@ impl DeltaScheduler {
                 DeltaReturn::Stable {
                     desc: successor.clone(),
                     parent,
+                    set_admit_result,
                 },
                 None,
                 None,
@@ -4339,6 +4456,7 @@ impl DeltaScheduler {
                 DeltaReturn::Stable {
                     desc: successor.clone(),
                     parent,
+                    set_admit_result: false,
                 },
                 seeds[range].iter().map(|seed| seed.output),
                 full,
@@ -4435,6 +4553,7 @@ impl DeltaScheduler {
                 DeltaReturn::Stable {
                     desc: successor.clone(),
                     parent,
+                    set_admit_result: false,
                 },
                 None,
                 full,
@@ -4465,6 +4584,7 @@ impl DeltaScheduler {
         &mut self,
         desc: DeltaDesc,
         successor: StateDesc,
+        set_admit_result: bool,
         batch: CandidateBatch,
         seeds: Vec<ResidualDeltaSeed>,
     ) -> Option<ActiveDeltaContinuation> {
@@ -4487,6 +4607,7 @@ impl DeltaScheduler {
                 DeltaReturn::Stable {
                     desc: successor.clone(),
                     parent,
+                    set_admit_result,
                 },
                 seeds[seed_range].iter().map(|seed| seed.output),
             );
@@ -4517,6 +4638,7 @@ impl DeltaScheduler {
         &mut self,
         desc: DeltaDesc,
         successor: StateDesc,
+        set_admit_result: bool,
         batch: CandidateBatch,
     ) -> Option<ActiveDeltaContinuation> {
         let stride = successor.bound.count();
@@ -4538,6 +4660,7 @@ impl DeltaScheduler {
                 DeltaReturn::Stable {
                     desc: successor.clone(),
                     parent,
+                    set_admit_result,
                 },
                 Some(source_candidates.into_boxed_slice()),
             );
@@ -4733,6 +4856,79 @@ impl DeltaScheduler {
         let mut drained = FormulaReducerDrain::default();
         while let Some(seed) = queue.pop_front() {
             match seed {
+                FormulaReducerSeed::SetAdmit(seed)
+                    if seed.destination.parent_count() > 1 =>
+                {
+                    let singletons = seed
+                        .destination
+                        .into_structural_singletons(seed.successor.bound.count());
+                    for destination in singletons.into_iter().rev() {
+                        queue.push_front(FormulaReducerSeed::SetAdmit(SetAdmissionSeed {
+                            successor: seed.successor.clone(),
+                            destination,
+                        }));
+                    }
+                }
+                FormulaReducerSeed::SetAdmit(mut seed) => {
+                    assert_eq!(
+                        seed.destination.parent_count(),
+                        1,
+                        "SET admission requires one affine parent"
+                    );
+                    let input = seed.destination.take_candidates();
+                    input.debug_assert_valid_for(1);
+                    let Some(program_state) = SetAdmissionState::start(input) else {
+                        if let Some(bucket) = seed
+                            .destination
+                            .into_live_bucket(seed.successor.bound.count())
+                        {
+                            prefer_continuation(
+                                &mut drained.continuation,
+                                file_with_plan(
+                                    stable,
+                                    stable_interner,
+                                    plan,
+                                    seed.successor,
+                                    bucket,
+                                    stats,
+                                ),
+                            );
+                        }
+                        continue;
+                    };
+
+                    let mut output = CandidatePayload::empty(1);
+                    output.defer_for_shared_activation(1);
+                    let state = self.prepare_engine_program(EngineProgramKind::SetAdmit);
+                    let activation = self.registry.open_program_activation(
+                        DeltaReducer::SetAdmit { output },
+                        DeltaReturn::SetAdmission {
+                            successor: seed.successor,
+                            destination: seed.destination,
+                        },
+                        None,
+                        None,
+                    );
+                    let credit = self
+                        .registry
+                        .issue_credit(activation, CreditKind::Program { join: None });
+                    let work = insert_engine_program_state(
+                        &SET_ADMISSION_PROGRAM,
+                        self.program_runtimes
+                            .get_mut(&state)
+                            .expect("prepared SET admission lost its runtime"),
+                        ProgramActivation(activation.0),
+                        program_state,
+                    );
+                    drained.active = self.file_program_state(
+                        state,
+                        vec![ProgramTask {
+                            activation,
+                            credit,
+                            work,
+                        }],
+                    );
+                }
                 FormulaReducerSeed::Admit(seed) if seed.batch.parents.row_count > 1 => {
                     let singletons = seed.batch.into_structural_singletons_with_input(
                         seed.bound.count(),
@@ -4907,6 +5103,7 @@ impl DeltaScheduler {
             .map(|seed| match seed {
                 FormulaReducerSeed::Admit(seed) => seed.batch.parents.row_count,
                 FormulaReducerSeed::Emit(seed) => seed.batch.parents.row_count,
+                FormulaReducerSeed::SetAdmit(seed) => seed.destination.parent_count(),
             })
             .sum();
         let drained = self.drain_formula_reducer_seeds(
@@ -4956,9 +5153,33 @@ impl DeltaScheduler {
                 stable_interner,
                 stats,
             ),
-            (DeltaReturn::Stable { desc, parent }, DeltaCompletion::Candidates(result)) => {
+            (
+                DeltaReturn::Stable {
+                    desc,
+                    parent,
+                    set_admit_result,
+                },
+                DeltaCompletion::Candidates(mut result),
+            ) => {
                 let continuation = if result.is_empty() {
                     None
+                } else if set_admit_result && !result.admit_set_tail_stable(1) {
+                    return self.drain_formula_reducer_seeds(
+                        vec![FormulaReducerSeed::SetAdmit(SetAdmissionSeed {
+                            successor: desc,
+                            destination: SetAdmissionDestination::Candidate(CandidateBatch {
+                                parents: RowBatch {
+                                    rows: parent.into_vec(),
+                                    row_count: 1,
+                                },
+                                candidates: result,
+                            }),
+                        })],
+                        plan,
+                        stable,
+                        stable_interner,
+                        stats,
+                    );
                 } else {
                     file_with_plan(
                         stable,
@@ -4975,6 +5196,31 @@ impl DeltaScheduler {
                         stats,
                     )
                 };
+                FormulaReducerDrain {
+                    continuation,
+                    active: None,
+                }
+            }
+            (
+                DeltaReturn::SetAdmission {
+                    successor,
+                    mut destination,
+                },
+                DeltaCompletion::Candidates(result),
+            ) => {
+                destination.install_candidates(result);
+                let continuation = destination
+                    .into_live_bucket(successor.bound.count())
+                    .and_then(|bucket| {
+                        file_with_plan(
+                            stable,
+                            stable_interner,
+                            plan,
+                            successor,
+                            bucket,
+                            stats,
+                        )
+                    });
                 FormulaReducerDrain {
                     continuation,
                     active: None,
@@ -5080,8 +5326,9 @@ impl DeltaScheduler {
                 drained
             }
             (DeltaReturn::FormulaOrAdmit { .. }, effect)
-            | (DeltaReturn::FormulaOrEmit { .. }, effect) => {
-                panic!("Formula OR reducer completed with incompatible effect: {effect:?}")
+            | (DeltaReturn::FormulaOrEmit { .. }, effect)
+            | (DeltaReturn::SetAdmission { .. }, effect) => {
+                panic!("engine reducer completed with incompatible effect: {effect:?}")
             }
             (DeltaReturn::Stable { .. } | DeltaReturn::Formula { .. }, effect) => {
                 panic!("ordinary delta reducer completed with incompatible effect: {effect:?}")
@@ -5123,7 +5370,7 @@ impl DeltaScheduler {
         stats.max_propose_candidates = stats.max_propose_candidates.max(accepted.len());
         let candidates = CandidatePayload::Values(accepted);
         if let Some(full) = direct_terminal_full {
-            let DeltaReturn::Stable { desc, parent } = streamed.return_to else {
+            let DeltaReturn::Stable { desc, parent, .. } = streamed.return_to else {
                 panic!("a direct-terminal publication returned through a formula")
             };
             let ResidualPhase::Candidate {
@@ -5163,7 +5410,7 @@ impl DeltaScheduler {
         }
         let mut reducer_seeds = Vec::new();
         let continuation = match streamed.return_to {
-            DeltaReturn::Stable { desc, parent } => file_with_plan(
+            DeltaReturn::Stable { desc, parent, .. } => file_with_plan(
                 stable,
                 stable_interner,
                 plan,
@@ -5192,8 +5439,10 @@ impl DeltaScheduler {
                 stats,
                 &mut reducer_seeds,
             ),
-            DeltaReturn::FormulaOrAdmit { .. } | DeltaReturn::FormulaOrEmit { .. } => {
-                panic!("a Formula OR reducer attempted streaming publication")
+            DeltaReturn::FormulaOrAdmit { .. }
+            | DeltaReturn::FormulaOrEmit { .. }
+            | DeltaReturn::SetAdmission { .. } => {
+                panic!("a private engine reducer attempted streaming publication")
             }
         };
         assert!(
@@ -7536,6 +7785,7 @@ mod tests {
                 phase: ResidualPhase::Ready,
             },
             parent: parent.into_boxed_slice(),
+            set_admit_result: false,
         }
     }
 
@@ -7551,6 +7801,7 @@ mod tests {
                 },
             },
             parent: parent.into_boxed_slice(),
+            set_admit_result: false,
         }
     }
 
@@ -9970,6 +10221,7 @@ mod tests {
                 request,
                 route,
                 successor,
+                false,
                 CandidateBatch {
                     parents: RowBatch {
                         rows: Vec::new(),
@@ -10525,6 +10777,7 @@ mod tests {
                 request,
                 route,
                 successor,
+                false,
                 CandidateBatch {
                     parents: RowBatch::seed(),
                     candidates: CandidatePayload::Values(vec![value(7)]),
@@ -10619,6 +10872,7 @@ mod tests {
                 request,
                 route,
                 successor,
+                false,
                 CandidateBatch {
                     parents: RowBatch {
                         rows: Vec::new(),
@@ -11985,6 +12239,342 @@ mod tests {
         );
     }
 
+    fn confirm_boundary_descs(plan: &ResidualPlan) -> (StateDesc, StateDesc) {
+        assert_eq!(plan.len(), 1);
+        let relevant = ChildSet::empty(1).with_inserted(0);
+        (
+            StateDesc {
+                bound: VariableSet::new_empty(),
+                phase: ResidualPhase::Confirm {
+                    variable: 0,
+                    relevant: relevant.clone(),
+                    checked: ChildSet::empty(1),
+                    confirmer: 0,
+                },
+            },
+            StateDesc {
+                bound: VariableSet::new_empty(),
+                phase: ResidualPhase::Candidate {
+                    variable: 0,
+                    relevant: relevant.clone(),
+                    checked: relevant,
+                },
+            },
+        )
+    }
+
+    #[test]
+    fn cyclic_confirm_set_admits_each_affine_parent_at_its_candidate_boundary() {
+        let root = MixedExpansion;
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let (previous, successor) = confirm_boundary_descs(&plan);
+        let formula_pcs = FormulaPcInterner::default();
+        let set_admit_result =
+            crosses_candidate_set_boundary(&previous, &successor, &plan, &formula_pcs);
+        assert!(set_admit_result);
+
+        let mut scheduler = DeltaScheduler::new();
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let mut stats = ResidualStateStats {
+            candidates_confirmed: 5,
+            ..ResidualStateStats::default()
+        };
+        for (activation, candidates) in [
+            (1, vec![value(1), value(2), value(1)]),
+            (2, vec![value(1), value(1)]),
+        ] {
+            let released = scheduler.release_completion(
+                CompletedActivation {
+                    activation: ActivationId(activation),
+                    return_to: DeltaReturn::Stable {
+                        desc: successor.clone(),
+                        parent: Vec::new().into_boxed_slice(),
+                        set_admit_result,
+                    },
+                    effect: DeltaCompletion::Candidates(CandidatePayload::Values(candidates)),
+                },
+                &plan,
+                &mut stable,
+                &mut stable_interner,
+                &mut stats,
+            );
+            assert!(released.continuation.is_some());
+            assert!(released.active.is_none());
+        }
+
+        let StateBucket::Candidates(batch) = stable
+            .values()
+            .flat_map(BTreeMap::values)
+            .next()
+            .expect("both affine parents rejoined one candidate state")
+        else {
+            panic!("cyclic Confirm returned a non-candidate payload")
+        };
+        assert_eq!(batch.parents.row_count, 2);
+        assert_eq!(
+            batch.candidates.iter().collect::<Vec<_>>(),
+            vec![(0, value(2)), (0, value(1)), (1, value(1))]
+        );
+        assert_eq!(
+            stats.candidates_confirmed, 5,
+            "SET admission must not rewrite raw Confirm telemetry"
+        );
+    }
+
+    #[test]
+    fn cyclic_confirm_keeps_a_nonboundary_internal_result_as_an_occurrence_bag() {
+        let root = IntersectionConstraint::new(vec![MixedExpansion; 3]);
+        let plan = ResidualPlan::compile(&root);
+        assert_eq!(plan.len(), 3);
+        let relevant = (0..3).fold(ChildSet::empty(3), |set, leaf| {
+            set.with_inserted(leaf)
+        });
+        let previous = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Confirm {
+                variable: 0,
+                relevant: relevant.clone(),
+                checked: ChildSet::empty(3).with_inserted(0),
+                confirmer: 1,
+            },
+        };
+        let successor = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Candidate {
+                variable: 0,
+                relevant,
+                checked: ChildSet::empty(3).with_inserted(0).with_inserted(1),
+            },
+        };
+        let formula_pcs = FormulaPcInterner::default();
+        let set_admit_result =
+            crosses_candidate_set_boundary(&previous, &successor, &plan, &formula_pcs);
+        assert!(!set_admit_result);
+
+        let mut scheduler = DeltaScheduler::new();
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let released = scheduler.release_completion(
+            CompletedActivation {
+                activation: ActivationId(1),
+                return_to: DeltaReturn::Stable {
+                    desc: successor,
+                    parent: Vec::new().into_boxed_slice(),
+                    set_admit_result,
+                },
+                effect: DeltaCompletion::Candidates(CandidatePayload::Values(vec![
+                    value(1),
+                    value(2),
+                    value(1),
+                ])),
+            },
+            &plan,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert!(released.continuation.is_some());
+        assert!(released.active.is_none());
+        let StateBucket::Candidates(batch) = stable
+            .values()
+            .flat_map(BTreeMap::values)
+            .next()
+            .unwrap()
+        else {
+            panic!("internal Confirm returned a non-candidate payload")
+        };
+        assert_eq!(
+            batch.candidates.iter().collect::<Vec<_>>(),
+            vec![(0, value(1)), (0, value(2)), (0, value(1))]
+        );
+    }
+
+    #[test]
+    fn deferred_cyclic_confirm_routes_to_bounded_set_admission_without_materializing() {
+        let root = MixedExpansion;
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let (previous, successor) = confirm_boundary_descs(&plan);
+        let set_admit_result = crosses_candidate_set_boundary(
+            &previous,
+            &successor,
+            &plan,
+            &FormulaPcInterner::default(),
+        );
+        let mut result = CandidatePayload::Values(vec![value(1), value(2), value(1)]);
+        result.defer_for_shared_activation(1);
+        assert!(matches!(result, CandidatePayload::Deferred(_)));
+
+        let mut scheduler = DeltaScheduler::new();
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let mut stats = ResidualStateStats {
+            candidates_confirmed: 3,
+            ..ResidualStateStats::default()
+        };
+        let released = scheduler.release_completion(
+            CompletedActivation {
+                activation: ActivationId(1),
+                return_to: DeltaReturn::Stable {
+                    desc: successor,
+                    parent: Vec::new().into_boxed_slice(),
+                    set_admit_result,
+                },
+                effect: DeltaCompletion::Candidates(result),
+            },
+            &plan,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert!(released.continuation.is_none());
+        let mut active = released
+            .active
+            .expect("segmented result opened bounded SET admission");
+        assert!(stable.is_empty(), "no partial relation may re-enter Candidate");
+        assert_eq!(
+            scheduler.interner.program(active.state),
+            Some(&ProgramAddress::Engine(EngineProgramKind::SetAdmit))
+        );
+        let activation = scheduler
+            .registry
+            .state
+            .activations
+            .get(&active.activation)
+            .expect("SET-admission activation remains live");
+        assert!(matches!(
+            &activation.reducer,
+            DeltaReducer::SetAdmit {
+                output: CandidatePayload::Deferred(_)
+            }
+        ));
+        let DeltaReturn::SetAdmission { destination, .. } = &activation.return_to else {
+            panic!("SET admission lost its candidate destination")
+        };
+        let SetAdmissionDestination::Candidate(destination) = destination else {
+            panic!("cyclic Confirm routed to a Formula destination")
+        };
+        assert!(destination.candidates.is_empty());
+
+        for _ in 0..16 {
+            let step = scheduler.step_active(
+                &root,
+                &plan,
+                active,
+                1,
+                &mut stable,
+                &mut stable_interner,
+                &mut stats,
+            );
+            if let Some(resume) = step.resume {
+                active = resume;
+                continue;
+            }
+            assert_eq!(step.status, ActiveDeltaStatus::Yielded);
+            break;
+        }
+        assert!(!stable.is_empty(), "SET admission failed to reach EOF");
+        let StateBucket::Candidates(batch) = stable
+            .values()
+            .flat_map(BTreeMap::values)
+            .next()
+            .unwrap()
+        else {
+            panic!("SET admission returned a non-candidate payload")
+        };
+        assert!(matches!(batch.candidates, CandidatePayload::Deferred(_)));
+        assert_eq!(
+            batch.candidates.iter().collect::<Vec<_>>(),
+            vec![(0, value(2)), (0, value(1))]
+        );
+        assert_eq!(stats.candidates_confirmed, 3);
+    }
+
+    #[test]
+    fn bounded_set_admission_structurally_splits_multi_parent_deferred_payload() {
+        let root = MixedExpansion;
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let (_, mut successor) = confirm_boundary_descs(&plan);
+        successor.bound = VariableSet::new_singleton(1);
+        let mut candidates = CandidatePayload::Tagged(vec![
+            (0, value(1)),
+            (0, value(2)),
+            (0, value(1)),
+            (1, value(1)),
+            (1, value(1)),
+        ]);
+        candidates.defer_for_shared_activation(2);
+        let mut scheduler = DeltaScheduler::new();
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let mut stats = ResidualStateStats {
+            candidates_confirmed: 5,
+            ..ResidualStateStats::default()
+        };
+        let seeded = scheduler.seed_formula_reducers(
+            vec![FormulaReducerSeed::SetAdmit(SetAdmissionSeed {
+                successor,
+                destination: SetAdmissionDestination::Candidate(CandidateBatch {
+                    parents: RowBatch {
+                        rows: vec![value(10), value(11)],
+                        row_count: 2,
+                    },
+                    candidates,
+                }),
+            })],
+            &plan,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        let active = seeded.active.expect("SET admission opened a Program cohort");
+        let tasks = &scheduler.program_worklist[&active.state].tasks;
+        assert_eq!(tasks.len(), 2);
+        assert_ne!(tasks[0].activation, tasks[1].activation);
+        for task in tasks {
+            let activation = &scheduler.registry.state.activations[&task.activation];
+            let DeltaReturn::SetAdmission { destination, .. } = &activation.return_to else {
+                panic!("SET admission lost its saved destination")
+            };
+            assert_eq!(destination.parent_count(), 1);
+        }
+
+        for _ in 0..32 {
+            if scheduler.is_empty() {
+                break;
+            }
+            let _ = scheduler.step(
+                &root,
+                &plan,
+                1,
+                &mut stable,
+                &mut stable_interner,
+                &mut stats,
+            );
+        }
+        assert!(scheduler.is_empty(), "unit grants did not drain SET admission");
+        let StateBucket::Candidates(batch) = stable
+            .values()
+            .flat_map(BTreeMap::values)
+            .next()
+            .expect("admitted parents rejoined their saved successor")
+        else {
+            panic!("SET admission returned a non-candidate payload")
+        };
+        assert_eq!(batch.parents.row_count, 2);
+        let mut by_parent: BTreeMap<RawInline, Vec<RawInline>> = BTreeMap::new();
+        for (parent, candidate) in batch.candidates.iter() {
+            by_parent
+                .entry(batch.parents.rows[parent as usize])
+                .or_default()
+                .push(candidate);
+        }
+        assert_eq!(by_parent[&value(10)], vec![value(2), value(1)]);
+        assert_eq!(by_parent[&value(11)], vec![value(1)]);
+        assert_eq!(stats.candidates_confirmed, 5);
+    }
+
     #[test]
     fn confirm_reducer_joins_multiple_roots_before_filtering_the_sequence() {
         let seed = value(1);
@@ -12338,6 +12928,7 @@ mod tests {
                     phase: ResidualPhase::Ready,
                 },
                 parent: vec![parent].into_boxed_slice(),
+                set_admit_result: false,
             }
         }
 
