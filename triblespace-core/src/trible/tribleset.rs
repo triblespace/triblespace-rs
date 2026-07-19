@@ -322,8 +322,9 @@ impl TribleSet {
         self.eav.has_prefix(&trible.data)
     }
 
-    /// Creates a constraint that proposes only values in the byte range
-    /// `[min, max]` (inclusive) using the VEA index with `infixes_range`.
+    /// Creates a constraint over the intersection of the set's V-axis domain
+    /// and the inclusive byte range `[min, max]`, using the VEA index with
+    /// `infixes_range`.
     ///
     /// Use with `and!` alongside a `pattern!` for efficient range queries:
     ///
@@ -344,8 +345,9 @@ impl TribleSet {
         triblesetrangeconstraint::TribleSetRangeConstraint::new(variable, min, max, self.clone())
     }
 
-    /// Creates a constraint that proposes only entity IDs in the byte range
-    /// `[min, max]` (inclusive) using the EAV index with `infixes_range`.
+    /// Creates a constraint over the intersection of the set's E-axis domain
+    /// and the inclusive byte range `[min, max]`, using the EAV index with
+    /// `infixes_range`.
     ///
     /// ```rust,ignore
     /// find!(id: Id,
@@ -364,8 +366,9 @@ impl TribleSet {
         triblesetidrangeconstraint::EntityRangeConstraint::new(variable, min, max, self.clone())
     }
 
-    /// Creates a constraint that proposes only attribute IDs in the byte range
-    /// `[min, max]` (inclusive) using the AEV index with `infixes_range`.
+    /// Creates a constraint over the intersection of the set's A-axis domain
+    /// and the inclusive byte range `[min, max]`, using the AEV index with
+    /// `infixes_range`.
     ///
     /// ```rust,ignore
     /// find!(attr: Id,

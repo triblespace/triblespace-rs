@@ -31,7 +31,8 @@ use super::triblesetconstraint::direct_source_page;
 use super::triblesetconstraint::next_id_source_in_range;
 
 /// An entity-range-aware constraint that uses the TribleSet's EAV index
-/// to propose only entity IDs in a byte-lexicographic range.
+/// to restrict IDs to the intersection of its E-axis domain and an inclusive
+/// byte-lexicographic range.
 ///
 /// Create via [`TribleSet::entity_in_range`]:
 ///
@@ -61,7 +62,8 @@ impl EntityRangeConstraint {
     }
 
     fn contains(&self, value: &RawInline) -> bool {
-        id_from_value(value).is_some_and(|id| id >= self.min && id <= self.max)
+        id_from_value(value)
+            .is_some_and(|id| id >= self.min && id <= self.max && self.set.eav.has_prefix(&id))
     }
 }
 
@@ -107,13 +109,7 @@ impl TypedProgramSpec for EntityRangeConstraint {
             effects,
             |_input, cursor, limit, accepted| {
                 direct_source_page(cursor, limit, accepted, |after| {
-                    next_id_source_in_range(
-                        &self.set.eav,
-                        &[],
-                        &self.min,
-                        &self.max,
-                        after,
-                    )
+                    next_id_source_in_range(&self.set.eav, &[], &self.min, &self.max, after)
                 })
             },
             |_input, value| self.contains(value),
@@ -168,12 +164,7 @@ impl<'a> Constraint<'a> for EntityRangeConstraint {
         candidates: &mut CandidateSink<'_>,
     ) {
         if variable == self.variable_e {
-            candidates.retain(|_, v| {
-                let Some(id) = id_from_value(v) else {
-                    return false;
-                };
-                id >= self.min && id <= self.max
-            });
+            candidates.retain(|_, v| self.contains(v));
         }
     }
 
@@ -213,19 +204,15 @@ impl<'a> Constraint<'a> for EntityRangeConstraint {
 
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match view.col(self.variable_e) {
-            Some(col) => view.iter().all(|row| {
-                let Some(id) = id_from_value(&row[col]) else {
-                    return false;
-                };
-                id >= self.min && id <= self.max
-            }),
+            Some(col) => view.iter().all(|row| self.contains(&row[col])),
             None => true,
         }
     }
 }
 
 /// An attribute-range-aware constraint that uses the TribleSet's AEV index
-/// to propose only attribute IDs in a byte-lexicographic range.
+/// to restrict IDs to the intersection of its A-axis domain and an inclusive
+/// byte-lexicographic range.
 ///
 /// Create via [`TribleSet::attribute_in_range`]:
 ///
@@ -255,7 +242,8 @@ impl AttributeRangeConstraint {
     }
 
     fn contains(&self, value: &RawInline) -> bool {
-        id_from_value(value).is_some_and(|id| id >= self.min && id <= self.max)
+        id_from_value(value)
+            .is_some_and(|id| id >= self.min && id <= self.max && self.set.aev.has_prefix(&id))
     }
 }
 
@@ -301,13 +289,7 @@ impl TypedProgramSpec for AttributeRangeConstraint {
             effects,
             |_input, cursor, limit, accepted| {
                 direct_source_page(cursor, limit, accepted, |after| {
-                    next_id_source_in_range(
-                        &self.set.aev,
-                        &[],
-                        &self.min,
-                        &self.max,
-                        after,
-                    )
+                    next_id_source_in_range(&self.set.aev, &[], &self.min, &self.max, after)
                 })
             },
             |_input, value| self.contains(value),
@@ -362,12 +344,7 @@ impl<'a> Constraint<'a> for AttributeRangeConstraint {
         candidates: &mut CandidateSink<'_>,
     ) {
         if variable == self.variable_a {
-            candidates.retain(|_, v| {
-                let Some(id) = id_from_value(v) else {
-                    return false;
-                };
-                id >= self.min && id <= self.max
-            });
+            candidates.retain(|_, v| self.contains(v));
         }
     }
 
@@ -407,12 +384,7 @@ impl<'a> Constraint<'a> for AttributeRangeConstraint {
 
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match view.col(self.variable_a) {
-            Some(col) => view.iter().all(|row| {
-                let Some(id) = id_from_value(&row[col]) else {
-                    return false;
-                };
-                id >= self.min && id <= self.max
-            }),
+            Some(col) => view.iter().all(|row| self.contains(&row[col])),
             None => true,
         }
     }
@@ -526,6 +498,80 @@ mod tests {
         .collect();
         assert_eq!(exact2.len(), 1);
         assert_eq!(exact2[0], id2);
+    }
+
+    #[test]
+    fn attached_id_ranges_reject_in_range_ids_absent_from_their_axis() {
+        let entity_min = deterministic_id(0x11);
+        let entity_candidate = deterministic_id(0x12);
+        let entity_max = deterministic_id(0x13);
+        let attribute_min = deterministic_id(0x21);
+        let attribute_candidate = deterministic_id(0x22);
+        let attribute_max = deterministic_id(0x23);
+        let entities = [
+            ExclusiveId::force(entity_min),
+            ExclusiveId::force(entity_max),
+            ExclusiveId::force(attribute_candidate),
+        ];
+        let values: [Inline<R256BE>; 3] = [1i128.to_inline(), 2i128.to_inline(), 3i128.to_inline()];
+
+        let mut data = TribleSet::new();
+        // entity_candidate occurs only on A; attribute_candidate occurs only
+        // on E. Membership is deliberately axis-specific.
+        data.insert(&Trible::new(&entities[0], &entity_candidate, &values[0]));
+        data.insert(&Trible::new(&entities[1], &entity_candidate, &values[1]));
+        data.insert(&Trible::new(&entities[2], &attribute_min, &values[2]));
+        data.insert(&Trible::new(&entities[2], &attribute_max, &values[2]));
+
+        let entity = Variable::<GenId>::new(0);
+        let entity_value: Inline<GenId> = (&entity_candidate).to_inline();
+        let sequential_entities: Vec<_> = Query::new(
+            and!(
+                entity.is(entity_value),
+                data.entity_in_range(entity, entity_min, entity_max),
+            ),
+            move |binding| project(entity.index, binding),
+        )
+        .sequential()
+        .collect();
+        assert!(sequential_entities.is_empty());
+        let residual_entities: Vec<_> = Query::new(
+            and!(
+                entity.is(entity_value),
+                data.entity_in_range(entity, entity_min, entity_max),
+            ),
+            move |binding| project(entity.index, binding),
+        )
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .cap(1)
+        .start_width(1)
+        .collect();
+        assert!(residual_entities.is_empty());
+
+        let attribute = Variable::<GenId>::new(0);
+        let attribute_value: Inline<GenId> = (&attribute_candidate).to_inline();
+        let sequential_attributes: Vec<_> = Query::new(
+            and!(
+                attribute.is(attribute_value),
+                data.attribute_in_range(attribute, attribute_min, attribute_max),
+            ),
+            move |binding| project(attribute.index, binding),
+        )
+        .sequential()
+        .collect();
+        assert!(sequential_attributes.is_empty());
+        let residual_attributes: Vec<_> = Query::new(
+            and!(
+                attribute.is(attribute_value),
+                data.attribute_in_range(attribute, attribute_min, attribute_max),
+            ),
+            move |binding| project(attribute.index, binding),
+        )
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .cap(1)
+        .start_width(1)
+        .collect();
+        assert!(residual_attributes.is_empty());
     }
 
     fn deterministic_id(byte: u8) -> Id {

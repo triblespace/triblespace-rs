@@ -5665,7 +5665,7 @@ impl FormulaBatch {
                     source.all_parents_in(self.parents.row_count)
                         && accumulator.sets.len() == self.parents.row_count
                         && accumulator.unique_len
-                            == accumulator.sets.iter().map(OrdSet::len).sum()
+                            == accumulator.sets.iter().map(OrdSet::len).sum::<usize>()
                 }
                 FormulaPayloadFrame::And { current } => {
                     current.all_parents_in(self.parents.row_count)
@@ -8090,6 +8090,12 @@ fn formula_action_transition<'a>(
     assert_eq!(batch.activations.len(), batch.parents.row_count);
 
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
+    if stage == FormulaStage::Confirm {
+        let parent_count = batch.parents.row_count;
+        batch
+            .input_mut()
+            .defer_for_shared_activation(parent_count);
+    }
     let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
     let constraint = plan.resolve_formula_node(root, occurrence, node);
     if stage == FormulaStage::Support {
@@ -8123,13 +8129,7 @@ fn formula_action_transition<'a>(
     let mut result = match stage {
         FormulaStage::Support => unreachable!("support returned above"),
         FormulaStage::Propose => CandidatePayload::empty(batch.parents.row_count),
-        FormulaStage::Confirm => {
-            let parent_count = batch.parents.row_count;
-            batch
-                .input_mut()
-                .defer_for_shared_activation(parent_count);
-            batch.input().clone()
-        }
+        FormulaStage::Confirm => batch.input().clone(),
     };
     let candidates_before = result.len();
     match stage {
@@ -10124,7 +10124,7 @@ impl ResidualStateMachine {
             &mut self.stats,
         );
         if let Some(continuation) = seeded.continuation.take() {
-            prefer_continuation(&mut stable_continuation, continuation);
+            prefer_continuation(&mut stable_continuation, Some(continuation));
         }
         MachineStep::DeltaSeeded {
             continuation: stable_continuation,

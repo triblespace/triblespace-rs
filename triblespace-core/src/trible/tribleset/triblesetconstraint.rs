@@ -1763,7 +1763,7 @@ mod tests {
             work = match effects.pages.pop().unwrap().resume {
                 Some(crate::query::ProgramResume::Immediate(next)) => next,
                 None => break,
-                Some(_) => panic!("TribleSet confirm used a non-immediate continuation"),
+                Some(_) => ::std::panic!("TribleSet confirm used a non-immediate continuation"),
             };
         }
 
