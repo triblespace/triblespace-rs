@@ -1,4 +1,5 @@
-//! Shared typed continuation for immutable ordered unary sources.
+//! Shared typed continuation for immutable unary sources with either a
+//! raw-ordered or stable ordinal cursor.
 //!
 //! This module owns only the physical continuation protocol. Constraint
 //! families retain their own source navigation and membership predicates, so
@@ -46,7 +47,8 @@ const PROPOSE_DISPATCH: DispatchClass = DispatchClass::new(0);
 const CONFIRM_DISPATCH: DispatchClass = DispatchClass::new(1);
 const SUPPORT_DISPATCH: DispatchClass = DispatchClass::new(2);
 
-pub(crate) fn route(variable: VariableId, request: ProgramRequest) -> Option<ProgramRoute> {
+#[doc(hidden)]
+pub fn route(variable: VariableId, request: ProgramRequest) -> Option<ProgramRoute> {
     let (key, route_variable) = match request.action {
         ProgramAction::Propose(route_variable) => {
             if route_variable != variable || request.bound.is_set(route_variable) {
@@ -82,7 +84,8 @@ pub(crate) fn route(variable: VariableId, request: ProgramRequest) -> Option<Pro
 ///
 /// Sources without a genuinely resumable cursor must decline Propose rather
 /// than hide eager materialization inside unbudgeted Program seeding.
-pub(crate) fn route_filter_only(
+#[doc(hidden)]
+pub fn route_filter_only(
     variable: VariableId,
     request: ProgramRequest,
 ) -> Option<ProgramRoute> {
@@ -92,7 +95,8 @@ pub(crate) fn route_filter_only(
     route(variable, request)
 }
 
-pub(crate) fn dispatch(state: &FiniteUnaryProgramState) -> DispatchClass {
+#[doc(hidden)]
+pub fn dispatch(state: &FiniteUnaryProgramState) -> DispatchClass {
     match state {
         FiniteUnaryProgramState::Propose { .. } => PROPOSE_DISPATCH,
         FiniteUnaryProgramState::Confirm { .. } => CONFIRM_DISPATCH,
@@ -100,11 +104,13 @@ pub(crate) fn dispatch(state: &FiniteUnaryProgramState) -> DispatchClass {
     }
 }
 
-pub(crate) fn pacing(_state: &FiniteUnaryProgramState) -> ProgramPacing {
+#[doc(hidden)]
+pub fn pacing(_state: &FiniteUnaryProgramState) -> ProgramPacing {
     ProgramPacing::Search
 }
 
-pub(crate) fn progress(state: &FiniteUnaryProgramState) -> [u64; 6] {
+#[doc(hidden)]
+pub fn progress(state: &FiniteUnaryProgramState) -> [u64; 6] {
     fn complemented_value_words(value: &RawInline) -> [u64; 4] {
         std::array::from_fn(|word| {
             let begin = word * 8;
@@ -128,8 +134,9 @@ pub(crate) fn progress(state: &FiniteUnaryProgramState) -> [u64; 6] {
                     rank[1] = u64::MAX - 1;
                     rank[2..].copy_from_slice(&complemented_value_words(value));
                 }
-                ResidualDeltaSourceCursor::Offset(_) => {
-                    panic!("ordinal cursor crossed into an ordered unary source")
+                ResidualDeltaSourceCursor::Offset(offset) => {
+                    rank[1] = u64::MAX - 2;
+                    rank[2] = u64::MAX - offset;
                 }
             }
         }
@@ -137,7 +144,8 @@ pub(crate) fn progress(state: &FiniteUnaryProgramState) -> [u64; 6] {
     rank
 }
 
-pub(crate) fn seed(
+#[doc(hidden)]
+pub fn seed(
     variable: VariableId,
     batch: ProgramSeedBatch<'_>,
     effects: &mut TypedSeedSink<FiniteUnaryProgramState, ()>,
@@ -171,7 +179,8 @@ pub(crate) fn seed(
     }
 }
 
-pub(crate) fn step(
+#[doc(hidden)]
+pub fn step(
     variable: VariableId,
     states: Vec<FiniteUnaryProgramState>,
     batch: TypedProgramBatch<'_>,
@@ -269,5 +278,23 @@ pub(crate) fn step(
                 effects.page(1, None);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinal_proposal_progress_strictly_descends() {
+        let state = |cursor| FiniteUnaryProgramState::Propose { cursor };
+        assert!(
+            progress(&state(ResidualDeltaSourceCursor::Start))
+                > progress(&state(ResidualDeltaSourceCursor::Offset(1)))
+        );
+        assert!(
+            progress(&state(ResidualDeltaSourceCursor::Offset(1)))
+                > progress(&state(ResidualDeltaSourceCursor::Offset(2)))
+        );
     }
 }

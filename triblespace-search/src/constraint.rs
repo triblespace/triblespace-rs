@@ -32,8 +32,10 @@ use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::query::{
-    CandidateSink, Constraint, EstimateSink, ResidualDeltaOutput, ResidualDeltaSourceCursor,
-    ResidualDeltaSourcePage, RowsView, Variable, VariableId, VariableSet,
+    finiteunaryprogram, CandidateSink, Constraint, DispatchClass, EstimateSink, ProgramPacing,
+    ProgramRef, ProgramRequest, ProgramRoute, ProgramSeedBatch, ResidualDeltaOutput,
+    ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, TypedEffectSink,
+    TypedProgramBatch, TypedProgramSpec, TypedSeedSink, Variable, VariableId, VariableSet,
 };
 
 use crate::bm25::BM25Index;
@@ -195,6 +197,10 @@ where
     /// across the query terms is `>= score_floor`. Score is
     /// dropped after the filter — re-derived on demand.
     entries: Vec<RawInline>,
+    /// Set-shaped companion to `entries` for pointwise confirmation. Keeping
+    /// it beside the occurrence sequence prevents width-one continuation
+    /// pages from rebuilding or linearly scanning the whole frontier.
+    membership: HashSet<RawInline>,
 }
 
 impl<S> BM25Filter<S>
@@ -212,10 +218,68 @@ where
     where
         I: IntoIterator<Item = RawInline>,
     {
+        let entries: Vec<_> = entries.into_iter().collect();
+        let membership = entries.iter().copied().collect();
         Self {
             doc,
-            entries: entries.into_iter().collect(),
+            entries,
+            membership,
         }
+    }
+
+    fn contains_raw(&self, value: &RawInline) -> bool {
+        self.membership.contains(value)
+    }
+}
+
+impl<S> TypedProgramSpec for BM25Filter<S>
+where
+    S: triblespace_core::inline::InlineEncoding,
+{
+    type State = finiteunaryprogram::FiniteUnaryProgramState;
+    type NoveltyKey = ();
+    type Rank = [u64; 6];
+
+    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+        finiteunaryprogram::route(self.doc.index, request)
+    }
+
+    fn dispatch(&self, state: &Self::State) -> DispatchClass {
+        finiteunaryprogram::dispatch(state)
+    }
+
+    fn pacing(&self, state: &Self::State) -> ProgramPacing {
+        finiteunaryprogram::pacing(state)
+    }
+
+    fn progress(&self, state: &Self::State) -> Self::Rank {
+        finiteunaryprogram::progress(state)
+    }
+
+    fn seed_typed(
+        &self,
+        batch: ProgramSeedBatch<'_>,
+        effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+    ) {
+        finiteunaryprogram::seed(self.doc.index, batch, effects);
+    }
+
+    fn step_typed(
+        &self,
+        states: Vec<Self::State>,
+        batch: TypedProgramBatch<'_>,
+        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+    ) {
+        finiteunaryprogram::step(
+            self.doc.index,
+            states,
+            batch,
+            effects,
+            |_input, cursor, limit, accepted| {
+                cached_candidate_page(&self.entries, cursor, limit, accepted)
+            },
+            |_input, value| self.contains_raw(value),
+        );
     }
 }
 
@@ -399,8 +463,11 @@ where
         if variable != self.doc.index {
             return;
         }
-        let valid: HashSet<RawInline> = self.entries.iter().copied().collect();
-        candidates.retain(|_, raw| valid.contains(raw));
+        candidates.retain(|_, raw| self.contains_raw(raw));
+    }
+
+    fn residual_confirm_is_page_local(&self) -> bool {
+        true
     }
 
     fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
@@ -436,9 +503,13 @@ where
         match view.col(self.doc.index) {
             Some(col) => view
                 .iter()
-                .all(|row| self.entries.iter().any(|d| *d == row[col])),
+                .all(|row| self.contains_raw(&row[col])),
             None => true,
         }
+    }
+
+    fn residual_program(&self) -> Option<ProgramRef<'_>> {
+        Some(ProgramRef::new(self))
     }
 }
 
@@ -769,6 +840,9 @@ pub struct SimilarTo {
     /// Eagerly-computed above-threshold handle set from the one
     /// walk at construction.
     candidates: Vec<RawInline>,
+    /// Set-shaped companion used by pointwise confirmation without changing
+    /// the native proposal order or duplicate occurrence bag.
+    membership: HashSet<RawInline>,
 }
 
 impl SimilarTo {
@@ -776,7 +850,64 @@ impl SimilarTo {
     /// through the `similar_to` method on an attached index
     /// rather than directly.
     pub fn from_candidates(var: Variable<Handle<Embedding>>, candidates: Vec<RawInline>) -> Self {
-        Self { var, candidates }
+        let membership = candidates.iter().copied().collect();
+        Self {
+            var,
+            candidates,
+            membership,
+        }
+    }
+
+    fn contains_raw(&self, value: &RawInline) -> bool {
+        self.membership.contains(value)
+    }
+}
+
+impl TypedProgramSpec for SimilarTo {
+    type State = finiteunaryprogram::FiniteUnaryProgramState;
+    type NoveltyKey = ();
+    type Rank = [u64; 6];
+
+    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+        finiteunaryprogram::route(self.var.index, request)
+    }
+
+    fn dispatch(&self, state: &Self::State) -> DispatchClass {
+        finiteunaryprogram::dispatch(state)
+    }
+
+    fn pacing(&self, state: &Self::State) -> ProgramPacing {
+        finiteunaryprogram::pacing(state)
+    }
+
+    fn progress(&self, state: &Self::State) -> Self::Rank {
+        finiteunaryprogram::progress(state)
+    }
+
+    fn seed_typed(
+        &self,
+        batch: ProgramSeedBatch<'_>,
+        effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+    ) {
+        finiteunaryprogram::seed(self.var.index, batch, effects);
+    }
+
+    fn step_typed(
+        &self,
+        states: Vec<Self::State>,
+        batch: TypedProgramBatch<'_>,
+        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+    ) {
+        finiteunaryprogram::step(
+            self.var.index,
+            states,
+            batch,
+            effects,
+            |_input, cursor, limit, accepted| {
+                cached_candidate_page(&self.candidates, cursor, limit, accepted)
+            },
+            |_input, value| self.contains_raw(value),
+        );
     }
 }
 
@@ -821,8 +952,11 @@ impl<'a> Constraint<'a> for SimilarTo {
         if variable != self.var.index {
             return;
         }
-        let allowed: HashSet<RawInline> = self.candidates.iter().copied().collect();
-        candidates.retain(|_, raw| allowed.contains(raw));
+        candidates.retain(|_, raw| self.contains_raw(raw));
+    }
+
+    fn residual_confirm_is_page_local(&self) -> bool {
+        true
     }
 
     fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
@@ -858,9 +992,13 @@ impl<'a> Constraint<'a> for SimilarTo {
         match view.col(self.var.index) {
             Some(col) => view
                 .iter()
-                .all(|row| self.candidates.iter().any(|c| *c == row[col])),
+                .all(|row| self.contains_raw(&row[col])),
             None => true,
         }
+    }
+
+    fn residual_program(&self) -> Option<ProgramRef<'_>> {
+        Some(ProgramRef::new(self))
     }
 }
 
@@ -873,7 +1011,7 @@ mod tests {
     use triblespace_core::id::Id;
     use triblespace_core::inline::{InlineEncoding, IntoInline};
     use triblespace_core::query::hashsetconstraint::SetConstraint;
-    use triblespace_core::query::residual::ResidualLowering;
+    use triblespace_core::query::residual::{try_constructed_program_query, ResidualLowering};
     use triblespace_core::query::{Binding, Candidates, Query};
     use triblespace_core::repo::BlobStore;
 
@@ -1416,12 +1554,20 @@ mod tests {
             !flat_constraint.residual_proposal_source_is_paged(b.index, &bound_pivot),
             "flat search currently has no failure-atomic resumable page API",
         );
+        assert!(
+            flat_constraint.residual_program().is_none(),
+            "a completed flat search must not be hidden inside unmetered Program seeding",
+        );
 
         let hnsw_view = hnsw.attach(&reader);
         let hnsw_constraint = hnsw_view.similar(a, b, 0.8);
         assert!(
             !hnsw_constraint.residual_proposal_source_is_paged(b.index, &bound_pivot),
             "naive HNSW exposes only a completed search Vec, not its heap/visited continuation",
+        );
+        assert!(
+            hnsw_constraint.residual_program().is_none(),
+            "a completed HNSW search must not masquerade as a resumable Program",
         );
 
         #[cfg(feature = "succinct")]
@@ -1432,6 +1578,10 @@ mod tests {
             assert!(
                 !succinct_constraint.residual_proposal_source_is_paged(b.index, &bound_pivot),
                 "succinct HNSW also exposes only a completed search Vec",
+            );
+            assert!(
+                succinct_constraint.residual_program().is_none(),
+                "succinct HNSW also lacks an owned search continuation",
             );
         }
     }
@@ -1541,6 +1691,55 @@ mod tests {
         assert_eq!(first_only.stats().delta_source_candidates_examined, 1);
         assert_eq!(first_only.stats().delta_source_direct_candidates, 1);
         drop(first_only);
+    }
+
+    #[test]
+    fn cached_search_programs_construct_as_source_and_confirmer_without_fallback() {
+        let candidate = Variable::<Handle<Embedding>>::new(0);
+        let source = vec![
+            embedding_raw(3),
+            embedding_raw(1),
+            embedding_raw(1),
+            embedding_raw(2),
+        ];
+        let allowed = vec![embedding_raw(1), embedding_raw(2)];
+        let expected = vec![embedding_raw(1), embedding_raw(1), embedding_raw(2)];
+
+        // BM25 supplies the native occurrence bag; SimilarTo confirms each
+        // bounded page. Width one forces every Offset continuation edge.
+        let forward_root = triblespace_core::and!(
+            BM25Filter::<Handle<Embedding>>::from_entries(candidate, source.clone()),
+            SimilarTo::from_candidates(candidate, allowed.clone()),
+        );
+        let mut forward = try_constructed_program_query(forward_root, project_first)
+            .expect("cached BM25 + SimilarTo must admit a complete typed Program chain")
+            .cap(1)
+            .start_width(1)
+            .growth(1);
+        let first = forward.next().expect("constructed cached source was empty");
+        let mirror = forward.clone();
+        let remainder: Vec<_> = forward.collect();
+        assert_eq!(mirror.collect::<Vec<_>>(), remainder);
+        assert_eq!(
+            std::iter::once(first)
+                .chain(remainder)
+                .collect::<Vec<_>>(),
+            expected,
+        );
+
+        // Reverse the occurrences so SimilarTo owns proposal paging and BM25
+        // exercises the same pointwise confirmation contract.
+        let reverse_root = triblespace_core::and!(
+            SimilarTo::from_candidates(candidate, source),
+            BM25Filter::<Handle<Embedding>>::from_entries(candidate, allowed),
+        );
+        let reverse: Vec<_> = try_constructed_program_query(reverse_root, project_first)
+            .expect("cached SimilarTo + BM25 must admit the reverse Program chain")
+            .cap(1)
+            .start_width(1)
+            .growth(1)
+            .collect();
+        assert_eq!(reverse, expected);
     }
 
     #[test]
