@@ -1276,8 +1276,11 @@ impl<'a, U> UnionArchive<'a, U> {
 
 /// Atomic normalized union over one finite set of Succinct archive shards.
 ///
-/// Ordinary constraint verbs retain [`UnionConstraint`]'s per-row set-union
-/// semantics. Proposal paging is specialized because every Succinct shard
+/// Estimates, proposals, and satisfaction retain [`UnionConstraint`]'s
+/// per-row set-union semantics. Confirmation instead treats shard union as a
+/// physical representation detail: it filters the original candidate bag by
+/// OR-membership, preserving every surviving occurrence's tag, order, and
+/// multiplicity. Proposal paging is specialized because every Succinct shard
 /// exposes the same strictly ordered raw-value cursor: one head per shard is
 /// enough to emit the global minimum once, and `After(value)` skips that
 /// normalized value in every shard on resume. The constraint deliberately
@@ -1340,7 +1343,74 @@ where
         view: &RowsView<'_>,
         candidates: &mut CandidateSink<'_>,
     ) {
-        self.union.confirm(variable, view, candidates)
+        if !self.variables().is_set(variable) {
+            return;
+        }
+        if candidates.is_empty() {
+            return;
+        }
+
+        match candidates {
+            CandidateSink::Values(values) => {
+                debug_assert_eq!(
+                    view.len(),
+                    1,
+                    "plain candidate values require one parent row"
+                );
+                let row_view = view.row_view(0);
+                // Shards normalize only the membership witnesses. Filtering
+                // the untouched input afterwards preserves its physical bag.
+                let mut witnesses = HashSet::with_capacity(values.len());
+                let mut shard_values = Vec::with_capacity(values.len());
+
+                for shard in 0..self.union.len() {
+                    let constraint = self.union.child(shard);
+                    if !constraint.satisfied(&row_view) {
+                        continue;
+                    }
+                    shard_values.clone_from(values);
+                    constraint.confirm(
+                        variable,
+                        &row_view,
+                        &mut CandidateSink::Values(&mut shard_values),
+                    );
+                    witnesses.extend(shard_values.iter().copied());
+                }
+
+                values.retain(|value| witnesses.contains(value));
+            }
+            CandidateSink::Tagged(pairs) => {
+                // Keep the parent tag in the witness key: equal values on a
+                // dead row must not borrow liveness from another row. Each
+                // shard still receives one whole-frontier confirm call so its
+                // Ring probes retain their batching opportunity.
+                let mut witnesses = HashSet::with_capacity(pairs.len());
+                let mut live_rows = Vec::with_capacity(view.len());
+                let mut shard_pairs = Vec::with_capacity(pairs.len());
+
+                for shard in 0..self.union.len() {
+                    let constraint = self.union.child(shard);
+                    live_rows.clear();
+                    live_rows.extend(
+                        (0..view.len()).map(|row| constraint.satisfied(&view.row_view(row))),
+                    );
+                    if !live_rows.iter().any(|live| *live) {
+                        continue;
+                    }
+
+                    shard_pairs.clone_from(pairs);
+                    shard_pairs.retain(|(row, _)| live_rows[*row as usize]);
+                    constraint.confirm(
+                        variable,
+                        view,
+                        &mut CandidateSink::Tagged(&mut shard_pairs),
+                    );
+                    witnesses.extend(shard_pairs.iter().copied());
+                }
+
+                pairs.retain(|pair| witnesses.contains(pair));
+            }
+        }
     }
 
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
@@ -1349,6 +1419,14 @@ where
 
     fn influence(&self, variable: VariableId) -> VariableSet {
         self.union.influence(variable)
+    }
+
+    fn residual_confirm_is_page_local(&self) -> bool {
+        (0..self.union.len()).all(|shard| {
+            self.union
+                .child(shard)
+                .residual_confirm_is_page_local()
+        })
     }
 
     fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
@@ -1494,8 +1572,13 @@ mod tests {
     use crate::blob::IntoBlob;
     use crate::examples::literature;
     use crate::id::fucid;
+    use crate::inline::encodings::UnknownInline;
+    use crate::inline::IntoInline;
+    use crate::query::intersectionconstraint::IntersectionConstraint;
+    use crate::query::{Binding, Query, Variable};
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::repo::{BlobStorePut, CommitHandle};
+    use crate::trible::Trible;
     use ed25519_dalek::SigningKey;
     use std::convert::Infallible;
 
@@ -1506,6 +1589,102 @@ mod tests {
     fn source(name: &str) -> TribleSet {
         let person = fucid();
         entity! { &person @ literature::firstname: name }.into_facts()
+    }
+
+    fn raw_value(tag: u8) -> RawInline {
+        [tag; 32]
+    }
+
+    fn fixed_archive(
+        entity: &Id,
+        attribute: &Id,
+        values: impl IntoIterator<Item = u8>,
+    ) -> SuccinctArchive<OrderedUniverse> {
+        let mut facts = TribleSet::new();
+        for tag in values {
+            facts.insert(&Trible::force(
+                entity,
+                attribute,
+                &Inline::<UnknownInline>::new(raw_value(tag)),
+            ));
+        }
+        (&facts).into()
+    }
+
+    struct CandidateBag<'a> {
+        values: &'a [RawInline],
+    }
+
+    impl<'a> Constraint<'a> for CandidateBag<'a> {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(0)
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != 0 {
+                return false;
+            }
+            // Force this sibling to propose so the archive is exercised as a
+            // confirmer by both scheduler families.
+            out.fill(0, view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            if variable == 0 {
+                for row in 0..view.len() as u32 {
+                    candidates.extend_row(row, self.values.iter().copied());
+                }
+            }
+        }
+
+        fn confirm(
+            &self,
+            variable: VariableId,
+            _view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            if variable == 0 {
+                candidates.retain(|_, value| self.values.contains(value));
+            }
+        }
+
+        fn satisfied(&self, view: &RowsView<'_>) -> bool {
+            view.col(0).is_none_or(|column| {
+                view.iter().all(|row| self.values.contains(&row[column]))
+            })
+        }
+    }
+
+    fn project_first(binding: &Binding) -> Option<RawInline> {
+        binding.get(0).copied()
+    }
+
+    fn solve_candidate_bag<'a>(
+        constraint: Box<dyn Constraint<'a> + 'a>,
+        values: &'a [RawInline],
+        residual: bool,
+    ) -> Vec<RawInline> {
+        let root = IntersectionConstraint::new(vec![
+            Box::new(CandidateBag { values }) as Box<dyn Constraint<'a> + 'a>,
+            constraint,
+        ]);
+        let query = Query::new(root, project_first);
+        if residual {
+            query.solve_residual_state_lazy().collect()
+        } else {
+            query.sequential().collect()
+        }
     }
 
     fn stored_commit(
@@ -1569,6 +1748,272 @@ mod tests {
 
         fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
             self.inner.reader()
+        }
+    }
+
+    #[test]
+    fn one_shard_union_archive_confirm_matches_direct_unsorted_duplicate_bag() {
+        let entity = Id::new([0x11; 16]).unwrap();
+        let attribute = Id::new([0x21; 16]).unwrap();
+        let archives = [fixed_archive(&entity, &attribute, [2, 4])];
+        let entity: Inline<GenId> = entity.to_inline();
+        let attribute: Inline<GenId> = attribute.to_inline();
+        let value = Variable::<UnknownInline>::new(0);
+        let direct = archives[0].pattern(entity, attribute, value);
+        let union_archive = UnionArchive::new(&archives);
+        let union = union_archive.pattern(entity, attribute, value);
+        let input = vec![
+            raw_value(4),
+            raw_value(1),
+            raw_value(2),
+            raw_value(4),
+            raw_value(3),
+            raw_value(2),
+        ];
+
+        let mut direct_candidates = input.clone();
+        direct.confirm(
+            value.index,
+            &RowsView::EMPTY,
+            &mut CandidateSink::Values(&mut direct_candidates),
+        );
+        let mut union_candidates = input;
+        union.confirm(
+            value.index,
+            &RowsView::EMPTY,
+            &mut CandidateSink::Values(&mut union_candidates),
+        );
+
+        assert_eq!(union_candidates, direct_candidates);
+        assert_eq!(
+            union_candidates,
+            vec![raw_value(4), raw_value(2), raw_value(4), raw_value(2)]
+        );
+    }
+
+    #[test]
+    fn multi_shard_union_archive_confirm_filters_by_or_membership_without_normalizing() {
+        let entity = Id::new([0x12; 16]).unwrap();
+        let attribute = Id::new([0x22; 16]).unwrap();
+        let archives = [
+            fixed_archive(&entity, &attribute, [1, 3]),
+            fixed_archive(&entity, &attribute, [2, 3]),
+        ];
+        let entity: Inline<GenId> = entity.to_inline();
+        let attribute: Inline<GenId> = attribute.to_inline();
+        let value = Variable::<UnknownInline>::new(0);
+        let union_archive = UnionArchive::new(&archives);
+        let union = union_archive.pattern(entity, attribute, value);
+        let mut candidates = vec![
+            raw_value(3),
+            raw_value(1),
+            raw_value(3),
+            raw_value(4),
+            raw_value(2),
+            raw_value(1),
+        ];
+
+        union.confirm(
+            value.index,
+            &RowsView::EMPTY,
+            &mut CandidateSink::Values(&mut candidates),
+        );
+
+        assert_eq!(
+            candidates,
+            vec![
+                raw_value(3),
+                raw_value(1),
+                raw_value(3),
+                raw_value(2),
+                raw_value(1),
+            ]
+        );
+    }
+
+    #[test]
+    fn scheduled_union_archive_confirm_matches_materialized_archive_candidate_bag() {
+        let entity = Id::new([0x17; 16]).unwrap();
+        let attribute = Id::new([0x25; 16]).unwrap();
+        let archives = [
+            fixed_archive(&entity, &attribute, [1, 3]),
+            fixed_archive(&entity, &attribute, [2, 3]),
+        ];
+        let materialized = fixed_archive(&entity, &attribute, [1, 2, 3]);
+        let entity: Inline<GenId> = entity.to_inline();
+        let attribute: Inline<GenId> = attribute.to_inline();
+        let value = Variable::<UnknownInline>::new(0);
+        let candidates = vec![
+            raw_value(3),
+            raw_value(1),
+            raw_value(3),
+            raw_value(4),
+            raw_value(2),
+            raw_value(1),
+        ];
+        let mut expected = vec![
+            raw_value(3),
+            raw_value(1),
+            raw_value(3),
+            raw_value(2),
+            raw_value(1),
+        ];
+        expected.sort_unstable();
+
+        for residual in [false, true] {
+            let union_archive = UnionArchive::new(&archives);
+            let mut union_results = solve_candidate_bag(
+                Box::new(union_archive.pattern(entity, attribute, value)),
+                &candidates,
+                residual,
+            );
+            let mut materialized_results = solve_candidate_bag(
+                Box::new(materialized.pattern(entity, attribute, value)),
+                &candidates,
+                residual,
+            );
+            union_results.sort_unstable();
+            materialized_results.sort_unstable();
+
+            assert_eq!(union_results, materialized_results);
+            assert_eq!(union_results, expected);
+        }
+    }
+
+    #[test]
+    fn union_archive_confirm_gates_shards_per_tagged_parent_row() {
+        let entity_one = Id::new([0x13; 16]).unwrap();
+        let entity_two = Id::new([0x14; 16]).unwrap();
+        let entity_dead = Id::new([0x15; 16]).unwrap();
+        let attribute = Id::new([0x23; 16]).unwrap();
+        let archives = [
+            fixed_archive(&entity_one, &attribute, [1]),
+            fixed_archive(&entity_two, &attribute, [2]),
+        ];
+        let entity = Variable::<GenId>::new(0);
+        let attribute_variable = Variable::<GenId>::new(1);
+        let value = Variable::<UnknownInline>::new(2);
+        let unrelated = Variable::<UnknownInline>::new(3);
+        let union_archive = UnionArchive::new(&archives);
+        let union = union_archive.pattern(entity, attribute_variable, value);
+        let vars = [entity.index, attribute_variable.index];
+        let entity_one: Inline<GenId> = entity_one.to_inline();
+        let entity_two: Inline<GenId> = entity_two.to_inline();
+        let entity_dead: Inline<GenId> = entity_dead.to_inline();
+        let attribute: Inline<GenId> = attribute.to_inline();
+        let rows = [
+            entity_one.raw,
+            attribute.raw,
+            entity_two.raw,
+            attribute.raw,
+            entity_dead.raw,
+            attribute.raw,
+        ];
+        let view = RowsView::new(&vars, &rows);
+        let one = raw_value(1);
+        let two = raw_value(2);
+        let input = vec![(0, one), (0, one), (1, one), (1, two), (2, one)];
+
+        let mut unrelated_candidates = input.clone();
+        union.confirm(
+            unrelated.index,
+            &view,
+            &mut CandidateSink::Tagged(&mut unrelated_candidates),
+        );
+        assert_eq!(unrelated_candidates, input);
+
+        let mut candidates = input;
+        union.confirm(
+            value.index,
+            &view,
+            &mut CandidateSink::Tagged(&mut candidates),
+        );
+
+        // Value 1 is a witness for row 0 but not row 1 or row 2. Keying
+        // witnesses by value alone would therefore leak it across parents.
+        assert_eq!(candidates, vec![(0, one), (0, one), (1, two)]);
+    }
+
+    #[test]
+    fn union_archive_confirm_is_page_local_over_duplicate_empty_parents() {
+        let entity = Id::new([0x16; 16]).unwrap();
+        let attribute = Id::new([0x24; 16]).unwrap();
+        let archives = [
+            fixed_archive(&entity, &attribute, [1, 3]),
+            fixed_archive(&entity, &attribute, [2, 3]),
+        ];
+        let entity: Inline<GenId> = entity.to_inline();
+        let attribute: Inline<GenId> = attribute.to_inline();
+        let value = Variable::<UnknownInline>::new(0);
+        let union_archive = UnionArchive::new(&archives);
+        let union = union_archive.pattern(entity, attribute, value);
+        let view = RowsView::new_with_row_count(&[], &[], 2);
+        let input = vec![
+            (0, raw_value(3)),
+            (0, raw_value(4)),
+            (0, raw_value(1)),
+            (0, raw_value(3)),
+            (1, raw_value(2)),
+            (1, raw_value(4)),
+            (1, raw_value(3)),
+            (1, raw_value(2)),
+        ];
+        assert!(union.residual_confirm_is_page_local());
+
+        let mut whole = input.clone();
+        union.confirm(
+            value.index,
+            &view,
+            &mut CandidateSink::Tagged(&mut whole),
+        );
+        assert_eq!(
+            whole,
+            vec![
+                (0, raw_value(3)),
+                (0, raw_value(1)),
+                (0, raw_value(3)),
+                (1, raw_value(2)),
+                (1, raw_value(3)),
+                (1, raw_value(2)),
+            ]
+        );
+
+        let mut empty = Vec::new();
+        union.confirm(
+            value.index,
+            &view,
+            &mut CandidateSink::Tagged(&mut empty),
+        );
+        assert!(empty.is_empty());
+
+        for cuts in 0..(1usize << (input.len() - 1)) {
+            let mut paged = Vec::new();
+            let mut start = 0;
+            for index in 0..input.len() - 1 {
+                if cuts & (1 << index) == 0 {
+                    continue;
+                }
+                let mut page = input[start..=index].to_vec();
+                union.confirm(
+                    value.index,
+                    &view,
+                    &mut CandidateSink::Tagged(&mut page),
+                );
+                paged.extend(page);
+                start = index + 1;
+            }
+            let mut page = input[start..].to_vec();
+            union.confirm(
+                value.index,
+                &view,
+                &mut CandidateSink::Tagged(&mut page),
+            );
+            paged.extend(page);
+
+            assert_eq!(
+                paged, whole,
+                "candidate partition {cuts:#b} changed tags, order, or multiplicity"
+            );
         }
     }
 
