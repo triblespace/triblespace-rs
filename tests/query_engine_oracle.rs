@@ -192,19 +192,13 @@ macro_rules! assert_all_engines_match {
         prop_assert_eq!(
             multiset($query),
             expected.clone(),
-            "{}: ordinary shape-selected Query",
+            "{}: ordinary residual-default Query",
             $label
         );
         prop_assert_eq!(
             multiset(($query).solve_blocked()),
             expected.clone(),
             "{}: blocked",
-            $label
-        );
-        prop_assert_eq!(
-            multiset(($query).solve_blocked_grouped()),
-            expected.clone(),
-            "{}: blocked-grouped",
             $label
         );
         prop_assert_eq!(
@@ -229,12 +223,6 @@ macro_rules! assert_all_engines_match {
             multiset(($query).solve_dag_lazy().start_width(1).growth(1)),
             expected.clone(),
             "{}: lazy dag fixed-width sprint",
-            $label
-        );
-        prop_assert_eq!(
-            multiset(($query).solve_dag_lazy().agglomerative_partition()),
-            expected.clone(),
-            "{}: agglomerative partition",
             $label
         );
         prop_assert_eq!(
@@ -285,7 +273,7 @@ macro_rules! assert_residual_engines_match {
         prop_assert_eq!(
             multiset($query),
             expected.clone(),
-            "{}: ordinary shape-selected Query",
+            "{}: ordinary residual-default Query",
             $label
         );
         prop_assert_eq!(

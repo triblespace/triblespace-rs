@@ -17,12 +17,11 @@
 //! terminating finite automata and repeated least-fixpoint programs.
 //!
 //! Ready and Candidate descriptors are pure planning states: they estimate,
-//! partition rows by a uniform semantic action, and file explicit Propose or
-//! Confirm descriptors without invoking either protocol verb. The action state
-//! is what calls one flattened leaf. Exact row-local variable choices are the
-//! leaves of the same topology-scaled agglomerative merge hierarchy used by the
-//! DAG engine; after a compatible group is reassigned, each row still chooses
-//! its tightest proposer for that scheduled variable. Occupancy scheduling
+//! partition rows by their exact uniform semantic action, and file explicit
+//! Propose or Confirm descriptors without invoking either protocol verb. The
+//! action state is what calls one flattened leaf. Variable choice remains
+//! row-local because its proposer owns the occurrence bag; rows batch only when
+//! they selected the same variable and proposer. Occupancy scheduling
 //! chooses the deepest live bucket able to fill the desired actionable width;
 //! if none can, it drains the minimum-rank bucket through the strict readiness
 //! gate. When a full Propose or Confirm action advances to an underfilled
@@ -1964,17 +1963,11 @@ pub struct ResidualStateStats {
     /// invoking the constraint protocol.
     pub ready_plan_pops: usize,
     /// Exact row-local preferred-variable groups observed by Ready planning,
-    /// summed across pops before topology-scaled agglomeration.
+    /// summed across pops.
     pub ready_preferred_variable_groups: usize,
-    /// Variable groups retained by Ready planning after topology-scaled
-    /// agglomeration, summed across pops.
-    pub ready_scheduled_variable_groups: usize,
-    /// Concrete `(scheduled variable, exact proposer occurrence)` groups filed
+    /// Concrete `(preferred variable, exact proposer occurrence)` groups filed
     /// by Ready planning, summed across pops.
     pub ready_proposal_groups: usize,
-    /// Ready pops where agglomeration reduced the preferred-variable group
-    /// count.
-    pub agglomerated_ready_pops: usize,
     /// Candidate-state chunks that planned row-local confirmation actions (or
     /// committed a fully checked candidate frontier) without invoking a
     /// constraint verb.
@@ -6756,10 +6749,11 @@ fn ready_plan_transition<'a>(
     let mut preferred = Vec::with_capacity(rows.row_count);
     let mut preferred_counts = vec![0; plans.len()];
     for row in 0..rows.row_count {
-        let mut best: Option<(usize, (u64, u64, u64))> = None;
+        let mut best = None;
         for (pi, plan) in plans.iter().enumerate() {
             let estimate = estimate_matrix[pi * rows.row_count + row];
-            let key = variable_order_key(
+            let key = variable_choice_key(
+                plan.variable,
                 estimate,
                 base_estimates[plan.variable],
                 influences[plan.variable].count(),
@@ -6776,37 +6770,15 @@ fn ready_plan_transition<'a>(
     }
 
     let preferred_groups = preferred_counts.iter().filter(|&&count| count > 0).count();
-    let mut scheduled = preferred.clone();
-    let mut scheduled_groups = preferred_groups;
-    if preferred_groups > 1 {
-        let mut owners = Vec::new();
-        let mut group_sums = Vec::new();
-        let mut compatible = Vec::new();
-        let mut active = Vec::new();
-        let plan = plan_agglomerative_partition(
-            &estimate_matrix,
-            rows.row_count,
-            &unbound,
-            influences,
-            &preferred,
-            &preferred_counts,
-            &mut owners,
-            &mut scheduled,
-            &mut group_sums,
-            &mut compatible,
-            &mut active,
-        );
-        debug_assert_eq!(plan.preferred_groups, preferred_groups);
-        scheduled_groups = plan.scheduled_groups;
-        if scheduled_groups < preferred_groups {
-            stats.agglomerated_ready_pops += 1;
-        }
-    }
+    // The chosen variable and proposer are semantic: `propose` owns the
+    // occurrence bag, and `Constraint` supplies no cross-variable bag
+    // equivalence law. Keep every row on its exact adaptive choice. Physical
+    // executors may still cohort equal actions after this boundary, but an
+    // estimate-compatible variable is not an interchangeable action.
     stats.ready_preferred_variable_groups += preferred_groups;
-    stats.ready_scheduled_variable_groups += scheduled_groups;
 
     let mut groups: BTreeMap<ProposeAction, Vec<usize>> = BTreeMap::new();
-    for (row, &variable_plan) in scheduled.iter().enumerate() {
+    for (row, &variable_plan) in preferred.iter().enumerate() {
         let variable_plan = variable_plan as usize;
         let action = ProposeAction {
             variable_plan,
@@ -15356,32 +15328,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_agglomeration_coalesces_near_variable_choices() {
-        const PARENT: VariableId = 0;
-        const LEFT: VariableId = 1;
-        const RIGHT: VariableId = 2;
-        let (actions, stats) = ready_action_fixture(vec![
-            RowEstimateLeaf {
-                parent: PARENT,
-                variable: LEFT,
-                estimates: [1, 2],
-            },
-            RowEstimateLeaf {
-                parent: PARENT,
-                variable: RIGHT,
-                estimates: [2, 1],
-            },
-        ]);
-
-        assert_eq!(actions, [(LEFT, 0, 2)]);
-        assert_eq!(stats.ready_preferred_variable_groups, 2);
-        assert_eq!(stats.ready_scheduled_variable_groups, 1);
-        assert_eq!(stats.ready_proposal_groups, 1);
-        assert_eq!(stats.agglomerated_ready_pops, 1);
-    }
-
-    #[test]
-    fn ready_agglomeration_selects_each_scheduled_rows_exact_proposer() {
+    fn ready_planning_preserves_each_rows_exact_variable_and_proposer() {
         const PARENT: VariableId = 0;
         const LEFT: VariableId = 1;
         const RIGHT: VariableId = 2;
@@ -15403,36 +15350,9 @@ mod tests {
             },
         ]);
 
-        assert_eq!(actions, [(LEFT, 0, 1), (LEFT, 1, 1)]);
+        assert_eq!(actions, [(LEFT, 0, 1), (RIGHT, 2, 1)]);
         assert_eq!(stats.ready_preferred_variable_groups, 2);
-        assert_eq!(stats.ready_scheduled_variable_groups, 1);
         assert_eq!(stats.ready_proposal_groups, 2);
-        assert_eq!(stats.agglomerated_ready_pops, 1);
-    }
-
-    #[test]
-    fn ready_agglomeration_keeps_incompatible_exact_choices() {
-        const PARENT: VariableId = 0;
-        const LEFT: VariableId = 1;
-        const RIGHT: VariableId = 2;
-        let (actions, stats) = ready_action_fixture(vec![
-            RowEstimateLeaf {
-                parent: PARENT,
-                variable: LEFT,
-                estimates: [1, 64],
-            },
-            RowEstimateLeaf {
-                parent: PARENT,
-                variable: RIGHT,
-                estimates: [64, 1],
-            },
-        ]);
-
-        assert_eq!(actions, [(LEFT, 0, 1), (RIGHT, 1, 1)]);
-        assert_eq!(stats.ready_preferred_variable_groups, 2);
-        assert_eq!(stats.ready_scheduled_variable_groups, 2);
-        assert_eq!(stats.ready_proposal_groups, 2);
-        assert_eq!(stats.agglomerated_ready_pops, 0);
     }
 
     #[test]
@@ -15497,7 +15417,6 @@ mod tests {
         actions.sort_unstable();
         assert_eq!(actions, [(LEFT, 0, 1), (RIGHT, 0, 1)]);
         assert_eq!(stats.ready_preferred_variable_groups, 2);
-        assert_eq!(stats.ready_scheduled_variable_groups, 2);
     }
 
     #[test]
@@ -23921,9 +23840,7 @@ mod tests {
         ));
         assert_eq!(machine.stats.ready_plan_pops, 1);
         assert_eq!(machine.stats.ready_preferred_variable_groups, 1);
-        assert_eq!(machine.stats.ready_scheduled_variable_groups, 1);
         assert_eq!(machine.stats.ready_proposal_groups, 1);
-        assert_eq!(machine.stats.agglomerated_ready_pops, 0);
         assert_eq!(machine.stats.propose_action_pops, 0);
         assert_eq!(machine.stats.propose_calls, 0);
         assert_eq!(proposes.load(Ordering::Relaxed), 0);

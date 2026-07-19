@@ -1,5 +1,5 @@
-//! PROBE (group-by-ordering): the skew fixture — data built to punish
-//! blocked-v1's single per-level variable choice.
+//! PROBE (group-by-ordering): a skew fixture that exercises exact per-row
+//! variable grouping in the block-native engines.
 //!
 //! Query: `?e p ?x . ?e q ?y . ?x r ?y` over two mixed sub-populations:
 //!
@@ -7,11 +7,8 @@
 //!   wants `?x` next (estimate 1 vs `fan`).
 //! - **Pop B**: mirrored — the row wants `?y` next.
 //!
-//! Wrong-ordered rows can't be pruned at their own level (every candidate
-//! has the confirming edge shape) and die only one level later, so v1's
-//! first-row choice inflates the intermediate block by ~`fan`× for half
-//! the frontier. Grouped descent partitions the block in two and gives
-//! each half its own order.
+//! The two populations split a wide frontier into two exact variable groups;
+//! this makes grouping cost, batch size, and DAG reconvergence visible.
 //!
 //! A **uniform control** (pop A only, same total size) isolates the cost
 //! of the grouping machinery when it buys nothing: one group per level,
@@ -21,7 +18,7 @@
 //!     cargo run --release --example blocked_group_skew_bench -- \
 //!         [n_per_pop=20000] [fan=64] [reps=5]
 //!
-//! Runs sequential / blocked-v1 / grouped on both backends (TribleSet
+//! Runs sequential / blocked / merged DAG on both backends (TribleSet
 //! default delegation, SuccinctArchive batched overrides) and prints per
 //! mode: median wall time, parity signature, group counts per level,
 //! batch-size distributions, and materialized intermediate rows.
@@ -88,8 +85,8 @@ fn add_pop_b(kb: &mut TribleSet, fan: usize, junk_sink: &ExclusiveId) {
     }
 }
 
-/// Interleaved A/B so v1's "first row" choice is representative of
-/// neither half in any stable way; expected results = total people.
+/// Interleaved A/B so each wide block contains both exact variable groups;
+/// expected results = total people.
 fn build_skew(n_per_pop: usize, fan: usize) -> (TribleSet, usize) {
     let mut kb = TribleSet::new();
     let junk_sink = ufoid();
@@ -113,9 +110,7 @@ fn build_uniform(n_people: usize, fan: usize) -> (TribleSet, usize) {
 enum Mode {
     Seq,
     Blk,
-    Grp,
     Dag,
-    DagU,
 }
 
 fn run_query<S: TriblePattern>(kb: &S, mode: Mode) -> (usize, u64) {
@@ -126,9 +121,7 @@ fn run_query<S: TriblePattern>(kb: &S, mode: Mode) -> (usize, u64) {
     match mode {
         Mode::Seq => tally(q.sequential()),
         Mode::Blk => tally(q.solve_blocked()),
-        Mode::Grp => tally(q.solve_blocked_grouped()),
         Mode::Dag => tally(q.solve_dag()),
-        Mode::DagU => tally(q.solve_dag_unmerged()),
     }
 }
 
@@ -139,13 +132,7 @@ fn median(v: &[f64]) -> f64 {
 }
 
 fn bench_backend<S: TriblePattern>(label: &str, kb: &S, expected: usize, reps: usize) {
-    let modes = [
-        ("seq", Mode::Seq),
-        ("blk", Mode::Blk),
-        ("grp", Mode::Grp),
-        ("dag", Mode::Dag),
-        ("dagu", Mode::DagU),
-    ];
+    let modes = [("seq", Mode::Seq), ("blk", Mode::Blk), ("dag", Mode::Dag)];
     let mut sigs = Vec::new();
     let mut meds = Vec::new();
     for &(_, mode) in &modes {
@@ -161,17 +148,14 @@ fn bench_backend<S: TriblePattern>(label: &str, kb: &S, expected: usize, reps: u
     }
     let parity = sigs.iter().all(|&s| s == sigs[0]) && sigs[0].0 == expected;
     println!(
-        "{label:<28} rows {:>8}  seq {:>9.2} ms  blk {:>9.2}  grp {:>9.2}  dag {:>9.2}  dagu {:>9.2}  \
-         grp/seq {:>6.3}x  dag/grp {:>6.3}x  dag/dagu {:>6.3}x  {}",
+        "{label:<28} rows {:>8}  seq {:>9.2} ms  blk {:>9.2}  dag {:>9.2}  \
+         blk/seq {:>6.3}x  dag/blk {:>6.3}x  {}",
         sigs[0].0,
         meds[0],
         meds[1],
         meds[2],
-        meds[3],
-        meds[4],
-        meds[2] / meds[0],
-        meds[3] / meds[2],
-        meds[3] / meds[4],
+        meds[1] / meds[0],
+        meds[2] / meds[1],
         if parity { "ok" } else { "MISMATCH" }
     );
     // Instrumented single passes: group/batch structure + intermediates.
@@ -182,7 +166,7 @@ fn bench_backend<S: TriblePattern>(label: &str, kb: &S, expected: usize, reps: u
         dag_stats::reset();
         run_query(kb, mode);
         println!("  {name}: {}", blocked_stats::report());
-        if mode == Mode::Dag || mode == Mode::DagU {
+        if mode == Mode::Dag {
             println!("  {name} buckets: {}", dag_stats::report());
         }
     }
@@ -235,7 +219,7 @@ fn main() {
     let uni_archive: SuccinctArchive<OrderedUniverse> = (&uni_kb).into();
     eprintln!("\narchives built in {:?}", t0.elapsed());
 
-    println!("\n== SuccinctArchive backend (batched blocked overrides) ==");
+    println!("\n== SuccinctArchive backend (batched propose/confirm) ==");
     bench_backend(
         "skew  ?e p ?x . q ?y . r",
         &skew_archive,

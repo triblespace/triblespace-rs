@@ -33,7 +33,7 @@ fn ordinary_query_with_non_send_output_is_send() {
     assert!(started.next().is_some());
     assert_send(started);
 
-    // The explicit lazy-DAG fallback likewise stores only raw rows and
+    // The explicit lazy-DAG control likewise stores only raw rows and
     // planning state, never a projected `R`.
     let mut context = VariableContext::new();
     let variable = context.next_variable::<U256BE>();
@@ -132,7 +132,7 @@ fn explicit_lazy_dag_override_bypasses_overlapping_residual_default() {
     assert!(pops > 0, "explicit lazy-DAG override was ignored");
 }
 
-/// Cloning the ordinary lazy-DAG iterator after a pull snapshots its raw
+/// Cloning an explicit lazy-DAG iterator after a pull snapshots its raw
 /// worklist and staged rows exactly, without requiring the output type itself
 /// to implement `Clone`.
 #[cfg(feature = "parallel")]
@@ -149,11 +149,12 @@ fn clone_after_iteration_snapshots_remaining_dag_state() {
     );
     let mut query = Query::new(constraint, move |binding| {
         binding.get(variable.index).copied()
-    });
+    })
+    .lazy_dag_scheduler();
 
     assert!(query.next().is_some());
     // The second resumption has width two: it stages two raw rows and yields
-    // one, so the clone must include both the residual worklist and the
+    // one, so the clone must include both the DAG worklist and the
     // unconsumed staged row.
     assert!(query.next().is_some());
     let cloned = query.clone();
@@ -176,7 +177,7 @@ fn clone_after_iteration_does_not_require_clone_output() {
         variable.is(values[2]),
         variable.is(values[3])
     );
-    let mut query = Query::new(constraint, |_| Some(NonClone));
+    let mut query = Query::new(constraint, |_| Some(NonClone)).lazy_dag_scheduler();
 
     assert!(query.next().is_some());
     assert!(query.next().is_some());
@@ -260,9 +261,10 @@ fn ordinary_residual_projection_filter_and_panic_resume_are_exact() {
     assert_eq!(resumed, projected[1]);
 }
 
-/// A partially consumed ordinary query owns a DAG worklist while its legacy
-/// DFS cursor is untouched. Converting it to rayon must drain that remaining
-/// worklist as one leaf, not split and restart the DFS cursor from the seed.
+/// A partially consumed explicit lazy-DAG query owns a worklist while its
+/// legacy DFS cursor is untouched. Converting it to rayon must drain that
+/// remaining worklist as one leaf, not split and restart the DFS cursor from
+/// the seed.
 #[cfg(feature = "parallel")]
 #[test]
 fn partially_consumed_dag_query_into_par_iter_keeps_exact_remainder() {
@@ -279,7 +281,8 @@ fn partially_consumed_dag_query_into_par_iter_keeps_exact_remainder() {
     );
     let mut query = Query::new(constraint, move |binding| {
         binding.get(variable.index).copied()
-    });
+    })
+    .lazy_dag_scheduler();
 
     assert!(query.next().is_some());
     let started_for_explicit_dag = query.clone();
@@ -396,8 +399,8 @@ fn fresh_query_into_par_iter_matches_scalar_scheduler() {
     actual.sort_unstable();
     assert_eq!(actual, expected);
 
-    // Ordinary Rayon conversion remains the scalar splitter even when the
-    // automatic shape selector chose residual execution.
+    // Ordinary Rayon conversion remains the scalar splitter even though serial
+    // ordinary iteration defaults to residual execution.
     let mut context = VariableContext::new();
     let variable = context.next_variable::<U256BE>();
     let constraint = and!(

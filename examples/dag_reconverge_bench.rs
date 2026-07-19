@@ -29,8 +29,8 @@
 //!
 //! Runs sequential / ordinary parallel-scalar / explicit parallel-DAG /
 //! explicit parallel residual-state /
-//! blocked-v1 / grouped / dag / eager residual-state / lazy residual-state /
-//! agglomerative / dag-unmerged on both backends
+//! dag / eager residual-state / lazy residual-state / dag-unmerged
+//! on both backends
 //! and prints per mode: min/median/max wall time, parity signature, and for the
 //! frontier engines the group/batch structure, materialized rows, peak live
 //! row-store cells, and the DAG's bucket/merge census.
@@ -223,12 +223,9 @@ enum Mode {
     ParDag,
     #[cfg(feature = "parallel")]
     ParResidual,
-    Blk,
-    Grp,
     Dag,
     Residual,
     ResidualLazy,
-    Agglomerative,
     DagU,
 }
 
@@ -253,17 +250,9 @@ fn run_query<S: TriblePattern>(kb: &S, markers: (Id, Id, Id, Id, Id), mode: Mode
         Mode::ParDag => tally_par(q.into_par_dag_iter()),
         #[cfg(feature = "parallel")]
         Mode::ParResidual => tally_par(q.into_par_residual_state_iter()),
-        Mode::Blk => tally(q.solve_blocked()),
-        Mode::Grp => tally(q.solve_blocked_grouped()),
         Mode::Dag => tally(q.solve_dag()),
         Mode::Residual => tally(q.solve_residual_state()),
         Mode::ResidualLazy => tally(q.solve_residual_state_lazy()),
-        Mode::Agglomerative => tally(
-            q.solve_dag_lazy()
-                .start_width(1)
-                .growth(2)
-                .agglomerative_partition(),
-        ),
         Mode::DagU => tally(q.solve_dag_unmerged()),
     }
 }
@@ -337,12 +326,9 @@ fn bench_backend<S: TriblePattern>(
         ("par-residual", Mode::ParResidual),
     ]);
     modes.extend([
-        ("blk", Mode::Blk),
-        ("grp", Mode::Grp),
         ("dag", Mode::Dag),
         ("residual", Mode::Residual),
         ("res-lazy", Mode::ResidualLazy),
-        ("agglomerative", Mode::Agglomerative),
         ("dagu", Mode::DagU),
     ]);
     for &(_, mode) in &modes {
@@ -440,7 +426,7 @@ fn bench_backend<S: TriblePattern>(
         dag_stats::reset();
         run_query(kb, markers, mode);
         println!("  {name}: {}", blocked_stats::report());
-        let is_dag = matches!(mode, Mode::Dag | Mode::Agglomerative | Mode::DagU);
+        let is_dag = matches!(mode, Mode::Dag | Mode::DagU);
         #[cfg(feature = "parallel")]
         let is_dag = is_dag || matches!(mode, Mode::ParDag);
         if is_dag {
@@ -819,7 +805,7 @@ fn main() {
     eprintln!("\narchive built in {:?}", t0.elapsed());
 
     if !controlled_gpu_only {
-        println!("\n== SuccinctArchive backend (batched blocked overrides) ==");
+        println!("\n== SuccinctArchive backend (batched propose/confirm) ==");
         bench_backend("reconverge 24-route", &archive, markers, expected, reps);
     }
 

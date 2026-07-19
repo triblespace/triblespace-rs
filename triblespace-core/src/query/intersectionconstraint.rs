@@ -8,9 +8,10 @@ use smallvec::SmallVec;
 ///
 /// The intersection delegates to its children using cardinality-aware
 /// ordering: per row, the child with the lowest
-/// [`estimate`](Constraint::estimate) proposes candidates, and the
-/// remaining children [`confirm`](Constraint::confirm) them — not per
-/// branch, but in whole-frontier passes, one per child. That deferral is
+/// [`estimate`](Constraint::estimate) proposes candidates, with lower child
+/// index breaking equal estimates, and the remaining children
+/// [`confirm`](Constraint::confirm) them — not per branch, but in
+/// whole-frontier passes, one per child. That deferral is
 /// what fuses the per-branch confirm trickle into one ragged batch per
 /// (child, level), which is what makes batched probe streams and accelerator
 /// dispatch possible in the first place.
@@ -108,9 +109,11 @@ where
     }
 
     /// Frontier expansion: per row the tightest child proposes (one
-    /// estimate column per relevant child, argmin per row), then the
-    /// sibling confirms run as **whole-frontier passes** — one per child,
-    /// cheapest (first-row estimate) first.
+    /// estimate column per relevant child, argmin per row, lower child index
+    /// on an equal estimate), then the sibling confirms run as
+    /// **whole-frontier passes** — one per child, cheapest (first-row
+    /// estimate) first. The proposer tie break is semantic because a
+    /// proposer owns the occurrence multiplicity of its candidate stream.
     ///
     /// When one child proposes for *every* row (the common case —
     /// proposer choice is usually structural), it receives the whole
@@ -143,7 +146,7 @@ where
             if relevant.is_empty() {
                 return;
             }
-            relevant.sort_unstable_by_key(|&(estimate, _)| estimate);
+            relevant.sort_unstable_by_key(|&(estimate, child)| (estimate, child));
             self.constraints[relevant[0].1].propose(variable, view, candidates);
             for &(_, ci) in &relevant[1..] {
                 self.constraints[ci].confirm(variable, view, candidates);
@@ -171,7 +174,7 @@ where
         let mut proposers: SmallVec<[u32; 32]> = SmallVec::with_capacity(n_rows);
         for i in 0..n_rows {
             let k = (0..relevant.len())
-                .min_by_key(|&k| cols[k * n_rows + i])
+                .min_by_key(|&k| (cols[k * n_rows + i], relevant[k]))
                 .expect("non-empty relevant");
             propose_counts[k] += 1;
             proposers.push(k as u32);
@@ -292,3 +295,113 @@ macro_rules! and {
 
 /// Re-export of the [`and!`] macro.
 pub use and;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two lawful intersection leaves with identical support and estimates,
+    /// but different proposal multiplicity. Confirm only filters, so child
+    /// order is the observable equal-estimate proposer tie break.
+    #[derive(Clone, Copy)]
+    struct EqualEstimateBagLeaf {
+        occurrences: usize,
+    }
+
+    impl EqualEstimateBagLeaf {
+        const VARIABLE: VariableId = 0;
+        const VALUE: RawInline = [7; 32];
+    }
+
+    impl Constraint<'static> for EqualEstimateBagLeaf {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(Self::VARIABLE)
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != Self::VARIABLE {
+                return false;
+            }
+            out.fill(1, view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            if variable != Self::VARIABLE {
+                return;
+            }
+            for (row_index, row) in view.iter().enumerate() {
+                if view
+                    .col(Self::VARIABLE)
+                    .is_none_or(|column| row[column] == Self::VALUE)
+                {
+                    candidates.extend_row(
+                        row_index as u32,
+                        std::iter::repeat_n(Self::VALUE, self.occurrences),
+                    );
+                }
+            }
+        }
+
+        fn confirm(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            if variable == Self::VARIABLE {
+                candidates.retain(|row, value| {
+                    *value == Self::VALUE
+                        && view
+                            .col(Self::VARIABLE)
+                            .is_none_or(|column| view.row(row as usize)[column] == Self::VALUE)
+                });
+            }
+        }
+
+        fn satisfied(&self, view: &RowsView<'_>) -> bool {
+            view.iter().all(|row| {
+                view.col(Self::VARIABLE)
+                    .is_none_or(|column| row[column] == Self::VALUE)
+            })
+        }
+    }
+
+    fn equal_estimate_bag_query() -> Query<
+        IntersectionConstraint<EqualEstimateBagLeaf>,
+        impl Fn(&Binding) -> Option<RawInline>,
+        RawInline,
+    > {
+        Query::new(
+            IntersectionConstraint::new(vec![
+                EqualEstimateBagLeaf { occurrences: 2 },
+                EqualEstimateBagLeaf { occurrences: 1 },
+            ]),
+            |binding: &Binding| binding.get(EqualEstimateBagLeaf::VARIABLE).copied(),
+        )
+    }
+
+    #[test]
+    fn equal_estimate_proposer_tie_preserves_child_occurrence_bag() {
+        let expected = vec![EqualEstimateBagLeaf::VALUE; 2];
+        let sequential: Vec<_> = equal_estimate_bag_query().sequential().collect();
+        let blocked = equal_estimate_bag_query().solve_blocked();
+        let residual: Vec<_> = equal_estimate_bag_query()
+            .solve_residual_state_lazy_with(residual::ResidualLowering::FULL)
+            .collect();
+
+        assert_eq!(sequential, expected);
+        assert_eq!(blocked, expected);
+        assert_eq!(residual, expected);
+    }
+}

@@ -1,8 +1,8 @@
 //! PROBE: sequential vs frontier-batched (`Query::solve_blocked`) on a
-//! **TribleSet** backend — the default-delegation worst case, where every
-//! `propose_blocked`/`confirm_blocked` falls back to per-row scratch
-//! bindings and the blocked engine has pure overhead and zero fusion
-//! payoff. Answers: is blocked evaluation at block cap 1 (set
+//! **TribleSet** backend — the default-delegation worst case, where block-native
+//! `propose`/`confirm` loop over rows without fusing backend probes and the
+//! blocked engine has pure overhead and zero fusion payoff. Answers: is blocked
+//! evaluation at block cap 1 (set
 //! `TRIBLES_BLOCK_ROW_CAP=1`) within a few percent of the classic DFS
 //! iterator, i.e. can the scalar path be subsumed?
 //!
@@ -49,9 +49,7 @@ fn tally<T: std::hash::Hash>(items: impl IntoIterator<Item = T>) -> (usize, u64)
 enum Mode {
     Seq,
     Blk,
-    Grp,
     Dag,
-    DagU,
 }
 
 macro_rules! run {
@@ -59,9 +57,7 @@ macro_rules! run {
         match $mode {
             Mode::Seq => tally($q.sequential()),
             Mode::Blk => tally($q.solve_blocked()),
-            Mode::Grp => tally($q.solve_blocked_grouped()),
             Mode::Dag => tally($q.solve_dag()),
-            Mode::DagU => tally($q.solve_dag_unmerged()),
         }
     };
 }
@@ -189,29 +185,22 @@ fn main() {
     }
 
     println!(
-        "{:<48} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>8} {:>8} {:>8}  parity",
+        "{:<48} {:>10} {:>10} {:>10} {:>10} {:>8} {:>8}  parity",
         "query",
         "rows",
         "seq ms",
         "blk ms",
-        "grp ms",
         "dag ms",
-        "dagu ms",
         "blk/seq",
-        "grp/seq",
         "dag/seq"
     );
     for (name, q) in &queries {
         let mut seq_times = Vec::new();
         let mut blk_times = Vec::new();
-        let mut grp_times = Vec::new();
         let mut dag_times = Vec::new();
-        let mut dagu_times = Vec::new();
         let mut seq_sig = (0, 0);
         let mut blk_sig = (0, 0);
-        let mut grp_sig = (0, 0);
         let mut dag_sig = (0, 0);
-        let mut dagu_sig = (0, 0);
         for _ in 0..reps {
             let t = Instant::now();
             seq_sig = q(&kb, Mode::Seq);
@@ -220,34 +209,22 @@ fn main() {
             blk_sig = q(&kb, Mode::Blk);
             blk_times.push(t.elapsed().as_secs_f64() * 1e3);
             let t = Instant::now();
-            grp_sig = q(&kb, Mode::Grp);
-            grp_times.push(t.elapsed().as_secs_f64() * 1e3);
-            let t = Instant::now();
             dag_sig = q(&kb, Mode::Dag);
             dag_times.push(t.elapsed().as_secs_f64() * 1e3);
-            let t = Instant::now();
-            dagu_sig = q(&kb, Mode::DagU);
-            dagu_times.push(t.elapsed().as_secs_f64() * 1e3);
         }
         let s = median(&seq_times);
         let b = median(&blk_times);
-        let g = median(&grp_times);
         let d = median(&dag_times);
-        let du = median(&dagu_times);
         println!(
-            "{:<48} {:>10} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>7.3}x {:>7.3}x {:>7.3}x  {}",
+            "{:<48} {:>10} {:>10.2} {:>10.2} {:>10.2} {:>7.3}x {:>7.3}x  {}",
             name,
             seq_sig.0,
             s,
             b,
-            g,
             d,
-            du,
             b / s,
-            g / s,
             d / s,
-            if seq_sig == blk_sig && seq_sig == grp_sig && seq_sig == dag_sig && seq_sig == dagu_sig
-            {
+            if seq_sig == blk_sig && seq_sig == dag_sig {
                 "ok"
             } else {
                 "MISMATCH"
@@ -259,24 +236,15 @@ fn main() {
         blocked_stats::reset();
         q(&kb, Mode::Blk);
         let blk_stats = blocked_stats::report();
-        blocked_stats::reset();
-        q(&kb, Mode::Grp);
-        let grp_stats = blocked_stats::report();
         use triblespace::core::query::dag_stats;
         dag_stats::set_enabled(true);
         blocked_stats::reset();
         dag_stats::reset();
         q(&kb, Mode::Dag);
         let dag_stats_line = format!("{} | {}", blocked_stats::report(), dag_stats::report());
-        blocked_stats::reset();
-        dag_stats::reset();
-        q(&kb, Mode::DagU);
-        let dagu_stats_line = format!("{} | {}", blocked_stats::report(), dag_stats::report());
         dag_stats::set_enabled(false);
         blocked_stats::set_enabled(false);
         println!("  blk: {blk_stats}");
-        println!("  grp: {grp_stats}");
         println!("  dag: {dag_stats_line}");
-        println!("  dagu: {dagu_stats_line}");
     }
 }
