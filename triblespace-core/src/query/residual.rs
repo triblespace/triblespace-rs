@@ -19845,7 +19845,11 @@ mod tests {
         assert_eq!(residual, [raw(1)]);
         assert_eq!(residual, sequential);
         assert_eq!(*whole_calls.lock().unwrap(), [4, 4]);
-        assert_eq!(*page_calls.lock().unwrap(), [1, 1, 2]);
+        assert_eq!(
+            *page_calls.lock().unwrap(),
+            [1, 2],
+            "the whole-group confirmer sees four raw occurrences before the page-local suffix sees its admitted relation"
+        );
 
         let synthetic_whole_calls = Arc::new(Mutex::new(Vec::new()));
         let synthetic_page_calls = Arc::new(Mutex::new(Vec::new()));
@@ -21111,51 +21115,58 @@ mod tests {
             "a complete drain must leave no terminal yield sample live"
         );
 
-        // Eight byte-identical affine parents exercise the internal duplicate
-        // occurrence protocol and the path program's convergent p/q witnesses.
-        // The typed program must keep those occurrences affine while terminal
-        // SET projection collapses their equal complete bindings.
-        let duplicate_source = id_into_value(&nodes[0][0]);
-        let make_duplicates = || {
+        // Eight distinct hidden parent identities carry the same path source.
+        // Action-boundary admission must retain all eight parents, the typed
+        // complete phase may cohort them, and explicit `(source, target)` SET
+        // projection still collapses the hidden discriminator.
+        let cohort_source = id_into_value(&nodes[0][0]);
+        let make_cohort = || {
+            let mut discriminators =
+                crate::debug::query::EstimateOverrideConstraint::new(FanoutLeaf {
+                    variable: 2,
+                    values: Arc::new((0..8).map(raw).collect()),
+                });
+            discriminators.set_estimate(2, 1);
             IntersectionConstraint::new(vec![
                 Box::new(FanoutLeaf {
                     variable: 0,
-                    values: Arc::new(vec![duplicate_source; 8]),
+                    values: Arc::new(vec![cohort_source]),
                 }) as ShapeConstraint,
+                Box::new(discriminators) as ShapeConstraint,
                 Box::new(make_path()) as ShapeConstraint,
             ])
         };
-        let mut eager_duplicates = Query::new(make_duplicates(), project)
+        let mut eager_cohort = Query::new_projected(make_cohort(), [0, 1], project)
             .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::OpaqueLeaves, true))
             .cap(64)
             .start_width(1)
             .growth(2)
             .collect_profiled();
-        let mut sparse_duplicates = Query::new(make_duplicates(), project)
+        let mut sparse_cohort = Query::new_projected(make_cohort(), [0, 1], project)
             .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::OpaqueLeaves, true))
             .cap(64)
             .start_width(1)
             .growth(2);
-        sparse_duplicates.state.eager_terminal_phase_enabled = false;
-        let mut sparse_duplicates = sparse_duplicates.collect_profiled();
-        eager_duplicates.results.sort_unstable();
-        sparse_duplicates.results.sort_unstable();
-        assert_eq!(eager_duplicates.results, sparse_duplicates.results);
-        assert_eq!(eager_duplicates.results.len(), nodes[0].len());
+        sparse_cohort.state.eager_terminal_phase_enabled = false;
+        let mut sparse_cohort = sparse_cohort.collect_profiled();
+        eager_cohort.results.sort_unstable();
+        sparse_cohort.results.sort_unstable();
+        assert_eq!(eager_cohort.results, sparse_cohort.results);
+        assert_eq!(eager_cohort.results.len(), nodes[0].len());
         assert!(
-            eager_duplicates
+            eager_cohort
                 .stats
                 .delta_terminal_eager_cohort_admissions
                 > 0,
             "certified RPQ never entered the complete Program phase"
         );
         assert_eq!(
-            sparse_duplicates
+            sparse_cohort
                 .stats
                 .delta_terminal_eager_cohort_admissions,
             0
         );
-        assert!(sparse_duplicates.stats.delta_terminal_calls > 0);
+        assert!(sparse_cohort.stats.delta_terminal_calls > 0);
     }
 
     #[test]
@@ -21199,23 +21210,29 @@ mod tests {
         let graph = Arc::new(graph);
         let source = id_into_value(a);
         let project =
-            |binding: &Binding| Some((binding.get(0).copied()?, binding.get(1).copied()?));
+            |binding: &Binding| Some((binding.get(0).copied()?, binding.get(2).copied()?));
         let make_path = |ops: &[PathOp]| {
             RegularPathConstraint::new(
                 graph.as_ref().clone(),
                 Variable::<GenId>::new(0),
-                Variable::<GenId>::new(1),
+                Variable::<GenId>::new(2),
                 ops,
             )
         };
         let make = |ops: &[PathOp]| {
             let mut sources = EstimateOverrideConstraint::new(FanoutLeaf {
                 variable: 0,
-                values: Arc::new(vec![source; 16]),
+                values: Arc::new(vec![source]),
             });
-            sources.set_estimate(0, 1);
+            sources.set_estimate(0, 0);
+            let mut discriminators = EstimateOverrideConstraint::new(FanoutLeaf {
+                variable: 1,
+                values: Arc::new((0..16).map(raw).collect()),
+            });
+            discriminators.set_estimate(1, 0);
             IntersectionConstraint::new(vec![
                 Box::new(sources) as ShapeConstraint,
+                Box::new(discriminators) as ShapeConstraint,
                 Box::new(make_path(ops)) as ShapeConstraint,
             ])
         };
@@ -21224,7 +21241,7 @@ mod tests {
         // certificate through every ordinary constraint wrapper.
         let capability_ops = [PathOp::Attr(p.raw()), PathOp::Plus];
         let request = ProgramRequest {
-            action: ProgramAction::Propose(1),
+            action: ProgramAction::Propose(2),
             bound: VariableSet::new_singleton(0),
         };
         let boxed: Box<dyn Constraint<'static> + Send + Sync> =
@@ -21282,8 +21299,10 @@ mod tests {
         ];
 
         for (name, ops) in cases {
-            let mut sequential: Vec<_> = Query::new(make(&ops), project).sequential().collect();
-            let mut typed = Query::new(make(&ops), project)
+            let mut sequential: Vec<_> = Query::new_projected(make(&ops), [0, 2], project)
+                .sequential()
+                .collect();
+            let mut typed = Query::new_projected(make(&ops), [0, 2], project)
                 .solve_residual_state_lazy_with(ResidualLowering::new(
                     FormulaScope::OpaqueLeaves,
                     true,
@@ -21292,7 +21311,7 @@ mod tests {
                 .start_width(1)
                 .growth(2)
                 .collect_profiled();
-            let mut sparse = Query::new(make(&ops), project)
+            let mut sparse = Query::new_projected(make(&ops), [0, 2], project)
                 .solve_residual_state_lazy_with(ResidualLowering::new(
                     FormulaScope::OpaqueLeaves,
                     true,
@@ -21319,7 +21338,7 @@ mod tests {
             );
 
             let expected = sequential.clone();
-            let mut clone_source = Query::new(Arc::new(make(&ops)), project)
+            let mut clone_source = Query::new_projected(Arc::new(make(&ops)), [0, 2], project)
                 .solve_residual_state_lazy_with(ResidualLowering::new(
                     FormulaScope::OpaqueLeaves,
                     true,
@@ -21368,7 +21387,7 @@ mod tests {
             {
                 for workers in [1, 4] {
                     let mut parallel: Vec<_> = with_parallel_workers(workers, || {
-                        Query::new(Arc::new(make(&ops)), project)
+                        Query::new_projected(Arc::new(make(&ops)), [0, 2], project)
                             .solve_residual_state_lazy_with(ResidualLowering::new(
                                 FormulaScope::OpaqueLeaves,
                                 true,
@@ -22746,7 +22765,7 @@ mod tests {
 
     #[cfg(feature = "parallel")]
     #[test]
-    fn parallel_page_local_sharding_bisects_one_parent_duplicate_run() {
+    fn parallel_page_local_sharding_bisects_one_parent_admitted_set() {
         let values = vec![
             raw(0),
             raw(0),
@@ -22787,7 +22806,7 @@ mod tests {
         one_worker.sort_unstable();
         let unique = [raw(0), raw(1), raw(2), raw(3), raw(4), raw(5)];
         assert_eq!(one_worker, unique);
-        assert_eq!(*calls.lock().unwrap(), [values.len()]);
+        assert_eq!(*calls.lock().unwrap(), [unique.len()]);
 
         calls.lock().unwrap().clear();
         let mut four_workers = with_parallel_workers(4, || {
@@ -22800,11 +22819,14 @@ mod tests {
         assert_eq!(four_workers, unique);
 
         let page_sizes = calls.lock().unwrap();
-        assert_eq!(page_sizes.iter().sum::<usize>(), values.len());
-        assert!(page_sizes.len() > 1, "one parent must span several shards");
+        assert_eq!(page_sizes.iter().sum::<usize>(), unique.len());
         assert!(
-            page_sizes.iter().all(|&size| size < values.len()),
-            "no worker may receive the original complete parent run"
+            page_sizes.len() > 1,
+            "one admitted parent set must span several shards"
+        );
+        assert!(
+            page_sizes.iter().all(|&size| size < unique.len()),
+            "no worker may receive the complete admitted parent set"
         );
     }
 
@@ -23000,7 +23022,7 @@ mod tests {
         assert_eq!(*whole_calls.lock().unwrap(), [4]);
         let mut custom_suffix = suffix_calls.lock().unwrap().clone();
         custom_suffix.sort_unstable();
-        assert_eq!(custom_suffix, [1, 1]);
+        assert_eq!(custom_suffix, [1]);
 
         let left_calls = Arc::new(Mutex::new(Vec::new()));
         let right_calls = Arc::new(Mutex::new(Vec::new()));
