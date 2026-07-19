@@ -423,7 +423,7 @@ fn negative_prefixes_grow_one_two_four_on_middle_and_domain_drivers() {
 }
 
 #[test]
-fn clone_drop_and_duplicate_affine_parents_preserve_exact_bags() {
+fn clone_drop_and_duplicate_affine_parents_preserve_exact_sets() {
     let attribute = id(0xa1);
     let set = negative_prefix_set(attribute, 8, |tag| tag % 2 == 0);
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
@@ -487,7 +487,7 @@ fn clone_drop_and_duplicate_affine_parents_preserve_exact_bags() {
         .collect();
     sequential.sort_unstable();
     residual.sort_unstable();
-    assert_eq!(sequential.len(), expected.len() * 2);
+    assert_eq!(sequential.len(), expected.len());
     assert!(sequential.iter().all(|(value, _)| *value == parent_value));
     assert_eq!(residual, sequential);
 }

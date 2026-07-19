@@ -1217,8 +1217,8 @@ fn synthetic_root_grouped_rpq_precedes_page_local_suffix_atomically() {
     assert_eq!(query.stats().delta_source_roots, 2);
     assert_eq!(
         *suffix_calls.lock().expect("suffix recorder poisoned"),
-        [1, 1],
-        "candidate paging may begin only after the grouped RPQ quiesces"
+        [1],
+        "the SET-admitted parent reaches the suffix only after the grouped RPQ quiesces"
     );
     assert_eq!(query.stats().max_confirm_candidates, 4);
 }
@@ -3752,7 +3752,7 @@ fn finite_same_variable_optional_pages_preserve_epsilon_scope_then_set_admit() {
 
     for (name, capabilities, source_work, source_roots) in [
         ("leaf", combined_effects(), 3, 2),
-        ("formula", root_formula_effects(), 4, 3),
+        ("formula", root_formula_effects(), 3, 2),
     ] {
         let root = same_variable_confirm_root(graph.set.clone(), candidates.clone(), &ops);
         let mut query = Query::new(root, project_start)
