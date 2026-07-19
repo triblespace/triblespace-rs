@@ -1211,7 +1211,7 @@ fn synthetic_root_grouped_rpq_precedes_page_local_suffix_atomically() {
         .cap(1)
         .start_width(1);
 
-    assert_eq!(query.by_ref().collect::<Vec<_>>(), vec![accepted, accepted]);
+    assert_eq!(query.by_ref().collect::<Vec<_>>(), vec![accepted]);
     assert_eq!(query.stats().delta_source_pages, 4);
     assert_eq!(query.stats().delta_source_candidates_examined, 4);
     assert_eq!(query.stats().delta_source_roots, 2);
@@ -1276,8 +1276,8 @@ fn synthetic_root_cyclic_proposer_respects_the_streamability_latency_boundary() 
                 "an ineligible suffix must retain the frozen global-width trace"
             );
             assert_eq!(query.stats().delta_handoff_probe_pops, 1);
-            assert_eq!(query.stats().delta_source_dead_pages, 3);
-            assert_eq!(query.stats().delta_source_negative_steps, 3);
+            assert_eq!(query.stats().delta_source_dead_pages, 4);
+            assert_eq!(query.stats().delta_source_negative_steps, 4);
             assert_eq!(query.stats().width_increases, 3);
             assert_eq!(query.current_width(), 8);
         }
@@ -1579,8 +1579,8 @@ fn synthetic_root_and_streams_early_and_late_page_local_survivors() {
         );
         assert_eq!(
             query.stats().delta_handoff_probe_pops,
-            expected_before_emit + 1,
-            "each adjacency and the typed program/formula boundary are probed exactly once"
+            expected_before_emit + 2,
+            "each adjacency plus the SET and typed program/formula handoffs are probed once"
         );
         assert_eq!(query.next(), None);
         assert_eq!(query.stats().delta_transition_pages, 5);
@@ -1650,7 +1650,7 @@ fn linear_formula_streaming_matches_the_always_quiescent_union_bag() {
 }
 
 #[test]
-fn linear_formula_streaming_keeps_byte_identical_parent_activations_distinct() {
+fn linear_formula_streaming_collapses_byte_identical_semantic_parents() {
     let graph = Graph::new(3, &[(0, 1), (1, 2)]);
     let outer = genid(&rngid().id).raw;
     let root = duplicate_parent_root(
@@ -1665,12 +1665,7 @@ fn linear_formula_streaming_keeps_byte_identical_parent_activations_distinct() {
         .start_width(1)
         .collect();
     actual.sort_unstable();
-    let mut expected = vec![
-        graph.value(1).raw,
-        graph.value(1).raw,
-        graph.value(2).raw,
-        graph.value(2).raw,
-    ];
+    let mut expected = vec![graph.value(1).raw, graph.value(2).raw];
     expected.sort_unstable();
     assert_eq!(actual, expected);
 }
@@ -1693,8 +1688,8 @@ fn clone_and_drop_preserve_a_live_linear_formula_stream() {
     assert_eq!(query.stats().delta_transition_candidates_examined, 1);
     assert_eq!(
         query.stats().delta_handoff_probe_pops,
-        1,
-        "the typed program/formula boundary is probed exactly once"
+        2,
+        "the accepted adjacency and typed program/formula boundary are each probed once"
     );
     let exact_clone = query.clone();
     let cancelled = query.clone();
@@ -2016,7 +2011,11 @@ fn formula_same_variable_sources_keep_novelty_separate_at_shared_terms() {
     assert_eq!(query.by_ref().collect::<Vec<_>>(), vec![graph.value(1).raw]);
     assert_eq!(query.stats().delta_source_roots, 2);
     assert_eq!(query.stats().delta_source_pages, 2);
-    assert_eq!(query.stats().delta_source_dead_pages, 1);
+    assert_eq!(
+        query.stats().delta_source_dead_pages,
+        2,
+        "a page whose only accepted endpoint was admitted earlier is scheduler-negative"
+    );
 }
 
 #[test]
@@ -2319,7 +2318,6 @@ fn same_variable_grouped_delta_confirm_filters_one_immutable_sequence() {
         (
             vec![PathOp::Attr(graph.attribute.raw()), PathOp::Star],
             vec![
-                graph.value(3).raw,
                 graph.value(0).raw,
                 graph.value(3).raw,
                 graph.value(1).raw,
@@ -2339,8 +2337,8 @@ fn same_variable_grouped_delta_confirm_filters_one_immutable_sequence() {
             query.stats().delta_source_candidates_examined,
             candidates.len()
         );
-        assert_eq!(query.current_width(), 4);
-        assert_eq!(query.stats().width_increases, 2);
+        assert_eq!(query.current_width(), 16);
+        assert_eq!(query.stats().width_increases, 4);
     }
 }
 
@@ -2953,7 +2951,7 @@ fn all_attr_inverse_and_bound_endpoint_routes_match_oracles() {
 }
 
 #[test]
-fn target_confirm_traverses_once_and_preserves_reachable_duplicate_candidates() {
+fn target_confirm_traverses_once_and_set_admits_reachable_candidates() {
     let graph = Graph::new(4, &[(0, 1), (1, 2)]);
     let forward = repeated(graph.attribute, false);
     let inverse = repeated(graph.attribute, true);
@@ -2968,7 +2966,7 @@ fn target_confirm_traverses_once_and_preserves_reachable_duplicate_candidates() 
                 graph.value(2).raw,
                 graph.value(1).raw,
             ],
-            vec![graph.value(2).raw, graph.value(2).raw, graph.value(1).raw],
+            vec![graph.value(2).raw, graph.value(1).raw],
             project_end as fn(&Binding) -> Option<RawInline>,
         ),
         (
@@ -2981,7 +2979,7 @@ fn target_confirm_traverses_once_and_preserves_reachable_duplicate_candidates() 
                 graph.value(0).raw,
                 graph.value(1).raw,
             ],
-            vec![graph.value(0).raw, graph.value(0).raw, graph.value(1).raw],
+            vec![graph.value(0).raw, graph.value(1).raw],
             project_end,
         ),
         (
@@ -2994,7 +2992,7 @@ fn target_confirm_traverses_once_and_preserves_reachable_duplicate_candidates() 
                 graph.value(0).raw,
                 graph.value(1).raw,
             ],
-            vec![graph.value(0).raw, graph.value(0).raw, graph.value(1).raw],
+            vec![graph.value(0).raw, graph.value(1).raw],
             project_start,
         ),
         (
@@ -3007,7 +3005,7 @@ fn target_confirm_traverses_once_and_preserves_reachable_duplicate_candidates() 
                 graph.value(2).raw,
                 graph.value(1).raw,
             ],
-            vec![graph.value(2).raw, graph.value(2).raw, graph.value(1).raw],
+            vec![graph.value(2).raw, graph.value(1).raw],
             project_start,
         ),
     ];
@@ -3026,7 +3024,7 @@ fn target_confirm_traverses_once_and_preserves_reachable_duplicate_candidates() 
 }
 
 #[test]
-fn automaton_target_confirm_filters_the_original_duplicate_sequence() {
+fn automaton_target_confirm_filters_then_set_admits_the_sequence() {
     let graph = Graph::new(3, &[(0, 1), (1, 2)]);
     let ops = vec![
         PathOp::Attr(graph.attribute.raw()),
@@ -3046,7 +3044,6 @@ fn automaton_target_confirm_filters_the_original_duplicate_sequence() {
     let expected = vec![
         graph.value(2).raw,
         graph.value(0).raw,
-        graph.value(2).raw,
         graph.value(1).raw,
     ];
     let residual = run(
@@ -3240,7 +3237,7 @@ fn conservative_residual_lowering_keeps_plus_opaque() {
     let mut query = Query::new(root, project_end).solve_residual_state_lazy();
     let mut actual: Vec<_> = query.by_ref().collect();
     actual.sort_unstable();
-    let mut expected = [graph.value(2).raw, graph.value(2).raw, graph.value(1).raw];
+    let mut expected = [graph.value(2).raw, graph.value(1).raw];
     expected.sort_unstable();
     assert_eq!(actual, expected);
     assert_eq!(
@@ -3692,7 +3689,7 @@ fn finite_concat_first_result_takes_only_its_two_transition_steps() {
 }
 
 #[test]
-fn finite_confirm_keeps_geometric_pages_and_duplicate_multiplicity() {
+fn finite_confirm_keeps_geometric_pages_then_set_admits() {
     let graph = Graph::new(4, &[(0, 1), (1, 2)]);
     let absent = genid(&rngid().id).raw;
     let candidates = vec![
@@ -3708,7 +3705,7 @@ fn finite_confirm_keeps_geometric_pages_and_duplicate_multiplicity() {
         PathOp::Concat,
     ];
     let expected = {
-        let mut values = vec![graph.value(2).raw, graph.value(2).raw];
+        let mut values = vec![graph.value(2).raw];
         values.sort_unstable();
         values
     };
@@ -3737,7 +3734,7 @@ fn finite_confirm_keeps_geometric_pages_and_duplicate_multiplicity() {
 }
 
 #[test]
-fn finite_same_variable_optional_pages_preserve_epsilon_scope_and_multiplicity() {
+fn finite_same_variable_optional_pages_preserve_epsilon_scope_then_set_admit() {
     let graph = Graph::new(3, &[(0, 1), (1, 2)]);
     let absent = genid(&rngid().id).raw;
     let candidates = vec![
@@ -3748,14 +3745,14 @@ fn finite_same_variable_optional_pages_preserve_epsilon_scope_and_multiplicity()
     ];
     let ops = vec![PathOp::Attr(graph.attribute.raw()), PathOp::Optional];
     let expected = {
-        let mut values = vec![graph.value(0).raw, graph.value(0).raw, graph.value(1).raw];
+        let mut values = vec![graph.value(0).raw, graph.value(1).raw];
         values.sort_unstable();
         values
     };
 
-    for (name, capabilities) in [
-        ("leaf", combined_effects()),
-        ("formula", root_formula_effects()),
+    for (name, capabilities, source_work, source_roots) in [
+        ("leaf", combined_effects(), 3, 2),
+        ("formula", root_formula_effects(), 4, 3),
     ] {
         let root = same_variable_confirm_root(graph.set.clone(), candidates.clone(), &ops);
         let mut query = Query::new(root, project_start)
@@ -3765,13 +3762,13 @@ fn finite_same_variable_optional_pages_preserve_epsilon_scope_and_multiplicity()
         let mut actual: Vec<_> = query.by_ref().collect();
         actual.sort_unstable();
         assert_eq!(actual, expected, "{name}");
-        assert_eq!(query.stats().delta_source_pages, candidates.len(), "{name}");
+        assert_eq!(query.stats().delta_source_pages, source_work, "{name}");
         assert_eq!(
             query.stats().delta_source_candidates_examined,
-            candidates.len(),
+            source_work,
             "{name}"
         );
-        assert_eq!(query.stats().delta_source_roots, 3, "{name}");
+        assert_eq!(query.stats().delta_source_roots, source_roots, "{name}");
         assert!(query.stats().delta_transition_pages > 0, "{name}");
         assert_eq!(query.stats().max_confirm_candidates, 1, "{name}");
     }
