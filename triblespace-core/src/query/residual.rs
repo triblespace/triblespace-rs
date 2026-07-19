@@ -9356,6 +9356,7 @@ impl ResidualStateMachine {
             },
             &mut effects,
         );
+        let raw_occurrence_count = effects.raw_occurrence_count;
         let candidates = CandidatePayload::from_tagged(effects.occurrences, rows.row_count);
         candidates.debug_assert_valid_for(rows.row_count);
         // The family call may unwind. Reserve receipt identities only after it
@@ -9365,8 +9366,11 @@ impl ResidualStateMachine {
         debug_assert!(receipts
             .iter()
             .all(|&receipt| !self.delta.receipt_has_live_activation(receipt)));
-        self.stats.candidates_proposed += candidates.len();
-        self.stats.max_propose_candidates = self.stats.max_propose_candidates.max(candidates.len());
+        self.stats.candidates_proposed += raw_occurrence_count;
+        self.stats.max_propose_candidates = self
+            .stats
+            .max_propose_candidates
+            .max(raw_occurrence_count);
 
         let mut origins = SmallVec::with_capacity(candidates.len());
         let (next_bound, published) = committed_candidate_rows_mapped(
@@ -12246,6 +12250,7 @@ mod tests {
     #[derive(Clone, Copy, Eq, PartialEq)]
     enum TerminalProgramMode {
         Equivalent,
+        Repeated,
         Divergent,
         Empty,
         Panic,
@@ -12260,7 +12265,9 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct TerminalProgramState;
+    struct TerminalProgramState {
+        repeated: Option<RawInline>,
+    }
 
     impl TypedProgramSpec for TerminalProgramLeaf {
         type State = TerminalProgramState;
@@ -12301,12 +12308,18 @@ mod tests {
             effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
         ) {
             for (parent, row) in batch.view.iter().enumerate() {
+                let value = raw(90 + row[0][0]);
                 let accepted = matches!(
                     self.mode,
                     TerminalProgramMode::Equivalent | TerminalProgramMode::Divergent
                 )
-                .then(|| raw(90 + row[0][0]));
-                effects.finite_root(parent as u32, TerminalProgramState, accepted);
+                .then_some(value);
+                let repeated = (self.mode == TerminalProgramMode::Repeated).then_some(value);
+                effects.finite_root(
+                    parent as u32,
+                    TerminalProgramState { repeated },
+                    accepted,
+                );
             }
         }
 
@@ -12316,7 +12329,11 @@ mod tests {
             _batch: TypedProgramBatch<'_>,
             effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
-            for _ in states {
+            for (input, state) in states.into_iter().enumerate() {
+                if let Some(value) = state.repeated {
+                    effects.accept(input as u32, value);
+                    effects.accept(input as u32, value);
+                }
                 effects.page(1, None);
             }
         }
@@ -12326,6 +12343,13 @@ mod tests {
                 TerminalProgramMode::Equivalent => {
                     for (parent, row) in batch.view.iter().enumerate() {
                         effects.push(parent as u32, raw(90 + row[0][0]));
+                    }
+                }
+                TerminalProgramMode::Repeated => {
+                    for (parent, row) in batch.view.iter().enumerate() {
+                        let value = raw(90 + row[0][0]);
+                        effects.push(parent as u32, value);
+                        effects.push(parent as u32, value);
                     }
                 }
                 TerminalProgramMode::Divergent | TerminalProgramMode::Empty => {}
@@ -12357,7 +12381,14 @@ mod tests {
             if variable != self.variable {
                 return false;
             }
-            out.fill(1, view.len());
+            out.fill(
+                if self.mode == TerminalProgramMode::Repeated {
+                    2
+                } else {
+                    1
+                },
+                view.len(),
+            );
             true
         }
 
@@ -12368,9 +12399,16 @@ mod tests {
             candidates: &mut CandidateSink<'_>,
         ) {
             assert_eq!(variable, self.variable);
-            if self.mode == TerminalProgramMode::Equivalent {
+            if matches!(
+                self.mode,
+                TerminalProgramMode::Equivalent | TerminalProgramMode::Repeated
+            ) {
                 for (parent, row) in view.iter().enumerate() {
-                    candidates.push(parent as u32, raw(90 + row[0][0]));
+                    let value = raw(90 + row[0][0]);
+                    candidates.push(parent as u32, value);
+                    if self.mode == TerminalProgramMode::Repeated {
+                        candidates.push(parent as u32, value);
+                    }
                 }
             }
         }
@@ -13515,6 +13553,7 @@ mod tests {
     }
 
     fn eager_terminal_test_iter<P, R>(
+        mode: TerminalProgramMode,
         postprocessing: P,
     ) -> ResidualStateIter<IntersectionConstraint<ShapeConstraint>, P, R>
     where
@@ -13524,7 +13563,7 @@ mod tests {
             Box::new(ShapeLeaf(0)) as ShapeConstraint,
             Box::new(TerminalProgramLeaf {
                 variable: 1,
-                mode: TerminalProgramMode::Equivalent,
+                mode,
             }) as ShapeConstraint,
         ]);
         let mut iter = Query::new(root, postprocessing).solve_residual_state_lazy_with(
@@ -13576,13 +13615,33 @@ mod tests {
     }
 
     #[test]
+    fn eager_complete_set_admission_preserves_raw_proposal_accounting() {
+        let mut repeated = eager_terminal_test_iter(
+            TerminalProgramMode::Repeated,
+            |binding: &Binding| Some((binding.get(0).copied()?, binding.get(1).copied()?)),
+        );
+
+        assert_eq!(repeated.state.stats.candidates_proposed, 6);
+        assert_eq!(repeated.state.stats.max_propose_candidates, 6);
+        assert_eq!(repeated.state.stats.delta_terminal_eager_cohort_rows, 3);
+        assert_eq!(
+            repeated.by_ref().collect::<Vec<_>>(),
+            [
+                (raw(12), raw(102)),
+                (raw(13), raw(103)),
+                (raw(14), raw(104)),
+            ]
+        );
+    }
+
+    #[test]
     fn eager_terminal_publication_preserves_order_clone_filter_unwind_and_zero_yield() {
         let project =
             |binding: &Binding| Some((binding.get(0).copied()?, binding.get(1).copied()?));
-        let mut ordered = eager_terminal_test_iter(project);
+        let mut ordered = eager_terminal_test_iter(TerminalProgramMode::Equivalent, project);
         assert_eq!(ordered.next(), Some((raw(12), raw(102))));
         let cloned_state = ordered.state.clone();
-        let mut cloned = eager_terminal_test_iter(project);
+        let mut cloned = eager_terminal_test_iter(TerminalProgramMode::Equivalent, project);
         cloned.state = cloned_state;
         let ordered_tail: Vec<_> = ordered.by_ref().collect();
         let cloned_tail: Vec<_> = cloned.by_ref().collect();
@@ -13599,11 +13658,14 @@ mod tests {
             (3, 0, 3, 3)
         );
 
-        let mut filtered = eager_terminal_test_iter(|binding: &Binding| {
-            let left = binding.get(0).copied()?;
-            let right = binding.get(1).copied()?;
-            (left != raw(13)).then_some((left, right))
-        });
+        let mut filtered = eager_terminal_test_iter(
+            TerminalProgramMode::Equivalent,
+            |binding: &Binding| {
+                let left = binding.get(0).copied()?;
+                let right = binding.get(1).copied()?;
+                (left != raw(13)).then_some((left, right))
+            },
+        );
         assert_eq!(
             filtered.by_ref().collect::<Vec<_>>(),
             [(raw(12), raw(102)), (raw(14), raw(104))]
@@ -13621,13 +13683,16 @@ mod tests {
 
         let panic_once = Arc::new(AtomicBool::new(true));
         let panic_projection = Arc::clone(&panic_once);
-        let mut unwound = eager_terminal_test_iter(move |binding: &Binding| {
-            let result = Some((binding.get(0).copied()?, binding.get(1).copied()?));
-            if panic_projection.swap(false, Ordering::SeqCst) {
-                panic!("intentional eager-terminal projection panic");
-            }
-            result
-        });
+        let mut unwound = eager_terminal_test_iter(
+            TerminalProgramMode::Equivalent,
+            move |binding: &Binding| {
+                let result = Some((binding.get(0).copied()?, binding.get(1).copied()?));
+                if panic_projection.swap(false, Ordering::SeqCst) {
+                    panic!("intentional eager-terminal projection panic");
+                }
+                result
+            },
+        );
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unwound.next()));
         assert!(panic.is_err());
         assert_eq!(

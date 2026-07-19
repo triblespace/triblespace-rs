@@ -10,7 +10,7 @@ use std::any::{type_name, Any, TypeId};
 use std::collections::hash_map::Entry;
 use std::hash::Hash;
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 
 use super::{RawInline, RowsView, VariableId, VariableSet};
 
@@ -189,8 +189,10 @@ pub enum ProgramGrouping {
 pub enum ProgramCompletion {
     /// The route must be evaluated through its budgeted affine continuation.
     PageableOnly,
-    /// [`TypedProgramSpec::complete_typed`] returns the exact complete
-    /// per-parent Propose occurrence bag produced by draining this route.
+    /// [`TypedProgramSpec::complete_typed`] returns the exact complete raw
+    /// per-parent Propose occurrence bag produced by draining this route. The
+    /// erased adapter validates that whole bag before admitting each distinct
+    /// `(parent, value)` once at the completed action boundary.
     CompleteActionEquivalent,
 }
 
@@ -218,11 +220,15 @@ pub struct ProgramCompleteBatch<'v> {
     pub view: RowsView<'v>,
 }
 
-/// Exact parent-tagged Propose occurrences returned by a complete action.
+/// Set-admitted parent-tagged Propose values returned by a complete action.
+///
+/// `raw_occurrence_count` preserves physical work accounting from the exact
+/// family occurrence bag before action-boundary admission.
 #[doc(hidden)]
 #[derive(Default)]
 pub struct ProgramCompleteEffects {
     pub occurrences: Vec<(u32, RawInline)>,
+    pub raw_occurrence_count: usize,
 }
 
 /// Family-facing complete-action sink.
@@ -1585,6 +1591,16 @@ where
             );
             previous = parent;
         }
+
+        let raw_occurrence_count = typed.occurrences.len();
+        let mut admitted = AHashSet::with_capacity(raw_occurrence_count);
+        typed
+            .occurrences
+            .retain(|occurrence| admitted.insert(*occurrence));
+        effects.raw_occurrence_count = effects
+            .raw_occurrence_count
+            .checked_add(raw_occurrence_count)
+            .expect("typed complete action occurrence count overflow");
         effects.occurrences.extend(typed.occurrences);
     }
 
@@ -1622,6 +1638,12 @@ where
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    fn raw(byte: u8) -> RawInline {
+        let mut value = RawInline::default();
+        value[0] = byte;
+        value
+    }
 
     #[derive(Clone)]
     struct NonComparableState {
@@ -2222,17 +2244,18 @@ mod tests {
             _batch: ProgramCompleteBatch<'_>,
             effects: &mut TypedCompleteSink,
         ) {
-            let value = RawInline::default();
             match self {
                 Self::RepeatedInOrder => {
-                    effects.push(0, value);
-                    effects.push(0, value);
-                    effects.push(1, value);
+                    effects.push(0, raw(1));
+                    effects.push(0, raw(2));
+                    effects.push(0, raw(1));
+                    effects.push(1, raw(1));
+                    effects.push(1, raw(1));
                 }
-                Self::OutOfRange => effects.push(2, value),
+                Self::OutOfRange => effects.push(2, raw(1)),
                 Self::Descending => {
-                    effects.push(1, value);
-                    effects.push(0, value);
+                    effects.push(1, raw(1));
+                    effects.push(0, raw(2));
                 }
             }
         }
@@ -2367,7 +2390,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_adapter_accepts_repeated_ordered_occurrences_and_rejects_bad_parent_tags() {
+    fn complete_adapter_set_admits_after_validating_the_raw_occurrence_bag() {
         let request = ProgramRequest {
             action: ProgramAction::Propose(1),
             bound: VariableSet::new_singleton(0),
@@ -2389,13 +2412,10 @@ mod tests {
             &mut effects,
         );
         assert_eq!(
-            effects
-                .occurrences
-                .iter()
-                .map(|(parent, _)| *parent)
-                .collect::<Vec<_>>(),
-            [0, 0, 1]
+            effects.occurrences,
+            [(0, raw(1)), (0, raw(2)), (1, raw(1))]
         );
+        assert_eq!(effects.raw_occurrence_count, 5);
 
         for attack in [CompleteTagProbe::OutOfRange, CompleteTagProbe::Descending] {
             let program = ProgramRef::new(&attack);
@@ -2917,6 +2937,7 @@ mod tests {
             &mut complete,
         );
         assert_eq!(complete.occurrences, [(0, RawInline::default())]);
+        assert_eq!(complete.raw_occurrence_count, 1);
         assert_eq!(calls.lock().unwrap().preferred_complete, 1);
     }
 

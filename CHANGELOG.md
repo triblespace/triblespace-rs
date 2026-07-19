@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Query::new` conservatively uses the complete constraint-variable binding as
   its head. Iterator clones snapshot claims independently, while Rayon sibling
   shards share one run-owned claim domain. There is no public bag mode.
+- **Certified complete Program proposals now cross the SET boundary before
+  publication.** The adapter first validates the entire raw grouped occurrence
+  bag, then admits each distinct `(parent, value)` in first-occurrence order.
+  Proposal statistics continue to charge the raw bag, while terminal row and
+  receipt accounting sees only the admitted per-parent relation.
 
 ### Fixed
 
