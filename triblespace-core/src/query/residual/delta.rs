@@ -789,6 +789,9 @@ struct RetiredSourcePage {
 #[derive(Debug)]
 struct SourcePageOutcome {
     roots: Vec<(ResidualDeltaNode, ProducerCredit)>,
+    /// Raw direct and accepting-root proposal occurrences before
+    /// activation-local SET admission. Non-streaming reducers report zero.
+    raw_proposal_occurrences: usize,
     accepted: Vec<RawInline>,
     resumed_source: Option<(ResidualDeltaSourceCursor, ProducerCredit)>,
     retired_source_page: Option<RetiredSourcePage>,
@@ -1414,12 +1417,25 @@ impl ProducerRegistry {
             "one residual source page repeated a root node"
         );
 
-        // Direct proposal effects are candidate occurrences, not transition
-        // witnesses. Preserve their order and multiplicity exactly as an
-        // ordinary `propose` call would. Product-state acceptance remains a
-        // set operation: several traversal witnesses for one endpoint emit
-        // that endpoint once per activation.
-        let mut accepted = direct;
+        // Direct proposal effects and accepting roots share one affine SET
+        // lifetime for streaming reducers. Quiescent proposals deliberately
+        // retain their raw direct bag until their later bounded boundary.
+        let raw_stream_occurrences = {
+            let activation = self
+                .state
+                .activations
+                .get(&generator.key.activation)
+                .expect("unknown delta activation");
+            if activation.reducer.streams() {
+                direct
+                    .len()
+                    .checked_add(roots.iter().filter(|root| root.accepted).count())
+                    .expect("source proposal occurrence count overflow")
+            } else {
+                0
+            }
+        };
+        let mut accepted = Vec::new();
         let had_stable_effect;
         {
             let activation = self
@@ -1444,9 +1460,18 @@ impl ProducerRegistry {
                 | DeltaReducer::FinalizingProposal { .. }
                 | DeltaReducer::FormulaOrAdmit
                 | DeltaReducer::FormulaOrEmit { .. } => assert!(
-                    accepted.is_empty(),
+                    direct.is_empty(),
                     "a non-proposal reducer received direct source candidates"
                 ),
+            }
+            if activation.reducer.streams() {
+                for value in direct {
+                    if activation.accepted.insert(value) {
+                        accepted.push(value);
+                    }
+                }
+            } else {
+                accepted = direct;
             }
             for value in roots
                 .iter()
@@ -1493,6 +1518,7 @@ impl ProducerRegistry {
         };
         SourcePageOutcome {
             roots: issued_roots,
+            raw_proposal_occurrences: raw_stream_occurrences,
             accepted,
             resumed_source,
             retired_source_page,
@@ -6640,6 +6666,17 @@ impl DeltaScheduler {
                 row_direct.iter().map(|(_, value)| *value),
                 page.next,
             );
+            if outcome.raw_proposal_occurrences != 0 {
+                assert!(
+                    outcome.raw_proposal_occurrences >= outcome.accepted.len(),
+                    "source SET admission manufactured proposal occurrences"
+                );
+                stats.candidates_proposed +=
+                    outcome.raw_proposal_occurrences - outcome.accepted.len();
+                stats.max_propose_candidates = stats
+                    .max_propose_candidates
+                    .max(outcome.raw_proposal_occurrences);
+            }
             for (node, credit) in outcome.roots {
                 traversal.push(DeltaTask {
                     activation: task.activation,
@@ -12064,7 +12101,8 @@ mod tests {
         let next = ResidualDeltaSourceCursor::After(value(9));
         let first = registry.replace_source(generator, [], [value(1), value(1)], Some(next));
         assert!(first.roots.is_empty());
-        assert_eq!(first.accepted, [value(1), value(1)]);
+        assert_eq!(first.raw_proposal_occurrences, 2);
+        assert_eq!(first.accepted, [value(1)]);
         assert_eq!(
             first
                 .retired_source_page
@@ -12085,8 +12123,9 @@ mod tests {
             DeltaStreamingEffect::Candidates
         );
 
-        let last = registry.replace_source(generator, [], [value(2)], None);
+        let last = registry.replace_source(generator, [], [value(1), value(2), value(2)], None);
         assert!(last.roots.is_empty());
+        assert_eq!(last.raw_proposal_occurrences, 3);
         assert_eq!(last.accepted, [value(2)]);
         assert!(last.resumed_source.is_none());
         assert!(
@@ -12107,6 +12146,38 @@ mod tests {
                 .effect,
             DeltaCompletion::Cleanup
         );
+    }
+
+    #[test]
+    fn streaming_source_set_admission_unifies_direct_and_accepting_roots_per_activation() {
+        let mut registry = ProducerRegistry::new();
+        let (activation, generator) = registry.start_source(
+            DeltaReducer::StreamProposal,
+            stable_return(Vec::new()),
+            None,
+        );
+        let page = registry.replace_source(
+            generator,
+            [sourced_output(7, 7, 0, true)],
+            [value(7), value(7), value(8)],
+            None,
+        );
+        assert_eq!(page.raw_proposal_occurrences, 4);
+        assert_eq!(page.accepted, [value(7), value(8)]);
+        let (_, root) = page.roots.into_iter().next().expect("one accepting root");
+        let retired = registry.replace_traversal(root, []);
+        assert!(retired.accepted.is_empty());
+        assert_eq!(retired.quiescence.unwrap().activation, activation);
+
+        let (sibling, sibling_generator) = registry.start_source(
+            DeltaReducer::StreamProposal,
+            stable_return(Vec::new()),
+            None,
+        );
+        let sibling_page = registry.replace_source(sibling_generator, [], [value(7)], None);
+        assert_eq!(sibling_page.raw_proposal_occurrences, 1);
+        assert_eq!(sibling_page.accepted, [value(7)]);
+        assert_eq!(sibling_page.quiescence.unwrap().activation, sibling);
     }
 
     #[test]

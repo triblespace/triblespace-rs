@@ -14030,8 +14030,9 @@ mod tests {
             postprocessing,
         );
         iter.projection = ProjectionGate::new([], iter.root.variables());
-        // Stage the complete four-row direct page so singleton projection has
-        // a physical suffix whose activation receipts must be retired.
+        // Read the complete four-occurrence raw page. Activation-local SET
+        // admission stages three rows, whose receipts singleton projection
+        // must still retire even when it stops after its first raw head.
         iter.state.width = 4;
         iter
     }
@@ -14043,7 +14044,7 @@ mod tests {
         P: Fn(&Binding) -> Option<R>,
     {
         assert_eq!(iter.state.emit_next, iter.state.emit_count);
-        assert_eq!(iter.state.emit_count, 4);
+        assert_eq!(iter.state.emit_count, 3);
         assert!(iter
             .state
             .terminal_yield
@@ -14118,7 +14119,7 @@ mod tests {
         assert_eq!(control_proposes.load(Ordering::Relaxed), 0);
 
         assert_eq!(direct_stats.delta_direct_terminal_publication_batches, 3);
-        assert_eq!(direct_stats.delta_direct_terminal_publication_rows, 4);
+        assert_eq!(direct_stats.delta_direct_terminal_publication_rows, 3);
         assert_eq!(control_stats.delta_direct_terminal_publication_batches, 0);
         assert_eq!(control_stats.delta_direct_terminal_publication_rows, 0);
         assert_eq!(direct_stats.delta_active_lease_steps, 3);
@@ -14216,7 +14217,7 @@ mod tests {
         assert_eq!(pages.load(Ordering::Relaxed), 3);
         assert_eq!(cold.stats().delta_active_lease_steps, 0);
         assert_eq!(cold.stats().delta_direct_terminal_publication_batches, 3);
-        assert_eq!(cold.stats().delta_direct_terminal_publication_rows, 4);
+        assert_eq!(cold.stats().delta_direct_terminal_publication_rows, 3);
         assert_eq!(cold.stats().candidate_plan_pops, 0);
         assert_eq!(cold.stats().emit_pops, 0);
     }
@@ -14286,7 +14287,7 @@ mod tests {
                 .flatten()
                 .map(|sample| sample.pending_rows)
                 .sum::<usize>(),
-            3
+            2
         );
         assert_eq!(panicking.next(), None);
         assert_empty_head_terminal_receipts_retired(&panicking, 0);
