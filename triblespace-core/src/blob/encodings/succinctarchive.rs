@@ -30,6 +30,9 @@ use succinctarchiveconstraint::base_range;
 /// Constraint implementation used by [`SuccinctArchive::pattern`].
 pub use succinctarchiveconstraint::SuccinctArchiveConstraint;
 
+/// Inclusive value-range constraint returned by [`SuccinctArchive::value_in_range`].
+pub use succinctarchiverangeconstraint::SuccinctArchiveRangeConstraint;
+
 /// Re-export all universe types and traits.
 pub use universe::*;
 
@@ -880,10 +883,8 @@ where
         variable: crate::query::Variable<V>,
         min: Inline<V>,
         max: Inline<V>,
-    ) -> succinctarchiverangeconstraint::SuccinctArchiveRangeConstraint<'_, U> {
-        succinctarchiverangeconstraint::SuccinctArchiveRangeConstraint::new(
-            variable, min, max, self,
-        )
+    ) -> SuccinctArchiveRangeConstraint<'_, U> {
+        SuccinctArchiveRangeConstraint::new(variable, min, max, self)
     }
 
     /// Iterates over all tribles by walking the EAV wavelet matrix and
