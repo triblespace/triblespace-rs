@@ -944,6 +944,11 @@ impl<'a, I: CosineSimilarity + ?Sized + 'a> Constraint<'a> for CosineAtLeast<'a,
 /// semantics are exact membership in this frozen bag; no engine action
 /// re-walks the index.
 ///
+/// In the relational-SET protocol this is therefore one fixed unary relation
+/// with exact proposal coverage. Native order and duplicate occurrences are
+/// physical properties of its proposal stream; the denotation is their raw
+/// [`RawInline`] support.
+///
 /// Produced by the `similar_to` method on an
 /// [`crate::hnsw::AttachedHNSWIndex`] /
 /// [`crate::hnsw::AttachedFlatIndex`] /
@@ -1068,6 +1073,22 @@ impl<'a> Constraint<'a> for SimilarTo {
         VariableSet::new_singleton(self.var.index)
     }
 
+    fn fixed_denotation(&self) -> bool {
+        true
+    }
+
+    fn proposal_coverage(
+        &self,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> ProposalCoverage {
+        if variable == self.var.index && !bound.is_set(variable) {
+            ProposalCoverage::Exact
+        } else {
+            ProposalCoverage::None
+        }
+    }
+
     fn estimate(
         &self,
         variable: VariableId,
@@ -1161,7 +1182,7 @@ mod tests {
     use crate::tokens::hash_tokens;
     use triblespace_core::blob::MemoryBlobStore;
     use triblespace_core::id::Id;
-    use triblespace_core::inline::{InlineEncoding, IntoInline};
+    use triblespace_core::inline::{InlineEncoding, IntoInline, TryFromInline};
     use triblespace_core::query::hashsetconstraint::SetConstraint;
     use triblespace_core::query::residual::ResidualLowering;
     use triblespace_core::query::{Binding, Candidates, Query};
@@ -1202,6 +1223,17 @@ mod tests {
 
     fn embedding_raw(byte: u8) -> RawInline {
         Inline::<Handle<Embedding>>::new([byte; 32]).raw
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct CollapsedEmbedding;
+
+    impl TryFromInline<'_, Handle<Embedding>> for CollapsedEmbedding {
+        type Error = std::convert::Infallible;
+
+        fn try_from_inline(_: &Inline<Handle<Embedding>>) -> Result<Self, Self::Error> {
+            Ok(Self)
+        }
     }
 
     fn sample_index() -> BM25Index {
@@ -1831,13 +1863,18 @@ mod tests {
             )
         };
         let mut sequential: Vec<_> = Query::new(make(), project_pair).sequential().collect();
+        let mut dag: Vec<_> = Query::new(make(), project_pair)
+            .lazy_dag_scheduler()
+            .collect();
         let mut residual = Query::new(make(), project_pair)
             .solve_residual_state_lazy_with(ResidualLowering::FULL)
             .cap(1)
             .start_width(1);
         let mut full: Vec<_> = residual.by_ref().collect();
         sequential.sort_unstable();
+        dag.sort_unstable();
         full.sort_unstable();
+        assert_eq!(dag, sequential);
         assert_eq!(full, sequential);
         assert_eq!(full, expected_public_pairs);
         for parent_value in parent_rows {
@@ -1875,6 +1912,41 @@ mod tests {
         assert_eq!(first_only.stats().delta_source_candidates_examined, 1);
         assert_eq!(first_only.stats().delta_source_direct_candidates, 1);
         drop(first_only);
+    }
+
+    #[test]
+    fn similar_to_set_identity_is_raw_support_before_rust_conversion() {
+        let first = embedding_raw(1);
+        let second = embedding_raw(2);
+        let rows = triblespace_core::find!(
+            neighbour: CollapsedEmbedding,
+            SimilarTo::from_candidates(neighbour, vec![first, first, second])
+        )
+        .collect::<Vec<_>>();
+
+        assert_eq!(rows, [CollapsedEmbedding, CollapsedEmbedding]);
+    }
+
+    #[test]
+    fn similar_to_snapshot_outlives_attached_index_and_blob_reader() {
+        let neighbour = Variable::<Handle<Embedding>>::new(0);
+        let (constraint, mut expected) = {
+            let (flat, _hnsw, mut store, handles) = sample_sim();
+            let reader = store.reader().unwrap();
+            let constraint = flat
+                .attach(&reader)
+                .similar_to(handles[0], neighbour, 0.8);
+            (constraint, vec![handles[0].raw, handles[2].raw])
+        };
+
+        let mut rows: Vec<_> = Query::new(constraint, project_first)
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .cap(1)
+            .start_width(1)
+            .collect();
+        rows.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(rows, expected);
     }
 
     #[test]
@@ -2196,7 +2268,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_receipts_keep_exact_search_separate_from_ann() {
+    fn semantic_receipts_distinguish_frozen_retrieval_from_dynamic_pair_filtering() {
         let variable = Variable::<Handle<Embedding>>::new(0);
         let bm25 = BM25Filter::from_entries(variable, Vec::<RawInline>::new());
         assert!(bm25.fixed_denotation());
@@ -2206,9 +2278,18 @@ mod tests {
         );
 
         let similar = SimilarTo::from_candidates(variable, Vec::new());
-        assert!(!similar.fixed_denotation());
+        assert!(similar.fixed_denotation());
         assert_eq!(
             similar.proposal_coverage(variable.index, VariableSet::new_empty()),
+            ProposalCoverage::Exact
+        );
+        let bound = VariableSet::new_singleton(variable.index);
+        assert_eq!(
+            similar.proposal_coverage(variable.index, bound),
+            ProposalCoverage::None
+        );
+        assert_eq!(
+            similar.proposal_coverage(variable.index + 1, VariableSet::new_empty()),
             ProposalCoverage::None
         );
 

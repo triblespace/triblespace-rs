@@ -21,7 +21,9 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 - `SimilarTo` remains the explicit fixed-probe retrieval operator. Its
   semantics are membership, native order, and duplicate multiplicity in one
   frozen backend result: complete for Flat, approximate for HNSW and succinct
-  HNSW.
+  HNSW. The frozen result now certifies a fixed relational-SET denotation with
+  exact proposal coverage; exactness is relative to that snapshot, not to
+  ideal nearest-neighbour recall.
 - Pairwise cosine now divides by both vector norms, so exact filtering remains
   truthful even for embedding blobs that bypass the crate's normalized-ingest
   helper. Zero vectors retain similarity zero.
