@@ -21134,6 +21134,229 @@ mod tests {
     }
 
     #[test]
+    fn constructed_program_mixes_unionarchive_confirm_with_succinct_and_cyclic_rpq() {
+        use crate::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
+        use crate::id::{id_into_value, ExclusiveId, Id};
+        use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
+        use crate::query::TriblePattern;
+        use crate::repo::index_home::UnionArchive;
+        use crate::trible::{Trible, TribleSet};
+
+        let activation_attribute = Id::new([101; crate::id::ID_LEN]).unwrap();
+        let candidate_attribute = Id::new([102; crate::id::ID_LEN]).unwrap();
+        let union_attribute = Id::new([103; crate::id::ID_LEN]).unwrap();
+        let edge_attribute = Id::new([104; crate::id::ID_LEN]).unwrap();
+        let source = Id::new([111; crate::id::ID_LEN]).unwrap();
+        let rejected_source = Id::new([112; crate::id::ID_LEN]).unwrap();
+        let a = Id::new([121; crate::id::ID_LEN]).unwrap();
+        let b = Id::new([122; crate::id::ID_LEN]).unwrap();
+        let c = Id::new([123; crate::id::ID_LEN]).unwrap();
+        let d = Id::new([124; crate::id::ID_LEN]).unwrap();
+        let z = Id::new([125; crate::id::ID_LEN]).unwrap();
+        let outers = [
+            Id::new([131; crate::id::ID_LEN]).unwrap(),
+            Id::new([132; crate::id::ID_LEN]).unwrap(),
+            Id::new([133; crate::id::ID_LEN]).unwrap(),
+        ];
+
+        let mut activation_set = TribleSet::new();
+        for (outer, value) in [
+            (&outers[0], &source),
+            (&outers[1], &source),
+            (&outers[2], &rejected_source),
+        ] {
+            activation_set.insert(&Trible::new::<GenId>(
+                ExclusiveId::force_ref(outer),
+                &activation_attribute,
+                &value.to_inline(),
+            ));
+        }
+        let mut candidate_set = TribleSet::new();
+        for (entity, value) in [
+            (&source, &a),
+            (&source, &b),
+            (&source, &source),
+            (&rejected_source, &d),
+            (&rejected_source, &rejected_source),
+        ] {
+            candidate_set.insert(&Trible::new::<GenId>(
+                ExclusiveId::force_ref(entity),
+                &candidate_attribute,
+                &value.to_inline(),
+            ));
+        }
+        let activation_archive: &'static SuccinctArchive<OrderedUniverse> =
+            Box::leak(Box::new((&activation_set).into()));
+        let candidate_archive: &'static SuccinctArchive<OrderedUniverse> =
+            Box::leak(Box::new((&candidate_set).into()));
+
+        let mut graph = TribleSet::new();
+        for (from, to) in [
+            (&source, &a),
+            (&a, &b),
+            (&b, &c),
+            (&c, &source),
+            (&rejected_source, &d),
+            (&d, &rejected_source),
+        ] {
+            graph.insert(&Trible::new::<GenId>(
+                ExclusiveId::force_ref(from),
+                &edge_attribute,
+                &to.to_inline(),
+            ));
+        }
+
+        let mut shard_one = TribleSet::new();
+        for (entity, value) in [
+            (&source, &a),
+            (&source, &b),
+            (&rejected_source, &z),
+        ] {
+            shard_one.insert(&Trible::new::<GenId>(
+                ExclusiveId::force_ref(entity),
+                &union_attribute,
+                &value.to_inline(),
+            ));
+        }
+        let mut shard_two = TribleSet::new();
+        for value in [&b, &c] {
+            shard_two.insert(&Trible::new::<GenId>(
+                ExclusiveId::force_ref(&source),
+                &union_attribute,
+                &value.to_inline(),
+            ));
+        }
+        let union_shards: &'static [SuccinctArchive<OrderedUniverse>] = Box::leak(
+            vec![(&shard_one).into(), (&shard_two).into()].into_boxed_slice(),
+        );
+        let union_archive: &'static UnionArchive<'static, OrderedUniverse> =
+            Box::leak(Box::new(UnionArchive::new(union_shards)));
+
+        let outer = Variable::<GenId>::new(0);
+        let source_variable = Variable::<GenId>::new(1);
+        let target_variable = Variable::<GenId>::new(2);
+        let activation_attribute = Inline::<GenId>::new(id_into_value(&activation_attribute));
+        let candidate_attribute = Inline::<GenId>::new(id_into_value(&candidate_attribute));
+        let union_attribute = Inline::<GenId>::new(id_into_value(&union_attribute));
+        let path = [PathOp::Attr(edge_attribute.raw()), PathOp::Plus];
+        let activation_constraint = || {
+            SuccinctArchiveConstraint::new(
+                outer,
+                activation_attribute,
+                source_variable,
+                activation_archive,
+            )
+        };
+        let candidate_constraint = || {
+            SuccinctArchiveConstraint::new(
+                source_variable,
+                candidate_attribute,
+                target_variable,
+                candidate_archive,
+            )
+        };
+        let union_constraint = || {
+            union_archive.pattern(source_variable, union_attribute, target_variable)
+        };
+
+        let oracle = IntersectionConstraint::new(vec![
+            Box::new(activation_constraint()) as ShapeConstraint,
+            Box::new(RegularPathConstraint::new(
+                graph.clone(),
+                source_variable,
+                target_variable,
+                &path,
+            )) as ShapeConstraint,
+            Box::new(candidate_constraint()) as ShapeConstraint,
+            Box::new(union_constraint()) as ShapeConstraint,
+        ]);
+        let mut expected: Vec<_> =
+            Query::new(oracle, constructed_source_target).sequential().collect();
+        expected.sort_unstable();
+        assert_eq!(
+            expected,
+            vec![
+                (id_into_value(&source), id_into_value(&a)),
+                (id_into_value(&source), id_into_value(&a)),
+                (id_into_value(&source), id_into_value(&b)),
+                (id_into_value(&source), id_into_value(&b)),
+            ],
+            "the oracle must retain duplicate outer parents but not overlapping shard witnesses"
+        );
+
+        let rpq_fallbacks = program_fallback_counters();
+        let root = Arc::new(IntersectionConstraint::new(vec![
+            Box::new(ConstructedProtocolTrap {
+                inner: activation_constraint(),
+            }) as ShapeConstraint,
+            Box::new(ConstructedProtocolTrap {
+                inner: program_only_rpq(
+                    RegularPathConstraint::new(
+                        graph,
+                        source_variable,
+                        target_variable,
+                        &path,
+                    ),
+                    &rpq_fallbacks,
+                ),
+            }) as ShapeConstraint,
+            Box::new(ConstructedProtocolTrap {
+                inner: candidate_constraint(),
+            }) as ShapeConstraint,
+            Box::new(ConstructedProtocolTrap {
+                inner: union_constraint(),
+            }) as ShapeConstraint,
+        ]));
+        let mut iterator = try_constructed_program_query(root, constructed_source_target)
+            .unwrap()
+            .cap(1)
+            .start_width(1)
+            .growth(1);
+        assert_eq!(
+            iterator.planner_kind(),
+            ResidualPlannerKind::ConstructedProgram
+        );
+        let target_step = &iterator
+            .plan
+            .constructed_program
+            .as_ref()
+            .unwrap()
+            .steps[2];
+        assert_eq!(target_step.variable, target_variable.index);
+        assert_eq!(target_step.proposer, 1);
+        assert_eq!(target_step.proposer_route.stratum, ProgramStratum::Fixpoint);
+        assert_eq!(
+            target_step
+                .confirmer_routes
+                .iter()
+                .map(|(leaf, _)| *leaf)
+                .collect::<Vec<_>>(),
+            vec![2, 3],
+            "candidate Succinct and UnionArchive must both confirm the RPQ frontier"
+        );
+
+        let first = iterator
+            .next()
+            .expect("strict mixed constructed Programs produced no row");
+        let transitions_at_first = iterator.stats().delta_transition_candidates_examined;
+        let mirror = iterator.clone();
+        let mut remainder: Vec<_> = iterator.by_ref().collect();
+        let transitions_after = iterator.stats().delta_transition_candidates_examined;
+        let mirrored: Vec<_> = mirror.collect();
+
+        assert_eq!(mirrored, remainder, "a clone changed the exact live remainder");
+        assert!(transitions_at_first > 0);
+        assert!(
+            transitions_after > transitions_at_first,
+            "the first result eagerly drained the cyclic RPQ continuation"
+        );
+        remainder.push(first);
+        remainder.sort_unstable();
+        assert_eq!(remainder, expected);
+        assert_program_fallbacks_unused(&rpq_fallbacks);
+    }
+
+    #[test]
     fn constructed_program_keeps_shared_occurrences_distinct() {
         let (graph, attribute) = constructed_program_graph();
         let expected_leaf = Arc::new(constructed_rpq(graph.clone(), &attribute, false));

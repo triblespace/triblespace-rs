@@ -526,7 +526,7 @@ where
     /// Row-local Boolean support. Partial schemas are optimistic, matching the
     /// ordinary constraint law; a fully resolved row performs exact Ring
     /// membership including entity/attribute inline-id validation.
-    fn support_row(&self, view: &RowsView<'_>, row: &[RawInline]) -> bool {
+    pub(crate) fn support_row(&self, view: &RowsView<'_>, row: &[RawInline]) -> bool {
         let (Some(se), Some(sa), Some(sv)) = (
             term_src(&self.term_e, view),
             term_src(&self.term_a, view),
@@ -1100,6 +1100,37 @@ where
             }
             _ => unreachable!("invalid succinct proposal source state"),
         }
+    }
+
+    /// Exact single-parent proposal page used by physical wrappers that own
+    /// their own typed continuation. Unlike the optional erased capability,
+    /// this entry point cannot decline after a wrapper route has been chosen.
+    pub(crate) fn proposal_source_page_single(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        cursor: ResidualDeltaSourceCursor,
+        limit: usize,
+        accepted: &mut Vec<RawInline>,
+    ) -> ResidualDeltaSourcePage {
+        assert_eq!(view.len(), 1, "Succinct proposal pages have one parent");
+        assert!(
+            view.col(variable).is_none(),
+            "Succinct proposal target is already bound"
+        );
+        let positions = self.positions(variable, view);
+        assert_ne!(
+            positions.target_count(),
+            0,
+            "Succinct proposal target is absent"
+        );
+        self.proposal_source_page_row(
+            &positions,
+            view.row(0),
+            cursor,
+            limit,
+            accepted,
+        )
     }
 }
 

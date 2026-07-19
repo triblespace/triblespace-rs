@@ -28,8 +28,11 @@ use crate::metadata;
 use crate::prelude::{attributes, entity, pattern};
 use crate::query::unionconstraint::UnionConstraint;
 use crate::query::{
-    CandidateSink, Constraint, ConstraintChildren, EstimateSink, RawTerm, ResidualDeltaOutput,
-    ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, Term, TriblePattern, VariableId,
+    CandidateSink, Candidates, Constraint, DispatchClass, EstimateSink,
+    ProgramAction, ProgramCompletion, ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef,
+    ProgramRequest, ProgramRoute, ProgramSeedBatch, ProgramStratum, RawTerm, ResidualDeltaOutput,
+    ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, Term, TriblePattern,
+    TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink, VariableId,
     VariableSet,
 };
 use crate::repo::index_range::{
@@ -1274,6 +1277,28 @@ impl<'a, U> UnionArchive<'a, U> {
     }
 }
 
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UnionArchiveProgramState {
+    Propose {
+        variable: VariableId,
+        cursor: ResidualDeltaSourceCursor,
+    },
+    Confirm {
+        variable: VariableId,
+        offset: usize,
+    },
+    Support,
+}
+
+const UNION_ARCHIVE_PROPOSE_ROUTE: u32 = 1 << 8;
+const UNION_ARCHIVE_CONFIRM_ROUTE: u32 = 2 << 8;
+const UNION_ARCHIVE_SUPPORT_ROUTE: u32 = 3 << 8;
+
+const UNION_ARCHIVE_PROPOSE_DISPATCH: DispatchClass = DispatchClass::new(0);
+const UNION_ARCHIVE_CONFIRM_DISPATCH: DispatchClass = DispatchClass::new(1);
+const UNION_ARCHIVE_SUPPORT_DISPATCH: DispatchClass = DispatchClass::new(2);
+
 /// Atomic normalized union over one finite set of Succinct archive shards.
 ///
 /// Estimates, proposals, and satisfaction retain [`UnionConstraint`]'s
@@ -1291,6 +1316,7 @@ where
     U: Universe,
 {
     union: UnionConstraint<SuccinctArchiveConstraint<'a, U>>,
+    shards: Vec<SuccinctArchiveConstraint<'a, U>>,
     terms: [RawTerm; 3],
 }
 
@@ -1304,9 +1330,391 @@ where
         term_a: RawTerm,
         term_v: RawTerm,
     ) -> Self {
+        let shards = constraints.clone();
         Self {
             union: UnionConstraint::new(constraints),
+            shards,
             terms: [term_e, term_a, term_v],
+        }
+    }
+
+    fn variable_position_mask(&self, variable: VariableId) -> u32 {
+        u32::from(self.terms[0].is_var(variable))
+            | (u32::from(self.terms[1].is_var(variable)) << 1)
+            | (u32::from(self.terms[2].is_var(variable)) << 2)
+    }
+
+    fn resolved_position_mask(&self, bound: VariableSet) -> u32 {
+        fn term_is_resolved(term: &RawTerm, bound: VariableSet) -> bool {
+            match term {
+                RawTerm::Var(variable) => bound.is_set(*variable),
+                RawTerm::Const(_) => true,
+            }
+        }
+
+        u32::from(term_is_resolved(&self.terms[0], bound))
+            | (u32::from(term_is_resolved(&self.terms[1], bound)) << 1)
+            | (u32::from(term_is_resolved(&self.terms[2], bound)) << 2)
+    }
+
+    fn support_variable(&self) -> Option<VariableId> {
+        self.terms.iter().find_map(|term| match term {
+            RawTerm::Var(variable) => Some(*variable),
+            RawTerm::Const(_) => None,
+        })
+    }
+
+    fn support_row(&self, view: &RowsView<'_>, row: &[RawInline]) -> bool {
+        self.shards
+            .iter()
+            .any(|shard| shard.support_row(view, row))
+    }
+
+    /// One exact page of the globally ordered, duplicate-free shard union.
+    /// Every shard contributes at most its first value after `cursor`; the
+    /// minimum head is emitted once and becomes the next value cursor.
+    fn proposal_source_page(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        mut cursor: ResidualDeltaSourceCursor,
+        limit: usize,
+        accepted: &mut Vec<RawInline>,
+    ) -> ResidualDeltaSourcePage {
+        assert_eq!(view.len(), 1, "UnionArchive source pages have one parent");
+        assert!(
+            view.col(variable).is_none(),
+            "UnionArchive proposal target is already bound"
+        );
+        assert_eq!(
+            self.variable_position_mask(variable).count_ones(),
+            1,
+            "UnionArchive proposal target must occupy exactly one position"
+        );
+        assert!(limit > 0, "UnionArchive source pages require positive demand");
+        if matches!(cursor, ResidualDeltaSourceCursor::Offset(_)) {
+            panic!("UnionArchive source received an ordinal cursor");
+        }
+
+        let accepted_base = accepted.len();
+        let mut next = None;
+        let mut heads = Vec::with_capacity(self.shards.len());
+        let mut shard_accepted = Vec::new();
+        while accepted.len() - accepted_base < limit {
+            heads.clear();
+            for shard in &self.shards {
+                shard_accepted.clear();
+                let page = shard.proposal_source_page_single(
+                    variable,
+                    view,
+                    cursor,
+                    1,
+                    &mut shard_accepted,
+                );
+                assert_eq!(
+                    shard_accepted.len(),
+                    page.examined,
+                    "a Succinct proposal source rejected its own candidate"
+                );
+                assert!(
+                    shard_accepted.len() <= 1,
+                    "a Succinct shard exceeded one-head demand"
+                );
+                if let Some(value) = shard_accepted.pop() {
+                    heads.push((value, page.next.is_some()));
+                } else {
+                    assert!(
+                        page.next.is_none(),
+                        "an empty Succinct shard page retained hidden work"
+                    );
+                }
+            }
+
+            let Some(value) = heads.iter().map(|(value, _)| *value).min() else {
+                next = None;
+                break;
+            };
+            accepted.push(value);
+            cursor = ResidualDeltaSourceCursor::After(value);
+            let has_more = heads
+                .iter()
+                .any(|(head, local_more)| *head > value || (*head == value && *local_more));
+            next = has_more.then_some(cursor);
+            if !has_more {
+                break;
+            }
+        }
+
+        ResidualDeltaSourcePage {
+            next,
+            examined: accepted.len() - accepted_base,
+        }
+    }
+}
+
+impl<U> TypedProgramSpec for UnionArchiveConstraint<'_, U>
+where
+    U: Universe,
+{
+    type State = UnionArchiveProgramState;
+    type NoveltyKey = ();
+    type Rank = [u64; 6];
+
+    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+        let resolved_positions = self.resolved_position_mask(request.bound);
+        let (key, variable) = match request.action {
+            ProgramAction::Propose(variable) | ProgramAction::Confirm(variable) => {
+                let target_positions = self.variable_position_mask(variable);
+                if request.bound.is_set(variable) || target_positions == 0 {
+                    return None;
+                }
+                if matches!(request.action, ProgramAction::Propose(_))
+                    && target_positions.count_ones() != 1
+                {
+                    return None;
+                }
+                debug_assert_eq!(resolved_positions & target_positions, 0);
+                let action = if matches!(request.action, ProgramAction::Propose(_)) {
+                    UNION_ARCHIVE_PROPOSE_ROUTE
+                } else {
+                    UNION_ARCHIVE_CONFIRM_ROUTE
+                };
+                (
+                    ProgramKey::new(action | (target_positions << 3) | resolved_positions),
+                    variable,
+                )
+            }
+            ProgramAction::Support => (
+                ProgramKey::new(UNION_ARCHIVE_SUPPORT_ROUTE | resolved_positions),
+                self.support_variable()?,
+            ),
+        };
+        Some(ProgramRoute {
+            key,
+            variable,
+            stratum: ProgramStratum::Finite,
+            grouping: ProgramGrouping::PageLocal,
+            completion: ProgramCompletion::PageableOnly,
+        })
+    }
+
+    fn dispatch(&self, state: &Self::State) -> DispatchClass {
+        match state {
+            UnionArchiveProgramState::Propose { .. } => UNION_ARCHIVE_PROPOSE_DISPATCH,
+            UnionArchiveProgramState::Confirm { .. } => UNION_ARCHIVE_CONFIRM_DISPATCH,
+            UnionArchiveProgramState::Support => UNION_ARCHIVE_SUPPORT_DISPATCH,
+        }
+    }
+
+    fn pacing(&self, _state: &Self::State) -> ProgramPacing {
+        ProgramPacing::Search
+    }
+
+    fn progress(&self, state: &Self::State) -> Self::Rank {
+        fn complemented_value_words(value: &RawInline) -> [u64; 4] {
+            std::array::from_fn(|word| {
+                let begin = word * 8;
+                !u64::from_be_bytes(value[begin..begin + 8].try_into().unwrap())
+            })
+        }
+
+        let mut rank = [0u64; 6];
+        match state {
+            UnionArchiveProgramState::Support => rank[0] = 1,
+            UnionArchiveProgramState::Confirm { offset, .. } => {
+                rank[0] = 2;
+                rank[1] = u64::MAX
+                    - u64::try_from(*offset)
+                        .expect("UnionArchive candidate offset exceeds rank limb");
+            }
+            UnionArchiveProgramState::Propose { cursor, .. } => {
+                rank[0] = 3;
+                match cursor {
+                    ResidualDeltaSourceCursor::Start => rank[1] = u64::MAX,
+                    ResidualDeltaSourceCursor::After(value) => {
+                        rank[1] = u64::MAX - 1;
+                        rank[2..].copy_from_slice(&complemented_value_words(value));
+                    }
+                    ResidualDeltaSourceCursor::Offset(_) => {
+                        panic!("ordinal cursor crossed into a typed UnionArchive source")
+                    }
+                }
+            }
+        }
+        rank
+    }
+
+    fn seed_typed(
+        &self,
+        batch: ProgramSeedBatch<'_>,
+        effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+    ) {
+        assert_eq!(batch.route.stratum, ProgramStratum::Finite);
+        assert_eq!(batch.route.grouping, ProgramGrouping::PageLocal);
+        assert_eq!(batch.route.completion, ProgramCompletion::PageableOnly);
+        let state = match batch.request.action {
+            ProgramAction::Propose(variable) => {
+                assert_eq!(batch.route.variable, variable);
+                assert!(!batch.request.bound.is_set(variable));
+                assert_eq!(self.variable_position_mask(variable).count_ones(), 1);
+                UnionArchiveProgramState::Propose {
+                    variable,
+                    cursor: ResidualDeltaSourceCursor::Start,
+                }
+            }
+            ProgramAction::Confirm(variable) => {
+                assert_eq!(batch.route.variable, variable);
+                assert!(!batch.request.bound.is_set(variable));
+                assert_ne!(self.variable_position_mask(variable), 0);
+                UnionArchiveProgramState::Confirm {
+                    variable,
+                    offset: 0,
+                }
+            }
+            ProgramAction::Support => {
+                assert_eq!(Some(batch.route.variable), self.support_variable());
+                UnionArchiveProgramState::Support
+            }
+        };
+        for parent in 0..batch.view.len() {
+            effects.finite_root(
+                u32::try_from(parent).expect("too many typed UnionArchive parents"),
+                state.clone(),
+                None,
+            );
+        }
+    }
+
+    fn step_typed(
+        &self,
+        states: Vec<Self::State>,
+        batch: TypedProgramBatch<'_>,
+        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+    ) {
+        assert_eq!(batch.stratum, ProgramStratum::Finite);
+        assert_eq!(states.len(), batch.view.len());
+        assert_eq!(states.len(), batch.candidate_sets.len());
+        assert_eq!(states.len(), batch.limits.len());
+        let Some(first) = states.first() else {
+            return;
+        };
+        match first {
+            UnionArchiveProgramState::Propose { variable, .. } => {
+                let variable = *variable;
+                for (input, state) in states.into_iter().enumerate() {
+                    let UnionArchiveProgramState::Propose {
+                        variable: state_variable,
+                        cursor,
+                    } = state
+                    else {
+                        panic!("one typed UnionArchive proposal cohort mixed action variants")
+                    };
+                    assert_eq!(state_variable, variable);
+                    assert!(
+                        batch.candidate_sets[input].is_none(),
+                        "typed UnionArchive proposal received a candidate group"
+                    );
+                    let mut direct = Vec::new();
+                    let page = self.proposal_source_page(
+                        variable,
+                        &batch.view.row_view(input),
+                        cursor,
+                        batch.limits[input],
+                        &mut direct,
+                    );
+                    let input = u32::try_from(input)
+                        .expect("too many typed UnionArchive inputs in one cohort");
+                    for value in direct {
+                        effects.direct(input, value);
+                    }
+                    assert!(
+                        page.next.is_none() || page.examined > 0,
+                        "typed UnionArchive proposal resumed without examining its source"
+                    );
+                    let resume = page.next.map(|cursor| {
+                        TypedResume::Immediate(UnionArchiveProgramState::Propose {
+                            variable,
+                            cursor,
+                        })
+                    });
+                    effects.account_source(page.examined, 0);
+                    effects.page(page.examined, resume);
+                }
+            }
+            UnionArchiveProgramState::Confirm { variable, .. } => {
+                let variable = *variable;
+                let mut tagged = Candidates::new();
+                let mut pages = Vec::with_capacity(states.len());
+                for (input, state) in states.into_iter().enumerate() {
+                    let UnionArchiveProgramState::Confirm {
+                        variable: state_variable,
+                        offset,
+                    } = state
+                    else {
+                        panic!("one typed UnionArchive confirmation cohort mixed action variants")
+                    };
+                    assert_eq!(state_variable, variable);
+                    let candidates = batch.candidate_sets[input]
+                        .expect("typed UnionArchive confirmation lost its candidate group");
+                    assert!(offset <= candidates.len());
+                    let end = offset
+                        .saturating_add(batch.limits[input])
+                        .min(candidates.len());
+                    let input_tag = u32::try_from(input)
+                        .expect("too many typed UnionArchive inputs in one cohort");
+                    tagged.extend(
+                        candidates[offset..end]
+                            .iter()
+                            .copied()
+                            .map(|value| (input_tag, value)),
+                    );
+                    pages.push((offset, end, candidates.len()));
+                }
+
+                // One corrected whole-frontier call preserves physical shard
+                // batching while retaining the immutable candidate bag's
+                // accepted occurrences, tags, and order.
+                if !tagged.is_empty() {
+                    self.confirm(
+                        variable,
+                        &batch.view,
+                        &mut CandidateSink::Tagged(&mut tagged),
+                    );
+                }
+                for (input, value) in tagged {
+                    effects.accept(input, value);
+                }
+                for (offset, end, candidate_len) in pages {
+                    let examined = end - offset;
+                    assert!(
+                        end == candidate_len || examined > 0,
+                        "typed UnionArchive confirmation resumed without examining a candidate"
+                    );
+                    let resume = (end < candidate_len).then(|| {
+                        TypedResume::Immediate(UnionArchiveProgramState::Confirm {
+                            variable,
+                            offset: end,
+                        })
+                    });
+                    effects.page(examined, resume);
+                }
+            }
+            UnionArchiveProgramState::Support => {
+                for (input, state) in states.into_iter().enumerate() {
+                    assert_eq!(state, UnionArchiveProgramState::Support);
+                    assert!(
+                        batch.candidate_sets[input].is_none(),
+                        "typed UnionArchive support received a candidate group"
+                    );
+                    if self.support_row(&batch.view, batch.view.row(input)) {
+                        effects.support(
+                            u32::try_from(input)
+                                .expect("too many typed UnionArchive inputs in one cohort"),
+                        );
+                    }
+                    effects.page(1, None);
+                }
+            }
         }
     }
 }
@@ -1363,8 +1771,7 @@ where
                 let mut witnesses = HashSet::with_capacity(values.len());
                 let mut shard_values = Vec::with_capacity(values.len());
 
-                for shard in 0..self.union.len() {
-                    let constraint = self.union.child(shard);
+                for constraint in &self.shards {
                     if !constraint.satisfied(&row_view) {
                         continue;
                     }
@@ -1388,8 +1795,7 @@ where
                 let mut live_rows = Vec::with_capacity(view.len());
                 let mut shard_pairs = Vec::with_capacity(pairs.len());
 
-                for shard in 0..self.union.len() {
-                    let constraint = self.union.child(shard);
+                for constraint in &self.shards {
                     live_rows.clear();
                     live_rows.extend(
                         (0..view.len()).map(|row| constraint.satisfied(&view.row_view(row))),
@@ -1422,11 +1828,9 @@ where
     }
 
     fn residual_confirm_is_page_local(&self) -> bool {
-        (0..self.union.len()).all(|shard| {
-            self.union
-                .child(shard)
-                .residual_confirm_is_page_local()
-        })
+        self.shards
+            .iter()
+            .all(|shard| shard.residual_confirm_is_page_local())
     }
 
     fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
@@ -1440,11 +1844,10 @@ where
                 .filter(|term| term.is_var(variable))
                 .count()
                 == 1
-            && (0..self.union.len()).all(|shard| {
-                self.union
-                    .child(shard)
-                    .residual_proposal_source_is_paged(variable, view)
-            })
+            && self
+                .shards
+                .iter()
+                .all(|shard| shard.residual_proposal_source_is_paged(variable, view))
     }
 
     fn residual_delta_source_page(
@@ -1452,7 +1855,7 @@ where
         variable: VariableId,
         view: &RowsView<'_>,
         candidates: Option<&[RawInline]>,
-        mut cursor: ResidualDeltaSourceCursor,
+        cursor: ResidualDeltaSourceCursor,
         limit: usize,
         _roots: &mut Vec<ResidualDeltaOutput>,
         accepted: &mut Vec<RawInline>,
@@ -1463,76 +1866,11 @@ where
         {
             return None;
         }
-        assert!(limit > 0, "residual source pages require positive demand");
-        if matches!(cursor, ResidualDeltaSourceCursor::Offset(_)) {
-            panic!("UnionArchive source received an ordinal cursor");
-        }
+        Some(self.proposal_source_page(variable, view, cursor, limit, accepted))
+    }
 
-        let accepted_base = accepted.len();
-        let mut next = None;
-        let mut heads = Vec::with_capacity(self.union.len());
-        let mut shard_roots = Vec::new();
-        let mut shard_accepted = Vec::new();
-        while accepted.len() - accepted_base < limit {
-            heads.clear();
-            for shard in 0..self.union.len() {
-                shard_roots.clear();
-                shard_accepted.clear();
-                let page = self
-                    .union
-                    .child(shard)
-                    .residual_delta_source_page(
-                        variable,
-                        view,
-                        None,
-                        cursor,
-                        1,
-                        &mut shard_roots,
-                        &mut shard_accepted,
-                    )
-                    .expect("an admitted Succinct shard source became unsupported");
-                assert!(
-                    shard_roots.is_empty(),
-                    "a Succinct proposal source returned transition roots"
-                );
-                assert_eq!(
-                    shard_accepted.len(),
-                    page.examined,
-                    "a Succinct proposal source rejected its own candidate"
-                );
-                assert!(
-                    shard_accepted.len() <= 1,
-                    "a Succinct shard exceeded one-head demand"
-                );
-                if let Some(value) = shard_accepted.pop() {
-                    heads.push((value, page.next.is_some()));
-                } else {
-                    assert!(
-                        page.next.is_none(),
-                        "an empty Succinct shard page retained hidden work"
-                    );
-                }
-            }
-
-            let Some(value) = heads.iter().map(|(value, _)| *value).min() else {
-                next = None;
-                break;
-            };
-            accepted.push(value);
-            cursor = ResidualDeltaSourceCursor::After(value);
-            let has_more = heads
-                .iter()
-                .any(|(head, local_more)| *head > value || (*head == value && *local_more));
-            next = has_more.then_some(cursor);
-            if !has_more {
-                break;
-            }
-        }
-
-        Some(ResidualDeltaSourcePage {
-            next,
-            examined: accepted.len() - accepted_base,
-        })
+    fn residual_program(&self) -> Option<ProgramRef<'_>> {
+        Some(ProgramRef::new(self))
     }
 }
 
@@ -1575,7 +1913,10 @@ mod tests {
     use crate::inline::encodings::UnknownInline;
     use crate::inline::IntoInline;
     use crate::query::intersectionconstraint::IntersectionConstraint;
-    use crate::query::{Binding, Query, Variable};
+    use crate::query::{
+        Binding, ProgramActivation, ProgramBatch, ProgramBatchEffects, ProgramResume, Query,
+        Variable,
+    };
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::repo::{BlobStorePut, CommitHandle};
     use crate::trible::Trible;
@@ -1609,6 +1950,184 @@ mod tests {
             ));
         }
         (&facts).into()
+    }
+
+    fn one_union_program_step<U>(
+        constraint: &UnionArchiveConstraint<'_, U>,
+        request: ProgramRequest,
+        view: RowsView<'_>,
+        candidate_sets: &[Option<&[RawInline]>],
+        limits: &[usize],
+    ) -> ProgramBatchEffects
+    where
+        U: Universe,
+    {
+        let program = constraint.residual_program().unwrap();
+        let route = program.route(request).unwrap();
+        let activations: Vec<_> = (0..view.len())
+            .map(|activation| ProgramActivation(activation as u64 + 1))
+            .collect();
+        let mut runtime = program.new_runtime();
+        let mut seeded = crate::query::ProgramSeedEffects::default();
+        program.seed_batch(
+            &mut runtime,
+            ProgramSeedBatch {
+                request,
+                route,
+                view,
+                activations: &activations,
+            },
+            &mut seeded,
+        );
+        assert_eq!(seeded.work.len(), view.len());
+        let work: Vec<_> = seeded.work.into_iter().map(|seed| seed.work).collect();
+        let mut effects = ProgramBatchEffects::default();
+        program.step_batch(
+            &mut runtime,
+            ProgramBatch {
+                stratum: route.stratum,
+                view,
+                candidate_sets,
+                activations: &activations,
+                work: &work,
+                limits,
+            },
+            &mut effects,
+        );
+        effects
+    }
+
+    fn drain_union_proposal<U>(
+        constraint: &UnionArchiveConstraint<'_, U>,
+        variable: VariableId,
+    ) -> (Vec<RawInline>, Vec<usize>)
+    where
+        U: Universe,
+    {
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(variable),
+            bound: VariableSet::new_empty(),
+        };
+        let program = constraint.residual_program().unwrap();
+        let route = program.route(request).unwrap();
+        let activations = [ProgramActivation(1)];
+        let mut runtime = program.new_runtime();
+        let mut seeded = crate::query::ProgramSeedEffects::default();
+        program.seed_batch(
+            &mut runtime,
+            ProgramSeedBatch {
+                request,
+                route,
+                view: RowsView::EMPTY,
+                activations: &activations,
+            },
+            &mut seeded,
+        );
+        let mut work = seeded.work.pop().unwrap().work;
+        assert!(seeded.work.is_empty());
+        let candidate_sets = [None];
+        let limits = [1];
+        let mut values = Vec::new();
+        let mut examined = Vec::new();
+        loop {
+            let mut effects = ProgramBatchEffects::default();
+            program.step_batch(
+                &mut runtime,
+                ProgramBatch {
+                    stratum: route.stratum,
+                    view: RowsView::EMPTY,
+                    candidate_sets: &candidate_sets,
+                    activations: &activations,
+                    work: std::slice::from_ref(&work),
+                    limits: &limits,
+                },
+                &mut effects,
+            );
+            values.extend(effects.direct.into_iter().map(|(input, value)| {
+                assert_eq!(input, 0);
+                value
+            }));
+            assert_eq!(effects.pages.len(), 1);
+            let page = effects.pages.pop().unwrap();
+            examined.push(page.examined);
+            work = match page.resume {
+                Some(ProgramResume::Immediate(next)) => next,
+                None => break,
+                Some(_) => panic!("UnionArchive proposal used a delayed continuation"),
+            };
+        }
+        (values, examined)
+    }
+
+    fn drain_union_confirmation<U>(
+        constraint: &UnionArchiveConstraint<'_, U>,
+        variable: VariableId,
+        bound: VariableSet,
+        view: RowsView<'_>,
+        candidate_sets: &[Option<&[RawInline]>],
+        limit: usize,
+    ) -> Vec<(u32, RawInline)>
+    where
+        U: Universe,
+    {
+        let request = ProgramRequest {
+            action: ProgramAction::Confirm(variable),
+            bound,
+        };
+        let program = constraint.residual_program().unwrap();
+        let route = program.route(request).unwrap();
+        let activations: Vec<_> = (0..view.len())
+            .map(|activation| ProgramActivation(activation as u64 + 1))
+            .collect();
+        let mut runtime = program.new_runtime();
+        let mut seeded = crate::query::ProgramSeedEffects::default();
+        program.seed_batch(
+            &mut runtime,
+            ProgramSeedBatch {
+                request,
+                route,
+                view,
+                activations: &activations,
+            },
+            &mut seeded,
+        );
+        let mut work: Vec<_> = seeded.work.into_iter().map(|seed| seed.work).collect();
+        let limits = vec![limit; view.len()];
+        let mut accepted = Vec::new();
+        loop {
+            let mut effects = ProgramBatchEffects::default();
+            program.step_batch(
+                &mut runtime,
+                ProgramBatch {
+                    stratum: route.stratum,
+                    view,
+                    candidate_sets,
+                    activations: &activations,
+                    work: &work,
+                    limits: &limits,
+                },
+                &mut effects,
+            );
+            accepted.extend(effects.accepted);
+            let mut finished = 0;
+            let mut next = Vec::new();
+            for page in effects.pages {
+                match page.resume {
+                    Some(ProgramResume::Immediate(resume)) => next.push(resume),
+                    None => finished += 1,
+                    Some(_) => panic!("UnionArchive confirmation used a delayed continuation"),
+                }
+            }
+            assert!(
+                finished == 0 || finished == view.len(),
+                "test fixture confirmation inputs finished on different pages"
+            );
+            if finished != 0 {
+                break;
+            }
+            work = next;
+        }
+        accepted
     }
 
     struct CandidateBag<'a> {
@@ -1749,6 +2268,268 @@ mod tests {
         fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
             self.inner.reader()
         }
+    }
+
+    #[test]
+    fn union_archive_program_routes_and_ranks_are_structural_and_strict() {
+        let entity_id = Id::new([0x31; 16]).unwrap();
+        let attribute_id = Id::new([0x41; 16]).unwrap();
+        let archives = [fixed_archive(&entity_id, &attribute_id, [1])];
+        let union_archive = UnionArchive::new(&archives);
+        let entity = Variable::<GenId>::new(0);
+        let attribute = Variable::<GenId>::new(1);
+        let value = Variable::<UnknownInline>::new(2);
+        let constraint = union_archive.pattern(entity, attribute, value);
+        let program = constraint.residual_program().unwrap();
+        let empty = VariableSet::new_empty();
+        let propose = program
+            .route(ProgramRequest {
+                action: ProgramAction::Propose(entity.index),
+                bound: empty,
+            })
+            .unwrap();
+        let confirm = program
+            .route(ProgramRequest {
+                action: ProgramAction::Confirm(entity.index),
+                bound: empty,
+            })
+            .unwrap();
+        let mut attribute_bound = empty;
+        attribute_bound.set(attribute.index);
+        let resolved = program
+            .route(ProgramRequest {
+                action: ProgramAction::Propose(entity.index),
+                bound: attribute_bound,
+            })
+            .unwrap();
+        let mut irrelevant_bound = empty;
+        irrelevant_bound.set(9);
+        let irrelevant = program
+            .route(ProgramRequest {
+                action: ProgramAction::Propose(entity.index),
+                bound: irrelevant_bound,
+            })
+            .unwrap();
+
+        assert_ne!(propose.key, confirm.key);
+        assert_ne!(propose.key, resolved.key);
+        assert_eq!(propose.key, irrelevant.key);
+        assert_eq!(propose.stratum, ProgramStratum::Finite);
+        assert_eq!(propose.grouping, ProgramGrouping::PageLocal);
+        assert_eq!(propose.completion, ProgramCompletion::PageableOnly);
+        assert!(program
+            .route(ProgramRequest {
+                action: ProgramAction::Propose(entity.index),
+                bound: VariableSet::new_singleton(entity.index),
+            })
+            .is_none());
+        assert!(program
+            .route(ProgramRequest {
+                action: ProgramAction::Confirm(9),
+                bound: empty,
+            })
+            .is_none());
+
+        let attribute_constant: Inline<GenId> = attribute_id.to_inline();
+        let repeated = union_archive.pattern(entity, attribute_constant, entity);
+        let repeated_program = repeated.residual_program().unwrap();
+        assert!(repeated_program
+            .route(ProgramRequest {
+                action: ProgramAction::Propose(entity.index),
+                bound: empty,
+            })
+            .is_none());
+        assert!(repeated_program
+            .route(ProgramRequest {
+                action: ProgramAction::Confirm(entity.index),
+                bound: empty,
+            })
+            .is_some());
+
+        let entity_constant: Inline<GenId> = entity_id.to_inline();
+        let constant = union_archive.pattern(
+            entity_constant,
+            attribute_constant,
+            Inline::<UnknownInline>::new(raw_value(1)),
+        );
+        assert!(constant
+            .residual_program()
+            .unwrap()
+            .route(ProgramRequest {
+                action: ProgramAction::Support,
+                bound: empty,
+            })
+            .is_none());
+
+        let start = UnionArchiveProgramState::Propose {
+            variable: entity.index,
+            cursor: ResidualDeltaSourceCursor::Start,
+        };
+        let after_one = UnionArchiveProgramState::Propose {
+            variable: entity.index,
+            cursor: ResidualDeltaSourceCursor::After(raw_value(1)),
+        };
+        let after_two = UnionArchiveProgramState::Propose {
+            variable: entity.index,
+            cursor: ResidualDeltaSourceCursor::After(raw_value(2)),
+        };
+        let confirm_zero = UnionArchiveProgramState::Confirm {
+            variable: entity.index,
+            offset: 0,
+        };
+        let confirm_one = UnionArchiveProgramState::Confirm {
+            variable: entity.index,
+            offset: 1,
+        };
+        assert!(constraint.progress(&start) > constraint.progress(&after_one));
+        assert!(constraint.progress(&after_one) > constraint.progress(&after_two));
+        assert!(constraint.progress(&confirm_zero) > constraint.progress(&confirm_one));
+        assert!(constraint.progress(&after_two) > constraint.progress(&confirm_zero));
+        assert!(
+            constraint.progress(&confirm_one)
+                > constraint.progress(&UnionArchiveProgramState::Support)
+        );
+    }
+
+    #[test]
+    fn union_archive_program_pages_one_ordered_unique_overlapping_shard_union() {
+        let entity = Id::new([0x32; 16]).unwrap();
+        let attribute = Id::new([0x42; 16]).unwrap();
+        let archives = [
+            fixed_archive(&entity, &attribute, [1, 3, 5]),
+            fixed_archive(&entity, &attribute, [2, 3, 4]),
+        ];
+        let union_archive = UnionArchive::new(&archives);
+        let value = Variable::<UnknownInline>::new(0);
+        let entity: Inline<GenId> = entity.to_inline();
+        let attribute: Inline<GenId> = attribute.to_inline();
+        let constraint = union_archive.pattern(entity, attribute, value);
+
+        let (values, examined) = drain_union_proposal(&constraint, value.index);
+
+        assert_eq!(values, (1..=5).map(raw_value).collect::<Vec<_>>());
+        assert_eq!(examined, vec![1; 5]);
+    }
+
+    #[test]
+    fn union_archive_program_confirm_batches_rows_and_preserves_duplicate_occurrences() {
+        let entity_one = Id::new([0x33; 16]).unwrap();
+        let entity_two = Id::new([0x34; 16]).unwrap();
+        let attribute = Id::new([0x43; 16]).unwrap();
+        let archives = [
+            fixed_archive(&entity_one, &attribute, [1, 3]),
+            fixed_archive(&entity_two, &attribute, [2, 3]),
+        ];
+        let union_archive = UnionArchive::new(&archives);
+        let entity = Variable::<GenId>::new(0);
+        let value = Variable::<UnknownInline>::new(1);
+        let attribute: Inline<GenId> = attribute.to_inline();
+        let constraint = union_archive.pattern(entity, attribute, value);
+        let vars = [entity.index];
+        let entity_one: Inline<GenId> = entity_one.to_inline();
+        let entity_two: Inline<GenId> = entity_two.to_inline();
+        let rows = [entity_one.raw, entity_two.raw];
+        let row_zero = [raw_value(3), raw_value(1), raw_value(3), raw_value(2)];
+        let row_one = [raw_value(1), raw_value(2), raw_value(2), raw_value(3)];
+        let candidate_sets = [Some(row_zero.as_slice()), Some(row_one.as_slice())];
+        let effects = one_union_program_step(
+            &constraint,
+            ProgramRequest {
+                action: ProgramAction::Confirm(value.index),
+                bound: VariableSet::new_singleton(entity.index),
+            },
+            RowsView::new(&vars, &rows),
+            &candidate_sets,
+            &[4, 4],
+        );
+
+        let expected = vec![
+            (0, raw_value(3)),
+            (0, raw_value(1)),
+            (0, raw_value(3)),
+            (1, raw_value(2)),
+            (1, raw_value(2)),
+            (1, raw_value(3)),
+        ];
+        assert_eq!(effects.accepted, expected);
+        assert!(effects
+            .pages
+            .iter()
+            .all(|page| page.examined == 4 && page.resume.is_none()));
+
+        let mut paged = drain_union_confirmation(
+            &constraint,
+            value.index,
+            VariableSet::new_singleton(entity.index),
+            RowsView::new(&vars, &rows),
+            &candidate_sets,
+            2,
+        );
+        let mut expected_bag = expected;
+        paged.sort_unstable();
+        expected_bag.sort_unstable();
+        assert_eq!(paged, expected_bag);
+    }
+
+    #[test]
+    fn union_archive_program_support_is_optimistic_partial_and_exact_physical_or() {
+        let entity_one = Id::new([0x35; 16]).unwrap();
+        let entity_two = Id::new([0x36; 16]).unwrap();
+        let entity_dead = Id::new([0x37; 16]).unwrap();
+        let attribute = Id::new([0x44; 16]).unwrap();
+        let archives = [
+            fixed_archive(&entity_one, &attribute, [1]),
+            fixed_archive(&entity_two, &attribute, [2]),
+        ];
+        let union_archive = UnionArchive::new(&archives);
+        let entity = Variable::<GenId>::new(0);
+        let attribute_variable = Variable::<GenId>::new(1);
+        let value = Variable::<UnknownInline>::new(2);
+        let constraint = union_archive.pattern(entity, attribute_variable, value);
+        let vars = [entity.index, attribute_variable.index, value.index];
+        let entity_one: Inline<GenId> = entity_one.to_inline();
+        let entity_two: Inline<GenId> = entity_two.to_inline();
+        let entity_dead: Inline<GenId> = entity_dead.to_inline();
+        let attribute: Inline<GenId> = attribute.to_inline();
+        let rows = [
+            entity_one.raw,
+            attribute.raw,
+            raw_value(1),
+            entity_two.raw,
+            attribute.raw,
+            raw_value(2),
+            entity_dead.raw,
+            attribute.raw,
+            raw_value(3),
+        ];
+        let all_bound = VariableSet::new_singleton(entity.index)
+            .union(VariableSet::new_singleton(attribute_variable.index))
+            .union(VariableSet::new_singleton(value.index));
+        let exact = one_union_program_step(
+            &constraint,
+            ProgramRequest {
+                action: ProgramAction::Support,
+                bound: all_bound,
+            },
+            RowsView::new(&vars, &rows),
+            &[None, None, None],
+            &[1, 1, 1],
+        );
+        assert_eq!(exact.supported, vec![(0, ()), (1, ())]);
+
+        let partial_vars = [entity.index];
+        let partial_rows = [entity_one.raw, entity_dead.raw];
+        let partial = one_union_program_step(
+            &constraint,
+            ProgramRequest {
+                action: ProgramAction::Support,
+                bound: VariableSet::new_singleton(entity.index),
+            },
+            RowsView::new(&partial_vars, &partial_rows),
+            &[None, None],
+            &[1, 1],
+        );
+        assert_eq!(partial.supported, vec![(0, ()), (1, ())]);
     }
 
     #[test]
