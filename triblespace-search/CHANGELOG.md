@@ -6,6 +6,12 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## Unreleased
 
+### Build integration
+
+- Aligned the Jerky revision with `triblespace-core` and `triblespace-gpu`, so
+  succinct search views implement the same `Serializable` trait instance as
+  core's compressed universes.
+
 ### Exact pair filtering is separate from ANN retrieval
 
 - Replaced the binding-history-dependent binary `Similar` / `.similar()` API
