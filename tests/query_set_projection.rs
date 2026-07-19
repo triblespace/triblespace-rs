@@ -229,7 +229,10 @@ fn projection_key_includes_every_visible_tail_across_hidden_witnesses() {
     assert_eq!(sorted(make().collect()), expected);
     assert_eq!(sorted(make().sequential().collect()), expected);
     assert_eq!(sorted(make().solve_dag_lazy().collect()), expected);
-    assert_eq!(sorted(make().solve_residual_state_lazy().collect()), expected);
+    assert_eq!(
+        sorted(make().solve_residual_state_lazy().collect()),
+        expected
+    );
 }
 
 #[test]
