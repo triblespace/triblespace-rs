@@ -363,11 +363,14 @@ type ProjectionKey = Box<[RawInline]>;
 
 /// The raw relational identity claimed before result conversion.
 ///
-/// Most queries keep an owned set. Rayon promotes that set to one shared
-/// run-owned domain when it creates the first sibling shard; ordinary
-/// `Query::clone` deliberately snapshots either representation back into an
-/// independent owned set.
+/// A full head is injective over complete bindings, whose uniqueness is
+/// already guaranteed by the engine's SET-admitted actions, so it needs no
+/// terminal claim table. Strict projections keep an owned set. Rayon promotes
+/// that set to one shared run-owned domain when it creates the first sibling
+/// shard; ordinary `Query::clone` deliberately snapshots either stored
+/// representation back into an independent owned set.
 enum ProjectionClaims {
+    Elided,
     Owned(AHashSet<ProjectionKey>),
     #[cfg(feature = "parallel")]
     Shared(Arc<Mutex<AHashSet<ProjectionKey>>>),
@@ -413,7 +416,11 @@ impl ProjectionGate {
         }
         Self {
             head: ordered.into(),
-            claims: ProjectionClaims::Owned(AHashSet::new()),
+            claims: if unique == variables {
+                ProjectionClaims::Elided
+            } else {
+                ProjectionClaims::Owned(AHashSet::new())
+            },
             mapper_binding: Some(Box::default()),
         }
     }
@@ -430,14 +437,17 @@ impl ProjectionGate {
 
     /// Whether every possible public key has already been claimed.
     ///
-    /// Only the empty head has a finite singleton key domain known without
-    /// searching. Parallel shards inspect the shared claim set, so one shard's
-    /// claim also stops its siblings at their next pull boundary.
+    /// Only a strict empty head needs a finite singleton claim domain. A full
+    /// zero-variable head is elided: the engine has one semantic seed and
+    /// consumes it before invoking user code. Parallel strict-projection
+    /// shards inspect the shared claim set, so one shard's claim also stops its
+    /// siblings at their next pull boundary.
     fn is_done(&self) -> bool {
         if !self.is_empty_head() {
             return false;
         }
         match &self.claims {
+            ProjectionClaims::Elided => false,
             ProjectionClaims::Owned(claims) => !claims.is_empty(),
             #[cfg(feature = "parallel")]
             ProjectionClaims::Shared(claims) => !claims
@@ -447,10 +457,15 @@ impl ProjectionGate {
         }
     }
 
-    /// Claims a projected raw key before any user conversion or mapper code
-    /// runs. A failed conversion, `None`, or panic therefore cannot cause the
-    /// same relational row to be retried through another witness.
+    /// Admits a complete raw binding before any user conversion or mapper code
+    /// runs. Strict heads claim their projected key here; full heads rely on
+    /// the upstream complete-binding uniqueness invariant. A failed
+    /// conversion, `None`, or panic therefore cannot cause the same relational
+    /// row to be retried through another witness.
     fn claim(&mut self, binding: &Binding) -> bool {
+        if matches!(&self.claims, ProjectionClaims::Elided) {
+            return true;
+        }
         let key: ProjectionKey = self
             .head
             .iter()
@@ -462,6 +477,9 @@ impl ProjectionGate {
             .collect::<Vec<_>>()
             .into_boxed_slice();
         match &mut self.claims {
+            ProjectionClaims::Elided => {
+                unreachable!("elided claims returned before key allocation")
+            }
             ProjectionClaims::Owned(claims) => claims.insert(key),
             #[cfg(feature = "parallel")]
             ProjectionClaims::Shared(claims) => claims
@@ -506,36 +524,50 @@ impl ProjectionGate {
     }
 
     #[cfg(feature = "parallel")]
-    fn share_for_parallel(&mut self) -> Arc<Mutex<AHashSet<ProjectionKey>>> {
+    fn share_for_parallel(&mut self) -> Option<Arc<Mutex<AHashSet<ProjectionKey>>>> {
         match &mut self.claims {
+            ProjectionClaims::Elided => None,
             ProjectionClaims::Owned(claims) => {
                 let shared = Arc::new(Mutex::new(std::mem::take(claims)));
                 self.claims = ProjectionClaims::Shared(Arc::clone(&shared));
-                shared
+                Some(shared)
             }
-            ProjectionClaims::Shared(claims) => Arc::clone(claims),
+            ProjectionClaims::Shared(claims) => Some(Arc::clone(claims)),
         }
     }
 
     #[cfg(feature = "parallel")]
-    fn attach_shared(&mut self, claims: Arc<Mutex<AHashSet<ProjectionKey>>>) {
-        self.claims = ProjectionClaims::Shared(claims);
+    fn attach_shared(
+        &mut self,
+        claims: Option<Arc<Mutex<AHashSet<ProjectionKey>>>>,
+    ) {
+        if let Some(claims) = claims {
+            self.claims = ProjectionClaims::Shared(claims);
+        } else {
+            assert!(
+                matches!(&self.claims, ProjectionClaims::Elided),
+                "parallel projection transfer cannot elide a stored claim domain"
+            );
+        }
     }
 }
 
 impl Clone for ProjectionGate {
     fn clone(&self) -> Self {
         let claims = match &self.claims {
-            ProjectionClaims::Owned(claims) => claims.clone(),
+            ProjectionClaims::Elided => ProjectionClaims::Elided,
+            ProjectionClaims::Owned(claims) => ProjectionClaims::Owned(claims.clone()),
             #[cfg(feature = "parallel")]
-            ProjectionClaims::Shared(claims) => claims
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .clone(),
+            ProjectionClaims::Shared(claims) => ProjectionClaims::Owned(
+                claims
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .clone(),
+            ),
         };
         Self {
             head: self.head.clone(),
-            claims: ProjectionClaims::Owned(claims),
+            claims,
             mapper_binding: self.mapper_binding.clone(),
         }
     }
@@ -2161,8 +2193,11 @@ enum QueryScheduler {
 /// [`Query::residual_lowering`] to select a conservative or intermediate
 /// lowering without changing the scheduler. Fully drained scheduler results
 /// produce the same distinct raw projected-row set; their iteration order may
-/// differ. Projection keys are claimed before Rust conversion, so conversion
-/// failure or panic never retries the same raw row through another witness.
+/// differ. Strict-projection keys are claimed before Rust conversion, so
+/// conversion failure or panic never retries the same raw row through another
+/// witness. Full heads need no terminal claim table: engine action admission
+/// already makes complete raw bindings unique, and a full projection is
+/// injective.
 /// The query engine is designed to be simple and efficient, providing low, consistent,
 /// and predictable latency, skew resistance, and no required (or possible) tuning.
 /// The query engine is designed to be used in combination with the [Constraint] trait,
@@ -2176,8 +2211,8 @@ enum QueryScheduler {
 pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
     constraint: C,
     postprocessing: P,
-    /// Raw projected-row identity and the keys already claimed by this exact
-    /// iterator snapshot.
+    /// Raw strict-projection identity and any keys claimed by this exact
+    /// iterator snapshot. Full heads carry an elided marker instead.
     projection: ProjectionGate,
     scheduler: QueryScheduler,
     /// Structural lowering selected independently from the physical scheduler.
@@ -2473,8 +2508,10 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// skips the current binding and continues the search. The complete set of
     /// variables named by the constraint is the raw SET projection head, so
     /// each byte-identical full binding reaches post-processing at most once.
-    /// The raw binding is claimed before post-processing; `None` or a panic
-    /// consumes that key rather than allowing another occurrence to retry it.
+    /// Because that complete-binding uniqueness is established inside the
+    /// engine, the injective full head needs no terminal claim table. The raw
+    /// binding is consumed before post-processing, so `None` or a panic cannot
+    /// retry it.
     ///
     /// This method is usually not called directly, but rather through the [find!] macro,
     pub fn new(constraint: C, postprocessing: P) -> Self {
@@ -4760,6 +4797,131 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+
+    fn variable_set(indices: impl IntoIterator<Item = VariableId>) -> VariableSet {
+        let mut variables = VariableSet::new_empty();
+        for variable in indices {
+            variables.set(variable);
+        }
+        variables
+    }
+
+    #[test]
+    fn projection_gate_elides_exact_full_head_masks() {
+        let variables = variable_set([0, 3, 7]);
+        let mut full = ProjectionGate::new([0, 3, 7], variables);
+        let reordered = ProjectionGate::new([7, 0, 3], variables);
+
+        assert!(matches!(&full.claims, ProjectionClaims::Elided));
+        assert!(matches!(&reordered.claims, ProjectionClaims::Elided));
+        assert!(matches!(
+            &reordered.clone().claims,
+            ProjectionClaims::Elided
+        ));
+
+        let mut binding = Binding::default();
+        binding.set(0, &[1; 32]);
+        binding.set(3, &[2; 32]);
+        binding.set(7, &[3; 32]);
+        assert!(full.claim(&binding));
+        assert!(
+            full.claim(&binding),
+            "an elided full head must not allocate or consult a terminal key table"
+        );
+
+        #[cfg(feature = "parallel")]
+        {
+            let transfer = full.share_for_parallel();
+            assert!(transfer.is_none());
+            assert!(matches!(&full.claims, ProjectionClaims::Elided));
+            let mut sibling = full.clone();
+            sibling.attach_shared(transfer);
+            assert!(matches!(&sibling.claims, ProjectionClaims::Elided));
+        }
+    }
+
+    #[test]
+    fn projection_gate_keeps_strict_claims_and_snapshots_clones() {
+        let variables = variable_set([0, 1]);
+        let mut strict = ProjectionGate::new([0], variables);
+        assert!(matches!(&strict.claims, ProjectionClaims::Owned(claims) if claims.is_empty()));
+
+        let mut first = Binding::default();
+        first.set(0, &[1; 32]);
+        first.set(1, &[10; 32]);
+        assert!(strict.claim(&first));
+        assert!(!strict.claim(&first));
+
+        let mut snapshot = strict.clone();
+        let mut second = Binding::default();
+        second.set(0, &[2; 32]);
+        second.set(1, &[20; 32]);
+        assert!(strict.claim(&second));
+        assert!(
+            snapshot.claim(&second),
+            "an ordinary clone must own an independent strict-projection snapshot"
+        );
+        assert!(matches!(
+            &snapshot.claims,
+            ProjectionClaims::Owned(claims) if claims.len() == 2
+        ));
+    }
+
+    #[test]
+    fn projection_gate_distinguishes_full_and_strict_zero_heads() {
+        let mut full_zero = ProjectionGate::new([], VariableSet::new_empty());
+        assert!(matches!(&full_zero.claims, ProjectionClaims::Elided));
+        assert!(full_zero.claim(&Binding::default()));
+        assert!(full_zero.claim(&Binding::default()));
+        assert!(!full_zero.is_done());
+
+        let mut strict_zero = ProjectionGate::new([], variable_set([0]));
+        assert!(matches!(
+            &strict_zero.claims,
+            ProjectionClaims::Owned(claims) if claims.is_empty()
+        ));
+        assert!(strict_zero.claim(&Binding::default()));
+        assert!(strict_zero.is_done());
+        assert!(!strict_zero.claim(&Binding::default()));
+        assert!(strict_zero.clone().is_done());
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn projection_gate_snapshots_shared_strict_claims_without_eliding_them() {
+        let variables = variable_set([0, 1]);
+        let mut strict = ProjectionGate::new([0], variables);
+        let mut first = Binding::default();
+        first.set(0, &[1; 32]);
+        first.set(1, &[10; 32]);
+        assert!(strict.claim(&first));
+
+        let transfer = strict
+            .share_for_parallel()
+            .expect("a strict projection has a shared claim domain");
+        assert!(matches!(&strict.claims, ProjectionClaims::Shared(_)));
+        let mut snapshot = strict.clone();
+        assert!(matches!(&snapshot.claims, ProjectionClaims::Owned(_)));
+
+        let mut second = Binding::default();
+        second.set(0, &[2; 32]);
+        second.set(1, &[20; 32]);
+        assert!(strict.claim(&second));
+        assert!(snapshot.claim(&second));
+
+        let mut sibling = snapshot.clone();
+        sibling.attach_shared(Some(transfer));
+        assert!(matches!(&sibling.claims, ProjectionClaims::Shared(_)));
+        assert!(!sibling.claim(&second));
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    #[should_panic(expected = "parallel projection transfer cannot elide")]
+    fn projection_gate_rejects_a_missing_strict_parallel_claim_transfer() {
+        let mut strict = ProjectionGate::new([0], variable_set([0, 1]));
+        strict.attach_shared(None);
+    }
 
     #[test]
     fn scheduler_and_residual_lowering_are_orthogonal_controls() {

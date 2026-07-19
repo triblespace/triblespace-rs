@@ -116,13 +116,20 @@ fn query_new_uses_the_complete_constraint_variable_head() {
     let left = U256BE::inline_from(10u64);
     let right = U256BE::inline_from(20u64);
 
-    let rows = Query::new(
-        and!(head.is(one), or!(witness.is(left), witness.is(right))),
-        move |binding| binding.get(head.index).copied(),
-    )
-    .collect::<Vec<_>>();
+    let make = || {
+        Query::new(
+            and!(head.is(one), or!(witness.is(left), witness.is(right))),
+            move |binding| binding.get(head.index).copied(),
+        )
+    };
 
-    assert_eq!(rows, vec![one.raw, one.raw]);
+    assert_eq!(make().collect::<Vec<_>>(), vec![one.raw, one.raw]);
+    assert_eq!(make().sequential().count(), 2);
+    assert_eq!(make().lazy_dag_scheduler().count(), 2);
+    assert_eq!(make().residual_state_scheduler().count(), 2);
+    assert_eq!(make().solve_dag_lazy().count(), 2);
+    assert_eq!(make().solve_residual_state_lazy().count(), 2);
+    assert_eq!(make().solve_residual_state().len(), 2);
 }
 
 #[test]
@@ -363,6 +370,40 @@ fn rayon_shards_share_one_projection_claim_domain() {
     assert_eq!(
         pool.install(|| make().into_par_residual_state_iter().count()),
         1
+    );
+}
+
+#[cfg(feature = "parallel")]
+#[test]
+fn rayon_full_heads_preserve_every_distinct_complete_binding_without_claims() {
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+    let make = || {
+        let mut context = VariableContext::new();
+        let head = context.next_variable::<U256BE>();
+        let witness = context.next_variable::<U256BE>();
+        let one = U256BE::inline_from(1u64);
+        let alternatives = (0..64)
+            .map(|value| witness.is(U256BE::inline_from(value as u64)))
+            .collect::<Vec<_>>();
+        Query::new(
+            and!(
+                head.is(one),
+                triblespace::core::query::unionconstraint::UnionConstraint::new(alternatives)
+            ),
+            move |binding| binding.get(head.index).copied(),
+        )
+    };
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    assert_eq!(pool.install(|| make().into_par_iter().count()), 64);
+    assert_eq!(pool.install(|| make().into_par_dag_iter().count()), 64);
+    assert_eq!(
+        pool.install(|| make().into_par_residual_state_iter().count()),
+        64
     );
 }
 
