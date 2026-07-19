@@ -5825,6 +5825,26 @@ impl FormulaBatch {
         live
     }
 
+    /// Tries to admit the current conjunction stream at its first shared
+    /// scheduling boundary without opening an immutable affine rope.
+    ///
+    /// A materialized stream is the complete result of one finite Formula
+    /// action, so reverse-stable admission preserves the order observed by
+    /// tail-first scheduling. `false` leaves a deferred occurrence rope
+    /// untouched so its caller can transfer the exact Formula payload to the
+    /// bounded engine SET-admission Program.
+    fn admit_current_and_set_tail_stable(&mut self) -> bool {
+        let parent_count = self.parents.row_count;
+        let FormulaPayloadFrame::And { current } = self
+            .frames
+            .last_mut()
+            .expect("formula payload has no current frame")
+        else {
+            panic!("Formula OR crossed an AND candidate admission boundary")
+        };
+        current.admit_set_tail_stable(parent_count)
+    }
+
     fn append(&mut self, mut other: Self) {
         let left_parents = self.parents.row_count;
         let right_parents = other.parents.row_count;
@@ -7375,10 +7395,18 @@ fn finish_formula_transition(
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
+    reducer_seeds: &mut Vec<FormulaReducerSeed>,
 ) -> Option<ContinuationToken> {
     let candidate = batch.finish();
     finish_formula_candidate_transition(
-        plan, desc, resume, candidate, worklist, interner, stats,
+        plan,
+        desc,
+        resume,
+        candidate,
+        worklist,
+        interner,
+        stats,
+        reducer_seeds,
     )
 }
 
@@ -7386,10 +7414,11 @@ fn finish_formula_candidate_transition(
     plan: &ResidualPlan,
     desc: &StateDesc,
     resume: &FormulaOuterResume,
-    candidate: CandidateBatch,
+    mut candidate: CandidateBatch,
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
+    reducer_seeds: &mut Vec<FormulaReducerSeed>,
 ) -> Option<ContinuationToken> {
     let leaf_count = plan.len();
     let (relevant, checked) = match &resume.verb {
@@ -7402,20 +7431,36 @@ fn finish_formula_candidate_transition(
             (relevant.clone(), checked.with_inserted(resume.occurrence))
         }
     };
+    let successor = StateDesc {
+        bound: desc.bound,
+        phase: ResidualPhase::Candidate {
+            variable: resume.variable,
+            relevant,
+            checked,
+        },
+    };
+    if crosses_candidate_set_boundary(desc, &successor, plan, &interner.formula_pcs) {
+        // A materialized action bag is admitted inline. Deferred output,
+        // including Formula OR's already ordered/distinct rope, crosses the
+        // same bounded idempotent Program so this seam never hides a scan.
+        if !candidate
+            .candidates
+            .admit_set_tail_stable(candidate.parents.row_count)
+        {
+            reducer_seeds.push(FormulaReducerSeed::SetAdmit(SetAdmissionSeed {
+                successor,
+                destination: SetAdmissionDestination::Candidate(candidate),
+            }));
+            return None;
+        }
+    }
     let stride = desc.bound.count();
     let candidate = candidate.compact(stride)?;
     file_with_plan(
         worklist,
         interner,
         plan,
-        StateDesc {
-            bound: desc.bound,
-            phase: ResidualPhase::Candidate {
-                variable: resume.variable,
-                relevant,
-                checked,
-            },
-        },
+        successor,
         StateBucket::Candidates(candidate),
         stats,
     )
@@ -7663,14 +7708,25 @@ fn continue_formula_transition(
         }
     };
     if !complete {
+        let successor = StateDesc {
+            bound: desc.bound,
+            phase: ResidualPhase::Formula { counter },
+        };
+        let mut batch = batch;
+        if crosses_candidate_set_boundary(desc, &successor, plan, &interner.formula_pcs)
+            && !batch.admit_current_and_set_tail_stable()
+        {
+            reducer_seeds.push(FormulaReducerSeed::SetAdmit(SetAdmissionSeed {
+                successor,
+                destination: SetAdmissionDestination::Formula(batch),
+            }));
+            return None;
+        }
         return file_with_plan(
             worklist,
             interner,
             plan,
-            StateDesc {
-                bound: desc.bound,
-                phase: ResidualPhase::Formula { counter },
-            },
+            successor,
             StateBucket::Formula(batch),
             stats,
         );
@@ -7726,7 +7782,16 @@ fn continue_formula_transition(
             unreachable!("ordinary formula completion returned through a support guard")
         }
         Err(resume) => {
-            finish_formula_transition(plan, desc, &resume, batch, worklist, interner, stats)
+            finish_formula_transition(
+                plan,
+                desc,
+                &resume,
+                batch,
+                worklist,
+                interner,
+                stats,
+                reducer_seeds,
+            )
         }
     }
 }
@@ -7771,7 +7836,14 @@ fn finish_formula_or_admission(
                     unreachable!("candidate reducer returned through a support guard")
                 }
                 Err(resume) => finish_formula_transition(
-                    plan, &desc, &resume, batch, worklist, interner, stats,
+                    plan,
+                    &desc,
+                    &resume,
+                    batch,
+                    worklist,
+                    interner,
+                    stats,
+                    reducer_seeds,
                 ),
             }
         }
@@ -7848,7 +7920,14 @@ fn finish_formula_or_emission(
         (Err(resume), FormulaFrameDestination::Root(result)) => {
             let candidate = batch.finish_with_emitted_root(result);
             finish_formula_candidate_transition(
-                plan, &desc, &resume, candidate, worklist, interner, stats,
+                plan,
+                &desc,
+                &resume,
+                candidate,
+                worklist,
+                interner,
+                stats,
+                reducer_seeds,
             )
         }
         (Ok(InternedFormulaSuccessor::Guard { .. }), _) => {
@@ -8252,7 +8331,16 @@ fn finish_formula_action_result(
             unreachable!("candidate action returned through a support guard")
         }
         Err(resume) => {
-            finish_formula_transition(plan, &desc, &resume, batch, worklist, interner, stats)
+            finish_formula_transition(
+                plan,
+                &desc,
+                &resume,
+                batch,
+                worklist,
+                interner,
+                stats,
+                reducer_seeds,
+            )
         }
     }
 }
@@ -18410,6 +18498,400 @@ mod tests {
     }
 
     #[test]
+    fn formula_and_live_filing_set_admits_parent_local_candidates() {
+        let root = IntersectionConstraint::new(vec![
+            Box::new(CapabilityLeaf {
+                variable: 0,
+                page_local: false,
+            }) as ShapeConstraint,
+            Box::new(CapabilityLeaf {
+                variable: 0,
+                page_local: true,
+            }),
+            Box::new(CapabilityLeaf {
+                variable: 0,
+                page_local: true,
+            }),
+        ]);
+        let plan = ResidualPlan::compile_lowering(
+            &root,
+            ResidualLowering::new(FormulaScope::WholeRoot, false),
+        );
+        let program = &plan.finite_formula;
+        let formula_root = program.root(0).expect("synthetic formula has a root");
+        let mut interner = StateInterner::default();
+        let relevant = ChildSet::empty(plan.len()).with_inserted(0);
+        let start = interner.start_formula(
+            program,
+            0,
+            0,
+            UnionVerb::Propose {
+                relevant: relevant.clone(),
+            },
+        );
+        let action = interner
+            .formula_pcs
+            .select_child_as_action(program, start, 0);
+        let completed = interner.formula_pcs.complete(program, action);
+        let Ok(InternedFormulaSuccessor::Formula(next)) =
+            interner.formula_pcs.resume_completed(program, completed)
+        else {
+            panic!("the root proposer did not return to its AND suffix")
+        };
+        let previous = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Formula { counter: action },
+        };
+        let successor = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Formula { counter: next },
+        };
+        assert!(crosses_candidate_set_boundary(
+            &previous,
+            &successor,
+            &plan,
+            &interner.formula_pcs,
+        ));
+
+        let mut batch = FormulaBatch::from_proposal(
+            RowBatch {
+                rows: Vec::new(),
+                row_count: 2,
+            },
+            vec![ActivationId(0), ActivationId(1)],
+            &program.node(formula_root).kind,
+        );
+        batch.apply_action_result(
+            FormulaStage::Propose,
+            candidate_payload(
+                2,
+                vec![
+                    (0, raw(1)),
+                    (0, raw(2)),
+                    (0, raw(1)),
+                    (1, raw(1)),
+                    (1, raw(1)),
+                    (1, raw(3)),
+                ],
+            ),
+        );
+        let mut worklist = Worklist::new();
+        let mut stats = ResidualStateStats {
+            candidates_proposed: 6,
+            ..ResidualStateStats::default()
+        };
+        let mut reducer_seeds = Vec::new();
+        let continuation = continue_formula_transition(
+            &plan,
+            &previous,
+            next,
+            batch,
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+            &mut reducer_seeds,
+        )
+        .expect("the live AND suffix was not filed");
+        assert!(reducer_seeds.is_empty());
+        assert_eq!(interner.get(continuation.state), &successor);
+        let StateBucket::Formula(filed) = worklist
+            .get(&continuation.rank)
+            .and_then(|level| level.get(&continuation.state))
+            .expect("the continuation receipt lost its formula batch")
+        else {
+            panic!("the Formula continuation filed the wrong payload shape")
+        };
+        assert_eq!(
+            filed.input().iter().collect::<Vec<_>>(),
+            [
+                (0, raw(2)),
+                (0, raw(1)),
+                (1, raw(1)),
+                (1, raw(3)),
+            ],
+            "tail order is stable, duplicates are parent-local, and equal values under distinct parents survive",
+        );
+
+        let raw_occurrences = vec![
+            (0, raw(1)),
+            (0, raw(2)),
+            (0, raw(1)),
+            (1, raw(1)),
+            (1, raw(1)),
+            (1, raw(3)),
+        ];
+        let mut deferred = FormulaBatch::from_proposal(
+            RowBatch {
+                rows: Vec::new(),
+                row_count: 2,
+            },
+            vec![ActivationId(2), ActivationId(3)],
+            &program.node(formula_root).kind,
+        );
+        deferred.apply_action_result(
+            FormulaStage::Propose,
+            deferred_candidate_payload(2, raw_occurrences.clone()),
+        );
+        let mut deferred_worklist = Worklist::new();
+        let mut deferred_seeds = Vec::new();
+        assert!(continue_formula_transition(
+            &plan,
+            &previous,
+            next,
+            deferred,
+            &mut deferred_worklist,
+            &mut interner,
+            &mut stats,
+            &mut deferred_seeds,
+        )
+        .is_none());
+        assert!(
+            deferred_worklist.is_empty(),
+            "a segmented occurrence bag became independently schedulable before SET admission"
+        );
+        let [FormulaReducerSeed::SetAdmit(SetAdmissionSeed {
+            successor: queued,
+            destination: SetAdmissionDestination::Formula(queued_batch),
+        })] = deferred_seeds.as_slice()
+        else {
+            panic!("the deferred Formula boundary did not queue one exact SET admission")
+        };
+        assert_eq!(queued, &successor);
+        assert!(matches!(queued_batch.input(), CandidatePayload::Deferred(_)));
+        assert_eq!(
+            queued_batch.input().iter().collect::<Vec<_>>(),
+            raw_occurrences,
+            "queueing bounded admission must not materialize or mutate its occurrence rope",
+        );
+
+        let mut scheduler = DeltaScheduler::new();
+        let seeded = scheduler.seed_formula_reducers(
+            deferred_seeds,
+            &plan,
+            &mut deferred_worklist,
+            &mut interner,
+            &mut stats,
+        );
+        assert!(seeded.active.is_some());
+        assert!(
+            deferred_worklist.is_empty(),
+            "SET admission exposed a partial Formula relation before EOF"
+        );
+        for _ in 0..32 {
+            if scheduler.is_empty() {
+                break;
+            }
+            let _ = scheduler.step(
+                &root,
+                &plan,
+                1,
+                &mut deferred_worklist,
+                &mut interner,
+                &mut stats,
+            );
+        }
+        assert!(scheduler.is_empty(), "unit grants did not drain SET admission");
+        let StateBucket::Formula(admitted) = deferred_worklist
+            .values()
+            .flat_map(BTreeMap::values)
+            .next()
+            .expect("SET admission failed to file the saved Formula successor")
+        else {
+            panic!("SET admission returned the wrong Formula payload shape")
+        };
+        assert!(matches!(admitted.input(), CandidatePayload::Deferred(_)));
+        let mut by_activation: BTreeMap<ActivationId, Vec<RawInline>> = BTreeMap::new();
+        for (parent, candidate) in admitted.input().iter() {
+            by_activation
+                .entry(admitted.activations[parent as usize])
+                .or_default()
+                .push(candidate);
+        }
+        assert_eq!(
+            by_activation[&ActivationId(2)],
+            [raw(2), raw(1)],
+            "the first affine activation lost its parent-local tail order",
+        );
+        assert_eq!(
+            by_activation[&ActivationId(3)],
+            [raw(1), raw(3)],
+            "the second affine activation lost its parent-local tail order",
+        );
+        assert_eq!(
+            stats.candidates_proposed, 6,
+            "SET admission must not rewrite raw Formula action telemetry",
+        );
+    }
+
+    #[test]
+    fn formula_outer_candidate_return_set_admits_before_commit() {
+        let root = IntersectionConstraint::new(vec![
+            Box::new(CapabilityLeaf {
+                variable: 0,
+                page_local: false,
+            }) as ShapeConstraint,
+            Box::new(CapabilityLeaf {
+                variable: 0,
+                page_local: false,
+            }),
+        ]);
+        let plan = ResidualPlan::compile_lowering(
+            &root,
+            ResidualLowering::new(FormulaScope::WholeRoot, false),
+        );
+        let program = &plan.finite_formula;
+        let mut interner = StateInterner::default();
+        let relevant = ChildSet::empty(plan.len()).with_inserted(0);
+        let start = interner.start_formula(
+            program,
+            0,
+            0,
+            UnionVerb::Propose {
+                relevant: relevant.clone(),
+            },
+        );
+        let proposer = interner
+            .formula_pcs
+            .select_child_as_action(program, start, 0);
+        let proposer_complete = interner.formula_pcs.complete(program, proposer);
+        let Ok(InternedFormulaSuccessor::Formula(confirm_plan)) = interner
+            .formula_pcs
+            .resume_completed(program, proposer_complete)
+        else {
+            panic!("the root proposer did not return to confirmation planning")
+        };
+        let confirmer = interner
+            .formula_pcs
+            .select_child_as_action(program, confirm_plan, 1);
+        let previous = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Formula { counter: confirmer },
+        };
+        let resume = interner.formula_resume(confirmer).clone();
+        let outer = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Candidate {
+                variable: 0,
+                relevant: relevant.clone(),
+                checked: relevant,
+            },
+        };
+        assert!(crosses_candidate_set_boundary(
+            &previous,
+            &outer,
+            &plan,
+            &interner.formula_pcs,
+        ));
+
+        let candidate = CandidateBatch {
+            parents: RowBatch {
+                rows: Vec::new(),
+                row_count: 2,
+            },
+            candidates: candidate_payload(
+                2,
+                vec![
+                    (0, raw(4)),
+                    (0, raw(5)),
+                    (0, raw(4)),
+                    (1, raw(4)),
+                    (1, raw(6)),
+                    (1, raw(4)),
+                ],
+            ),
+        };
+        let mut worklist = Worklist::new();
+        let mut stats = ResidualStateStats {
+            candidates_confirmed: 6,
+            ..ResidualStateStats::default()
+        };
+        let mut reducer_seeds = Vec::new();
+        let continuation = finish_formula_candidate_transition(
+            &plan,
+            &previous,
+            &resume,
+            candidate,
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+            &mut reducer_seeds,
+        )
+        .expect("the outer Formula result was not filed");
+        assert!(reducer_seeds.is_empty());
+        assert_eq!(interner.get(continuation.state), &outer);
+        let StateBucket::Candidates(filed) = worklist
+            .get(&continuation.rank)
+            .and_then(|level| level.get(&continuation.state))
+            .expect("the continuation receipt lost its candidate batch")
+        else {
+            panic!("the outer Formula result filed the wrong payload shape")
+        };
+        assert_eq!(
+            filed.candidates.iter().collect::<Vec<_>>(),
+            [
+                (0, raw(5)),
+                (0, raw(4)),
+                (1, raw(6)),
+                (1, raw(4)),
+            ],
+        );
+
+        let raw_occurrences = vec![
+            (0, raw(4)),
+            (0, raw(5)),
+            (0, raw(4)),
+            (1, raw(4)),
+            (1, raw(6)),
+            (1, raw(4)),
+        ];
+        let deferred = CandidateBatch {
+            parents: RowBatch {
+                rows: Vec::new(),
+                row_count: 2,
+            },
+            candidates: deferred_candidate_payload(2, raw_occurrences.clone()),
+        };
+        let mut deferred_worklist = Worklist::new();
+        let mut deferred_seeds = Vec::new();
+        assert!(finish_formula_candidate_transition(
+            &plan,
+            &previous,
+            &resume,
+            deferred,
+            &mut deferred_worklist,
+            &mut interner,
+            &mut stats,
+            &mut deferred_seeds,
+        )
+        .is_none());
+        assert!(
+            deferred_worklist.is_empty(),
+            "a segmented outer result was filed before SET admission"
+        );
+        let [FormulaReducerSeed::SetAdmit(SetAdmissionSeed {
+            successor: queued,
+            destination: SetAdmissionDestination::Candidate(queued_batch),
+        })] = deferred_seeds.as_slice()
+        else {
+            panic!("the deferred outer boundary did not queue one exact SET admission")
+        };
+        assert_eq!(queued, &outer);
+        assert!(matches!(
+            queued_batch.candidates,
+            CandidatePayload::Deferred(_)
+        ));
+        assert_eq!(
+            queued_batch.candidates.iter().collect::<Vec<_>>(),
+            raw_occurrences,
+            "queueing bounded admission must not compact or mutate its occurrence rope",
+        );
+        assert_eq!(
+            stats.candidates_confirmed, 6,
+            "SET admission must not rewrite raw Formula action telemetry",
+        );
+    }
+
+    #[test]
     fn page_local_candidate_state_uses_candidate_occupancy_and_keeps_remainder_live() {
         let root = IntersectionConstraint::new(vec![
             CapabilityLeaf {
@@ -19997,7 +20479,11 @@ mod tests {
         synthetic.sort_unstable();
         assert_eq!(synthetic, residual);
         assert_eq!(*synthetic_whole_calls.lock().unwrap(), [4]);
-        assert_eq!(*synthetic_page_calls.lock().unwrap(), [1, 1]);
+        assert_eq!(
+            *synthetic_page_calls.lock().unwrap(),
+            [1],
+            "the Formula whole-group action preserves its raw bag, then admits the relation before the page-local suffix",
+        );
     }
 
     #[test]
