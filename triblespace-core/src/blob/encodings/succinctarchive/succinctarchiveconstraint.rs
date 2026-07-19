@@ -1412,6 +1412,22 @@ where
         variables
     }
 
+    fn fixed_denotation(&self) -> bool {
+        true
+    }
+
+    fn proposal_coverage(
+        &self,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> ProposalCoverage {
+        if !bound.is_set(variable) && self.variables().is_set(variable) {
+            ProposalCoverage::Exact
+        } else {
+            ProposalCoverage::None
+        }
+    }
+
     /// Per-row rank probes with the arm dispatch hoisted out of the row
     /// loop. Batching the resulting rank stream is possible exactly like
     /// confirm's and remains deferred — it only changes constants, not calls.

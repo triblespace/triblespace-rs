@@ -32,7 +32,7 @@ use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::query::{
     finiteunaryprogram, CandidateSink, Constraint, DispatchClass, EstimateSink, ProgramAction,
     ProgramCompletion, ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef, ProgramRequest,
-    ProgramRoute, ProgramSeedBatch, ProgramStratum, ResidualDeltaOutput,
+    ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage, ResidualDeltaOutput,
     ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, TypedEffectSink,
     TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink, Variable, VariableId,
     VariableSet,
@@ -424,6 +424,22 @@ where
 {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.doc.index)
+    }
+
+    fn fixed_denotation(&self) -> bool {
+        true
+    }
+
+    fn proposal_coverage(
+        &self,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> ProposalCoverage {
+        if variable == self.doc.index && !bound.is_set(variable) {
+            ProposalCoverage::Exact
+        } else {
+            ProposalCoverage::None
+        }
     }
 
     fn estimate(
@@ -854,6 +870,10 @@ impl<I: CosineSimilarity + ?Sized> TypedProgramSpec for CosineAtLeast<'_, I> {
 impl<'a, I: CosineSimilarity + ?Sized + 'a> Constraint<'a> for CosineAtLeast<'a, I> {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.a.index).union(VariableSet::new_singleton(self.b.index))
+    }
+
+    fn fixed_denotation(&self) -> bool {
+        true
     }
 
     fn estimate(
@@ -2135,6 +2155,35 @@ mod tests {
                 .solve_residual_state_lazy_with(ResidualLowering::FULL)
                 .next()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn semantic_receipts_keep_exact_search_separate_from_ann() {
+        let variable = Variable::<Handle<Embedding>>::new(0);
+        let bm25 = BM25Filter::from_entries(variable, Vec::<RawInline>::new());
+        assert!(bm25.fixed_denotation());
+        assert_eq!(
+            bm25.proposal_coverage(variable.index, VariableSet::new_empty()),
+            ProposalCoverage::Exact
+        );
+
+        let similar = SimilarTo::from_candidates(variable, Vec::new());
+        assert!(!similar.fixed_denotation());
+        assert_eq!(
+            similar.proposal_coverage(variable.index, VariableSet::new_empty()),
+            ProposalCoverage::None
+        );
+
+        let (flat, _hnsw, mut store, _handles) = sample_sim();
+        let reader = store.reader().unwrap();
+        let view = flat.attach(&reader);
+        let peer = Variable::<Handle<Embedding>>::new(1);
+        let cosine = view.cosine_at_least(variable, peer, 0.5);
+        assert!(cosine.fixed_denotation());
+        assert_eq!(
+            cosine.proposal_coverage(variable.index, VariableSet::new_empty()),
+            ProposalCoverage::None
         );
     }
 }

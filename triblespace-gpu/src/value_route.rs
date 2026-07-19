@@ -76,7 +76,7 @@ use triblespace_core::query::{
     CandidateSink, Constraint, ConstraintChildren, ConstraintShape, DispatchClass, EstimateSink,
     PreferredProgram, ProgramAction, ProgramCompletion, ProgramGrouping, ProgramKey, ProgramPacing,
     ProgramPhysicalReceipt, ProgramRef, ProgramRequest, ProgramRoute, ProgramSeedBatch,
-    ProgramStratum, RawTerm, ResidualDeltaExpandBatch, ResidualDeltaExpandCursor,
+    ProgramStratum, ProposalCoverage, RawTerm, ResidualDeltaExpandBatch, ResidualDeltaExpandCursor,
     ResidualDeltaExpandPage, ResidualDeltaNode, ResidualDeltaOutput, ResidualDeltaSeed,
     ResidualDeltaSourceBatch, ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, Term,
     TriblePattern, TypedEffectSink, TypedPhysicalStep, TypedProgramBatch, TypedProgramSpec,
@@ -1471,6 +1471,20 @@ where
 {
     fn variables(&self) -> VariableSet {
         self.program.canonical().variables()
+    }
+
+    fn fixed_denotation(&self) -> bool {
+        self.program.canonical().fixed_denotation()
+    }
+
+    fn proposal_coverage(
+        &self,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> ProposalCoverage {
+        self.program
+            .canonical()
+            .proposal_coverage(variable, bound)
     }
 
     fn estimate(

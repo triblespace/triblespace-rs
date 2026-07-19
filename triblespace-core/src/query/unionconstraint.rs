@@ -79,6 +79,33 @@ where
         self.constraints[0].variables()
     }
 
+    /// A union has one fixed relation only when every arm does.
+    fn fixed_denotation(&self) -> bool {
+        self.constraints.iter().all(Constraint::fixed_denotation)
+    }
+
+    /// Every potentially live arm must cover the target. The union receipt is
+    /// therefore the meet of its arm receipts: one `None` arm removes source
+    /// eligibility, all-`Exact` remains exact, and every other complete mix is
+    /// covering.
+    fn proposal_coverage(
+        &self,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> ProposalCoverage {
+        if !self.fixed_denotation()
+            || bound.is_set(variable)
+            || !self.variables().is_set(variable)
+        {
+            return ProposalCoverage::None;
+        }
+        self.constraints
+            .iter()
+            .map(|constraint| constraint.proposal_coverage(variable, bound))
+            .min()
+            .unwrap_or(ProposalCoverage::None)
+    }
+
     /// Appends the elementwise **sum** of estimates across all variants.
     /// A union can produce candidates from any branch, so the
     /// cardinalities add.

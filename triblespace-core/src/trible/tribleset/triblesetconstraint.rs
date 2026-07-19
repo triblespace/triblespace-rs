@@ -24,6 +24,7 @@ use crate::query::ProgramRequest;
 use crate::query::ProgramRoute;
 use crate::query::ProgramSeedBatch;
 use crate::query::ProgramStratum;
+use crate::query::ProposalCoverage;
 use crate::query::RawTerm;
 use crate::query::ResidualDeltaOutput;
 use crate::query::ResidualDeltaSourceCursor;
@@ -1327,6 +1328,22 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
         self.term_a.add_to(&mut variables);
         self.term_v.add_to(&mut variables);
         variables
+    }
+
+    fn fixed_denotation(&self) -> bool {
+        true
+    }
+
+    fn proposal_coverage(
+        &self,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> ProposalCoverage {
+        if !bound.is_set(variable) && self.variables().is_set(variable) {
+            ProposalCoverage::Exact
+        } else {
+            ProposalCoverage::None
+        }
     }
 
     /// One [`segmented_len`](crate::patch::PATCH::segmented_len) count per

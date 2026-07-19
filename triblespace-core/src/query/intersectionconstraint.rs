@@ -57,6 +57,39 @@ where
             .fold(VariableSet::new_empty(), |vs, c| vs.union(c.variables()))
     }
 
+    /// A conjunction has one fixed relation only when every child does.
+    fn fixed_denotation(&self) -> bool {
+        self.constraints.iter().all(Constraint::fixed_denotation)
+    }
+
+    /// Any covering relevant child is a complete source for an intersection:
+    /// the joint fiber is a subset of that child's fiber. A multi-child
+    /// conjunction is not generally exact even when its source is exact,
+    /// because the remaining children can eliminate proposed values.
+    fn proposal_coverage(
+        &self,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> ProposalCoverage {
+        if !self.fixed_denotation()
+            || bound.is_set(variable)
+            || !self.variables().is_set(variable)
+        {
+            return ProposalCoverage::None;
+        }
+        if let [constraint] = self.constraints.as_slice() {
+            return constraint.proposal_coverage(variable, bound);
+        }
+        self.constraints
+            .iter()
+            .filter(|constraint| constraint.variables().is_set(variable))
+            .any(|constraint| {
+                constraint.proposal_coverage(variable, bound) >= ProposalCoverage::Covering
+            })
+            .then_some(ProposalCoverage::Covering)
+            .unwrap_or(ProposalCoverage::None)
+    }
+
     /// Pushes the elementwise **minimum** estimate across children that
     /// constrain `variable`. The tightest child bounds the search per
     /// row, reflecting the intersection semantics: every child must

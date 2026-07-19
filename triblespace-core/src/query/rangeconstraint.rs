@@ -218,6 +218,10 @@ impl<'a> Constraint<'a> for InlineRange {
         VariableSet::new_singleton(self.variable)
     }
 
+    fn fixed_denotation(&self) -> bool {
+        true
+    }
+
     /// Estimates `usize::MAX` so the intersection never chooses this
     /// constraint as the proposer — it only confirms.
     fn estimate(

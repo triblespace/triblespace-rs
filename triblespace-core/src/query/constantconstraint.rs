@@ -216,6 +216,22 @@ impl<'a> Constraint<'a> for ConstantConstraint {
         VariableSet::new_singleton(self.variable)
     }
 
+    fn fixed_denotation(&self) -> bool {
+        true
+    }
+
+    fn proposal_coverage(
+        &self,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> ProposalCoverage {
+        if variable == self.variable && !bound.is_set(variable) {
+            ProposalCoverage::Exact
+        } else {
+            ProposalCoverage::None
+        }
+    }
+
     /// Always estimates exactly one candidate, for every row.
     fn estimate(
         &self,
