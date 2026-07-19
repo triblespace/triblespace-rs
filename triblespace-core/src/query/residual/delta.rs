@@ -6819,7 +6819,9 @@ mod tests {
 
     use rand::{rngs::StdRng, Rng, SeedableRng};
 
-    use crate::query::unionconstraint::UnionConstraint;
+    use crate::query::{
+        intersectionconstraint::IntersectionConstraint, unionconstraint::UnionConstraint,
+    };
 
     use super::*;
 
@@ -8880,14 +8882,31 @@ mod tests {
             0,
             UnionVerb::Propose { relevant },
         );
-        let counter =
-            stable_interner
-                .formula_pcs
-                .select_child_as_action(&plan.finite_formula, counter, 0);
         let root = plan
             .finite_formula
             .root(0)
             .expect("the synthetic root has a formula program");
+        let FiniteFormulaNodeKind::And { children } = &plan.finite_formula.node(root).kind
+        else {
+            panic!("the streaming fixture requires a linear AND root")
+        };
+        assert_eq!(children.len(), 2);
+        let counter = stable_interner
+            .formula_pcs
+            .skip_child(&plan.finite_formula, counter, 1);
+        let counter =
+            stable_interner
+                .formula_pcs
+                .select_child_as_action(&plan.finite_formula, counter, 0);
+        assert_eq!(
+            plan.interned_formula_proposal_streamability(
+                &stable_interner.formula_pcs,
+                counter,
+                VariableSet::new_empty(),
+            ),
+            FormulaProposalStreamability::Linear,
+            "the streaming fixture constructed an impossible production state"
+        );
         DeltaReturn::Formula {
             bound: VariableSet::new_empty(),
             counter,
@@ -11724,17 +11743,18 @@ mod tests {
 
     #[test]
     fn batched_delta_step_keeps_dead_page_and_seeded_formula_handoff_independent() {
-        // Keep a real formula boundary in this white-box fixture. A lone
-        // opaque root is deliberately normalized to the flat action plan.
-        let root = UnionConstraint::new(vec![MixedExpansion]);
+        // Keep a real, streamable formula boundary in this white-box fixture.
+        // A lone opaque root is deliberately normalized to the flat action
+        // plan, while an OR frame is a streaming barrier by construction.
+        let root = IntersectionConstraint::new(vec![MixedExpansion, MixedExpansion]);
         let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
         let formula_root = plan
             .finite_formula
             .root(0)
-            .expect("the union root has a formula program");
-        let FiniteFormulaNodeKind::Or { children } = &plan.finite_formula.node(formula_root).kind
+            .expect("the intersection root has a formula program");
+        let FiniteFormulaNodeKind::And { children } = &plan.finite_formula.node(formula_root).kind
         else {
-            panic!("the union root did not compile as OR")
+            panic!("the intersection root did not compile as AND")
         };
         let desc = DeltaDesc::formula(0, 0, children[0]);
         let mut scheduler = DeltaScheduler::new();
