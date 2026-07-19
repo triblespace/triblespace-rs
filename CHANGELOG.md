@@ -45,6 +45,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The residual delta handoff regression now constructs a reachable Formula
+  state.** Its streaming proposal runs through a certified linear AND suffix
+  with the irrelevant sibling already skipped, rather than manually placing a
+  streaming reducer beneath an OR barrier that the production planner cannot
+  cross.
 - **Search and core now share one Jerky crate identity.** The search crate is
   pinned to the same Jerky revision as core and GPU, restoring its succinct
   build and preventing `Serializable` methods from disappearing behind two
