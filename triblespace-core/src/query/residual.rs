@@ -2136,7 +2136,10 @@ pub(super) fn seed_survives<'a>(
 impl ResidualLowering {
     /// Conservative residual lowering used by explicit probe solvers.
     pub const CONSERVATIVE: Self = Self::new(FormulaScope::OpaqueLeaves, false);
-    /// Full formula and transition-program lowering used by ordinary queries.
+    /// Production lowering: retain fused formula kernels while enabling
+    /// heterogeneous transition programs such as regular-path execution.
+    pub const HYBRID: Self = Self::new(FormulaScope::OpaqueLeaves, true);
+    /// Maximally exposed formula and transition-program lowering.
     pub const FULL: Self = Self::new(FormulaScope::WholeRoot, true);
 
     /// Constructs one of the six canonical lowering forms.
@@ -12402,7 +12405,7 @@ mod parallel {
         /// independent shard atoms.
         ///
         /// The iterator preserves the query's selected [`ResidualLowering`].
-        /// Fresh queries use [`ResidualLowering::FULL`] by default; an explicit
+        /// Fresh queries use [`ResidualLowering::HYBRID`] by default; an explicit
         /// [`Query::residual_lowering`] override remains in force.
         ///
         /// # Panics
@@ -12781,6 +12784,10 @@ mod tests {
 
         assert_eq!(forms.len(), 6);
         assert_eq!(ResidualLowering::default(), ResidualLowering::CONSERVATIVE);
+        assert_eq!(
+            ResidualLowering::HYBRID,
+            ResidualLowering::new(FormulaScope::OpaqueLeaves, true)
+        );
         assert_eq!(
             ResidualLowering::FULL,
             ResidualLowering::new(FormulaScope::WholeRoot, true)
@@ -20626,7 +20633,7 @@ mod tests {
 
     #[cfg(feature = "parallel")]
     #[test]
-    fn ordinary_query_clone_snapshots_parked_formula_remainder() {
+    fn full_lowering_query_clone_snapshots_parked_formula_remainder() {
         let values: Vec<_> = (0..64).map(raw).collect();
         let root = Arc::new(IntersectionConstraint::new(vec![
             Box::new(FanoutLeaf {
@@ -20640,7 +20647,8 @@ mod tests {
                 calls: Arc::new(Mutex::new(Vec::new())),
             }) as ShapeConstraint,
         ]));
-        let mut query = Query::new(root, |binding: &Binding| binding.get(0).copied());
+        let mut query = Query::new(root, |binding: &Binding| binding.get(0).copied())
+            .residual_lowering(ResidualLowering::FULL);
 
         let first = query.next().expect("the formula frontier is nonempty");
         let runtime = query.residual.as_deref().expect("residual cursor started");

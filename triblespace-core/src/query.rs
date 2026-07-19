@@ -2499,13 +2499,14 @@ enum QueryScheduler {
 /// A query is an iterator over the results of a query.
 /// It takes a constraint and a post-processing function as input,
 /// and returns the results of the query as a stream of values.
-/// On this full-switch probe, every live fresh ordinary iterator uses canonical
+/// Every live fresh ordinary iterator uses canonical
 /// residual states. It starts with narrow, depth-first action cohorts and
 /// widens as the consumer keeps pulling, while histories with identical future
-/// computation can reconverge under one state identity. Its root runs as one
-/// finite AND/OR formula and eligible regular-path transition programs execute
-/// inside that formula; unsupported custom programs remain ordinary opaque
-/// constraint actions. Seed-rejected queries start no runtime. Use
+/// computation can reconverge under one state identity. The production
+/// lowering keeps finite formula boundaries as fused constraint kernels while
+/// eligible regular-path transition programs execute as heterogeneous state
+/// actions; unsupported custom programs remain ordinary opaque constraint
+/// actions. Seed-rejected queries start no runtime. Use
 /// [`Query::lazy_dag_scheduler`] for the bound-variable-set DAG control and
 /// [`Query::sequential`] for the scalar depth-first specialization. The
 /// Scheduler selection and structural lowering are independent controls; use
@@ -2825,7 +2826,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
 
     /// Select structural lowering independently from the physical scheduler.
     ///
-    /// Ordinary live queries start with [`residual::ResidualLowering::FULL`].
+    /// Ordinary live queries start with [`residual::ResidualLowering::HYBRID`].
     /// Explicit scheduler comparisons can request
     /// [`residual::ResidualLowering::CONSERVATIVE`] or any intermediate form
     /// without changing their scheduler.
@@ -2979,7 +2980,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             postprocessing,
             projection,
             scheduler,
-            residual_lowering: residual::ResidualLowering::FULL,
+            residual_lowering: residual::ResidualLowering::HYBRID,
             certified_denotation,
             mode,
             iteration_started: false,
@@ -5352,7 +5353,10 @@ mod tests {
         let variable = context.next_variable::<U256BE>();
         let ordinary = Query::new(variable.is(U256BE::inline_from(1u64)), |_| Some(()));
         assert_eq!(ordinary.scheduler, QueryScheduler::ResidualState);
-        assert_eq!(ordinary.residual_lowering, residual::ResidualLowering::FULL);
+        assert_eq!(
+            ordinary.residual_lowering,
+            residual::ResidualLowering::HYBRID
+        );
 
         let conservative = ordinary
             .residual_lowering(residual::ResidualLowering::CONSERVATIVE)

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Ordinary residual queries now use hybrid structural lowering.** Finite
+  logical composites stay fused behind their certified constraint kernels,
+  while typed transition Programs such as regular-path execution remain
+  enabled. `ResidualLowering::FULL` remains the explicit maximally exposed
+  formula interpreter; `ResidualLowering::HYBRID` is the production default.
 - **Cyclic Confirm actions now cross the same parent-local SET boundary as
   ordinary actions.** Graph traversal retains the immutable original
   occurrence bag and raw confirmation telemetry until its complete result
@@ -432,7 +437,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   root conjunction, and preserves opaque scope and group-reducer boundaries.
   Root-AND confirmations retain candidate-occurrence paging once the exact
   remaining suffix is page-local, including width-one and geometric
-  first-result traces. Ordinary live queries use `ResidualLowering::FULL`;
+  first-result traces. Ordinary live queries use `ResidualLowering::HYBRID`;
   explicit residual probe solvers remain conservative by default.
 - **WGPU Succinct confirmation can opt into exact residual-action executor
   samples.** `WgpuSuccinctArchive::observe_residual_actions()` returns a
