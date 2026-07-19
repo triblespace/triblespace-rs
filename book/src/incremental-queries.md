@@ -63,6 +63,21 @@ Because each variant touches only one triple from the changed set, the work
 grows with the number of constraints and the size of the delta
 rather than the size of the full dataset.
 
+`find!` applies its normal SET projection to the union of variants. If several
+changed triples or several restricted variants prove the same ordered raw head
+tuple during one `pattern_changes!` query, that tuple is returned once. Hidden
+variables remain existential witnesses and do not multiply the projected
+answer.
+
+The claim domain belongs to one query invocation, not to the lifetime of an
+incremental stream. A later delta can therefore return the same projected tuple
+again when a newly added fact supplies a new proof. This reports support that
+is new in that delta; it does not claim the tuple was absent from all earlier
+results. Applications that need global once-only delivery should retain the
+projected keys they have already consumed (for example in a set), while
+applications that need distinct witness events should project the relevant
+witness identity explicitly.
+
 ## Monotonicity and CALM
 
 Removed results are not tracked. Tribles follow the

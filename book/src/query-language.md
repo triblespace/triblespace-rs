@@ -30,6 +30,14 @@ let results = find!((a), a.is(1.into())).collect::<Vec<_>>();
 variables. Matches can be consumed lazily or collected into common
 collections.
 
+The head is an ordered relational projection with **SET semantics**. The
+engine emits each distinct tuple of raw inline head values at most once,
+regardless of how many assignments of hidden variables prove it. Distinctness
+uses the raw inline bytes before Rust conversion, so different raw values that
+convert to equal Rust values remain different projected rows. Conversely, a
+conversion failure claims that raw tuple before filtering it: another hidden
+witness for the same tuple does not retry the conversion.
+
 When the head declares a **single variable**, omit the parentheses to get bare
 values instead of 1-tuples:
 
@@ -89,8 +97,18 @@ find!((x: i32, y: Inline<ShortString>?),
 | `name?` | inferred type, yield `Result<T, E>` (no filter) |
 | `name: Type?` | explicit type, yield `Result<T, E>` (no filter) |
 
-The query engine walks all possible assignments that satisfy the constraint and
-yields tuples of the declared variables in the order they appear in the head.
+The query engine explores assignments that satisfy the constraint and yields
+each distinct tuple of the declared variables in head order. Variables omitted
+from the head are existential witnesses: they affect whether a tuple exists,
+not how many times it is returned. A repeated variable in the head is rejected
+because it would not add a new projected column.
+
+The empty head `find!((), constraint)` therefore yields at most one `()`—one
+when any assignment satisfies the body, and none otherwise. It is an existence
+projection rather than a way to count satisfying assignments. Once its single
+raw key is claimed, iteration stops without draining additional hidden
+witnesses; this remains true when conversion or mapper code rejects or panics
+on that key.
 
 ### Collecting results
 
@@ -209,9 +227,9 @@ find!((alias: Inline<_>),
 ```
 
 Each branch contributes every match it can produce given the current bindings.
-In the example above, people who have both a nickname and a display name yield
-two rows—one for each attribute—because the solver keeps the union of all
-solutions to preserve the query's monotonic semantics. Branches that cannot
+The example projects each distinct alias once. A nickname and display name with
+different raw values contribute two aliases; equal values collapse, as do the
+same alias values witnessed by different hidden entities. Branches that cannot
 match simply contribute nothing.
 
 All branches of an `or!` must bind exactly the same set of variables;
@@ -258,6 +276,10 @@ schemas implied by the constraints they appear in, so no extra annotations are
 required. When working outside the query macros, call
 [`VariableContext::next_variable`](triblespace::core::query::VariableContext::next_variable)
 directly instead.
+
+Because temporary variables are not part of the projection head, several
+friends that prove the same projected `person` still produce that person once.
+Project the witness explicitly when its identity belongs in the result.
 
 When the helper variable lives entirely within a single pattern, consider using
 `_?alias` instead of `temp!`. Both [`pattern!`](triblespace::core::macros::pattern) and

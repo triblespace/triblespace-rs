@@ -270,12 +270,12 @@ fn assert_query_shape<'a, FS, FA, CS, CA, const N: usize>(
         assert_eq!(
             collect_sorted(make_set(), variables, scheduler),
             baseline,
-            "{name}/{scheduler:?}: TribleSet scheduler changed the result bag",
+            "{name}/{scheduler:?}: TribleSet scheduler changed the result set",
         );
         assert_eq!(
             collect_sorted(make_archive(), variables, scheduler),
             baseline,
-            "{name}/{scheduler:?}: SuccinctArchive changed the result bag",
+            "{name}/{scheduler:?}: SuccinctArchive changed the result set",
         );
     }
 }

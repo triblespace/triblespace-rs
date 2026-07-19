@@ -1,10 +1,12 @@
 //! Executable representability and scheduler-parity probes for query constraints.
 //!
 //! These fixtures deliberately distinguish a canonical structural control key
-//! from activation-private affine state.  Two equal outer bindings are still
-//! two derivation occurrences: a reducer may deduplicate alternatives *within*
-//! each occurrence, and a fixpoint may deduplicate path witnesses *within*
-//! each occurrence, but neither may accidentally deduplicate the occurrences.
+//! from activation-private affine state. These fixtures explicitly include
+//! activation IDs in their query heads, so distinct activation identities
+//! remain distinct projected rows even when their other bindings agree. A
+//! reducer may deduplicate alternatives *within* each occurrence, and a
+//! fixpoint may deduplicate path witnesses *within* each occurrence, but
+//! neither may accidentally merge the projected activation identities.
 
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -118,12 +120,12 @@ where
 
 /// A finite reducer's branch accumulator is activation-private.
 ///
-/// Three distinct hidden activation entities map to projected bindings
-/// `[a, a, b]`.  Unlike duplicate candidates for one parent (which set-valued
-/// constraints may legitimately deduplicate), these are three derivation rows.
-/// Exactly one Union arm is live for each row.  Lowering is allowed to cohort
+/// Three distinct projected activation entities map to values `[a, a, b]`.
+/// Unlike duplicate candidates for one parent (which set-valued constraints
+/// may legitimately deduplicate), these are three distinct relational rows.
+/// Exactly one Union arm is live for each row. Lowering is allowed to cohort
 /// their shared structural action, but must neither let a dead row-local arm
-/// contribute nor merge the two equal projected `a` activations.
+/// contribute nor merge the two activation identities that map to `a`.
 #[test]
 fn union_dead_arms_are_row_local_and_duplicate_activations_are_affine() {
     let a = fixture_id(1);
@@ -137,16 +139,23 @@ fn union_dead_arms_are_row_local_and_duplicate_activations_are_affine() {
     let activation_1 = fixture_id(31);
     let activation_2 = fixture_id(32);
     let activation_3 = fixture_id(33);
+    let activation_1_v: Inline<GenId> = (&activation_1).to_inline();
+    let activation_2_v: Inline<GenId> = (&activation_2).to_inline();
+    let activation_3_v: Inline<GenId> = (&activation_3).to_inline();
     let mut activations = TribleSet::new();
     insert_relation(&mut activations, &activation_1, &parity::activates, &a);
     insert_relation(&mut activations, &activation_2, &parity::activates, &a);
     insert_relation(&mut activations, &activation_3, &parity::activates, &b);
 
-    let expected = vec![(a_v, y_a_v), (a_v, y_a_v), (b_v, y_b_v)];
+    let expected = vec![
+        (activation_1_v, a_v, y_a_v),
+        (activation_2_v, a_v, y_a_v),
+        (activation_3_v, b_v, y_b_v),
+    ];
     assert_scheduler_matrix("row-varying-dead-union-arm", expected, || {
-        find!((x: Inline<GenId>, y: Inline<GenId>),
+        find!((activation: Inline<GenId>, x: Inline<GenId>, y: Inline<GenId>),
             and!(
-                pattern!(&activations, [{ _?activation @ parity::activates: ?x }]),
+                pattern!(&activations, [{ ?activation @ parity::activates: ?x }]),
                 or!(
                     and!(x.is(a_v), y.is(y_a_v)),
                     and!(x.is(b_v), y.is(y_b_v)),
@@ -175,10 +184,11 @@ fn union_confirm_deduplicates_equal_candidates_within_one_parent() {
 
 /// A recursive fixpoint's visited/frontier/result sets are activation-private.
 ///
-/// `a -> c` and `a -> b -> c` are duplicate witnesses for `c`; each source
-/// activation must emit `c` once.  The `a <-> b` cycle makes the Plus closure
-/// include its origin via a non-empty path.  Finally `[a, a, b]` requires the
-/// two equal outer `a` occurrences to survive as two independent activations.
+/// `a -> c` and `a -> b -> c` are duplicate witnesses for `c`; each projected
+/// source activation must emit `c` once. The `a <-> b` cycle makes the Plus
+/// closure include its origin via a non-empty path. Finally two distinct
+/// activation IDs mapped to `a` must survive independently under SET
+/// projection because their full heads differ.
 #[test]
 fn rpq_plus_deduplicates_witnesses_not_outer_activations() {
     let a = fixture_id(21);
@@ -193,25 +203,37 @@ fn rpq_plus_deduplicates_witnesses_not_outer_activations() {
     let a_v: Inline<GenId> = (&a).to_inline();
     let b_v: Inline<GenId> = (&b).to_inline();
     let c_v: Inline<GenId> = (&c).to_inline();
-    let outer = [a_v, a_v, b_v];
-    let outer = SortedSlice::new(&outer).unwrap();
+    let activation_1 = fixture_id(51);
+    let activation_2 = fixture_id(52);
+    let activation_3 = fixture_id(53);
+    let activation_1_v: Inline<GenId> = (&activation_1).to_inline();
+    let activation_2_v: Inline<GenId> = (&activation_2).to_inline();
+    let activation_3_v: Inline<GenId> = (&activation_3).to_inline();
+    let mut activations = TribleSet::new();
+    insert_relation(&mut activations, &activation_1, &parity::activates, &a);
+    insert_relation(&mut activations, &activation_2, &parity::activates, &a);
+    insert_relation(&mut activations, &activation_3, &parity::activates, &b);
 
     let expected = vec![
-        (a_v, a_v),
-        (a_v, a_v),
-        (a_v, b_v),
-        (a_v, b_v),
-        (a_v, c_v),
-        (a_v, c_v),
-        (b_v, a_v),
-        (b_v, b_v),
-        (b_v, c_v),
+        (activation_1_v, a_v, a_v),
+        (activation_1_v, a_v, b_v),
+        (activation_1_v, a_v, c_v),
+        (activation_2_v, a_v, a_v),
+        (activation_2_v, a_v, b_v),
+        (activation_2_v, a_v, c_v),
+        (activation_3_v, b_v, a_v),
+        (activation_3_v, b_v, b_v),
+        (activation_3_v, b_v, c_v),
     ];
     assert_scheduler_matrix("rpq-plus-affine-fixpoint", expected, || {
         find!(
-            (source: Inline<GenId>, target: Inline<GenId>),
+            (
+                activation: Inline<GenId>,
+                source: Inline<GenId>,
+                target: Inline<GenId>
+            ),
             and!(
-                outer.has(source),
+                pattern!(&activations, [{ ?activation @ parity::activates: ?source }]),
                 path!(graph.clone(), source parity::edge+ target),
             )
         )
@@ -219,10 +241,10 @@ fn rpq_plus_deduplicates_witnesses_not_outer_activations() {
 }
 
 /// In contrast to Union, RPQ confirmation is a pointwise reachability filter.
-/// It may reject candidates but must preserve equal occurrences that were
-/// supplied by another constraint for the same parent.
+/// It may preserve equal internal candidate occurrences supplied by another
+/// constraint, but terminal SET projection collapses their equal raw head.
 #[test]
-fn rpq_confirm_preserves_equal_candidate_occurrences() {
+fn rpq_confirm_equal_candidates_collapse_at_projection() {
     let source_id = fixture_id(51);
     let target_id = fixture_id(52);
     let source_v: Inline<GenId> = (&source_id).to_inline();
@@ -234,7 +256,7 @@ fn rpq_confirm_preserves_equal_candidate_occurrences() {
 
     assert_scheduler_matrix(
         "rpq-confirm-preserves-candidate-occurrences",
-        vec![(source_v, target_v), (source_v, target_v)],
+        vec![(source_v, target_v)],
         || {
             find!((source: Inline<GenId>, target: Inline<GenId>), {
                 let mut start = EstimateOverrideConstraint::new(source.is(source_v));

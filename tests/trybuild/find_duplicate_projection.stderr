@@ -1,0 +1,5 @@
+error: projected variable `value` appears more than once in the query head
+ --> tests/trybuild/find_duplicate_projection.rs:8:13
+  |
+8 |             value: Inline<inlineencodings::U256BE>
+  |             ^^^^^

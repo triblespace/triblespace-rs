@@ -1,7 +1,7 @@
 //! PROBE semantics gate for the frontier-batched solver
-//! (`Query::solve_blocked`): every query must yield the same result
-//! **multiset** as the sequential iterator, on both the TribleSet backend
-//! (per-row block-native operations) and the SuccinctArchive backend (batched
+//! (`Query::solve_blocked`): every query must yield the same **distinct raw
+//! projected-row set** as the sequential iterator, on both the TribleSet
+//! backend (per-row block-native operations) and the SuccinctArchive backend (batched
 //! `propose`/`confirm` operations), across point/star/filter/intersect/chain join
 //! shapes plus edge cases.
 
@@ -280,7 +280,7 @@ fn fully_constant_settlement_on_succinctarchive() {
 /// state rather than a cursor-shape inference: a drained successful
 /// zero-variable query and an untouched failed settlement are both `Done`
 /// with empty cursors. The former must refuse; the latter remains fresh and
-/// yields the empty multiset.
+/// yields the empty projected set.
 #[test]
 fn probe_solvers_refuse_started_query() {
     let (kb, human, anchor) = build_world();
@@ -752,8 +752,8 @@ fn blocked_no_variables_yields_one_unit_row() {
     assert_eq!(rows, vec![()]);
 }
 
-/// Every item of `sub` (with multiplicity) must appear in `sup`.
-fn assert_sub_multiset<T: Hash + Eq + std::fmt::Debug>(
+/// Every item of `sub` must appear in `sup`; counts also catch duplicate leakage.
+fn assert_result_subset<T: Hash + Eq + std::fmt::Debug>(
     sub: &HashMap<T, usize>,
     sup: &HashMap<T, usize>,
     what: &str,
@@ -770,7 +770,7 @@ fn assert_sub_multiset<T: Hash + Eq + std::fmt::Debug>(
 /// PROBE (lazy-dag) partial consumption: `take(1)`, `take(k)`, an
 /// exists-style first-match-then-drop, and drop-without-consuming must
 /// all terminate cleanly (dropping the iterator drops the worklist) and
-/// yield rows that are a sub-multiset of the sequential result.
+/// yield rows that are a subset of the sequential result.
 fn gate_partial<S: TriblePattern>(kb: &S, human: Id) {
     macro_rules! star3 {
         () => {
@@ -786,7 +786,7 @@ fn gate_partial<S: TriblePattern>(kb: &S, human: Id) {
     // take(1) — first-result path, narrow sprint width only.
     let one = multiset(star3!().solve_dag_lazy().take(1));
     assert_eq!(one.values().sum::<usize>(), 1);
-    assert_sub_multiset(&one, &sequential, "take(1)");
+    assert_result_subset(&one, &sequential, "take(1)");
 
     // take(k) across the slow-start ramp.
     for k in [3usize, 17, 64] {
@@ -796,7 +796,7 @@ fn gate_partial<S: TriblePattern>(kb: &S, human: Id) {
             k.min(sequential.values().sum()),
             "take({k}) yielded the wrong number of rows"
         );
-        assert_sub_multiset(&some, &sequential, "take(k)");
+        assert_result_subset(&some, &sequential, "take(k)");
     }
 
     // exists-style: first match, then drop the iterator mid-flight.

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking: query heads now have relational SET semantics.** `find!` emits
+  each distinct ordered tuple of raw projected inline values once, collapsing
+  assignments that differ only in hidden witnesses. The empty head therefore
+  yields at most one `()` and stops searching once its singleton raw key is
+  claimed. Raw identity is claimed before conversion or mapper code, so a
+  filtered row or panic is not retried through another witness;
+  non-injective Rust conversions do not collapse distinct raw tuples. Direct
+  `Query::new` conservatively uses the complete constraint-variable binding as
+  its head. Iterator clones snapshot claims independently, while Rayon sibling
+  shards share one run-owned claim domain. There is no public bag mode.
+
 ### Fixed
 
 - **Attached range constraints now denote an index-domain intersection.**
@@ -25,7 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The residual engine and the explicit lazy-DAG control retain each row's exact
   adaptive next variable instead of reassigning estimate-compatible groups.
   Since the selected proposer owns occurrence multiplicity, the old physical
-  coalescing could make full result bags depend on scheduler width despite the
+  coalescing could make raw terminal rows depend on scheduler width despite the
   constraint protocol supplying no cross-variable bag-equivalence law. Equal
   ordering keys now use an explicit lower-variable-ID tie break in every
   planner instead of inheriting unstable-sort behavior. Within an
@@ -289,7 +302,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   secondary filter; SuccinctArchive and shard-union repeated shapes retain
   their eager fallback.
 - **Formula Support gains composed affine parity receipts.** End-to-end RPQ
-  tests now pin duplicate-parent bag multiplicity, nested AND/OR arm-order
+  tests now pin duplicate-parent affine handling through terminal SET
+  projection, nested AND/OR arm-order
   invariance, monotone graph growth, live clone and Rayon worker parity, and
   the parent-atomic barrier before page-local candidate confirmation.
 - **Fully-bound constraints can expose transition-backed support seeds.** The
@@ -412,8 +426,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parent a semantics-safe occupancy unit, though candidate fanout means it is
   not a total-work estimate. Exact descriptors remain interned so early states
   can safely reopen when later histories reach them. Full drains preserve the
-  eager solver's result bag; partial consumers may drop the remaining affine
-  frontier after the first useful result. Ready planning retains each row's
+  eager solver's distinct raw projected-row set; partial consumers may drop
+  the remaining affine frontier after the first useful result. Ready planning retains each row's
   exact adaptive variable and proposing leaf, then cohorts only rows with the
   same action.
 - **Index homes use typed artifacts over exact commit-DAG ranges.** Recipe
@@ -757,7 +771,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mid-iteration clones without `R: Clone`.
   `Query::solve_dag_lazy` remains the configurable entry point and `solve_dag`
   exposes the eager saturated form. Fully drained schedulers preserve the same
-  result multiset, but result order may differ. Probe solvers require a
+  distinct raw projected-row set, but result order may differ. Probe solvers require a
   never-pulled `Query`; freshness is tracked explicitly so exhausted
   zero-variable queries cannot be mistaken for untouched ones.
 - **`Pile::restore()` is now `Pile::amputate()` — the destructive

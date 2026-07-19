@@ -714,11 +714,11 @@ where
     lazy_default.sort_unstable();
     lazy_cap_one.sort_unstable();
     ordinary.sort_unstable();
-    assert_eq!(sequential, expected, "scalar result bag vs fixture oracle");
-    assert_eq!(eager, expected, "eager residual result bag");
-    assert_eq!(lazy_default, expected, "default lazy residual result bag");
-    assert_eq!(lazy_cap_one, expected, "cap=1 lazy residual result bag");
-    assert_eq!(ordinary, expected, "ordinary Query residual result bag");
+    assert_eq!(sequential, expected, "scalar result set vs fixture oracle");
+    assert_eq!(eager, expected, "eager residual result set");
+    assert_eq!(lazy_default, expected, "default lazy residual result set");
+    assert_eq!(lazy_cap_one, expected, "cap=1 lazy residual result set");
+    assert_eq!(ordinary, expected, "ordinary Query residual result set");
 }
 
 #[test]
@@ -892,10 +892,10 @@ fn flipped_proposers_remerge_before_the_last_confirmation() {
     residual.results.sort_unstable();
     sequential.sort_unstable();
     oracle.sort_unstable();
-    assert_eq!(residual.results, oracle, "residual result bag vs oracle");
+    assert_eq!(residual.results, oracle, "residual result set vs oracle");
     assert_eq!(
         residual.results, sequential,
-        "residual result bag vs scalar DFS"
+        "residual result set vs scalar DFS"
     );
 
     let trace = trace.lock().unwrap();
@@ -980,9 +980,8 @@ fn nested_and_flipped_proposers_remerge_before_the_last_confirmation() {
 }
 
 #[test]
-fn flat_left_and_right_nested_forms_preserve_bags_and_outer_duplicates() {
+fn flat_left_and_right_nested_forms_share_set_projection() {
     let expected = vec![
-        (encoded(b'n', 0), encoded(b'n', 0)),
         (encoded(b'n', 0), encoded(b'n', 0)),
         (encoded(b'n', 1), encoded(b'n', 1)),
     ];
@@ -1353,7 +1352,7 @@ fn rejected_projection_ramps_search_without_confirming_demand() {
 }
 
 #[test]
-fn lazy_fixed_width_reopens_states_without_changing_the_result_bag() {
+fn lazy_fixed_width_reopens_states_without_changing_the_result_set() {
     const N: usize = 12;
     let (root, _) = fixture(N);
     let mut lazy = Query::new(Arc::new(root), project_pair)
@@ -1632,8 +1631,11 @@ fn lazy_cap_builder_does_not_raise_an_already_clamped_start_width() {
 }
 
 #[test]
-fn reconvergence_preserves_duplicate_projection_multiplicity() {
+fn reconvergence_preserves_distinct_full_bindings_under_noninjective_mapper() {
     const N: usize = 12;
+    // `Query::new` uses the complete raw binding as its conservative head, so
+    // these N distinct bindings remain N rows even though every mapper result
+    // is the same unit value.
     let (root, _) = fixture(N);
     let residual = Query::new(root, project_same).solve_residual_state_profiled();
     let (lazy_root, _) = fixture(N);
@@ -1702,9 +1704,11 @@ fn zero_variable_intersections_emit_the_empty_binding_iff_true() {
     assert_eq!(lazy_true.stats().width_increases, 0);
     assert_eq!(lazy_true.stats().terminal_demand_width_promotions, 0);
     assert_eq!(lazy_true.next(), None);
-    assert_eq!(lazy_true.current_width(), 2);
-    assert_eq!(lazy_true.stats().width_increases, 1);
-    assert_eq!(lazy_true.stats().terminal_demand_width_promotions, 1);
+    // The empty full head has one possible public key. Once that key was
+    // claimed, a later pull terminates before opening another demand window.
+    assert_eq!(lazy_true.current_width(), 1);
+    assert_eq!(lazy_true.stats().width_increases, 0);
+    assert_eq!(lazy_true.stats().terminal_demand_width_promotions, 0);
     assert_eq!(residual_true.results, ["empty binding"]);
     assert_eq!(residual_true.results, sequential_true);
     assert_eq!(residual_true.stats.state_pops, 1);
