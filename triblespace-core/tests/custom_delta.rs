@@ -1824,16 +1824,14 @@ fn custom_cyclic_delta_composes_with_recursive_root_formula() {
         0
     );
 
-    let ordinary_evidence = Arc::new(DeltaEvidence::default());
-    let ordinary =
-        sorted(Query::new(fixture(Arc::clone(&ordinary_evidence)), project_end).collect());
-    assert!(ordinary_evidence.seeded_roots.load(Ordering::Relaxed) > 0);
-    assert!(ordinary_evidence.expanded_nodes.load(Ordering::Relaxed) > 0);
+    let hybrid_evidence = Arc::new(DeltaEvidence::default());
+    let hybrid = sorted(Query::new(fixture(Arc::clone(&hybrid_evidence)), project_end).collect());
     assert_eq!(
-        ordinary_evidence.continuation_mask.load(Ordering::Relaxed) & 0b11,
-        0b11,
-        "the full-switch ordinary path must run both custom continuation states"
+        hybrid_evidence.seeded_roots.load(Ordering::Relaxed),
+        0,
+        "hybrid lowering keeps the recursive formula fused"
     );
+    assert_eq!(hybrid_evidence.expanded_nodes.load(Ordering::Relaxed), 0);
 
     let residual_evidence = Arc::new(DeltaEvidence::default());
     let residual = Query::new(fixture(Arc::clone(&residual_evidence)), project_end)
@@ -1845,7 +1843,7 @@ fn custom_cyclic_delta_composes_with_recursive_root_formula() {
 
     let expected = sorted(vec![raw(2), raw(2), raw(6), raw(6)]);
     assert_eq!(sequential, expected);
-    assert_eq!(ordinary, sequential);
+    assert_eq!(hybrid, sequential);
     assert_eq!(residual, sequential);
     assert!(residual_evidence.seeded_roots.load(Ordering::Relaxed) > 0);
     assert!(residual_evidence.expanded_nodes.load(Ordering::Relaxed) > 0);

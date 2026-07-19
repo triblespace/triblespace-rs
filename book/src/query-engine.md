@@ -9,7 +9,7 @@ adapt to the values already found instead of being fixed before evaluation.
 
 The current protocol is **block-native**. Its unit of work is not necessarily
 one partial binding, but a block of partial bindings that have the same set of
-bound variables. On the semantic full-switch probe, every live serial ordinary
+bound variables. Every live serial ordinary
 iterator uses the canonical residual-state worklist. The bound-variable-set
 DAG and [`Query::sequential`](triblespace::core::query::Query::sequential)
 remain explicit controls; the sequential path speaks the same protocol with
@@ -247,13 +247,14 @@ The ordinary [`Query`](triblespace::core::query::Query) uses this engine wheneve
 exact seed settlement leaves a live search. Opaque roots, one-leaf ANDs,
 disjoint conjunctions, finite Union roots, RPQ roots, and live zero-variable
 truths therefore all exercise the same residual substrate. A seed-rejected
-query starts no worklist at all. This is a semantic coverage experiment, not a
-claim that residual control overhead pays back for every shape; the explicit
-lazy DAG remains the comparison path.
+query starts no worklist at all. Production lowering keeps finite logical
+composites as fused constraint kernels inside that substrate while enabling
+typed transition Programs for RPQs and other heterogeneous actions. The
+explicit lazy DAG remains the comparison path.
 
 [`Query::residual_state_scheduler`](triblespace::core::query::Query::residual_state_scheduler)
 selects the residual cursor for any root while preserving the query's chosen
-lowering (`FULL` by default; `Query::residual_lowering` may change it).
+lowering (`HYBRID` by default; `Query::residual_lowering` may change it).
 `solve_residual_state_lazy` is the separate conservative-lowering capability
 control and exposes its width policy;
 `solve_residual_state` is the eager saturated form, and
@@ -416,9 +417,9 @@ Every shard retains canonical state merging locally. As with the DAG splitter,
 cross-shard reconvergence is traded for concurrency, state is moved rather
 than duplicated, and the constraint/postprocessor pair is cloned only when a
 real sibling shard is created. This entry point preserves the query's selected
-residual lowering: fresh queries use full formula and transition-program
-lowering, while an explicit `Query::residual_lowering` override remains in
-force.
+residual lowering: fresh queries use hybrid lowering, which keeps formula
+kernels fused and enables transition Programs, while an explicit
+`Query::residual_lowering` override remains in force.
 
 ### Opt-in residual action observation
 
