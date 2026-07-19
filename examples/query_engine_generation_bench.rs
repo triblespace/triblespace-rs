@@ -184,7 +184,17 @@ const ENGINE: &str = "legacy Binding DFS";
 const ENGINE: &str = "current scalar DFS";
 #[cfg(engine_current_residual)]
 const ENGINE: &str = "current residual";
-#[cfg(not(any(engine_legacy_binding, engine_current_scalar, engine_current_residual)))]
+#[cfg(engine_current_conservative)]
+const ENGINE: &str = "current conservative residual";
+#[cfg(engine_current_opaque_programs)]
+const ENGINE: &str = "current opaque-formula residual with transition programs";
+#[cfg(not(any(
+    engine_legacy_binding,
+    engine_current_scalar,
+    engine_current_residual,
+    engine_current_conservative,
+    engine_current_opaque_programs
+)))]
 const ENGINE: &str = "ordinary Query iterator";
 
 const REVISION: &str = match option_env!("ENGINE_REVISION") {
@@ -201,7 +211,24 @@ macro_rules! engine_query {
         {
             query.sequential()
         }
-        #[cfg(not(engine_current_scalar))]
+        #[cfg(engine_current_conservative)]
+        {
+            query.solve_residual_state_lazy()
+        }
+        #[cfg(engine_current_opaque_programs)]
+        {
+            query.solve_residual_state_lazy_with(
+                triblespace::core::query::residual::ResidualLowering::new(
+                    triblespace::core::query::residual::FormulaScope::OpaqueLeaves,
+                    true,
+                ),
+            )
+        }
+        #[cfg(not(any(
+            engine_current_scalar,
+            engine_current_conservative,
+            engine_current_opaque_programs
+        )))]
         {
             query
         }
@@ -1212,6 +1239,8 @@ fn main() {
 
     let rpq_expected = fixture.cyclic_rpq_oracle();
     let mixed_expected = fixture.mixed_formula_rpq_oracle();
+    let finite_expected = fixture.finite_union_oracle();
+    let nested_expected = fixture.nested_formula_oracle();
 
     println!("diagnostic: source-identical prefix checkpoints");
     println!("engine: {ENGINE}");
@@ -1244,11 +1273,36 @@ fn main() {
         "formula + cyclic RPQ",
         "SuccinctArchive sibling",
     );
+    exact_check(
+        finite_collect(&fixture.graph, &fixture),
+        &finite_expected,
+        "finite OR-of-AND",
+        "TribleSet",
+    );
+    exact_check(
+        nested_collect(&fixture.graph, &fixture),
+        &nested_expected,
+        "recursive AND/OR",
+        "TribleSet",
+    );
     println!("oracle parity: all three prefix-diagnostic cells exact");
 
     #[cfg(engine_current_residual)]
     {
         use triblespace::core::query::residual::ResidualLowering;
+
+        residual_checkpoint_stats(
+            "finite OR-of-AND / TribleSet",
+            finite_union_query!(&fixture.graph, &fixture)
+                .solve_residual_state_lazy_with(ResidualLowering::FULL),
+            |query| (query.current_width(), format!("{:?}", query.stats())),
+        );
+        residual_checkpoint_stats(
+            "recursive AND/OR / TribleSet",
+            nested_formula_query!(&fixture.graph, &fixture)
+                .solve_residual_state_lazy_with(ResidualLowering::FULL),
+            |query| (query.current_width(), format!("{:?}", query.stats())),
+        );
 
         residual_checkpoint_stats(
             "cyclic RPQ / TribleSet",
