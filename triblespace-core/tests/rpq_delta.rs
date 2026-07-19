@@ -9,7 +9,7 @@ use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace_core::query::residual::{
-    ActionVerb, FormulaScope, ResidualLowering, ResidualShadowEpoch,
+    ActionVerb, FormulaScope, ProgramScope, ResidualLowering, ResidualShadowEpoch,
 };
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
@@ -526,7 +526,7 @@ enum Scheduler {
 }
 
 fn combined_effects() -> ResidualLowering {
-    ResidualLowering::new(FormulaScope::UnionLeaves, true)
+    ResidualLowering::new(FormulaScope::UnionLeaves, ProgramScope::All)
 }
 
 fn root_formula_effects() -> ResidualLowering {
@@ -1152,12 +1152,12 @@ fn synthetic_root_atom_same_variable_rpq_composes_capabilities() {
     let cases = [
         (
             "root-only",
-            ResidualLowering::new(FormulaScope::WholeRoot, false),
+            ResidualLowering::new(FormulaScope::WholeRoot, ProgramScope::Disabled),
             false,
         ),
         (
             "cyclic-only",
-            ResidualLowering::new(FormulaScope::OpaqueLeaves, true),
+            ResidualLowering::new(FormulaScope::OpaqueLeaves, ProgramScope::All),
             true,
         ),
         ("whole-root-transitions", ResidualLowering::FULL, true),
@@ -1812,8 +1812,8 @@ fn formula_transition_lowering_remains_capability_and_shape_gated() {
         values
     };
     for lowering in [
-        ResidualLowering::new(FormulaScope::UnionLeaves, false),
-        ResidualLowering::new(FormulaScope::OpaqueLeaves, true),
+        ResidualLowering::new(FormulaScope::UnionLeaves, ProgramScope::Disabled),
+        ResidualLowering::new(FormulaScope::OpaqueLeaves, ProgramScope::All),
     ] {
         let root = formula_bound_start_root(graph.set.clone(), graph.value(0), &plus);
         let mut query = Query::new(root, project_end).solve_residual_state_lazy_with(lowering);
@@ -3469,19 +3469,19 @@ fn generated_combined_formula_rpq_matrix_matches_frozen_schedulers_and_is_monoto
         ("opaque", ResidualLowering::CONSERVATIVE),
         (
             "union-leaves",
-            ResidualLowering::new(FormulaScope::UnionLeaves, false),
+            ResidualLowering::new(FormulaScope::UnionLeaves, ProgramScope::Disabled),
         ),
         (
             "whole-root",
-            ResidualLowering::new(FormulaScope::WholeRoot, false),
+            ResidualLowering::new(FormulaScope::WholeRoot, ProgramScope::Disabled),
         ),
         (
             "opaque-transitions",
-            ResidualLowering::new(FormulaScope::OpaqueLeaves, true),
+            ResidualLowering::new(FormulaScope::OpaqueLeaves, ProgramScope::All),
         ),
         (
             "union-leaves-transitions",
-            ResidualLowering::new(FormulaScope::UnionLeaves, true),
+            ResidualLowering::new(FormulaScope::UnionLeaves, ProgramScope::All),
         ),
         ("whole-root-transitions", ResidualLowering::FULL),
     ];

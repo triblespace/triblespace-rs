@@ -74,6 +74,7 @@ fn patch_program_route(
         stratum: super::ProgramStratum::Finite,
         grouping: super::ProgramGrouping::PageLocal,
         completion: super::ProgramCompletion::PageableOnly,
+        exposure: super::ProgramExposure::Production,
     })
 }
 

@@ -172,6 +172,7 @@ where
             stratum: ProgramStratum::Finite,
             grouping: ProgramGrouping::PageLocal,
             completion: ProgramCompletion::PageableOnly,
+            exposure: ProgramExposure::Production,
         })
     }
 

@@ -736,6 +736,7 @@ impl<I: CosineSimilarity + ?Sized> TypedProgramSpec for CosineAtLeast<'_, I> {
             stratum: ProgramStratum::Finite,
             grouping: ProgramGrouping::PageLocal,
             completion: ProgramCompletion::PageableOnly,
+            exposure: triblespace_core::query::ProgramExposure::Production,
         })
     }
 

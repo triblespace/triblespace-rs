@@ -16,6 +16,7 @@ use crate::query::DispatchClass;
 use crate::query::EstimateSink;
 use crate::query::ProgramAction;
 use crate::query::ProgramCompletion;
+use crate::query::ProgramExposure;
 use crate::query::ProgramGrouping;
 use crate::query::ProgramKey;
 use crate::query::ProgramPacing;
@@ -1118,6 +1119,7 @@ impl TypedProgramSpec for TribleSetConstraint {
             stratum: ProgramStratum::Finite,
             grouping: ProgramGrouping::PageLocal,
             completion: ProgramCompletion::PageableOnly,
+            exposure: ProgramExposure::Production,
         })
     }
 

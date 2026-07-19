@@ -11,9 +11,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Ordinary residual queries now use hybrid structural lowering.** Finite
   logical composites stay fused behind their certified constraint kernels,
-  while typed transition Programs such as regular-path execution remain
-  enabled. `ResidualLowering::FULL` remains the explicit maximally exposed
-  formula interpreter; `ResidualLowering::HYBRID` is the production default.
+  while production-qualified typed Programs such as regular-path execution
+  remain enabled. Explicit Program routes stay on the ordinary constraint
+  protocol under `ResidualLowering::HYBRID`; `ResidualLowering::FULL` opts into
+  them together with the maximally exposed formula interpreter.
+- **Typed Program selection now has an explicit exposure policy.** Every route
+  is `Production` or `Explicit`, and the residual lowering's `ProgramScope`
+  independently selects `Disabled`, `Production`, or `All`. The centralized
+  selector distinguishes an absent route from a policy-deferred route: absence
+  may still use legacy transition hooks, while deferral uses the stable
+  ordinary action and never its legacy pager, seeds, grouping, or stronger
+  Program receipt. UnionArchive's page-producing Propose and Confirm streams
+  are explicit while the finite Support route remains production-qualified.
 - **Cyclic Confirm actions now cross the same parent-local SET boundary as
   ordinary actions.** Graph traversal retains the immutable original
   occurrence bag and raw confirmation telemetry until its complete result
@@ -450,9 +459,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cohorts use these retained views to prove every fresh positive branch fits
   the geometric page budget before emitting, eliminating the former count
   descent followed by a second enumeration descent.
-- **Residual lowering has six canonical, scheduler-independent forms.**
+- **Residual lowering has nine canonical, scheduler-independent forms.**
   `ResidualLowering` crosses the `FormulaScope` chain (`OpaqueLeaves`,
-  `UnionLeaves`, `WholeRoot`) with one independent `transition_programs` axis;
+  `UnionLeaves`, `WholeRoot`) with the independent `ProgramScope` chain
+  (`Disabled`, `Production`, `All`);
   whole-root lowering structurally absorbs union-leaf lowering. Scheduler
   setters no longer rewrite lowering, and `Query::residual_lowering` selects it
   independently. Whole-root scope keeps variable selection and the commit

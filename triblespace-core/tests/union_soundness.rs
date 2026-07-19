@@ -29,7 +29,9 @@ use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::patch::{Entry, IdentitySchema, PATCH};
 use triblespace_core::prelude::*;
 use triblespace_core::query::regularpathconstraint::{PathOp, RegularPathConstraint};
-use triblespace_core::query::residual::{FormulaScope, ResidualLowering, ResidualShadowEpoch};
+use triblespace_core::query::residual::{
+    FormulaScope, ProgramScope, ResidualLowering, ResidualShadowEpoch,
+};
 use triblespace_core::query::sortedsliceconstraint::SortedSlice;
 use triblespace_core::query::{
     Constraint, ContainsConstraint, RowsView, TriblePattern, Variable, VariableContext,
@@ -172,12 +174,12 @@ fn pattern_changes_monotone_growth_keeps_results() {
         ("opaque", ResidualLowering::CONSERVATIVE, false),
         (
             "union-leaves",
-            ResidualLowering::new(FormulaScope::UnionLeaves, false),
+            ResidualLowering::new(FormulaScope::UnionLeaves, ProgramScope::Disabled),
             false,
         ),
         (
             "whole-root",
-            ResidualLowering::new(FormulaScope::WholeRoot, false),
+            ResidualLowering::new(FormulaScope::WholeRoot, ProgramScope::Disabled),
             true,
         ),
     ];

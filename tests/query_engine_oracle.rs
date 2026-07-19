@@ -14,7 +14,8 @@ use proptest::prelude::*;
 use rayon::prelude::*;
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use triblespace::core::query::residual::{
-    ActionVerb, FormulaScope, ResidualLowering, ResidualShadowEpoch, ResidualShadowStatus,
+    ActionVerb, FormulaScope, ProgramScope, ResidualLowering, ResidualShadowEpoch,
+    ResidualShadowStatus,
 };
 use triblespace::core::query::{Binding, Constraint, Query};
 use triblespace::prelude::inlineencodings::GenId;
@@ -534,7 +535,7 @@ fn root_formula_candidate_paging_is_storage_polymorphic() {
                         query!($store)
                             .solve_residual_state_lazy_with(ResidualLowering::new(
                                 FormulaScope::WholeRoot,
-                                false,
+                                ProgramScope::Disabled,
                             ))
                             .cap(cap)
                             .start_width(1)
@@ -552,7 +553,10 @@ fn root_formula_candidate_paging_is_storage_polymorphic() {
     assert_backend!("SuccinctArchiveConstraint", &archive);
 
     let lowered = query!(&archive)
-        .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::WholeRoot, false))
+        .solve_residual_state_lazy_with(ResidualLowering::new(
+            FormulaScope::WholeRoot,
+            ProgramScope::Disabled,
+        ))
         .cap(1)
         .start_width(1)
         .growth(1)

@@ -10,6 +10,7 @@ use crate::inline::RawInline;
 use super::DispatchClass;
 use super::ProgramAction;
 use super::ProgramCompletion;
+use super::ProgramExposure;
 use super::ProgramGrouping;
 use super::ProgramKey;
 use super::ProgramPacing;
@@ -77,6 +78,7 @@ pub fn route(variable: VariableId, request: ProgramRequest) -> Option<ProgramRou
         stratum: ProgramStratum::Finite,
         grouping: ProgramGrouping::PageLocal,
         completion: ProgramCompletion::PageableOnly,
+        exposure: ProgramExposure::Production,
     })
 }
 

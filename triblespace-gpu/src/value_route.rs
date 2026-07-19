@@ -1100,6 +1100,7 @@ impl<'a, U: Universe> TypedProgramSpec for SuccinctTwoBoundFamily<'a, U> {
             stratum: ProgramStratum::Finite,
             grouping: ProgramGrouping::PageLocal,
             completion: ProgramCompletion::PageableOnly,
+            exposure: triblespace_core::query::ProgramExposure::Production,
         })
     }
 

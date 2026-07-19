@@ -15,12 +15,12 @@ use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace_core::query::rangeconstraint::InlineRange;
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
-    residual::{FormulaScope, ResidualLowering},
+    residual::{FormulaScope, ProgramScope, ResidualLowering},
     Binding, CandidateSink, Constraint, ConstraintShape, DispatchClass, EstimateSink, PathOp,
-    ProgramAction, ProgramCompletion, ProgramGrouping, ProgramKey, ProgramRef, ProgramRequest,
-    ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage, Query, RegularPathConstraint,
-    RowsView, TriblePattern, TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedSeedSink,
-    Variable, VariableId, VariableSet,
+    ProgramAction, ProgramCompletion, ProgramExposure, ProgramGrouping, ProgramKey, ProgramRef,
+    ProgramRequest, ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage, Query,
+    RegularPathConstraint, RowsView, TriblePattern, TypedEffectSink, TypedProgramBatch,
+    TypedProgramSpec, TypedSeedSink, Variable, VariableId, VariableSet,
 };
 use triblespace_core::trible::{Trible, TribleSet};
 
@@ -1069,6 +1069,7 @@ struct CoveringProposalWithExactProgram {
     ordinary_proposes: Arc<AtomicUsize>,
     ordinary_confirms: Arc<AtomicUsize>,
     program_seeds: Arc<AtomicUsize>,
+    exposure: ProgramExposure,
 }
 
 impl TypedProgramSpec for CoveringProposalWithExactProgram {
@@ -1086,6 +1087,7 @@ impl TypedProgramSpec for CoveringProposalWithExactProgram {
             stratum: ProgramStratum::Finite,
             grouping: ProgramGrouping::PageLocal,
             completion: ProgramCompletion::PageableOnly,
+            exposure: self.exposure,
         })
     }
 
@@ -1270,6 +1272,7 @@ fn exact_program_receipt_does_not_discharge_covering_stable_fallback() {
         ordinary_proposes: ordinary_proposes.clone(),
         ordinary_confirms: ordinary_confirms.clone(),
         program_seeds: program_seeds.clone(),
+        exposure: ProgramExposure::Production,
     };
     assert_eq!(
         proposer.proposal_coverage(X, VariableSet::new_empty()),
@@ -1287,7 +1290,10 @@ fn exact_program_receipt_does_not_discharge_covering_stable_fallback() {
         }) as DynConstraint,
     ]);
     let results: Vec<_> = Query::new(root, project_x)
-        .solve_residual_state_lazy_with(ResidualLowering::new(FormulaScope::OpaqueLeaves, true))
+        .solve_residual_state_lazy_with(ResidualLowering::new(
+            FormulaScope::OpaqueLeaves,
+            ProgramScope::All,
+        ))
         .collect();
 
     assert_eq!(results, vec![MEMBER]);
@@ -1301,5 +1307,42 @@ fn exact_program_receipt_does_not_discharge_covering_stable_fallback() {
         program_seeds.load(Ordering::Relaxed),
         0,
         "the non-page-local sibling must keep this proposal on stable execution"
+    );
+}
+
+#[test]
+fn deferred_exact_program_receipt_does_not_discharge_covering_ordinary_source() {
+    let ordinary_proposes = Arc::new(AtomicUsize::new(0));
+    let ordinary_confirms = Arc::new(AtomicUsize::new(0));
+    let program_seeds = Arc::new(AtomicUsize::new(0));
+    let proposer = CoveringProposalWithExactProgram {
+        ordinary_proposes: ordinary_proposes.clone(),
+        ordinary_confirms: ordinary_confirms.clone(),
+        program_seeds: program_seeds.clone(),
+        exposure: ProgramExposure::Explicit,
+    };
+    assert_eq!(
+        proposer.proposal_coverage(X, VariableSet::new_empty()),
+        ProposalCoverage::Covering
+    );
+    assert_eq!(
+        proposer.residual_program_proposal_coverage(X, VariableSet::new_empty()),
+        ProposalCoverage::Exact
+    );
+
+    let results: Vec<_> = Query::new(proposer, project_x)
+        .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+        .collect();
+
+    assert_eq!(results, vec![MEMBER]);
+    assert!(ordinary_proposes.load(Ordering::Relaxed) > 0);
+    assert!(
+        ordinary_confirms.load(Ordering::Relaxed) > 0,
+        "a deferred Exact Program receipt must leave Covering self-confirmation active"
+    );
+    assert_eq!(
+        program_seeds.load(Ordering::Relaxed),
+        0,
+        "a deferred Explicit route must not seed its Program"
     );
 }

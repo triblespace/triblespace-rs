@@ -65,7 +65,7 @@ use crate::inline::RawInline;
 pub use program::{
     DispatchClass, PreferredProgram, ProgramAction, ProgramActivation, ProgramBatch,
     ProgramBatchEffects, ProgramChild, ProgramCompleteBatch, ProgramCompleteEffects,
-    ProgramCompletion, ProgramGrouping, ProgramKey, ProgramPacing, ProgramPage,
+    ProgramCompletion, ProgramExposure, ProgramGrouping, ProgramKey, ProgramPacing, ProgramPage,
     ProgramPhysicalReceipt, ProgramRef, ProgramRequest, ProgramResume, ProgramRoute,
     ProgramRuntime, ProgramSeedBatch, ProgramSeedEffects, ProgramSeedWork, ProgramStratum,
     ProgramWork, ProgramWorkHandle, TypedCompleteSink, TypedEffectSink, TypedPhysicalStep,
@@ -2511,9 +2511,9 @@ enum QueryScheduler {
 /// widens as the consumer keeps pulling, while histories with identical future
 /// computation can reconverge under one state identity. The production
 /// lowering keeps finite formula boundaries as fused constraint kernels while
-/// eligible regular-path transition programs execute as heterogeneous state
-/// actions; unsupported custom programs remain ordinary opaque constraint
-/// actions. Seed-rejected queries start no runtime. Use
+/// production-qualified regular-path Programs execute as heterogeneous state
+/// actions; explicit or unsupported custom Programs remain ordinary opaque
+/// constraint actions. Seed-rejected queries start no runtime. Use
 /// [`Query::lazy_dag_scheduler`] for the bound-variable-set DAG control and
 /// [`Query::sequential`] for the scalar depth-first specialization. The
 /// Scheduler selection and structural lowering are independent controls; use
@@ -2811,7 +2811,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// seed-rejected query still starts no worklist. The selector preserves the
     /// query's structural lowering. Use
     /// [`Query::residual_lowering`] before this method to choose another of the
-    /// six canonical lowering forms. The runtime cursor remains behind
+    /// nine canonical lowering forms. The runtime cursor remains behind
     /// `Query::next`, so cloning a started query
     /// snapshots its exact raw remainder. Ordinary Rayon conversion of an
     /// unstarted query still uses the established scalar splitter; use
@@ -5389,8 +5389,10 @@ mod tests {
 
         let mut context = VariableContext::new();
         let variable = context.next_variable::<U256BE>();
-        let intermediate =
-            residual::ResidualLowering::new(residual::FormulaScope::UnionLeaves, true);
+        let intermediate = residual::ResidualLowering::new(
+            residual::FormulaScope::UnionLeaves,
+            residual::ProgramScope::All,
+        );
         let dag = Query::new(variable.is(U256BE::inline_from(1u64)), |_| Some(()))
             .lazy_dag_scheduler()
             .residual_lowering(intermediate);

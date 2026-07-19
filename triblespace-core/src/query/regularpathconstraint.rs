@@ -20,6 +20,7 @@ use crate::query::EstimateSink;
 use crate::query::ProgramAction;
 use crate::query::ProgramCompleteBatch;
 use crate::query::ProgramCompletion;
+use crate::query::ProgramExposure;
 use crate::query::ProgramGrouping;
 use crate::query::ProgramKey;
 use crate::query::ProgramPacing;
@@ -2651,6 +2652,7 @@ impl TypedProgramSpec for RegularPathConstraint {
                         stratum,
                         grouping: ProgramGrouping::ParentAtomic,
                         completion: ProgramCompletion::PageableOnly,
+                        exposure: ProgramExposure::Production,
                     }
                 } else {
                     // Ordinary `satisfied` is deliberately optimistic while
@@ -2663,6 +2665,7 @@ impl TypedProgramSpec for RegularPathConstraint {
                         stratum: ProgramStratum::Finite,
                         grouping: ProgramGrouping::PageLocal,
                         completion: ProgramCompletion::PageableOnly,
+                        exposure: ProgramExposure::Production,
                     }
                 }
             }
@@ -2684,6 +2687,7 @@ impl TypedProgramSpec for RegularPathConstraint {
                             ProgramGrouping::PageLocal
                         },
                         completion: ProgramCompletion::PageableOnly,
+                        exposure: ProgramExposure::Production,
                     }
                 } else {
                     let (opposite, bound_key, first_key, confirm_first_key) =
@@ -2717,6 +2721,7 @@ impl TypedProgramSpec for RegularPathConstraint {
                             } else {
                                 ProgramCompletion::CompleteActionEquivalent
                             },
+                            exposure: ProgramExposure::Production,
                         }
                     } else if matches!(request.action, ProgramAction::Propose(_)) {
                         // First-endpoint paging is a finite direct observation
@@ -2728,6 +2733,7 @@ impl TypedProgramSpec for RegularPathConstraint {
                             stratum: ProgramStratum::Finite,
                             grouping: ProgramGrouping::PageLocal,
                             completion: ProgramCompletion::PageableOnly,
+                            exposure: ProgramExposure::Production,
                         }
                     } else {
                         // With the opposite endpoint absent, confirmation is
@@ -2741,6 +2747,7 @@ impl TypedProgramSpec for RegularPathConstraint {
                             stratum: ProgramStratum::Finite,
                             grouping: ProgramGrouping::PageLocal,
                             completion: ProgramCompletion::PageableOnly,
+                            exposure: ProgramExposure::Production,
                         }
                     }
                 }

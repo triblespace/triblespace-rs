@@ -13,9 +13,9 @@ use triblespace_core::query::residual::{
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, DispatchClass, EstimateSink, ProgramAction,
-    ProgramCompletion, ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef, ProgramRequest,
-    ProgramRoute, ProgramSeedBatch, ProgramStratum, Query, ResidualDeltaNode, ResidualDeltaOutput,
-    ResidualDeltaSeed, ResidualDeltaSourceBatch, ResidualDeltaSourceCursor,
+    ProgramCompletion, ProgramExposure, ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef,
+    ProgramRequest, ProgramRoute, ProgramSeedBatch, ProgramStratum, Query, ResidualDeltaNode,
+    ResidualDeltaOutput, ResidualDeltaSeed, ResidualDeltaSourceBatch, ResidualDeltaSourceCursor,
     ResidualDeltaSourcePage, RowsView, TypedEffectSink, TypedProgramBatch, TypedProgramSpec,
     TypedResume, TypedSeedSink, Variable, VariableId, VariableSet,
 };
@@ -344,6 +344,7 @@ impl TypedProgramSpec for ProgramAlternatingClosure {
             stratum: ProgramStratum::Fixpoint,
             grouping: ProgramGrouping::ParentAtomic,
             completion: ProgramCompletion::PageableOnly,
+            exposure: ProgramExposure::Production,
         })
     }
 

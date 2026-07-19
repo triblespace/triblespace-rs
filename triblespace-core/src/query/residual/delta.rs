@@ -7128,6 +7128,7 @@ mod tests {
                 stratum: ProgramStratum::Finite,
                 grouping: ProgramGrouping::PageLocal,
                 completion: ProgramCompletion::PageableOnly,
+                exposure: ProgramExposure::Production,
             })
         }
 
@@ -7221,6 +7222,7 @@ mod tests {
                 stratum: ProgramStratum::Finite,
                 grouping: ProgramGrouping::PageLocal,
                 completion: ProgramCompletion::PageableOnly,
+                exposure: ProgramExposure::Production,
             })
         }
 
@@ -9609,6 +9611,7 @@ mod tests {
             stratum: ProgramStratum::Fixpoint,
             grouping: ProgramGrouping::PageLocal,
             completion: ProgramCompletion::PageableOnly,
+            exposure: ProgramExposure::Production,
         };
         let state = scheduler
             .interner
@@ -9687,6 +9690,7 @@ mod tests {
             stratum: ProgramStratum::Fixpoint,
             grouping: ProgramGrouping::PageLocal,
             completion: ProgramCompletion::PageableOnly,
+            exposure: ProgramExposure::Production,
         };
         scheduler
             .interner
@@ -10093,6 +10097,7 @@ mod tests {
                 stratum: ProgramStratum::Fixpoint,
                 grouping: ProgramGrouping::PageLocal,
                 completion: ProgramCompletion::PageableOnly,
+                exposure: ProgramExposure::Production,
             })
         }
 
@@ -11018,6 +11023,7 @@ mod tests {
             stratum: ProgramStratum::Fixpoint,
             grouping: ProgramGrouping::PageLocal,
             completion: ProgramCompletion::PageableOnly,
+            exposure: ProgramExposure::Production,
         };
         let state = scheduler
             .interner

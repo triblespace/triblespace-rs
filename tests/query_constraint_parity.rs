@@ -15,7 +15,7 @@ use std::hash::Hash;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use triblespace::core::debug::query::EstimateOverrideConstraint;
-use triblespace::core::query::residual::{FormulaScope, ResidualLowering};
+use triblespace::core::query::residual::{FormulaScope, ProgramScope, ResidualLowering};
 use triblespace::core::query::{Binding, Constraint, Query};
 use triblespace::prelude::inlineencodings::GenId;
 use triblespace::prelude::*;
@@ -54,7 +54,7 @@ fn multiset<T: Eq + Hash>(items: impl IntoIterator<Item = T>) -> HashMap<T, usiz
 }
 
 fn combined_effects() -> ResidualLowering {
-    ResidualLowering::new(FormulaScope::UnionLeaves, true)
+    ResidualLowering::new(FormulaScope::UnionLeaves, ProgramScope::All)
 }
 
 /// Runs the stable schedulers around one replaceable residual-capability seam.

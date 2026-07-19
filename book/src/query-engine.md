@@ -148,12 +148,14 @@ more structure, so lowering never crosses an undeclared semantic boundary.
 
 Every live ordinary root runs as one finite formula after variable selection.
 Exposed AND/OR progress then becomes canonical formula state, and eligible
-cyclic regular paths run through the delta submachine. Unsupported path
-programs and custom atoms keep using their ordinary opaque `Constraint`
-actions. The `root_formula` capability currently subsumes finite-union exposure
-on this path; the ordinary policy nevertheless names both capabilities
-explicitly so they remain separate composable controls for other residual
-entry points.
+cyclic regular paths run through the delta submachine. `ProgramScope` is an
+orthogonal three-level policy: `Disabled` admits no typed Programs,
+`Production` admits production-qualified routes, and `All` also admits
+explicit routes. A structurally absent route may still use older transition
+hooks. A route deferred by policy instead uses the stable ordinary
+`Constraint` action; it never falls through to a legacy pager or strengthens
+an ordinary proposal receipt. The formula and Program scope chains therefore
+form nine scheduler-independent lowering combinations.
 
 Each canonical descriptor includes the bound-variable schema and one of four
 phases:
@@ -249,8 +251,10 @@ disjoint conjunctions, finite Union roots, RPQ roots, and live zero-variable
 truths therefore all exercise the same residual substrate. A seed-rejected
 query starts no worklist at all. Production lowering keeps finite logical
 composites as fused constraint kernels inside that substrate while enabling
-typed transition Programs for RPQs and other heterogeneous actions. The
-explicit lazy DAG remains the comparison path.
+production-qualified typed Programs for RPQs and other heterogeneous actions.
+Explicit page-producing routes, including UnionArchive Propose and Confirm,
+require `ProgramScope::All` (provided by `ResidualLowering::FULL`). The explicit
+lazy DAG remains the comparison path.
 
 [`Query::residual_state_scheduler`](triblespace::core::query::Query::residual_state_scheduler)
 selects the residual cursor for any root while preserving the query's chosen

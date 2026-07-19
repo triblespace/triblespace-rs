@@ -28,12 +28,12 @@ use crate::metadata;
 use crate::prelude::{attributes, entity, pattern};
 use crate::query::unionconstraint::UnionConstraint;
 use crate::query::{
-    CandidateSink, Candidates, Constraint, DispatchClass, EstimateSink,
-    ProgramAction, ProgramCompletion, ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef,
+    CandidateSink, Candidates, Constraint, DispatchClass, EstimateSink, ProgramAction,
+    ProgramCompletion, ProgramExposure, ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef,
     ProgramRequest, ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage, RawTerm,
     ResidualDeltaOutput, ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, Term,
-    TriblePattern, TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink,
-    VariableId, VariableSet,
+    TriblePattern, TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedResume,
+    TypedSeedSink, VariableId, VariableSet,
 };
 use crate::repo::index_range::{
     convex_union, is_ancestor, validate_exact_frontier_cover, RangeRecord, RangeRecordError,
@@ -1507,6 +1507,10 @@ where
             stratum: ProgramStratum::Finite,
             grouping: ProgramGrouping::PageLocal,
             completion: ProgramCompletion::PageableOnly,
+            exposure: match request.action {
+                ProgramAction::Propose(_) | ProgramAction::Confirm(_) => ProgramExposure::Explicit,
+                ProgramAction::Support => ProgramExposure::Production,
+            },
         })
     }
 
@@ -1983,6 +1987,7 @@ mod tests {
     use crate::inline::encodings::UnknownInline;
     use crate::inline::IntoInline;
     use crate::query::intersectionconstraint::IntersectionConstraint;
+    use crate::query::residual::ResidualLowering;
     use crate::query::{
         Binding, ProgramActivation, ProgramBatch, ProgramBatchEffects, ProgramResume, Query,
         Variable,
@@ -2283,7 +2288,9 @@ mod tests {
         ]);
         let query = Query::new(root, project_first);
         if residual {
-            query.solve_residual_state_lazy().collect()
+            query
+                .solve_residual_state_lazy_with(ResidualLowering::FULL)
+                .collect()
         } else {
             query.sequential().collect()
         }
@@ -2380,6 +2387,12 @@ mod tests {
                 bound: empty,
             })
             .unwrap();
+        let support = program
+            .route(ProgramRequest {
+                action: ProgramAction::Support,
+                bound: empty,
+            })
+            .unwrap();
         let mut attribute_bound = empty;
         attribute_bound.set(attribute.index);
         let resolved = program
@@ -2403,6 +2416,9 @@ mod tests {
         assert_eq!(propose.stratum, ProgramStratum::Finite);
         assert_eq!(propose.grouping, ProgramGrouping::PageLocal);
         assert_eq!(propose.completion, ProgramCompletion::PageableOnly);
+        assert_eq!(propose.exposure, ProgramExposure::Explicit);
+        assert_eq!(confirm.exposure, ProgramExposure::Explicit);
+        assert_eq!(support.exposure, ProgramExposure::Production);
         assert!(program
             .route(ProgramRequest {
                 action: ProgramAction::Propose(entity.index),
@@ -2511,12 +2527,13 @@ mod tests {
         );
         assert_eq!(examined, vec![1; 6]);
 
-        let (wide_values, wide_examined) =
-            drain_union_proposal(&constraint, value.index, 4);
+        let (wide_values, wide_examined) = drain_union_proposal(&constraint, value.index, 4);
         assert_eq!(wide_values, values, "physical grants changed shard order");
         assert_eq!(wide_examined, [4, 2]);
 
-        let mut admitted: Vec<_> = Query::new(constraint, project_first).collect();
+        let mut admitted: Vec<_> = Query::new(constraint, project_first)
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .collect();
         admitted.sort_unstable();
         assert_eq!(admitted, (1..=5).map(raw_value).collect::<Vec<_>>());
     }
