@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Cyclic Confirm actions now cross the same parent-local SET boundary as
+  ordinary actions.** Graph traversal retains the immutable original
+  occurrence bag and raw confirmation telemetry until its complete result
+  first reaches a candidate continuation that may split or commit. Contiguous
+  results use the tail-stable fast path; segmented ropes enter a bounded,
+  clone-cheap scan/emit Program that preserves last-position storage order
+  without materialization. Independent affine parents remain independent.
 - **Streaming proposal sources and typed Programs now admit SET candidates per
   affine activation.** Direct values, accepting roots, and typed observations
   retain their raw receipt counts for telemetry, then first-occurrence-stably
