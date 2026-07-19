@@ -164,15 +164,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Equal novelty keys now have tests proving first-receipt ownership across
   input tags of one activation while remaining independently admissible for
   distinct activations.
-- **Constraints can publish inert set-denotation receipts.**
+- **Constraints publish certified set-denotation receipts.**
   `fixed_denotation` certifies one route-independent relation and
   `proposal_coverage` distinguishes no source proof, a covering proposal, and
   exact proposal support. Both capabilities default conservatively, forward
   through transparent wrappers, and compose structurally through AND/OR;
   coherent finite, indexed, search, path, and resident-GPU constraints opt in.
   Repaired attached range constraints certify their exact attached-axis-domain
-  intersections as well. No planner consumes the receipts yet, and approximate
-  ANN remains deliberately uncertified.
+  intersections as well. The residual planner consumes these receipts only in
+  certified fixed-denotation regions: coverage, rather than estimates, selects
+  a source; Covering proposals retain self-confirmation, while Exact proposals
+  may discharge it. Approximate ANN remains deliberately uncertified.
 - **Typed Program capabilities compose by immutable semantic route arm.**
   `PreferredProgram` chooses a preferred typed family only when that family
   structurally owns an action, otherwise choosing a canonical typed fallback
