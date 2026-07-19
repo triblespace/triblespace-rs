@@ -21497,6 +21497,45 @@ mod tests {
     }
 
     #[test]
+    fn constructed_program_uses_filter_only_inline_range_as_a_confirmer() {
+        use crate::inline::encodings::UnknownInline;
+        use crate::query::rangeconstraint::value_range;
+
+        let variable = Variable::<UnknownInline>::new(0);
+        let min = Inline::<UnknownInline>::new(raw(2));
+        let max = Inline::<UnknownInline>::new(raw(4));
+        for (constant, expected) in [
+            (Inline::<UnknownInline>::new(raw(2)), vec![raw(2)]),
+            (Inline::<UnknownInline>::new(raw(4)), vec![raw(4)]),
+            (Inline::<UnknownInline>::new(raw(5)), Vec::new()),
+        ] {
+            let root = Arc::new(IntersectionConstraint::new(vec![
+                Box::new(ConstructedProtocolTrap {
+                    inner: variable.is(constant),
+                }) as ShapeConstraint,
+                Box::new(ConstructedProtocolTrap {
+                    inner: value_range(variable, min, max),
+                }) as ShapeConstraint,
+            ]));
+            let iterator = try_constructed_program_query(root, |binding: &Binding| {
+                binding.get(variable.index).copied()
+            })
+            .unwrap();
+            let step = &iterator.plan.constructed_program.as_ref().unwrap().steps[0];
+            assert_eq!(step.proposer, 0);
+            assert_eq!(
+                step.confirmer_routes
+                    .iter()
+                    .map(|(leaf, _)| *leaf)
+                    .collect::<Vec<_>>(),
+                vec![1],
+                "InlineRange must confirm another atom's source"
+            );
+            assert_eq!(iterator.collect::<Vec<_>>(), expected);
+        }
+    }
+
+    #[test]
     fn constructed_program_keeps_shared_occurrences_distinct() {
         let (graph, attribute) = constructed_program_graph();
         let expected_leaf = Arc::new(constructed_rpq(graph.clone(), &attribute, false));
