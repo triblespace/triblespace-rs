@@ -2894,10 +2894,14 @@ enum UnionVerb {
 }
 
 impl UnionVerb {
-    fn checked_count(&self) -> usize {
+    /// Outer protocol band enclosing this finite-formula continuation.
+    /// Proposal formulas live between `Propose` and the first `Candidate`;
+    /// confirmation formulas live between their `Confirm` and the next
+    /// `Candidate`, including the self-confirm band of a covering proposer.
+    fn rank_band(&self) -> usize {
         match self {
             UnionVerb::Propose { .. } => 0,
-            UnionVerb::Confirm { checked, .. } => checked.count(),
+            UnionVerb::Confirm { checked, .. } => 1 + checked.count(),
         }
     }
 }
@@ -2990,7 +2994,6 @@ impl StateDesc {
                 "residual checked set contains a non-leaf occurrence"
             );
             assert!(relevant.count() > 0, "residual relevant set is empty");
-            assert!(checked.count() > 0, "residual checked set is empty");
             assert!(
                 checked.is_subset_of(relevant),
                 "residual checked set is not a subset of the relevant set"
@@ -3080,8 +3083,12 @@ impl StateDesc {
     ) -> usize {
         self.validate(leaf_count, formula_pcs);
         assert!(action_span >= 2, "residual action span is too small");
+        // One band before any checked occurrence is required for a Covering
+        // proposer: its candidates exist, but its own confirm still has to
+        // validate them. The final spare band separates the largest complete
+        // candidate state from Ready at the next binding schema.
         let stride = leaf_count
-            .checked_add(1)
+            .checked_add(2)
             .and_then(|value| value.checked_mul(action_span))
             .expect("residual-state rank stride overflow");
         let base = self
@@ -3096,19 +3103,21 @@ impl StateDesc {
             }
             ResidualPhase::Candidate { checked, .. } => checked
                 .count()
-                .checked_mul(action_span)
+                .checked_add(1)
+                .and_then(|count| count.checked_mul(action_span))
                 .and_then(|grade| base.checked_add(grade))
                 .expect("residual-state rank overflow"),
             ResidualPhase::Confirm { checked, .. } => checked
                 .count()
-                .checked_mul(action_span)
+                .checked_add(1)
+                .and_then(|count| count.checked_mul(action_span))
                 .and_then(|grade| grade.checked_add(1))
                 .and_then(|grade| base.checked_add(grade))
                 .expect("residual-state rank overflow"),
             ResidualPhase::Formula { counter } => formula_pcs
                 .resume(*counter)
                 .verb
-                .checked_count()
+                .rank_band()
                 .checked_mul(action_span)
                 .and_then(|grade| grade.checked_add(1))
                 .and_then(|grade| {
@@ -17453,18 +17462,20 @@ mod tests {
         assert!(formula_ranks[0] > outer_propose);
         assert!(formula_ranks.windows(2).all(|pair| pair[0] < pair[1]));
 
+        // A Covering proposal enters the first candidate band with no leaf
+        // checked yet. Its own occurrence is the next confirmer.
         let proposal_candidate = rank(
             &formula_pcs,
             ResidualPhase::Candidate {
                 variable: 0,
                 relevant: relevant.clone(),
-                checked: ChildSet::empty(plan.len()).with_inserted(1),
+                checked: ChildSet::empty(plan.len()),
             },
         );
         assert_eq!(proposal_candidate, action_span);
         assert!(formula_ranks.last().unwrap() < &proposal_candidate);
 
-        let checked = ChildSet::empty(plan.len()).with_inserted(0);
+        let checked = ChildSet::empty(plan.len());
         let outer_confirm = rank(
             &formula_pcs,
             ResidualPhase::Confirm {
@@ -25788,24 +25799,27 @@ mod tests {
             },
         };
 
-        // S = 2(L + 1) = 10. The action grades interleave planning
-        // states, so every concrete transition raises rank by exactly one
-        // until a complete candidate jumps to the next binding schema.
-        assert_eq!(ready.rank(leaf_count), 10);
-        assert_eq!(propose.rank(leaf_count), 11);
-        assert_eq!(candidate(checked_a.clone()).rank(leaf_count), 12);
-        assert_eq!(candidate(checked_b).rank(leaf_count), 12);
-        assert_eq!(confirm(checked_a, 1).rank(leaf_count), 13);
-        assert_eq!(candidate(checked_ab.clone()).rank(leaf_count), 14);
-        assert_eq!(confirm(checked_ab.clone(), 2).rank(leaf_count), 15);
+        // S = 2(L + 2) = 12. The first candidate/confirm band represents a
+        // Covering proposal before and during its own validation. Subsequent
+        // bands remain history-independent: only the checked set matters.
+        assert_eq!(ready.rank(leaf_count), 12);
+        assert_eq!(propose.rank(leaf_count), 13);
+        let checked_none = ChildSet::empty(leaf_count);
+        assert_eq!(candidate(checked_none.clone()).rank(leaf_count), 14);
+        assert_eq!(confirm(checked_none, 0).rank(leaf_count), 15);
+        assert_eq!(candidate(checked_a.clone()).rank(leaf_count), 16);
+        assert_eq!(candidate(checked_b).rank(leaf_count), 16);
+        assert_eq!(confirm(checked_a, 1).rank(leaf_count), 17);
+        assert_eq!(candidate(checked_ab.clone()).rank(leaf_count), 18);
+        assert_eq!(confirm(checked_ab.clone(), 2).rank(leaf_count), 19);
 
         let full_candidate = candidate(checked_ab.with_inserted(2));
-        assert_eq!(full_candidate.rank(leaf_count), 16);
+        assert_eq!(full_candidate.rank(leaf_count), 20);
         let next_ready = StateDesc {
             bound: bound.union(VariableSet::new_singleton(3)),
             phase: ResidualPhase::Ready,
         };
-        assert_eq!(next_ready.rank(leaf_count), 20);
+        assert_eq!(next_ready.rank(leaf_count), 24);
         assert!(full_candidate.rank(leaf_count) < next_ready.rank(leaf_count));
     }
 
