@@ -227,7 +227,7 @@ fn built_in_capability_receipts_distinguish_native_paths_from_opaque_fallbacks()
             finite_union_arms: None,
             page_local_confirm: true,
             direct_proposal_source: true,
-            typed_program: false,
+            typed_program: true,
         },
         "SortedSliceConstraint"
     );

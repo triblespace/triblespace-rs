@@ -21536,6 +21536,48 @@ mod tests {
     }
 
     #[test]
+    fn constructed_program_pages_sorted_slice_duplicates_without_fallback() {
+        use crate::inline::encodings::UnknownInline;
+        use crate::query::sortedsliceconstraint::SortedSlice;
+
+        let values: &'static [Inline<UnknownInline>] = Box::leak(
+            vec![
+                Inline::new(raw(1)),
+                Inline::new(raw(1)),
+                Inline::new(raw(2)),
+                Inline::new(raw(3)),
+            ]
+            .into_boxed_slice(),
+        );
+        let variable = Variable::<UnknownInline>::new(0);
+        let root = Arc::new(IntersectionConstraint::new(vec![
+            Box::new(ConstructedProtocolTrap {
+                inner: SortedSlice::new(values).unwrap().has(variable),
+            }) as ShapeConstraint,
+        ]));
+        let mut iterator = try_constructed_program_query(root, |binding: &Binding| {
+            binding.get(variable.index).copied()
+        })
+        .unwrap()
+        .cap(1)
+        .start_width(1)
+        .growth(1);
+        let step = &iterator.plan.constructed_program.as_ref().unwrap().steps[0];
+        assert_eq!(step.proposer, 0);
+        assert!(step.confirmer_routes.is_empty());
+
+        let first = iterator.next().expect("sorted Program produced no row");
+        let mirror = iterator.clone();
+        let remainder: Vec<_> = iterator.collect();
+        assert_eq!(mirror.collect::<Vec<_>>(), remainder);
+        let mut actual = std::iter::once(first)
+            .chain(remainder)
+            .collect::<Vec<_>>();
+        actual.sort_unstable();
+        assert_eq!(actual, [raw(1), raw(1), raw(2), raw(3)]);
+    }
+
+    #[test]
     fn constructed_program_keeps_shared_occurrences_distinct() {
         let (graph, attribute) = constructed_program_graph();
         let expected_leaf = Arc::new(constructed_rpq(graph.clone(), &attribute, false));
