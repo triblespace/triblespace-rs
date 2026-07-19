@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Attached range constraints now denote an index-domain intersection.**
+  `TribleSet` value/entity/attribute ranges and `SuccinctArchive` value ranges
+  reject in-range candidates that do not occur on the attached V/E/A axis in
+  ordinary confirmation, typed Program confirmation, and bound-row support;
+  proposals and confirmations therefore implement the same relation even when
+  another constraint supplies the candidate.
+- **The residual query branch builds as an ordinary workspace again.** The
+  core crate now declares its `im` dependency directly instead of inheriting a
+  workspace dependency table that does not exist, and the formula reducer's
+  accumulated-length, continuation, and shared-input borrow paths once again
+  type-check under the workspace toolchain. A test-only panic is also fully
+  qualified so newer compilers do not report an ambiguous macro import.
 - **Variable grouping no longer changes a row's semantic proposal action.**
   The residual engine and the explicit lazy-DAG control retain each row's exact
   adaptive next variable instead of reassigning estimate-compatible groups.

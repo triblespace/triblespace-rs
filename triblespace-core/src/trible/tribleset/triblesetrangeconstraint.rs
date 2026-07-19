@@ -28,7 +28,8 @@ use super::triblesetconstraint::direct_source_page;
 use super::triblesetconstraint::next_inline_source_in_range;
 
 /// A value-range-aware constraint that uses the TribleSet's VEA index
-/// to propose only values in a byte-lexicographic range.
+/// to restrict values to the intersection of its V-axis domain and an
+/// inclusive byte-lexicographic range.
 ///
 /// When proposing for the value variable with the attribute bound, it
 /// calls `infixes_range` on the AVE index — the trie skips entire
@@ -77,7 +78,7 @@ impl TribleSetRangeConstraint {
     }
 
     fn contains(&self, value: &RawInline) -> bool {
-        *value >= self.min && *value <= self.max
+        *value >= self.min && *value <= self.max && self.set.vea.has_prefix(value)
     }
 }
 
@@ -123,13 +124,7 @@ impl TypedProgramSpec for TribleSetRangeConstraint {
             effects,
             |_input, cursor, limit, accepted| {
                 direct_source_page(cursor, limit, accepted, |after| {
-                    next_inline_source_in_range(
-                        &self.set.vea,
-                        &[],
-                        &self.min,
-                        &self.max,
-                        after,
-                    )
+                    next_inline_source_in_range(&self.set.vea, &[], &self.min, &self.max, after)
                 })
             },
             |_input, value| self.contains(value),
@@ -184,7 +179,7 @@ impl<'a> Constraint<'a> for TribleSetRangeConstraint {
         candidates: &mut CandidateSink<'_>,
     ) {
         if variable == self.variable_v {
-            candidates.retain(|_, v| *v >= self.min && *v <= self.max);
+            candidates.retain(|_, v| self.contains(v));
         }
     }
 
@@ -224,9 +219,7 @@ impl<'a> Constraint<'a> for TribleSetRangeConstraint {
 
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match view.col(self.variable_v) {
-            Some(col) => view
-                .iter()
-                .all(|row| row[col] >= self.min && row[col] <= self.max),
+            Some(col) => view.iter().all(|row| self.contains(&row[col])),
             None => true,
         }
     }
@@ -234,6 +227,7 @@ impl<'a> Constraint<'a> for TribleSetRangeConstraint {
 
 #[cfg(test)]
 mod tests {
+    use crate::inline::encodings::genid::GenId;
     use crate::inline::RawInline;
     use crate::prelude::inlineencodings::R256BE;
     use crate::prelude::*;
@@ -327,6 +321,55 @@ mod tests {
         )
         .collect();
         assert_eq!(empty.len(), 0);
+    }
+
+    #[test]
+    fn attached_value_range_rejects_in_range_values_absent_from_the_v_axis() {
+        let candidate_entity = ufoid();
+        let value_entity_1 = ufoid();
+        let value_entity_2 = ufoid();
+        let candidate_id: Inline<GenId> = (&candidate_entity).to_inline();
+        let value_id_1: Inline<GenId> = (&value_entity_1).to_inline();
+        let value_id_2: Inline<GenId> = (&value_entity_2).to_inline();
+        let candidate = Inline::<R256BE>::new(candidate_id.raw);
+        let value_1 = Inline::<R256BE>::new(value_id_1.raw);
+        let value_2 = Inline::<R256BE>::new(value_id_2.raw);
+
+        let mut data = TribleSet::new();
+        data += entity! { &candidate_entity @ range_test_score: value_1 };
+        data += entity! { &value_entity_1 @ range_test_score: value_2 };
+
+        let min = Inline::<R256BE>::new([0; 32]);
+        let mut max_raw = [0; 32];
+        max_raw[16..].fill(u8::MAX);
+        let max = Inline::<R256BE>::new(max_raw);
+        let variable = Variable::<R256BE>::new(0);
+
+        // The candidate is present in E but absent from V. Constant has the
+        // smaller estimate, forcing the attached range to confirm it.
+        let sequential: Vec<_> = Query::new(
+            and!(
+                variable.is(candidate),
+                data.value_in_range(variable, min, max)
+            ),
+            move |binding| project(variable.index, binding),
+        )
+        .sequential()
+        .collect();
+        assert!(sequential.is_empty());
+
+        let residual: Vec<_> = Query::new(
+            and!(
+                variable.is(candidate),
+                data.value_in_range(variable, min, max)
+            ),
+            move |binding| project(variable.index, binding),
+        )
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .cap(1)
+        .start_width(1)
+        .collect();
+        assert!(residual.is_empty());
     }
 
     /// Regression: the range-constraint estimate must report the count of

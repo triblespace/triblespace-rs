@@ -859,8 +859,8 @@ where
         self.rotation_view(rotation).changed_pair
     }
 
-    /// A value-range constraint that proposes only V-position values
-    /// in the inclusive byte-lexicographic range `[min, max]`.
+    /// A constraint over the intersection of the archive's V-axis domain and
+    /// the inclusive byte-lexicographic range `[min, max]`.
     ///
     /// Mirrors [`TribleSet::value_in_range`](crate::trible::TribleSet::value_in_range).
     /// The cost is O(log n + k) for an [`OrderedUniverse`] (n = universe

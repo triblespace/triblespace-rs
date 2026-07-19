@@ -23,7 +23,8 @@ use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
 
-/// Inline-range constraint for [`SuccinctArchive`].
+/// Inline-range constraint for [`SuccinctArchive`]. Its denotation is the
+/// intersection of the archive's V-axis domain and the inclusive raw range.
 ///
 /// Mirrors [`TribleSet::value_in_range`](crate::trible::TribleSet::value_in_range).
 /// The implementation leans on two archive primitives:
@@ -90,7 +91,15 @@ where
     }
 
     fn contains(&self, value: &RawInline) -> bool {
-        *value >= self.min && *value <= self.max
+        if *value < self.min || *value > self.max {
+            return false;
+        }
+        !super::succinctarchiveconstraint::base_range(
+            &self.archive.domain,
+            &self.archive.v_a,
+            value,
+        )
+        .is_empty()
     }
 }
 
@@ -199,7 +208,7 @@ where
         candidates: &mut CandidateSink<'_>,
     ) {
         if variable == self.variable_v {
-            candidates.retain(|_, v| *v >= self.min && *v <= self.max);
+            candidates.retain(|_, v| self.contains(v));
         }
     }
 
@@ -243,9 +252,7 @@ where
 
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match view.col(self.variable_v) {
-            Some(col) => view
-                .iter()
-                .all(|row| row[col] >= self.min && row[col] <= self.max),
+            Some(col) => view.iter().all(|row| self.contains(&row[col])),
             None => true,
         }
     }
