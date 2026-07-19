@@ -28,6 +28,9 @@
     future releases.
 
 ## Desired Functionality
+- Reconcile the residual branch's workspace-wide rustfmt baseline (or pin the
+  intended formatter toolchain): `cargo fmt --all` currently rewrites many
+  unrelated files, obscuring focused query-engine diffs.
 - Provide additional examples showcasing advanced queries and repository usage.
 - Include a regular path query example that combines attributes from multiple
   `attributes!` modules in the book.

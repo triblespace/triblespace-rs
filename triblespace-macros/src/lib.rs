@@ -400,6 +400,15 @@ pub fn pattern(input: TokenStream) -> TokenStream {
 /// match must come from `delta_set`, while the rest of the join may come from
 /// `current_set`.
 ///
+/// A surrounding [`find!`] publishes a set of its declared raw projection
+/// tuples for each invocation. Multiple delta placements or hidden witnesses
+/// that produce the same declared tuple therefore collapse within that call.
+/// The query keeps no history between invocations: a later disjoint delta may
+/// legitimately publish the same tuple again through a newly introduced
+/// witness. Persist the projected tuples in application state when once-only
+/// delivery across calls is required, or project the witness variables when
+/// those derivations should remain distinguishable.
+///
 /// ```rust,ignore
 /// for (work,) in find!(
 ///     (work: Inline<_>),

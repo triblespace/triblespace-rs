@@ -53,6 +53,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`pattern_changes!` documents its delivery boundary.** Its API docs now
+  distinguish per-invocation projected SET semantics from legitimate
+  recurrence of the same tuple through a witness introduced by a later delta,
+  with guidance for caller-retained once-only state and witness projection.
 - **Typed Program novelty activation scope has executable regression coverage.**
   Equal novelty keys now have tests proving first-receipt ownership across
   input tags of one activation while remaining independently admissible for
