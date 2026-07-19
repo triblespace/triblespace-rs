@@ -1514,6 +1514,39 @@ where
         self.program.canonical().confirm(variable, view, candidates)
     }
 
+    fn estimate_certified(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        self.program
+            .canonical()
+            .estimate_certified(variable, view, out)
+    }
+
+    fn propose_certified(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.program
+            .canonical()
+            .propose_certified(variable, view, candidates)
+    }
+
+    fn confirm_certified(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.program
+            .canonical()
+            .confirm_certified(variable, view, candidates)
+    }
+
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         self.program.canonical().satisfied(view)
     }
@@ -1548,6 +1581,16 @@ where
     /// physical placement decline never changes that semantic choice.
     fn residual_program(&self) -> Option<ProgramRef<'_>> {
         Some(self.program.program_ref())
+    }
+
+    fn residual_program_proposal_coverage(
+        &self,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> ProposalCoverage {
+        self.program
+            .canonical()
+            .residual_program_proposal_coverage(variable, bound)
     }
 
     fn residual_delta_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
@@ -1668,7 +1711,7 @@ mod tests {
     use triblespace_core::id::{ExclusiveId, Id};
     use triblespace_core::inline::encodings::genid::GenId;
     use triblespace_core::inline::InlineEncoding;
-    use triblespace_core::query::ProgramStratum;
+    use triblespace_core::query::{ProgramStratum, VariableContext};
     use triblespace_core::trible::{Trible, TribleSet};
 
     fn fixture_id(prefix: u8, ordinal: usize) -> Id {
@@ -1704,6 +1747,89 @@ mod tests {
             }
         }
         ((&set).into(), entities, attributes)
+    }
+
+    #[test]
+    fn canonical_wrapper_forwards_certified_surface_without_device() {
+        let (archive, entities, attributes) = fixture();
+        let mut context = VariableContext::new();
+        let entity = context.next_variable::<GenId>();
+        let attribute = context.next_variable::<GenId>();
+        let value = context.next_variable::<GenId>();
+        let canonical = SuccinctArchiveConstraint::new(entity, attribute, value, &archive);
+        let wrapped = ResidentTwoBoundConstraint {
+            program: ResidentProgram::Canonical(canonical),
+        };
+        assert!(wrapped.family().is_none());
+
+        let bound_variables = [entity.index, attribute.index];
+        let bound_row = [raw(entities[0]), raw(attributes[1])];
+        let view = RowsView::new(&bound_variables, &bound_row);
+        let mut bound = VariableSet::new_empty();
+        bound.set(entity.index);
+        bound.set(attribute.index);
+
+        assert_eq!(wrapped.fixed_denotation(), canonical.fixed_denotation());
+        assert_eq!(
+            wrapped.proposal_coverage(value.index, bound),
+            canonical.proposal_coverage(value.index, bound)
+        );
+        assert_eq!(
+            wrapped.proposal_coverage(value.index, bound),
+            ProposalCoverage::Exact
+        );
+        assert_eq!(
+            wrapped.residual_program_proposal_coverage(value.index, bound),
+            canonical.residual_program_proposal_coverage(value.index, bound)
+        );
+
+        let mut canonical_estimate = usize::MAX;
+        let canonical_quoted = canonical.estimate_certified(
+            value.index,
+            &view,
+            &mut EstimateSink::Scalar(&mut canonical_estimate),
+        );
+        let mut wrapped_estimate = usize::MAX;
+        let wrapped_quoted = wrapped.estimate_certified(
+            value.index,
+            &view,
+            &mut EstimateSink::Scalar(&mut wrapped_estimate),
+        );
+        assert_eq!(wrapped_quoted, canonical_quoted);
+        assert_eq!(wrapped_estimate, canonical_estimate);
+
+        let mut canonical_proposals = Vec::new();
+        canonical.propose_certified(
+            value.index,
+            &view,
+            &mut CandidateSink::Values(&mut canonical_proposals),
+        );
+        let mut wrapped_proposals = Vec::new();
+        wrapped.propose_certified(
+            value.index,
+            &view,
+            &mut CandidateSink::Values(&mut wrapped_proposals),
+        );
+        assert_eq!(wrapped_proposals, canonical_proposals);
+
+        let mut canonical_candidates = vec![
+            raw(fixture_id(3, 0)),
+            raw(fixture_id(3, 1)),
+            raw(fixture_id(9, 0)),
+        ];
+        let mut wrapped_candidates = canonical_candidates.clone();
+        canonical.confirm_certified(
+            value.index,
+            &view,
+            &mut CandidateSink::Values(&mut canonical_candidates),
+        );
+        wrapped.confirm_certified(
+            value.index,
+            &view,
+            &mut CandidateSink::Values(&mut wrapped_candidates),
+        );
+        assert_eq!(wrapped_candidates, canonical_candidates);
+        assert_eq!(wrapped_candidates, vec![raw(fixture_id(3, 0))]);
     }
 
     fn var_family<'a>(

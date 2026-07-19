@@ -287,6 +287,15 @@ pub mod query {
                 .residual_proposal_source_is_paged(variable, view)
         }
 
+        fn residual_proposal_source_has_transition_roots(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+        ) -> bool {
+            self.constraint
+                .residual_proposal_source_has_transition_roots(variable, view)
+        }
+
         fn residual_delta_source_page(
             &self,
             variable: VariableId,
@@ -362,6 +371,78 @@ pub mod query {
         ) -> bool {
             self.constraint
                 .residual_delta_expand(variable, nodes, successors)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        struct RootProducingSource {
+            variable: VariableId,
+        }
+
+        impl Constraint<'static> for RootProducingSource {
+            fn variables(&self) -> VariableSet {
+                VariableSet::new_singleton(self.variable)
+            }
+
+            fn estimate(
+                &self,
+                _variable: VariableId,
+                _view: &RowsView<'_>,
+                _out: &mut EstimateSink<'_>,
+            ) -> bool {
+                false
+            }
+
+            fn propose(
+                &self,
+                _variable: VariableId,
+                _view: &RowsView<'_>,
+                _candidates: &mut CandidateSink<'_>,
+            ) {
+            }
+
+            fn confirm(
+                &self,
+                _variable: VariableId,
+                _view: &RowsView<'_>,
+                _candidates: &mut CandidateSink<'_>,
+            ) {
+            }
+
+            fn residual_proposal_source_is_paged(
+                &self,
+                variable: VariableId,
+                view: &RowsView<'_>,
+            ) -> bool {
+                variable == self.variable && view.col(variable).is_none()
+            }
+
+            fn residual_proposal_source_has_transition_roots(
+                &self,
+                variable: VariableId,
+                view: &RowsView<'_>,
+            ) -> bool {
+                variable == self.variable && view.col(variable).is_none()
+            }
+        }
+
+        #[test]
+        fn estimate_override_preserves_root_producing_proposal_capability() {
+            let variable = 7;
+            let wrapped = EstimateOverrideConstraint::new(RootProducingSource { variable });
+
+            assert!(wrapped.residual_proposal_source_is_paged(variable, &RowsView::EMPTY));
+            assert!(wrapped.residual_proposal_source_has_transition_roots(
+                variable,
+                &RowsView::EMPTY
+            ));
+            assert!(!wrapped.residual_proposal_source_has_transition_roots(
+                variable + 1,
+                &RowsView::EMPTY
+            ));
         }
     }
 }
