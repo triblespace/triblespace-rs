@@ -87,7 +87,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use im::{OrdSet, Vector};
 use indexmap::IndexSet;
 use smallvec::SmallVec;
@@ -3146,6 +3146,33 @@ impl StateDesc {
     }
 }
 
+/// A candidate payload becomes a relation before any executor may split its
+/// occurrences independently or commit a fully checked variable binding.
+/// This is physical boundary evidence, not canonical state identity.
+fn candidate_payload_is_set_admitted(
+    desc: &StateDesc,
+    plan: &ResidualPlan,
+    formula_pcs: &FormulaPcInterner,
+) -> bool {
+    let fully_checked = matches!(
+        &desc.phase,
+        ResidualPhase::Candidate {
+            relevant, checked, ..
+        } if relevant == checked
+    );
+    fully_checked || desc.uses_candidate_pages(plan, formula_pcs)
+}
+
+fn crosses_candidate_set_boundary(
+    previous: &StateDesc,
+    successor: &StateDesc,
+    plan: &ResidualPlan,
+    formula_pcs: &FormulaPcInterner,
+) -> bool {
+    !candidate_payload_is_set_admitted(previous, plan, formula_pcs)
+        && candidate_payload_is_set_admitted(successor, plan, formula_pcs)
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct StateId(u32);
 
@@ -4660,6 +4687,52 @@ impl CandidatePayload {
             Self::Values(values) => CandidatePayloadIter::Values(values.iter()),
             Self::Tagged(pairs) => CandidatePayloadIter::Tagged(pairs.iter()),
             Self::Deferred(candidates) => CandidatePayloadIter::Deferred(candidates.iter()),
+        }
+    }
+
+    /// Admits one occurrence of each `(parent, value)` while preserving the
+    /// order observed by tail-first candidate scheduling.
+    ///
+    /// Deferred ropes deliberately return `false` unchanged: set admission
+    /// must become its own bounded Program before it may traverse a segmented
+    /// affine payload. It must never hide an unbounded materialization here.
+    fn admit_set_tail_stable(&mut self, parent_count: usize) -> bool {
+        self.debug_assert_valid_for(parent_count);
+        match self {
+            Self::Values(values) => {
+                let mut admitted = AHashSet::with_capacity(values.len());
+                values.reverse();
+                values.retain(|value| admitted.insert(*value));
+                values.reverse();
+                true
+            }
+            Self::Tagged(pairs) => {
+                let mut admitted = AHashSet::with_capacity(pairs.len());
+                pairs.reverse();
+                pairs.retain(|pair| admitted.insert(*pair));
+                pairs.reverse();
+                true
+            }
+            Self::Deferred(_) => false,
+        }
+    }
+
+    /// Admits one occurrence of each `(parent, value)` in first-occurrence
+    /// order for direct forward publication.
+    fn admit_set_forward_stable(&mut self, parent_count: usize) -> bool {
+        self.debug_assert_valid_for(parent_count);
+        match self {
+            Self::Values(values) => {
+                let mut admitted = AHashSet::with_capacity(values.len());
+                values.retain(|value| admitted.insert(*value));
+                true
+            }
+            Self::Tagged(pairs) => {
+                let mut admitted = AHashSet::with_capacity(pairs.len());
+                pairs.retain(|pair| admitted.insert(*pair));
+                true
+            }
+            Self::Deferred(_) => false,
         }
     }
 
@@ -6886,6 +6959,20 @@ fn propose_action_transition<'a>(
 
     let mut checked = ChildSet::empty(leaf_count);
     checked.insert(proposer);
+    let successor = StateDesc {
+        bound: desc.bound,
+        phase: ResidualPhase::Candidate {
+            variable,
+            relevant: relevant.clone(),
+            checked,
+        },
+    };
+    if crosses_candidate_set_boundary(desc, &successor, plan, &interner.formula_pcs) {
+        assert!(
+            candidates.admit_set_tail_stable(rows.row_count),
+            "an ordinary proposal returned a deferred candidate payload"
+        );
+    }
     let candidate = CandidateBatch {
         parents: rows,
         candidates,
@@ -6895,14 +6982,7 @@ fn propose_action_transition<'a>(
             worklist,
             interner,
             plan,
-            StateDesc {
-                bound: desc.bound,
-                phase: ResidualPhase::Candidate {
-                    variable,
-                    relevant: relevant.clone(),
-                    checked,
-                },
-            },
+            successor,
             StateBucket::Candidates(candidate),
             stats,
         )
@@ -7159,19 +7239,28 @@ fn confirm_action_transition<'a>(
     stats.candidates_confirmed += candidates_before;
     stats.max_confirm_candidates = stats.max_confirm_candidates.max(candidates_before);
 
+    let successor = StateDesc {
+        bound: desc.bound,
+        phase: ResidualPhase::Candidate {
+            variable,
+            relevant: relevant.clone(),
+            checked: checked.with_inserted(confirmer),
+        },
+    };
+    if crosses_candidate_set_boundary(desc, &successor, plan, &interner.formula_pcs) {
+        assert!(
+            batch
+                .candidates
+                .admit_set_tail_stable(batch.parents.row_count),
+            "an ordinary confirmation returned a deferred candidate payload"
+        );
+    }
     if let Some(batch) = batch.compact(vars.len()) {
         file_with_plan(
             worklist,
             interner,
             plan,
-            StateDesc {
-                bound: desc.bound,
-                phase: ResidualPhase::Candidate {
-                    variable,
-                    relevant: relevant.clone(),
-                    checked: checked.with_inserted(confirmer),
-                },
-            },
+            successor,
             StateBucket::Candidates(batch),
             stats,
         )
@@ -9359,6 +9448,14 @@ impl ResidualStateMachine {
         let raw_occurrence_count = effects.raw_occurrence_count;
         let candidates = CandidatePayload::from_tagged(effects.occurrences, rows.row_count);
         candidates.debug_assert_valid_for(rows.row_count);
+        debug_assert!(
+            {
+                let mut admitted = candidates.clone();
+                admitted.admit_set_forward_stable(rows.row_count)
+                    && admitted.len() == candidates.len()
+            },
+            "typed complete adapter returned a duplicate candidate"
+        );
         // The family call may unwind. Reserve receipt identities only after it
         // succeeds so a caught action panic cannot leave ghost terminal
         // samples in the shared activation namespace.
@@ -17500,6 +17597,39 @@ mod tests {
     }
 
     #[test]
+    fn candidate_set_admission_is_parent_local_stable_and_never_materializes_ropes() {
+        let mut tail = CandidatePayload::Values(vec![raw(1), raw(2), raw(1)]);
+        assert!(tail.admit_set_tail_stable(1));
+        assert_eq!(tail, [(0, raw(2)), (0, raw(1))]);
+
+        let mut forward = candidate_payload(
+            2,
+            vec![
+                (0, raw(1)),
+                (0, raw(2)),
+                (0, raw(1)),
+                (1, raw(1)),
+                (1, raw(1)),
+            ],
+        );
+        assert!(forward.admit_set_forward_stable(2));
+        assert_eq!(
+            forward,
+            [(0, raw(1)), (0, raw(2)), (1, raw(1))],
+            "equal values under distinct affine parents remain distinct"
+        );
+
+        let mut deferred = deferred_candidate_payload(
+            1,
+            vec![(0, raw(1)), (0, raw(1)), (0, raw(2))],
+        );
+        let before = deferred.tagged_snapshot();
+        assert!(!deferred.admit_set_tail_stable(1));
+        assert!(matches!(deferred, CandidatePayload::Deferred(_)));
+        assert_eq!(deferred.tagged_snapshot(), before);
+    }
+
+    #[test]
     fn deferred_candidate_clone_and_cursor_share_the_immutable_root() {
         let payload = deferred_candidate_payload(
             1,
@@ -18116,16 +18246,47 @@ mod tests {
             },
         };
         assert!(!before_atomic.uses_candidate_pages(&plan, &formula_pcs));
+        assert!(!candidate_payload_is_set_admitted(
+            &before_atomic,
+            &plan,
+            &formula_pcs
+        ));
 
         let after_atomic = StateDesc {
             bound: VariableSet::new_empty(),
             phase: ResidualPhase::Candidate {
                 variable: 0,
-                relevant,
+                relevant: relevant.clone(),
                 checked: proposer_checked.with_inserted(1),
             },
         };
         assert!(after_atomic.uses_candidate_pages(&plan, &formula_pcs));
+        assert!(crosses_candidate_set_boundary(
+            &before_atomic,
+            &after_atomic,
+            &plan,
+            &formula_pcs
+        ));
+
+        let fully_checked = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Candidate {
+                variable: 0,
+                relevant: relevant.clone(),
+                checked: relevant,
+            },
+        };
+        assert!(candidate_payload_is_set_admitted(
+            &fully_checked,
+            &plan,
+            &formula_pcs
+        ));
+        assert!(!crosses_candidate_set_boundary(
+            &after_atomic,
+            &fully_checked,
+            &plan,
+            &formula_pcs
+        ));
     }
 
     #[test]
@@ -24103,6 +24264,115 @@ mod tests {
         assert_eq!(machine.stats.propose_action_pops, 1);
         assert_eq!(machine.stats.propose_calls, 1);
         assert_eq!(proposes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn ordinary_proposal_set_admits_before_fully_checked_filing() {
+        let root = FanoutLeaf {
+            variable: 0,
+            values: Arc::new(vec![raw(1), raw(2), raw(1)]),
+        };
+        let plan = ResidualPlan::compile(&root);
+        let mut relevant = ChildSet::empty(plan.len());
+        relevant.insert(0);
+        let desc = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Propose {
+                variable: 0,
+                relevant: relevant.clone(),
+                proposer: 0,
+            },
+        };
+        let mut worklist = Worklist::new();
+        let mut interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let mut next_activation = 0;
+
+        let token = propose_action_transition(
+            &root,
+            &plan,
+            &desc,
+            0,
+            &relevant,
+            0,
+            RowBatch::seed(),
+            &mut next_activation,
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+        )
+        .expect("the proposal files its admitted relation");
+        let StateBucket::Candidates(batch) = worklist
+            .values()
+            .find_map(|level| level.get(&token.state))
+            .expect("the proposal successor remains live")
+        else {
+            panic!("the proposal filed a non-candidate payload")
+        };
+
+        assert_eq!(batch.candidates, [(0, raw(2)), (0, raw(1))]);
+        assert_eq!(stats.candidates_proposed, 3, "raw work remains charged");
+    }
+
+    #[test]
+    fn ordinary_confirmation_set_admits_at_the_first_page_safe_successor() {
+        let root = IntersectionConstraint::new(vec![
+            Box::new(FanoutLeaf {
+                variable: 0,
+                values: Arc::new(vec![raw(1), raw(2), raw(1)]),
+            }) as ShapeConstraint,
+            Box::new(CapabilityLeaf {
+                variable: 0,
+                page_local: false,
+            }) as ShapeConstraint,
+        ]);
+        let plan = ResidualPlan::compile(&root);
+        let mut relevant = ChildSet::empty(plan.len());
+        relevant.insert(0);
+        relevant.insert(1);
+        let checked = ChildSet::empty(plan.len()).with_inserted(0);
+        let desc = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Confirm {
+                variable: 0,
+                relevant: relevant.clone(),
+                checked: checked.clone(),
+                confirmer: 1,
+            },
+        };
+        let mut worklist = Worklist::new();
+        let mut interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let mut next_activation = 0;
+
+        let token = confirm_action_transition(
+            &root,
+            &plan,
+            &desc,
+            0,
+            &relevant,
+            &checked,
+            1,
+            CandidateBatch {
+                parents: RowBatch::seed(),
+                candidates: CandidatePayload::Values(vec![raw(1), raw(2), raw(1)]),
+            },
+            &mut next_activation,
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+        )
+        .expect("the confirmer files its admitted relation");
+        let StateBucket::Candidates(batch) = worklist
+            .values()
+            .find_map(|level| level.get(&token.state))
+            .expect("the confirmation successor remains live")
+        else {
+            panic!("the confirmer filed a non-candidate payload")
+        };
+
+        assert_eq!(batch.candidates, [(0, raw(2)), (0, raw(1))]);
+        assert_eq!(stats.candidates_confirmed, 3, "raw work remains charged");
     }
 
     #[test]

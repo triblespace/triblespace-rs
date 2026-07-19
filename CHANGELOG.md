@@ -24,6 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bag, then admits each distinct `(parent, value)` in first-occurrence order.
   Proposal statistics continue to charge the raw bag, while terminal row and
   receipt accounting sees only the admitted per-parent relation.
+- **Ordinary residual actions admit SET candidates at their first semantic
+  boundary.** Opaque Propose and Confirm actions retain raw work telemetry,
+  then tail-stably collapse equal values per affine parent before a fully
+  checked binding is committed or page-local candidates may split. Equal
+  values belonging to different parent rows remain independent. Segmented
+  affine ropes are explicitly left for bounded reducer admission rather than
+  being materialized merely to deduplicate them.
 
 ### Fixed
 
