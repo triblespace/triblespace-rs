@@ -290,6 +290,27 @@ impl<'c> Constraint<'c> for EqualityConstraint {
         vs
     }
 
+    fn fixed_denotation(&self) -> bool {
+        true
+    }
+
+    /// Equality becomes an exact finite source only after the peer variable is
+    /// bound. With both variables free it remains a validator rather than
+    /// pretending to own the universe of raw values.
+    fn proposal_coverage(
+        &self,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> ProposalCoverage {
+        if bound.is_set(variable) {
+            return ProposalCoverage::None;
+        }
+        match self.peer(variable) {
+            Some(peer) if peer != variable && bound.is_set(peer) => ProposalCoverage::Exact,
+            _ => ProposalCoverage::None,
+        }
+    }
+
     /// Estimates exactly one candidate per row when the peer variable is
     /// already bound. Returns `false` when the peer is unbound — the
     /// constraint has no independent opinion about the variable's

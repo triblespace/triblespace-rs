@@ -19,6 +19,7 @@ use crate::query::ProgramRef;
 use crate::query::ProgramRequest;
 use crate::query::ProgramRoute;
 use crate::query::ProgramSeedBatch;
+use crate::query::ProposalCoverage;
 use crate::query::RowsView;
 use crate::query::TypedEffectSink;
 use crate::query::TypedProgramBatch;
@@ -135,6 +136,22 @@ where
 {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.variable.index)
+    }
+
+    fn fixed_denotation(&self) -> bool {
+        true
+    }
+
+    fn proposal_coverage(
+        &self,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> ProposalCoverage {
+        if variable == self.variable.index && !bound.is_set(variable) {
+            ProposalCoverage::Exact
+        } else {
+            ProposalCoverage::None
+        }
     }
 
     fn estimate(

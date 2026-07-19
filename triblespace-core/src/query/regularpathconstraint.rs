@@ -28,6 +28,7 @@ use crate::query::ProgramRequest;
 use crate::query::ProgramRoute;
 use crate::query::ProgramSeedBatch;
 use crate::query::ProgramStratum;
+use crate::query::ProposalCoverage;
 use crate::query::RowsView;
 use crate::query::TriblePattern;
 use crate::query::TypedCompleteSink;
@@ -3259,6 +3260,25 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         vars.set(self.start);
         vars.set(self.end);
         vars
+    }
+
+    fn fixed_denotation(&self) -> bool {
+        true
+    }
+
+    /// A free endpoint proposal begins with graph-local transition seeds that
+    /// cover every successful path but can include starts which cannot finish
+    /// the remaining expression. Confirmation supplies the exact path test.
+    fn proposal_coverage(
+        &self,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> ProposalCoverage {
+        if !bound.is_set(variable) && (variable == self.start || variable == self.end) {
+            ProposalCoverage::Covering
+        } else {
+            ProposalCoverage::None
+        }
     }
 
     fn estimate(

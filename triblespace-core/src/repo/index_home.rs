@@ -30,10 +30,10 @@ use crate::query::unionconstraint::UnionConstraint;
 use crate::query::{
     CandidateSink, Candidates, Constraint, DispatchClass, EstimateSink,
     ProgramAction, ProgramCompletion, ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef,
-    ProgramRequest, ProgramRoute, ProgramSeedBatch, ProgramStratum, RawTerm, ResidualDeltaOutput,
-    ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, Term, TriblePattern,
-    TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink, VariableId,
-    VariableSet,
+    ProgramRequest, ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage, RawTerm,
+    ResidualDeltaOutput, ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, Term,
+    TriblePattern, TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink,
+    VariableId, VariableSet,
 };
 use crate::repo::index_range::{
     convex_union, is_ancestor, validate_exact_frontier_cover, RangeRecord, RangeRecordError,
@@ -1725,6 +1725,22 @@ where
 {
     fn variables(&self) -> VariableSet {
         self.union.variables()
+    }
+
+    fn fixed_denotation(&self) -> bool {
+        true
+    }
+
+    fn proposal_coverage(
+        &self,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> ProposalCoverage {
+        if !bound.is_set(variable) && self.variables().is_set(variable) {
+            ProposalCoverage::Exact
+        } else {
+            ProposalCoverage::None
+        }
     }
 
     fn estimate(

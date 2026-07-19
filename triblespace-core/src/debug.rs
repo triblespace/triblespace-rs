@@ -5,6 +5,7 @@ pub mod query {
     use crate::query::Constraint;
     use crate::query::EstimateSink;
     use crate::query::ProgramRef;
+    use crate::query::ProposalCoverage;
     use crate::query::ResidualDeltaExpandBatch;
     use crate::query::ResidualDeltaExpandCursor;
     use crate::query::ResidualDeltaExpandPage;
@@ -38,6 +39,18 @@ pub mod query {
     impl<'a, C: Constraint<'a>> Constraint<'a> for DebugConstraint<C> {
         fn variables(&self) -> VariableSet {
             self.constraint.variables()
+        }
+
+        fn fixed_denotation(&self) -> bool {
+            self.constraint.fixed_denotation()
+        }
+
+        fn proposal_coverage(
+            &self,
+            variable: VariableId,
+            bound: VariableSet,
+        ) -> ProposalCoverage {
+            self.constraint.proposal_coverage(variable, bound)
         }
 
         fn estimate(
@@ -116,6 +129,18 @@ pub mod query {
     impl<'a, C: Constraint<'a>> Constraint<'a> for EstimateOverrideConstraint<C> {
         fn variables(&self) -> VariableSet {
             self.constraint.variables()
+        }
+
+        fn fixed_denotation(&self) -> bool {
+            self.constraint.fixed_denotation()
+        }
+
+        fn proposal_coverage(
+            &self,
+            variable: VariableId,
+            bound: VariableSet,
+        ) -> ProposalCoverage {
+            self.constraint.proposal_coverage(variable, bound)
         }
 
         fn estimate(

@@ -885,6 +885,42 @@ pub struct ResidualDeltaExpandBatch<'v> {
     pub limits: &'v [usize],
 }
 
+/// Structural proof carried by a constraint's proposal for one variable.
+///
+/// For a constraint occurrence `C`, target variable `x`, bound-variable
+/// schema `B`, and one row `b`, let `F_C(x | b)` be the set of values that
+/// extend `b` to at least one complete solution of `C`. Coverage compares
+/// that existential fiber with the **support** of `C.propose(x, b)`; proposal
+/// occurrence multiplicity is deliberately not part of the receipt.
+///
+/// The variants form the proof-strength order
+/// [`None`](Self::None) < [`Covering`](Self::Covering) <
+/// [`Exact`](Self::Exact). This order is suitable for conservative meets,
+/// but it is not a cardinality estimate and must never be inferred from one.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[must_use]
+pub enum ProposalCoverage {
+    /// No completeness claim is made for this proposal.
+    ///
+    /// The constraint may still validate candidates proposed elsewhere, but
+    /// this occurrence is not a sound source for the target variable.
+    #[default]
+    None,
+
+    /// The proposal support contains the complete existential fiber.
+    ///
+    /// False positives are permitted, so the proposing occurrence must still
+    /// confirm its own candidates before they are considered semantically
+    /// admitted.
+    Covering,
+
+    /// The proposal support equals the complete existential fiber.
+    ///
+    /// Physical duplicate occurrences are permitted; exactness concerns only
+    /// which distinct values occur in the proposal.
+    Exact,
+}
+
 /// Object-safe child access for a structural constraint shape.
 #[doc(hidden)]
 pub trait ConstraintChildren<'a> {
@@ -927,6 +963,12 @@ pub trait ConstraintChildren<'a> {
 /// [`influence`](Constraint::influence) completes the picture by telling
 /// the engine which estimates to refresh when a variable is bound or
 /// unbound.
+///
+/// [`fixed_denotation`](Constraint::fixed_denotation) and
+/// [`proposal_coverage`](Constraint::proposal_coverage) are inert semantic
+/// receipts. They do not alter the ordinary protocol by themselves; an
+/// optimizer may use them only after the complete constraint occurrence is
+/// certified.
 ///
 /// # Statelessness
 ///
@@ -1005,6 +1047,47 @@ pub trait Constraint<'a> {
     /// graphs and to determine which constraints participate when a
     /// particular variable is being bound.
     fn variables(&self) -> VariableSet;
+
+    /// Certifies that this occurrence denotes one fixed set relation.
+    ///
+    /// Returning `true` is a proof obligation over the whole occurrence and
+    /// every execution route it exposes. For the duration of one solve:
+    ///
+    /// - ordinary, paged, typed-Program, and complete-equivalent routes must
+    ///   agree on the same relation over [`Self::variables`];
+    /// - `confirm(x, b, input)` must be a subbag of `input`, retain every
+    ///   occurrence whose value belongs to the existential fiber, and become
+    ///   exact once all occurrence variables other than `x` are bound;
+    /// - `satisfied(b) == false` must prove that `b` has no completion, and
+    ///   `satisfied` must be exact once all occurrence variables are bound;
+    /// - estimates remain costs only and cannot change relevance, coverage,
+    ///   or the denoted relation.
+    ///
+    /// The default is conservative. It preserves the existing action-defined
+    /// scheduling behavior for custom constraints until they explicitly
+    /// certify these laws.
+    fn fixed_denotation(&self) -> bool {
+        false
+    }
+
+    /// Returns the proposal proof for `variable` under bound schema `bound`.
+    ///
+    /// A non-[`None`](ProposalCoverage::None) result is legal only when
+    /// [`Self::fixed_denotation`] is `true` and `variable` belongs to
+    /// [`Self::variables`]. The result is structural for this occurrence,
+    /// target, and bound-variable set: it may depend on `bound`, but never on
+    /// row values, estimates, route availability, page size, execution
+    /// placement, or scheduler width.
+    ///
+    /// The default makes no source claim. A confirmation-only constraint can
+    /// therefore certify a fixed denotation while retaining this default.
+    fn proposal_coverage(
+        &self,
+        _variable: VariableId,
+        _bound: VariableSet,
+    ) -> ProposalCoverage {
+        ProposalCoverage::None
+    }
 
     /// Estimates the number of candidate values for `variable` for
     /// **every row** of the block, pushing one estimate per row into
@@ -1481,6 +1564,20 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.variables()
     }
 
+    fn fixed_denotation(&self) -> bool {
+        let inner: &T = self;
+        inner.fixed_denotation()
+    }
+
+    fn proposal_coverage(
+        &self,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> ProposalCoverage {
+        let inner: &T = self;
+        inner.proposal_coverage(variable, bound)
+    }
+
     fn estimate(
         &self,
         variable: VariableId,
@@ -1651,6 +1748,20 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     fn variables(&self) -> VariableSet {
         let inner: &T = self;
         inner.variables()
+    }
+
+    fn fixed_denotation(&self) -> bool {
+        let inner: &T = self;
+        inner.fixed_denotation()
+    }
+
+    fn proposal_coverage(
+        &self,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> ProposalCoverage {
+        let inner: &T = self;
+        inner.proposal_coverage(variable, bound)
     }
 
     fn estimate(

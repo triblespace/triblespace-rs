@@ -11,6 +11,7 @@ use super::CandidateSink;
 use super::Constraint;
 use super::ContainsConstraint;
 use super::EstimateSink;
+use super::ProposalCoverage;
 use super::ResidualDeltaOutput;
 use super::ResidualDeltaSourceCursor;
 use super::ResidualDeltaSourcePage;
@@ -374,6 +375,22 @@ impl<'a, S: InlineEncoding> Constraint<'a> for PatchValueConstraint<'a, S> {
         VariableSet::new_singleton(self.variable.index)
     }
 
+    fn fixed_denotation(&self) -> bool {
+        true
+    }
+
+    fn proposal_coverage(
+        &self,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> ProposalCoverage {
+        if variable == self.variable.index && !bound.is_set(variable) {
+            ProposalCoverage::Exact
+        } else {
+            ProposalCoverage::None
+        }
+    }
+
     fn estimate(
         &self,
         variable: VariableId,
@@ -567,6 +584,22 @@ where
 {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.variable.index)
+    }
+
+    fn fixed_denotation(&self) -> bool {
+        true
+    }
+
+    fn proposal_coverage(
+        &self,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> ProposalCoverage {
+        if variable == self.variable.index && !bound.is_set(variable) {
+            ProposalCoverage::Exact
+        } else {
+            ProposalCoverage::None
+        }
     }
 
     fn estimate(
