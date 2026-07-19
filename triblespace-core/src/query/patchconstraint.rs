@@ -19,6 +19,234 @@ use super::Variable;
 use super::VariableId;
 use super::VariableSet;
 
+/// Canonical finite continuation shared by PATCH value and ID membership.
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PatchProgramState {
+    Propose {
+        cursor: ResidualDeltaSourceCursor,
+    },
+    Confirm {
+        offset: usize,
+    },
+    Support,
+}
+
+const PATCH_PROPOSE_ROUTE: super::ProgramKey = super::ProgramKey::new(0);
+const PATCH_CONFIRM_ROUTE: super::ProgramKey = super::ProgramKey::new(1);
+const PATCH_SUPPORT_UNBOUND_ROUTE: super::ProgramKey = super::ProgramKey::new(2);
+const PATCH_SUPPORT_BOUND_ROUTE: super::ProgramKey = super::ProgramKey::new(3);
+
+const PATCH_PROPOSE_DISPATCH: super::DispatchClass = super::DispatchClass::new(0);
+const PATCH_CONFIRM_DISPATCH: super::DispatchClass = super::DispatchClass::new(1);
+const PATCH_SUPPORT_DISPATCH: super::DispatchClass = super::DispatchClass::new(2);
+
+fn patch_program_route(
+    variable: VariableId,
+    request: super::ProgramRequest,
+) -> Option<super::ProgramRoute> {
+    let (key, routed) = match request.action {
+        super::ProgramAction::Propose(target) => {
+            if target != variable || request.bound.is_set(target) {
+                return None;
+            }
+            (PATCH_PROPOSE_ROUTE, target)
+        }
+        super::ProgramAction::Confirm(target) => {
+            if target != variable || request.bound.is_set(target) {
+                return None;
+            }
+            (PATCH_CONFIRM_ROUTE, target)
+        }
+        super::ProgramAction::Support => (
+            if request.bound.is_set(variable) {
+                PATCH_SUPPORT_BOUND_ROUTE
+            } else {
+                PATCH_SUPPORT_UNBOUND_ROUTE
+            },
+            variable,
+        ),
+    };
+    Some(super::ProgramRoute {
+        key,
+        variable: routed,
+        stratum: super::ProgramStratum::Finite,
+        grouping: super::ProgramGrouping::PageLocal,
+        completion: super::ProgramCompletion::PageableOnly,
+    })
+}
+
+fn patch_program_dispatch(state: &PatchProgramState) -> super::DispatchClass {
+    match state {
+        PatchProgramState::Propose { .. } => PATCH_PROPOSE_DISPATCH,
+        PatchProgramState::Confirm { .. } => PATCH_CONFIRM_DISPATCH,
+        PatchProgramState::Support => PATCH_SUPPORT_DISPATCH,
+    }
+}
+
+fn patch_program_progress(state: &PatchProgramState) -> [u64; 6] {
+    fn complemented_value_words(value: &RawInline) -> [u64; 4] {
+        std::array::from_fn(|word| {
+            let begin = word * 8;
+            !u64::from_be_bytes(value[begin..begin + 8].try_into().unwrap())
+        })
+    }
+
+    let mut rank = [0; 6];
+    match state {
+        PatchProgramState::Support => rank[0] = 1,
+        PatchProgramState::Confirm { offset } => {
+            rank[0] = 2;
+            rank[1] = u64::MAX
+                - u64::try_from(*offset).expect("PATCH candidate offset exceeds rank limb");
+        }
+        PatchProgramState::Propose { cursor } => {
+            rank[0] = 3;
+            match cursor {
+                ResidualDeltaSourceCursor::Start => rank[1] = u64::MAX,
+                ResidualDeltaSourceCursor::After(value) => {
+                    rank[1] = u64::MAX - 1;
+                    rank[2..].copy_from_slice(&complemented_value_words(value));
+                }
+                ResidualDeltaSourceCursor::Offset(_) => {
+                    panic!("ordinal cursor crossed into a typed PATCH source")
+                }
+            }
+        }
+    }
+    rank
+}
+
+fn patch_program_seed(
+    variable: VariableId,
+    batch: super::ProgramSeedBatch<'_>,
+    effects: &mut super::TypedSeedSink<PatchProgramState, ()>,
+) {
+    assert_eq!(batch.route.stratum, super::ProgramStratum::Finite);
+    assert_eq!(batch.route.grouping, super::ProgramGrouping::PageLocal);
+    assert_eq!(
+        batch.route.completion,
+        super::ProgramCompletion::PageableOnly
+    );
+    let state = match batch.request.action {
+        super::ProgramAction::Propose(target) => {
+            assert_eq!(target, variable);
+            assert!(!batch.request.bound.is_set(target));
+            PatchProgramState::Propose {
+                cursor: ResidualDeltaSourceCursor::Start,
+            }
+        }
+        super::ProgramAction::Confirm(target) => {
+            assert_eq!(target, variable);
+            assert!(!batch.request.bound.is_set(target));
+            PatchProgramState::Confirm { offset: 0 }
+        }
+        super::ProgramAction::Support => PatchProgramState::Support,
+    };
+    for parent in 0..batch.view.len() {
+        effects.finite_root(
+            u32::try_from(parent).expect("too many typed PATCH parents"),
+            state.clone(),
+            None,
+        );
+    }
+}
+
+fn patch_program_step(
+    variable: VariableId,
+    states: Vec<PatchProgramState>,
+    batch: super::TypedProgramBatch<'_>,
+    effects: &mut super::TypedEffectSink<PatchProgramState, ()>,
+    source_page: impl Fn(
+        ResidualDeltaSourceCursor,
+        usize,
+        &mut Vec<RawInline>,
+    ) -> ResidualDeltaSourcePage,
+    contains: impl Fn(&RawInline) -> bool,
+) {
+    assert_eq!(batch.stratum, super::ProgramStratum::Finite);
+    assert_eq!(states.len(), batch.view.len());
+    assert_eq!(states.len(), batch.candidate_sets.len());
+    assert_eq!(states.len(), batch.limits.len());
+    let Some(first) = states.first() else {
+        return;
+    };
+    match first {
+        PatchProgramState::Propose { .. } => {
+            for (input, state) in states.into_iter().enumerate() {
+                let PatchProgramState::Propose { cursor } = state else {
+                    panic!("one typed PATCH cohort mixed action variants")
+                };
+                assert!(
+                    batch.candidate_sets[input].is_none(),
+                    "typed PATCH proposal received a candidate group"
+                );
+                let mut direct = Vec::new();
+                let page = source_page(cursor, batch.limits[input], &mut direct);
+                let input_tag =
+                    u32::try_from(input).expect("too many typed PATCH inputs in one cohort");
+                for value in direct {
+                    effects.direct(input_tag, value);
+                }
+                assert!(
+                    page.next.is_none() || page.examined > 0,
+                    "typed PATCH proposal resumed without examining its source"
+                );
+                let resume = page.next.map(|cursor| {
+                    super::TypedResume::Immediate(PatchProgramState::Propose { cursor })
+                });
+                effects.account_source(page.examined, 0);
+                effects.page(page.examined, resume);
+            }
+        }
+        PatchProgramState::Confirm { .. } => {
+            for (input, state) in states.into_iter().enumerate() {
+                let PatchProgramState::Confirm { offset } = state else {
+                    panic!("one typed PATCH cohort mixed action variants")
+                };
+                let candidates = batch.candidate_sets[input]
+                    .expect("typed PATCH confirmation lost its candidate group");
+                assert!(offset <= candidates.len());
+                let end = offset
+                    .saturating_add(batch.limits[input])
+                    .min(candidates.len());
+                let input_tag =
+                    u32::try_from(input).expect("too many typed PATCH inputs in one cohort");
+                for &candidate in &candidates[offset..end] {
+                    if contains(&candidate) {
+                        effects.accept(input_tag, candidate);
+                    }
+                }
+                let examined = end - offset;
+                assert!(
+                    end == candidates.len() || examined > 0,
+                    "typed PATCH confirmation resumed without examining a candidate"
+                );
+                let resume = (end < candidates.len()).then(|| {
+                    super::TypedResume::Immediate(PatchProgramState::Confirm { offset: end })
+                });
+                effects.page(examined, resume);
+            }
+        }
+        PatchProgramState::Support => {
+            let column = batch.view.col(variable);
+            for (input, state) in states.into_iter().enumerate() {
+                assert_eq!(state, PatchProgramState::Support);
+                assert!(
+                    batch.candidate_sets[input].is_none(),
+                    "typed PATCH support received a candidate group"
+                );
+                if column.is_none_or(|column| contains(&batch.view.row(input)[column])) {
+                    effects.support(
+                        u32::try_from(input).expect("too many typed PATCH inputs in one cohort"),
+                    );
+                }
+                effects.page(1, None);
+            }
+        }
+    }
+}
+
 /// Consume a bounded page from one strict raw-inline successor frontier.
 ///
 /// The lookahead only determines whether the frontier remains live. It is not
@@ -70,6 +298,75 @@ impl<'a, T: InlineEncoding> PatchValueConstraint<'a, T> {
     pub fn new(variable: Variable<T>, patch: &'a PATCH<INLINE_LEN, IdentitySchema, ()>) -> Self {
         PatchValueConstraint { variable, patch }
     }
+
+    fn contains_raw(&self, value: &RawInline) -> bool {
+        self.patch.has_prefix(value)
+    }
+
+    fn proposal_page(
+        &self,
+        cursor: ResidualDeltaSourceCursor,
+        limit: usize,
+        accepted: &mut Vec<RawInline>,
+    ) -> ResidualDeltaSourcePage {
+        direct_source_page(cursor, limit, accepted, |after| match after {
+            None => self.patch.first_infix_range(
+                &[0; 0],
+                &[u8::MIN; INLINE_LEN],
+                &[u8::MAX; INLINE_LEN],
+            ),
+            Some(value) => {
+                self.patch
+                    .next_infix_after(&[0; 0], value, &[u8::MAX; INLINE_LEN])
+            }
+        })
+    }
+}
+
+impl<S: InlineEncoding> super::TypedProgramSpec for PatchValueConstraint<'_, S> {
+    type State = PatchProgramState;
+    type NoveltyKey = ();
+    type Rank = [u64; 6];
+
+    fn route(&self, request: super::ProgramRequest) -> Option<super::ProgramRoute> {
+        patch_program_route(self.variable.index, request)
+    }
+
+    fn dispatch(&self, state: &Self::State) -> super::DispatchClass {
+        patch_program_dispatch(state)
+    }
+
+    fn pacing(&self, _state: &Self::State) -> super::ProgramPacing {
+        super::ProgramPacing::Search
+    }
+
+    fn progress(&self, state: &Self::State) -> Self::Rank {
+        patch_program_progress(state)
+    }
+
+    fn seed_typed(
+        &self,
+        batch: super::ProgramSeedBatch<'_>,
+        effects: &mut super::TypedSeedSink<Self::State, Self::NoveltyKey>,
+    ) {
+        patch_program_seed(self.variable.index, batch, effects);
+    }
+
+    fn step_typed(
+        &self,
+        states: Vec<Self::State>,
+        batch: super::TypedProgramBatch<'_>,
+        effects: &mut super::TypedEffectSink<Self::State, Self::NoveltyKey>,
+    ) {
+        patch_program_step(
+            self.variable.index,
+            states,
+            batch,
+            effects,
+            |cursor, limit, accepted| self.proposal_page(cursor, limit, accepted),
+            |value| self.contains_raw(value),
+        );
+    }
 }
 
 impl<'a, S: InlineEncoding> Constraint<'a> for PatchValueConstraint<'a, S> {
@@ -111,7 +408,7 @@ impl<'a, S: InlineEncoding> Constraint<'a> for PatchValueConstraint<'a, S> {
         candidates: &mut CandidateSink<'_>,
     ) {
         if self.variable.index == variable {
-            candidates.retain(|_, v| self.patch.has_prefix(v));
+            candidates.retain(|_, value| self.contains_raw(value));
         }
     }
 
@@ -140,21 +437,7 @@ impl<'a, S: InlineEncoding> Constraint<'a> for PatchValueConstraint<'a, S> {
         {
             return None;
         }
-        Some(direct_source_page(
-            cursor,
-            limit,
-            accepted,
-            |after| match after {
-                None => self.patch.first_infix_range(
-                    &[0; 0],
-                    &[u8::MIN; INLINE_LEN],
-                    &[u8::MAX; INLINE_LEN],
-                ),
-                Some(value) => self
-                    .patch
-                    .next_infix_after(&[0; 0], value, &[u8::MAX; INLINE_LEN]),
-            },
-        ))
+        Some(self.proposal_page(cursor, limit, accepted))
     }
 
     /// Exact when the variable is bound: checks whether every row's bound
@@ -162,9 +445,13 @@ impl<'a, S: InlineEncoding> Constraint<'a> for PatchValueConstraint<'a, S> {
     /// the variable is unbound.
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match view.col(self.variable.index) {
-            Some(c) => view.iter().all(|row| self.patch.has_prefix(&row[c])),
+            Some(c) => view.iter().all(|row| self.contains_raw(&row[c])),
             None => true,
         }
+    }
+
+    fn residual_program(&self) -> Option<super::ProgramRef<'_>> {
+        Some(super::ProgramRef::new(self))
     }
 }
 
@@ -198,6 +485,79 @@ where
     /// Creates a constraint that restricts `variable` to IDs in `patch`.
     pub fn new(variable: Variable<S>, patch: PATCH<ID_LEN, IdentitySchema, ()>) -> Self {
         PatchIdConstraint { variable, patch }
+    }
+
+    fn contains_raw(&self, value: &RawInline) -> bool {
+        id_from_value(value).is_some_and(|id| self.patch.has_prefix(&id))
+    }
+
+    fn proposal_page(
+        &self,
+        cursor: ResidualDeltaSourceCursor,
+        limit: usize,
+        accepted: &mut Vec<RawInline>,
+    ) -> ResidualDeltaSourcePage {
+        direct_source_page(cursor, limit, accepted, |after| {
+            let id = match after {
+                None => self.patch.first_infix_range(
+                    &[0; 0],
+                    &[u8::MIN; ID_LEN],
+                    &[u8::MAX; ID_LEN],
+                ),
+                Some(value) => {
+                    let id = id_from_value(value)?;
+                    self.patch
+                        .next_infix_after(&[0; 0], &id, &[u8::MAX; ID_LEN])
+                }
+            }?;
+            Some(id_into_value(&id))
+        })
+    }
+}
+
+impl<S: InlineEncoding> super::TypedProgramSpec for PatchIdConstraint<S> {
+    type State = PatchProgramState;
+    type NoveltyKey = ();
+    type Rank = [u64; 6];
+
+    fn route(&self, request: super::ProgramRequest) -> Option<super::ProgramRoute> {
+        patch_program_route(self.variable.index, request)
+    }
+
+    fn dispatch(&self, state: &Self::State) -> super::DispatchClass {
+        patch_program_dispatch(state)
+    }
+
+    fn pacing(&self, _state: &Self::State) -> super::ProgramPacing {
+        super::ProgramPacing::Search
+    }
+
+    fn progress(&self, state: &Self::State) -> Self::Rank {
+        patch_program_progress(state)
+    }
+
+    fn seed_typed(
+        &self,
+        batch: super::ProgramSeedBatch<'_>,
+        effects: &mut super::TypedSeedSink<Self::State, Self::NoveltyKey>,
+    ) {
+        patch_program_seed(self.variable.index, batch, effects);
+    }
+
+    fn step_typed(
+        &self,
+        states: Vec<Self::State>,
+        batch: super::TypedProgramBatch<'_>,
+        effects: &mut super::TypedEffectSink<Self::State, Self::NoveltyKey>,
+    ) {
+        patch_program_step(
+            self.variable.index,
+            states,
+            batch,
+            effects,
+            |cursor, limit, accepted| self.proposal_page(cursor, limit, accepted),
+            |value| self.contains_raw(value),
+        );
     }
 }
 
@@ -244,13 +604,7 @@ where
         candidates: &mut CandidateSink<'_>,
     ) {
         if self.variable.index == variable {
-            candidates.retain(|_, v| {
-                if let Some(id) = id_from_value(v) {
-                    self.patch.has_prefix(&id)
-                } else {
-                    false
-                }
-            });
+            candidates.retain(|_, value| self.contains_raw(value));
         }
     }
 
@@ -279,20 +633,7 @@ where
         {
             return None;
         }
-        Some(direct_source_page(cursor, limit, accepted, |after| {
-            let id = match after {
-                None => {
-                    self.patch
-                        .first_infix_range(&[0; 0], &[u8::MIN; ID_LEN], &[u8::MAX; ID_LEN])
-                }
-                Some(value) => {
-                    let id = id_from_value(value)?;
-                    self.patch
-                        .next_infix_after(&[0; 0], &id, &[u8::MAX; ID_LEN])
-                }
-            }?;
-            Some(id_into_value(&id))
-        }))
+        Some(self.proposal_page(cursor, limit, accepted))
     }
 
     /// Exact when the variable is bound: checks whether every row's bound
@@ -300,12 +641,13 @@ where
     /// while the variable is unbound.
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match view.col(self.variable.index) {
-            Some(c) => view.iter().all(|row| match id_from_value(&row[c]) {
-                Some(id) => self.patch.has_prefix(&id),
-                None => false,
-            }),
+            Some(c) => view.iter().all(|row| self.contains_raw(&row[c])),
             None => true,
         }
+    }
+
+    fn residual_program(&self) -> Option<super::ProgramRef<'_>> {
+        Some(super::ProgramRef::new(self))
     }
 }
 
@@ -327,9 +669,11 @@ mod tests {
     use crate::inline::encodings::UnknownInline;
     use crate::patch::Entry;
     use crate::query::intersectionconstraint::IntersectionConstraint;
-    use crate::query::residual::ResidualLowering;
-    use crate::query::Binding;
-    use crate::query::Query;
+    use crate::query::residual::{try_constructed_program_query, ResidualLowering};
+    use crate::query::{
+        Binding, ProgramAction, ProgramCompletion, ProgramGrouping, ProgramRequest, ProgramStratum,
+        Query, TypedProgramSpec,
+    };
 
     use super::*;
 
@@ -421,6 +765,23 @@ mod tests {
         let patch = value_patch(&[3, 1, 2, 2]);
         let variable = Variable::<UnknownInline>::new(0);
         let constraint = PatchValueConstraint::new(variable, &patch);
+        let program = constraint.residual_program().unwrap();
+        let route = program
+            .route(ProgramRequest {
+                action: ProgramAction::Propose(variable.index),
+                bound: VariableSet::new_empty(),
+            })
+            .unwrap();
+        assert_eq!(route.stratum, ProgramStratum::Finite);
+        assert_eq!(route.grouping, ProgramGrouping::PageLocal);
+        assert_eq!(route.completion, ProgramCompletion::PageableOnly);
+        assert!(
+            constraint.progress(&PatchProgramState::Propose {
+                cursor: ResidualDeltaSourceCursor::Start,
+            }) > constraint.progress(&PatchProgramState::Propose {
+                cursor: ResidualDeltaSourceCursor::After(raw(1)),
+            })
+        );
         let direct = paged_proposal(&constraint, variable.index, &RowsView::EMPTY);
         assert_eq!(direct, [raw(1), raw(2), raw(3)]);
         assert_eq!(
@@ -459,6 +820,18 @@ mod tests {
         );
         assert_eq!(full_query.stats().delta_source_roots, 0);
         assert_eq!(full_query.stats().max_propose_candidates, 1);
+
+        let mut constructed: Vec<_> = try_constructed_program_query(
+            IntersectionConstraint::new(vec![PatchValueConstraint::new(variable, &patch)]),
+            project_value,
+        )
+        .unwrap()
+        .cap(1)
+        .start_width(1)
+        .growth(1)
+        .collect();
+        constructed.sort_unstable();
+        assert_eq!(constructed, direct);
     }
 
     #[test]
@@ -496,6 +869,18 @@ mod tests {
         assert_eq!(ordinary, sequential);
         assert_eq!(eager, sequential);
         assert_eq!(full, sequential);
+
+        let mut constructed: Vec<_> = try_constructed_program_query(
+            IntersectionConstraint::new(vec![make()]),
+            project_value,
+        )
+        .unwrap()
+        .cap(1)
+        .start_width(1)
+        .growth(1)
+        .collect();
+        constructed.sort_unstable();
+        assert_eq!(constructed, direct);
     }
 
     #[test]
