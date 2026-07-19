@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Search and core now share one Jerky crate identity.** The search crate is
+  pinned to the same Jerky revision as core and GPU, restoring its succinct
+  build and preventing `Serializable` methods from disappearing behind two
+  revision-distinct copies of the same trait.
 - **Attached range constraints now denote an index-domain intersection.**
   `TribleSet` value/entity/attribute ranges and `SuccinctArchive` value ranges
   reject in-range candidates that do not occur on the attached V/E/A axis in
