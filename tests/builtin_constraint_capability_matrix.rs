@@ -1,6 +1,6 @@
 //! Executable capability and scheduler-parity matrix for built-in constraints.
 //!
-//! Exact result bags alone cannot distinguish a native residual capability
+//! Exact projected result sets alone cannot distinguish a native residual capability
 //! from the deliberately correct opaque fallback.  These fixtures therefore
 //! pair scheduler parity with static capability receipts and residual runtime
 //! counters.  A future capability change must update both halves consciously.
@@ -27,7 +27,7 @@ struct MatrixProfiles {
     full_geometric: ResidualStateStats,
 }
 
-fn sorted_bag<R: Ord>(mut values: Vec<R>) -> Vec<R> {
+fn sorted_rows<R: Ord>(mut values: Vec<R>) -> Vec<R> {
     values.sort_unstable();
     values
 }
@@ -48,9 +48,9 @@ where
     R: Clone + Debug + Ord,
     Make: Fn() -> Query<C, P, R>,
 {
-    let expected = sorted_bag(expected);
+    let expected = sorted_rows(expected);
     let assert_engine = |engine: &str, actual: Vec<R>| {
-        assert_eq!(sorted_bag(actual), expected, "{label}: {engine}");
+        assert_eq!(sorted_rows(actual), expected, "{label}: {engine}");
     };
 
     assert_engine("sequential oracle", make_query().sequential().collect());
@@ -120,8 +120,8 @@ where
     let original_remainder: Vec<_> = original.collect();
     let cloned_remainder: Vec<_> = cloned.collect();
     assert_eq!(
-        sorted_bag(original_remainder.clone()),
-        sorted_bag(cloned_remainder),
+        sorted_rows(original_remainder.clone()),
+        sorted_rows(cloned_remainder),
         "{label}: cloned exact remainder"
     );
     assert_engine(
@@ -304,7 +304,7 @@ fn built_in_capability_receipts_distinguish_native_paths_from_opaque_fallbacks()
 }
 
 #[test]
-fn atomic_constraints_have_exact_bags_across_residual_widths() {
+fn atomic_constraints_have_exact_sets_across_residual_widths() {
     let a = value(1);
     let b = value(2);
     let c = value(3);
@@ -355,7 +355,7 @@ fn membership_constraints_record_native_and_fallback_execution() {
     let sorted = SortedSlice::new(&sorted_values).unwrap();
     let sorted_profiles = assert_scheduler_matrix(
         "sorted slice preserves duplicate proposal occurrences",
-        sorted_values.to_vec(),
+        vec![a, b, c],
         || find!(x: Inline<UnknownInline>, Arc::new(sorted.has(x))),
     );
     assert_eq!(
@@ -474,7 +474,7 @@ fn finite_union_and_wrappers_have_explicit_execution_receipts() {
     let sorted_values = [a, a, b];
     let sorted = SortedSlice::new(&sorted_values).unwrap();
     let debug_record = Rc::new(RefCell::new(Vec::new()));
-    let debug_profiles = assert_scheduler_matrix("debug wrapper", sorted_values.to_vec(), || {
+    let debug_profiles = assert_scheduler_matrix("debug wrapper", vec![a, b], || {
         find!(
             x: Inline<UnknownInline>,
             Arc::new(DebugConstraint::new(
@@ -491,7 +491,7 @@ fn finite_union_and_wrappers_have_explicit_execution_receipts() {
     );
 
     let estimate_profiles =
-        assert_scheduler_matrix("estimate override wrapper", sorted_values.to_vec(), || {
+        assert_scheduler_matrix("estimate override wrapper", vec![a, b], || {
             find!(
                 x: Inline<UnknownInline>,
                 Arc::new(EstimateOverrideConstraint::new(sorted.has(x)))
@@ -518,17 +518,7 @@ fn finite_union_and_wrappers_have_explicit_execution_receipts() {
     let wrapped_values = SortedSlice::new(&wrapped_values).unwrap();
     let affine_profiles = assert_scheduler_matrix(
         "estimate wrapper preserves direct occurrences for every affine parent",
-        vec![
-            (parent_a, a),
-            (parent_a, a),
-            (parent_a, a),
-            (parent_a, a),
-            (parent_a, b),
-            (parent_a, b),
-            (parent_b, a),
-            (parent_b, a),
-            (parent_b, b),
-        ],
+        vec![(parent_a, a), (parent_a, b), (parent_b, a), (parent_b, b)],
         || {
             find!(
                 (parent: Inline<UnknownInline>, x: Inline<UnknownInline>),

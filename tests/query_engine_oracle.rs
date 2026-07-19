@@ -3,7 +3,7 @@
 //! Engine-to-engine parity can preserve a shared bug. These tests instead
 //! interpret generated relations with plain Rust set algebra, then require the
 //! sequential cursor and every worklist configuration to produce exactly that
-//! multiset on both in-memory and succinct backends.
+//! distinct raw projected-row set on both in-memory and succinct backends.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
@@ -470,13 +470,13 @@ fn root_formula_candidate_paging_is_storage_polymorphic() {
     }
 
     let archive: SuccinctArchive<OrderedUniverse> = (&kb).into();
-    let expected = multiset(middles[2..10].iter().flat_map(|middle| {
+    let expected = multiset(middles[2..10].iter().map(|middle| {
         let middle: Inline<GenId> = middle.to_inline();
-        [middle, middle]
+        middle
     }));
     assert!(
-        expected.values().all(|&count| count == sources.len()),
-        "fixture must expose projected bag multiplicity"
+        expected.values().all(|&count| count == 1),
+        "hidden source witnesses must collapse at projection"
     );
 
     macro_rules! query {
@@ -610,7 +610,7 @@ proptest! {
     /// witnesses, endpoint fan-in, and absent paths are exercised in every
     /// case rather than merely left to the generator. The independent oracle
     /// is Warshall closure over the generated union relation; it contains one
-    /// row per reachable endpoint pair, so exact sorted-bag comparison also
+    /// row per reachable endpoint pair, so exact counted-set comparison also
     /// catches duplicate leakage from multiple witnesses.
     #[test]
     fn rpq_schedulers_match_generated_reachability_oracle(
@@ -681,9 +681,9 @@ proptest! {
                     let pair = (nodes[from].to_inline(), nodes[to].to_inline());
                     expected.push(pair);
                     if to == 2 || to == N - 1 || has_bit(marked_mask, to) {
-                        // Projecting only the endpoint below deliberately keeps
-                        // one occurrence per reachable source. Multiple sources
-                        // therefore become genuine bag multiplicity.
+                        // Projecting only the endpoint below deliberately hides
+                        // the source. Multiple sources are existential
+                        // witnesses for one SET-projected endpoint.
                         expected_marked.push(nodes[to].to_inline());
                     }
                 }
@@ -691,14 +691,22 @@ proptest! {
         }
         expected.sort_unstable();
         expected_marked.sort_unstable();
+        expected_marked.dedup();
         let endpoint_two = nodes[2].to_inline();
         assert!(
+            (0..N)
+                .filter(|&from| reachable[from][2])
+                .count()
+                >= 2,
+            "fixture lost the multiple hidden witnesses for its shared endpoint"
+        );
+        assert_eq!(
             expected_marked
                 .iter()
                 .filter(|&&endpoint| endpoint == endpoint_two)
-                .count()
-                >= 2,
-            "forced shared endpoint lost its projected bag multiplicity"
+                .count(),
+            1,
+            "SET projection must keep the shared endpoint once"
         );
 
         let archive: SuccinctArchive<OrderedUniverse> = (&graph).into();

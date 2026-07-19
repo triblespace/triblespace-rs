@@ -176,7 +176,20 @@ There are three common shapes:
 
 - `find!(value, constraint)` for one projected variable as a bare value
 - `find!((a, b), constraint)` for tuples
-- `find!((), constraint)` when you care only that matches exist
+- `find!((), constraint)` when you care only that at least one match exists
+
+`find!` heads have relational SET semantics: each distinct ordered tuple of
+raw projected values is emitted once. Hidden variables introduced by
+`temp!` or `_?name` are existential witnesses and do not multiply an otherwise
+identical result. The empty head consequently returns either one `()` or no
+row, never one unit per witness, and stops once its singleton raw key has been
+claimed instead of draining the hidden fanout. Project a witness explicitly
+when its distinct values should remain visible.
+
+The engine claims raw projected identity before converting the head to Rust
+types. A failed conversion filters that tuple without allowing another hidden
+witness to retry it; different raw tuples remain distinct even if their Rust
+conversions compare equal.
 
 Typed projections happen in the head:
 

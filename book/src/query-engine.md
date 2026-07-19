@@ -169,8 +169,9 @@ Planning phases only estimate, partition, and file work; protocol calls happen
 in the explicit action phases. The checked-leaf set is canonical, so histories
 that applied the same constraints in different orders can append to the same
 future state before its remaining work runs. Row and candidate payloads still
-carry every occurrence, preserving bag semantics even when control states
-collapse.
+carry every internal occurrence even when control states collapse. This
+occurrence-bag invariant belongs to the constraint protocol and scheduling
+worklists; the terminal query projection applies public SET semantics.
 
 Lazy residual execution begins with actionable width one. A surviving action
 keeps its newly filed continuation hot, allowing a successful path to descend
@@ -250,8 +251,8 @@ lowering (`FULL` by default; `Query::residual_lowering` may change it).
 control and exposes its width policy;
 `solve_residual_state` is the eager saturated form, and
 `solve_residual_state_profiled` reports state, merge, action, and batch
-measurements. Fully drained variants preserve the result multiset, but may
-change result order.
+measurements. Fully drained variants preserve the distinct raw projected-row
+set, but may change result order.
 
 ## DAG worklist engine
 
@@ -320,8 +321,8 @@ matrix and stable counting partition.
 Both block-native engines keep fully-bound rows in raw inline form until the
 consumer pulls them. Neither worklist stores projected result values, so a
 query's `Send`/`Sync` properties do not depend on its output type and cloning a
-partially consumed query snapshots its exact remaining raw state without
-requiring the result type to implement `Clone`.
+partially consumed query snapshots its exact remaining raw state and claimed
+projection keys without requiring the result type to implement `Clone`.
 
 [`Query::solve_dag_lazy`](triblespace::core::query::Query::solve_dag_lazy)
 exposes the same scheduler as a configurable iterator with explicit starting
@@ -330,7 +331,37 @@ not a selectable physical policy.
 
 [`Query::solve_dag`](triblespace::core::query::Query::solve_dag) is the eager,
 saturated-width form. Fully drained schedulers produce the same result
-**multiset**, but worklist scheduling may produce a different row order.
+**set of raw projected rows**, but worklist scheduling may produce a different
+row order.
+
+## Terminal projection and SET identity
+
+Schedulers deliberately preserve internal row and candidate occurrences until
+a full binding reaches the terminal projection gate. The gate derives an
+ordered key from the raw inline bytes of the declared `find!` head and claims
+that key before running `TryFromInline` conversion or user mapper code. A
+second full binding with the same projected key is discarded, even when its
+hidden witness or route through an `or!` differs.
+
+This ordering gives projection ordinary relational SET semantics while keeping
+conversion outside the relational identity. Two distinct raw keys may convert
+to Rust values that compare equal and are still emitted separately. In the
+other direction, a failed conversion, mapper returning `None`, or mapper panic
+consumes its raw key; another witness cannot retry user code for that key. The
+empty head has one possible key, so `find!((), constraint)` emits at most one
+unit value. Claiming that singleton key exhausts the public projection: the
+next pull stops before scheduler work, while `None` stops the claiming pull and
+a caught mapper panic leaves the next pull immediately exhausted.
+
+The `find!` macro supplies its explicit ordered head. Direct `Query::new`
+construction uses every variable in the constraint as its conservative head,
+so it removes only byte-identical complete bindings. There is no public bag
+mode.
+
+Cloning a serial iterator copies both its remaining raw cursor and its claimed
+keys into an independent snapshot. Rayon sibling shards instead share one
+run-owned claim domain, ensuring that duplicates discovered by different
+workers are still emitted once.
 
 ## Parallel execution
 
@@ -469,8 +500,8 @@ A partially consumed ordinary residual or DAG query converted through
 `into_par_iter()` is drained as one parallel leaf so its exact remaining state
 cannot be restarted. Both explicit block-native entry points require a fresh
 query. With one Rayon worker each has a zero split budget; with `N` workers each
-permits at most `N - 1` splits. In every case the result guarantee is multiset
-equality, not iteration order.
+permits at most `N - 1` splits. In every case the result guarantee is equality
+of the distinct raw projected-row set, not iteration order.
 
 The parallel paths clone the constraint tree and result postprocessor per
 shard. Code that needs aggregate observations across clones should use shared

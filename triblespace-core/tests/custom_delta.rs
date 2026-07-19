@@ -722,7 +722,10 @@ impl PagedDirectDomain {
                 panic!("occurrence-bearing custom source received a value cursor")
             }
         };
-        assert!(begin <= self.values.len(), "custom source cursor out of range");
+        assert!(
+            begin <= self.values.len(),
+            "custom source cursor out of range"
+        );
         let end = begin.saturating_add(limit).min(self.values.len());
         let page_values = self.values[begin..end].to_vec();
         accepted.extend(page_values.iter().copied());
@@ -842,11 +845,7 @@ impl<'a> Constraint<'a> for PagedDirectDomain {
             .expect("direct source cohort trace poisoned")
             .push(DirectCohortTrace {
                 vars: batch.view.vars.to_vec(),
-                parents: batch
-                    .view
-                    .iter()
-                    .map(|row| row[parent_column])
-                    .collect(),
+                parents: batch.view.iter().map(|row| row[parent_column]).collect(),
                 candidate_mode,
                 cursors: batch.cursors.to_vec(),
                 limits: batch.limits.to_vec(),
@@ -1503,10 +1502,7 @@ fn custom_direct_source_first_pull_is_rootless_and_drop_cancels_the_frontier() {
     assert_eq!(pages[0].cursor, ResidualDeltaSourceCursor::Start);
     assert_eq!(pages[0].limit, 1);
     assert_eq!(pages[0].accepted, [raw(1)]);
-    assert_eq!(
-        pages[0].next,
-        Some(ResidualDeltaSourceCursor::Offset(1))
-    );
+    assert_eq!(pages[0].next, Some(ResidualDeltaSourceCursor::Offset(1)));
     assert_eq!(query.stats().delta_source_pages, 1);
     assert_eq!(query.stats().delta_source_candidates_examined, 1);
     assert_eq!(query.stats().delta_source_roots, 0);
@@ -1582,7 +1578,7 @@ fn assert_direct_source_case(values: Vec<RawInline>, expected: Vec<RawInline>) -
 }
 
 #[test]
-fn custom_direct_source_preserves_affine_bag_and_monotone_growth() {
+fn custom_direct_source_preserves_distinct_full_bindings_and_monotone_growth() {
     let inherited =
         assert_direct_source_case(vec![raw(1), raw(3)], vec![raw(1), raw(1), raw(3), raw(3)]);
     let mut extension = assert_direct_source_case(
@@ -1600,7 +1596,7 @@ fn custom_direct_source_preserves_affine_bag_and_monotone_growth() {
 }
 
 #[test]
-fn custom_direct_source_preserves_duplicate_occurrences_at_width_one() {
+fn custom_direct_source_duplicate_occurrences_collapse_per_parent_at_width_one() {
     // Equal occurrences straddle pages deliberately. The ordinal cursor is
     // what makes their two positions representable despite equal values.
     let values = vec![raw(1), raw(1)];
@@ -1612,7 +1608,9 @@ fn custom_direct_source_preserves_duplicate_occurrences_at_width_one() {
         .sequential()
         .collect(),
     );
-    assert_eq!(oracle, [raw(1), raw(1), raw(1), raw(1)]);
+    // The two parents remain distinct complete bindings, while equal source
+    // occurrences under the same parent share one raw projection key.
+    assert_eq!(oracle, [raw(1), raw(1)]);
 
     let evidence = Arc::new(DirectSourceEvidence::default());
     let residual = Query::new(
@@ -1748,10 +1746,7 @@ fn default_scalar_source_pages_consume_one_real_compatible_cohort() {
 #[test]
 fn live_custom_direct_source_clones_exactly_and_matches_rayon_workers() {
     let values = vec![raw(1), raw(2), raw(3), raw(4)];
-    let mut expected: Vec<_> = values
-        .iter()
-        .flat_map(|value| [*value, *value])
-        .collect();
+    let mut expected: Vec<_> = values.iter().flat_map(|value| [*value, *value]).collect();
     expected.sort_unstable();
 
     let evidence = Arc::new(DirectSourceEvidence::default());

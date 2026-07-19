@@ -47,7 +47,12 @@ mod variableset;
 use std::fmt;
 use std::iter::FromIterator;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
+#[cfg(feature = "parallel")]
+use std::sync::Mutex;
+
+use ahash::AHashSet;
 use arrayvec::ArrayVec;
 use constantconstraint::*;
 
@@ -58,13 +63,13 @@ use crate::inline::RawInline;
 
 #[doc(hidden)]
 pub use program::{
-    DispatchClass, ProgramAction, ProgramActivation, ProgramBatch, ProgramBatchEffects,
-    ProgramChild, ProgramCompleteBatch, ProgramCompleteEffects, ProgramCompletion, ProgramGrouping,
-    PreferredProgram, ProgramKey, ProgramPacing, ProgramPage, ProgramPhysicalReceipt, ProgramRef,
-    ProgramRequest, ProgramResume, ProgramRoute, ProgramRuntime, ProgramSeedBatch,
-    ProgramSeedEffects, ProgramSeedWork, ProgramStratum, ProgramWork, ProgramWorkHandle,
-    TypedCompleteSink, TypedEffectSink, TypedPhysicalStep, TypedProgramBatch, TypedProgramSpec,
-    TypedResume, TypedSeedSink,
+    DispatchClass, PreferredProgram, ProgramAction, ProgramActivation, ProgramBatch,
+    ProgramBatchEffects, ProgramChild, ProgramCompleteBatch, ProgramCompleteEffects,
+    ProgramCompletion, ProgramGrouping, ProgramKey, ProgramPacing, ProgramPage,
+    ProgramPhysicalReceipt, ProgramRef, ProgramRequest, ProgramResume, ProgramRoute,
+    ProgramRuntime, ProgramSeedBatch, ProgramSeedEffects, ProgramSeedWork, ProgramStratum,
+    ProgramWork, ProgramWorkHandle, TypedCompleteSink, TypedEffectSink, TypedPhysicalStep,
+    TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink,
 };
 /// Re-export of [`PathOp`].
 pub use regularpathconstraint::PathOp;
@@ -350,6 +355,188 @@ impl Default for Binding {
         Self {
             bound: VariableSet::new_empty(),
             values: [[0; 32]; 128],
+        }
+    }
+}
+
+type ProjectionKey = Box<[RawInline]>;
+
+/// The raw relational identity claimed before result conversion.
+///
+/// Most queries keep an owned set. Rayon promotes that set to one shared
+/// run-owned domain when it creates the first sibling shard; ordinary
+/// `Query::clone` deliberately snapshots either representation back into an
+/// independent owned set.
+enum ProjectionClaims {
+    Owned(AHashSet<ProjectionKey>),
+    #[cfg(feature = "parallel")]
+    Shared(Arc<Mutex<AHashSet<ProjectionKey>>>),
+}
+
+struct ProjectionGate {
+    /// Projected variables in declared head order. This order, together with
+    /// the raw inline bytes, is the public row identity; converted Rust values
+    /// never participate in distinctness.
+    head: Arc<[VariableId]>,
+    claims: ProjectionClaims,
+    /// Macro-created projections expose only their declared head to the
+    /// mapper. Direct `Query::new` uses the original complete binding instead.
+    mapper_binding: Option<Box<Binding>>,
+}
+
+/// Result of offering one complete raw binding to the public projection.
+///
+/// `Done` is distinct from `Skip`: an empty head has exactly one possible raw
+/// key. Once that key is claimed, no later hidden witness can produce another
+/// public row, even when conversion or mapper code rejected the claimed key.
+enum ProjectionStep<R> {
+    Yield(R),
+    Skip,
+    Done,
+}
+
+impl ProjectionGate {
+    fn new(head: impl IntoIterator<Item = VariableId>, variables: VariableSet) -> Self {
+        let mut ordered = Vec::new();
+        let mut unique = VariableSet::new_empty();
+        for variable in head {
+            assert!(
+                variables.is_set(variable),
+                "projected variable {variable} is not constrained by this query"
+            );
+            assert!(
+                !unique.is_set(variable),
+                "projected variable {variable} appears more than once in the query head"
+            );
+            unique.set(variable);
+            ordered.push(variable);
+        }
+        Self {
+            head: ordered.into(),
+            claims: ProjectionClaims::Owned(AHashSet::new()),
+            mapper_binding: Some(Box::default()),
+        }
+    }
+
+    fn full(variables: VariableSet) -> Self {
+        let mut gate = Self::new(variables, variables);
+        gate.mapper_binding = None;
+        gate
+    }
+
+    fn is_empty_head(&self) -> bool {
+        self.head.is_empty()
+    }
+
+    /// Whether every possible public key has already been claimed.
+    ///
+    /// Only the empty head has a finite singleton key domain known without
+    /// searching. Parallel shards inspect the shared claim set, so one shard's
+    /// claim also stops its siblings at their next pull boundary.
+    fn is_done(&self) -> bool {
+        if !self.is_empty_head() {
+            return false;
+        }
+        match &self.claims {
+            ProjectionClaims::Owned(claims) => !claims.is_empty(),
+            #[cfg(feature = "parallel")]
+            ProjectionClaims::Shared(claims) => !claims
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .is_empty(),
+        }
+    }
+
+    /// Claims a projected raw key before any user conversion or mapper code
+    /// runs. A failed conversion, `None`, or panic therefore cannot cause the
+    /// same relational row to be retried through another witness.
+    fn claim(&mut self, binding: &Binding) -> bool {
+        let key: ProjectionKey = self
+            .head
+            .iter()
+            .map(|&variable| {
+                *binding
+                    .get(variable)
+                    .expect("projection attempted before a head variable was bound")
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        match &mut self.claims {
+            ProjectionClaims::Owned(claims) => claims.insert(key),
+            #[cfg(feature = "parallel")]
+            ProjectionClaims::Shared(claims) => claims
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .insert(key),
+        }
+    }
+
+    /// Claims the raw head, then invokes the mapper with exactly the binding
+    /// scope represented by that head. Hidden witnesses cannot affect a
+    /// macro-created result through the doc-hidden constructor seam.
+    fn project<P, R>(&mut self, binding: &Binding, postprocessing: &P) -> ProjectionStep<R>
+    where
+        P: Fn(&Binding) -> Option<R>,
+    {
+        if !self.claim(binding) {
+            return if self.is_empty_head() {
+                ProjectionStep::Done
+            } else {
+                ProjectionStep::Skip
+            };
+        }
+        let mapped = if let Some(projected) = &mut self.mapper_binding {
+            for &variable in self.head.iter() {
+                projected.set(
+                    variable,
+                    binding
+                        .get(variable)
+                        .expect("projection attempted before a head variable was bound"),
+                );
+            }
+            postprocessing(projected)
+        } else {
+            postprocessing(binding)
+        };
+        match mapped {
+            Some(result) => ProjectionStep::Yield(result),
+            None if self.is_empty_head() => ProjectionStep::Done,
+            None => ProjectionStep::Skip,
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    fn share_for_parallel(&mut self) -> Arc<Mutex<AHashSet<ProjectionKey>>> {
+        match &mut self.claims {
+            ProjectionClaims::Owned(claims) => {
+                let shared = Arc::new(Mutex::new(std::mem::take(claims)));
+                self.claims = ProjectionClaims::Shared(Arc::clone(&shared));
+                shared
+            }
+            ProjectionClaims::Shared(claims) => Arc::clone(claims),
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    fn attach_shared(&mut self, claims: Arc<Mutex<AHashSet<ProjectionKey>>>) {
+        self.claims = ProjectionClaims::Shared(claims);
+    }
+}
+
+impl Clone for ProjectionGate {
+    fn clone(&self) -> Self {
+        let claims = match &self.claims {
+            ProjectionClaims::Owned(claims) => claims.clone(),
+            #[cfg(feature = "parallel")]
+            ProjectionClaims::Shared(claims) => claims
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone(),
+        };
+        Self {
+            head: self.head.clone(),
+            claims: ProjectionClaims::Owned(claims),
+            mapper_binding: self.mapper_binding.clone(),
         }
     }
 }
@@ -1952,7 +2139,9 @@ enum QueryScheduler {
 /// Scheduler selection and structural lowering are independent controls; use
 /// [`Query::residual_lowering`] to select a conservative or intermediate
 /// lowering without changing the scheduler. Fully drained scheduler results
-/// are compared as multisets; their iteration order may differ.
+/// produce the same distinct raw projected-row set; their iteration order may
+/// differ. Projection keys are claimed before Rust conversion, so conversion
+/// failure or panic never retries the same raw row through another witness.
 /// The query engine is designed to be simple and efficient, providing low, consistent,
 /// and predictable latency, skew resistance, and no required (or possible) tuning.
 /// The query engine is designed to be used in combination with the [Constraint] trait,
@@ -1966,6 +2155,9 @@ enum QueryScheduler {
 pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
     constraint: C,
     postprocessing: P,
+    /// Raw projected-row identity and the keys already claimed by this exact
+    /// iterator snapshot.
+    projection: ProjectionGate,
     scheduler: QueryScheduler,
     /// Structural lowering selected independently from the physical scheduler.
     residual_lowering: residual::ResidualLowering,
@@ -2033,6 +2225,7 @@ where
         Self {
             constraint: self.constraint.clone(),
             postprocessing: self.postprocessing.clone(),
+            projection: self.projection.clone(),
             scheduler: self.scheduler,
             residual_lowering: self.residual_lowering,
             mode: self.mode,
@@ -2115,11 +2308,11 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
 
     /// Fills the emit-only [`Binding`] from the cursor and runs the
     /// postprocessing closure on it.
-    fn emit(&mut self) -> Option<R> {
+    fn emit(&mut self) -> ProjectionStep<R> {
         for (k, &v) in self.stack.iter().enumerate() {
             self.binding.set(v, &self.row[k]);
         }
-        (self.postprocessing)(&self.binding)
+        self.projection.project(&self.binding, &self.postprocessing)
     }
 
     /// PROBE: frontier-batched (block-at-a-time) solver — the exact-grouped,
@@ -2138,7 +2331,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// the same adaptive next-variable choice as scalar execution, and rows
     /// batch only when that semantic action agrees.
     ///
-    /// Semantics: yields the same result **multiset** as the iterator;
+    /// Semantics: yields the same distinct projected-row set as the iterator;
     /// row order may differ (block order instead of DFS order).
     pub fn solve_blocked(self) -> Vec<R> {
         let mut it = self.solve_dag_lazy().start_width(usize::MAX);
@@ -2244,11 +2437,44 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// The query takes a constraint and a post-processing function as input,
     /// and returns the results of the query as a stream of values.
     /// The post-processing function returns `Option<R>`: returning `None`
-    /// skips the current binding and continues the search.
+    /// skips the current binding and continues the search. The complete set of
+    /// variables named by the constraint is the raw SET projection head, so
+    /// each byte-identical full binding reaches post-processing at most once.
+    /// The raw binding is claimed before post-processing; `None` or a panic
+    /// consumes that key rather than allowing another occurrence to retry it.
     ///
     /// This method is usually not called directly, but rather through the [find!] macro,
     pub fn new(constraint: C, postprocessing: P) -> Self {
         let variables = constraint.variables();
+        let projection = ProjectionGate::full(variables);
+        Self::new_inner(constraint, postprocessing, variables, projection)
+    }
+
+    /// Constructs a query with an explicit relational projection head.
+    ///
+    /// This is the macro expansion seam for [`find!`](crate::find). It is not
+    /// a bag-mode control: every supplied head still has public SET semantics.
+    /// The postprocessor sees only variables in `head`; hidden witnesses are
+    /// absent from its [`Binding`].
+    /// Direct callers should normally use [`Query::new`], whose head is the
+    /// complete constraint-variable set.
+    #[doc(hidden)]
+    pub fn new_projected<const N: usize>(
+        constraint: C,
+        head: [VariableId; N],
+        postprocessing: P,
+    ) -> Self {
+        let variables = constraint.variables();
+        let projection = ProjectionGate::new(head, variables);
+        Self::new_inner(constraint, postprocessing, variables, projection)
+    }
+
+    fn new_inner(
+        constraint: C,
+        postprocessing: P,
+        variables: VariableSet,
+        projection: ProjectionGate,
+    ) -> Self {
         let influences = std::array::from_fn(|v| {
             if variables.is_set(v) {
                 constraint.influence(v)
@@ -2309,6 +2535,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         Query {
             constraint,
             postprocessing,
+            projection,
             scheduler,
             residual_lowering: residual::ResidualLowering::FULL,
             mode,
@@ -2436,8 +2663,7 @@ fn variable_choice_key(
     base_estimate: usize,
     influence_count: usize,
 ) -> (u64, u64, u64, std::cmp::Reverse<VariableId>) {
-    let (first, second, third) =
-        variable_order_key(estimate, base_estimate, influence_count);
+    let (first, second, third) = variable_order_key(estimate, base_estimate, influence_count);
     (first, second, third, std::cmp::Reverse(variable))
 }
 
@@ -2923,7 +3149,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// hidden). Where routes never reconverge the gate never blocks and
     /// the schedule is DFS-like.
     ///
-    /// Semantics: same result **multiset** as the sequential iterator
+    /// Semantics: same distinct projected-row set as the sequential iterator
     /// (each row still value-partitions its region of the search space;
     /// merging is co-location only). Row order differs.
     pub fn solve_dag(self) -> Vec<R> {
@@ -2997,7 +3223,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// For `R` rows and `V ≤ 128` unbound variables, planning takes `O(RV)`
     /// time and uses `O(RV + V)` reusable scratch space.
     ///
-    /// Semantics: fully drained, the same result **multiset** as the
+    /// Semantics: fully drained, the same distinct projected-row set as the
     /// sequential iterator and the eager DAG solver; row order differs.
     ///
     /// # Panics
@@ -3008,7 +3234,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// duplicate emission and ambiguity after exhaustion. An untouched query
     /// is fresh, including one whose zero-variable settlement already failed
     /// in [`Query::new`] (`Search::Done` without a `next()` call): that one
-    /// correctly yields the empty multiset.
+    /// correctly yields the empty set.
     pub fn solve_dag_lazy(self) -> DagIter<C, P, R> {
         assert!(
             !self.iteration_started
@@ -3024,6 +3250,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         let Query {
             constraint,
             postprocessing,
+            projection,
             influences,
             base_estimates,
             mode,
@@ -3037,13 +3264,14 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         // consults zero-variable constraints (they have no unbound
         // variables to propose for), so honor the settlement here by
         // starting with an empty worklist — the DAG engine then agrees
-        // with the sequential engine's empty result multiset.
+        // with the sequential engine's empty result set.
         if matches!(mode, Search::Done) {
             state.buckets.clear();
         }
         DagIter {
             constraint,
             postprocessing,
+            projection,
             influences,
             base_estimates,
             state,
@@ -3083,6 +3311,7 @@ fn lazy_growth() -> usize {
 pub struct DagIter<C, P: Fn(&Binding) -> Option<R>, R> {
     constraint: C,
     postprocessing: P,
+    projection: ProjectionGate,
     influences: [VariableSet; 128],
     base_estimates: [usize; 128],
     state: DagState,
@@ -3631,7 +3860,11 @@ impl DagState {
             scratch.preferred.push(preferred as u32);
             scratch.group_counts[preferred] += 1;
         }
-        let n_groups = scratch.group_counts.iter().filter(|&&count| count > 0).count();
+        let n_groups = scratch
+            .group_counts
+            .iter()
+            .filter(|&&count| count > 0)
+            .count();
 
         // 3. Partition (stable counting sort); a single group borrows the
         //    popped rows directly.
@@ -3723,6 +3956,7 @@ impl DagState {
         &mut self,
         constraint: &C,
         postprocessing: &P,
+        projection: &mut ProjectionGate,
         influences: &[VariableSet; 128],
         base_estimates: &[usize; 128],
     ) -> Option<R>
@@ -3730,6 +3964,9 @@ impl DagState {
         C: Constraint<'a>,
         P: Fn(&Binding) -> Option<R>,
     {
+        if projection.is_done() {
+            return None;
+        }
         loop {
             while self.emit_next < self.emit_count {
                 let row_index = self.emit_next;
@@ -3743,8 +3980,10 @@ impl DagState {
                 for (k, &v) in self.emit_vars.iter().enumerate() {
                     self.binding.set(v, &row[k]);
                 }
-                if let Some(r) = postprocessing(&self.binding) {
-                    return Some(r);
+                match projection.project(&self.binding, postprocessing) {
+                    ProjectionStep::Yield(result) => return Some(result),
+                    ProjectionStep::Skip => {}
+                    ProjectionStep::Done => return None,
                 }
             }
             if self.buckets.is_empty() {
@@ -3769,6 +4008,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for DagIte
         self.state.pull(
             &self.constraint,
             &self.postprocessing,
+            &mut self.projection,
             &self.influences,
             &self.base_estimates,
         )
@@ -3803,10 +4043,16 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
         // after a pull. Record the call before any iterator return path.
         self.iteration_started = true;
 
+        if self.projection.is_done() {
+            self.mode = Search::Done;
+            return None;
+        }
+
         if let Some(state) = &mut self.dag {
             return state.pull(
                 &self.constraint,
                 &self.postprocessing,
+                &mut self.projection,
                 &self.influences,
                 &self.base_estimates,
             );
@@ -3816,6 +4062,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
             return state.pull(
                 &self.constraint,
                 &self.postprocessing,
+                &mut self.projection,
                 &self.influences,
                 &self.base_estimates,
             );
@@ -3838,6 +4085,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
             return state.pull(
                 &self.constraint,
                 &self.postprocessing,
+                &mut self.projection,
                 &self.influences,
                 &self.base_estimates,
             );
@@ -3860,6 +4108,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
             return state.pull(
                 &self.constraint,
                 &self.postprocessing,
+                &mut self.projection,
                 &self.influences,
                 &self.base_estimates,
             );
@@ -3870,8 +4119,13 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
                 Search::NextVariable => {
                     self.mode = Search::NextValue;
                     if self.unbound.is_empty() {
-                        if let Some(result) = self.emit() {
-                            return Some(result);
+                        match self.emit() {
+                            ProjectionStep::Yield(result) => return Some(result),
+                            ProjectionStep::Skip => {}
+                            ProjectionStep::Done => {
+                                self.mode = Search::Done;
+                                return None;
+                            }
                         }
                         // Post-processing rejected this binding; continue
                         // searching (mode is already NextValue).
@@ -4030,7 +4284,7 @@ mod parallel {
         /// Each shard preserves backend batches, per-row variable selection,
         /// and route reconvergence among the rows it owns; reconvergence across
         /// shards is traded for parallelism. Fully drained results preserve the
-        /// query's result multiset, not its iteration order.
+        /// query's distinct projected-row set, not its iteration order.
         ///
         /// This path is intended for block-oriented or accelerator-backed
         /// constraints. The scalar splitter can remain faster for CPU-only
@@ -4115,6 +4369,13 @@ mod parallel {
         /// `fold_with`. See the module comment for both non-re-enumeration
         /// arguments.
         fn split(mut self) -> (Self, Option<Self>) {
+            // The empty projection has one possible public key. Sharding its
+            // hidden witnesses can only do redundant work and weakens the
+            // existence-query latency guarantee, so keep it in one leaf.
+            if self.inner.projection.is_empty_head() {
+                self.split_budget = 0;
+                return (self, None);
+            }
             // A query converted after an ordinary `next()` may own a resumable
             // DAG or residual worklist with projected progress. Keep it as
             // one leaf so the exact remainder is neither restarted nor
@@ -4155,9 +4416,11 @@ mod parallel {
                 // split does not deep-clone all of its frontier rows merely
                 // to overwrite them with `right_state`.
                 let left_state = self.inner.dag.take().expect("checked above");
+                let projection = self.inner.projection.share_for_parallel();
                 let mut right = (*self.inner).clone();
                 self.inner.dag = Some(left_state);
                 right.dag = Some(Box::new(right_state));
+                right.projection.attach_shared(projection);
                 let left_budget = self.split_budget / 2;
                 let right_budget = self.split_budget - left_budget;
                 self.split_budget = left_budget;
@@ -4233,8 +4496,10 @@ mod parallel {
                         let vals = q.values[top].as_mut().unwrap();
                         let mid = vals.len() / 2;
                         let right_vals: Vec<RawInline> = vals.drain(mid..).collect();
+                        let projection = q.projection.share_for_parallel();
                         let mut right = q.clone();
                         right.values[top] = Some(right_vals);
+                        right.projection.attach_shared(projection);
 
                         let left_budget = self.split_budget / 2;
                         let right_budget = self.split_budget - left_budget;
@@ -4314,9 +4579,21 @@ mod parallel {
 /// | `name?` | inferred type, yield `Result<T, E>` (no filter) |
 /// | `name: Type?` | explicit type, yield `Result<T, E>` (no filter) |
 ///
-/// The unit form `find!((), constraint)` projects no variables and yields one
-/// `()` for every matching row. This is useful when you only care about
-/// existence, counting, or composing the query without returning values.
+/// Query heads have relational SET semantics. Two satisfying assignments with
+/// the same ordered raw inline values for every declared head variable produce
+/// one result, even when they differ in hidden variables. Distinctness is
+/// decided before [`TryFromInline`](crate::inline::TryFromInline) conversion;
+/// two different raw values may therefore still convert to equal Rust values.
+/// A raw head is claimed before conversion or mapper code runs, so a conversion
+/// failure, filtered row, or panic is not retried through another hidden
+/// witness.
+///
+/// The unit form `find!((), constraint)` projects no variables and consequently
+/// yields at most one `()`: one if any assignment satisfies the constraint and
+/// none otherwise. Claiming that singleton key stops the search without
+/// draining additional hidden witnesses, including when mapper code returns
+/// `None` or panics. Use an explicitly projected witness when its distinct
+/// values need to be counted.
 ///
 /// **Filter semantics (default):** when a variable's conversion fails the
 /// entire row is silently skipped — like a constraint that doesn't match.
@@ -4841,12 +5118,13 @@ mod tests {
         }
 
         fn satisfied(&self, view: &RowsView<'_>) -> bool {
-            view.iter()
-                .all(|row| Self::row_valid_so_far(view, row))
+            view.iter().all(|row| Self::row_valid_so_far(view, row))
         }
     }
 
-    fn variable_order_bag_query(tie_children: bool) -> Query<
+    fn variable_order_bag_query(
+        tie_children: bool,
+    ) -> Query<
         VariableOrderBagConstraint,
         impl Fn(&Binding) -> Option<(RawInline, RawInline, RawInline)>,
         (RawInline, RawInline, RawInline),
@@ -4896,8 +5174,21 @@ mod tests {
             )
         };
         for (tie_children, mut expected) in [
-            (false, vec![row(VariableOrderBagConstraint::P0), row(VariableOrderBagConstraint::P1)]),
-            (true, vec![row(VariableOrderBagConstraint::P0), row(VariableOrderBagConstraint::P1), row(VariableOrderBagConstraint::P1)]),
+            (
+                false,
+                vec![
+                    row(VariableOrderBagConstraint::P0),
+                    row(VariableOrderBagConstraint::P1),
+                ],
+            ),
+            (
+                true,
+                vec![
+                    row(VariableOrderBagConstraint::P0),
+                    row(VariableOrderBagConstraint::P1),
+                    row(VariableOrderBagConstraint::P1),
+                ],
+            ),
         ] {
             expected.sort_unstable();
 

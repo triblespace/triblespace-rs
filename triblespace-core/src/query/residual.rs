@@ -2181,7 +2181,7 @@ pub struct ResidualStateStats {
 #[must_use]
 #[non_exhaustive]
 pub struct ResidualStateSolve<R> {
-    /// Projected query results, preserving bag semantics.
+    /// Distinct projected query results.
     pub results: Vec<R>,
     /// Scheduler/interner measurements for the solve.
     pub stats: ResidualStateStats,
@@ -3991,7 +3991,6 @@ impl DeferredCandidateCursor {
             }
         }
     }
-
 }
 
 impl std::fmt::Debug for DeferredCandidateCursor {
@@ -4192,10 +4191,7 @@ impl DeferredCandidateNode {
                 .children()
                 .expect("an imbalanced AVL subtree cannot be a leaf");
             if left_left.height() >= left_right.height() {
-                return Self::branch(
-                    left_left,
-                    Self::branch(left_right, right),
-                );
+                return Self::branch(left_left, Self::branch(left_right, right));
             }
             let (middle_left, middle_right) = left_right
                 .children()
@@ -4210,10 +4206,7 @@ impl DeferredCandidateNode {
             .children()
             .expect("an imbalanced AVL subtree cannot be a leaf");
         if right_right.height() >= right_left.height() {
-            return Self::branch(
-                Self::branch(left, right_left),
-                right_right,
-            );
+            return Self::branch(Self::branch(left, right_left), right_right);
         }
         let (middle_left, middle_right) = right_left
             .children()
@@ -4310,7 +4303,10 @@ impl DeferredCandidateNode {
         Option<DeferredCandidateSubtree>,
         Option<DeferredCandidateSubtree>,
     ) {
-        assert!(node.grouped(), "parent split requires grouped candidate tags");
+        assert!(
+            node.grouped(),
+            "parent split requires grouped candidate tags"
+        );
         if node.last_parent() < first_tail_parent {
             return (Some(node), None);
         }
@@ -4322,27 +4318,23 @@ impl DeferredCandidateNode {
                 unreachable!("one-parent leaf cannot straddle a parent boundary")
             }
             DeferredCandidateNodeKind::Tagged { pairs, range } => {
-                let local_boundary =
-                    unshift_candidate_parent(first_tail_parent, node.parent_delta);
-                let cut = pairs[range.clone()]
-                    .partition_point(|(parent, _)| *parent < local_boundary);
+                let local_boundary = unshift_candidate_parent(first_tail_parent, node.parent_delta);
+                let cut =
+                    pairs[range.clone()].partition_point(|(parent, _)| *parent < local_boundary);
                 let cut = range.start + cut;
                 let prefix = Self::tagged_view(pairs.clone(), range.start..cut)
                     .map(|view| view.shifted(node.parent_delta));
-                let tail = Self::tagged_view(pairs.clone(), cut..range.end)
-                    .map(|view| {
-                        view.shifted(node.parent_delta)
-                            .shifted(-i64::from(first_tail_parent))
-                    });
+                let tail = Self::tagged_view(pairs.clone(), cut..range.end).map(|view| {
+                    view.shifted(node.parent_delta)
+                        .shifted(-i64::from(first_tail_parent))
+                });
                 (prefix, tail)
             }
             DeferredCandidateNodeKind::Concat { left, right } => {
                 let left = left.clone().shifted(node.parent_delta);
                 let right = right.clone().shifted(node.parent_delta);
-                let (left_prefix, left_tail) =
-                    Self::split_parents(left, first_tail_parent);
-                let (right_prefix, right_tail) =
-                    Self::split_parents(right, first_tail_parent);
+                let (left_prefix, left_tail) = Self::split_parents(left, first_tail_parent);
+                let (right_prefix, right_tail) = Self::split_parents(right, first_tail_parent);
                 (
                     Self::concat(left_prefix, right_prefix),
                     Self::concat(left_tail, right_tail),
@@ -4708,9 +4700,7 @@ impl CandidatePayload {
         let Self::Deferred(_) = self else {
             return;
         };
-        let Self::Deferred(candidates) =
-            std::mem::replace(self, Self::Tagged(Vec::new()))
-        else {
+        let Self::Deferred(candidates) = std::mem::replace(self, Self::Tagged(Vec::new())) else {
             unreachable!()
         };
         *self = candidates.into_contiguous();
@@ -4749,9 +4739,7 @@ impl CandidatePayload {
                         assert_eq!(root.first_parent(), 0);
                         &values[range.clone()]
                     }
-                    _ => panic!(
-                        "one-parent activation input was segmented before cyclic opening"
-                    ),
+                    _ => panic!("one-parent activation input was segmented before cyclic opening"),
                 },
             },
             Self::Tagged(_) => {
@@ -4888,12 +4876,7 @@ impl CandidatePayload {
                 parent_count,
             );
             let right = DeferredCandidates::from_payload(other, parent_count);
-            *self = Self::Deferred(DeferredCandidates::concat(
-                left,
-                right,
-                0,
-                parent_count,
-            ));
+            *self = Self::Deferred(DeferredCandidates::concat(left, right, 0, parent_count));
             return;
         }
         match (self, other) {
@@ -4936,11 +4919,7 @@ impl CandidatePayload {
         if let Self::Deferred(candidates) = self {
             let (tail, first_tail_parent, prefix_parent_count) =
                 candidates.take_occurrence_tail(take);
-            return (
-                Self::Deferred(tail),
-                first_tail_parent,
-                prefix_parent_count,
-            );
+            return (Self::Deferred(tail), first_tail_parent, prefix_parent_count);
         }
         let cut = self.len() - take;
         match self {
@@ -5147,8 +5126,7 @@ impl CandidateBatch {
                 return BTreeMap::from([(first.clone(), self)]);
             }
         }
-        self.candidates
-            .materialize_for_planning_or_action_opening();
+        self.candidates.materialize_for_planning_or_action_opening();
         let RowBatch { rows, row_count } = self.parents;
         let mut remap = vec![u32::MAX; row_count];
         let mut groups: BTreeMap<K, Self> = BTreeMap::new();
@@ -5215,8 +5193,7 @@ impl CandidateBatch {
             assert_eq!(self.parents.row_count, 1);
             return Some(self);
         }
-        self.candidates
-            .materialize_for_planning_or_action_opening();
+        self.candidates.materialize_for_planning_or_action_opening();
         let CandidatePayload::Tagged(pairs) = &mut self.candidates else {
             unreachable!()
         };
@@ -5265,8 +5242,7 @@ impl CandidateBatch {
 
     fn into_parent_candidates(mut self) -> (RowBatch, Vec<Vec<RawInline>>) {
         let parent_count = self.parents.row_count;
-        self.candidates
-            .materialize_for_planning_or_action_opening();
+        self.candidates.materialize_for_planning_or_action_opening();
         let groups = match self.candidates {
             CandidatePayload::Values(values) => {
                 assert_eq!(parent_count, 1);
@@ -5411,9 +5387,9 @@ impl FormulaPayloadFrame {
 
     fn result(self, parent_count: usize) -> CandidatePayload {
         match self {
-            Self::Or { .. } => panic!(
-                "Formula OR result crossed its pageable ordered-emission boundary"
-            ),
+            Self::Or { .. } => {
+                panic!("Formula OR result crossed its pageable ordered-emission boundary")
+            }
             Self::And { current } => {
                 current.debug_assert_valid_for(parent_count);
                 current
@@ -5640,10 +5616,9 @@ impl FormulaBatch {
         // only that grouping; OR is deliberately rejected below.
         debug_assert_candidates_grouped(&result, self.parents.row_count);
         match (self.frames.last_mut().unwrap(), stage) {
-            (
-                FormulaPayloadFrame::Or { .. },
-                FormulaStage::Propose | FormulaStage::Confirm,
-            ) => panic!("Formula OR action bypassed pageable admission"),
+            (FormulaPayloadFrame::Or { .. }, FormulaStage::Propose | FormulaStage::Confirm) => {
+                panic!("Formula OR action bypassed pageable admission")
+            }
             (FormulaPayloadFrame::And { current }, FormulaStage::Propose) => {
                 assert!(current.is_empty(), "an AND ran two proposers");
                 *current = result;
@@ -5686,8 +5661,7 @@ impl FormulaBatch {
                 // Every OR arm reads one immutable source. Freeze it before
                 // cloning a nested frame so arm selection shares an Arc root
                 // instead of copying an O(n) Values/Tagged bag per arm.
-                self.input_mut()
-                    .defer_for_shared_activation(parent_count);
+                self.input_mut().defer_for_shared_activation(parent_count);
                 self.input().clone()
             }
         };
@@ -5975,8 +5949,7 @@ impl FormulaBatch {
                         let target = groups
                             .get_mut(&assignment[parent])
                             .expect("every Formula assignment created its group");
-                        let FormulaPayloadFrame::Or { accumulator, .. } =
-                            &mut target.frames[frame]
+                        let FormulaPayloadFrame::Or { accumulator, .. } = &mut target.frames[frame]
                         else {
                             panic!("Formula accumulator disagrees with its structural frame")
                         };
@@ -6035,7 +6008,10 @@ impl FormulaBatch {
     /// occurrences merely to mint one affine Program credit per parent.
     fn into_structural_singletons(mut self, stride: usize) -> Vec<Self> {
         let parent_count = self.parents.row_count;
-        assert!(parent_count > 0, "Formula reducer seed has no affine parent");
+        assert!(
+            parent_count > 0,
+            "Formula reducer seed has no affine parent"
+        );
         self.defer_all_frame_candidates();
         let mut reversed = Vec::with_capacity(parent_count);
         while self.parents.row_count > 1 {
@@ -6052,7 +6028,10 @@ impl FormulaBatch {
         mut input: CandidatePayload,
     ) -> Vec<(Self, CandidatePayload)> {
         let parent_count = self.parents.row_count;
-        assert!(parent_count > 0, "Formula reducer seed has no affine parent");
+        assert!(
+            parent_count > 0,
+            "Formula reducer seed has no affine parent"
+        );
         self.defer_all_frame_candidates();
         input.debug_assert_valid_for(parent_count);
         input.defer_for_shared_activation(parent_count);
@@ -7190,9 +7169,7 @@ fn finish_formula_transition(
     stats: &mut ResidualStateStats,
 ) -> Option<ContinuationToken> {
     let candidate = batch.finish();
-    finish_formula_candidate_transition(
-        plan, desc, resume, candidate, worklist, interner, stats,
-    )
+    finish_formula_candidate_transition(plan, desc, resume, candidate, worklist, interner, stats)
 }
 
 fn finish_formula_candidate_transition(
@@ -7633,23 +7610,19 @@ fn finish_formula_or_emission(
         phase: ResidualPhase::Formula { counter },
     };
     match (successor, destination) {
-        (
-            Ok(InternedFormulaSuccessor::Formula(next)),
-            FormulaFrameDestination::ParentAnd,
-        ) => continue_formula_transition(
-            plan,
-            &desc,
-            next,
-            batch,
-            worklist,
-            interner,
-            stats,
-            reducer_seeds,
-        ),
-        (
-            Ok(InternedFormulaSuccessor::Formula(next)),
-            FormulaFrameDestination::ParentOr(input),
-        ) => {
+        (Ok(InternedFormulaSuccessor::Formula(next)), FormulaFrameDestination::ParentAnd) => {
+            continue_formula_transition(
+                plan,
+                &desc,
+                next,
+                batch,
+                worklist,
+                interner,
+                stats,
+                reducer_seeds,
+            )
+        }
+        (Ok(InternedFormulaSuccessor::Formula(next)), FormulaFrameDestination::ParentOr(input)) => {
             reducer_seeds.push(FormulaReducerSeed::Admit(FormulaOrAdmissionSeed {
                 bound,
                 batch,
@@ -8049,18 +8022,16 @@ fn finish_formula_action_result(
         .formula_pcs
         .resume_completed(&plan.finite_formula, completed)
     {
-        Ok(InternedFormulaSuccessor::Formula(next)) => {
-            continue_formula_transition(
-                plan,
-                &desc,
-                next,
-                batch,
-                worklist,
-                interner,
-                stats,
-                reducer_seeds,
-            )
-        }
+        Ok(InternedFormulaSuccessor::Formula(next)) => continue_formula_transition(
+            plan,
+            &desc,
+            next,
+            batch,
+            worklist,
+            interner,
+            stats,
+            reducer_seeds,
+        ),
         Ok(InternedFormulaSuccessor::Guard { .. }) => {
             unreachable!("candidate action returned through a support guard")
         }
@@ -8092,9 +8063,7 @@ fn formula_action_transition<'a>(
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
     if stage == FormulaStage::Confirm {
         let parent_count = batch.parents.row_count;
-        batch
-            .input_mut()
-            .defer_for_shared_activation(parent_count);
+        batch.input_mut().defer_for_shared_activation(parent_count);
     }
     let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
     let constraint = plan.resolve_formula_node(root, occurrence, node);
@@ -8864,6 +8833,7 @@ pub(super) struct SeededResidualFrame<C> {
     root: C,
     plan: ResidualPlan,
     machine: ResidualStateMachine,
+    projection: ProjectionGate,
     influences: [VariableSet; 128],
     base_estimates: [usize; 128],
 }
@@ -8924,6 +8894,7 @@ where
             root,
             plan,
             machine,
+            projection: ProjectionGate::full(full),
             influences,
             base_estimates,
         }
@@ -8934,6 +8905,7 @@ where
             &self.root,
             &self.plan,
             &|binding| Some(binding.clone()),
+            &mut self.projection,
             &self.influences,
             &self.base_estimates,
         )
@@ -8955,14 +8927,21 @@ impl ResidualQueryState {
         &mut self,
         root: &dyn Constraint<'a>,
         postprocessing: &P,
+        projection: &mut ProjectionGate,
         influences: &[VariableSet; 128],
         base_estimates: &[usize; 128],
     ) -> Option<R>
     where
         P: Fn(&Binding) -> Option<R>,
     {
-        self.machine
-            .pull(root, &self.plan, postprocessing, influences, base_estimates)
+        self.machine.pull(
+            root,
+            &self.plan,
+            postprocessing,
+            projection,
+            influences,
+            base_estimates,
+        )
     }
 }
 
@@ -10440,6 +10419,19 @@ impl ResidualStateMachine {
         self.increase_delta_activation_width();
     }
 
+    /// Discards the staged raw suffix after the public projection is known to
+    /// be exhausted, settling every direct-publication receipt without
+    /// invoking mapper code or charging projected demand.
+    fn retire_staged_projection_receipts(&mut self) {
+        while self.emit_next < self.emit_count {
+            let row = self.emit_next;
+            self.emit_next += 1;
+            if let Some(origin) = self.emit_origins.as_ref().map(|origins| origins[row]) {
+                drop(self.terminal_yield.begin_projection(origin));
+            }
+        }
+    }
+
     /// Opens the next confirmed terminal-demand window at a public pull
     /// boundary. Producing the last row in a window merely marks exhaustion;
     /// only a later pull proves that the caller wanted more.
@@ -10486,12 +10478,17 @@ impl ResidualStateMachine {
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
         postprocessing: &P,
+        projection_gate: &mut ProjectionGate,
         influences: &[VariableSet; 128],
         base_estimates: &[usize; 128],
     ) -> Option<R>
     where
         P: Fn(&Binding) -> Option<R>,
     {
+        if projection_gate.is_done() {
+            self.retire_staged_projection_receipts();
+            return None;
+        }
         self.confirm_terminal_demand();
         loop {
             let draining_unprojected_emit = self.emit_next < self.emit_count;
@@ -10508,15 +10505,25 @@ impl ResidualStateMachine {
                 for (column, &variable) in self.emit_vars.iter().enumerate() {
                     self.binding.set(variable, &self.emit_rows[start + column]);
                 }
-                if let Some(result) = postprocessing(&self.binding) {
-                    if let Some(projection) = &mut projection {
-                        projection.mark_successful();
+                match projection_gate.project(&self.binding, postprocessing) {
+                    ProjectionStep::Yield(result) => {
+                        if let Some(projection) = &mut projection {
+                            projection.mark_successful();
+                        }
+                        drop(projection);
+                        self.charge_projected_result();
+                        if projection_gate.is_done() {
+                            self.retire_staged_projection_receipts();
+                        }
+                        return Some(result);
                     }
-                    drop(projection);
-                    self.charge_projected_result();
-                    return Some(result);
+                    ProjectionStep::Skip => drop(projection),
+                    ProjectionStep::Done => {
+                        drop(projection);
+                        self.retire_staged_projection_receipts();
+                        return None;
+                    }
                 }
-                drop(projection);
             }
             if draining_unprojected_emit {
                 // Exhausting a staged raw-result suffix without satisfying
@@ -10557,11 +10564,10 @@ impl ResidualStateMachine {
                         ActiveDeltaStatus::Pending => {
                             debug_assert!(focused.outcome.completed_activation_ids.is_empty());
                             self.account_delta_feedback(&focused.outcome);
-                            self.active_delta = Some(
-                                focused
-                                    .resume
-                                    .expect("a pending affine activation has an exact continuation"),
-                            );
+                            self.active_delta =
+                                Some(focused.resume.expect(
+                                    "a pending affine activation has an exact continuation",
+                                ));
                         }
                         ActiveDeltaStatus::Quiescent => {
                             // Quiescence carries the exact activation receipt
@@ -10664,6 +10670,7 @@ impl ResidualStateMachine {
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
         postprocessing: &P,
+        projection: &mut ProjectionGate,
         influences: &[VariableSet; 128],
         base_estimates: &[usize; 128],
     ) -> Option<R>
@@ -10675,6 +10682,7 @@ impl ResidualStateMachine {
             root,
             plan,
             postprocessing,
+            projection,
             influences,
             base_estimates,
         )
@@ -10689,6 +10697,7 @@ impl ResidualStateMachine {
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
         postprocessing: &P,
+        projection: &mut ProjectionGate,
         influences: &[VariableSet; 128],
         base_estimates: &[usize; 128],
     ) -> Option<R>
@@ -10700,6 +10709,7 @@ impl ResidualStateMachine {
             root,
             plan,
             postprocessing,
+            projection,
             influences,
             base_estimates,
         )
@@ -11021,12 +11031,14 @@ impl ResidualStateMachine {
 /// The cap only bounds geometric width growth.
 ///
 /// Dropping the iterator discards its remaining affine frontier. Fully drained,
-/// it produces the same result multiset as [`Query::solve_residual_state`].
+/// it produces the same distinct projected-row set as
+/// [`Query::solve_residual_state`].
 #[must_use]
 pub struct ResidualStateIter<C, P: Fn(&Binding) -> Option<R>, R> {
     root: C,
     plan: ResidualPlan,
     postprocessing: P,
+    projection: ProjectionGate,
     influences: [VariableSet; 128],
     base_estimates: [usize; 128],
     state: ResidualStateMachine,
@@ -11048,6 +11060,7 @@ where
             root: self.root.clone(),
             plan: self.plan.clone(),
             postprocessing: self.postprocessing.clone(),
+            projection: self.projection.clone(),
             influences: self.influences,
             base_estimates: self.base_estimates,
             state: self.state.clone(),
@@ -11061,7 +11074,7 @@ where
 #[must_use]
 #[non_exhaustive]
 pub struct ResidualShadowSolve<R> {
-    /// Projected query results, preserving bag semantics.
+    /// Distinct projected query results.
     pub results: Vec<R>,
     /// Ordinary residual scheduler statistics from the observed execution.
     pub stats: ResidualStateStats,
@@ -11230,6 +11243,7 @@ where
             &self.root,
             &self.plan,
             &self.postprocessing,
+            &mut self.projection,
             &self.influences,
             &self.base_estimates,
         )
@@ -11277,6 +11291,7 @@ where
             &self.inner.root,
             &self.inner.plan,
             &self.inner.postprocessing,
+            &mut self.inner.projection,
             &self.inner.influences,
             &self.inner.base_estimates,
         );
@@ -11293,6 +11308,7 @@ where
 fn solve<'a, P, R>(
     root: &dyn Constraint<'a>,
     postprocessing: P,
+    mut projection: ProjectionGate,
     influences: [VariableSet; 128],
     base_estimates: [usize; 128],
     mode: Search,
@@ -11323,7 +11339,10 @@ where
     let mut results = Vec::new();
     let mut binding = Binding::default();
     let mut next_activation = 0;
-    while let Some((&rank, _)) = worklist.first_key_value() {
+    'search: while let Some((&rank, _)) = worklist.first_key_value() {
+        if projection.is_done() {
+            break;
+        }
         let level = worklist
             .remove(&rank)
             .expect("observed worklist level exists");
@@ -11371,8 +11390,15 @@ where
                         for (column, &variable) in vars.iter().enumerate() {
                             binding.set(variable, &row_view.row(0)[column]);
                         }
-                        if let Some(result) = postprocessing(&binding) {
-                            results.push(result);
+                        match projection.project(&binding, &postprocessing) {
+                            ProjectionStep::Yield(result) => {
+                                results.push(result);
+                                if projection.is_done() {
+                                    break 'search;
+                                }
+                            }
+                            ProjectionStep::Skip => {}
+                            ProjectionStep::Done => break 'search,
                         }
                     }
                 }
@@ -11413,7 +11439,7 @@ where
     /// later pull boundary. Whenever no continuation is hot and no live state
     /// can fill the desired search width, the minimum-rank state
     /// drains readiness-safely. Result order may differ from the ordinary
-    /// iterator; a full drain preserves its result multiset.
+    /// iterator; a full drain preserves its distinct projected-row set.
     ///
     /// # Panics
     ///
@@ -11440,6 +11466,7 @@ where
         let Query {
             constraint,
             postprocessing,
+            projection,
             influences,
             base_estimates,
             mode,
@@ -11452,6 +11479,7 @@ where
             root: constraint,
             plan,
             postprocessing,
+            projection,
             influences,
             base_estimates,
             state,
@@ -11473,7 +11501,7 @@ where
     /// protocol.
     ///
     /// Result order may differ from the ordinary iterator; the result
-    /// multiset is the same. Use
+    /// distinct projected-row set is the same. Use
     /// [`solve_residual_state_profiled`](Self::solve_residual_state_profiled)
     /// to inspect reconvergence and batch measurements.
     ///
@@ -11499,6 +11527,7 @@ where
         let Query {
             constraint,
             postprocessing,
+            projection,
             influences,
             base_estimates,
             mode,
@@ -11507,6 +11536,7 @@ where
         solve(
             &constraint,
             postprocessing,
+            projection,
             influences,
             base_estimates,
             mode,
@@ -11559,7 +11589,7 @@ mod parallel {
         /// Seed negotiation advances in place until an affine frontier can be
         /// split; it is never restarted. At most one residual shard per Rayon
         /// worker is created, and fully drained output preserves the serial
-        /// query's result multiset rather than its order.
+        /// query's distinct projected-row set rather than its order.
         ///
         /// Candidate payloads stay parent-atomic across whole-group
         /// confirmers. Once the compiled continuation proves every remaining
@@ -11609,7 +11639,10 @@ mod parallel {
         type Item = R;
 
         fn split(mut self) -> (Self, Option<Self>) {
-            if self.inner.iteration_started || self.split_budget == 0 {
+            if self.inner.projection.is_empty_head()
+                || self.inner.iteration_started
+                || self.split_budget == 0
+            {
                 self.split_budget = 0;
                 return (self, None);
             }
@@ -11631,10 +11664,14 @@ mod parallel {
 
             // Only an actual shard pays for cloning user-owned execution
             // machinery. The affine state itself is moved, never cloned.
+            let projection = self.inner.projection.share_for_parallel();
+            let mut right_projection = self.inner.projection.clone();
+            right_projection.attach_shared(projection);
             let right = ResidualStateIter {
                 root: self.inner.root.clone(),
                 plan: self.inner.plan.clone(),
                 postprocessing: self.inner.postprocessing.clone(),
+                projection: right_projection,
                 influences: self.inner.influences,
                 base_estimates: self.inner.base_estimates,
                 state: right_state,
@@ -11758,7 +11795,10 @@ mod parallel {
         type Item = R;
 
         fn split(mut self) -> (Self, Option<Self>) {
-            if self.inner.inner.iteration_started || self.split_budget == 0 {
+            if self.inner.inner.projection.is_empty_head()
+                || self.inner.inner.iteration_started
+                || self.split_budget == 0
+            {
                 self.split_budget = 0;
                 return (self, None);
             }
@@ -11779,10 +11819,14 @@ mod parallel {
                 return (self, None);
             };
 
+            let projection = self.inner.inner.projection.share_for_parallel();
+            let mut right_projection = self.inner.inner.projection.clone();
+            right_projection.attach_shared(projection);
             let right_inner = ResidualStateIter {
                 root: self.inner.inner.root.clone(),
                 plan: self.inner.inner.plan.clone(),
                 postprocessing: self.inner.inner.postprocessing.clone(),
+                projection: right_projection,
                 influences: self.inner.inner.influences,
                 base_estimates: self.inner.inner.base_estimates,
                 state: right_state,
@@ -13779,7 +13823,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_terminal_publication_preserves_order_duplicates_and_feedback() {
+    fn direct_terminal_publication_preserves_set_order_and_physical_feedback() {
         let values = Arc::new(vec![raw(3), raw(1), raw(3), raw(2)]);
         let direct_proposes = Arc::new(AtomicUsize::new(0));
         let direct_pages = Arc::new(AtomicUsize::new(0));
@@ -13799,7 +13843,7 @@ mod tests {
                 direct_yield.completed,
                 direct_yield.projected,
             ),
-            (1, 0, 1, 4)
+            (1, 0, 1, 3)
         );
 
         let control_proposes = Arc::new(AtomicUsize::new(0));
@@ -13821,12 +13865,7 @@ mod tests {
             "the no-direct ablation cannot honestly attribute stable projection"
         );
 
-        let expected = [
-            (raw(9), raw(3)),
-            (raw(9), raw(1)),
-            (raw(9), raw(3)),
-            (raw(9), raw(2)),
-        ];
+        let expected = [(raw(9), raw(3)), (raw(9), raw(1)), (raw(9), raw(2))];
         assert_eq!(direct_results, expected);
         assert_eq!(control_results, expected);
         assert_eq!(direct_pages.load(Ordering::Relaxed), 3);
@@ -13924,12 +13963,7 @@ mod tests {
         let results: Vec<_> = cold.by_ref().collect();
         assert_eq!(
             results,
-            [
-                (raw(9), raw(3)),
-                (raw(9), raw(1)),
-                (raw(9), raw(3)),
-                (raw(9), raw(2)),
-            ]
+            [(raw(9), raw(3)), (raw(9), raw(1)), (raw(9), raw(2)),]
         );
         assert_eq!(pages.load(Ordering::Relaxed), 3);
         assert_eq!(cold.stats().delta_active_lease_steps, 0);
@@ -13962,7 +13996,6 @@ mod tests {
         assert_eq!(pages.load(Ordering::Relaxed), 1);
         assert_eq!(iter.next(), Some((raw(9), raw(1))));
         assert_eq!(pages.load(Ordering::Relaxed), 2);
-        assert_eq!(iter.next(), Some((raw(9), raw(3))));
         assert_eq!(iter.next(), Some((raw(9), raw(2))));
         assert_eq!(iter.next(), None);
         let family = &iter.state.terminal_yield.families[&StateId(u32::MAX)];
@@ -13973,8 +14006,8 @@ mod tests {
                 family.completed,
                 family.projected,
             ),
-            (1, 0, 1, 3),
-            "the unwound row is consumed but contributes no projected yield"
+            (1, 0, 1, 2),
+            "the unwound row and its later duplicate are consumed but contribute no projected yield"
         );
     }
 
@@ -15163,10 +15196,7 @@ mod tests {
         CandidatePayload::from_tagged(candidates, parent_count)
     }
 
-    fn deferred_candidate_payload(
-        parent_count: usize,
-        candidates: Candidates,
-    ) -> CandidatePayload {
+    fn deferred_candidate_payload(parent_count: usize, candidates: Candidates) -> CandidatePayload {
         let mut payload = candidate_payload(parent_count, candidates);
         payload.defer_for_shared_activation(parent_count);
         payload
@@ -15195,9 +15225,7 @@ mod tests {
                 assert_eq!(subtree.node.last_parent, right.last_parent());
                 assert_eq!(
                     subtree.node.grouped,
-                    left.grouped()
-                        && right.grouped()
-                        && left.last_parent() <= right.first_parent()
+                    left.grouped() && right.grouped() && left.last_parent() <= right.first_parent()
                 );
                 (
                     subtree.node.height,
@@ -16228,9 +16256,7 @@ mod tests {
         batch.admit_current_or_value(0, raw(2));
         batch.admit_current_or_value(0, raw(1));
         batch.admit_current_or_value(0, raw(2));
-        let emitted = CandidatePayload::Values(
-            batch.current_or_set().iter().copied().collect(),
-        );
+        let emitted = CandidatePayload::Values(batch.current_or_set().iter().copied().collect());
         assert!(matches!(
             batch.return_emitted_or(emitted),
             FormulaFrameDestination::ParentAnd
@@ -16273,10 +16299,8 @@ mod tests {
             structural.iter().collect::<Vec<_>>(),
             [(0, raw(1)), (0, raw(2)), (0, raw(1)), (0, raw(3))]
         );
-        let (
-            CandidatePayload::Deferred(legacy_input),
-            CandidatePayload::Deferred(structural),
-        ) = (legacy.input(), &structural)
+        let (CandidatePayload::Deferred(legacy_input), CandidatePayload::Deferred(structural)) =
+            (legacy.input(), &structural)
         else {
             panic!("legacy Confirm opening materialized its shared rope")
         };
@@ -16312,10 +16336,7 @@ mod tests {
                     rows: vec![raw(10), raw(11)],
                     row_count: 2,
                 },
-                candidates: candidate_payload(
-                    2,
-                    vec![(0, raw(1)), (0, raw(2)), (1, raw(3))],
-                ),
+                candidates: candidate_payload(2, vec![(0, raw(1)), (0, raw(2)), (1, raw(3))]),
             },
             vec![ActivationId(0), ActivationId(1)],
             &FiniteFormulaNodeKind::Or {
@@ -16329,15 +16350,12 @@ mod tests {
             },
             FormulaStage::Confirm,
         );
-        let [
-            FormulaPayloadFrame::Or {
-                source: CandidatePayload::Deferred(source),
-                ..
-            },
-            FormulaPayloadFrame::And {
-                current: CandidatePayload::Deferred(child),
-            },
-        ] = batch.frames.as_slice()
+        let [FormulaPayloadFrame::Or {
+            source: CandidatePayload::Deferred(source),
+            ..
+        }, FormulaPayloadFrame::And {
+            current: CandidatePayload::Deferred(child),
+        }] = batch.frames.as_slice()
         else {
             panic!("Confirm frame entry did not preserve shared deferred storage")
         };
@@ -16358,8 +16376,14 @@ mod tests {
 
         assert_eq!(accumulator.unique_len, 2);
         assert_eq!(accumulator.sets.len(), 2);
-        assert_eq!(accumulator.sets[0].iter().copied().collect::<Vec<_>>(), [candidate]);
-        assert_eq!(accumulator.sets[1].iter().copied().collect::<Vec<_>>(), [candidate]);
+        assert_eq!(
+            accumulator.sets[0].iter().copied().collect::<Vec<_>>(),
+            [candidate]
+        );
+        assert_eq!(
+            accumulator.sets[1].iter().copied().collect::<Vec<_>>(),
+            [candidate]
+        );
     }
 
     #[test]
@@ -16370,10 +16394,7 @@ mod tests {
                     rows: vec![raw(10), raw(11), raw(12)],
                     row_count: 3,
                 },
-                candidates: candidate_payload(
-                    3,
-                    vec![(0, raw(20)), (1, raw(21)), (2, raw(22))],
-                ),
+                candidates: candidate_payload(3, vec![(0, raw(20)), (1, raw(21)), (2, raw(22))]),
             },
             vec![ActivationId(0), ActivationId(1), ActivationId(2)],
             &FiniteFormulaNodeKind::Or {
@@ -16405,7 +16426,11 @@ mod tests {
                 _ => unreachable!(),
             };
             assert_eq!(
-                accumulator.singleton_set().iter().copied().collect::<Vec<_>>(),
+                accumulator
+                    .singleton_set()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
                 expected
             );
         }
@@ -16509,7 +16534,10 @@ mod tests {
         };
         assert_eq!(source, &vec![(0, raw(20)), (2, raw(21))]);
         assert!(accumulator.sets[0].is_empty());
-        assert_eq!(accumulator.sets[1].iter().copied().collect::<Vec<_>>(), [raw(22)]);
+        assert_eq!(
+            accumulator.sets[1].iter().copied().collect::<Vec<_>>(),
+            [raw(22)]
+        );
         assert!(accumulator.sets[2].is_empty());
         assert_eq!(current, &vec![(0, raw(30)), (1, raw(31)), (2, raw(32))]);
 
@@ -17284,10 +17312,8 @@ mod tests {
 
     #[test]
     fn deferred_candidate_clone_and_cursor_share_the_immutable_root() {
-        let payload = deferred_candidate_payload(
-            1,
-            vec![(0, raw(1)), (0, raw(1)), (0, raw(2)), (0, raw(3))],
-        );
+        let payload =
+            deferred_candidate_payload(1, vec![(0, raw(1)), (0, raw(1)), (0, raw(2)), (0, raw(3))]);
         let cloned = payload.clone();
         let (CandidatePayload::Deferred(original), CandidatePayload::Deferred(copy)) =
             (&payload, &cloned)
@@ -17300,11 +17326,7 @@ mod tests {
                 .as_ref()
                 .expect("nonempty payload has a root")
                 .node,
-            &copy
-                .root
-                .as_ref()
-                .expect("cloned payload has a root")
-                .node,
+            &copy.root.as_ref().expect("cloned payload has a root").node,
         ));
 
         let mut cursor = original.cursor();
@@ -17412,8 +17434,7 @@ mod tests {
         }
 
         for cut in [1, 2, 3, 31, 255, 1_023, 1_024, PARENTS - 1] {
-            let (prefix, tail) =
-                DeferredCandidateNode::split_occurrences(root.clone(), cut);
+            let (prefix, tail) = DeferredCandidateNode::split_occurrences(root.clone(), cut);
             if let Some(prefix) = &prefix {
                 assert_deferred_candidate_avl(prefix);
             }
@@ -17425,20 +17446,15 @@ mod tests {
         }
 
         for first_tail_parent in [1, 2, 17, 511, 1_024, PARENTS - 1] {
-            let (prefix, tail) = DeferredCandidateNode::split_parents(
-                root.clone(),
-                first_tail_parent as u32,
-            );
+            let (prefix, tail) =
+                DeferredCandidateNode::split_parents(root.clone(), first_tail_parent as u32);
             if let Some(prefix) = &prefix {
                 assert_deferred_candidate_avl(prefix);
             }
             if let Some(tail) = &tail {
                 assert_deferred_candidate_avl(tail);
             }
-            assert_eq!(
-                deferred_snapshot(prefix),
-                expected[..first_tail_parent]
-            );
+            assert_eq!(deferred_snapshot(prefix), expected[..first_tail_parent]);
             let rebased_tail = expected[first_tail_parent..]
                 .iter()
                 .map(|(parent, value)| (*parent - first_tail_parent as u32, *value))
@@ -17450,10 +17466,7 @@ mod tests {
     #[test]
     fn deferred_avl_joins_adversarial_unequal_heights_in_both_orders() {
         fn tiny_pages(start: usize, count: usize) -> DeferredCandidates {
-            let mut payload = deferred_candidate_payload(
-                1,
-                vec![(0, raw((start % 251) as u8))],
-            );
+            let mut payload = deferred_candidate_payload(1, vec![(0, raw((start % 251) as u8))]);
             for offset in 1..count {
                 payload.extend_same_domain(
                     CandidatePayload::Values(vec![raw(((start + offset) % 251) as u8)]),
@@ -17495,26 +17508,24 @@ mod tests {
         assert_eq!(tall_then_short.iter().collect::<Vec<_>>(), expected);
         let mut reverse_expected = short_snapshot;
         reverse_expected.extend(tall_snapshot);
-        assert_eq!(
-            short_then_tall.iter().collect::<Vec<_>>(),
-            reverse_expected
-        );
+        assert_eq!(short_then_tall.iter().collect::<Vec<_>>(), reverse_expected);
     }
 
     #[test]
     fn deferred_same_parent_concat_preserves_duplicates_and_constant_time_liveness() {
-        let mut payload = deferred_candidate_payload(
-            1,
-            vec![(0, raw(3)), (0, raw(1)), (0, raw(3))],
-        );
-        payload.extend_same_domain(
-            candidate_payload(1, vec![(0, raw(2)), (0, raw(2))]),
-            1,
-        );
+        let mut payload =
+            deferred_candidate_payload(1, vec![(0, raw(3)), (0, raw(1)), (0, raw(3))]);
+        payload.extend_same_domain(candidate_payload(1, vec![(0, raw(2)), (0, raw(2))]), 1);
         assert!(matches!(&payload, CandidatePayload::Deferred(_)));
         assert_eq!(
             payload.tagged_snapshot(),
-            [(0, raw(3)), (0, raw(1)), (0, raw(3)), (0, raw(2)), (0, raw(2))]
+            [
+                (0, raw(3)),
+                (0, raw(1)),
+                (0, raw(3)),
+                (0, raw(2)),
+                (0, raw(2))
+            ]
         );
 
         let mut live = [false];
@@ -17530,10 +17541,8 @@ mod tests {
 
     #[test]
     fn deferred_disjoint_concat_splits_parents_and_occurrences_structurally() {
-        let mut payload = deferred_candidate_payload(
-            2,
-            vec![(0, raw(10)), (0, raw(11)), (1, raw(12))],
-        );
+        let mut payload =
+            deferred_candidate_payload(2, vec![(0, raw(10)), (0, raw(11)), (1, raw(12))]);
         payload.append_disjoint(
             candidate_payload(2, vec![(0, raw(20)), (0, raw(20)), (1, raw(21))]),
             2,
@@ -17575,10 +17584,7 @@ mod tests {
         // The cut lands between the two occurrences of old parent 2. Its
         // affine parent row must therefore be present in both result pages.
         let occurrence_tail = occurrence_prefix.take_candidate_tail(1, 2);
-        assert_eq!(
-            occurrence_prefix.parents.rows,
-            [raw(30), raw(31), raw(32)]
-        );
+        assert_eq!(occurrence_prefix.parents.rows, [raw(30), raw(31), raw(32)]);
         assert_eq!(occurrence_tail.parents.rows, [raw(32), raw(33)]);
         assert!(matches!(
             &occurrence_prefix.candidates,
@@ -17597,10 +17603,7 @@ mod tests {
             [(0, raw(20)), (1, raw(21))]
         );
 
-        fn tagged_leaf_buffers(
-            subtree: &DeferredCandidateSubtree,
-            buffers: &mut Vec<usize>,
-        ) {
+        fn tagged_leaf_buffers(subtree: &DeferredCandidateSubtree, buffers: &mut Vec<usize>) {
             match &subtree.node.kind {
                 DeferredCandidateNodeKind::Tagged { pairs, .. } => {
                     buffers.push(Arc::as_ptr(pairs) as usize)
@@ -17621,7 +17624,10 @@ mod tests {
         let mut prefix_buffers = Vec::new();
         let mut tail_buffers = Vec::new();
         tagged_leaf_buffers(
-            prefix_deferred.root.as_ref().expect("prefix has candidates"),
+            prefix_deferred
+                .root
+                .as_ref()
+                .expect("prefix has candidates"),
             &mut prefix_buffers,
         );
         tagged_leaf_buffers(
@@ -17643,10 +17649,8 @@ mod tests {
 
     #[test]
     fn uniform_candidate_partition_retains_the_deferred_root() {
-        let payload = deferred_candidate_payload(
-            3,
-            vec![(0, raw(1)), (1, raw(2)), (1, raw(2)), (2, raw(3))],
-        );
+        let payload =
+            deferred_candidate_payload(3, vec![(0, raw(1)), (1, raw(2)), (1, raw(2)), (2, raw(3))]);
         let CandidatePayload::Deferred(deferred) = &payload else {
             panic!("test payload was not deferred")
         };
@@ -19332,7 +19336,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_candidate_multiplicity_survives_page_splitting() {
+    fn duplicate_candidates_survive_page_splitting_until_set_projection() {
         let values = vec![raw(0), raw(0), raw(1), raw(1), raw(1), raw(2)];
         let make = || {
             IntersectionConstraint::new(vec![
@@ -19361,7 +19365,7 @@ mod tests {
         sequential.sort_unstable();
         cap_one.sort_unstable();
         geometric.sort_unstable();
-        assert_eq!(sequential, values);
+        assert_eq!(sequential, [raw(0), raw(1), raw(2)]);
         assert_eq!(cap_one, sequential);
         assert_eq!(geometric, sequential);
     }
@@ -19405,7 +19409,7 @@ mod tests {
         // sibling can merge. Pin the old physical schedule so the fixture
         // continues to exercise several zero-width parent occurrences under
         // one canonical state. The default sprint remains enabled in the
-        // exact-bag comparison below.
+        // exact projected-set comparison below.
         profiled.state.continuation_sprint_enabled = false;
         let profiled = profiled.collect_profiled();
         assert!(profiled.results.is_empty());
@@ -19415,8 +19419,8 @@ mod tests {
         assert_eq!(&*calls.lock().unwrap(), &[1, 2, 2, 3]);
 
         // Production-schedule coverage: with sprinting enabled, the same
-        // pages need not reconverge, but every affine occurrence must remain
-        // in the exact output bag.
+        // pages need not reconverge, but every distinct raw binding must remain
+        // in the exact projected set.
         let project = |binding: &Binding| binding.get(0).copied();
         let mut residual: Vec<_> = Query::new(make(Arc::new(Mutex::new(Vec::new()))), project)
             .solve_residual_state_lazy()
@@ -19464,7 +19468,7 @@ mod tests {
         let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
         residual.sort_unstable();
         sequential.sort_unstable();
-        assert_eq!(residual, [raw(1), raw(1)]);
+        assert_eq!(residual, [raw(1)]);
         assert_eq!(residual, sequential);
         assert_eq!(*whole_calls.lock().unwrap(), [4, 4]);
         assert_eq!(*page_calls.lock().unwrap(), [1, 1, 2]);
@@ -19723,14 +19727,18 @@ mod tests {
         assert_eq!(lowered.results, sequential);
         assert_eq!(left_rows.load(Ordering::Relaxed), 1);
         assert_eq!(right_rows.load(Ordering::Relaxed), 1);
+        // SET projection removes duplicate terminal pulls from the demand
+        // window, so equivalent histories need not overlap as live buckets.
+        // An interner hit is the scheduler-invariant evidence that they still
+        // returned to the same canonical future computation.
         assert!(
-            lowered.stats.bucket_merges > 0,
-            "opposite done-arm histories never reconverged"
+            lowered.stats.interner_hits > 0,
+            "opposite done-arm histories never reconverged canonically"
         );
     }
 
     #[test]
-    fn finite_union_keeps_duplicate_outer_parents_affine() {
+    fn finite_union_duplicate_outer_parents_collapse_at_projection() {
         let make = || {
             let leaf = |estimate| VerbLeaf {
                 variable: 1,
@@ -19761,7 +19769,7 @@ mod tests {
             .collect();
         sequential.sort_unstable();
         lowered.sort_unstable();
-        assert_eq!(lowered, [(raw(7), raw(1)), (raw(7), raw(1))]);
+        assert_eq!(lowered, [(raw(7), raw(1))]);
         assert_eq!(lowered, sequential);
     }
 
@@ -19982,13 +19990,12 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_program_routing_preserves_sorted_constant_bag_and_child_order() {
+    fn adaptive_program_routing_preserves_sorted_constant_projection_and_child_order() {
         use crate::inline::encodings::UnknownInline;
         use crate::query::sortedsliceconstraint::SortedSlice;
 
         let a = Inline::<UnknownInline>::new(raw(7));
-        let values: &'static [Inline<UnknownInline>] =
-            Box::leak(vec![a, a].into_boxed_slice());
+        let values: &'static [Inline<UnknownInline>] = Box::leak(vec![a, a].into_boxed_slice());
         let variable = Variable::<UnknownInline>::new(0);
         let project = |binding: &Binding| binding.get(variable.index).copied();
 
@@ -20033,8 +20040,8 @@ mod tests {
         residual_constant_first.sort_unstable();
 
         // The constant's estimate of one wins over the two-occurrence source.
-        // Confirmation is filter-only, so the status-quo bag contains one
-        // occurrence regardless of which child is stored first.
+        // Confirmation is filter-only, and terminal SET projection contains
+        // one raw row regardless of which child is stored first.
         assert_eq!(sequential_source_first, vec![raw(7)]);
         assert_eq!(sequential_constant_first, sequential_source_first);
         assert_eq!(residual_source_first, sequential_source_first);
@@ -20124,13 +20131,18 @@ mod tests {
         residual.sort_unstable();
         oracle.sort_unstable();
         assert_eq!(residual, oracle);
-        assert_eq!(residual.len(), 4, "duplicate source candidates are a bag");
+        assert_eq!(
+            residual.len(),
+            2,
+            "duplicate source candidates project once"
+        );
         assert!(source_residual_query.stats().confirm_action_pops > 0);
         assert_program_fallbacks_unused(&confirm_counters);
 
-        // The inverse partial-confirm route has the same affine bag law: the
-        // candidate offsets are neither sorted nor deduplicated before the
-        // finite FIRST-step filter walks them.
+        // The inverse partial-confirm route has the same internal affine
+        // occurrence law: candidate offsets are neither sorted nor
+        // deduplicated before the finite FIRST-step filter walks them. The
+        // terminal gate still collapses equal complete bindings.
         let end_candidates = vec![
             id_into_value(&nodes[3]),
             id_into_value(&nodes[1]),
@@ -20158,7 +20170,7 @@ mod tests {
         inverse.sort_unstable();
         inverse_expected.sort_unstable();
         assert_eq!(inverse, inverse_expected);
-        assert_eq!(inverse.len(), 4, "duplicate end candidates are a bag");
+        assert_eq!(inverse.len(), 2, "duplicate end candidates project once");
         assert!(inverse_query.stats().confirm_action_pops > 0);
         assert_program_fallbacks_unused(&inverse_counters);
 
@@ -20315,8 +20327,8 @@ mod tests {
                 );
                 assert_eq!(
                     actual.len(),
-                    if repeated { 6 } else { 4 },
-                    "the duplicated two-hop-only candidates did not follow the route stratum"
+                    if repeated { 3 } else { 2 },
+                    "the distinct two-hop-only candidate did not follow the route stratum"
                 );
                 assert!(
                     query.stats().confirm_action_pops > 0,
@@ -20441,7 +20453,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_same_variable_confirm_offsets_preserve_an_unsorted_duplicate_bag() {
+    fn repeated_same_variable_confirm_offsets_preserve_order_before_set_projection() {
         use crate::id::{id_into_value, ExclusiveId, Id};
         use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
         use crate::trible::{Trible, TribleSet};
@@ -20488,16 +20500,13 @@ mod tests {
                 as ShapeConstraint,
         ]);
         let mut expected: Vec<_> = Query::new(oracle, project).sequential().collect();
-        let mut exact_bag = vec![
-            id_into_value(&accepted_c),
-            id_into_value(&accepted_a),
-            id_into_value(&accepted_c),
-            id_into_value(&accepted_a),
-        ];
+        // Confirm still receives and filters the unsorted duplicate occurrence
+        // stream; only the public terminal gate collapses its raw projection.
+        let mut exact_set = vec![id_into_value(&accepted_c), id_into_value(&accepted_a)];
         actual.sort_unstable();
         expected.sort_unstable();
-        exact_bag.sort_unstable();
-        assert_eq!(actual, exact_bag);
+        exact_set.sort_unstable();
+        assert_eq!(actual, exact_set);
         assert_eq!(actual, expected);
         assert!(query.stats().delta_source_pages > 1);
         assert_program_fallbacks_unused(&counters);
@@ -20731,10 +20740,10 @@ mod tests {
             "a complete drain must leave no terminal yield sample live"
         );
 
-        // Eight byte-identical affine parents exercise both duplicate outer
-        // bag semantics and the path program's convergent p/q witnesses. The
-        // typed program must preserve the duplicate outer bag while keeping
-        // bound-endpoint traversal budgeted in both physical configurations.
+        // Eight byte-identical affine parents exercise the internal duplicate
+        // occurrence protocol and the path program's convergent p/q witnesses.
+        // The typed program must keep those occurrences affine while terminal
+        // SET projection collapses their equal complete bindings.
         let duplicate_source = id_into_value(&nodes[0][0]);
         let make_duplicates = || {
             IntersectionConstraint::new(vec![
@@ -20761,7 +20770,7 @@ mod tests {
         eager_duplicates.results.sort_unstable();
         sparse_duplicates.results.sort_unstable();
         assert_eq!(eager_duplicates.results, sparse_duplicates.results);
-        assert_eq!(eager_duplicates.results.len(), 8 * nodes[0].len());
+        assert_eq!(eager_duplicates.results.len(), nodes[0].len());
         assert!(
             eager_duplicates
                 .stats
@@ -20948,12 +20957,24 @@ mod tests {
                 .start_width(1)
                 .growth(2);
             let mut prefix = Vec::new();
-            while clone_source.stats().delta_terminal_eager_cohort_admissions == 0 {
-                prefix.push(
-                    clone_source.next().unwrap_or_else(|| {
-                        panic!("{name} drained before the complete Program phase")
-                    }),
-                );
+            let drained_before_phase = loop {
+                if clone_source.stats().delta_terminal_eager_cohort_admissions > 0 {
+                    break false;
+                }
+                let Some(result) = clone_source.next() else {
+                    break true;
+                };
+                prefix.push(result);
+            };
+            if drained_before_phase {
+                // Duplicate terminal occurrences used to keep public demand
+                // open long enough to guarantee a live post-admission clone
+                // point. SET projection can satisfy the complete result set
+                // first; the full-run assertion above still verifies that an
+                // unconstrained drain admits the eager Program cohort.
+                prefix.sort_unstable();
+                assert_eq!(prefix, expected, "pre-phase drain mismatch for {name}");
+                continue;
             }
             assert!(
                 clone_source.stats().delta_terminal_eager_cohort_admissions > 0,
@@ -21465,8 +21486,11 @@ mod tests {
         assert_eq!(lowered.results, sequential);
         assert_eq!(*left_proposals.lock().unwrap(), [vec![raw(0)]]);
         assert_eq!(*right_proposals.lock().unwrap(), [vec![raw(1)]]);
+        // Duplicate public rows no longer extend the terminal-demand window;
+        // the histories may therefore reenter an already interned state after
+        // its prior bucket drained instead of merging into a live bucket.
         assert!(
-            lowered.stats.bucket_merges > 0,
+            lowered.stats.interner_hits > 0,
             "opposite AND child histories did not reconverge at one canonical PC"
         );
 
@@ -21489,8 +21513,8 @@ mod tests {
         assert_eq!(*root_left_proposals.lock().unwrap(), [vec![raw(0)]]);
         assert_eq!(*root_right_proposals.lock().unwrap(), [vec![raw(1)]]);
         assert!(
-            synthetic.stats.bucket_merges > 0,
-            "synthetic root histories did not remerge at one canonical PC"
+            synthetic.stats.interner_hits > 0,
+            "synthetic root histories did not reconverge at one canonical PC"
         );
     }
 
@@ -21581,9 +21605,12 @@ mod tests {
         assert_eq!(flatten(&left_proposals), [raw(0), raw(1)]);
         assert_eq!(flatten(&right_proposals), [raw(0), raw(1)]);
         assert_eq!(flatten(&outer_proposals), [raw(2), raw(3)]);
+        // SET terminal demand can drain one canonical bucket before the next
+        // equivalent history arrives. Count both live-bucket merges and later
+        // state reentries through their shared interner-hit receipt.
         assert!(
-            lowered.stats.bucket_merges >= 3,
-            "recursive opposite-order histories did not remerge at multiple zipper depths: {:?}",
+            lowered.stats.interner_hits >= 3,
+            "recursive opposite-order histories did not reconverge at multiple zipper depths: {:?}",
             lowered.stats
         );
     }
@@ -22106,7 +22133,7 @@ mod tests {
     }
 
     #[test]
-    fn recursive_formula_preserves_duplicate_affine_parent_occurrences() {
+    fn recursive_formula_duplicate_parents_collapse_at_projection() {
         let make = || {
             let inner = UnionConstraint::new(vec![
                 Box::new(VerbLeaf {
@@ -22153,7 +22180,7 @@ mod tests {
         sequential.sort_unstable();
         opaque.sort_unstable();
         lowered.sort_unstable();
-        assert_eq!(lowered, [(raw(7), raw(1)), (raw(7), raw(1))]);
+        assert_eq!(lowered, [(raw(7), raw(1))]);
         assert_eq!(lowered, sequential);
         assert_eq!(lowered, opaque);
     }
@@ -22383,7 +22410,8 @@ mod tests {
                 .collect::<Vec<_>>()
         });
         one_worker.sort_unstable();
-        assert_eq!(one_worker, values);
+        let unique = [raw(0), raw(1), raw(2), raw(3), raw(4), raw(5)];
+        assert_eq!(one_worker, unique);
         assert_eq!(*calls.lock().unwrap(), [values.len()]);
 
         calls.lock().unwrap().clear();
@@ -22394,7 +22422,7 @@ mod tests {
                 .collect::<Vec<_>>()
         });
         four_workers.sort_unstable();
-        assert_eq!(four_workers, values);
+        assert_eq!(four_workers, unique);
 
         let page_sizes = calls.lock().unwrap();
         assert_eq!(page_sizes.iter().sum::<usize>(), values.len());
@@ -22529,14 +22557,23 @@ mod tests {
         assert!(right.continuation.is_none());
 
         let project = |binding: &Binding| binding.get(0).copied();
-        let drain = |machine: &mut ResidualStateMachine| {
+        let drain = |machine: &mut ResidualStateMachine, projection: &mut ProjectionGate| {
             std::iter::from_fn(|| {
-                machine.pull(&root, &plan, &project, &influences, &base_estimates)
+                machine.pull(
+                    &root,
+                    &plan,
+                    &project,
+                    projection,
+                    &influences,
+                    &base_estimates,
+                )
             })
             .collect::<Vec<_>>()
         };
-        let left_rows = drain(&mut machine);
-        let right_rows = drain(&mut right);
+        let mut left_projection = ProjectionGate::full(root.variables());
+        let mut right_projection = ProjectionGate::full(root.variables());
+        let left_rows = drain(&mut machine, &mut left_projection);
+        let right_rows = drain(&mut right, &mut right_projection);
         assert!(!left_rows.is_empty());
         assert!(!right_rows.is_empty());
         let mut actual = left_rows;
@@ -22584,7 +22621,7 @@ mod tests {
                 .collect::<Vec<_>>()
         });
         custom.sort_unstable();
-        assert_eq!(custom, [raw(1), raw(1)]);
+        assert_eq!(custom, [raw(1)]);
         assert_eq!(*whole_calls.lock().unwrap(), [4]);
         let mut custom_suffix = suffix_calls.lock().unwrap().clone();
         custom_suffix.sort_unstable();

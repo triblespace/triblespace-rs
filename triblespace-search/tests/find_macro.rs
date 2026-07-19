@@ -182,16 +182,16 @@ fn find_matches_term_on_succinct() {
 
 /// The succinct HNSW view plugs into `find!` via the unary
 /// [`SimilarTo`] snapshot. Pin the probe at construction, let the engine
-/// enumerate the frozen HNSW result bag, and cross-check against the direct
+/// enumerate the frozen HNSW result set, and cross-check against the direct
 /// `candidates_above` API.
 ///
 /// [`SimilarTo`]: triblespace_search::constraint::SimilarTo
 #[test]
 fn find_hnsw_similar_to_on_succinct() {
     use triblespace_core::blob::MemoryBlobStore;
-    use triblespace_core::repo::BlobStore;
     use triblespace_core::inline::encodings::hash::Handle;
     use triblespace_core::inline::Inline;
+    use triblespace_core::repo::BlobStore;
     use triblespace_search::hnsw::HNSWBuilder;
     use triblespace_search::schemas::{put_embedding, Embedding};
 

@@ -2,6 +2,7 @@ use proc_macro2::Span;
 use proc_macro2::TokenStream as TokenStream2;
 use proc_macro2::TokenTree;
 use quote::{format_ident, quote};
+use std::collections::HashSet;
 use syn::parse::{Parse, ParseStream};
 use syn::{Ident, Token};
 
@@ -163,6 +164,22 @@ fn ensure_projected_var_mentioned(
     }
 }
 
+fn ensure_unique_projected_vars(variables: &[FindVariable]) -> syn::Result<()> {
+    let mut names = HashSet::new();
+    for variable in variables {
+        if !names.insert(variable.name.to_string()) {
+            return Err(syn::Error::new(
+                variable.name.span(),
+                format!(
+                    "projected variable `{}` appears more than once in the query head",
+                    variable.name
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn find_impl(input: TokenStream2) -> syn::Result<TokenStream2> {
     let FindImplInput {
         crate_path,
@@ -175,7 +192,7 @@ pub fn find_impl(input: TokenStream2) -> syn::Result<TokenStream2> {
 
     match mode {
         FindMode::Unit => Ok(quote! {
-            #crate_path::query::Query::new(#constraint,
+            #crate_path::query::Query::new_projected(#constraint, [],
                 move |_binding| {
                     ::core::option::Option::Some(())
                 })
@@ -188,7 +205,7 @@ pub fn find_impl(input: TokenStream2) -> syn::Result<TokenStream2> {
             Ok(quote! {
                 {
                     #decl
-                    #crate_path::query::Query::new(#constraint,
+                    #crate_path::query::Query::new_projected(#constraint, [#name.index],
                         move |#binding| {
                             #conversion
                             ::core::option::Option::Some(#name)
@@ -198,6 +215,7 @@ pub fn find_impl(input: TokenStream2) -> syn::Result<TokenStream2> {
             })
         }
         FindMode::Tuple(variables) => {
+            ensure_unique_projected_vars(&variables)?;
             for variable in &variables {
                 ensure_projected_var_mentioned(&constraint, variable)?;
             }
@@ -208,6 +226,10 @@ pub fn find_impl(input: TokenStream2) -> syn::Result<TokenStream2> {
                 .map(|v| gen_var_conversion(&crate_path, &binding, v))
                 .collect();
             let var_names: Vec<&Ident> = variables.iter().map(|v| &v.name).collect();
+            let head: Vec<TokenStream2> = var_names
+                .iter()
+                .map(|name| quote! { #name.index })
+                .collect();
             let tuple_expr = match var_names.len() {
                 1 => {
                     let v = var_names[0];
@@ -220,7 +242,7 @@ pub fn find_impl(input: TokenStream2) -> syn::Result<TokenStream2> {
             Ok(quote! {
                 {
                     #(#var_decls)*
-                    #crate_path::query::Query::new(#constraint,
+                    #crate_path::query::Query::new_projected(#constraint, [#(#head),*],
                         move |#binding| {
                             #(#var_conversions)*
                             ::core::option::Option::Some(#tuple_expr)

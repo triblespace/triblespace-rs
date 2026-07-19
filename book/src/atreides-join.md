@@ -151,8 +151,10 @@ depth-first traversal from thrashing through unrelated values.
 - The explicit `Query::sequential()` scheduler keeps a stack of bound variables
   and a parallel row of values. It presents that cursor to constraints as a
   one-row `RowsView`; `Binding` is now only reconstructed at the
-  result-projection boundary. A `touched_variables` set marks which estimates
-  need refreshing before the next decision point.
+  result-projection boundary. The terminal gate preserves one result per
+  distinct ordered raw query head; internal proposal occurrences remain bags
+  until that boundary. A `touched_variables` set marks which estimates need
+  refreshing before the next decision point.
 - The ordinary iterator lifts the same negotiation to blocks of sibling rows
   through canonical residual states for every live root. Those states key
   future work by bound schema, planned action, and checked leaf occurrences.
