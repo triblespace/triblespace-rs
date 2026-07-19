@@ -85,13 +85,12 @@ proptest! {
             pattern!(&set, [{ test_ns::name: ?n }])
         ).collect();
 
-        // Every name we inserted should be queryable
-        for name in &names {
-            prop_assert!(results.contains(name),
-                "missing name {:?}", name);
-        }
-        // Count should match (each entity has exactly one name)
-        prop_assert_eq!(results.len(), names.len());
+        // The query projects only the name, so distinct entities carrying an
+        // equal raw name collapse to one public SET row.
+        let expected: std::collections::BTreeSet<_> = names.iter().collect();
+        let actual: std::collections::BTreeSet<_> = results.iter().collect();
+        prop_assert_eq!(&actual, &expected);
+        prop_assert_eq!(results.len(), actual.len());
     }
 
     // ── Multi-entity join ──────────────────────────────────────────────
