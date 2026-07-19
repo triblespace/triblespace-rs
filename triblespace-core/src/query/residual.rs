@@ -21357,6 +21357,146 @@ mod tests {
     }
 
     #[test]
+    fn constructed_program_composes_constant_equality_and_cyclic_rpq_without_fallback() {
+        use crate::id::{id_into_value, ExclusiveId, Id};
+        use crate::query::equalityconstraint::EqualityConstraint;
+        use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
+        use crate::trible::{Trible, TribleSet};
+
+        let edge = Id::new([141; crate::id::ID_LEN]).unwrap();
+        let source = Id::new([142; crate::id::ID_LEN]).unwrap();
+        let a = Id::new([143; crate::id::ID_LEN]).unwrap();
+        let b = Id::new([144; crate::id::ID_LEN]).unwrap();
+        let c = Id::new([145; crate::id::ID_LEN]).unwrap();
+        let mut graph = TribleSet::new();
+        for (from, to) in [(&source, &a), (&a, &b), (&b, &c), (&c, &source)] {
+            graph.insert(&Trible::new::<GenId>(
+                ExclusiveId::force_ref(from),
+                &edge,
+                &to.to_inline(),
+            ));
+        }
+
+        let source_variable = Variable::<GenId>::new(0);
+        let alias_variable = Variable::<GenId>::new(1);
+        let target_variable = Variable::<GenId>::new(2);
+        let path = [PathOp::Attr(edge.raw()), PathOp::Plus];
+        let make_root = |graph: TribleSet, trap: bool, counters: &ProgramFallbackCounters| {
+            let source_constant = source_variable.is(source.to_inline());
+            let equality = EqualityConstraint::new(source_variable.index, alias_variable.index);
+            let rpq = RegularPathConstraint::new(
+                graph,
+                alias_variable,
+                target_variable,
+                &path,
+            );
+            let target_constant = target_variable.is(b.to_inline());
+            if trap {
+                IntersectionConstraint::new(vec![
+                    Box::new(ConstructedProtocolTrap {
+                        inner: source_constant,
+                    }) as ShapeConstraint,
+                    Box::new(ConstructedProtocolTrap { inner: equality }) as ShapeConstraint,
+                    Box::new(ConstructedProtocolTrap {
+                        inner: program_only_rpq(rpq, counters),
+                    }) as ShapeConstraint,
+                    Box::new(ConstructedProtocolTrap {
+                        inner: target_constant,
+                    }) as ShapeConstraint,
+                ])
+            } else {
+                IntersectionConstraint::new(vec![
+                    Box::new(source_constant) as ShapeConstraint,
+                    Box::new(equality) as ShapeConstraint,
+                    Box::new(rpq) as ShapeConstraint,
+                    Box::new(target_constant) as ShapeConstraint,
+                ])
+            }
+        };
+
+        let unused_oracle_counters = program_fallback_counters();
+        let mut expected: Vec<_> = Query::new(
+            make_root(graph.clone(), false, &unused_oracle_counters),
+            constructed_source_target,
+        )
+        .sequential()
+        .collect();
+        expected.sort_unstable();
+        assert_eq!(
+            expected,
+            vec![(id_into_value(&source), id_into_value(&b))]
+        );
+
+        let rpq_fallbacks = program_fallback_counters();
+        let root = Arc::new(make_root(graph, true, &rpq_fallbacks));
+        let iterator = try_constructed_program_query(root, constructed_source_target).unwrap();
+        assert_eq!(iterator.planner_kind(), ResidualPlannerKind::ConstructedProgram);
+        let steps = &iterator.plan.constructed_program.as_ref().unwrap().steps;
+        assert_eq!(steps.len(), 3);
+        assert_eq!((steps[0].variable, steps[0].proposer), (0, 0));
+        assert_eq!(
+            steps[0]
+                .confirmer_routes
+                .iter()
+                .map(|(leaf, _)| *leaf)
+                .collect::<Vec<_>>(),
+            vec![1],
+            "unbound equality must be an identity confirmer"
+        );
+        assert_eq!((steps[1].variable, steps[1].proposer), (1, 1));
+        assert_eq!(
+            steps[1]
+                .confirmer_routes
+                .iter()
+                .map(|(leaf, _)| *leaf)
+                .collect::<Vec<_>>(),
+            vec![2],
+            "bound-peer equality must propose into RPQ confirmation"
+        );
+        assert_eq!((steps[2].variable, steps[2].proposer), (2, 2));
+        assert_eq!(steps[2].proposer_route.stratum, ProgramStratum::Fixpoint);
+        assert_eq!(
+            steps[2]
+                .confirmer_routes
+                .iter()
+                .map(|(leaf, _)| *leaf)
+                .collect::<Vec<_>>(),
+            vec![3],
+            "the target constant must confirm the cyclic RPQ frontier"
+        );
+
+        let mut actual: Vec<_> = iterator.collect();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
+        assert_program_fallbacks_unused(&rpq_fallbacks);
+    }
+
+    #[test]
+    fn constructed_program_treats_same_variable_equality_as_identity_confirmation() {
+        use crate::id::{id_into_value, Id};
+        use crate::query::equalityconstraint::EqualityConstraint;
+
+        let value = Id::new([151; crate::id::ID_LEN]).unwrap();
+        let variable = Variable::<GenId>::new(0);
+        let root = Arc::new(IntersectionConstraint::new(vec![
+            Box::new(ConstructedProtocolTrap {
+                inner: variable.is(value.to_inline()),
+            }) as ShapeConstraint,
+            Box::new(ConstructedProtocolTrap {
+                inner: EqualityConstraint::new(variable.index, variable.index),
+            }) as ShapeConstraint,
+        ]));
+        let iterator = try_constructed_program_query(root, |binding: &Binding| {
+            binding.get(variable.index).copied()
+        })
+        .unwrap();
+        let step = &iterator.plan.constructed_program.as_ref().unwrap().steps[0];
+        assert_eq!(step.proposer, 0);
+        assert_eq!(step.confirmer_routes.len(), 1);
+        assert_eq!(iterator.collect::<Vec<_>>(), vec![id_into_value(&value)]);
+    }
+
+    #[test]
     fn constructed_program_keeps_shared_occurrences_distinct() {
         let (graph, attribute) = constructed_program_graph();
         let expected_leaf = Arc::new(constructed_rpq(graph.clone(), &attribute, false));

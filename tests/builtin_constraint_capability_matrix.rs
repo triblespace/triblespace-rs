@@ -140,6 +140,7 @@ struct CapabilityReceipt {
     finite_union_arms: Option<usize>,
     page_local_confirm: bool,
     direct_proposal_source: bool,
+    typed_program: bool,
 }
 
 fn capability_receipt<'a, C: Constraint<'a>>(
@@ -154,6 +155,7 @@ fn capability_receipt<'a, C: Constraint<'a>>(
         page_local_confirm: constraint.residual_confirm_is_page_local(),
         direct_proposal_source: constraint
             .residual_proposal_source_is_paged(variable, &RowsView::EMPTY),
+        typed_program: constraint.residual_program().is_some(),
     }
 }
 
@@ -192,6 +194,7 @@ fn built_in_capability_receipts_distinguish_native_paths_from_opaque_fallbacks()
             finite_union_arms: None,
             page_local_confirm: true,
             direct_proposal_source: false,
+            typed_program: true,
         },
         "ConstantConstraint"
     );
@@ -202,6 +205,7 @@ fn built_in_capability_receipts_distinguish_native_paths_from_opaque_fallbacks()
             finite_union_arms: None,
             page_local_confirm: true,
             direct_proposal_source: false,
+            typed_program: true,
         },
         "EqualityConstraint"
     );
@@ -212,6 +216,7 @@ fn built_in_capability_receipts_distinguish_native_paths_from_opaque_fallbacks()
             finite_union_arms: None,
             page_local_confirm: true,
             direct_proposal_source: false,
+            typed_program: false,
         },
         "InlineRange"
     );
@@ -222,6 +227,7 @@ fn built_in_capability_receipts_distinguish_native_paths_from_opaque_fallbacks()
             finite_union_arms: None,
             page_local_confirm: true,
             direct_proposal_source: true,
+            typed_program: false,
         },
         "SortedSliceConstraint"
     );
@@ -232,6 +238,7 @@ fn built_in_capability_receipts_distinguish_native_paths_from_opaque_fallbacks()
             finite_union_arms: None,
             page_local_confirm: true,
             direct_proposal_source: false,
+            typed_program: false,
         },
         "HashSet SetConstraint"
     );
@@ -242,6 +249,7 @@ fn built_in_capability_receipts_distinguish_native_paths_from_opaque_fallbacks()
             finite_union_arms: None,
             page_local_confirm: true,
             direct_proposal_source: false,
+            typed_program: false,
         },
         "HashMap KeysConstraint"
     );
@@ -254,6 +262,7 @@ fn built_in_capability_receipts_distinguish_native_paths_from_opaque_fallbacks()
             finite_union_arms: Some(3),
             page_local_confirm: false,
             direct_proposal_source: false,
+            typed_program: false,
         },
         "UnionConstraint exposes finite formula arms but keeps group-global confirm"
     );
@@ -266,6 +275,7 @@ fn built_in_capability_receipts_distinguish_native_paths_from_opaque_fallbacks()
             finite_union_arms: None,
             page_local_confirm: false,
             direct_proposal_source: false,
+            typed_program: false,
         },
         "DebugConstraint honestly stays on the instrumented opaque protocol"
     );
@@ -277,6 +287,7 @@ fn built_in_capability_receipts_distinguish_native_paths_from_opaque_fallbacks()
             finite_union_arms: None,
             page_local_confirm: true,
             direct_proposal_source: true,
+            typed_program: false,
         },
         "EstimateOverrideConstraint keeps shape opaque but forwards exact execution capabilities"
     );
@@ -304,7 +315,9 @@ fn atomic_constraints_have_exact_bags_across_residual_widths() {
         || find!(x: Inline<UnknownInline>, Arc::new(x.is(a))),
     );
     assert_eq!(constant.conservative_geometric.delta_source_pages, 0);
-    assert_eq!(constant.full_geometric.delta_source_pages, 0);
+    assert_eq!(constant.full_geometric.delta_source_pages, 1);
+    assert_eq!(constant.full_geometric.delta_source_candidates_examined, 1);
+    assert_eq!(constant.full_geometric.delta_source_direct_candidates, 1);
 
     let left = Arc::new(HashSet::from([a, b, c]));
     let right = Arc::new(HashSet::from([b, c, d]));
