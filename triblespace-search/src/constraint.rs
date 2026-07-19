@@ -1569,10 +1569,18 @@ mod tests {
             &RowsView::new(&[parent.index], &parent_rows),
             &mut CandidateSink::Tagged(&mut eager),
         );
-        let mut eager_pairs: Vec<_> = eager
+        let eager_pairs: Vec<_> = eager
             .iter()
             .map(|&(row, value)| (parent_rows[row as usize], value))
             .collect();
+        let expected_eager_pairs: Vec<_> = parent_rows
+            .iter()
+            .flat_map(|&parent_value| entries.iter().map(move |&entry| (parent_value, entry)))
+            .collect();
+        assert_eq!(eager_pairs, expected_eager_pairs);
+        let mut expected_public_pairs = eager_pairs.clone();
+        expected_public_pairs.sort_unstable();
+        expected_public_pairs.dedup();
 
         let make = || {
             triblespace_core::and!(
@@ -1586,19 +1594,25 @@ mod tests {
             .cap(1)
             .start_width(1);
         let mut full: Vec<_> = residual.by_ref().collect();
-        eager_pairs.sort_unstable();
         sequential.sort_unstable();
         full.sort_unstable();
         assert_eq!(full, sequential);
-        assert_eq!(full, eager_pairs);
-        assert_eq!(full.len(), parents.len() * entries.len());
+        assert_eq!(full, expected_public_pairs);
         for parent_value in parent_rows {
+            assert_eq!(
+                eager_pairs
+                    .iter()
+                    .filter(|(p, d)| *p == parent_value && *d == entries[1])
+                    .count(),
+                2,
+                "the internal proposal bag retains both doc occurrences",
+            );
             assert_eq!(
                 full.iter()
                     .filter(|(p, d)| *p == parent_value && *d == entries[1])
                     .count(),
-                2,
-                "each affine parent retains both repeated doc occurrences",
+                1,
+                "the public raw head collapses repeated doc occurrences",
             );
         }
         assert_eq!(
@@ -1793,10 +1807,22 @@ mod tests {
             &RowsView::new(&[parent.index], &parent_rows),
             &mut CandidateSink::Tagged(&mut eager),
         );
-        let mut eager_pairs: Vec<_> = eager
+        let eager_pairs: Vec<_> = eager
             .iter()
             .map(|&(row, value)| (parent_rows[row as usize], value))
             .collect();
+        let expected_eager_pairs: Vec<_> = parent_rows
+            .iter()
+            .flat_map(|&parent_value| {
+                candidates
+                    .iter()
+                    .map(move |&candidate| (parent_value, candidate))
+            })
+            .collect();
+        assert_eq!(eager_pairs, expected_eager_pairs);
+        let mut expected_public_pairs = eager_pairs.clone();
+        expected_public_pairs.sort_unstable();
+        expected_public_pairs.dedup();
 
         let make = || {
             triblespace_core::and!(
@@ -1810,19 +1836,25 @@ mod tests {
             .cap(1)
             .start_width(1);
         let mut full: Vec<_> = residual.by_ref().collect();
-        eager_pairs.sort_unstable();
         sequential.sort_unstable();
         full.sort_unstable();
         assert_eq!(full, sequential);
-        assert_eq!(full, eager_pairs);
-        assert_eq!(full.len(), parents.len() * candidates.len());
+        assert_eq!(full, expected_public_pairs);
         for parent_value in parent_rows {
+            assert_eq!(
+                eager_pairs
+                    .iter()
+                    .filter(|(p, candidate)| { *p == parent_value && *candidate == candidates[1] })
+                    .count(),
+                2,
+                "the internal proposal bag retains both handle occurrences",
+            );
             assert_eq!(
                 full.iter()
                     .filter(|(p, candidate)| { *p == parent_value && *candidate == candidates[1] })
                     .count(),
-                2,
-                "each affine parent retains both repeated handle occurrences",
+                1,
+                "the public raw head collapses repeated handle occurrences",
             );
         }
         assert_eq!(
@@ -1860,7 +1892,7 @@ mod tests {
         // Both children can propose, so adaptive execution chooses SimilarTo's
         // tighter two-row bag even though BM25 is listed first. BM25 confirms
         // each bounded page. Width one forces every Offset continuation edge.
-        let forward_sequential: Vec<_> = Query::new(
+        let mut forward_sequential: Vec<_> = Query::new(
             triblespace_core::and!(
                 BM25Filter::<Handle<Embedding>>::from_entries(candidate, source.clone()),
                 SimilarTo::from_candidates(candidate, allowed.clone()),
@@ -1869,9 +1901,14 @@ mod tests {
         )
         .sequential()
         .collect();
+        // Public query heads are sets. Scalar DFS consumes its proposal vector
+        // LIFO while the typed residual route pages the same source forward,
+        // so only the denotation is shared across schedulers. Exact source
+        // order and occurrence multiplicity are asserted at the direct-source
+        // seams in the two tests above.
+        forward_sequential.sort_unstable();
         assert_eq!(forward_sequential, expected);
-        let forward_bm25 =
-            BM25Filter::<Handle<Embedding>>::from_entries(candidate, source.clone());
+        let forward_bm25 = BM25Filter::<Handle<Embedding>>::from_entries(candidate, source.clone());
         let forward_similar = SimilarTo::from_candidates(candidate, allowed.clone());
         assert!(forward_bm25
             .route(ProgramRequest {
@@ -1891,20 +1928,19 @@ mod tests {
             .cap(1)
             .start_width(1)
             .growth(1);
-        let first = forward.next().expect("FULL residual cached source was empty");
+        let first = forward
+            .next()
+            .expect("FULL residual cached source was empty");
         let mirror = forward.clone();
         let remainder: Vec<_> = forward.collect();
         assert_eq!(mirror.collect::<Vec<_>>(), remainder);
-        assert_eq!(
-            std::iter::once(first)
-                .chain(remainder)
-                .collect::<Vec<_>>(),
-            forward_sequential,
-        );
+        let mut forward_results = std::iter::once(first).chain(remainder).collect::<Vec<_>>();
+        forward_results.sort_unstable();
+        assert_eq!(forward_results, forward_sequential);
 
         // Reversing the child types makes BM25's shorter bag own proposal
         // paging while SimilarTo exercises the same pointwise confirmation.
-        let reverse_sequential: Vec<_> = Query::new(
+        let mut reverse_sequential: Vec<_> = Query::new(
             triblespace_core::and!(
                 SimilarTo::from_candidates(candidate, source.clone()),
                 BM25Filter::<Handle<Embedding>>::from_entries(candidate, allowed.clone()),
@@ -1913,10 +1949,10 @@ mod tests {
         )
         .sequential()
         .collect();
+        reverse_sequential.sort_unstable();
         assert_eq!(reverse_sequential, expected);
         let reverse_similar = SimilarTo::from_candidates(candidate, source);
-        let reverse_bm25 =
-            BM25Filter::<Handle<Embedding>>::from_entries(candidate, allowed);
+        let reverse_bm25 = BM25Filter::<Handle<Embedding>>::from_entries(candidate, allowed);
         assert!(reverse_similar
             .route(ProgramRequest {
                 action: ProgramAction::Propose(candidate.index),
@@ -1930,12 +1966,13 @@ mod tests {
             })
             .is_some());
         let reverse_root = triblespace_core::and!(reverse_similar, reverse_bm25);
-        let reverse: Vec<_> = Query::new(reverse_root, project_first)
+        let mut reverse: Vec<_> = Query::new(reverse_root, project_first)
             .solve_residual_state_lazy_with(ResidualLowering::FULL)
             .cap(1)
             .start_width(1)
             .growth(1)
             .collect();
+        reverse.sort_unstable();
         assert_eq!(reverse, reverse_sequential);
     }
 
