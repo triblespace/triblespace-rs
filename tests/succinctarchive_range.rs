@@ -6,11 +6,15 @@
 use triblespace::core::blob::encodings::succinctarchive::OrderedUniverse;
 use triblespace::core::blob::encodings::succinctarchive::SuccinctArchive;
 use triblespace::core::inline::RawInline;
-use triblespace::core::query::Constraint;
 use triblespace::core::query::Binding;
-use triblespace::core::query::intersectionconstraint::IntersectionConstraint;
-use triblespace::core::query::residual::try_constructed_program_query;
+use triblespace::core::query::Constraint;
+use triblespace::core::query::ProgramAction;
+use triblespace::core::query::ProgramRequest;
+use triblespace::core::query::Query;
+use triblespace::core::query::TypedProgramSpec;
 use triblespace::core::query::VariableContext;
+use triblespace::core::query::VariableSet;
+use triblespace::core::query::residual::ResidualLowering;
 use triblespace::prelude::inlineencodings::R256BE;
 use triblespace::prelude::*;
 
@@ -168,7 +172,7 @@ fn project(variable: usize, binding: &Binding) -> Option<RawInline> {
 }
 
 #[test]
-fn value_range_is_a_strict_constructed_ordered_source_and_confirmer() {
+fn value_range_executes_as_an_ordered_source_and_confirmer_under_full_lowering() {
     let v10: Inline<R256BE> = 10i128.to_inline();
     let v50: Inline<R256BE> = 50i128.to_inline();
     let v90: Inline<R256BE> = 90i128.to_inline();
@@ -181,11 +185,18 @@ fn value_range_is_a_strict_constructed_ordered_source_and_confirmer() {
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
     let variable = Variable::<R256BE>::new(0);
 
-    let mut source: Vec<_> = try_constructed_program_query(
-        IntersectionConstraint::new(vec![archive.value_in_range(variable, v10, v90)]),
+    let source_constraint = archive.value_in_range(variable, v10, v90);
+    assert!(source_constraint
+        .route(ProgramRequest {
+            action: ProgramAction::Propose(variable.index),
+            bound: VariableSet::new_empty(),
+        })
+        .is_some());
+    let mut source: Vec<_> = Query::new(
+        source_constraint,
         move |binding| project(variable.index, binding),
     )
-    .expect("the succinct range source constructs without an opaque fallback")
+    .solve_residual_state_lazy_with(ResidualLowering::FULL)
     .cap(1)
     .start_width(1)
     .growth(1)
@@ -193,14 +204,18 @@ fn value_range_is_a_strict_constructed_ordered_source_and_confirmer() {
     source.sort_unstable();
     assert_eq!(source, [v10.raw, v50.raw, v90.raw]);
 
-    let mut confirmed: Vec<_> = try_constructed_program_query(
-        and!(
-            variable.is(v50),
-            archive.value_in_range(variable, v10, v90),
-        ),
+    let confirmer = archive.value_in_range(variable, v10, v90);
+    assert!(confirmer
+        .route(ProgramRequest {
+            action: ProgramAction::Confirm(variable.index),
+            bound: VariableSet::new_empty(),
+        })
+        .is_some());
+    let mut confirmed: Vec<_> = Query::new(
+        and!(variable.is(v50), confirmer),
         move |binding| project(variable.index, binding),
     )
-    .expect("the succinct range confirmer composes with another finite Program")
+    .solve_residual_state_lazy_with(ResidualLowering::FULL)
     .cap(1)
     .start_width(1)
     .growth(1)

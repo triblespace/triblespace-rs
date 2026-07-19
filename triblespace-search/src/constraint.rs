@@ -1143,7 +1143,7 @@ mod tests {
     use triblespace_core::id::Id;
     use triblespace_core::inline::{InlineEncoding, IntoInline};
     use triblespace_core::query::hashsetconstraint::SetConstraint;
-    use triblespace_core::query::residual::{try_constructed_program_query, ResidualLowering};
+    use triblespace_core::query::residual::ResidualLowering;
     use triblespace_core::query::{Binding, Candidates, Query};
     use triblespace_core::repo::{BlobStore, BlobStorePut};
 
@@ -1826,7 +1826,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_search_programs_construct_as_source_and_confirmer_without_fallback() {
+    fn cached_search_programs_execute_as_source_and_confirmer_under_full_lowering() {
         let candidate = Variable::<Handle<Embedding>>::new(0);
         let source = vec![
             embedding_raw(3),
@@ -1835,20 +1835,43 @@ mod tests {
             embedding_raw(2),
         ];
         let allowed = vec![embedding_raw(1), embedding_raw(2)];
-        let expected = vec![embedding_raw(1), embedding_raw(1), embedding_raw(2)];
+        let expected = vec![embedding_raw(1), embedding_raw(2)];
 
-        // BM25 supplies the native occurrence bag; SimilarTo confirms each
-        // bounded page. Width one forces every Offset continuation edge.
-        let forward_root = triblespace_core::and!(
-            BM25Filter::<Handle<Embedding>>::from_entries(candidate, source.clone()),
-            SimilarTo::from_candidates(candidate, allowed.clone()),
-        );
-        let mut forward = try_constructed_program_query(forward_root, project_first)
-            .expect("cached BM25 + SimilarTo must admit a complete typed Program chain")
+        // Both children can propose, so adaptive execution chooses SimilarTo's
+        // tighter two-row bag even though BM25 is listed first. BM25 confirms
+        // each bounded page. Width one forces every Offset continuation edge.
+        let forward_sequential: Vec<_> = Query::new(
+            triblespace_core::and!(
+                BM25Filter::<Handle<Embedding>>::from_entries(candidate, source.clone()),
+                SimilarTo::from_candidates(candidate, allowed.clone()),
+            ),
+            project_first,
+        )
+        .sequential()
+        .collect();
+        assert_eq!(forward_sequential, expected);
+        let forward_bm25 =
+            BM25Filter::<Handle<Embedding>>::from_entries(candidate, source.clone());
+        let forward_similar = SimilarTo::from_candidates(candidate, allowed.clone());
+        assert!(forward_bm25
+            .route(ProgramRequest {
+                action: ProgramAction::Propose(candidate.index),
+                bound: VariableSet::new_empty(),
+            })
+            .is_some());
+        assert!(forward_similar
+            .route(ProgramRequest {
+                action: ProgramAction::Confirm(candidate.index),
+                bound: VariableSet::new_empty(),
+            })
+            .is_some());
+        let forward_root = triblespace_core::and!(forward_bm25, forward_similar);
+        let mut forward = Query::new(forward_root, project_first)
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
             .cap(1)
             .start_width(1)
             .growth(1);
-        let first = forward.next().expect("constructed cached source was empty");
+        let first = forward.next().expect("FULL residual cached source was empty");
         let mirror = forward.clone();
         let remainder: Vec<_> = forward.collect();
         assert_eq!(mirror.collect::<Vec<_>>(), remainder);
@@ -1856,22 +1879,44 @@ mod tests {
             std::iter::once(first)
                 .chain(remainder)
                 .collect::<Vec<_>>(),
-            expected,
+            forward_sequential,
         );
 
-        // Reverse the occurrences so SimilarTo owns proposal paging and BM25
-        // exercises the same pointwise confirmation contract.
-        let reverse_root = triblespace_core::and!(
-            SimilarTo::from_candidates(candidate, source),
-            BM25Filter::<Handle<Embedding>>::from_entries(candidate, allowed),
-        );
-        let reverse: Vec<_> = try_constructed_program_query(reverse_root, project_first)
-            .expect("cached SimilarTo + BM25 must admit the reverse Program chain")
+        // Reversing the child types makes BM25's shorter bag own proposal
+        // paging while SimilarTo exercises the same pointwise confirmation.
+        let reverse_sequential: Vec<_> = Query::new(
+            triblespace_core::and!(
+                SimilarTo::from_candidates(candidate, source.clone()),
+                BM25Filter::<Handle<Embedding>>::from_entries(candidate, allowed.clone()),
+            ),
+            project_first,
+        )
+        .sequential()
+        .collect();
+        assert_eq!(reverse_sequential, expected);
+        let reverse_similar = SimilarTo::from_candidates(candidate, source);
+        let reverse_bm25 =
+            BM25Filter::<Handle<Embedding>>::from_entries(candidate, allowed);
+        assert!(reverse_similar
+            .route(ProgramRequest {
+                action: ProgramAction::Propose(candidate.index),
+                bound: VariableSet::new_empty(),
+            })
+            .is_some());
+        assert!(reverse_bm25
+            .route(ProgramRequest {
+                action: ProgramAction::Confirm(candidate.index),
+                bound: VariableSet::new_empty(),
+            })
+            .is_some());
+        let reverse_root = triblespace_core::and!(reverse_similar, reverse_bm25);
+        let reverse: Vec<_> = Query::new(reverse_root, project_first)
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
             .cap(1)
             .start_width(1)
             .growth(1)
             .collect();
-        assert_eq!(reverse, expected);
+        assert_eq!(reverse, reverse_sequential);
     }
 
     #[test]
@@ -2036,20 +2081,33 @@ mod tests {
     }
 
     #[test]
-    fn exact_cosine_program_constructs_without_a_proposal_route() {
+    fn exact_cosine_filters_under_full_lowering_without_a_proposal_route() {
         let (flat, _hnsw, mut store, handles) = sample_sim();
         let reader = store.reader().unwrap();
         let view = flat.attach(&reader);
         let a = Variable::<Handle<Embedding>>::new(0);
         let b = Variable::<Handle<Embedding>>::new(1);
 
+        let exact = view.cosine_at_least(a, b, 0.8);
+        assert!(exact
+            .route(ProgramRequest {
+                action: ProgramAction::Propose(a.index),
+                bound: VariableSet::new_empty(),
+            })
+            .is_none());
+        assert!(exact
+            .route(ProgramRequest {
+                action: ProgramAction::Confirm(a.index),
+                bound: VariableSet::new_empty(),
+            })
+            .is_some());
         let good = triblespace_core::and!(
             a.is(handles[0]),
             b.is(handles[2]),
-            view.cosine_at_least(a, b, 0.8),
+            exact,
         );
-        let rows: Vec<_> = try_constructed_program_query(good, project_pair)
-            .expect("constant sources plus exact cosine must construct")
+        let rows: Vec<_> = Query::new(good, project_pair)
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
             .cap(1)
             .start_width(1)
             .growth(1)
@@ -2062,8 +2120,8 @@ mod tests {
             view.cosine_at_least(a, b, 0.8),
         );
         assert!(
-            try_constructed_program_query(bad, project_pair)
-                .expect("the same exact cosine route must construct for a false pair")
+            Query::new(bad, project_pair)
+                .solve_residual_state_lazy_with(ResidualLowering::FULL)
                 .next()
                 .is_none()
         );
@@ -2073,8 +2131,8 @@ mod tests {
             view.cosine_at_least(a, a, 1.01),
         );
         assert!(
-            try_constructed_program_query(repeated, project_first)
-                .expect("repeated-variable cosine must construct as a confirmer")
+            Query::new(repeated, project_first)
+                .solve_residual_state_lazy_with(ResidualLowering::FULL)
                 .next()
                 .is_none()
         );

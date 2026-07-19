@@ -425,8 +425,6 @@ mod tests {
     use crate::inline::RawInline;
     use crate::prelude::inlineencodings::R256BE;
     use crate::prelude::*;
-    use crate::query::intersectionconstraint::IntersectionConstraint;
-    use crate::query::residual::try_constructed_program_query;
     use crate::query::residual::ResidualLowering;
     use crate::query::Binding;
     use crate::query::Constraint;
@@ -647,22 +645,18 @@ mod tests {
         assert_eq!(entity_query.stats().delta_source_direct_candidates, 1);
         drop(entity_query);
 
-        let mut constructed_entities: Vec<_> = try_constructed_program_query(
-            IntersectionConstraint::new(vec![data.entity_in_range(
-                entity,
-                entity_ids[1],
-                entity_ids[2],
-            )]),
+        let mut full_entities: Vec<_> = Query::new(
+            data.entity_in_range(entity, entity_ids[1], entity_ids[2]),
             move |binding| project(entity.index, binding),
         )
-        .expect("the entity-range Program constructs without an opaque fallback")
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
         .cap(1)
         .start_width(1)
         .growth(1)
         .collect();
-        constructed_entities.sort_unstable();
+        full_entities.sort_unstable();
         assert_eq!(
-            constructed_entities,
+            full_entities,
             [
                 id_into_value(&entity_ids[1].raw()),
                 id_into_value(&entity_ids[2].raw())
@@ -693,21 +687,5 @@ mod tests {
                 id_into_value(&attributes[2].raw())
             ]
         );
-
-        let mut constructed_attributes: Vec<_> = try_constructed_program_query(
-            IntersectionConstraint::new(vec![data.attribute_in_range(
-                attribute,
-                attributes[1],
-                attributes[2],
-            )]),
-            move |binding| project(attribute.index, binding),
-        )
-        .expect("the attribute-range Program constructs without an opaque fallback")
-        .cap(1)
-        .start_width(1)
-        .growth(1)
-        .collect();
-        constructed_attributes.sort_unstable();
-        assert_eq!(constructed_attributes, actual);
     }
 }

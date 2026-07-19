@@ -238,8 +238,6 @@ mod tests {
     use crate::prelude::inlineencodings::R256BE;
     use crate::prelude::*;
     use crate::query::residual::ResidualLowering;
-    use crate::query::residual::try_constructed_program_query;
-    use crate::query::intersectionconstraint::IntersectionConstraint;
     use crate::query::Binding;
     use crate::query::Constraint;
     use crate::query::ProgramAction;
@@ -469,18 +467,6 @@ mod tests {
         assert_eq!(query.stats().delta_source_candidates_examined, 3);
         assert_eq!(query.stats().delta_source_direct_candidates, 3);
         assert_eq!(query.stats().delta_source_roots, 0);
-
-        let mut constructed: Vec<_> = try_constructed_program_query(
-            IntersectionConstraint::new(vec![data.value_in_range(variable, v10, v90)]),
-            move |binding| project(variable.index, binding),
-        )
-        .expect("the range Program constructs without an opaque fallback")
-        .cap(1)
-        .start_width(1)
-        .growth(1)
-        .collect();
-        constructed.sort_unstable();
-        assert_eq!(constructed, expected);
 
         let mut first_only = Query::new(data.value_in_range(variable, v10, v90), move |binding| {
             project(variable.index, binding)

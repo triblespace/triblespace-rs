@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **The unpublished estimate-free constructed-Program planner is gone.**
+  Residual queries now always keep the ordinary adaptive Ready/Candidate
+  negotiation and select typed Program routes only after that semantic action
+  is chosen. The probe-only admission function, rejection types, frozen-plan
+  metadata, and planner introspection were removed rather than retained as a
+  second query mode.
 - **External database comparisons no longer burden benchmark builds.**
   Removed the Oxigraph and OxRDF development dependencies and comparison paths;
   the retained JSON roundtrip and insertion benchmarks now measure TribleSpace

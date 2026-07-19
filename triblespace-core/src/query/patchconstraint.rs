@@ -669,7 +669,7 @@ mod tests {
     use crate::inline::encodings::UnknownInline;
     use crate::patch::Entry;
     use crate::query::intersectionconstraint::IntersectionConstraint;
-    use crate::query::residual::{try_constructed_program_query, ResidualLowering};
+    use crate::query::residual::ResidualLowering;
     use crate::query::{
         Binding, ProgramAction, ProgramCompletion, ProgramGrouping, ProgramRequest, ProgramStratum,
         Query, TypedProgramSpec,
@@ -820,18 +820,6 @@ mod tests {
         );
         assert_eq!(full_query.stats().delta_source_roots, 0);
         assert_eq!(full_query.stats().max_propose_candidates, 1);
-
-        let mut constructed: Vec<_> = try_constructed_program_query(
-            IntersectionConstraint::new(vec![PatchValueConstraint::new(variable, &patch)]),
-            project_value,
-        )
-        .unwrap()
-        .cap(1)
-        .start_width(1)
-        .growth(1)
-        .collect();
-        constructed.sort_unstable();
-        assert_eq!(constructed, direct);
     }
 
     #[test]
@@ -869,18 +857,6 @@ mod tests {
         assert_eq!(ordinary, sequential);
         assert_eq!(eager, sequential);
         assert_eq!(full, sequential);
-
-        let mut constructed: Vec<_> = try_constructed_program_query(
-            IntersectionConstraint::new(vec![make()]),
-            project_value,
-        )
-        .unwrap()
-        .cap(1)
-        .start_width(1)
-        .growth(1)
-        .collect();
-        constructed.sort_unstable();
-        assert_eq!(constructed, direct);
     }
 
     #[test]

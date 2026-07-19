@@ -1426,97 +1426,6 @@ impl PartialEq<ConstraintPath> for ResidualLeaf {
     }
 }
 
-/// One schema-level action in the strict constructed-Program probe.
-///
-/// Routes live in plan metadata rather than canonical state identity. Every
-/// row with `bound` therefore follows the same structural proposer and the
-/// same preorder confirmation suffix without consulting cardinality methods.
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ConstructedProgramStep {
-    bound: VariableSet,
-    variable: VariableId,
-    relevant: ChildSet,
-    proposer: usize,
-    proposer_route: ProgramRoute,
-    confirmer_routes: Box<[(usize, ProgramRoute)]>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ConstructedProgramPlan {
-    steps: Box<[ConstructedProgramStep]>,
-}
-
-impl ConstructedProgramPlan {
-    fn step(&self, bound: VariableSet) -> Option<&ConstructedProgramStep> {
-        self.steps
-            .get(bound.count())
-            .filter(|step| step.bound == bound)
-    }
-}
-
-/// Structural reason an owned query was not admitted to the strict
-/// constructed-Program engine.
-///
-/// Admission inspects only declared shape and typed [`ProgramRef`] routes. It
-/// never calls ordinary cardinality, influence, satisfaction, proposal, or
-/// confirmation methods.
-#[doc(hidden)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ConstructedProgramError {
-    /// The root is not an exposed conjunction.
-    RootNotFlatAnd,
-    /// The exposed root conjunction has no direct children.
-    EmptyAnd,
-    /// A direct child exposes another conjunction instead of one opaque leaf.
-    NestedAndOccurrence {
-        occurrence: usize,
-    },
-    /// The root conjunction binds no query variable.
-    EmptyQuery,
-    /// A leaf exposes finite formula children.
-    FormulaOccurrence {
-        occurrence: usize,
-    },
-    /// One direct leaf binds no query variable.
-    ZeroVariableOccurrence {
-        occurrence: usize,
-    },
-    /// One direct leaf exposes no typed Program family.
-    MissingProgram {
-        occurrence: usize,
-    },
-    /// No leaf can propose the next ascending variable under this schema.
-    MissingProposalRoute {
-        variable: VariableId,
-        bound: VariableSet,
-    },
-    /// A relevant non-proposer has no confirmation route.
-    MissingConfirmRoute {
-        occurrence: usize,
-        variable: VariableId,
-        bound: VariableSet,
-    },
-    /// A returned route names a different variable from its request.
-    RouteVariableMismatch {
-        occurrence: usize,
-        variable: VariableId,
-        routed: VariableId,
-        bound: VariableSet,
-    },
-    /// Confirmation requires one complete parent candidate bag.
-    ParentAtomicConfirm {
-        occurrence: usize,
-        variable: VariableId,
-        bound: VariableSet,
-    },
-    /// A relevant confirmation cannot operate on independent candidate pages.
-    NonPageLocalConfirm {
-        occurrence: usize,
-        variable: VariableId,
-        bound: VariableSet,
-    },
-}
-
 /// Borrow-free lowering plan safe to store beside its owned root.
 ///
 /// Occurrence identity is the path's preorder position, not the address or
@@ -1542,9 +1451,6 @@ struct ResidualPlan {
     /// The nontrivial exposed root is one formula occurrence. Whole-root
     /// identity shells around one opaque atom normalize to the flat plan.
     synthetic_root_formula: bool,
-    /// Strict schema-level construction used only by the private probe entry
-    /// point. Ordinary residual plans retain their adaptive planner.
-    constructed_program: Option<ConstructedProgramPlan>,
 }
 
 impl ResidualPlan {
@@ -1677,218 +1583,11 @@ impl ResidualPlan {
             transition_programs,
             grouped_delta_confirm_requirements,
             synthetic_root_formula,
-            constructed_program: None,
         }
-    }
-
-    /// Compiles one deterministic, estimate-free action chain for a flat
-    /// conjunction of typed Programs.
-    ///
-    /// Variables are committed in ascending ID order. For each schema, the
-    /// first preorder proposer whose remaining relevant occurrences all own a
-    /// page-local Confirm route wins. Rejecting parent-atomic confirmers keeps
-    /// pageable proposal output sound without introducing an eager
-    /// materialization phase into this deliberately narrow probe.
-    fn try_compile_constructed_program<'a>(
-        root: &dyn Constraint<'a>,
-    ) -> Result<(Self, VariableSet), ConstructedProgramError> {
-        let children = match root.residual_shape() {
-            ConstraintShape::And(children) => children,
-            _ => return Err(ConstructedProgramError::RootNotFlatAnd),
-        };
-        if children.len() == 0 {
-            return Err(ConstructedProgramError::EmptyAnd);
-        }
-        for occurrence in 0..children.len() {
-            if !matches!(children.child(occurrence).residual_shape(), ConstraintShape::Opaque) {
-                return Err(ConstructedProgramError::NestedAndOccurrence { occurrence });
-            }
-        }
-
-        let full = root.variables();
-        if full.is_empty() {
-            return Err(ConstructedProgramError::EmptyQuery);
-        }
-
-        let mut plan = Self::compile_mode(root, FormulaScope::OpaqueLeaves, true);
-        debug_assert_eq!(plan.len(), children.len());
-        let mut leaf_variables = Vec::with_capacity(plan.len());
-        for occurrence in 0..plan.len() {
-            let constraint = plan.resolve(root, occurrence);
-            if constraint.residual_union_children().is_some() {
-                return Err(ConstructedProgramError::FormulaOccurrence { occurrence });
-            }
-            let variables = constraint.variables();
-            if variables.is_empty() {
-                return Err(ConstructedProgramError::ZeroVariableOccurrence { occurrence });
-            }
-            if constraint.residual_program().is_none() {
-                return Err(ConstructedProgramError::MissingProgram { occurrence });
-            }
-            leaf_variables.push(variables);
-        }
-
-        let mut bound = VariableSet::new_empty();
-        let mut steps = Vec::with_capacity(full.count());
-        for variable in full {
-            let relevant_occurrences: Vec<_> = leaf_variables
-                .iter()
-                .enumerate()
-                .filter_map(|(occurrence, variables)| {
-                    variables.is_set(variable).then_some(occurrence)
-                })
-                .collect();
-            let mut relevant = ChildSet::empty(plan.len());
-            for &occurrence in &relevant_occurrences {
-                relevant.insert(occurrence);
-            }
-
-            let mut first_rejection = None;
-            let mut selected = None;
-            for &proposer in &relevant_occurrences {
-                let program = plan
-                    .resolve(root, proposer)
-                    .residual_program()
-                    .expect("constructed Program disappeared during compilation");
-                let Some(proposer_route) = program.route(ProgramRequest {
-                    action: ProgramAction::Propose(variable),
-                    bound,
-                }) else {
-                    continue;
-                };
-                if proposer_route.variable != variable {
-                    first_rejection.get_or_insert(
-                        ConstructedProgramError::RouteVariableMismatch {
-                            occurrence: proposer,
-                            variable,
-                            routed: proposer_route.variable,
-                            bound,
-                        },
-                    );
-                    continue;
-                }
-
-                let mut confirmer_routes = Vec::with_capacity(relevant_occurrences.len() - 1);
-                let mut rejected = None;
-                for &confirmer in &relevant_occurrences {
-                    if confirmer == proposer {
-                        continue;
-                    }
-                    let program = plan
-                        .resolve(root, confirmer)
-                        .residual_program()
-                        .expect("constructed Program disappeared during compilation");
-                    let Some(route) = program.route(ProgramRequest {
-                        action: ProgramAction::Confirm(variable),
-                        bound,
-                    }) else {
-                        rejected = Some(ConstructedProgramError::MissingConfirmRoute {
-                            occurrence: confirmer,
-                            variable,
-                            bound,
-                        });
-                        break;
-                    };
-                    if route.variable != variable {
-                        rejected = Some(ConstructedProgramError::RouteVariableMismatch {
-                            occurrence: confirmer,
-                            variable,
-                            routed: route.variable,
-                            bound,
-                        });
-                        break;
-                    }
-                    if route.grouping == ProgramGrouping::ParentAtomic {
-                        rejected = Some(ConstructedProgramError::ParentAtomicConfirm {
-                            occurrence: confirmer,
-                            variable,
-                            bound,
-                        });
-                        break;
-                    }
-                    if !plan.page_local_confirms[confirmer] {
-                        rejected = Some(ConstructedProgramError::NonPageLocalConfirm {
-                            occurrence: confirmer,
-                            variable,
-                            bound,
-                        });
-                        break;
-                    }
-                    if grouped_delta_confirm_is_active(
-                        &plan.grouped_delta_confirm_requirements[confirmer],
-                        variable,
-                        bound,
-                    ) {
-                        rejected = Some(ConstructedProgramError::ParentAtomicConfirm {
-                            occurrence: confirmer,
-                            variable,
-                            bound,
-                        });
-                        break;
-                    }
-                    confirmer_routes.push((confirmer, route));
-                }
-                if let Some(rejected) = rejected {
-                    first_rejection.get_or_insert(rejected);
-                    continue;
-                }
-                selected = Some((proposer, proposer_route, confirmer_routes));
-                break;
-            }
-
-            let Some((proposer, proposer_route, confirmer_routes)) = selected else {
-                return Err(first_rejection.unwrap_or(
-                    ConstructedProgramError::MissingProposalRoute { variable, bound },
-                ));
-            };
-            steps.push(ConstructedProgramStep {
-                bound,
-                variable,
-                relevant,
-                proposer,
-                proposer_route,
-                confirmer_routes: confirmer_routes.into_boxed_slice(),
-            });
-            bound.set(variable);
-        }
-        debug_assert_eq!(bound, full);
-        plan.constructed_program = Some(ConstructedProgramPlan {
-            steps: steps.into_boxed_slice(),
-        });
-        Ok((plan, full))
     }
 
     fn len(&self) -> usize {
         self.leaves.len()
-    }
-
-    fn constructed_step(&self, bound: VariableSet) -> Option<&ConstructedProgramStep> {
-        self.constructed_program.as_ref()?.step(bound)
-    }
-
-    fn constructed_proposal_route(
-        &self,
-        bound: VariableSet,
-        variable: VariableId,
-        proposer: usize,
-    ) -> Option<ProgramRoute> {
-        let step = self.constructed_step(bound)?;
-        (step.variable == variable && step.proposer == proposer).then_some(step.proposer_route)
-    }
-
-    fn constructed_confirm_route(
-        &self,
-        bound: VariableSet,
-        variable: VariableId,
-        confirmer: usize,
-    ) -> Option<ProgramRoute> {
-        let step = self.constructed_step(bound)?;
-        if step.variable != variable {
-            return None;
-        }
-        step.confirmer_routes
-            .iter()
-            .find_map(|&(occurrence, route)| (occurrence == confirmer).then_some(route))
     }
 
     fn action_span(&self) -> usize {
@@ -5911,7 +5610,7 @@ impl FormulaBatch {
     }
 
     /// Freezes a Confirm input that must also cross the old slice-based graph
-    /// seam. Constructed Programs and delta sources borrow the complete input
+    /// seam. Typed Programs and delta sources borrow the complete input
     /// from `source_context`; a preceding pageable Confirm may have left it as
     /// a segmented rope, so their action opening explicitly recoalesces it.
     fn shared_contiguous_confirm_original(&mut self) -> CandidatePayload {
@@ -6986,38 +6685,6 @@ fn confirm_leaf<'a>(
     plan.resolve(root, leaf).confirm(variable, view, candidates);
 }
 
-fn constructed_ready_plan_transition(
-    plan: &ResidualPlan,
-    desc: &StateDesc,
-    rows: RowBatch,
-    worklist: &mut Worklist,
-    interner: &mut StateInterner,
-    stats: &mut ResidualStateStats,
-) -> ContinuationToken {
-    let step = plan
-        .constructed_step(desc.bound)
-        .expect("constructed Ready state left its compiled schema chain");
-    stats.ready_preferred_variable_groups += 1;
-    stats.ready_scheduled_variable_groups += 1;
-    stats.ready_proposal_groups += 1;
-    file_with_plan(
-        worklist,
-        interner,
-        plan,
-        StateDesc {
-            bound: desc.bound,
-            phase: ResidualPhase::Propose {
-                variable: step.variable,
-                relevant: step.relevant.clone(),
-                proposer: step.proposer,
-            },
-        },
-        StateBucket::Rows(rows),
-        stats,
-    )
-    .expect("constructed Ready planning filed an empty action")
-}
-
 fn ready_plan_transition<'a>(
     root: &dyn Constraint<'a>,
     plan: &ResidualPlan,
@@ -7361,58 +7028,6 @@ fn commit_candidates(
         StateBucket::Rows(rows),
         stats,
     )
-}
-
-fn constructed_candidate_plan_transition(
-    plan: &ResidualPlan,
-    desc: &StateDesc,
-    variable: VariableId,
-    relevant: &ChildSet,
-    checked: &ChildSet,
-    batch: CandidateBatch,
-    worklist: &mut Worklist,
-    interner: &mut StateInterner,
-    stats: &mut ResidualStateStats,
-) -> ContinuationToken {
-    if relevant == checked {
-        return commit_candidates(plan, desc, variable, batch, worklist, interner, stats)
-            .expect("fully checked constructed candidates committed no rows");
-    }
-
-    let step = plan
-        .constructed_step(desc.bound)
-        .expect("constructed Candidate state left its compiled schema chain");
-    assert_eq!(
-        step.variable, variable,
-        "constructed Candidate changed its schema variable"
-    );
-    assert_eq!(
-        &step.relevant, relevant,
-        "constructed Candidate changed its relevant occurrence set"
-    );
-    let confirmer = step
-        .confirmer_routes
-        .iter()
-        .find_map(|&(occurrence, _)| (!checked.contains(occurrence)).then_some(occurrence))
-        .expect("constructed Candidate has no compiled unchecked confirmer");
-    stats.candidate_confirmation_groups += 1;
-    file_with_plan(
-        worklist,
-        interner,
-        plan,
-        StateDesc {
-            bound: desc.bound,
-            phase: ResidualPhase::Confirm {
-                variable,
-                relevant: relevant.clone(),
-                checked: checked.clone(),
-                confirmer,
-            },
-        },
-        StateBucket::Candidates(batch),
-        stats,
-    )
-    .expect("constructed Candidate planning filed an empty action")
 }
 
 fn candidate_plan_transition<'a>(
@@ -8664,22 +8279,18 @@ fn execute_task<'a>(
         }
         (ResidualPhase::Ready, StateBucket::Rows(rows)) => {
             stats.ready_plan_pops += 1;
-            let continuation = if plan.constructed_program.is_some() {
-                constructed_ready_plan_transition(plan, &desc, rows, worklist, interner, stats)
-            } else {
-                ready_plan_transition(
-                    root,
-                    plan,
-                    &desc,
-                    rows,
-                    full,
-                    influences,
-                    base_estimates,
-                    worklist,
-                    interner,
-                    stats,
-                )
-            };
+            let continuation = ready_plan_transition(
+                root,
+                plan,
+                &desc,
+                rows,
+                full,
+                influences,
+                base_estimates,
+                worklist,
+                interner,
+                stats,
+            );
             StepOutcome::Advanced(continuation)
         }
         (
@@ -8722,16 +8333,9 @@ fn execute_task<'a>(
             StateBucket::Candidates(batch),
         ) => {
             stats.candidate_plan_pops += 1;
-            let continuation = if plan.constructed_program.is_some() {
-                constructed_candidate_plan_transition(
-                    plan, &desc, *variable, relevant, checked, batch, worklist, interner, stats,
-                )
-            } else {
-                candidate_plan_transition(
-                    root, plan, &desc, *variable, relevant, checked, batch, worklist, interner,
-                    stats,
-                )
-            };
+            let continuation = candidate_plan_transition(
+                root, plan, &desc, *variable, relevant, checked, batch, worklist, interner, stats,
+            );
             StepOutcome::Advanced(continuation)
         }
         (
@@ -9851,10 +9455,6 @@ impl ResidualStateMachine {
         let mut checked = ChildSet::empty(plan.len());
         checked.insert(*proposer);
         if !plan.remaining_confirms_accept_pages(relevant, &checked, *variable, task.desc.bound) {
-            assert!(
-                plan.constructed_program.is_none(),
-                "constructed proposal escaped compile-time confirmation grouping checks"
-            );
             return Err(task);
         }
         let variable = *variable;
@@ -9880,19 +9480,9 @@ impl ResidualStateMachine {
         // declines this exact structural request before any activation has
         // opened, so the legacy paged/seed hooks below remain available.
         // Exclusivity begins only once the family returns a route.
-        let program = if plan.constructed_program.is_some() {
-            let route = plan
-                .constructed_proposal_route(task.desc.bound, variable, proposer)
-                .expect("constructed proposal lost its compiled Program route");
-            let spec = constraint
-                .residual_program()
-                .expect("constructed proposal Program disappeared during execution");
-            Some((spec, route))
-        } else {
-            constraint
-                .residual_program()
-                .and_then(|spec| spec.route(program_request).map(|route| (spec, route)))
-        };
+        let program = constraint
+            .residual_program()
+            .and_then(|spec| spec.route(program_request).map(|route| (spec, route)));
         let selected_parent_count = rows.row_count;
         let admitted_parent_count = if terminal_streaming {
             self.terminal_admission_width(task.state, selected_parent_count)
@@ -9902,7 +9492,6 @@ impl ResidualStateMachine {
         let complete_terminal_phase = terminal_streaming
             && admitted_parent_count > 1
             && self.uses_eager_terminal_phase()
-            && plan.constructed_program.is_none()
             && program.is_some_and(|(_, route)| {
                 route.completion == ProgramCompletion::CompleteActionEquivalent
             });
@@ -10096,19 +9685,9 @@ impl ResidualStateMachine {
             action: ProgramAction::Confirm(variable),
             bound: task.desc.bound,
         };
-        let program = if plan.constructed_program.is_some() {
-            let route = plan
-                .constructed_confirm_route(task.desc.bound, variable, confirmer)
-                .expect("constructed confirmation lost its compiled Program route");
-            let spec = constraint
-                .residual_program()
-                .expect("constructed confirmation Program disappeared during execution");
-            Some((spec, route))
-        } else {
-            constraint
-                .residual_program()
-                .and_then(|spec| spec.route(program_request).map(|route| (spec, route)))
-        };
+        let program = constraint
+            .residual_program()
+            .and_then(|spec| spec.route(program_request).map(|route| (spec, route)));
         if let Some((spec, route)) = program {
             if route.grouping == ProgramGrouping::ParentAtomic {
                 assert!(
@@ -11448,16 +11027,6 @@ impl ResidualStateMachine {
     }
 }
 
-/// Planning discipline frozen into one residual iterator.
-#[doc(hidden)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ResidualPlannerKind {
-    /// Ordinary estimate-driven residual planning.
-    Adaptive,
-    /// Complete schema chain compiled from typed Program routes at admission.
-    ConstructedProgram,
-}
-
 /// Demand-driven canonical residual-state execution for any root constraint.
 ///
 /// The iterator begins with a narrow desired actionable width, so full
@@ -11609,25 +11178,6 @@ impl<C, P: Fn(&Binding) -> Option<R>, R> ResidualShadowIter<C, P, R> {
 }
 
 impl<C, P: Fn(&Binding) -> Option<R>, R> ResidualStateIter<C, P, R> {
-    /// Identifies the planning discipline frozen into this iterator.
-    #[doc(hidden)]
-    pub fn planner_kind(&self) -> ResidualPlannerKind {
-        if self.plan.constructed_program.is_some() {
-            ResidualPlannerKind::ConstructedProgram
-        } else {
-            ResidualPlannerKind::Adaptive
-        }
-    }
-
-    /// Number of schema-level actions frozen by constructed admission.
-    #[doc(hidden)]
-    pub fn constructed_program_step_count(&self) -> Option<usize> {
-        self.plan
-            .constructed_program
-            .as_ref()
-            .map(|program| program.steps.len())
-    }
-
     /// Overrides the initial chunk width, clamped to `1..=cap`.
     pub fn start_width(mut self, width: usize) -> Self {
         self.state.width = width.clamp(1, self.state.cap);
@@ -11766,91 +11316,6 @@ where
         pull.disarm();
         item
     }
-}
-
-/// Owned rejection from [`try_constructed_program_query`].
-///
-/// Keeping both inputs here makes fallback an explicit caller decision. In
-/// particular, [`Query::new`] is not constructed speculatively before typed
-/// admission has rejected the structural shape.
-#[doc(hidden)]
-#[must_use]
-pub struct ConstructedProgramQueryRejection<C, P> {
-    root: C,
-    postprocessing: P,
-    reason: ConstructedProgramError,
-}
-
-impl<C, P> std::fmt::Debug for ConstructedProgramQueryRejection<C, P> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ConstructedProgramQueryRejection")
-            .field("reason", &self.reason)
-            .finish_non_exhaustive()
-    }
-}
-
-impl<C, P> ConstructedProgramQueryRejection<C, P> {
-    /// Returns the structural admission failure without consuming the inputs.
-    pub fn reason(&self) -> &ConstructedProgramError {
-        &self.reason
-    }
-
-    /// Recovers both owned inputs and the structural admission failure.
-    pub fn into_inputs(self) -> (C, P, ConstructedProgramError) {
-        (self.root, self.postprocessing, self.reason)
-    }
-
-    /// Constructs the ordinary query only after explicit rejection.
-    pub fn into_query<'a, R>(self) -> Query<C, P, R>
-    where
-        C: Constraint<'a> + 'a,
-        P: Fn(&Binding) -> Option<R>,
-    {
-        Query::new(self.root, self.postprocessing)
-    }
-}
-
-/// Attempts an estimate-free residual query constructed entirely from typed
-/// [`ProgramRef`] routes.
-///
-/// This is an explicit production-admission probe, not an ordinary scheduler
-/// default. It accepts only a nonempty flat AND with at least one variable,
-/// compiles the complete ascending-variable Propose/Confirm route chain while
-/// `root` is still borrowed, and moves the owned inputs only after that
-/// borrow-free plan is complete. Accepted execution cannot call
-/// [`Query::new`], reconstruct routes, or fall back to ordinary constraint
-/// verbs after affine work begins. A rejection returns both owned inputs
-/// and its structural reason; callers may then deliberately construct an
-/// ordinary query with [`ConstructedProgramQueryRejection::into_query`].
-#[doc(hidden)]
-pub fn try_constructed_program_query<'a, C, P, R>(
-    root: C,
-    postprocessing: P,
-) -> Result<ResidualStateIter<C, P, R>, ConstructedProgramQueryRejection<C, P>>
-where
-    C: Constraint<'a> + 'a,
-    P: Fn(&Binding) -> Option<R>,
-{
-    let (plan, full) = match ResidualPlan::try_compile_constructed_program(&root) {
-        Ok(compiled) => compiled,
-        Err(reason) => {
-            return Err(ConstructedProgramQueryRejection {
-                root,
-                postprocessing,
-                reason,
-            });
-        }
-    };
-    let state = ResidualStateMachine::new_for_plan(full, &plan, Search::NextVariable);
-    Ok(ResidualStateIter {
-        root,
-        plan,
-        postprocessing,
-        influences: [VariableSet::new_empty(); 128],
-        base_estimates: [usize::MAX; 128],
-        state,
-        iteration_started: false,
-    })
 }
 
 fn solve<'a, P, R>(
@@ -20531,13 +19996,15 @@ mod tests {
         assert_eq!(counters.2.load(Ordering::Relaxed), 0);
     }
 
-    struct ConstructedProtocolTrap<C> {
+    /// Keeps adaptive planning visible while proving selected actions execute
+    /// through the typed Program route rather than the ordinary protocol.
+    struct ProgramActionTrap<C> {
         inner: C,
     }
 
-    impl<C> Constraint<'static> for ConstructedProtocolTrap<C>
+    impl<'a, C> Constraint<'a> for ProgramActionTrap<C>
     where
-        C: Constraint<'static>,
+        C: Constraint<'a>,
     {
         fn variables(&self) -> VariableSet {
             self.inner.variables()
@@ -20545,11 +20012,11 @@ mod tests {
 
         fn estimate(
             &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-            _out: &mut EstimateSink<'_>,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
         ) -> bool {
-            panic!("constructed Program planner called ordinary estimate")
+            self.inner.estimate(variable, view, out)
         }
 
         fn propose(
@@ -20558,7 +20025,7 @@ mod tests {
             _view: &RowsView<'_>,
             _candidates: &mut CandidateSink<'_>,
         ) {
-            panic!("constructed Program planner called ordinary propose")
+            panic!("ordinary propose bypassed an available typed Program route")
         }
 
         fn confirm(
@@ -20567,15 +20034,15 @@ mod tests {
             _view: &RowsView<'_>,
             _candidates: &mut CandidateSink<'_>,
         ) {
-            panic!("constructed Program planner called ordinary confirm")
+            panic!("ordinary confirm bypassed an available typed Program route")
         }
 
-        fn satisfied(&self, _view: &RowsView<'_>) -> bool {
-            panic!("constructed Program planner called ordinary satisfied")
+        fn satisfied(&self, view: &RowsView<'_>) -> bool {
+            self.inner.satisfied(view)
         }
 
-        fn influence(&self, _variable: VariableId) -> VariableSet {
-            panic!("constructed Program planner called ordinary influence")
+        fn influence(&self, variable: VariableId) -> VariableSet {
+            self.inner.influence(variable)
         }
 
         fn residual_confirm_is_page_local(&self) -> bool {
@@ -20595,1193 +20062,64 @@ mod tests {
         }
     }
 
-    struct ConstructedZeroVariable;
-
-    impl Constraint<'static> for ConstructedZeroVariable {
-        fn variables(&self) -> VariableSet {
-            VariableSet::new_empty()
-        }
-
-        fn estimate(
-            &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-            _out: &mut EstimateSink<'_>,
-        ) -> bool {
-            panic!("zero-variable rejection called estimate")
-        }
-
-        fn propose(
-            &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-            _candidates: &mut CandidateSink<'_>,
-        ) {
-            panic!("zero-variable rejection called propose")
-        }
-
-        fn confirm(
-            &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-            _candidates: &mut CandidateSink<'_>,
-        ) {
-            panic!("zero-variable rejection called confirm")
-        }
-
-        fn satisfied(&self, _view: &RowsView<'_>) -> bool {
-            panic!("zero-variable rejection called satisfied")
-        }
-
-        fn influence(&self, _variable: VariableId) -> VariableSet {
-            panic!("zero-variable rejection called influence")
-        }
-    }
-
-    struct ConstructedMissingProgram(VariableId);
-
-    impl Constraint<'static> for ConstructedMissingProgram {
-        fn variables(&self) -> VariableSet {
-            VariableSet::new_singleton(self.0)
-        }
-
-        fn estimate(
-            &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-            _out: &mut EstimateSink<'_>,
-        ) -> bool {
-            panic!("missing-Program rejection called estimate")
-        }
-
-        fn propose(
-            &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-            _candidates: &mut CandidateSink<'_>,
-        ) {
-            panic!("missing-Program rejection called propose")
-        }
-
-        fn confirm(
-            &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-            _candidates: &mut CandidateSink<'_>,
-        ) {
-            panic!("missing-Program rejection called confirm")
-        }
-
-        fn satisfied(&self, _view: &RowsView<'_>) -> bool {
-            panic!("missing-Program rejection called satisfied")
-        }
-
-        fn influence(&self, _variable: VariableId) -> VariableSet {
-            panic!("missing-Program rejection called influence")
-        }
-    }
-
-    struct ConstructedFallbackProbe {
-        planning_calls: Arc<AtomicUsize>,
-    }
-
-    impl Constraint<'static> for ConstructedFallbackProbe {
-        fn variables(&self) -> VariableSet {
-            VariableSet::new_singleton(0)
-        }
-
-        fn estimate(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            out: &mut EstimateSink<'_>,
-        ) -> bool {
-            self.planning_calls.fetch_add(1, Ordering::Relaxed);
-            if variable != 0 {
-                return false;
-            }
-            out.fill(1, view.len());
-            true
-        }
-
-        fn propose(
-            &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-            _candidates: &mut CandidateSink<'_>,
-        ) {
-        }
-
-        fn confirm(
-            &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-            _candidates: &mut CandidateSink<'_>,
-        ) {
-        }
-
-        fn satisfied(&self, _view: &RowsView<'_>) -> bool {
-            self.planning_calls.fetch_add(1, Ordering::Relaxed);
-            true
-        }
-
-        fn influence(&self, variable: VariableId) -> VariableSet {
-            self.planning_calls.fetch_add(1, Ordering::Relaxed);
-            VariableSet::new_singleton(variable)
-        }
-    }
-
-    fn constructed_program_graph() -> (crate::trible::TribleSet, crate::id::Id) {
-        use crate::id::{ExclusiveId, Id};
-        use crate::trible::{Trible, TribleSet};
-
-        let attribute = Id::new([171; crate::id::ID_LEN]).unwrap();
-        let nodes: Vec<_> = (172..=176)
-            .map(|byte| Id::new([byte; crate::id::ID_LEN]).unwrap())
-            .collect();
-        let mut graph = TribleSet::new();
-        for &(from, to) in &[(0, 1), (0, 2), (1, 3), (2, 3), (3, 4), (4, 0)] {
-            graph.insert(&Trible::new::<GenId>(
-                ExclusiveId::force_ref(&nodes[from]),
-                &attribute,
-                &nodes[to].to_inline(),
-            ));
-        }
-        (graph, attribute)
-    }
-
-    fn constructed_rpq(
-        graph: crate::trible::TribleSet,
-        attribute: &crate::id::Id,
-        repeated: bool,
-    ) -> crate::query::regularpathconstraint::RegularPathConstraint {
-        use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
-
-        let mut operations = vec![PathOp::Attr(attribute.raw())];
-        if repeated {
-            operations.push(PathOp::Plus);
-        }
-        RegularPathConstraint::new(
-            graph,
-            Variable::<GenId>::new(0),
-            Variable::<GenId>::new(1),
-            &operations,
-        )
-    }
-
-    fn constructed_pair(binding: &Binding) -> Option<(RawInline, RawInline)> {
-        Some((binding.get(0).copied()?, binding.get(1).copied()?))
-    }
-
-    fn constructed_source_target(binding: &Binding) -> Option<(RawInline, RawInline)> {
-        Some((binding.get(1).copied()?, binding.get(2).copied()?))
-    }
-
-    fn constructed_unit(_binding: &Binding) -> Option<()> {
-        Some(())
-    }
-
-    fn take_constructed_error<C, P, R>(
-        result: Result<ResidualStateIter<C, P, R>, ConstructedProgramQueryRejection<C, P>>,
-    ) -> ConstructedProgramError
-    where
-        P: Fn(&Binding) -> Option<R>,
-    {
-        match result {
-            Ok(_) => panic!("strict constructed Program admission unexpectedly succeeded"),
-            Err(rejection) => rejection.into_inputs().2,
-        }
-    }
-
     #[test]
-    fn constructed_program_bypasses_protocol_planning_and_matches_sequential_bag() {
-        let (graph, attribute) = constructed_program_graph();
-        let mut expected: Vec<_> = Query::new(
-            constructed_rpq(graph.clone(), &attribute, false),
-            constructed_pair,
-        )
-        .sequential()
-        .collect();
-        let root = Arc::new(IntersectionConstraint::new(vec![Arc::new(
-            ConstructedProtocolTrap {
-                inner: constructed_rpq(graph, &attribute, false),
-            },
-        )]));
-        let iterator = try_constructed_program_query(root, constructed_pair).unwrap();
-        assert_eq!(
-            iterator.planner_kind(),
-            ResidualPlannerKind::ConstructedProgram
-        );
-        assert_eq!(iterator.constructed_program_step_count(), Some(2));
-        let mut constructed: Vec<_> = iterator.collect();
-
-        expected.sort_unstable();
-        constructed.sort_unstable();
-        assert!(expected.len() > 1);
-        assert_eq!(constructed, expected);
-    }
-
-    #[test]
-    fn constructed_program_clone_preserves_the_exact_remainder() {
-        let (graph, attribute) = constructed_program_graph();
-        let mut expected: Vec<_> = Query::new(
-            constructed_rpq(graph.clone(), &attribute, false),
-            constructed_pair,
-        )
-        .sequential()
-        .collect();
-        let root = Arc::new(IntersectionConstraint::new(vec![Arc::new(
-            ConstructedProtocolTrap {
-                inner: constructed_rpq(graph, &attribute, false),
-            },
-        )]));
-        let mut iterator = try_constructed_program_query(root, constructed_pair).unwrap();
-        let first = iterator.next().expect("constructed RPQ produced no row");
-        let clone = iterator.clone();
-        let mut left: Vec<_> = iterator.collect();
-        let mut right: Vec<_> = clone.collect();
-
-        left.sort_unstable();
-        right.sort_unstable();
-        assert_eq!(left, right);
-        left.push(first);
-        left.sort_unstable();
-        expected.sort_unstable();
-        assert_eq!(left, expected);
-    }
-
-    #[test]
-    fn constructed_program_pages_heterogeneous_tribleset_and_rpq_without_fallback() {
-        use crate::id::{id_into_value, ExclusiveId, Id};
-        use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
-        use crate::query::TriblePattern;
-        use crate::trible::{Trible, TribleSet};
-
-        let activation_attribute = Id::new([201; crate::id::ID_LEN]).unwrap();
-        let candidate_attribute = Id::new([202; crate::id::ID_LEN]).unwrap();
-        let edge_attribute = Id::new([203; crate::id::ID_LEN]).unwrap();
-        let source = Id::new([211; crate::id::ID_LEN]).unwrap();
-        let rejected_source = Id::new([212; crate::id::ID_LEN]).unwrap();
-        let target = Id::new([221; crate::id::ID_LEN]).unwrap();
-        let rejected_target = Id::new([222; crate::id::ID_LEN]).unwrap();
-        let activations = [
-            Id::new([231; crate::id::ID_LEN]).unwrap(),
-            Id::new([232; crate::id::ID_LEN]).unwrap(),
-            Id::new([233; crate::id::ID_LEN]).unwrap(),
-        ];
-
-        let mut activation_set = TribleSet::new();
-        for (activation, value) in [
-            (&activations[0], &source),
-            (&activations[1], &source),
-            (&activations[2], &rejected_source),
-        ] {
-            activation_set.insert(&Trible::new::<GenId>(
-                ExclusiveId::force_ref(activation),
-                &activation_attribute,
-                &value.to_inline(),
-            ));
-        }
-        let mut candidate_set = TribleSet::new();
-        for (entity, value) in [
-            (&source, &target),
-            (&source, &rejected_target),
-            (&rejected_source, &target),
-        ] {
-            candidate_set.insert(&Trible::new::<GenId>(
-                ExclusiveId::force_ref(entity),
-                &candidate_attribute,
-                &value.to_inline(),
-            ));
-        }
-        let mut graph = TribleSet::new();
-        graph.insert(&Trible::new::<GenId>(
-            ExclusiveId::force_ref(&source),
-            &edge_attribute,
-            &target.to_inline(),
-        ));
-
-        let activation = Variable::<GenId>::new(0);
-        let source_variable = Variable::<GenId>::new(1);
-        let target_variable = Variable::<GenId>::new(2);
-        let activation_attribute = Inline::<GenId>::new(id_into_value(&activation_attribute));
-        let candidate_attribute = Inline::<GenId>::new(id_into_value(&candidate_attribute));
-        let path = [PathOp::Attr(edge_attribute.raw())];
-
-        let oracle = IntersectionConstraint::new(vec![
-            Box::new(activation_set.pattern(
-                activation,
-                activation_attribute,
-                source_variable,
-            )) as ShapeConstraint,
-            Box::new(candidate_set.pattern(
-                source_variable,
-                candidate_attribute,
-                target_variable,
-            )) as ShapeConstraint,
-            Box::new(RegularPathConstraint::new(
-                graph.clone(),
-                source_variable,
-                target_variable,
-                &path,
-            )) as ShapeConstraint,
-        ]);
-        let mut expected: Vec<_> =
-            Query::new(oracle, constructed_source_target).sequential().collect();
-
-        let root = Arc::new(IntersectionConstraint::new(vec![
-            Box::new(ConstructedProtocolTrap {
-                inner: activation_set.pattern(
-                    activation,
-                    activation_attribute,
-                    source_variable,
-                ),
-            }) as ShapeConstraint,
-            Box::new(ConstructedProtocolTrap {
-                inner: candidate_set.pattern(
-                    source_variable,
-                    candidate_attribute,
-                    target_variable,
-                ),
-            }) as ShapeConstraint,
-            Box::new(ConstructedProtocolTrap {
-                inner: RegularPathConstraint::new(
-                    graph,
-                    source_variable,
-                    target_variable,
-                    &path,
-                ),
-            }) as ShapeConstraint,
-        ]));
-        let mut iterator = try_constructed_program_query(root, constructed_source_target)
-            .unwrap()
-            .cap(1)
-            .start_width(1)
-            .growth(1);
-        let first = iterator
-            .next()
-            .expect("heterogeneous constructed Programs produced no row");
-        let examined_before_remainder = iterator.stats().delta_source_candidates_examined;
-        let mirror = iterator.clone();
-        let mut remainder: Vec<_> = iterator.by_ref().collect();
-        let examined_after_remainder = iterator.stats().delta_source_candidates_examined;
-        let mut mirrored: Vec<_> = mirror.collect();
-
-        remainder.sort_unstable();
-        mirrored.sort_unstable();
-        assert_eq!(mirrored, remainder);
-        assert!(
-            examined_after_remainder > examined_before_remainder,
-            "the first result drained every ordered Program source"
-        );
-        remainder.push(first);
-        remainder.sort_unstable();
-        expected.sort_unstable();
-        assert_eq!(
-            expected,
-            vec![
-                (id_into_value(&source), id_into_value(&target)),
-                (id_into_value(&source), id_into_value(&target)),
-            ],
-            "the oracle fixture must expose duplicate parents and rejecting confirmers"
-        );
-        assert_eq!(remainder, expected);
-    }
-
-    #[test]
-    fn constructed_program_pages_heterogeneous_succinctarchive_and_rpq_without_fallback() {
-        use crate::blob::encodings::succinctarchive::{
-            OrderedUniverse, SuccinctArchive, SuccinctArchiveConstraint,
-        };
-        use crate::id::{id_into_value, ExclusiveId, Id};
-        use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
-        use crate::trible::{Trible, TribleSet};
-
-        let activation_attribute = Id::new([201; crate::id::ID_LEN]).unwrap();
-        let candidate_attribute = Id::new([202; crate::id::ID_LEN]).unwrap();
-        let edge_attribute = Id::new([203; crate::id::ID_LEN]).unwrap();
-        let source = Id::new([211; crate::id::ID_LEN]).unwrap();
-        let rejected_source = Id::new([212; crate::id::ID_LEN]).unwrap();
-        let target = Id::new([221; crate::id::ID_LEN]).unwrap();
-        let rejected_target = Id::new([222; crate::id::ID_LEN]).unwrap();
-        let activations = [
-            Id::new([231; crate::id::ID_LEN]).unwrap(),
-            Id::new([232; crate::id::ID_LEN]).unwrap(),
-            Id::new([233; crate::id::ID_LEN]).unwrap(),
-        ];
-
-        let mut activation_set = TribleSet::new();
-        for (activation, value) in [
-            (&activations[0], &source),
-            (&activations[1], &source),
-            (&activations[2], &rejected_source),
-        ] {
-            activation_set.insert(&Trible::new::<GenId>(
-                ExclusiveId::force_ref(activation),
-                &activation_attribute,
-                &value.to_inline(),
-            ));
-        }
-        let mut candidate_set = TribleSet::new();
-        for (entity, value) in [
-            (&source, &target),
-            (&source, &rejected_target),
-            (&rejected_source, &target),
-        ] {
-            candidate_set.insert(&Trible::new::<GenId>(
-                ExclusiveId::force_ref(entity),
-                &candidate_attribute,
-                &value.to_inline(),
-            ));
-        }
-        let activation_archive: &'static SuccinctArchive<OrderedUniverse> =
-            Box::leak(Box::new((&activation_set).into()));
-        let candidate_archive: &'static SuccinctArchive<OrderedUniverse> =
-            Box::leak(Box::new((&candidate_set).into()));
-
-        let mut graph = TribleSet::new();
-        graph.insert(&Trible::new::<GenId>(
-            ExclusiveId::force_ref(&source),
-            &edge_attribute,
-            &target.to_inline(),
-        ));
-
-        let activation = Variable::<GenId>::new(0);
-        let source_variable = Variable::<GenId>::new(1);
-        let target_variable = Variable::<GenId>::new(2);
-        let activation_attribute = Inline::<GenId>::new(id_into_value(&activation_attribute));
-        let candidate_attribute = Inline::<GenId>::new(id_into_value(&candidate_attribute));
-        let path = [PathOp::Attr(edge_attribute.raw())];
-        let activation_constraint = || {
-            SuccinctArchiveConstraint::new(
-                activation,
-                activation_attribute,
-                source_variable,
-                activation_archive,
-            )
-        };
-        let candidate_constraint = || {
-            SuccinctArchiveConstraint::new(
-                source_variable,
-                candidate_attribute,
-                target_variable,
-                candidate_archive,
-            )
-        };
-
-        let oracle = IntersectionConstraint::new(vec![
-            Box::new(activation_constraint()) as ShapeConstraint,
-            Box::new(candidate_constraint()) as ShapeConstraint,
-            Box::new(RegularPathConstraint::new(
-                graph.clone(),
-                source_variable,
-                target_variable,
-                &path,
-            )) as ShapeConstraint,
-        ]);
-        let mut expected: Vec<_> =
-            Query::new(oracle, constructed_source_target).sequential().collect();
-
-        let root = Arc::new(IntersectionConstraint::new(vec![
-            Box::new(ConstructedProtocolTrap {
-                inner: activation_constraint(),
-            }) as ShapeConstraint,
-            Box::new(ConstructedProtocolTrap {
-                inner: candidate_constraint(),
-            }) as ShapeConstraint,
-            Box::new(ConstructedProtocolTrap {
-                inner: RegularPathConstraint::new(
-                    graph,
-                    source_variable,
-                    target_variable,
-                    &path,
-                ),
-            }) as ShapeConstraint,
-        ]));
-        let mut iterator = try_constructed_program_query(root, constructed_source_target)
-            .unwrap()
-            .cap(1)
-            .start_width(1)
-            .growth(1);
-        let first = iterator
-            .next()
-            .expect("heterogeneous SuccinctArchive Programs produced no row");
-        let examined_before_remainder = iterator.stats().delta_source_candidates_examined;
-        let mirror = iterator.clone();
-        let mut remainder: Vec<_> = iterator.by_ref().collect();
-        let examined_after_remainder = iterator.stats().delta_source_candidates_examined;
-        let mut mirrored: Vec<_> = mirror.collect();
-
-        remainder.sort_unstable();
-        mirrored.sort_unstable();
-        assert_eq!(mirrored, remainder);
-        assert!(
-            examined_after_remainder > examined_before_remainder,
-            "the first result drained every ordered SuccinctArchive source"
-        );
-        remainder.push(first);
-        remainder.sort_unstable();
-        expected.sort_unstable();
-        assert_eq!(
-            expected,
-            vec![
-                (id_into_value(&source), id_into_value(&target)),
-                (id_into_value(&source), id_into_value(&target)),
-            ],
-            "the succinct oracle must expose duplicate parents and rejecting confirmers"
-        );
-        assert_eq!(remainder, expected);
-    }
-
-    #[test]
-    fn constructed_program_mixes_unionarchive_confirm_with_succinct_and_cyclic_rpq() {
-        use crate::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
-        use crate::id::{id_into_value, ExclusiveId, Id};
-        use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
-        use crate::query::TriblePattern;
-        use crate::repo::index_home::UnionArchive;
-        use crate::trible::{Trible, TribleSet};
-
-        let activation_attribute = Id::new([101; crate::id::ID_LEN]).unwrap();
-        let candidate_attribute = Id::new([102; crate::id::ID_LEN]).unwrap();
-        let union_attribute = Id::new([103; crate::id::ID_LEN]).unwrap();
-        let edge_attribute = Id::new([104; crate::id::ID_LEN]).unwrap();
-        let source = Id::new([111; crate::id::ID_LEN]).unwrap();
-        let rejected_source = Id::new([112; crate::id::ID_LEN]).unwrap();
-        let a = Id::new([121; crate::id::ID_LEN]).unwrap();
-        let b = Id::new([122; crate::id::ID_LEN]).unwrap();
-        let c = Id::new([123; crate::id::ID_LEN]).unwrap();
-        let d = Id::new([124; crate::id::ID_LEN]).unwrap();
-        let z = Id::new([125; crate::id::ID_LEN]).unwrap();
-        let outers = [
-            Id::new([131; crate::id::ID_LEN]).unwrap(),
-            Id::new([132; crate::id::ID_LEN]).unwrap(),
-            Id::new([133; crate::id::ID_LEN]).unwrap(),
-        ];
-
-        let mut activation_set = TribleSet::new();
-        for (outer, value) in [
-            (&outers[0], &source),
-            (&outers[1], &source),
-            (&outers[2], &rejected_source),
-        ] {
-            activation_set.insert(&Trible::new::<GenId>(
-                ExclusiveId::force_ref(outer),
-                &activation_attribute,
-                &value.to_inline(),
-            ));
-        }
-        let mut candidate_set = TribleSet::new();
-        for (entity, value) in [
-            (&source, &a),
-            (&source, &b),
-            (&source, &source),
-            (&rejected_source, &d),
-            (&rejected_source, &rejected_source),
-        ] {
-            candidate_set.insert(&Trible::new::<GenId>(
-                ExclusiveId::force_ref(entity),
-                &candidate_attribute,
-                &value.to_inline(),
-            ));
-        }
-        let activation_archive: &'static SuccinctArchive<OrderedUniverse> =
-            Box::leak(Box::new((&activation_set).into()));
-        let candidate_archive: &'static SuccinctArchive<OrderedUniverse> =
-            Box::leak(Box::new((&candidate_set).into()));
-
-        let mut graph = TribleSet::new();
-        for (from, to) in [
-            (&source, &a),
-            (&a, &b),
-            (&b, &c),
-            (&c, &source),
-            (&rejected_source, &d),
-            (&d, &rejected_source),
-        ] {
-            graph.insert(&Trible::new::<GenId>(
-                ExclusiveId::force_ref(from),
-                &edge_attribute,
-                &to.to_inline(),
-            ));
-        }
-
-        let mut shard_one = TribleSet::new();
-        for (entity, value) in [
-            (&source, &a),
-            (&source, &b),
-            (&rejected_source, &z),
-        ] {
-            shard_one.insert(&Trible::new::<GenId>(
-                ExclusiveId::force_ref(entity),
-                &union_attribute,
-                &value.to_inline(),
-            ));
-        }
-        let mut shard_two = TribleSet::new();
-        for value in [&b, &c] {
-            shard_two.insert(&Trible::new::<GenId>(
-                ExclusiveId::force_ref(&source),
-                &union_attribute,
-                &value.to_inline(),
-            ));
-        }
-        let union_shards: &'static [SuccinctArchive<OrderedUniverse>] = Box::leak(
-            vec![(&shard_one).into(), (&shard_two).into()].into_boxed_slice(),
-        );
-        let union_archive: &'static UnionArchive<'static, OrderedUniverse> =
-            Box::leak(Box::new(UnionArchive::new(union_shards)));
-
-        let outer = Variable::<GenId>::new(0);
-        let source_variable = Variable::<GenId>::new(1);
-        let target_variable = Variable::<GenId>::new(2);
-        let activation_attribute = Inline::<GenId>::new(id_into_value(&activation_attribute));
-        let candidate_attribute = Inline::<GenId>::new(id_into_value(&candidate_attribute));
-        let union_attribute = Inline::<GenId>::new(id_into_value(&union_attribute));
-        let path = [PathOp::Attr(edge_attribute.raw()), PathOp::Plus];
-        let activation_constraint = || {
-            SuccinctArchiveConstraint::new(
-                outer,
-                activation_attribute,
-                source_variable,
-                activation_archive,
-            )
-        };
-        let candidate_constraint = || {
-            SuccinctArchiveConstraint::new(
-                source_variable,
-                candidate_attribute,
-                target_variable,
-                candidate_archive,
-            )
-        };
-        let union_constraint = || {
-            union_archive.pattern(source_variable, union_attribute, target_variable)
-        };
-
-        let oracle = IntersectionConstraint::new(vec![
-            Box::new(activation_constraint()) as ShapeConstraint,
-            Box::new(RegularPathConstraint::new(
-                graph.clone(),
-                source_variable,
-                target_variable,
-                &path,
-            )) as ShapeConstraint,
-            Box::new(candidate_constraint()) as ShapeConstraint,
-            Box::new(union_constraint()) as ShapeConstraint,
-        ]);
-        let mut expected: Vec<_> =
-            Query::new(oracle, constructed_source_target).sequential().collect();
-        expected.sort_unstable();
-        assert_eq!(
-            expected,
-            vec![
-                (id_into_value(&source), id_into_value(&a)),
-                (id_into_value(&source), id_into_value(&a)),
-                (id_into_value(&source), id_into_value(&b)),
-                (id_into_value(&source), id_into_value(&b)),
-            ],
-            "the oracle must retain duplicate outer parents but not overlapping shard witnesses"
-        );
-
-        let rpq_fallbacks = program_fallback_counters();
-        let root = Arc::new(IntersectionConstraint::new(vec![
-            Box::new(ConstructedProtocolTrap {
-                inner: activation_constraint(),
-            }) as ShapeConstraint,
-            Box::new(ConstructedProtocolTrap {
-                inner: program_only_rpq(
-                    RegularPathConstraint::new(
-                        graph,
-                        source_variable,
-                        target_variable,
-                        &path,
-                    ),
-                    &rpq_fallbacks,
-                ),
-            }) as ShapeConstraint,
-            Box::new(ConstructedProtocolTrap {
-                inner: candidate_constraint(),
-            }) as ShapeConstraint,
-            Box::new(ConstructedProtocolTrap {
-                inner: union_constraint(),
-            }) as ShapeConstraint,
-        ]));
-        let mut iterator = try_constructed_program_query(root, constructed_source_target)
-            .unwrap()
-            .cap(1)
-            .start_width(1)
-            .growth(1);
-        assert_eq!(
-            iterator.planner_kind(),
-            ResidualPlannerKind::ConstructedProgram
-        );
-        let target_step = &iterator
-            .plan
-            .constructed_program
-            .as_ref()
-            .unwrap()
-            .steps[2];
-        assert_eq!(target_step.variable, target_variable.index);
-        assert_eq!(target_step.proposer, 1);
-        assert_eq!(target_step.proposer_route.stratum, ProgramStratum::Fixpoint);
-        assert_eq!(
-            target_step
-                .confirmer_routes
-                .iter()
-                .map(|(leaf, _)| *leaf)
-                .collect::<Vec<_>>(),
-            vec![2, 3],
-            "candidate Succinct and UnionArchive must both confirm the RPQ frontier"
-        );
-
-        let first = iterator
-            .next()
-            .expect("strict mixed constructed Programs produced no row");
-        let transitions_at_first = iterator.stats().delta_transition_candidates_examined;
-        let mirror = iterator.clone();
-        let mut remainder: Vec<_> = iterator.by_ref().collect();
-        let transitions_after = iterator.stats().delta_transition_candidates_examined;
-        let mirrored: Vec<_> = mirror.collect();
-
-        assert_eq!(mirrored, remainder, "a clone changed the exact live remainder");
-        assert!(transitions_at_first > 0);
-        assert!(
-            transitions_after > transitions_at_first,
-            "the first result eagerly drained the cyclic RPQ continuation"
-        );
-        remainder.push(first);
-        remainder.sort_unstable();
-        assert_eq!(remainder, expected);
-        assert_program_fallbacks_unused(&rpq_fallbacks);
-    }
-
-    #[test]
-    fn constructed_program_composes_constant_equality_and_cyclic_rpq_without_fallback() {
-        use crate::id::{id_into_value, ExclusiveId, Id};
-        use crate::query::equalityconstraint::EqualityConstraint;
-        use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
-        use crate::trible::{Trible, TribleSet};
-
-        let edge = Id::new([141; crate::id::ID_LEN]).unwrap();
-        let source = Id::new([142; crate::id::ID_LEN]).unwrap();
-        let a = Id::new([143; crate::id::ID_LEN]).unwrap();
-        let b = Id::new([144; crate::id::ID_LEN]).unwrap();
-        let c = Id::new([145; crate::id::ID_LEN]).unwrap();
-        let mut graph = TribleSet::new();
-        for (from, to) in [(&source, &a), (&a, &b), (&b, &c), (&c, &source)] {
-            graph.insert(&Trible::new::<GenId>(
-                ExclusiveId::force_ref(from),
-                &edge,
-                &to.to_inline(),
-            ));
-        }
-
-        let source_variable = Variable::<GenId>::new(0);
-        let alias_variable = Variable::<GenId>::new(1);
-        let target_variable = Variable::<GenId>::new(2);
-        let path = [PathOp::Attr(edge.raw()), PathOp::Plus];
-        let make_root = |graph: TribleSet, trap: bool, counters: &ProgramFallbackCounters| {
-            let source_constant = source_variable.is(source.to_inline());
-            let equality = EqualityConstraint::new(source_variable.index, alias_variable.index);
-            let rpq = RegularPathConstraint::new(
-                graph,
-                alias_variable,
-                target_variable,
-                &path,
-            );
-            let target_constant = target_variable.is(b.to_inline());
-            if trap {
-                IntersectionConstraint::new(vec![
-                    Box::new(ConstructedProtocolTrap {
-                        inner: source_constant,
-                    }) as ShapeConstraint,
-                    Box::new(ConstructedProtocolTrap { inner: equality }) as ShapeConstraint,
-                    Box::new(ConstructedProtocolTrap {
-                        inner: program_only_rpq(rpq, counters),
-                    }) as ShapeConstraint,
-                    Box::new(ConstructedProtocolTrap {
-                        inner: target_constant,
-                    }) as ShapeConstraint,
-                ])
-            } else {
-                IntersectionConstraint::new(vec![
-                    Box::new(source_constant) as ShapeConstraint,
-                    Box::new(equality) as ShapeConstraint,
-                    Box::new(rpq) as ShapeConstraint,
-                    Box::new(target_constant) as ShapeConstraint,
-                ])
-            }
-        };
-
-        let unused_oracle_counters = program_fallback_counters();
-        let mut expected: Vec<_> = Query::new(
-            make_root(graph.clone(), false, &unused_oracle_counters),
-            constructed_source_target,
-        )
-        .sequential()
-        .collect();
-        expected.sort_unstable();
-        assert_eq!(
-            expected,
-            vec![(id_into_value(&source), id_into_value(&b))]
-        );
-
-        let rpq_fallbacks = program_fallback_counters();
-        let root = Arc::new(make_root(graph, true, &rpq_fallbacks));
-        let iterator = try_constructed_program_query(root, constructed_source_target).unwrap();
-        assert_eq!(iterator.planner_kind(), ResidualPlannerKind::ConstructedProgram);
-        let steps = &iterator.plan.constructed_program.as_ref().unwrap().steps;
-        assert_eq!(steps.len(), 3);
-        assert_eq!((steps[0].variable, steps[0].proposer), (0, 0));
-        assert_eq!(
-            steps[0]
-                .confirmer_routes
-                .iter()
-                .map(|(leaf, _)| *leaf)
-                .collect::<Vec<_>>(),
-            vec![1],
-            "unbound equality must be an identity confirmer"
-        );
-        assert_eq!((steps[1].variable, steps[1].proposer), (1, 1));
-        assert_eq!(
-            steps[1]
-                .confirmer_routes
-                .iter()
-                .map(|(leaf, _)| *leaf)
-                .collect::<Vec<_>>(),
-            vec![2],
-            "bound-peer equality must propose into RPQ confirmation"
-        );
-        assert_eq!((steps[2].variable, steps[2].proposer), (2, 2));
-        assert_eq!(steps[2].proposer_route.stratum, ProgramStratum::Fixpoint);
-        assert_eq!(
-            steps[2]
-                .confirmer_routes
-                .iter()
-                .map(|(leaf, _)| *leaf)
-                .collect::<Vec<_>>(),
-            vec![3],
-            "the target constant must confirm the cyclic RPQ frontier"
-        );
-
-        let mut actual: Vec<_> = iterator.collect();
-        actual.sort_unstable();
-        assert_eq!(actual, expected);
-        assert_program_fallbacks_unused(&rpq_fallbacks);
-    }
-
-    #[test]
-    fn constructed_program_treats_same_variable_equality_as_identity_confirmation() {
-        use crate::id::{id_into_value, Id};
-        use crate::query::equalityconstraint::EqualityConstraint;
-
-        let value = Id::new([151; crate::id::ID_LEN]).unwrap();
-        let variable = Variable::<GenId>::new(0);
-        let root = Arc::new(IntersectionConstraint::new(vec![
-            Box::new(ConstructedProtocolTrap {
-                inner: variable.is(value.to_inline()),
-            }) as ShapeConstraint,
-            Box::new(ConstructedProtocolTrap {
-                inner: EqualityConstraint::new(variable.index, variable.index),
-            }) as ShapeConstraint,
-        ]));
-        let iterator = try_constructed_program_query(root, |binding: &Binding| {
-            binding.get(variable.index).copied()
-        })
-        .unwrap();
-        let step = &iterator.plan.constructed_program.as_ref().unwrap().steps[0];
-        assert_eq!(step.proposer, 0);
-        assert_eq!(step.confirmer_routes.len(), 1);
-        assert_eq!(iterator.collect::<Vec<_>>(), vec![id_into_value(&value)]);
-    }
-
-    #[test]
-    fn constructed_program_uses_filter_only_inline_range_as_a_confirmer() {
-        use crate::inline::encodings::UnknownInline;
-        use crate::query::rangeconstraint::value_range;
-
-        let variable = Variable::<UnknownInline>::new(0);
-        let min = Inline::<UnknownInline>::new(raw(2));
-        let max = Inline::<UnknownInline>::new(raw(4));
-        for (constant, expected) in [
-            (Inline::<UnknownInline>::new(raw(2)), vec![raw(2)]),
-            (Inline::<UnknownInline>::new(raw(4)), vec![raw(4)]),
-            (Inline::<UnknownInline>::new(raw(5)), Vec::new()),
-        ] {
-            let root = Arc::new(IntersectionConstraint::new(vec![
-                Box::new(ConstructedProtocolTrap {
-                    inner: variable.is(constant),
-                }) as ShapeConstraint,
-                Box::new(ConstructedProtocolTrap {
-                    inner: value_range(variable, min, max),
-                }) as ShapeConstraint,
-            ]));
-            let iterator = try_constructed_program_query(root, |binding: &Binding| {
-                binding.get(variable.index).copied()
-            })
-            .unwrap();
-            let step = &iterator.plan.constructed_program.as_ref().unwrap().steps[0];
-            assert_eq!(step.proposer, 0);
-            assert_eq!(
-                step.confirmer_routes
-                    .iter()
-                    .map(|(leaf, _)| *leaf)
-                    .collect::<Vec<_>>(),
-                vec![1],
-                "InlineRange must confirm another atom's source"
-            );
-            assert_eq!(iterator.collect::<Vec<_>>(), expected);
-        }
-    }
-
-    #[test]
-    fn constructed_program_pages_sorted_slice_duplicates_without_fallback() {
+    fn adaptive_program_routing_preserves_sorted_constant_bag_and_child_order() {
         use crate::inline::encodings::UnknownInline;
         use crate::query::sortedsliceconstraint::SortedSlice;
 
-        let values: &'static [Inline<UnknownInline>] = Box::leak(
-            vec![
-                Inline::new(raw(1)),
-                Inline::new(raw(1)),
-                Inline::new(raw(2)),
-                Inline::new(raw(3)),
-            ]
-            .into_boxed_slice(),
-        );
+        let a = Inline::<UnknownInline>::new(raw(7));
+        let values: &'static [Inline<UnknownInline>] =
+            Box::leak(vec![a, a].into_boxed_slice());
         let variable = Variable::<UnknownInline>::new(0);
-        let root = Arc::new(IntersectionConstraint::new(vec![
-            Box::new(ConstructedProtocolTrap {
+        let project = |binding: &Binding| binding.get(variable.index).copied();
+
+        let plain = |constant_first| {
+            let source =
+                Box::new(SortedSlice::new(values).unwrap().has(variable)) as ShapeConstraint;
+            let constant = Box::new(variable.is(a)) as ShapeConstraint;
+            IntersectionConstraint::new(if constant_first {
+                vec![constant, source]
+            } else {
+                vec![source, constant]
+            })
+        };
+        let trapped = |constant_first| {
+            let source = Box::new(ProgramActionTrap {
                 inner: SortedSlice::new(values).unwrap().has(variable),
-            }) as ShapeConstraint,
-        ]));
-        let mut iterator = try_constructed_program_query(root, |binding: &Binding| {
-            binding.get(variable.index).copied()
-        })
-        .unwrap()
-        .cap(1)
-        .start_width(1)
-        .growth(1);
-        let step = &iterator.plan.constructed_program.as_ref().unwrap().steps[0];
-        assert_eq!(step.proposer, 0);
-        assert!(step.confirmer_routes.is_empty());
+            }) as ShapeConstraint;
+            let constant = Box::new(ProgramActionTrap {
+                inner: variable.is(a),
+            }) as ShapeConstraint;
+            IntersectionConstraint::new(if constant_first {
+                vec![constant, source]
+            } else {
+                vec![source, constant]
+            })
+        };
 
-        let first = iterator.next().expect("sorted Program produced no row");
-        let mirror = iterator.clone();
-        let remainder: Vec<_> = iterator.collect();
-        assert_eq!(mirror.collect::<Vec<_>>(), remainder);
-        let mut actual = std::iter::once(first)
-            .chain(remainder)
-            .collect::<Vec<_>>();
-        actual.sort_unstable();
-        assert_eq!(actual, [raw(1), raw(1), raw(2), raw(3)]);
-    }
-
-    #[test]
-    fn constructed_program_keeps_shared_occurrences_distinct() {
-        let (graph, attribute) = constructed_program_graph();
-        let expected_leaf = Arc::new(constructed_rpq(graph.clone(), &attribute, false));
-        let oracle = IntersectionConstraint::new(vec![
-            Arc::clone(&expected_leaf),
-            Arc::clone(&expected_leaf),
-        ]);
-        let mut expected: Vec<_> = Query::new(oracle, constructed_pair)
-            .sequential()
+        let mut sequential_source_first: Vec<_> =
+            Query::new(plain(false), project).sequential().collect();
+        let mut sequential_constant_first: Vec<_> =
+            Query::new(plain(true), project).sequential().collect();
+        let mut residual_source_first: Vec<_> = Query::new(trapped(false), project)
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .collect();
+        let mut residual_constant_first: Vec<_> = Query::new(trapped(true), project)
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
             .collect();
 
-        let shared = Arc::new(ConstructedProtocolTrap {
-            inner: constructed_rpq(graph, &attribute, false),
-        });
-        let root = Arc::new(IntersectionConstraint::new(vec![
-            Arc::clone(&shared),
-            Arc::clone(&shared),
-        ]));
-        let iterator = try_constructed_program_query(root, constructed_pair).unwrap();
-        let constructed_plan = iterator.plan.constructed_program.as_ref().unwrap();
-        assert!(constructed_plan.steps.iter().all(|step| {
-            step.relevant.count() == 2 && step.confirmer_routes.len() == 1
-        }));
-        let mut constructed: Vec<_> = iterator.collect();
+        sequential_source_first.sort_unstable();
+        sequential_constant_first.sort_unstable();
+        residual_source_first.sort_unstable();
+        residual_constant_first.sort_unstable();
 
-        expected.sort_unstable();
-        constructed.sort_unstable();
-        assert_eq!(constructed, expected);
-    }
-
-    #[test]
-    fn constructed_program_plan_is_invariant_under_estimate_overrides() {
-        use crate::debug::query::EstimateOverrideConstraint;
-
-        let (graph, attribute) = constructed_program_graph();
-        let mut low = EstimateOverrideConstraint::new(ConstructedProtocolTrap {
-            inner: constructed_rpq(graph.clone(), &attribute, false),
-        });
-        low.set_estimate(0, 0);
-        low.set_estimate(1, usize::MAX);
-        let mut high = EstimateOverrideConstraint::new(ConstructedProtocolTrap {
-            inner: constructed_rpq(graph, &attribute, false),
-        });
-        high.set_estimate(0, usize::MAX);
-        high.set_estimate(1, 0);
-
-        let low = try_constructed_program_query(
-            Arc::new(IntersectionConstraint::new(vec![Arc::new(low)])),
-            constructed_pair,
-        )
-        .unwrap();
-        let high = try_constructed_program_query(
-            Arc::new(IntersectionConstraint::new(vec![Arc::new(high)])),
-            constructed_pair,
-        )
-        .unwrap();
-        assert_eq!(low.plan.constructed_program, high.plan.constructed_program);
-        let mut low_results: Vec<_> = low.collect();
-        let mut high_results: Vec<_> = high.collect();
-        low_results.sort_unstable();
-        high_results.sort_unstable();
-        assert_eq!(low_results, high_results);
-    }
-
-    #[test]
-    fn constructed_program_rejects_unsupported_shapes_without_fallback() {
-        let fallback_calls = Arc::new(AtomicUsize::new(0));
-        let rejection = match try_constructed_program_query(
-            ConstructedFallbackProbe {
-                planning_calls: Arc::clone(&fallback_calls),
-            },
-            constructed_unit,
-        ) {
-            Ok(_) => panic!("a non-AND root was admitted"),
-            Err(rejection) => rejection,
-        };
-        assert_eq!(rejection.reason(), &ConstructedProgramError::RootNotFlatAnd);
-        assert_eq!(fallback_calls.load(Ordering::Relaxed), 0);
-        let _fallback: Query<_, _, ()> = rejection.into_query();
-        assert!(fallback_calls.load(Ordering::Relaxed) > 0);
-
-        assert_eq!(
-            take_constructed_error(try_constructed_program_query(
-                ConstructedZeroVariable,
-                constructed_unit,
-            )),
-            ConstructedProgramError::RootNotFlatAnd
-        );
-        assert_eq!(
-            take_constructed_error(try_constructed_program_query(
-                IntersectionConstraint::<ConstructedZeroVariable>::new(Vec::new()),
-                constructed_unit,
-            )),
-            ConstructedProgramError::EmptyAnd
-        );
-        assert_eq!(
-            take_constructed_error(try_constructed_program_query(
-                IntersectionConstraint::new(vec![ConstructedZeroVariable]),
-                constructed_unit,
-            )),
-            ConstructedProgramError::EmptyQuery
-        );
-
-        let (graph, attribute) = constructed_program_graph();
-        let mixed = IntersectionConstraint::new(vec![
-            Box::new(ConstructedProtocolTrap {
-                inner: constructed_rpq(graph.clone(), &attribute, false),
-            }) as ShapeConstraint,
-            Box::new(ConstructedZeroVariable) as ShapeConstraint,
-        ]);
-        assert_eq!(
-            take_constructed_error(try_constructed_program_query(mixed, constructed_unit)),
-            ConstructedProgramError::ZeroVariableOccurrence { occurrence: 1 }
-        );
-
-        assert_eq!(
-            take_constructed_error(try_constructed_program_query(
-                IntersectionConstraint::new(vec![ConstructedMissingProgram(0)]),
-                constructed_unit,
-            )),
-            ConstructedProgramError::MissingProgram { occurrence: 0 }
-        );
-
-        let nested = IntersectionConstraint::new(vec![IntersectionConstraint::new(vec![
-            ConstructedMissingProgram(0),
-        ])]);
-        assert_eq!(
-            take_constructed_error(try_constructed_program_query(nested, constructed_unit)),
-            ConstructedProgramError::NestedAndOccurrence { occurrence: 0 }
-        );
-
-        let left = Arc::new(ConstructedProtocolTrap {
-            inner: constructed_rpq(graph.clone(), &attribute, false),
-        });
-        let right = Arc::new(ConstructedProtocolTrap {
-            inner: constructed_rpq(graph.clone(), &attribute, false),
-        });
-        let formula = IntersectionConstraint::new(vec![UnionConstraint::new(vec![left, right])]);
-        assert_eq!(
-            take_constructed_error(try_constructed_program_query(formula, constructed_pair)),
-            ConstructedProgramError::FormulaOccurrence { occurrence: 0 }
-        );
-
-        let route_hole = IntersectionConstraint::new(vec![
-            TerminalProgramLeaf {
-                variable: 0,
-                mode: TerminalProgramMode::Divergent,
-            },
-            TerminalProgramLeaf {
-                variable: 0,
-                mode: TerminalProgramMode::Divergent,
-            },
-        ]);
-        assert!(matches!(
-            take_constructed_error(try_constructed_program_query(route_hole, constructed_unit)),
-            ConstructedProgramError::MissingConfirmRoute {
-                variable: 0,
-                bound,
-                ..
-            } if bound.is_empty()
-        ));
-
-        let repeated = Arc::new(ConstructedProtocolTrap {
-            inner: constructed_rpq(graph, &attribute, true),
-        });
-        let repeated = IntersectionConstraint::new(vec![
-            Arc::clone(&repeated),
-            Arc::clone(&repeated),
-        ]);
-        assert!(matches!(
-            take_constructed_error(try_constructed_program_query(repeated, constructed_pair)),
-            ConstructedProgramError::ParentAtomicConfirm {
-                variable: 1,
-                bound,
-                ..
-            } if bound == VariableSet::new_singleton(0)
-        ));
-    }
-
-    #[cfg(feature = "parallel")]
-    #[test]
-    fn constructed_program_parallel_source_matches_sequential_bag() {
-        let (graph, attribute) = constructed_program_graph();
-        let mut expected: Vec<_> = Query::new(
-            constructed_rpq(graph.clone(), &attribute, false),
-            constructed_pair,
-        )
-        .sequential()
-        .collect();
-        let root = Arc::new(IntersectionConstraint::new(vec![Arc::new(
-            ConstructedProtocolTrap {
-                inner: constructed_rpq(graph, &attribute, false),
-            },
-        )]));
-        let mut constructed: Vec<_> = with_parallel_workers(4, || {
-            try_constructed_program_query(root, constructed_pair)
-                .unwrap()
-                .into_par_iter()
-                .collect()
-        });
-
-        expected.sort_unstable();
-        constructed.sort_unstable();
-        assert_eq!(constructed, expected);
+        // The constant's estimate of one wins over the two-occurrence source.
+        // Confirmation is filter-only, so the status-quo bag contains one
+        // occurrence regardless of which child is stored first.
+        assert_eq!(sequential_source_first, vec![raw(7)]);
+        assert_eq!(sequential_constant_first, sequential_source_first);
+        assert_eq!(residual_source_first, sequential_source_first);
+        assert_eq!(residual_constant_first, sequential_source_first);
     }
 
     fn preferred_fanout(
