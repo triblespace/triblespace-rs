@@ -1119,7 +1119,7 @@ impl TypedProgramSpec for TribleSetConstraint {
             stratum: ProgramStratum::Finite,
             grouping: ProgramGrouping::PageLocal,
             completion: ProgramCompletion::PageableOnly,
-            exposure: ProgramExposure::Production,
+            exposure: ProgramExposure::Explicit,
         })
     }
 
@@ -1632,6 +1632,15 @@ mod tests {
         assert_eq!(propose.stratum, ProgramStratum::Finite);
         assert_eq!(propose.grouping, ProgramGrouping::PageLocal);
         assert_eq!(propose.completion, ProgramCompletion::PageableOnly);
+        assert_eq!(propose.exposure, ProgramExposure::Explicit);
+        assert_eq!(confirm.exposure, ProgramExposure::Explicit);
+        let support = program
+            .route(ProgramRequest {
+                action: ProgramAction::Support,
+                bound: empty,
+            })
+            .unwrap();
+        assert_eq!(support.exposure, ProgramExposure::Explicit);
         assert!(program
             .route(ProgramRequest {
                 action: ProgramAction::Propose(0),
