@@ -54,7 +54,7 @@ writes one scalar estimate directly into its cursor state.
 
 ## The constraint protocol
 
-Six methods perform the query negotiation:
+Six execution methods perform the ordinary query negotiation:
 
 | Method | Responsibility |
 |---|---|
@@ -64,6 +64,16 @@ Six methods perform the query negotiation:
 | `confirm` | Remove candidates that violate this constraint. |
 | `satisfied` | Check the truth of a constraint whose relevant variables have become bound. |
 | `influence` | Report which variables may need fresh estimates after another variable changes binding state. |
+
+Two opt-in semantic receipts let the engine plan a completely certified query
+as one fixed relation. `fixed_denotation` certifies an occurrence's relational
+SET meaning, while `proposal_coverage` says whether a proposal is absent as a
+source, covering, or exact for one target and bound schema. Their defaults keep
+the legacy action-defined protocol. Receipt-aware planning activates only when
+every occurrence in the complete root certifies its denotation. A transparent
+wrapper that forwards either receipt must also forward the certified action
+methods; otherwise its proof would describe a relation its execution does not
+implement.
 
 Four laws are load-bearing for correctness:
 
@@ -249,8 +259,9 @@ The ordinary [`Query`](triblespace::core::query::Query) uses this engine wheneve
 exact seed settlement leaves a live search. Opaque roots, one-leaf ANDs,
 disjoint conjunctions, finite Union roots, RPQ roots, and live zero-variable
 truths therefore all exercise the same residual substrate. A seed-rejected
-query starts no worklist at all. Production lowering keeps finite logical
-composites as fused constraint kernels inside that substrate while enabling
+query starts no worklist at all. Production lowering flattens exposed
+associative AND regions, keeps other finite logical composites such as Union as
+fused constraint kernels inside that substrate, and enables
 production-qualified typed Programs for RPQs and other heterogeneous actions.
 Explicit page-producing routes, including UnionArchive Propose and Confirm,
 require `ProgramScope::All` (provided by `ResidualLowering::FULL`). The explicit

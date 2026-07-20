@@ -2199,7 +2199,10 @@ pub enum FormulaScope {
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 #[must_use]
 pub enum ProgramScope {
-    /// Execute every action through the stable ordinary constraint protocol.
+    /// Admit no typed Program routes.
+    ///
+    /// A structurally absent route may still leave legacy pager or seed hooks
+    /// eligible; a route deferred by this policy uses the ordinary protocol.
     #[default]
     Disabled,
     /// Admit routes marked [`ProgramExposure::Production`].
@@ -2225,7 +2228,9 @@ impl ProgramScope {
 /// Orthogonal structural lowering selected for one residual solve.
 ///
 /// Formula scope and Program scope are independent three-element chains,
-/// giving exactly nine canonical lowering forms.
+/// giving exactly nine canonical lowering forms. `Default` is
+/// [`ResidualLowering::CONSERVATIVE`]; fresh [`Query`] values explicitly use
+/// [`ResidualLowering::HYBRID`] instead.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 #[must_use]
 pub struct ResidualLowering {

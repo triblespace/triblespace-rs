@@ -10,7 +10,7 @@ results.
 ## Constraints as the search frontier
 
 Every constraint implements the [`Constraint`](triblespace::core::query::Constraint) trait,
-which exposes six methods that shape the search:
+whose six ordinary execution methods shape the search:
 
 1. **`variables`** – returns the set of variables this constraint touches.
 2. **`estimate`** – predicts how many results remain for a variable under the
@@ -22,11 +22,18 @@ which exposes six methods that shape the search:
 6. **`influence`** – reports which other variables need their estimates refreshed
    when this variable changes.
 
+Constraints may additionally publish `fixed_denotation` and
+`proposal_coverage` receipts. These do not replace the six execution methods;
+they certify that the complete tree denotes one fixed relation and identify
+sound proposal sources. The engine uses them only when every occurrence in the
+root opts in. Transparent wrappers that forward the receipts must also forward
+the certified action methods.
+
 Traditional databases rely on a query planner to combine statistics into a join
 plan. Atreides instead consults the constraints directly while it searches. Each
 constraint can base its estimates on whatever structure it maintains—hash maps,
 precomputed counts, or even constant values for predicates that admit at most
-one match—so long as it can provide a quick upper bound. Whenever a binding
+one match—so long as it can provide a quick cost quote. Whenever a binding
 changes, the engine asks the influenced constraints for fresh estimates. Those
 estimates are cached per variable and reused until another binding invalidates
 them, keeping the guidance loop responsive as the search progresses.

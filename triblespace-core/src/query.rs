@@ -2511,10 +2511,12 @@ enum QueryScheduler {
 /// residual states. It starts with narrow, depth-first action cohorts and
 /// widens as the consumer keeps pulling, while histories with identical future
 /// computation can reconverge under one state identity. The production
-/// lowering keeps finite formula boundaries as fused constraint kernels while
-/// production-qualified regular-path Programs execute as heterogeneous state
-/// actions; explicit or unsupported custom Programs remain ordinary opaque
-/// constraint actions. Seed-rejected queries start no runtime. Use
+/// lowering flattens exposed associative AND regions, preserves other finite
+/// composites such as Union as fused constraint kernels, and executes
+/// production-qualified regular-path Programs as heterogeneous state actions.
+/// Explicit routes deferred by policy use the ordinary constraint action. A
+/// structurally absent route may instead retain the constraint's legacy pager
+/// or seed hooks. Seed-rejected queries start no runtime. Use
 /// [`Query::lazy_dag_scheduler`] for the bound-variable-set DAG control and
 /// [`Query::sequential`] for the scalar depth-first specialization. The
 /// Scheduler selection and structural lowering are independent controls; use
@@ -5109,7 +5111,8 @@ mod parallel {
 /// two different raw values may therefore still convert to equal Rust values.
 /// A raw head is claimed before conversion or mapper code runs, so a conversion
 /// failure, filtered row, or panic is not retried through another hidden
-/// witness.
+/// witness. Every projected variable must be unique; repeating a variable in
+/// the head is a compile error because it would not add a projected column.
 ///
 /// The unit form `find!((), constraint)` projects no variables and consequently
 /// yields at most one `()`: one if any assignment satisfies the constraint and

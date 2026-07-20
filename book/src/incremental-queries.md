@@ -51,7 +51,9 @@ point lookups and single-digit microsecond joins.
 Given a full dataset and a set of changed tribles, the engine runs
 the original query multiple times. Each run restricts a different triple
 constraint to the changed set while the remaining constraints see the full set.
-The union of these runs yields exactly the new solutions. The process is:
+The union of these runs yields solutions supported by at least one changed
+trible. A tuple emitted by an earlier invocation may legitimately recur when a
+later delta adds another witness. The process is:
 
 1. accumulate `changed` into `full` with `full += &changed`, which merges
    both the facts and the commit set,

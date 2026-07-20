@@ -191,7 +191,7 @@ fn repeated_pattern_uses_the_canonical_program_without_a_resident_family() {
 }
 
 #[test]
-fn serial_full_lowering_is_bag_identical_and_default_off_never_places() {
+fn serial_full_lowering_is_set_identical_and_default_off_never_places() {
     let set = fixture_set();
     let expected = oracle_pairs(&set);
     assert_eq!(expected.len(), 60);
@@ -375,7 +375,7 @@ fn public_force_route_places_all_three_two_bound_actions_without_preparation() {
 
 #[test]
 #[ignore = "requires a native WGPU adapter"]
-fn serial_forced_routing_places_physically_and_stays_bag_identical() {
+fn serial_forced_routing_places_physically_and_stays_set_identical() {
     let set = fixture_set();
     let expected = oracle_pairs(&set);
 
@@ -391,7 +391,7 @@ fn serial_forced_routing_places_physically_and_stays_bag_identical() {
         .solve_residual_state_lazy_with(ResidualLowering::FULL)
         .collect_profiled();
 
-    // Bag-identical to the pure-CPU oracle of the same query.
+    // SET-identical to the pure-CPU oracle of the same query.
     let mut results = solve.results;
     results.sort();
     assert_eq!(results, expected);
@@ -429,7 +429,7 @@ fn serial_forced_routing_places_physically_and_stays_bag_identical() {
 
 #[test]
 #[ignore = "requires a native WGPU adapter"]
-fn parallel_forced_routing_places_physically_and_stays_bag_identical() {
+fn parallel_forced_routing_places_physically_and_stays_set_identical() {
     let set = fixture_set();
     let expected = oracle_pairs(&set);
 
@@ -442,7 +442,8 @@ fn parallel_forced_routing_places_physically_and_stays_bag_identical() {
         pattern!(&route, [{ ?e @ ns::fanout: ?v }])
     );
     // The public parallel residual entry preserves the query's selected
-    // lowering (FULL by default), so typed Programs stay reachable.
+    // lowering (HYBRID for a fresh query), so production-qualified typed
+    // Programs stay reachable.
     let mut results: Vec<(Id, Id)> = query.into_par_residual_state_iter().collect();
 
     results.sort();

@@ -9,12 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Ordinary residual queries now use hybrid structural lowering.** Finite
-  logical composites stay fused behind their certified constraint kernels,
-  while production-qualified typed Programs such as regular-path execution
-  remain enabled. Explicit Program routes stay on the ordinary constraint
-  protocol under `ResidualLowering::HYBRID`; `ResidualLowering::FULL` opts into
-  them together with the maximally exposed formula interpreter.
+- **Ordinary residual queries now use hybrid structural lowering.** Exposed
+  associative AND regions remain flattened into residual occurrences, while
+  other finite logical composites, including Union, stay fused behind their
+  certified constraint kernels. Production-qualified typed Programs such as
+  regular-path execution remain enabled. Explicit Program routes stay on the
+  ordinary constraint protocol under `ResidualLowering::HYBRID`;
+  `ResidualLowering::FULL` opts into them together with the maximally exposed
+  formula interpreter.
 - **Typed Program selection now has an explicit exposure policy.** Every route
   is `Production` or `Explicit`, and the residual lowering's `ProgramScope`
   independently selects `Disabled`, `Production`, or `All`. The centralized
@@ -23,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ordinary action and never its legacy pager, seeds, grouping, or stronger
   Program receipt. UnionArchive's page-producing Propose and Confirm streams
   are explicit while the finite Support route remains production-qualified.
+  `ResidualLowering::new` now takes a `ProgramScope` instead of a boolean
+  (`false` maps to `Disabled`, `true` to `All`), and `program_scope()` replaces
+  the old `transition_programs()` getter. Custom typed Program specs must also
+  classify each returned route with a `ProgramExposure`.
 - **Cyclic Confirm actions now cross the same parent-local SET boundary as
   ordinary actions.** Graph traversal retains the immutable original
   occurrence bag and raw confirmation telemetry until its complete result
@@ -53,7 +59,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   allocation, and Rayon claim mutex entirely. Direct `Query::new`
   conservatively uses that complete constraint-variable head. Iterator clones
   snapshot strict-head claims independently, while Rayon strict-head siblings
-  share one run-owned claim domain. There is no public bag mode.
+  share one run-owned claim domain. Repeating a variable in a `find!` head is
+  now a compile error; project it once and duplicate the converted value in
+  application code if needed. There is no public bag mode.
 - **Certified complete Program proposals now cross the SET boundary before
   publication.** The adapter first validates the entire raw grouped occurrence
   bag, then admits each distinct `(parent, value)` in first-occurrence order.
@@ -171,9 +179,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through transparent wrappers, and compose structurally through AND/OR;
   coherent finite, indexed, search, path, and resident-GPU constraints opt in.
   Repaired attached range constraints certify their exact attached-axis-domain
-  intersections as well. The residual planner consumes these receipts only in
-  certified fixed-denotation regions: coverage, rather than estimates, selects
-  a source; Covering proposals retain self-confirmation, while Exact proposals
+  intersections as well. The residual planner consumes these receipts only
+  when every occurrence in the complete query root certifies
+  `fixed_denotation`; any default-false occurrence retains legacy
+  action-defined planning. Coverage, rather than estimates, then selects a
+  source; Covering proposals retain self-confirmation, while Exact proposals
   may discharge it. Approximate ANN remains deliberately uncertified.
 - **Typed Program capabilities compose by immutable semantic route arm.**
   `PreferredProgram` chooses a preferred typed family only when that family
@@ -284,11 +294,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   churn.** A selected singleton or retained affine lease may turn accepted
   proposal pages directly into the ordinary projection buffer only when its
   reducer and return payload already classify it as terminal. The path shares
-  the candidate-commit row builder, preserves source order, bag multiplicity,
-  and independent cyclic credits, and bypasses Candidate planning plus terminal
-  Ready pops. Cold cohorts and nonterminal leases remain unchanged; output does
-  not widen search `S`, and projected demand `q` is still charged only after a
-  successful public projection.
+  the candidate-commit row builder, preserves first-occurrence source order and
+  independent cyclic credits, applies the same per-activation SET admission as
+  the stable path, and bypasses Candidate planning plus terminal Ready pops.
+  Cold cohorts and nonterminal leases remain unchanged; output does not widen
+  search `S`, and projected demand `q` is still charged only after a successful
+  public projection.
 - **The cross-generation query benchmark can diagnose live prefix costs.**
   Its opt-in checkpoint mode separates cumulative time-to-N, fresh-query
   time-to-N, and drop-at-N cancellation cost at 1/10/63/64/65/100/1,000 rows,
@@ -323,8 +334,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   opaque because native proposal execution would bypass its observation log.
 - **Built-in constraints gain an executable residual capability matrix.**
   Constants, equality, inclusive ranges, sorted slices, hash-set and hash-map
-  membership, finite unions, diagnostic wrappers, and repeated projected
-  variables now have exact bag receipts across the scalar oracle,
+  membership, finite unions, diagnostic wrappers, and repeated pattern
+  variables now have exact relational SET parity across the scalar oracle,
   eager DAG, conservative and full residual lowering, fixed width one,
   geometric growth, and a cloned live remainder. Static capability assertions
   and runtime counters distinguish native paging/formula execution from the
@@ -597,7 +608,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   constraint and exposes one typed Program for `(A,V) -> E`, `(E,V) -> A`, and
   `(E,A) -> V` proposals. One immutable rotation descriptor drives both Native
   paging and resident WGPU dispatch with exact ragged grants, absolute
-  continuations, branded receipts, and bag semantics. Its typed capability is
+  continuations, branded receipts, and raw occurrence-bag execution below the
+  SET-admission boundary. Its typed capability is
   now left-biased over the canonical Succinct Program: qualifying two-bound
   proposals select the resident family, while insufficiently bound proposals,
   Confirm, and Support select the canonical family before runtime construction.
@@ -617,18 +629,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Declined typed Program actions retain residual paging.** A constraint may
+- **Structurally absent typed Program routes retain residual paging.** A constraint may
   expose a typed Program for only some structural actions. When its family
   returns no route for the current request, the residual engine now continues
   through that same constraint's paged source and seed capabilities instead
-  of dropping directly to eager ordinary execution. Once a Program route is
-  returned it remains exclusive. This preserves geometric lazy latency for
-  heterogeneous wrappers such as the resident succinct two-bound route.
+  of dropping directly to eager ordinary execution. A route selected by the
+  active `ProgramScope` remains exclusive. A route that exists but is deferred
+  by policy instead uses the stable ordinary action and does not fall through
+  to legacy paging. This preserves geometric lazy latency for heterogeneous
+  wrappers such as the resident succinct two-bound route without bypassing
+  exposure policy.
 - **Explicit parallel residual queries preserve their selected lowering.**
-  `Query::into_par_residual_state_iter` now carries the query's default full
-  formula and transition-program lowering into its affine shards, while still
-  honoring an explicit conservative or intermediate `residual_lowering`
-  selection.
+  `Query::into_par_residual_state_iter` now carries the query's selected
+  lowering into its affine shards; fresh queries select `HYBRID`, while an
+  explicit conservative or intermediate `residual_lowering` remains honored.
 - **BM25 tokenization preserves non-ASCII symbols and emoji.**
   `hash_tokens` previously discarded every token without an alphanumeric
   character, making standalone emoji queries produce an empty term list.
@@ -844,11 +858,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CandidateSink` provide scalar/plain-value representations for the explicit
   sequential scheduler and per-row/tagged representations for frontier
   execution. The sequential engine is therefore the block-of-one case rather
-  than a separate constraint API. Custom constraints must obey three soundness
+  than a separate constraint API. Custom constraints must obey four soundness
   laws: `propose` receives and owns an empty sink, `confirm` only filters, and
   `satisfied` is exact whenever all relevant variables are bound. The latter
   includes constant, zero-variable constraints and lets unions reject dead arms
-  while negotiating variables owned by another arm.
+  while negotiating variables owned by another arm. In addition, every
+  row-taking verb is row-homomorphic: splitting a block and concatenating the
+  row-remapped answers cannot change its semantics.
 - **The ordinary `Query` iterator now runs every live seed through canonical
   residual states.** Opaque roots, one-leaf and disjoint conjunctions, finite
   unions, regular paths, and custom wrappers all exercise the same residual
@@ -864,8 +880,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   readiness-gated batch harvesting. The DAG cohorts exact-variable groups and
   delegates row-local proposer choice to the root constraint; residual
   planning cohorts explicit `(variable, proposer occurrence)` actions. Neither
-  path reassigns a row's choice, because that action owns candidate
-  multiplicity. Planning is
+  path reassigns a row's choice, because that action owns candidate support and
+  first-seen order. Planning is
   `O(RV)` with `O(RV + V)` reusable scratch for `R` rows and `V` unbound
   variables.
   `Query::sequential()` explicitly selects the scalar block-of-one DFS

@@ -63,11 +63,13 @@ interest. Selectors power history traversals such as `parents`,
 `nth_ancestors`, ranges like `a..b`, and helpers such as `history_of(entity)`.
 
 ### Constraint
-The trait that every query operator implements. A constraint exposes six methods
-— `variables`, `estimate`, `propose`, `confirm`, `satisfied`, and `influence`
-— that let the Atreides join engine navigate the search space without a
-separate planner. Custom data sources and application predicates participate in
-queries by implementing this trait.
+The trait that every query operator implements. Its six ordinary execution
+methods—`variables`, `estimate`, `propose`, `confirm`, `satisfied`, and
+`influence`—let the Atreides join engine navigate the search space without a
+separate planner. Optional `fixed_denotation` and `proposal_coverage` receipts
+certify a complete tree's relational SET meaning and sound proposal sources.
+Custom data sources and application predicates participate in queries by
+implementing this trait.
 
 ### Entity
 The first position in a trible. Entities identify the subject making a

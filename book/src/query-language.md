@@ -469,7 +469,8 @@ The example wraps an external `HashSet` so it can be queried directly.  A
 `TriblePattern` implementation follows the same shape: create a constraint
 type that reads from your backing store and return it from `pattern`.  The query
 engine drives both traits through `Constraint`, so any data source that speaks
-the block-native protocol can participate in `find!`. The six core methods are:
+the block-native protocol can participate in `find!`. The six ordinary
+execution methods are:
 
 | Method | Role |
 |---|---|
@@ -479,6 +480,14 @@ the block-native protocol can participate in `find!`. The six core methods are:
 | `confirm` | Filter candidates proposed by another constraint without adding any. |
 | `satisfied` | Report exact truth once every relevant variable is bound. |
 | `influence` | Name estimates that may change after a variable is bound or unbound. |
+
+The optional `fixed_denotation` and `proposal_coverage` methods are semantic
+receipts rather than execution verbs. Their defaults retain action-defined
+planning. A complete root enters receipt-aware relational SET planning only
+when every occurrence certifies a fixed denotation; proposal coverage then
+selects sound sources independently of estimates. A transparent wrapper that
+forwards these receipts must also forward the certified estimate, proposal,
+and confirmation methods.
 
 The explicit `Query::sequential()` scheduler calls these methods with a one-row
 [`RowsView`](triblespace::core::query::RowsView) and scalar/plain-value sinks;

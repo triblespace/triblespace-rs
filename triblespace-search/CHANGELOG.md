@@ -17,13 +17,17 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 - Replaced the binding-history-dependent binary `Similar` / `.similar()` API
   with `CosineAtLeast` / `.cosine_at_least()`, an exact symmetric,
   filter-only predicate. It never enumerates a handle domain and now exposes a
-  finite page-local confirmer Program.
+  finite page-local confirmer Program. The public `SimilaritySearch` trait is
+  replaced by `CosineSimilarity`; its exact shared operation is
+  `cosine_between`. The former `neighbours_above` operation leaves the shared
+  trait; directional retrieval remains backend-specific behind `similar_to`.
 - `SimilarTo` remains the explicit fixed-probe retrieval operator. Its
-  semantics are membership, native order, and duplicate multiplicity in one
-  frozen backend result: complete for Flat, approximate for HNSW and succinct
-  HNSW. The frozen result now certifies a fixed relational-SET denotation with
-  exact proposal coverage; exactness is relative to that snapshot, not to
-  ideal nearest-neighbour recall.
+  relational semantics are membership in one frozen backend result: complete
+  for Flat, approximate for HNSW and succinct HNSW. Native order and duplicate
+  multiplicity are physical stream properties, not part of that relation. The
+  frozen result certifies a fixed relational-SET denotation with exact proposal
+  coverage; exactness is relative to that snapshot, not to ideal nearest-
+  neighbour recall.
 - Pairwise cosine now divides by both vector norms, so exact filtering remains
   truthful even for embedding blobs that bypass the crate's normalized-ingest
   helper. Zero vectors retain similarity zero.
