@@ -1243,11 +1243,11 @@ impl ConfirmationUnitClass {
 
 /// Static directed unit costs for one constraint occurrence and target.
 ///
-/// Proposal and confirmation are deliberately separate: an intersection
-/// prices choosing source `S` as the number of candidate **occurrences**
-/// quoted by `S`, multiplied by `S`'s proposal unit, one engine SET-admission
-/// unit, and the confirmation units of every occurrence that must validate
-/// those candidates.
+/// Proposal and confirmation are deliberately separate: flattened residual
+/// planning prices choosing source `S` as the number of candidate
+/// **occurrences** quoted by `S`, multiplied by `S`'s proposal unit, one engine
+/// SET-admission unit, and the confirmation units of every occurrence that
+/// must validate those candidates.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ActionUnitClasses {
     pub proposal: ProposalUnitClass,
@@ -1325,13 +1325,6 @@ impl DirectedActionModel {
             .saturating_mul(unit_weight)
             .min((usize::MAX - 1) as u128) as usize
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ActionSourceChoice {
-    pub occurrence: usize,
-    pub coverage: ProposalCoverage,
-    pub planning_cost: usize,
 }
 
 /// Object-safe child access for a structural constraint shape.
@@ -1539,11 +1532,14 @@ pub trait Constraint<'a> {
     /// may depend on `variable` and `bound`, but never on row values, sampled
     /// timings, frontier width, or scheduler state. They affect planning only:
     /// they neither strengthen proposal coverage nor enter canonical state,
-    /// route, or action identity. An intersection uses directed pricing only
-    /// when every relevant occurrence opts in; otherwise the complete action
-    /// falls back atomically to legacy estimate ordering. The count promise
-    /// above means an opted-in source cannot lawfully return an unknown quote;
-    /// the planner nevertheless preserves `usize::MAX` if it does.
+    /// route, or action identity. The flattened residual Ready planner uses
+    /// directed pricing only when every relevant occurrence opts in;
+    /// otherwise the complete action falls back atomically to legacy estimate
+    /// ordering. Directed prices select a source only within one variable;
+    /// cross-variable ordering continues to compare raw source counts. The
+    /// count promise above means an opted-in source cannot lawfully return an
+    /// unknown quote; the planner nevertheless preserves `usize::MAX` if it
+    /// does.
     ///
     /// A confirmation-only occurrence may return `Some` without providing a
     /// candidate count because its proposal class is not consulted. The
@@ -2936,10 +2932,9 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         }
         let values = self.values[variable].get_or_insert(Vec::new());
         values.clear();
-        // Estimates are ordering costs, not capacity promises. In particular,
-        // directed intersection pricing multiplies a physical candidate count
-        // by unit-work weights. Amortized growth is the only lawful default
-        // until the protocol exposes a separate occurrence-count receipt.
+        // Estimates are ordering costs, not capacity promises. Amortized
+        // growth is the only lawful default until the protocol exposes a
+        // separate occurrence-count receipt.
         let view = RowsView::new_indexed(&self.stack, &self.row, &self.cols);
         propose_constraint(
             &self.constraint,

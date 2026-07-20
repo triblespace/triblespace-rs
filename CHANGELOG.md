@@ -9,15 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Certified intersections can price directed backend work instead of raw
-  proposal width alone.** Lawful leaves may publish immutable logarithmic
+- **Flattened residual AND planning can price directed backend work instead of
+  raw proposal width alone.** Lawful leaves may publish immutable logarithmic
   proposal and confirmation unit classes while their existing estimates quote
-  physical candidate occurrences. Planning then includes proposal, engine SET
+  physical candidate occurrences. The directed price chooses a source within
+  one target variable; cross-variable ordering and generic composite estimates
+  remain on raw cardinalities. Planning includes proposal, engine SET
   admission, and every required confirmation occurrence, with an atomic legacy
   fallback unless all relevant peers opt in. HashSet and single-position
   Succinct sources publish broad hash/sequential versus random-rank classes;
-  repeated-position Succinct targets and multi-shard UnionArchive constraints
-  remain on legacy estimates.
+  finite-formula actions, repeated-position Succinct targets, and multi-shard
+  UnionArchive constraints remain on legacy estimates.
 - **Finite equality work and pointwise TribleSet checks stay on the ordinary
   hybrid path, while TribleSet proposal cursors remain production-resumable.**
   Equality Propose, Confirm, and Support plus TribleSet Confirm and Support are

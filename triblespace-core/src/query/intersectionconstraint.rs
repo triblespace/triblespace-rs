@@ -26,10 +26,6 @@ pub struct IntersectionConstraint<C> {
     constraints: Vec<C>,
 }
 
-struct CertifiedSourcePlan {
-    choices: Vec<ActionSourceChoice>,
-}
-
 impl<'a, C> IntersectionConstraint<C>
 where
     C: Constraint<'a> + 'a,
@@ -49,83 +45,22 @@ where
             .collect()
     }
 
-    fn certified_source_plan(
+    fn target_sources(
         &self,
         variable: VariableId,
-        view: &RowsView<'_>,
-        scalar_quotes: bool,
-    ) -> Option<CertifiedSourcePlan> {
-        let bound = view.bound();
-        let peers: SmallVec<[ActionCostPeer; 16]> = self
-            .target_validators(variable)
-            .into_iter()
-            .map(|occurrence| {
-                let constraint = &self.constraints[occurrence];
-                ActionCostPeer {
-                    occurrence,
-                    coverage: constraint.proposal_coverage(variable, bound),
-                    classes: constraint.action_unit_classes(variable, bound),
-                }
-            })
-            .collect();
-        if !peers
+        bound: VariableSet,
+    ) -> SmallVec<[(usize, ProposalCoverage); 16]> {
+        self.constraints
             .iter()
-            .any(|peer| peer.coverage >= ProposalCoverage::Covering)
-        {
-            return None;
-        }
-
-        let row_count = view.len();
-        let directed = DirectedActionModel::new(&peers);
-        let mut choices = vec![None; row_count];
-        let mut column = Vec::with_capacity(row_count);
-        for &peer in &peers {
-            if peer.coverage < ProposalCoverage::Covering {
-                continue;
-            }
-            column.clear();
-            if scalar_quotes {
-                debug_assert_eq!(row_count, 1, "Scalar quote requires one row");
-                let mut estimate = usize::MAX;
-                self.constraints[peer.occurrence].estimate_certified(
-                    variable,
-                    view,
-                    &mut EstimateSink::Scalar(&mut estimate),
-                );
-                column.push(estimate);
-            } else if !self.constraints[peer.occurrence].estimate_certified(
-                variable,
-                view,
-                &mut EstimateSink::Column(&mut column),
-            ) {
-                debug_assert!(column.is_empty());
-                column.resize(row_count, usize::MAX);
-            } else {
-                debug_assert_eq!(column.len(), row_count);
-            }
-            for (row, &candidate_count) in column.iter().enumerate() {
-                let planning_cost = directed.map_or(candidate_count, |model| {
-                    model.planning_cost(peer, candidate_count)
-                });
-                let key = (planning_cost, peer.occurrence);
-                if choices[row].is_none_or(|best: ActionSourceChoice| {
-                    key < (best.planning_cost, best.occurrence)
-                }) {
-                    choices[row] = Some(ActionSourceChoice {
-                        occurrence: peer.occurrence,
-                        coverage: peer.coverage,
-                        planning_cost,
-                    });
+            .enumerate()
+            .filter_map(|(index, constraint)| {
+                if !constraint.variables().is_set(variable) {
+                    return None;
                 }
-            }
-        }
-
-        Some(CertifiedSourcePlan {
-            choices: choices
-                .into_iter()
-                .map(|choice| choice.expect("a certified source plan observed a source"))
-                .collect(),
-        })
+                let coverage = constraint.proposal_coverage(variable, bound);
+                (coverage >= ProposalCoverage::Covering).then_some((index, coverage))
+            })
+            .collect()
     }
 
     fn certified_estimate(
@@ -134,18 +69,43 @@ where
         view: &RowsView<'_>,
         out: &mut EstimateSink<'_>,
     ) -> bool {
+        let sources = self.target_sources(variable, view.bound());
+        if sources.is_empty() {
+            return false;
+        }
+
         match out {
             EstimateSink::Scalar(slot) => {
-                let Some(plan) = self.certified_source_plan(variable, view, true) else {
-                    return false;
-                };
-                **slot = plan.choices[0].planning_cost;
+                let mut best = usize::MAX;
+                for &(index, _) in &sources {
+                    let mut estimate = usize::MAX;
+                    self.constraints[index].estimate_certified(
+                        variable,
+                        view,
+                        &mut EstimateSink::Scalar(&mut estimate),
+                    );
+                    best = best.min(estimate);
+                }
+                **slot = best;
             }
             EstimateSink::Column(out) => {
-                let Some(plan) = self.certified_source_plan(variable, view, false) else {
-                    return false;
-                };
-                out.extend(plan.choices.iter().map(|choice| choice.planning_cost));
+                let base = out.len();
+                out.resize(base + view.len(), usize::MAX);
+                let mut scratch = Vec::new();
+                for &(index, _) in &sources {
+                    scratch.clear();
+                    if self.constraints[index].estimate_certified(
+                        variable,
+                        view,
+                        &mut EstimateSink::Column(&mut scratch),
+                    ) {
+                        debug_assert_eq!(scratch.len(), view.len());
+                        for (best, estimate) in out[base..].iter_mut().zip(scratch.iter().copied())
+                        {
+                            *best = (*best).min(estimate);
+                        }
+                    }
+                }
             }
         }
         true
@@ -180,45 +140,66 @@ where
         view: &RowsView<'_>,
         candidates: &mut CandidateSink<'_>,
     ) {
-        if view.is_empty() {
+        let sources = self.target_sources(variable, view.bound());
+        if sources.is_empty() || view.is_empty() {
             return;
         }
 
         if matches!(candidates, CandidateSink::Values(_)) {
-            let Some(plan) = self.certified_source_plan(variable, view, true) else {
-                return;
-            };
-            let choice = plan.choices[0];
-            let proposer = choice.occurrence;
+            let &(proposer, coverage) = sources
+                .iter()
+                .min_by_key(|&&(index, _)| {
+                    let mut estimate = usize::MAX;
+                    self.constraints[index].estimate_certified(
+                        variable,
+                        view,
+                        &mut EstimateSink::Scalar(&mut estimate),
+                    );
+                    (estimate, index)
+                })
+                .expect("non-empty certified sources");
             self.constraints[proposer].propose_certified(variable, view, candidates);
-            let skip = (choice.coverage == ProposalCoverage::Exact).then_some(proposer);
+            let skip = (coverage == ProposalCoverage::Exact).then_some(proposer);
             for (_, index) in self.certified_validator_order(variable, view, skip) {
                 self.constraints[index].confirm_certified(variable, view, candidates);
             }
             return;
         }
 
-        let Some(plan) = self.certified_source_plan(variable, view, false) else {
-            return;
-        };
         let n_rows = view.len();
-        let mut propose_counts: SmallVec<[usize; 16]> =
-            SmallVec::from_elem(0, self.constraints.len());
-        let mut proposers: SmallVec<[u32; 32]> = SmallVec::with_capacity(n_rows);
-        for choice in &plan.choices {
-            propose_counts[choice.occurrence] += 1;
-            proposers.push(choice.occurrence as u32);
+        let mut columns = Vec::with_capacity(sources.len() * n_rows);
+        for &(index, _) in &sources {
+            let base = columns.len();
+            if !self.constraints[index].estimate_certified(
+                variable,
+                view,
+                &mut EstimateSink::Column(&mut columns),
+            ) {
+                columns.resize(base + n_rows, usize::MAX);
+            } else {
+                debug_assert_eq!(columns.len(), base + n_rows);
+            }
         }
 
-        let uniform = (0..self.constraints.len()).find(|&index| propose_counts[index] == n_rows);
-        if let Some(proposer) = uniform {
-            self.constraints[proposer].propose_certified(variable, view, candidates);
+        let mut propose_counts: SmallVec<[usize; 16]> = SmallVec::from_elem(0, sources.len());
+        let mut proposers: SmallVec<[u32; 32]> = SmallVec::with_capacity(n_rows);
+        for row in 0..n_rows {
+            let source = (0..sources.len())
+                .min_by_key(|&source| (columns[source * n_rows + row], sources[source].0))
+                .expect("non-empty certified sources");
+            propose_counts[source] += 1;
+            proposers.push(source as u32);
+        }
+
+        let uniform = (0..sources.len()).find(|&source| propose_counts[source] == n_rows);
+        if let Some(source) = uniform {
+            self.constraints[sources[source].0].propose_certified(variable, view, candidates);
         } else {
             let mut scratch = Vec::new();
-            for (row, &proposer) in proposers.iter().enumerate() {
+            for (row, &source) in proposers.iter().enumerate() {
                 let row_view = view.row_view(row);
                 scratch.clear();
-                self.constraints[proposer as usize].propose_certified(
+                self.constraints[sources[source as usize].0].propose_certified(
                     variable,
                     &row_view,
                     &mut CandidateSink::Values(&mut scratch),
@@ -227,8 +208,8 @@ where
             }
         }
 
-        let skip = uniform.and_then(|proposer| {
-            (plan.choices[0].coverage == ProposalCoverage::Exact).then_some(proposer)
+        let skip = uniform.and_then(|source| {
+            (sources[source].1 == ProposalCoverage::Exact).then_some(sources[source].0)
         });
         let first = view.row_view(0);
         for (_, index) in self.certified_validator_order(variable, &first, skip) {
@@ -909,7 +890,7 @@ mod tests {
     }
 
     #[test]
-    fn certified_intersection_zero_cost_opt_in_preserves_legacy_per_row_choices() {
+    fn certified_intersection_selects_the_cheapest_source_per_row() {
         let constraint = IntersectionConstraint::new(vec![
             RowAdaptiveSource {
                 cheap_on: FIRST_ROW,
@@ -924,80 +905,44 @@ mod tests {
         let view = RowsView::new(&[1], &rows);
         let mut candidates = Vec::new();
 
-        assert!(
-            constraint
-                .constraints
-                .iter()
-                .all(|source| source.action_unit_classes(0, view.bound()).is_none())
-        );
         constraint.propose_certified(0, &view, &mut CandidateSink::Tagged(&mut candidates));
 
         assert_eq!(candidates, vec![(0, MEMBER), (1, MEMBER), (1, MEMBER)]);
     }
 
     #[test]
-    fn directed_cost_selects_more_archive_occurrences_to_avoid_random_confirmation() {
-        let constraint = IntersectionConstraint::new(vec![
-            DirectedMultiplicitySource {
+    fn nested_certified_intersection_keeps_raw_scalar_source_order() {
+        type DynConstraint = Box<dyn Constraint<'static> + Send + Sync>;
+
+        let inner = IntersectionConstraint::new(vec![
+            Box::new(DirectedMultiplicitySource {
                 occurrences: 8,
                 classes: ActionUnitClasses::new(
                     ProposalUnitClass::HASH_TABLE_ENUMERATION,
                     ConfirmationUnitClass::HASH_TABLE_MEMBERSHIP,
                 ),
-            },
-            DirectedMultiplicitySource {
+            }) as DynConstraint,
+            Box::new(DirectedMultiplicitySource {
                 occurrences: 29,
                 classes: ActionUnitClasses::new(
                     ProposalUnitClass::SUCCINCT_ORDERED_ENUMERATION,
                     ConfirmationUnitClass::SUCCINCT_RANDOM_MEMBERSHIP,
                 ),
-            },
+            }) as DynConstraint,
         ]);
+        let root = IntersectionConstraint::new(vec![Box::new(inner) as DynConstraint]);
+
+        let mut estimate = usize::MAX;
+        assert!(root.estimate_certified(
+            0,
+            &RowsView::EMPTY,
+            &mut EstimateSink::Scalar(&mut estimate),
+        ));
+        assert_eq!(estimate, 8);
 
         let mut scalar = Vec::new();
-        constraint.propose_certified(0, &RowsView::EMPTY, &mut CandidateSink::Values(&mut scalar));
-        assert_eq!(scalar, vec![MEMBER; 29]);
-
-        let view = RowsView::new_with_row_count(&[], &[], 2);
-        let mut blocked = Vec::new();
-        constraint.propose_certified(0, &view, &mut CandidateSink::Tagged(&mut blocked));
-        assert_eq!(blocked.len(), 58);
-        assert_eq!(blocked.iter().filter(|(row, _)| *row == 0).count(), 29);
-        assert_eq!(blocked.iter().filter(|(row, _)| *row == 1).count(), 29);
-    }
-
-    #[test]
-    fn directed_cost_flips_every_contested_q33_type_bucket() {
-        const SIGNATURE_SUBJECTS: usize = 8_488_750;
-        const CONTESTED_TYPE_BUCKETS: [usize; 5] =
-            [29_400_871, 29_233_605, 21_905_520, 16_409_379, 8_554_462];
-
-        for type_bucket in CONTESTED_TYPE_BUCKETS {
-            let constraint = IntersectionConstraint::new(vec![
-                DirectedMultiplicitySource {
-                    occurrences: SIGNATURE_SUBJECTS,
-                    classes: ActionUnitClasses::new(
-                        ProposalUnitClass::HASH_TABLE_ENUMERATION,
-                        ConfirmationUnitClass::HASH_TABLE_MEMBERSHIP,
-                    ),
-                },
-                DirectedMultiplicitySource {
-                    occurrences: type_bucket,
-                    classes: ActionUnitClasses::new(
-                        ProposalUnitClass::SUCCINCT_ORDERED_ENUMERATION,
-                        ConfirmationUnitClass::SUCCINCT_RANDOM_MEMBERSHIP,
-                    ),
-                },
-            ]);
-
-            let plan = constraint
-                .certified_source_plan(0, &RowsView::EMPTY, true)
-                .expect("q33 action has a certified source");
-            assert_eq!(
-                plan.choices[0].occurrence, 1,
-                "archive source must win for contested type bucket {type_bucket}"
-            );
-        }
+        root.propose_certified(0, &RowsView::EMPTY, &mut CandidateSink::Values(&mut scalar));
+        assert_eq!(scalar, vec![MEMBER; 8]);
     }
 
     /// Two lawful intersection leaves with identical support and estimates,

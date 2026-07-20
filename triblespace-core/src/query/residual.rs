@@ -7362,8 +7362,10 @@ fn ready_plan_transition<'a>(
     let unbound: Vec<VariableId> = full.subtract(desc.bound).into_iter().collect();
     let mut plans = Vec::with_capacity(unbound.len());
     let mut estimate_matrix = Vec::with_capacity(unbound.len() * rows.row_count);
+    let mut proposal_costs = vec![usize::MAX; rows.row_count];
 
     for &variable in &unbound {
+        proposal_costs.fill(usize::MAX);
         let mut relevant = ChildSet::empty(leaf_count);
         let mut proposers = vec![usize::MAX; rows.row_count];
         let estimate_start = estimate_matrix.len();
@@ -7388,7 +7390,16 @@ fn ready_plan_transition<'a>(
                 }
             }
 
-            let directed = DirectedActionModel::new(&peers);
+            // A finite-formula occurrence executes an internal action program,
+            // not the opaque leaf proposal/confirmation pair priced by this
+            // model. Current formula composites already decline unit classes;
+            // keep the structural guard explicit so future forwarding cannot
+            // accidentally price the wrong physical route.
+            let directed = (!peers
+                .iter()
+                .any(|peer| plan.has_finite_formula(peer.occurrence)))
+            .then(|| DirectedActionModel::new(&peers))
+            .flatten();
             for &peer in &peers {
                 if peer.coverage < ProposalCoverage::Covering {
                     continue;
@@ -7420,10 +7431,18 @@ fn ready_plan_transition<'a>(
                     });
                     if proposers[row] == usize::MAX
                         || (planning_cost, peer.occurrence)
-                            < (estimates[row], proposers[row])
+                            < (proposal_costs[row], proposers[row])
                     {
                         proposers[row] = peer.occurrence;
-                        estimates[row] = planning_cost;
+                        proposal_costs[row] = planning_cost;
+                        // Directed work prices select the physical source for
+                        // this variable. Cross-variable ordering remains the
+                        // established cardinality heuristic: compare the raw
+                        // occurrence count quoted by each variable's selected
+                        // source, not backend-specific action units. This
+                        // keeps source direction and logical variable order
+                        // independent.
+                        estimates[row] = column[row];
                     }
                 }
             }
@@ -16234,6 +16253,72 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct DirectedEstimateLeaf {
+        variable: VariableId,
+        occurrences: usize,
+        classes: ActionUnitClasses,
+    }
+
+    impl Constraint<'static> for DirectedEstimateLeaf {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(self.variable)
+        }
+
+        fn fixed_denotation(&self) -> bool {
+            true
+        }
+
+        fn proposal_coverage(
+            &self,
+            variable: VariableId,
+            bound: VariableSet,
+        ) -> ProposalCoverage {
+            if variable == self.variable && !bound.is_set(variable) {
+                ProposalCoverage::Exact
+            } else {
+                ProposalCoverage::None
+            }
+        }
+
+        fn action_unit_classes(
+            &self,
+            variable: VariableId,
+            bound: VariableSet,
+        ) -> Option<ActionUnitClasses> {
+            (variable == self.variable && !bound.is_set(variable)).then_some(self.classes)
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != self.variable {
+                return false;
+            }
+            out.fill(self.occurrences, view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+    }
+
     #[derive(Clone)]
     struct RowAdaptiveLeaf {
         parent: VariableId,
@@ -16776,6 +16861,63 @@ mod tests {
         (actions, stats)
     }
 
+    fn directed_ready_action_fixture(
+        leaves: Vec<DirectedEstimateLeaf>,
+    ) -> Vec<(VariableId, usize, usize)> {
+        let root = IntersectionConstraint::new(leaves);
+        let plan = ResidualPlan::compile(&root);
+        assert!(plan.certified_denotation);
+        let desc = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Ready,
+        };
+        let rows = RowBatch {
+            rows: Vec::new(),
+            row_count: 1,
+        };
+        let full = root.variables();
+        let influences = std::array::from_fn(|variable| root.influence(variable));
+        let mut base_estimates = [usize::MAX; 128];
+        for variable in full {
+            assert!(root.estimate_certified(
+                variable,
+                &RowsView::EMPTY,
+                &mut EstimateSink::Scalar(&mut base_estimates[variable]),
+            ));
+        }
+        let mut worklist = Worklist::new();
+        let mut interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+
+        let _continuation = ready_plan_transition(
+            &root,
+            &plan,
+            &desc,
+            rows,
+            full,
+            &influences,
+            &base_estimates,
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+        );
+
+        let mut actions = Vec::new();
+        for level in worklist.values() {
+            for (&id, bucket) in level {
+                let ResidualPhase::Propose {
+                    variable, proposer, ..
+                } = interner.get(id).phase
+                else {
+                    panic!("Ready planning filed a non-proposal state")
+                };
+                actions.push((variable, proposer, bucket.row_count()));
+            }
+        }
+        actions.sort_unstable();
+        actions
+    }
+
     #[test]
     fn ready_planning_preserves_each_rows_exact_variable_and_proposer() {
         const PARENT: VariableId = 0;
@@ -16802,6 +16944,64 @@ mod tests {
         assert_eq!(actions, [(LEFT, 0, 1), (RIGHT, 2, 1)]);
         assert_eq!(stats.ready_preferred_variable_groups, 2);
         assert_eq!(stats.ready_proposal_groups, 2);
+    }
+
+    #[test]
+    fn ready_directed_cost_keeps_q33_larger_archive_source_direction() {
+        const VARIABLE: VariableId = 0;
+        let actions = directed_ready_action_fixture(vec![
+            DirectedEstimateLeaf {
+                variable: VARIABLE,
+                occurrences: 8_488_750,
+                classes: ActionUnitClasses::new(
+                    ProposalUnitClass::HASH_TABLE_ENUMERATION,
+                    ConfirmationUnitClass::HASH_TABLE_MEMBERSHIP,
+                ),
+            },
+            DirectedEstimateLeaf {
+                variable: VARIABLE,
+                occurrences: 29_400_871,
+                classes: ActionUnitClasses::new(
+                    ProposalUnitClass::SUCCINCT_ORDERED_ENUMERATION,
+                    ConfirmationUnitClass::SUCCINCT_RANDOM_MEMBERSHIP,
+                ),
+            },
+        ]);
+
+        assert_eq!(actions, [(VARIABLE, 1, 1)]);
+    }
+
+    #[test]
+    fn ready_variable_order_uses_q39_raw_count_after_directed_source_choice() {
+        const A: VariableId = 0;
+        const B: VariableId = 1;
+        let archive = ActionUnitClasses::new(
+            ProposalUnitClass::SUCCINCT_ORDERED_ENUMERATION,
+            ConfirmationUnitClass::SUCCINCT_RANDOM_MEMBERSHIP,
+        );
+        let actions = directed_ready_action_fixture(vec![
+            DirectedEstimateLeaf {
+                variable: A,
+                occurrences: 58_801_742,
+                classes: archive,
+            },
+            DirectedEstimateLeaf {
+                variable: B,
+                occurrences: 8_488_750,
+                classes: archive,
+            },
+            DirectedEstimateLeaf {
+                variable: B,
+                occurrences: 8_554_462,
+                classes: archive,
+            },
+        ]);
+
+        assert_eq!(
+            actions,
+            [(B, 1, 1)],
+            "the b source keeps its directed peer pricing, but b must beat a by raw width"
+        );
     }
 
     #[test]
