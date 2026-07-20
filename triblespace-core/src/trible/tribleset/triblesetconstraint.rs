@@ -15,6 +15,7 @@ use crate::query::Constraint;
 use crate::query::DispatchClass;
 use crate::query::EstimateSink;
 use crate::query::ProgramAction;
+use crate::query::ProgramCompleteBatch;
 use crate::query::ProgramCompletion;
 use crate::query::ProgramExposure;
 use crate::query::ProgramGrouping;
@@ -32,6 +33,7 @@ use crate::query::ResidualDeltaSourceCursor;
 use crate::query::ResidualDeltaSourcePage;
 use crate::query::RowsView;
 use crate::query::Term;
+use crate::query::TypedCompleteSink;
 use crate::query::TypedEffectSink;
 use crate::query::TypedProgramBatch;
 use crate::query::TypedProgramSpec;
@@ -1091,27 +1093,38 @@ impl TypedProgramSpec for TribleSetConstraint {
 
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
         let bound_positions = self.bound_position_mask(request.bound);
-        let (key, variable, exposure) = match request.action {
+        let (key, variable, completion, exposure) = match request.action {
             ProgramAction::Propose(variable) | ProgramAction::Confirm(variable) => {
                 let target_positions = self.variable_position_mask(variable);
                 if request.bound.is_set(variable) || target_positions == 0 {
                     return None;
                 }
                 debug_assert_eq!(bound_positions & target_positions, 0);
-                let (action, exposure) = if matches!(request.action, ProgramAction::Propose(_)) {
-                    (TRIBLESET_PROPOSE_ROUTE, ProgramExposure::Production)
-                } else {
-                    (TRIBLESET_CONFIRM_ROUTE, ProgramExposure::Explicit)
-                };
+                let (action, completion, exposure) =
+                    if matches!(request.action, ProgramAction::Propose(_)) {
+                        (
+                            TRIBLESET_PROPOSE_ROUTE,
+                            ProgramCompletion::CompleteActionEquivalent,
+                            ProgramExposure::Production,
+                        )
+                    } else {
+                        (
+                            TRIBLESET_CONFIRM_ROUTE,
+                            ProgramCompletion::PageableOnly,
+                            ProgramExposure::Explicit,
+                        )
+                    };
                 (
                     ProgramKey::new(action | (target_positions << 3) | bound_positions),
                     variable,
+                    completion,
                     exposure,
                 )
             }
             ProgramAction::Support => (
                 ProgramKey::new(TRIBLESET_SUPPORT_ROUTE | bound_positions),
                 self.support_variable()?,
+                ProgramCompletion::PageableOnly,
                 ProgramExposure::Explicit,
             ),
         };
@@ -1120,7 +1133,7 @@ impl TypedProgramSpec for TribleSetConstraint {
             variable,
             stratum: ProgramStratum::Finite,
             grouping: ProgramGrouping::PageLocal,
-            completion: ProgramCompletion::PageableOnly,
+            completion,
             exposure,
         })
     }
@@ -1178,9 +1191,12 @@ impl TypedProgramSpec for TribleSetConstraint {
     ) {
         assert_eq!(batch.route.stratum, ProgramStratum::Finite);
         assert_eq!(batch.route.grouping, ProgramGrouping::PageLocal);
-        assert_eq!(batch.route.completion, ProgramCompletion::PageableOnly);
         let state = match batch.request.action {
             ProgramAction::Propose(variable) => {
+                assert_eq!(
+                    batch.route.completion,
+                    ProgramCompletion::CompleteActionEquivalent
+                );
                 assert_eq!(batch.route.variable, variable);
                 assert!(!batch.request.bound.is_set(variable));
                 assert_ne!(self.variable_position_mask(variable), 0);
@@ -1190,12 +1206,14 @@ impl TypedProgramSpec for TribleSetConstraint {
                 }
             }
             ProgramAction::Confirm(variable) => {
+                assert_eq!(batch.route.completion, ProgramCompletion::PageableOnly);
                 assert_eq!(batch.route.variable, variable);
                 assert!(!batch.request.bound.is_set(variable));
                 assert_ne!(self.variable_position_mask(variable), 0);
                 TribleSetProgramState::Confirm { variable, offset: 0 }
             }
             ProgramAction::Support => {
+                assert_eq!(batch.route.completion, ProgramCompletion::PageableOnly);
                 assert_eq!(Some(batch.route.variable), self.support_variable());
                 TribleSetProgramState::Support
             }
@@ -1319,6 +1337,18 @@ impl TypedProgramSpec for TribleSetConstraint {
                     effects.page(1, None);
                 }
             }
+        }
+    }
+
+    fn complete_typed(&self, batch: ProgramCompleteBatch<'_>, effects: &mut TypedCompleteSink) {
+        let ProgramAction::Propose(variable) = batch.request.action else {
+            panic!("TribleSet complete actions support only proposals")
+        };
+        assert_eq!(variable, batch.route.variable);
+        let positions = self.positions(variable, &batch.view);
+        for (parent, row) in batch.view.iter().enumerate() {
+            let parent = u32::try_from(parent).expect("too many TribleSet complete-action parents");
+            self.propose_row(&positions, row, &mut |value| effects.push(parent, value));
         }
     }
 }
@@ -1633,7 +1663,14 @@ mod tests {
         assert_ne!(propose.key, bound_propose.key);
         assert_eq!(propose.stratum, ProgramStratum::Finite);
         assert_eq!(propose.grouping, ProgramGrouping::PageLocal);
-        assert_eq!(propose.completion, ProgramCompletion::PageableOnly);
+        assert_eq!(
+            propose.completion,
+            ProgramCompletion::CompleteActionEquivalent
+        );
+        assert_eq!(
+            bound_propose.completion,
+            ProgramCompletion::CompleteActionEquivalent
+        );
         assert_eq!(propose.exposure, ProgramExposure::Production);
         assert_eq!(bound_propose.exposure, ProgramExposure::Production);
         assert_eq!(confirm.exposure, ProgramExposure::Explicit);
@@ -1656,6 +1693,63 @@ mod tests {
                 bound: empty,
             })
             .is_none());
+    }
+
+    #[test]
+    fn typed_complete_proposal_matches_the_ordinary_occurrence_bag() {
+        let (set, entities, attributes, _) = direct_fixture();
+        let e = Variable::<GenId>::new(0);
+        let v = Variable::<UnknownInline>::new(1);
+        let constraint = TribleSetConstraint::new(e, Inline::<GenId>::new(attributes[0]), v, set);
+        let variables = [e.index];
+        let view = RowsView::new(&variables, &entities);
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(v.index),
+            bound: VariableSet::new_singleton(e.index),
+        };
+        let program = constraint.residual_program().unwrap();
+        let route = program.route(request).unwrap();
+
+        let mut ordinary = Vec::new();
+        constraint.propose(v.index, &view, &mut CandidateSink::Tagged(&mut ordinary));
+        let mut complete = crate::query::ProgramCompleteEffects::default();
+        program.complete_batch(
+            ProgramCompleteBatch {
+                request,
+                route,
+                view,
+            },
+            &mut complete,
+        );
+
+        assert_eq!(complete.raw_occurrence_count, ordinary.len());
+        assert_eq!(complete.occurrences, ordinary);
+    }
+
+    #[test]
+    fn typed_complete_certificate_keeps_single_parent_proposals_pageable() {
+        let attribute = rngid();
+        let value = Inline::<UnknownInline>::new([0x5b; INLINE_LEN]);
+        let mut set = TribleSet::new();
+        for _ in 0..64 {
+            set.insert(&Trible::new(&rngid(), &attribute, &value));
+        }
+        let entity = Variable::<GenId>::new(0);
+        let constraint = TribleSetConstraint::new(
+            entity,
+            Inline::<GenId>::new(id_into_value(&attribute)),
+            value,
+            set,
+        );
+        let mut query = Query::new(constraint, |binding: &Binding| binding.get(0).copied())
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .cap(1)
+            .start_width(1);
+
+        assert!(query.next().is_some());
+        assert_eq!(query.stats().delta_source_pages, 1);
+        assert_eq!(query.stats().delta_source_candidates_examined, 1);
+        assert_eq!(query.stats().delta_terminal_eager_cohort_admissions, 0);
     }
 
     #[test]
