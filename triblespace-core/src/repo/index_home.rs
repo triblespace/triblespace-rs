@@ -9,9 +9,10 @@
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
+use std::hash::Hash;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use itertools::Itertools;
+use ahash::AHashSet;
 
 use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
 use crate::blob::encodings::succinctarchive::{
@@ -1288,36 +1289,33 @@ impl<'a, U> UnionArchive<'a, U> {
 }
 
 /// Confirm one immutable candidate bag against a physical union through a
-/// sorted, duplicate-free witness frontier.
+/// sorted, duplicate-free probe frontier.
 ///
 /// Each source sees the same logical candidate set in locality order. The
 /// final source consumes the base frontier, so a one-source union needs only
-/// the copy that sorting already requires. Since confirmation only filters,
-/// every survivor run remains sorted and unique. One live source returns that
-/// run directly; several live sources use one k-way merge, bounding comparison
-/// work by the total survivor count times the logarithm of the source count.
-/// This deliberately retains the survivor runs until the merge, trading their
-/// memory for locality and avoiding either a hash table or repeated growing-
-/// union copies. Callers retain the untouched physical bag by binary-searching
-/// the returned witnesses.
-fn sorted_confirmation_witnesses<T, S>(
+/// the copy that sorting already requires. Each source's survivors enter the
+/// membership set immediately, so peak witness storage is bounded by the
+/// distinct candidate count rather than the number of live sources. Hashing
+/// happens only after the ordered Succinct probes; callers then retain the
+/// untouched physical bag through expected-constant-time membership checks.
+fn ordered_confirmation_witnesses<T, S>(
     candidates: &[T],
     sources: impl IntoIterator<Item = S>,
     mut confirm: impl FnMut(S, &mut Vec<T>),
-) -> Vec<T>
+) -> AHashSet<T>
 where
-    T: Copy + Ord,
+    T: Copy + Hash + Ord,
 {
     let mut sources = sources.into_iter().peekable();
     if sources.peek().is_none() {
-        return Vec::new();
+        return AHashSet::new();
     }
 
     let mut base = candidates.to_vec();
     base.sort_unstable();
     base.dedup();
 
-    let mut survivor_runs = Vec::new();
+    let mut witnesses = AHashSet::with_capacity(base.len());
     while let Some(source) = sources.next() {
         let mut survivors = if sources.peek().is_none() {
             std::mem::take(&mut base)
@@ -1326,15 +1324,9 @@ where
         };
         confirm(source, &mut survivors);
         debug_assert!(survivors.windows(2).all(|pair| pair[0] < pair[1]));
-        if !survivors.is_empty() {
-            survivor_runs.push(survivors);
-        }
+        witnesses.extend(survivors);
     }
-    match survivor_runs.len() {
-        0 => Vec::new(),
-        1 => survivor_runs.pop().unwrap(),
-        _ => survivor_runs.into_iter().kmerge().dedup().collect(),
-    }
+    witnesses
 }
 
 #[doc(hidden)]
@@ -1900,7 +1892,7 @@ where
                     .shards
                     .iter()
                     .filter(|constraint| constraint.satisfied(&row_view));
-                let witnesses = sorted_confirmation_witnesses(
+                let witnesses = ordered_confirmation_witnesses(
                     values,
                     live_shards,
                     |constraint, shard_values| {
@@ -1912,7 +1904,7 @@ where
                     },
                 );
 
-                values.retain(|value| witnesses.binary_search(value).is_ok());
+                values.retain(|value| witnesses.contains(value));
             }
             CandidateSink::Tagged(pairs) => {
                 // The lexicographic `(row, value)` witness key both isolates
@@ -1931,7 +1923,7 @@ where
                         .any(|live| *live)
                         .then_some((constraint, live_rows))
                 });
-                let witnesses = sorted_confirmation_witnesses(
+                let witnesses = ordered_confirmation_witnesses(
                     pairs,
                     live_shards,
                     |(constraint, live_rows), shard_pairs| {
@@ -1940,7 +1932,7 @@ where
                     },
                 );
 
-                pairs.retain(|pair| witnesses.binary_search(pair).is_ok());
+                pairs.retain(|pair| witnesses.contains(pair));
             }
         }
     }
