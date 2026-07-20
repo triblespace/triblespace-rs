@@ -1831,6 +1831,13 @@ where
         if candidates.is_empty() {
             return;
         }
+        // A unary set union is its sole child. Delegating the untouched bag
+        // avoids cloning the complete frontier and rebuilding an identical
+        // witness set merely to recover the child's membership result.
+        if self.shards.len() == 1 {
+            self.shards[0].confirm(variable, view, candidates);
+            return;
+        }
 
         match candidates {
             CandidateSink::Values(values) => {
@@ -2718,6 +2725,54 @@ mod tests {
         assert_eq!(
             union_candidates,
             vec![raw_value(4), raw_value(2), raw_value(4), raw_value(2)]
+        );
+    }
+
+    #[test]
+    fn one_shard_union_archive_confirm_matches_direct_tagged_duplicate_bag() {
+        let entity = Id::new([0x17; 16]).unwrap();
+        let attribute = Id::new([0x25; 16]).unwrap();
+        let archives = [fixed_archive(&entity, &attribute, [2, 4])];
+        let entity: Inline<GenId> = entity.to_inline();
+        let attribute: Inline<GenId> = attribute.to_inline();
+        let value = Variable::<UnknownInline>::new(0);
+        let direct = archives[0].pattern(entity, attribute, value);
+        let union_archive = UnionArchive::new(&archives);
+        let union = union_archive.pattern(entity, attribute, value);
+        let view = RowsView::new_with_row_count(&[], &[], 2);
+        let input = vec![
+            (0, raw_value(4)),
+            (0, raw_value(1)),
+            (0, raw_value(2)),
+            (0, raw_value(4)),
+            (1, raw_value(3)),
+            (1, raw_value(2)),
+            (1, raw_value(2)),
+        ];
+
+        let mut direct_candidates = input.clone();
+        direct.confirm(
+            value.index,
+            &view,
+            &mut CandidateSink::Tagged(&mut direct_candidates),
+        );
+        let mut union_candidates = input;
+        union.confirm(
+            value.index,
+            &view,
+            &mut CandidateSink::Tagged(&mut union_candidates),
+        );
+
+        assert_eq!(union_candidates, direct_candidates);
+        assert_eq!(
+            union_candidates,
+            vec![
+                (0, raw_value(4)),
+                (0, raw_value(2)),
+                (0, raw_value(4)),
+                (1, raw_value(2)),
+                (1, raw_value(2)),
+            ]
         );
     }
 
