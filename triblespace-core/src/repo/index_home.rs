@@ -28,11 +28,11 @@ use crate::metadata;
 use crate::prelude::{attributes, entity, pattern};
 use crate::query::unionconstraint::UnionConstraint;
 use crate::query::{
-    CandidateSink, Candidates, Constraint, DispatchClass, EstimateSink, ProgramAction,
-    ProgramCompletion, ProgramExposure, ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef,
-    ProgramRequest, ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage, RawTerm,
-    ResidualDeltaOutput, ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, Term,
-    TriblePattern, TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedResume,
+    ActionUnitClasses, CandidateSink, Candidates, Constraint, DispatchClass, EstimateSink,
+    ProgramAction, ProgramCompletion, ProgramExposure, ProgramGrouping, ProgramKey, ProgramPacing,
+    ProgramRef, ProgramRequest, ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage,
+    RawTerm, ResidualDeltaOutput, ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView,
+    Term, TriblePattern, TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedResume,
     TypedSeedSink, VariableId, VariableSet,
 };
 use crate::repo::index_range::{
@@ -1801,6 +1801,17 @@ where
         }
     }
 
+    fn action_unit_classes(
+        &self,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> Option<ActionUnitClasses> {
+        let [shard] = self.shards.as_slice() else {
+            return None;
+        };
+        shard.action_unit_classes(variable, bound)
+    }
+
     fn estimate(
         &self,
         variable: VariableId,
@@ -2004,8 +2015,8 @@ mod tests {
     use crate::query::intersectionconstraint::IntersectionConstraint;
     use crate::query::residual::ResidualLowering;
     use crate::query::{
-        Binding, ProgramActivation, ProgramBatch, ProgramBatchEffects, ProgramResume, Query,
-        Variable,
+        Binding, ConfirmationUnitClass, ProgramActivation, ProgramBatch, ProgramBatchEffects,
+        ProgramResume, ProposalUnitClass, Query, Variable,
     };
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::repo::{BlobStorePut, CommitHandle};
@@ -2052,6 +2063,68 @@ mod tests {
         ];
 
         assert_eq!(UnionArchive::new(&archives).segment_count(), 2);
+    }
+
+    #[test]
+    fn union_archive_directed_classes_require_one_shard_and_one_target_position() {
+        let entity_id = Id::new([0x31; 16]).unwrap();
+        let attribute_id = Id::new([0x41; 16]).unwrap();
+        let unary_segments = [fixed_archive(&entity_id, &attribute_id, [1, 2])];
+        let entity: Inline<GenId> = entity_id.to_inline();
+        let attribute: Inline<GenId> = attribute_id.to_inline();
+        let value = Variable::<UnknownInline>::new(0);
+        let unary_archive = UnionArchive::new(&unary_segments);
+        let unary = unary_archive.pattern(entity, attribute, value);
+        let classes = unary
+            .action_unit_classes(value.index, VariableSet::new_empty())
+            .expect("a unary single-position archive union inherits exact leaf costs");
+        assert_eq!(
+            classes.proposal,
+            ProposalUnitClass::SUCCINCT_ORDERED_ENUMERATION
+        );
+        assert_eq!(
+            classes.confirmation,
+            ConfirmationUnitClass::SUCCINCT_RANDOM_MEMBERSHIP
+        );
+
+        let mut estimate = usize::MAX;
+        assert!(unary.estimate(
+            value.index,
+            &RowsView::EMPTY,
+            &mut EstimateSink::Scalar(&mut estimate),
+        ));
+        let mut proposed = Vec::new();
+        unary.propose(
+            value.index,
+            &RowsView::EMPTY,
+            &mut CandidateSink::Values(&mut proposed),
+        );
+        assert_eq!(estimate, proposed.len());
+
+        let multi_segments = [
+            fixed_archive(&entity_id, &attribute_id, [1]),
+            fixed_archive(&entity_id, &attribute_id, [2]),
+        ];
+        let multi_archive = UnionArchive::new(&multi_segments);
+        let multi = multi_archive.pattern(entity, attribute, value);
+        assert!(
+            multi
+                .action_unit_classes(value.index, VariableSet::new_empty())
+                .is_none(),
+            "multi-shard union normalization has no v1 unit class"
+        );
+
+        let repeated = unary_archive.pattern(
+            Variable::<GenId>::new(1),
+            attribute,
+            Variable::<GenId>::new(1),
+        );
+        assert!(
+            repeated
+                .action_unit_classes(1, VariableSet::new_empty())
+                .is_none(),
+            "repeated-target estimates are conservative upper bounds"
+        );
     }
 
     fn one_union_program_step<U>(

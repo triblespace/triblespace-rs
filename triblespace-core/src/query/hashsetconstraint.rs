@@ -132,6 +132,19 @@ where
         }
     }
 
+    fn action_unit_classes(
+        &self,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> Option<ActionUnitClasses> {
+        (variable == self.variable.index && !bound.is_set(variable)).then_some(
+            ActionUnitClasses::new(
+                ProposalUnitClass::HASH_TABLE_ENUMERATION,
+                ConfirmationUnitClass::HASH_TABLE_MEMBERSHIP,
+            ),
+        )
+    }
+
     fn estimate(
         &self,
         variable: VariableId,
@@ -222,5 +235,52 @@ where
 
     fn has(self, v: Variable<S>) -> Self::Constraint {
         SetConstraint::new(v, self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inline::Inline;
+    use crate::inline::encodings::UnknownInline;
+
+    #[test]
+    fn hash_set_action_classes_cover_exact_proposal_occurrences() {
+        let values: HashSet<_> = [
+            Inline::<UnknownInline>::new([0x11; 32]),
+            Inline::<UnknownInline>::new([0x22; 32]),
+        ]
+        .into_iter()
+        .collect();
+        let variable = Variable::<UnknownInline>::new(0);
+        let constraint = SetConstraint::new(variable, &values);
+        let classes = constraint
+            .action_unit_classes(variable.index, VariableSet::new_empty())
+            .expect("an unbound HashSet target has exact occurrence counts");
+
+        assert_eq!(classes.proposal, ProposalUnitClass::HASH_TABLE_ENUMERATION);
+        assert_eq!(
+            classes.confirmation,
+            ConfirmationUnitClass::HASH_TABLE_MEMBERSHIP
+        );
+        let mut estimate = usize::MAX;
+        assert!(constraint.estimate(
+            variable.index,
+            &RowsView::EMPTY,
+            &mut EstimateSink::Scalar(&mut estimate),
+        ));
+        let mut proposed = Vec::new();
+        constraint.propose(
+            variable.index,
+            &RowsView::EMPTY,
+            &mut CandidateSink::Values(&mut proposed),
+        );
+        assert_eq!(estimate, proposed.len());
+        let bound = VariableSet::new_singleton(variable.index);
+        assert!(
+            constraint
+                .action_unit_classes(variable.index, bound)
+                .is_none()
+        );
     }
 }

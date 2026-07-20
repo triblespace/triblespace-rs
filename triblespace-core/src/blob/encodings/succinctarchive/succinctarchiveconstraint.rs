@@ -1429,6 +1429,20 @@ where
         }
     }
 
+    fn action_unit_classes(
+        &self,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> Option<ActionUnitClasses> {
+        let target_count = usize::from(self.term_e.is_var(variable))
+            + usize::from(self.term_a.is_var(variable))
+            + usize::from(self.term_v.is_var(variable));
+        (!bound.is_set(variable) && target_count == 1).then_some(ActionUnitClasses::new(
+            ProposalUnitClass::SUCCINCT_ORDERED_ENUMERATION,
+            ConfirmationUnitClass::SUCCINCT_RANDOM_MEMBERSHIP,
+        ))
+    }
+
     /// Per-row rank probes with the arm dispatch hoisted out of the row
     /// loop. Batching the resulting rank stream is possible exactly like
     /// confirm's and remains deferred — it only changes constants, not calls.
@@ -2014,6 +2028,67 @@ mod typed_program_tests {
                 bound: empty,
             })
             .is_none());
+    }
+
+    #[test]
+    fn directed_classes_require_one_target_position_and_exact_occurrence_count() {
+        let set: TribleSet = [
+            trible(1, 11, inline_value(21)),
+            trible(1, 11, inline_value(22)),
+        ]
+        .into_iter()
+        .collect();
+        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+        let value = Variable::<UnknownInline>::new(0);
+        let constraint = SuccinctArchiveConstraint::new(
+            Inline::<GenId>::new(id_value(1)),
+            Inline::<GenId>::new(id_value(11)),
+            value,
+            &archive,
+        );
+        let classes = constraint
+            .action_unit_classes(value.index, VariableSet::new_empty())
+            .expect("a single-position Succinct target has exact occurrence counts");
+        assert_eq!(
+            classes.proposal,
+            ProposalUnitClass::SUCCINCT_ORDERED_ENUMERATION
+        );
+        assert_eq!(
+            classes.confirmation,
+            ConfirmationUnitClass::SUCCINCT_RANDOM_MEMBERSHIP
+        );
+
+        let mut estimate = usize::MAX;
+        assert!(constraint.estimate(
+            value.index,
+            &RowsView::EMPTY,
+            &mut EstimateSink::Scalar(&mut estimate),
+        ));
+        let mut proposed = Vec::new();
+        constraint.propose(
+            value.index,
+            &RowsView::EMPTY,
+            &mut CandidateSink::Values(&mut proposed),
+        );
+        assert_eq!(estimate, proposed.len());
+
+        let repeated = SuccinctArchiveConstraint::new(
+            Variable::<GenId>::new(1),
+            Inline::<GenId>::new(id_value(11)),
+            Variable::<GenId>::new(1),
+            &archive,
+        );
+        assert!(
+            repeated
+                .action_unit_classes(1, VariableSet::new_empty())
+                .is_none(),
+            "a repeated target uses a conservative estimate, not an occurrence count"
+        );
+        assert!(
+            constraint
+                .action_unit_classes(value.index, VariableSet::new_singleton(value.index))
+                .is_none()
+        );
     }
 
     #[test]

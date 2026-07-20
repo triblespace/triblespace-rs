@@ -1189,6 +1189,12 @@ impl ProposalUnitClass {
     /// domain, so exact-source subtraction cannot erase other peers.
     pub const MAX_LOG2_RANK: u8 = 63;
 
+    /// Direct iteration through a hash table's occupied entries.
+    pub const HASH_TABLE_ENUMERATION: Self = Self(0);
+
+    /// Ordered enumeration from a succinct index range.
+    pub const SUCCINCT_ORDERED_ENUMERATION: Self = Self(0);
+
     /// Defines a backend capability tier by its base-two rank.
     pub const fn from_log2_rank(rank: u8) -> Self {
         assert!(rank <= Self::MAX_LOG2_RANK, "unit-work rank exceeds 63");
@@ -1212,6 +1218,16 @@ pub struct ConfirmationUnitClass(u8);
 impl ConfirmationUnitClass {
     /// Largest public tier; see [`ProposalUnitClass::MAX_LOG2_RANK`].
     pub const MAX_LOG2_RANK: u8 = ProposalUnitClass::MAX_LOG2_RANK;
+
+    /// One locality-friendly hash membership probe.
+    pub const HASH_TABLE_MEMBERSHIP: Self = Self(0);
+
+    /// A domain search followed by dependent random rank/select probes.
+    ///
+    /// Rank 5 is the broad 32x capability tier: calibration places this
+    /// operation around 35x a sequential/hash unit, with a crossover near
+    /// 15x. The tier describes the access pattern, not any particular query.
+    pub const SUCCINCT_RANDOM_MEMBERSHIP: Self = Self(5);
 
     /// Defines a backend capability tier by its base-two rank.
     pub const fn from_log2_rank(rank: u8) -> Self {
@@ -5500,6 +5516,35 @@ mod tests {
     }
 
     #[test]
+    fn directed_cost_can_choose_a_larger_ordered_source() {
+        let hash = ActionCostPeer {
+            occurrence: 0,
+            coverage: ProposalCoverage::Exact,
+            classes: Some(ActionUnitClasses::new(
+                ProposalUnitClass::HASH_TABLE_ENUMERATION,
+                ConfirmationUnitClass::HASH_TABLE_MEMBERSHIP,
+            )),
+        };
+        let archive = ActionCostPeer {
+            occurrence: 1,
+            coverage: ProposalCoverage::Exact,
+            classes: Some(ActionUnitClasses::new(
+                ProposalUnitClass::SUCCINCT_ORDERED_ENUMERATION,
+                ConfirmationUnitClass::SUCCINCT_RANDOM_MEMBERSHIP,
+            )),
+        };
+        let model = DirectedActionModel::new(&[hash, archive]).expect("complete classes");
+        let hash_cost = model.planning_cost(hash, 8);
+
+        for archive_count in [9, 16, 21, 29] {
+            assert!(
+                model.planning_cost(archive, archive_count) < hash_cost,
+                "ordered source width {archive_count} should avoid random succinct confirmation"
+            );
+        }
+    }
+
+    #[test]
     fn directed_action_model_covering_source_confirms_itself() {
         let covering = action_peer(0, ProposalCoverage::Covering, 0, 6);
         let peer = action_peer(1, ProposalCoverage::Exact, 0, 0);
@@ -5532,8 +5577,8 @@ mod tests {
         let model = DirectedActionModel::new(&[source]).expect("complete classes");
 
         assert_eq!(model.planning_cost(source, 0), 0);
-        let one = ((1u128 << ProposalUnitClass::MAX_LOG2_RANK) + 1)
-            .min((usize::MAX - 1) as u128) as usize;
+        let one = ((1u128 << ProposalUnitClass::MAX_LOG2_RANK) + 1).min((usize::MAX - 1) as u128)
+            as usize;
         assert_eq!(model.planning_cost(source, 1), one);
         assert_eq!(model.planning_cost(source, 2), usize::MAX - 1);
         assert_eq!(model.planning_cost(source, usize::MAX), usize::MAX);

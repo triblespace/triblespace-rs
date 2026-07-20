@@ -728,6 +728,79 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct DirectedMultiplicitySource {
+        occurrences: usize,
+        classes: ActionUnitClasses,
+    }
+
+    impl Constraint<'static> for DirectedMultiplicitySource {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(0)
+        }
+
+        fn fixed_denotation(&self) -> bool {
+            true
+        }
+
+        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+            if variable == 0 && !bound.is_set(variable) {
+                ProposalCoverage::Exact
+            } else {
+                ProposalCoverage::None
+            }
+        }
+
+        fn action_unit_classes(
+            &self,
+            variable: VariableId,
+            bound: VariableSet,
+        ) -> Option<ActionUnitClasses> {
+            (variable == 0 && !bound.is_set(variable)).then_some(self.classes)
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != 0 {
+                return false;
+            }
+            out.fill(self.occurrences, view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            if variable == 0 {
+                for row in 0..view.len() as u32 {
+                    candidates.extend_row(row, std::iter::repeat_n(MEMBER, self.occurrences));
+                }
+            }
+        }
+
+        fn confirm(
+            &self,
+            variable: VariableId,
+            _view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            if variable == 0 {
+                candidates.retain(|_, value| *value == MEMBER);
+            }
+        }
+
+        fn satisfied(&self, _view: &RowsView<'_>) -> bool {
+            true
+        }
+    }
+
     #[test]
     fn certified_intersection_never_promotes_a_low_quoted_none_validator() {
         let constraint = IntersectionConstraint::new(vec![
@@ -860,6 +933,37 @@ mod tests {
         constraint.propose_certified(0, &view, &mut CandidateSink::Tagged(&mut candidates));
 
         assert_eq!(candidates, vec![(0, MEMBER), (1, MEMBER), (1, MEMBER)]);
+    }
+
+    #[test]
+    fn directed_cost_selects_more_archive_occurrences_to_avoid_random_confirmation() {
+        let constraint = IntersectionConstraint::new(vec![
+            DirectedMultiplicitySource {
+                occurrences: 8,
+                classes: ActionUnitClasses::new(
+                    ProposalUnitClass::HASH_TABLE_ENUMERATION,
+                    ConfirmationUnitClass::HASH_TABLE_MEMBERSHIP,
+                ),
+            },
+            DirectedMultiplicitySource {
+                occurrences: 29,
+                classes: ActionUnitClasses::new(
+                    ProposalUnitClass::SUCCINCT_ORDERED_ENUMERATION,
+                    ConfirmationUnitClass::SUCCINCT_RANDOM_MEMBERSHIP,
+                ),
+            },
+        ]);
+
+        let mut scalar = Vec::new();
+        constraint.propose_certified(0, &RowsView::EMPTY, &mut CandidateSink::Values(&mut scalar));
+        assert_eq!(scalar, vec![MEMBER; 29]);
+
+        let view = RowsView::new_with_row_count(&[], &[], 2);
+        let mut blocked = Vec::new();
+        constraint.propose_certified(0, &view, &mut CandidateSink::Tagged(&mut blocked));
+        assert_eq!(blocked.len(), 58);
+        assert_eq!(blocked.iter().filter(|(row, _)| *row == 0).count(), 29);
+        assert_eq!(blocked.iter().filter(|(row, _)| *row == 1).count(), 29);
     }
 
     /// Two lawful intersection leaves with identical support and estimates,
