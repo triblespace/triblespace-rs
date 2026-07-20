@@ -1180,7 +1180,7 @@ pub enum ProposalCoverage {
 /// bound-variable schema, but never on row values, observed timings, frontier
 /// width, or scheduler state. The engine uses only their ordering and integer
 /// weights; they do not participate in semantic receipts or action identity.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProposalUnitClass(u8);
 
 impl ProposalUnitClass {
@@ -1212,7 +1212,7 @@ impl ProposalUnitClass {
 /// Rank `r` in `0..=63` represents the broad capability class `2^r`. Like
 /// [`ProposalUnitClass`], this is immutable planning metadata rather than a
 /// runtime measurement or semantic capability.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConfirmationUnitClass(u8);
 
 impl ConfirmationUnitClass {
@@ -1248,7 +1248,7 @@ impl ConfirmationUnitClass {
 /// quoted by `S`, multiplied by `S`'s proposal unit, one engine SET-admission
 /// unit, and the confirmation units of every occurrence that must validate
 /// those candidates.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ActionUnitClasses {
     pub proposal: ProposalUnitClass,
     pub confirmation: ConfirmationUnitClass,
@@ -2873,7 +2873,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// [`UnindexedProducer::split`](crate::query::QueryParIter) implementation
     /// — the "push + propose" dance is identical in both.
     fn push_next_variable(&mut self) {
-        let (variable, coverage, estimate) = if self.certified_denotation {
+        let (variable, coverage) = if self.certified_denotation {
             // Coverage is structural in the complete bound schema and may be
             // enabled by any newly bound peer (Equality is the smallest
             // example). Recompute the at-most-128 source receipts rather than
@@ -2899,9 +2899,9 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
                     best = Some((index, coverage, estimate, key));
                 }
             }
-            let (index, coverage, estimate, _) =
+            let (index, coverage, _, _) =
                 best.unwrap_or_else(|| panic!("{CERTIFIED_SOURCE_FRONTIER_ERROR}"));
-            (self.unbound.remove(index), coverage, estimate)
+            (self.unbound.remove(index), coverage)
         } else {
             let mut stale_estimates = VariableSet::new_empty();
             while let Some(variable) = self.touched_variables.drain_next_ascending() {
@@ -2929,16 +2929,17 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             }
 
             let variable = self.unbound.pop().expect("non-empty unbound");
-            (variable, ProposalCoverage::Exact, self.estimates[variable])
+            (variable, ProposalCoverage::Exact)
         };
         if order_trace::enabled() {
             order_trace::record(self.stack.len(), variable, 1);
         }
         let values = self.values[variable].get_or_insert(Vec::new());
         values.clear();
-        if estimate != usize::MAX {
-            values.reserve_exact(estimate.saturating_sub(values.capacity()));
-        }
+        // Estimates are ordering costs, not capacity promises. In particular,
+        // directed intersection pricing multiplies a physical candidate count
+        // by unit-work weights. Amortized growth is the only lawful default
+        // until the protocol exposes a separate occurrence-count receipt.
         let view = RowsView::new_indexed(&self.stack, &self.row, &self.cols);
         propose_constraint(
             &self.constraint,

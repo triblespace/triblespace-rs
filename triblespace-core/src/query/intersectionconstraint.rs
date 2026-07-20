@@ -966,6 +966,40 @@ mod tests {
         assert_eq!(blocked.iter().filter(|(row, _)| *row == 1).count(), 29);
     }
 
+    #[test]
+    fn directed_cost_flips_every_contested_q33_type_bucket() {
+        const SIGNATURE_SUBJECTS: usize = 8_488_750;
+        const CONTESTED_TYPE_BUCKETS: [usize; 5] =
+            [29_400_871, 29_233_605, 21_905_520, 16_409_379, 8_554_462];
+
+        for type_bucket in CONTESTED_TYPE_BUCKETS {
+            let constraint = IntersectionConstraint::new(vec![
+                DirectedMultiplicitySource {
+                    occurrences: SIGNATURE_SUBJECTS,
+                    classes: ActionUnitClasses::new(
+                        ProposalUnitClass::HASH_TABLE_ENUMERATION,
+                        ConfirmationUnitClass::HASH_TABLE_MEMBERSHIP,
+                    ),
+                },
+                DirectedMultiplicitySource {
+                    occurrences: type_bucket,
+                    classes: ActionUnitClasses::new(
+                        ProposalUnitClass::SUCCINCT_ORDERED_ENUMERATION,
+                        ConfirmationUnitClass::SUCCINCT_RANDOM_MEMBERSHIP,
+                    ),
+                },
+            ]);
+
+            let plan = constraint
+                .certified_source_plan(0, &RowsView::EMPTY, true)
+                .expect("q33 action has a certified source");
+            assert_eq!(
+                plan.choices[0].occurrence, 1,
+                "archive source must win for contested type bucket {type_bucket}"
+            );
+        }
+    }
+
     /// Two lawful intersection leaves with identical support and estimates,
     /// but different proposal multiplicity. Confirm only filters, so child
     /// order is the observable equal-estimate proposer tie break.
