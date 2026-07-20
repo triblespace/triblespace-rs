@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Residual execution has an opt-in, query-local phase probe for causal
+  diagnostics.** An explicit thread-local `arm`/`take` interval records bounded
+  per-query counters and wall time for HashSet proposal/filter work,
+  source-attributed inline and pageable SET admission, logical UnionArchive
+  work, physical SuccinctArchive proposal/confirmation probe traffic, and
+  terminal draining. Recording remains off by default, and multi-query
+  translations retain their witness/main solve boundary.
 - **Finite equality work and pointwise TribleSet checks stay on the ordinary
   hybrid path, while TribleSet proposal cursors remain production-resumable.**
   Equality Propose, Confirm, and Support plus TribleSet Confirm and Support are

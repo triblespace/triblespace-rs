@@ -1628,6 +1628,10 @@ where
         };
         match first {
             UnionArchiveProgramState::Propose { variable, .. } => {
+                let phase_started = crate::debug::query::residual_phase_timer();
+                let parent_rows = states.len();
+                let mut examined_total = 0usize;
+                let mut output_total = 0usize;
                 let variable = *variable;
                 for (input, state) in states.into_iter().enumerate() {
                     let UnionArchiveProgramState::Propose {
@@ -1653,6 +1657,7 @@ where
                     let mut examined = 0usize;
                     while examined < limit && shard_index < self.shards.len() {
                         let accepted_base = direct.len();
+                        let shard_started = crate::debug::query::residual_phase_timer();
                         let page = self.shards[shard_index].proposal_source_page_single(
                             variable,
                             &view,
@@ -1660,6 +1665,14 @@ where
                             limit - examined,
                             &mut direct,
                         );
+                        if let Some(started) = shard_started {
+                            crate::debug::query::record_succinct_source(
+                                1,
+                                page.examined,
+                                direct.len() - accepted_base,
+                                started.elapsed(),
+                            );
+                        }
                         assert_eq!(
                             direct.len() - accepted_base,
                             page.examined,
@@ -1679,6 +1692,8 @@ where
                             cursor = ResidualDeltaSourceCursor::Start;
                         }
                     }
+                    examined_total += examined;
+                    output_total += direct.len();
                     let input = u32::try_from(input)
                         .expect("too many typed UnionArchive inputs in one cohort");
                     for value in direct {
@@ -1697,6 +1712,14 @@ where
                     );
                     effects.account_source(examined, 0);
                     effects.page(examined, resume.map(TypedResume::Immediate));
+                }
+                if let Some(started) = phase_started {
+                    crate::debug::query::record_union_archive_source(
+                        parent_rows,
+                        examined_total,
+                        output_total,
+                        started.elapsed(),
+                    );
                 }
             }
             UnionArchiveProgramState::Confirm { variable, .. } => {
@@ -1816,7 +1839,18 @@ where
         view: &RowsView<'_>,
         candidates: &mut CandidateSink<'_>,
     ) {
-        self.union.propose(variable, view, candidates)
+        let phase_started = crate::debug::query::residual_phase_timer();
+        let output_before = candidates.len();
+        self.union.propose(variable, view, candidates);
+        if let Some(started) = phase_started {
+            let output = candidates.len().saturating_sub(output_before);
+            crate::debug::query::record_union_archive_source(
+                view.len(),
+                output,
+                output,
+                started.elapsed(),
+            );
+        }
     }
 
     fn confirm(
@@ -1832,6 +1866,8 @@ where
             return;
         }
 
+        let phase_started = crate::debug::query::residual_phase_timer();
+        let input = candidates.len();
         match candidates {
             CandidateSink::Values(values) => {
                 debug_assert_eq!(
@@ -1890,6 +1926,14 @@ where
 
                 pairs.retain(|pair| witnesses.contains(pair));
             }
+        }
+        if let Some(started) = phase_started {
+            crate::debug::query::record_union_archive_confirm(
+                view.len(),
+                input,
+                candidates.len(),
+                started.elapsed(),
+            );
         }
     }
 

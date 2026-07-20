@@ -93,6 +93,16 @@ where
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
+        let confirming = matches!(
+            states.first(),
+            Some(finiteunaryprogram::FiniteUnaryProgramState::Confirm { .. })
+        );
+        let parent_rows = states.len();
+        let phase_started = confirming
+            .then(crate::debug::query::residual_phase_timer)
+            .flatten();
+        let mut examined = 0usize;
+        let mut accepted = 0usize;
         finiteunaryprogram::step(
             self.variable.index,
             states,
@@ -101,8 +111,23 @@ where
             |_input, _cursor, _limit, _accepted| {
                 panic!("filter-only hash-set Program entered an ordered proposal step")
             },
-            |_input, value| self.contains_raw(value),
-        )
+            |_input, value| {
+                let contains = self.contains_raw(value);
+                if confirming {
+                    examined += 1;
+                    accepted += usize::from(contains);
+                }
+                contains
+            },
+        );
+        if let Some(started) = phase_started {
+            crate::debug::query::record_hashset_confirm(
+                parent_rows,
+                examined,
+                accepted,
+                started.elapsed(),
+            );
+        }
     }
 }
 
@@ -153,8 +178,19 @@ where
         candidates: &mut CandidateSink<'_>,
     ) {
         if self.variable.index == variable {
+            let phase_started = crate::debug::query::residual_phase_timer();
+            let output_before = candidates.len();
             for i in 0..view.len() as u32 {
                 candidates.extend_row(i, self.set.iter().map(|v| IntoInline::to_inline(v).raw));
+            }
+            if let Some(started) = phase_started {
+                let output = candidates.len().saturating_sub(output_before);
+                crate::debug::query::record_hashset_source(
+                    view.len(),
+                    output,
+                    output,
+                    started.elapsed(),
+                );
             }
         }
     }
@@ -162,11 +198,21 @@ where
     fn confirm(
         &self,
         variable: VariableId,
-        _view: &RowsView<'_>,
+        view: &RowsView<'_>,
         candidates: &mut CandidateSink<'_>,
     ) {
         if self.variable.index == variable {
+            let phase_started = crate::debug::query::residual_phase_timer();
+            let input = candidates.len();
             candidates.retain(|_, value| self.contains_raw(value));
+            if let Some(started) = phase_started {
+                crate::debug::query::record_hashset_confirm(
+                    view.len(),
+                    input,
+                    candidates.len(),
+                    started.elapsed(),
+                );
+            }
         }
     }
 

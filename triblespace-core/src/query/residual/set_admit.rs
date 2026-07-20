@@ -56,7 +56,9 @@ impl SetAdmissionState {
         if input.is_empty() {
             return None;
         }
+        let input_len = input.len();
         input.defer_for_shared_activation(1);
+        crate::debug::query::record_pageable_set_admission_start(input_len);
         Some(Self {
             phase: SetAdmissionPhase::Scan(ScanState {
                 input: input.shared_one_parent_cursor(),
@@ -86,8 +88,10 @@ impl SetAdmissionState {
 
     pub(super) fn advance(mut self, grant: usize) -> SetAdmissionPage {
         assert!(grant > 0, "SET admission requires a positive grant");
+        let phase_started = crate::debug::query::residual_phase_timer();
         let previous_rank = self.rank();
         let mut examined = 0usize;
+        let mut scanned = 0usize;
         let mut emitted = Vec::new();
 
         while examined < grant {
@@ -119,6 +123,7 @@ impl SetAdmissionState {
                     );
                     self.phase = SetAdmissionPhase::Scan(state);
                     examined += 1;
+                    scanned += 1;
                 }
                 SetAdmissionPhase::Emit(mut values) => {
                     let Some((&position, &value)) = values.iter().next() else {
@@ -137,6 +142,13 @@ impl SetAdmissionState {
         assert!(examined <= grant, "SET admission exceeded its grant");
         let rank = self.rank();
         assert!(rank < previous_rank, "SET admission did not lower its rank");
+        if let Some(started) = phase_started {
+            crate::debug::query::record_pageable_set_admission(
+                scanned,
+                emitted.len(),
+                started.elapsed(),
+            );
+        }
         SetAdmissionPage {
             examined,
             emitted,

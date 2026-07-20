@@ -1,4 +1,3 @@
-use std::ops::Not;
 use std::ops::Range;
 
 use super::*;
@@ -1278,6 +1277,10 @@ where
         };
         match first {
             SuccinctArchiveProgramState::Propose { variable, .. } => {
+                let phase_started = crate::debug::query::residual_phase_timer();
+                let parent_rows = states.len();
+                let mut examined_total = 0usize;
+                let mut output_total = 0usize;
                 let variable = *variable;
                 let positions = self.positions(variable, &batch.view);
                 for (input, state) in states.into_iter().enumerate() {
@@ -1301,6 +1304,8 @@ where
                         batch.limits[input],
                         &mut direct,
                     );
+                    examined_total += page.examined;
+                    output_total += direct.len();
                     let input = u32::try_from(input)
                         .expect("too many typed SuccinctArchive inputs in one cohort");
                     for value in direct {
@@ -1318,6 +1323,14 @@ where
                     });
                     effects.account_source(page.examined, 0);
                     effects.page(page.examined, resume);
+                }
+                if let Some(started) = phase_started {
+                    crate::debug::query::record_succinct_source(
+                        parent_rows,
+                        examined_total,
+                        output_total,
+                        started.elapsed(),
+                    );
                 }
             }
             SuccinctArchiveProgramState::Confirm { variable, .. } => {
@@ -1464,6 +1477,8 @@ where
         {
             return;
         }
+        let phase_started = crate::debug::query::residual_phase_timer();
+        let output_before = candidates.len();
         let p = self.positions(variable, view);
 
         match candidates {
@@ -1477,6 +1492,15 @@ where
                     self.propose_row(&p, row, &mut |v| values.push(v));
                 }
             }
+        }
+        if let Some(started) = phase_started {
+            let output = candidates.len().saturating_sub(output_before);
+            crate::debug::query::record_succinct_source(
+                view.len(),
+                output,
+                output,
+                started.elapsed(),
+            );
         }
     }
 
@@ -1513,11 +1537,31 @@ where
             return;
         }
 
+        let phase_started = crate::debug::query::residual_phase_timer();
+        let input = candidates.len();
+        let parent_rows = view.len();
         let p = self.positions(variable, view);
         if p.target_count() > 1 {
             candidates.retain(|row_idx, value| {
                 self.repeated_value_matches(&p, view.row(row_idx as usize), value)
             });
+            if let Some(started) = phase_started {
+                crate::debug::query::record_succinct_confirm(
+                    crate::debug::query::SuccinctConfirmSample {
+                        parent_rows,
+                        input,
+                        output: candidates.len(),
+                        prefix_candidates: 0,
+                        repeated_candidates: input,
+                        range_rows: 0,
+                        domain_searches: 0,
+                        domain_hits: 0,
+                        rank_probes: 0,
+                        external_rank_batches: 0,
+                        wall: started.elapsed(),
+                    },
+                );
+            }
             return;
         }
         let archive = self.archive;
@@ -1535,8 +1579,33 @@ where
                     } else {
                         &archive.v_a
                     };
-                    candidates
-                        .retain(|_, val| base_range(&archive.domain, prefix, val).is_empty().not());
+                    let mut domain_hits = 0usize;
+                    candidates.retain(|_, val| {
+                        let Some(code) = archive.domain.search(val) else {
+                            return false;
+                        };
+                        domain_hits += 1;
+                        let start = prefix.select1(code).unwrap() - code;
+                        let end = prefix.select1(code + 1).unwrap() - (code + 1);
+                        start != end
+                    });
+                    if let Some(started) = phase_started {
+                        crate::debug::query::record_succinct_confirm(
+                            crate::debug::query::SuccinctConfirmSample {
+                                parent_rows,
+                                input,
+                                output: candidates.len(),
+                                prefix_candidates: input,
+                                repeated_candidates: 0,
+                                range_rows: 0,
+                                domain_searches: input,
+                                domain_hits,
+                                rank_probes: 0,
+                                external_rank_batches: 0,
+                                wall: started.elapsed(),
+                            },
+                        );
+                    }
                     return;
                 }
                 (Some(se), None, None, false, true, false) => (
@@ -1624,18 +1693,24 @@ where
         let mut has_probes: Vec<bool> = Vec::with_capacity(candidates.len());
         let mut current_row: Option<u32> = None;
         let mut r: Range<usize> = 0..0;
+        let mut range_rows = 0usize;
+        let mut domain_searches = 0usize;
+        let mut domain_hits = 0usize;
         candidates.for_each(|row_idx, val| {
             if current_row != Some(row_idx) {
                 current_row = Some(row_idx);
                 r = range_fn(view.row(row_idx as usize));
+                range_rows += 1;
             }
             if r.is_empty() {
                 has_probes.push(false);
                 return;
             }
+            domain_searches += 1;
             match archive.domain.search(val) {
                 None => has_probes.push(false),
                 Some(d) => {
+                    domain_hits += 1;
                     probe_pos.push(r.start);
                     probe_val.push(d);
                     probe_pos.push(r.end);
@@ -1681,6 +1756,23 @@ where
             i += 1;
             keep
         });
+        if let Some(started) = phase_started {
+            crate::debug::query::record_succinct_confirm(
+                crate::debug::query::SuccinctConfirmSample {
+                    parent_rows,
+                    input,
+                    output: candidates.len(),
+                    prefix_candidates: 0,
+                    repeated_candidates: 0,
+                    range_rows,
+                    domain_searches,
+                    domain_hits,
+                    rank_probes: probe_pos.len(),
+                    external_rank_batches: usize::from(self.ring_batch.is_some()),
+                    wall: started.elapsed(),
+                },
+            );
+        }
     }
 
     fn residual_confirm_is_page_local(&self) -> bool {

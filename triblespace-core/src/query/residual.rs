@@ -5156,7 +5156,9 @@ impl CandidatePayload {
     /// affine payload. It must never hide an unbounded materialization here.
     fn admit_set_tail_stable(&mut self, parent_count: usize) -> bool {
         self.debug_assert_valid_for(parent_count);
-        match self {
+        let phase_started = crate::debug::query::residual_phase_timer();
+        let input = self.len();
+        let admitted = match self {
             Self::Values(values) => {
                 let mut admitted = AHashSet::with_capacity(values.len());
                 values.reverse();
@@ -5172,14 +5174,27 @@ impl CandidatePayload {
                 true
             }
             Self::Deferred(_) => false,
+        };
+        if admitted {
+            if let Some(started) = phase_started {
+                crate::debug::query::record_inline_set_admission(
+                    false,
+                    input,
+                    self.len(),
+                    started.elapsed(),
+                );
+            }
         }
+        admitted
     }
 
     /// Admits one occurrence of each `(parent, value)` in first-occurrence
     /// order for direct forward publication.
     fn admit_set_forward_stable(&mut self, parent_count: usize) -> bool {
         self.debug_assert_valid_for(parent_count);
-        match self {
+        let phase_started = crate::debug::query::residual_phase_timer();
+        let input = self.len();
+        let admitted = match self {
             Self::Values(values) => {
                 let mut admitted = AHashSet::with_capacity(values.len());
                 values.retain(|value| admitted.insert(*value));
@@ -5191,7 +5206,18 @@ impl CandidatePayload {
                 true
             }
             Self::Deferred(_) => false,
+        };
+        if admitted {
+            if let Some(started) = phase_started {
+                crate::debug::query::record_inline_set_admission(
+                    true,
+                    input,
+                    self.len(),
+                    started.elapsed(),
+                );
+            }
         }
+        admitted
     }
 
     /// Moves a contiguous payload behind an immutable shared root without
@@ -7594,6 +7620,7 @@ fn propose_action_transition<'a>(
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
     let view = rows_view(&vars, &rows.rows, rows.row_count);
     let mut candidates = CandidatePayload::empty(rows.row_count);
+    let source_attribution = crate::debug::query::begin_residual_source_attribution();
     propose_leaf(
         root,
         plan,
@@ -7602,6 +7629,7 @@ fn propose_action_transition<'a>(
         &view,
         &mut candidates.sink(rows.row_count),
     );
+    let source_origin = crate::debug::query::take_residual_source_attribution(source_attribution);
     stats.propose_calls += 1;
     stats.propose_rows += rows.row_count;
     stats.max_propose_rows = stats.max_propose_rows.max(rows.row_count);
@@ -7621,6 +7649,7 @@ fn propose_action_transition<'a>(
         },
     };
     if crosses_candidate_set_boundary(desc, &successor, plan, &interner.formula_pcs) {
+        let _admission_origin = crate::debug::query::enter_residual_admission_origin(source_origin);
         assert!(
             candidates.admit_set_tail_stable(rows.row_count),
             "an ordinary proposal returned a deferred candidate payload"
@@ -9719,6 +9748,8 @@ struct ResidualStateMachine {
     width: usize,
     growth: usize,
     cap: usize,
+    /// Query-local, off-by-default phase recorder capability.
+    phase_probe: Option<crate::debug::query::ResidualPhaseQueryToken>,
 }
 
 /// Borrow-free residual cursor stored by the ordinary [`Query`].
@@ -9848,14 +9879,18 @@ where
     }
 
     pub(super) fn next_binding(&mut self) -> Option<Binding> {
-        self.machine.pull(
+        let binding = self.machine.pull(
             &self.root,
             &self.plan,
             &|binding| Some(binding.clone()),
             &mut self.projection,
             &self.influences,
             &self.base_estimates,
-        )
+        );
+        if binding.is_none() {
+            self.machine.finish_phase_probe();
+        }
+        binding
     }
 }
 
@@ -9881,14 +9916,18 @@ impl ResidualQueryState {
     where
         P: Fn(&Binding) -> Option<R>,
     {
-        self.machine.pull(
-                root,
-                &self.plan,
-                postprocessing,
-                projection,
-                influences,
-                base_estimates,
-            )
+        let result = self.machine.pull(
+            root,
+            &self.plan,
+            postprocessing,
+            projection,
+            influences,
+            base_estimates,
+        );
+        if result.is_none() {
+            self.machine.finish_phase_probe();
+        }
+        result
     }
 }
 
@@ -9929,6 +9968,7 @@ impl ResidualStateMachine {
         seed: FrameSeedRow,
     ) -> Self {
         let cap = block_row_cap();
+        let phase_probe = crate::debug::query::begin_residual_phase_query(full.count(), leaf_count);
         let mut state = Self {
             full,
             leaf_count,
@@ -9963,6 +10003,7 @@ impl ResidualStateMachine {
             width: lazy_start_width().clamp(1, cap),
             growth: lazy_growth(),
             cap,
+            phase_probe,
         };
         if matches!(mode, Search::NextVariable) {
             file_with_span(
@@ -11466,6 +11507,8 @@ impl ResidualStateMachine {
     where
         P: Fn(&Binding) -> Option<R>,
     {
+        let _phase_scope =
+            crate::debug::query::enter_residual_phase_query(self.phase_probe.as_ref());
         if projection_gate.is_done() {
             self.retire_staged_projection_receipts();
             return None;
@@ -11706,6 +11749,12 @@ impl ResidualStateMachine {
             base_estimates,
         )
     }
+
+    fn finish_phase_probe(&mut self) {
+        if let Some(token) = self.phase_probe.take() {
+            crate::debug::query::finish_residual_phase_query(token, &self.stats);
+        }
+    }
 }
 
 #[cfg(feature = "parallel")]
@@ -11751,6 +11800,9 @@ impl ResidualStateMachine {
             width: self.width,
             growth: self.growth,
             cap: self.cap,
+            // A thread-local serial probe cannot soundly aggregate a Rayon
+            // sibling. The owning machine retains the query capability.
+            phase_probe: None,
         }
     }
 
@@ -12231,14 +12283,18 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         self.iteration_started = true;
-        self.state.pull(
+        let result = self.state.pull(
             &self.root,
             &self.plan,
             &self.postprocessing,
             &mut self.projection,
             &self.influences,
             &self.base_estimates,
-        )
+        );
+        if result.is_none() {
+            self.state.finish_phase_probe();
+        }
+        result
     }
 }
 
@@ -12288,6 +12344,7 @@ where
             &self.inner.base_estimates,
         );
         if item.is_none() && self.lifecycle == ShadowIteratorLifecycle::Owner {
+            self.inner.state.finish_phase_probe();
             if self.epoch.finish_exhausted() == ResidualShadowStatus::Closed {
                 self.lifecycle = ShadowIteratorLifecycle::Finished;
             }
