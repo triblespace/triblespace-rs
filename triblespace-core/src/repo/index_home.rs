@@ -11,6 +11,8 @@ use std::error::Error;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use itertools::Itertools;
+
 use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
 use crate::blob::encodings::succinctarchive::{
     merge_ordered_archives, merge_ordered_archives_with_backend, OrderedUniverse, SuccinctArchive,
@@ -1285,6 +1287,56 @@ impl<'a, U> UnionArchive<'a, U> {
     }
 }
 
+/// Confirm one immutable candidate bag against a physical union through a
+/// sorted, duplicate-free witness frontier.
+///
+/// Each source sees the same logical candidate set in locality order. The
+/// final source consumes the base frontier, so a one-source union needs only
+/// the copy that sorting already requires. Since confirmation only filters,
+/// every survivor run remains sorted and unique. One live source returns that
+/// run directly; several live sources use one k-way merge, bounding comparison
+/// work by the total survivor count times the logarithm of the source count.
+/// This deliberately retains the survivor runs until the merge, trading their
+/// memory for locality and avoiding either a hash table or repeated growing-
+/// union copies. Callers retain the untouched physical bag by binary-searching
+/// the returned witnesses.
+fn sorted_confirmation_witnesses<T, S>(
+    candidates: &[T],
+    sources: impl IntoIterator<Item = S>,
+    mut confirm: impl FnMut(S, &mut Vec<T>),
+) -> Vec<T>
+where
+    T: Copy + Ord,
+{
+    let mut sources = sources.into_iter().peekable();
+    if sources.peek().is_none() {
+        return Vec::new();
+    }
+
+    let mut base = candidates.to_vec();
+    base.sort_unstable();
+    base.dedup();
+
+    let mut survivor_runs = Vec::new();
+    while let Some(source) = sources.next() {
+        let mut survivors = if sources.peek().is_none() {
+            std::mem::take(&mut base)
+        } else {
+            base.clone()
+        };
+        confirm(source, &mut survivors);
+        debug_assert!(survivors.windows(2).all(|pair| pair[0] < pair[1]));
+        if !survivors.is_empty() {
+            survivor_runs.push(survivors);
+        }
+    }
+    match survivor_runs.len() {
+        0 => Vec::new(),
+        1 => survivor_runs.pop().unwrap(),
+        _ => survivor_runs.into_iter().kmerge().dedup().collect(),
+    }
+}
+
 #[doc(hidden)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UnionArchiveProgramState {
@@ -1840,55 +1892,55 @@ where
                     "plain candidate values require one parent row"
                 );
                 let row_view = view.row_view(0);
-                // Shards normalize only the membership witnesses. Filtering
-                // the untouched input afterwards preserves its physical bag.
-                let mut witnesses = HashSet::with_capacity(values.len());
-                let mut shard_values = Vec::with_capacity(values.len());
+                // Sort and deduplicate only the internal membership frontier.
+                // Succinct confirmation then probes each shard in locality
+                // order, while filtering this untouched bag afterwards keeps
+                // its externally observable order and multiplicity.
+                let live_shards = self
+                    .shards
+                    .iter()
+                    .filter(|constraint| constraint.satisfied(&row_view));
+                let witnesses = sorted_confirmation_witnesses(
+                    values,
+                    live_shards,
+                    |constraint, shard_values| {
+                        constraint.confirm(
+                            variable,
+                            &row_view,
+                            &mut CandidateSink::Values(shard_values),
+                        );
+                    },
+                );
 
-                for constraint in &self.shards {
-                    if !constraint.satisfied(&row_view) {
-                        continue;
-                    }
-                    shard_values.clone_from(values);
-                    constraint.confirm(
-                        variable,
-                        &row_view,
-                        &mut CandidateSink::Values(&mut shard_values),
-                    );
-                    witnesses.extend(shard_values.iter().copied());
-                }
-
-                values.retain(|value| witnesses.contains(value));
+                values.retain(|value| witnesses.binary_search(value).is_ok());
             }
             CandidateSink::Tagged(pairs) => {
-                // Keep the parent tag in the witness key: equal values on a
-                // dead row must not borrow liveness from another row. Each
-                // shard still receives one whole-frontier confirm call so its
-                // Ring probes retain their batching opportunity.
-                let mut witnesses = HashSet::with_capacity(pairs.len());
-                let mut live_rows = Vec::with_capacity(view.len());
-                let mut shard_pairs = Vec::with_capacity(pairs.len());
+                // The lexicographic `(row, value)` witness key both isolates
+                // parent liveness and restores the row grouping expected by a
+                // whole-frontier Succinct confirm. Live-row masks are computed
+                // once per shard, not once per candidate. Equal values on a
+                // dead row therefore cannot borrow a witness from another
+                // parent, and the original tagged bag remains untouched until
+                // the final stable filter.
+                let live_shards = self.shards.iter().filter_map(|constraint| {
+                    let live_rows: Vec<_> = (0..view.len())
+                        .map(|row| constraint.satisfied(&view.row_view(row)))
+                        .collect();
+                    live_rows
+                        .iter()
+                        .any(|live| *live)
+                        .then_some((constraint, live_rows))
+                });
+                let witnesses = sorted_confirmation_witnesses(
+                    pairs,
+                    live_shards,
+                    |(constraint, live_rows), shard_pairs| {
+                        shard_pairs.retain(|(row, _)| live_rows[*row as usize]);
+                        constraint.confirm(variable, view, &mut CandidateSink::Tagged(shard_pairs));
+                    },
+                );
 
-                for constraint in &self.shards {
-                    live_rows.clear();
-                    live_rows.extend(
-                        (0..view.len()).map(|row| constraint.satisfied(&view.row_view(row))),
-                    );
-                    if !live_rows.iter().any(|live| *live) {
-                        continue;
-                    }
-
-                    shard_pairs.clone_from(pairs);
-                    shard_pairs.retain(|(row, _)| live_rows[*row as usize]);
-                    constraint.confirm(
-                        variable,
-                        view,
-                        &mut CandidateSink::Tagged(&mut shard_pairs),
-                    );
-                    witnesses.extend(shard_pairs.iter().copied());
-                }
-
-                pairs.retain(|pair| witnesses.contains(pair));
+                pairs.retain(|pair| witnesses.binary_search(pair).is_ok());
             }
         }
     }
@@ -2880,6 +2932,63 @@ mod tests {
         // Value 1 is a witness for row 0 but not row 1 or row 2. Keying
         // witnesses by value alone would therefore leak it across parents.
         assert_eq!(candidates, vec![(0, one), (0, one), (1, two)]);
+    }
+
+    #[test]
+    fn union_archive_sorted_witnesses_preserve_tagged_bag_and_parent_isolation() {
+        let entity_one = Id::new([0x18; 16]).unwrap();
+        let entity_two = Id::new([0x19; 16]).unwrap();
+        let entity_dead = Id::new([0x1a; 16]).unwrap();
+        let attribute = Id::new([0x26; 16]).unwrap();
+        let archives = [
+            fixed_archive(&entity_one, &attribute, [1, 3]),
+            fixed_archive(&entity_two, &attribute, [2, 3]),
+        ];
+        let entity = Variable::<GenId>::new(0);
+        let value = Variable::<UnknownInline>::new(1);
+        let attribute: Inline<GenId> = attribute.to_inline();
+        let union_archive = UnionArchive::new(&archives);
+        let union = union_archive.pattern(entity, attribute, value);
+        let vars = [entity.index];
+        let entity_one: Inline<GenId> = entity_one.to_inline();
+        let entity_two: Inline<GenId> = entity_two.to_inline();
+        let entity_dead: Inline<GenId> = entity_dead.to_inline();
+        let rows = [entity_one.raw, entity_two.raw, entity_dead.raw];
+        let view = RowsView::new(&vars, &rows);
+        let one = raw_value(1);
+        let two = raw_value(2);
+        let three = raw_value(3);
+        let four = raw_value(4);
+        let mut candidates = vec![
+            (0, three),
+            (0, one),
+            (0, three),
+            (0, four),
+            (1, one),
+            (1, three),
+            (1, two),
+            (1, two),
+            (2, one),
+            (2, three),
+        ];
+
+        union.confirm(
+            value.index,
+            &view,
+            &mut CandidateSink::Tagged(&mut candidates),
+        );
+
+        assert_eq!(
+            candidates,
+            vec![
+                (0, three),
+                (0, one),
+                (0, three),
+                (1, three),
+                (1, two),
+                (1, two),
+            ]
+        );
     }
 
     #[test]

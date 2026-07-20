@@ -89,6 +89,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`UnionArchive` confirmation now preserves Succinct probe locality without
+  changing candidate-bag semantics.** Physical candidates are sorted and
+  deduplicated only in an internal `(parent, value)` witness frontier, confirmed
+  against every live shard, and merged as sorted membership witnesses. The
+  untouched input is then filtered by binary search, preserving original order,
+  multiplicity, parent tags, and dead-row isolation while removing randomized
+  HashSet probes from the hot path.
+
 - **Typed `UnionArchive` proposals no longer re-scan every attached shard for
   every emitted value.** The residual Program now keeps its current shard and
   that shard's ordered cursor in affine continuation state, draining physical
