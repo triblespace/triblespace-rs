@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Finite equality work and pointwise TribleSet checks stay on the ordinary
+  hybrid path, while TribleSet proposal cursors remain production-resumable.**
+  Equality Propose, Confirm, and Support plus TribleSet Confirm and Support are
+  explicit Program routes: `ResidualLowering::HYBRID` executes their already
+  bounded ordinary kernels, while `FULL` retains typed representability.
+  TribleSet Propose remains production-qualified and pageable for low-demand
+  and high-fanout work. For multi-parent terminal cohorts, its exact complete
+  occurrence-bag certificate lets the geometrically widened scheduler drain a
+  batch without opening one Program activation per parent.
 - **Hash-set and hash-map membership filters stay on the ordinary production
   residual path.** Their pointwise Confirm and Support work is already bounded
   by the scheduler's input page, so HYBRID no longer expands each cheap hash

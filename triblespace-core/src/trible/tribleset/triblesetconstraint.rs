@@ -15,6 +15,7 @@ use crate::query::Constraint;
 use crate::query::DispatchClass;
 use crate::query::EstimateSink;
 use crate::query::ProgramAction;
+use crate::query::ProgramCompleteBatch;
 use crate::query::ProgramCompletion;
 use crate::query::ProgramExposure;
 use crate::query::ProgramGrouping;
@@ -32,6 +33,7 @@ use crate::query::ResidualDeltaSourceCursor;
 use crate::query::ResidualDeltaSourcePage;
 use crate::query::RowsView;
 use crate::query::Term;
+use crate::query::TypedCompleteSink;
 use crate::query::TypedEffectSink;
 use crate::query::TypedProgramBatch;
 use crate::query::TypedProgramSpec;
@@ -1091,26 +1093,39 @@ impl TypedProgramSpec for TribleSetConstraint {
 
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
         let bound_positions = self.bound_position_mask(request.bound);
-        let (key, variable) = match request.action {
+        let (key, variable, completion, exposure) = match request.action {
             ProgramAction::Propose(variable) | ProgramAction::Confirm(variable) => {
                 let target_positions = self.variable_position_mask(variable);
                 if request.bound.is_set(variable) || target_positions == 0 {
                     return None;
                 }
                 debug_assert_eq!(bound_positions & target_positions, 0);
-                let action = if matches!(request.action, ProgramAction::Propose(_)) {
-                    TRIBLESET_PROPOSE_ROUTE
-                } else {
-                    TRIBLESET_CONFIRM_ROUTE
-                };
+                let (action, completion, exposure) =
+                    if matches!(request.action, ProgramAction::Propose(_)) {
+                        (
+                            TRIBLESET_PROPOSE_ROUTE,
+                            ProgramCompletion::CompleteActionEquivalent,
+                            ProgramExposure::Production,
+                        )
+                    } else {
+                        (
+                            TRIBLESET_CONFIRM_ROUTE,
+                            ProgramCompletion::PageableOnly,
+                            ProgramExposure::Explicit,
+                        )
+                    };
                 (
                     ProgramKey::new(action | (target_positions << 3) | bound_positions),
                     variable,
+                    completion,
+                    exposure,
                 )
             }
             ProgramAction::Support => (
                 ProgramKey::new(TRIBLESET_SUPPORT_ROUTE | bound_positions),
                 self.support_variable()?,
+                ProgramCompletion::PageableOnly,
+                ProgramExposure::Explicit,
             ),
         };
         Some(ProgramRoute {
@@ -1118,8 +1133,8 @@ impl TypedProgramSpec for TribleSetConstraint {
             variable,
             stratum: ProgramStratum::Finite,
             grouping: ProgramGrouping::PageLocal,
-            completion: ProgramCompletion::PageableOnly,
-            exposure: ProgramExposure::Production,
+            completion,
+            exposure,
         })
     }
 
@@ -1176,9 +1191,12 @@ impl TypedProgramSpec for TribleSetConstraint {
     ) {
         assert_eq!(batch.route.stratum, ProgramStratum::Finite);
         assert_eq!(batch.route.grouping, ProgramGrouping::PageLocal);
-        assert_eq!(batch.route.completion, ProgramCompletion::PageableOnly);
         let state = match batch.request.action {
             ProgramAction::Propose(variable) => {
+                assert_eq!(
+                    batch.route.completion,
+                    ProgramCompletion::CompleteActionEquivalent
+                );
                 assert_eq!(batch.route.variable, variable);
                 assert!(!batch.request.bound.is_set(variable));
                 assert_ne!(self.variable_position_mask(variable), 0);
@@ -1188,12 +1206,14 @@ impl TypedProgramSpec for TribleSetConstraint {
                 }
             }
             ProgramAction::Confirm(variable) => {
+                assert_eq!(batch.route.completion, ProgramCompletion::PageableOnly);
                 assert_eq!(batch.route.variable, variable);
                 assert!(!batch.request.bound.is_set(variable));
                 assert_ne!(self.variable_position_mask(variable), 0);
                 TribleSetProgramState::Confirm { variable, offset: 0 }
             }
             ProgramAction::Support => {
+                assert_eq!(batch.route.completion, ProgramCompletion::PageableOnly);
                 assert_eq!(Some(batch.route.variable), self.support_variable());
                 TribleSetProgramState::Support
             }
@@ -1317,6 +1337,18 @@ impl TypedProgramSpec for TribleSetConstraint {
                     effects.page(1, None);
                 }
             }
+        }
+    }
+
+    fn complete_typed(&self, batch: ProgramCompleteBatch<'_>, effects: &mut TypedCompleteSink) {
+        let ProgramAction::Propose(variable) = batch.request.action else {
+            panic!("TribleSet complete actions support only proposals")
+        };
+        assert_eq!(variable, batch.route.variable);
+        let positions = self.positions(variable, &batch.view);
+        for (parent, row) in batch.view.iter().enumerate() {
+            let parent = u32::try_from(parent).expect("too many TribleSet complete-action parents");
+            self.propose_row(&positions, row, &mut |value| effects.push(parent, value));
         }
     }
 }
@@ -1513,6 +1545,7 @@ mod tests {
     use crate::query::residual::ResidualLowering;
     use crate::query::unionconstraint::UnionConstraint;
     use crate::query::Binding;
+    use crate::query::ContainsConstraint;
     use crate::query::Query;
     use crate::query::TriblePattern;
     use crate::query::Variable;
@@ -1631,7 +1664,24 @@ mod tests {
         assert_ne!(propose.key, bound_propose.key);
         assert_eq!(propose.stratum, ProgramStratum::Finite);
         assert_eq!(propose.grouping, ProgramGrouping::PageLocal);
-        assert_eq!(propose.completion, ProgramCompletion::PageableOnly);
+        assert_eq!(
+            propose.completion,
+            ProgramCompletion::CompleteActionEquivalent
+        );
+        assert_eq!(
+            bound_propose.completion,
+            ProgramCompletion::CompleteActionEquivalent
+        );
+        assert_eq!(propose.exposure, ProgramExposure::Production);
+        assert_eq!(bound_propose.exposure, ProgramExposure::Production);
+        assert_eq!(confirm.exposure, ProgramExposure::Explicit);
+        let support = program
+            .route(ProgramRequest {
+                action: ProgramAction::Support,
+                bound: empty,
+            })
+            .unwrap();
+        assert_eq!(support.exposure, ProgramExposure::Explicit);
         assert!(program
             .route(ProgramRequest {
                 action: ProgramAction::Propose(0),
@@ -1644,6 +1694,82 @@ mod tests {
                 bound: empty,
             })
             .is_none());
+    }
+
+    #[test]
+    fn typed_complete_proposal_matches_the_ordinary_occurrence_bag() {
+        let (set, entities, attributes, _) = direct_fixture();
+        let e = Variable::<GenId>::new(0);
+        let v = Variable::<UnknownInline>::new(1);
+        let constraint = TribleSetConstraint::new(e, Inline::<GenId>::new(attributes[0]), v, set);
+        let variables = [e.index];
+        let rows = [entities[0], entities[0], entities[1]];
+        let view = RowsView::new(&variables, &rows);
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(v.index),
+            bound: VariableSet::new_singleton(e.index),
+        };
+        let program = constraint.residual_program().unwrap();
+        let route = program.route(request).unwrap();
+
+        let mut ordinary = Vec::new();
+        constraint.propose(v.index, &view, &mut CandidateSink::Tagged(&mut ordinary));
+        let mut complete = crate::query::ProgramCompleteEffects::default();
+        program.complete_batch(
+            ProgramCompleteBatch {
+                request,
+                route,
+                view,
+            },
+            &mut complete,
+        );
+
+        assert_eq!(complete.raw_occurrence_count, ordinary.len());
+        assert_eq!(complete.occurrences, ordinary);
+        let first_parent_values: Vec<_> = complete
+            .occurrences
+            .iter()
+            .filter_map(|&(parent, value)| (parent == 0).then_some(value))
+            .collect();
+        let identical_parent_values: Vec<_> = complete
+            .occurrences
+            .iter()
+            .filter_map(|&(parent, value)| (parent == 1).then_some(value))
+            .collect();
+        assert_eq!(first_parent_values, identical_parent_values);
+    }
+
+    #[test]
+    fn typed_complete_certificate_keeps_single_parent_proposals_pageable() {
+        let attribute = rngid();
+        let value = Inline::<UnknownInline>::new([0x5b; INLINE_LEN]);
+        let mut set = TribleSet::new();
+        for _ in 0..64 {
+            set.insert(&Trible::new(&rngid(), &attribute, &value));
+        }
+        let entity = Variable::<GenId>::new(0);
+        let constraint = Arc::new(TribleSetConstraint::new(
+            entity,
+            Inline::<GenId>::new(id_into_value(&attribute)),
+            value,
+            set,
+        ));
+        let mut query = Query::new(constraint, |binding: &Binding| binding.get(0).copied())
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .cap(1)
+            .start_width(1);
+
+        let first = query.next().unwrap();
+        assert_eq!(query.stats().delta_source_pages, 1);
+        assert_eq!(query.stats().delta_source_candidates_examined, 1);
+        assert_eq!(query.stats().delta_terminal_eager_cohort_admissions, 0);
+        let mut mirror = query.clone();
+        let second = query.next().unwrap();
+        assert_ne!(second, first);
+        assert_eq!(mirror.next(), Some(second));
+        assert_eq!(query.stats().delta_source_pages, 2);
+        assert_eq!(query.stats().delta_source_candidates_examined, 2);
+        assert_eq!(query.stats().delta_terminal_eager_cohort_admissions, 0);
     }
 
     #[test]
@@ -1846,6 +1972,39 @@ mod tests {
         }
         values.sort_unstable();
         values
+    }
+
+    fn complete_proposal(
+        constraint: &TribleSetConstraint,
+        variable: VariableId,
+        view: RowsView<'_>,
+    ) -> Vec<(u32, RawInline)> {
+        let mut bound = VariableSet::new_empty();
+        for &variable in view.vars {
+            bound.set(variable);
+        }
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(variable),
+            bound,
+        };
+        let program = constraint.residual_program().unwrap();
+        let route = program.route(request).unwrap();
+        assert_eq!(
+            route.completion,
+            ProgramCompletion::CompleteActionEquivalent
+        );
+        let mut effects = crate::query::ProgramCompleteEffects::default();
+        program.complete_batch(
+            ProgramCompleteBatch {
+                request,
+                route,
+                view,
+            },
+            &mut effects,
+        );
+        assert_eq!(effects.raw_occurrence_count, effects.occurrences.len());
+        effects.occurrences.sort_unstable();
+        effects.occurrences
     }
 
     #[derive(Clone, Default)]
@@ -2213,10 +2372,19 @@ mod tests {
 
         for (name, variable, vars, row) in schemas {
             let view = RowsView::new(&vars, &row);
+            let eager = eager_proposal(&constraint, variable, &view);
             assert_eq!(
                 paged_proposal(&constraint, variable, &view),
-                eager_proposal(&constraint, variable, &view),
-                "schema {name}"
+                eager,
+                "paged schema {name}"
+            );
+            assert_eq!(
+                complete_proposal(&constraint, variable, view),
+                eager
+                    .into_iter()
+                    .map(|value| (0, value))
+                    .collect::<Vec<_>>(),
+                "complete schema {name}"
             );
         }
     }
@@ -2285,10 +2453,19 @@ mod tests {
                              vars: &[VariableId],
                              row: &[RawInline]| {
             let view = RowsView::new(vars, row);
+            let eager = eager_proposal(&constraint, x.index, &view);
             assert_eq!(
                 paged_proposal(&constraint, x.index, &view),
-                eager_proposal(&constraint, x.index, &view),
-                "schema {name}",
+                eager,
+                "paged schema {name}",
+            );
+            assert_eq!(
+                complete_proposal(&constraint, x.index, view),
+                eager
+                    .into_iter()
+                    .map(|value| (0, value))
+                    .collect::<Vec<_>>(),
+                "complete schema {name}",
             );
         };
 
@@ -2432,6 +2609,70 @@ mod tests {
         assert_eq!(sequential.len(), set.len());
         assert_eq!(ordinary, sequential);
         assert_eq!(residual, sequential);
+    }
+
+    #[test]
+    fn q51_shaped_hashset_to_tribleset_query_uses_terminal_complete_cohorts() {
+        const ENTITY: VariableId = 0;
+        const VALUE: VariableId = 1;
+
+        let target_attribute_id = rngid();
+        let target_attribute = Inline::<GenId>::new(id_into_value(&target_attribute_id));
+        let mut set = TribleSet::new();
+        let mut needed = std::collections::HashSet::new();
+        for ordinal in 1u64..=4096 {
+            let mut entity_raw = [0; ID_LEN];
+            entity_raw[ID_LEN - 8..].copy_from_slice(&ordinal.to_be_bytes());
+            let entity_id = Id::new(entity_raw).unwrap();
+            if ordinal <= 1024 {
+                needed.insert(entity_id);
+            }
+            let entity = crate::id::ExclusiveId::force(entity_id);
+            let mut value_raw = [0; INLINE_LEN];
+            value_raw[INLINE_LEN - 8..].copy_from_slice(&ordinal.to_be_bytes());
+            let value = Inline::<UnknownInline>::new(value_raw);
+            set.insert(&Trible::new(&entity, &target_attribute_id, &value));
+        }
+        let needed = Arc::new(needed);
+        let entity = Variable::<GenId>::new(ENTITY);
+        let value = Variable::<UnknownInline>::new(VALUE);
+        let make = || {
+            IntersectionConstraint::new(vec![
+                Box::new(needed.clone().has(entity)) as Box<dyn Constraint<'static>>,
+                Box::new(TribleSetConstraint::new(
+                    entity,
+                    target_attribute,
+                    value,
+                    set.clone(),
+                )) as Box<dyn Constraint<'static>>,
+            ])
+        };
+        let project = |binding: &Binding| Some((*binding.get(ENTITY)?, *binding.get(VALUE)?));
+
+        let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
+        let mut ordinary: Vec<_> = Query::new(make(), project).collect();
+        let mut query = Query::new(make(), project)
+            .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+            .start_width(1)
+            .growth(2)
+            .cap(256);
+        let mut residual: Vec<_> = query.by_ref().collect();
+        sequential.sort_unstable();
+        ordinary.sort_unstable();
+        residual.sort_unstable();
+
+        assert_eq!(ordinary, sequential);
+        assert_eq!(residual, sequential);
+        assert!(
+            query.stats().delta_terminal_eager_cohort_admissions > 0,
+            "{:#?}",
+            query.stats()
+        );
+        assert!(query.stats().delta_terminal_eager_cohort_parents > 1);
+        assert_eq!(
+            query.stats().delta_terminal_eager_cohort_rows,
+            query.stats().delta_terminal_eager_cohort_parents
+        );
     }
 
     #[test]

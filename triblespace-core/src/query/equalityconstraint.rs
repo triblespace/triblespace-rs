@@ -117,7 +117,7 @@ impl TypedProgramSpec for EqualityConstraint {
             stratum: ProgramStratum::Finite,
             grouping: ProgramGrouping::PageLocal,
             completion: ProgramCompletion::PageableOnly,
-            exposure: ProgramExposure::Production,
+            exposure: ProgramExposure::Explicit,
         })
     }
 
@@ -391,12 +391,13 @@ mod typed_program_tests {
                 bound: empty,
             })
             .is_none());
-        assert!(program
+        let unbound_confirmation = program
             .route(ProgramRequest {
                 action: ProgramAction::Confirm(2),
                 bound: empty,
             })
-            .is_some());
+            .unwrap();
+        assert_eq!(unbound_confirmation.exposure, ProgramExposure::Explicit);
 
         let peer_bound = VariableSet::new_singleton(2);
         let proposal = program
@@ -408,6 +409,21 @@ mod typed_program_tests {
         assert_eq!(proposal.variable, 5);
         assert_eq!(proposal.stratum, ProgramStratum::Finite);
         assert_eq!(proposal.grouping, ProgramGrouping::PageLocal);
+        assert_eq!(proposal.exposure, ProgramExposure::Explicit);
+        let confirmation = program
+            .route(ProgramRequest {
+                action: ProgramAction::Confirm(5),
+                bound: peer_bound,
+            })
+            .unwrap();
+        assert_eq!(confirmation.exposure, ProgramExposure::Explicit);
+        let support = program
+            .route(ProgramRequest {
+                action: ProgramAction::Support,
+                bound: peer_bound,
+            })
+            .unwrap();
+        assert_eq!(support.exposure, ProgramExposure::Explicit);
         assert!(program
             .route(ProgramRequest {
                 action: ProgramAction::Propose(2),
@@ -429,12 +445,13 @@ mod typed_program_tests {
                 bound: empty,
             })
             .is_none());
-        assert!(same_program
+        let same_confirmation = same_program
             .route(ProgramRequest {
                 action: ProgramAction::Confirm(4),
                 bound: empty,
             })
-            .is_some());
+            .unwrap();
+        assert_eq!(same_confirmation.exposure, ProgramExposure::Explicit);
         assert!(
             same.progress(&EqualityProgramState::Confirm {
                 variable: 4,
