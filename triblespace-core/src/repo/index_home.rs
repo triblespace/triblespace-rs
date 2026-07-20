@@ -1312,7 +1312,9 @@ where
     }
 
     let mut base = candidates.to_vec();
-    base.sort_unstable();
+    if !base.is_sorted() {
+        base.sort_unstable();
+    }
     base.dedup();
 
     let mut witnesses = AHashSet::with_capacity(base.len());

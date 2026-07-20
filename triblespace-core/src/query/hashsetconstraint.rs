@@ -152,9 +152,33 @@ where
         view: &RowsView<'_>,
         candidates: &mut CandidateSink<'_>,
     ) {
-        if self.variable.index == variable {
-            for i in 0..view.len() as u32 {
-                candidates.extend_row(i, self.set.iter().map(|v| IntoInline::to_inline(v).raw));
+        if self.variable.index != variable {
+            return;
+        }
+
+        // Eager proposal already materializes the complete mathematical set;
+        // raw order therefore costs no streaming opportunity and keeps
+        // tail-split residual pages adjacent in storage key space.
+        match candidates {
+            CandidateSink::Values(values) => {
+                values.extend(
+                    self.set
+                        .iter()
+                        .map(|value| IntoInline::to_inline(value).raw),
+                );
+                values.sort_unstable();
+            }
+            CandidateSink::Tagged(pairs) => {
+                let mut values: Vec<_> = self
+                    .set
+                    .iter()
+                    .map(|value| IntoInline::to_inline(value).raw)
+                    .collect();
+                values.sort_unstable();
+                pairs.reserve(view.len().saturating_mul(values.len()));
+                for row in 0..view.len() as u32 {
+                    pairs.extend(values.iter().copied().map(|value| (row, value)));
+                }
             }
         }
     }
@@ -222,5 +246,90 @@ where
 
     fn has(self, v: Variable<S>) -> Self::Constraint {
         SetConstraint::new(v, self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inline::encodings::UnknownInline;
+
+    fn value(byte: u8) -> Inline<UnknownInline> {
+        Inline::new([byte; 32])
+    }
+
+    #[test]
+    fn value_proposals_are_raw_ordered_with_unchanged_membership_and_coverage() {
+        let variable = Variable::<UnknownInline>::new(0);
+        let values: HashSet<_> = [value(3), value(1), value(2)].into_iter().collect();
+        let constraint = (&values).has(variable);
+
+        assert_eq!(
+            constraint.proposal_coverage(variable.index, VariableSet::new_empty()),
+            ProposalCoverage::Exact
+        );
+        assert_eq!(
+            constraint
+                .proposal_coverage(variable.index, VariableSet::new_singleton(variable.index)),
+            ProposalCoverage::None
+        );
+
+        let mut proposed = Vec::new();
+        constraint.propose(
+            variable.index,
+            &RowsView::EMPTY,
+            &mut CandidateSink::Values(&mut proposed),
+        );
+        assert_eq!(proposed, [value(1).raw, value(2).raw, value(3).raw]);
+
+        let mut candidates = vec![
+            value(4).raw,
+            value(2).raw,
+            value(1).raw,
+            value(2).raw,
+            value(0).raw,
+        ];
+        constraint.confirm(
+            variable.index,
+            &RowsView::EMPTY,
+            &mut CandidateSink::Values(&mut candidates),
+        );
+        assert_eq!(
+            candidates,
+            [value(2).raw, value(1).raw, value(2).raw],
+            "confirmation keeps the original membership, order, and multiplicity"
+        );
+    }
+
+    #[test]
+    fn tagged_proposals_repeat_one_raw_ordered_run_per_ascending_parent() {
+        let variable = Variable::<UnknownInline>::new(1);
+        let peer = Variable::<UnknownInline>::new(0);
+        let values: HashSet<_> = [value(4), value(1), value(3)].into_iter().collect();
+        let constraint = (&values).has(variable);
+        let vars = [peer.index];
+        let rows = [value(7).raw, value(8).raw, value(9).raw];
+        let view = RowsView::new(&vars, &rows);
+        let ordered = [value(1).raw, value(3).raw, value(4).raw];
+
+        let mut proposed = Vec::new();
+        constraint.propose(
+            variable.index,
+            &view,
+            &mut CandidateSink::Tagged(&mut proposed),
+        );
+
+        let expected: Candidates = (0..view.len() as u32)
+            .flat_map(|row| ordered.into_iter().map(move |value| (row, value)))
+            .collect();
+        assert_eq!(proposed, expected);
+        assert!(proposed.windows(2).all(|pair| pair[0] <= pair[1]));
+        for row in 0..view.len() as u32 {
+            let row_values: Vec<_> = proposed
+                .iter()
+                .filter_map(|(parent, value)| (*parent == row).then_some(*value))
+                .collect();
+            assert_eq!(row_values, ordered);
+        }
     }
 }

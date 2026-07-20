@@ -89,6 +89,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Hash-set proposals now enter residual paging in canonical raw order.**
+  `SetConstraint` converts and sorts its finite raw frontier once, then reuses
+  that ordered run for every parent row. Geometric tail splits therefore expose
+  adjacent key-space regions instead of inheriting randomized `HashSet`
+  iteration order, while exact proposal coverage, membership, and typed-set
+  occurrence semantics stay unchanged. `UnionArchive` confirmation recognizes
+  an already ordered probe frontier and skips its redundant sort before
+  deduplication.
+
 - **`UnionArchive` confirmation now preserves Succinct probe locality without
   changing candidate-bag semantics.** Physical candidates are sorted and
   deduplicated only in an internal `(parent, value)` witness frontier, confirmed
