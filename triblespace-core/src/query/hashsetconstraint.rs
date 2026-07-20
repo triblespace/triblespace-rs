@@ -107,6 +107,26 @@ where
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
         let (event, due) = trace::event("hashset_program_step");
+        let examined = due.then(|| {
+            states
+                .iter()
+                .enumerate()
+                .map(|(input, state)| match state {
+                    finiteunaryprogram::FiniteUnaryProgramState::Confirm { offset } => {
+                        let candidates = batch.candidate_sets[input]
+                            .expect("hash-set Confirm lost its candidate group");
+                        offset
+                            .saturating_add(batch.limits[input])
+                            .min(candidates.len())
+                            .saturating_sub(*offset)
+                    }
+                    finiteunaryprogram::FiniteUnaryProgramState::Support => 1,
+                    finiteunaryprogram::FiniteUnaryProgramState::Propose { .. } => {
+                        unreachable!("filter-only hash-set Program entered a proposal state")
+                    }
+                })
+                .sum::<usize>()
+        });
         if due {
             let mut confirm_count = 0usize;
             let mut support_count = 0usize;
@@ -156,6 +176,8 @@ where
                 batch.limits.iter().copied().max().unwrap_or(0),
             ));
         }
+        let started = due.then(std::time::Instant::now);
+        let mut membership_hits = 0usize;
         finiteunaryprogram::step(
             self.variable.index,
             states,
@@ -164,8 +186,20 @@ where
             |_input, _cursor, _limit, _accepted| {
                 panic!("filter-only hash-set Program entered an ordered proposal step")
             },
-            |_input, value| self.contains_raw(value),
-        )
+            |_input, value| {
+                let contained = self.contains_raw(value);
+                membership_hits += usize::from(contained);
+                contained
+            },
+        );
+        if due {
+            trace::emit(format_args!(
+                "HashSet Program step #{event} end examined={} membership_hits={} elapsed_us={}",
+                examined.unwrap_or(0),
+                membership_hits,
+                started.map_or(0, |started| started.elapsed().as_micros()),
+            ));
+        }
     }
 }
 
