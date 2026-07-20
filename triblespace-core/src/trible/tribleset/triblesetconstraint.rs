@@ -1091,26 +1091,28 @@ impl TypedProgramSpec for TribleSetConstraint {
 
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
         let bound_positions = self.bound_position_mask(request.bound);
-        let (key, variable) = match request.action {
+        let (key, variable, exposure) = match request.action {
             ProgramAction::Propose(variable) | ProgramAction::Confirm(variable) => {
                 let target_positions = self.variable_position_mask(variable);
                 if request.bound.is_set(variable) || target_positions == 0 {
                     return None;
                 }
                 debug_assert_eq!(bound_positions & target_positions, 0);
-                let action = if matches!(request.action, ProgramAction::Propose(_)) {
-                    TRIBLESET_PROPOSE_ROUTE
+                let (action, exposure) = if matches!(request.action, ProgramAction::Propose(_)) {
+                    (TRIBLESET_PROPOSE_ROUTE, ProgramExposure::Production)
                 } else {
-                    TRIBLESET_CONFIRM_ROUTE
+                    (TRIBLESET_CONFIRM_ROUTE, ProgramExposure::Explicit)
                 };
                 (
                     ProgramKey::new(action | (target_positions << 3) | bound_positions),
                     variable,
+                    exposure,
                 )
             }
             ProgramAction::Support => (
                 ProgramKey::new(TRIBLESET_SUPPORT_ROUTE | bound_positions),
                 self.support_variable()?,
+                ProgramExposure::Explicit,
             ),
         };
         Some(ProgramRoute {
@@ -1119,7 +1121,7 @@ impl TypedProgramSpec for TribleSetConstraint {
             stratum: ProgramStratum::Finite,
             grouping: ProgramGrouping::PageLocal,
             completion: ProgramCompletion::PageableOnly,
-            exposure: ProgramExposure::Explicit,
+            exposure,
         })
     }
 
@@ -1632,7 +1634,8 @@ mod tests {
         assert_eq!(propose.stratum, ProgramStratum::Finite);
         assert_eq!(propose.grouping, ProgramGrouping::PageLocal);
         assert_eq!(propose.completion, ProgramCompletion::PageableOnly);
-        assert_eq!(propose.exposure, ProgramExposure::Explicit);
+        assert_eq!(propose.exposure, ProgramExposure::Production);
+        assert_eq!(bound_propose.exposure, ProgramExposure::Production);
         assert_eq!(confirm.exposure, ProgramExposure::Explicit);
         let support = program
             .route(ProgramRequest {
