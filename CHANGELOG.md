@@ -19,7 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fallback unless all relevant peers opt in. HashSet and single-position
   Succinct sources publish broad hash/sequential versus random-rank classes;
   finite-formula actions, repeated-position Succinct targets, and multi-shard
-  UnionArchive constraints remain on legacy estimates.
+  UnionArchive constraints remain on legacy estimates. Ready planning allocates
+  per-row directed-cost scratch only when at least two covering sources can
+  actually compete; a forced single source keeps the same plan without unused
+  arbitration state.
 - **Finite equality work and pointwise TribleSet checks stay on the ordinary
   hybrid path, while TribleSet proposal cursors remain production-resumable.**
   Equality Propose, Confirm, and Support plus TribleSet Confirm and Support are

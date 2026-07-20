@@ -7283,6 +7283,24 @@ struct VariablePlan {
     proposers: Vec<usize>,
 }
 
+/// Builds the per-row cost model only when it can choose between sources.
+/// Validators still enter the model's confirmation sum, but do not by
+/// themselves turn a forced proposal into a planning decision.
+fn directed_source_arbitration(
+    peers: &[ActionCostPeer],
+    has_finite_formula: bool,
+) -> Option<DirectedActionModel> {
+    let competing_sources = peers
+        .iter()
+        .filter(|peer| peer.coverage >= ProposalCoverage::Covering)
+        .take(2)
+        .count()
+        == 2;
+    (competing_sources && !has_finite_formula)
+        .then(|| DirectedActionModel::new(peers))
+        .flatten()
+}
+
 fn estimate_leaf<'a>(
     root: &dyn Constraint<'a>,
     plan: &ResidualPlan,
@@ -7362,10 +7380,9 @@ fn ready_plan_transition<'a>(
     let unbound: Vec<VariableId> = full.subtract(desc.bound).into_iter().collect();
     let mut plans = Vec::with_capacity(unbound.len());
     let mut estimate_matrix = Vec::with_capacity(unbound.len() * rows.row_count);
-    let mut proposal_costs = vec![usize::MAX; rows.row_count];
+    let mut proposal_costs = Vec::new();
 
     for &variable in &unbound {
-        proposal_costs.fill(usize::MAX);
         let mut relevant = ChildSet::empty(leaf_count);
         let mut proposers = vec![usize::MAX; rows.row_count];
         let estimate_start = estimate_matrix.len();
@@ -7395,11 +7412,16 @@ fn ready_plan_transition<'a>(
             // model. Current formula composites already decline unit classes;
             // keep the structural guard explicit so future forwarding cannot
             // accidentally price the wrong physical route.
-            let directed = (!peers
-                .iter()
-                .any(|peer| plan.has_finite_formula(peer.occurrence)))
-            .then(|| DirectedActionModel::new(&peers))
-            .flatten();
+            let directed = directed_source_arbitration(
+                &peers,
+                peers
+                    .iter()
+                    .any(|peer| plan.has_finite_formula(peer.occurrence)),
+            );
+            if directed.is_some() {
+                proposal_costs.resize(rows.row_count, usize::MAX);
+                proposal_costs.fill(usize::MAX);
+            }
             for &peer in &peers {
                 if peer.coverage < ProposalCoverage::Covering {
                     continue;
@@ -7426,15 +7448,24 @@ fn ready_plan_transition<'a>(
                     column.resize(rows.row_count, usize::MAX);
                 }
                 for row in 0..rows.row_count {
-                    let planning_cost = directed.map_or(column[row], |model| {
-                        model.planning_cost(peer, column[row])
-                    });
-                    if proposers[row] == usize::MAX
-                        || (planning_cost, peer.occurrence)
-                            < (proposal_costs[row], proposers[row])
-                    {
+                    let preferred = if let Some(model) = directed {
+                        let planning_cost = model.planning_cost(peer, column[row]);
+                        if proposers[row] == usize::MAX
+                            || (planning_cost, peer.occurrence)
+                                < (proposal_costs[row], proposers[row])
+                        {
+                            proposal_costs[row] = planning_cost;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        proposers[row] == usize::MAX
+                            || (column[row], peer.occurrence)
+                                < (estimates[row], proposers[row])
+                    };
+                    if preferred {
                         proposers[row] = peer.occurrence;
-                        proposal_costs[row] = planning_cost;
                         // Directed work prices select the physical source for
                         // this variable. Cross-variable ordering remains the
                         // established cardinality heuristic: compare the raw
@@ -16969,6 +17000,34 @@ mod tests {
         ]);
 
         assert_eq!(actions, [(VARIABLE, 1, 1)]);
+    }
+
+    #[test]
+    fn ready_directed_arbitration_requires_competing_sources() {
+        let classes = ActionUnitClasses::new(
+            ProposalUnitClass::HASH_TABLE_ENUMERATION,
+            ConfirmationUnitClass::HASH_TABLE_MEMBERSHIP,
+        );
+        let source = ActionCostPeer {
+            occurrence: 0,
+            coverage: ProposalCoverage::Exact,
+            classes: Some(classes),
+        };
+        let validator = ActionCostPeer {
+            occurrence: 1,
+            coverage: ProposalCoverage::None,
+            classes: Some(classes),
+        };
+        assert!(directed_source_arbitration(&[source], false).is_none());
+        assert!(directed_source_arbitration(&[source, validator], false).is_none());
+
+        let second_source = ActionCostPeer {
+            occurrence: 2,
+            coverage: ProposalCoverage::Covering,
+            classes: Some(classes),
+        };
+        assert!(directed_source_arbitration(&[source, second_source], false).is_some());
+        assert!(directed_source_arbitration(&[source, second_source], true).is_none());
     }
 
     #[test]
