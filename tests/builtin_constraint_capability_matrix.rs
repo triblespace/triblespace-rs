@@ -15,8 +15,8 @@ use triblespace::core::debug::query::{DebugConstraint, EstimateOverrideConstrain
 use triblespace::core::query::equalityconstraint::EqualityConstraint;
 use triblespace::core::query::residual::{ResidualLowering, ResidualStateStats};
 use triblespace::core::query::{
-    Binding, Constraint, ConstraintShape, ProgramAction, ProgramRequest, Query, RowsView,
-    TypedProgramSpec, Variable, VariableId, VariableSet,
+    Binding, Constraint, ConstraintShape, ProgramAction, ProgramExposure, ProgramRequest, Query,
+    RowsView, TypedProgramSpec, Variable, VariableId, VariableSet,
 };
 use triblespace::prelude::inlineencodings::GenId;
 use triblespace::prelude::*;
@@ -401,12 +401,13 @@ fn membership_constraints_record_native_and_fallback_execution() {
             bound: VariableSet::new_empty(),
         })
         .is_none());
-    assert!(set_program
+    let set_confirm = set_program
         .route(ProgramRequest {
             action: ProgramAction::Confirm(variable.index),
             bound: VariableSet::new_empty(),
         })
-        .is_some());
+        .expect("hash-set confirm Program route");
+    assert_eq!(set_confirm.exposure, ProgramExposure::Explicit);
 
     let lawful_values = [a, b, c];
     let lawful_source = SortedSlice::new(&lawful_values).unwrap();
@@ -441,12 +442,13 @@ fn membership_constraints_record_native_and_fallback_execution() {
             bound: VariableSet::new_empty(),
         })
         .is_none());
-    assert!(map_program
+    let map_confirm = map_program
         .route(ProgramRequest {
             action: ProgramAction::Confirm(variable.index),
             bound: VariableSet::new_empty(),
         })
-        .is_some());
+        .expect("hash-map confirm Program route");
+    assert_eq!(map_confirm.exposure, ProgramExposure::Explicit);
 
     let mut full_map: Vec<_> = Query::new(
         and!(lawful_source.has(variable), map.clone().has(variable)),

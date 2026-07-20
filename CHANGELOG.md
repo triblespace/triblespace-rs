@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Hash-set and hash-map membership filters stay on the ordinary production
+  residual path.** Their pointwise Confirm and Support work is already bounded
+  by the scheduler's input page, so HYBRID no longer expands each cheap hash
+  lookup into a typed Program activation. The filter-only Program routes remain
+  available to `ResidualLowering::FULL` as explicit representability controls.
 - **Ordinary residual queries now use hybrid structural lowering.** Exposed
   associative AND regions remain flattened into residual occurrences, while
   other finite logical composites, including Union, stay fused behind their
