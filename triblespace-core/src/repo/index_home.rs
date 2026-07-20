@@ -1831,9 +1831,10 @@ where
         if candidates.is_empty() {
             return;
         }
-        // A unary set union is its sole child. Delegating the untouched bag
-        // avoids cloning the complete frontier and rebuilding an identical
-        // witness set merely to recover the child's membership result.
+        // A unary set union is its sole child. `Constraint::confirm` requires
+        // an order-preserving retain of the input bag, so delegating the
+        // untouched bag is observably equivalent while avoiding a complete
+        // frontier clone and an identical witness-set reconstruction.
         if self.shards.len() == 1 {
             self.shards[0].confirm(variable, view, candidates);
             return;
