@@ -1551,7 +1551,10 @@ where
             key,
             variable,
             stratum: ProgramStratum::Finite,
-            grouping: ProgramGrouping::PageLocal,
+            grouping: match request.action {
+                ProgramAction::Confirm(_) => ProgramGrouping::ParentAtomic,
+                ProgramAction::Propose(_) | ProgramAction::Support => ProgramGrouping::PageLocal,
+            },
             completion: ProgramCompletion::PageableOnly,
             exposure: match request.action {
                 ProgramAction::Propose(_) | ProgramAction::Confirm(_) => ProgramExposure::Explicit,
@@ -1623,7 +1626,13 @@ where
         effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
     ) {
         assert_eq!(batch.route.stratum, ProgramStratum::Finite);
-        assert_eq!(batch.route.grouping, ProgramGrouping::PageLocal);
+        assert_eq!(
+            batch.route.grouping,
+            match batch.request.action {
+                ProgramAction::Confirm(_) => ProgramGrouping::ParentAtomic,
+                ProgramAction::Propose(_) | ProgramAction::Support => ProgramGrouping::PageLocal,
+            }
+        );
         assert_eq!(batch.route.completion, ProgramCompletion::PageableOnly);
         let state = match batch.request.action {
             ProgramAction::Propose(variable) => {
@@ -1948,9 +1957,7 @@ where
     }
 
     fn residual_confirm_is_page_local(&self) -> bool {
-        self.shards
-            .iter()
-            .all(|shard| shard.residual_confirm_is_page_local())
+        false
     }
 
     fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
@@ -2461,6 +2468,8 @@ mod tests {
         assert_eq!(propose.key, irrelevant.key);
         assert_eq!(propose.stratum, ProgramStratum::Finite);
         assert_eq!(propose.grouping, ProgramGrouping::PageLocal);
+        assert_eq!(confirm.grouping, ProgramGrouping::ParentAtomic);
+        assert_eq!(support.grouping, ProgramGrouping::PageLocal);
         assert_eq!(propose.completion, ProgramCompletion::PageableOnly);
         assert_eq!(propose.exposure, ProgramExposure::Explicit);
         assert_eq!(confirm.exposure, ProgramExposure::Explicit);
@@ -2986,7 +2995,7 @@ mod tests {
     }
 
     #[test]
-    fn union_archive_confirm_is_page_local_over_duplicate_empty_parents() {
+    fn union_archive_confirm_is_forced_parent_atomic_over_duplicate_empty_parents() {
         let entity = Id::new([0x16; 16]).unwrap();
         let attribute = Id::new([0x24; 16]).unwrap();
         let archives = [
@@ -3009,7 +3018,7 @@ mod tests {
             (1, raw_value(3)),
             (1, raw_value(2)),
         ];
-        assert!(union.residual_confirm_is_page_local());
+        assert!(!union.residual_confirm_is_page_local());
 
         let mut whole = input.clone();
         union.confirm(

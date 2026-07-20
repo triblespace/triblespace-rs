@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Diagnostic: UnionArchive confirmation is forced parent-atomic.** Ordinary
+  residual capability discovery and explicit typed Program routing both keep a
+  parent's complete candidate bag together, while Propose and Support remain
+  page-local. This isolates the performance effect of confirmation paging.
 - **Ordinary residual queries now use hybrid structural lowering.** Exposed
   associative AND regions remain flattened into residual occurrences, while
   other finite logical composites, including Union, stay fused behind their
