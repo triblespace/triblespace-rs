@@ -7370,21 +7370,34 @@ fn ready_plan_transition<'a>(
         estimate_matrix.resize(estimate_start + rows.row_count, usize::MAX);
         let estimates = &mut estimate_matrix[estimate_start..];
         let mut column = Vec::with_capacity(rows.row_count);
-        for leaf in 0..leaf_count {
-            let constraint = plan.resolve(root, leaf);
-            if plan.certified_denotation {
+        if plan.certified_denotation {
+            let mut peers = Vec::new();
+            for leaf in 0..leaf_count {
+                let constraint = plan.resolve(root, leaf);
                 if constraint.variables().is_set(variable) {
                     relevant.insert(leaf);
+                    peers.push(ActionCostPeer {
+                        occurrence: leaf,
+                        coverage: plan.ready_proposal_coverage(
+                            constraint,
+                            variable,
+                            desc.bound,
+                        ),
+                        classes: constraint.action_unit_classes(variable, desc.bound),
+                    });
                 }
-                let coverage = plan.ready_proposal_coverage(constraint, variable, desc.bound);
-                if coverage < ProposalCoverage::Covering {
+            }
+
+            let directed = DirectedActionModel::new(&peers);
+            for &peer in &peers {
+                if peer.coverage < ProposalCoverage::Covering {
                     continue;
                 }
                 column.clear();
                 if estimate_leaf(
                     root,
                     plan,
-                    leaf,
+                    peer.occurrence,
                     variable,
                     &view,
                     &mut EstimateSink::Column(&mut column),
@@ -7402,48 +7415,56 @@ fn ready_plan_transition<'a>(
                     column.resize(rows.row_count, usize::MAX);
                 }
                 for row in 0..rows.row_count {
-                    if proposers[row] == usize::MAX || column[row] < estimates[row] {
-                        proposers[row] = leaf;
-                        estimates[row] = column[row];
+                    let planning_cost = directed.map_or(column[row], |model| {
+                        model.planning_cost(peer, column[row])
+                    });
+                    if proposers[row] == usize::MAX
+                        || (planning_cost, peer.occurrence)
+                            < (estimates[row], proposers[row])
+                    {
+                        proposers[row] = peer.occurrence;
+                        estimates[row] = planning_cost;
                     }
                 }
-                continue;
             }
-            column.clear();
-            let is_relevant = estimate_leaf(
-                root,
-                plan,
-                leaf,
-                variable,
-                &view,
-                &mut EstimateSink::Column(&mut column),
-            );
-            if is_relevant {
-                assert_eq!(
-                    column.len(),
-                    rows.row_count,
-                    "constraint estimate must append one value per row"
+        } else {
+            for leaf in 0..leaf_count {
+                column.clear();
+                let is_relevant = estimate_leaf(
+                    root,
+                    plan,
+                    leaf,
+                    variable,
+                    &view,
+                    &mut EstimateSink::Column(&mut column),
                 );
-                relevant.insert(leaf);
-                for row in 0..rows.row_count {
-                    if proposers[row] == usize::MAX || column[row] < estimates[row] {
-                        proposers[row] = leaf;
-                        estimates[row] = column[row];
+                if is_relevant {
+                    assert_eq!(
+                        column.len(),
+                        rows.row_count,
+                        "constraint estimate must append one value per row"
+                    );
+                    relevant.insert(leaf);
+                    for row in 0..rows.row_count {
+                        if proposers[row] == usize::MAX || column[row] < estimates[row] {
+                            proposers[row] = leaf;
+                            estimates[row] = column[row];
+                        }
                     }
+                } else {
+                    assert_eq!(
+                        column.len(),
+                        0,
+                        "irrelevant constraint estimate must leave its sink untouched"
+                    );
                 }
-            } else {
-                assert_eq!(
-                    column.len(),
-                    0,
-                    "irrelevant constraint estimate must leave its sink untouched"
-                );
             }
         }
         if proposers.iter().any(|&child| child == usize::MAX) {
-        assert!(
+            assert!(
                 plan.certified_denotation,
-            "unconstrained variable in residual-state query"
-        );
+                "unconstrained variable in residual-state query"
+            );
             estimate_matrix.truncate(estimate_start);
             continue;
         }

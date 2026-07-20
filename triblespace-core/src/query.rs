@@ -1173,6 +1173,151 @@ pub enum ProposalCoverage {
     Exact,
 }
 
+/// Logarithmic unit-work tier for one proposal candidate occurrence.
+///
+/// Rank `r` in `0..=63` represents the broad capability class `2^r`. Ranks are
+/// static backend properties: they may depend on the target axis and
+/// bound-variable schema, but never on row values, observed timings, frontier
+/// width, or scheduler state. The engine uses only their ordering and integer
+/// weights; they do not participate in semantic receipts or action identity.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ProposalUnitClass(u8);
+
+impl ProposalUnitClass {
+    /// Largest public tier. With at most `usize::MAX` occurrences, summing
+    /// rank-63 peer weights remains representable in the model's `u128` work
+    /// domain, so exact-source subtraction cannot erase other peers.
+    pub const MAX_LOG2_RANK: u8 = 63;
+
+    /// Defines a backend capability tier by its base-two rank.
+    pub const fn from_log2_rank(rank: u8) -> Self {
+        assert!(rank <= Self::MAX_LOG2_RANK, "unit-work rank exceeds 63");
+        Self(rank)
+    }
+
+    /// Returns the base-two rank of this capability tier.
+    pub const fn log2_rank(self) -> u8 {
+        self.0
+    }
+}
+
+/// Logarithmic unit-work tier for confirming one candidate occurrence.
+///
+/// Rank `r` in `0..=63` represents the broad capability class `2^r`. Like
+/// [`ProposalUnitClass`], this is immutable planning metadata rather than a
+/// runtime measurement or semantic capability.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ConfirmationUnitClass(u8);
+
+impl ConfirmationUnitClass {
+    /// Largest public tier; see [`ProposalUnitClass::MAX_LOG2_RANK`].
+    pub const MAX_LOG2_RANK: u8 = ProposalUnitClass::MAX_LOG2_RANK;
+
+    /// Defines a backend capability tier by its base-two rank.
+    pub const fn from_log2_rank(rank: u8) -> Self {
+        assert!(rank <= Self::MAX_LOG2_RANK, "unit-work rank exceeds 63");
+        Self(rank)
+    }
+
+    /// Returns the base-two rank of this capability tier.
+    pub const fn log2_rank(self) -> u8 {
+        self.0
+    }
+}
+
+/// Static directed unit costs for one constraint occurrence and target.
+///
+/// Proposal and confirmation are deliberately separate: an intersection
+/// prices choosing source `S` as the number of candidate **occurrences**
+/// quoted by `S`, multiplied by `S`'s proposal unit, one engine SET-admission
+/// unit, and the confirmation units of every occurrence that must validate
+/// those candidates.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ActionUnitClasses {
+    pub proposal: ProposalUnitClass,
+    pub confirmation: ConfirmationUnitClass,
+}
+
+impl ActionUnitClasses {
+    /// Creates one immutable pair of directed unit-work tiers.
+    pub const fn new(proposal: ProposalUnitClass, confirmation: ConfirmationUnitClass) -> Self {
+        Self {
+            proposal,
+            confirmation,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ActionCostPeer {
+    pub occurrence: usize,
+    pub coverage: ProposalCoverage,
+    pub classes: Option<ActionUnitClasses>,
+}
+
+fn unit_class_weight(rank: u8) -> u128 {
+    1u128.checked_shl(rank.into()).unwrap_or(u128::MAX)
+}
+
+/// Every certified proposal occurrence crosses the engine's SET-admission
+/// boundary before descendants observe it. Keep that engine work explicit
+/// rather than hiding it inside a backend proposal class.
+const SET_ADMISSION_LOG2_RANK: u8 = 0;
+const SET_ADMISSION_UNIT_WEIGHT: u128 = 1u128 << SET_ADMISSION_LOG2_RANK;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DirectedActionModel {
+    confirmation_weight: u128,
+}
+
+impl DirectedActionModel {
+    pub(crate) fn new(peers: &[ActionCostPeer]) -> Option<Self> {
+        let mut confirmation_weight = 0u128;
+        for peer in peers {
+            let classes = peer.classes?;
+            confirmation_weight = confirmation_weight
+                .saturating_add(unit_class_weight(classes.confirmation.log2_rank()));
+        }
+        Some(Self {
+            confirmation_weight,
+        })
+    }
+
+    /// Prices one source as `occurrences × directed unit work`.
+    ///
+    /// An exact source need not confirm its own output; a covering source does.
+    /// Saturation stops below `usize::MAX`, which remains the engine's sentinel
+    /// for an unknown legacy estimate. A missing source count conservatively
+    /// retains that sentinel.
+    pub(crate) fn planning_cost(self, source: ActionCostPeer, candidate_count: usize) -> usize {
+        if candidate_count == usize::MAX {
+            return usize::MAX;
+        }
+        let classes = source
+            .classes
+            .expect("a directed model contains classes for every occurrence");
+        let own_confirmation = unit_class_weight(classes.confirmation.log2_rank());
+        let confirmation_weight = if source.coverage == ProposalCoverage::Exact {
+            self.confirmation_weight.saturating_sub(own_confirmation)
+        } else {
+            self.confirmation_weight
+        };
+        let unit_weight = unit_class_weight(classes.proposal.log2_rank())
+            .saturating_add(SET_ADMISSION_UNIT_WEIGHT)
+            .saturating_add(confirmation_weight);
+        (candidate_count as u128)
+            .saturating_mul(unit_weight)
+            .min((usize::MAX - 1) as u128) as usize
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ActionSourceChoice {
+    pub occurrence: usize,
+    pub coverage: ProposalCoverage,
+    pub planning_cost: usize,
+}
+
 /// Object-safe child access for a structural constraint shape.
 #[doc(hidden)]
 pub trait ConstraintChildren<'a> {
@@ -1361,6 +1506,40 @@ pub trait Constraint<'a> {
         ProposalCoverage::None
     }
 
+    /// Optionally publishes static directed unit costs for one target action.
+    ///
+    /// This capability is consulted only under a completely
+    /// [`fixed_denotation`](Constraint::fixed_denotation) root. Returning
+    /// `Some` promises that, whenever
+    /// [`proposal_coverage`](Constraint::proposal_coverage) is at least
+    /// [`Covering`](ProposalCoverage::Covering), each value emitted by
+    /// [`estimate_certified`](Constraint::estimate_certified) for the same
+    /// target and bound schema is the number of physical candidate
+    /// **occurrences** that [`propose_certified`](Constraint::propose_certified)
+    /// would produce for that row before intersection confirmation. It is not
+    /// the number of distinct values unless the proposal itself is distinct.
+    ///
+    /// The classes must describe broad, immutable backend capabilities. They
+    /// may depend on `variable` and `bound`, but never on row values, sampled
+    /// timings, frontier width, or scheduler state. They affect planning only:
+    /// they neither strengthen proposal coverage nor enter canonical state,
+    /// route, or action identity. An intersection uses directed pricing only
+    /// when every relevant occurrence opts in; otherwise the complete action
+    /// falls back atomically to legacy estimate ordering. The count promise
+    /// above means an opted-in source cannot lawfully return an unknown quote;
+    /// the planner nevertheless preserves `usize::MAX` if it does.
+    ///
+    /// A confirmation-only occurrence may return `Some` without providing a
+    /// candidate count because its proposal class is not consulted. The
+    /// conservative default declines directed pricing.
+    fn action_unit_classes(
+        &self,
+        _variable: VariableId,
+        _bound: VariableSet,
+    ) -> Option<ActionUnitClasses> {
+        None
+    }
+
     /// Estimates the number of candidate values for `variable` for
     /// **every row** of the block, pushing one estimate per row into
     /// `out`.
@@ -1373,10 +1552,12 @@ pub trait Constraint<'a> {
     /// [`proposal_coverage`](Constraint::proposal_coverage), and the engine
     /// uses `usize::MAX` as the unknown cost.
     ///
-    /// Estimates need not equal the eventual candidate count. Tighter quotes
-    /// improve adaptive ordering, but cannot change the denoted relation; see
-    /// the [Atreides join](crate) family for how estimate fidelity affects
-    /// performance.
+    /// Estimates need not equal the eventual candidate count unless this
+    /// occurrence opts into
+    /// [`action_unit_classes`](Constraint::action_unit_classes). Tighter
+    /// quotes improve adaptive ordering, but cannot change the denoted
+    /// relation; see the [Atreides join](crate) family for how estimate
+    /// fidelity affects performance.
     fn estimate(
         &self,
         variable: VariableId,
@@ -2071,6 +2252,15 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.proposal_coverage(variable, bound)
     }
 
+    fn action_unit_classes(
+        &self,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> Option<ActionUnitClasses> {
+        let inner: &T = self;
+        inner.action_unit_classes(variable, bound)
+    }
+
     fn estimate(
         &self,
         variable: VariableId,
@@ -2290,6 +2480,15 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
         let inner: &T = self;
         inner.proposal_coverage(variable, bound)
+    }
+
+    fn action_unit_classes(
+        &self,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> Option<ActionUnitClasses> {
+        let inner: &T = self;
+        inner.action_unit_classes(variable, bound)
     }
 
     fn estimate(
@@ -5251,6 +5450,105 @@ mod tests {
             variables.set(variable);
         }
         variables
+    }
+
+    fn action_peer(
+        occurrence: usize,
+        coverage: ProposalCoverage,
+        proposal_rank: u8,
+        confirmation_rank: u8,
+    ) -> ActionCostPeer {
+        ActionCostPeer {
+            occurrence,
+            coverage,
+            classes: Some(ActionUnitClasses::new(
+                ProposalUnitClass::from_log2_rank(proposal_rank),
+                ConfirmationUnitClass::from_log2_rank(confirmation_rank),
+            )),
+        }
+    }
+
+    #[test]
+    fn directed_action_model_requires_every_relevant_occurrence() {
+        let mut peers = vec![action_peer(0, ProposalCoverage::Exact, 0, 0)];
+        peers.push(ActionCostPeer {
+            occurrence: 1,
+            coverage: ProposalCoverage::None,
+            classes: None,
+        });
+
+        assert!(DirectedActionModel::new(&peers).is_none());
+    }
+
+    #[test]
+    fn directed_action_model_prices_engine_set_admission_explicitly() {
+        let source = action_peer(0, ProposalCoverage::Exact, 0, 6);
+        let model = DirectedActionModel::new(&[source]).expect("complete classes");
+
+        assert_eq!(model.planning_cost(source, 7), 14);
+    }
+
+    #[test]
+    fn directed_action_model_prices_proposal_and_confirmation_direction() {
+        let expensive_to_confirm = action_peer(0, ProposalCoverage::Exact, 0, 6);
+        let cheap_to_confirm = action_peer(1, ProposalCoverage::Exact, 0, 0);
+        let model = DirectedActionModel::new(&[expensive_to_confirm, cheap_to_confirm])
+            .expect("complete classes");
+
+        assert_eq!(model.planning_cost(expensive_to_confirm, 32), 96);
+        assert_eq!(model.planning_cost(cheap_to_confirm, 16), 1_056);
+    }
+
+    #[test]
+    fn directed_action_model_covering_source_confirms_itself() {
+        let covering = action_peer(0, ProposalCoverage::Covering, 0, 6);
+        let peer = action_peer(1, ProposalCoverage::Exact, 0, 0);
+        let model = DirectedActionModel::new(&[covering, peer]).expect("complete classes");
+
+        assert_eq!(model.planning_cost(covering, 32), 2_144);
+    }
+
+    #[test]
+    fn directed_action_model_counts_repeated_occurrences() {
+        let source = action_peer(0, ProposalCoverage::Exact, 0, 0);
+        let validator = action_peer(1, ProposalCoverage::None, 0, 2);
+        let repeated_validator = action_peer(2, ProposalCoverage::None, 0, 2);
+        let once = DirectedActionModel::new(&[source, validator]).expect("complete classes");
+        let twice = DirectedActionModel::new(&[source, validator, repeated_validator])
+            .expect("complete classes");
+
+        assert_eq!(once.planning_cost(source, 3), 18);
+        assert_eq!(twice.planning_cost(source, 3), 30);
+    }
+
+    #[test]
+    fn directed_action_model_is_monotone_and_preserves_unknown_sentinel() {
+        let source = action_peer(
+            0,
+            ProposalCoverage::Exact,
+            ProposalUnitClass::MAX_LOG2_RANK,
+            0,
+        );
+        let model = DirectedActionModel::new(&[source]).expect("complete classes");
+
+        assert_eq!(model.planning_cost(source, 0), 0);
+        let one = ((1u128 << ProposalUnitClass::MAX_LOG2_RANK) + 1)
+            .min((usize::MAX - 1) as u128) as usize;
+        assert_eq!(model.planning_cost(source, 1), one);
+        assert_eq!(model.planning_cost(source, 2), usize::MAX - 1);
+        assert_eq!(model.planning_cost(source, usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    #[should_panic(expected = "unit-work rank exceeds 63")]
+    fn proposal_unit_class_rejects_unlawful_rank() {
+        ProposalUnitClass::from_log2_rank(ProposalUnitClass::MAX_LOG2_RANK + 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "unit-work rank exceeds 63")]
+    fn confirmation_unit_class_rejects_unlawful_rank() {
+        ConfirmationUnitClass::from_log2_rank(ConfirmationUnitClass::MAX_LOG2_RANK + 1);
     }
 
     #[test]
