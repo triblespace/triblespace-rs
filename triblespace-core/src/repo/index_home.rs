@@ -1836,6 +1836,13 @@ where
         // untouched bag is observably equivalent while avoiding a complete
         // frontier clone and an identical witness-set reconstruction.
         if self.shards.len() == 1 {
+            if let CandidateSink::Values(_) = candidates {
+                debug_assert_eq!(
+                    view.len(),
+                    1,
+                    "plain candidate values require one parent row"
+                );
+            }
             self.shards[0].confirm(variable, view, candidates);
             return;
         }
