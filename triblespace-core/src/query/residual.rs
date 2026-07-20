@@ -99,6 +99,7 @@ use super::*;
 mod delta;
 mod materialize;
 mod set_admit;
+pub(crate) mod trace;
 use delta::{
     ActivationId as DeltaActivationId, ActiveDeltaContinuation, ActiveDeltaStatus, DeltaDesc,
     DeltaScheduler, DeltaSeedOutcome, DeltaStepOutcome, TerminalPublicationBatch,
@@ -7602,6 +7603,15 @@ fn propose_action_transition<'a>(
         &view,
         &mut candidates.sink(rows.row_count),
     );
+    let (trace_event, trace_due) = trace::event("ordinary_propose");
+    if trace_due {
+        trace::emit(format_args!(
+            "ordinary propose #{trace_event} variable={variable} leaf={proposer} path={:?} parents={} result {}",
+            plan.leaves[proposer].path,
+            rows.row_count,
+            trace::candidates(&candidates),
+        ));
+    }
     stats.propose_calls += 1;
     stats.propose_rows += rows.row_count;
     stats.max_propose_rows = stats.max_propose_rows.max(rows.row_count);
@@ -7898,6 +7908,15 @@ fn confirm_action_transition<'a>(
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
     let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
     let candidates_before = batch.candidates.len();
+    let (trace_event, trace_due) = trace::event("ordinary_confirm");
+    if trace_due {
+        trace::emit(format_args!(
+            "ordinary confirm #{trace_event} begin variable={variable} leaf={confirmer} path={:?} parents={} input {}",
+            plan.leaves[confirmer].path,
+            batch.parents.row_count,
+            trace::candidates(&batch.candidates),
+        ));
+    }
     confirm_leaf(
         root,
         plan,
@@ -7906,6 +7925,12 @@ fn confirm_action_transition<'a>(
         &view,
         &mut batch.candidates.sink(batch.parents.row_count),
     );
+    if trace_due {
+        trace::emit(format_args!(
+            "ordinary confirm #{trace_event} end survivors {}",
+            trace::candidates(&batch.candidates),
+        ));
+    }
     stats.confirm_calls += 1;
     stats.confirm_rows += batch.parents.row_count;
     stats.max_confirm_rows = stats.max_confirm_rows.max(batch.parents.row_count);
@@ -9023,6 +9048,20 @@ fn formula_action_transition<'a>(
         FormulaStage::Confirm => batch.input().clone(),
     };
     let candidates_before = result.len();
+    let trace_kind = match stage {
+        FormulaStage::Support => unreachable!("support returned above"),
+        FormulaStage::Propose => "formula_ordinary_propose",
+        FormulaStage::Confirm => "formula_ordinary_confirm",
+    };
+    let (trace_event, trace_due) = trace::event(trace_kind);
+    if trace_due {
+        trace::emit(format_args!(
+            "formula ordinary action #{trace_event} begin stage={stage:?} variable={variable} occurrence={occurrence} node={node:?} path={:?} parents={} input {}",
+            plan.finite_formula.node(node).path,
+            batch.parents.row_count,
+            trace::candidates(&result),
+        ));
+    }
     match stage {
         FormulaStage::Support => unreachable!("support returned above"),
         FormulaStage::Propose => {
@@ -9047,6 +9086,12 @@ fn formula_action_transition<'a>(
             stats.candidates_confirmed += candidates_before;
             stats.max_confirm_candidates = stats.max_confirm_candidates.max(candidates_before);
         }
+    }
+    if trace_due {
+        trace::emit(format_args!(
+            "formula ordinary action #{trace_event} end stage={stage:?} result {}",
+            trace::candidates(&result),
+        ));
     }
     match stage {
         FormulaStage::Support => unreachable!("support returned above"),
@@ -9719,6 +9764,10 @@ struct ResidualStateMachine {
     width: usize,
     growth: usize,
     cap: usize,
+    /// Diagnostic identity and clock. Both are inert unless the environment
+    /// explicitly arms the private residual trace.
+    trace_id: u64,
+    trace_started: Option<Instant>,
 }
 
 /// Borrow-free residual cursor stored by the ordinary [`Query`].
@@ -9929,6 +9978,7 @@ impl ResidualStateMachine {
         seed: FrameSeedRow,
     ) -> Self {
         let cap = block_row_cap();
+        let trace_id = trace::new_query();
         let mut state = Self {
             full,
             leaf_count,
@@ -9963,6 +10013,8 @@ impl ResidualStateMachine {
             width: lazy_start_width().clamp(1, cap),
             growth: lazy_growth(),
             cap,
+            trace_id,
+            trace_started: (trace_id != 0).then(Instant::now),
         };
         if matches!(mode, Search::NextVariable) {
             file_with_span(
@@ -9982,6 +10034,18 @@ impl ResidualStateMachine {
                 &mut state.stats,
             );
         }
+        trace::emit_for(
+            trace_id,
+            format_args!(
+                "machine initialized full_vars={} leaves={} action_span={} width={} growth={} cap={} search={mode:?}",
+                full.count(),
+                leaf_count,
+                action_span,
+                state.width,
+                state.growth,
+                state.cap,
+            ),
+        );
         state
     }
 
@@ -10924,6 +10988,31 @@ impl ResidualStateMachine {
             }
         }
         if let Some((spec, route)) = program {
+            let (event, due) = trace::event("formula_program_seed");
+            if due {
+                trace::emit(format_args!(
+                    "formula Program seed #{event} elapsed_ms={} stage={stage:?} outer_variable={} route_variable={} occurrence={} node={node:?} path={:?} bound={} parents={} candidates={} stream_proposal={} route={route:?} width={} cumulative_confirm_calls={} cumulative_confirm_candidates={} max_confirm_candidates={}",
+                    self.trace_started.map_or(0, |started| started.elapsed().as_millis()),
+                    outer_variable,
+                    route.variable,
+                    occurrence,
+                    formula_node.path,
+                    desc.bound.count(),
+                    batch.parents.row_count,
+                    batch.action_candidate_count(stage),
+                    stream_proposal,
+                    self.width,
+                    self.stats.confirm_calls,
+                    self.stats.candidates_confirmed,
+                    self.stats.max_confirm_candidates,
+                ));
+                if stage == FormulaStage::Confirm && event <= 4 {
+                    trace::emit(format_args!(
+                        "formula Program seed #{event} original candidates {}",
+                        trace::candidates(batch.input())
+                    ));
+                }
+            }
             return Ok(self.delta.seed_program_formula(
                 spec,
                 DeltaDesc::formula(variable, occurrence, node),
@@ -11112,6 +11201,49 @@ impl ResidualStateMachine {
             self.take_next_with_plan(plan, width)
                 .expect("pop_once requires a non-empty residual worklist")
         };
+        let (trace_event, trace_due) = trace::event("stable_pop");
+        if trace_due {
+            let candidate_pages = task
+                .desc
+                .uses_candidate_pages(plan, &self.interner.formula_pcs);
+            let candidates = match &task.bucket {
+                StateBucket::Rows(_) => 0,
+                StateBucket::Candidates(batch) => batch.candidate_count(),
+                StateBucket::Formula(batch) => batch.page_candidate_count(),
+            };
+            trace::emit(format_args!(
+                "stable pop #{trace_event} elapsed_ms={} width={} selection={:?} state={:?} bound={} phase={:?} rows={} candidates={} occupancy={} candidate_pages={} action={:?} cumulative_confirm_calls={} cumulative_confirm_candidates={} max_confirm_candidates={}",
+                self.trace_started.map_or(0, |started| started.elapsed().as_millis()),
+                width,
+                self.last_selection,
+                task.state,
+                task.desc.bound.count(),
+                task.desc.phase,
+                task.bucket.row_count(),
+                candidates,
+                task.bucket.occupancy(candidate_pages),
+                candidate_pages,
+                task.action_task(plan, &self.interner),
+                self.stats.confirm_calls,
+                self.stats.candidates_confirmed,
+                self.stats.max_confirm_candidates,
+            ));
+            if trace_event <= 4 {
+                match &task.bucket {
+                    StateBucket::Candidates(batch) => trace::emit(format_args!(
+                        "stable pop #{trace_event} candidate payload {}",
+                        trace::candidates(&batch.candidates)
+                    )),
+                    StateBucket::Formula(batch) if !batch.input().is_empty() => {
+                        trace::emit(format_args!(
+                            "stable pop #{trace_event} formula input {}",
+                            trace::candidates(batch.input())
+                        ));
+                    }
+                    StateBucket::Rows(_) | StateBucket::Formula(_) => {}
+                }
+            }
+        }
         if self.should_defer_terminal_admission(&task) {
             let SelectedResidualTask {
                 state,
@@ -11170,8 +11302,19 @@ impl ResidualStateMachine {
         if floor <= self.width {
             return;
         }
+        let previous = self.width;
         self.width = floor;
         self.stats.width_increases += 1;
+        trace::emit(format_args!(
+            "width {} -> {} elapsed_ms={} increases={} cumulative_confirm_calls={} cumulative_confirm_candidates={} max_confirm_candidates={}",
+            previous,
+            self.width,
+            self.trace_started.map_or(0, |started| started.elapsed().as_millis()),
+            self.stats.width_increases,
+            self.stats.confirm_calls,
+            self.stats.candidates_confirmed,
+            self.stats.max_confirm_candidates,
+        ));
     }
 
     fn increase_delta_activation_width(&mut self) {
@@ -11466,6 +11609,7 @@ impl ResidualStateMachine {
     where
         P: Fn(&Binding) -> Option<R>,
     {
+        let _trace_scope = trace::enter(self.trace_id);
         if projection_gate.is_done() {
             self.retire_staged_projection_receipts();
             return None;
@@ -11751,6 +11895,8 @@ impl ResidualStateMachine {
             width: self.width,
             growth: self.growth,
             cap: self.cap,
+            trace_id: self.trace_id,
+            trace_started: self.trace_started,
         }
     }
 

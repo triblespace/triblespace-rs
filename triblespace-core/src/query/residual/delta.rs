@@ -15,6 +15,7 @@ use super::materialize::{
     ProposalMaterializePhaseKind, ProposalMaterializerState,
 };
 use super::set_admit::{SetAdmissionPhaseKind, SetAdmissionState};
+use super::trace;
 use super::*;
 
 static NEXT_REGISTRY_BRAND: AtomicU64 = AtomicU64::new(1);
@@ -4269,6 +4270,25 @@ impl DeltaScheduler {
         let seeded_parents = batch.parents.row_count;
         let parent_rows = batch.parents.rows.clone();
         let singletons = batch.into_singletons(bound.count());
+        let (candidate_sum, candidate_min, candidate_max) = singletons.iter().fold(
+            (0usize, usize::MAX, 0usize),
+            |(sum, min, max), singleton| {
+                let len = singleton.action_candidate_count(stage);
+                (sum.saturating_add(len), min.min(len), max.max(len))
+            },
+        );
+        let (event, due) = trace::event("program_delta_seed");
+        if due {
+            trace::emit(format_args!(
+                "delta Program seed #{event} address={desc:?} request={request:?} route={route:?} stage={stage:?} bound={} parents={} singleton_candidate_sum={} singleton_candidate_min={} singleton_candidate_max={} stream_proposal={}",
+                bound.count(),
+                seeded_parents,
+                candidate_sum,
+                if singletons.is_empty() { 0 } else { candidate_min },
+                candidate_max,
+                stream_proposal,
+            ));
+        }
         let state = self.prepare_program(desc, route, spec);
         let mut activations = Vec::with_capacity(singletons.len());
         for mut batch in singletons {
@@ -5954,6 +5974,7 @@ impl DeltaScheduler {
                 state,
                 tasks,
                 &dispatch.task_limits,
+                search_width,
                 direct_terminal_full,
                 stable,
                 stable_interner,
@@ -6105,6 +6126,7 @@ impl DeltaScheduler {
                 state,
                 tasks,
                 &dispatch.task_limits,
+                search_width,
                 direct_terminal_publication_full,
                 stable,
                 stable_interner,
@@ -6436,6 +6458,7 @@ impl DeltaScheduler {
         state: DeltaStateId,
         tasks: Vec<ProgramTask>,
         limits: &[usize],
+        search_width: usize,
         direct_terminal_full: Option<VariableSet>,
         stable: &mut Worklist,
         stable_interner: &mut StateInterner,
@@ -6485,6 +6508,36 @@ impl DeltaScheduler {
             work.push(task.work);
         }
         let mut receipt = ProgramBatchEffects::default();
+        let (trace_event, trace_due) = trace::event("program_step");
+        if trace_due {
+            let (candidate_groups, candidate_sum, candidate_min, candidate_max) =
+                candidate_sets.iter().fold(
+                    (0usize, 0usize, usize::MAX, 0usize),
+                    |(groups, sum, min, max), candidates| match candidates {
+                        Some(candidates) => (
+                            groups + 1,
+                            sum.saturating_add(candidates.len()),
+                            min.min(candidates.len()),
+                            max.max(candidates.len()),
+                        ),
+                        None => (groups, sum, min, max),
+                    },
+                );
+            let limit_sum = limits.iter().copied().sum::<usize>();
+            trace::emit(format_args!(
+                "Program step #{trace_event} begin address={address:?} search_width={search_width} rows={row_count} bound={} candidate_groups={} candidate_sum={} candidate_min={} candidate_max={} limit_sum={} limit_min={} limit_max={} class={:?}",
+                cohort_key.bound.count(),
+                candidate_groups,
+                candidate_sum,
+                if candidate_groups == 0 { 0 } else { candidate_min },
+                candidate_max,
+                limit_sum,
+                limits.iter().copied().min().unwrap_or(0),
+                limits.iter().copied().max().unwrap_or(0),
+                cohort_key.class,
+            ));
+        }
+        let trace_started = trace_due.then(std::time::Instant::now);
         spec.step_batch_for(
             self.program_runtimes
                 .get_mut(&state)
@@ -6500,6 +6553,32 @@ impl DeltaScheduler {
             },
             &mut receipt,
         );
+        if trace_due {
+            let examined_sum = receipt.pages.iter().map(|page| page.examined).sum::<usize>();
+            let resumed = receipt
+                .pages
+                .iter()
+                .filter(|page| page.resume.is_some())
+                .count();
+            trace::emit(format_args!(
+                "Program step #{trace_event} end pages={} examined_sum={} examined_min={} examined_max={} resumed={} children={} direct={} accepted={} supported={} source_pages={} source_examined={} transition_pages={} transition_examined={} placement={:?} elapsed_us={}",
+                receipt.pages.len(),
+                examined_sum,
+                receipt.pages.iter().map(|page| page.examined).min().unwrap_or(0),
+                receipt.pages.iter().map(|page| page.examined).max().unwrap_or(0),
+                resumed,
+                receipt.children.len(),
+                receipt.direct.len(),
+                receipt.accepted.len(),
+                receipt.supported.len(),
+                receipt.source_pages,
+                receipt.source_examined,
+                receipt.transition_pages,
+                receipt.transition_examined,
+                receipt.placement,
+                trace_started.map_or(0, |started| started.elapsed().as_micros()),
+            ));
+        }
         drop(candidate_sets);
         assert_eq!(
             receipt.pages.len(),

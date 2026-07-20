@@ -6,6 +6,7 @@ use std::sync::Arc;
 use crate::inline::IntoInline;
 use crate::inline::TryFromInline;
 
+use super::residual::trace;
 use super::*;
 
 /// Constrains a variable to values present in a [`HashSet`].
@@ -84,6 +85,18 @@ where
         if matches!(batch.request.action, ProgramAction::Propose(_)) {
             panic!("filter-only hash-set Program admitted a proposal")
         }
+        let (event, due) = trace::event("hashset_program_seed");
+        if due {
+            trace::emit(format_args!(
+                "HashSet Program seed #{event} variable={} set_len={} request={:?} route={:?} parents={} bound={}",
+                self.variable.index,
+                self.set.len(),
+                batch.request,
+                batch.route,
+                batch.view.len(),
+                batch.request.bound.count(),
+            ));
+        }
         finiteunaryprogram::seed(self.variable.index, batch, effects);
     }
 
@@ -93,6 +106,56 @@ where
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
+        let (event, due) = trace::event("hashset_program_step");
+        if due {
+            let mut confirm_count = 0usize;
+            let mut support_count = 0usize;
+            let mut offset_min = usize::MAX;
+            let mut offset_max = 0usize;
+            for state in &states {
+                match state {
+                    finiteunaryprogram::FiniteUnaryProgramState::Confirm { offset } => {
+                        confirm_count += 1;
+                        offset_min = offset_min.min(*offset);
+                        offset_max = offset_max.max(*offset);
+                    }
+                    finiteunaryprogram::FiniteUnaryProgramState::Support => support_count += 1,
+                    finiteunaryprogram::FiniteUnaryProgramState::Propose { .. } => {
+                        unreachable!("filter-only hash-set Program entered a proposal state")
+                    }
+                }
+            }
+            let (candidate_groups, candidate_sum, candidate_min, candidate_max) =
+                batch.candidate_sets.iter().fold(
+                    (0usize, 0usize, usize::MAX, 0usize),
+                    |(groups, sum, min, max), candidates| match candidates {
+                        Some(candidates) => (
+                            groups + 1,
+                            sum.saturating_add(candidates.len()),
+                            min.min(candidates.len()),
+                            max.max(candidates.len()),
+                        ),
+                        None => (groups, sum, min, max),
+                    },
+                );
+            trace::emit(format_args!(
+                "HashSet Program step #{event} variable={} set_len={} rows={} confirm_states={} support_states={} offset_min={} offset_max={} candidate_groups={} candidate_sum={} candidate_min={} candidate_max={} limit_sum={} limit_min={} limit_max={}",
+                self.variable.index,
+                self.set.len(),
+                states.len(),
+                confirm_count,
+                support_count,
+                if confirm_count == 0 { 0 } else { offset_min },
+                offset_max,
+                candidate_groups,
+                candidate_sum,
+                if candidate_groups == 0 { 0 } else { candidate_min },
+                candidate_max,
+                batch.limits.iter().copied().sum::<usize>(),
+                batch.limits.iter().copied().min().unwrap_or(0),
+                batch.limits.iter().copied().max().unwrap_or(0),
+            ));
+        }
         finiteunaryprogram::step(
             self.variable.index,
             states,
