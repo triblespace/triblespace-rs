@@ -656,6 +656,8 @@ where
     /// Exact number of values examined and emitted by an unbounded walk for
     /// this row. Single-target Ring estimates are rank/select counts over the
     /// same located source, so this does no proposal traversal.
+    #[cold]
+    #[inline(never)]
     pub(crate) fn exact_len(&self, row: &[RawInline]) -> usize {
         assert_eq!(
             row.len(),

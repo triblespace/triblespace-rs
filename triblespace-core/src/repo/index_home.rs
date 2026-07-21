@@ -1633,6 +1633,8 @@ where
         });
     }
 
+    #[cold]
+    #[inline(never)]
     fn quote_complete_typed(
         &self,
         batch: ProgramCompleteBatch<'_>,
