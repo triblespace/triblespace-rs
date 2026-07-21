@@ -5746,7 +5746,12 @@ impl DeltaScheduler {
         &mut self,
         active: ActiveDeltaContinuation,
         search_width: usize,
-    ) -> (DeltaStateId, Vec<ProgramTask>, PhysicalDispatch) {
+    ) -> (
+        DeltaStateId,
+        ProgramCohortKey,
+        Vec<ProgramTask>,
+        PhysicalDispatch,
+    ) {
         let (selection, empty, remainder_tasks) = {
             let bucket = self
                 .program_worklist
@@ -5771,13 +5776,18 @@ impl DeltaScheduler {
             limits,
             remainder_tasks,
         );
-        (active.state, tasks, dispatch)
+        (active.state, key, tasks, dispatch)
     }
 
     fn pop_program_bounded(
         &mut self,
         search_width: usize,
-    ) -> (DeltaStateId, Vec<ProgramTask>, PhysicalDispatch) {
+    ) -> (
+        DeltaStateId,
+        ProgramCohortKey,
+        Vec<ProgramTask>,
+        PhysicalDispatch,
+    ) {
         let id = *self
             .program_worklist
             .last_key_value()
@@ -5813,7 +5823,7 @@ impl DeltaScheduler {
             limits,
             remainder_tasks,
         );
-        (id, tasks, dispatch)
+        (id, key, tasks, dispatch)
     }
 
     #[cfg(test)]
@@ -5992,11 +6002,13 @@ impl DeltaScheduler {
             .delta_source_candidates_examined
             .saturating_add(stats.delta_transition_candidates_examined);
         let outcome = if has_program {
-            let (state, tasks, dispatch) = self.pop_active_program(active, search_width);
+            let (state, cohort_key, tasks, dispatch) =
+                self.pop_active_program(active, search_width);
             let physical = self.step_program(
                 root,
                 plan,
                 state,
+                cohort_key,
                 tasks,
                 &dispatch.task_limits,
                 direct_terminal_full,
@@ -6140,7 +6152,7 @@ impl DeltaScheduler {
         stats: &mut ResidualStateStats,
     ) -> DeltaStepOutcome {
         if !self.program_worklist.is_empty() {
-            let (state, tasks, dispatch) = self.pop_program_bounded(search_width);
+            let (state, cohort_key, tasks, dispatch) = self.pop_program_bounded(search_width);
             let examined_before = stats
                 .delta_source_candidates_examined
                 .saturating_add(stats.delta_transition_candidates_examined);
@@ -6148,6 +6160,7 @@ impl DeltaScheduler {
                 root,
                 plan,
                 state,
+                cohort_key,
                 tasks,
                 &dispatch.task_limits,
                 direct_terminal_publication_full,
@@ -6479,6 +6492,7 @@ impl DeltaScheduler {
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
         state: DeltaStateId,
+        cohort_key: ProgramCohortKey,
         mut tasks: Vec<ProgramTask>,
         limits: &[usize],
         direct_terminal_full: Option<VariableSet>,
@@ -6498,12 +6512,14 @@ impl DeltaScheduler {
         let address_key = address.key();
         let spec = address.resolve(root, plan);
         let private_direct = address.has_private_direct_effects();
-        let cohort_key = ProgramCohortKey::of(&self.registry, &tasks[0]);
-        assert!(
+        // Selection compared every admitted task against this exact key. Keep
+        // that contract executable in debug builds without repeating its
+        // registry probes on the release hot path.
+        debug_assert!(
             tasks
                 .iter()
                 .all(|task| ProgramCohortKey::of(&self.registry, task) == cohort_key),
-            "one typed program cohort mixed incompatible physical dispatch shapes"
+            "selected typed program cohort key no longer describes every task"
         );
 
         let row_count = tasks.len();
@@ -9771,7 +9787,7 @@ mod tests {
 
         assert_eq!(scheduler.program_worklist.len(), 1);
         assert_eq!(scheduler.program_worklist[&state].tasks.len(), 2);
-        let (popped_state, hot, dispatch) = scheduler.pop_active_program(active, 1);
+        let (popped_state, _cohort_key, hot, dispatch) = scheduler.pop_active_program(active, 1);
         assert_eq!(popped_state, state);
         assert_eq!(dispatch.kind, PhysicalDispatchKind::Program);
         assert_eq!(hot.len(), 1);
@@ -9848,12 +9864,18 @@ mod tests {
         );
         let storage_nonces: Vec<_> = tasks.iter().map(|task| task.credit.key.nonce).collect();
         let active = scheduler.file_program_state(state, tasks).unwrap();
-        let (popped_state, selected, dispatch) = if active_pop {
+        let (popped_state, cohort_key, selected, dispatch) = if active_pop {
             scheduler.pop_active_program(active, 3)
         } else {
             scheduler.pop_program_bounded(3)
         };
         assert_eq!(popped_state, state);
+        assert!(
+            selected
+                .iter()
+                .all(|task| ProgramCohortKey::of(&scheduler.registry, task) == cohort_key),
+            "popped Program work must carry the key certified during selection"
+        );
         assert_eq!(
             dispatch.kind,
             match pacing {
@@ -9946,7 +9968,7 @@ mod tests {
         );
         let _ = scheduler.file_program_state(state, vec![s0, q0, s1, q1]);
 
-        let (popped_state, tasks, dispatch) = scheduler.pop_program_bounded(4);
+        let (popped_state, _cohort_key, tasks, dispatch) = scheduler.pop_program_bounded(4);
         assert_eq!(popped_state, state);
         assert_eq!(dispatch.kind, PhysicalDispatchKind::Source);
         assert_eq!(dispatch.task_limits, [1, 1, 1, 1]);
@@ -10012,7 +10034,7 @@ mod tests {
         );
         let _ = scheduler.file_program_state(state, vec![a0, b0, a1, b1, a2]);
 
-        let (popped_state, tasks, dispatch) = scheduler.pop_program_bounded(4);
+        let (popped_state, _cohort_key, tasks, dispatch) = scheduler.pop_program_bounded(4);
         assert_eq!(popped_state, state);
         assert_eq!(dispatch.kind, PhysicalDispatchKind::Program);
         assert_eq!(dispatch.task_limits, [1, 1, 1, 1]);
@@ -10103,7 +10125,7 @@ mod tests {
         );
         let _ = scheduler.file_program_state(state, vec![a0, b0, c0, a1, incompatible, b1, c1]);
 
-        let (popped_state, tasks, dispatch) = scheduler.pop_program_bounded(8);
+        let (popped_state, _cohort_key, tasks, dispatch) = scheduler.pop_program_bounded(8);
         assert_eq!(popped_state, state);
         assert_eq!(
             tasks
@@ -11154,7 +11176,7 @@ mod tests {
         let retained = n0.credit.key.nonce;
         let _ = scheduler.file_program_state(state, vec![n0, w0, n1, w1, w2]);
 
-        let (popped_state, tasks, dispatch) = scheduler.pop_program_bounded(8);
+        let (popped_state, _cohort_key, tasks, dispatch) = scheduler.pop_program_bounded(8);
         assert_eq!(popped_state, state);
         assert_eq!(
             tasks
@@ -11262,7 +11284,7 @@ mod tests {
             ],
         );
 
-        let (popped_state, tasks, dispatch) = scheduler.pop_program_bounded(8);
+        let (popped_state, _cohort_key, tasks, dispatch) = scheduler.pop_program_bounded(8);
         assert_eq!(popped_state, state);
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].activation, wide);
