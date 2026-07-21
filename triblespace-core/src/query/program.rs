@@ -775,7 +775,9 @@ impl ProgramPhysicalReceipt {
 /// Effects returned by one typed cohort call.
 ///
 /// The erased adapter publishes this receipt only after validating every tag
-/// and static page law across the complete cohort.
+/// and static page law across the complete cohort. Scheduler consumers may
+/// therefore traverse the grouped streams with monotone input cursors without
+/// rebuilding a second per-row index.
 #[doc(hidden)]
 #[derive(Default)]
 pub struct ProgramBatchEffects {
