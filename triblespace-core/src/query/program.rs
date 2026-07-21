@@ -367,8 +367,9 @@ pub struct ProgramBatchEffects {
     /// Novel work children, grouped by ascending input tag.
     pub children: Vec<ProgramChild>,
     /// Direct proposal occurrences from source pages. Unlike accepted product
-    /// endpoints, order and multiplicity are preserved.
-    pub direct: Vec<(u32, RawInline)>,
+    /// endpoints, order and multiplicity are preserved. Input ownership is
+    /// encoded once per nonempty run rather than repeated beside every value.
+    pub direct: ProgramDirectEffects,
     /// Candidate observations proved by the program without manufacturing a
     /// continuation node solely to carry the value.
     pub accepted: Vec<(u32, RawInline)>,
@@ -387,6 +388,143 @@ pub struct ProgramBatchEffects {
     /// the ordinary typed implementation, including immediate fallback after
     /// a physical attempt declined or failed before effect commit.
     pub placement: Option<ProgramPhysicalReceipt>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProgramDirectRun {
+    input: u32,
+    count: usize,
+}
+
+/// Canonical grouped direct proposal effects for one typed cohort.
+///
+/// `values` is the occurrence stream in family order. `runs` is its complete
+/// partition into nonempty, strictly ascending input groups. The typed adapter
+/// validates that partition before publishing any part of the receipt.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct ProgramDirectEffects {
+    values: Vec<RawInline>,
+    runs: Vec<ProgramDirectRun>,
+}
+
+impl ProgramDirectEffects {
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    fn push_run(&mut self, input: u32, count: usize) {
+        if count == 0 {
+            return;
+        }
+        if let Some(run) = self.runs.last_mut().filter(|run| run.input == input) {
+            run.count = run
+                .count
+                .checked_add(count)
+                .expect("typed direct run length overflow");
+        } else {
+            self.runs.push(ProgramDirectRun { input, count });
+        }
+    }
+
+    fn push(&mut self, input: u32, value: RawInline) {
+        self.values.push(value);
+        self.push_run(input, 1);
+    }
+
+    fn push_page(&mut self, input: u32, mut values: Vec<RawInline>) {
+        let count = values.len();
+        if count == 0 {
+            return;
+        }
+        if self.values.is_empty() {
+            self.values = values;
+        } else {
+            self.values.append(&mut values);
+        }
+        self.push_run(input, count);
+    }
+
+    fn append(&mut self, mut other: Self) {
+        if self.is_empty() {
+            *self = other;
+            return;
+        }
+        self.values.append(&mut other.values);
+        for run in other.runs {
+            self.push_run(run.input, run.count);
+        }
+    }
+
+    fn validate_and_count(&self, input_count: usize, raw_effects: &mut [usize]) {
+        assert_eq!(raw_effects.len(), input_count);
+        let mut partition_len = 0usize;
+        let mut previous = None;
+        for run in &self.runs {
+            assert!(run.count > 0, "typed direct effect contained an empty run");
+            assert!(
+                (run.input as usize) < input_count,
+                "typed direct observation tag is out of range"
+            );
+            assert!(
+                previous.is_none_or(|previous| run.input > previous),
+                "typed direct observations are not grouped in ascending order"
+            );
+            previous = Some(run.input);
+            partition_len = partition_len
+                .checked_add(run.count)
+                .expect("typed direct partition length overflow");
+            raw_effects[run.input as usize] = raw_effects[run.input as usize]
+                .checked_add(run.count)
+                .expect("typed raw effect count overflow");
+        }
+        assert_eq!(
+            partition_len,
+            self.values.len(),
+            "typed direct runs did not completely partition their value buffer"
+        );
+    }
+
+    pub(crate) fn input_slice<'a>(
+        &'a self,
+        input: usize,
+        run_cursor: &mut usize,
+        value_cursor: &mut usize,
+    ) -> &'a [RawInline] {
+        let begin = *value_cursor;
+        let Some(run) = self.runs.get(*run_cursor) else {
+            return &self.values[begin..begin];
+        };
+        if run.input as usize != input {
+            debug_assert!(run.input as usize > input);
+            return &self.values[begin..begin];
+        }
+        *run_cursor += 1;
+        *value_cursor = value_cursor
+            .checked_add(run.count)
+            .expect("typed direct value cursor overflow");
+        &self.values[begin..*value_cursor]
+    }
+
+    pub(crate) fn assert_consumed(&self, run_cursor: usize, value_cursor: usize) {
+        assert_eq!(run_cursor, self.runs.len());
+        assert_eq!(value_cursor, self.values.len());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_single_input(self, input: u32) -> Vec<RawInline> {
+        assert!(
+            self.runs
+                .iter()
+                .all(|run| run.input == input && run.count > 0),
+            "typed direct effects did not belong to the expected single input"
+        );
+        self.values
+    }
 }
 
 struct TypedSeedWork<State, NoveltyKey> {
@@ -474,7 +612,7 @@ struct TypedChild<State, NoveltyKey> {
 pub struct TypedEffectSink<State, NoveltyKey> {
     pages: Vec<TypedPage<State>>,
     children: Vec<TypedChild<State, NoveltyKey>>,
-    direct: Vec<(u32, RawInline)>,
+    direct: ProgramDirectEffects,
     accepted: Vec<(u32, RawInline)>,
     supported: Vec<(u32, ())>,
     source_pages: usize,
@@ -489,7 +627,7 @@ impl<State, NoveltyKey> Default for TypedEffectSink<State, NoveltyKey> {
         Self {
             pages: Vec::new(),
             children: Vec::new(),
-            direct: Vec::new(),
+            direct: ProgramDirectEffects::default(),
             accepted: Vec::new(),
             supported: Vec::new(),
             source_pages: 0,
@@ -537,7 +675,13 @@ impl<State, NoveltyKey> TypedEffectSink<State, NoveltyKey> {
     }
 
     pub fn direct(&mut self, input: u32, value: RawInline) {
-        self.direct.push((input, value));
+        self.direct.push(input, value);
+    }
+
+    /// Moves one complete direct page into the receipt under a single input
+    /// run. Empty pages add neither values nor metadata.
+    pub fn direct_page(&mut self, input: u32, values: Vec<RawInline>) {
+        self.direct.push_page(input, values);
     }
 
     /// Records one candidate value proved by this input page.
@@ -1460,16 +1604,9 @@ where
             child_admitted.push(admitted);
         }
 
-        let mut previous = 0u32;
-        for (position, (input, _)) in typed.direct.iter().enumerate() {
-            assert!((*input as usize) < input_count);
-            assert!(
-                position == 0 || *input >= previous,
-                "typed direct observations are not grouped in ascending order"
-            );
-            previous = *input;
-            raw_effects[*input as usize] += 1;
-        }
+        typed
+            .direct
+            .validate_and_count(input_count, &mut raw_effects);
         let mut previous = 0u32;
         for (position, (input, _)) in typed.accepted.iter().enumerate() {
             assert!((*input as usize) < input_count);
@@ -1582,7 +1719,7 @@ where
             });
         }
 
-        effects.direct.extend(direct);
+        effects.direct.append(direct);
         effects.accepted.extend(accepted);
         effects.supported.extend(supported);
         effects.source_pages += source_pages;
@@ -1710,6 +1847,82 @@ mod tests {
         value
     }
 
+    #[test]
+    fn direct_effect_runs_coalesce_scalar_and_bulk_pages_without_losing_order() {
+        let mut effects = TypedEffectSink::<(), ()>::default();
+        effects.direct(0, raw(1));
+        effects.direct_page(0, vec![raw(2), raw(1)]);
+        effects.direct_page(1, Vec::new());
+        effects.direct(2, raw(3));
+
+        assert_eq!(
+            effects.direct.runs,
+            [
+                ProgramDirectRun { input: 0, count: 3 },
+                ProgramDirectRun { input: 2, count: 1 },
+            ]
+        );
+        assert_eq!(effects.direct.values, [raw(1), raw(2), raw(1), raw(3)]);
+
+        let mut raw_effects = vec![0; 3];
+        effects.direct.validate_and_count(3, &mut raw_effects);
+        assert_eq!(raw_effects, [3, 0, 1]);
+    }
+
+    #[test]
+    fn direct_effect_page_and_adapter_move_the_flat_buffer_wholesale() {
+        let page = vec![raw(1), raw(2), raw(3)];
+        let allocation = page.as_ptr();
+        let mut typed = ProgramDirectEffects::default();
+        typed.push_page(0, page);
+        assert_eq!(typed.values.as_ptr(), allocation);
+
+        let mut erased = ProgramDirectEffects::default();
+        erased.append(typed);
+        assert_eq!(erased.values.as_ptr(), allocation);
+        assert_eq!(erased.values, [raw(1), raw(2), raw(3)]);
+    }
+
+    #[test]
+    fn direct_effect_cursor_covers_empty_inputs_in_one_multi_row_pass() {
+        let mut direct = ProgramDirectEffects::default();
+        direct.push_page(0, vec![raw(1), raw(2)]);
+        direct.push_page(2, vec![raw(3)]);
+
+        let mut run_cursor = 0;
+        let mut value_cursor = 0;
+        assert_eq!(
+            direct.input_slice(0, &mut run_cursor, &mut value_cursor),
+            [raw(1), raw(2)]
+        );
+        assert!(direct
+            .input_slice(1, &mut run_cursor, &mut value_cursor)
+            .is_empty());
+        assert_eq!(
+            direct.input_slice(2, &mut run_cursor, &mut value_cursor),
+            [raw(3)]
+        );
+        assert!(direct
+            .input_slice(3, &mut run_cursor, &mut value_cursor)
+            .is_empty());
+        direct.assert_consumed(run_cursor, value_cursor);
+    }
+
+    #[test]
+    fn direct_effect_validation_requires_a_complete_value_partition() {
+        let direct = ProgramDirectEffects {
+            values: vec![raw(1), raw(2)],
+            runs: vec![ProgramDirectRun { input: 0, count: 1 }],
+        };
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            direct.validate_and_count(1, &mut [0]);
+        }));
+        assert!(
+            panic_text(rejected.expect_err("partial direct partition must fail"))
+                .contains("did not completely partition")
+        );
+    }
+
     #[derive(Clone)]
     struct NonComparableState {
         exact_cursor: usize,
@@ -1784,6 +1997,7 @@ mod tests {
         Complete,
         OverBudget,
         LateRawAmplification,
+        DescendingDirectTags,
     }
 
     struct PhysicalProbe {
@@ -1875,7 +2089,8 @@ mod tests {
                 PhysicalProbeMode::Decline => None,
                 PhysicalProbeMode::Complete
                 | PhysicalProbeMode::OverBudget
-                | PhysicalProbeMode::LateRawAmplification => {
+                | PhysicalProbeMode::LateRawAmplification
+                | PhysicalProbeMode::DescendingDirectTags => {
                     let mut step = TypedPhysicalStep::new(ProgramPhysicalReceipt::new(
                         "test-physical",
                         "dense-page",
@@ -1885,6 +2100,7 @@ mod tests {
                             PhysicalProbeMode::Complete => 1,
                             PhysicalProbeMode::OverBudget => batch.limits[input] + 1,
                             PhysicalProbeMode::LateRawAmplification => 1,
+                            PhysicalProbeMode::DescendingDirectTags => 1,
                             PhysicalProbeMode::Decline => unreachable!(),
                         };
                         let resume = matches!(self.mode, PhysicalProbeMode::LateRawAmplification)
@@ -1906,6 +2122,11 @@ mod tests {
                             step.effects_mut()
                                 .direct(input as u32, RawInline::default());
                         }
+                    }
+                    if matches!(self.mode, PhysicalProbeMode::DescendingDirectTags) {
+                        assert_eq!(states.len(), 2);
+                        step.effects_mut().direct(1, raw(1));
+                        step.effects_mut().direct(0, raw(2));
                     }
                     Some(step)
                 }
@@ -3135,6 +3356,17 @@ mod tests {
         }));
         let message = panic_text(rejected.expect_err("over-budget physical receipt must fail"));
         assert!(message.contains("exceeded one input's physical work budget"));
+        assert!(spec.native_states.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn direct_effect_validation_rejects_descending_runs_before_publication() {
+        let spec = PhysicalProbe::new(PhysicalProbeMode::DescendingDirectTags);
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = step_physical_probe(&spec, &[1, 1]);
+        }));
+        let message = panic_text(rejected.expect_err("descending direct runs must fail closed"));
+        assert!(message.contains("not grouped in ascending order"));
         assert!(spec.native_states.lock().unwrap().is_empty());
     }
 

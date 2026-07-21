@@ -1320,9 +1320,7 @@ where
                     );
                     let input = u32::try_from(input)
                         .expect("too many typed SuccinctArchive inputs in one cohort");
-                    for value in direct {
-                        effects.direct(input, value);
-                    }
+                    effects.direct_page(input, direct);
                     assert!(
                         page.next.is_none() || page.examined > 0,
                         "typed SuccinctArchive proposal resumed without examining its source"
@@ -2044,10 +2042,7 @@ mod typed_program_tests {
             );
             assert!(effects.accepted.is_empty());
             assert!(effects.supported.is_empty());
-            values.extend(effects.direct.into_iter().map(|(input, value)| {
-                assert_eq!(input, 0);
-                value
-            }));
+            values.extend(effects.direct.into_single_input(0));
             assert_eq!(effects.pages.len(), 1);
             let page = effects.pages.pop().unwrap();
             examined.push(page.examined);
