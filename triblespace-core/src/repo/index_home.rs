@@ -1715,7 +1715,7 @@ where
                     }
                     let input = u32::try_from(input)
                         .expect("too many typed UnionArchive inputs in one cohort");
-                    for value in direct.drain(..) {
+                    for value in direct.iter().copied() {
                         effects.direct(input, value);
                     }
                     let resume = (shard_index < self.shards.len()).then_some(
