@@ -3304,6 +3304,54 @@ enum DeltaSettlement {
     Retargeted(ActiveDeltaContinuation),
 }
 
+/// Exact affine handoffs emitted by one physical delta step.
+///
+/// Directed chain execution overwhelmingly transfers a single activation at
+/// a time. Keep that receipt inline while preserving the map-like surface for
+/// the genuinely wider reducer cohorts, which spill through `SmallVec`.
+#[derive(Debug, Default)]
+pub(super) struct RetargetedActivations {
+    entries: SmallVec<[(ActivationId, ActiveDeltaContinuation); 1]>,
+}
+
+impl RetargetedActivations {
+    fn insert(
+        &mut self,
+        activation: ActivationId,
+        continuation: ActiveDeltaContinuation,
+    ) -> Option<ActiveDeltaContinuation> {
+        if let Some((_, previous)) = self
+            .entries
+            .iter_mut()
+            .find(|(existing, _)| *existing == activation)
+        {
+            return Some(std::mem::replace(previous, continuation));
+        }
+        self.entries.push((activation, continuation));
+        None
+    }
+
+    fn get(&self, activation: &ActivationId) -> Option<&ActiveDeltaContinuation> {
+        self.entries
+            .iter()
+            .find_map(|(existing, continuation)| (existing == activation).then_some(continuation))
+    }
+
+    fn contains_key(&self, activation: &ActivationId) -> bool {
+        self.get(activation).is_some()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    fn values(&self) -> impl Iterator<Item = &ActiveDeltaContinuation> {
+        self.entries.iter().map(|(_, continuation)| continuation)
+    }
+}
+
 /// Insertion-ordered activation membership with an allocation-free singleton
 /// lookup. Physical cohorts observe activation order while repeated feedback
 /// checks need set rather than quadratic vector membership.
@@ -3437,7 +3485,7 @@ pub(super) struct DeltaStepOutcome {
     /// Exact Program continuation installed by quiescence settlement, keyed
     /// by the affine activation because one physical cohort may transfer more
     /// than one reducer. Queue layout is not a continuation receipt.
-    pub(super) retargeted: AHashMap<ActivationId, ActiveDeltaContinuation>,
+    pub(super) retargeted: RetargetedActivations,
     pub(super) dead_pages: usize,
     pub(super) source_dead_pages: usize,
     pub(super) transition_dead_pages: usize,
@@ -6327,7 +6375,7 @@ impl DeltaScheduler {
         let mut resumed_sources = Vec::new();
         let mut effects = DeltaStableEffects::default();
         let mut completed_activation_ids = Vec::new();
-        let mut retargeted = AHashMap::new();
+        let mut retargeted = RetargetedActivations::default();
         let mut dead_pages = 0usize;
         let mut source_dead_pages = 0usize;
         let mut transition_dead_pages = 0usize;
@@ -6637,7 +6685,7 @@ impl DeltaScheduler {
             scratch.receipt.source_pages > 0 && scratch.receipt.transition_pages == 0;
         let mut effects = DeltaStableEffects::default();
         let mut completed_activation_ids = Vec::new();
-        let mut retargeted = AHashMap::new();
+        let mut retargeted = RetargetedActivations::default();
         let mut dead_pages = 0usize;
         let mut source_dead_pages = 0usize;
         let mut transition_dead_pages = 0usize;
@@ -6984,7 +7032,7 @@ impl DeltaScheduler {
         stats.delta_source_pages += row_count;
         let mut effects = DeltaStableEffects::default();
         let mut completed_activation_ids = Vec::new();
-        let mut retargeted = AHashMap::new();
+        let mut retargeted = RetargetedActivations::default();
         let mut traversal = Vec::new();
         let mut resumed_sources = Vec::new();
         let mut dead_pages = 0usize;
