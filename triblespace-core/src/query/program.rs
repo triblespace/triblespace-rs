@@ -12,6 +12,7 @@ use std::hash::Hash;
 use std::marker::PhantomData;
 
 use ahash::{AHashMap, AHashSet};
+use smallvec::SmallVec;
 
 use super::{RawInline, RowsView, VariableId, VariableSet};
 
@@ -718,6 +719,23 @@ pub struct ProgramBatch<'v> {
     pub limits: &'v [usize],
 }
 
+/// One opaque work item plus its immutable parent context.
+///
+/// This is the scalar transaction form of [`ProgramBatch`]. It exists so the
+/// latency path does not have to manufacture six one-element heap vectors
+/// before crossing the same typed family boundary. Wider cohorts continue to
+/// use the unchanged batch contract.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct ProgramOneBatch<'v> {
+    pub stratum: ProgramStratum,
+    pub view: RowsView<'v>,
+    pub candidate_set: Option<&'v [RawInline]>,
+    pub activation: ProgramActivation,
+    pub work: &'v ProgramWork,
+    pub limit: usize,
+}
+
 /// Replacement metadata for one input work item.
 #[doc(hidden)]
 #[derive(Clone, Debug)]
@@ -803,6 +821,27 @@ pub struct ProgramBatchEffects {
     pub placement: Option<ProgramPhysicalReceipt>,
 }
 
+/// Effects returned by one scalar typed Program transaction.
+///
+/// The common zero/one cardinalities stay inline. A genuinely branching page
+/// may spill without weakening the one-input transaction or changing the
+/// existing many-input representation.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct ProgramOneEffects {
+    pub page: Option<ProgramPage>,
+    pub children: SmallVec<[ProgramChild; 1]>,
+    pub direct: SmallVec<[RawInline; 1]>,
+    pub accepted: SmallVec<[RawInline; 1]>,
+    pub supported: bool,
+    pub source_pages: usize,
+    pub source_examined: usize,
+    pub source_roots: usize,
+    pub transition_pages: usize,
+    pub transition_examined: usize,
+    pub placement: Option<ProgramPhysicalReceipt>,
+}
+
 struct TypedSeedWork<State, NoveltyKey> {
     parent: u32,
     state: State,
@@ -859,6 +898,17 @@ pub struct TypedProgramBatch<'v> {
     pub limits: &'v [usize],
 }
 
+/// Handle-free context for one scalar typed Program transaction.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct TypedProgramOneBatch<'v> {
+    pub stratum: ProgramStratum,
+    pub view: RowsView<'v>,
+    pub candidate_set: Option<&'v [RawInline]>,
+    pub activation: ProgramActivation,
+    pub limit: usize,
+}
+
 /// Typed exact continuation disposition.
 #[doc(hidden)]
 pub enum TypedResume<State> {
@@ -896,6 +946,161 @@ pub struct TypedEffectSink<State, NoveltyKey> {
     source_roots: usize,
     transition_pages: usize,
     transition_examined: usize,
+}
+
+/// Typed scalar effect sink. Input tags are absent because the transaction
+/// has exactly one input; the common RPQ corridor therefore remains entirely
+/// stack-backed while a real branch can still spill.
+#[doc(hidden)]
+pub struct TypedOneEffectSink<State, NoveltyKey> {
+    page: Option<TypedPage<State>>,
+    children: SmallVec<[TypedChild<State, NoveltyKey>; 1]>,
+    direct: SmallVec<[RawInline; 1]>,
+    accepted: SmallVec<[RawInline; 1]>,
+    supported: bool,
+    source_pages: usize,
+    source_examined: usize,
+    source_roots: usize,
+    transition_pages: usize,
+    transition_examined: usize,
+}
+
+impl<State, NoveltyKey> Default for TypedOneEffectSink<State, NoveltyKey> {
+    fn default() -> Self {
+        Self {
+            page: None,
+            children: SmallVec::new(),
+            direct: SmallVec::new(),
+            accepted: SmallVec::new(),
+            supported: false,
+            source_pages: 0,
+            source_examined: 0,
+            source_roots: 0,
+            transition_pages: 0,
+            transition_examined: 0,
+        }
+    }
+}
+
+impl<State, NoveltyKey> TypedOneEffectSink<State, NoveltyKey> {
+    pub fn reserve_children(&mut self, additional: usize) {
+        self.children.reserve(additional);
+    }
+
+    pub fn page(&mut self, examined: usize, resume: Option<TypedResume<State>>) {
+        assert!(
+            self.page.replace(TypedPage { examined, resume }).is_none(),
+            "one typed Program input returned more than one page"
+        );
+    }
+
+    pub fn finite_child(&mut self, state: State, accepted: Option<RawInline>) {
+        self.children.push(TypedChild {
+            input: 0,
+            state,
+            novelty: None,
+            accepted,
+        });
+    }
+
+    pub fn fixpoint_child(
+        &mut self,
+        state: State,
+        novelty: NoveltyKey,
+        accepted: Option<RawInline>,
+    ) {
+        self.children.push(TypedChild {
+            input: 0,
+            state,
+            novelty: Some(novelty),
+            accepted,
+        });
+    }
+
+    pub fn direct(&mut self, value: RawInline) {
+        self.direct.push(value);
+    }
+
+    pub fn accept(&mut self, value: RawInline) {
+        self.accepted.push(value);
+    }
+
+    pub fn support(&mut self) {
+        assert!(
+            !self.supported,
+            "one typed input reported Boolean support twice"
+        );
+        self.supported = true;
+    }
+
+    pub fn account_source(&mut self, examined: usize, roots: usize) {
+        self.source_pages += 1;
+        self.source_examined += examined;
+        self.source_roots += roots;
+    }
+
+    pub fn account_transition(&mut self, examined: usize) {
+        self.transition_pages += 1;
+        self.transition_examined += examined;
+    }
+
+    fn absorb_batch(&mut self, batch: TypedEffectSink<State, NoveltyKey>) {
+        let TypedEffectSink {
+            pages,
+            children,
+            direct,
+            accepted,
+            supported,
+            source_pages,
+            source_examined,
+            source_roots,
+            transition_pages,
+            transition_examined,
+        } = batch;
+        assert_eq!(
+            pages.len(),
+            1,
+            "typed scalar bridge returned the wrong page count"
+        );
+        self.page = pages.into_iter().next();
+        for child in children {
+            assert_eq!(
+                child.input, 0,
+                "typed scalar bridge returned a foreign child tag"
+            );
+            self.children.push(child);
+        }
+        for (input, value) in direct {
+            assert_eq!(
+                input, 0,
+                "typed scalar bridge returned a foreign direct tag"
+            );
+            self.direct.push(value);
+        }
+        for (input, value) in accepted {
+            assert_eq!(
+                input, 0,
+                "typed scalar bridge returned a foreign accepted tag"
+            );
+            self.accepted.push(value);
+        }
+        for (input, ()) in supported {
+            assert_eq!(
+                input, 0,
+                "typed scalar bridge returned a foreign support tag"
+            );
+            assert!(
+                !self.supported,
+                "one typed input reported Boolean support twice"
+            );
+            self.supported = true;
+        }
+        self.source_pages += source_pages;
+        self.source_examined += source_examined;
+        self.source_roots += source_roots;
+        self.transition_pages += transition_pages;
+        self.transition_examined += transition_examined;
+    }
 }
 
 impl<State, NoveltyKey> Default for TypedEffectSink<State, NoveltyKey> {
@@ -1054,6 +1259,33 @@ pub trait TypedProgramSpec {
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     );
 
+    /// Executes one typed state without requiring the engine to manufacture a
+    /// one-element batch. Families may override this latency seam while the
+    /// default bridge preserves the existing typed contract exactly.
+    fn step_one_typed(
+        &self,
+        state: Self::State,
+        batch: TypedProgramOneBatch<'_>,
+        effects: &mut TypedOneEffectSink<Self::State, Self::NoveltyKey>,
+    ) {
+        let candidate_sets = [batch.candidate_set];
+        let activations = [batch.activation];
+        let limits = [batch.limit];
+        let mut bridged = TypedEffectSink::default();
+        self.step_typed(
+            vec![state],
+            TypedProgramBatch {
+                stratum: batch.stratum,
+                view: batch.view,
+                candidate_sets: &candidate_sets,
+                activations: &activations,
+                limits: &limits,
+            },
+            &mut bridged,
+        );
+        effects.absorb_batch(bridged);
+    }
+
     /// Attempts one already-formed cohort on a family-owned physical backend.
     ///
     /// The adapter calls this only after affinely taking and revalidating every
@@ -1211,6 +1443,14 @@ trait ErasedProgramSpec {
         effects: &mut ProgramBatchEffects,
     );
 
+    fn step_one(
+        &self,
+        runtime: &mut ProgramRuntime,
+        key: ProgramKey,
+        batch: ProgramOneBatch<'_>,
+        effects: &mut ProgramOneEffects,
+    );
+
     fn try_complete_bounded(
         &self,
         batch: ProgramCompleteBatch<'_>,
@@ -1295,6 +1535,16 @@ impl<'a> ProgramRef<'a> {
         effects: &mut ProgramBatchEffects,
     ) {
         self.erased.step_batch(runtime, key, batch, effects);
+    }
+
+    pub(crate) fn step_one_for(
+        self,
+        runtime: &mut ProgramRuntime,
+        key: ProgramKey,
+        batch: ProgramOneBatch<'_>,
+        effects: &mut ProgramOneEffects,
+    ) {
+        self.erased.step_one(runtime, key, batch, effects);
     }
 
     #[cold]
@@ -1659,6 +1909,17 @@ where
         selected.step_batch(runtime, child_key, batch, effects);
     }
 
+    fn step_one(
+        &self,
+        runtime: &mut ProgramRuntime,
+        key: ProgramKey,
+        batch: ProgramOneBatch<'_>,
+        effects: &mut ProgramOneEffects,
+    ) {
+        let (selected, child_key) = self.selected(key);
+        selected.step_one(runtime, child_key, batch, effects);
+    }
+
     #[cold]
     #[inline(never)]
     fn try_complete_bounded(
@@ -1773,6 +2034,240 @@ where
                 accepted: seed.accepted,
             });
         }
+    }
+
+    fn step_one(
+        &self,
+        runtime: &mut ProgramRuntime,
+        key: ProgramKey,
+        batch: ProgramOneBatch<'_>,
+        effects: &mut ProgramOneEffects,
+    ) {
+        assert_eq!(
+            key.arm,
+            ProgramRouteArm::Direct,
+            "a direct typed Program step received a composed route arm"
+        );
+        assert!(effects.page.is_none(), "one Program effect sink was reused");
+        assert!(effects.children.is_empty());
+        assert!(effects.direct.is_empty());
+        assert!(effects.accepted.is_empty());
+        assert!(!effects.supported);
+        assert!(effects.placement.is_none());
+        assert_eq!(batch.view.len(), 1);
+        assert!(batch.limit > 0);
+
+        assert_eq!(
+            runtime.family,
+            TypeId::of::<TypedProgramRuntime<T::State, T::NoveltyKey>>(),
+            "residual program step expected family {}, received {}",
+            type_name::<TypedProgramRuntime<T::State, T::NoveltyKey>>(),
+            runtime.family_name
+        );
+        let runtime = runtime
+            .erased
+            .as_mut()
+            .as_any_mut()
+            .downcast_mut::<TypedProgramRuntime<T::State, T::NoveltyKey>>()
+            .expect("residual program step received another family's runtime");
+        let state = runtime.take(batch.activation, batch.work.handle.clone());
+        let input_rank = self.progress(&state);
+        assert_eq!(
+            self.dispatch(&state),
+            batch.work.dispatch,
+            "typed program work entered an incompatible dispatch cohort"
+        );
+        assert_eq!(
+            self.pacing(&state),
+            batch.work.pacing,
+            "typed program work entered an incompatible pacing cohort"
+        );
+
+        let candidate_sets = [batch.candidate_set];
+        let activations = [batch.activation];
+        let limits = [batch.limit];
+        let typed_batch = TypedProgramOneBatch {
+            stratum: batch.stratum,
+            view: batch.view,
+            candidate_set: batch.candidate_set,
+            activation: batch.activation,
+            limit: batch.limit,
+        };
+        let mut typed = TypedOneEffectSink::default();
+        let placement = if let Some(physical) = self.try_step_physical(
+            std::slice::from_ref(&state),
+            TypedProgramBatch {
+                stratum: batch.stratum,
+                view: batch.view,
+                candidate_sets: &candidate_sets,
+                activations: &activations,
+                limits: &limits,
+            },
+        ) {
+            let (physical, placement) = physical.into_parts();
+            typed.absorb_batch(physical);
+            Some(placement)
+        } else {
+            self.step_one_typed(state, typed_batch, &mut typed);
+            None
+        };
+
+        let page = typed
+            .page
+            .as_ref()
+            .expect("typed scalar program returned no page");
+        assert!(
+            page.examined <= batch.limit,
+            "typed program exceeded one input's physical work budget"
+        );
+        let resume_physical = match &page.resume {
+            Some(TypedResume::Immediate(state) | TypedResume::AfterChildren(state)) => {
+                assert!(
+                    self.progress(state) < input_rank,
+                    "typed program resume did not strictly decrease its finite rank"
+                );
+                Some((self.dispatch(state), self.pacing(state)))
+            }
+            Some(TypedResume::AfterChildrenDone) | None => None,
+        };
+
+        let raw_effects = typed
+            .children
+            .len()
+            .checked_add(typed.direct.len())
+            .and_then(|count| count.checked_add(typed.accepted.len()))
+            .and_then(|count| count.checked_add(usize::from(typed.supported)))
+            .expect("typed scalar effect count overflow");
+        assert!(
+            raw_effects <= page.examined,
+            "typed program emitted more raw effects than its examined-work receipt"
+        );
+
+        // Validate the complete scalar receipt before publishing novelty,
+        // replacement handles, or outward effects. Linear duplicate probing
+        // is allocation-free and appropriate for a one-input page; a real
+        // wide fanout has already crossed the SmallVec spill boundary.
+        let mut child_admitted: SmallVec<[bool; 1]> = SmallVec::new();
+        for (position, child) in typed.children.iter().enumerate() {
+            assert_eq!(child.input, 0);
+            assert!(
+                batch.stratum == ProgramStratum::Fixpoint || child.novelty.is_none(),
+                "a finite typed program emitted a fixpoint child"
+            );
+            if child.novelty.is_none() {
+                assert!(
+                    self.progress(&child.state) < input_rank,
+                    "typed program finite child did not strictly decrease its input rank"
+                );
+            }
+            let _ = self.dispatch(&child.state);
+            let _ = self.pacing(&child.state);
+
+            let admitted = if let Some(novelty) = child.novelty.as_ref() {
+                let prior = typed.children[..position]
+                    .iter()
+                    .find(|prior| prior.novelty.as_ref() == Some(novelty));
+                if let Some(prior) = prior {
+                    assert_eq!(
+                        prior.accepted, child.accepted,
+                        "one typed novelty key changed its endpoint observation"
+                    );
+                    false
+                } else {
+                    match runtime
+                        .novelty
+                        .get(&batch.activation)
+                        .and_then(|seen| seen.get(novelty))
+                    {
+                        Some(previous) => {
+                            assert_eq!(
+                                *previous, child.accepted,
+                                "one typed novelty key changed its endpoint observation"
+                            );
+                            false
+                        }
+                        None => true,
+                    }
+                }
+            } else {
+                true
+            };
+            child_admitted.push(admitted);
+        }
+
+        let TypedOneEffectSink {
+            page,
+            children,
+            direct,
+            accepted,
+            supported,
+            source_pages,
+            source_examined,
+            source_roots,
+            transition_pages,
+            transition_examined,
+        } = typed;
+        let page = page.expect("typed scalar program page vanished after validation");
+        let resume = match (page.resume, resume_physical) {
+            (Some(TypedResume::Immediate(state)), Some((dispatch, pacing))) => {
+                Some(ProgramResume::Immediate(ProgramWork {
+                    handle: runtime.insert(batch.activation, state),
+                    dispatch,
+                    pacing,
+                }))
+            }
+            (Some(TypedResume::AfterChildren(state)), Some((dispatch, pacing))) => {
+                Some(ProgramResume::AfterChildren(ProgramWork {
+                    handle: runtime.insert(batch.activation, state),
+                    dispatch,
+                    pacing,
+                }))
+            }
+            (Some(TypedResume::AfterChildrenDone), None) => Some(ProgramResume::AfterChildrenDone),
+            (None, None) => None,
+            _ => unreachable!("typed Program resume preflight lost alignment"),
+        };
+        effects.page = Some(ProgramPage {
+            examined: page.examined,
+            resume,
+        });
+
+        for (child, admitted) in children.into_iter().zip(child_admitted) {
+            if !admitted {
+                continue;
+            }
+            if let Some(novelty) = child.novelty {
+                let previous = runtime
+                    .novelty
+                    .entry(batch.activation)
+                    .or_default()
+                    .insert(novelty, child.accepted);
+                assert!(
+                    previous.is_none(),
+                    "typed novelty preflight admitted an existing key"
+                );
+            }
+            let dispatch = self.dispatch(&child.state);
+            let pacing = self.pacing(&child.state);
+            effects.children.push(ProgramChild {
+                input: 0,
+                work: ProgramWork {
+                    handle: runtime.insert(batch.activation, child.state),
+                    dispatch,
+                    pacing,
+                },
+                accepted: child.accepted,
+            });
+        }
+        effects.direct.extend(direct);
+        effects.accepted.extend(accepted);
+        effects.supported = supported;
+        effects.source_pages += source_pages;
+        effects.source_examined += source_examined;
+        effects.source_roots += source_roots;
+        effects.transition_pages += transition_pages;
+        effects.transition_examined += transition_examined;
+        effects.placement = placement;
     }
 
     fn step_batch(
@@ -3738,8 +4233,7 @@ mod tests {
     fn novelty_transaction_scopes_equal_key_bytes_by_activation() {
         let activations = [ProgramActivation(23), ProgramActivation(24)];
         let endpoints = [Some([0xA1; 32]), None];
-        let (mut runtime, effects) =
-            run_novelty_scope_probe(&activations, endpoints.to_vec());
+        let (mut runtime, effects) = run_novelty_scope_probe(&activations, endpoints.to_vec());
 
         assert_eq!(effects.pages.len(), 2);
         assert_eq!(

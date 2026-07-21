@@ -900,6 +900,17 @@ struct ProgramReplaceOutcome {
     quiescence: Option<QuiescenceProof>,
 }
 
+struct ProgramReplaceOneOutcome {
+    scheduled: SmallVec<[(DeltaStateId, ProgramWork, ProducerCredit); 2]>,
+    /// Raw proposal occurrences reported by this typed page before
+    /// activation-local SET admission. This remains telemetry only.
+    raw_proposal_occurrences: usize,
+    accepted: SmallVec<[RawInline; 1]>,
+    dead_search_pages: usize,
+    dead_source_telemetry_pages: usize,
+    quiescence: Option<QuiescenceProof>,
+}
+
 struct CompletedActivation {
     activation: ActivationId,
     return_to: DeltaReturn,
@@ -2088,6 +2099,343 @@ impl ProducerRegistry {
             }
         };
         ProgramReplaceOutcome {
+            scheduled,
+            raw_proposal_occurrences: raw_stream_occurrences,
+            accepted,
+            dead_search_pages,
+            dead_source_telemetry_pages,
+            quiescence,
+        }
+    }
+
+    /// Scalar form of [`Self::replace_program`]. The affine and reducer laws
+    /// are identical; only receipt-local zero/one collections stay inline.
+    #[allow(clippy::too_many_arguments)]
+    fn replace_program_one(
+        &mut self,
+        parent: ProducerCredit,
+        state: DeltaStateId,
+        children: &[ProgramChild],
+        observed: SmallVec<[RawInline; 1]>,
+        mut direct: SmallVec<[RawInline; 1]>,
+        reported_support: bool,
+        search_page: bool,
+        source_telemetry: bool,
+        resume: Option<ProgramResume>,
+    ) -> ProgramReplaceOneOutcome {
+        assert_eq!(
+            parent.brand, self.brand,
+            "program credit crossed registries"
+        );
+        let activation_id = parent.key.activation;
+        let parent_join = {
+            let activation = self
+                .state
+                .activations
+                .get(&activation_id)
+                .expect("unknown program activation");
+            assert_eq!(activation.status, ActivationStatus::Open);
+            match activation.live.get(&parent.key.nonce) {
+                Some(CreditKind::Program { join }) => *join,
+                _ => panic!("unknown, replayed, or wrong-kind program credit"),
+            }
+        };
+
+        let raw_stream_occurrences = {
+            let activation = self
+                .state
+                .activations
+                .get(&activation_id)
+                .expect("unknown program activation");
+            if activation.reducer.streams() {
+                direct
+                    .len()
+                    .checked_add(observed.len())
+                    .and_then(|count| {
+                        count.checked_add(
+                            children
+                                .iter()
+                                .filter(|child| child.accepted.is_some())
+                                .count(),
+                        )
+                    })
+                    .expect("typed proposal occurrence count overflow")
+            } else {
+                0
+            }
+        };
+        let mut accepted: SmallVec<[RawInline; 1]> = SmallVec::new();
+        {
+            let activation = self
+                .state
+                .activations
+                .get_mut(&activation_id)
+                .expect("unknown program activation");
+            match (&mut activation.reducer, &mut activation.return_to) {
+                (DeltaReducer::QuiescentProposal { .. }, _) => {}
+                (
+                    DeltaReducer::StreamProposal | DeltaReducer::StreamFormulaProposal,
+                    _,
+                ) => {
+                    for value in direct.drain(..) {
+                        if activation.accepted.insert(value) {
+                            accepted.push(value);
+                        }
+                    }
+                }
+                (DeltaReducer::FinalizingConfirm { output }, _) => {
+                    assert!(
+                        observed.is_empty() && children.is_empty() && !reported_support,
+                        "engine Confirm finalizer reported graph effects"
+                    );
+                    assert!(
+                        activation.accepted.is_empty(),
+                        "Confirm finalizer reacquired mutable graph Accepted state"
+                    );
+                    if !direct.is_empty() {
+                        let mut page = CandidatePayload::Values(
+                            std::mem::take(&mut direct).into_vec(),
+                        );
+                        page.defer_for_shared_activation(1);
+                        output.extend_same_domain(page, 1);
+                    }
+                }
+                (DeltaReducer::FinalizingProposal { output }, _) => {
+                    assert!(
+                        observed.is_empty() && children.is_empty() && !reported_support,
+                        "engine proposal materializer reported graph effects"
+                    );
+                    assert!(
+                        activation.accepted.is_empty(),
+                        "proposal materializer reacquired mutable graph Accepted state"
+                    );
+                    append_one_parent_page(output, std::mem::take(&mut direct).into_vec());
+                }
+                (
+                    DeltaReducer::SetAdmit { output },
+                    DeltaReturn::SetAdmission { .. },
+                ) => {
+                    assert!(
+                        observed.is_empty() && children.is_empty() && !reported_support,
+                        "engine SET admission reported graph effects"
+                    );
+                    assert!(
+                        activation.accepted.is_empty(),
+                        "SET admission acquired graph Accepted state"
+                    );
+                    append_one_parent_page(output, std::mem::take(&mut direct).into_vec());
+                }
+                (
+                    DeltaReducer::FormulaOrAdmit,
+                    DeltaReturn::FormulaOrAdmit { batch, .. },
+                ) => {
+                    assert!(
+                        observed.is_empty() && children.is_empty() && !reported_support,
+                        "engine Formula OR admission reported graph effects"
+                    );
+                    assert!(
+                        activation.accepted.is_empty(),
+                        "Formula OR admission acquired graph Accepted state"
+                    );
+                    for value in direct.drain(..) {
+                        batch.admit_current_or_value(0, value);
+                    }
+                }
+                (
+                    DeltaReducer::FormulaOrEmit { output },
+                    DeltaReturn::FormulaOrEmit { .. },
+                ) => {
+                    assert!(
+                        observed.is_empty() && children.is_empty() && !reported_support,
+                        "engine Formula OR emission reported graph effects"
+                    );
+                    assert!(
+                        activation.accepted.is_empty(),
+                        "Formula OR emission acquired graph Accepted state"
+                    );
+                    if !direct.is_empty() {
+                        let mut page = CandidatePayload::Values(
+                            std::mem::take(&mut direct).into_vec(),
+                        );
+                        page.defer_for_shared_activation(1);
+                        output.extend_same_domain(page, 1);
+                    }
+                }
+                (DeltaReducer::FormulaOrAdmit, _)
+                | (DeltaReducer::FormulaOrEmit { .. }, _)
+                | (DeltaReducer::SetAdmit { .. }, _) => {
+                    panic!("engine reducer lost its exact affine return payload")
+                }
+                (DeltaReducer::Support { .. } | DeltaReducer::Confirm { .. }, _) => {
+                    assert!(
+                        direct.is_empty(),
+                        "a non-proposal program reducer observed direct candidates"
+                    )
+                }
+            }
+            for value in observed
+                .into_iter()
+                .chain(children.iter().filter_map(|child| child.accepted))
+            {
+                if activation.accepted.insert(value) {
+                    accepted.push(value);
+                }
+            }
+            if matches!(activation.reducer, DeltaReducer::QuiescentProposal { .. }) {
+                let mut retained = Vec::with_capacity(direct.len() + accepted.len());
+                retained.extend(direct.iter().copied());
+                retained.extend(accepted.iter().copied());
+                activation
+                    .reducer
+                    .retain_quiescent_proposal_page(retained);
+            }
+        }
+
+        let publishes_stable_effect = {
+            let activation = self
+                .state
+                .activations
+                .get(&activation_id)
+                .expect("unknown program activation");
+            match &activation.reducer {
+                DeltaReducer::StreamProposal | DeltaReducer::StreamFormulaProposal => {
+                    !accepted.is_empty()
+                }
+                DeltaReducer::Support { published } => {
+                    !*published && (reported_support || !accepted.is_empty())
+                }
+                DeltaReducer::QuiescentProposal { .. }
+                | DeltaReducer::Confirm { .. }
+                | DeltaReducer::FinalizingConfirm { .. }
+                | DeltaReducer::FinalizingProposal { .. }
+                | DeltaReducer::SetAdmit { .. }
+                | DeltaReducer::FormulaOrAdmit
+                | DeltaReducer::FormulaOrEmit { .. } => false,
+            }
+        };
+        if publishes_stable_effect {
+            self.mark_program_join_stable_effect(activation_id, parent_join);
+        }
+
+        let no_replacement =
+            children.is_empty() && matches!(&resume, None | Some(ProgramResume::AfterChildrenDone));
+        let mut scheduled: SmallVec<[(DeltaStateId, ProgramWork, ProducerCredit); 2]> =
+            SmallVec::new();
+        match resume {
+            Some(ProgramResume::AfterChildren(resume)) if !children.is_empty() => {
+                let join = self.new_program_join(
+                    activation_id,
+                    children.len(),
+                    Some(resume),
+                    state,
+                    parent_join,
+                    search_page,
+                    source_telemetry,
+                    publishes_stable_effect,
+                );
+                for child in children {
+                    let credit =
+                        self.issue_credit(activation_id, CreditKind::Program { join: Some(join) });
+                    scheduled.push((state, child.work.clone(), credit));
+                }
+            }
+            Some(ProgramResume::AfterChildrenDone) if !children.is_empty() => {
+                let join = self.new_program_join(
+                    activation_id,
+                    children.len(),
+                    None,
+                    state,
+                    parent_join,
+                    search_page,
+                    source_telemetry,
+                    publishes_stable_effect,
+                );
+                for child in children {
+                    let credit =
+                        self.issue_credit(activation_id, CreditKind::Program { join: Some(join) });
+                    scheduled.push((state, child.work.clone(), credit));
+                }
+            }
+            resume => {
+                let immediate_resume = match resume {
+                    Some(ProgramResume::Immediate(work) | ProgramResume::AfterChildren(work)) => {
+                        Some(work)
+                    }
+                    Some(ProgramResume::AfterChildrenDone) | None => None,
+                };
+                let replacement_count = children.len() + usize::from(immediate_resume.is_some());
+                if let Some(join) = parent_join {
+                    let record = self
+                        .state
+                        .activations
+                        .get_mut(&activation_id)
+                        .expect("unknown program activation")
+                        .program_joins
+                        .get_mut(&join)
+                        .expect("program parent named an unknown join");
+                    if replacement_count > 0 {
+                        record.remaining = record
+                            .remaining
+                            .checked_add(replacement_count - 1)
+                            .expect("program join width overflow");
+                    }
+                }
+                for child in children {
+                    let credit =
+                        self.issue_credit(activation_id, CreditKind::Program { join: parent_join });
+                    scheduled.push((state, child.work.clone(), credit));
+                }
+                if let Some(work) = immediate_resume {
+                    let credit =
+                        self.issue_credit(activation_id, CreditKind::Program { join: parent_join });
+                    scheduled.push((state, work, credit));
+                }
+            }
+        }
+
+        assert_eq!(
+            self.state
+                .activations
+                .get_mut(&activation_id)
+                .expect("unknown program activation")
+                .live
+                .remove(&parent.key.nonce),
+            Some(CreditKind::Program { join: parent_join })
+        );
+
+        let mut dead_search_pages = 0usize;
+        let mut dead_source_telemetry_pages = 0usize;
+        if no_replacement {
+            if let Some(join) = parent_join {
+                let completed = self.finish_program_join_member(activation_id, join);
+                dead_search_pages += completed.dead_search_pages;
+                dead_source_telemetry_pages += completed.dead_source_telemetry_pages;
+                if let Some(resumed) = completed.scheduled {
+                    scheduled.push(resumed);
+                }
+            }
+        }
+
+        let quiescence = {
+            let activation = self
+                .state
+                .activations
+                .get_mut(&activation_id)
+                .expect("unknown program activation");
+            if activation.live.is_empty() {
+                assert!(
+                    activation.program_joins.is_empty(),
+                    "program activation lost every credit behind a live join"
+                );
+                activation.status = ActivationStatus::Quiescent;
+                Some(QuiescenceProof {
+                    activation: activation_id,
+                })
+            } else {
+                None
+            }
+        };
+        ProgramReplaceOneOutcome {
             scheduled,
             raw_proposal_occurrences: raw_stream_occurrences,
             accepted,
@@ -6442,6 +6790,300 @@ impl DeltaScheduler {
         }
     }
 
+    /// Executes one scalar opaque typed continuation without manufacturing a
+    /// one-row batch at either side of the erased family boundary.
+    #[allow(clippy::too_many_arguments)]
+    fn step_program_one<'a>(
+        &mut self,
+        root: &dyn Constraint<'a>,
+        plan: &ResidualPlan,
+        state: DeltaStateId,
+        task: ProgramTask,
+        limit: usize,
+        direct_terminal_full: Option<VariableSet>,
+        stable: &mut Worklist,
+        stable_interner: &mut StateInterner,
+        stats: &mut ResidualStateStats,
+    ) -> DeltaPhysicalOutcome {
+        assert!(limit > 0);
+        assert_eq!(task.activation, task.credit.key.activation);
+        let address = self
+            .interner
+            .program(state)
+            .cloned()
+            .expect("typed program task was scheduled under a legacy delta state");
+        let address_key = address.key();
+        let spec = address.resolve(root, plan);
+        let private_direct = address.has_private_direct_effects();
+        let cohort_key = ProgramCohortKey::of(&self.registry, &task);
+        let terminal = self.registry.physical_activation_class(task.activation)
+            == DeltaPhysicalClass::TerminalStreaming;
+        let within_search_page = self
+            .registry
+            .program_credit_within_search_page(&task.credit);
+        let unique_unjoined = self
+            .registry
+            .program_credit_is_unjoined_unique(&task.credit);
+        let (bound, parent, candidate_set) = self.registry.source_context(task.activation);
+        assert_eq!(bound, cohort_key.bound);
+        assert_eq!(candidate_set.is_some(), cohort_key.has_candidates);
+        let vars: SmallVec<[VariableId; 8]> = bound.into_iter().collect();
+        let view = rows_view(&vars, parent, 1);
+        let activation = ProgramActivation(task.activation.0);
+        let input_dispatch = task.work.dispatch;
+        let input_pacing = task.work.pacing;
+
+        let mut receipt = ProgramOneEffects::default();
+        spec.step_one_for(
+            self.program_runtimes
+                .get_mut(&state)
+                .expect("typed program state lost its runtime"),
+            address_key,
+            ProgramOneBatch {
+                stratum: address.stratum(),
+                view,
+                candidate_set,
+                activation,
+                work: &task.work,
+                limit,
+            },
+            &mut receipt,
+        );
+        let page = receipt
+            .page
+            .take()
+            .expect("typed scalar program returned no page");
+        assert!(
+            page.examined <= limit,
+            "typed program exceeded one input's physical work budget"
+        );
+
+        if receipt.placement.is_some() {
+            stats.delta_program_physical_cohorts += 1;
+            stats.delta_program_physical_rows += 1;
+            stats.delta_program_physical_granted_work += limit;
+            stats.max_delta_program_physical_cohort =
+                stats.max_delta_program_physical_cohort.max(1);
+            stats.max_delta_program_physical_granted_work = stats
+                .max_delta_program_physical_granted_work
+                .max(limit);
+        }
+        stats.delta_source_pages += receipt.source_pages;
+        stats.delta_source_candidates_examined += receipt.source_examined;
+        stats.delta_source_roots += receipt.source_roots;
+        if !private_direct {
+            stats.delta_source_direct_candidates += receipt.direct.len();
+        }
+        if receipt.source_pages > 0 {
+            stats.delta_source_cohorts += 1;
+            stats.max_delta_source_cohort = stats.max_delta_source_cohort.max(receipt.source_pages);
+        }
+        stats.delta_transition_pages += receipt.transition_pages;
+        stats.delta_transition_candidates_examined += receipt.transition_examined;
+        if receipt.transition_pages > 0 {
+            stats.delta_transition_cohorts += 1;
+            stats.max_delta_transition_cohort = stats
+                .max_delta_transition_cohort
+                .max(receipt.transition_pages);
+        }
+
+        let search_cohort = cohort_key.class.pacing() == ProgramPacing::Search;
+        let source_telemetry_cohort = receipt.source_pages > 0 && receipt.transition_pages == 0;
+        assert!(
+            page.examined > 0 || (page.resume.is_none() && receipt.children.is_empty()),
+            "typed program scheduled zero-examined continuation work without a positive work receipt"
+        );
+        let page_had_program_effect = !receipt.children.is_empty()
+            || (!private_direct && !receipt.direct.is_empty())
+            || !receipt.accepted.is_empty()
+            || receipt.supported;
+        let single_child_no_barrier = receipt.children.len() == 1 && page.resume.is_none();
+        stats.delta_program_single_child_no_barrier += usize::from(single_child_no_barrier);
+        if single_child_no_barrier {
+            let child = &receipt.children[0];
+            let compatible =
+                child.work.dispatch == input_dispatch && child.work.pacing == input_pacing;
+            stats.delta_program_affine_tail_opportunities +=
+                usize::from(unique_unjoined && compatible);
+        }
+
+        let outcome = self.registry.replace_program_one(
+            task.credit,
+            state,
+            &receipt.children,
+            std::mem::take(&mut receipt.accepted),
+            std::mem::take(&mut receipt.direct),
+            receipt.supported,
+            search_cohort,
+            source_telemetry_cohort,
+            page.resume,
+        );
+        if outcome.raw_proposal_occurrences != 0 {
+            assert!(
+                outcome.raw_proposal_occurrences >= outcome.accepted.len(),
+                "typed SET admission manufactured proposal occurrences"
+            );
+            stats.candidates_proposed +=
+                outcome.raw_proposal_occurrences - outcome.accepted.len();
+            stats.max_propose_candidates = stats
+                .max_propose_candidates
+                .max(outcome.raw_proposal_occurrences);
+        }
+        let mut scheduled = outcome
+            .scheduled
+            .into_iter()
+            .map(|(scheduled_state, work, credit)| {
+                assert_eq!(
+                    scheduled_state, state,
+                    "typed program continuation crossed occurrence-local runtime state"
+                );
+                ProgramTask {
+                    activation: task.activation,
+                    credit,
+                    work,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut effects = DeltaStableEffects::default();
+        let mut completed_activation_ids = Vec::new();
+        let mut retargeted = AHashMap::new();
+        let mut retired = false;
+        let mut completed_activations = 0usize;
+        if receipt.supported {
+            assert!(
+                outcome.accepted.is_empty(),
+                "one typed page mixed Boolean support with candidate acceptance"
+            );
+            if let Some(streamed) = self.registry.take_program_support_return(task.activation) {
+                let released = self.release_streaming(
+                    task.activation,
+                    streamed,
+                    Vec::new(),
+                    None,
+                    plan,
+                    stable,
+                    stable_interner,
+                    stats,
+                );
+                effects.absorb(released.stable);
+                if let Some(active) = released.active {
+                    assert!(retargeted.insert(task.activation, active).is_none());
+                }
+            }
+        }
+        if !outcome.accepted.is_empty() {
+            let direct_terminal = direct_terminal_full.filter(|_| terminal);
+            if let Some(streamed) = self.registry.take_streaming_return(task.activation) {
+                let released = self.release_streaming(
+                    task.activation,
+                    streamed,
+                    outcome.accepted.into_vec(),
+                    direct_terminal,
+                    plan,
+                    stable,
+                    stable_interner,
+                    stats,
+                );
+                effects.absorb(released.stable);
+                if let Some(active) = released.active {
+                    assert!(retargeted.insert(task.activation, active).is_none());
+                }
+            }
+        }
+        if let Some(proof) = outcome.quiescence {
+            assert_eq!(proof.activation, task.activation);
+            match self.settle_quiescence(proof) {
+                DeltaSettlement::Retargeted(active) => {
+                    assert_eq!(active.activation, task.activation);
+                    assert!(retargeted.insert(task.activation, active).is_none());
+                }
+                DeltaSettlement::Completed(completed) => {
+                    let old_activation = completed.activation;
+                    let released = self.release_completion(
+                        completed,
+                        plan,
+                        stable,
+                        stable_interner,
+                        stats,
+                    );
+                    prefer_continuation(&mut effects.continuation, released.continuation);
+                    if let Some(active) = released.active {
+                        assert!(retargeted.insert(old_activation, active).is_none());
+                    } else if !retargeted.contains_key(&old_activation) {
+                        completed_activations += 1;
+                        completed_activation_ids.push(old_activation);
+                    }
+                }
+            }
+            retired = true;
+        }
+
+        let mut dead_pages = 0usize;
+        let mut source_dead_pages = 0usize;
+        let mut transition_dead_pages = 0usize;
+        let page_dead = !page_had_program_effect && !effects.has_effect();
+        if page_dead {
+            dead_pages += usize::from(!within_search_page);
+            if source_telemetry_cohort {
+                source_dead_pages += 1;
+            } else if !private_direct {
+                transition_dead_pages += 1;
+            }
+        }
+        let retired_search_dead_pages = if effects.has_effect() {
+            0
+        } else {
+            outcome.dead_search_pages
+        };
+        let retired_source_telemetry_dead_pages = if effects.has_effect() {
+            0
+        } else {
+            outcome.dead_source_telemetry_pages
+        };
+        dead_pages += retired_search_dead_pages;
+        source_dead_pages += retired_source_telemetry_dead_pages;
+
+        let mut terminal_publications = OrderedActivationSet::default();
+        if terminal && effects.has_effect() {
+            let _ = terminal_publications.insert(task.activation);
+        }
+        if !scheduled.is_empty() {
+            stats.delta_program_continuation_files += 1;
+            stats.delta_program_continuation_tasks_filed += scheduled.len();
+            stats.delta_program_continuation_reentries +=
+                usize::from(!self.program_worklist.contains_key(&state));
+        }
+        let _ = self.file_program_state(state, std::mem::take(&mut scheduled));
+        if retired {
+            spec.retire_activations(
+                self.program_runtimes
+                    .get_mut(&state)
+                    .expect("typed program state lost its runtime during retirement"),
+                address_key,
+                std::slice::from_ref(&activation),
+            );
+        }
+        stats.delta_source_dead_pages += source_dead_pages;
+        stats.delta_transition_dead_pages += transition_dead_pages;
+        DeltaPhysicalOutcome {
+            outcome: DeltaStepOutcome {
+                continuation: effects.continuation,
+                publication: effects.publication,
+                completed_activation_ids,
+                retargeted,
+                dead_pages,
+                source_dead_pages,
+                transition_dead_pages,
+                completed_activations,
+                completed_transition_cohort: false,
+                allows_global_width_growth: true,
+            },
+            terminal_publications,
+            retired_search_receipt: retired_search_dead_pages > 0,
+        }
+    }
+
     /// Executes one physically compatible cohort of opaque typed
     /// continuations. The erased family boundary is crossed once: handles are
     /// affinely taken into a dense typed vector, and the adapter returns one
@@ -6452,7 +7094,7 @@ impl DeltaScheduler {
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
         state: DeltaStateId,
-        tasks: Vec<ProgramTask>,
+        mut tasks: Vec<ProgramTask>,
         limits: &[usize],
         active_pop: bool,
         direct_terminal_full: Option<VariableSet>,
@@ -6470,6 +7112,21 @@ impl DeltaScheduler {
             stats.delta_program_active_pops += 1;
         } else {
             stats.delta_program_global_pops += 1;
+        }
+
+        if tasks.len() == 1 {
+            let task = tasks.pop().expect("scalar Program cohort lost its task");
+            return self.step_program_one(
+                root,
+                plan,
+                state,
+                task,
+                limits[0],
+                direct_terminal_full,
+                stable,
+                stable_interner,
+                stats,
+            );
         }
 
         let address = self

@@ -68,10 +68,11 @@ pub use program::{
     DispatchClass, PreferredProgram, ProgramAction, ProgramActivation, ProgramBatch,
     ProgramBatchEffects, ProgramChild, ProgramCompleteBatch, ProgramCompleteWorkEvidence,
     ProgramCompleteWorkQuote, ProgramCompletion, ProgramExposure, ProgramGrouping, ProgramKey,
-    ProgramPacing, ProgramPage, ProgramPhysicalReceipt, ProgramRef, ProgramRequest, ProgramResume,
-    ProgramRoute, ProgramRuntime, ProgramSeedBatch, ProgramSeedEffects, ProgramSeedWork,
-    ProgramStratum, ProgramWork, ProgramWorkHandle, TypedCompleteArbiter, TypedCompleteSink,
-    TypedEffectSink, TypedPhysicalStep, TypedProgramBatch, TypedProgramSpec, TypedResume,
+    ProgramOneBatch, ProgramOneEffects, ProgramPacing, ProgramPage, ProgramPhysicalReceipt,
+    ProgramRef, ProgramRequest, ProgramResume, ProgramRoute, ProgramRuntime, ProgramSeedBatch,
+    ProgramSeedEffects, ProgramSeedWork, ProgramStratum, ProgramWork, ProgramWorkHandle,
+    TypedCompleteArbiter, TypedCompleteSink, TypedEffectSink, TypedOneEffectSink,
+    TypedPhysicalStep, TypedProgramBatch, TypedProgramOneBatch, TypedProgramSpec, TypedResume,
     TypedSeedSink,
 };
 pub(crate) use program::{ProgramCompleteAdmission, ProgramCompleteAffinity};

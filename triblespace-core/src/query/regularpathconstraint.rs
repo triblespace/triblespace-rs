@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::collections::VecDeque;
 
+use smallvec::SmallVec;
+
 use crate::id::id_into_value;
 use crate::id::RawId;
 use crate::id::ID_LEN;
@@ -34,7 +36,9 @@ use crate::query::RowsView;
 use crate::query::TriblePattern;
 use crate::query::TypedCompleteSink;
 use crate::query::TypedEffectSink;
+use crate::query::TypedOneEffectSink;
 use crate::query::TypedProgramBatch;
+use crate::query::TypedProgramOneBatch;
 use crate::query::TypedProgramSpec;
 use crate::query::TypedResume;
 use crate::query::TypedSeedSink;
@@ -3258,6 +3262,219 @@ impl TypedProgramSpec for RegularPathConstraint {
                 )
             });
             effects.page(examined, resume);
+        }
+    }
+
+    fn step_one_typed(
+        &self,
+        state: Self::State,
+        batch: TypedProgramOneBatch<'_>,
+        effects: &mut TypedOneEffectSink<Self::State, Self::NoveltyKey>,
+    ) {
+        assert_eq!(batch.view.len(), 1);
+        match state.into_kind() {
+            RpqStateKind::Support => {
+                effects.support();
+                effects.page(1, None);
+            }
+            RpqStateKind::CandidateFilter { variable, offset } => {
+                let candidates = batch
+                    .candidate_set
+                    .expect("typed RPQ confirmation filter lost its candidate set");
+                assert!(offset <= candidates.len());
+                let end = offset.saturating_add(batch.limit).min(candidates.len());
+                let (nullable, first) = if variable == self.start {
+                    (self.nullable, self.first.as_ref())
+                } else {
+                    assert_eq!(variable, self.end);
+                    (self.inverse_nullable, self.inverse_first.as_ref())
+                };
+                for &candidate in &candidates[offset..end] {
+                    if nullable || can_take_first_step(&self.set, first, &candidate) {
+                        effects.accept(candidate);
+                    }
+                }
+                let resume = (end < candidates.len())
+                    .then(|| TypedResume::Immediate(RpqState::candidate_filter(variable, end)));
+                effects.page(end - offset, resume);
+            }
+            RpqStateKind::Source {
+                variable,
+                cursor,
+                roots,
+            } => {
+                // Source discovery can genuinely return a page of independent
+                // roots. Keep its existing pageable implementation; the
+                // scalar transaction removes engine batching tax while this
+                // family-local fanout spills only when the page is actually
+                // wider than one.
+                let mut root_outputs = Vec::new();
+                let mut direct = Vec::new();
+                let page = if roots {
+                    let program = match self
+                        .program_for_variable(variable)
+                        .expect("same-variable RPQ source lost its program")
+                    {
+                        RpqRoute::SameVariable { program } => program,
+                        RpqRoute::BoundEndpoint { .. } => {
+                            panic!("root-producing source changed RPQ route")
+                        }
+                    };
+                    self.same_variable_source_page(
+                        program,
+                        batch.candidate_set,
+                        cursor,
+                        batch.limit,
+                        &mut root_outputs,
+                    )
+                } else {
+                    self.first_binding_source_page(variable, cursor, batch.limit, &mut direct)
+                };
+                for output in root_outputs.iter().copied() {
+                    let node = output.node;
+                    let state = RpqState::transition(variable, node, RpqExpandCursor::Start);
+                    let accepted = output.accepted.then_some(node.value);
+                    match batch.stratum {
+                        ProgramStratum::Finite => effects.finite_child(state, accepted),
+                        ProgramStratum::Fixpoint => effects.fixpoint_child(
+                            state,
+                            RpqNoveltyKey {
+                                source: node.source,
+                                value: node.value,
+                                pc: node.pc,
+                            },
+                            accepted,
+                        ),
+                    }
+                }
+                for value in direct {
+                    effects.direct(value);
+                }
+                let resume = match page.next {
+                    Some(cursor) => Some(TypedResume::AfterChildren(RpqState::source(
+                        variable, cursor, roots,
+                    ))),
+                    None if !root_outputs.is_empty() => Some(TypedResume::AfterChildrenDone),
+                    None => None,
+                };
+                effects.account_source(page.examined, root_outputs.len());
+                effects.page(page.examined, resume);
+            }
+            RpqStateKind::Transition {
+                variable,
+                node,
+                cursor,
+            } => {
+                let program = match self
+                    .program_for_variable(variable)
+                    .expect("typed RPQ transition lost its program")
+                {
+                    RpqRoute::BoundEndpoint { program, .. }
+                    | RpqRoute::SameVariable { program } => program,
+                };
+                let program_state = program.decode(node.pc);
+
+                // Preserve the cohort implementation's atomic all-fit choice,
+                // but keep the overwhelmingly common one-branch plan inline.
+                // We must retain borrowed PATCH walkers until every branch has
+                // fitted; emitting a valid prefix before a later negated or
+                // oversized branch would change the pageable protocol.
+                let mut plans: SmallVec<[(u32, bool, PositiveDeltaInfixes<'_>); 2]> =
+                    SmallVec::new();
+                let mut fanout = 0usize;
+                let mut all_fit =
+                    cursor == RpqExpandCursor::Start && !program.steps[program_state].is_empty();
+                if all_fit {
+                    for &(step, target) in &program.steps[program_state] {
+                        debug_assert!(fanout <= batch.limit);
+                        let Some(infixes) = self.bounded_positive_delta_infixes(
+                            step,
+                            &node.value,
+                            batch.limit - fanout,
+                        ) else {
+                            all_fit = false;
+                            break;
+                        };
+                        fanout += infixes.len();
+                        plans.push((
+                            program.encode(target),
+                            program.accepting[target as usize],
+                            infixes,
+                        ));
+                    }
+                }
+
+                if all_fit {
+                    #[cfg(test)]
+                    BULK_TRANSITION_COHORTS.with(|cohorts| cohorts.set(cohorts.get() + 1));
+                    effects.reserve_children(fanout);
+                    for (pc, target_accepting, infixes) in plans {
+                        infixes.for_each(|value| {
+                            let child = RpqNode {
+                                source: node.source,
+                                value,
+                                pc,
+                            };
+                            let state =
+                                RpqState::transition(variable, child, RpqExpandCursor::Start);
+                            let accepted = (target_accepting
+                                && node.source.is_none_or(|anchor| value == anchor))
+                            .then_some(value);
+                            match batch.stratum {
+                                ProgramStratum::Finite => effects.finite_child(state, accepted),
+                                ProgramStratum::Fixpoint => effects.fixpoint_child(
+                                    state,
+                                    RpqNoveltyKey {
+                                        source: child.source,
+                                        value: child.value,
+                                        pc: child.pc,
+                                    },
+                                    accepted,
+                                ),
+                            }
+                        });
+                    }
+                    effects.account_transition(fanout);
+                    effects.page(fanout, None);
+                    return;
+                }
+
+                let mut successors = Vec::new();
+                let page = self.expand_delta_program_page(
+                    program,
+                    node,
+                    cursor,
+                    batch.limit,
+                    &mut successors,
+                );
+                for output in successors {
+                    let child = output.node;
+                    let state = RpqState::transition(variable, child, RpqExpandCursor::Start);
+                    let accepted = output.accepted.then_some(child.value);
+                    match batch.stratum {
+                        ProgramStratum::Finite => effects.finite_child(state, accepted),
+                        ProgramStratum::Fixpoint => effects.fixpoint_child(
+                            state,
+                            RpqNoveltyKey {
+                                source: child.source,
+                                value: child.value,
+                                pc: child.pc,
+                            },
+                            accepted,
+                        ),
+                    }
+                }
+                let (examined, resume) = page.map_or((0, None), |page| {
+                    effects.account_transition(page.examined);
+                    (
+                        page.examined,
+                        page.next.map(|cursor| {
+                            TypedResume::Immediate(RpqState::transition(variable, node, cursor))
+                        }),
+                    )
+                });
+                effects.page(examined, resume);
+            }
         }
     }
 }
