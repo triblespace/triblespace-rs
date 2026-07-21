@@ -96,6 +96,43 @@ use smallvec::SmallVec;
 
 use super::*;
 
+/// Thread-local phase marker for allocation attribution in diagnostic builds.
+/// Production builds contain neither the marker nor its guards.
+#[cfg(feature = "allocation-probe")]
+#[doc(hidden)]
+pub mod allocation_probe {
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    #[repr(u8)]
+    pub enum Phase {
+        Other = 0,
+        Program = 1,
+        Candidate = 2,
+        Ready = 3,
+    }
+
+    thread_local! {
+        static CURRENT: Cell<Phase> = const { Cell::new(Phase::Other) };
+    }
+
+    pub fn current() -> Phase {
+        CURRENT.get()
+    }
+
+    pub(crate) struct Guard(Phase);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            CURRENT.set(self.0);
+        }
+    }
+
+    pub(crate) fn enter(phase: Phase) -> Guard {
+        Guard(CURRENT.replace(phase))
+    }
+}
+
 mod delta;
 mod materialize;
 mod set_admit;
@@ -11155,6 +11192,18 @@ impl ResidualStateMachine {
         influences: &[VariableSet; 128],
         base_estimates: &[usize; 128],
     ) -> MachineStep {
+        #[cfg(feature = "allocation-probe")]
+        let _allocation_probe = match &task.desc.phase {
+            ResidualPhase::Candidate { .. } => Some(allocation_probe::enter(
+                allocation_probe::Phase::Candidate,
+            )),
+            ResidualPhase::Ready => {
+                Some(allocation_probe::enter(allocation_probe::Phase::Ready))
+            }
+            ResidualPhase::Propose { .. }
+            | ResidualPhase::Confirm { .. }
+            | ResidualPhase::Formula { .. } => None,
+        };
         let task = match self.seed_delta_proposal(root, plan, task) {
             Ok(DeltaSeedOutcome {
                 continuation,

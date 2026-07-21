@@ -50,6 +50,85 @@
 
 use std::time::Instant;
 
+#[cfg(feature = "allocation-probe")]
+mod allocation_probe {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use triblespace::core::query::residual::allocation_probe::{self as phase_probe, Phase};
+
+    struct CountingAllocator;
+
+    const PHASES: usize = 4;
+    static ALLOCATIONS: [AtomicU64; PHASES] = [const { AtomicU64::new(0) }; PHASES];
+    static BYTES: [AtomicU64; PHASES] = [const { AtomicU64::new(0) }; PHASES];
+
+    fn record(size: usize) {
+        let phase = phase_probe::current() as usize;
+        ALLOCATIONS[phase].fetch_add(1, Ordering::Relaxed);
+        BYTES[phase].fetch_add(size as u64, Ordering::Relaxed);
+    }
+
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let ptr = unsafe { System.alloc(layout) };
+            if !ptr.is_null() {
+                record(layout.size());
+            }
+            ptr
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) };
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, old: Layout, new_size: usize) -> *mut u8 {
+            let new_ptr = unsafe { System.realloc(ptr, old, new_size) };
+            if !new_ptr.is_null() {
+                record(new_size);
+            }
+            new_ptr
+        }
+    }
+
+    #[global_allocator]
+    static GLOBAL: CountingAllocator = CountingAllocator;
+
+    #[derive(Clone, Copy)]
+    pub struct Snapshot {
+        allocations: [u64; PHASES],
+        bytes: [u64; PHASES],
+    }
+
+    impl Snapshot {
+        pub fn now() -> Self {
+            Self {
+                allocations: std::array::from_fn(|phase| {
+                    ALLOCATIONS[phase].load(Ordering::Relaxed)
+                }),
+                bytes: std::array::from_fn(|phase| BYTES[phase].load(Ordering::Relaxed)),
+            }
+        }
+
+        pub fn report_since(self, before: Self, label: &str, rows: usize) {
+            let names = ["other", "program", "candidate", "ready"];
+            for phase in [Phase::Program, Phase::Candidate, Phase::Ready] {
+                let index = phase as usize;
+                let allocations = self.allocations[index] - before.allocations[index];
+                let bytes = self.bytes[index] - before.bytes[index];
+                println!(
+                    "\tALLOC {label} phase={} calls={} bytes={} calls_per_row={:.3} bytes_per_row={:.1}",
+                    names[index],
+                    allocations,
+                    bytes,
+                    allocations as f64 / rows.max(1) as f64,
+                    bytes as f64 / rows.max(1) as f64,
+                );
+            }
+        }
+    }
+}
+
 use triblespace::core::inline::encodings::genid::GenId;
 use triblespace::core::query::residual::{ResidualLowering, ResidualStateStats};
 use triblespace::core::trible::TribleSet;
@@ -282,6 +361,8 @@ fn report(cell: &CellReport) {
 /// the first pulled row, an order-independent signature, and final stats.
 macro_rules! run_residual_cell {
     ($label:expr, $query:expr, $budget:expr) => {{
+        #[cfg(feature = "allocation-probe")]
+        let allocation_before = allocation_probe::Snapshot::now();
         let t0 = Instant::now();
         let mut iter = ($query).solve_residual_state_lazy_with(ResidualLowering::FULL);
         let mut rows = 0usize;
@@ -300,6 +381,8 @@ macro_rules! run_residual_cell {
                 break;
             }
         }
+        #[cfg(feature = "allocation-probe")]
+        let allocation_after = allocation_probe::Snapshot::now();
         let cell = CellReport {
             label: $label.to_string(),
             rows,
@@ -309,6 +392,8 @@ macro_rules! run_residual_cell {
             stats: Some(iter.stats().clone()),
         };
         report(&cell);
+        #[cfg(feature = "allocation-probe")]
+        allocation_after.report_since(allocation_before, $label, rows);
         cell
     }};
 }

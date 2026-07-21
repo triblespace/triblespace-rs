@@ -79,6 +79,8 @@ net = ["dep:triblespace-net"]
 search = ["dep:triblespace-search"]
 parallel = ["triblespace-core/parallel"]
 gpu = ["parallel", "dep:triblespace-gpu", "triblespace-gpu/wgpu"]
+# Diagnostic-only allocator phase markers used by residual examples.
+allocation-probe = ["triblespace-core/allocation-probe"]
 
 [[bench]]
 name = "benchmark"

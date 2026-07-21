@@ -6460,6 +6460,9 @@ impl DeltaScheduler {
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
     ) -> DeltaPhysicalOutcome {
+        #[cfg(feature = "allocation-probe")]
+        let _allocation_probe =
+            super::allocation_probe::enter(super::allocation_probe::Phase::Program);
         assert!(!tasks.is_empty());
         assert_eq!(tasks.len(), limits.len());
         assert!(limits.iter().all(|&limit| limit > 0));

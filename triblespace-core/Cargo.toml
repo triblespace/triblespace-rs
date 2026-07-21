@@ -79,6 +79,8 @@ kani = []
 deterministic = []
 wasm = ["dep:wasmi"]
 parallel = ["dep:rayon", "blake3/rayon"]
+# Diagnostic-only allocator phase markers used by the residual engine probes.
+allocation-probe = []
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(nightly)', 'cfg(kani)'] }
