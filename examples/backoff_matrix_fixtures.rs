@@ -357,6 +357,7 @@ fn main() {
     let oasis_fan = args.get(2).copied().unwrap_or(64);
     let khop_k = args.get(3).copied().unwrap_or(16);
     let take_budget = args.get(4).copied().unwrap_or(1);
+    let residual_only = std::env::var_os("TRIBLES_R1_RESIDUAL_ONLY").is_some();
 
     println!("== R1 pacing-matrix fixtures ==  config: {}", env_config());
 
@@ -364,37 +365,45 @@ fn main() {
     let (chain, c0) = build_chain(chain_n, false, 1);
     let c0i: Inline<GenId> = c0.to_inline();
     println!("\n-- F1 metronome chain: n={chain_n}, full drain --");
-    let q = find!(
-        (x: Inline<GenId>),
-        temp!((s), and!(s.is(c0i), path!(chain.clone(), s r1_schema::mp+ x)))
-    );
-    let sc = run_scalar_cell!("F1/scalar", q, usize::MAX);
+    let sc = (!residual_only).then(|| {
+        let q = find!(
+            (x: Inline<GenId>),
+            temp!((s), and!(s.is(c0i), path!(chain.clone(), s r1_schema::mp+ x)))
+        );
+        run_scalar_cell!("F1/scalar", q, usize::MAX)
+    });
     let q = find!(
         (x: Inline<GenId>),
         temp!((s), and!(s.is(c0i), path!(chain.clone(), s r1_schema::mp+ x)))
     );
     let rc = run_residual_cell!("F1/residual", q, usize::MAX);
-    assert_eq!(
-        (sc.rows, sc.sig),
-        (rc.rows, rc.sig),
-        "F1 parity: scalar and residual must agree exactly"
-    );
+    if let Some(sc) = sc {
+        assert_eq!(
+            (sc.rows, sc.sig),
+            (rc.rows, rc.sig),
+            "F1 parity: scalar and residual must agree exactly"
+        );
+    }
 
     // F2 ring — P2 (novelty-saturated fixpoint) + K>1 control.
     let (ring, r0) = build_chain(chain_n.min(20_000), true, 4);
     let r0i: Inline<GenId> = r0.to_inline();
     println!("\n-- F2 ring fixpoint (n={}, K=4 sources control) --", chain_n.min(20_000));
-    let q = find!(
-        (x: Inline<GenId>),
-        temp!((s), and!(s.is(r0i), path!(ring.clone(), s r1_schema::mp+ x)))
-    );
-    let sc = run_scalar_cell!("F2/scalar", q, usize::MAX);
+    let sc = (!residual_only).then(|| {
+        let q = find!(
+            (x: Inline<GenId>),
+            temp!((s), and!(s.is(r0i), path!(ring.clone(), s r1_schema::mp+ x)))
+        );
+        run_scalar_cell!("F2/scalar", q, usize::MAX)
+    });
     let q = find!(
         (x: Inline<GenId>),
         temp!((s), and!(s.is(r0i), path!(ring.clone(), s r1_schema::mp+ x)))
     );
     let rc = run_residual_cell!("F2/residual", q, usize::MAX);
-    assert_eq!((sc.rows, sc.sig), (rc.rows, rc.sig), "F2 parity");
+    if let Some(sc) = sc {
+        assert_eq!((sc.rows, sc.sig), (rc.rows, rc.sig), "F2 parity");
+    }
     let q = find!(
         (s: Inline<GenId>, x: Inline<GenId>),
         and!(
@@ -409,15 +418,17 @@ fn main() {
     println!(
         "\n-- F3 oasis-last: k={oasis_k}, fan={oasis_fan}, deaths=20, take({take_budget}) --"
     );
-    let q = find!(
-        (e: Inline<GenId>, y: Inline<GenId>, z: Inline<GenId>),
-        and!(
-            pattern!(&oasis, [{ ?e @ r1_schema::otype: ?e }]),
-            pattern!(&oasis, [{ ?e @ r1_schema::op: ?y }]),
-            pattern!(&oasis, [{ ?y @ r1_schema::oq: ?z }]),
-        )
-    );
-    let sc = run_scalar_cell!("F3/scalar", q, take_budget);
+    let sc = (!residual_only).then(|| {
+        let q = find!(
+            (e: Inline<GenId>, y: Inline<GenId>, z: Inline<GenId>),
+            and!(
+                pattern!(&oasis, [{ ?e @ r1_schema::otype: ?e }]),
+                pattern!(&oasis, [{ ?e @ r1_schema::op: ?y }]),
+                pattern!(&oasis, [{ ?y @ r1_schema::oq: ?z }]),
+            )
+        );
+        run_scalar_cell!("F3/scalar", q, take_budget)
+    });
     let q = find!(
         (e: Inline<GenId>, y: Inline<GenId>, z: Inline<GenId>),
         and!(
@@ -429,7 +440,7 @@ fn main() {
     let rc = run_residual_cell!("F3/residual", q, take_budget);
     // The accumulation-bound assertion arms once backoff exists: TTFR must
     // stay sequential-class (within 100x of scalar's) in any backoff cell.
-    if std::env::var("TRIBLES_BACKOFF_MODE").is_ok() {
+    if let (Ok(_), Some(sc)) = (std::env::var("TRIBLES_BACKOFF_MODE"), sc) {
         let (s, r) = (sc.ttfr_ms.unwrap_or(0.0), rc.ttfr_ms.unwrap_or(f64::MAX));
         assert!(
             r <= (s.max(0.01)) * 100.0,
@@ -441,29 +452,35 @@ fn main() {
     let (khop, k0) = build_khop(khop_k);
     let k0i: Inline<GenId> = k0.to_inline();
     println!("\n-- F4 thin k-hop functional chain: k={khop_k}, full drain --");
-    let q = find!(
-        (x: Inline<GenId>),
-        temp!((s), and!(s.is(k0i), path!(khop.clone(), s r1_schema::khop+ x)))
-    );
-    let sc = run_scalar_cell!("F4/scalar", q, usize::MAX);
+    let sc = (!residual_only).then(|| {
+        let q = find!(
+            (x: Inline<GenId>),
+            temp!((s), and!(s.is(k0i), path!(khop.clone(), s r1_schema::khop+ x)))
+        );
+        run_scalar_cell!("F4/scalar", q, usize::MAX)
+    });
     let q = find!(
         (x: Inline<GenId>),
         temp!((s), and!(s.is(k0i), path!(khop.clone(), s r1_schema::khop+ x)))
     );
     let rc = run_residual_cell!("F4/residual", q, usize::MAX);
-    assert_eq!((sc.rows, sc.sig), (rc.rows, rc.sig), "F4 parity");
+    if let Some(sc) = sc {
+        assert_eq!((sc.rows, sc.sig), (rc.rows, rc.sig), "F4 parity");
+    }
 
     // F5 diamond — P5 (reconvergence capture: reentries -> merges).
     let diamond = build_diamond(256);
     println!("\n-- F5 two-route diamond: 2x256, full drain --");
-    let q = find!(
-        (e: Inline<GenId>, x: Inline<GenId>, y: Inline<GenId>),
-        and!(
-            pattern!(&diamond, [{ ?e @ r1_schema::da: ?x }]),
-            pattern!(&diamond, [{ ?e @ r1_schema::db: ?y }]),
-        )
-    );
-    let sc = run_scalar_cell!("F5/scalar", q, usize::MAX);
+    let sc = (!residual_only).then(|| {
+        let q = find!(
+            (e: Inline<GenId>, x: Inline<GenId>, y: Inline<GenId>),
+            and!(
+                pattern!(&diamond, [{ ?e @ r1_schema::da: ?x }]),
+                pattern!(&diamond, [{ ?e @ r1_schema::db: ?y }]),
+            )
+        );
+        run_scalar_cell!("F5/scalar", q, usize::MAX)
+    });
     let q = find!(
         (e: Inline<GenId>, x: Inline<GenId>, y: Inline<GenId>),
         and!(
@@ -472,9 +489,11 @@ fn main() {
         )
     );
     let rc = run_residual_cell!("F5/residual", q, usize::MAX);
-    assert_eq!((sc.rows, sc.sig), (rc.rows, rc.sig), "F5 parity");
+    if let Some(sc) = sc {
+        assert_eq!((sc.rows, sc.sig), (rc.rows, rc.sig), "F5 parity");
+    }
     let (count, _) = tally(std::iter::empty::<u8>());
     let _ = count;
 
-    println!("\nAll parity assertions held. Matrix cells become meaningful per-policy once the backoff/conservation knobs land (sol's opt-in branch); rerun this binary per cell with the env matrix and diff the counter blocks.");
+    println!("\nAll enabled parity assertions held. Matrix cells become meaningful per-policy once the backoff/conservation knobs land (sol's opt-in branch); rerun this binary per cell with the env matrix and diff the counter blocks.");
 }
