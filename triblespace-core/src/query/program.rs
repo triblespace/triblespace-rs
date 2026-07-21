@@ -231,6 +231,34 @@ pub struct ProgramCompleteBatch<'v> {
     pub view: RowsView<'v>,
 }
 
+/// Exact, parent-local admission evidence for one complete action.
+///
+/// This is not an execution grant or a reservation. The scheduler may use it
+/// only before entering completion; once entered, the family-owned complete
+/// action remains an unsuspendable fixpoint.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProgramCompleteWorkQuote {
+    /// Physical units examined by a complete drain for this parent.
+    pub drain_work_units: usize,
+    /// Raw occurrences emitted before action-boundary SET admission.
+    pub raw_occurrences: usize,
+}
+
+/// Physical admission evidence orthogonal to semantic completion equivalence.
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProgramCompleteWorkEvidence {
+    /// This family predates physical quoting; retain the established complete
+    /// admission policy selected by independent scheduler evidence.
+    Unquoted,
+    /// Exact parent-local evidence for this batch.
+    Quoted(Vec<ProgramCompleteWorkQuote>),
+    /// This family owns a quote path but cannot cheaply certify this batch;
+    /// open fresh pageable roots instead.
+    Declined,
+}
+
 /// Set-admitted parent-tagged Propose values returned by a complete action.
 ///
 /// `raw_occurrence_count` preserves physical work accounting from the exact
@@ -664,6 +692,23 @@ pub trait TypedProgramSpec {
     fn complete_typed(&self, _batch: ProgramCompleteBatch<'_>, _effects: &mut TypedCompleteSink) {
         panic!("typed Program certified a complete action without implementing it")
     }
+
+    /// Cheap exact admission evidence for each parent in `batch`, in parent
+    /// order. [`ProgramCompleteWorkEvidence::Declined`] rejects complete
+    /// admission without doing query work; the scheduler must then open fresh
+    /// pageable roots.
+    ///
+    /// A family that returns quotes must return exactly one quote per parent.
+    /// The quote carries no continuation identity and is deliberately not
+    /// passed to [`Self::complete_typed`]. Evidence must be deterministic for
+    /// identical batches over the immutable family; the erased adapter may
+    /// re-quote immediately before completion to validate the raw count.
+    fn quote_complete_typed(
+        &self,
+        _batch: ProgramCompleteBatch<'_>,
+    ) -> ProgramCompleteWorkEvidence {
+        ProgramCompleteWorkEvidence::Unquoted
+    }
 }
 
 trait ErasedProgramRuntime: Any + Send {
@@ -769,6 +814,11 @@ trait ErasedProgramSpec {
 
     fn complete_batch(&self, batch: ProgramCompleteBatch<'_>, effects: &mut ProgramCompleteEffects);
 
+    fn quote_complete_batch(
+        &self,
+        batch: ProgramCompleteBatch<'_>,
+    ) -> ProgramCompleteWorkEvidence;
+
     fn retire_activations(
         &self,
         runtime: &mut ProgramRuntime,
@@ -850,6 +900,13 @@ impl<'a> ProgramRef<'a> {
         effects: &mut ProgramCompleteEffects,
     ) {
         self.erased.complete_batch(batch, effects);
+    }
+
+    pub(crate) fn quote_complete_batch(
+        self,
+        batch: ProgramCompleteBatch<'_>,
+    ) -> ProgramCompleteWorkEvidence {
+        self.erased.quote_complete_batch(batch)
     }
 
     pub(crate) fn retire_activations(
@@ -1190,6 +1247,20 @@ where
             },
             effects,
         );
+    }
+
+    fn quote_complete_batch(
+        &self,
+        batch: ProgramCompleteBatch<'_>,
+    ) -> ProgramCompleteWorkEvidence {
+        let (selected, child_key) = self.selected(batch.route.key);
+        selected.quote_complete_batch(ProgramCompleteBatch {
+            route: ProgramRoute {
+                key: child_key,
+                ..batch.route
+            },
+            ..batch
+        })
     }
 
     fn retire_activations(
@@ -1641,6 +1712,25 @@ where
             "typed complete action proposal variable was already bound"
         );
 
+        let quoted_raw_occurrences = match self.quote_complete_typed(batch) {
+            ProgramCompleteWorkEvidence::Unquoted => None,
+            ProgramCompleteWorkEvidence::Declined => {
+                panic!("typed complete action entered after its work quote declined")
+            }
+            ProgramCompleteWorkEvidence::Quoted(quotes) => {
+                assert_eq!(
+                    quotes.len(),
+                    batch.view.len(),
+                    "typed complete-action quote did not cover every parent exactly once"
+                );
+                Some(quotes.into_iter().fold(0usize, |total, quote| {
+                    total
+                        .checked_add(quote.raw_occurrences)
+                        .expect("typed complete-action raw quote overflow")
+                }))
+            }
+        };
+
         let mut typed = TypedCompleteSink {
             occurrences: Vec::new(),
         };
@@ -1660,6 +1750,12 @@ where
         }
 
         let raw_occurrence_count = typed.occurrences.len();
+        if let Some(quoted_raw_occurrences) = quoted_raw_occurrences {
+            assert_eq!(
+                raw_occurrence_count, quoted_raw_occurrences,
+                "typed complete action disagreed with its exact raw-occurrence quote"
+            );
+        }
         let mut admitted = AHashSet::with_capacity(raw_occurrence_count);
         typed
             .occurrences
@@ -1669,6 +1765,60 @@ where
             .checked_add(raw_occurrence_count)
             .expect("typed complete action occurrence count overflow");
         effects.occurrences.extend(typed.occurrences);
+    }
+
+    fn quote_complete_batch(
+        &self,
+        batch: ProgramCompleteBatch<'_>,
+    ) -> ProgramCompleteWorkEvidence {
+        assert_eq!(
+            batch.route.key.arm,
+            ProgramRouteArm::Direct,
+            "a direct typed Program quote received a composed route arm"
+        );
+        let ProgramAction::Propose(variable) = batch.request.action else {
+            panic!("typed complete-action quotes currently support only Propose")
+        };
+        assert_eq!(
+            variable, batch.route.variable,
+            "typed complete-action quote route changed its proposal variable"
+        );
+        assert_eq!(
+            batch.route.completion,
+            ProgramCompletion::CompleteActionEquivalent,
+            "typed complete-action quote lacked an equivalence certificate"
+        );
+        assert_eq!(
+            TypedProgramSpec::route(self, batch.request),
+            Some(batch.route),
+            "typed complete-action quote route was not pure for its request"
+        );
+        let mut view_bound = VariableSet::new_empty();
+        for &bound in batch.view.vars {
+            assert!(
+                !view_bound.is_set(bound),
+                "typed complete-action quote view repeated a bound variable"
+            );
+            view_bound.set(bound);
+        }
+        assert_eq!(
+            view_bound, batch.request.bound,
+            "typed complete-action quote view disagreed with its bound schema"
+        );
+        assert!(
+            batch.view.col(variable).is_none(),
+            "typed complete-action quote proposal variable was already bound"
+        );
+
+        let evidence = self.quote_complete_typed(batch);
+        if let ProgramCompleteWorkEvidence::Quoted(quotes) = &evidence {
+            assert_eq!(
+                quotes.len(),
+                batch.view.len(),
+                "typed complete-action quote did not cover every parent exactly once"
+            );
+        }
+        evidence
     }
 
     fn retire_activations(

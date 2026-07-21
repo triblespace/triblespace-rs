@@ -104,6 +104,12 @@ use delta::{
     DeltaScheduler, DeltaSeedOutcome, DeltaStepOutcome, TerminalPublicationBatch,
 };
 
+/// V1 complete-admission consistency law: a fresh contiguous suffix
+/// demonstrates appetite only when both quoted totals are at most `c * S`,
+/// with fixed `c = 1`. This is protocol evidence, not an execution budget or
+/// an adaptive tuning knob.
+const COMPLETE_QUOTE_APPETITE_FACTOR: usize = 1;
+
 /// One deterministic route from the owned root to an opaque residual leaf.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ConstraintPath(Box<[usize]>);
@@ -10270,6 +10276,64 @@ impl ResidualStateMachine {
         reservoir.min(demand_width.max(miss_width).max(fair_width))
     }
 
+    /// Refines an already-admitted terminal cohort using optional exact
+    /// complete-work evidence. Physical evidence may only shrink the semantic
+    /// admission; it never enlarges it.
+    ///
+    /// A quoted family may complete only a contiguous tail suffix whose total
+    /// drain work and raw buffering each fit current search `S`. Keeping the
+    /// suffix contiguous lets the caller refile the untouched prefix without
+    /// changing affine parent order. A singleton suffix is not worth splitting
+    /// from the pageable cohort.
+    fn complete_terminal_quote_tail_width(
+        &self,
+        program: ProgramRef<'_>,
+        request: ProgramRequest,
+        route: ProgramRoute,
+        rows: &RowBatch,
+    ) -> Option<usize> {
+        debug_assert!(rows.row_count > 1);
+        let vars: Vec<VariableId> = request.bound.into_iter().collect();
+        let view = rows_view(&vars, &rows.rows, rows.row_count);
+        match program.quote_complete_batch(ProgramCompleteBatch {
+            request,
+            route,
+            view,
+        }) {
+            ProgramCompleteWorkEvidence::Unquoted => Some(rows.row_count),
+            ProgramCompleteWorkEvidence::Declined => None,
+            ProgramCompleteWorkEvidence::Quoted(quotes) => {
+                let capacity = self
+                    .width
+                    .max(1)
+                    .checked_mul(COMPLETE_QUOTE_APPETITE_FACTOR)
+                    .expect("complete-action quote capacity overflow");
+                let mut drain_work = 0usize;
+                let mut raw_occurrences = 0usize;
+                let mut suffix = 0usize;
+                for quote in quotes.iter().rev() {
+                    let Some(next_drain_work) =
+                        drain_work.checked_add(quote.drain_work_units)
+                    else {
+                        break;
+                    };
+                    let Some(next_raw_occurrences) =
+                        raw_occurrences.checked_add(quote.raw_occurrences)
+                    else {
+                        break;
+                    };
+                    if next_drain_work > capacity || next_raw_occurrences > capacity {
+                        break;
+                    }
+                    drain_work = next_drain_work;
+                    raw_occurrences = next_raw_occurrences;
+                    suffix += 1;
+                }
+                (suffix > 1).then_some(suffix)
+            }
+        }
+    }
+
     fn should_defer_terminal_admission(&self, task: &SelectedResidualTask) -> bool {
         if !self.uses_direct_terminal_publication()
             || !self.terminal_yield.families.contains_key(&task.state)
@@ -10433,12 +10497,12 @@ impl ResidualStateMachine {
             ProgramOffer::Selected(spec, route) => Some((spec, route)),
         };
         let selected_parent_count = rows.row_count;
-        let admitted_parent_count = if terminal_streaming {
+        let mut admitted_parent_count = if terminal_streaming {
             self.terminal_admission_width(task.state, selected_parent_count)
         } else {
             selected_parent_count
         };
-        let complete_terminal_phase = terminal_streaming
+        let complete_terminal_candidate = terminal_streaming
             && admitted_parent_count > 1
             && self.uses_eager_terminal_phase()
             && program.is_some_and(|(_, route)| {
@@ -10472,16 +10536,6 @@ impl ResidualStateMachine {
         };
         debug_assert_eq!(selected_parent_count, selected_rows.row_count);
         let first_admitted = selected_parent_count - admitted_parent_count;
-        if terminal_streaming {
-            self.stats.delta_terminal_admissions += 1;
-            self.stats.delta_terminal_admitted_parents += admitted_parent_count;
-            self.stats.max_delta_terminal_admission_parents = self
-                .stats
-                .max_delta_terminal_admission_parents
-                .max(admitted_parent_count);
-            self.stats.delta_terminal_demand_wide_admissions +=
-                usize::from(admitted_parent_count > 1);
-        }
         if terminal_streaming && first_admitted > 0 {
             let admitted = bucket.take_tail(desc.bound.count(), admitted_parent_count, false);
             let remainder_rows = bucket.row_count();
@@ -10505,16 +10559,66 @@ impl ResidualStateMachine {
                 }
             }
         }
-        let StateBucket::Rows(rows) = bucket else {
+        let StateBucket::Rows(mut rows) = bucket else {
             unreachable!("terminal admission preserved proposal rows")
         };
+        let complete_parent_count = complete_terminal_candidate
+            .then(|| {
+                let (spec, route) = program.expect("complete candidate lost its Program route");
+                self.complete_terminal_quote_tail_width(
+                    spec,
+                    program_request,
+                    route,
+                    &rows,
+                )
+            })
+            .flatten();
+        if let Some(complete_parent_count) = complete_parent_count {
+            debug_assert!(complete_parent_count > 1);
+            debug_assert!(complete_parent_count <= rows.row_count);
+            if complete_parent_count < rows.row_count {
+                let mut admitted = StateBucket::Rows(rows);
+                let completed = admitted.take_tail(
+                    desc.bound.count(),
+                    complete_parent_count,
+                    false,
+                );
+                let deferred_parents = admitted.row_count();
+                let receipt = file_with_plan(
+                    &mut self.worklist,
+                    &mut self.interner,
+                    plan,
+                    desc.clone(),
+                    admitted,
+                    &mut self.stats,
+                )
+                .expect("quoted complete-action prefix is nonempty");
+                debug_assert_eq!(receipt.state, state);
+                let StateBucket::Rows(completed) = completed else {
+                    unreachable!("quoted terminal split preserved row payloads")
+                };
+                rows = completed;
+                self.stats.delta_terminal_admission_remainders += deferred_parents;
+            }
+            admitted_parent_count = complete_parent_count;
+        }
+        if terminal_streaming {
+            self.stats.delta_terminal_admissions += 1;
+            self.stats.delta_terminal_admitted_parents += admitted_parent_count;
+            self.stats.max_delta_terminal_admission_parents = self
+                .stats
+                .max_delta_terminal_admission_parents
+                .max(admitted_parent_count);
+            self.stats.delta_terminal_demand_wide_admissions +=
+                usize::from(admitted_parent_count > 1);
+        }
         let direct_terminal_publication_full = self.direct_terminal_publication_full();
         self.stats.propose_action_pops += 1;
         self.stats.propose_calls += 1;
         self.stats.propose_rows += rows.row_count;
         self.stats.max_propose_rows = self.stats.max_propose_rows.max(rows.row_count);
         if let Some((spec, route)) = program {
-            if complete_terminal_phase {
+            if complete_parent_count.is_some() {
                 return Ok(self.complete_terminal_program_proposal(
                     spec,
                     program_request,
@@ -14562,7 +14666,7 @@ mod tests {
     }
 
     #[test]
-    fn skewed_union_complete_cohort_exposes_post_prefix_raw_work_and_buffering() {
+    fn union_complete_work_quotes_bound_skew_and_preserve_fitting_cohorts() {
         use crate::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
         use crate::id::Id;
         use crate::inline::encodings::UnknownInline;
@@ -14571,21 +14675,26 @@ mod tests {
 
         const WIDE: usize = 16;
 
-        fn fixture() -> IntersectionConstraint<ShapeConstraint> {
-            let entities = [
-                Id::new([201; crate::id::ID_LEN]).unwrap(),
-                Id::new([202; crate::id::ID_LEN]).unwrap(),
-                Id::new([203; crate::id::ID_LEN]).unwrap(),
-            ];
-            let attribute = Id::new([204; crate::id::ID_LEN]).unwrap();
+        fn fixture(fanouts: &[usize]) -> IntersectionConstraint<ShapeConstraint> {
+            let entities: Vec<_> = (0..fanouts.len())
+                .map(|index| {
+                    Id::new([201 + index as u8; crate::id::ID_LEN]).unwrap()
+                })
+                .collect();
+            let attribute = Id::new([250; crate::id::ID_LEN]).unwrap();
             let mut facts = TribleSet::new();
-            facts.insert(&Trible::force(
-                &entities[0],
-                &attribute,
-                &Inline::<UnknownInline>::new(raw(1)),
-            ));
-            for (entity, base) in [(&entities[1], 32u8), (&entities[2], 96u8)] {
-                for offset in 0..WIDE {
+            for ((entity, base), fanout) in entities
+                .iter()
+                .zip((0..fanouts.len()).map(|index| {
+                    if index == 0 {
+                        1u8
+                    } else {
+                        u8::try_from(index * 32).unwrap()
+                    }
+                }))
+                .zip(fanouts.iter().copied())
+            {
+                for offset in 0..fanout {
                     facts.insert(&Trible::force(
                         entity,
                         &attribute,
@@ -14620,7 +14729,7 @@ mod tests {
         }
 
         let project = |binding: &Binding| Some((*binding.get(0)?, *binding.get(1)?));
-        let mut eager = Query::new(fixture(), project)
+        let mut eager = Query::new(fixture(&[1, WIDE, WIDE]), project)
             .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
             .cap(64)
             .start_width(1)
@@ -14634,23 +14743,19 @@ mod tests {
         let raw_before = eager.state.stats.candidates_proposed;
         let _second = eager
             .next()
-            .expect("continued demand admits the two wide parents");
+            .expect("continued demand pages the two wide parents");
         assert_eq!(eager.state.width, 2);
-        assert_eq!(
-            eager.state.stats.candidates_proposed - raw_before,
-            2 * WIDE,
-            "the complete phase drains both fresh parents before returning"
+        assert_eq!(eager.state.stats.delta_terminal_eager_cohort_admissions, 0);
+        assert!(
+            eager.state.stats.candidates_proposed - raw_before <= eager.state.width,
+            "rank-only quote evidence must not count as query work"
         );
-        assert_eq!(eager.state.stats.delta_terminal_eager_cohort_admissions, 1);
-        assert_eq!(eager.state.stats.delta_terminal_eager_cohort_parents, 2);
-        assert_eq!(eager.state.stats.delta_terminal_eager_cohort_rows, 2 * WIDE);
-        assert_eq!(
-            eager.state.emit_count - eager.state.emit_next,
-            2 * WIDE - 1,
-            "one returned row leaves the complete cohort staged"
+        assert!(
+            eager.state.emit_count - eager.state.emit_next < eager.state.width,
+            "an over-capacity quoted cohort must remain pageable"
         );
 
-        let mut competing = Query::new(fixture(), project)
+        let mut competing = Query::new(fixture(&[1, WIDE, WIDE]), project)
             .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
             .cap(64)
             .start_width(1)
@@ -14676,6 +14781,104 @@ mod tests {
         assert!(
             competing.state.emit_count - competing.state.emit_next < competing.state.width,
             "the pageable path stages at most its current search-width page"
+        );
+
+        let mut fitting = Query::new(fixture(&[1, 1, 1]), project)
+            .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+            .cap(64)
+            .start_width(1)
+            .growth(2);
+        let mut fitting_output = vec![fitting.next().unwrap()];
+        let raw_before = fitting.state.stats.candidates_proposed;
+        fitting_output.push(fitting.next().unwrap());
+        assert_eq!(fitting.state.stats.delta_terminal_eager_cohort_admissions, 1);
+        assert_eq!(fitting.state.stats.delta_terminal_eager_cohort_parents, 2);
+        assert_eq!(fitting.state.stats.delta_terminal_eager_cohort_rows, 2);
+        assert_eq!(fitting.state.stats.candidates_proposed - raw_before, 2);
+        assert_eq!(fitting.state.emit_count - fitting.state.emit_next, 1);
+        fitting_output.extend(&mut fitting);
+        assert_eq!(fitting_output.len(), 3);
+        assert_eq!(fitting_output[0].1, raw(1));
+        assert_eq!(fitting_output[1].1, raw(64));
+        assert_eq!(fitting_output[2].1, raw(32));
+
+        let mut fitting_pageable = Query::new(fixture(&[1, 1, 1]), project)
+            .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+            .cap(64)
+            .start_width(1)
+            .growth(2);
+        fitting_pageable.state.eager_terminal_phase_enabled = false;
+        let mut fitting_set = fitting_output.clone();
+        fitting_set.sort_unstable();
+        let mut pageable_set = fitting_pageable.collect::<Vec<_>>();
+        pageable_set.sort_unstable();
+        assert_eq!(
+            fitting_set, pageable_set,
+            "quoted completion must preserve the exact pageable result set"
+        );
+
+        // The next demand window admits [wide, one, one]. Only its contiguous
+        // fitting tail may complete; the wide prefix is refiled untouched.
+        let mut mixed = Query::new(fixture(&[1, 1, 1, 1, 1, WIDE]), project)
+            .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+            .cap(64)
+            .start_width(1)
+            .growth(2);
+        let mut mixed_output = vec![mixed.next().unwrap()];
+        mixed_output.push(mixed.next().unwrap());
+        mixed_output.push(mixed.next().unwrap());
+        assert_eq!(mixed_output[0].1, raw(1));
+        assert_eq!(mixed_output[1].1, raw(64));
+        assert_eq!(mixed_output[2].1, raw(32));
+        assert_eq!(mixed.state.stats.delta_terminal_eager_cohort_admissions, 1);
+        let raw_before = mixed.state.stats.candidates_proposed;
+        let remainders_before = mixed.state.stats.delta_terminal_admission_remainders;
+        mixed_output.push(mixed.next().unwrap());
+        assert_eq!(mixed.state.width, 4);
+        assert_eq!(mixed_output[3].1, raw(128));
+        assert_eq!(mixed.state.stats.candidates_proposed - raw_before, 2);
+        assert_eq!(mixed.state.stats.delta_terminal_eager_cohort_admissions, 2);
+        assert_eq!(mixed.state.stats.delta_terminal_eager_cohort_parents, 4);
+        assert_eq!(
+            mixed.state.stats.delta_terminal_admission_remainders,
+            remainders_before + 1
+        );
+        mixed_output.extend(&mut mixed);
+
+        let mut mixed_pageable = Query::new(fixture(&[1, 1, 1, 1, 1, WIDE]), project)
+            .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+            .cap(64)
+            .start_width(1)
+            .growth(2);
+        mixed_pageable.state.eager_terminal_phase_enabled = false;
+        let mut mixed_set = mixed_output;
+        mixed_set.sort_unstable();
+        let mut mixed_pageable_set = mixed_pageable.collect::<Vec<_>>();
+        mixed_pageable_set.sort_unstable();
+        assert_eq!(mixed_set, mixed_pageable_set);
+
+        let mut blocked = Query::new(fixture(&[1, WIDE, 1]), project)
+            .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+            .cap(64)
+            .start_width(1)
+            .growth(2);
+        let mut blocked_output = vec![blocked.next().unwrap()];
+        let raw_before = blocked.state.stats.candidates_proposed;
+        blocked_output.push(blocked.next().unwrap());
+        assert_eq!(blocked.state.stats.delta_terminal_eager_cohort_admissions, 0);
+        assert!(blocked.state.stats.candidates_proposed - raw_before <= blocked.state.width);
+        blocked_output.extend(&mut blocked);
+
+        let mut blocked_pageable = Query::new(fixture(&[1, WIDE, 1]), project)
+            .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+            .cap(64)
+            .start_width(1)
+            .growth(2);
+        blocked_pageable.state.eager_terminal_phase_enabled = false;
+        assert_eq!(
+            blocked_output,
+            blocked_pageable.collect::<Vec<_>>(),
+            "a fitting parent behind an oversized tail must page without reordering"
         );
     }
 

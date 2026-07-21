@@ -29,11 +29,12 @@ use crate::prelude::{attributes, entity, pattern};
 use crate::query::unionconstraint::UnionConstraint;
 use crate::query::{
     ActionUnitClasses, CandidateSink, Candidates, Constraint, DispatchClass, EstimateSink,
-    ProgramAction, ProgramCompleteBatch, ProgramCompletion, ProgramExposure, ProgramGrouping,
-    ProgramKey, ProgramPacing, ProgramRef, ProgramRequest, ProgramRoute, ProgramSeedBatch,
-    ProgramStratum, ProposalCoverage, RawTerm, ResidualDeltaOutput, ResidualDeltaSourceCursor,
-    ResidualDeltaSourcePage, RowsView, Term, TriblePattern, TypedCompleteSink, TypedEffectSink,
-    TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink, VariableId, VariableSet,
+    ProgramAction, ProgramCompleteBatch, ProgramCompleteWorkEvidence, ProgramCompleteWorkQuote,
+    ProgramCompletion, ProgramExposure, ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef,
+    ProgramRequest, ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage, RawTerm,
+    ResidualDeltaOutput, ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, Term,
+    TriblePattern, TypedCompleteSink, TypedEffectSink, TypedProgramBatch, TypedProgramSpec,
+    TypedResume, TypedSeedSink, VariableId, VariableSet,
 };
 use crate::repo::index_range::{
     convex_union, is_ancestor, validate_exact_frontier_cover, RangeRecord, RangeRecordError,
@@ -1632,6 +1633,43 @@ where
         });
     }
 
+    fn quote_complete_typed(
+        &self,
+        batch: ProgramCompleteBatch<'_>,
+    ) -> ProgramCompleteWorkEvidence {
+        let ProgramAction::Propose(variable) = batch.request.action else {
+            return ProgramCompleteWorkEvidence::Declined;
+        };
+        assert_eq!(variable, batch.route.variable);
+
+        let locators: Vec<_> = self
+            .shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .proposal_walk_locator_single_target(variable, &batch.view)
+                    .expect("one-target Succinct shard has no proposal locator")
+            })
+            .collect();
+        ProgramCompleteWorkEvidence::Quoted(
+            batch
+                .view
+                .iter()
+                .map(|row| {
+                    let raw_occurrences = locators.iter().fold(0usize, |total, locator| {
+                        total
+                            .checked_add(locator.exact_len(row))
+                            .expect("UnionArchive complete-action quote overflow")
+                    });
+                    ProgramCompleteWorkQuote {
+                        drain_work_units: raw_occurrences,
+                        raw_occurrences,
+                    }
+                })
+                .collect(),
+        )
+    }
+
     fn progress(&self, state: &Self::State) -> Self::Rank {
         fn complemented_value_words(value: &RawInline) -> [u64; 4] {
             std::array::from_fn(|word| {
@@ -2920,6 +2958,25 @@ mod tests {
         let program = constraint.residual_program().unwrap();
         let route = program.route(request).unwrap();
         let mut complete = crate::query::ProgramCompleteEffects::default();
+
+        assert_eq!(
+            program.quote_complete_batch(ProgramCompleteBatch {
+                request,
+                route,
+                view,
+            }),
+            ProgramCompleteWorkEvidence::Quoted(vec![
+                ProgramCompleteWorkQuote {
+                    drain_work_units: 4,
+                    raw_occurrences: 4,
+                },
+                ProgramCompleteWorkQuote {
+                    drain_work_units: 4,
+                    raw_occurrences: 4,
+                },
+            ]),
+            "quotes count the pre-SET cross-shard occurrence bag per parent"
+        );
 
         let mut raw = Vec::new();
         constraint.for_each_complete_proposal_occurrence(

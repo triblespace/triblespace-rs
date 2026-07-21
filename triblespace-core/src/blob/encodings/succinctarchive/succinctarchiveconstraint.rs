@@ -652,6 +652,18 @@ where
             .located_proposal_walk(&self.positions, row)
             .expect("single-target Succinct proposal locator lost its walk")
     }
+
+    /// Exact number of values examined and emitted by an unbounded walk for
+    /// this row. Single-target Ring estimates are rank/select counts over the
+    /// same located source, so this does no proposal traversal.
+    pub(crate) fn exact_len(&self, row: &[RawInline]) -> usize {
+        assert_eq!(
+            row.len(),
+            self.row_width,
+            "Succinct proposal row disagrees with its locator schema"
+        );
+        self.constraint.estimate_row(&self.positions, row)
+    }
 }
 
 impl<'a, U> SuccinctArchiveConstraint<'a, U>
@@ -2101,12 +2113,15 @@ mod typed_program_tests {
             .proposal_walk_locator_single_target(variable, &view)
             .expect("test shape must have one target position");
         for parent in 0..view.len() {
-            let walk = locator.locate(view.row(parent));
+            let row = view.row(parent);
+            let exact_len = locator.exact_len(row);
+            let walk = locator.locate(row);
             let mut emitted = 0usize;
             let page = walk.consume(ResidualDeltaSourceCursor::Start, usize::MAX, |value| {
                 emitted += 1;
                 walked.push((parent as u32, value));
             });
+            assert_eq!(exact_len, emitted, "{label}: exact locator quote");
             assert_eq!(page.examined, emitted, "{label}: full walk accounting");
             assert_eq!(page.next, None, "{label}: full walk must drain");
         }
@@ -2238,26 +2253,33 @@ mod typed_program_tests {
 
         // Six middle walks, each with two independently located parent rows.
         let e_vars = [e.index];
-        let e_rows = [entities[0], entities[1]];
+        let e_rows = [entities[0], entities[1], id_value(9)];
         let e_view = RowsView::new(&e_vars, &e_rows);
         assert_ordinary_propose_equals_full_walks("middle EAV", &constraint, a.index, e_view);
         assert_ordinary_propose_equals_full_walks("middle EVA", &constraint, v.index, e_view);
 
         let a_vars = [a.index];
-        let a_rows = [attributes[0], attributes[1]];
+        let a_rows = [attributes[0], attributes[1], id_value(19)];
         let a_view = RowsView::new(&a_vars, &a_rows);
         assert_ordinary_propose_equals_full_walks("middle AEV", &constraint, e.index, a_view);
         assert_ordinary_propose_equals_full_walks("middle AVE", &constraint, v.index, a_view);
 
         let v_vars = [v.index];
-        let v_rows = [values[0], values[1]];
+        let v_rows = [values[0], values[1], inline_value(29)];
         let v_view = RowsView::new(&v_vars, &v_rows);
         assert_ordinary_propose_equals_full_walks("middle VEA", &constraint, e.index, v_view);
         assert_ordinary_propose_equals_full_walks("middle VAE", &constraint, a.index, v_view);
 
         // Three last walks with two different fixed pairs apiece.
         let av_vars = [a.index, v.index];
-        let av_rows = [attributes[0], values[0], attributes[1], values[1]];
+        let av_rows = [
+            attributes[0],
+            values[0],
+            attributes[1],
+            values[1],
+            id_value(19),
+            inline_value(29),
+        ];
         assert_ordinary_propose_equals_full_walks(
             "last VAE",
             &constraint,
@@ -2266,7 +2288,14 @@ mod typed_program_tests {
         );
 
         let ev_vars = [e.index, v.index];
-        let ev_rows = [entities[0], values[0], entities[1], values[1]];
+        let ev_rows = [
+            entities[0],
+            values[0],
+            entities[1],
+            values[1],
+            id_value(9),
+            inline_value(29),
+        ];
         assert_ordinary_propose_equals_full_walks(
             "last VEA",
             &constraint,
@@ -2275,7 +2304,14 @@ mod typed_program_tests {
         );
 
         let ea_vars = [e.index, a.index];
-        let ea_rows = [entities[0], attributes[0], entities[1], attributes[1]];
+        let ea_rows = [
+            entities[0],
+            attributes[0],
+            entities[1],
+            attributes[1],
+            id_value(9),
+            id_value(19),
+        ];
         assert_ordinary_propose_equals_full_walks(
             "last AEV",
             &constraint,

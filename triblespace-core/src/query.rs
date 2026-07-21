@@ -65,11 +65,12 @@ use crate::inline::RawInline;
 pub use program::{
     DispatchClass, PreferredProgram, ProgramAction, ProgramActivation, ProgramBatch,
     ProgramBatchEffects, ProgramChild, ProgramCompleteBatch, ProgramCompleteEffects,
-    ProgramCompletion, ProgramExposure, ProgramGrouping, ProgramKey, ProgramPacing, ProgramPage,
-    ProgramPhysicalReceipt, ProgramRef, ProgramRequest, ProgramResume, ProgramRoute,
-    ProgramRuntime, ProgramSeedBatch, ProgramSeedEffects, ProgramSeedWork, ProgramStratum,
-    ProgramWork, ProgramWorkHandle, TypedCompleteSink, TypedEffectSink, TypedPhysicalStep,
-    TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink,
+    ProgramCompleteWorkEvidence, ProgramCompleteWorkQuote, ProgramCompletion, ProgramExposure,
+    ProgramGrouping, ProgramKey, ProgramPacing, ProgramPage, ProgramPhysicalReceipt, ProgramRef,
+    ProgramRequest, ProgramResume, ProgramRoute, ProgramRuntime, ProgramSeedBatch,
+    ProgramSeedEffects, ProgramSeedWork, ProgramStratum, ProgramWork, ProgramWorkHandle,
+    TypedCompleteSink, TypedEffectSink, TypedPhysicalStep, TypedProgramBatch, TypedProgramSpec,
+    TypedResume, TypedSeedSink,
 };
 /// Re-export of [`PathOp`].
 pub use regularpathconstraint::PathOp;
