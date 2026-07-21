@@ -9,6 +9,7 @@
 use std::any::{type_name, Any, TypeId};
 use std::collections::hash_map::Entry;
 use std::hash::Hash;
+use std::marker::PhantomData;
 
 use ahash::{AHashMap, AHashSet};
 
@@ -278,15 +279,29 @@ pub(crate) enum ProgramCompleteAdmission {
 /// Unique non-zero-sized identity for one cold completion transaction.
 ///
 /// Slice identity alone cannot distinguish zero-column row batches because
-/// their backing storage is empty. The residual owner creates one token per
-/// exact batch and presents that same live token when consuming the result.
-pub(crate) struct ProgramCompleteAffinity {
+/// their backing storage is empty. The token therefore borrows and records
+/// the sized owner of those slices, in addition to carrying its own identity.
+pub(crate) struct ProgramCompleteAffinity<'owner> {
+    owner: *const (),
+    _owner: PhantomData<&'owner u8>,
     _identity: u8,
 }
 
-impl ProgramCompleteAffinity {
-    pub(crate) fn new() -> Self {
-        Self { _identity: 0 }
+impl<'owner> ProgramCompleteAffinity<'owner> {
+    pub(crate) fn new<T: Sized>(owner: &'owner T) -> Self {
+        assert!(
+            std::mem::size_of_val(owner) > 0,
+            "bounded Program completion owner must have an address identity"
+        );
+        Self {
+            owner: std::ptr::from_ref(owner).cast(),
+            _owner: PhantomData,
+            _identity: 0,
+        }
+    }
+
+    fn is_owner<T: Sized>(&self, owner: &T) -> bool {
+        std::ptr::eq(self.owner, std::ptr::from_ref(owner).cast())
     }
 }
 
@@ -295,20 +310,21 @@ impl ProgramCompleteAffinity {
 /// The fields stay private so quote evidence cannot become scheduler state.
 /// `into_parts_for` checks both the transaction token and original slice
 /// identity before releasing owned effects to the one cold residual owner.
-pub(crate) struct ProgramBoundedCompletion<'v, 'affinity> {
+pub(crate) struct ProgramBoundedCompletion<'v, 'affinity, 'owner> {
     batch: ProgramCompleteBatch<'v>,
-    affinity: &'affinity ProgramCompleteAffinity,
+    affinity: &'affinity ProgramCompleteAffinity<'owner>,
     first_parent: usize,
     admission: ProgramCompleteAdmission,
     raw_occurrence_count: usize,
     occurrences: Vec<(u32, RawInline)>,
 }
 
-impl<'v> ProgramBoundedCompletion<'v, '_> {
-    pub(crate) fn into_parts_for(
+impl<'v> ProgramBoundedCompletion<'v, '_, '_> {
+    pub(crate) fn into_parts_for<T: Sized>(
         self,
         batch: ProgramCompleteBatch<'v>,
-        affinity: &ProgramCompleteAffinity,
+        affinity: &ProgramCompleteAffinity<'_>,
+        owner: &T,
     ) -> (
         usize,
         ProgramCompleteAdmission,
@@ -318,6 +334,10 @@ impl<'v> ProgramBoundedCompletion<'v, '_> {
         assert!(
             std::ptr::eq(self.affinity, affinity),
             "bounded Program completion was paired with another transaction"
+        );
+        assert!(
+            affinity.is_owner(owner),
+            "bounded Program completion was paired with another owner"
         );
         assert_eq!(self.batch.request, batch.request);
         assert_eq!(self.batch.route, batch.route);
@@ -962,12 +982,12 @@ impl<'a> ProgramRef<'a> {
 
     #[cold]
     #[inline(never)]
-    pub(crate) fn try_complete_bounded<'v, 'affinity>(
+    pub(crate) fn try_complete_bounded<'v, 'affinity, 'owner>(
         self,
         batch: ProgramCompleteBatch<'v>,
         capacity: usize,
-        affinity: &'affinity ProgramCompleteAffinity,
-    ) -> Option<ProgramBoundedCompletion<'v, 'affinity>> {
+        affinity: &'affinity ProgramCompleteAffinity<'owner>,
+    ) -> Option<ProgramBoundedCompletion<'v, 'affinity, 'owner>> {
         self.erased
             .try_complete_bounded(batch, capacity)
             .map(|effects| ProgramBoundedCompletion {
@@ -986,11 +1006,13 @@ impl<'a> ProgramRef<'a> {
         batch: ProgramCompleteBatch<'_>,
         effects: &mut ProgramCompleteEffects,
     ) {
-        let affinity = ProgramCompleteAffinity::new();
+        let owner = batch;
+        let affinity = ProgramCompleteAffinity::new(&owner);
         let completion = self
             .try_complete_bounded(batch, usize::MAX, &affinity)
             .expect("test complete action declined");
-        let (_, _, raw_occurrence_count, occurrences) = completion.into_parts_for(batch, &affinity);
+        let (_, _, raw_occurrence_count, occurrences) =
+            completion.into_parts_for(batch, &affinity, &owner);
         effects.raw_occurrence_count = effects
             .raw_occurrence_count
             .checked_add(raw_occurrence_count)
@@ -2923,12 +2945,12 @@ mod tests {
                 route: program.route(request).unwrap(),
                 view: RowsView::new(&vars, &rows),
             };
-            let affinity = ProgramCompleteAffinity::new();
+            let affinity = ProgramCompleteAffinity::new(&rows);
             let completion = program
                 .try_complete_bounded(batch, capacity, &affinity)
                 .expect("a multi-parent exact tail fits");
             let (first, admission, raw_occurrence_count, occurrences) =
-                completion.into_parts_for(batch, &affinity);
+                completion.into_parts_for(batch, &affinity, &rows);
             assert_eq!(first, expected_first);
             assert_eq!(
                 admission,
@@ -2985,7 +3007,7 @@ mod tests {
                 route: program.route(request).unwrap(),
                 view: RowsView::new(&vars, &rows),
             };
-            let affinity = ProgramCompleteAffinity::new();
+            let affinity = ProgramCompleteAffinity::new(&rows);
             assert!(program
                 .try_complete_bounded(batch, capacity, &affinity)
                 .is_none());
@@ -3021,12 +3043,12 @@ mod tests {
             route,
             view: RowsView::new(&vars, &foreign_rows),
         };
-        let affinity = ProgramCompleteAffinity::new();
+        let affinity = ProgramCompleteAffinity::new(&original_rows);
         let completion = program
             .try_complete_bounded(original, 2, &affinity)
             .unwrap();
         let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            completion.into_parts_for(foreign, &affinity)
+            completion.into_parts_for(foreign, &affinity, &original_rows)
         }));
         assert!(
             panic_text(rejected.expect_err("completion affinity must reject another batch"))
@@ -3035,7 +3057,12 @@ mod tests {
     }
 
     #[test]
-    fn bounded_completion_result_rejects_a_zero_column_foreign_token() {
+    fn bounded_completion_result_rejects_a_same_token_zero_column_foreign_owner() {
+        struct ZeroColumnOwner {
+            rows: Vec<RawInline>,
+            row_count: usize,
+        }
+
         static QUOTES: &[(usize, usize)] = &[(1, 1), (1, 1)];
         let probe = BoundedQuoteProbe {
             mode: BoundedQuoteMode::Quoted(QUOTES),
@@ -3047,27 +3074,36 @@ mod tests {
             bound: VariableSet::new_empty(),
         };
         let route = program.route(request).unwrap();
+        let original_owner = ZeroColumnOwner {
+            rows: Vec::new(),
+            row_count: 2,
+        };
+        let foreign_owner = ZeroColumnOwner {
+            rows: Vec::new(),
+            row_count: 2,
+        };
         let original = ProgramCompleteBatch {
             request,
             route,
-            view: RowsView::new_with_row_count(&[], &[], 2),
+            view: RowsView::new_with_row_count(&[], &original_owner.rows, original_owner.row_count),
         };
         let foreign = ProgramCompleteBatch {
             request,
             route,
-            view: RowsView::new_with_row_count(&[], &[], 2),
+            view: RowsView::new_with_row_count(&[], &foreign_owner.rows, foreign_owner.row_count),
         };
-        let original_affinity = ProgramCompleteAffinity::new();
-        let foreign_affinity = ProgramCompleteAffinity::new();
+        assert!(std::ptr::eq(original.view.vars, foreign.view.vars));
+        assert!(std::ptr::eq(original.view.rows, foreign.view.rows));
+        let affinity = ProgramCompleteAffinity::new(&original_owner);
         let completion = program
-            .try_complete_bounded(original, 2, &original_affinity)
+            .try_complete_bounded(original, 2, &affinity)
             .unwrap();
         let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            completion.into_parts_for(foreign, &foreign_affinity)
+            completion.into_parts_for(foreign, &affinity, &foreign_owner)
         }));
         assert!(
-            panic_text(rejected.expect_err("completion affinity must reject another token"))
-                .contains("paired with another transaction")
+            panic_text(rejected.expect_err("completion affinity must reject another owner"))
+                .contains("paired with another owner")
         );
     }
 
@@ -3689,12 +3725,12 @@ mod tests {
             view: RowsView::new_with_row_count(&[], &[], 2),
         };
         assert_eq!(batch.route.key.arm, ProgramRouteArm::Preferred);
-        let affinity = ProgramCompleteAffinity::new();
+        let affinity = ProgramCompleteAffinity::new(&batch);
         let completion = program
             .try_complete_bounded(batch, 2, &affinity)
             .expect("preferred child has an exact two-parent completion");
         let (first, admission, raw_occurrences, occurrences) =
-            completion.into_parts_for(batch, &affinity);
+            completion.into_parts_for(batch, &affinity, &batch);
         assert_eq!(first, 0);
         assert_eq!(
             admission,

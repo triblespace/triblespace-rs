@@ -10306,7 +10306,7 @@ impl ResidualStateMachine {
         assert!(rows.row_count > 1, "eager terminal phase requires a cohort");
         let capacity = self.width.max(1);
         let completion = {
-            let affinity = ProgramCompleteAffinity::new();
+            let affinity = ProgramCompleteAffinity::new(&rows);
             let vars: Vec<VariableId> = request.bound.into_iter().collect();
             let batch = ProgramCompleteBatch {
                 request,
@@ -10315,7 +10315,7 @@ impl ResidualStateMachine {
             };
             program
                 .try_complete_bounded(batch, capacity, &affinity)
-                .map(|completion| completion.into_parts_for(batch, &affinity))
+                .map(|completion| completion.into_parts_for(batch, &affinity, &rows))
         };
 
         let Some((first_parent, admission, raw_occurrence_count, occurrences)) = completion else {
@@ -15497,7 +15497,7 @@ mod tests {
                 route,
                 view: RowsView::new(&vars, &rows),
             };
-            let affinity = ProgramCompleteAffinity::new();
+            let affinity = ProgramCompleteAffinity::new(&rows);
             let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 ProgramRef::new(&malformed).try_complete_bounded(batch, usize::MAX, &affinity)
             }));
