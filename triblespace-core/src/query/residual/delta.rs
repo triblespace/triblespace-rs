@@ -1747,6 +1747,22 @@ impl ProducerRegistry {
         false
     }
 
+    /// Whether this credit is the activation's sole live producer and is not
+    /// nested below a receipt-local Program join. This is diagnostic evidence
+    /// for an affine tail call; it does not itself transfer or replace credit.
+    fn program_credit_is_unjoined_unique(&self, credit: &ProducerCredit) -> bool {
+        let activation = self
+            .state
+            .activations
+            .get(&credit.key.activation)
+            .expect("unknown program activation");
+        activation.live.len() == 1
+            && matches!(
+                activation.live.get(&credit.key.nonce),
+                Some(CreditKind::Program { join: None })
+            )
+    }
+
     /// Replaces one opaque typed producer through the single affine law.
     ///
     /// Immediate resumes are siblings of admitted children. `AfterChildren`
@@ -5954,6 +5970,7 @@ impl DeltaScheduler {
                 state,
                 tasks,
                 &dispatch.task_limits,
+                true,
                 direct_terminal_full,
                 stable,
                 stable_interner,
@@ -6105,6 +6122,7 @@ impl DeltaScheduler {
                 state,
                 tasks,
                 &dispatch.task_limits,
+                false,
                 direct_terminal_publication_full,
                 stable,
                 stable_interner,
@@ -6436,6 +6454,7 @@ impl DeltaScheduler {
         state: DeltaStateId,
         tasks: Vec<ProgramTask>,
         limits: &[usize],
+        active_pop: bool,
         direct_terminal_full: Option<VariableSet>,
         stable: &mut Worklist,
         stable_interner: &mut StateInterner,
@@ -6444,6 +6463,11 @@ impl DeltaScheduler {
         assert!(!tasks.is_empty());
         assert_eq!(tasks.len(), limits.len());
         assert!(limits.iter().all(|&limit| limit > 0));
+        if active_pop {
+            stats.delta_program_active_pops += 1;
+        } else {
+            stats.delta_program_global_pops += 1;
+        }
 
         let address = self
             .interner
@@ -6481,7 +6505,16 @@ impl DeltaScheduler {
         let mut task_receipts = Vec::with_capacity(row_count);
         let mut work = Vec::with_capacity(row_count);
         for task in tasks {
-            task_receipts.push((task.activation, task.credit));
+            let unique_unjoined = self
+                .registry
+                .program_credit_is_unjoined_unique(&task.credit);
+            task_receipts.push((
+                task.activation,
+                task.credit,
+                task.work.dispatch,
+                task.work.pacing,
+                unique_unjoined,
+            ));
             work.push(task.work);
         }
         let mut receipt = ProgramBatchEffects::default();
@@ -6577,7 +6610,10 @@ impl DeltaScheduler {
         for (
             input,
             (
-                (((((activation, credit), page), child_range), direct_range), accepted_range),
+                ((((
+                    (activation, credit, input_dispatch, input_pacing, unique_unjoined),
+                    page,
+                ), child_range), direct_range), accepted_range),
                 supported_range,
             ),
         ) in task_receipts
@@ -6604,6 +6640,16 @@ impl DeltaScheduler {
                 || (!private_direct && !direct_range.is_empty())
                 || !accepted_range.is_empty()
                 || !supported_range.is_empty();
+            let single_child_no_barrier = child_range.len() == 1 && page.resume.is_none();
+            stats.delta_program_single_child_no_barrier +=
+                usize::from(single_child_no_barrier);
+            if single_child_no_barrier {
+                let child = &receipt.children[child_range.clone()][0];
+                let compatible = child.work.dispatch == input_dispatch
+                    && child.work.pacing == input_pacing;
+                stats.delta_program_affine_tail_opportunities +=
+                    usize::from(unique_unjoined && compatible);
+            }
             let outcome = self.registry.replace_program(
                 credit,
                 state,
@@ -6750,6 +6796,12 @@ impl DeltaScheduler {
             debug_assert!(input < row_count);
         }
 
+        if !scheduled.is_empty() {
+            stats.delta_program_continuation_files += 1;
+            stats.delta_program_continuation_tasks_filed += scheduled.len();
+            stats.delta_program_continuation_reentries +=
+                usize::from(!self.program_worklist.contains_key(&state));
+        }
         let _ = self.file_program_state(state, scheduled);
         if !retired_activations.is_empty() {
             spec.retire_activations(

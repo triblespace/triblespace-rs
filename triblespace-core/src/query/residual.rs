@@ -2453,6 +2453,28 @@ pub struct ResidualStateStats {
     /// Largest sum of exact per-input work limits granted to one successful
     /// non-Native placement.
     pub max_delta_program_physical_granted_work: usize,
+    /// Directed typed Program pops serving an exact affine activation lease.
+    /// Together with [`delta_program_global_pops`](Self::delta_program_global_pops),
+    /// this is the complete count of typed Program physical calls.
+    pub delta_program_active_pops: usize,
+    /// Typed Program pops selected from the shared cyclic frontier.
+    pub delta_program_global_pops: usize,
+    /// Program inputs whose committed receipt admitted exactly one child and
+    /// carried no same-input resume/barrier. This is a shape observation only;
+    /// it does not imply that the child can safely remain resident.
+    pub delta_program_single_child_no_barrier: usize,
+    /// Strict affine-tail opportunities: one admitted child, no resume/barrier,
+    /// unchanged dispatch and pacing, and a sole live unjoined producer credit.
+    /// These conditions are sufficient to investigate bounded in-place tail
+    /// execution without weakening canonical state or affine ownership.
+    pub delta_program_affine_tail_opportunities: usize,
+    /// Nonempty continuation filings produced by typed Program calls.
+    pub delta_program_continuation_files: usize,
+    /// Affine tasks carried by those continuation filings.
+    pub delta_program_continuation_tasks_filed: usize,
+    /// Continuation filings that reopened an absent Program bucket under an
+    /// already-interned canonical Program state.
+    pub delta_program_continuation_reentries: usize,
     /// Bounded pages requested from constraint-owned source frontiers.
     pub delta_source_pages: usize,
     /// Physical calls that consumed one compatible cohort of affine source
