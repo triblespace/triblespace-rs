@@ -6027,7 +6027,7 @@ impl DeltaScheduler {
                 root,
                 plan,
                 state,
-                cohort_key,
+                &cohort_key,
                 tasks,
                 &dispatch.task_limits,
                 true,
@@ -6180,7 +6180,7 @@ impl DeltaScheduler {
                 root,
                 plan,
                 state,
-                cohort_key,
+                &cohort_key,
                 tasks,
                 &dispatch.task_limits,
                 false,
@@ -6513,7 +6513,7 @@ impl DeltaScheduler {
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
         state: DeltaStateId,
-        cohort_key: ProgramCohortKey,
+        cohort_key: &ProgramCohortKey,
         mut tasks: Vec<ProgramTask>,
         limits: &[usize],
         active_pop: bool,
@@ -6548,7 +6548,7 @@ impl DeltaScheduler {
         debug_assert!(
             tasks
                 .iter()
-                .all(|task| ProgramCohortKey::of(&self.registry, task) == cohort_key),
+                .all(|task| ProgramCohortKey::of(&self.registry, task) == *cohort_key),
             "selected typed program cohort key no longer describes every task"
         );
 
