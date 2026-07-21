@@ -3307,11 +3307,14 @@ enum DeltaSettlement {
 /// Exact affine handoffs emitted by one physical delta step.
 ///
 /// Directed chain execution overwhelmingly transfers a single activation at
-/// a time. Keep that receipt inline while preserving the map-like surface for
-/// the genuinely wider reducer cohorts, which spill through `SmallVec`.
+/// a time. Keep that receipt inline while preserving expected constant-time
+/// lookup for the genuinely wider reducer cohorts.
 #[derive(Debug, Default)]
-pub(super) struct RetargetedActivations {
-    entries: SmallVec<[(ActivationId, ActiveDeltaContinuation); 1]>,
+pub(super) enum RetargetedActivations {
+    #[default]
+    Empty,
+    One(ActivationId, ActiveDeltaContinuation),
+    Many(AHashMap<ActivationId, ActiveDeltaContinuation>),
 }
 
 impl RetargetedActivations {
@@ -3320,21 +3323,33 @@ impl RetargetedActivations {
         activation: ActivationId,
         continuation: ActiveDeltaContinuation,
     ) -> Option<ActiveDeltaContinuation> {
-        if let Some((_, previous)) = self
-            .entries
-            .iter_mut()
-            .find(|(existing, _)| *existing == activation)
-        {
-            return Some(std::mem::replace(previous, continuation));
+        match self {
+            Self::Empty => {
+                *self = Self::One(activation, continuation);
+                None
+            }
+            Self::One(existing, previous) if *existing == activation => {
+                Some(std::mem::replace(previous, continuation))
+            }
+            Self::One(existing, previous) => {
+                let mut entries = AHashMap::with_capacity(2);
+                assert!(entries.insert(*existing, *previous).is_none());
+                assert!(entries.insert(activation, continuation).is_none());
+                *self = Self::Many(entries);
+                None
+            }
+            Self::Many(entries) => entries.insert(activation, continuation),
         }
-        self.entries.push((activation, continuation));
-        None
     }
 
     fn get(&self, activation: &ActivationId) -> Option<&ActiveDeltaContinuation> {
-        self.entries
-            .iter()
-            .find_map(|(existing, continuation)| (existing == activation).then_some(continuation))
+        match self {
+            Self::Empty => None,
+            Self::One(existing, continuation) => {
+                (existing == activation).then_some(continuation)
+            }
+            Self::Many(entries) => entries.get(activation),
+        }
     }
 
     fn contains_key(&self, activation: &ActivationId) -> bool {
@@ -3343,12 +3358,20 @@ impl RetargetedActivations {
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.entries.len()
+        match self {
+            Self::Empty => 0,
+            Self::One(_, _) => 1,
+            Self::Many(entries) => entries.len(),
+        }
     }
 
     #[cfg(test)]
-    fn values(&self) -> impl Iterator<Item = &ActiveDeltaContinuation> {
-        self.entries.iter().map(|(_, continuation)| continuation)
+    fn values(&self) -> Box<dyn Iterator<Item = &ActiveDeltaContinuation> + '_> {
+        match self {
+            Self::Empty => Box::new(std::iter::empty()),
+            Self::One(_, continuation) => Box::new(std::iter::once(continuation)),
+            Self::Many(entries) => Box::new(entries.values()),
+        }
     }
 }
 
