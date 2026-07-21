@@ -156,7 +156,7 @@ fn patch_program_seed(
 
 fn patch_program_step(
     variable: VariableId,
-    states: Vec<PatchProgramState>,
+    states: crate::query::TypedProgramStateBatch<PatchProgramState>,
     batch: super::TypedProgramBatch<'_>,
     effects: &mut super::TypedEffectSink<PatchProgramState, ()>,
     source_page: impl Fn(
@@ -356,7 +356,7 @@ impl<S: InlineEncoding> super::TypedProgramSpec for PatchValueConstraint<'_, S> 
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: crate::query::TypedProgramStateBatch<Self::State>,
         batch: super::TypedProgramBatch<'_>,
         effects: &mut super::TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
@@ -564,7 +564,7 @@ impl<S: InlineEncoding> super::TypedProgramSpec for PatchIdConstraint<S> {
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: crate::query::TypedProgramStateBatch<Self::State>,
         batch: super::TypedProgramBatch<'_>,
         effects: &mut super::TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {

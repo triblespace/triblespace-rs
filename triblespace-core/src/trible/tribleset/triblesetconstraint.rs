@@ -1229,7 +1229,7 @@ impl TypedProgramSpec for TribleSetConstraint {
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: crate::query::TypedProgramStateBatch<Self::State>,
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
@@ -1806,7 +1806,7 @@ mod tests {
             &[None, None],
             &[1, 1],
         );
-        assert_eq!(exact.supported, vec![(0, ())]);
+        assert_eq!(exact.supported.as_slice(), &[(0, ())]);
         assert!(exact.pages.iter().all(|page| page.examined == 1));
 
         // Bound schema is a physical cohort key, so partial rows form their
@@ -1823,7 +1823,7 @@ mod tests {
             &[None, None],
             &[1, 1],
         );
-        assert_eq!(partial.supported, vec![(0, ()), (1, ())]);
+        assert_eq!(partial.supported.as_slice(), &[(0, ()), (1, ())]);
 
         let true_constant = TribleSetConstraint::new(
             Inline::<GenId>::new(id_into_value(&entity)),

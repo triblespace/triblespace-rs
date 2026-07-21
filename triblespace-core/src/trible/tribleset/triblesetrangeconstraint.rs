@@ -114,7 +114,7 @@ impl TypedProgramSpec for TribleSetRangeConstraint {
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: crate::query::TypedProgramStateBatch<Self::State>,
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {

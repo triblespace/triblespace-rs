@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ahash::{AHashMap, AHashSet};
+use smallvec::SmallVec;
 
 use crate::query::program::insert_engine_program_state;
 
@@ -196,7 +197,7 @@ impl TypedProgramSpec for ConfirmFinalizerProgram {
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: crate::query::TypedProgramStateBatch<Self::State>,
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
@@ -266,7 +267,7 @@ impl TypedProgramSpec for SetAdmissionProgram {
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: crate::query::TypedProgramStateBatch<Self::State>,
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
@@ -326,7 +327,7 @@ impl TypedProgramSpec for FormulaOrAdmissionProgram {
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: crate::query::TypedProgramStateBatch<Self::State>,
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
@@ -400,7 +401,7 @@ impl TypedProgramSpec for FormulaOrEmissionProgram {
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: crate::query::TypedProgramStateBatch<Self::State>,
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
@@ -484,7 +485,7 @@ impl TypedProgramSpec for ProposalMaterializerProgram {
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: crate::query::TypedProgramStateBatch<Self::State>,
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
@@ -890,11 +891,11 @@ struct ProgramInstallOutcome {
 }
 
 struct ProgramReplaceOutcome {
-    scheduled: Vec<(DeltaStateId, ProgramWork, ProducerCredit)>,
+    scheduled: SmallVec<[(DeltaStateId, ProgramWork, ProducerCredit); 2]>,
     /// Raw proposal occurrences reported by this typed page before
     /// activation-local SET admission. This remains telemetry only.
     raw_proposal_occurrences: usize,
-    accepted: Vec<RawInline>,
+    accepted: SmallVec<[RawInline; 1]>,
     dead_search_pages: usize,
     dead_source_telemetry_pages: usize,
     quiescence: Option<QuiescenceProof>,
@@ -1824,7 +1825,7 @@ impl ProducerRegistry {
                 0
             }
         };
-        let mut accepted = Vec::new();
+        let mut accepted: SmallVec<[RawInline; 1]> = SmallVec::new();
         {
             let activation = self
                 .state
@@ -1937,11 +1938,14 @@ impl ProducerRegistry {
                     accepted.push(value);
                 }
             }
-            let mut retained = direct.clone();
-            retained.extend(accepted.iter().copied());
-            activation
-                .reducer
-                .retain_quiescent_proposal_page(retained);
+            if matches!(activation.reducer, DeltaReducer::QuiescentProposal { .. }) {
+                let mut retained = Vec::with_capacity(direct.len() + accepted.len());
+                retained.extend(direct.iter().copied());
+                retained.extend(accepted.iter().copied());
+                activation
+                    .reducer
+                    .retain_quiescent_proposal_page(retained);
+            }
         }
 
         let publishes_stable_effect = {
@@ -1972,7 +1976,8 @@ impl ProducerRegistry {
 
         let no_replacement =
             children.is_empty() && matches!(&resume, None | Some(ProgramResume::AfterChildrenDone));
-        let mut scheduled = Vec::new();
+        let mut scheduled: SmallVec<[(DeltaStateId, ProgramWork, ProducerCredit); 2]> =
+            SmallVec::new();
         match resume {
             Some(ProgramResume::AfterChildren(resume)) if !children.is_empty() => {
                 let join = self.new_program_join(
@@ -2677,8 +2682,8 @@ fn program_seed_ranges(
 fn program_child_ranges(
     children: &[ProgramChild],
     input_count: usize,
-) -> Vec<std::ops::Range<usize>> {
-    let mut ranges = Vec::with_capacity(input_count);
+) -> SmallVec<[std::ops::Range<usize>; 1]> {
+    let mut ranges = SmallVec::with_capacity(input_count);
     let mut cursor = 0usize;
     for input in 0..input_count {
         let begin = cursor;
@@ -2699,8 +2704,8 @@ fn tagged_ranges<T>(
     values: &[(u32, T)],
     parent_count: usize,
     kind: &str,
-) -> Vec<std::ops::Range<usize>> {
-    let mut ranges = Vec::with_capacity(parent_count);
+) -> SmallVec<[std::ops::Range<usize>; 1]> {
+    let mut ranges = SmallVec::with_capacity(parent_count);
     let mut cursor = 0usize;
     for parent in 0..parent_count {
         let begin = cursor;
@@ -5353,17 +5358,21 @@ impl DeltaScheduler {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn release_streaming(
+    fn release_streaming<Accepted>(
         &mut self,
         activation: ActivationId,
         streamed: DeltaStreamingReturn,
-        accepted: Vec<RawInline>,
+        accepted: Accepted,
         direct_terminal_full: Option<VariableSet>,
         plan: &ResidualPlan,
         stable: &mut Worklist,
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
-    ) -> DeltaStreamingRelease {
+    ) -> DeltaStreamingRelease
+    where
+        Accepted: IntoIterator<Item = RawInline>,
+        Accepted::IntoIter: ExactSizeIterator,
+    {
         if streamed.effect == DeltaStreamingEffect::Support {
             let released = self.release_support(
                 streamed.return_to,
@@ -5381,10 +5390,11 @@ impl DeltaScheduler {
                 active: released.active,
             };
         }
-        debug_assert!(!accepted.is_empty());
-        stats.candidates_proposed += accepted.len();
-        stats.max_propose_candidates = stats.max_propose_candidates.max(accepted.len());
-        let candidates = CandidatePayload::Values(accepted);
+        let accepted = accepted.into_iter();
+        let accepted_len = accepted.len();
+        debug_assert!(accepted_len > 0);
+        stats.candidates_proposed += accepted_len;
+        stats.max_propose_candidates = stats.max_propose_candidates.max(accepted_len);
         if let Some(full) = direct_terminal_full {
             let DeltaReturn::Stable { desc, parent, .. } = streamed.return_to else {
                 panic!("a direct-terminal publication returned through a formula")
@@ -5401,16 +5411,20 @@ impl DeltaScheduler {
                 relevant, checked,
                 "a direct-terminal publication retained unchecked confirmers"
             );
-            let (committed, rows) = committed_candidate_rows(
+            let (committed, rows) = committed_candidate_rows_with(
                 desc.bound,
                 *variable,
-                CandidateBatch {
-                    parents: RowBatch {
-                        rows: parent.into_vec(),
-                        row_count: 1,
-                    },
-                    candidates,
+                RowBatch {
+                    rows: parent.into_vec(),
+                    row_count: 1,
                 },
+                accepted_len,
+                |commit_one| {
+                    for candidate in accepted {
+                        commit_one(0, candidate);
+                    }
+                },
+                |_| {},
             );
             assert_eq!(
                 committed, full,
@@ -5424,6 +5438,7 @@ impl DeltaScheduler {
                 active: None,
             };
         }
+        let candidates = CandidatePayload::Values(accepted.collect());
         let mut reducer_seeds = Vec::new();
         let continuation = match streamed.return_to {
             DeltaReturn::Stable { desc, parent, .. } => file_with_plan(
@@ -6489,8 +6504,9 @@ impl DeltaScheduler {
         );
 
         let row_count = tasks.len();
-        let mut parents = Vec::new();
-        let mut candidate_sets = Vec::with_capacity(row_count);
+        let mut parents: SmallVec<[RawInline; 8]> = SmallVec::new();
+        let mut candidate_sets: SmallVec<[Option<&[RawInline]>; 1]> =
+            SmallVec::with_capacity(row_count);
         for task in &tasks {
             assert_eq!(task.activation, task.credit.key.activation);
             let (bound, parent, candidates) = self.registry.source_context(task.activation);
@@ -6499,14 +6515,22 @@ impl DeltaScheduler {
             parents.extend_from_slice(parent);
             candidate_sets.push(candidates);
         }
-        let vars: Vec<_> = cohort_key.bound.into_iter().collect();
+        let vars: SmallVec<[VariableId; 8]> = cohort_key.bound.into_iter().collect();
         let view = rows_view(&vars, &parents, row_count);
-        let activations: Vec<_> = tasks
+        let activations: SmallVec<[ProgramActivation; 1]> = tasks
             .iter()
             .map(|task| ProgramActivation(task.activation.0))
             .collect();
-        let mut task_receipts = Vec::with_capacity(row_count);
-        let mut work = Vec::with_capacity(row_count);
+        let mut task_receipts: SmallVec<
+            [(
+                ActivationId,
+                ProducerCredit,
+                DispatchClass,
+                ProgramPacing,
+                bool,
+            ); 1],
+        > = SmallVec::with_capacity(row_count);
+        let mut work: SmallVec<[ProgramWork; 1]> = SmallVec::with_capacity(row_count);
         for task in tasks {
             let unique_unjoined = self
                 .registry
@@ -7207,7 +7231,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            states: Vec<Self::State>,
+            states: crate::query::TypedProgramStateBatch<Self::State>,
             _batch: TypedProgramBatch<'_>,
             effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
@@ -7303,7 +7327,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            states: Vec<Self::State>,
+            states: crate::query::TypedProgramStateBatch<Self::State>,
             batch: TypedProgramBatch<'_>,
             effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
@@ -8126,7 +8150,7 @@ mod tests {
             false,
             None,
         );
-        assert_eq!(first.accepted, [value(3), value(2)]);
+        assert_eq!(first.accepted.as_slice(), &[value(3), value(2)]);
         assert!(first.quiescence.is_none());
         let (_, _, child_credit) = first
             .scheduled
@@ -8144,7 +8168,7 @@ mod tests {
             false,
             None,
         );
-        assert_eq!(last.accepted, [value(5)]);
+        assert_eq!(last.accepted.as_slice(), &[value(5)]);
         let DeltaSettlement::Retargeted(mut active) = scheduler.settle_quiescence(
             last.quiescence
                 .expect("the typed proposal graph proved quiescence"),
@@ -9321,7 +9345,7 @@ mod tests {
             None,
         );
         assert_eq!(first.raw_proposal_occurrences, 6);
-        assert_eq!(first.accepted, [value(7), value(8), value(9)]);
+        assert_eq!(first.accepted.as_slice(), &[value(7), value(8), value(9)]);
         assert!(first.quiescence.is_none());
 
         let second = registry.replace_program(
@@ -9336,7 +9360,7 @@ mod tests {
             None,
         );
         assert_eq!(second.raw_proposal_occurrences, 6);
-        assert_eq!(second.accepted, [value(10), value(11)]);
+        assert_eq!(second.accepted.as_slice(), &[value(10), value(11)]);
         assert!(second.quiescence.is_some());
 
         let sibling = registry.open_program_activation(
@@ -9369,7 +9393,7 @@ mod tests {
             None,
         );
         assert_eq!(sibling.raw_proposal_occurrences, 1);
-        assert_eq!(sibling.accepted, [value(7)]);
+        assert_eq!(sibling.accepted.as_slice(), &[value(7)]);
     }
 
     #[test]
@@ -9590,7 +9614,7 @@ mod tests {
             assert_eq!(child.dead_search_pages, usize::from(!publishes));
             assert_eq!(child.dead_source_telemetry_pages, usize::from(!publishes));
             if publishes {
-                assert_eq!(child.accepted, [value(7)]);
+                assert_eq!(child.accepted.as_slice(), &[value(7)]);
                 assert!(registry.take_streaming_return(activation).is_some());
             }
             let completed = registry.finish(
@@ -10184,7 +10208,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            states: Vec<Self::State>,
+            states: crate::query::TypedProgramStateBatch<Self::State>,
             batch: TypedProgramBatch<'_>,
             effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {

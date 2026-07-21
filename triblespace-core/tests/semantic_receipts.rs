@@ -1112,7 +1112,7 @@ impl TypedProgramSpec for CoveringProposalWithExactProgram {
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: triblespace_core::query::TypedProgramStateBatch<Self::State>,
         _batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {

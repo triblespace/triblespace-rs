@@ -12,6 +12,7 @@ use std::hash::Hash;
 use std::marker::PhantomData;
 
 use ahash::{AHashMap, AHashSet};
+use smallvec::{smallvec, SmallVec};
 
 use super::{RawInline, RowsView, VariableId, VariableSet};
 
@@ -777,19 +778,19 @@ impl ProgramPhysicalReceipt {
 #[derive(Default)]
 pub struct ProgramBatchEffects {
     /// Exactly one page per input handle, in input order.
-    pub pages: Vec<ProgramPage>,
+    pub pages: SmallVec<[ProgramPage; 1]>,
     /// Novel work children, grouped by ascending input tag.
-    pub children: Vec<ProgramChild>,
+    pub children: SmallVec<[ProgramChild; 1]>,
     /// Direct proposal occurrences from source pages. Unlike accepted product
     /// endpoints, order and multiplicity are preserved.
-    pub direct: Vec<(u32, RawInline)>,
+    pub direct: SmallVec<[(u32, RawInline); 1]>,
     /// Candidate observations proved by the program without manufacturing a
     /// continuation node solely to carry the value.
-    pub accepted: Vec<(u32, RawInline)>,
+    pub accepted: SmallVec<[(u32, RawInline); 1]>,
     /// Boolean support observations. The unit payload keeps these tags in
     /// the same grouped-effect shape as candidate observations while making
     /// it impossible to smuggle a synthetic candidate witness.
-    pub supported: Vec<(u32, ())>,
+    pub supported: SmallVec<[(u32, ()); 1]>,
     /// Family-reported telemetry only. These counters never affect dispatch
     /// or affine replacement.
     pub source_pages: usize,
@@ -886,11 +887,11 @@ struct TypedChild<State, NoveltyKey> {
 /// the blanket erased adapter after the family call returns.
 #[doc(hidden)]
 pub struct TypedEffectSink<State, NoveltyKey> {
-    pages: Vec<TypedPage<State>>,
-    children: Vec<TypedChild<State, NoveltyKey>>,
-    direct: Vec<(u32, RawInline)>,
-    accepted: Vec<(u32, RawInline)>,
-    supported: Vec<(u32, ())>,
+    pages: SmallVec<[TypedPage<State>; 1]>,
+    children: SmallVec<[TypedChild<State, NoveltyKey>; 1]>,
+    direct: SmallVec<[(u32, RawInline); 1]>,
+    accepted: SmallVec<[(u32, RawInline); 1]>,
+    supported: SmallVec<[(u32, ()); 1]>,
     source_pages: usize,
     source_examined: usize,
     source_roots: usize,
@@ -901,11 +902,11 @@ pub struct TypedEffectSink<State, NoveltyKey> {
 impl<State, NoveltyKey> Default for TypedEffectSink<State, NoveltyKey> {
     fn default() -> Self {
         Self {
-            pages: Vec::new(),
-            children: Vec::new(),
-            direct: Vec::new(),
-            accepted: Vec::new(),
-            supported: Vec::new(),
+            pages: SmallVec::new(),
+            children: SmallVec::new(),
+            direct: SmallVec::new(),
+            accepted: SmallVec::new(),
+            supported: SmallVec::new(),
             source_pages: 0,
             source_examined: 0,
             source_roots: 0,
@@ -914,6 +915,13 @@ impl<State, NoveltyKey> Default for TypedEffectSink<State, NoveltyKey> {
         }
     }
 }
+
+/// Dense typed states for one physical Program cohort.
+///
+/// The ordinary lazy scheduler is singleton-heavy, so one state remains
+/// stack-backed while wider cohorts retain the same spillable batch path.
+#[doc(hidden)]
+pub type TypedProgramStateBatch<State> = SmallVec<[State; 1]>;
 
 impl<State, NoveltyKey> TypedEffectSink<State, NoveltyKey> {
     /// Reserves family-known child capacity without exposing the private
@@ -1049,7 +1057,7 @@ pub trait TypedProgramSpec {
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: TypedProgramStateBatch<Self::State>,
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     );
@@ -1449,7 +1457,7 @@ where
         &mut self,
         activations: &[ProgramActivation],
         handles: &[ProgramWork],
-    ) -> Vec<State> {
+    ) -> TypedProgramStateBatch<State> {
         assert_eq!(activations.len(), handles.len());
         activations
             .iter()
@@ -1814,7 +1822,8 @@ where
             .downcast_mut::<TypedProgramRuntime<T::State, T::NoveltyKey>>()
             .expect("residual program step received another family's runtime");
         let states = runtime.take_batch(batch.activations, batch.work);
-        let input_ranks: Vec<_> = states.iter().map(|state| self.progress(state)).collect();
+        let input_ranks: SmallVec<[_; 1]> =
+            states.iter().map(|state| self.progress(state)).collect();
         for (state, work) in states.iter().zip(batch.work) {
             assert_eq!(
                 self.dispatch(state),
@@ -1851,7 +1860,8 @@ where
             input_count,
             "typed program returned the wrong page count"
         );
-        let examined: Vec<_> = typed.pages.iter().map(|page| page.examined).collect();
+        let examined: SmallVec<[_; 1]> =
+            typed.pages.iter().map(|page| page.examined).collect();
         assert!(
             examined
                 .iter()
@@ -1859,13 +1869,13 @@ where
                 .all(|(&spent, &limit)| spent <= limit),
             "typed program exceeded one input's physical work budget"
         );
-        let mut raw_effects = vec![0usize; input_count];
+        let mut raw_effects: SmallVec<[usize; 1]> = smallvec![0usize; input_count];
 
         // Validate the entire typed receipt before publishing any replacement
         // handle, novelty admission, or outward effect. A physical `Some`
         // result is a transaction candidate, not permission to commit a valid
         // prefix before a later malformed effect is discovered.
-        let mut resume_physical = Vec::with_capacity(input_count);
+        let mut resume_physical: SmallVec<[_; 1]> = SmallVec::with_capacity(input_count);
         for (input, page) in typed.pages.iter().enumerate() {
             match &page.resume {
                 Some(TypedResume::Immediate(state) | TypedResume::AfterChildren(state)) => {
@@ -1885,8 +1895,10 @@ where
         // the batch observation first, so only the first exact key reads the
         // runtime. Neither map nor handles are mutated until every receipt law
         // below has validated.
-        let mut child_admitted = Vec::with_capacity(typed.children.len());
-        let mut child_physical = Vec::with_capacity(typed.children.len());
+        let mut child_admitted: SmallVec<[bool; 1]> =
+            SmallVec::with_capacity(typed.children.len());
+        let mut child_physical: SmallVec<[_; 1]> =
+            SmallVec::with_capacity(typed.children.len());
         let mut previous = 0u32;
         for (position, child) in typed.children.iter().enumerate() {
             assert!(
@@ -2228,7 +2240,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            states: Vec<Self::State>,
+            states: crate::query::TypedProgramStateBatch<Self::State>,
             _batch: TypedProgramBatch<'_>,
             effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
@@ -2313,7 +2325,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            states: Vec<Self::State>,
+            states: crate::query::TypedProgramStateBatch<Self::State>,
             _batch: TypedProgramBatch<'_>,
             effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
@@ -2449,7 +2461,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            states: Vec<Self::State>,
+            states: crate::query::TypedProgramStateBatch<Self::State>,
             _batch: TypedProgramBatch<'_>,
             effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
@@ -2538,7 +2550,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            states: Vec<Self::State>,
+            states: crate::query::TypedProgramStateBatch<Self::State>,
             _batch: TypedProgramBatch<'_>,
             effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
@@ -2594,7 +2606,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            _states: Vec<Self::State>,
+            _states: crate::query::TypedProgramStateBatch<Self::State>,
             _batch: TypedProgramBatch<'_>,
             effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
@@ -2676,7 +2688,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            states: Vec<Self::State>,
+            states: crate::query::TypedProgramStateBatch<Self::State>,
             _batch: TypedProgramBatch<'_>,
             effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
@@ -2724,7 +2736,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            _states: Vec<Self::State>,
+            _states: crate::query::TypedProgramStateBatch<Self::State>,
             _batch: TypedProgramBatch<'_>,
             _effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
@@ -2784,7 +2796,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            _states: Vec<Self::State>,
+            _states: crate::query::TypedProgramStateBatch<Self::State>,
             _batch: TypedProgramBatch<'_>,
             _effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
@@ -2884,7 +2896,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            _states: Vec<Self::State>,
+            _states: crate::query::TypedProgramStateBatch<Self::State>,
             _batch: TypedProgramBatch<'_>,
             _effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
@@ -2978,7 +2990,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            _states: Vec<Self::State>,
+            _states: crate::query::TypedProgramStateBatch<Self::State>,
             _batch: TypedProgramBatch<'_>,
             effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
@@ -3031,7 +3043,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            mut states: Vec<Self::State>,
+            mut states: crate::query::TypedProgramStateBatch<Self::State>,
             _batch: TypedProgramBatch<'_>,
             effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {

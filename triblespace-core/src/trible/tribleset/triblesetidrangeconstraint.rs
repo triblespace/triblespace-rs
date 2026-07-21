@@ -99,7 +99,7 @@ impl TypedProgramSpec for EntityRangeConstraint {
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: crate::query::TypedProgramStateBatch<Self::State>,
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
@@ -291,7 +291,7 @@ impl TypedProgramSpec for AttributeRangeConstraint {
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: crate::query::TypedProgramStateBatch<Self::State>,
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {

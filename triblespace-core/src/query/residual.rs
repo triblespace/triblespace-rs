@@ -7747,19 +7747,59 @@ fn committed_candidate_rows_mapped(
     bound: VariableSet,
     variable: VariableId,
     batch: CandidateBatch,
+    observe_parent: impl FnMut(usize),
+) -> (VariableSet, RowBatch) {
+    let candidate_count = batch.candidates.len();
+    let CandidateBatch {
+        parents,
+        candidates,
+    } = batch;
+    let parent_count = parents.row_count;
+    committed_candidate_rows_with(
+        bound,
+        variable,
+        parents,
+        candidate_count,
+        |commit_one| match candidates {
+            CandidatePayload::Values(values) => {
+                assert_eq!(parent_count, 1, "plain candidates require one parent");
+                for candidate in values {
+                    commit_one(0, candidate);
+                }
+            }
+            CandidatePayload::Tagged(pairs) => {
+                for (parent, candidate) in pairs {
+                    commit_one(parent as usize, candidate);
+                }
+            }
+            CandidatePayload::Deferred(candidates) => {
+                for (parent, candidate) in candidates.iter() {
+                    commit_one(parent as usize, candidate);
+                }
+            }
+        },
+        observe_parent,
+    )
+}
+
+fn committed_candidate_rows_with(
+    bound: VariableSet,
+    variable: VariableId,
+    parents: RowBatch,
+    candidate_count: usize,
+    emit_candidates: impl FnOnce(&mut dyn FnMut(usize, RawInline)),
     mut observe_parent: impl FnMut(usize),
 ) -> (VariableSet, RowBatch) {
     let parent_vars: Vec<VariableId> = bound.into_iter().collect();
     let mut next_bound = bound;
     next_bound.set(variable);
     let next_vars: Vec<VariableId> = next_bound.into_iter().collect();
-    let mut next_rows = Vec::with_capacity(batch.candidates.len() * next_vars.len());
+    let mut next_rows = Vec::with_capacity(candidate_count * next_vars.len());
 
     let mut commit_one = |parent: usize, candidate: RawInline| {
-        let parent = parent as usize;
         observe_parent(parent);
         let parent_row =
-            &batch.parents.rows[parent * parent_vars.len()..(parent + 1) * parent_vars.len()];
+            &parents.rows[parent * parent_vars.len()..(parent + 1) * parent_vars.len()];
         let mut source = 0usize;
         for &column_variable in &next_vars {
             if column_variable == variable {
@@ -7770,24 +7810,7 @@ fn committed_candidate_rows_mapped(
             }
         }
     };
-    match batch.candidates {
-        CandidatePayload::Values(values) => {
-            assert_eq!(batch.parents.row_count, 1);
-            for candidate in values {
-                commit_one(0, candidate);
-            }
-        }
-        CandidatePayload::Tagged(pairs) => {
-            for (parent, candidate) in pairs {
-                commit_one(parent as usize, candidate);
-            }
-        }
-        CandidatePayload::Deferred(candidates) => {
-            for (parent, candidate) in candidates.iter() {
-                commit_one(parent as usize, candidate);
-            }
-        }
-    }
+    emit_candidates(&mut commit_one);
 
     let row_count = if next_vars.is_empty() {
         0
@@ -13609,7 +13632,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            states: Vec<Self::State>,
+            states: crate::query::TypedProgramStateBatch<Self::State>,
             _batch: TypedProgramBatch<'_>,
             effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
@@ -13914,7 +13937,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            states: Vec<Self::State>,
+            states: crate::query::TypedProgramStateBatch<Self::State>,
             _batch: TypedProgramBatch<'_>,
             effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
@@ -14032,7 +14055,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            _states: Vec<Self::State>,
+            _states: crate::query::TypedProgramStateBatch<Self::State>,
             _batch: TypedProgramBatch<'_>,
             _effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {

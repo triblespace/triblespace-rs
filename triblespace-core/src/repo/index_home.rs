@@ -1919,7 +1919,7 @@ where
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: crate::query::TypedProgramStateBatch<Self::State>,
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
@@ -2414,7 +2414,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            states: Vec<Self::State>,
+            states: crate::query::TypedProgramStateBatch<Self::State>,
             batch: TypedProgramBatch<'_>,
             effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
@@ -3585,7 +3585,7 @@ mod tests {
             (1, raw_value(2)),
             (1, raw_value(3)),
         ];
-        assert_eq!(effects.accepted, expected);
+        assert_eq!(effects.accepted.as_slice(), expected.as_slice());
         assert!(effects
             .pages
             .iter()
@@ -3649,7 +3649,7 @@ mod tests {
             &[None, None, None],
             &[1, 1, 1],
         );
-        assert_eq!(exact.supported, vec![(0, ()), (1, ())]);
+        assert_eq!(exact.supported.as_slice(), &[(0, ()), (1, ())]);
 
         let partial_vars = [entity.index];
         let partial_rows = [entity_one.raw, entity_dead.raw];
@@ -3663,7 +3663,7 @@ mod tests {
             &[None, None],
             &[1, 1],
         );
-        assert_eq!(partial.supported, vec![(0, ()), (1, ())]);
+        assert_eq!(partial.supported.as_slice(), &[(0, ()), (1, ())]);
     }
 
     #[test]

@@ -1386,7 +1386,7 @@ where
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: crate::query::TypedProgramStateBatch<Self::State>,
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
@@ -2709,8 +2709,8 @@ mod typed_program_tests {
         );
 
         assert_eq!(
-            effects.accepted,
-            vec![
+            effects.accepted.as_slice(),
+            &[
                 (0, id_value(11)),
                 (0, id_value(11)),
                 (1, id_value(12)),
@@ -2761,7 +2761,7 @@ mod typed_program_tests {
             &[None, None, None],
             &[1, 1, 1],
         );
-        assert_eq!(exact.supported, vec![(0, ())]);
+        assert_eq!(exact.supported.as_slice(), &[(0, ())]);
         assert!(exact.pages.iter().all(|page| page.examined == 1));
 
         let partial_vars = [e.index];
@@ -2776,7 +2776,7 @@ mod typed_program_tests {
             &[None, None],
             &[1, 1],
         );
-        assert_eq!(partial.supported, vec![(0, ()), (1, ())]);
+        assert_eq!(partial.supported.as_slice(), &[(0, ()), (1, ())]);
 
         let true_constant = SuccinctArchiveConstraint::new(
             Inline::<GenId>::new(id_value(1)),

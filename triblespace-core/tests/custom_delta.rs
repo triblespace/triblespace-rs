@@ -404,7 +404,7 @@ impl TypedProgramSpec for ProgramAlternatingClosure {
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: triblespace_core::query::TypedProgramStateBatch<Self::State>,
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {

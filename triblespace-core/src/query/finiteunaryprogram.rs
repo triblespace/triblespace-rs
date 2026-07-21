@@ -189,7 +189,7 @@ pub fn seed(
 #[doc(hidden)]
 pub fn step(
     variable: VariableId,
-    states: Vec<FiniteUnaryProgramState>,
+    states: crate::query::TypedProgramStateBatch<FiniteUnaryProgramState>,
     batch: TypedProgramBatch<'_>,
     effects: &mut TypedEffectSink<FiniteUnaryProgramState, ()>,
     mut proposal_page: impl FnMut(
