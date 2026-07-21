@@ -2955,6 +2955,11 @@ impl ProgramWorklist {
             );
             self.active[word] |= bit;
             self.len += 1;
+        } else {
+            assert!(
+                !self.buckets[index].is_empty(),
+                "active typed Program bucket lost its live work"
+            );
         }
         self.buckets[index].append(tasks);
     }
@@ -10002,6 +10007,119 @@ mod tests {
                 credit,
             })
             .collect()
+    }
+
+    #[test]
+    fn dense_program_worklist_tracks_live_states_across_bitset_holes() {
+        let mut registry = ProducerRegistry::new();
+        let activation = registry.open_program_activation(
+            DeltaReducer::StreamProposal,
+            stable_return(Vec::new()),
+            None,
+            None,
+        );
+        let mut tasks = install_program_tasks(
+            &mut registry,
+            activation,
+            0..6,
+            DispatchClass::new(0),
+            ProgramPacing::Activation,
+        )
+        .into_iter();
+        let low = DeltaStateId(1);
+        let middle = DeltaStateId(65);
+        let high = DeltaStateId(130);
+        let mut worklist = ProgramWorklist::default();
+
+        let mut empty = Vec::new();
+        worklist.append(high, &mut empty);
+        assert!(worklist.is_empty());
+        assert!(worklist.buckets.is_empty());
+
+        for state in [middle, low, high] {
+            let mut filed = vec![tasks.next().unwrap()];
+            worklist.append(state, &mut filed);
+            assert!(filed.is_empty());
+        }
+        assert_eq!(worklist.len(), 3);
+        assert_eq!(worklist.last_id(), Some(high));
+        assert_eq!(
+            worklist.iter().map(|(state, _)| state).collect::<Vec<_>>(),
+            [low, middle, high]
+        );
+
+        let high_capacity = worklist[&high].tasks.capacity();
+        worklist.get_mut(&high).unwrap().tasks.clear();
+        worklist.deactivate(high);
+        assert_eq!(worklist.len(), 2);
+        assert!(!worklist.contains_key(&high));
+        assert_eq!(worklist.last_id(), Some(middle));
+
+        let mut refiled = vec![tasks.next().unwrap()];
+        worklist.append(high, &mut refiled);
+        assert_eq!(worklist[&high].tasks.capacity(), high_capacity);
+        assert_eq!(worklist.last_id(), Some(high));
+
+        worklist.get_mut(&middle).unwrap().tasks.clear();
+        worklist.deactivate(middle);
+        assert_eq!(worklist.last_id(), Some(high));
+        assert_eq!(
+            worklist.iter().map(|(state, _)| state).collect::<Vec<_>>(),
+            [low, high]
+        );
+
+        for state in [high, low] {
+            worklist.get_mut(&state).unwrap().tasks.clear();
+            worklist.deactivate(state);
+        }
+        assert!(worklist.is_empty());
+        assert_eq!(worklist.last_id(), None);
+        assert!(worklist.iter().next().is_none());
+    }
+
+    #[test]
+    fn dense_program_worklist_membership_matches_ordered_reference() {
+        let mut registry = ProducerRegistry::new();
+        let activation = registry.open_program_activation(
+            DeltaReducer::StreamProposal,
+            stable_return(Vec::new()),
+            None,
+            None,
+        );
+        let mut tasks = install_program_tasks(
+            &mut registry,
+            activation,
+            0..2048,
+            DispatchClass::new(0),
+            ProgramPacing::Activation,
+        )
+        .into_iter();
+        let mut worklist = ProgramWorklist::default();
+        let mut reference = BTreeSet::new();
+        let mut random = 0xA076_1D64_78BD_642Fu64;
+
+        for _ in 0..1024 {
+            random = random
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let state = DeltaStateId(((random >> 24) % 257) as u32);
+            if random & 3 == 0 && reference.remove(&state) {
+                worklist.get_mut(&state).unwrap().tasks.clear();
+                worklist.deactivate(state);
+            } else {
+                let mut filed = vec![tasks.next().expect("fixture exhausted Program tasks")];
+                worklist.append(state, &mut filed);
+                reference.insert(state);
+            }
+
+            assert_eq!(worklist.len(), reference.len());
+            assert_eq!(worklist.is_empty(), reference.is_empty());
+            assert_eq!(worklist.last_id(), reference.last().copied());
+            assert_eq!(
+                worklist.iter().map(|(state, _)| state).collect::<Vec<_>>(),
+                reference.iter().copied().collect::<Vec<_>>()
+            );
+        }
     }
 
     fn program_order_trace(
