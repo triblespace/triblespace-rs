@@ -357,6 +357,35 @@ fn report(cell: &CellReport) {
         s.delta_program_continuation_tasks_filed,
         s.delta_program_continuation_reentries,
     );
+    const CLASSES: [&str; 5] = [
+        "Search/General",
+        "Search/Terminal",
+        "Activation/Streaming",
+        "Activation/Quiescent",
+        "Activation/TerminalStreaming",
+    ];
+    const REDUCERS: [&str; 10] = [
+        "StreamProposal",
+        "StreamFormulaProposal",
+        "QuiescentProposal",
+        "Support",
+        "Confirm",
+        "FinalizingConfirm",
+        "FinalizingProposal",
+        "SetAdmit",
+        "FormulaOrAdmit",
+        "FormulaOrEmit",
+    ];
+    for (class, reducers) in s.delta_program_active_pop_contingency.iter().enumerate() {
+        for (reducer, counts) in reducers.iter().enumerate() {
+            if counts.iter().any(|&count| count != 0) {
+                println!(
+                    "\tL5 pop: class={} reducer={} !p!l={} !pl={} p!l={} pl={}",
+                    CLASSES[class], REDUCERS[reducer], counts[0], counts[1], counts[2], counts[3],
+                );
+            }
+        }
+    }
 }
 
 /// Drain a residual iterator (optionally bounded), recording wall, TTFR at

@@ -2503,6 +2503,17 @@ pub struct ResidualStateStats {
     /// produced no local replacement. Nested same-state filings may make the
     /// looked-up bucket nonempty and therefore preserve it.
     pub delta_program_cleanup_lookups: usize,
+    /// Diagnostic contingency table for directed Program pops, indexed as
+    /// `[physical class][reducer class][parked/local outcome]`.
+    ///
+    /// Physical classes are, in order: Search/General, Search/Terminal,
+    /// Activation/Streaming, Activation/Quiescent, and
+    /// Activation/TerminalStreaming. Reducers are StreamProposal,
+    /// StreamFormulaProposal, QuiescentProposal, Support, Confirm,
+    /// FinalizingConfirm, FinalizingProposal, SetAdmit, FormulaOrAdmit, and
+    /// FormulaOrEmit. Outcome slots are `!parked/!local`, `!parked/local`,
+    /// `parked/!local`, and `parked/local`.
+    pub delta_program_active_pop_contingency: [[[usize; 4]; 10]; 5],
     /// Program inputs whose committed receipt admitted exactly one child and
     /// carried no same-input resume/barrier. This is a shape observation only;
     /// it does not imply that the child can safely remain resident.

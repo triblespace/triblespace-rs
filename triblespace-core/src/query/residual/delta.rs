@@ -704,9 +704,55 @@ impl DeltaReducer {
         matches!(self, Self::StreamProposal | Self::StreamFormulaProposal)
     }
 
+    fn class(&self) -> DeltaReducerClass {
+        match self {
+            Self::StreamProposal => DeltaReducerClass::StreamProposal,
+            Self::StreamFormulaProposal => DeltaReducerClass::StreamFormulaProposal,
+            Self::QuiescentProposal { .. } => DeltaReducerClass::QuiescentProposal,
+            Self::Support { .. } => DeltaReducerClass::Support,
+            Self::Confirm { .. } => DeltaReducerClass::Confirm,
+            Self::FinalizingConfirm { .. } => DeltaReducerClass::FinalizingConfirm,
+            Self::FinalizingProposal { .. } => DeltaReducerClass::FinalizingProposal,
+            Self::SetAdmit { .. } => DeltaReducerClass::SetAdmit,
+            Self::FormulaOrAdmit => DeltaReducerClass::FormulaOrAdmit,
+            Self::FormulaOrEmit { .. } => DeltaReducerClass::FormulaOrEmit,
+        }
+    }
+
     fn retain_quiescent_proposal_page(&mut self, values: Vec<RawInline>) {
         if let Self::QuiescentProposal { occurrences } = self {
             append_one_parent_page(occurrences, values);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeltaReducerClass {
+    StreamProposal,
+    StreamFormulaProposal,
+    QuiescentProposal,
+    Support,
+    Confirm,
+    FinalizingConfirm,
+    FinalizingProposal,
+    SetAdmit,
+    FormulaOrAdmit,
+    FormulaOrEmit,
+}
+
+impl DeltaReducerClass {
+    fn index(self) -> usize {
+        match self {
+            Self::StreamProposal => 0,
+            Self::StreamFormulaProposal => 1,
+            Self::QuiescentProposal => 2,
+            Self::Support => 3,
+            Self::Confirm => 4,
+            Self::FinalizingConfirm => 5,
+            Self::FinalizingProposal => 6,
+            Self::SetAdmit => 7,
+            Self::FormulaOrAdmit => 8,
+            Self::FormulaOrEmit => 9,
         }
     }
 }
@@ -2225,6 +2271,15 @@ impl ProducerRegistry {
             .streams()
     }
 
+    fn activation_reducer_class(&self, activation: ActivationId) -> DeltaReducerClass {
+        self.state
+            .activations
+            .get(&activation)
+            .expect("unknown delta activation")
+            .reducer
+            .class()
+    }
+
     fn physical_activation_class(&self, activation: ActivationId) -> DeltaPhysicalClass {
         self.state
             .activations
@@ -2843,6 +2898,20 @@ impl ProgramCohortClass {
             Self::ActivationStreaming
             | Self::ActivationQuiescent
             | Self::ActivationTerminalStreaming => ProgramPacing::Activation,
+        }
+    }
+
+    fn contingency_index(self) -> usize {
+        match self {
+            Self::Search {
+                physical: DeltaPhysicalClass::General,
+            } => 0,
+            Self::Search {
+                physical: DeltaPhysicalClass::TerminalStreaming,
+            } => 1,
+            Self::ActivationStreaming => 2,
+            Self::ActivationQuiescent => 3,
+            Self::ActivationTerminalStreaming => 4,
         }
     }
 }
@@ -6555,12 +6624,25 @@ impl DeltaScheduler {
         let spec = address.resolve(root, plan);
         let private_direct = address.has_private_direct_effects();
         let cohort_key = ProgramCohortKey::of(&self.registry, &tasks[0]);
+        let reducer_class = active_pop.then(|| {
+            self.registry
+                .activation_reducer_class(tasks[0].activation)
+        });
         assert!(
             tasks
                 .iter()
                 .all(|task| ProgramCohortKey::of(&self.registry, task) == cohort_key),
             "one typed program cohort mixed incompatible physical dispatch shapes"
         );
+        if let Some(reducer_class) = reducer_class {
+            assert!(
+                tasks.iter().all(|task| self
+                    .registry
+                    .activation_reducer_class(task.activation)
+                    == reducer_class),
+                "one directed typed Program cohort mixed reducer classes"
+            );
+        }
 
         let row_count = tasks.len();
         let mut scratch = self
@@ -6917,6 +6999,12 @@ impl DeltaScheduler {
         }
 
         let local_replacements = !tasks.is_empty();
+        if let Some(reducer_class) = reducer_class {
+            let outcome = usize::from(parked_active_bucket) * 2
+                + usize::from(local_replacements);
+            stats.delta_program_active_pop_contingency[cohort_key.class.contingency_index()]
+                [reducer_class.index()][outcome] += 1;
+        }
         if !tasks.is_empty() {
             stats.delta_program_continuation_files += 1;
             stats.delta_program_continuation_tasks_filed += tasks.len();
