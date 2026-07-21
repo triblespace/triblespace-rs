@@ -1413,6 +1413,51 @@ where
             .any(|shard| shard.support_row(view, row))
     }
 
+    /// Emit the exact complete proposal occurrence bag in the same
+    /// parent-major, shard-major, Ring order as the typed pageable route.
+    /// Cross-shard duplicates stay visible here; the complete-action adapter
+    /// owns the later parent-local SET admission.
+    fn for_each_complete_proposal_occurrence(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        mut emit: impl FnMut(u32, RawInline),
+    ) {
+        assert_eq!(
+            self.variable_position_mask(variable).count_ones(),
+            1,
+            "UnionArchive complete proposal target must occupy exactly one position"
+        );
+        assert!(
+            view.col(variable).is_none(),
+            "UnionArchive complete proposal target is already bound"
+        );
+
+        for parent_index in 0..view.len() {
+            let parent =
+                u32::try_from(parent_index).expect("too many UnionArchive complete-action parents");
+            let row_view = view.row_view(parent_index);
+            for shard in &self.shards {
+                let walk = shard
+                    .proposal_walk_single_target(variable, &row_view)
+                    .expect("one-target Succinct shard has no located proposal walk");
+                let mut emitted = 0usize;
+                let page = walk.consume(ResidualDeltaSourceCursor::Start, usize::MAX, |value| {
+                    emitted += 1;
+                    emit(parent, value);
+                });
+                assert_eq!(
+                    page.examined, emitted,
+                    "a complete Succinct walk did not emit every examined value"
+                );
+                assert!(
+                    page.next.is_none(),
+                    "an unbounded complete Succinct walk retained a continuation"
+                );
+            }
+        }
+    }
+
     /// One exact page of the globally ordered, duplicate-free shard union.
     /// Every shard contributes at most its first value after `cursor`; the
     /// minimum head is emitted once and becomes the next value cursor.
@@ -1567,40 +1612,13 @@ where
         };
         assert_eq!(variable, batch.route.variable);
 
-        // The typed pageable route drains one parent at a time and, within
-        // each parent, one physical shard at a time. Preserve that exact raw
-        // occurrence bag here: ordinary `UnionConstraint::propose` would sort
-        // and deduplicate overlapping shard values before the complete-action
-        // adapter gets to account for and SET-admit them.
-        let mut shard_occurrences = Vec::with_capacity(self.shards.len());
-        for shard in &self.shards {
-            let mut occurrences = Candidates::new();
-            Constraint::propose(
-                shard,
-                variable,
-                &batch.view,
-                &mut CandidateSink::Tagged(&mut occurrences),
-            );
-            shard_occurrences.push(occurrences);
-        }
-        let mut shard_offsets = vec![0usize; shard_occurrences.len()];
-        for parent in 0..batch.view.len() {
-            let parent = u32::try_from(parent)
-                .expect("too many UnionArchive complete-action parents");
-            for (occurrences, offset) in shard_occurrences.iter().zip(&mut shard_offsets) {
-                while let Some(&(tag, value)) = occurrences.get(*offset) {
-                    if tag != parent {
-                        break;
-                    }
-                    effects.push(parent, value);
-                    *offset += 1;
-                }
-            }
-        }
-        debug_assert!(shard_occurrences
-            .iter()
-            .zip(shard_offsets)
-            .all(|(occurrences, offset)| offset == occurrences.len()));
+        // Ordinary `UnionConstraint::propose` would normalize overlapping
+        // shard values too early. Drain each shard's located ordered walk
+        // directly instead: the complete-action adapter still sees the exact
+        // pageable raw bag before performing parent-local SET admission.
+        self.for_each_complete_proposal_occurrence(variable, &batch.view, |parent, value| {
+            effects.push(parent, value)
+        });
     }
 
     fn progress(&self, state: &Self::State) -> Self::Rank {
@@ -2892,6 +2910,27 @@ mod tests {
         let route = program.route(request).unwrap();
         let mut complete = crate::query::ProgramCompleteEffects::default();
 
+        let mut raw = Vec::new();
+        constraint.for_each_complete_proposal_occurrence(
+            value.index,
+            &view,
+            |parent, candidate| raw.push((parent, candidate)),
+        );
+        assert_eq!(
+            raw,
+            [
+                (0, raw_value(1)),
+                (0, raw_value(3)),
+                (0, raw_value(2)),
+                (0, raw_value(3)),
+                (1, raw_value(1)),
+                (1, raw_value(3)),
+                (1, raw_value(2)),
+                (1, raw_value(3)),
+            ],
+            "complete emission must preserve parent/shard order and raw duplicates"
+        );
+
         program.complete_batch(
             ProgramCompleteBatch {
                 request,
@@ -2914,6 +2953,74 @@ mod tests {
                 (1, raw_value(1)),
                 (1, raw_value(3)),
                 (1, raw_value(2)),
+            ]
+        );
+    }
+
+    #[test]
+    fn union_archive_complete_bag_uses_each_parent_row_before_advancing_shards() {
+        let entity_one = Id::new([0x3b; 16]).unwrap();
+        let entity_two = Id::new([0x3c; 16]).unwrap();
+        let attribute = Id::new([0x4b; 16]).unwrap();
+        let archives = [
+            fixed_archive(&entity_one, &attribute, [1, 3]),
+            fixed_archive(&entity_one, &attribute, [2, 3]),
+            fixed_archive(&entity_two, &attribute, [4]),
+            fixed_archive(&entity_two, &attribute, [4, 5]),
+        ];
+        let union_archive = UnionArchive::new(&archives);
+        let entity = Variable::<GenId>::new(0);
+        let value = Variable::<UnknownInline>::new(1);
+        let attribute: Inline<GenId> = attribute.to_inline();
+        let constraint = union_archive.pattern(entity, attribute, value);
+        let vars = [entity.index];
+        let entity_one: Inline<GenId> = entity_one.to_inline();
+        let entity_two: Inline<GenId> = entity_two.to_inline();
+        let rows = [entity_one.raw, entity_two.raw];
+        let view = RowsView::new(&vars, &rows);
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(value.index),
+            bound: VariableSet::new_singleton(entity.index),
+        };
+
+        let mut raw = Vec::new();
+        constraint.for_each_complete_proposal_occurrence(
+            value.index,
+            &view,
+            |parent, candidate| raw.push((parent, candidate)),
+        );
+        assert_eq!(
+            raw,
+            [
+                (0, raw_value(1)),
+                (0, raw_value(3)),
+                (0, raw_value(2)),
+                (0, raw_value(3)),
+                (1, raw_value(4)),
+                (1, raw_value(4)),
+                (1, raw_value(5)),
+            ]
+        );
+
+        let program = constraint.residual_program().unwrap();
+        let mut complete = crate::query::ProgramCompleteEffects::default();
+        program.complete_batch(
+            ProgramCompleteBatch {
+                request,
+                route: program.route(request).unwrap(),
+                view,
+            },
+            &mut complete,
+        );
+        assert_eq!(complete.raw_occurrence_count, raw.len());
+        assert_eq!(
+            complete.occurrences,
+            [
+                (0, raw_value(1)),
+                (0, raw_value(3)),
+                (0, raw_value(2)),
+                (1, raw_value(4)),
+                (1, raw_value(5)),
             ]
         );
     }

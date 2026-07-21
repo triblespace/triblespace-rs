@@ -2025,6 +2025,43 @@ mod typed_program_tests {
         }
     }
 
+    fn assert_ordinary_propose_equals_full_walks<U>(
+        label: &str,
+        constraint: &SuccinctArchiveConstraint<'_, U>,
+        variable: VariableId,
+        view: RowsView<'_>,
+    ) where
+        U: Universe,
+    {
+        let mut ordinary = Candidates::new();
+        Constraint::propose(
+            constraint,
+            variable,
+            &view,
+            &mut CandidateSink::Tagged(&mut ordinary),
+        );
+
+        let mut walked = Candidates::new();
+        for parent in 0..view.len() {
+            let row_view = view.row_view(parent);
+            let walk = constraint
+                .proposal_walk_single_target(variable, &row_view)
+                .expect("test shape must have one target position");
+            let mut emitted = 0usize;
+            let page = walk.consume(ResidualDeltaSourceCursor::Start, usize::MAX, |value| {
+                emitted += 1;
+                walked.push((parent as u32, value));
+            });
+            assert_eq!(page.examined, emitted, "{label}: full walk accounting");
+            assert_eq!(page.next, None, "{label}: full walk must drain");
+        }
+
+        assert_eq!(
+            walked, ordinary,
+            "{label}: full located walks must preserve ordinary tagged propose"
+        );
+    }
+
     #[test]
     fn located_walk_dense_and_bounded_match_for_all_single_target_shapes() {
         let entities: Vec<_> = (1..=4).map(id_value).collect();
@@ -2103,6 +2140,92 @@ mod typed_program_tests {
             v.index,
             RowsView::new(&ea_vars, &ea_rows),
             &values,
+        );
+    }
+
+    #[test]
+    fn ordinary_propose_matches_full_attached_walks_for_all_single_target_shapes() {
+        struct PanicRingBatch;
+
+        impl RingBatchQuery for PanicRingBatch {
+            fn rank_batch(
+                &self,
+                _rotation: SuccinctRotation,
+                _positions: &[usize],
+                _values: &[usize],
+            ) -> Vec<usize> {
+                panic!("proposal paths must not consult the attached Ring backend")
+            }
+        }
+
+        let entities: Vec<_> = (1..=4).map(id_value).collect();
+        let attributes: Vec<_> = (11..=14).map(id_value).collect();
+        let values: Vec<_> = (21..=24).map(inline_value).collect();
+        let set: TribleSet = (1..=4)
+            .flat_map(|entity| {
+                (11..=14).flat_map(move |attribute| {
+                    (21..=24).map(move |value| trible(entity, attribute, inline_value(value)))
+                })
+            })
+            .collect();
+        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+        let e = Variable::<GenId>::new(0);
+        let a = Variable::<GenId>::new(1);
+        let v = Variable::<UnknownInline>::new(2);
+        let ring_batch = PanicRingBatch;
+        let constraint = SuccinctArchiveConstraint::with_ring_batch(e, a, v, &archive, &ring_batch);
+
+        // Three top-level domain walks over two explicit empty bindings.
+        let seeds = RowsView::new_with_row_count(&[], &[], 2);
+        assert_ordinary_propose_equals_full_walks("domain E", &constraint, e.index, seeds);
+        assert_ordinary_propose_equals_full_walks("domain A", &constraint, a.index, seeds);
+        assert_ordinary_propose_equals_full_walks("domain V", &constraint, v.index, seeds);
+
+        // Six middle walks, each with two independently located parent rows.
+        let e_vars = [e.index];
+        let e_rows = [entities[0], entities[1]];
+        let e_view = RowsView::new(&e_vars, &e_rows);
+        assert_ordinary_propose_equals_full_walks("middle EAV", &constraint, a.index, e_view);
+        assert_ordinary_propose_equals_full_walks("middle EVA", &constraint, v.index, e_view);
+
+        let a_vars = [a.index];
+        let a_rows = [attributes[0], attributes[1]];
+        let a_view = RowsView::new(&a_vars, &a_rows);
+        assert_ordinary_propose_equals_full_walks("middle AEV", &constraint, e.index, a_view);
+        assert_ordinary_propose_equals_full_walks("middle AVE", &constraint, v.index, a_view);
+
+        let v_vars = [v.index];
+        let v_rows = [values[0], values[1]];
+        let v_view = RowsView::new(&v_vars, &v_rows);
+        assert_ordinary_propose_equals_full_walks("middle VEA", &constraint, e.index, v_view);
+        assert_ordinary_propose_equals_full_walks("middle VAE", &constraint, a.index, v_view);
+
+        // Three last walks with two different fixed pairs apiece.
+        let av_vars = [a.index, v.index];
+        let av_rows = [attributes[0], values[0], attributes[1], values[1]];
+        assert_ordinary_propose_equals_full_walks(
+            "last VAE",
+            &constraint,
+            e.index,
+            RowsView::new(&av_vars, &av_rows),
+        );
+
+        let ev_vars = [e.index, v.index];
+        let ev_rows = [entities[0], values[0], entities[1], values[1]];
+        assert_ordinary_propose_equals_full_walks(
+            "last VEA",
+            &constraint,
+            a.index,
+            RowsView::new(&ev_vars, &ev_rows),
+        );
+
+        let ea_vars = [e.index, a.index];
+        let ea_rows = [entities[0], attributes[0], entities[1], attributes[1]];
+        assert_ordinary_propose_equals_full_walks(
+            "last AEV",
+            &constraint,
+            v.index,
+            RowsView::new(&ea_vars, &ea_rows),
         );
     }
 
