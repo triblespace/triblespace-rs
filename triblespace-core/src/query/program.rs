@@ -1362,6 +1362,105 @@ struct ArenaSlot<T> {
     value: Option<(ProgramActivation, T)>,
 }
 
+struct BorrowedBatchNovelty<'a, NoveltyKey> {
+    activation: ProgramActivation,
+    key: &'a NoveltyKey,
+    accepted: Option<RawInline>,
+}
+
+/// Receipt-local novelty preflight with an allocation-free singleton state.
+///
+/// The first observation remains borrowed from the typed child receipt. A
+/// second observation promotes that singleton into the scratch-owned map,
+/// after which the same map path handles the rest of the batch. The committed
+/// runtime remains read-only throughout preflight.
+#[derive(Default)]
+enum BatchNoveltyPreflight<'a, NoveltyKey> {
+    #[default]
+    Empty,
+    First(BorrowedBatchNovelty<'a, NoveltyKey>),
+    Materialized,
+}
+
+impl<'a, NoveltyKey> BatchNoveltyPreflight<'a, NoveltyKey>
+where
+    NoveltyKey: Clone + Eq + Hash,
+{
+    #[inline]
+    fn observe(
+        &mut self,
+        materialized: &mut AHashMap<(ProgramActivation, NoveltyKey), Option<RawInline>>,
+        committed: &AHashMap<ProgramActivation, AHashMap<NoveltyKey, Option<RawInline>>>,
+        activation: ProgramActivation,
+        key: &'a NoveltyKey,
+        accepted: Option<RawInline>,
+    ) -> bool {
+        let first_in_batch = match self {
+            Self::Empty => {
+                *self = Self::First(BorrowedBatchNovelty {
+                    activation,
+                    key,
+                    accepted,
+                });
+                true
+            }
+            Self::First(first) => {
+                let first_activation = first.activation;
+                let first_key = first.key.clone();
+                let first_accepted = first.accepted;
+                *self = Self::Materialized;
+                assert!(
+                    materialized
+                        .insert((first_activation, first_key), first_accepted)
+                        .is_none(),
+                    "typed Program novelty scratch retained a prior batch observation"
+                );
+                Self::observe_materialized(materialized, activation, key, accepted)
+            }
+            Self::Materialized => {
+                Self::observe_materialized(materialized, activation, key, accepted)
+            }
+        };
+
+        if !first_in_batch {
+            return false;
+        }
+        match committed.get(&activation).and_then(|seen| seen.get(key)) {
+            Some(previous) => {
+                assert_eq!(
+                    *previous, accepted,
+                    "one typed novelty key changed its endpoint observation"
+                );
+                false
+            }
+            None => true,
+        }
+    }
+
+    #[inline]
+    fn observe_materialized(
+        materialized: &mut AHashMap<(ProgramActivation, NoveltyKey), Option<RawInline>>,
+        activation: ProgramActivation,
+        key: &NoveltyKey,
+        accepted: Option<RawInline>,
+    ) -> bool {
+        match materialized.entry((activation, key.clone())) {
+            Entry::Occupied(previous) => {
+                assert_eq!(
+                    *previous.get(),
+                    accepted,
+                    "one typed novelty key changed its endpoint observation"
+                );
+                false
+            }
+            Entry::Vacant(first) => {
+                first.insert(accepted);
+                true
+            }
+        }
+    }
+}
+
 /// Query-local typed state and novelty storage for one program occurrence.
 ///
 /// `State` is deliberately not constrained by equality or hashing. Only the
@@ -1968,77 +2067,60 @@ where
         }
 
         scratch.batch_novelty.clear();
-        // The bitmap is a receipt-local transaction plan. Repetitions consult
-        // the batch observation first, so only the first exact key reads the
-        // runtime. Neither map nor handles are mutated until every receipt law
+        // The preflight is a receipt-local transaction plan. Its first novelty
+        // observation remains borrowed; only a second observation materializes
+        // the scratch-owned map. Repetitions consult the batch observation
+        // first, so only the first exact key reads the runtime. Neither the
+        // runtime novelty map nor handles are mutated until every receipt law
         // below has validated.
         scratch.child_admitted.clear();
         scratch.child_admitted.reserve(typed.children.len());
         scratch.child_physical.clear();
         scratch.child_physical.reserve(typed.children.len());
-        let mut previous = 0u32;
-        for (position, child) in typed.children.iter().enumerate() {
-            assert!(
-                (child.input as usize) < input_count,
-                "typed program child tag is out of range"
-            );
-            assert!(
-                position == 0 || child.input >= previous,
-                "typed program child tags are not grouped in ascending order"
-            );
-            previous = child.input;
-            scratch.raw_effects[child.input as usize] += 1;
-            assert!(
-                batch.stratum == ProgramStratum::Fixpoint || child.novelty.is_none(),
-                "a finite typed program emitted a fixpoint child"
-            );
-            if child.novelty.is_none() {
+        {
+            // This lexical transaction owns the only borrow into
+            // `typed.children`; it ends before the later commit drains them.
+            let mut batch_novelty_preflight = BatchNoveltyPreflight::default();
+            let mut previous = 0u32;
+            for (position, child) in typed.children.iter().enumerate() {
                 assert!(
-                    self.progress(&child.state) < scratch.input_ranks[child.input as usize],
-                    "typed program finite child did not strictly decrease its input rank"
+                    (child.input as usize) < input_count,
+                    "typed program child tag is out of range"
                 );
-            }
-            scratch
-                .child_physical
-                .push((self.dispatch(&child.state), self.pacing(&child.state)));
-
-            let admitted = if let Some(novelty) = child.novelty.as_ref() {
-                let activation = batch.activations[child.input as usize];
-                match scratch
-                    .batch_novelty
-                    .entry((activation, novelty.clone()))
-                {
-                    Entry::Occupied(previous) => {
-                        assert_eq!(
-                            *previous.get(),
-                            child.accepted,
-                            "one typed novelty key changed its endpoint observation"
-                        );
-                        false
-                    }
-                    Entry::Vacant(first) => {
-                        let admitted = match runtime
-                            .novelty
-                            .get(&activation)
-                            .and_then(|seen| seen.get(novelty))
-                        {
-                            Some(previous) => {
-                                assert_eq!(
-                                    *previous, child.accepted,
-                                    "one typed novelty key changed its endpoint observation"
-                                );
-                                false
-                            }
-                            None => true,
-                        };
-                        first.insert(child.accepted);
-                        admitted
-                    }
+                assert!(
+                    position == 0 || child.input >= previous,
+                    "typed program child tags are not grouped in ascending order"
+                );
+                previous = child.input;
+                scratch.raw_effects[child.input as usize] += 1;
+                assert!(
+                    batch.stratum == ProgramStratum::Fixpoint || child.novelty.is_none(),
+                    "a finite typed program emitted a fixpoint child"
+                );
+                if child.novelty.is_none() {
+                    assert!(
+                        self.progress(&child.state) < scratch.input_ranks[child.input as usize],
+                        "typed program finite child did not strictly decrease its input rank"
+                    );
                 }
-            } else {
-                true
-            };
-            scratch.child_admitted.push(admitted);
+                scratch
+                    .child_physical
+                    .push((self.dispatch(&child.state), self.pacing(&child.state)));
+
+                let admitted = if let Some(novelty) = child.novelty.as_ref() {
+                    let activation = batch.activations[child.input as usize];
+                    batch_novelty_preflight.observe(
+                        &mut scratch.batch_novelty,
+                        &runtime.novelty,
+                        activation,
+                        novelty,
+                        child.accepted,
+                    )
+                } else {
+                    true
+                };
+                scratch.child_admitted.push(admitted);
+            }
         }
 
         let mut previous = 0u32;
@@ -3776,6 +3858,160 @@ mod tests {
     }
 
     #[test]
+    fn novelty_preflight_keeps_one_new_or_existing_observation_borrowed() {
+        let activation = ProgramActivation(31);
+        let new_key = Key(1);
+        let mut materialized = AHashMap::new();
+        let committed = AHashMap::new();
+        let mut new_preflight = BatchNoveltyPreflight::default();
+
+        assert!(new_preflight.observe(
+            &mut materialized,
+            &committed,
+            activation,
+            &new_key,
+            Some(raw(0xA1)),
+        ));
+        assert!(matches!(new_preflight, BatchNoveltyPreflight::First(_)));
+        assert!(
+            materialized.is_empty(),
+            "one new observation must not enter the owned scratch map"
+        );
+
+        let existing_key = Key(2);
+        let existing_endpoint = Some(raw(0xB2));
+        let mut seen = AHashMap::new();
+        seen.insert(Key(2), existing_endpoint);
+        let mut committed = AHashMap::new();
+        committed.insert(activation, seen);
+        let mut existing_preflight = BatchNoveltyPreflight::default();
+
+        assert!(!existing_preflight.observe(
+            &mut materialized,
+            &committed,
+            activation,
+            &existing_key,
+            existing_endpoint,
+        ));
+        assert!(matches!(
+            existing_preflight,
+            BatchNoveltyPreflight::First(_)
+        ));
+        assert!(
+            materialized.is_empty(),
+            "one rejected observation must remain borrowed too"
+        );
+    }
+
+    #[test]
+    fn novelty_preflight_materializes_on_a_second_equal_key_and_checks_full_endpoint() {
+        let activation = ProgramActivation(32);
+        let first_key = Key(7);
+        let second_key = Key(7);
+        let endpoint = Some(raw(0xC3));
+        let committed = AHashMap::new();
+        let mut materialized = AHashMap::new();
+        let mut preflight = BatchNoveltyPreflight::default();
+
+        assert!(preflight.observe(
+            &mut materialized,
+            &committed,
+            activation,
+            &first_key,
+            endpoint,
+        ));
+        assert!(!preflight.observe(
+            &mut materialized,
+            &committed,
+            activation,
+            &second_key,
+            endpoint,
+        ));
+        assert!(matches!(preflight, BatchNoveltyPreflight::Materialized));
+        assert_eq!(materialized.len(), 1);
+        assert_eq!(materialized.get(&(activation, Key(7))), Some(&endpoint));
+
+        let conflicting_first = Key(8);
+        let conflicting_second = Key(8);
+        let mut conflicting_materialized = AHashMap::new();
+        let mut conflicting_preflight = BatchNoveltyPreflight::default();
+        assert!(conflicting_preflight.observe(
+            &mut conflicting_materialized,
+            &committed,
+            activation,
+            &conflicting_first,
+            Some(raw(0xD4)),
+        ));
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            conflicting_preflight.observe(
+                &mut conflicting_materialized,
+                &committed,
+                activation,
+                &conflicting_second,
+                Some(raw(0xE5)),
+            )
+        }));
+        assert!(
+            panic_text(rejected.expect_err("different Some endpoints must conflict"))
+                .contains("changed its endpoint observation")
+        );
+        assert!(
+            committed.is_empty(),
+            "preflight must not mutate runtime novelty"
+        );
+    }
+
+    #[test]
+    fn novelty_preflight_scopes_distinct_keys_and_activations_and_reuses_owned_scratch() {
+        let first_activation = ProgramActivation(33);
+        let second_activation = ProgramActivation(34);
+        let first_key = Key(9);
+        let same_bytes_other_activation = Key(9);
+        let other_key_same_activation = Key(10);
+        let committed = AHashMap::new();
+        let mut materialized = AHashMap::new();
+        let mut preflight = BatchNoveltyPreflight::default();
+
+        assert!(preflight.observe(
+            &mut materialized,
+            &committed,
+            first_activation,
+            &first_key,
+            None,
+        ));
+        assert!(preflight.observe(
+            &mut materialized,
+            &committed,
+            second_activation,
+            &same_bytes_other_activation,
+            Some(raw(0xF6)),
+        ));
+        assert!(preflight.observe(
+            &mut materialized,
+            &committed,
+            first_activation,
+            &other_key_same_activation,
+            None,
+        ));
+        assert_eq!(materialized.len(), 3);
+
+        let retained_capacity = materialized.capacity();
+        assert!(retained_capacity > 0);
+        materialized.clear();
+        let next_key = Key(11);
+        let mut next_preflight = BatchNoveltyPreflight::default();
+        assert!(next_preflight.observe(
+            &mut materialized,
+            &committed,
+            first_activation,
+            &next_key,
+            None,
+        ));
+        assert!(materialized.is_empty());
+        assert_eq!(materialized.capacity(), retained_capacity);
+    }
+
+    #[test]
     fn novelty_batch_filters_existing_and_local_duplicates_in_first_admission_order() {
         let (result, mut runtime, effects, activation) =
             run_novelty_batch_probe(NoveltyBatchMode::Stable);
@@ -3797,6 +4033,15 @@ mod tests {
             .as_any_mut()
             .downcast_mut::<TypedProgramRuntime<NonComparableState, Key, u64>>()
             .unwrap();
+        let scratch = typed_runtime
+            .scratch
+            .as_ref()
+            .expect("novelty batch returned its reusable scratch");
+        assert!(scratch.batch_novelty.is_empty());
+        assert!(
+            scratch.batch_novelty.capacity() > 0,
+            "the promoted novelty map must retain its allocation across batches"
+        );
         let cursors = effects
             .children
             .iter()
