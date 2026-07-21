@@ -265,7 +265,9 @@ fn upper_bound_indexed(
 /// view; no prefix of candidates is materialized or replayed. Every distinct
 /// driver value consumes demand even when `accept` rejects it, and continuation
 /// resumes strictly after the last value examined rather than the last emitted
-/// candidate.
+/// candidate. Page entry binary-seeks the public value cursor once; within the
+/// page duplicate runs advance linearly, matching the dense proposal sweep
+/// instead of paying another binary search for every distinct value.
 fn page_indexed_distinct_filtered(
     len: usize,
     at: impl Fn(usize) -> RawInline,
@@ -284,15 +286,24 @@ fn page_indexed_distinct_filtered(
     };
     let mut examined = 0usize;
     let mut last = None;
+    let mut buffered = None;
     while index < len && examined < limit {
-        let value = at(index);
+        let value = buffered.take().unwrap_or_else(|| at(index));
         debug_assert!(last.is_none_or(|previous| previous < value));
         examined += 1;
         last = Some(value);
         if accept(&value) {
             accepted.push(value);
         }
-        index = upper_bound_indexed(index + 1, len, &value, &at);
+        index += 1;
+        while index < len {
+            let next = at(index);
+            if next != value {
+                buffered = Some(next);
+                break;
+            }
+            index += 1;
+        }
     }
     ResidualDeltaSourcePage {
         next: (index < len).then(|| {
