@@ -61,7 +61,6 @@ use crate::inline::Inline;
 use crate::inline::InlineEncoding;
 use crate::inline::RawInline;
 
-pub(crate) use program::ProgramCompleteAdmission;
 #[cfg(test)]
 pub use program::ProgramCompleteEffects;
 #[doc(hidden)]
@@ -74,6 +73,7 @@ pub use program::{
     ProgramStratum, ProgramWork, ProgramWorkHandle, TypedCompleteSink, TypedEffectSink,
     TypedPhysicalStep, TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink,
 };
+pub(crate) use program::{ProgramCompleteAdmission, ProgramCompleteAffinity};
 /// Re-export of [`PathOp`].
 pub use regularpathconstraint::PathOp;
 /// Re-export of [`RegularPathConstraint`].

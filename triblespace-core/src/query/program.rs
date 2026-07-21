@@ -275,29 +275,50 @@ pub(crate) enum ProgramCompleteAdmission {
     },
 }
 
+/// Unique non-zero-sized identity for one cold completion transaction.
+///
+/// Slice identity alone cannot distinguish zero-column row batches because
+/// their backing storage is empty. The residual owner creates one token per
+/// exact batch and presents that same live token when consuming the result.
+pub(crate) struct ProgramCompleteAffinity {
+    _identity: u8,
+}
+
+impl ProgramCompleteAffinity {
+    pub(crate) fn new() -> Self {
+        Self { _identity: 0 }
+    }
+}
+
 /// Non-cloneable completion result affined to its exact borrowed input batch.
 ///
 /// The fields stay private so quote evidence cannot become scheduler state.
-/// `into_parts_for` checks the original slice identity before releasing owned
-/// effects to the one cold residual transaction that owns those rows.
-pub(crate) struct ProgramBoundedCompletion<'v> {
+/// `into_parts_for` checks both the transaction token and original slice
+/// identity before releasing owned effects to the one cold residual owner.
+pub(crate) struct ProgramBoundedCompletion<'v, 'affinity> {
     batch: ProgramCompleteBatch<'v>,
+    affinity: &'affinity ProgramCompleteAffinity,
     first_parent: usize,
     admission: ProgramCompleteAdmission,
     raw_occurrence_count: usize,
     occurrences: Vec<(u32, RawInline)>,
 }
 
-impl<'v> ProgramBoundedCompletion<'v> {
+impl<'v> ProgramBoundedCompletion<'v, '_> {
     pub(crate) fn into_parts_for(
         self,
         batch: ProgramCompleteBatch<'v>,
+        affinity: &ProgramCompleteAffinity,
     ) -> (
         usize,
         ProgramCompleteAdmission,
         usize,
         Vec<(u32, RawInline)>,
     ) {
+        assert!(
+            std::ptr::eq(self.affinity, affinity),
+            "bounded Program completion was paired with another transaction"
+        );
         assert_eq!(self.batch.request, batch.request);
         assert_eq!(self.batch.route, batch.route);
         assert_eq!(self.batch.view.len(), batch.view.len());
@@ -941,15 +962,17 @@ impl<'a> ProgramRef<'a> {
 
     #[cold]
     #[inline(never)]
-    pub(crate) fn try_complete_bounded<'v>(
+    pub(crate) fn try_complete_bounded<'v, 'affinity>(
         self,
         batch: ProgramCompleteBatch<'v>,
         capacity: usize,
-    ) -> Option<ProgramBoundedCompletion<'v>> {
+        affinity: &'affinity ProgramCompleteAffinity,
+    ) -> Option<ProgramBoundedCompletion<'v, 'affinity>> {
         self.erased
             .try_complete_bounded(batch, capacity)
             .map(|effects| ProgramBoundedCompletion {
                 batch,
+                affinity,
                 first_parent: effects.first_parent,
                 admission: effects.admission,
                 raw_occurrence_count: effects.raw_occurrence_count,
@@ -963,10 +986,11 @@ impl<'a> ProgramRef<'a> {
         batch: ProgramCompleteBatch<'_>,
         effects: &mut ProgramCompleteEffects,
     ) {
+        let affinity = ProgramCompleteAffinity::new();
         let completion = self
-            .try_complete_bounded(batch, usize::MAX)
+            .try_complete_bounded(batch, usize::MAX, &affinity)
             .expect("test complete action declined");
-        let (_, _, raw_occurrence_count, occurrences) = completion.into_parts_for(batch);
+        let (_, _, raw_occurrence_count, occurrences) = completion.into_parts_for(batch, &affinity);
         effects.raw_occurrence_count = effects
             .raw_occurrence_count
             .checked_add(raw_occurrence_count)
@@ -1784,10 +1808,10 @@ where
                 for quote in quotes.iter().rev() {
                     let Some(next_drain) = drain_work_units.checked_add(quote.drain_work_units)
                     else {
-                        return None;
+                        break;
                     };
                     let Some(next_raw) = raw_occurrences.checked_add(quote.raw_occurrences) else {
-                        return None;
+                        break;
                     };
                     if next_drain > capacity || next_raw > capacity {
                         break;
@@ -2634,10 +2658,14 @@ mod tests {
         fn complete_typed(&self, batch: ProgramCompleteBatch<'_>, effects: &mut TypedCompleteSink) {
             let mut calls = self.calls.lock().unwrap();
             calls.completions += 1;
-            calls.completed_rows = batch.view.iter().map(|row| row[0][0]).collect();
+            calls.completed_rows = batch
+                .view
+                .iter()
+                .map(|row| row.first().map_or(0, |value| value[0]))
+                .collect();
             drop(calls);
             for (parent, row) in batch.view.iter().enumerate() {
-                effects.push(parent as u32, raw(row[0][0]));
+                effects.push(parent as u32, row.first().copied().unwrap_or_default());
             }
         }
 
@@ -2869,10 +2897,13 @@ mod tests {
     fn bounded_completion_selects_the_maximal_tail_under_both_exact_bounds() {
         static DRAIN_LIMITED: &[(usize, usize)] = &[(9, 1), (2, 1), (1, 1), (1, 1)];
         static RAW_LIMITED: &[(usize, usize)] = &[(1, 1), (1, 3), (1, 1), (1, 1)];
+        static OVERFLOW_BOUNDARY: &[(usize, usize)] = &[(usize::MAX, 1), (1, 1), (1, 1)];
 
-        for (quotes, capacity, expected_first, expected_drain) in
-            [(DRAIN_LIMITED, 4, 1, 4), (RAW_LIMITED, 3, 2, 2)]
-        {
+        for (quotes, capacity, expected_first, expected_drain) in [
+            (DRAIN_LIMITED, 4, 1, 4),
+            (RAW_LIMITED, 3, 2, 2),
+            (OVERFLOW_BOUNDARY, 2, 1, 2),
+        ] {
             let calls = Arc::new(Mutex::new(BoundedQuoteCalls::default()));
             let probe = BoundedQuoteProbe {
                 mode: BoundedQuoteMode::Quoted(quotes),
@@ -2884,26 +2915,29 @@ mod tests {
                 bound: VariableSet::new_singleton(0),
             };
             let vars = [0];
-            let rows = [raw(10), raw(11), raw(12), raw(13)];
+            let rows: Vec<_> = (0..quotes.len())
+                .map(|offset| raw(10 + offset as u8))
+                .collect();
             let batch = ProgramCompleteBatch {
                 request,
                 route: program.route(request).unwrap(),
                 view: RowsView::new(&vars, &rows),
             };
+            let affinity = ProgramCompleteAffinity::new();
             let completion = program
-                .try_complete_bounded(batch, capacity)
+                .try_complete_bounded(batch, capacity, &affinity)
                 .expect("a multi-parent exact tail fits");
             let (first, admission, raw_occurrence_count, occurrences) =
-                completion.into_parts_for(batch);
+                completion.into_parts_for(batch, &affinity);
             assert_eq!(first, expected_first);
             assert_eq!(
                 admission,
                 ProgramCompleteAdmission::Exact {
                     drain_work_units: expected_drain,
-                    raw_occurrences: 4 - expected_first,
+                    raw_occurrences: quotes.len() - expected_first,
                 }
             );
-            assert_eq!(raw_occurrence_count, 4 - expected_first);
+            assert_eq!(raw_occurrence_count, quotes.len() - expected_first);
             assert_eq!(
                 occurrences,
                 rows[expected_first..]
@@ -2925,14 +2959,14 @@ mod tests {
     }
 
     #[test]
-    fn bounded_completion_decline_singleton_and_overflow_do_no_complete_work() {
+    fn bounded_completion_decline_and_singleton_do_no_complete_work() {
         static SINGLETON: &[(usize, usize)] = &[(1, 1), (5, 1), (1, 1)];
-        static OVERFLOW: &[(usize, usize)] = &[(usize::MAX, 1), (1, 1), (1, 1)];
+        static OVERFLOW_SINGLETON: &[(usize, usize)] = &[(1, 1), (usize::MAX, 1), (1, 1)];
 
         for (mode, capacity) in [
             (BoundedQuoteMode::Declined, 8),
             (BoundedQuoteMode::Quoted(SINGLETON), 1),
-            (BoundedQuoteMode::Quoted(OVERFLOW), usize::MAX),
+            (BoundedQuoteMode::Quoted(OVERFLOW_SINGLETON), 2),
         ] {
             let calls = Arc::new(Mutex::new(BoundedQuoteCalls::default()));
             let probe = BoundedQuoteProbe {
@@ -2951,7 +2985,10 @@ mod tests {
                 route: program.route(request).unwrap(),
                 view: RowsView::new(&vars, &rows),
             };
-            assert!(program.try_complete_bounded(batch, capacity).is_none());
+            let affinity = ProgramCompleteAffinity::new();
+            assert!(program
+                .try_complete_bounded(batch, capacity, &affinity)
+                .is_none());
             let calls = calls.lock().unwrap();
             assert_eq!((calls.quotes, calls.completions), (1, 0));
             assert!(calls.completed_rows.is_empty());
@@ -2984,13 +3021,53 @@ mod tests {
             route,
             view: RowsView::new(&vars, &foreign_rows),
         };
-        let completion = program.try_complete_bounded(original, 2).unwrap();
+        let affinity = ProgramCompleteAffinity::new();
+        let completion = program
+            .try_complete_bounded(original, 2, &affinity)
+            .unwrap();
         let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            completion.into_parts_for(foreign)
+            completion.into_parts_for(foreign, &affinity)
         }));
         assert!(
             panic_text(rejected.expect_err("completion affinity must reject another batch"))
                 .contains("paired with another row batch")
+        );
+    }
+
+    #[test]
+    fn bounded_completion_result_rejects_a_zero_column_foreign_token() {
+        static QUOTES: &[(usize, usize)] = &[(1, 1), (1, 1)];
+        let probe = BoundedQuoteProbe {
+            mode: BoundedQuoteMode::Quoted(QUOTES),
+            calls: Arc::new(Mutex::new(BoundedQuoteCalls::default())),
+        };
+        let program = ProgramRef::new(&probe);
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(1),
+            bound: VariableSet::new_empty(),
+        };
+        let route = program.route(request).unwrap();
+        let original = ProgramCompleteBatch {
+            request,
+            route,
+            view: RowsView::new_with_row_count(&[], &[], 2),
+        };
+        let foreign = ProgramCompleteBatch {
+            request,
+            route,
+            view: RowsView::new_with_row_count(&[], &[], 2),
+        };
+        let original_affinity = ProgramCompleteAffinity::new();
+        let foreign_affinity = ProgramCompleteAffinity::new();
+        let completion = program
+            .try_complete_bounded(original, 2, &original_affinity)
+            .unwrap();
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            completion.into_parts_for(foreign, &foreign_affinity)
+        }));
+        assert!(
+            panic_text(rejected.expect_err("completion affinity must reject another token"))
+                .contains("paired with another transaction")
         );
     }
 
@@ -3612,10 +3689,12 @@ mod tests {
             view: RowsView::new_with_row_count(&[], &[], 2),
         };
         assert_eq!(batch.route.key.arm, ProgramRouteArm::Preferred);
+        let affinity = ProgramCompleteAffinity::new();
         let completion = program
-            .try_complete_bounded(batch, 2)
+            .try_complete_bounded(batch, 2, &affinity)
             .expect("preferred child has an exact two-parent completion");
-        let (first, admission, raw_occurrences, occurrences) = completion.into_parts_for(batch);
+        let (first, admission, raw_occurrences, occurrences) =
+            completion.into_parts_for(batch, &affinity);
         assert_eq!(first, 0);
         assert_eq!(
             admission,

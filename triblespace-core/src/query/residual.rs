@@ -10306,6 +10306,7 @@ impl ResidualStateMachine {
         assert!(rows.row_count > 1, "eager terminal phase requires a cohort");
         let capacity = self.width.max(1);
         let completion = {
+            let affinity = ProgramCompleteAffinity::new();
             let vars: Vec<VariableId> = request.bound.into_iter().collect();
             let batch = ProgramCompleteBatch {
                 request,
@@ -10313,8 +10314,8 @@ impl ResidualStateMachine {
                 view: rows_view(&vars, &rows.rows, rows.row_count),
             };
             program
-                .try_complete_bounded(batch, capacity)
-                .map(|completion| completion.into_parts_for(batch))
+                .try_complete_bounded(batch, capacity, &affinity)
+                .map(|completion| completion.into_parts_for(batch, &affinity))
         };
 
         let Some((first_parent, admission, raw_occurrence_count, occurrences)) = completion else {
@@ -13529,6 +13530,7 @@ mod tests {
                     panic!("declined complete action was executed")
                 }
                 TerminalProgramMode::Panic => {
+                    effects.push(0, raw(1));
                     panic!("intentional complete Program action panic")
                 }
                 TerminalProgramMode::OutOfRange => {
@@ -15495,8 +15497,9 @@ mod tests {
                 route,
                 view: RowsView::new(&vars, &rows),
             };
+            let affinity = ProgramCompleteAffinity::new();
             let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                ProgramRef::new(&malformed).try_complete_bounded(batch, usize::MAX)
+                ProgramRef::new(&malformed).try_complete_bounded(batch, usize::MAX, &affinity)
             }));
 
             assert!(rejected.is_err(), "malformed complete output was accepted");
