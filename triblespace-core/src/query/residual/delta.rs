@@ -6,6 +6,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use ahash::{AHashMap, AHashSet};
 
@@ -18,6 +20,11 @@ use super::set_admit::{SetAdmissionPhaseKind, SetAdmissionState};
 use super::*;
 
 static NEXT_REGISTRY_BRAND: AtomicU64 = AtomicU64::new(1);
+
+fn typed_program_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TRIBLESPACE_TYPED_PROFILE").is_some())
+}
 
 /// Structural constraint occurrence that owns one cyclic expansion kernel.
 /// The exact finite or outer continuation deliberately remains activation
@@ -6441,6 +6448,7 @@ impl DeltaScheduler {
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
     ) -> DeltaPhysicalOutcome {
+        let step_started = Instant::now();
         assert!(!tasks.is_empty());
         assert_eq!(tasks.len(), limits.len());
         assert!(limits.iter().all(|&limit| limit > 0));
@@ -6500,6 +6508,7 @@ impl DeltaScheduler {
             },
             &mut receipt,
         );
+        let adapter_finished = Instant::now();
         drop(candidate_sets);
         assert_eq!(
             receipt.pages.len(),
@@ -6521,6 +6530,20 @@ impl DeltaScheduler {
         );
         let supported_ranges =
             tagged_ranges(&receipt.supported, row_count, "program support observation");
+        let shape_finished = Instant::now();
+        let diagnostic_prepare_ns = receipt.diagnostic_prepare_ns;
+        let diagnostic_family_ns = receipt.diagnostic_family_ns;
+        let diagnostic_validate_ns = receipt.diagnostic_validate_ns;
+        let diagnostic_commit_ns = receipt.diagnostic_commit_ns;
+        let diagnostic_direct = receipt.direct.len();
+        let diagnostic_accepted = receipt.accepted.len();
+        let diagnostic_children = receipt.children.len();
+        let diagnostic_examined = receipt
+            .pages
+            .iter()
+            .map(|page| page.examined)
+            .sum::<usize>();
+        let diagnostic_limits = limits.iter().sum::<usize>();
 
         // Placement is observation only. Static executor labels deliberately
         // stay out of the ordinary hot-path aggregate and never feed dispatch.
@@ -6573,6 +6596,8 @@ impl DeltaScheduler {
         let mut retired_search_receipts = 0usize;
         let mut completed_activations = 0usize;
         let mut terminal_publications = OrderedActivationSet::default();
+        let mut registry_replace_ns = 0u128;
+        let mut settlement_ns = 0u128;
 
         for (
             input,
@@ -6604,6 +6629,7 @@ impl DeltaScheduler {
                 || (!private_direct && !direct_range.is_empty())
                 || !accepted_range.is_empty()
                 || !supported_range.is_empty();
+            let replace_started = Instant::now();
             let outcome = self.registry.replace_program(
                 credit,
                 state,
@@ -6617,6 +6643,8 @@ impl DeltaScheduler {
                 source_telemetry_cohort,
                 page.resume,
             );
+            let replace_finished = Instant::now();
+            registry_replace_ns += replace_finished.duration_since(replace_started).as_nanos();
             if outcome.raw_proposal_occurrences != 0 {
                 assert!(
                     outcome.raw_proposal_occurrences >= outcome.accepted.len(),
@@ -6748,8 +6776,10 @@ impl DeltaScheduler {
             }
             effects.absorb(task_effects);
             debug_assert!(input < row_count);
+            settlement_ns += Instant::now().duration_since(replace_finished).as_nanos();
         }
 
+        let finalize_started = Instant::now();
         let _ = self.file_program_state(state, scheduled);
         if !retired_activations.is_empty() {
             spec.retire_activations(
@@ -6758,6 +6788,16 @@ impl DeltaScheduler {
                     .expect("typed program state lost its runtime during retirement"),
                 address_key,
                 &retired_activations,
+            );
+        }
+        let finalized = Instant::now();
+        if typed_program_profile_enabled() {
+            eprintln!(
+                "TRIBLESPACE_TYPED_PROFILE\taddress={address:?}\trows={row_count}\tlimits={diagnostic_limits}\texamined={diagnostic_examined}\tdirect={diagnostic_direct}\taccepted={diagnostic_accepted}\tchildren={diagnostic_children}\tprepare_ns={diagnostic_prepare_ns}\tfamily_ns={diagnostic_family_ns}\tvalidate_ns={diagnostic_validate_ns}\tcommit_ns={diagnostic_commit_ns}\tadapter_outer_ns={}\tshape_ns={}\treplace_ns={registry_replace_ns}\tsettlement_ns={settlement_ns}\tfinalize_ns={}\ttotal_ns={}",
+                adapter_finished.duration_since(step_started).as_nanos(),
+                shape_finished.duration_since(adapter_finished).as_nanos(),
+                finalized.duration_since(finalize_started).as_nanos(),
+                finalized.duration_since(step_started).as_nanos(),
             );
         }
         stats.delta_source_dead_pages += source_dead_pages;
