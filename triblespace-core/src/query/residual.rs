@@ -13747,13 +13747,9 @@ mod tests {
         fn residual_proposal_source_is_paged(
             &self,
             variable: VariableId,
-            view: &RowsView<'_>,
+            _view: &RowsView<'_>,
         ) -> bool {
-            let paged = variable == self.variable;
-            if paged {
-                self.record_propose(view.len());
-            }
-            paged
+            variable == self.variable
         }
 
         fn residual_proposal_source_has_transition_roots(
@@ -13767,7 +13763,7 @@ mod tests {
         fn residual_delta_source_page(
             &self,
             variable: VariableId,
-            _view: &RowsView<'_>,
+            view: &RowsView<'_>,
             candidates: Option<&[RawInline]>,
             cursor: ResidualDeltaSourceCursor,
             limit: usize,
@@ -13777,6 +13773,7 @@ mod tests {
             assert_eq!(variable, self.variable);
             assert!(candidates.is_none());
             assert!(roots.is_empty());
+            self.record_propose(view.len());
             self.pages.fetch_add(1, Ordering::Relaxed);
             let offset = match cursor {
                 ResidualDeltaSourceCursor::Start => 0,
