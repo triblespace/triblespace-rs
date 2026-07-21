@@ -1538,7 +1538,10 @@ where
             stratum: ProgramStratum::Finite,
             grouping: ProgramGrouping::PageLocal,
             completion: ProgramCompletion::PageableOnly,
-            exposure: ProgramExposure::Production,
+            exposure: match request.action {
+                ProgramAction::Propose(_) | ProgramAction::Support => ProgramExposure::Production,
+                ProgramAction::Confirm(_) => ProgramExposure::Explicit,
+            },
         })
     }
 
@@ -2234,9 +2237,15 @@ mod tests {
         let unary_archive = UnionArchive::new(&unary_segments);
         let unary = unary_archive.pattern(entity, attribute, value);
         let unary_program = unary.residual_program().unwrap();
-        for action in [
-            ProgramAction::Propose(value.index),
-            ProgramAction::Confirm(value.index),
+        for (action, exposure) in [
+            (
+                ProgramAction::Propose(value.index),
+                ProgramExposure::Production,
+            ),
+            (
+                ProgramAction::Confirm(value.index),
+                ProgramExposure::Explicit,
+            ),
         ] {
             assert_eq!(
                 unary_program
@@ -2246,7 +2255,7 @@ mod tests {
                     })
                     .unwrap()
                     .exposure,
-                ProgramExposure::Production,
+                exposure,
                 "UnionArchive route exposure must not depend on shard count"
             );
         }
@@ -2680,7 +2689,7 @@ mod tests {
         assert_eq!(propose.grouping, ProgramGrouping::PageLocal);
         assert_eq!(propose.completion, ProgramCompletion::PageableOnly);
         assert_eq!(propose.exposure, ProgramExposure::Production);
-        assert_eq!(confirm.exposure, ProgramExposure::Production);
+        assert_eq!(confirm.exposure, ProgramExposure::Explicit);
         assert_eq!(support.exposure, ProgramExposure::Production);
         assert!(program
             .route(ProgramRequest {
@@ -2712,7 +2721,7 @@ mod tests {
                 })
                 .unwrap()
                 .exposure,
-            ProgramExposure::Production
+            ProgramExposure::Explicit
         );
 
         let entity_constant: Inline<GenId> = entity_id.to_inline();
