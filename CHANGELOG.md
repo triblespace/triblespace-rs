@@ -19,9 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Confirm, and Support routes participate in ordinary hybrid lowering, keeping
   their typed paging and physical-backend seam available without requiring
   maximally exposed `ResidualLowering::FULL`.
-- **Typed `UnionArchive` paging is production-qualified.** Propose and Confirm
-  now join Support in ordinary hybrid lowering; their route keys, paging
-  contracts, and normalized relational SET semantics are unchanged.
+- **Typed `UnionArchive` Propose and Support are `Production`; Confirm remains
+  `Explicit`.** Ordinary hybrid lowering keeps sparse, geometrically
+  widened paging for low-demand and nonterminal work. A fresh multi-parent
+  terminal Propose cohort may instead use its `CompleteActionEquivalent`
+  certificate, preserving the exact parent-major then shard-major raw
+  occurrence bag before parent-local SET admission.
 - **Specialized `UnionArchiveConstraint`s can now retain per-shard execution
   attachments.** `from_shards` accepts already-constructed Succinct archive
   constraints, validates their exact ordered entity/attribute/value terms, and
@@ -131,11 +134,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Typed `UnionArchive` proposals no longer re-scan every attached shard for
-  every emitted value.** The residual Program now keeps its current shard and
-  that shard's ordered cursor in affine continuation state, draining physical
-  shards in attachment order. Raw cross-shard duplicates remain visible to
-  work telemetry and collapse at the engine's existing parent-local SET
-  boundary. The legacy proposal-page capability retains its globally ordered,
+  every emitted value.** Bounded shard paging and dense complete drains share
+  the same already-located Succinct Ring walk. Sparse continuations keep their
+  current shard and ordered cursor, while raw cross-shard duplicates remain
+  visible to work telemetry until the engine's parent-local SET boundary. The
+  legacy proposal-page capability retains its globally ordered,
   duplicate-free stream.
 
 - **Exact compiled Formula proposals no longer confirm the whole Formula
