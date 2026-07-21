@@ -2021,7 +2021,7 @@ mod tests {
 
         // The public wrapper's preferred family owns the admitted two-bound
         // proposals above. Its structural declines select the canonical
-        // Succinct fallback, whose pageable actions remain explicit.
+        // Succinct fallback, whose pageable actions remain production-qualified.
         let canonical = SuccinctArchiveConstraint::new(
             Variable::<GenId>::new(0),
             Variable::<GenId>::new(1),
@@ -2034,14 +2034,14 @@ mod tests {
                 bound: bound(&[0]),
             })
             .expect("canonical fallback owns insufficiently bound proposal");
-        assert_eq!(canonical_propose.exposure, ProgramExposure::Explicit);
+        assert_eq!(canonical_propose.exposure, ProgramExposure::Production);
         let canonical_confirm = canonical
             .route(ProgramRequest {
                 action: ProgramAction::Confirm(2),
                 bound: bound(&[0, 1]),
             })
             .expect("canonical fallback owns declined confirmation");
-        assert_eq!(canonical_confirm.exposure, ProgramExposure::Explicit);
+        assert_eq!(canonical_confirm.exposure, ProgramExposure::Production);
 
         // Constant entity and attribute: the route needs no bound variables.
         let (_, entities, attributes) = fixture();
