@@ -268,7 +268,7 @@ production-qualified, so their pageable typed form participates in ordinary
 hybrid lowering. Program retirement validates a wider activation receipt with
 one arena membership pass, avoiding the previous activation-count by arena-size
 multiplier while retaining cheap singleton and fully drained paths.
-Multi-shard UnionArchive Propose and Confirm routes remain explicit and require
+UnionArchive Propose and Confirm routes remain explicit and require
 `ProgramScope::All` (provided by `ResidualLowering::FULL`): their ordinary
 normalized kernels already preserve whole-frontier batching. UnionArchive
 Support remains production-qualified. A resident WGPU two-bound proposal is a
