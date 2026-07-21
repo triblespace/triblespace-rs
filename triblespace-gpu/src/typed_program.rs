@@ -63,8 +63,8 @@ use std::env;
 use triblespace_core::inline::RawInline;
 use triblespace_core::query::{
     DispatchClass, ProgramPacing, ProgramPhysicalReceipt, ProgramRequest, ProgramRoute,
-    ProgramSeedBatch, TypedEffectSink, TypedPhysicalStep, TypedProgramBatch, TypedProgramSpec,
-    TypedResume, TypedSeedSink,
+    ProgramSeedBatch, TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedResume,
+    TypedSeedSink,
 };
 use triblespace_core::blob::encodings::succinctarchive::Universe;
 
@@ -575,11 +575,12 @@ impl<'p, 'a, U: Universe> TypedProgramSpec for SuccinctProgramFamily<'p, 'a, U> 
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: &mut Vec<Self::State>,
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
-        let outcome = self.native_outcome(&states, batch.limits);
+        let outcome = self.native_outcome(states, batch.limits);
+        states.clear();
         Self::write_outcome(outcome, effects);
     }
 
@@ -587,14 +588,17 @@ impl<'p, 'a, U: Universe> TypedProgramSpec for SuccinctProgramFamily<'p, 'a, U> 
         &self,
         states: &[Self::State],
         batch: TypedProgramBatch<'_>,
-    ) -> Option<TypedPhysicalStep<Self::State, Self::NoveltyKey>> {
+        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+    ) -> Option<ProgramPhysicalReceipt> {
+        // Decline before mutating the borrowed transaction sink so the
+        // adapter can execute the exact retained states on Native.
         let outcome = self.device_outcome(states, batch.limits)?;
-        let mut step = TypedPhysicalStep::new(ProgramPhysicalReceipt::new(
+        let placement = ProgramPhysicalReceipt::new(
             WGPU_RESIDENT_EXECUTOR,
             TWO_BOUND_BUDGETED_OP,
-        ));
-        Self::write_outcome(outcome, step.effects_mut());
-        Some(step)
+        );
+        Self::write_outcome(outcome, effects);
+        Some(placement)
     }
 }
 
@@ -746,7 +750,10 @@ mod tests {
             .with_admission(BackendAdmissionPolicy::route_from(1));
         let states = ea_states(&family, &program, &entities, attributes[0], 4);
         let limits = vec![8usize; states.len()];
-        assert!(family.try_step_physical(&states, batch(&limits)).is_none());
+        let mut effects = TypedEffectSink::default();
+        assert!(family
+            .try_step_physical(&states, batch(&limits), &mut effects)
+            .is_none());
         assert!(family.device_outcome(&states, &limits).is_none());
     }
 
@@ -865,13 +872,14 @@ mod tests {
         )
         .unwrap();
         let family = SuccinctProgramFamily::native(&program);
-        let states = ea_states(&family, &program, &entities, attributes[0], 6);
+        let mut states = ea_states(&family, &program, &entities, attributes[0], 6);
         let limits = vec![2usize; states.len()];
         let mut effects = TypedEffectSink::default();
-        family.step_typed(states, batch(&limits), &mut effects);
+        family.step_typed(&mut states, batch(&limits), &mut effects);
         // The sink is engine-internal; this covers only that the write path
         // holds the page-count law the adapter asserts first.
         // (Content equivalence is proven against `native_outcome` directly.)
+        assert!(states.is_empty());
     }
 
     #[test]
@@ -1066,7 +1074,10 @@ mod tests {
         assert!(clamped > 0, "the fixture must observe real clamping");
 
         // The physical hook commits the same outcome with a placement.
-        assert!(family.try_step_physical(&states, batch(&limits)).is_some());
+        let mut effects = TypedEffectSink::default();
+        assert!(family
+            .try_step_physical(&states, batch(&limits), &mut effects)
+            .is_some());
         assert_eq!(WGPU_RESIDENT_EXECUTOR, "wgpu-resident");
         assert_eq!(TWO_BOUND_BUDGETED_OP, "two-bound-transition/budgeted");
     }
@@ -1096,7 +1107,10 @@ mod tests {
         let disabled = SuccinctProgramFamily::with_device(&program, &resident)
             .unwrap()
             .with_admission(BackendAdmissionPolicy::disabled());
-        assert!(disabled.try_step_physical(&states, batch(&limits)).is_none());
+        let mut effects = TypedEffectSink::default();
+        assert!(disabled
+            .try_step_physical(&states, batch(&limits), &mut effects)
+            .is_none());
 
         // Below the cohort-size threshold the cohort stays Native.
         let selective = SuccinctProgramFamily::with_device(&program, &resident)

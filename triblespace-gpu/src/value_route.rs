@@ -79,8 +79,8 @@ use triblespace_core::query::{
     ProgramStratum, ProposalCoverage, RawTerm, ResidualDeltaExpandBatch, ResidualDeltaExpandCursor,
     ResidualDeltaExpandPage, ResidualDeltaNode, ResidualDeltaOutput, ResidualDeltaSeed,
     ResidualDeltaSourceBatch, ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, Term,
-    TriblePattern, TypedEffectSink, TypedPhysicalStep, TypedProgramBatch, TypedProgramSpec,
-    TypedResume, TypedSeedSink, VariableId, VariableSet,
+    TriblePattern, TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedResume,
+    TypedSeedSink, VariableId, VariableSet,
 };
 
 use crate::budgeted::CohortGrants;
@@ -1154,11 +1154,12 @@ impl<'a, U: Universe> TypedProgramSpec for SuccinctTwoBoundFamily<'a, U> {
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: &mut Vec<Self::State>,
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
-        let outcome = self.native_outcome(&states, batch.limits);
+        let outcome = self.native_outcome(states, batch.limits);
+        states.clear();
         Self::write_outcome(outcome, effects);
     }
 
@@ -1166,7 +1167,10 @@ impl<'a, U: Universe> TypedProgramSpec for SuccinctTwoBoundFamily<'a, U> {
         &self,
         states: &[Self::State],
         batch: TypedProgramBatch<'_>,
-    ) -> Option<TypedPhysicalStep<Self::State, Self::NoveltyKey>> {
+        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+    ) -> Option<ProgramPhysicalReceipt> {
+        // Decline before mutating the borrowed transaction sink so the
+        // adapter can execute the exact retained states on Native.
         let outcome = self.device_outcome(states, &batch)?;
         let target = states
             .first()
@@ -1178,12 +1182,9 @@ impl<'a, U: Universe> TypedProgramSpec for SuccinctTwoBoundFamily<'a, U> {
             ProgramAxis::Attribute => TWO_BOUND_ATTRIBUTE_ROUTE_OP,
             ProgramAxis::Value => TWO_BOUND_VALUE_ROUTE_OP,
         };
-        let mut step = TypedPhysicalStep::new(ProgramPhysicalReceipt::new(
-            WGPU_RESIDENT_EXECUTOR,
-            operation,
-        ));
-        Self::write_outcome(outcome, step.effects_mut());
-        Some(step)
+        let placement = ProgramPhysicalReceipt::new(WGPU_RESIDENT_EXECUTOR, operation);
+        Self::write_outcome(outcome, effects);
+        Some(placement)
     }
 }
 
@@ -2192,6 +2193,11 @@ mod tests {
             }
             assert_eq!(&consumed, oracle, "input {input}");
         }
+
+        let mut typed_states = states.clone();
+        let mut effects = TypedEffectSink::default();
+        family.step_typed(&mut typed_states, batch(&limits), &mut effects);
+        assert!(typed_states.is_empty());
     }
 
     #[test]
@@ -2244,7 +2250,10 @@ mod tests {
         assert!(off.core.device.is_none(), "Off constructs no device arm");
         let states = ea_states(&off, &entities, attributes[0], 8);
         let limits = vec![8usize; states.len()];
-        assert!(off.try_step_physical(&states, batch(&limits)).is_none());
+        let mut effects = TypedEffectSink::default();
+        assert!(off
+            .try_step_physical(&states, batch(&limits), &mut effects)
+            .is_none());
         assert_eq!(off.counters().physical_cohorts, 0);
         assert_eq!(off.counters().declined_policy, 1);
         assert_eq!(
@@ -2257,7 +2266,7 @@ mod tests {
         // declines by geometry.
         let selective = var_family(&resident, TwoBoundRouteAdmission::WarmM4);
         assert!(selective
-            .try_step_physical(&states, batch(&limits))
+            .try_step_physical(&states, batch(&limits), &mut effects)
             .is_none());
         assert_eq!(selective.counters().declined_policy, 1);
 
@@ -2265,7 +2274,9 @@ mod tests {
         // a busy lane falls through to Native instantly.
         let forced = var_family(&resident, TwoBoundRouteAdmission::Force);
         let guard = resident.program_lease().try_acquire().unwrap();
-        assert!(forced.try_step_physical(&states, batch(&limits)).is_none());
+        assert!(forced
+            .try_step_physical(&states, batch(&limits), &mut effects)
+            .is_none());
         assert_eq!(forced.counters().declined_lease, 1);
 
         // Default-poison: dropping the guard without an explicit commit
@@ -2274,7 +2285,9 @@ mod tests {
         drop(guard);
         assert!(resident.program_lease().is_failed());
         assert!(resident.program_lease().try_acquire().is_none());
-        assert!(forced.try_step_physical(&states, batch(&limits)).is_none());
+        assert!(forced
+            .try_step_physical(&states, batch(&limits), &mut effects)
+            .is_none());
         assert_eq!(forced.counters().declined_lease, 2);
 
         // An explicit preparation against the already-failed lane defaults
@@ -2385,7 +2398,10 @@ mod tests {
         assert_eq!(counters.declined_contract, 0);
 
         // The typed hook commits the same outcome with a placement receipt.
-        assert!(family.try_step_physical(&states, batch(&limits)).is_some());
+        let mut effects = TypedEffectSink::default();
+        assert!(family
+            .try_step_physical(&states, batch(&limits), &mut effects)
+            .is_some());
         assert_eq!(TWO_BOUND_VALUE_ROUTE_OP, "two-bound-transition/value-route");
     }
 

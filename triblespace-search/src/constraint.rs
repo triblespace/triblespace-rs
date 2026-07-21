@@ -265,7 +265,7 @@ where
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: &mut Vec<Self::State>,
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
@@ -794,7 +794,7 @@ impl<I: CosineSimilarity + ?Sized> TypedProgramSpec for CosineAtLeast<'_, I> {
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: &mut Vec<Self::State>,
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
@@ -808,7 +808,7 @@ impl<I: CosineSimilarity + ?Sized> TypedProgramSpec for CosineAtLeast<'_, I> {
         match first {
             CosineAtLeastProgramState::Confirm { variable, .. } => {
                 let variable = *variable;
-                for (input, state) in states.into_iter().enumerate() {
+                for (input, state) in states.drain(..).enumerate() {
                     let CosineAtLeastProgramState::Confirm {
                         variable: state_variable,
                         offset,
@@ -850,7 +850,7 @@ impl<I: CosineSimilarity + ?Sized> TypedProgramSpec for CosineAtLeast<'_, I> {
                 }
             }
             CosineAtLeastProgramState::Support => {
-                for (input, state) in states.into_iter().enumerate() {
+                for (input, state) in states.drain(..).enumerate() {
                     assert_eq!(state, CosineAtLeastProgramState::Support);
                     assert!(
                         batch.candidate_sets[input].is_none(),
@@ -1052,7 +1052,7 @@ impl TypedProgramSpec for SimilarTo {
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: &mut Vec<Self::State>,
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
