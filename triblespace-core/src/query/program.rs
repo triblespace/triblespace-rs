@@ -877,7 +877,13 @@ struct ArenaSlot<T> {
 struct TypedProgramRuntime<State, NoveltyKey> {
     slots: Vec<ArenaSlot<State>>,
     free: Vec<u32>,
+    /// Positive-only count of occupied arena slots owned by each activation.
+    /// Absence therefore certifies that the activation has no live affine
+    /// handle, without scanning the arena high-water mark.
+    live_handles: AHashMap<ProgramActivation, usize>,
     novelty: AHashMap<ProgramActivation, AHashMap<NoveltyKey, Option<RawInline>>>,
+    #[cfg(test)]
+    retirement_owner_checks: usize,
 }
 
 impl<State, NoveltyKey> Default for TypedProgramRuntime<State, NoveltyKey> {
@@ -885,7 +891,10 @@ impl<State, NoveltyKey> Default for TypedProgramRuntime<State, NoveltyKey> {
         Self {
             slots: Vec::new(),
             free: Vec::new(),
+            live_handles: AHashMap::new(),
             novelty: AHashMap::new(),
+            #[cfg(test)]
+            retirement_owner_checks: 0,
         }
     }
 }
@@ -896,7 +905,7 @@ where
     NoveltyKey: Clone + Eq + Hash + Send + 'static,
 {
     fn insert(&mut self, activation: ProgramActivation, state: State) -> ProgramWorkHandle {
-        if let Some(slot) = self.free.pop() {
+        let handle = if let Some(slot) = self.free.pop() {
             let record = &mut self.slots[slot as usize];
             assert!(
                 record.value.is_none(),
@@ -917,7 +926,12 @@ where
                 slot,
                 generation: 0,
             }
-        }
+        };
+        let count = self.live_handles.entry(activation).or_default();
+        *count = count
+            .checked_add(1)
+            .expect("program activation live-handle count overflowed");
+        handle
     }
 
     /// Affinely takes one continuation. A copied or replayed handle is stale.
@@ -939,15 +953,30 @@ where
             owner, activation,
             "program work handle crossed activation ownership"
         );
+        let next_generation = record
+            .generation
+            .checked_add(1)
+            .expect("program work generation exhausted");
         let (_, value) = record
             .value
             .take()
             .expect("validated program work handle disappeared");
-        record.generation = record
-            .generation
-            .checked_add(1)
-            .expect("program work generation exhausted");
+        record.generation = next_generation;
         self.free.push(handle.slot);
+        match self.live_handles.entry(activation) {
+            Entry::Occupied(mut entry) => {
+                let remaining = entry
+                    .get()
+                    .checked_sub(1)
+                    .expect("program activation live-handle count underflowed");
+                if remaining == 0 {
+                    entry.remove();
+                } else {
+                    *entry.get_mut() = remaining;
+                }
+            }
+            Entry::Vacant(_) => panic!("live program handle had no activation count"),
+        }
         value
     }
 
@@ -988,16 +1017,23 @@ where
         }
     }
 
-    fn retire(&mut self, activation: ProgramActivation) {
-        assert!(
-            self.slots.iter().all(|slot| {
-                slot.value
-                    .as_ref()
-                    .is_none_or(|(owner, _)| *owner != activation)
-            }),
-            "program activation retired while a live state handle remained"
-        );
-        self.novelty.remove(&activation);
+    /// Validates the whole retirement set before dropping any novelty state.
+    /// Cost is proportional to the requested activations, independent of the
+    /// arena high-water mark.
+    fn retire_many(&mut self, activations: &[ProgramActivation]) {
+        for activation in activations {
+            #[cfg(test)]
+            {
+                self.retirement_owner_checks += 1;
+            }
+            assert!(
+                !self.live_handles.contains_key(activation),
+                "program activation retired while a live state handle remained"
+            );
+        }
+        for activation in activations {
+            self.novelty.remove(activation);
+        }
     }
 
     #[cfg(test)]
@@ -1005,6 +1041,35 @@ where
         self.slots
             .get(handle.slot as usize)
             .is_some_and(|slot| slot.generation == handle.generation && slot.value.is_some())
+    }
+
+    #[cfg(test)]
+    fn assert_arena_model(&self) {
+        let mut owners = AHashMap::<ProgramActivation, usize>::new();
+        let mut free = vec![false; self.slots.len()];
+        for &slot in &self.free {
+            let entry = free
+                .get_mut(slot as usize)
+                .expect("program free list named an unknown slot");
+            assert!(!*entry, "program free list repeated a slot");
+            *entry = true;
+        }
+        for (index, slot) in self.slots.iter().enumerate() {
+            assert_eq!(
+                slot.value.is_none(),
+                free[index],
+                "program free list disagreed with arena occupancy"
+            );
+            if let Some((activation, _)) = &slot.value {
+                *owners.entry(*activation).or_default() += 1;
+            }
+        }
+        assert!(self.live_handles.values().all(|&count| count > 0));
+        assert_eq!(self.live_handles, owners);
+        assert_eq!(
+            self.live_handles.values().sum::<usize>() + self.free.len(),
+            self.slots.len()
+        );
     }
 }
 
@@ -1639,9 +1704,7 @@ where
             .as_any_mut()
             .downcast_mut::<TypedProgramRuntime<T::State, T::NoveltyKey>>()
             .expect("residual program retirement received another family's runtime");
-        for &activation in activations {
-            runtime.retire(activation);
-        }
+        runtime.retire_many(activations);
     }
 }
 
@@ -2531,12 +2594,113 @@ mod tests {
         let activation = ProgramActivation(1);
         let handle = left.insert(activation, NonComparableState { exact_cursor: 11 });
         let mut right = left.clone();
+        left.assert_arena_model();
+        right.assert_arena_model();
         assert!(left.contains(&handle));
         assert!(right.contains(&handle));
         assert_eq!(left.take(activation, handle.clone()).exact_cursor, 11);
         assert!(!left.contains(&handle));
         assert!(right.contains(&handle));
+        left.retire_many(&[activation]);
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            right.retire_many(&[activation]);
+        }));
+        assert!(rejected.is_err());
+        left.assert_arena_model();
+        right.assert_arena_model();
         assert_eq!(right.take(activation, handle).exact_cursor, 11);
+        right.retire_many(&[activation]);
+        right.assert_arena_model();
+    }
+
+    #[test]
+    fn retirement_rejects_a_live_owner_before_dropping_any_novelty() {
+        let mut runtime = TypedProgramRuntime::<NonComparableState, Key>::default();
+        let drained = ProgramActivation(1);
+        let live = ProgramActivation(2);
+        assert!(runtime.admit(drained, Key(1), None));
+        assert!(runtime.admit(live, Key(1), None));
+        let drained_handle = runtime.insert(drained, NonComparableState { exact_cursor: 1 });
+        let live_handle = runtime.insert(live, NonComparableState { exact_cursor: 2 });
+        assert_eq!(runtime.take(drained, drained_handle).exact_cursor, 1);
+        runtime.assert_arena_model();
+
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.retire_many(&[drained, live]);
+        }));
+        assert!(rejected.is_err());
+        assert!(runtime.novelty.contains_key(&drained));
+        assert!(runtime.novelty.contains_key(&live));
+        assert_eq!(runtime.live_handles.get(&live), Some(&1));
+        runtime.assert_arena_model();
+
+        assert_eq!(runtime.take(live, live_handle).exact_cursor, 2);
+        runtime.retire_many(&[drained, live]);
+        assert!(!runtime.novelty.contains_key(&drained));
+        assert!(!runtime.novelty.contains_key(&live));
+        runtime.assert_arena_model();
+    }
+
+    #[test]
+    fn retirement_cost_tracks_the_requested_cohort_not_arena_high_water() {
+        const HIGH_WATER: usize = 4_096;
+        const RETIREMENTS: usize = 1_024;
+
+        let mut runtime = TypedProgramRuntime::<NonComparableState, Key>::default();
+        let high_water_owner = ProgramActivation(1);
+        let handles: Vec<_> = (0..HIGH_WATER)
+            .map(|exact_cursor| {
+                runtime.insert(high_water_owner, NonComparableState { exact_cursor })
+            })
+            .collect();
+        for handle in handles {
+            let _ = runtime.take(high_water_owner, handle);
+        }
+        runtime.retire_many(&[high_water_owner]);
+        runtime.retirement_owner_checks = 0;
+        assert_eq!(runtime.slots.len(), HIGH_WATER);
+        assert_eq!(runtime.free.len(), HIGH_WATER);
+        runtime.assert_arena_model();
+
+        for index in 0..RETIREMENTS {
+            let activation = ProgramActivation(10 + index as u64);
+            assert!(runtime.admit(activation, Key(0), None));
+            runtime.retire_many(&[activation]);
+        }
+
+        assert_eq!(runtime.retirement_owner_checks, RETIREMENTS);
+        assert_eq!(runtime.slots.len(), HIGH_WATER);
+        assert_eq!(runtime.free.len(), HIGH_WATER);
+        runtime.assert_arena_model();
+    }
+
+    #[test]
+    fn wide_retirement_checks_each_activation_once() {
+        const WIDTH: usize = 65_536;
+
+        let mut runtime = TypedProgramRuntime::<NonComparableState, Key>::default();
+        let activations: Vec<_> = (0..WIDTH)
+            .map(|index| ProgramActivation(index as u64))
+            .collect();
+        for (index, &activation) in activations.iter().enumerate() {
+            assert!(runtime.admit(activation, Key(0), None));
+            let handle = runtime.insert(
+                activation,
+                NonComparableState {
+                    exact_cursor: index,
+                },
+            );
+            assert_eq!(runtime.take(activation, handle).exact_cursor, index);
+        }
+        runtime.assert_arena_model();
+        runtime.retirement_owner_checks = 0;
+
+        runtime.retire_many(&activations);
+
+        assert_eq!(runtime.retirement_owner_checks, WIDTH);
+        assert!(runtime.live_handles.is_empty());
+        assert!(runtime.novelty.is_empty());
+        runtime.assert_arena_model();
     }
 
     fn step_physical_probe(spec: &PhysicalProbe, limits: &[usize]) -> ProgramBatchEffects {
