@@ -1538,10 +1538,7 @@ where
             stratum: ProgramStratum::Finite,
             grouping: ProgramGrouping::PageLocal,
             completion: ProgramCompletion::PageableOnly,
-            exposure: match request.action {
-                ProgramAction::Propose(_) | ProgramAction::Confirm(_) => ProgramExposure::Explicit,
-                ProgramAction::Support => ProgramExposure::Production,
-            },
+            exposure: ProgramExposure::Production,
         })
     }
 
@@ -2236,6 +2233,23 @@ mod tests {
         let value = Variable::<UnknownInline>::new(0);
         let unary_archive = UnionArchive::new(&unary_segments);
         let unary = unary_archive.pattern(entity, attribute, value);
+        let unary_program = unary.residual_program().unwrap();
+        for action in [
+            ProgramAction::Propose(value.index),
+            ProgramAction::Confirm(value.index),
+        ] {
+            assert_eq!(
+                unary_program
+                    .route(ProgramRequest {
+                        action,
+                        bound: VariableSet::new_empty(),
+                    })
+                    .unwrap()
+                    .exposure,
+                ProgramExposure::Production,
+                "UnionArchive route exposure must not depend on shard count"
+            );
+        }
         let classes = unary
             .action_unit_classes(value.index, VariableSet::new_empty())
             .expect("a unary single-position archive union inherits exact leaf costs");
@@ -2538,7 +2552,7 @@ mod tests {
         let query = Query::new(root, project_first);
         if residual {
             query
-                .solve_residual_state_lazy_with(ResidualLowering::FULL)
+                .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
                 .collect()
         } else {
             query.sequential().collect()
@@ -2665,8 +2679,8 @@ mod tests {
         assert_eq!(propose.stratum, ProgramStratum::Finite);
         assert_eq!(propose.grouping, ProgramGrouping::PageLocal);
         assert_eq!(propose.completion, ProgramCompletion::PageableOnly);
-        assert_eq!(propose.exposure, ProgramExposure::Explicit);
-        assert_eq!(confirm.exposure, ProgramExposure::Explicit);
+        assert_eq!(propose.exposure, ProgramExposure::Production);
+        assert_eq!(confirm.exposure, ProgramExposure::Production);
         assert_eq!(support.exposure, ProgramExposure::Production);
         assert!(program
             .route(ProgramRequest {
@@ -2690,12 +2704,16 @@ mod tests {
                 bound: empty,
             })
             .is_none());
-        assert!(repeated_program
-            .route(ProgramRequest {
-                action: ProgramAction::Confirm(entity.index),
-                bound: empty,
-            })
-            .is_some());
+        assert_eq!(
+            repeated_program
+                .route(ProgramRequest {
+                    action: ProgramAction::Confirm(entity.index),
+                    bound: empty,
+                })
+                .unwrap()
+                .exposure,
+            ProgramExposure::Production
+        );
 
         let entity_constant: Inline<GenId> = entity_id.to_inline();
         let constant = union_archive.pattern(
@@ -2781,7 +2799,7 @@ mod tests {
         assert_eq!(wide_examined, [4, 2]);
 
         let mut admitted: Vec<_> = Query::new(constraint, project_first)
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
             .collect();
         admitted.sort_unstable();
         assert_eq!(admitted, (1..=5).map(raw_value).collect::<Vec<_>>());

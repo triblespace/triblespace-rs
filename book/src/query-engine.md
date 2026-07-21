@@ -268,13 +268,12 @@ production-qualified, so their pageable typed form participates in ordinary
 hybrid lowering. Program retirement validates a wider activation receipt with
 one arena membership pass, avoiding the previous activation-count by arena-size
 multiplier while retaining cheap singleton and fully drained paths.
-UnionArchive Propose and Confirm routes remain explicit and require
-`ProgramScope::All` (provided by `ResidualLowering::FULL`): their ordinary
-normalized kernels already preserve whole-frontier batching. UnionArchive
-Support remains production-qualified. A resident WGPU two-bound proposal is a
-distinct preferred production family; a structurally declined action falls
-back to the canonical production Succinct route. The explicit lazy DAG remains
-the comparison path.
+UnionArchive Propose, Confirm, and Support routes are production-qualified, so
+their typed shard paging participates in ordinary hybrid lowering independent
+of physical shard count. A resident WGPU two-bound proposal is a distinct
+preferred production family; a structurally declined action falls back to the
+canonical production Succinct route. The explicit lazy DAG remains the
+comparison path.
 
 [`Query::residual_state_scheduler`](triblespace::core::query::Query::residual_state_scheduler)
 selects the residual cursor for any root while preserving the query's chosen
