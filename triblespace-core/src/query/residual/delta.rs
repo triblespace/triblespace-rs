@@ -156,7 +156,7 @@ impl ProgramAddress {
 #[derive(Clone)]
 struct ConfirmFinalizerState {
     original: DeferredCandidateCursor,
-    accepted: Arc<AHashSet<RawInline>>,
+    accepted: Arc<ActivationAcceptedSet>,
 }
 
 struct ConfirmFinalizerProgram;
@@ -799,6 +799,77 @@ struct ProgramJoinCompletion {
     dead_source_telemetry_pages: usize,
 }
 
+/// Activation-local SET admission optimized for ordered proposal streams.
+///
+/// Succinct sources commonly report strictly ascending raw values. Keeping
+/// that prefix ordered avoids allocating and probing a hash table for every
+/// accepted proposal. The first duplicate or inversion proves that append-only
+/// admission is no longer sufficient, so the complete prefix is upgraded once
+/// to the general hash representation. The representation never downgrades.
+#[derive(Clone)]
+enum ActivationAcceptedSet {
+    Ordered(SmallVec<[RawInline; 1]>),
+    Hashed(AHashSet<RawInline>),
+}
+
+impl Default for ActivationAcceptedSet {
+    fn default() -> Self {
+        Self::Ordered(SmallVec::new())
+    }
+}
+
+impl ActivationAcceptedSet {
+    fn insert(&mut self, value: RawInline) -> bool {
+        match self {
+            Self::Ordered(values) if values.last().is_none_or(|previous| *previous < value) => {
+                values.push(value);
+                true
+            }
+            Self::Ordered(ordered) => {
+                let mut hashed = AHashSet::with_capacity(ordered.len() + 1);
+                hashed.extend(ordered.iter().copied());
+                let inserted = hashed.insert(value);
+                *self = Self::Hashed(hashed);
+                inserted
+            }
+            Self::Hashed(values) => values.insert(value),
+        }
+    }
+
+    fn contains(&self, value: &RawInline) -> bool {
+        match self {
+            Self::Ordered(values) => values.binary_search(value).is_ok(),
+            Self::Hashed(values) => values.contains(value),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Ordered(values) => values.is_empty(),
+            Self::Hashed(values) => values.is_empty(),
+        }
+    }
+
+    #[cfg(test)]
+    fn is_ordered(&self) -> bool {
+        matches!(self, Self::Ordered(_))
+    }
+
+    #[cfg(test)]
+    fn is_hashed(&self) -> bool {
+        matches!(self, Self::Hashed(_))
+    }
+
+    #[cfg(test)]
+    fn heap_capacity(&self) -> usize {
+        match self {
+            Self::Ordered(values) if values.spilled() => values.capacity(),
+            Self::Ordered(_) => 0,
+            Self::Hashed(values) => values.capacity(),
+        }
+    }
+}
+
 /// One affine parent reducer scope. Several speculative source roots may own
 /// live credits inside it; they share novelty and Accepted, while source stays
 /// in each node so their product states cannot suppress one another.
@@ -820,7 +891,7 @@ struct Activation {
     suspended_source_page: Option<SuspendedSourcePage>,
     program_joins: AHashMap<ProgramJoinId, ProgramJoin>,
     seen: AHashMap<ResidualDeltaNode, bool>,
-    accepted: AHashSet<RawInline>,
+    accepted: ActivationAcceptedSet,
     /// The complete affine producer ledger for this activation. Presence
     /// proves that the nonce is live; the value distinguishes generator and
     /// traversal replacement authority without a second global owner map.
@@ -1106,7 +1177,7 @@ impl ProducerRegistry {
             "activation",
         ));
         let mut live = AHashMap::new();
-        let mut accepted = AHashSet::new();
+        let mut accepted = ActivationAcceptedSet::default();
         let mut initial_accepted = Vec::new();
         let mut roots = Vec::with_capacity(seeds.size_hint().0);
         for seed in seeds {
@@ -1214,7 +1285,7 @@ impl ProducerRegistry {
                         suspended_source_page: None,
                         program_joins: AHashMap::new(),
                         seen: AHashMap::new(),
-                        accepted: AHashSet::new(),
+                        accepted: ActivationAcceptedSet::default(),
                         live: AHashMap::new(),
                         status: ActivationStatus::Open,
                     },
@@ -1255,7 +1326,7 @@ impl ProducerRegistry {
                         suspended_source_page: None,
                         program_joins: AHashMap::new(),
                         seen: AHashMap::new(),
-                        accepted: AHashSet::new(),
+                        accepted: ActivationAcceptedSet::default(),
                         live: AHashMap::new(),
                         status: ActivationStatus::Open,
                     },
@@ -2507,7 +2578,7 @@ impl ProducerRegistry {
                     };
                     let state = ProposalMaterializerState::start(occurrences)
                         .expect("nonempty proposal failed to open its materializer");
-                    activation.accepted = AHashSet::new();
+                    activation.accepted = ActivationAcceptedSet::default();
                     activation.seen = AHashMap::new();
                     activation.program_joins = AHashMap::new();
                     activation.source_candidates = None;
@@ -7714,6 +7785,95 @@ mod tests {
         [byte; 32]
     }
 
+    #[test]
+    fn activation_accepted_set_keeps_strictly_ascending_values_ordered() {
+        let mut accepted = ActivationAcceptedSet::default();
+        for byte in [1, 2, 3, 4] {
+            assert!(accepted.insert(value(byte)));
+        }
+
+        assert!(accepted.is_ordered());
+        assert!(!accepted.is_hashed());
+        assert!(accepted.contains(&value(1)));
+        assert!(accepted.contains(&value(4)));
+        assert!(!accepted.contains(&value(5)));
+        let ActivationAcceptedSet::Ordered(values) = accepted else {
+            unreachable!("strictly ascending admission upgraded unexpectedly")
+        };
+        assert_eq!(values.as_slice(), &[value(1), value(2), value(3), value(4)]);
+    }
+
+    #[test]
+    fn activation_accepted_set_duplicate_upgrades_once_and_rejects_duplicate() {
+        let mut accepted = ActivationAcceptedSet::default();
+        assert!(accepted.insert(value(1)));
+        assert!(!accepted.insert(value(1)));
+        assert!(accepted.is_hashed());
+
+        assert!(accepted.insert(value(2)));
+        assert!(!accepted.insert(value(2)));
+        assert!(accepted.is_hashed());
+        assert!(accepted.contains(&value(1)));
+        assert!(accepted.contains(&value(2)));
+    }
+
+    #[test]
+    fn activation_accepted_set_inversion_upgrades_without_losing_values() {
+        let mut accepted = ActivationAcceptedSet::default();
+        assert!(accepted.insert(value(3)));
+        assert!(accepted.insert(value(1)));
+        assert!(accepted.is_hashed());
+
+        assert!(accepted.insert(value(2)));
+        assert!(!accepted.insert(value(3)));
+        assert!(accepted.is_hashed());
+        for byte in [1, 2, 3] {
+            assert!(accepted.contains(&value(byte)));
+        }
+    }
+
+    #[test]
+    fn confirm_finalizer_handoff_preserves_ordered_accepted_membership() {
+        let original = shared_one_parent_candidates(vec![value(3), value(2), value(1), value(3)]);
+        let mut registry = ProducerRegistry::new();
+        let started = registry.start_many(
+            DeltaReducer::Confirm { original },
+            candidate_return(Vec::new()),
+            [output(1, 0, true), output(3, 0, true)],
+        );
+        let activation = started.activation;
+        let mut proof = None;
+        for (_, credit) in started.roots {
+            if let Some(quiescence) = registry.replace_traversal(credit, []).quiescence {
+                assert!(proof.replace(quiescence).is_none());
+            }
+        }
+
+        let RegistrySettlement::ConfirmFinalizer(seed) =
+            registry.settle_quiescence(proof.expect("Confirm graph quiesced"))
+        else {
+            panic!("nonempty Confirm did not open its finalizer")
+        };
+        assert!(seed.state.accepted.is_ordered());
+        let finalizing = registry
+            .state
+            .activations
+            .get(&activation)
+            .expect("Confirm finalizer retained its activation");
+        assert!(finalizing.accepted.is_empty());
+        assert_eq!(finalizing.accepted.heap_capacity(), 0);
+
+        let mut state = seed.state;
+        let mut retained = Vec::new();
+        while let Some((parent, candidate)) = state.original.next() {
+            assert_eq!(parent, 0);
+            if state.accepted.contains(&candidate) {
+                retained.push(candidate);
+            }
+        }
+        assert_eq!(retained, [value(3), value(1), value(3)]);
+    }
+
     fn output(byte: u8, continuation: u32, accepted: bool) -> ResidualDeltaOutput {
         ResidualDeltaOutput {
             node: ResidualDeltaNode {
@@ -10414,7 +10574,7 @@ mod tests {
             assert_eq!(finalizing.program_joins.capacity(), 0);
             assert!(finalizing.source_candidates.is_none());
             assert!(finalizing.accepted.is_empty());
-            assert_eq!(finalizing.accepted.capacity(), 0);
+            assert_eq!(finalizing.accepted.heap_capacity(), 0);
             assert_eq!(
                 finalizing.live.values().copied().collect::<Vec<_>>(),
                 [CreditKind::Program { join: None }]
