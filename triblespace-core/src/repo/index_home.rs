@@ -29,11 +29,11 @@ use crate::prelude::{attributes, entity, pattern};
 use crate::query::unionconstraint::UnionConstraint;
 use crate::query::{
     ActionUnitClasses, CandidateSink, Candidates, Constraint, DispatchClass, EstimateSink,
-    ProgramAction, ProgramCompletion, ProgramExposure, ProgramGrouping, ProgramKey, ProgramPacing,
-    ProgramRef, ProgramRequest, ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage,
-    RawTerm, ResidualDeltaOutput, ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView,
-    Term, TriblePattern, TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedResume,
-    TypedSeedSink, VariableId, VariableSet,
+    ProgramAction, ProgramCompleteBatch, ProgramCompletion, ProgramExposure, ProgramGrouping,
+    ProgramKey, ProgramPacing, ProgramRef, ProgramRequest, ProgramRoute, ProgramSeedBatch,
+    ProgramStratum, ProposalCoverage, RawTerm, ResidualDeltaOutput, ResidualDeltaSourceCursor,
+    ResidualDeltaSourcePage, RowsView, Term, TriblePattern, TypedCompleteSink, TypedEffectSink,
+    TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink, VariableId, VariableSet,
 };
 use crate::repo::index_range::{
     convex_union, is_ancestor, validate_exact_frontier_cover, RangeRecord, RangeRecordError,
@@ -1537,7 +1537,11 @@ where
             variable,
             stratum: ProgramStratum::Finite,
             grouping: ProgramGrouping::PageLocal,
-            completion: ProgramCompletion::PageableOnly,
+            completion: if matches!(request.action, ProgramAction::Propose(_)) {
+                ProgramCompletion::CompleteActionEquivalent
+            } else {
+                ProgramCompletion::PageableOnly
+            },
             exposure: match request.action {
                 ProgramAction::Propose(_) | ProgramAction::Support => ProgramExposure::Production,
                 ProgramAction::Confirm(_) => ProgramExposure::Explicit,
@@ -1555,6 +1559,48 @@ where
 
     fn pacing(&self, _state: &Self::State) -> ProgramPacing {
         ProgramPacing::Search
+    }
+
+    fn complete_typed(&self, batch: ProgramCompleteBatch<'_>, effects: &mut TypedCompleteSink) {
+        let ProgramAction::Propose(variable) = batch.request.action else {
+            panic!("UnionArchive complete actions support only proposals")
+        };
+        assert_eq!(variable, batch.route.variable);
+
+        // The typed pageable route drains one parent at a time and, within
+        // each parent, one physical shard at a time. Preserve that exact raw
+        // occurrence bag here: ordinary `UnionConstraint::propose` would sort
+        // and deduplicate overlapping shard values before the complete-action
+        // adapter gets to account for and SET-admit them.
+        let mut shard_occurrences = Vec::with_capacity(self.shards.len());
+        for shard in &self.shards {
+            let mut occurrences = Candidates::new();
+            Constraint::propose(
+                shard,
+                variable,
+                &batch.view,
+                &mut CandidateSink::Tagged(&mut occurrences),
+            );
+            shard_occurrences.push(occurrences);
+        }
+        let mut shard_offsets = vec![0usize; shard_occurrences.len()];
+        for parent in 0..batch.view.len() {
+            let parent = u32::try_from(parent)
+                .expect("too many UnionArchive complete-action parents");
+            for (occurrences, offset) in shard_occurrences.iter().zip(&mut shard_offsets) {
+                while let Some(&(tag, value)) = occurrences.get(*offset) {
+                    if tag != parent {
+                        break;
+                    }
+                    effects.push(parent, value);
+                    *offset += 1;
+                }
+            }
+        }
+        debug_assert!(shard_occurrences
+            .iter()
+            .zip(shard_offsets)
+            .all(|(occurrences, offset)| offset == occurrences.len()));
     }
 
     fn progress(&self, state: &Self::State) -> Self::Rank {
@@ -1609,7 +1655,14 @@ where
     ) {
         assert_eq!(batch.route.stratum, ProgramStratum::Finite);
         assert_eq!(batch.route.grouping, ProgramGrouping::PageLocal);
-        assert_eq!(batch.route.completion, ProgramCompletion::PageableOnly);
+        assert_eq!(
+            batch.route.completion,
+            if matches!(batch.request.action, ProgramAction::Propose(_)) {
+                ProgramCompletion::CompleteActionEquivalent
+            } else {
+                ProgramCompletion::PageableOnly
+            }
+        );
         let state = match batch.request.action {
             ProgramAction::Propose(variable) => {
                 assert_eq!(batch.route.variable, variable);
@@ -2687,7 +2740,10 @@ mod tests {
         assert_eq!(propose.key, irrelevant.key);
         assert_eq!(propose.stratum, ProgramStratum::Finite);
         assert_eq!(propose.grouping, ProgramGrouping::PageLocal);
-        assert_eq!(propose.completion, ProgramCompletion::PageableOnly);
+        assert_eq!(
+            propose.completion,
+            ProgramCompletion::CompleteActionEquivalent
+        );
         assert_eq!(propose.exposure, ProgramExposure::Production);
         assert_eq!(confirm.exposure, ProgramExposure::Explicit);
         assert_eq!(support.exposure, ProgramExposure::Production);
@@ -2812,6 +2868,54 @@ mod tests {
             .collect();
         admitted.sort_unstable();
         assert_eq!(admitted, (1..=5).map(raw_value).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn union_archive_complete_proposal_preserves_pageable_raw_shard_bag() {
+        let entity = Id::new([0x3a; 16]).unwrap();
+        let attribute = Id::new([0x4a; 16]).unwrap();
+        let archives = [
+            fixed_archive(&entity, &attribute, [1, 3]),
+            fixed_archive(&entity, &attribute, [2, 3]),
+        ];
+        let union_archive = UnionArchive::new(&archives);
+        let value = Variable::<UnknownInline>::new(0);
+        let entity: Inline<GenId> = entity.to_inline();
+        let attribute: Inline<GenId> = attribute.to_inline();
+        let constraint = union_archive.pattern(entity, attribute, value);
+        let view = RowsView::new_with_row_count(&[], &[], 2);
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(value.index),
+            bound: VariableSet::new_empty(),
+        };
+        let program = constraint.residual_program().unwrap();
+        let route = program.route(request).unwrap();
+        let mut complete = crate::query::ProgramCompleteEffects::default();
+
+        program.complete_batch(
+            ProgramCompleteBatch {
+                request,
+                route,
+                view,
+            },
+            &mut complete,
+        );
+
+        // Each pageable parent drains [1, 3] from shard zero and [2, 3]
+        // from shard one. The adapter accounts for all eight raw occurrences,
+        // then SET-admits the overlapping 3 once per parent without sorting.
+        assert_eq!(complete.raw_occurrence_count, 8);
+        assert_eq!(
+            complete.occurrences,
+            [
+                (0, raw_value(1)),
+                (0, raw_value(3)),
+                (0, raw_value(2)),
+                (1, raw_value(1)),
+                (1, raw_value(3)),
+                (1, raw_value(2)),
+            ]
+        );
     }
 
     #[test]
