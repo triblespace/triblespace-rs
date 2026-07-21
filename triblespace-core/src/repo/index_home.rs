@@ -1660,6 +1660,9 @@ where
         match first {
             UnionArchiveProgramState::Propose { variable, .. } => {
                 let variable = *variable;
+                // Every input is drained before the next one, so retain the
+                // largest cross-shard page allocation for this dense cohort.
+                let mut direct = Vec::new();
                 for (input, state) in states.into_iter().enumerate() {
                     let UnionArchiveProgramState::Propose {
                         variable: state_variable,
@@ -1680,7 +1683,7 @@ where
                     );
                     let view = batch.view.row_view(input);
                     let limit = batch.limits[input];
-                    let mut direct = Vec::new();
+                    direct.clear();
                     let mut examined = 0usize;
                     while examined < limit && shard_index < self.shards.len() {
                         let accepted_base = direct.len();
@@ -1712,7 +1715,7 @@ where
                     }
                     let input = u32::try_from(input)
                         .expect("too many typed UnionArchive inputs in one cohort");
-                    for value in direct {
+                    for value in direct.drain(..) {
                         effects.direct(input, value);
                     }
                     let resume = (shard_index < self.shards.len()).then_some(
@@ -2785,6 +2788,53 @@ mod tests {
             .collect();
         admitted.sort_unstable();
         assert_eq!(admitted, (1..=5).map(raw_value).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn union_archive_proposal_cohort_keeps_direct_pages_input_local() {
+        let entity_one = Id::new([0x39; 16]).unwrap();
+        let entity_two = Id::new([0x3a; 16]).unwrap();
+        let entity_dead = Id::new([0x3b; 16]).unwrap();
+        let attribute = Id::new([0x49; 16]).unwrap();
+        let archives = [
+            fixed_archive(&entity_one, &attribute, [1, 3]),
+            fixed_archive(&entity_two, &attribute, [2]),
+        ];
+        let union_archive = UnionArchive::new(&archives);
+        let entity = Variable::<GenId>::new(0);
+        let value = Variable::<UnknownInline>::new(1);
+        let attribute: Inline<GenId> = attribute.to_inline();
+        let constraint = union_archive.pattern(entity, attribute, value);
+        let vars = [entity.index];
+        let entity_one: Inline<GenId> = entity_one.to_inline();
+        let entity_two: Inline<GenId> = entity_two.to_inline();
+        let entity_dead: Inline<GenId> = entity_dead.to_inline();
+        let rows = [entity_one.raw, entity_two.raw, entity_dead.raw];
+        let candidate_sets = [None, None, None];
+        let effects = one_union_program_step(
+            &constraint,
+            ProgramRequest {
+                action: ProgramAction::Propose(value.index),
+                bound: VariableSet::new_singleton(entity.index),
+            },
+            RowsView::new(&vars, &rows),
+            &candidate_sets,
+            &[usize::MAX; 3],
+        );
+
+        assert_eq!(
+            effects.direct,
+            [(0, raw_value(1)), (0, raw_value(3)), (1, raw_value(2))]
+        );
+        assert_eq!(
+            effects
+                .pages
+                .iter()
+                .map(|page| page.examined)
+                .collect::<Vec<_>>(),
+            [2, 1, 0]
+        );
+        assert!(effects.pages.iter().all(|page| page.resume.is_none()));
     }
 
     #[test]

@@ -1297,6 +1297,9 @@ where
             SuccinctArchiveProgramState::Propose { variable, .. } => {
                 let variable = *variable;
                 let positions = self.positions(variable, &batch.view);
+                // Every input is drained before the next one, so retain the
+                // largest page allocation for the rest of this dense cohort.
+                let mut direct = Vec::new();
                 for (input, state) in states.into_iter().enumerate() {
                     let SuccinctArchiveProgramState::Propose {
                         variable: state_variable,
@@ -1310,7 +1313,7 @@ where
                         batch.candidate_sets[input].is_none(),
                         "typed SuccinctArchive proposal received a candidate group"
                     );
-                    let mut direct = Vec::new();
+                    direct.clear();
                     let page = self.proposal_source_page_row(
                         &positions,
                         batch.view.row(input),
@@ -1320,7 +1323,7 @@ where
                     );
                     let input = u32::try_from(input)
                         .expect("too many typed SuccinctArchive inputs in one cohort");
-                    for value in direct {
+                    for value in direct.drain(..) {
                         effects.direct(input, value);
                     }
                     assert!(
@@ -2296,6 +2299,57 @@ mod typed_program_tests {
         );
         assert_eq!(values, vec![id_value(1), id_value(4)]);
         assert_eq!(examined, vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn typed_proposal_cohort_keeps_direct_pages_input_local() {
+        let set: TribleSet = [
+            trible(1, 11, inline_value(21)),
+            trible(1, 11, inline_value(22)),
+            trible(2, 11, inline_value(23)),
+        ]
+        .into_iter()
+        .collect();
+        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+        let entity = Variable::<GenId>::new(0);
+        let value = Variable::<UnknownInline>::new(1);
+        let constraint = SuccinctArchiveConstraint::new(
+            entity,
+            Inline::<GenId>::new(id_value(11)),
+            value,
+            &archive,
+        );
+        let vars = [entity.index];
+        let rows = [id_value(1), id_value(2), id_value(3)];
+        let candidate_sets = [None, None, None];
+        let effects = one_program_step(
+            &constraint,
+            ProgramRequest {
+                action: ProgramAction::Propose(value.index),
+                bound: VariableSet::new_singleton(entity.index),
+            },
+            RowsView::new(&vars, &rows),
+            &candidate_sets,
+            &[usize::MAX; 3],
+        );
+
+        assert_eq!(
+            effects.direct,
+            [
+                (0, inline_value(21)),
+                (0, inline_value(22)),
+                (1, inline_value(23)),
+            ]
+        );
+        assert_eq!(
+            effects
+                .pages
+                .iter()
+                .map(|page| page.examined)
+                .collect::<Vec<_>>(),
+            [2, 1, 0]
+        );
+        assert!(effects.pages.iter().all(|page| page.resume.is_none()));
     }
 
     #[test]
