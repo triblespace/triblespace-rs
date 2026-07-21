@@ -803,6 +803,22 @@ pub struct ProgramBatchEffects {
     pub placement: Option<ProgramPhysicalReceipt>,
 }
 
+impl ProgramBatchEffects {
+    pub(crate) fn clear(&mut self) {
+        self.pages.clear();
+        self.children.clear();
+        self.direct.clear();
+        self.accepted.clear();
+        self.supported.clear();
+        self.source_pages = 0;
+        self.source_examined = 0;
+        self.source_roots = 0;
+        self.transition_pages = 0;
+        self.transition_examined = 0;
+        self.placement = None;
+    }
+}
+
 struct TypedSeedWork<State, NoveltyKey> {
     parent: u32,
     state: State,
@@ -916,6 +932,19 @@ impl<State, NoveltyKey> Default for TypedEffectSink<State, NoveltyKey> {
 }
 
 impl<State, NoveltyKey> TypedEffectSink<State, NoveltyKey> {
+    fn clear(&mut self) {
+        self.pages.clear();
+        self.children.clear();
+        self.direct.clear();
+        self.accepted.clear();
+        self.supported.clear();
+        self.source_pages = 0;
+        self.source_examined = 0;
+        self.source_roots = 0;
+        self.transition_pages = 0;
+        self.transition_examined = 0;
+    }
+
     /// Reserves family-known child capacity without exposing the private
     /// effect representation or committing any receipt prefix.
     pub fn reserve_children(&mut self, additional: usize) {
@@ -976,35 +1005,6 @@ impl<State, NoveltyKey> TypedEffectSink<State, NoveltyKey> {
     }
 }
 
-/// Complete, still-uncommitted result of an optional physical Program step.
-///
-/// The owning family builds effects in this private transaction. Only after
-/// this value is returned does the erased adapter apply the same page, budget,
-/// rank, tag, novelty, and affine-handle checks as Native execution.
-#[doc(hidden)]
-#[must_use]
-pub struct TypedPhysicalStep<State, NoveltyKey> {
-    effects: TypedEffectSink<State, NoveltyKey>,
-    placement: ProgramPhysicalReceipt,
-}
-
-impl<State, NoveltyKey> TypedPhysicalStep<State, NoveltyKey> {
-    pub fn new(placement: ProgramPhysicalReceipt) -> Self {
-        Self {
-            effects: TypedEffectSink::default(),
-            placement,
-        }
-    }
-
-    pub fn effects_mut(&mut self) -> &mut TypedEffectSink<State, NoveltyKey> {
-        &mut self.effects
-    }
-
-    fn into_parts(self) -> (TypedEffectSink<State, NoveltyKey>, ProgramPhysicalReceipt) {
-        (self.effects, self.placement)
-    }
-}
-
 /// Family-typed residual program contract.
 ///
 /// Program code can emit only typed states and novelty keys. It cannot create
@@ -1019,7 +1019,7 @@ pub trait TypedProgramSpec {
     /// Every resume and every child without a novelty key must strictly
     /// decrease this rank. Novelty-admitted fixpoint roots and children may
     /// enter at any rank, but their later finite pagination must decrease.
-    type Rank: Ord;
+    type Rank: Ord + Send + 'static;
 
     /// Selects one structural action route.
     ///
@@ -1049,7 +1049,7 @@ pub trait TypedProgramSpec {
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: &mut Vec<Self::State>,
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     );
@@ -1060,13 +1060,16 @@ pub trait TypedProgramSpec {
     /// canonical state. Inputs remain borrowed so `None` can immediately move
     /// the exact retained states into [`Self::step_typed`]. A successful result
     /// is still uncommitted and passes through the ordinary adapter checks.
+    /// `effects` is a borrowed transaction sink: returning `None` discards any
+    /// speculative prefix before Native fallback.
     /// Implementations must return `None` rather than wait when their backend
     /// is unsupported, unavailable, still preparing, or fails recoverably.
     fn try_step_physical(
         &self,
         _states: &[Self::State],
         _batch: TypedProgramBatch<'_>,
-    ) -> Option<TypedPhysicalStep<Self::State, Self::NoveltyKey>> {
+        _effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+    ) -> Option<ProgramPhysicalReceipt> {
         None
     }
 
@@ -1358,23 +1361,74 @@ struct ArenaSlot<T> {
 /// `State` is deliberately not constrained by equality or hashing. Only the
 /// smaller family-defined `NoveltyKey` participates in per-activation
 /// admission.
-#[derive(Clone)]
-struct TypedProgramRuntime<State, NoveltyKey> {
+struct TypedProgramScratch<State, NoveltyKey, Rank> {
+    states: Vec<State>,
+    input_ranks: Vec<Rank>,
+    effects: TypedEffectSink<State, NoveltyKey>,
+    examined: Vec<usize>,
+    raw_effects: Vec<usize>,
+    resume_physical: Vec<Option<(DispatchClass, ProgramPacing)>>,
+    batch_novelty: AHashMap<(ProgramActivation, NoveltyKey), Option<RawInline>>,
+    child_admitted: Vec<bool>,
+    child_physical: Vec<(DispatchClass, ProgramPacing)>,
+}
+
+impl<State, NoveltyKey, Rank> Default for TypedProgramScratch<State, NoveltyKey, Rank> {
+    fn default() -> Self {
+        Self {
+            states: Vec::new(),
+            input_ranks: Vec::new(),
+            effects: TypedEffectSink::default(),
+            examined: Vec::new(),
+            raw_effects: Vec::new(),
+            resume_physical: Vec::new(),
+            batch_novelty: AHashMap::new(),
+            child_admitted: Vec::new(),
+            child_physical: Vec::new(),
+        }
+    }
+}
+
+struct TypedProgramRuntime<State, NoveltyKey, Rank> {
     slots: Vec<ArenaSlot<State>>,
     free: Vec<u32>,
     novelty: AHashMap<ProgramActivation, AHashMap<NoveltyKey, Option<RawInline>>>,
+    /// Lazily allocated so dormant program occurrences pay only one pointer.
+    /// Clones deliberately start cold rather than retaining cohort-sized
+    /// buffers from the source query.
+    scratch: Option<Box<TypedProgramScratch<State, NoveltyKey, Rank>>>,
     #[cfg(test)]
     retirement_slot_probes: usize,
     #[cfg(test)]
     retirement_membership_builds: usize,
 }
 
-impl<State, NoveltyKey> Default for TypedProgramRuntime<State, NoveltyKey> {
+impl<State, NoveltyKey, Rank> Clone for TypedProgramRuntime<State, NoveltyKey, Rank>
+where
+    State: Clone,
+    NoveltyKey: Clone + Eq + Hash,
+{
+    fn clone(&self) -> Self {
+        Self {
+            slots: self.slots.clone(),
+            free: self.free.clone(),
+            novelty: self.novelty.clone(),
+            scratch: None,
+            #[cfg(test)]
+            retirement_slot_probes: self.retirement_slot_probes,
+            #[cfg(test)]
+            retirement_membership_builds: self.retirement_membership_builds,
+        }
+    }
+}
+
+impl<State, NoveltyKey, Rank> Default for TypedProgramRuntime<State, NoveltyKey, Rank> {
     fn default() -> Self {
         Self {
             slots: Vec::new(),
             free: Vec::new(),
             novelty: AHashMap::new(),
+            scratch: None,
             #[cfg(test)]
             retirement_slot_probes: 0,
             #[cfg(test)]
@@ -1383,7 +1437,7 @@ impl<State, NoveltyKey> Default for TypedProgramRuntime<State, NoveltyKey> {
     }
 }
 
-impl<State, NoveltyKey> TypedProgramRuntime<State, NoveltyKey>
+impl<State, NoveltyKey, Rank> TypedProgramRuntime<State, NoveltyKey, Rank>
 where
     State: Clone + Send + 'static,
     NoveltyKey: Clone + Eq + Hash + Send + 'static,
@@ -1445,17 +1499,18 @@ where
     }
 
     /// Takes a cohort into one dense typed vector in scheduler order.
-    fn take_batch(
+    fn take_batch_into(
         &mut self,
         activations: &[ProgramActivation],
         handles: &[ProgramWork],
-    ) -> Vec<State> {
+        states: &mut Vec<State>,
+    ) {
         assert_eq!(activations.len(), handles.len());
-        activations
-            .iter()
-            .zip(handles)
-            .map(|(&activation, work)| self.take(activation, work.handle.clone()))
-            .collect()
+        states.clear();
+        states.reserve(activations.len());
+        for (&activation, work) in activations.iter().zip(handles) {
+            states.push(self.take(activation, work.handle.clone()));
+        }
     }
 
     /// Admits one typed novelty key for an activation.
@@ -1569,9 +1624,9 @@ where
 {
     assert_eq!(
         runtime.family,
-        TypeId::of::<TypedProgramRuntime<T::State, T::NoveltyKey>>(),
+        TypeId::of::<TypedProgramRuntime<T::State, T::NoveltyKey, T::Rank>>(),
         "engine Program state expected family {}, received {}",
-        type_name::<TypedProgramRuntime<T::State, T::NoveltyKey>>(),
+        type_name::<TypedProgramRuntime<T::State, T::NoveltyKey, T::Rank>>(),
         runtime.family_name
     );
     let dispatch = spec.dispatch(&state);
@@ -1580,7 +1635,7 @@ where
         .erased
         .as_mut()
         .as_any_mut()
-        .downcast_mut::<TypedProgramRuntime<T::State, T::NoveltyKey>>()
+        .downcast_mut::<TypedProgramRuntime<T::State, T::NoveltyKey, T::Rank>>()
         .expect("engine Program state received another family's runtime");
     let handle = runtime.insert(activation, state);
     ProgramWork {
@@ -1701,9 +1756,9 @@ where
             "a direct typed Program received a composed route arm"
         );
         ProgramRuntime {
-            erased: Box::new(TypedProgramRuntime::<T::State, T::NoveltyKey>::default()),
-            family: TypeId::of::<TypedProgramRuntime<T::State, T::NoveltyKey>>(),
-            family_name: type_name::<TypedProgramRuntime<T::State, T::NoveltyKey>>(),
+            erased: Box::new(TypedProgramRuntime::<T::State, T::NoveltyKey, T::Rank>::default()),
+            family: TypeId::of::<TypedProgramRuntime<T::State, T::NoveltyKey, T::Rank>>(),
+            family_name: type_name::<TypedProgramRuntime<T::State, T::NoveltyKey, T::Rank>>(),
         }
     }
 
@@ -1725,16 +1780,16 @@ where
         assert_eq!(batch.activations.len(), batch.view.len());
         assert_eq!(
             runtime.family,
-            TypeId::of::<TypedProgramRuntime<T::State, T::NoveltyKey>>(),
+            TypeId::of::<TypedProgramRuntime<T::State, T::NoveltyKey, T::Rank>>(),
             "residual program seed expected family {}, received {}",
-            type_name::<TypedProgramRuntime<T::State, T::NoveltyKey>>(),
+            type_name::<TypedProgramRuntime<T::State, T::NoveltyKey, T::Rank>>(),
             runtime.family_name
         );
         let runtime = runtime
             .erased
             .as_mut()
             .as_any_mut()
-            .downcast_mut::<TypedProgramRuntime<T::State, T::NoveltyKey>>()
+            .downcast_mut::<TypedProgramRuntime<T::State, T::NoveltyKey, T::Rank>>()
             .expect("residual program seed received another family's runtime");
         let mut typed = TypedSeedSink::default();
         self.seed_typed(batch, &mut typed);
@@ -1802,20 +1857,27 @@ where
         // affinely into one dense family-typed vector.
         assert_eq!(
             runtime.family,
-            TypeId::of::<TypedProgramRuntime<T::State, T::NoveltyKey>>(),
+            TypeId::of::<TypedProgramRuntime<T::State, T::NoveltyKey, T::Rank>>(),
             "residual program step expected family {}, received {}",
-            type_name::<TypedProgramRuntime<T::State, T::NoveltyKey>>(),
+            type_name::<TypedProgramRuntime<T::State, T::NoveltyKey, T::Rank>>(),
             runtime.family_name
         );
         let runtime = runtime
             .erased
             .as_mut()
             .as_any_mut()
-            .downcast_mut::<TypedProgramRuntime<T::State, T::NoveltyKey>>()
+            .downcast_mut::<TypedProgramRuntime<T::State, T::NoveltyKey, T::Rank>>()
             .expect("residual program step received another family's runtime");
-        let states = runtime.take_batch(batch.activations, batch.work);
-        let input_ranks: Vec<_> = states.iter().map(|state| self.progress(state)).collect();
-        for (state, work) in states.iter().zip(batch.work) {
+        let mut scratch = runtime
+            .scratch
+            .take()
+            .unwrap_or_else(|| Box::new(TypedProgramScratch::default()));
+        runtime.take_batch_into(batch.activations, batch.work, &mut scratch.states);
+        scratch.input_ranks.clear();
+        scratch
+            .input_ranks
+            .extend(scratch.states.iter().map(|state| self.progress(state)));
+        for (state, work) in scratch.states.iter().zip(batch.work) {
             assert_eq!(
                 self.dispatch(state),
                 work.dispatch,
@@ -1835,58 +1897,79 @@ where
             activations: batch.activations,
             limits: batch.limits,
         };
-        let (typed, placement) = match self.try_step_physical(&states, typed_batch) {
-            Some(physical) => {
-                let (effects, placement) = physical.into_parts();
-                (effects, Some(placement))
+        scratch.effects.clear();
+        let placement = match self.try_step_physical(
+            &scratch.states,
+            typed_batch,
+            &mut scratch.effects,
+        ) {
+            Some(placement) => {
+                scratch.states.clear();
+                Some(placement)
             }
             None => {
-                let mut typed = TypedEffectSink::default();
-                self.step_typed(states, typed_batch, &mut typed);
-                (typed, None)
+                // A declined physical attempt has no committed prefix. Clear
+                // its borrowed transaction before executing the same Native
+                // kernel into the retained scratch sink.
+                scratch.effects.clear();
+                self.step_typed(&mut scratch.states, typed_batch, &mut scratch.effects);
+                scratch.states.clear();
+                None
             }
         };
+        let typed = &mut scratch.effects;
         assert_eq!(
             typed.pages.len(),
             input_count,
             "typed program returned the wrong page count"
         );
-        let examined: Vec<_> = typed.pages.iter().map(|page| page.examined).collect();
+        scratch.examined.clear();
+        scratch
+            .examined
+            .extend(typed.pages.iter().map(|page| page.examined));
         assert!(
-            examined
+            scratch
+                .examined
                 .iter()
                 .zip(batch.limits)
                 .all(|(&spent, &limit)| spent <= limit),
             "typed program exceeded one input's physical work budget"
         );
-        let mut raw_effects = vec![0usize; input_count];
+        scratch.raw_effects.clear();
+        scratch.raw_effects.resize(input_count, 0);
 
         // Validate the entire typed receipt before publishing any replacement
         // handle, novelty admission, or outward effect. A physical `Some`
         // result is a transaction candidate, not permission to commit a valid
         // prefix before a later malformed effect is discovered.
-        let mut resume_physical = Vec::with_capacity(input_count);
+        scratch.resume_physical.clear();
+        scratch.resume_physical.reserve(input_count);
         for (input, page) in typed.pages.iter().enumerate() {
             match &page.resume {
                 Some(TypedResume::Immediate(state) | TypedResume::AfterChildren(state)) => {
                     assert!(
-                        self.progress(state) < input_ranks[input],
+                        self.progress(state) < scratch.input_ranks[input],
                         "typed program resume did not strictly decrease its finite rank"
                     );
-                    resume_physical.push(Some((self.dispatch(state), self.pacing(state))));
+                    scratch
+                        .resume_physical
+                        .push(Some((self.dispatch(state), self.pacing(state))));
                 }
-                Some(TypedResume::AfterChildrenDone) | None => resume_physical.push(None),
+                Some(TypedResume::AfterChildrenDone) | None => {
+                    scratch.resume_physical.push(None)
+                }
             }
         }
 
-        let mut batch_novelty: AHashMap<(ProgramActivation, &T::NoveltyKey), Option<RawInline>> =
-            AHashMap::new();
+        scratch.batch_novelty.clear();
         // The bitmap is a receipt-local transaction plan. Repetitions consult
         // the batch observation first, so only the first exact key reads the
         // runtime. Neither map nor handles are mutated until every receipt law
         // below has validated.
-        let mut child_admitted = Vec::with_capacity(typed.children.len());
-        let mut child_physical = Vec::with_capacity(typed.children.len());
+        scratch.child_admitted.clear();
+        scratch.child_admitted.reserve(typed.children.len());
+        scratch.child_physical.clear();
+        scratch.child_physical.reserve(typed.children.len());
         let mut previous = 0u32;
         for (position, child) in typed.children.iter().enumerate() {
             assert!(
@@ -1898,22 +1981,27 @@ where
                 "typed program child tags are not grouped in ascending order"
             );
             previous = child.input;
-            raw_effects[child.input as usize] += 1;
+            scratch.raw_effects[child.input as usize] += 1;
             assert!(
                 batch.stratum == ProgramStratum::Fixpoint || child.novelty.is_none(),
                 "a finite typed program emitted a fixpoint child"
             );
             if child.novelty.is_none() {
                 assert!(
-                    self.progress(&child.state) < input_ranks[child.input as usize],
+                    self.progress(&child.state) < scratch.input_ranks[child.input as usize],
                     "typed program finite child did not strictly decrease its input rank"
                 );
             }
-            child_physical.push((self.dispatch(&child.state), self.pacing(&child.state)));
+            scratch
+                .child_physical
+                .push((self.dispatch(&child.state), self.pacing(&child.state)));
 
             let admitted = if let Some(novelty) = child.novelty.as_ref() {
                 let activation = batch.activations[child.input as usize];
-                match batch_novelty.entry((activation, novelty)) {
+                match scratch
+                    .batch_novelty
+                    .entry((activation, novelty.clone()))
+                {
                     Entry::Occupied(previous) => {
                         assert_eq!(
                             *previous.get(),
@@ -1944,7 +2032,7 @@ where
             } else {
                 true
             };
-            child_admitted.push(admitted);
+            scratch.child_admitted.push(admitted);
         }
 
         let mut previous = 0u32;
@@ -1955,7 +2043,7 @@ where
                 "typed direct observations are not grouped in ascending order"
             );
             previous = *input;
-            raw_effects[*input as usize] += 1;
+            scratch.raw_effects[*input as usize] += 1;
         }
         let mut previous = 0u32;
         for (position, (input, _)) in typed.accepted.iter().enumerate() {
@@ -1965,7 +2053,7 @@ where
                 "typed candidate observations are not grouped in ascending order"
             );
             previous = *input;
-            raw_effects[*input as usize] += 1;
+            scratch.raw_effects[*input as usize] += 1;
         }
         let mut previous = 0u32;
         for (position, (input, ())) in typed.supported.iter().enumerate() {
@@ -1975,29 +2063,18 @@ where
                 "typed support observations are not grouped in ascending order"
             );
             previous = *input;
-            raw_effects[*input as usize] += 1;
+            scratch.raw_effects[*input as usize] += 1;
         }
         assert!(
-            raw_effects
+            scratch
+                .raw_effects
                 .iter()
-                .zip(&examined)
+                .zip(&scratch.examined)
                 .all(|(&outputs, &spent)| outputs <= spent),
             "typed program emitted more raw effects than its examined-work receipt"
         );
 
-        drop(batch_novelty);
-        let TypedEffectSink {
-            pages,
-            children,
-            direct,
-            accepted,
-            supported,
-            source_pages,
-            source_examined,
-            source_roots,
-            transition_pages,
-            transition_examined,
-        } = typed;
+        scratch.batch_novelty.clear();
 
         // From here onward every family-derived value and every static receipt
         // law has already been checked. Allocation failure, generation
@@ -2006,7 +2083,7 @@ where
         // before reaching this commit phase.
         effects
             .pages
-            .extend(pages.into_iter().zip(resume_physical).enumerate().map(
+            .extend(typed.pages.drain(..).zip(scratch.resume_physical.drain(..)).enumerate().map(
                 |(input, (page, physical))| {
                     let activation = batch.activations[input];
                     let resume = match (page.resume, physical) {
@@ -2040,7 +2117,11 @@ where
             ));
 
         for ((child, (dispatch, pacing)), admitted) in
-            children.into_iter().zip(child_physical).zip(child_admitted)
+            typed
+                .children
+                .drain(..)
+                .zip(scratch.child_physical.drain(..))
+                .zip(scratch.child_admitted.drain(..))
         {
             if !admitted {
                 continue;
@@ -2069,15 +2150,20 @@ where
             });
         }
 
-        effects.direct.extend(direct);
-        effects.accepted.extend(accepted);
-        effects.supported.extend(supported);
-        effects.source_pages += source_pages;
-        effects.source_examined += source_examined;
-        effects.source_roots += source_roots;
-        effects.transition_pages += transition_pages;
-        effects.transition_examined += transition_examined;
+        effects.direct.extend(typed.direct.drain(..));
+        effects.accepted.extend(typed.accepted.drain(..));
+        effects.supported.extend(typed.supported.drain(..));
+        effects.source_pages += typed.source_pages;
+        effects.source_examined += typed.source_examined;
+        effects.source_roots += typed.source_roots;
+        effects.transition_pages += typed.transition_pages;
+        effects.transition_examined += typed.transition_examined;
         effects.placement = placement;
+        typed.clear();
+        scratch.input_ranks.clear();
+        scratch.examined.clear();
+        scratch.raw_effects.clear();
+        runtime.scratch = Some(scratch);
     }
 
     #[cold]
@@ -2148,16 +2234,16 @@ where
         );
         assert_eq!(
             runtime.family,
-            TypeId::of::<TypedProgramRuntime<T::State, T::NoveltyKey>>(),
+            TypeId::of::<TypedProgramRuntime<T::State, T::NoveltyKey, T::Rank>>(),
             "residual program retirement expected family {}, received {}",
-            type_name::<TypedProgramRuntime<T::State, T::NoveltyKey>>(),
+            type_name::<TypedProgramRuntime<T::State, T::NoveltyKey, T::Rank>>(),
             runtime.family_name
         );
         let runtime = runtime
             .erased
             .as_mut()
             .as_any_mut()
-            .downcast_mut::<TypedProgramRuntime<T::State, T::NoveltyKey>>()
+            .downcast_mut::<TypedProgramRuntime<T::State, T::NoveltyKey, T::Rank>>()
             .expect("residual program retirement received another family's runtime");
         runtime.retire_activations(activations);
     }
@@ -2228,7 +2314,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            states: Vec<Self::State>,
+            states: &mut Vec<Self::State>,
             _batch: TypedProgramBatch<'_>,
             effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
@@ -2313,7 +2399,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            states: Vec<Self::State>,
+            states: &mut Vec<Self::State>,
             _batch: TypedProgramBatch<'_>,
             effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
@@ -2330,7 +2416,8 @@ mod tests {
             &self,
             states: &[Self::State],
             batch: TypedProgramBatch<'_>,
-        ) -> Option<TypedPhysicalStep<Self::State, Self::NoveltyKey>> {
+            effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+        ) -> Option<ProgramPhysicalReceipt> {
             self.physical_states
                 .lock()
                 .unwrap()
@@ -2340,10 +2427,10 @@ mod tests {
                 PhysicalProbeMode::Complete
                 | PhysicalProbeMode::OverBudget
                 | PhysicalProbeMode::LateRawAmplification => {
-                    let mut step = TypedPhysicalStep::new(ProgramPhysicalReceipt::new(
+                    let placement = ProgramPhysicalReceipt::new(
                         "test-physical",
                         "dense-page",
-                    ));
+                    );
                     for (input, state) in states.iter().enumerate() {
                         let examined = match self.mode {
                             PhysicalProbeMode::Complete => 1,
@@ -2357,9 +2444,9 @@ mod tests {
                                     exact_cursor: state.exact_cursor - 1,
                                 })
                             });
-                        step.effects_mut().page(examined, resume);
+                        effects.page(examined, resume);
                         if matches!(self.mode, PhysicalProbeMode::LateRawAmplification) {
-                            step.effects_mut().fixpoint_child(
+                            effects.fixpoint_child(
                                 input as u32,
                                 NonComparableState {
                                     exact_cursor: state.exact_cursor - 2,
@@ -2367,11 +2454,10 @@ mod tests {
                                 Key(input as u8 + 64),
                                 None,
                             );
-                            step.effects_mut()
-                                .direct(input as u32, RawInline::default());
+                            effects.direct(input as u32, RawInline::default());
                         }
                     }
-                    Some(step)
+                    Some(placement)
                 }
             }
         }
@@ -2449,7 +2535,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            states: Vec<Self::State>,
+            states: &mut Vec<Self::State>,
             _batch: TypedProgramBatch<'_>,
             effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
@@ -2463,7 +2549,8 @@ mod tests {
             &self,
             _states: &[Self::State],
             _batch: TypedProgramBatch<'_>,
-        ) -> Option<TypedPhysicalStep<Self::State, Self::NoveltyKey>> {
+            _effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+        ) -> Option<ProgramPhysicalReceipt> {
             self.calls.lock().unwrap().preferred_physical += 1;
             None
         }
@@ -2538,7 +2625,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            states: Vec<Self::State>,
+            states: &mut Vec<Self::State>,
             _batch: TypedProgramBatch<'_>,
             effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
@@ -2594,7 +2681,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            _states: Vec<Self::State>,
+            _states: &mut Vec<Self::State>,
             _batch: TypedProgramBatch<'_>,
             effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
@@ -2676,7 +2763,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            states: Vec<Self::State>,
+            states: &mut Vec<Self::State>,
             _batch: TypedProgramBatch<'_>,
             effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
@@ -2724,7 +2811,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            _states: Vec<Self::State>,
+            _states: &mut Vec<Self::State>,
             _batch: TypedProgramBatch<'_>,
             _effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
@@ -2784,7 +2871,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            _states: Vec<Self::State>,
+            _states: &mut Vec<Self::State>,
             _batch: TypedProgramBatch<'_>,
             _effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
@@ -2884,7 +2971,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            _states: Vec<Self::State>,
+            _states: &mut Vec<Self::State>,
             _batch: TypedProgramBatch<'_>,
             _effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
@@ -2978,7 +3065,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            _states: Vec<Self::State>,
+            _states: &mut Vec<Self::State>,
             _batch: TypedProgramBatch<'_>,
             effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
@@ -3031,7 +3118,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            mut states: Vec<Self::State>,
+            states: &mut Vec<Self::State>,
             _batch: TypedProgramBatch<'_>,
             effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
@@ -3050,7 +3137,7 @@ mod tests {
 
     #[test]
     fn exact_state_and_novelty_have_independent_type_laws() {
-        let mut runtime = TypedProgramRuntime::<NonComparableState, Key>::default();
+        let mut runtime = TypedProgramRuntime::<NonComparableState, Key, u64>::default();
         let activation = ProgramActivation(1);
         let handle = runtime.insert(activation, NonComparableState { exact_cursor: 7 });
         assert!(runtime.admit(ProgramActivation(1), Key(3), None));
@@ -3372,7 +3459,7 @@ mod tests {
 
     #[test]
     fn stale_handles_are_rejected_after_slot_reuse() {
-        let mut runtime = TypedProgramRuntime::<NonComparableState, Key>::default();
+        let mut runtime = TypedProgramRuntime::<NonComparableState, Key, u64>::default();
         let activation = ProgramActivation(1);
         let stale = runtime.insert(activation, NonComparableState { exact_cursor: 1 });
         let _ = runtime.take(activation, stale.clone());
@@ -3388,7 +3475,7 @@ mod tests {
 
     #[test]
     fn deep_clone_preserves_live_handles_without_sharing_mutation() {
-        let mut left = TypedProgramRuntime::<NonComparableState, Key>::default();
+        let mut left = TypedProgramRuntime::<NonComparableState, Key, u64>::default();
         let activation = ProgramActivation(1);
         let handle = left.insert(activation, NonComparableState { exact_cursor: 11 });
         let mut right = left.clone();
@@ -3412,7 +3499,7 @@ mod tests {
         const HIGH_WATER: usize = 4_096;
         const RETIRING: usize = 1_024;
 
-        let mut runtime = TypedProgramRuntime::<NonComparableState, Key>::default();
+        let mut runtime = TypedProgramRuntime::<NonComparableState, Key, u64>::default();
         let keeper = ProgramActivation(0);
         let handles: Vec<_> = (0..HIGH_WATER)
             .map(|exact_cursor| runtime.insert(keeper, NonComparableState { exact_cursor }))
@@ -3443,7 +3530,7 @@ mod tests {
     fn activation_retirement_skips_membership_and_scans_when_the_arena_is_drained() {
         const HIGH_WATER: usize = 4_096;
 
-        let mut runtime = TypedProgramRuntime::<NonComparableState, Key>::default();
+        let mut runtime = TypedProgramRuntime::<NonComparableState, Key, u64>::default();
         let activations: Vec<_> = (0..HIGH_WATER)
             .map(|index| ProgramActivation(index as u64))
             .collect();
@@ -3472,7 +3559,7 @@ mod tests {
 
     #[test]
     fn activation_retirement_rejection_preserves_the_whole_receipt_cohort() {
-        let mut runtime = TypedProgramRuntime::<NonComparableState, Key>::default();
+        let mut runtime = TypedProgramRuntime::<NonComparableState, Key, u64>::default();
         let quiescent = ProgramActivation(11);
         let live = ProgramActivation(12);
         assert!(runtime.admit(quiescent, Key(3), None));
@@ -3654,7 +3741,7 @@ mod tests {
             .erased
             .as_mut()
             .as_any_mut()
-            .downcast_mut::<TypedProgramRuntime<NonComparableState, Key>>()
+            .downcast_mut::<TypedProgramRuntime<NonComparableState, Key, u64>>()
             .unwrap();
         let cursors = effects
             .children
@@ -3693,7 +3780,7 @@ mod tests {
                 .erased
                 .as_mut()
                 .as_any_mut()
-                .downcast_mut::<TypedProgramRuntime<NonComparableState, Key>>()
+                .downcast_mut::<TypedProgramRuntime<NonComparableState, Key, u64>>()
                 .unwrap();
             assert!(typed_runtime.slots.iter().all(|slot| slot.value.is_none()));
             let seen = typed_runtime.novelty.get(&activation).unwrap();
@@ -3719,7 +3806,7 @@ mod tests {
             .erased
             .as_mut()
             .as_any_mut()
-            .downcast_mut::<TypedProgramRuntime<NonComparableState, Key>>()
+            .downcast_mut::<TypedProgramRuntime<NonComparableState, Key, u64>>()
             .unwrap();
         assert_eq!(
             typed_runtime
@@ -3755,7 +3842,7 @@ mod tests {
             .erased
             .as_mut()
             .as_any_mut()
-            .downcast_mut::<TypedProgramRuntime<NonComparableState, Key>>()
+            .downcast_mut::<TypedProgramRuntime<NonComparableState, Key, u64>>()
             .unwrap();
         for (input, child) in effects.children.iter().enumerate() {
             assert_eq!(
@@ -4020,7 +4107,7 @@ mod tests {
             .erased
             .as_mut()
             .as_any_mut()
-            .downcast_mut::<TypedProgramRuntime<NonComparableState, Key>>()
+            .downcast_mut::<TypedProgramRuntime<NonComparableState, Key, u64>>()
             .unwrap()
             .novelty
             .clone();
@@ -4060,7 +4147,7 @@ mod tests {
             .erased
             .as_mut()
             .as_any_mut()
-            .downcast_mut::<TypedProgramRuntime<NonComparableState, Key>>()
+            .downcast_mut::<TypedProgramRuntime<NonComparableState, Key, u64>>()
             .unwrap();
         assert!(
             typed_runtime.slots.iter().all(|slot| slot.value.is_none()),

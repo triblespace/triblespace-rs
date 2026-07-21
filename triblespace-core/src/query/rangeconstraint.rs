@@ -153,7 +153,7 @@ impl TypedProgramSpec for InlineRange {
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: &mut Vec<Self::State>,
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
@@ -166,7 +166,7 @@ impl TypedProgramSpec for InlineRange {
         };
         match first {
             InlineRangeProgramState::Confirm { .. } => {
-                for (input, state) in states.into_iter().enumerate() {
+                for (input, state) in states.drain(..).enumerate() {
                     let InlineRangeProgramState::Confirm { offset } = state else {
                         panic!("one typed inline-range cohort mixed action variants")
                     };
@@ -196,7 +196,7 @@ impl TypedProgramSpec for InlineRange {
             }
             InlineRangeProgramState::Support => {
                 let column = batch.view.col(self.variable);
-                for (input, state) in states.into_iter().enumerate() {
+                for (input, state) in states.drain(..).enumerate() {
                     assert_eq!(state, InlineRangeProgramState::Support);
                     assert!(
                         batch.candidate_sets[input].is_none(),

@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::collections::VecDeque;
 
+use smallvec::SmallVec;
+
 use crate::id::id_into_value;
 use crate::id::RawId;
 use crate::id::ID_LEN;
@@ -2972,7 +2974,7 @@ impl TypedProgramSpec for RegularPathConstraint {
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: &mut Vec<Self::State>,
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
@@ -2981,7 +2983,7 @@ impl TypedProgramSpec for RegularPathConstraint {
             .first()
             .is_some_and(|state| matches!(state.kind(), RpqStateKind::Support))
         {
-            for (input, state) in states.into_iter().enumerate() {
+            for (input, state) in states.drain(..).enumerate() {
                 let RpqStateKind::Support = state.into_kind() else {
                     panic!("one typed RPQ support cohort mixed continuation variants")
                 };
@@ -2999,7 +3001,7 @@ impl TypedProgramSpec for RegularPathConstraint {
             .first()
             .is_some_and(|state| matches!(state.kind(), RpqStateKind::CandidateFilter { .. }))
         {
-            for (input, state) in states.into_iter().enumerate() {
+            for (input, state) in states.drain(..).enumerate() {
                 let RpqStateKind::CandidateFilter { variable, offset } = state.into_kind() else {
                     panic!("one typed RPQ candidate cohort mixed continuation variants")
                 };
@@ -3036,7 +3038,7 @@ impl TypedProgramSpec for RegularPathConstraint {
             .first()
             .is_some_and(|state| matches!(state.kind(), RpqStateKind::Source { .. }))
         {
-            for (input, state) in states.into_iter().enumerate() {
+            for (input, state) in states.drain(..).enumerate() {
                 let RpqStateKind::Source {
                     variable,
                     cursor,
@@ -3109,8 +3111,11 @@ impl TypedProgramSpec for RegularPathConstraint {
         // grant. Planning is atomic across the cohort: one resumed cursor,
         // negated branch, or oversized fanout discards the borrowed plans and
         // preserves the ordinary affine pageable protocol for every input.
-        let mut plans = Vec::new();
-        let mut fanouts = Vec::with_capacity(states.len());
+        let mut plans: SmallVec<
+            [(u32, RpqNode, u32, bool, PositiveDeltaInfixes<'_>); 1],
+        > = SmallVec::new();
+        let mut fanouts: SmallVec<[usize; 1]> = SmallVec::new();
+        fanouts.reserve(states.len());
         let mut all_fit = true;
         'inputs: for (input, state) in states.iter().enumerate() {
             let RpqStateKind::Transition {
@@ -3204,7 +3209,7 @@ impl TypedProgramSpec for RegularPathConstraint {
             return;
         }
 
-        for (input, state) in states.into_iter().enumerate() {
+        for (input, state) in states.drain(..).enumerate() {
             let RpqStateKind::Transition {
                 variable,
                 node,

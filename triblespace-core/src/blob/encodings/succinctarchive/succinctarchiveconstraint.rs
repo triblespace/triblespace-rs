@@ -1386,7 +1386,7 @@ where
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: &mut Vec<Self::State>,
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
@@ -1401,7 +1401,7 @@ where
             SuccinctArchiveProgramState::Propose { variable, .. } => {
                 let variable = *variable;
                 let positions = self.positions(variable, &batch.view);
-                for (input, state) in states.into_iter().enumerate() {
+                for (input, state) in states.drain(..).enumerate() {
                     let SuccinctArchiveProgramState::Propose {
                         variable: state_variable,
                         cursor,
@@ -1445,7 +1445,7 @@ where
                 let variable = *variable;
                 let mut tagged = Candidates::new();
                 let mut pages = Vec::with_capacity(states.len());
-                for (input, state) in states.into_iter().enumerate() {
+                for (input, state) in states.drain(..).enumerate() {
                     let SuccinctArchiveProgramState::Confirm {
                         variable: state_variable,
                         offset,
@@ -1503,7 +1503,7 @@ where
                 }
             }
             SuccinctArchiveProgramState::Support => {
-                for (input, state) in states.into_iter().enumerate() {
+                for (input, state) in states.drain(..).enumerate() {
                     assert_eq!(state, SuccinctArchiveProgramState::Support);
                     assert!(
                         batch.candidate_sets[input].is_none(),
