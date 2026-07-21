@@ -1,4 +1,4 @@
-//! Deterministic counter probe for exact complete-work admission quotes.
+//! Deterministic counter probe for fused bounded completion.
 //!
 //! A width-one query first publishes one singleton parent. The next pull opens
 //! `S = 2` and exposes two fresh terminal parents together. They look like a
@@ -9,10 +9,10 @@
 //!
 //! This probe intentionally measures no time. It verifies the complete result
 //! set and prints deterministic semantic hashes plus the phase/work counters
-//! that distinguish quoted from unquoted admission.
+//! that distinguish bounded skew from a fitting eager completion.
 //!
 //! ```text
-//! cargo run --release --example union_complete_quote_skew_probe -- [fanout=4096] [quoted|unquoted]
+//! cargo run --release --example union_complete_quote_skew_probe -- [fanout=4096]
 //! ```
 
 use blake3::Hasher;
@@ -31,22 +31,6 @@ use triblespace::core::trible::{Trible, TribleSet};
 use triblespace::prelude::*;
 
 type Pair = (RawInline, RawInline);
-
-#[derive(Clone, Copy)]
-enum ExpectedPolicy {
-    Quoted,
-    Unquoted,
-}
-
-impl ExpectedPolicy {
-    fn parse(value: Option<String>) -> Self {
-        match value.as_deref() {
-            None | Some("quoted") => Self::Quoted,
-            Some("unquoted") => Self::Unquoted,
-            Some(other) => panic!("expected policy must be quoted or unquoted, got {other}"),
-        }
-    }
-}
 
 /// Preserve only the ordinary constraint protocol for the tiny parent source.
 /// This makes all three parents one deterministic proposal bag, rather than
@@ -280,24 +264,13 @@ fn main() {
         .next()
         .map(|arg| arg.parse::<usize>().expect("fanout must be an integer"))
         .unwrap_or(4096);
-    let expected_policy = ExpectedPolicy::parse(args.next());
     assert!(args.next().is_none(), "unexpected extra argument");
     assert!(fanout > 1, "skew fanout must exceed S/parent = 1");
 
     let skew = run_case("skew", fanout);
     assert!(skew.exact_complete_work > skew.search_width);
-    match expected_policy {
-        ExpectedPolicy::Quoted => {
-            assert_eq!(skew.second_pull_eager_admissions, 0);
-            assert!(skew.second_pull_proposed <= skew.search_width);
-        }
-        ExpectedPolicy::Unquoted => {
-            assert_eq!(skew.second_pull_eager_admissions, 1);
-            assert_eq!(skew.second_pull_eager_parents, 2);
-            assert_eq!(skew.second_pull_eager_rows, skew.exact_complete_work);
-            assert_eq!(skew.second_pull_proposed, skew.exact_complete_work);
-        }
-    }
+    assert_eq!(skew.second_pull_eager_admissions, 0);
+    assert!(skew.second_pull_proposed <= skew.search_width);
 
     let fitting = run_case("fitting", 1);
     assert_eq!(fitting.second_pull_eager_admissions, 1);
