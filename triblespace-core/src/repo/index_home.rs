@@ -1539,6 +1539,15 @@ where
             grouping: ProgramGrouping::PageLocal,
             completion: ProgramCompletion::PageableOnly,
             exposure: match request.action {
+                // With no bound variables the proposal depends only on the
+                // pattern's literal positions, so one geometric source can
+                // feed the root frontier directly. Once any variable is
+                // bound, proposal is parent-row dependent and stays behind
+                // explicit policy until that whole-frontier route pays for
+                // itself independently.
+                ProgramAction::Propose(_) if request.bound.is_empty() => {
+                    ProgramExposure::Production
+                }
                 ProgramAction::Propose(_) | ProgramAction::Confirm(_) => ProgramExposure::Explicit,
                 ProgramAction::Support => ProgramExposure::Production,
             },
@@ -2665,7 +2674,9 @@ mod tests {
         assert_eq!(propose.stratum, ProgramStratum::Finite);
         assert_eq!(propose.grouping, ProgramGrouping::PageLocal);
         assert_eq!(propose.completion, ProgramCompletion::PageableOnly);
-        assert_eq!(propose.exposure, ProgramExposure::Explicit);
+        assert_eq!(propose.exposure, ProgramExposure::Production);
+        assert_eq!(resolved.exposure, ProgramExposure::Explicit);
+        assert_eq!(irrelevant.exposure, ProgramExposure::Explicit);
         assert_eq!(confirm.exposure, ProgramExposure::Explicit);
         assert_eq!(support.exposure, ProgramExposure::Production);
         assert!(program
@@ -2682,6 +2693,31 @@ mod tests {
             .is_none());
 
         let attribute_constant: Inline<GenId> = attribute_id.to_inline();
+        let constant_attribute = union_archive.pattern(entity, attribute_constant, value);
+        let constant_attribute_program = constant_attribute.residual_program().unwrap();
+        assert_eq!(
+            constant_attribute_program
+                .route(ProgramRequest {
+                    action: ProgramAction::Propose(entity.index),
+                    bound: empty,
+                })
+                .unwrap()
+                .exposure,
+            ProgramExposure::Production,
+            "literal-resolved positions do not make a root proposal row-dependent"
+        );
+        assert_eq!(
+            constant_attribute_program
+                .route(ProgramRequest {
+                    action: ProgramAction::Propose(entity.index),
+                    bound: VariableSet::new_singleton(value.index),
+                })
+                .unwrap()
+                .exposure,
+            ProgramExposure::Explicit,
+            "one bound variable makes the proposal row-dependent"
+        );
+
         let repeated = union_archive.pattern(entity, attribute_constant, entity);
         let repeated_program = repeated.residual_program().unwrap();
         assert!(repeated_program
