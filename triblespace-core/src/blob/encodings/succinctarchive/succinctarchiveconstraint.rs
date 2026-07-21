@@ -260,9 +260,9 @@ fn upper_bound_indexed(
 ///
 /// The ordinary two-bound proposal arms defensively call `unique()`. Keeping
 /// that semantic here makes the source exact even if an archive implementation
-/// later exposes repeated adjacent codes inside a fixed-pair range. Seeking and
-/// duplicate skipping are binary searches over the immutable wavelet/range
-/// view; no prefix of candidates is materialized or replayed. Every distinct
+/// later exposes repeated adjacent codes inside a fixed-pair range. Seeking is
+/// a binary search over the immutable wavelet/range view; no prefix of
+/// candidates is materialized or replayed. Every distinct
 /// driver value consumes demand even when `accept` rejects it, and continuation
 /// resumes strictly after the last value examined rather than the last emitted
 /// candidate. Page entry binary-seeks the public value cursor once; within the
@@ -1788,6 +1788,7 @@ where
 
 #[cfg(test)]
 mod typed_program_tests {
+    use std::cell::Cell;
     use std::sync::Mutex;
 
     use super::*;
@@ -1812,6 +1813,78 @@ mod typed_program_tests {
         data[16..32].fill(attribute);
         data[32..].copy_from_slice(&value);
         Trible { data }
+    }
+
+    #[test]
+    fn indexed_page_seeks_once_then_advances_duplicate_runs_linearly() {
+        let sequence = [
+            inline_value(1),
+            inline_value(1),
+            inline_value(2),
+            inline_value(2),
+            inline_value(2),
+            inline_value(3),
+            inline_value(5),
+            inline_value(5),
+        ];
+        let accesses = Cell::new(0usize);
+        let mut accepted = Vec::new();
+        let page = page_indexed_distinct_filtered(
+            sequence.len(),
+            |index| {
+                accesses.set(accesses.get() + 1);
+                sequence[index]
+            },
+            ResidualDeltaSourceCursor::Start,
+            usize::MAX,
+            &mut accepted,
+            |_| true,
+        );
+        assert_eq!(
+            accepted,
+            [
+                inline_value(1),
+                inline_value(2),
+                inline_value(3),
+                inline_value(5),
+            ]
+        );
+        assert_eq!(page.examined, accepted.len());
+        assert_eq!(page.next, None);
+        assert_eq!(
+            accesses.get(),
+            sequence.len(),
+            "a full page should inspect each physical occurrence once"
+        );
+
+        let mut first = Vec::new();
+        let first_page = page_indexed_distinct_filtered(
+            sequence.len(),
+            |index| sequence[index],
+            ResidualDeltaSourceCursor::Start,
+            2,
+            &mut first,
+            |value| *value != inline_value(2),
+        );
+        assert_eq!(first, [inline_value(1)]);
+        assert_eq!(first_page.examined, 2);
+        assert_eq!(
+            first_page.next,
+            Some(ResidualDeltaSourceCursor::After(inline_value(2)))
+        );
+
+        let mut suffix = Vec::new();
+        let suffix_page = page_indexed_distinct_filtered(
+            sequence.len(),
+            |index| sequence[index],
+            first_page.next.unwrap(),
+            usize::MAX,
+            &mut suffix,
+            |_| true,
+        );
+        assert_eq!(suffix, [inline_value(3), inline_value(5)]);
+        assert_eq!(suffix_page.examined, suffix.len());
+        assert_eq!(suffix_page.next, None);
     }
 
     fn one_program_step<U>(
