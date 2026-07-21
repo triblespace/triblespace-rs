@@ -2869,6 +2869,129 @@ struct ProgramBucket {
     tasks: Vec<ProgramTask>,
 }
 
+/// Dense membership index for typed Program work.
+///
+/// [`DeltaStateId`] values are allocated monotonically from one shared dense
+/// interner. Keeping one reusable bucket per observed ID therefore lets an
+/// affine pop deactivate a state without destroying the bucket's allocation.
+/// Refiling the same state only flips its membership bit and appends into the
+/// retained storage. The active bitset also preserves the `BTreeMap` policy of
+/// selecting the greatest live state ID for global work, without allocating a
+/// tree node on every remove/reinsert cycle.
+#[derive(Default)]
+struct ProgramWorklist {
+    buckets: Vec<ProgramBucket>,
+    active: Vec<u64>,
+    len: usize,
+}
+
+impl ProgramWorklist {
+    const WORD_BITS: usize = u64::BITS as usize;
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn contains_key(&self, state: &DeltaStateId) -> bool {
+        let index = state.0 as usize;
+        let word = index / Self::WORD_BITS;
+        let bit = index % Self::WORD_BITS;
+        self.active
+            .get(word)
+            .is_some_and(|active| active & (1u64 << bit) != 0)
+    }
+
+    fn get(&self, state: &DeltaStateId) -> Option<&ProgramBucket> {
+        self.contains_key(state)
+            .then(|| &self.buckets[state.0 as usize])
+    }
+
+    fn get_mut(&mut self, state: &DeltaStateId) -> Option<&mut ProgramBucket> {
+        self.contains_key(state)
+            .then(|| &mut self.buckets[state.0 as usize])
+    }
+
+    fn append(&mut self, state: DeltaStateId, tasks: &mut Vec<ProgramTask>) {
+        if tasks.is_empty() {
+            return;
+        }
+        let index = state.0 as usize;
+        if self.buckets.len() <= index {
+            self.buckets.resize_with(index + 1, ProgramBucket::default);
+        }
+        let word = index / Self::WORD_BITS;
+        if self.active.len() <= word {
+            self.active.resize(word + 1, 0);
+        }
+        let bit = 1u64 << (index % Self::WORD_BITS);
+        if self.active[word] & bit == 0 {
+            assert!(
+                self.buckets[index].is_empty(),
+                "inactive typed Program bucket retained live work"
+            );
+            self.active[word] |= bit;
+            self.len += 1;
+        }
+        self.buckets[index].append(tasks);
+    }
+
+    fn deactivate(&mut self, state: DeltaStateId) {
+        let index = state.0 as usize;
+        let word = index / Self::WORD_BITS;
+        let bit = 1u64 << (index % Self::WORD_BITS);
+        let active = self
+            .active
+            .get_mut(word)
+            .expect("typed Program state was never activated");
+        assert_ne!(*active & bit, 0, "typed Program state was not active");
+        assert!(
+            self.buckets[index].is_empty(),
+            "nonempty typed Program state was deactivated"
+        );
+        *active &= !bit;
+        self.len -= 1;
+    }
+
+    fn last_id(&self) -> Option<DeltaStateId> {
+        for (word_index, &word) in self.active.iter().enumerate().rev() {
+            if word != 0 {
+                let bit = (u64::BITS - 1 - word.leading_zeros()) as usize;
+                let index = word_index * Self::WORD_BITS + bit;
+                return Some(DeltaStateId(
+                    u32::try_from(index).expect("typed Program state id overflow"),
+                ));
+            }
+        }
+        None
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (DeltaStateId, &ProgramBucket)> {
+        self.buckets
+            .iter()
+            .enumerate()
+            .filter_map(|(index, bucket)| {
+                let state = DeltaStateId(
+                    u32::try_from(index).expect("typed Program state id overflow"),
+                );
+                self.contains_key(&state).then_some((state, bucket))
+            })
+    }
+}
+
+impl std::ops::Index<&DeltaStateId> for ProgramWorklist {
+    type Output = ProgramBucket;
+
+    fn index(&self, state: &DeltaStateId) -> &Self::Output {
+        self.get(state)
+            .expect("typed Program worklist has no active state")
+    }
+}
+
 impl ProgramBucket {
     fn len(&self) -> usize {
         self.tasks.len()
@@ -3919,7 +4042,7 @@ pub(super) struct DeltaScheduler {
     /// One unified queue of opaque typed continuations. Source generation and
     /// product expansion are family-private states distinguished only by
     /// opaque physical dispatch classes.
-    program_worklist: BTreeMap<DeltaStateId, ProgramBucket>,
+    program_worklist: ProgramWorklist,
     program_runtimes: AHashMap<DeltaStateId, ProgramRuntime>,
     /// Program-only cohort scratch is lazy so non-Program queries retain the
     /// baseline scheduler footprint. One allocation is amortized across all
@@ -3943,7 +4066,7 @@ impl DeltaScheduler {
             interner: DeltaInterner::default(),
             worklist: BTreeMap::new(),
             source_worklist: BTreeMap::new(),
-            program_worklist: BTreeMap::new(),
+            program_worklist: ProgramWorklist::default(),
             program_runtimes: AHashMap::new(),
             program_scratch: None,
             activation_width: 1,
@@ -5596,10 +5719,7 @@ impl DeltaScheduler {
             self.interner.program(state).is_some(),
             "typed program task was filed under a legacy delta state"
         );
-        self.program_worklist
-            .entry(state)
-            .or_default()
-            .append(&mut tasks);
+        self.program_worklist.append(state, &mut tasks);
         Some(ActiveDeltaContinuation { state, activation })
     }
 
@@ -5756,7 +5876,7 @@ impl DeltaScheduler {
             (selection, bucket.is_empty(), bucket.len())
         };
         if empty {
-            self.program_worklist.remove(&active.state);
+            self.program_worklist.deactivate(active.state);
         }
         let ProgramSelection { key, tasks, limits } = selection;
         let kind = match key.class.pacing() {
@@ -5778,11 +5898,10 @@ impl DeltaScheduler {
         &mut self,
         search_width: usize,
     ) -> (DeltaStateId, Vec<ProgramTask>, PhysicalDispatch) {
-        let id = *self
+        let id = self
             .program_worklist
-            .last_key_value()
-            .expect("typed program pop requires live work")
-            .0;
+            .last_id()
+            .expect("typed program pop requires live work");
         let (selection, empty, remainder_tasks) = {
             let bucket = self
                 .program_worklist
@@ -5798,7 +5917,7 @@ impl DeltaScheduler {
             (selection, bucket.is_empty(), bucket.len())
         };
         if empty {
-            self.program_worklist.remove(&id);
+            self.program_worklist.deactivate(id);
         }
         let ProgramSelection { key, tasks, limits } = selection;
         let kind = match key.class.pacing() {
@@ -7159,8 +7278,8 @@ impl DeltaScheduler {
             }
             source_worklist.insert(id, SourceBucket { tasks });
         }
-        let mut program_worklist = BTreeMap::new();
-        for (&id, bucket) in &self.program_worklist {
+        let mut program_worklist = ProgramWorklist::default();
+        for (id, bucket) in self.program_worklist.iter() {
             let mut tasks = Vec::with_capacity(bucket.tasks.len());
             for task in &bucket.tasks {
                 let credit = remap
@@ -7172,7 +7291,7 @@ impl DeltaScheduler {
                     work: task.work.clone(),
                 });
             }
-            program_worklist.insert(id, ProgramBucket { tasks });
+            program_worklist.append(id, &mut tasks);
         }
         assert!(
             remap.is_empty(),
