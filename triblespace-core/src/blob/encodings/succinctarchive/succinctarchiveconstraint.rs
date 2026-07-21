@@ -1032,18 +1032,17 @@ where
         limit: usize,
         accepted: &mut Vec<RawInline>,
     ) -> ResidualDeltaSourcePage {
-        let Positions {
-            e_var,
-            a_var,
-            v_var,
-            ..
-        } = *p;
-        let e_bound = p.e(row);
-        let a_bound = p.a(row);
-        let v_bound = p.v(row);
-        let all_codes = 0..self.archive.domain.len();
-
         if p.target_count() > 1 {
+            let Positions {
+                e_var,
+                a_var,
+                v_var,
+                ..
+            } = *p;
+            let e_bound = p.e(row);
+            let a_bound = p.a(row);
+            let v_bound = p.v(row);
+            let all_codes = 0..self.archive.domain.len();
             let accept = |value: &RawInline| self.repeated_value_matches(p, row, value);
             return match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
                 (_, Some(a), _, true, false, true) => page_middle_filtered(
