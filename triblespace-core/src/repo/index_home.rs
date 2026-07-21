@@ -32,12 +32,12 @@ use crate::prelude::{attributes, entity, pattern};
 use crate::query::unionconstraint::UnionConstraint;
 use crate::query::{
     ActionUnitClasses, CandidateSink, Candidates, Constraint, DispatchClass, EstimateSink,
-    ProgramAction, ProgramCompleteBatch, ProgramCompleteWorkQuote, ProgramCompletion,
-    ProgramExposure, ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef, ProgramRequest,
-    ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage, RawTerm, ResidualDeltaOutput,
-    ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, Term, TriblePattern,
-    TypedCompleteArbiter, TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedResume,
-    TypedSeedSink, VariableId, VariableSet,
+    ProgramAction, ProgramCompleteBatch, ProgramCompleteWorkEvidence, ProgramCompleteWorkQuote,
+    ProgramCompletion, ProgramExposure, ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef,
+    ProgramRequest, ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage, RawTerm,
+    ResidualDeltaOutput, ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, Term,
+    TriblePattern, TypedCompleteArbiter, TypedCompleteSink, TypedEffectSink, TypedProgramBatch,
+    TypedProgramSpec, TypedResume, TypedSeedSink, VariableId, VariableSet,
 };
 use crate::repo::index_range::{
     convex_union, is_ancestor, validate_exact_frontier_cover, RangeRecord, RangeRecordError,
@@ -1275,8 +1275,17 @@ pub struct UnionArchive<'a, U> {
 }
 
 impl<'a, U> UnionArchive<'a, U> {
-    /// Wrap attached physical shards. Querying an empty union is invalid.
+    /// Wrap attached physical shards.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `segments` is empty. A physical union requires at least
+    /// one shard; use a different constraint to represent an empty relation.
     pub fn new(segments: &'a [SuccinctArchive<U>]) -> Self {
+        assert!(
+            !segments.is_empty(),
+            "UnionArchive requires at least one physical shard"
+        );
         Self { segments }
     }
 
@@ -1471,7 +1480,6 @@ where
     /// parent-major, shard-major, Ring order as the typed pageable route.
     /// Cross-shard duplicates stay visible here; the complete-action adapter
     /// owns the later parent-local SET admission.
-    #[cfg(test)]
     fn for_each_complete_proposal_occurrence(
         &self,
         variable: VariableId,
@@ -1670,6 +1678,63 @@ where
 
     fn pacing(&self, _state: &Self::State) -> ProgramPacing {
         ProgramPacing::Search
+    }
+
+    /// Semantic fallback for wrappers that compose the public typed Program
+    /// hooks while inheriting the engine-owned bounded transaction.
+    #[cold]
+    #[inline(never)]
+    fn complete_typed(&self, batch: ProgramCompleteBatch<'_>, effects: &mut TypedCompleteSink) {
+        let ProgramAction::Propose(variable) = batch.request.action else {
+            panic!("UnionArchive complete actions support only proposals")
+        };
+        assert_eq!(variable, batch.route.variable);
+
+        // Ordinary `UnionConstraint::propose` would normalize overlapping
+        // shard values too early. Preserve the exact pageable raw bag; the
+        // complete-action adapter performs parent-local SET admission later.
+        self.for_each_complete_proposal_occurrence(variable, &batch.view, |parent, value| {
+            effects.push(parent, value)
+        });
+    }
+
+    /// Exact fallback quote paired with `complete_typed`. Direct UnionArchive
+    /// dispatch still uses `complete_bounded_typed` and retains located walks.
+    #[cold]
+    #[inline(never)]
+    fn quote_complete_typed(&self, batch: ProgramCompleteBatch<'_>) -> ProgramCompleteWorkEvidence {
+        let ProgramAction::Propose(variable) = batch.request.action else {
+            return ProgramCompleteWorkEvidence::Declined;
+        };
+        assert_eq!(variable, batch.route.variable);
+
+        let locators: Vec<_> = self
+            .shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .proposal_walk_locator_single_target(variable, &batch.view)
+                    .expect("one-target Succinct shard has no proposal locator")
+            })
+            .collect();
+        let mut quotes = Vec::with_capacity(batch.view.len());
+        for row in batch.view.iter() {
+            let mut raw_occurrences = 0usize;
+            for locator in &locators {
+                let Some(total) = raw_occurrences.checked_add(locator.locate(row).exact_len())
+                else {
+                    return ProgramCompleteWorkEvidence::Declined;
+                };
+                raw_occurrences = total;
+            }
+            // One-target Succinct walks emit every examined Ring value, so
+            // drain and raw bag counts are equal, including overlaps.
+            quotes.push(ProgramCompleteWorkQuote {
+                drain_work_units: raw_occurrences,
+                raw_occurrences,
+            });
+        }
+        ProgramCompleteWorkEvidence::Quoted(quotes)
     }
 
     fn complete_bounded_typed(
@@ -2310,6 +2375,72 @@ mod tests {
         (&facts).into()
     }
 
+    /// Models an external semantic decorator written against the ordinary
+    /// typed Program hooks. It deliberately inherits `complete_bounded_typed`
+    /// so the test below protects the default's composability law.
+    struct DefaultBoundedForwarder<'a, T>(&'a T);
+
+    impl<T> TypedProgramSpec for DefaultBoundedForwarder<'_, T>
+    where
+        T: TypedProgramSpec,
+    {
+        type State = T::State;
+        type NoveltyKey = T::NoveltyKey;
+        type Rank = T::Rank;
+
+        fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+            self.0.route(request)
+        }
+
+        fn dispatch(&self, state: &Self::State) -> DispatchClass {
+            self.0.dispatch(state)
+        }
+
+        fn pacing(&self, state: &Self::State) -> ProgramPacing {
+            self.0.pacing(state)
+        }
+
+        fn progress(&self, state: &Self::State) -> Self::Rank {
+            self.0.progress(state)
+        }
+
+        fn seed_typed(
+            &self,
+            batch: ProgramSeedBatch<'_>,
+            effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+        ) {
+            self.0.seed_typed(batch, effects);
+        }
+
+        fn step_typed(
+            &self,
+            states: Vec<Self::State>,
+            batch: TypedProgramBatch<'_>,
+            effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+        ) {
+            self.0.step_typed(states, batch, effects);
+        }
+
+        fn try_step_physical(
+            &self,
+            states: &[Self::State],
+            batch: TypedProgramBatch<'_>,
+        ) -> Option<crate::query::TypedPhysicalStep<Self::State, Self::NoveltyKey>> {
+            self.0.try_step_physical(states, batch)
+        }
+
+        fn complete_typed(&self, batch: ProgramCompleteBatch<'_>, effects: &mut TypedCompleteSink) {
+            self.0.complete_typed(batch, effects);
+        }
+
+        fn quote_complete_typed(
+            &self,
+            batch: ProgramCompleteBatch<'_>,
+        ) -> ProgramCompleteWorkEvidence {
+            self.0.quote_complete_typed(batch)
+        }
+    }
+
     struct RecordingRingBatch<'a> {
         archive: &'a SuccinctArchive<OrderedUniverse>,
         calls: Mutex<Vec<(SuccinctRotation, usize)>>,
@@ -2343,6 +2474,13 @@ mod tests {
         ];
 
         assert_eq!(UnionArchive::new(&archives).segment_count(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "UnionArchive requires at least one physical shard")]
+    fn union_archive_rejects_an_empty_physical_union_at_construction() {
+        let archives: [SuccinctArchive<OrderedUniverse>; 0] = [];
+        let _ = UnionArchive::new(&archives);
     }
 
     #[test]
@@ -3176,6 +3314,64 @@ mod tests {
                 (1, raw_value(5)),
             ]
         );
+    }
+
+    #[test]
+    fn union_archive_complete_hooks_compose_through_the_inherited_bounded_default() {
+        let entities = [
+            Id::new([0x58; 16]).unwrap(),
+            Id::new([0x59; 16]).unwrap(),
+            Id::new([0x5a; 16]).unwrap(),
+        ];
+        let attribute = Id::new([0x63; 16]).unwrap();
+        let facts = [(entities[0], 41), (entities[1], 42), (entities[2], 43)];
+        let archives = [
+            fixed_rows_archive(&attribute, facts),
+            fixed_rows_archive(&attribute, facts),
+        ];
+        let union_archive = UnionArchive::new(&archives);
+        let entity = Variable::<GenId>::new(0);
+        let value = Variable::<UnknownInline>::new(1);
+        let attribute: Inline<GenId> = attribute.to_inline();
+        let constraint = union_archive.pattern(entity, attribute, value);
+        let forwarder = DefaultBoundedForwarder(&constraint);
+        let vars = [entity.index];
+        let rows = entities
+            .into_iter()
+            .map(|entity| {
+                let entity: Inline<GenId> = entity.to_inline();
+                entity.raw
+            })
+            .collect::<Vec<_>>();
+        let view = RowsView::new(&vars, &rows);
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(value.index),
+            bound: VariableSet::new_singleton(entity.index),
+        };
+        let program = ProgramRef::new(&forwarder);
+        let batch = ProgramCompleteBatch {
+            request,
+            route: program.route(request).unwrap(),
+            view,
+        };
+        let affinity = ProgramCompleteAffinity::new(&rows);
+
+        let completion = program
+            .try_complete_bounded(batch, 4, &affinity)
+            .expect("the forwarded hooks admit the final two parents");
+        let (first_parent, admission, raw_occurrence_count, occurrences) =
+            completion.into_parts_for(batch, &affinity, &rows);
+
+        assert_eq!(first_parent, 1);
+        assert_eq!(
+            admission,
+            ProgramCompleteAdmission::Exact {
+                drain_work_units: 4,
+                raw_occurrences: 4,
+            }
+        );
+        assert_eq!(raw_occurrence_count, 4);
+        assert_eq!(occurrences, [(0, raw_value(42)), (1, raw_value(43))]);
     }
 
     #[test]
