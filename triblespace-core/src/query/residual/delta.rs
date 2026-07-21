@@ -10392,21 +10392,93 @@ mod tests {
             "graph-family retirement must precede finalizer execution"
         );
 
-        let outcome = scheduler.step_bounded(
+        let wide_capacities = {
+            let scratch = scheduler
+                .program_scratch
+                .as_ref()
+                .expect("wide graph cohort warmed scheduler scratch");
+            assert!(scratch.parents.is_empty());
+            assert!(scratch.vars.is_empty());
+            assert!(scratch.activations.is_empty());
+            assert!(scratch.task_receipts.is_empty());
+            assert!(scratch.work.is_empty());
+            assert!(scratch.receipt.pages.is_empty());
+            assert!(scratch.receipt.children.is_empty());
+            assert!(scratch.receipt.direct.is_empty());
+            assert!(scratch.receipt.accepted.is_empty());
+            assert!(scratch.receipt.supported.is_empty());
+            assert!(scratch.child_ranges.is_empty());
+            assert!(scratch.direct_ranges.is_empty());
+            assert!(scratch.accepted_ranges.is_empty());
+            assert!(scratch.supported_ranges.is_empty());
+            assert!(scratch.retired_activations.is_empty());
+            (
+                scratch.receipt.pages.capacity(),
+                scratch.child_ranges.capacity(),
+                scratch.direct_ranges.capacity(),
+                scratch.accepted_ranges.capacity(),
+                scratch.supported_ranges.capacity(),
+            )
+        };
+        let cold_clone = scheduler.clone();
+        assert!(scheduler.program_scratch.is_some());
+        assert!(cold_clone.program_scratch.is_none());
+
+        // The graph cohort above was two rows wide. Limit the first finalizer
+        // pop to one row so every retained receipt and tag-range buffer is
+        // exercised wide -> narrow on the same scratch allocation.
+        let first_finalized = scheduler.step_bounded(
             &root,
             &plan,
-            8,
+            1,
             None,
             &mut stable,
             &mut stable_interner,
             &mut stats,
         );
-        let mut completed_ids = outcome.completed_activation_ids.clone();
+        assert_eq!(first_finalized.completed_activation_ids.len(), 1);
+        assert_eq!(first_finalized.completed_activations, 1);
+        assert!(!first_finalized.completed_transition_cohort);
+        assert!(first_finalized.continuation.is_some());
+        assert_eq!(scheduler.program_worklist.len(), 1);
+        let scratch = scheduler.program_scratch.as_ref().unwrap();
+        assert!(scratch.parents.is_empty());
+        assert!(scratch.vars.is_empty());
+        assert!(scratch.activations.is_empty());
+        assert!(scratch.task_receipts.is_empty());
+        assert!(scratch.work.is_empty());
+        assert!(scratch.receipt.pages.is_empty());
+        assert!(scratch.receipt.children.is_empty());
+        assert!(scratch.receipt.direct.is_empty());
+        assert!(scratch.receipt.accepted.is_empty());
+        assert!(scratch.receipt.supported.is_empty());
+        assert!(scratch.child_ranges.is_empty());
+        assert!(scratch.direct_ranges.is_empty());
+        assert!(scratch.accepted_ranges.is_empty());
+        assert!(scratch.supported_ranges.is_empty());
+        assert!(scratch.retired_activations.is_empty());
+        assert!(scratch.receipt.pages.capacity() >= wide_capacities.0);
+        assert!(scratch.child_ranges.capacity() >= wide_capacities.1);
+        assert!(scratch.direct_ranges.capacity() >= wide_capacities.2);
+        assert!(scratch.accepted_ranges.capacity() >= wide_capacities.3);
+        assert!(scratch.supported_ranges.capacity() >= wide_capacities.4);
+
+        let second_finalized = scheduler.step_bounded(
+            &root,
+            &plan,
+            1,
+            None,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        let mut completed_ids = first_finalized.completed_activation_ids.clone();
+        completed_ids.extend(second_finalized.completed_activation_ids.iter().copied());
         completed_ids.sort_unstable();
         assert_eq!(completed_ids, activation_ids);
-        assert_eq!(outcome.completed_activations, 2);
-        assert!(!outcome.completed_transition_cohort);
-        assert!(outcome.continuation.is_some());
+        assert_eq!(second_finalized.completed_activations, 1);
+        assert!(!second_finalized.completed_transition_cohort);
+        assert!(second_finalized.continuation.is_some());
         assert!(scheduler.program_worklist.is_empty());
         assert!(activation_ids
             .iter()
