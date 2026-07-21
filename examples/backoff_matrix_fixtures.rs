@@ -489,14 +489,24 @@ fn main() {
     if let Some(sc) = sc {
         assert_eq!((sc.rows, sc.sig), (rc.rows, rc.sig), "F2 parity");
     }
-    let q = find!(
-        (s: Inline<GenId>, x: Inline<GenId>),
-        and!(
-            pattern!(&ring, [{ ?s @ r1_schema::msrc: ?s }]),
-            path!(ring.clone(), s r1_schema::mp+ x),
-        )
-    );
-    let _ = run_residual_cell!("F2/residual-K4-nonterminal", q, usize::MAX);
+    let profile_k4_repetitions = std::env::var("TRIBLES_PROFILE_K4_REPETITIONS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1);
+    for _ in 0..profile_k4_repetitions {
+        let q = find!(
+            (s: Inline<GenId>, x: Inline<GenId>),
+            and!(
+                pattern!(&ring, [{ ?s @ r1_schema::msrc: ?s }]),
+                path!(ring.clone(), s r1_schema::mp+ x),
+            )
+        );
+        let _ = run_residual_cell!("F2/residual-K4-nonterminal", q, usize::MAX);
+    }
+    if profile_k4_repetitions > 1 {
+        return;
+    }
 
     // F3 oasis-last — P3: take(1) with the oasis in the last-explored slot.
     let (oasis, _o0) = build_oasis(oasis_k, oasis_fan, 20);
