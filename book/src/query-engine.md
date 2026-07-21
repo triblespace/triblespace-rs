@@ -271,13 +271,23 @@ multiplier while retaining cheap singleton and fully drained paths.
 UnionArchive Propose and Support routes are `Production`; Confirm remains
 `Explicit`. Propose normally retains sparse, geometrically widened shard
 paging for low-demand and nonterminal work. A fresh multi-parent terminal
-cohort may instead use `CompleteActionEquivalent`, preserving the exact
-parent-major then shard-major raw occurrence bag until parent-local SET
-admission. Dense complete drains and bounded Succinct proposal pages consume
-the same already-located Ring walk. A resident WGPU two-bound proposal is a
-distinct preferred production family; a structurally declined action falls
-back to the canonical production Succinct route. The explicit lazy DAG remains
-the comparison path.
+cohort may instead use `CompleteActionEquivalent`. That certificate proves
+semantic equivalence only; optional `ProgramCompleteWorkEvidence` supplies the
+orthogonal physical admission evidence. Existing RPQ and TribleSet actions are
+`Unquoted` and retain their established policy. UnionArchive returns exact
+per-parent rank/select quotes, including raw cross-shard duplicates before SET
+admission. With the fixed V1 consistency factor `c = 1`, the scheduler admits
+the maximal contiguous tail suffix whose cumulative drain work and raw
+occurrences each fit current search width `S`, and only when at least two
+parents fit. It refiles the untouched prefix under the same canonical state;
+the quote is neither a capacity reservation nor part of state identity. Once
+admitted, completion remains unsuspendable. The complete action preserves the
+exact parent-major then shard-major raw bag until parent-local SET admission,
+and dense complete drains and bounded Succinct proposal pages consume the same
+already-located Ring walk. A resident WGPU two-bound proposal is a distinct
+preferred production family; a structurally declined action falls back to the
+canonical production Succinct route. The explicit lazy DAG remains the
+comparison path.
 
 [`Query::residual_state_scheduler`](triblespace::core::query::Query::residual_state_scheduler)
 selects the residual cursor for any root while preserving the query's chosen

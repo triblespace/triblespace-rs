@@ -23,8 +23,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Explicit`.** Ordinary hybrid lowering keeps sparse, geometrically
   widened paging for low-demand and nonterminal work. A fresh multi-parent
   terminal Propose cohort may instead use its `CompleteActionEquivalent`
-  certificate, preserving the exact parent-major then shard-major raw
-  occurrence bag before parent-local SET admission.
+  certificate after exact work quoting admits an order-preserving suffix,
+  preserving the parent-major then shard-major raw occurrence bag before
+  parent-local SET admission.
+- **Complete Program work quotes refine admission without turning completion
+  into paging.** Semantic `CompleteActionEquivalent` remains independent from
+  tri-state physical evidence: `Unquoted` retains the established RPQ and
+  TribleSet policy, `Declined` opens pageable roots, and `Quoted` reports exact
+  per-parent drain work and pre-SET raw occurrences. UnionArchive V1 admits the
+  maximal contiguous tail suffix whose two cumulative counts each fit current
+  search width `S`, and only when at least two parents fit. The untouched
+  prefix is refiled at the same canonical state. Quotes are neither capacity
+  reservations nor state identity; once admitted, the complete action remains
+  an unsuspendable family-owned fixpoint.
 - **Specialized `UnionArchiveConstraint`s can now retain per-shard execution
   attachments.** `from_shards` accepts already-constructed Succinct archive
   constraints, validates their exact ordered entity/attribute/value terms, and
