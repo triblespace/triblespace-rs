@@ -249,7 +249,7 @@ pub struct ProgramCompleteWorkQuote {
 #[doc(hidden)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProgramCompleteWorkEvidence {
-    /// This family predates physical quoting; retain the established complete
+    /// This family requires no additional physical quote; use the complete
     /// admission policy selected by independent scheduler evidence.
     Unquoted,
     /// Exact parent-local evidence for this batch.
