@@ -1885,6 +1885,63 @@ mod typed_program_tests {
         assert_eq!(suffix, [inline_value(3), inline_value(5)]);
         assert_eq!(suffix_page.examined, suffix.len());
         assert_eq!(suffix_page.next, None);
+
+        let mut cursor = ResidualDeltaSourceCursor::Start;
+        let mut resumed = Vec::new();
+        let mut resumed_examined = 0usize;
+        loop {
+            let page = page_indexed_distinct(
+                sequence.len(),
+                |index| sequence[index],
+                cursor,
+                1,
+                &mut resumed,
+            );
+            resumed_examined += page.examined;
+            let Some(next) = page.next else {
+                break;
+            };
+            cursor = next;
+        }
+        assert_eq!(resumed, accepted);
+        assert_eq!(resumed_examined, accepted.len());
+
+        let mut after_gap = Vec::new();
+        let after_gap_page = page_indexed_distinct(
+            sequence.len(),
+            |index| sequence[index],
+            ResidualDeltaSourceCursor::After(inline_value(4)),
+            1,
+            &mut after_gap,
+        );
+        assert_eq!(after_gap, [inline_value(5)]);
+        assert_eq!(after_gap_page.examined, 1);
+        assert_eq!(after_gap_page.next, None);
+
+        let duplicates = [inline_value(7); 8];
+        let mut one = Vec::new();
+        let duplicate_page = page_indexed_distinct(
+            duplicates.len(),
+            |index| duplicates[index],
+            ResidualDeltaSourceCursor::Start,
+            1,
+            &mut one,
+        );
+        assert_eq!(one, [inline_value(7)]);
+        assert_eq!(duplicate_page.examined, 1);
+        assert_eq!(duplicate_page.next, None);
+
+        let mut empty = Vec::new();
+        let empty_page = page_indexed_distinct(
+            0,
+            |_| unreachable!("an empty page must not inspect its driver"),
+            ResidualDeltaSourceCursor::Start,
+            1,
+            &mut empty,
+        );
+        assert!(empty.is_empty());
+        assert_eq!(empty_page.examined, 0);
+        assert_eq!(empty_page.next, None);
     }
 
     fn one_program_step<U>(
