@@ -9163,6 +9163,12 @@ enum MachineStep {
     },
 }
 
+/// Boundary between scheduler work and the generic public projection shell.
+enum PullAdvance {
+    EmitReady,
+    Exhausted,
+}
+
 /// Executes one canonical control state after the scheduler has selected its
 /// affine payload chunk. The explicit owned task is the common eager/lazy
 /// dispatch boundary; its action-only view is where a future executor can
@@ -11597,77 +11603,29 @@ impl ResidualStateMachine {
             self.terminal_demand_consumed == self.terminal_demand_width;
     }
 
-    fn pull_with_dispatch<'a, P, R>(
+    /// Drives the non-generic stable/delta scheduler until it stages raw rows
+    /// for projection or proves the affine frontier exhausted.
+    ///
+    /// Keeping this loop independent of the mapper and projected result type
+    /// gives ordinary and shadow execution one monomorph each while preserving
+    /// their statically dispatched action boundary.
+    #[inline(never)]
+    fn advance_to_emit_with_dispatch<'a>(
         &mut self,
         dispatch: &impl ResidualActionDispatch,
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
-        postprocessing: &P,
-        projection_gate: &mut ProjectionGate,
         influences: &[VariableSet; 128],
         base_estimates: &[usize; 128],
-    ) -> Option<R>
-    where
-        P: Fn(&Binding) -> Option<R>,
-    {
-        if projection_gate.is_done() {
-            self.retire_staged_projection_receipts();
-            return None;
-        }
-        // Do not interpret a pull after proven scheduler exhaustion as demand
-        // for a wider terminal window. This matters for an elided zero-variable
-        // full head: its single semantic seed needs no claim table, and after
-        // that seed is consumed there is no remaining work to promote.
-        if self.emit_next >= self.emit_count
-            && self.worklist.is_empty()
-            && self.delta.is_empty()
-        {
-            return None;
-        }
-        self.confirm_terminal_demand();
+    ) -> PullAdvance {
         loop {
-            let draining_unprojected_emit = self.emit_next < self.emit_count;
-            while self.emit_next < self.emit_count {
-                let row = self.emit_next;
-                // Consume before invoking user code. If it panics and the
-                // unwind is caught, a later pull must not repeat its effects.
-                self.emit_next += 1;
-                let origin = self.emit_origins.as_ref().map(|origins| origins[row]);
-                let mut projection =
-                    origin.map(|activation| self.terminal_yield.begin_projection(activation));
-                let stride = self.emit_vars.len();
-                let start = row * stride;
-                for (column, &variable) in self.emit_vars.iter().enumerate() {
-                    self.binding.set(variable, &self.emit_rows[start + column]);
-                }
-                match projection_gate.project(&self.binding, postprocessing) {
-                    ProjectionStep::Yield(result) => {
-                        if let Some(projection) = &mut projection {
-                            projection.mark_successful();
-                        }
-                        drop(projection);
-                        self.charge_projected_result();
-                        if projection_gate.is_done() {
-                            self.retire_staged_projection_receipts();
-                        }
-                        return Some(result);
-                    }
-                    ProjectionStep::Skip => drop(projection),
-                    ProjectionStep::Done => {
-                        drop(projection);
-                        self.retire_staged_projection_receipts();
-                        return None;
-                    }
-                }
-            }
-            if draining_unprojected_emit {
-                // Exhausting a staged raw-result suffix without satisfying
-                // this public pull is negative search feedback, but it is not
-                // confirmed projected-result demand.
-                self.increase_width();
+            // Direct terminal publication can stage the final rows while also
+            // exhausting the cyclic frontier. Observe staged output first.
+            if self.emit_next < self.emit_count {
+                return PullAdvance::EmitReady;
             }
             if self.worklist.is_empty() && self.delta.is_empty() {
-                return None;
+                return PullAdvance::Exhausted;
             }
 
             let width = self.width;
@@ -11797,6 +11755,88 @@ impl ResidualStateMachine {
                         completed_activation_ids,
                     );
                 }
+            }
+        }
+    }
+
+    fn pull_with_dispatch<'a, P, R>(
+        &mut self,
+        dispatch: &impl ResidualActionDispatch,
+        root: &dyn Constraint<'a>,
+        plan: &ResidualPlan,
+        postprocessing: &P,
+        projection_gate: &mut ProjectionGate,
+        influences: &[VariableSet; 128],
+        base_estimates: &[usize; 128],
+    ) -> Option<R>
+    where
+        P: Fn(&Binding) -> Option<R>,
+    {
+        if projection_gate.is_done() {
+            self.retire_staged_projection_receipts();
+            return None;
+        }
+        // Do not interpret a pull after proven scheduler exhaustion as demand
+        // for a wider terminal window. This matters for an elided zero-variable
+        // full head: its single semantic seed needs no claim table, and after
+        // that seed is consumed there is no remaining work to promote.
+        if self.emit_next >= self.emit_count
+            && self.worklist.is_empty()
+            && self.delta.is_empty()
+        {
+            return None;
+        }
+        self.confirm_terminal_demand();
+        loop {
+            let draining_unprojected_emit = self.emit_next < self.emit_count;
+            while self.emit_next < self.emit_count {
+                let row = self.emit_next;
+                // Consume before invoking user code. If it panics and the
+                // unwind is caught, a later pull must not repeat its effects.
+                self.emit_next += 1;
+                let origin = self.emit_origins.as_ref().map(|origins| origins[row]);
+                let mut projection =
+                    origin.map(|activation| self.terminal_yield.begin_projection(activation));
+                let stride = self.emit_vars.len();
+                let start = row * stride;
+                for (column, &variable) in self.emit_vars.iter().enumerate() {
+                    self.binding.set(variable, &self.emit_rows[start + column]);
+                }
+                match projection_gate.project(&self.binding, postprocessing) {
+                    ProjectionStep::Yield(result) => {
+                        if let Some(projection) = &mut projection {
+                            projection.mark_successful();
+                        }
+                        drop(projection);
+                        self.charge_projected_result();
+                        if projection_gate.is_done() {
+                            self.retire_staged_projection_receipts();
+                        }
+                        return Some(result);
+                    }
+                    ProjectionStep::Skip => drop(projection),
+                    ProjectionStep::Done => {
+                        drop(projection);
+                        self.retire_staged_projection_receipts();
+                        return None;
+                    }
+                }
+            }
+            if draining_unprojected_emit {
+                // Exhausting a staged raw-result suffix without satisfying
+                // this public pull is negative search feedback, but it is not
+                // confirmed projected-result demand.
+                self.increase_width();
+            }
+            match self.advance_to_emit_with_dispatch(
+                dispatch,
+                root,
+                plan,
+                influences,
+                base_estimates,
+            ) {
+                PullAdvance::EmitReady => {}
+                PullAdvance::Exhausted => return None,
             }
         }
     }
