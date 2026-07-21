@@ -1433,14 +1433,25 @@ where
             "UnionArchive complete proposal target is already bound"
         );
 
+        // Positions are a block-schema specialization, not row state. Build
+        // one small locator per shard so parent-major emission does not pay
+        // variable-to-column resolution for every parent × shard pair.
+        let locators: Vec<_> = self
+            .shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .proposal_walk_locator_single_target(variable, view)
+                    .expect("one-target Succinct shard has no proposal locator")
+            })
+            .collect();
+
         for parent_index in 0..view.len() {
             let parent =
                 u32::try_from(parent_index).expect("too many UnionArchive complete-action parents");
-            let row_view = view.row_view(parent_index);
-            for shard in &self.shards {
-                let walk = shard
-                    .proposal_walk_single_target(variable, &row_view)
-                    .expect("one-target Succinct shard has no located proposal walk");
+            let row = view.row(parent_index);
+            for locator in &locators {
+                let walk = locator.locate(row);
                 let mut emitted = 0usize;
                 let page = walk.consume(ResidualDeltaSourceCursor::Start, usize::MAX, |value| {
                     emitted += 1;
