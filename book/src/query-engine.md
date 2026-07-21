@@ -263,18 +263,18 @@ query starts no worklist at all. Production lowering flattens exposed
 associative AND regions, keeps other finite logical composites such as Union as
 fused constraint kernels inside that substrate, and enables
 production-qualified typed Programs for RPQs and other heterogeneous actions.
-Canonical SuccinctArchive and UnionArchive Propose and Confirm routes are
-explicit and require `ProgramScope::All` (provided by
-`ResidualLowering::FULL`). Their ordinary block-native methods already preserve
-whole-frontier batching; selecting the pageable typed form under production
-instead creates one activation per parent and can turn cheap CPU or batched
-rank work into scheduler overhead. Their finite Support routes remain
-production-qualified. A resident WGPU two-bound proposal is a distinct
-exception: the wrapper's preferred accelerator-capable family stays
-production-qualified, while a structurally declined action falls back to the
-canonical explicit Succinct route. Thus hybrid lowering keeps the genuinely
-heterogeneous route without forcing every archive action through typed paging.
-The explicit lazy DAG remains the comparison path.
+Canonical single-shard SuccinctArchive Propose, Confirm, and Support routes are
+production-qualified, so their pageable typed form participates in ordinary
+hybrid lowering. Program retirement validates a wider activation receipt with
+one arena membership pass, avoiding the previous activation-count by arena-size
+multiplier while retaining cheap singleton and fully drained paths.
+Multi-shard UnionArchive Propose and Confirm routes remain explicit and require
+`ProgramScope::All` (provided by `ResidualLowering::FULL`): their ordinary
+normalized kernels already preserve whole-frontier batching. UnionArchive
+Support remains production-qualified. A resident WGPU two-bound proposal is a
+distinct preferred production family; a structurally declined action falls
+back to the canonical production Succinct route. The explicit lazy DAG remains
+the comparison path.
 
 [`Query::residual_state_scheduler`](triblespace::core::query::Query::residual_state_scheduler)
 selects the residual cursor for any root while preserving the query's chosen
