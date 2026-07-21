@@ -924,6 +924,13 @@ enum RegistrySettlement {
     ProposalMaterializer(ProposalMaterializerSeed),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QuiescenceHandoff {
+    Complete,
+    ConfirmFinalizer,
+    ProposalMaterializer,
+}
+
 #[derive(Debug)]
 enum DeltaCompletion {
     /// Every semantic effect was released before quiescence.
@@ -2449,39 +2456,11 @@ impl ProducerRegistry {
     /// independently. Engine-owned Formula OR reducers settle directly
     /// through their own pageable Program families.
     fn settle_quiescence(&mut self, proof: QuiescenceProof) -> RegistrySettlement {
-        enum Handoff {
-            Complete,
-            Confirm,
-            Proposal,
-        }
-
-        let handoff = {
-            let activation = self
-                .state
-                .activations
-                .get(&proof.activation)
-                .expect("unknown delta activation");
-            assert_eq!(activation.status, ActivationStatus::Quiescent);
-            assert!(activation.live.is_empty());
-            let eligible_return = match &activation.return_to {
-                DeltaReturn::Stable { .. } => true,
-                DeltaReturn::Formula { batch, .. } => batch.confirm_finalizer_capable(),
-                DeltaReturn::FormulaOrAdmit { .. }
-                | DeltaReturn::FormulaOrEmit { .. }
-                | DeltaReturn::SetAdmission { .. } => false,
-            };
-            match &activation.reducer {
-                DeltaReducer::QuiescentProposal { occurrences }
-                    if !occurrences.is_empty() => Handoff::Proposal,
-                DeltaReducer::Confirm { original }
-                    if eligible_return && !original.is_empty() => Handoff::Confirm,
-                _ => Handoff::Complete,
-            }
-        };
+        let handoff = self.quiescence_handoff(&proof);
 
         match handoff {
-            Handoff::Complete => RegistrySettlement::Completed(self.finish(proof)),
-            Handoff::Proposal => {
+            QuiescenceHandoff::Complete => RegistrySettlement::Completed(self.finish(proof)),
+            QuiescenceHandoff::ProposalMaterializer => {
                 let state = {
                     let activation = self
                         .state
@@ -2524,7 +2503,7 @@ impl ProducerRegistry {
                     credit,
                 })
             }
-            Handoff::Confirm => {
+            QuiescenceHandoff::ConfirmFinalizer => {
                 let state = {
                     let activation = self
                         .state
@@ -2569,6 +2548,38 @@ impl ProducerRegistry {
                     credit,
                 })
             }
+        }
+    }
+
+    /// Classifies a completion boundary without consuming its affine proof.
+    ///
+    /// The scheduler uses this read-only preflight to batch only homogeneous
+    /// finalizer handoffs. If one member differs, every proof retains the
+    /// established scalar settlement path; no activation is half-transferred
+    /// before the all-fit decision is known.
+    fn quiescence_handoff(&self, proof: &QuiescenceProof) -> QuiescenceHandoff {
+        let activation = self
+            .state
+            .activations
+            .get(&proof.activation)
+            .expect("unknown delta activation");
+        assert_eq!(activation.status, ActivationStatus::Quiescent);
+        assert!(activation.live.is_empty());
+        let eligible_return = match &activation.return_to {
+            DeltaReturn::Stable { .. } => true,
+            DeltaReturn::Formula { batch, .. } => batch.confirm_finalizer_capable(),
+            DeltaReturn::FormulaOrAdmit { .. }
+            | DeltaReturn::FormulaOrEmit { .. }
+            | DeltaReturn::SetAdmission { .. } => false,
+        };
+        match &activation.reducer {
+            DeltaReducer::QuiescentProposal { occurrences } if !occurrences.is_empty() => {
+                QuiescenceHandoff::ProposalMaterializer
+            }
+            DeltaReducer::Confirm { original } if eligible_return && !original.is_empty() => {
+                QuiescenceHandoff::ConfirmFinalizer
+            }
+            _ => QuiescenceHandoff::Complete,
         }
     }
 
@@ -4017,6 +4028,62 @@ impl DeltaScheduler {
                 DeltaSettlement::Retargeted(active)
             }
         }
+    }
+
+    /// Transfers one homogeneous physical cohort of Confirm reducers into the
+    /// canonical engine-finalizer state with a single worklist append.
+    ///
+    /// Every parent keeps its original activation, novelty scope, reducer,
+    /// immutable candidate cursor, and affine credit. Only the administrative
+    /// Q->finalizer handoff is fused. The caller must preflight the complete
+    /// cohort through [`ProducerRegistry::quiescence_handoff`]; this method
+    /// consumes no mixed batch and therefore never needs partial rollback.
+    fn settle_confirm_quiescence_batch(
+        &mut self,
+        proofs: Vec<QuiescenceProof>,
+    ) -> Vec<ActiveDeltaContinuation> {
+        assert!(!proofs.is_empty(), "Confirm settlement batch is empty");
+        let mut seeds = Vec::with_capacity(proofs.len());
+        for proof in proofs {
+            let RegistrySettlement::ConfirmFinalizer(seed) =
+                self.registry.settle_quiescence(proof)
+            else {
+                panic!("preflighted Confirm settlement changed handoff class")
+            };
+            seeds.push(seed);
+        }
+
+        let state = self.prepare_engine_program(EngineProgramKind::ConfirmFinalize);
+        let mut tasks = Vec::with_capacity(seeds.len());
+        let mut active = Vec::with_capacity(seeds.len());
+        {
+            let runtime = self
+                .program_runtimes
+                .get_mut(&state)
+                .expect("prepared Confirm finalizer lost its runtime");
+            for seed in seeds {
+                let work = insert_engine_program_state(
+                    &CONFIRM_FINALIZER_PROGRAM,
+                    runtime,
+                    ProgramActivation(seed.activation.0),
+                    seed.state,
+                );
+                active.push(ActiveDeltaContinuation {
+                    state,
+                    activation: seed.activation,
+                });
+                tasks.push(ProgramTask {
+                    activation: seed.activation,
+                    credit: seed.credit,
+                    work,
+                });
+            }
+        }
+        let filed = self
+            .file_program_state(state, tasks)
+            .expect("Confirm settlement batch filed no finalizer tasks");
+        debug_assert_eq!(filed, *active.last().unwrap());
+        active
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6574,6 +6641,19 @@ impl DeltaScheduler {
         let mut completed_activations = 0usize;
         let mut terminal_publications = OrderedActivationSet::default();
 
+        struct PendingProgramSettlement {
+            activation: ActivationId,
+            terminal: bool,
+            within_search_page: bool,
+            page_had_program_effect: bool,
+            dead_search_pages: usize,
+            dead_source_telemetry_pages: usize,
+            quiescence: Option<QuiescenceProof>,
+            effects: DeltaStableEffects,
+        }
+
+        let mut pending = Vec::with_capacity(row_count);
+
         for (
             input,
             (
@@ -6682,8 +6762,70 @@ impl DeltaScheduler {
                     }
                 }
             }
-            if let Some(proof) = outcome.quiescence {
+            if let Some(proof) = &outcome.quiescence {
                 assert_eq!(proof.activation, activation);
+            }
+            pending.push(PendingProgramSettlement {
+                activation,
+                terminal,
+                within_search_page,
+                page_had_program_effect,
+                dead_search_pages: outcome.dead_search_pages,
+                dead_source_telemetry_pages: outcome.dead_source_telemetry_pages,
+                quiescence: outcome.quiescence,
+                effects: task_effects,
+            });
+            debug_assert!(input < row_count);
+        }
+
+        // Settlement starts only after every affine Program receipt has been
+        // replaced. This makes the all-fit decision observational: a mixed
+        // cohort cannot be left half-transferred if one handoff differs.
+        let batched_confirm = pending.len() > 1
+            && pending.iter().all(|item| {
+                item.quiescence.as_ref().is_some_and(|proof| {
+                    self.registry.quiescence_handoff(proof)
+                        == QuiescenceHandoff::ConfirmFinalizer
+                })
+            });
+        if batched_confirm {
+            let proofs: Vec<_> = pending
+                .iter_mut()
+                .map(|item| {
+                    item.quiescence
+                        .take()
+                        .expect("batched Confirm settlement lost one proof")
+                })
+                .collect();
+            let batch_width = proofs.len();
+            let active = self.settle_confirm_quiescence_batch(proofs);
+            assert_eq!(active.len(), batch_width);
+            for continuation in active {
+                let activation = continuation.activation;
+                assert!(retargeted.insert(activation, continuation).is_none());
+                retired_activations.push(ProgramActivation(activation.0));
+            }
+            stats.delta_program_settlement_batches += 1;
+            stats.delta_program_settlement_activations += batch_width;
+            stats.max_delta_program_settlement_batch =
+                stats.max_delta_program_settlement_batch.max(batch_width);
+            stats.delta_program_settlement_refiles += 1;
+        } else {
+            let had_confirm_handoff = pending.iter().any(|item| {
+                item.quiescence.as_ref().is_some_and(|proof| {
+                    self.registry.quiescence_handoff(proof)
+                        == QuiescenceHandoff::ConfirmFinalizer
+                })
+            });
+            if pending.len() > 1 && had_confirm_handoff {
+                stats.delta_program_settlement_fallbacks += 1;
+                stats.delta_program_settlement_fallback_activations += pending.len();
+            }
+            for item in &mut pending {
+                let Some(proof) = item.quiescence.take() else {
+                    continue;
+                };
+                let activation = item.activation;
                 match self.settle_quiescence(proof) {
                     DeltaSettlement::Retargeted(active) => {
                         assert_eq!(active.activation, activation);
@@ -6699,7 +6841,7 @@ impl DeltaScheduler {
                             stats,
                         );
                         prefer_continuation(
-                            &mut task_effects.continuation,
+                            &mut item.effects.continuation,
                             released.continuation,
                         );
                         if let Some(active) = released.active {
@@ -6710,44 +6852,42 @@ impl DeltaScheduler {
                         }
                     }
                 }
-                // Whether this proof removed the activation or transferred it
-                // to the engine finalizer, the just-drained Program family's
-                // activation-local arena is dead at this boundary.
                 retired_activations.push(ProgramActivation(activation.0));
             }
+        }
 
-            let page_dead = !page_had_program_effect && !task_effects.has_effect();
+        for item in pending {
+            let page_dead = !item.page_had_program_effect && !item.effects.has_effect();
             if page_dead {
                 // A child nested below an AfterChildren source receipt is
                 // local work for that one source page. Preserve its exact
                 // transition telemetry, but defer geometric feedback until
                 // the receipt-local barrier knows whether any descendant
                 // produced a stable effect.
-                dead_pages += usize::from(!within_search_page);
+                dead_pages += usize::from(!item.within_search_page);
                 if source_telemetry_cohort {
                     source_dead_pages += 1;
                 } else if !private_direct {
                     transition_dead_pages += 1;
                 }
             }
-            let retired_search_dead_pages = if task_effects.has_effect() {
+            let retired_search_dead_pages = if item.effects.has_effect() {
                 0
             } else {
-                outcome.dead_search_pages
+                item.dead_search_pages
             };
-            let retired_source_telemetry_dead_pages = if task_effects.has_effect() {
+            let retired_source_telemetry_dead_pages = if item.effects.has_effect() {
                 0
             } else {
-                outcome.dead_source_telemetry_pages
+                item.dead_source_telemetry_pages
             };
             dead_pages += retired_search_dead_pages;
             retired_search_receipts += retired_search_dead_pages;
             source_dead_pages += retired_source_telemetry_dead_pages;
-            if terminal && task_effects.has_effect() {
-                let _ = terminal_publications.insert(activation);
+            if item.terminal && item.effects.has_effect() {
+                let _ = terminal_publications.insert(item.activation);
             }
-            effects.absorb(task_effects);
-            debug_assert!(input < row_count);
+            effects.absorb(item.effects);
         }
 
         let _ = self.file_program_state(state, scheduled);
@@ -10077,9 +10217,11 @@ mod tests {
             {
                 assert_eq!(state, 1);
                 let candidates = candidates.expect("Confirm activation lost its source set");
-                assert_eq!(candidates.len(), 1);
+                assert!(candidates.len() <= 1);
                 effects.page(1, None);
-                effects.accept(input as u32, candidates[0]);
+                if let Some(&candidate) = candidates.first() {
+                    effects.accept(input as u32, candidate);
+                }
                 effects.account_transition(1);
             }
         }
@@ -10282,14 +10424,32 @@ mod tests {
             scheduler.interner.program(finalizer_state),
             Some(&ProgramAddress::Engine(EngineProgramKind::ConfirmFinalize))
         );
+        assert_eq!(scheduler.program_worklist[&finalizer_state].tasks.len(), 2);
         assert!(activation_ids
             .iter()
             .all(|activation| scheduler.registry.is_live(*activation)));
+        assert_eq!(stats.delta_program_settlement_batches, 1);
+        assert_eq!(stats.delta_program_settlement_activations, 2);
+        assert_eq!(stats.max_delta_program_settlement_batch, 2);
+        assert_eq!(stats.delta_program_settlement_refiles, 1);
+        assert_eq!(stats.delta_program_settlement_fallbacks, 0);
+        assert_eq!(stats.delta_program_settlement_fallback_activations, 0);
         assert_eq!(
             novelty_drops.load(Ordering::Relaxed),
             drops_before_step + 2,
             "graph-family retirement must precede finalizer execution"
         );
+
+        let mut cloned = scheduler.clone();
+        let original_finalizers = &scheduler.program_worklist[&finalizer_state].tasks;
+        let cloned_finalizers = &cloned.program_worklist[&finalizer_state].tasks;
+        assert_eq!(original_finalizers.len(), cloned_finalizers.len());
+        assert!(original_finalizers
+            .iter()
+            .zip(cloned_finalizers)
+            .all(|(original, cloned)| {
+                original.activation == cloned.activation && original.credit.brand != cloned.credit.brand
+            }));
 
         let outcome = scheduler.step_bounded(
             &root,
@@ -10334,6 +10494,38 @@ mod tests {
         let mut returned_values: Vec<_> = snapshot.into_iter().map(|(_, value)| value).collect();
         returned_values.sort_unstable();
         assert_eq!(returned_values, [value(7), value(8)]);
+
+        let mut cloned_stable = Worklist::new();
+        let mut cloned_interner = StateInterner::default();
+        let mut cloned_stats = ResidualStateStats::default();
+        let cloned_outcome = cloned.step_bounded(
+            &root,
+            &plan,
+            8,
+            None,
+            &mut cloned_stable,
+            &mut cloned_interner,
+            &mut cloned_stats,
+        );
+        let mut cloned_completed_ids = cloned_outcome.completed_activation_ids.clone();
+        cloned_completed_ids.sort_unstable();
+        assert_eq!(cloned_completed_ids, activation_ids);
+        let cloned_batches: Vec<_> = cloned_stable
+            .values()
+            .flat_map(|level| level.values())
+            .collect();
+        assert_eq!(cloned_batches.len(), 1);
+        let StateBucket::Candidates(cloned_batch) = cloned_batches[0] else {
+            panic!("cloned settlement batch returned the wrong stable payload")
+        };
+        assert_eq!(cloned_batch.parents.row_count, 2);
+        let mut cloned_values: Vec<_> = cloned_batch
+            .candidates
+            .iter()
+            .map(|(_, value)| value)
+            .collect();
+        cloned_values.sort_unstable();
+        assert_eq!(cloned_values, returned_values);
         assert_eq!(stats.delta_transition_pages, 2);
         assert_eq!(stats.delta_transition_candidates_examined, 2);
         assert_eq!(stats.delta_transition_cohorts, 1);
@@ -10344,6 +10536,12 @@ mod tests {
         assert_eq!(stats.delta_program_physical_granted_work, 0);
         assert_eq!(stats.max_delta_program_physical_cohort, 0);
         assert_eq!(stats.max_delta_program_physical_granted_work, 0);
+        assert_eq!(stats.delta_program_settlement_batches, 1);
+        assert_eq!(stats.delta_program_settlement_activations, 2);
+        assert_eq!(stats.max_delta_program_settlement_batch, 2);
+        assert_eq!(stats.delta_program_settlement_refiles, 1);
+        assert_eq!(stats.delta_program_settlement_fallbacks, 0);
+        assert_eq!(stats.delta_program_settlement_fallback_activations, 0);
     }
 
     #[test]
@@ -10907,6 +11105,11 @@ mod tests {
         assert_eq!(stats.delta_program_physical_granted_work, 8);
         assert_eq!(stats.max_delta_program_physical_cohort, 2);
         assert_eq!(stats.max_delta_program_physical_granted_work, 8);
+        assert_eq!(stats.delta_program_settlement_batches, 1);
+        assert_eq!(stats.delta_program_settlement_activations, 2);
+        assert_eq!(stats.max_delta_program_settlement_batch, 2);
+        assert_eq!(stats.delta_program_settlement_refiles, 1);
+        assert_eq!(stats.delta_program_settlement_fallbacks, 0);
 
         let finalized = scheduler.step_bounded(
             &root,
@@ -10921,6 +11124,101 @@ mod tests {
         assert_eq!(stats.delta_program_physical_cohorts, 1);
         assert_eq!(stats.delta_program_physical_rows, 2);
         assert_eq!(stats.delta_program_physical_granted_work, 8);
+    }
+
+    #[test]
+    fn mixed_program_settlement_falls_back_as_one_uncommitted_cohort() {
+        let root = OneShotConfirmProgram {
+            novelty_drops: Arc::new(AtomicUsize::new(0)),
+            physical: false,
+        };
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let relevant = ChildSet::empty(plan.len()).with_inserted(0);
+        let successor = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Candidate {
+                variable: 0,
+                relevant: relevant.clone(),
+                checked: relevant,
+            },
+        };
+        let request = ProgramRequest {
+            action: ProgramAction::Confirm(0),
+            bound: VariableSet::new_empty(),
+        };
+        let spec = root.residual_program().unwrap();
+        let route = spec.route(request).unwrap();
+        let mut scheduler = DeltaScheduler::new();
+        scheduler.activation_width = 2;
+        let active = scheduler
+            .seed_program_confirms(
+                spec,
+                DeltaDesc::leaf(0, 0),
+                request,
+                route,
+                successor,
+                false,
+                CandidateBatch {
+                    parents: RowBatch {
+                        rows: Vec::new(),
+                        row_count: 2,
+                    },
+                    candidates: CandidatePayload::Tagged(vec![(0, value(7))]),
+                },
+            )
+            .expect("mixed Confirm parents must seed one physical cohort");
+        let initial_tasks = &scheduler.program_worklist[&active.state].tasks;
+        assert_eq!(initial_tasks.len(), 2);
+        let activation_ids: Vec<_> = initial_tasks
+            .iter()
+            .map(|task| task.activation)
+            .collect();
+
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let graph = scheduler.step_bounded(
+            &root,
+            &plan,
+            8,
+            None,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+
+        assert_eq!(graph.retargeted.len(), 1);
+        assert_eq!(graph.completed_activation_ids.len(), 1);
+        assert_eq!(graph.completed_activations, 1);
+        let retargeted = graph.retargeted.values().next().unwrap();
+        assert_eq!(retargeted.activation, activation_ids[0]);
+        assert_eq!(graph.completed_activation_ids, [activation_ids[1]]);
+        assert!(scheduler.registry.is_live(activation_ids[0]));
+        assert!(!scheduler.registry.is_live(activation_ids[1]));
+        assert_eq!(stats.delta_program_settlement_batches, 0);
+        assert_eq!(stats.delta_program_settlement_activations, 0);
+        assert_eq!(stats.max_delta_program_settlement_batch, 0);
+        assert_eq!(stats.delta_program_settlement_refiles, 0);
+        assert_eq!(stats.delta_program_settlement_fallbacks, 1);
+        assert_eq!(stats.delta_program_settlement_fallback_activations, 2);
+
+        let finalized = scheduler.step_bounded(
+            &root,
+            &plan,
+            8,
+            None,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert_eq!(finalized.completed_activation_ids, [activation_ids[0]]);
+        let batches: Vec<_> = stable.values().flat_map(|level| level.values()).collect();
+        assert_eq!(batches.len(), 1);
+        let StateBucket::Candidates(batch) = batches[0] else {
+            panic!("mixed settlement returned the wrong stable payload")
+        };
+        assert_eq!(batch.parents.row_count, 1);
+        assert_eq!(batch.candidates.iter().collect::<Vec<_>>(), [(0, value(7))]);
     }
 
     #[test]

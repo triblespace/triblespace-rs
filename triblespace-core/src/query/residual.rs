@@ -2453,6 +2453,23 @@ pub struct ResidualStateStats {
     /// Largest sum of exact per-input work limits granted to one successful
     /// non-Native placement.
     pub max_delta_program_physical_granted_work: usize,
+    /// Homogeneous multi-activation Confirm handoffs settled as one physical
+    /// batch.
+    pub delta_program_settlement_batches: usize,
+    /// Parent activations transferred through batched Confirm settlement.
+    pub delta_program_settlement_activations: usize,
+    /// Largest number of parent activations transferred by one settlement
+    /// batch.
+    pub max_delta_program_settlement_batch: usize,
+    /// Canonical Confirm-finalizer bucket appends performed by batched
+    /// settlement.
+    pub delta_program_settlement_refiles: usize,
+    /// Multi-input Program cohorts rejected by the all-fit settlement
+    /// preflight and therefore settled through the scalar path.
+    pub delta_program_settlement_fallbacks: usize,
+    /// Program inputs in settlement cohorts counted by
+    /// [`delta_program_settlement_fallbacks`](Self::delta_program_settlement_fallbacks).
+    pub delta_program_settlement_fallback_activations: usize,
     /// Bounded pages requested from constraint-owned source frontiers.
     pub delta_source_pages: usize,
     /// Physical calls that consumed one compatible cohort of affine source
