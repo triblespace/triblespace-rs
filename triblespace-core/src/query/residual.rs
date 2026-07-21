@@ -13680,6 +13680,20 @@ mod tests {
         transition_source: bool,
         proposes: Arc<AtomicUsize>,
         pages: Arc<AtomicUsize>,
+        action_log: Option<(usize, Arc<Mutex<Vec<LoggedAction>>>)>,
+    }
+
+    impl PagedProposalLeaf {
+        fn record_propose(&self, parent_rows: usize) {
+            if let Some((leaf_occurrence, log)) = &self.action_log {
+                log.lock().unwrap().push(LoggedAction {
+                    verb: ActionVerb::Propose,
+                    leaf_occurrence: *leaf_occurrence,
+                    parent_rows,
+                    candidate_occurrences: 0,
+                });
+            }
+        }
     }
 
     impl Constraint<'static> for PagedProposalLeaf {
@@ -13707,6 +13721,7 @@ mod tests {
             candidates: &mut CandidateSink<'_>,
         ) {
             assert_eq!(variable, self.variable);
+            self.record_propose(view.len());
             self.proposes.fetch_add(1, Ordering::Relaxed);
             for row in 0..view.len() {
                 candidates.extend_row(row as u32, self.values.iter().copied());
@@ -13732,9 +13747,13 @@ mod tests {
         fn residual_proposal_source_is_paged(
             &self,
             variable: VariableId,
-            _view: &RowsView<'_>,
+            view: &RowsView<'_>,
         ) -> bool {
-            variable == self.variable
+            let paged = variable == self.variable;
+            if paged {
+                self.record_propose(view.len());
+            }
+            paged
         }
 
         fn residual_proposal_source_has_transition_roots(
@@ -14224,6 +14243,7 @@ mod tests {
             transition_source: false,
             proposes: Arc::clone(&proposes),
             pages: Arc::clone(&pages),
+            action_log: None,
         });
         let mut solve = Query::new(leaf, |binding: &Binding| binding.get(0).copied())
             .solve_residual_state_lazy_with(ResidualLowering::new(
@@ -14327,6 +14347,7 @@ mod tests {
                 transition_source: true,
                 proposes: Arc::clone(&proposes),
                 pages: Arc::clone(&pages),
+                action_log: None,
             })
         };
         let root = UnionConstraint::new(vec![
@@ -14701,6 +14722,7 @@ mod tests {
                 transition_source: false,
                 proposes: Arc::new(AtomicUsize::new(0)),
                 pages: Arc::new(AtomicUsize::new(0)),
+                action_log: None,
             }) as ShapeConstraint,
         ]);
         let profiled = Query::new(root, |binding: &Binding| {
@@ -15575,6 +15597,7 @@ mod tests {
                 transition_source: false,
                 proposes,
                 pages,
+                action_log: None,
             }) as ShapeConstraint,
         ]);
         let mut iter = Query::new(root, postprocessing)
@@ -15848,6 +15871,43 @@ mod tests {
         assert_eq!(cold.stats().delta_direct_terminal_publication_rows, 3);
         assert_eq!(cold.stats().candidate_plan_pops, 0);
         assert_eq!(cold.stats().emit_pops, 0);
+    }
+
+    #[test]
+    fn stable_emit_projection_unwind_consumes_raw_row_before_resume() {
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let observed_attempts = Arc::clone(&attempts);
+        let panic_once = Arc::new(AtomicBool::new(true));
+        let projection_guard = Arc::clone(&panic_once);
+        let mut iter = Query::new(
+            FanoutLeaf {
+                variable: 0,
+                values: Arc::new(vec![raw(1), raw(2), raw(3)]),
+            },
+            move |binding: &Binding| {
+                let value = binding.get(0).copied()?;
+                observed_attempts.lock().unwrap().push(value);
+                if projection_guard.swap(false, Ordering::SeqCst) {
+                    panic!("intentional stable-emit projection panic");
+                }
+                Some(value)
+            },
+        )
+        .solve_residual_state_lazy()
+        .cap(8)
+        .start_width(8);
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| iter.next()));
+        assert!(unwind.is_err());
+        assert_eq!(*attempts.lock().unwrap(), [raw(1)]);
+        assert_eq!((iter.state.emit_next, iter.state.emit_count), (1, 3));
+        assert!(iter.state.emit_origins.is_none());
+        assert_eq!(iter.stats().delta_direct_terminal_publication_batches, 0);
+
+        assert_eq!(iter.next(), Some(raw(2)));
+        assert_eq!(iter.next(), Some(raw(3)));
+        assert_eq!(iter.next(), None);
+        assert_eq!(*attempts.lock().unwrap(), [raw(1), raw(2), raw(3)]);
     }
 
     #[test]
@@ -20868,6 +20928,30 @@ mod tests {
         ])
     }
 
+    fn logged_direct_terminal_fixture(
+        log: Arc<Mutex<Vec<LoggedAction>>>,
+        pages: Arc<AtomicUsize>,
+    ) -> IntersectionConstraint<ShapeConstraint> {
+        IntersectionConstraint::new(vec![
+            Box::new(LoggedLeaf {
+                variable: 0,
+                leaf_occurrence: 0,
+                estimate: 1,
+                proposed: Arc::new(vec![raw(9)]),
+                accepted: None,
+                log: Arc::clone(&log),
+            }) as ShapeConstraint,
+            Box::new(PagedProposalLeaf {
+                variable: 1,
+                values: Arc::new(vec![raw(3), raw(1), raw(3), raw(2)]),
+                transition_source: false,
+                proposes: Arc::new(AtomicUsize::new(0)),
+                pages,
+                action_log: Some((1, log)),
+            }) as ShapeConstraint,
+        ])
+    }
+
     #[cfg(feature = "parallel")]
     fn parallel_logged_filter_fixture(
         values: Vec<RawInline>,
@@ -21025,6 +21109,98 @@ mod tests {
 
         assert!(saw_dead_confirm);
         assert!(saw_surviving_confirm);
+    }
+
+    #[test]
+    fn residual_shadow_preserves_direct_terminal_all_skip_sequence_and_feedback() {
+        let direct_log = Arc::new(Mutex::new(Vec::new()));
+        let direct_pages = Arc::new(AtomicUsize::new(0));
+        let direct_attempts = Arc::new(AtomicUsize::new(0));
+        let counted_direct_attempts = Arc::clone(&direct_attempts);
+        let direct = Query::new(
+            logged_direct_terminal_fixture(Arc::clone(&direct_log), Arc::clone(&direct_pages)),
+            move |_binding: &Binding| {
+                counted_direct_attempts.fetch_add(1, Ordering::Relaxed);
+                None::<()>
+            },
+        )
+        .solve_residual_state_lazy_with(ResidualLowering::new(
+            FormulaScope::OpaqueLeaves,
+            ProgramScope::All,
+        ))
+        .cap(8)
+        .start_width(4)
+        .growth(2)
+        .collect_profiled();
+
+        let shadow_log = Arc::new(Mutex::new(Vec::new()));
+        let shadow_pages = Arc::new(AtomicUsize::new(0));
+        let shadow_attempts = Arc::new(AtomicUsize::new(0));
+        let counted_shadow_attempts = Arc::clone(&shadow_attempts);
+        let epoch = ResidualShadowEpoch::new();
+        let shadow = Query::new(
+            logged_direct_terminal_fixture(Arc::clone(&shadow_log), Arc::clone(&shadow_pages)),
+            move |_binding: &Binding| {
+                counted_shadow_attempts.fetch_add(1, Ordering::Relaxed);
+                None::<()>
+            },
+        )
+        .solve_residual_state_lazy_with(ResidualLowering::new(
+            FormulaScope::OpaqueLeaves,
+            ProgramScope::All,
+        ))
+        .cap(8)
+        .start_width(4)
+        .growth(2)
+        .shadow(epoch.clone())
+        .collect_profiled();
+
+        assert!(direct.results.is_empty());
+        assert!(shadow.results.is_empty());
+        assert_eq!(shadow.stats, direct.stats);
+        assert_eq!(shadow.shadow.status, ResidualShadowStatus::Closed);
+        assert_eq!(epoch.status(), ResidualShadowStatus::Closed);
+        assert_eq!(direct_pages.load(Ordering::Relaxed), 1);
+        assert_eq!(shadow_pages.load(Ordering::Relaxed), 1);
+        assert_eq!(direct_attempts.load(Ordering::Relaxed), 3);
+        assert_eq!(shadow_attempts.load(Ordering::Relaxed), 3);
+        assert_eq!(direct.stats.delta_direct_terminal_publication_batches, 1);
+        assert_eq!(direct.stats.delta_direct_terminal_publication_rows, 3);
+        assert_eq!(direct.stats.terminal_demand_projected_rows, 0);
+        assert_eq!(direct.stats.width_increases, 1);
+
+        let direct_calls = direct_log.lock().unwrap().clone();
+        let shadow_calls = shadow_log.lock().unwrap().clone();
+        assert_eq!(shadow_calls, direct_calls);
+        assert_eq!(
+            direct_calls,
+            [
+                LoggedAction {
+                    verb: ActionVerb::Propose,
+                    leaf_occurrence: 0,
+                    parent_rows: 1,
+                    candidate_occurrences: 0,
+                },
+                LoggedAction {
+                    verb: ActionVerb::Propose,
+                    leaf_occurrence: 1,
+                    parent_rows: 1,
+                    candidate_occurrences: 0,
+                },
+            ]
+        );
+        let observed_calls: Vec<_> = shadow
+            .shadow
+            .events
+            .iter()
+            .map(|event| LoggedAction {
+                verb: event.site.verb,
+                leaf_occurrence: event.site.leaf_occurrence,
+                parent_rows: event.geometry.parent_rows,
+                candidate_occurrences: event.geometry.candidate_occurrences,
+            })
+            .collect();
+        assert_eq!(observed_calls, direct_calls);
     }
 
     #[test]
@@ -23953,6 +24129,7 @@ mod tests {
                 transition_source,
                 proposes: Arc::clone(&proposes),
                 pages: Arc::clone(&pages),
+                action_log: None,
             };
             let root = UnionConstraint::new(vec![
                 leaf(vec![raw(1), raw(2), raw(2)]),
@@ -23988,6 +24165,7 @@ mod tests {
                 transition_source: false,
                 proposes: Arc::clone(&finite_proposes),
                 pages: Arc::clone(&finite_pages),
+                action_log: None,
             },
             PagedProposalLeaf {
                 variable: 0,
@@ -23995,6 +24173,7 @@ mod tests {
                 transition_source: true,
                 proposes: Arc::clone(&transition_proposes),
                 pages: Arc::clone(&transition_pages),
+                action_log: None,
             },
         ]);
         let mut heterogeneous: Vec<_> =
