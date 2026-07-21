@@ -2496,6 +2496,13 @@ pub struct ResidualStateStats {
     pub delta_program_active_pops: usize,
     /// Typed Program pops selected from the shared cyclic frontier.
     pub delta_program_global_pops: usize,
+    /// Directed Program pops that exhausted their canonical bucket and left
+    /// its empty storage parked across the synchronous physical call.
+    pub delta_program_parked_active_pops: usize,
+    /// Sparse post-call map lookups performed because a parked directed pop
+    /// produced no local replacement. Nested same-state filings may make the
+    /// looked-up bucket nonempty and therefore preserve it.
+    pub delta_program_cleanup_lookups: usize,
     /// Program inputs whose committed receipt admitted exactly one child and
     /// carried no same-input resume/barrier. This is a shape observation only;
     /// it does not imply that the child can safely remain resident.

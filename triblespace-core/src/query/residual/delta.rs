@@ -4,7 +4,7 @@
 //! producer credits, and parent rows remain payload, so unrelated traversals
 //! can share one expansion cohort without becoming semantically conflated.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{btree_map::Entry, BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ahash::{AHashMap, AHashSet};
@@ -5622,6 +5622,30 @@ impl DeltaScheduler {
         Some(ActiveDeltaContinuation { state, activation })
     }
 
+    /// Cleans up the empty sentinel from an exhausted directed Program pop.
+    ///
+    /// The map lookup is deliberately sparse: a retained remainder needs no
+    /// sentinel, while a local replacement has already made the parked bucket
+    /// nonempty through ordinary filing. Only an exhausted pop with no local
+    /// replacement can still need removal. Nested same-state filings remain
+    /// protected by the final emptiness check.
+    fn cleanup_parked_program_state(
+        &mut self,
+        state: DeltaStateId,
+        parked: bool,
+        local_replacements: bool,
+    ) -> bool {
+        if !parked || local_replacements {
+            return false;
+        }
+        if let Entry::Occupied(entry) = self.program_worklist.entry(state) {
+            if entry.get().is_empty() {
+                entry.remove();
+            }
+        }
+        true
+    }
+
     fn has_active_source(&self, active: ActiveDeltaContinuation) -> bool {
         self.source_worklist
             .get(&active.state)
@@ -5765,8 +5789,8 @@ impl DeltaScheduler {
         &mut self,
         active: ActiveDeltaContinuation,
         search_width: usize,
-    ) -> (DeltaStateId, Vec<ProgramTask>, PhysicalDispatch) {
-        let (selection, empty, remainder_tasks) = {
+    ) -> (DeltaStateId, Vec<ProgramTask>, PhysicalDispatch, bool) {
+        let (selection, parked, remainder_tasks) = {
             let bucket = self
                 .program_worklist
                 .get_mut(&active.state)
@@ -5774,9 +5798,6 @@ impl DeltaScheduler {
             let selection = bucket.take_active(&self.registry, active.activation, search_width);
             (selection, bucket.is_empty(), bucket.len())
         };
-        if empty {
-            self.program_worklist.remove(&active.state);
-        }
         let ProgramSelection { key, tasks, limits } = selection;
         let kind = match key.class.pacing() {
             ProgramPacing::Search => PhysicalDispatchKind::Source,
@@ -5790,7 +5811,7 @@ impl DeltaScheduler {
             limits,
             remainder_tasks,
         );
-        (active.state, tasks, dispatch)
+        (active.state, tasks, dispatch, parked)
     }
 
     fn pop_program_bounded(
@@ -6011,7 +6032,8 @@ impl DeltaScheduler {
             .delta_source_candidates_examined
             .saturating_add(stats.delta_transition_candidates_examined);
         let outcome = if has_program {
-            let (state, tasks, dispatch) = self.pop_active_program(active, search_width);
+            let (state, tasks, dispatch, parked) =
+                self.pop_active_program(active, search_width);
             let physical = self.step_program(
                 root,
                 plan,
@@ -6019,6 +6041,7 @@ impl DeltaScheduler {
                 tasks,
                 &dispatch.task_limits,
                 true,
+                parked,
                 direct_terminal_full,
                 stable,
                 stable_interner,
@@ -6170,6 +6193,7 @@ impl DeltaScheduler {
                 state,
                 tasks,
                 &dispatch.task_limits,
+                false,
                 false,
                 direct_terminal_publication_full,
                 stable,
@@ -6503,6 +6527,7 @@ impl DeltaScheduler {
         mut tasks: Vec<ProgramTask>,
         limits: &[usize],
         active_pop: bool,
+        parked_active_bucket: bool,
         direct_terminal_full: Option<VariableSet>,
         stable: &mut Worklist,
         stable_interner: &mut StateInterner,
@@ -6519,6 +6544,7 @@ impl DeltaScheduler {
         } else {
             stats.delta_program_global_pops += 1;
         }
+        stats.delta_program_parked_active_pops += usize::from(parked_active_bucket);
 
         let address = self
             .interner
@@ -6890,6 +6916,7 @@ impl DeltaScheduler {
             debug_assert!(input < row_count);
         }
 
+        let local_replacements = !tasks.is_empty();
         if !tasks.is_empty() {
             stats.delta_program_continuation_files += 1;
             stats.delta_program_continuation_tasks_filed += tasks.len();
@@ -6897,6 +6924,12 @@ impl DeltaScheduler {
                 usize::from(!self.program_worklist.contains_key(&state));
         }
         let _ = self.file_program_state(state, tasks);
+        let cleanup_lookup = self.cleanup_parked_program_state(
+            state,
+            parked_active_bucket,
+            local_replacements,
+        );
+        stats.delta_program_cleanup_lookups += usize::from(cleanup_lookup);
         if !retired_activations.is_empty() {
             spec.retire_activations(
                 self.program_runtimes
@@ -9829,7 +9862,7 @@ mod tests {
 
         assert_eq!(scheduler.program_worklist.len(), 1);
         assert_eq!(scheduler.program_worklist[&state].tasks.len(), 2);
-        let (popped_state, hot, dispatch) = scheduler.pop_active_program(active, 1);
+        let (popped_state, hot, dispatch, _) = scheduler.pop_active_program(active, 1);
         assert_eq!(popped_state, state);
         assert_eq!(dispatch.kind, PhysicalDispatchKind::Program);
         assert_eq!(hot.len(), 1);
@@ -9838,6 +9871,177 @@ mod tests {
         assert_eq!(
             scheduler.program_worklist[&state].tasks[0].activation,
             second
+        );
+    }
+
+    #[test]
+    fn parked_active_program_replacement_needs_no_cleanup_lookup() {
+        let mut scheduler = DeltaScheduler::new();
+        let state = test_program_state(&mut scheduler);
+        let activation = scheduler.registry.open_program_activation(
+            DeltaReducer::StreamProposal,
+            stable_return(Vec::new()),
+            None,
+            None,
+        );
+        let mut tasks = install_program_tasks(
+            &mut scheduler.registry,
+            activation,
+            [0, 1, 2],
+            DispatchClass::new(0),
+            ProgramPacing::Activation,
+        )
+        .into_iter();
+        let popped = tasks.next().unwrap();
+        let nested = tasks.next().unwrap();
+        let replacement = tasks.next().unwrap();
+        let nested_nonce = nested.credit.key.nonce;
+        let replacement_nonce = replacement.credit.key.nonce;
+        let active = scheduler.file_program_state(state, vec![popped]).unwrap();
+
+        let (_, selected, _, parked) = scheduler.pop_active_program(active, 1);
+        assert_eq!(selected.len(), 1);
+        assert!(parked);
+        assert!(scheduler.program_worklist[&state].is_empty());
+
+        let _ = scheduler.file_program_state(state, vec![nested]);
+        let _ = scheduler.file_program_state(state, vec![replacement]);
+        assert!(!scheduler.cleanup_parked_program_state(state, parked, true));
+        assert_eq!(
+            scheduler.program_worklist[&state]
+                .tasks
+                .iter()
+                .map(|task| task.credit.key.nonce)
+                .collect::<Vec<_>>(),
+            [nested_nonce, replacement_nonce]
+        );
+    }
+
+    #[test]
+    fn parked_active_program_without_replacement_looks_up_once_and_drains() {
+        let mut scheduler = DeltaScheduler::new();
+        let state = test_program_state(&mut scheduler);
+        let activation = scheduler.registry.open_program_activation(
+            DeltaReducer::StreamProposal,
+            stable_return(Vec::new()),
+            None,
+            None,
+        );
+        let tasks = install_program_tasks(
+            &mut scheduler.registry,
+            activation,
+            [0],
+            DispatchClass::new(0),
+            ProgramPacing::Activation,
+        );
+        let active = scheduler.file_program_state(state, tasks).unwrap();
+
+        let (_, _, _, parked) = scheduler.pop_active_program(active, 1);
+        assert!(parked);
+        assert!(scheduler.cleanup_parked_program_state(state, parked, false));
+        assert!(!scheduler.program_worklist.contains_key(&state));
+    }
+
+    #[test]
+    fn nested_same_state_filing_survives_sparse_cleanup_lookup() {
+        let mut scheduler = DeltaScheduler::new();
+        let state = test_program_state(&mut scheduler);
+        let activation = scheduler.registry.open_program_activation(
+            DeltaReducer::StreamProposal,
+            stable_return(Vec::new()),
+            None,
+            None,
+        );
+        let mut tasks = install_program_tasks(
+            &mut scheduler.registry,
+            activation,
+            [0, 1],
+            DispatchClass::new(0),
+            ProgramPacing::Activation,
+        )
+        .into_iter();
+        let popped = tasks.next().unwrap();
+        let nested = tasks.next().unwrap();
+        let nested_nonce = nested.credit.key.nonce;
+        let active = scheduler.file_program_state(state, vec![popped]).unwrap();
+
+        let (_, _, _, parked) = scheduler.pop_active_program(active, 1);
+        assert!(parked);
+        let _ = scheduler.file_program_state(state, vec![nested]);
+        assert!(scheduler.cleanup_parked_program_state(state, parked, false));
+
+        assert_eq!(scheduler.program_worklist[&state].len(), 1);
+        assert_eq!(
+            scheduler.program_worklist[&state].tasks[0]
+                .credit
+                .key
+                .nonce,
+            nested_nonce
+        );
+    }
+
+    #[test]
+    fn retained_active_program_remainder_needs_no_cleanup_lookup() {
+        let mut scheduler = DeltaScheduler::new();
+        let state = test_program_state(&mut scheduler);
+        let activation = scheduler.registry.open_program_activation(
+            DeltaReducer::StreamProposal,
+            stable_return(Vec::new()),
+            None,
+            None,
+        );
+        let tasks = install_program_tasks(
+            &mut scheduler.registry,
+            activation,
+            [0, 1],
+            DispatchClass::new(0),
+            ProgramPacing::Activation,
+        );
+        let active = scheduler.file_program_state(state, tasks).unwrap();
+
+        let (_, selected, _, parked) = scheduler.pop_active_program(active, 1);
+        assert_eq!(selected.len(), 1);
+        assert!(!parked);
+        assert!(!scheduler.cleanup_parked_program_state(state, parked, false));
+        assert_eq!(scheduler.program_worklist[&state].len(), 1);
+    }
+
+    #[test]
+    fn global_program_pop_keeps_the_remove_reinsert_boundary() {
+        let mut scheduler = DeltaScheduler::new();
+        let state = test_program_state(&mut scheduler);
+        let activation = scheduler.registry.open_program_activation(
+            DeltaReducer::StreamProposal,
+            stable_return(Vec::new()),
+            None,
+            None,
+        );
+        let mut tasks = install_program_tasks(
+            &mut scheduler.registry,
+            activation,
+            [0, 1],
+            DispatchClass::new(0),
+            ProgramPacing::Activation,
+        )
+        .into_iter();
+        let popped = tasks.next().unwrap();
+        let replacement = tasks.next().unwrap();
+        let replacement_nonce = replacement.credit.key.nonce;
+        let _ = scheduler.file_program_state(state, vec![popped]);
+
+        let (popped_state, selected, _) = scheduler.pop_program_bounded(1);
+        assert_eq!(popped_state, state);
+        assert_eq!(selected.len(), 1);
+        assert!(!scheduler.program_worklist.contains_key(&state));
+
+        let _ = scheduler.file_program_state(state, vec![replacement]);
+        assert!(!scheduler.cleanup_parked_program_state(state, false, true));
+        assert_eq!(
+            scheduler.program_worklist[&state].tasks[0]
+                .credit
+                .key
+                .nonce,
+            replacement_nonce
         );
     }
 
@@ -9907,7 +10111,8 @@ mod tests {
         let storage_nonces: Vec<_> = tasks.iter().map(|task| task.credit.key.nonce).collect();
         let active = scheduler.file_program_state(state, tasks).unwrap();
         let (popped_state, selected, dispatch) = if active_pop {
-            scheduler.pop_active_program(active, 3)
+            let (state, tasks, dispatch, _) = scheduler.pop_active_program(active, 3);
+            (state, tasks, dispatch)
         } else {
             scheduler.pop_program_bounded(3)
         };
