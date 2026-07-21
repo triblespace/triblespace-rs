@@ -32,12 +32,12 @@ use crate::prelude::{attributes, entity, pattern};
 use crate::query::unionconstraint::UnionConstraint;
 use crate::query::{
     ActionUnitClasses, CandidateSink, Candidates, Constraint, DispatchClass, EstimateSink,
-    ProgramAction, ProgramCompleteBatch, ProgramCompleteWorkQuote, ProgramCompletion,
-    ProgramExposure, ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef, ProgramRequest,
-    ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage, RawTerm, ResidualDeltaOutput,
-    ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, Term, TriblePattern,
-    TypedCompleteArbiter, TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedResume,
-    TypedSeedSink, VariableId, VariableSet,
+    ProgramAction, ProgramCompleteBatch, ProgramCompleteWorkEvidence, ProgramCompleteWorkQuote,
+    ProgramCompletion, ProgramExposure, ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef,
+    ProgramRequest, ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage, RawTerm,
+    ResidualDeltaOutput, ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, Term,
+    TriblePattern, TypedCompleteSink, TypedEffectSink, TypedProgramBatch, TypedProgramSpec,
+    TypedResume, TypedSeedSink, VariableId, VariableSet,
 };
 use crate::repo::index_range::{
     convex_union, is_ancestor, validate_exact_frontier_cover, RangeRecord, RangeRecordError,
@@ -1471,7 +1471,6 @@ where
     /// parent-major, shard-major, Ring order as the typed pageable route.
     /// Cross-shard duplicates stay visible here; the complete-action adapter
     /// owns the later parent-local SET admission.
-    #[cfg(test)]
     fn for_each_complete_proposal_occurrence(
         &self,
         variable: VariableId,
@@ -1672,13 +1671,24 @@ where
         ProgramPacing::Search
     }
 
-    fn complete_bounded_typed(
-        &self,
-        batch: ProgramCompleteBatch<'_>,
-        arbiter: &mut TypedCompleteArbiter,
-    ) {
+    fn complete_typed(&self, batch: ProgramCompleteBatch<'_>, effects: &mut TypedCompleteSink) {
         let ProgramAction::Propose(variable) = batch.request.action else {
             panic!("UnionArchive complete actions support only proposals")
+        };
+        assert_eq!(variable, batch.route.variable);
+
+        // This ablation deliberately restores the pre-fusion fallback: quote
+        // and completion locate independently while the fde9 arbiter remains.
+        self.for_each_complete_proposal_occurrence(variable, &batch.view, |parent, value| {
+            effects.push(parent, value)
+        });
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn quote_complete_typed(&self, batch: ProgramCompleteBatch<'_>) -> ProgramCompleteWorkEvidence {
+        let ProgramAction::Propose(variable) = batch.request.action else {
+            return ProgramCompleteWorkEvidence::Declined;
         };
         assert_eq!(variable, batch.route.variable);
 
@@ -1691,71 +1701,22 @@ where
                     .expect("one-target Succinct shard has no proposal locator")
             })
             .collect();
-        assert!(
-            !locators.is_empty(),
-            "UnionArchive complete action requires at least one shard"
-        );
-        let shard_count = locators.len();
-        let mut retained_walks = Vec::new();
-        for parent in (0..batch.view.len()).rev() {
-            let retained_start = retained_walks.len();
-            let row = batch.view.row(parent);
-            let mut raw_occurrences = Some(0usize);
+        let mut quotes = Vec::with_capacity(batch.view.len());
+        for row in batch.view.iter() {
+            let mut raw_occurrences = 0usize;
             for locator in &locators {
-                #[cfg(test)]
-                record_union_complete_walk_located();
-                let walk = locator.locate(row);
-                let exact_len = walk.exact_len();
-                raw_occurrences = raw_occurrences.and_then(|total| total.checked_add(exact_len));
-                retained_walks.push(walk);
+                let Some(total) = raw_occurrences.checked_add(locator.locate(row).exact_len())
+                else {
+                    return ProgramCompleteWorkEvidence::Declined;
+                };
+                raw_occurrences = total;
             }
-            let admitted = if let Some(raw_occurrences) = raw_occurrences {
-                // One-target Succinct walks emit every examined Ring value,
-                // so drain and raw bag counts are equal, including overlaps.
-                arbiter.try_admit_tail_parent(
-                    parent,
-                    ProgramCompleteWorkQuote {
-                        drain_work_units: raw_occurrences,
-                        raw_occurrences,
-                    },
-                )
-            } else {
-                arbiter.reject_tail_parent(parent);
-                false
-            };
-            if !admitted {
-                retained_walks.truncate(retained_start);
-                break;
-            }
+            quotes.push(ProgramCompleteWorkQuote {
+                drain_work_units: raw_occurrences,
+                raw_occurrences,
+            });
         }
-
-        let Some(selection) = arbiter.seal_tail_admission() else {
-            return;
-        };
-        let retained_parent_count = batch.view.len() - selection.first_parent();
-        debug_assert_eq!(retained_walks.len(), retained_parent_count * shard_count);
-        let effects = arbiter.effects_mut();
-        for (parent, walks) in retained_walks.chunks_exact(shard_count).rev().enumerate() {
-            let parent =
-                u32::try_from(parent).expect("too many UnionArchive complete-action parents");
-            for walk in walks {
-                #[cfg(test)]
-                record_union_complete_walk_consumed();
-                let mut emitted = 0usize;
-                let page = walk.consume(ResidualDeltaSourceCursor::Start, usize::MAX, |value| {
-                    emitted += 1;
-                    effects.push(parent, value);
-                });
-                assert_eq!(
-                    page.examined, emitted,
-                    "a complete Succinct walk did not emit every examined value"
-                );
-                assert!(
-                    page.next.is_none(),
-                    "an unbounded complete Succinct walk retained a continuation"
-                );
-            }
-        }
+        ProgramCompleteWorkEvidence::Quoted(quotes)
     }
 
     fn progress(&self, state: &Self::State) -> Self::Rank {
