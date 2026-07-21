@@ -803,9 +803,11 @@ struct ProgramJoinCompletion {
 ///
 /// Succinct sources commonly report strictly ascending raw values. Keeping
 /// that prefix ordered avoids allocating and probing a hash table for every
-/// accepted proposal. The first duplicate or inversion proves that append-only
-/// admission is no longer sufficient, so the complete prefix is upgraded once
-/// to the general hash representation. The representation never downgrades.
+/// accepted proposal. A repeated current maximum can be rejected without
+/// leaving ordered form. The first value below that maximum proves that
+/// append-only admission is no longer sufficient, so the complete prefix is
+/// upgraded once to the general hash representation. The representation never
+/// downgrades.
 #[derive(Clone)]
 enum ActivationAcceptedSet {
     Ordered(SmallVec<[RawInline; 1]>),
@@ -825,6 +827,7 @@ impl ActivationAcceptedSet {
                 values.push(value);
                 true
             }
+            Self::Ordered(values) if values.last() == Some(&value) => false,
             Self::Ordered(ordered) => {
                 let mut hashed = AHashSet::with_capacity(ordered.len() + 1);
                 hashed.extend(ordered.iter().copied());
@@ -7807,14 +7810,34 @@ mod tests {
     fn activation_accepted_set_duplicate_upgrades_once_and_rejects_duplicate() {
         let mut accepted = ActivationAcceptedSet::default();
         assert!(accepted.insert(value(1)));
+        assert!(accepted.insert(value(2)));
         assert!(!accepted.insert(value(1)));
         assert!(accepted.is_hashed());
 
-        assert!(accepted.insert(value(2)));
+        assert!(accepted.insert(value(3)));
         assert!(!accepted.insert(value(2)));
         assert!(accepted.is_hashed());
         assert!(accepted.contains(&value(1)));
         assert!(accepted.contains(&value(2)));
+        assert!(accepted.contains(&value(3)));
+    }
+
+    #[test]
+    fn activation_accepted_set_duplicate_max_stays_ordered_until_inversion() {
+        let mut accepted = ActivationAcceptedSet::default();
+        assert!(accepted.insert(value(1)));
+        assert!(accepted.insert(value(2)));
+        assert!(!accepted.insert(value(2)));
+        assert!(accepted.is_ordered());
+        assert!(!accepted.is_hashed());
+
+        assert!(accepted.insert(value(3)));
+        assert!(accepted.is_ordered());
+        assert!(accepted.insert(value(0)));
+        assert!(accepted.is_hashed());
+        for byte in [0, 1, 2, 3] {
+            assert!(accepted.contains(&value(byte)));
+        }
     }
 
     #[test]
