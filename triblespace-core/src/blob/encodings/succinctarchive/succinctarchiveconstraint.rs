@@ -621,6 +621,39 @@ where
     }
 }
 
+/// One block-schema specialization for locating single-target proposal walks.
+///
+/// [`Positions`] contains only target flags and column/constant sources, so it
+/// is invariant across every row of a [`RowsView`]. Physical wrappers that
+/// need parent-major traversal can build this locator once, then locate each
+/// row without repeating variable-to-column resolution.
+pub(crate) struct ProposalWalkLocator<'a, U>
+where
+    U: Universe,
+{
+    constraint: SuccinctArchiveConstraint<'a, U>,
+    positions: Positions,
+    row_width: usize,
+}
+
+impl<'a, U> ProposalWalkLocator<'a, U>
+where
+    U: Universe,
+{
+    /// Locate one row's ordered Ring walk using the already-resolved block
+    /// schema. The resulting walk owns no borrow of the row or this locator.
+    pub(crate) fn locate(&self, row: &[RawInline]) -> LocatedProposalWalk<'a, U> {
+        assert_eq!(
+            row.len(),
+            self.row_width,
+            "Succinct proposal row disagrees with its locator schema"
+        );
+        self.constraint
+            .located_proposal_walk(&self.positions, row)
+            .expect("single-target Succinct proposal locator lost its walk")
+    }
+}
+
 impl<'a, U> SuccinctArchiveConstraint<'a, U>
 where
     U: Universe,
@@ -1136,11 +1169,33 @@ where
         variable: VariableId,
         view: &RowsView<'_>,
     ) -> Option<LocatedProposalWalk<'a, U>> {
-        if view.len() != 1 || view.col(variable).is_some() {
+        if view.len() != 1 {
+            return None;
+        }
+        self.proposal_walk_locator_single_target(variable, view)
+            .map(|locator| locator.locate(view.row(0)))
+    }
+
+    /// Resolve one single-target proposal schema for every row in `view`.
+    /// Row values are deliberately absent from this object; [`locate`](ProposalWalkLocator::locate)
+    /// supplies them later while preserving the shared column layout.
+    pub(crate) fn proposal_walk_locator_single_target(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+    ) -> Option<ProposalWalkLocator<'a, U>> {
+        if view.col(variable).is_some() {
             return None;
         }
         let positions = self.positions(variable, view);
-        self.located_proposal_walk(&positions, view.row(0))
+        if positions.target_count() != 1 {
+            return None;
+        }
+        Some(ProposalWalkLocator {
+            constraint: *self,
+            positions,
+            row_width: view.stride(),
+        })
     }
 
     /// Exact single-parent proposal page used by physical wrappers that own
@@ -2042,11 +2097,11 @@ mod typed_program_tests {
         );
 
         let mut walked = Candidates::new();
+        let locator = constraint
+            .proposal_walk_locator_single_target(variable, &view)
+            .expect("test shape must have one target position");
         for parent in 0..view.len() {
-            let row_view = view.row_view(parent);
-            let walk = constraint
-                .proposal_walk_single_target(variable, &row_view)
-                .expect("test shape must have one target position");
+            let walk = locator.locate(view.row(parent));
             let mut emitted = 0usize;
             let page = walk.consume(ResidualDeltaSourceCursor::Start, usize::MAX, |value| {
                 emitted += 1;
