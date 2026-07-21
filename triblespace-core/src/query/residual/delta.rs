@@ -6509,6 +6509,9 @@ impl DeltaScheduler {
         }
         let mut receipt = ProgramBatchEffects::default();
         let (trace_event, trace_due) = trace::event("program_step");
+        let settlement_trace_due = trace_due
+            || (row_count >= 1024
+                && std::env::var_os("TRIBLESPACE_SETTLEMENT_TRACE").is_some());
         if trace_due {
             let (candidate_groups, candidate_sum, candidate_min, candidate_max) =
                 candidate_sets.iter().fold(
@@ -6652,6 +6655,11 @@ impl DeltaScheduler {
         let mut retired_search_receipts = 0usize;
         let mut completed_activations = 0usize;
         let mut terminal_publications = OrderedActivationSet::default();
+        let settlement_loop_started = settlement_trace_due.then(std::time::Instant::now);
+        let mut replace_elapsed = std::time::Duration::ZERO;
+        let mut streaming_elapsed = std::time::Duration::ZERO;
+        let mut settle_elapsed = std::time::Duration::ZERO;
+        let mut completion_elapsed = std::time::Duration::ZERO;
 
         for (
             input,
@@ -6683,6 +6691,7 @@ impl DeltaScheduler {
                 || (!private_direct && !direct_range.is_empty())
                 || !accepted_range.is_empty()
                 || !supported_range.is_empty();
+            let replace_started = settlement_trace_due.then(std::time::Instant::now);
             let outcome = self.registry.replace_program(
                 credit,
                 state,
@@ -6696,6 +6705,9 @@ impl DeltaScheduler {
                 source_telemetry_cohort,
                 page.resume,
             );
+            if let Some(started) = replace_started {
+                replace_elapsed += started.elapsed();
+            }
             if outcome.raw_proposal_occurrences != 0 {
                 assert!(
                     outcome.raw_proposal_occurrences >= outcome.accepted.len(),
@@ -6720,6 +6732,7 @@ impl DeltaScheduler {
             }
 
             let mut task_effects = DeltaStableEffects::default();
+            let streaming_started = settlement_trace_due.then(std::time::Instant::now);
             if !supported_range.is_empty() {
                 assert!(
                     outcome.accepted.is_empty(),
@@ -6761,15 +6774,24 @@ impl DeltaScheduler {
                     }
                 }
             }
+            if let Some(started) = streaming_started {
+                streaming_elapsed += started.elapsed();
+            }
             if let Some(proof) = outcome.quiescence {
                 assert_eq!(proof.activation, activation);
-                match self.settle_quiescence(proof) {
+                let settle_started = settlement_trace_due.then(std::time::Instant::now);
+                let settlement = self.settle_quiescence(proof);
+                if let Some(started) = settle_started {
+                    settle_elapsed += started.elapsed();
+                }
+                match settlement {
                     DeltaSettlement::Retargeted(active) => {
                         assert_eq!(active.activation, activation);
                         assert!(retargeted.insert(activation, active).is_none());
                     }
                     DeltaSettlement::Completed(completed) => {
                         let old_activation = completed.activation;
+                        let completion_started = settlement_trace_due.then(std::time::Instant::now);
                         let released = self.release_completion(
                             completed,
                             plan,
@@ -6777,6 +6799,9 @@ impl DeltaScheduler {
                             stable_interner,
                             stats,
                         );
+                        if let Some(started) = completion_started {
+                            completion_elapsed += started.elapsed();
+                        }
                         prefer_continuation(
                             &mut task_effects.continuation,
                             released.continuation,
@@ -6827,6 +6852,17 @@ impl DeltaScheduler {
             }
             effects.absorb(task_effects);
             debug_assert!(input < row_count);
+        }
+
+        if settlement_trace_due {
+            eprintln!(
+                "Program step #{trace_event} settlement rows={row_count} total_us={} replace_us={} streaming_us={} settle_us={} completion_us={}",
+                settlement_loop_started.map_or(0, |started| started.elapsed().as_micros()),
+                replace_elapsed.as_micros(),
+                streaming_elapsed.as_micros(),
+                settle_elapsed.as_micros(),
+                completion_elapsed.as_micros(),
+            );
         }
 
         let _ = self.file_program_state(state, scheduled);
