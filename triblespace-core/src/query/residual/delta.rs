@@ -2682,26 +2682,19 @@ fn program_seed_ranges(
     ranges
 }
 
-fn program_child_ranges_into(
-    children: &[ProgramChild],
-    input_count: usize,
-    ranges: &mut Vec<std::ops::Range<usize>>,
-) {
-    ranges.clear();
-    ranges.reserve(input_count);
-    let mut cursor = 0usize;
-    for input in 0..input_count {
-        let begin = cursor;
-        while cursor < children.len() && children[cursor].input as usize == input {
-            cursor += 1;
-        }
-        ranges.push(begin..cursor);
+#[inline]
+/// Takes one contiguous input group from an adapter-certified effect stream.
+fn take_grouped_range<T>(
+    values: &[T],
+    input: usize,
+    cursor: &mut usize,
+    tag: impl Fn(&T) -> u32,
+) -> std::ops::Range<usize> {
+    let begin = *cursor;
+    while *cursor < values.len() && tag(&values[*cursor]) as usize == input {
+        *cursor += 1;
     }
-    assert_eq!(
-        cursor,
-        children.len(),
-        "typed program child tags skipped an input range"
-    );
+    begin..*cursor
 }
 
 fn tagged_ranges<T>(
@@ -2799,10 +2792,6 @@ struct ProgramSchedulerScratch {
     task_receipts: Vec<ProgramTaskReceipt>,
     work: Vec<ProgramWork>,
     receipt: ProgramBatchEffects,
-    child_ranges: Vec<std::ops::Range<usize>>,
-    direct_ranges: Vec<std::ops::Range<usize>>,
-    accepted_ranges: Vec<std::ops::Range<usize>>,
-    supported_ranges: Vec<std::ops::Range<usize>>,
     retired_activations: Vec<ProgramActivation>,
 }
 
@@ -6604,30 +6593,6 @@ impl DeltaScheduler {
                 "typed program exceeded one input's physical work budget"
             );
         }
-        program_child_ranges_into(
-            &scratch.receipt.children,
-            row_count,
-            &mut scratch.child_ranges,
-        );
-        tagged_ranges_into(
-            &scratch.receipt.direct,
-            row_count,
-            "program direct effect",
-            &mut scratch.direct_ranges,
-        );
-        tagged_ranges_into(
-            &scratch.receipt.accepted,
-            row_count,
-            "program candidate observation",
-            &mut scratch.accepted_ranges,
-        );
-        tagged_ranges_into(
-            &scratch.receipt.supported,
-            row_count,
-            "program support observation",
-            &mut scratch.supported_ranges,
-        );
-
         // Placement is observation only. Static executor labels deliberately
         // stay out of the ordinary hot-path aggregate and never feed dispatch.
         if scratch.receipt.placement.is_some() {
@@ -6685,10 +6650,6 @@ impl DeltaScheduler {
         let ProgramSchedulerScratch {
             task_receipts,
             receipt,
-            child_ranges,
-            direct_ranges,
-            accepted_ranges,
-            supported_ranges,
             retired_activations,
             ..
         } = &mut *scratch;
@@ -6700,18 +6661,28 @@ impl DeltaScheduler {
             supported,
             ..
         } = receipt;
-        for (
-            input,
-            (((((task, page), child_range), direct_range), accepted_range), supported_range),
-        ) in task_receipts
-            .drain(..)
-            .zip(pages.drain(..))
-            .zip(child_ranges.drain(..))
-            .zip(direct_ranges.drain(..))
-            .zip(accepted_ranges.drain(..))
-            .zip(supported_ranges.drain(..))
-            .enumerate()
-        {
+        let mut child_cursor = 0usize;
+        let mut direct_cursor = 0usize;
+        let mut accepted_cursor = 0usize;
+        let mut supported_cursor = 0usize;
+        for (input, (task, page)) in task_receipts.drain(..).zip(pages.drain(..)).enumerate() {
+            // The erased adapter has already certified every effect stream as
+            // in-range and grouped. Consume those groups directly instead of
+            // materializing four retained Range vectors and draining them
+            // straight back into the same row order.
+            let child_range = take_grouped_range(children, input, &mut child_cursor, |child| {
+                child.input
+            });
+            let direct_range =
+                take_grouped_range(direct, input, &mut direct_cursor, |(input, _)| *input);
+            let accepted_range =
+                take_grouped_range(accepted, input, &mut accepted_cursor, |(input, _)| *input);
+            let supported_range = take_grouped_range(
+                supported,
+                input,
+                &mut supported_cursor,
+                |(input, ())| *input,
+            );
             let ProgramTaskReceipt {
                 activation,
                 credit,
@@ -6722,13 +6693,13 @@ impl DeltaScheduler {
             let terminal = self.registry.physical_activation_class(activation)
                 == DeltaPhysicalClass::TerminalStreaming;
             let within_search_page = self.registry.program_credit_within_search_page(&credit);
-            assert!(
+            debug_assert!(
                 page.examined > 0 || (page.resume.is_none() && child_range.is_empty()),
-                "typed program scheduled zero-examined continuation work without a positive work receipt"
+                "the erased adapter admitted zero-examined continuation work"
             );
-            assert!(
+            debug_assert!(
                 supported_range.len() <= 1,
-                "one typed input page reported Boolean support more than once"
+                "the erased adapter admitted repeated Boolean support"
             );
             let page_had_program_effect = !child_range.is_empty()
                 || (!private_direct && !direct_range.is_empty())
@@ -6889,6 +6860,26 @@ impl DeltaScheduler {
             effects.absorb(task_effects);
             debug_assert!(input < row_count);
         }
+        assert_eq!(
+            child_cursor,
+            children.len(),
+            "typed program child tags skipped an input range"
+        );
+        assert_eq!(
+            direct_cursor,
+            direct.len(),
+            "typed program direct-effect tags skipped an input range"
+        );
+        assert_eq!(
+            accepted_cursor,
+            accepted.len(),
+            "typed program candidate-observation tags skipped an input range"
+        );
+        assert_eq!(
+            supported_cursor,
+            supported.len(),
+            "typed program support-observation tags skipped an input range"
+        );
 
         if !tasks.is_empty() {
             stats.delta_program_continuation_files += 1;
@@ -7477,6 +7468,32 @@ mod tests {
             message.contains("zero-examined continuation work"),
             "unexpected panic: {message}"
         );
+    }
+
+    #[test]
+    fn grouped_range_cursor_preserves_dense_groups_and_empty_rows() {
+        let effects = [
+            (0u32, 10u8),
+            (0, 11),
+            (2, 20),
+            (2, 21),
+            (2, 22),
+            (4, 40),
+        ];
+        let mut cursor = 0usize;
+        let ranges: Vec<_> = (0..5)
+            .map(|input| {
+                take_grouped_range(&effects, input, &mut cursor, |(input, _)| *input)
+            })
+            .collect();
+
+        assert_eq!(ranges, [0..2, 2..2, 2..5, 5..5, 5..6]);
+        assert_eq!(cursor, effects.len());
+        assert_eq!(&effects[ranges[0].clone()], &effects[0..2]);
+        assert!(effects[ranges[1].clone()].is_empty());
+        assert_eq!(&effects[ranges[2].clone()], &effects[2..5]);
+        assert!(effects[ranges[3].clone()].is_empty());
+        assert_eq!(&effects[ranges[4].clone()], &effects[5..6]);
     }
 
     #[derive(Clone, Copy)]
@@ -10450,7 +10467,7 @@ mod tests {
             "graph-family retirement must precede finalizer execution"
         );
 
-        let wide_capacities = {
+        let wide_capacity = {
             let scratch = scheduler
                 .program_scratch
                 .as_ref()
@@ -10465,26 +10482,16 @@ mod tests {
             assert!(scratch.receipt.direct.is_empty());
             assert!(scratch.receipt.accepted.is_empty());
             assert!(scratch.receipt.supported.is_empty());
-            assert!(scratch.child_ranges.is_empty());
-            assert!(scratch.direct_ranges.is_empty());
-            assert!(scratch.accepted_ranges.is_empty());
-            assert!(scratch.supported_ranges.is_empty());
             assert!(scratch.retired_activations.is_empty());
-            (
-                scratch.receipt.pages.capacity(),
-                scratch.child_ranges.capacity(),
-                scratch.direct_ranges.capacity(),
-                scratch.accepted_ranges.capacity(),
-                scratch.supported_ranges.capacity(),
-            )
+            scratch.receipt.pages.capacity()
         };
         let cold_clone = scheduler.clone();
         assert!(scheduler.program_scratch.is_some());
         assert!(cold_clone.program_scratch.is_none());
 
         // The graph cohort above was two rows wide. Limit the first finalizer
-        // pop to one row so every retained receipt and tag-range buffer is
-        // exercised wide -> narrow on the same scratch allocation.
+        // pop to one row so every retained receipt buffer is exercised
+        // wide -> narrow on the same scratch allocation.
         let first_finalized = scheduler.step_bounded(
             &root,
             &plan,
@@ -10510,16 +10517,8 @@ mod tests {
         assert!(scratch.receipt.direct.is_empty());
         assert!(scratch.receipt.accepted.is_empty());
         assert!(scratch.receipt.supported.is_empty());
-        assert!(scratch.child_ranges.is_empty());
-        assert!(scratch.direct_ranges.is_empty());
-        assert!(scratch.accepted_ranges.is_empty());
-        assert!(scratch.supported_ranges.is_empty());
         assert!(scratch.retired_activations.is_empty());
-        assert!(scratch.receipt.pages.capacity() >= wide_capacities.0);
-        assert!(scratch.child_ranges.capacity() >= wide_capacities.1);
-        assert!(scratch.direct_ranges.capacity() >= wide_capacities.2);
-        assert!(scratch.accepted_ranges.capacity() >= wide_capacities.3);
-        assert!(scratch.supported_ranges.capacity() >= wide_capacities.4);
+        assert!(scratch.receipt.pages.capacity() >= wide_capacity);
 
         let second_finalized = scheduler.step_bounded(
             &root,
