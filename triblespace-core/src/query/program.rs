@@ -2614,6 +2614,70 @@ mod tests {
     }
 
     #[test]
+    fn rejected_take_does_not_mutate_ownership_or_free_list() {
+        let mut runtime = TypedProgramRuntime::<NonComparableState, Key>::default();
+        let owner = ProgramActivation(1);
+        let other = ProgramActivation(2);
+        let handle = runtime.insert(owner, NonComparableState { exact_cursor: 7 });
+        runtime.assert_arena_model();
+
+        let crossed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = runtime.take(other, handle.clone());
+        }));
+        assert!(crossed.is_err());
+        assert!(runtime.contains(&handle));
+        assert_eq!(runtime.free.len(), 0);
+        assert_eq!(runtime.live_handles.get(&owner), Some(&1));
+        runtime.assert_arena_model();
+
+        let unknown = ProgramWorkHandle {
+            slot: 17,
+            generation: 0,
+        };
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = runtime.take(owner, unknown);
+        }));
+        assert!(rejected.is_err());
+        assert!(runtime.contains(&handle));
+        assert_eq!(runtime.free.len(), 0);
+        assert_eq!(runtime.live_handles.get(&owner), Some(&1));
+        runtime.assert_arena_model();
+
+        assert_eq!(runtime.take(owner, handle).exact_cursor, 7);
+        runtime.retire_many(&[owner]);
+        runtime.assert_arena_model();
+    }
+
+    #[test]
+    fn arena_count_matches_naive_model_across_mixed_operations() {
+        let mut runtime = TypedProgramRuntime::<NonComparableState, Key>::default();
+        let mut live = Vec::<(ProgramActivation, ProgramWorkHandle)>::new();
+        let mut random = 0x5eed_cafe_f00d_ba5eu64;
+        for step in 0..512 {
+            random = random
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            if live.is_empty() || random & 3 != 0 {
+                let activation = ProgramActivation((random >> 32) % 11);
+                let handle = runtime.insert(activation, NonComparableState { exact_cursor: step });
+                live.push((activation, handle));
+            } else {
+                let index = (random as usize) % live.len();
+                let (activation, handle) = live.swap_remove(index);
+                assert!(runtime.take(activation, handle).exact_cursor <= step);
+            }
+            runtime.assert_arena_model();
+        }
+        for (activation, handle) in live {
+            let _ = runtime.take(activation, handle);
+            runtime.assert_arena_model();
+        }
+        let activations: Vec<_> = (0..11).map(ProgramActivation).collect();
+        runtime.retire_many(&activations);
+        runtime.assert_arena_model();
+    }
+
+    #[test]
     fn retirement_rejects_a_live_owner_before_dropping_any_novelty() {
         let mut runtime = TypedProgramRuntime::<NonComparableState, Key>::default();
         let drained = ProgramActivation(1);
