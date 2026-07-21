@@ -3007,6 +3007,7 @@ impl ProgramWorklist {
     }
 }
 
+#[cfg(test)]
 impl std::ops::Index<&DeltaStateId> for ProgramWorklist {
     type Output = ProgramBucket;
 
@@ -10120,6 +10121,159 @@ mod tests {
                 reference.iter().copied().collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn exhausted_program_bucket_reactivates_nested_work_before_local_replacements() {
+        let mut scheduler = DeltaScheduler::new();
+        let state = test_program_state(&mut scheduler);
+        let activation = scheduler.registry.open_program_activation(
+            DeltaReducer::StreamProposal,
+            stable_return(Vec::new()),
+            None,
+            None,
+        );
+        let mut tasks = install_program_tasks(
+            &mut scheduler.registry,
+            activation,
+            0..4,
+            DispatchClass::new(0),
+            ProgramPacing::Search,
+        )
+        .into_iter();
+        let initial = vec![tasks.next().unwrap(), tasks.next().unwrap()];
+        let nested = tasks.next().unwrap();
+        let local = tasks.next().unwrap();
+        let nested_nonce = nested.credit.key.nonce;
+        let local_nonce = local.credit.key.nonce;
+        let active = scheduler.file_program_state(state, initial).unwrap();
+
+        let (_, selected, _) = scheduler.pop_active_program(active, 2);
+        assert_eq!(selected.len(), 2);
+        assert!(!scheduler.program_worklist.contains_key(&state));
+        let parked_capacity = scheduler.program_worklist.buckets[state.0 as usize]
+            .tasks
+            .capacity();
+        assert!(parked_capacity >= 2);
+
+        let _ = scheduler.file_program_state(state, vec![nested]);
+        let _ = scheduler.file_program_state(state, vec![local]);
+
+        assert_eq!(scheduler.program_worklist.len(), 1);
+        assert_eq!(
+            scheduler.program_worklist[&state]
+                .tasks
+                .iter()
+                .map(|task| task.credit.key.nonce)
+                .collect::<Vec<_>>(),
+            [nested_nonce, local_nonce]
+        );
+        assert_eq!(
+            scheduler.program_worklist[&state].tasks.capacity(),
+            parked_capacity,
+            "reactivation should reuse the exhausted bucket allocation"
+        );
+    }
+
+    #[test]
+    fn scheduler_clone_does_not_resurrect_inactive_program_bucket_capacity() {
+        let mut scheduler = DeltaScheduler::new();
+        let dormant_state = test_program_state(&mut scheduler);
+        let active_route = ProgramRoute {
+            key: ProgramKey::new(0),
+            variable: 0,
+            stratum: ProgramStratum::Fixpoint,
+            grouping: ProgramGrouping::PageLocal,
+            completion: ProgramCompletion::PageableOnly,
+            exposure: ProgramExposure::Production,
+        };
+        let active_state = scheduler.interner.intern_program(ProgramAddress::new(
+            DeltaDesc::leaf(0, 1),
+            active_route,
+        ));
+
+        let dormant_activation = scheduler.registry.open_program_activation(
+            DeltaReducer::StreamProposal,
+            stable_return(Vec::new()),
+            None,
+            None,
+        );
+        let dormant_tasks = install_program_tasks(
+            &mut scheduler.registry,
+            dormant_activation,
+            [0],
+            DispatchClass::new(0),
+            ProgramPacing::Activation,
+        );
+        let dormant_active = scheduler
+            .file_program_state(dormant_state, dormant_tasks)
+            .unwrap();
+        let (_, mut popped, _) = scheduler.pop_active_program(dormant_active, 1);
+        let dormant_capacity = scheduler.program_worklist.buckets[dormant_state.0 as usize]
+            .tasks
+            .capacity();
+        assert!(dormant_capacity > 0);
+        let dormant_task = popped.pop().unwrap();
+        let retired = scheduler.registry.replace_program(
+            dormant_task.credit,
+            dormant_state,
+            &[],
+            std::iter::empty::<RawInline>(),
+            std::iter::empty::<RawInline>(),
+            false,
+            false,
+            false,
+            None,
+        );
+        let completed = scheduler
+            .registry
+            .finish(retired.quiescence.expect("dormant activation must retire"));
+        assert_eq!(completed.effect, DeltaCompletion::Cleanup);
+
+        let active_activation = scheduler.registry.open_program_activation(
+            DeltaReducer::StreamProposal,
+            stable_return(Vec::new()),
+            None,
+            None,
+        );
+        let active_tasks = install_program_tasks(
+            &mut scheduler.registry,
+            active_activation,
+            [1],
+            DispatchClass::new(0),
+            ProgramPacing::Activation,
+        );
+        let _ = scheduler.file_program_state(active_state, active_tasks);
+        let cloned = scheduler.clone();
+
+        assert_eq!(scheduler.program_worklist.len(), 1);
+        assert_eq!(cloned.program_worklist.len(), 1);
+        assert!(!scheduler.program_worklist.contains_key(&dormant_state));
+        assert!(!cloned.program_worklist.contains_key(&dormant_state));
+        assert!(scheduler.program_worklist.contains_key(&active_state));
+        assert!(cloned.program_worklist.contains_key(&active_state));
+        assert_eq!(
+            scheduler.program_worklist.buckets[dormant_state.0 as usize]
+                .tasks
+                .capacity(),
+            dormant_capacity
+        );
+        assert_eq!(
+            cloned.program_worklist.buckets[dormant_state.0 as usize]
+                .tasks
+                .capacity(),
+            0,
+            "clone should not copy dormant high-water capacity"
+        );
+        assert_ne!(
+            scheduler.program_worklist[&active_state].tasks[0]
+                .credit
+                .brand,
+            cloned.program_worklist[&active_state].tasks[0]
+                .credit
+                .brand,
+            "clone must still rebrand the one live Program credit"
+        );
     }
 
     fn program_order_trace(
