@@ -3304,6 +3304,77 @@ enum DeltaSettlement {
     Retargeted(ActiveDeltaContinuation),
 }
 
+/// Exact affine handoffs emitted by one physical delta step.
+///
+/// Directed chain execution overwhelmingly transfers a single activation at
+/// a time. Keep that receipt inline while preserving expected constant-time
+/// lookup for the genuinely wider reducer cohorts.
+#[derive(Debug, Default)]
+pub(super) enum RetargetedActivations {
+    #[default]
+    Empty,
+    One(ActivationId, ActiveDeltaContinuation),
+    Many(AHashMap<ActivationId, ActiveDeltaContinuation>),
+}
+
+impl RetargetedActivations {
+    fn insert(
+        &mut self,
+        activation: ActivationId,
+        continuation: ActiveDeltaContinuation,
+    ) -> Option<ActiveDeltaContinuation> {
+        match self {
+            Self::Empty => {
+                *self = Self::One(activation, continuation);
+                None
+            }
+            Self::One(existing, previous) if *existing == activation => {
+                Some(std::mem::replace(previous, continuation))
+            }
+            Self::One(existing, previous) => {
+                let mut entries = AHashMap::with_capacity(2);
+                assert!(entries.insert(*existing, *previous).is_none());
+                assert!(entries.insert(activation, continuation).is_none());
+                *self = Self::Many(entries);
+                None
+            }
+            Self::Many(entries) => entries.insert(activation, continuation),
+        }
+    }
+
+    fn get(&self, activation: &ActivationId) -> Option<&ActiveDeltaContinuation> {
+        match self {
+            Self::Empty => None,
+            Self::One(existing, continuation) => {
+                (existing == activation).then_some(continuation)
+            }
+            Self::Many(entries) => entries.get(activation),
+        }
+    }
+
+    fn contains_key(&self, activation: &ActivationId) -> bool {
+        self.get(activation).is_some()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::One(_, _) => 1,
+            Self::Many(entries) => entries.len(),
+        }
+    }
+
+    #[cfg(test)]
+    fn values(&self) -> Box<dyn Iterator<Item = &ActiveDeltaContinuation> + '_> {
+        match self {
+            Self::Empty => Box::new(std::iter::empty()),
+            Self::One(_, continuation) => Box::new(std::iter::once(continuation)),
+            Self::Many(entries) => Box::new(entries.values()),
+        }
+    }
+}
+
 /// Insertion-ordered activation membership with an allocation-free singleton
 /// lookup. Physical cohorts observe activation order while repeated feedback
 /// checks need set rather than quadratic vector membership.
@@ -3437,7 +3508,7 @@ pub(super) struct DeltaStepOutcome {
     /// Exact Program continuation installed by quiescence settlement, keyed
     /// by the affine activation because one physical cohort may transfer more
     /// than one reducer. Queue layout is not a continuation receipt.
-    pub(super) retargeted: AHashMap<ActivationId, ActiveDeltaContinuation>,
+    pub(super) retargeted: RetargetedActivations,
     pub(super) dead_pages: usize,
     pub(super) source_dead_pages: usize,
     pub(super) transition_dead_pages: usize,
@@ -6327,7 +6398,7 @@ impl DeltaScheduler {
         let mut resumed_sources = Vec::new();
         let mut effects = DeltaStableEffects::default();
         let mut completed_activation_ids = Vec::new();
-        let mut retargeted = AHashMap::new();
+        let mut retargeted = RetargetedActivations::default();
         let mut dead_pages = 0usize;
         let mut source_dead_pages = 0usize;
         let mut transition_dead_pages = 0usize;
@@ -6637,7 +6708,7 @@ impl DeltaScheduler {
             scratch.receipt.source_pages > 0 && scratch.receipt.transition_pages == 0;
         let mut effects = DeltaStableEffects::default();
         let mut completed_activation_ids = Vec::new();
-        let mut retargeted = AHashMap::new();
+        let mut retargeted = RetargetedActivations::default();
         let mut dead_pages = 0usize;
         let mut source_dead_pages = 0usize;
         let mut transition_dead_pages = 0usize;
@@ -6984,7 +7055,7 @@ impl DeltaScheduler {
         stats.delta_source_pages += row_count;
         let mut effects = DeltaStableEffects::default();
         let mut completed_activation_ids = Vec::new();
-        let mut retargeted = AHashMap::new();
+        let mut retargeted = RetargetedActivations::default();
         let mut traversal = Vec::new();
         let mut resumed_sources = Vec::new();
         let mut dead_pages = 0usize;
@@ -7210,6 +7281,75 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn retargeted_activations_preserve_map_semantics_across_storage_shapes() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<RetargetedActivations>();
+
+        let first_key = ActivationId::test(11);
+        let second_key = ActivationId::test(22);
+        let third_key = ActivationId::test(33);
+        let missing_key = ActivationId::test(44);
+        let continuation = |state, activation| ActiveDeltaContinuation {
+            state: DeltaStateId(state),
+            activation: ActivationId::test(activation),
+        };
+        let first = continuation(1, 101);
+        let first_replacement = continuation(2, 102);
+        let first_many_replacement = continuation(3, 103);
+        let second = continuation(4, 104);
+        let second_replacement = continuation(5, 105);
+        let third = continuation(6, 106);
+
+        let mut retargeted = RetargetedActivations::default();
+        assert!(matches!(&retargeted, RetargetedActivations::Empty));
+        assert_eq!(retargeted.len(), 0);
+        assert_eq!(retargeted.get(&first_key), None);
+        assert!(!retargeted.contains_key(&missing_key));
+
+        assert_eq!(retargeted.insert(first_key, first), None);
+        assert!(matches!(
+            &retargeted,
+            RetargetedActivations::One(activation, continuation)
+                if *activation == first_key && *continuation == first
+        ));
+        assert_eq!(retargeted.len(), 1);
+        assert_eq!(retargeted.get(&first_key), Some(&first));
+
+        assert_eq!(
+            retargeted.insert(first_key, first_replacement),
+            Some(first)
+        );
+        assert_eq!(retargeted.len(), 1);
+        assert_eq!(retargeted.get(&first_key), Some(&first_replacement));
+
+        assert_eq!(retargeted.insert(second_key, second), None);
+        assert!(matches!(
+            &retargeted,
+            RetargetedActivations::Many(entries) if entries.len() == 2
+        ));
+        assert_eq!(retargeted.get(&first_key), Some(&first_replacement));
+        assert_eq!(retargeted.get(&second_key), Some(&second));
+        assert_eq!(retargeted.get(&missing_key), None);
+
+        assert_eq!(
+            retargeted.insert(first_key, first_many_replacement),
+            Some(first_replacement)
+        );
+        assert_eq!(
+            retargeted.insert(second_key, second_replacement),
+            Some(second)
+        );
+        assert_eq!(retargeted.insert(third_key, third), None);
+        assert_eq!(retargeted.len(), 3);
+        assert_eq!(retargeted.get(&first_key), Some(&first_many_replacement));
+        assert_eq!(retargeted.get(&second_key), Some(&second_replacement));
+        assert_eq!(retargeted.get(&third_key), Some(&third));
+        assert!(retargeted.contains_key(&first_key));
+        assert!(!retargeted.contains_key(&missing_key));
+    }
 
     #[derive(Clone)]
     struct ZeroProgressState(u64);
