@@ -258,22 +258,23 @@ fn upper_bound_indexed(
 
 /// Pages one nondecreasing indexed driver through an exact secondary filter.
 ///
-/// The ordinary two-bound proposal arms defensively call `unique()`. Keeping
-/// that semantic here makes the source exact even if an archive implementation
-/// later exposes repeated adjacent codes inside a fixed-pair range. Seeking is
-/// a binary search over the immutable wavelet/range view; no prefix of
-/// candidates is materialized or replayed. Every distinct
+/// The legacy ordinary two-bound proposal arms defensively collapsed repeated
+/// values. Keeping that semantic here makes the source exact even if an
+/// archive implementation later exposes repeated adjacent codes inside a
+/// fixed-pair range. Seeking is a binary search over the immutable
+/// wavelet/range view; no prefix of candidates is materialized or replayed.
+/// Every distinct
 /// driver value consumes demand even when `accept` rejects it, and continuation
 /// resumes strictly after the last value examined rather than the last emitted
 /// candidate. Page entry binary-seeks the public value cursor once; within the
 /// page duplicate runs advance linearly, matching the dense proposal sweep
 /// instead of paying another binary search for every distinct value.
-fn page_indexed_distinct_filtered(
+fn consume_indexed_distinct_filtered(
     len: usize,
     at: impl Fn(usize) -> RawInline,
     cursor: ResidualDeltaSourceCursor,
     limit: usize,
-    accepted: &mut Vec<RawInline>,
+    mut emit: impl FnMut(RawInline),
     mut accept: impl FnMut(&RawInline) -> bool,
 ) -> ResidualDeltaSourcePage {
     assert!(limit > 0, "residual source pages require positive demand");
@@ -293,7 +294,7 @@ fn page_indexed_distinct_filtered(
         examined += 1;
         last = Some(value);
         if accept(&value) {
-            accepted.push(value);
+            emit(value);
         }
         index += 1;
         while index < len {
@@ -315,6 +316,18 @@ fn page_indexed_distinct_filtered(
     }
 }
 
+fn page_indexed_distinct_filtered(
+    len: usize,
+    at: impl Fn(usize) -> RawInline,
+    cursor: ResidualDeltaSourceCursor,
+    limit: usize,
+    accepted: &mut Vec<RawInline>,
+    accept: impl FnMut(&RawInline) -> bool,
+) -> ResidualDeltaSourcePage {
+    consume_indexed_distinct_filtered(len, at, cursor, limit, |value| accepted.push(value), accept)
+}
+
+#[cfg(test)]
 fn page_indexed_distinct(
     len: usize,
     at: impl Fn(usize) -> RawInline,
@@ -325,20 +338,59 @@ fn page_indexed_distinct(
     page_indexed_distinct_filtered(len, at, cursor, limit, accepted, |_| true)
 }
 
+/// Consumes a physically unique ordered driver. Unlike
+/// [`consume_indexed_distinct_filtered`], this does not spend a comparison on
+/// duplicate defence: callers must own a structural proof that every physical
+/// position denotes a different logical value.
+fn consume_indexed_unique(
+    len: usize,
+    at: impl Fn(usize) -> RawInline,
+    cursor: ResidualDeltaSourceCursor,
+    limit: usize,
+    mut emit: impl FnMut(RawInline),
+) -> ResidualDeltaSourcePage {
+    assert!(limit > 0, "residual source pages require positive demand");
+    let mut index = match cursor {
+        ResidualDeltaSourceCursor::Start => 0,
+        ResidualDeltaSourceCursor::After(after) => upper_bound_indexed(0, len, &after, &at),
+        ResidualDeltaSourceCursor::Offset(_) => {
+            panic!("SuccinctArchive source received an ordinal cursor")
+        }
+    };
+    let mut examined = 0usize;
+    let mut last = None;
+    while index < len && examined < limit {
+        let value = at(index);
+        debug_assert!(last.is_none_or(|previous| previous < value));
+        emit(value);
+        last = Some(value);
+        examined += 1;
+        index += 1;
+    }
+    ResidualDeltaSourcePage {
+        next: (index < len).then(|| {
+            ResidualDeltaSourceCursor::After(
+                last.expect("a nonterminal positive page examined a candidate"),
+            )
+        }),
+        examined,
+    }
+}
+
 /// Pages the distinct values that occur on one top-level archive axis.
 /// `Universe::search_upper` translates the public raw-value cursor into the
 /// first possible archive-local code, and `enumerate_domain_in_range` skips
 /// absent code groups with the prefix bitvector's select stride.
-/// Filtered counterpart of [`page_domain`]. Prefix navigation stays identical;
-/// only the orthogonal admission predicate may make `accepted.len()` smaller
-/// than `examined`.
-fn page_domain_filtered<U>(
+/// Generic-sink counterpart of [`page_domain`]. Prefix navigation stays
+/// identical; only the orthogonal admission predicate may make emitted output
+/// smaller than `examined`.
+fn consume_domain_filtered<U>(
     archive: &SuccinctArchive<U>,
     prefix: &BitVector<Rank9SelIndex>,
     mut code_range: Range<usize>,
     cursor: ResidualDeltaSourceCursor,
     limit: usize,
-    accepted: &mut Vec<RawInline>,
+    mut emit: impl FnMut(RawInline),
     mut accept: impl FnMut(&RawInline) -> bool,
 ) -> ResidualDeltaSourcePage
 where
@@ -370,7 +422,7 @@ where
         examined += 1;
         last = Some(value);
         if accept(&value) {
-            accepted.push(value);
+            emit(value);
         }
     }
     ResidualDeltaSourcePage {
@@ -381,6 +433,29 @@ where
         }),
         examined,
     }
+}
+
+fn page_domain_filtered<U>(
+    archive: &SuccinctArchive<U>,
+    prefix: &BitVector<Rank9SelIndex>,
+    code_range: Range<usize>,
+    cursor: ResidualDeltaSourceCursor,
+    limit: usize,
+    accepted: &mut Vec<RawInline>,
+    accept: impl FnMut(&RawInline) -> bool,
+) -> ResidualDeltaSourcePage
+where
+    U: Universe,
+{
+    consume_domain_filtered(
+        archive,
+        prefix,
+        code_range,
+        cursor,
+        limit,
+        |value| accepted.push(value),
+        accept,
+    )
 }
 
 pub(super) fn page_domain<U>(
@@ -394,45 +469,21 @@ pub(super) fn page_domain<U>(
 where
     U: Universe,
 {
-    page_domain_filtered(archive, prefix, code_range, cursor, limit, accepted, |_| {
-        true
-    })
-}
-
-/// Pages the middle component of a fixed-first Ring range. `changed_pair`
-/// indexes one occurrence per distinct `(first, middle)` pair; the Ring hop
-/// maps that occurrence to the middle code in the adjacent rotation.
-#[allow(clippy::too_many_arguments)]
-fn page_middle<U>(
-    archive: &SuccinctArchive<U>,
-    changed_pair: &BitVector<Rank9SelIndex>,
-    range: Range<usize>,
-    last_column: &WaveletMatrix<Rank9SelIndex>,
-    last_prefix: &BitVector<Rank9SelIndex>,
-    middle_column: &WaveletMatrix<Rank9SelIndex>,
-    cursor: ResidualDeltaSourceCursor,
-    limit: usize,
-    accepted: &mut Vec<RawInline>,
-) -> ResidualDeltaSourcePage
-where
-    U: Universe,
-{
-    page_middle_filtered(
+    consume_domain_filtered(
         archive,
-        changed_pair,
-        range,
-        last_column,
-        last_prefix,
-        middle_column,
+        prefix,
+        code_range,
         cursor,
         limit,
-        accepted,
+        |value| accepted.push(value),
         |_| true,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Filtered counterpart of [`page_middle`], sharing its exact Ring navigation.
+/// Filtered fixed-first traversal used by repeated-position proposal shapes.
+/// The unfiltered single-target shapes use [`LocatedProposalWalk`], whose
+/// dense and bounded consumers share the already-located navigation head.
 fn page_middle_filtered<U>(
     archive: &SuccinctArchive<U>,
     changed_pair: &BitVector<Rank9SelIndex>,
@@ -468,29 +519,106 @@ where
     )
 }
 
-/// Pages the final component of one fixed `(first, middle)` Ring range.
-fn page_last<U>(
-    archive: &SuccinctArchive<U>,
-    range: Range<usize>,
-    last_column: &WaveletMatrix<Rank9SelIndex>,
-    cursor: ResidualDeltaSourceCursor,
-    limit: usize,
-    accepted: &mut Vec<RawInline>,
-) -> ResidualDeltaSourcePage
+/// The immutable navigation head for one single-target Succinct proposal.
+///
+/// This is the Ring analogue of PATCH's bounded-infix view: construction pays
+/// the row-dependent prefix/range location once, then dense and bounded
+/// consumption traverse that exact head. The consumers differ only in their
+/// public value cursor and work budget.
+enum LocatedProposalHead<'a> {
+    /// One top-level axis. `prefix` proves occurrence and distinctness; absent
+    /// universe codes are skipped by select stride.
+    Domain {
+        prefix: &'a BitVector<Rank9SelIndex>,
+        code_range: Range<usize>,
+    },
+    /// The middle component of a fixed-first rotation. `changed_pair` has one
+    /// bit per distinct `(first, middle)` pair, so this indexed driver is
+    /// physically unique as well as ordered.
+    Middle {
+        changed_pair: &'a BitVector<Rank9SelIndex>,
+        first_rank: usize,
+        len: usize,
+        last_column: &'a WaveletMatrix<Rank9SelIndex>,
+        last_prefix: &'a BitVector<Rank9SelIndex>,
+        middle_column: &'a WaveletMatrix<Rank9SelIndex>,
+    },
+    /// The last component of a fixed pair. Canonical archives are sets, hence
+    /// the last component is unique inside the pair, but consumption retains
+    /// adjacent duplicate collapse as the ordinary proposal path did.
+    Last {
+        range: Range<usize>,
+        last_column: &'a WaveletMatrix<Rank9SelIndex>,
+    },
+}
+
+pub(crate) struct LocatedProposalWalk<'a, U>
 where
     U: Universe,
 {
-    page_indexed_distinct(
-        range.len(),
-        |offset| {
-            archive
-                .domain
-                .access(last_column.access(range.start + offset).unwrap())
-        },
-        cursor,
-        limit,
-        accepted,
-    )
+    archive: &'a SuccinctArchive<U>,
+    head: LocatedProposalHead<'a>,
+}
+
+impl<U> LocatedProposalWalk<'_, U>
+where
+    U: Universe,
+{
+    /// Consume this already-located ordered walk. `Start` plus an unbounded
+    /// budget is the dense proposal; a finite budget plus `After(value)` is
+    /// its bounded infix. Both feed the caller's sink directly.
+    pub(crate) fn consume(
+        &self,
+        cursor: ResidualDeltaSourceCursor,
+        limit: usize,
+        emit: impl FnMut(RawInline),
+    ) -> ResidualDeltaSourcePage {
+        match &self.head {
+            LocatedProposalHead::Domain { prefix, code_range } => consume_domain_filtered(
+                self.archive,
+                prefix,
+                code_range.clone(),
+                cursor,
+                limit,
+                emit,
+                |_| true,
+            ),
+            LocatedProposalHead::Middle {
+                changed_pair,
+                first_rank,
+                len,
+                last_column,
+                last_prefix,
+                middle_column,
+            } => consume_indexed_unique(
+                *len,
+                |offset| {
+                    let position = changed_pair.select1(*first_rank + offset).unwrap();
+                    let last = last_column.access(position).unwrap();
+                    let rotated = last_prefix.select1(last).unwrap() - last
+                        + last_column.rank(position, last).unwrap();
+                    self.archive
+                        .domain
+                        .access(middle_column.access(rotated).unwrap())
+                },
+                cursor,
+                limit,
+                emit,
+            ),
+            LocatedProposalHead::Last { range, last_column } => consume_indexed_distinct_filtered(
+                range.len(),
+                |offset| {
+                    self.archive
+                        .domain
+                        .access(last_column.access(range.start + offset).unwrap())
+                },
+                cursor,
+                limit,
+                emit,
+                |_| true,
+            ),
+        }
+    }
 }
 
 impl<'a, U> SuccinctArchiveConstraint<'a, U>
@@ -506,6 +634,160 @@ where
             pa: term_src(&self.term_a, view),
             pv: term_src(&self.term_v, view),
         }
+    }
+
+    fn domain_walk(&self, prefix: &'a BitVector<Rank9SelIndex>) -> LocatedProposalWalk<'a, U> {
+        LocatedProposalWalk {
+            archive: self.archive,
+            head: LocatedProposalHead::Domain {
+                prefix,
+                code_range: 0..self.archive.domain.len(),
+            },
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn middle_walk(
+        &self,
+        changed_pair: &'a BitVector<Rank9SelIndex>,
+        range: Range<usize>,
+        last_column: &'a WaveletMatrix<Rank9SelIndex>,
+        last_prefix: &'a BitVector<Rank9SelIndex>,
+        middle_column: &'a WaveletMatrix<Rank9SelIndex>,
+    ) -> LocatedProposalWalk<'a, U> {
+        let first_rank = changed_pair.rank1(range.start).unwrap();
+        let len = changed_pair.rank1(range.end).unwrap() - first_rank;
+        LocatedProposalWalk {
+            archive: self.archive,
+            head: LocatedProposalHead::Middle {
+                changed_pair,
+                first_rank,
+                len,
+                last_column,
+                last_prefix,
+                middle_column,
+            },
+        }
+    }
+
+    fn last_walk(
+        &self,
+        range: Range<usize>,
+        last_column: &'a WaveletMatrix<Rank9SelIndex>,
+    ) -> LocatedProposalWalk<'a, U> {
+        LocatedProposalWalk {
+            archive: self.archive,
+            head: LocatedProposalHead::Last { range, last_column },
+        }
+    }
+
+    /// Locate the ordered source shared by dense and bounded single-target
+    /// proposals. Repeated-position shapes remain on their filtered paths.
+    fn located_proposal_walk(
+        &self,
+        p: &Positions,
+        row: &[RawInline],
+    ) -> Option<LocatedProposalWalk<'a, U>> {
+        if p.target_count() != 1 {
+            return None;
+        }
+        let Positions {
+            e_var,
+            a_var,
+            v_var,
+            ..
+        } = *p;
+        let e_bound = p.e(row);
+        let a_bound = p.a(row);
+        let v_bound = p.v(row);
+
+        Some(match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
+            (None, None, None, true, false, false) => self.domain_walk(&self.archive.e_a),
+            (None, None, None, false, true, false) => self.domain_walk(&self.archive.a_a),
+            (None, None, None, false, false, true) => self.domain_walk(&self.archive.v_a),
+            (Some(e), None, None, false, true, false) => self.middle_walk(
+                &self.archive.changed_e_a,
+                base_range(&self.archive.domain, &self.archive.e_a, e),
+                &self.archive.eav_c,
+                &self.archive.v_a,
+                &self.archive.vea_c,
+            ),
+            (Some(e), None, None, false, false, true) => self.middle_walk(
+                &self.archive.changed_e_v,
+                base_range(&self.archive.domain, &self.archive.e_a, e),
+                &self.archive.eva_c,
+                &self.archive.a_a,
+                &self.archive.aev_c,
+            ),
+            (None, Some(a), None, true, false, false) => self.middle_walk(
+                &self.archive.changed_a_e,
+                base_range(&self.archive.domain, &self.archive.a_a, a),
+                &self.archive.aev_c,
+                &self.archive.v_a,
+                &self.archive.vae_c,
+            ),
+            (None, Some(a), None, false, false, true) => self.middle_walk(
+                &self.archive.changed_a_v,
+                base_range(&self.archive.domain, &self.archive.a_a, a),
+                &self.archive.ave_c,
+                &self.archive.e_a,
+                &self.archive.eav_c,
+            ),
+            (None, None, Some(v), true, false, false) => self.middle_walk(
+                &self.archive.changed_v_e,
+                base_range(&self.archive.domain, &self.archive.v_a, v),
+                &self.archive.vea_c,
+                &self.archive.a_a,
+                &self.archive.ave_c,
+            ),
+            (None, None, Some(v), false, true, false) => self.middle_walk(
+                &self.archive.changed_v_a,
+                base_range(&self.archive.domain, &self.archive.v_a, v),
+                &self.archive.vae_c,
+                &self.archive.e_a,
+                &self.archive.eva_c,
+            ),
+            (None, Some(a), Some(v), true, false, false) => {
+                let range = base_range(&self.archive.domain, &self.archive.a_a, a);
+                self.last_walk(
+                    restrict_range(
+                        &self.archive.domain,
+                        &self.archive.v_a,
+                        &self.archive.aev_c,
+                        v,
+                        &range,
+                    ),
+                    &self.archive.vae_c,
+                )
+            }
+            (Some(e), None, Some(v), false, true, false) => {
+                let range = base_range(&self.archive.domain, &self.archive.e_a, e);
+                self.last_walk(
+                    restrict_range(
+                        &self.archive.domain,
+                        &self.archive.v_a,
+                        &self.archive.eav_c,
+                        v,
+                        &range,
+                    ),
+                    &self.archive.vea_c,
+                )
+            }
+            (Some(e), Some(a), None, false, false, true) => {
+                let range = base_range(&self.archive.domain, &self.archive.e_a, e);
+                self.last_walk(
+                    restrict_range(
+                        &self.archive.domain,
+                        &self.archive.a_a,
+                        &self.archive.eva_c,
+                        a,
+                        &range,
+                    ),
+                    &self.archive.aev_c,
+                )
+            }
+            _ => return None,
+        })
     }
 
     fn variable_position_mask(&self, variable: VariableId) -> u32 {
@@ -712,11 +994,9 @@ where
         }
     }
 
-    /// Enumerates one row's candidates: `enumerate_domain` /
-    /// `enumerate_in` select-strides for the zero/one-bound arms,
-    /// `restrict_range` wavelet sweeps for the two-bound arms. Feeds a
-    /// monomorphized `push`; the sink dispatch happens once per protocol
-    /// call in [`Constraint::propose`].
+    /// Drains one row's already-located ordered walk into a monomorphized
+    /// `push`; the sink dispatch happens once per protocol call in
+    /// [`Constraint::propose`].
     fn propose_row<F: FnMut(RawInline)>(&self, p: &Positions, row: &[RawInline], push: &mut F) {
         if p.target_count() > 1 {
             // E=V, E=A, and E=A=V all have to occur on the entity axis;
@@ -734,142 +1014,11 @@ where
                 .for_each(push);
             return;
         }
-        let Positions {
-            e_var,
-            a_var,
-            v_var,
-            ..
-        } = *p;
-        let e_bound = p.e(row);
-        let a_bound = p.a(row);
-        let v_bound = p.v(row);
-
-        match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
-            (None, None, None, true, false, false) => self
-                .archive
-                .enumerate_domain(&self.archive.e_a)
-                .for_each(&mut *push),
-            (None, None, None, false, true, false) => self
-                .archive
-                .enumerate_domain(&self.archive.a_a)
-                .for_each(&mut *push),
-            (None, None, None, false, false, true) => self
-                .archive
-                .enumerate_domain(&self.archive.v_a)
-                .for_each(&mut *push),
-            (Some(e), None, None, false, true, false) => {
-                let r = base_range(&self.archive.domain, &self.archive.e_a, e);
-                self.archive
-                    .enumerate_in(
-                        &self.archive.changed_e_a,
-                        &r,
-                        &self.archive.eav_c,
-                        &self.archive.v_a,
-                    )
-                    .map(|x| self.archive.vea_c.access(x).unwrap())
-                    .for_each(|a| push(self.archive.domain.access(a)))
-            }
-            (Some(e), None, None, false, false, true) => {
-                let r = base_range(&self.archive.domain, &self.archive.e_a, e);
-                self.archive
-                    .enumerate_in(
-                        &self.archive.changed_e_v,
-                        &r,
-                        &self.archive.eva_c,
-                        &self.archive.a_a,
-                    )
-                    .map(|x| self.archive.aev_c.access(x).unwrap())
-                    .for_each(|v| push(self.archive.domain.access(v)))
-            }
-            (None, Some(a), None, true, false, false) => {
-                let r = base_range(&self.archive.domain, &self.archive.a_a, a);
-                self.archive
-                    .enumerate_in(
-                        &self.archive.changed_a_e,
-                        &r,
-                        &self.archive.aev_c,
-                        &self.archive.v_a,
-                    )
-                    .map(|x| self.archive.vae_c.access(x).unwrap())
-                    .for_each(|e| push(self.archive.domain.access(e)))
-            }
-            (None, Some(a), None, false, false, true) => {
-                let r = base_range(&self.archive.domain, &self.archive.a_a, a);
-                self.archive
-                    .enumerate_in(
-                        &self.archive.changed_a_v,
-                        &r,
-                        &self.archive.ave_c,
-                        &self.archive.e_a,
-                    )
-                    .map(|x| self.archive.eav_c.access(x).unwrap())
-                    .for_each(|v| push(self.archive.domain.access(v)))
-            }
-            (None, None, Some(v), true, false, false) => {
-                let r = base_range(&self.archive.domain, &self.archive.v_a, v);
-                self.archive
-                    .enumerate_in(
-                        &self.archive.changed_v_e,
-                        &r,
-                        &self.archive.vea_c,
-                        &self.archive.a_a,
-                    )
-                    .map(|x| self.archive.ave_c.access(x).unwrap())
-                    .for_each(|e| push(self.archive.domain.access(e)))
-            }
-            (None, None, Some(v), false, true, false) => {
-                let r = base_range(&self.archive.domain, &self.archive.v_a, v);
-                self.archive
-                    .enumerate_in(
-                        &self.archive.changed_v_a,
-                        &r,
-                        &self.archive.vae_c,
-                        &self.archive.e_a,
-                    )
-                    .map(|x| self.archive.eva_c.access(x).unwrap())
-                    .for_each(|a| push(self.archive.domain.access(a)))
-            }
-            (None, Some(a), Some(v), true, false, false) => {
-                let r = base_range(&self.archive.domain, &self.archive.a_a, a);
-                restrict_range(
-                    &self.archive.domain,
-                    &self.archive.v_a,
-                    &self.archive.aev_c,
-                    v,
-                    &r,
-                )
-                .map(|e| self.archive.vae_c.access(e).unwrap())
-                .unique()
-                .for_each(|e| push(self.archive.domain.access(e)))
-            }
-            (Some(e), None, Some(v), false, true, false) => {
-                let r = base_range(&self.archive.domain, &self.archive.e_a, e);
-                restrict_range(
-                    &self.archive.domain,
-                    &self.archive.v_a,
-                    &self.archive.eav_c,
-                    v,
-                    &r,
-                )
-                .map(|a| self.archive.vea_c.access(a).unwrap())
-                .unique()
-                .for_each(|a| push(self.archive.domain.access(a)))
-            }
-            (Some(e), Some(a), None, false, false, true) => {
-                let r = base_range(&self.archive.domain, &self.archive.e_a, e);
-                restrict_range(
-                    &self.archive.domain,
-                    &self.archive.a_a,
-                    &self.archive.eva_c,
-                    a,
-                    &r,
-                )
-                .map(|v| self.archive.aev_c.access(v).unwrap())
-                .unique()
-                .for_each(|v| push(self.archive.domain.access(v)))
-            }
-            _ => unreachable!(),
-        }
+        let walk = self
+            .located_proposal_walk(p, row)
+            .expect("single-target Succinct proposal has an ordered walk");
+        let page = walk.consume(ResidualDeltaSourceCursor::Start, usize::MAX, &mut *push);
+        debug_assert_eq!(page.next, None, "an unbounded dense walk must drain");
     }
 
     /// Bounded counterpart of [`Self::propose_row`]. Every supported arm
@@ -973,150 +1122,26 @@ where
             };
         }
 
-        match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
-            (None, None, None, true, false, false) => page_domain(
-                self.archive,
-                &self.archive.e_a,
-                all_codes,
-                cursor,
-                limit,
-                accepted,
-            ),
-            (None, None, None, false, true, false) => page_domain(
-                self.archive,
-                &self.archive.a_a,
-                all_codes,
-                cursor,
-                limit,
-                accepted,
-            ),
-            (None, None, None, false, false, true) => page_domain(
-                self.archive,
-                &self.archive.v_a,
-                all_codes,
-                cursor,
-                limit,
-                accepted,
-            ),
-            (Some(e), None, None, false, true, false) => page_middle(
-                self.archive,
-                &self.archive.changed_e_a,
-                base_range(&self.archive.domain, &self.archive.e_a, e),
-                &self.archive.eav_c,
-                &self.archive.v_a,
-                &self.archive.vea_c,
-                cursor,
-                limit,
-                accepted,
-            ),
-            (Some(e), None, None, false, false, true) => page_middle(
-                self.archive,
-                &self.archive.changed_e_v,
-                base_range(&self.archive.domain, &self.archive.e_a, e),
-                &self.archive.eva_c,
-                &self.archive.a_a,
-                &self.archive.aev_c,
-                cursor,
-                limit,
-                accepted,
-            ),
-            (None, Some(a), None, true, false, false) => page_middle(
-                self.archive,
-                &self.archive.changed_a_e,
-                base_range(&self.archive.domain, &self.archive.a_a, a),
-                &self.archive.aev_c,
-                &self.archive.v_a,
-                &self.archive.vae_c,
-                cursor,
-                limit,
-                accepted,
-            ),
-            (None, Some(a), None, false, false, true) => page_middle(
-                self.archive,
-                &self.archive.changed_a_v,
-                base_range(&self.archive.domain, &self.archive.a_a, a),
-                &self.archive.ave_c,
-                &self.archive.e_a,
-                &self.archive.eav_c,
-                cursor,
-                limit,
-                accepted,
-            ),
-            (None, None, Some(v), true, false, false) => page_middle(
-                self.archive,
-                &self.archive.changed_v_e,
-                base_range(&self.archive.domain, &self.archive.v_a, v),
-                &self.archive.vea_c,
-                &self.archive.a_a,
-                &self.archive.ave_c,
-                cursor,
-                limit,
-                accepted,
-            ),
-            (None, None, Some(v), false, true, false) => page_middle(
-                self.archive,
-                &self.archive.changed_v_a,
-                base_range(&self.archive.domain, &self.archive.v_a, v),
-                &self.archive.vae_c,
-                &self.archive.e_a,
-                &self.archive.eva_c,
-                cursor,
-                limit,
-                accepted,
-            ),
-            (None, Some(a), Some(v), true, false, false) => {
-                let range = base_range(&self.archive.domain, &self.archive.a_a, a);
-                page_last(
-                    self.archive,
-                    restrict_range(
-                        &self.archive.domain,
-                        &self.archive.v_a,
-                        &self.archive.aev_c,
-                        v,
-                        &range,
-                    ),
-                    &self.archive.vae_c,
-                    cursor,
-                    limit,
-                    accepted,
-                )
-            }
-            (Some(e), None, Some(v), false, true, false) => {
-                let range = base_range(&self.archive.domain, &self.archive.e_a, e);
-                page_last(
-                    self.archive,
-                    restrict_range(
-                        &self.archive.domain,
-                        &self.archive.v_a,
-                        &self.archive.eav_c,
-                        v,
-                        &range,
-                    ),
-                    &self.archive.vea_c,
-                    cursor,
-                    limit,
-                    accepted,
-                )
-            }
-            (Some(e), Some(a), None, false, false, true) => {
-                let range = base_range(&self.archive.domain, &self.archive.e_a, e);
-                page_last(
-                    self.archive,
-                    restrict_range(
-                        &self.archive.domain,
-                        &self.archive.a_a,
-                        &self.archive.eva_c,
-                        a,
-                        &range,
-                    ),
-                    &self.archive.aev_c,
-                    cursor,
-                    limit,
-                    accepted,
-                )
-            }
-            _ => unreachable!("invalid succinct proposal source state"),
+        self.located_proposal_walk(p, row)
+            .expect("single-target Succinct proposal has an ordered walk")
+            .consume(cursor, limit, |value| accepted.push(value))
+    }
+
+    /// Returns the already-located ordered walk for a one-parent,
+    /// single-position target. Physical wrappers such as a union may consume
+    /// this directly into their own SET-admission sink without materialising a
+    /// per-shard vector. Repeated-position targets keep their filtered source
+    /// path and return `None` here.
+    pub(crate) fn proposal_walk_single_target(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+    ) -> Option<LocatedProposalWalk<'a, U>> {
+        if view.len() != 1 || view.col(variable).is_some() {
+            return None;
         }
+        let positions = self.positions(variable, view);
+        self.located_proposal_walk(&positions, view.row(0))
     }
 
     /// Exact single-parent proposal page used by physical wrappers that own
@@ -1130,6 +1155,9 @@ where
         limit: usize,
         accepted: &mut Vec<RawInline>,
     ) -> ResidualDeltaSourcePage {
+        if let Some(walk) = self.proposal_walk_single_target(variable, view) {
+            return walk.consume(cursor, limit, |value| accepted.push(value));
+        }
         assert_eq!(view.len(), 1, "Succinct proposal pages have one parent");
         assert!(
             view.col(variable).is_none(),
@@ -1141,13 +1169,7 @@ where
             0,
             "Succinct proposal target is absent"
         );
-        self.proposal_source_page_row(
-            &positions,
-            view.row(0),
-            cursor,
-            limit,
-            accepted,
-        )
+        self.proposal_source_page_row(&positions, view.row(0), cursor, limit, accepted)
     }
 }
 
@@ -1942,6 +1964,147 @@ mod typed_program_tests {
         assert!(empty.is_empty());
         assert_eq!(empty_page.examined, 0);
         assert_eq!(empty_page.next, None);
+    }
+
+    fn assert_dense_equals_bounded<U>(
+        label: &str,
+        constraint: &SuccinctArchiveConstraint<'_, U>,
+        variable: VariableId,
+        view: RowsView<'_>,
+        expected: &[RawInline],
+    ) where
+        U: Universe,
+    {
+        assert_eq!(view.len(), 1, "{label}: test view must have one row");
+        let positions = constraint.positions(variable, &view);
+        assert_eq!(
+            positions.target_count(),
+            1,
+            "{label}: test shape must have one target position"
+        );
+
+        let mut dense = Vec::new();
+        constraint.propose_row(&positions, view.row(0), &mut |value| dense.push(value));
+        assert_eq!(dense, expected, "{label}: dense Ring order");
+
+        let n = expected.len();
+        let mut limits = vec![1, n.saturating_sub(1).max(1), n.max(1), n + 1, usize::MAX];
+        limits.sort_unstable();
+        limits.dedup();
+        for limit in limits {
+            let mut cursor = ResidualDeltaSourceCursor::Start;
+            let mut bounded = Vec::new();
+            let mut examined = 0usize;
+            loop {
+                let page = constraint.proposal_source_page_row(
+                    &positions,
+                    view.row(0),
+                    cursor,
+                    limit,
+                    &mut bounded,
+                );
+                assert!(page.examined <= limit, "{label}: page exceeds demand");
+                examined += page.examined;
+                let Some(next) = page.next else {
+                    break;
+                };
+                assert!(
+                    page.examined > 0,
+                    "{label}: a live continuation must make progress"
+                );
+                cursor = next;
+            }
+            assert_eq!(
+                bounded, dense,
+                "{label}: bounded concatenation at limit {limit}"
+            );
+            assert_eq!(
+                examined,
+                dense.len(),
+                "{label}: every logical candidate is examined once"
+            );
+        }
+    }
+
+    #[test]
+    fn located_walk_dense_and_bounded_match_for_all_single_target_shapes() {
+        let entities: Vec<_> = (1..=4).map(id_value).collect();
+        let attributes: Vec<_> = (11..=14).map(id_value).collect();
+        let values: Vec<_> = (21..=24).map(inline_value).collect();
+        let set: TribleSet = (1..=4)
+            .flat_map(|entity| {
+                (11..=14).flat_map(move |attribute| {
+                    (21..=24).map(move |value| trible(entity, attribute, inline_value(value)))
+                })
+            })
+            .collect();
+        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+        let e = Variable::<GenId>::new(0);
+        let a = Variable::<GenId>::new(1);
+        let v = Variable::<UnknownInline>::new(2);
+        let constraint = SuccinctArchiveConstraint::new(e, a, v, &archive);
+
+        // Three top-level domain walks.
+        assert_dense_equals_bounded("domain E", &constraint, e.index, RowsView::EMPTY, &entities);
+        assert_dense_equals_bounded(
+            "domain A",
+            &constraint,
+            a.index,
+            RowsView::EMPTY,
+            &attributes,
+        );
+        assert_dense_equals_bounded("domain V", &constraint, v.index, RowsView::EMPTY, &values);
+
+        // Six fixed-first middle walks, one through every Ring rotation.
+        let e_vars = [e.index];
+        let e_rows = [entities[0]];
+        let e_view = RowsView::new(&e_vars, &e_rows);
+        assert_dense_equals_bounded("middle EAV", &constraint, a.index, e_view, &attributes);
+        assert_dense_equals_bounded("middle EVA", &constraint, v.index, e_view, &values);
+
+        let a_vars = [a.index];
+        let a_rows = [attributes[0]];
+        let a_view = RowsView::new(&a_vars, &a_rows);
+        assert_dense_equals_bounded("middle AEV", &constraint, e.index, a_view, &entities);
+        assert_dense_equals_bounded("middle AVE", &constraint, v.index, a_view, &values);
+
+        let v_vars = [v.index];
+        let v_rows = [values[0]];
+        let v_view = RowsView::new(&v_vars, &v_rows);
+        assert_dense_equals_bounded("middle VEA", &constraint, e.index, v_view, &entities);
+        assert_dense_equals_bounded("middle VAE", &constraint, a.index, v_view, &attributes);
+
+        // Three fixed-pair last walks. These retain ordinary adjacent
+        // duplicate collapse even though this set fixture proves uniqueness.
+        let av_vars = [a.index, v.index];
+        let av_rows = [attributes[0], values[0]];
+        assert_dense_equals_bounded(
+            "last VAE",
+            &constraint,
+            e.index,
+            RowsView::new(&av_vars, &av_rows),
+            &entities,
+        );
+
+        let ev_vars = [e.index, v.index];
+        let ev_rows = [entities[0], values[0]];
+        assert_dense_equals_bounded(
+            "last VEA",
+            &constraint,
+            a.index,
+            RowsView::new(&ev_vars, &ev_rows),
+            &attributes,
+        );
+
+        let ea_vars = [e.index, a.index];
+        let ea_rows = [entities[0], attributes[0]];
+        assert_dense_equals_bounded(
+            "last AEV",
+            &constraint,
+            v.index,
+            RowsView::new(&ea_vars, &ea_rows),
+            &values,
+        );
     }
 
     fn one_program_step<U>(
