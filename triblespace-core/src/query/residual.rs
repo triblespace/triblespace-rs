@@ -13538,11 +13538,11 @@ mod tests {
 
         fn step_typed(
             &self,
-            states: Vec<Self::State>,
+            states: &mut Vec<Self::State>,
             _batch: TypedProgramBatch<'_>,
             effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
-            for (input, state) in states.into_iter().enumerate() {
+            for (input, state) in states.drain(..).enumerate() {
                 if let Some(value) = state.repeated {
                     effects.accept(input as u32, value);
                     effects.accept(input as u32, value);
@@ -13843,7 +13843,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            states: Vec<Self::State>,
+            states: &mut Vec<Self::State>,
             _batch: TypedProgramBatch<'_>,
             effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
@@ -13961,7 +13961,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            _states: Vec<Self::State>,
+            _states: &mut Vec<Self::State>,
             _batch: TypedProgramBatch<'_>,
             _effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {

@@ -404,7 +404,7 @@ impl TypedProgramSpec for ProgramAlternatingClosure {
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: &mut Vec<Self::State>,
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
@@ -414,7 +414,7 @@ impl TypedProgramSpec for ProgramAlternatingClosure {
             .support_expanded_nodes
             .fetch_add(states.len(), Ordering::Relaxed);
 
-        for (input, state) in states.into_iter().enumerate() {
+        for (input, state) in states.drain(..).enumerate() {
             let edges = match state.phase {
                 ProgramSupportPhase::Red => &self.0.red,
                 ProgramSupportPhase::Blue => &self.0.blue,

@@ -1919,7 +1919,7 @@ where
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: &mut Vec<Self::State>,
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
@@ -1933,7 +1933,7 @@ where
         match first {
             UnionArchiveProgramState::Propose { variable, .. } => {
                 let variable = *variable;
-                for (input, state) in states.into_iter().enumerate() {
+                for (input, state) in states.drain(..).enumerate() {
                     let UnionArchiveProgramState::Propose {
                         variable: state_variable,
                         mut shard_index,
@@ -2007,7 +2007,7 @@ where
                 let variable = *variable;
                 let mut tagged = Candidates::new();
                 let mut pages = Vec::with_capacity(states.len());
-                for (input, state) in states.into_iter().enumerate() {
+                for (input, state) in states.drain(..).enumerate() {
                     let UnionArchiveProgramState::Confirm {
                         variable: state_variable,
                         offset,
@@ -2062,7 +2062,7 @@ where
                 }
             }
             UnionArchiveProgramState::Support => {
-                for (input, state) in states.into_iter().enumerate() {
+                for (input, state) in states.drain(..).enumerate() {
                     assert_eq!(state, UnionArchiveProgramState::Support);
                     assert!(
                         batch.candidate_sets[input].is_none(),
@@ -2414,7 +2414,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            states: Vec<Self::State>,
+            states: &mut Vec<Self::State>,
             batch: TypedProgramBatch<'_>,
             effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
@@ -2425,8 +2425,9 @@ mod tests {
             &self,
             states: &[Self::State],
             batch: TypedProgramBatch<'_>,
-        ) -> Option<crate::query::TypedPhysicalStep<Self::State, Self::NoveltyKey>> {
-            self.0.try_step_physical(states, batch)
+            effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+        ) -> Option<crate::query::ProgramPhysicalReceipt> {
+            self.0.try_step_physical(states, batch, effects)
         }
 
         fn complete_typed(&self, batch: ProgramCompleteBatch<'_>, effects: &mut TypedCompleteSink) {

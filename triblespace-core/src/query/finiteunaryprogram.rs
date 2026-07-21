@@ -189,7 +189,7 @@ pub fn seed(
 #[doc(hidden)]
 pub fn step(
     variable: VariableId,
-    states: Vec<FiniteUnaryProgramState>,
+    states: &mut Vec<FiniteUnaryProgramState>,
     batch: TypedProgramBatch<'_>,
     effects: &mut TypedEffectSink<FiniteUnaryProgramState, ()>,
     mut proposal_page: impl FnMut(
@@ -209,7 +209,7 @@ pub fn step(
     };
     match first {
         FiniteUnaryProgramState::Propose { .. } => {
-            for (input, state) in states.into_iter().enumerate() {
+            for (input, state) in states.drain(..).enumerate() {
                 let FiniteUnaryProgramState::Propose { cursor } = state else {
                     panic!("one ordered unary cohort mixed action variants")
                 };
@@ -241,7 +241,7 @@ pub fn step(
             }
         }
         FiniteUnaryProgramState::Confirm { .. } => {
-            for (input, state) in states.into_iter().enumerate() {
+            for (input, state) in states.drain(..).enumerate() {
                 let FiniteUnaryProgramState::Confirm { offset } = state else {
                     panic!("one ordered unary cohort mixed action variants")
                 };
@@ -271,7 +271,7 @@ pub fn step(
         }
         FiniteUnaryProgramState::Support => {
             let column = batch.view.col(variable);
-            for (input, state) in states.into_iter().enumerate() {
+            for (input, state) in states.drain(..).enumerate() {
                 assert_eq!(state, FiniteUnaryProgramState::Support);
                 assert!(
                     batch.candidate_sets[input].is_none(),

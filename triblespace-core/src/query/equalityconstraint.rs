@@ -186,7 +186,7 @@ impl TypedProgramSpec for EqualityConstraint {
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: &mut Vec<Self::State>,
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
@@ -208,7 +208,7 @@ impl TypedProgramSpec for EqualityConstraint {
                     .view
                     .col(peer)
                     .expect("typed equality proposal lost its bound peer");
-                for (input, state) in states.into_iter().enumerate() {
+                for (input, state) in states.drain(..).enumerate() {
                     assert_eq!(state, EqualityProgramState::Propose { variable });
                     assert!(
                         batch.candidate_sets[input].is_none(),
@@ -226,7 +226,7 @@ impl TypedProgramSpec for EqualityConstraint {
             EqualityProgramState::Confirm { variable, .. } => {
                 let variable = *variable;
                 let peer_column = self.peer(variable).and_then(|peer| batch.view.col(peer));
-                for (input, state) in states.into_iter().enumerate() {
+                for (input, state) in states.drain(..).enumerate() {
                     let EqualityProgramState::Confirm {
                         variable: state_variable,
                         offset,
@@ -265,7 +265,7 @@ impl TypedProgramSpec for EqualityConstraint {
                 }
             }
             EqualityProgramState::Support => {
-                for (input, state) in states.into_iter().enumerate() {
+                for (input, state) in states.drain(..).enumerate() {
                     assert_eq!(state, EqualityProgramState::Support);
                     assert!(
                         batch.candidate_sets[input].is_none(),

@@ -196,7 +196,7 @@ impl TypedProgramSpec for ConfirmFinalizerProgram {
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: &mut Vec<Self::State>,
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
@@ -206,7 +206,7 @@ impl TypedProgramSpec for ConfirmFinalizerProgram {
             batch.candidate_sets.iter().all(|candidates| candidates.is_none()),
             "Confirm finalizer unexpectedly borrowed a graph candidate slice"
         );
-        for (input, (mut state, &limit)) in states.into_iter().zip(batch.limits).enumerate() {
+        for (input, (mut state, &limit)) in states.drain(..).zip(batch.limits).enumerate() {
             let mut examined = 0usize;
             while examined < limit {
                 let Some((parent, candidate)) = state.original.next() else {
@@ -266,14 +266,14 @@ impl TypedProgramSpec for SetAdmissionProgram {
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: &mut Vec<Self::State>,
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
         assert_eq!(states.len(), batch.limits.len());
         assert_eq!(states.len(), batch.view.len());
         assert!(batch.candidate_sets.iter().all(Option::is_none));
-        for (input, (state, &limit)) in states.into_iter().zip(batch.limits).enumerate() {
+        for (input, (state, &limit)) in states.drain(..).zip(batch.limits).enumerate() {
             let page = state.advance(limit);
             for value in page.emitted {
                 effects.direct(
@@ -326,14 +326,14 @@ impl TypedProgramSpec for FormulaOrAdmissionProgram {
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: &mut Vec<Self::State>,
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
         assert_eq!(states.len(), batch.limits.len());
         assert_eq!(states.len(), batch.view.len());
         assert!(batch.candidate_sets.iter().all(Option::is_none));
-        for (input, (mut state, &limit)) in states.into_iter().zip(batch.limits).enumerate() {
+        for (input, (mut state, &limit)) in states.drain(..).zip(batch.limits).enumerate() {
             let mut examined = 0usize;
             while examined < limit {
                 let Some((parent, value)) = state.input.next() else {
@@ -400,7 +400,7 @@ impl TypedProgramSpec for FormulaOrEmissionProgram {
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: &mut Vec<Self::State>,
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
@@ -409,7 +409,7 @@ impl TypedProgramSpec for FormulaOrEmissionProgram {
         assert_eq!(states.len(), batch.limits.len());
         assert_eq!(states.len(), batch.view.len());
         assert!(batch.candidate_sets.iter().all(Option::is_none));
-        for (input, (mut state, &limit)) in states.into_iter().zip(batch.limits).enumerate() {
+        for (input, (mut state, &limit)) in states.drain(..).zip(batch.limits).enumerate() {
             // "Singleton emission" is one affine parent/credit, not one
             // value per receipt.  One Search page may move at most its grant
             // into one new rope leaf.
@@ -484,14 +484,14 @@ impl TypedProgramSpec for ProposalMaterializerProgram {
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: &mut Vec<Self::State>,
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
         assert_eq!(states.len(), batch.limits.len());
         assert_eq!(states.len(), batch.view.len());
         assert!(batch.candidate_sets.iter().all(Option::is_none));
-        for (input, (state, &limit)) in states.into_iter().zip(batch.limits).enumerate() {
+        for (input, (state, &limit)) in states.drain(..).zip(batch.limits).enumerate() {
             let page = state.advance(limit);
             for value in page.emitted {
                 effects.direct(
@@ -890,11 +890,11 @@ struct ProgramInstallOutcome {
 }
 
 struct ProgramReplaceOutcome {
-    scheduled: Vec<(DeltaStateId, ProgramWork, ProducerCredit)>,
+    scheduled: SmallVec<[(DeltaStateId, ProgramWork, ProducerCredit); 2]>,
     /// Raw proposal occurrences reported by this typed page before
     /// activation-local SET admission. This remains telemetry only.
     raw_proposal_occurrences: usize,
-    accepted: Vec<RawInline>,
+    accepted: SmallVec<[RawInline; 1]>,
     dead_search_pages: usize,
     dead_source_telemetry_pages: usize,
     quiescence: Option<QuiescenceProof>,
@@ -1783,8 +1783,8 @@ impl ProducerRegistry {
             }
         };
 
-        let observed: Vec<_> = observed.into_iter().collect();
-        let mut direct: Vec<_> = direct.into_iter().collect();
+        let observed: SmallVec<[RawInline; 1]> = observed.into_iter().collect();
+        let mut direct: SmallVec<[RawInline; 1]> = direct.into_iter().collect();
         let raw_stream_occurrences = {
             let activation = self
                 .state
@@ -1808,7 +1808,7 @@ impl ProducerRegistry {
                 0
             }
         };
-        let mut accepted = Vec::new();
+        let mut accepted: SmallVec<[RawInline; 1]> = SmallVec::new();
         {
             let activation = self
                 .state
@@ -1837,7 +1837,9 @@ impl ProducerRegistry {
                         "Confirm finalizer reacquired mutable graph Accepted state"
                     );
                     if !direct.is_empty() {
-                        let mut page = CandidatePayload::Values(std::mem::take(&mut direct));
+                        let mut page = CandidatePayload::Values(
+                            std::mem::take(&mut direct).into_vec(),
+                        );
                         page.defer_for_shared_activation(1);
                         output.extend_same_domain(page, 1);
                     }
@@ -1851,7 +1853,7 @@ impl ProducerRegistry {
                         activation.accepted.is_empty(),
                         "proposal materializer reacquired mutable graph Accepted state"
                     );
-                    append_one_parent_page(output, std::mem::take(&mut direct));
+                    append_one_parent_page(output, std::mem::take(&mut direct).into_vec());
                 }
                 (
                     DeltaReducer::SetAdmit { output },
@@ -1865,7 +1867,7 @@ impl ProducerRegistry {
                         activation.accepted.is_empty(),
                         "SET admission acquired graph Accepted state"
                     );
-                    append_one_parent_page(output, std::mem::take(&mut direct));
+                    append_one_parent_page(output, std::mem::take(&mut direct).into_vec());
                 }
                 (
                     DeltaReducer::FormulaOrAdmit,
@@ -1896,7 +1898,9 @@ impl ProducerRegistry {
                         "Formula OR emission acquired graph Accepted state"
                     );
                     if !direct.is_empty() {
-                        let mut page = CandidatePayload::Values(std::mem::take(&mut direct));
+                        let mut page = CandidatePayload::Values(
+                            std::mem::take(&mut direct).into_vec(),
+                        );
                         page.defer_for_shared_activation(1);
                         output.extend_same_domain(page, 1);
                     }
@@ -1921,11 +1925,14 @@ impl ProducerRegistry {
                     accepted.push(value);
                 }
             }
-            let mut retained = direct.clone();
-            retained.extend(accepted.iter().copied());
-            activation
-                .reducer
-                .retain_quiescent_proposal_page(retained);
+            if matches!(activation.reducer, DeltaReducer::QuiescentProposal { .. }) {
+                let mut retained = Vec::with_capacity(direct.len() + accepted.len());
+                retained.extend(direct.iter().copied());
+                retained.extend(accepted.iter().copied());
+                activation
+                    .reducer
+                    .retain_quiescent_proposal_page(retained);
+            }
         }
 
         let publishes_stable_effect = {
@@ -1956,7 +1963,8 @@ impl ProducerRegistry {
 
         let no_replacement =
             children.is_empty() && matches!(&resume, None | Some(ProgramResume::AfterChildrenDone));
-        let mut scheduled = Vec::new();
+        let mut scheduled: SmallVec<[(DeltaStateId, ProgramWork, ProducerCredit); 2]> =
+            SmallVec::new();
         match resume {
             Some(ProgramResume::AfterChildren(resume)) if !children.is_empty() => {
                 let join = self.new_program_join(
@@ -2658,11 +2666,13 @@ fn program_seed_ranges(
     ranges
 }
 
-fn program_child_ranges(
+fn program_child_ranges_into(
     children: &[ProgramChild],
     input_count: usize,
-) -> Vec<std::ops::Range<usize>> {
-    let mut ranges = Vec::with_capacity(input_count);
+    ranges: &mut Vec<std::ops::Range<usize>>,
+) {
+    ranges.clear();
+    ranges.reserve(input_count);
     let mut cursor = 0usize;
     for input in 0..input_count {
         let begin = cursor;
@@ -2676,7 +2686,6 @@ fn program_child_ranges(
         children.len(),
         "typed program child tags skipped an input range"
     );
-    ranges
 }
 
 fn tagged_ranges<T>(
@@ -2685,6 +2694,18 @@ fn tagged_ranges<T>(
     kind: &str,
 ) -> Vec<std::ops::Range<usize>> {
     let mut ranges = Vec::with_capacity(parent_count);
+    tagged_ranges_into(values, parent_count, kind, &mut ranges);
+    ranges
+}
+
+fn tagged_ranges_into<T>(
+    values: &[(u32, T)],
+    parent_count: usize,
+    kind: &str,
+    ranges: &mut Vec<std::ops::Range<usize>>,
+) {
+    ranges.clear();
+    ranges.reserve(parent_count);
     let mut cursor = 0usize;
     for parent in 0..parent_count {
         let begin = cursor;
@@ -2698,7 +2719,6 @@ fn tagged_ranges<T>(
         values.len(),
         "residual {kind} tags are out of range or not grouped in ascending order"
     );
-    ranges
 }
 
 #[derive(Debug)]
@@ -2745,6 +2765,26 @@ struct ProgramTask {
     activation: ActivationId,
     credit: ProducerCredit,
     work: ProgramWork,
+}
+
+struct ProgramTaskReceipt {
+    activation: ActivationId,
+    credit: ProducerCredit,
+}
+
+#[derive(Default)]
+struct ProgramSchedulerScratch {
+    parents: Vec<RawInline>,
+    vars: Vec<VariableId>,
+    activations: Vec<ProgramActivation>,
+    task_receipts: Vec<ProgramTaskReceipt>,
+    work: Vec<ProgramWork>,
+    receipt: ProgramBatchEffects,
+    child_ranges: Vec<std::ops::Range<usize>>,
+    direct_ranges: Vec<std::ops::Range<usize>>,
+    accepted_ranges: Vec<std::ops::Range<usize>>,
+    supported_ranges: Vec<std::ops::Range<usize>>,
+    retired_activations: Vec<ProgramActivation>,
 }
 
 /// Physical Program-call class after removing activation-local reducer state.
@@ -3881,6 +3921,10 @@ pub(super) struct DeltaScheduler {
     /// opaque physical dispatch classes.
     program_worklist: BTreeMap<DeltaStateId, ProgramBucket>,
     program_runtimes: AHashMap<DeltaStateId, ProgramRuntime>,
+    /// Program-only cohort scratch is lazy so non-Program queries retain the
+    /// baseline scheduler footprint. One allocation is amortized across all
+    /// Program steps in the query.
+    program_scratch: Option<Box<ProgramSchedulerScratch>>,
     /// Number of independent quiescent activations that may share one
     /// transition cohort. This grows only when activations complete; `width`
     /// remains the separate intra-activation page/work budget.
@@ -3901,6 +3945,7 @@ impl DeltaScheduler {
             source_worklist: BTreeMap::new(),
             program_worklist: BTreeMap::new(),
             program_runtimes: AHashMap::new(),
+            program_scratch: None,
             activation_width: 1,
             terminal_selection_slots: AHashMap::new(),
             terminal_selections: Vec::new(),
@@ -6434,7 +6479,7 @@ impl DeltaScheduler {
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
         state: DeltaStateId,
-        tasks: Vec<ProgramTask>,
+        mut tasks: Vec<ProgramTask>,
         limits: &[usize],
         direct_terminal_full: Option<VariableSet>,
         stable: &mut Worklist,
@@ -6462,29 +6507,40 @@ impl DeltaScheduler {
         );
 
         let row_count = tasks.len();
-        let mut parents = Vec::new();
-        let mut candidate_sets = Vec::with_capacity(row_count);
+        let mut scratch = self
+            .program_scratch
+            .take()
+            .unwrap_or_else(|| Box::new(ProgramSchedulerScratch::default()));
+        scratch.parents.clear();
+        let mut candidate_sets: SmallVec<[Option<&[RawInline]>; 1]> = SmallVec::new();
+        candidate_sets.reserve(row_count);
         for task in &tasks {
             assert_eq!(task.activation, task.credit.key.activation);
             let (bound, parent, candidates) = self.registry.source_context(task.activation);
             assert_eq!(bound, cohort_key.bound);
             assert_eq!(candidates.is_some(), cohort_key.has_candidates);
-            parents.extend_from_slice(parent);
+            scratch.parents.extend_from_slice(parent);
             candidate_sets.push(candidates);
         }
-        let vars: Vec<_> = cohort_key.bound.into_iter().collect();
-        let view = rows_view(&vars, &parents, row_count);
-        let activations: Vec<_> = tasks
-            .iter()
-            .map(|task| ProgramActivation(task.activation.0))
-            .collect();
-        let mut task_receipts = Vec::with_capacity(row_count);
-        let mut work = Vec::with_capacity(row_count);
-        for task in tasks {
-            task_receipts.push((task.activation, task.credit));
-            work.push(task.work);
+        scratch.vars.clear();
+        scratch.vars.extend(cohort_key.bound.into_iter());
+        let view = rows_view(&scratch.vars, &scratch.parents, row_count);
+        scratch.activations.clear();
+        scratch.activations.extend(
+            tasks
+                .iter()
+                .map(|task| ProgramActivation(task.activation.0)),
+        );
+        scratch.task_receipts.clear();
+        scratch.work.clear();
+        for task in tasks.drain(..) {
+            scratch.task_receipts.push(ProgramTaskReceipt {
+                activation: task.activation,
+                credit: task.credit,
+            });
+            scratch.work.push(task.work);
         }
-        let mut receipt = ProgramBatchEffects::default();
+        scratch.receipt.clear();
         spec.step_batch_for(
             self.program_runtimes
                 .get_mut(&state)
@@ -6494,37 +6550,51 @@ impl DeltaScheduler {
                 stratum: address.stratum(),
                 view,
                 candidate_sets: &candidate_sets,
-                activations: &activations,
-                work: &work,
+                activations: &scratch.activations,
+                work: &scratch.work,
                 limits,
             },
-            &mut receipt,
+            &mut scratch.receipt,
         );
         drop(candidate_sets);
         assert_eq!(
-            receipt.pages.len(),
+            scratch.receipt.pages.len(),
             row_count,
             "typed program returned the wrong page count"
         );
-        for (page, &limit) in receipt.pages.iter().zip(limits) {
+        for (page, &limit) in scratch.receipt.pages.iter().zip(limits) {
             assert!(
                 page.examined <= limit,
                 "typed program exceeded one input's physical work budget"
             );
         }
-        let child_ranges = program_child_ranges(&receipt.children, row_count);
-        let direct_ranges = tagged_ranges(&receipt.direct, row_count, "program direct effect");
-        let accepted_ranges = tagged_ranges(
-            &receipt.accepted,
+        program_child_ranges_into(
+            &scratch.receipt.children,
+            row_count,
+            &mut scratch.child_ranges,
+        );
+        tagged_ranges_into(
+            &scratch.receipt.direct,
+            row_count,
+            "program direct effect",
+            &mut scratch.direct_ranges,
+        );
+        tagged_ranges_into(
+            &scratch.receipt.accepted,
             row_count,
             "program candidate observation",
+            &mut scratch.accepted_ranges,
         );
-        let supported_ranges =
-            tagged_ranges(&receipt.supported, row_count, "program support observation");
+        tagged_ranges_into(
+            &scratch.receipt.supported,
+            row_count,
+            "program support observation",
+            &mut scratch.supported_ranges,
+        );
 
         // Placement is observation only. Static executor labels deliberately
         // stay out of the ordinary hot-path aggregate and never feed dispatch.
-        if receipt.placement.is_some() {
+        if scratch.receipt.placement.is_some() {
             let granted_work = limits.iter().sum();
             stats.delta_program_physical_cohorts += 1;
             stats.delta_program_physical_rows += row_count;
@@ -6538,35 +6608,36 @@ impl DeltaScheduler {
 
         // Source/transition naming remains family-reported telemetry; it is
         // never consulted for dispatch, novelty, or replacement semantics.
-        stats.delta_source_pages += receipt.source_pages;
-        stats.delta_source_candidates_examined += receipt.source_examined;
-        stats.delta_source_roots += receipt.source_roots;
+        stats.delta_source_pages += scratch.receipt.source_pages;
+        stats.delta_source_candidates_examined += scratch.receipt.source_examined;
+        stats.delta_source_roots += scratch.receipt.source_roots;
         if !private_direct {
-            stats.delta_source_direct_candidates += receipt.direct.len();
+            stats.delta_source_direct_candidates += scratch.receipt.direct.len();
         }
-        if receipt.source_pages > 0 {
+        if scratch.receipt.source_pages > 0 {
             stats.delta_source_cohorts += 1;
-            stats.max_delta_source_cohort = stats.max_delta_source_cohort.max(receipt.source_pages);
+            stats.max_delta_source_cohort = stats
+                .max_delta_source_cohort
+                .max(scratch.receipt.source_pages);
         }
-        stats.delta_transition_pages += receipt.transition_pages;
-        stats.delta_transition_candidates_examined += receipt.transition_examined;
-        if receipt.transition_pages > 0 {
+        stats.delta_transition_pages += scratch.receipt.transition_pages;
+        stats.delta_transition_candidates_examined += scratch.receipt.transition_examined;
+        if scratch.receipt.transition_pages > 0 {
             stats.delta_transition_cohorts += 1;
             stats.max_delta_transition_cohort = stats
                 .max_delta_transition_cohort
-                .max(receipt.transition_pages);
+                .max(scratch.receipt.transition_pages);
         }
 
         // Physical pacing is revalidated by the typed adapter from canonical
         // state before this receipt is produced. Family-reported source and
         // transition counts remain telemetry only.
         let search_cohort = cohort_key.class.pacing() == ProgramPacing::Search;
-        let source_telemetry_cohort = receipt.source_pages > 0 && receipt.transition_pages == 0;
-        let mut scheduled = Vec::new();
+        let source_telemetry_cohort =
+            scratch.receipt.source_pages > 0 && scratch.receipt.transition_pages == 0;
         let mut effects = DeltaStableEffects::default();
         let mut completed_activation_ids = Vec::new();
         let mut retargeted = AHashMap::new();
-        let mut retired_activations = Vec::new();
         let mut dead_pages = 0usize;
         let mut source_dead_pages = 0usize;
         let mut transition_dead_pages = 0usize;
@@ -6574,21 +6645,38 @@ impl DeltaScheduler {
         let mut completed_activations = 0usize;
         let mut terminal_publications = OrderedActivationSet::default();
 
+        scratch.retired_activations.clear();
+        let ProgramSchedulerScratch {
+            task_receipts,
+            receipt,
+            child_ranges,
+            direct_ranges,
+            accepted_ranges,
+            supported_ranges,
+            retired_activations,
+            ..
+        } = &mut *scratch;
+        let ProgramBatchEffects {
+            pages,
+            children,
+            direct,
+            accepted,
+            supported,
+            ..
+        } = receipt;
         for (
             input,
-            (
-                (((((activation, credit), page), child_range), direct_range), accepted_range),
-                supported_range,
-            ),
+            (((((task, page), child_range), direct_range), accepted_range), supported_range),
         ) in task_receipts
-            .into_iter()
-            .zip(receipt.pages)
-            .zip(child_ranges)
-            .zip(direct_ranges)
-            .zip(accepted_ranges)
-            .zip(supported_ranges)
+            .drain(..)
+            .zip(pages.drain(..))
+            .zip(child_ranges.drain(..))
+            .zip(direct_ranges.drain(..))
+            .zip(accepted_ranges.drain(..))
+            .zip(supported_ranges.drain(..))
             .enumerate()
         {
+            let ProgramTaskReceipt { activation, credit } = task;
             let terminal = self.registry.physical_activation_class(activation)
                 == DeltaPhysicalClass::TerminalStreaming;
             let within_search_page = self.registry.program_credit_within_search_page(&credit);
@@ -6607,11 +6695,11 @@ impl DeltaScheduler {
             let outcome = self.registry.replace_program(
                 credit,
                 state,
-                &receipt.children[child_range],
-                receipt.accepted[accepted_range]
+                &children[child_range],
+                accepted[accepted_range]
                     .iter()
                     .map(|(_, value)| *value),
-                receipt.direct[direct_range].iter().map(|(_, value)| *value),
+                direct[direct_range].iter().map(|(_, value)| *value),
                 !supported_range.is_empty(),
                 search_cohort,
                 source_telemetry_cohort,
@@ -6633,7 +6721,7 @@ impl DeltaScheduler {
                     scheduled_state, state,
                     "typed program continuation crossed occurrence-local runtime state"
                 );
-                scheduled.push(ProgramTask {
+                tasks.push(ProgramTask {
                     activation,
                     credit,
                     work,
@@ -6669,7 +6757,7 @@ impl DeltaScheduler {
                     let released = self.release_streaming(
                         activation,
                         streamed,
-                        outcome.accepted,
+                        outcome.accepted.into_vec(),
                         direct_terminal,
                         plan,
                         stable,
@@ -6750,7 +6838,7 @@ impl DeltaScheduler {
             debug_assert!(input < row_count);
         }
 
-        let _ = self.file_program_state(state, scheduled);
+        let _ = self.file_program_state(state, tasks);
         if !retired_activations.is_empty() {
             spec.retire_activations(
                 self.program_runtimes
@@ -6760,6 +6848,17 @@ impl DeltaScheduler {
                 &retired_activations,
             );
         }
+        children.clear();
+        direct.clear();
+        accepted.clear();
+        supported.clear();
+        scratch.parents.clear();
+        scratch.vars.clear();
+        scratch.activations.clear();
+        scratch.work.clear();
+        scratch.receipt.clear();
+        scratch.retired_activations.clear();
+        self.program_scratch = Some(scratch);
         stats.delta_source_dead_pages += source_dead_pages;
         stats.delta_transition_dead_pages += transition_dead_pages;
         DeltaPhysicalOutcome {
@@ -7086,6 +7185,7 @@ impl DeltaScheduler {
             source_worklist,
             program_worklist,
             program_runtimes: self.program_runtimes.clone(),
+            program_scratch: None,
             activation_width: self.activation_width,
             terminal_selection_slots: AHashMap::new(),
             terminal_selections: Vec::new(),
@@ -7152,7 +7252,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            states: Vec<Self::State>,
+            states: &mut Vec<Self::State>,
             _batch: TypedProgramBatch<'_>,
             effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
@@ -7248,12 +7348,12 @@ mod tests {
 
         fn step_typed(
             &self,
-            states: Vec<Self::State>,
+            states: &mut Vec<Self::State>,
             batch: TypedProgramBatch<'_>,
             effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
             assert_eq!(states.len(), batch.limits.len());
-            for (input, state) in states.into_iter().enumerate() {
+            for (input, state) in states.drain(..).enumerate() {
                 effects.support(u32::try_from(input).unwrap());
                 effects.page(
                     1,
@@ -8071,7 +8171,7 @@ mod tests {
             false,
             None,
         );
-        assert_eq!(first.accepted, [value(3), value(2)]);
+        assert_eq!(first.accepted.as_slice(), [value(3), value(2)]);
         assert!(first.quiescence.is_none());
         let (_, _, child_credit) = first
             .scheduled
@@ -8089,7 +8189,7 @@ mod tests {
             false,
             None,
         );
-        assert_eq!(last.accepted, [value(5)]);
+        assert_eq!(last.accepted.as_slice(), [value(5)]);
         let DeltaSettlement::Retargeted(mut active) = scheduler.settle_quiescence(
             last.quiescence
                 .expect("the typed proposal graph proved quiescence"),
@@ -9266,7 +9366,7 @@ mod tests {
             None,
         );
         assert_eq!(first.raw_proposal_occurrences, 6);
-        assert_eq!(first.accepted, [value(7), value(8), value(9)]);
+        assert_eq!(first.accepted.as_slice(), [value(7), value(8), value(9)]);
         assert!(first.quiescence.is_none());
 
         let second = registry.replace_program(
@@ -9281,7 +9381,7 @@ mod tests {
             None,
         );
         assert_eq!(second.raw_proposal_occurrences, 6);
-        assert_eq!(second.accepted, [value(10), value(11)]);
+        assert_eq!(second.accepted.as_slice(), [value(10), value(11)]);
         assert!(second.quiescence.is_some());
 
         let sibling = registry.open_program_activation(
@@ -9314,7 +9414,7 @@ mod tests {
             None,
         );
         assert_eq!(sibling.raw_proposal_occurrences, 1);
-        assert_eq!(sibling.accepted, [value(7)]);
+        assert_eq!(sibling.accepted.as_slice(), [value(7)]);
     }
 
     #[test]
@@ -9535,7 +9635,7 @@ mod tests {
             assert_eq!(child.dead_search_pages, usize::from(!publishes));
             assert_eq!(child.dead_source_telemetry_pages, usize::from(!publishes));
             if publishes {
-                assert_eq!(child.accepted, [value(7)]);
+                assert_eq!(child.accepted.as_slice(), [value(7)]);
                 assert!(registry.take_streaming_return(activation).is_some());
             }
             let completed = registry.finish(
@@ -10129,7 +10229,7 @@ mod tests {
 
         fn step_typed(
             &self,
-            states: Vec<Self::State>,
+            states: &mut Vec<Self::State>,
             batch: TypedProgramBatch<'_>,
             effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
@@ -10140,16 +10240,17 @@ mod tests {
             &self,
             states: &[Self::State],
             batch: TypedProgramBatch<'_>,
-        ) -> Option<TypedPhysicalStep<Self::State, Self::NoveltyKey>> {
+            effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+        ) -> Option<ProgramPhysicalReceipt> {
             if !self.physical {
                 return None;
             }
-            let mut step = TypedPhysicalStep::new(ProgramPhysicalReceipt::new(
+            let placement = ProgramPhysicalReceipt::new(
                 "test-physical",
                 "one-shot-confirm",
-            ));
-            self.fill_step(states, batch, step.effects_mut());
-            Some(step)
+            );
+            self.fill_step(states, batch, effects);
+            Some(placement)
         }
     }
 

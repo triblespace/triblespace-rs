@@ -156,7 +156,7 @@ fn patch_program_seed(
 
 fn patch_program_step(
     variable: VariableId,
-    states: Vec<PatchProgramState>,
+    states: &mut Vec<PatchProgramState>,
     batch: super::TypedProgramBatch<'_>,
     effects: &mut super::TypedEffectSink<PatchProgramState, ()>,
     source_page: impl Fn(
@@ -175,7 +175,7 @@ fn patch_program_step(
     };
     match first {
         PatchProgramState::Propose { .. } => {
-            for (input, state) in states.into_iter().enumerate() {
+            for (input, state) in states.drain(..).enumerate() {
                 let PatchProgramState::Propose { cursor } = state else {
                     panic!("one typed PATCH cohort mixed action variants")
                 };
@@ -202,7 +202,7 @@ fn patch_program_step(
             }
         }
         PatchProgramState::Confirm { .. } => {
-            for (input, state) in states.into_iter().enumerate() {
+            for (input, state) in states.drain(..).enumerate() {
                 let PatchProgramState::Confirm { offset } = state else {
                     panic!("one typed PATCH cohort mixed action variants")
                 };
@@ -232,7 +232,7 @@ fn patch_program_step(
         }
         PatchProgramState::Support => {
             let column = batch.view.col(variable);
-            for (input, state) in states.into_iter().enumerate() {
+            for (input, state) in states.drain(..).enumerate() {
                 assert_eq!(state, PatchProgramState::Support);
                 assert!(
                     batch.candidate_sets[input].is_none(),
@@ -356,7 +356,7 @@ impl<S: InlineEncoding> super::TypedProgramSpec for PatchValueConstraint<'_, S> 
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: &mut Vec<Self::State>,
         batch: super::TypedProgramBatch<'_>,
         effects: &mut super::TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
@@ -564,7 +564,7 @@ impl<S: InlineEncoding> super::TypedProgramSpec for PatchIdConstraint<S> {
 
     fn step_typed(
         &self,
-        states: Vec<Self::State>,
+        states: &mut Vec<Self::State>,
         batch: super::TypedProgramBatch<'_>,
         effects: &mut super::TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
