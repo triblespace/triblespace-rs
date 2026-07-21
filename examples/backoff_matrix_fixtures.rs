@@ -249,7 +249,7 @@ fn report(cell: &CellReport) {
          \tL1 outer: state_pops={} readiness={} reentries={} merges={}\n\
          \tL2 propose: calls={} rows={} max_batch={}\n\
          \tL3 delta-terminal: calls={} resets={} widenings={}\n\
-         \tL4 program: active_pops={} global_pops={} single_child={} affine_tail={} retained={} resumed={} files={} tasks_filed={} reentries={}",
+         \tL4 program: active_pops={} global_pops={} single_child={} affine_tail={} retained={} resumed={} refill_batches={} refill_rows={} files={} tasks_filed={} reentries={}",
         cell.label,
         env_config(),
         cell.rows,
@@ -274,6 +274,8 @@ fn report(cell: &CellReport) {
         s.delta_program_affine_tail_opportunities,
         s.delta_program_affine_tail_retentions,
         s.delta_program_affine_tail_resumptions,
+        s.delta_program_affine_refill_batches,
+        s.delta_program_affine_refill_rows,
         s.delta_program_continuation_files,
         s.delta_program_continuation_tasks_filed,
         s.delta_program_continuation_reentries,

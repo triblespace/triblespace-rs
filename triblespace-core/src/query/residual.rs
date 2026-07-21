@@ -2475,6 +2475,12 @@ pub struct ResidualStateStats {
     /// The difference from retentions is a bounded suffix abandoned when a
     /// consumer stops pulling the iterator.
     pub delta_program_affine_tail_resumptions: usize,
+    /// Geometrically demand-bounded refill batches assembled by repeatedly
+    /// alternating one retained Program page with its exact stable handoff.
+    pub delta_program_affine_refill_batches: usize,
+    /// Raw terminal rows staged by those refill batches. Projection may still
+    /// reject rows later; no batch exceeds its confirmed output window.
+    pub delta_program_affine_refill_rows: usize,
     /// Nonempty continuation filings produced by typed Program calls.
     pub delta_program_continuation_files: usize,
     /// Affine tasks carried by those continuation filings.
@@ -11554,6 +11560,13 @@ impl ResidualStateMachine {
         self.emit_count = rows.row_count;
     }
 
+    fn stage_affine_program_refill(&mut self, rows: RowBatch) {
+        assert!(rows.row_count > 0, "an affine Program refill staged no rows");
+        self.stats.delta_program_affine_refill_batches += 1;
+        self.stats.delta_program_affine_refill_rows += rows.row_count;
+        self.stage_emit(rows);
+    }
+
     fn stage_direct_terminal_publication(&mut self, publication: TerminalPublicationBatch) {
         let TerminalPublicationBatch { rows, origins } = publication;
         assert!(rows.row_count > 0, "direct publication staged no rows");
@@ -11613,6 +11626,15 @@ impl ResidualStateMachine {
         self.terminal_demand_exhausted = false;
     }
 
+    fn remaining_confirmed_terminal_output_demand(&self) -> usize {
+        let remaining = self
+            .terminal_demand_width
+            .checked_sub(self.terminal_demand_consumed)
+            .expect("terminal demand consumption exceeded its open window");
+        assert!(remaining > 0, "scheduler advanced without confirmed terminal demand");
+        remaining
+    }
+
     fn charge_projected_result(&mut self) {
         debug_assert!(!self.terminal_demand_exhausted);
         self.terminal_projected_rows = self
@@ -11647,13 +11669,41 @@ impl ResidualStateMachine {
         influences: &[VariableSet; 128],
         base_estimates: &[usize; 128],
     ) -> PullAdvance {
+        let mut affine_refill = None::<RowBatch>;
+        let mut affine_refill_vars = None::<Vec<VariableId>>;
+        let mut affine_refill_remaining = self.remaining_confirmed_terminal_output_demand();
+        let mut affine_awaits_program = false;
+        let mut affine_awaits_stable = false;
         loop {
             // Direct terminal publication can stage the final rows while also
             // exhausting the cyclic frontier. Observe staged output first.
             if self.emit_next < self.emit_count {
+                assert!(
+                    affine_refill.is_none(),
+                    "direct publication overtook a buffered affine refill"
+                );
                 return PullAdvance::EmitReady;
             }
+            let affine_path_live = (!affine_awaits_program && !affine_awaits_stable)
+                || (affine_awaits_program
+                    && self.continuation.is_none()
+                    && self.active_delta.is_some_and(|active| {
+                        self.delta.has_retained_program(active)
+                    }))
+                || (affine_awaits_stable && self.continuation.is_some());
+            if !affine_path_live {
+                affine_awaits_program = false;
+                affine_awaits_stable = false;
+                if let Some(rows) = affine_refill.take() {
+                    self.stage_affine_program_refill(rows);
+                    return PullAdvance::EmitReady;
+                }
+            }
             if self.worklist.is_empty() && self.delta.is_empty() {
+                if let Some(rows) = affine_refill.take() {
+                    self.stage_affine_program_refill(rows);
+                    return PullAdvance::EmitReady;
+                }
                 return PullAdvance::Exhausted;
             }
 
@@ -11665,6 +11715,7 @@ impl ResidualStateMachine {
             // source/transition worklists.
             if self.continuation.is_none() {
                 if let Some(active) = self.active_delta.take() {
+                    affine_awaits_program = false;
                     self.stats.delta_active_lease_steps += 1;
                     self.stats.delta_active_post_yield_resumptions +=
                         usize::from(self.active_delta_after_yield);
@@ -11681,7 +11732,26 @@ impl ResidualStateMachine {
                     );
                     match focused.status {
                         ActiveDeltaStatus::Yielded => {
-                            self.accept_delta_step_with_resume(focused.outcome, focused.resume)
+                            let retained = focused
+                                .resume
+                                .is_some_and(|resume| self.delta.has_retained_program(resume));
+                            let stable_handoff = focused.outcome.continuation.is_some()
+                                && focused.outcome.publication.is_none()
+                                && (retained || affine_refill.is_some());
+                            if affine_refill.is_some() {
+                                assert!(
+                                    focused.outcome.publication.is_none(),
+                                    "a stable affine refill changed publication modes"
+                                );
+                            }
+                            self.accept_delta_step_with_resume(focused.outcome, focused.resume);
+                            affine_awaits_stable = stable_handoff;
+                            if !stable_handoff {
+                                if let Some(rows) = affine_refill.take() {
+                                    self.stage_affine_program_refill(rows);
+                                    return PullAdvance::EmitReady;
+                                }
+                            }
                         }
                         ActiveDeltaStatus::Pending => {
                             debug_assert!(focused.outcome.completed_activation_ids.is_empty());
@@ -11691,6 +11761,11 @@ impl ResidualStateMachine {
                                     .resume
                                     .expect("a pending affine activation has an exact continuation"),
                             );
+                            affine_awaits_stable = false;
+                            if let Some(rows) = affine_refill.take() {
+                                self.stage_affine_program_refill(rows);
+                                return PullAdvance::EmitReady;
+                            }
                         }
                         ActiveDeltaStatus::Quiescent => {
                             // Quiescence carries the exact activation receipt
@@ -11699,6 +11774,11 @@ impl ResidualStateMachine {
                             // ordinary receipt acceptance path.
                             self.accept_delta_step(focused.outcome);
                             self.stats.delta_active_quiescent_releases += 1;
+                            affine_awaits_stable = false;
+                            if let Some(rows) = affine_refill.take() {
+                                self.stage_affine_program_refill(rows);
+                                return PullAdvance::EmitReady;
+                            }
                         }
                     }
                     continue;
@@ -11733,16 +11813,66 @@ impl ResidualStateMachine {
             ) {
                 MachineStep::Stable(StepOutcome::Advanced(continuation)) => {
                     self.continuation = self.continuation_after_advanced(plan, width, continuation);
+                    if affine_awaits_stable && self.continuation.is_none() {
+                        affine_awaits_stable = false;
+                        if let Some(rows) = affine_refill.take() {
+                            self.stage_affine_program_refill(rows);
+                            return PullAdvance::EmitReady;
+                        }
+                    }
                 }
                 MachineStep::Stable(StepOutcome::Dead) => {
                     self.continuation = None;
                     self.increase_width();
                     self.increase_delta_activation_width();
+                    affine_awaits_stable = false;
+                    if let Some(rows) = affine_refill.take() {
+                        self.stage_affine_program_refill(rows);
+                        return PullAdvance::EmitReady;
+                    }
                 }
                 MachineStep::Stable(StepOutcome::Emit(rows)) => {
                     self.continuation = None;
-                    self.stage_emit(rows);
                     self.increase_delta_activation_width();
+                    if affine_awaits_stable {
+                        affine_awaits_stable = false;
+                        assert_eq!(
+                            rows.row_count, 1,
+                            "one accepted affine Program endpoint emitted a nonsingleton batch"
+                        );
+                        assert!(
+                            affine_refill_remaining >= rows.row_count,
+                            "affine Program refill exceeded confirmed terminal demand"
+                        );
+                        if let Some(vars) = &affine_refill_vars {
+                            assert_eq!(
+                                vars, &self.emit_vars,
+                                "one affine Program refill changed its output schema"
+                            );
+                        } else {
+                            affine_refill_vars = Some(self.emit_vars.clone());
+                        }
+                        affine_refill_remaining -= rows.row_count;
+                        if let Some(buffered) = &mut affine_refill {
+                            buffered.append(rows);
+                        } else {
+                            affine_refill = Some(rows);
+                        }
+                        let retained = self.active_delta.is_some_and(|active| {
+                            self.delta.has_retained_program(active)
+                        });
+                        if affine_refill_remaining > 0 && retained {
+                            affine_awaits_program = true;
+                            continue;
+                        }
+                        self.stage_affine_program_refill(
+                            affine_refill
+                                .take()
+                                .expect("affine refill lost its emitted rows"),
+                        );
+                        return PullAdvance::EmitReady;
+                    }
+                    self.stage_emit(rows);
                 }
                 MachineStep::DeferredTerminalAdmission => {
                     assert!(
@@ -11764,6 +11894,12 @@ impl ResidualStateMachine {
                         &mut self.stats,
                     );
                     self.accept_delta_step(outcome);
+                    affine_awaits_program = false;
+                    affine_awaits_stable = false;
+                    if let Some(rows) = affine_refill.take() {
+                        self.stage_affine_program_refill(rows);
+                        return PullAdvance::EmitReady;
+                    }
                 }
                 MachineStep::DeltaSeeded {
                     continuation,
@@ -11783,6 +11919,12 @@ impl ResidualStateMachine {
                         terminal_activations,
                         completed_activation_ids,
                     );
+                    affine_awaits_program = false;
+                    affine_awaits_stable = false;
+                    if let Some(rows) = affine_refill.take() {
+                        self.stage_affine_program_refill(rows);
+                        return PullAdvance::EmitReady;
+                    }
                 }
             }
         }

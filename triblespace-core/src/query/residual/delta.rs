@@ -5623,12 +5623,17 @@ impl DeltaScheduler {
     }
 
     fn has_active_program(&self, active: ActiveDeltaContinuation) -> bool {
-        self.retained_program.iter().any(|retained| {
-            retained.state == active.state && retained.task.activation == active.activation
-        }) || self
+        self.has_retained_program(active)
+            || self
             .program_worklist
             .get(&active.state)
             .is_some_and(|bucket| bucket.contains_activation(active.activation))
+    }
+
+    pub(super) fn has_retained_program(&self, active: ActiveDeltaContinuation) -> bool {
+        self.retained_program.iter().any(|retained| {
+            retained.state == active.state && retained.task.activation == active.activation
+        })
     }
 
     fn allows_global_width_growth(
