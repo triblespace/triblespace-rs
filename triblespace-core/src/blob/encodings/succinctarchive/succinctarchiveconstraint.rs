@@ -360,6 +360,39 @@ fn page_indexed_distinct(
     page_indexed_distinct_filtered(len, at, cursor, limit, accepted, |_| true)
 }
 
+/// Pages a private typed driver whose physical positions are already unique.
+///
+/// Unlike [`page_indexed_distinct_filtered`], this path needs neither a value
+/// seek nor duplicate-run lookahead: the cursor names the first unexamined
+/// position in this exact immutable index. Only the unfiltered one-target
+/// `page_middle` and `page_last` shapes use it.
+#[inline]
+fn page_indexed_unique_ordinal(
+    len: usize,
+    at: impl Fn(usize) -> RawInline,
+    offset: u64,
+    limit: usize,
+    accepted: &mut Vec<RawInline>,
+) -> ResidualDeltaSourcePage {
+    assert!(limit > 0, "residual source pages require positive demand");
+    let start =
+        usize::try_from(offset).expect("SuccinctArchive source offset exceeds addressable memory");
+    assert!(
+        start <= len,
+        "SuccinctArchive source offset exceeds its indexed driver"
+    );
+    let end = start.saturating_add(limit).min(len);
+    accepted.extend((start..end).map(at));
+    ResidualDeltaSourcePage {
+        next: (end < len).then(|| {
+            ResidualDeltaSourceCursor::Offset(
+                u64::try_from(end).expect("SuccinctArchive source offset exceeds cursor width"),
+            )
+        }),
+        examined: end - start,
+    }
+}
+
 /// Pages the distinct values that occur on one top-level archive axis.
 /// `Universe::search_upper` translates the public raw-value cursor into the
 /// first possible archive-local code, and `enumerate_domain_in_range` skips
@@ -452,18 +485,38 @@ fn page_middle<U>(
 where
     U: Universe,
 {
-    page_middle_filtered(
-        archive,
-        changed_pair,
-        range,
-        last_column,
-        last_prefix,
-        middle_column,
-        cursor,
-        limit,
-        accepted,
-        |_| true,
-    )
+    if let ResidualDeltaSourceCursor::Offset(offset) = cursor {
+        let first_rank = changed_pair.rank1(range.start).unwrap();
+        let len = changed_pair.rank1(range.end).unwrap() - first_rank;
+        page_indexed_unique_ordinal(
+            len,
+            |ordinal| {
+                let position = changed_pair.select1(first_rank + ordinal).unwrap();
+                let last = last_column.access(position).unwrap();
+                let rotated = last_prefix.select1(last).unwrap() - last
+                    + last_column.rank(position, last).unwrap();
+                archive
+                    .domain
+                    .access(middle_column.access(rotated).unwrap())
+            },
+            offset,
+            limit,
+            accepted,
+        )
+    } else {
+        page_middle_filtered(
+            archive,
+            changed_pair,
+            range,
+            last_column,
+            last_prefix,
+            middle_column,
+            cursor,
+            limit,
+            accepted,
+            |_| true,
+        )
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -515,17 +568,18 @@ fn page_last<U>(
 where
     U: Universe,
 {
-    page_indexed_distinct(
-        range.len(),
-        |offset| {
-            archive
-                .domain
-                .access(last_column.access(range.start + offset).unwrap())
-        },
-        cursor,
-        limit,
-        accepted,
-    )
+    let len = range.len();
+    let at = |offset| {
+        archive
+            .domain
+            .access(last_column.access(range.start + offset).unwrap())
+    };
+    match cursor {
+        ResidualDeltaSourceCursor::Offset(offset) => {
+            page_indexed_unique_ordinal(len, at, offset, limit, accepted)
+        }
+        cursor => page_indexed_distinct(len, at, cursor, limit, accepted),
+    }
 }
 
 impl<'a, U> SuccinctArchiveConstraint<'a, U>
@@ -1961,7 +2015,7 @@ mod typed_program_tests {
         assert_eq!(
             ordinal_prefix_page.next,
             Some(ResidualDeltaSourceCursor::Offset(5)),
-            "the ordinal continuation must name the first unexamined physical occurrence"
+            "the generic defensive pager must skip the whole duplicate run"
         );
 
         let mut ordinal_suffix = Vec::new();
@@ -2032,6 +2086,83 @@ mod typed_program_tests {
         assert!(empty.is_empty());
         assert_eq!(empty_page.examined, 0);
         assert_eq!(empty_page.next, None);
+    }
+
+    #[test]
+    fn unique_ordinal_page_appends_exact_contiguous_windows() {
+        let sequence = [
+            inline_value(1),
+            inline_value(2),
+            inline_value(3),
+            inline_value(4),
+            inline_value(5),
+        ];
+        let accesses = Cell::new(0usize);
+        let mut accepted = vec![inline_value(0)];
+        let first = page_indexed_unique_ordinal(
+            sequence.len(),
+            |index| {
+                accesses.set(accesses.get() + 1);
+                sequence[index]
+            },
+            1,
+            2,
+            &mut accepted,
+        );
+        assert_eq!(
+            accepted,
+            [inline_value(0), inline_value(2), inline_value(3)]
+        );
+        assert_eq!(accesses.get(), 2, "the page must not read ahead");
+        assert_eq!(first.examined, 2);
+        assert_eq!(first.next, Some(ResidualDeltaSourceCursor::Offset(3)));
+
+        let suffix = page_indexed_unique_ordinal(
+            sequence.len(),
+            |index| {
+                accesses.set(accesses.get() + 1);
+                sequence[index]
+            },
+            3,
+            usize::MAX,
+            &mut accepted,
+        );
+        assert_eq!(
+            accepted,
+            [
+                inline_value(0),
+                inline_value(2),
+                inline_value(3),
+                inline_value(4),
+                inline_value(5),
+            ]
+        );
+        assert_eq!(accesses.get(), 4);
+        assert_eq!(suffix.examined, 2);
+        assert_eq!(suffix.next, None);
+
+        let terminal = page_indexed_unique_ordinal(
+            sequence.len(),
+            |_| unreachable!("an end cursor must not inspect its driver"),
+            sequence.len() as u64,
+            1,
+            &mut accepted,
+        );
+        assert_eq!(terminal.examined, 0);
+        assert_eq!(terminal.next, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "SuccinctArchive source offset exceeds its indexed driver")]
+    fn unique_ordinal_page_rejects_offsets_beyond_the_driver() {
+        let mut accepted = Vec::new();
+        let _ = page_indexed_unique_ordinal(
+            2,
+            |_| unreachable!("an invalid cursor must fail before reading"),
+            3,
+            1,
+            &mut accepted,
+        );
     }
 
     fn one_program_step<U>(
@@ -2483,6 +2614,7 @@ mod typed_program_tests {
         let set: TribleSet = [
             trible(1, 11, inline_value(21)),
             trible(1, 11, inline_value(22)),
+            trible(1, 12, inline_value(24)),
             trible(2, 11, inline_value(23)),
         ]
         .into_iter()
@@ -2503,6 +2635,21 @@ mod typed_program_tests {
         );
         assert_eq!(values, vec![inline_value(21), inline_value(22)]);
         assert!(examined.iter().all(|&page| page == 1));
+
+        let entity = Variable::<GenId>::new(0);
+        let attribute = Variable::<GenId>::new(1);
+        let any_value = Variable::<UnknownInline>::new(2);
+        let middle = SuccinctArchiveConstraint::new(entity, attribute, any_value, &archive);
+        let vars = [entity.index];
+        let rows = [id_value(1)];
+        let (values, examined) = drain_unit_proposal(
+            &middle,
+            attribute.index,
+            VariableSet::new_singleton(entity.index),
+            RowsView::new(&vars, &rows),
+        );
+        assert_eq!(values, vec![id_value(11), id_value(12)]);
+        assert_eq!(examined, vec![1, 1]);
 
         let repeated_set: TribleSet = [
             trible(1, 11, id_value(1)),
