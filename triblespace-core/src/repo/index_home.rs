@@ -1672,6 +1672,8 @@ where
         ProgramPacing::Search
     }
 
+    #[cold]
+    #[inline(never)]
     fn complete_bounded_typed(
         &self,
         batch: ProgramCompleteBatch<'_>,

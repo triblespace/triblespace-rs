@@ -1098,6 +1098,8 @@ pub trait TypedProgramSpec {
     /// crate-owned physical family may override this hidden seam to retain
     /// prepared work while the arbiter alone selects the admissible tail.
     #[doc(hidden)]
+    #[cold]
+    #[inline(never)]
     fn complete_bounded_typed(
         &self,
         batch: ProgramCompleteBatch<'_>,
