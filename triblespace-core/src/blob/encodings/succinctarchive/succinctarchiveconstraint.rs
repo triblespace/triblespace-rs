@@ -1119,6 +1119,60 @@ where
         }
     }
 
+    /// Pages one compatible block while resolving its column layout once.
+    ///
+    /// Each request remains row-local: its cursor, demand, examined count, and
+    /// continuation belong exclusively to the row at the same input index.
+    /// Direct occurrences are tagged and grouped in ascending input order.
+    /// Physical wrappers use this crate-private seam when their own typed
+    /// continuation already proved that every row targets this same archive.
+    pub(crate) fn for_each_proposal_source_page(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        requests: impl ExactSizeIterator<Item = (ResidualDeltaSourceCursor, usize)>,
+        mut emit: impl FnMut(u32, ResidualDeltaSourcePage, &[RawInline]),
+    ) {
+        assert_eq!(
+            requests.len(),
+            view.len(),
+            "Succinct proposal requests must be row aligned"
+        );
+        assert!(
+            view.col(variable).is_none(),
+            "Succinct proposal target is already bound"
+        );
+        let positions = self.positions(variable, view);
+        assert_ne!(
+            positions.target_count(),
+            0,
+            "Succinct proposal target is absent"
+        );
+
+        let emits_every_examined = positions.target_count() == 1;
+        let mut row_direct = Vec::new();
+        for (input, (cursor, limit)) in requests.enumerate() {
+            row_direct.clear();
+            let page = self.proposal_source_page_row(
+                &positions,
+                view.row(input),
+                cursor,
+                limit,
+                &mut row_direct,
+            );
+            if emits_every_examined {
+                assert_eq!(
+                    row_direct.len(),
+                    page.examined,
+                    "a one-target Succinct page did not emit every examined value"
+                );
+            }
+            let input =
+                u32::try_from(input).expect("too many Succinct proposal inputs in one cohort");
+            emit(input, page, &row_direct);
+        }
+    }
+
     /// Exact single-parent proposal page used by physical wrappers that own
     /// their own typed continuation. Unlike the optional erased capability,
     /// this entry point cannot decline after a wrapper route has been chosen.
@@ -1942,6 +1996,132 @@ mod typed_program_tests {
         assert!(empty.is_empty());
         assert_eq!(empty_page.examined, 0);
         assert_eq!(empty_page.next, None);
+    }
+
+    #[test]
+    fn block_pages_keep_row_local_cursors_limits_and_empty_rows() {
+        let set: TribleSet = [
+            trible(1, 11, inline_value(21)),
+            trible(1, 11, inline_value(22)),
+            trible(2, 11, inline_value(31)),
+            trible(2, 11, inline_value(32)),
+            trible(2, 11, inline_value(33)),
+        ]
+        .into_iter()
+        .collect();
+        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+        let entity = Variable::<GenId>::new(0);
+        let value = Variable::<UnknownInline>::new(1);
+        let constraint = SuccinctArchiveConstraint::new(
+            entity,
+            Inline::<GenId>::new(id_value(11)),
+            value,
+            &archive,
+        );
+        let vars = [entity.index];
+        let rows = [id_value(1), id_value(2), id_value(3)];
+        let requests = [
+            (ResidualDeltaSourceCursor::Start, 1),
+            (ResidualDeltaSourceCursor::After(inline_value(31)), 2),
+            (ResidualDeltaSourceCursor::Start, 4),
+        ];
+
+        let mut pages = Vec::new();
+        let mut direct = Candidates::new();
+        constraint.for_each_proposal_source_page(
+            value.index,
+            &RowsView::new(&vars, &rows),
+            requests.into_iter(),
+            |input, page, values| {
+                direct.extend(values.iter().copied().map(|value| (input, value)));
+                pages.push(page);
+            },
+        );
+
+        assert_eq!(
+            direct,
+            vec![
+                (0, inline_value(21)),
+                (1, inline_value(32)),
+                (1, inline_value(33)),
+            ]
+        );
+        assert_eq!(
+            pages,
+            vec![
+                ResidualDeltaSourcePage {
+                    next: Some(ResidualDeltaSourceCursor::After(inline_value(21))),
+                    examined: 1,
+                },
+                ResidualDeltaSourcePage {
+                    next: None,
+                    examined: 2,
+                },
+                ResidualDeltaSourcePage {
+                    next: None,
+                    examined: 0,
+                },
+            ]
+        );
+
+        let empty_view = RowsView::new_with_row_count(&vars, &[], 0);
+        let mut empty_pages = Vec::new();
+        let mut empty_direct = Candidates::new();
+        constraint.for_each_proposal_source_page(
+            value.index,
+            &empty_view,
+            std::iter::empty(),
+            |input, page, values| {
+                empty_direct.extend(values.iter().copied().map(|value| (input, value)));
+                empty_pages.push(page);
+            },
+        );
+        assert!(empty_pages.is_empty());
+        assert!(empty_direct.is_empty());
+
+        let constants = SuccinctArchiveConstraint::new(
+            Inline::<GenId>::new(id_value(1)),
+            Inline::<GenId>::new(id_value(11)),
+            value,
+            &archive,
+        );
+        let empty_rows = RowsView::new_with_row_count(&[], &[], 2);
+        let mut pages = Vec::new();
+        let mut direct = Candidates::new();
+        constants.for_each_proposal_source_page(
+            value.index,
+            &empty_rows,
+            [
+                (ResidualDeltaSourceCursor::Start, 2),
+                (ResidualDeltaSourceCursor::After(inline_value(21)), 2),
+            ]
+            .into_iter(),
+            |input, page, values| {
+                direct.extend(values.iter().copied().map(|value| (input, value)));
+                pages.push(page);
+            },
+        );
+        assert_eq!(
+            direct,
+            vec![
+                (0, inline_value(21)),
+                (0, inline_value(22)),
+                (1, inline_value(22)),
+            ]
+        );
+        assert_eq!(
+            pages,
+            vec![
+                ResidualDeltaSourcePage {
+                    next: None,
+                    examined: 2,
+                },
+                ResidualDeltaSourcePage {
+                    next: None,
+                    examined: 1,
+                },
+            ]
+        );
     }
 
     fn one_program_step<U>(

@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Unary typed `UnionArchive` proposals retain block-native Succinct paging.**
+  The wrapper resolves its shared row schema once, then applies each parent's
+  independent cursor and demand through one tagged batch seam instead of
+  reconstructing a one-row view and re-resolving archive positions per row.
 - **Typed Program activation retirement scans its arena at most once per
   cohort.** A fully drained arena retires immediately; singleton receipts keep
   their allocation-free scalar scan, while wider live arenas build activation

@@ -1660,6 +1660,63 @@ where
         match first {
             UnionArchiveProgramState::Propose { variable, .. } => {
                 let variable = *variable;
+                if let [shard] = self.shards.as_slice() {
+                    for (input, state) in states.iter().enumerate() {
+                        let UnionArchiveProgramState::Propose {
+                            variable: state_variable,
+                            shard_index,
+                            ..
+                        } = state
+                        else {
+                            panic!("one typed UnionArchive proposal cohort mixed action variants")
+                        };
+                        assert_eq!(*state_variable, variable);
+                        assert_eq!(
+                            *shard_index, 0,
+                            "typed unary UnionArchive proposal resumed after its sole shard"
+                        );
+                        assert!(
+                            batch.candidate_sets[input].is_none(),
+                            "typed UnionArchive proposal received a candidate group"
+                        );
+                    }
+
+                    let requests = states.into_iter().zip(batch.limits.iter().copied()).map(
+                        |(state, limit)| {
+                            let UnionArchiveProgramState::Propose { cursor, .. } = state else {
+                                unreachable!(
+                                    "typed unary UnionArchive proposal states were prevalidated"
+                                )
+                            };
+                            (cursor, limit)
+                        },
+                    );
+                    shard.for_each_proposal_source_page(
+                        variable,
+                        &batch.view,
+                        requests,
+                        |input, page, direct| {
+                            for &value in direct {
+                                effects.direct(input, value);
+                            }
+                            assert!(
+                                page.next.is_none() || page.examined > 0,
+                                "typed Succinct shard resumed without examining its source"
+                            );
+                            let resume = page.next.map(|cursor| {
+                                TypedResume::Immediate(UnionArchiveProgramState::Propose {
+                                    variable,
+                                    shard_index: 0,
+                                    cursor,
+                                })
+                            });
+                            effects.account_source(page.examined, 0);
+                            effects.page(page.examined, resume);
+                        },
+                    );
+                    return;
+                }
+
                 for (input, state) in states.into_iter().enumerate() {
                     let UnionArchiveProgramState::Propose {
                         variable: state_variable,
@@ -2785,6 +2842,53 @@ mod tests {
             .collect();
         admitted.sort_unstable();
         assert_eq!(admitted, (1..=5).map(raw_value).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn unary_union_program_pages_empty_parent_rows_with_independent_limits() {
+        let entity = Id::new([0x3a; 16]).unwrap();
+        let attribute = Id::new([0x4a; 16]).unwrap();
+        let archives = [fixed_archive(&entity, &attribute, [1, 2, 3])];
+        let union_archive = UnionArchive::new(&archives);
+        let value = Variable::<UnknownInline>::new(0);
+        let constraint = union_archive.pattern(entity.to_inline(), attribute.to_inline(), value);
+        let view = RowsView::new_with_row_count(&[], &[], 3);
+
+        let effects = one_union_program_step(
+            &constraint,
+            ProgramRequest {
+                action: ProgramAction::Propose(value.index),
+                bound: VariableSet::new_empty(),
+            },
+            view,
+            &[None, None, None],
+            &[1, 2, 8],
+        );
+
+        assert_eq!(
+            effects.direct,
+            vec![
+                (0, raw_value(1)),
+                (1, raw_value(1)),
+                (1, raw_value(2)),
+                (2, raw_value(1)),
+                (2, raw_value(2)),
+                (2, raw_value(3)),
+            ]
+        );
+        assert_eq!(
+            effects
+                .pages
+                .iter()
+                .map(|page| page.examined)
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert!(effects.pages[0].resume.is_some());
+        assert!(effects.pages[1].resume.is_some());
+        assert!(effects.pages[2].resume.is_none());
+        assert_eq!(effects.source_pages, 3);
+        assert_eq!(effects.source_examined, 6);
     }
 
     #[test]
