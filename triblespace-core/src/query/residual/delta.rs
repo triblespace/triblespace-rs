@@ -275,12 +275,10 @@ impl TypedProgramSpec for SetAdmissionProgram {
         assert!(batch.candidate_sets.iter().all(Option::is_none));
         for (input, (state, &limit)) in states.into_iter().zip(batch.limits).enumerate() {
             let page = state.advance(limit);
-            for value in page.emitted {
-                effects.direct(
-                    u32::try_from(input).expect("too many SET-admission inputs"),
-                    value,
-                );
-            }
+            effects.direct_page(
+                u32::try_from(input).expect("too many SET-admission inputs"),
+                page.emitted,
+            );
             effects.page(page.examined, page.next.map(TypedResume::Immediate));
         }
     }
@@ -423,24 +421,24 @@ impl TypedProgramSpec for FormulaOrEmissionProgram {
                 None => state.set.iter().take(limit).copied().collect(),
             };
             assert!(!values.is_empty(), "a nonempty Formula emission made no progress");
-            for &value in &values {
-                effects.direct(
-                    u32::try_from(input).expect("too many Formula emission inputs"),
-                    value,
-                );
-            }
+            let last_emitted = values.last().copied();
+            let emitted = values.len();
+            effects.direct_page(
+                u32::try_from(input).expect("too many Formula emission inputs"),
+                values,
+            );
             state.emitted_count = state
                 .emitted_count
-                .checked_add(values.len())
+                .checked_add(emitted)
                 .expect("Formula emission count overflow");
-            state.last_emitted = values.last().copied();
+            state.last_emitted = last_emitted;
             let remaining = state
                 .set
                 .len()
                 .checked_sub(state.emitted_count)
                 .expect("Formula emission count exceeded its ordered set");
             let resume = (remaining > 0).then_some(TypedResume::Immediate(state));
-            effects.page(values.len(), resume);
+            effects.page(emitted, resume);
         }
     }
 }
@@ -493,12 +491,10 @@ impl TypedProgramSpec for ProposalMaterializerProgram {
         assert!(batch.candidate_sets.iter().all(Option::is_none));
         for (input, (state, &limit)) in states.into_iter().zip(batch.limits).enumerate() {
             let page = state.advance(limit);
-            for value in page.emitted {
-                effects.direct(
-                    u32::try_from(input).expect("too many proposal materializer inputs"),
-                    value,
-                );
-            }
+            effects.direct_page(
+                u32::try_from(input).expect("too many proposal materializer inputs"),
+                page.emitted,
+            );
             effects.page(
                 page.examined,
                 page.next.map(TypedResume::Immediate),
@@ -1759,7 +1755,7 @@ impl ProducerRegistry {
         state: DeltaStateId,
         children: &[ProgramChild],
         observed: impl IntoIterator<Item = RawInline>,
-        direct: impl IntoIterator<Item = RawInline>,
+        direct: &[RawInline],
         reported_support: bool,
         search_page: bool,
         source_telemetry: bool,
@@ -1784,7 +1780,6 @@ impl ProducerRegistry {
         };
 
         let observed: Vec<_> = observed.into_iter().collect();
-        let mut direct: Vec<_> = direct.into_iter().collect();
         let raw_stream_occurrences = {
             let activation = self
                 .state
@@ -1821,7 +1816,7 @@ impl ProducerRegistry {
                     DeltaReducer::StreamProposal | DeltaReducer::StreamFormulaProposal,
                     _,
                 ) => {
-                    for value in direct.drain(..) {
+                    for &value in direct {
                         if activation.accepted.insert(value) {
                             accepted.push(value);
                         }
@@ -1837,7 +1832,7 @@ impl ProducerRegistry {
                         "Confirm finalizer reacquired mutable graph Accepted state"
                     );
                     if !direct.is_empty() {
-                        let mut page = CandidatePayload::Values(std::mem::take(&mut direct));
+                        let mut page = CandidatePayload::Values(direct.to_vec());
                         page.defer_for_shared_activation(1);
                         output.extend_same_domain(page, 1);
                     }
@@ -1851,7 +1846,7 @@ impl ProducerRegistry {
                         activation.accepted.is_empty(),
                         "proposal materializer reacquired mutable graph Accepted state"
                     );
-                    append_one_parent_page(output, std::mem::take(&mut direct));
+                    append_one_parent_page(output, direct.to_vec());
                 }
                 (
                     DeltaReducer::SetAdmit { output },
@@ -1865,7 +1860,7 @@ impl ProducerRegistry {
                         activation.accepted.is_empty(),
                         "SET admission acquired graph Accepted state"
                     );
-                    append_one_parent_page(output, std::mem::take(&mut direct));
+                    append_one_parent_page(output, direct.to_vec());
                 }
                 (
                     DeltaReducer::FormulaOrAdmit,
@@ -1879,7 +1874,7 @@ impl ProducerRegistry {
                         activation.accepted.is_empty(),
                         "Formula OR admission acquired graph Accepted state"
                     );
-                    for value in direct.drain(..) {
+                    for &value in direct {
                         batch.admit_current_or_value(0, value);
                     }
                 }
@@ -1896,7 +1891,7 @@ impl ProducerRegistry {
                         "Formula OR emission acquired graph Accepted state"
                     );
                     if !direct.is_empty() {
-                        let mut page = CandidatePayload::Values(std::mem::take(&mut direct));
+                        let mut page = CandidatePayload::Values(direct.to_vec());
                         page.defer_for_shared_activation(1);
                         output.extend_same_domain(page, 1);
                     }
@@ -1921,11 +1916,14 @@ impl ProducerRegistry {
                     accepted.push(value);
                 }
             }
-            let mut retained = direct.clone();
-            retained.extend(accepted.iter().copied());
-            activation
-                .reducer
-                .retain_quiescent_proposal_page(retained);
+            if matches!(activation.reducer, DeltaReducer::QuiescentProposal { .. }) {
+                let mut retained = Vec::with_capacity(direct.len() + accepted.len());
+                retained.extend_from_slice(direct);
+                retained.extend(accepted.iter().copied());
+                activation
+                    .reducer
+                    .retain_quiescent_proposal_page(retained);
+            }
         }
 
         let publishes_stable_effect = {
@@ -6513,7 +6511,6 @@ impl DeltaScheduler {
             );
         }
         let child_ranges = program_child_ranges(&receipt.children, row_count);
-        let direct_ranges = tagged_ranges(&receipt.direct, row_count, "program direct effect");
         let accepted_ranges = tagged_ranges(
             &receipt.accepted,
             row_count,
@@ -6573,22 +6570,25 @@ impl DeltaScheduler {
         let mut retired_search_receipts = 0usize;
         let mut completed_activations = 0usize;
         let mut terminal_publications = OrderedActivationSet::default();
+        let mut direct_run_cursor = 0usize;
+        let mut direct_value_cursor = 0usize;
 
         for (
             input,
-            (
-                (((((activation, credit), page), child_range), direct_range), accepted_range),
-                supported_range,
-            ),
+            (((((activation, credit), page), child_range), accepted_range), supported_range),
         ) in task_receipts
             .into_iter()
             .zip(receipt.pages)
             .zip(child_ranges)
-            .zip(direct_ranges)
             .zip(accepted_ranges)
             .zip(supported_ranges)
             .enumerate()
         {
+            let direct = receipt.direct.input_slice(
+                input,
+                &mut direct_run_cursor,
+                &mut direct_value_cursor,
+            );
             let terminal = self.registry.physical_activation_class(activation)
                 == DeltaPhysicalClass::TerminalStreaming;
             let within_search_page = self.registry.program_credit_within_search_page(&credit);
@@ -6601,7 +6601,7 @@ impl DeltaScheduler {
                 "one typed input page reported Boolean support more than once"
             );
             let page_had_program_effect = !child_range.is_empty()
-                || (!private_direct && !direct_range.is_empty())
+                || (!private_direct && !direct.is_empty())
                 || !accepted_range.is_empty()
                 || !supported_range.is_empty();
             let outcome = self.registry.replace_program(
@@ -6611,7 +6611,7 @@ impl DeltaScheduler {
                 receipt.accepted[accepted_range]
                     .iter()
                     .map(|(_, value)| *value),
-                receipt.direct[direct_range].iter().map(|(_, value)| *value),
+                direct,
                 !supported_range.is_empty(),
                 search_cohort,
                 source_telemetry_cohort,
@@ -6749,6 +6749,9 @@ impl DeltaScheduler {
             effects.absorb(task_effects);
             debug_assert!(input < row_count);
         }
+        receipt
+            .direct
+            .assert_consumed(direct_run_cursor, direct_value_cursor);
 
         let _ = self.file_program_state(state, scheduled);
         if !retired_activations.is_empty() {
@@ -7749,7 +7752,7 @@ mod tests {
             DeltaStateId(0),
             &[],
             std::iter::empty(),
-            emitted,
+            &emitted,
             false,
             true,
             false,
@@ -8065,7 +8068,7 @@ mod tests {
                 accepted: Some(value(2)),
             }],
             [value(3), value(2)],
-            [value(3), value(3), value(1)],
+            &[value(3), value(3), value(1)],
             false,
             false,
             false,
@@ -8083,7 +8086,7 @@ mod tests {
             DeltaStateId(0),
             &[],
             [value(4), value(5), value(5)],
-            [value(2)],
+            &[value(2)],
             false,
             false,
             false,
@@ -9259,7 +9262,7 @@ mod tests {
             DeltaStateId(0),
             &[],
             [value(8), value(9), value(9)],
-            [value(7), value(7), value(8)],
+            &[value(7), value(7), value(8)],
             false,
             false,
             false,
@@ -9274,7 +9277,7 @@ mod tests {
             DeltaStateId(0),
             &[],
             [value(7), value(11), value(11)],
-            [value(8), value(10), value(10)],
+            &[value(8), value(10), value(10)],
             false,
             false,
             false,
@@ -9307,7 +9310,7 @@ mod tests {
             DeltaStateId(0),
             &[],
             std::iter::empty::<RawInline>(),
-            [value(7)],
+            &[value(7)],
             false,
             false,
             false,
@@ -9346,7 +9349,7 @@ mod tests {
             DeltaStateId(0),
             &[],
             std::iter::empty::<RawInline>(),
-            std::iter::empty::<RawInline>(),
+            &[],
             false,
             false,
             false,
@@ -9367,7 +9370,7 @@ mod tests {
                 DeltaStateId(0),
                 &[],
                 std::iter::empty::<RawInline>(),
-                std::iter::empty::<RawInline>(),
+                &[],
                 false,
                 false,
                 false,
@@ -9422,7 +9425,7 @@ mod tests {
                 accepted: None,
             }],
             std::iter::empty::<RawInline>(),
-            std::iter::empty::<RawInline>(),
+            &[],
             false,
             false,
             false,
@@ -9438,7 +9441,7 @@ mod tests {
             DeltaStateId(0),
             &[],
             std::iter::empty::<RawInline>(),
-            std::iter::empty::<RawInline>(),
+            &[],
             false,
             false,
             false,
@@ -9460,7 +9463,7 @@ mod tests {
             DeltaStateId(0),
             &[],
             std::iter::empty::<RawInline>(),
-            std::iter::empty::<RawInline>(),
+            &[],
             false,
             false,
             false,
@@ -9510,7 +9513,7 @@ mod tests {
                     accepted: None,
                 }],
                 std::iter::empty::<RawInline>(),
-                std::iter::empty::<RawInline>(),
+                &[],
                 false,
                 true,
                 true,
@@ -9526,7 +9529,7 @@ mod tests {
                 DeltaStateId(0),
                 &[],
                 observed,
-                std::iter::empty::<RawInline>(),
+                &[],
                 false,
                 false,
                 false,

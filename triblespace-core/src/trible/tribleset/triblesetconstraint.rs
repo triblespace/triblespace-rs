@@ -1266,9 +1266,7 @@ impl TypedProgramSpec for TribleSetConstraint {
                     );
                     let input =
                         u32::try_from(input).expect("too many typed TribleSet inputs in one cohort");
-                    for value in direct {
-                        effects.direct(input, value);
-                    }
+                    effects.direct_page(input, direct);
                     assert!(
                         page.next.is_none() || page.examined > 0,
                         "typed TribleSet proposal resumed without examining its source"

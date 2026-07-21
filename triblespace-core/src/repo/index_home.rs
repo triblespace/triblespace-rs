@@ -1783,9 +1783,7 @@ where
                     }
                     let input = u32::try_from(input)
                         .expect("too many typed UnionArchive inputs in one cohort");
-                    for value in direct {
-                        effects.direct(input, value);
-                    }
+                    effects.direct_page(input, direct);
                     let resume = (shard_index < self.shards.len()).then_some(
                         UnionArchiveProgramState::Propose {
                             variable,
@@ -2474,10 +2472,7 @@ mod tests {
                 },
                 &mut effects,
             );
-            values.extend(effects.direct.into_iter().map(|(input, value)| {
-                assert_eq!(input, 0);
-                value
-            }));
+            values.extend(effects.direct.into_single_input(0));
             assert_eq!(effects.pages.len(), 1);
             let page = effects.pages.pop().unwrap();
             examined.push(page.examined);
