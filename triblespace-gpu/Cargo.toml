@@ -23,7 +23,7 @@ cuda = ["dep:cubecl", "cubecl/cuda"]
 [dependencies]
 cubecl = { version = "=0.10.0", default-features = false, features = ["std"], optional = true }
 itertools = { version = "0.14.0", optional = true }
-jerky = { version = "0.9.0", git = "https://github.com/triblespace/jerky.git", rev = "aeb3ba0817c4e481723c23eda696dc3beeacaf69", default-features = false, features = ["gpu"], optional = true }
+jerky = { version = "0.9.0", git = "https://github.com/triblespace/jerky.git", rev = "8a066da4a70eb1188f5c6dca70c009e07aa6d048", default-features = false, features = ["gpu"], optional = true }
 triblespace-core = { version = "0.47.0", path = "../triblespace-core", default-features = false }
 
 [dev-dependencies]
