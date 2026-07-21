@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Typed Program activation retirement is proportional to the retiring
+  cohort.** A positive-only per-activation live-handle count preserves the
+  affine ownership assertion without rescanning the arena high-water mark for
+  every completed activation. Bulk retirement validates every owner before
+  removing novelty state in original receipt order.
 - **Canonical Succinct archive paging is now an explicit lowering choice.**
   Controlled single-shard runs showed that selecting the pageable Propose and
   Confirm Programs under ordinary hybrid lowering opened one activation per
