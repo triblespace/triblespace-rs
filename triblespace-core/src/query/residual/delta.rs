@@ -6528,12 +6528,14 @@ impl DeltaScheduler {
         let address_key = address.key();
         let spec = address.resolve(root, plan);
         let private_direct = address.has_private_direct_effects();
-        let cohort_key = ProgramCohortKey::of(&self.registry, &tasks[0]);
-        assert!(
-            tasks
-                .iter()
-                .all(|task| ProgramCohortKey::of(&self.registry, task) == cohort_key),
-            "one typed program cohort mixed incompatible physical dispatch shapes"
+        debug_assert!(
+            {
+                let cohort_key = ProgramCohortKey::of(&self.registry, &tasks[0]);
+                tasks
+                    .iter()
+                    .all(|task| ProgramCohortKey::of(&self.registry, task) == cohort_key)
+            },
+            "selected typed program cohort mixed incompatible physical dispatch shapes"
         );
 
         let row_count = tasks.len();
@@ -6544,16 +6546,25 @@ impl DeltaScheduler {
         scratch.parents.clear();
         let mut candidate_sets: SmallVec<[Option<&[RawInline]>; 1]> = SmallVec::new();
         candidate_sets.reserve(row_count);
-        for task in &tasks {
+        let (first, rest) = tasks
+            .split_first()
+            .expect("typed Program execution requires one selected task");
+        assert_eq!(first.activation, first.credit.key.activation);
+        let search_cohort = first.work.pacing == ProgramPacing::Search;
+        let (cohort_bound, parent, candidates) = self.registry.source_context(first.activation);
+        let cohort_has_candidates = candidates.is_some();
+        scratch.parents.extend_from_slice(parent);
+        candidate_sets.push(candidates);
+        for task in rest {
             assert_eq!(task.activation, task.credit.key.activation);
             let (bound, parent, candidates) = self.registry.source_context(task.activation);
-            assert_eq!(bound, cohort_key.bound);
-            assert_eq!(candidates.is_some(), cohort_key.has_candidates);
+            assert_eq!(bound, cohort_bound);
+            assert_eq!(candidates.is_some(), cohort_has_candidates);
             scratch.parents.extend_from_slice(parent);
             candidate_sets.push(candidates);
         }
         scratch.vars.clear();
-        scratch.vars.extend(cohort_key.bound.into_iter());
+        scratch.vars.extend(cohort_bound.into_iter());
         let view = rows_view(&scratch.vars, &scratch.parents, row_count);
         scratch.activations.clear();
         scratch.activations.extend(
@@ -6668,7 +6679,6 @@ impl DeltaScheduler {
         // Physical pacing is revalidated by the typed adapter from canonical
         // state before this receipt is produced. Family-reported source and
         // transition counts remain telemetry only.
-        let search_cohort = cohort_key.class.pacing() == ProgramPacing::Search;
         let source_telemetry_cohort =
             scratch.receipt.source_pages > 0 && scratch.receipt.transition_pages == 0;
         let mut effects = DeltaStableEffects::default();
