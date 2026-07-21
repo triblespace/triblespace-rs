@@ -2468,6 +2468,13 @@ pub struct ResidualStateStats {
     /// These conditions are sufficient to investigate bounded in-place tail
     /// execution without weakening canonical state or affine ownership.
     pub delta_program_affine_tail_opportunities: usize,
+    /// Strict terminal affine children retained outside the canonical Program
+    /// worklist after their producing page was fully accounted.
+    pub delta_program_affine_tail_retentions: usize,
+    /// Retained affine children resumed directly on a later scheduler step.
+    /// The difference from retentions is a bounded suffix abandoned when a
+    /// consumer stops pulling the iterator.
+    pub delta_program_affine_tail_resumptions: usize,
     /// Nonempty continuation filings produced by typed Program calls.
     pub delta_program_continuation_files: usize,
     /// Affine tasks carried by those continuation filings.

@@ -2763,6 +2763,17 @@ struct ProgramTask {
     work: ProgramWork,
 }
 
+/// One exact affine Program child kept beside the scheduler instead of being
+/// round-tripped through its canonical-state worklist.
+///
+/// This is only a physical representation of an already-issued live credit.
+/// The canonical state and typed handle remain unchanged, and the task is
+/// eligible only while its activation owns the sole unjoined producer.
+struct RetainedProgramTask {
+    state: DeltaStateId,
+    task: ProgramTask,
+}
+
 /// Physical Program-call class after removing activation-local reducer state.
 ///
 /// Search pages may mix streaming and quiescent reducers because reducer
@@ -3896,6 +3907,10 @@ pub(super) struct DeltaScheduler {
     /// product expansion are family-private states distinguished only by
     /// opaque physical dispatch classes.
     program_worklist: BTreeMap<DeltaStateId, ProgramBucket>,
+    /// Hot singleton replacement of the last directed terminal Program page.
+    /// Keeping it here makes scheduler emptiness and deep cloning account for
+    /// the live credit without manufacturing a worklist filing boundary.
+    retained_program: Vec<RetainedProgramTask>,
     program_runtimes: AHashMap<DeltaStateId, ProgramRuntime>,
     /// Number of independent quiescent activations that may share one
     /// transition cohort. This grows only when activations complete; `width`
@@ -3916,6 +3931,7 @@ impl DeltaScheduler {
             worklist: BTreeMap::new(),
             source_worklist: BTreeMap::new(),
             program_worklist: BTreeMap::new(),
+            retained_program: Vec::new(),
             program_runtimes: AHashMap::new(),
             activation_width: 1,
             terminal_selection_slots: AHashMap::new(),
@@ -3953,6 +3969,7 @@ impl DeltaScheduler {
         self.worklist.is_empty()
             && self.source_worklist.is_empty()
             && self.program_worklist.is_empty()
+            && self.retained_program.is_empty()
     }
 
     fn prepare_program(
@@ -5574,6 +5591,20 @@ impl DeltaScheduler {
         Some(ActiveDeltaContinuation { state, activation })
     }
 
+    /// Restores hot affine tasks to their ordinary canonical-state buckets
+    /// when the outer scheduler relinquishes exact-activation preference.
+    /// Insertion order is preserved, so this is observationally identical to
+    /// filing each child at its original receipt boundary.
+    fn flush_retained_program(&mut self, stats: &mut ResidualStateStats) {
+        for retained in std::mem::take(&mut self.retained_program) {
+            stats.delta_program_continuation_files += 1;
+            stats.delta_program_continuation_tasks_filed += 1;
+            stats.delta_program_continuation_reentries +=
+                usize::from(!self.program_worklist.contains_key(&retained.state));
+            let _ = self.file_program_state(retained.state, vec![retained.task]);
+        }
+    }
+
     fn has_active_source(&self, active: ActiveDeltaContinuation) -> bool {
         self.source_worklist
             .get(&active.state)
@@ -5592,7 +5623,10 @@ impl DeltaScheduler {
     }
 
     fn has_active_program(&self, active: ActiveDeltaContinuation) -> bool {
-        self.program_worklist
+        self.retained_program.iter().any(|retained| {
+            retained.state == active.state && retained.task.activation == active.activation
+        }) || self
+            .program_worklist
             .get(&active.state)
             .is_some_and(|bucket| bucket.contains_activation(active.activation))
     }
@@ -5717,7 +5751,35 @@ impl DeltaScheduler {
         &mut self,
         active: ActiveDeltaContinuation,
         search_width: usize,
-    ) -> (DeltaStateId, Vec<ProgramTask>, PhysicalDispatch) {
+    ) -> (DeltaStateId, Vec<ProgramTask>, PhysicalDispatch, bool) {
+        if let Some(position) = self.retained_program.iter().position(|retained| {
+            retained.state == active.state && retained.task.activation == active.activation
+        }) {
+            let retained = self.retained_program.remove(position);
+            let key = ProgramCohortKey::of(&self.registry, &retained.task);
+            assert_eq!(
+                key.class.pacing(),
+                ProgramPacing::Activation,
+                "a Search-paced Program task entered the affine tail slot"
+            );
+            let work_budget = self
+                .registry
+                .transition_dispatch_width(active.activation, search_width);
+            let remainder_tasks = self
+                .program_worklist
+                .get(&active.state)
+                .map_or(0, ProgramBucket::len);
+            let tasks = vec![retained.task];
+            let dispatch = PhysicalDispatch::new(
+                &self.registry,
+                PhysicalDispatchKind::Program,
+                search_width,
+                tasks.iter().map(|task| task.activation),
+                vec![work_budget],
+                remainder_tasks,
+            );
+            return (active.state, tasks, dispatch, true);
+        }
         let (selection, empty, remainder_tasks) = {
             let bucket = self
                 .program_worklist
@@ -5742,7 +5804,7 @@ impl DeltaScheduler {
             limits,
             remainder_tasks,
         );
-        (active.state, tasks, dispatch)
+        (active.state, tasks, dispatch, false)
     }
 
     fn pop_program_bounded(
@@ -5963,7 +6025,9 @@ impl DeltaScheduler {
             .delta_source_candidates_examined
             .saturating_add(stats.delta_transition_candidates_examined);
         let outcome = if has_program {
-            let (state, tasks, dispatch) = self.pop_active_program(active, search_width);
+            let (state, tasks, dispatch, retained_pop) =
+                self.pop_active_program(active, search_width);
+            stats.delta_program_affine_tail_resumptions += usize::from(retained_pop);
             let physical = self.step_program(
                 root,
                 plan,
@@ -6111,6 +6175,7 @@ impl DeltaScheduler {
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
     ) -> DeltaStepOutcome {
+        self.flush_retained_program(stats);
         if !self.program_worklist.is_empty() {
             let (state, tasks, dispatch) = self.pop_program_bounded(search_width);
             let examined_before = stats
@@ -6643,13 +6708,23 @@ impl DeltaScheduler {
             let single_child_no_barrier = child_range.len() == 1 && page.resume.is_none();
             stats.delta_program_single_child_no_barrier +=
                 usize::from(single_child_no_barrier);
-            if single_child_no_barrier {
+            let affine_tail_opportunity = if single_child_no_barrier {
                 let child = &receipt.children[child_range.clone()][0];
                 let compatible = child.work.dispatch == input_dispatch
                     && child.work.pacing == input_pacing;
-                stats.delta_program_affine_tail_opportunities +=
-                    usize::from(unique_unjoined && compatible);
-            }
+                unique_unjoined
+                    && compatible
+                    && input_pacing == ProgramPacing::Activation
+                    && page.examined == 1
+                    && child.accepted.is_some()
+                    && direct_range.is_empty()
+                    && accepted_range.is_empty()
+                    && supported_range.is_empty()
+            } else {
+                false
+            };
+            stats.delta_program_affine_tail_opportunities +=
+                usize::from(affine_tail_opportunity);
             let outcome = self.registry.replace_program(
                 credit,
                 state,
@@ -6663,6 +6738,7 @@ impl DeltaScheduler {
                 source_telemetry_cohort,
                 page.resume,
             );
+            let publishes_new_candidate = !outcome.accepted.is_empty();
             if outcome.raw_proposal_occurrences != 0 {
                 assert!(
                     outcome.raw_proposal_occurrences >= outcome.accepted.len(),
@@ -6674,17 +6750,23 @@ impl DeltaScheduler {
                     .max_propose_candidates
                     .max(outcome.raw_proposal_occurrences);
             }
+            let mut page_scheduled = Vec::with_capacity(outcome.scheduled.len());
             for (scheduled_state, work, credit) in outcome.scheduled {
                 assert_eq!(
                     scheduled_state, state,
                     "typed program continuation crossed occurrence-local runtime state"
                 );
-                scheduled.push(ProgramTask {
+                page_scheduled.push(ProgramTask {
                     activation,
                     credit,
                     work,
                 });
             }
+            let retain_affine_tail_shape = active_pop
+                && row_count == 1
+                && affine_tail_opportunity
+                && publishes_new_candidate
+                && page_scheduled.len() == 1;
 
             let mut task_effects = DeltaStableEffects::default();
             if !supported_range.is_empty() {
@@ -6760,6 +6842,27 @@ impl DeltaScheduler {
                 // to the engine finalizer, the just-drained Program family's
                 // activation-local arena is dead at this boundary.
                 retired_activations.push(ProgramActivation(activation.0));
+            }
+
+            if retain_affine_tail_shape && task_effects.has_effect() {
+                assert!(
+                    task_effects.publication.is_some() || task_effects.continuation.is_some(),
+                    "a retained Program tail did not publish its accepted endpoint"
+                );
+                let task = page_scheduled
+                    .pop()
+                    .expect("retained Program tail lost its sole replacement");
+                assert!(
+                    self.retained_program
+                        .iter()
+                        .all(|retained| retained.task.activation != activation),
+                    "one activation retained two affine Program tails"
+                );
+                self.retained_program
+                    .push(RetainedProgramTask { state, task });
+                stats.delta_program_affine_tail_retentions += 1;
+            } else {
+                scheduled.append(&mut page_scheduled);
             }
 
             let page_dead = !page_had_program_effect && !task_effects.has_effect();
@@ -7127,6 +7230,23 @@ impl DeltaScheduler {
             }
             program_worklist.insert(id, ProgramBucket { tasks });
         }
+        let retained_program = self
+            .retained_program
+            .iter()
+            .map(|retained| {
+                let credit = remap
+                    .remove(&retained.task.credit.key)
+                    .expect("delta clone omitted the retained Program credit");
+                RetainedProgramTask {
+                    state: retained.state,
+                    task: ProgramTask {
+                        activation: retained.task.activation,
+                        credit,
+                        work: retained.task.work.clone(),
+                    },
+                }
+            })
+            .collect();
         assert!(
             remap.is_empty(),
             "delta registry held a live credit without a scheduled task"
@@ -7137,6 +7257,7 @@ impl DeltaScheduler {
             worklist,
             source_worklist,
             program_worklist,
+            retained_program,
             program_runtimes: self.program_runtimes.clone(),
             activation_width: self.activation_width,
             terminal_selection_slots: AHashMap::new(),
@@ -9723,7 +9844,9 @@ mod tests {
 
         assert_eq!(scheduler.program_worklist.len(), 1);
         assert_eq!(scheduler.program_worklist[&state].tasks.len(), 2);
-        let (popped_state, hot, dispatch) = scheduler.pop_active_program(active, 1);
+        let (popped_state, hot, dispatch, retained) =
+            scheduler.pop_active_program(active, 1);
+        assert!(!retained);
         assert_eq!(popped_state, state);
         assert_eq!(dispatch.kind, PhysicalDispatchKind::Program);
         assert_eq!(hot.len(), 1);
@@ -9801,7 +9924,10 @@ mod tests {
         let storage_nonces: Vec<_> = tasks.iter().map(|task| task.credit.key.nonce).collect();
         let active = scheduler.file_program_state(state, tasks).unwrap();
         let (popped_state, selected, dispatch) = if active_pop {
-            scheduler.pop_active_program(active, 3)
+            let (state, tasks, dispatch, retained) =
+                scheduler.pop_active_program(active, 3);
+            assert!(!retained);
+            (state, tasks, dispatch)
         } else {
             scheduler.pop_program_bounded(3)
         };
