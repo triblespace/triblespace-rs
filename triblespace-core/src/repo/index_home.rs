@@ -11,6 +11,9 @@ use std::error::Error;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
 use crate::blob::encodings::succinctarchive::{
     merge_ordered_archives, merge_ordered_archives_with_backend, OrderedUniverse, SuccinctArchive,
@@ -29,12 +32,12 @@ use crate::prelude::{attributes, entity, pattern};
 use crate::query::unionconstraint::UnionConstraint;
 use crate::query::{
     ActionUnitClasses, CandidateSink, Candidates, Constraint, DispatchClass, EstimateSink,
-    ProgramAction, ProgramCompleteBatch, ProgramCompleteWorkEvidence, ProgramCompleteWorkQuote,
-    ProgramCompletion, ProgramExposure, ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef,
-    ProgramRequest, ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage, RawTerm,
-    ResidualDeltaOutput, ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, Term,
-    TriblePattern, TypedCompleteSink, TypedEffectSink, TypedProgramBatch, TypedProgramSpec,
-    TypedResume, TypedSeedSink, VariableId, VariableSet,
+    ProgramAction, ProgramCompleteBatch, ProgramCompleteWorkQuote, ProgramCompletion,
+    ProgramExposure, ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef, ProgramRequest,
+    ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage, RawTerm, ResidualDeltaOutput,
+    ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, Term, TriblePattern,
+    TypedCompleteArbiter, TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedResume,
+    TypedSeedSink, VariableId, VariableSet,
 };
 use crate::repo::index_range::{
     convex_union, is_ancestor, validate_exact_frontier_cover, RangeRecord, RangeRecordError,
@@ -1309,6 +1312,58 @@ const UNION_ARCHIVE_PROPOSE_DISPATCH: DispatchClass = DispatchClass::new(0);
 const UNION_ARCHIVE_CONFIRM_DISPATCH: DispatchClass = DispatchClass::new(1);
 const UNION_ARCHIVE_SUPPORT_DISPATCH: DispatchClass = DispatchClass::new(2);
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct UnionCompleteWalkCounts {
+    located: usize,
+    consumed: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static UNION_COMPLETE_WALK_COUNTS: Cell<Option<UnionCompleteWalkCounts>> = const {
+        Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn arm_union_complete_walk_counts() {
+    UNION_COMPLETE_WALK_COUNTS.with(|counts| {
+        assert!(counts
+            .replace(Some(UnionCompleteWalkCounts::default()))
+            .is_none());
+    });
+}
+
+#[cfg(test)]
+fn record_union_complete_walk_located() {
+    UNION_COMPLETE_WALK_COUNTS.with(|counts| {
+        if let Some(mut count) = counts.get() {
+            count.located += 1;
+            counts.set(Some(count));
+        }
+    });
+}
+
+#[cfg(test)]
+fn record_union_complete_walk_consumed() {
+    UNION_COMPLETE_WALK_COUNTS.with(|counts| {
+        if let Some(mut count) = counts.get() {
+            count.consumed += 1;
+            counts.set(Some(count));
+        }
+    });
+}
+
+#[cfg(test)]
+fn take_union_complete_walk_counts() -> UnionCompleteWalkCounts {
+    UNION_COMPLETE_WALK_COUNTS.with(|counts| {
+        counts
+            .take()
+            .expect("Union complete walk counter was not armed")
+    })
+}
+
 /// Atomic normalized union over one finite set of Succinct archive shards.
 ///
 /// Estimates, proposals, and satisfaction retain [`UnionConstraint`]'s
@@ -1409,15 +1464,14 @@ where
     }
 
     fn support_row(&self, view: &RowsView<'_>, row: &[RawInline]) -> bool {
-        self.shards
-            .iter()
-            .any(|shard| shard.support_row(view, row))
+        self.shards.iter().any(|shard| shard.support_row(view, row))
     }
 
     /// Emit the exact complete proposal occurrence bag in the same
     /// parent-major, shard-major, Ring order as the typed pageable route.
     /// Cross-shard duplicates stay visible here; the complete-action adapter
     /// owns the later parent-local SET admission.
+    #[cfg(test)]
     fn for_each_complete_proposal_occurrence(
         &self,
         variable: VariableId,
@@ -1618,26 +1672,13 @@ where
         ProgramPacing::Search
     }
 
-    fn complete_typed(&self, batch: ProgramCompleteBatch<'_>, effects: &mut TypedCompleteSink) {
+    fn complete_bounded_typed(
+        &self,
+        batch: ProgramCompleteBatch<'_>,
+        arbiter: &mut TypedCompleteArbiter,
+    ) {
         let ProgramAction::Propose(variable) = batch.request.action else {
             panic!("UnionArchive complete actions support only proposals")
-        };
-        assert_eq!(variable, batch.route.variable);
-
-        // Ordinary `UnionConstraint::propose` would normalize overlapping
-        // shard values too early. Drain each shard's located ordered walk
-        // directly instead: the complete-action adapter still sees the exact
-        // pageable raw bag before performing parent-local SET admission.
-        self.for_each_complete_proposal_occurrence(variable, &batch.view, |parent, value| {
-            effects.push(parent, value)
-        });
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn quote_complete_typed(&self, batch: ProgramCompleteBatch<'_>) -> ProgramCompleteWorkEvidence {
-        let ProgramAction::Propose(variable) = batch.request.action else {
-            return ProgramCompleteWorkEvidence::Declined;
         };
         assert_eq!(variable, batch.route.variable);
 
@@ -1650,24 +1691,71 @@ where
                     .expect("one-target Succinct shard has no proposal locator")
             })
             .collect();
-        let mut quotes = Vec::with_capacity(batch.view.len());
-        for row in batch.view.iter() {
-            let mut raw_occurrences = 0usize;
+        assert!(
+            !locators.is_empty(),
+            "UnionArchive complete action requires at least one shard"
+        );
+        let shard_count = locators.len();
+        let mut retained_walks = Vec::new();
+        for parent in (0..batch.view.len()).rev() {
+            let retained_start = retained_walks.len();
+            let row = batch.view.row(parent);
+            let mut raw_occurrences = Some(0usize);
             for locator in &locators {
-                let Some(total) = raw_occurrences.checked_add(locator.locate(row).exact_len())
-                else {
-                    return ProgramCompleteWorkEvidence::Declined;
-                };
-                raw_occurrences = total;
+                #[cfg(test)]
+                record_union_complete_walk_located();
+                let walk = locator.locate(row);
+                let exact_len = walk.exact_len();
+                raw_occurrences = raw_occurrences.and_then(|total| total.checked_add(exact_len));
+                retained_walks.push(walk);
             }
-            // One-target Succinct walks emit every examined Ring value, so
-            // Union's drain and raw bag counts are equal, including overlaps.
-            quotes.push(ProgramCompleteWorkQuote {
-                drain_work_units: raw_occurrences,
-                raw_occurrences,
-            });
+            let admitted = if let Some(raw_occurrences) = raw_occurrences {
+                // One-target Succinct walks emit every examined Ring value,
+                // so drain and raw bag counts are equal, including overlaps.
+                arbiter.try_admit_tail_parent(
+                    parent,
+                    ProgramCompleteWorkQuote {
+                        drain_work_units: raw_occurrences,
+                        raw_occurrences,
+                    },
+                )
+            } else {
+                arbiter.reject_tail_parent(parent);
+                false
+            };
+            if !admitted {
+                retained_walks.truncate(retained_start);
+                break;
+            }
         }
-        ProgramCompleteWorkEvidence::Quoted(quotes)
+
+        let Some(selection) = arbiter.seal_tail_admission() else {
+            return;
+        };
+        let retained_parent_count = batch.view.len() - selection.first_parent();
+        debug_assert_eq!(retained_walks.len(), retained_parent_count * shard_count);
+        let effects = arbiter.effects_mut();
+        for (parent, walks) in retained_walks.chunks_exact(shard_count).rev().enumerate() {
+            let parent =
+                u32::try_from(parent).expect("too many UnionArchive complete-action parents");
+            for walk in walks {
+                #[cfg(test)]
+                record_union_complete_walk_consumed();
+                let mut emitted = 0usize;
+                let page = walk.consume(ResidualDeltaSourceCursor::Start, usize::MAX, |value| {
+                    emitted += 1;
+                    effects.push(parent, value);
+                });
+                assert_eq!(
+                    page.examined, emitted,
+                    "a complete Succinct walk did not emit every examined value"
+                );
+                assert!(
+                    page.next.is_none(),
+                    "an unbounded complete Succinct walk retained a continuation"
+                );
+            }
+        }
     }
 
     fn progress(&self, state: &Self::State) -> Self::Rank {
@@ -2168,7 +2256,8 @@ mod tests {
     use crate::query::residual::ResidualLowering;
     use crate::query::{
         Binding, ConfirmationUnitClass, ProgramActivation, ProgramBatch, ProgramBatchEffects,
-        ProgramResume, ProposalUnitClass, Query, Variable,
+        ProgramCompleteAdmission, ProgramCompleteAffinity, ProgramResume, ProposalUnitClass, Query,
+        Variable,
     };
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::repo::{BlobStorePut, CommitHandle};
@@ -2199,6 +2288,21 @@ mod tests {
         for tag in values {
             facts.insert(&Trible::force(
                 entity,
+                attribute,
+                &Inline::<UnknownInline>::new(raw_value(tag)),
+            ));
+        }
+        (&facts).into()
+    }
+
+    fn fixed_rows_archive(
+        attribute: &Id,
+        rows: impl IntoIterator<Item = (Id, u8)>,
+    ) -> SuccinctArchive<OrderedUniverse> {
+        let mut facts = TribleSet::new();
+        for (entity, tag) in rows {
+            facts.insert(&Trible::force(
+                &entity,
                 attribute,
                 &Inline::<UnknownInline>::new(raw_value(tag)),
             ));
@@ -3071,6 +3175,155 @@ mod tests {
                 (1, raw_value(4)),
                 (1, raw_value(5)),
             ]
+        );
+    }
+
+    #[test]
+    fn union_archive_bounded_completion_locates_and_consumes_each_all_fit_walk_once() {
+        let entities = [
+            Id::new([0x51; 16]).unwrap(),
+            Id::new([0x52; 16]).unwrap(),
+            Id::new([0x53; 16]).unwrap(),
+        ];
+        let attribute = Id::new([0x61; 16]).unwrap();
+        let archives = [
+            fixed_rows_archive(
+                &attribute,
+                [(entities[0], 11), (entities[1], 12), (entities[2], 13)],
+            ),
+            fixed_rows_archive(&attribute, []),
+        ];
+        let union_archive = UnionArchive::new(&archives);
+        let entity = Variable::<GenId>::new(0);
+        let value = Variable::<UnknownInline>::new(1);
+        let attribute: Inline<GenId> = attribute.to_inline();
+        let constraint = union_archive.pattern(entity, attribute, value);
+        let vars = [entity.index];
+        let rows = entities
+            .into_iter()
+            .map(|entity| {
+                let entity: Inline<GenId> = entity.to_inline();
+                entity.raw
+            })
+            .collect::<Vec<_>>();
+        let view = RowsView::new(&vars, &rows);
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(value.index),
+            bound: VariableSet::new_singleton(entity.index),
+        };
+        let program = constraint.residual_program().unwrap();
+        let batch = ProgramCompleteBatch {
+            request,
+            route: program.route(request).unwrap(),
+            view,
+        };
+        let affinity = ProgramCompleteAffinity::new(&rows);
+
+        arm_union_complete_walk_counts();
+        let completion = program
+            .try_complete_bounded(batch, 3, &affinity)
+            .expect("the three exact parents fit");
+        let (first_parent, admission, raw_occurrence_count, occurrences) =
+            completion.into_parts_for(batch, &affinity, &rows);
+        let counts = take_union_complete_walk_counts();
+
+        assert_eq!(first_parent, 0);
+        assert_eq!(
+            admission,
+            ProgramCompleteAdmission::Exact {
+                drain_work_units: 3,
+                raw_occurrences: 3,
+            }
+        );
+        assert_eq!(raw_occurrence_count, 3);
+        assert_eq!(
+            occurrences,
+            [(0, raw_value(11)), (1, raw_value(12)), (2, raw_value(13)),]
+        );
+        assert_eq!(
+            counts,
+            UnionCompleteWalkCounts {
+                located: 6,
+                consumed: 6,
+            },
+            "each of two shard walks must be located and consumed once per admitted parent"
+        );
+    }
+
+    #[test]
+    fn union_archive_bounded_completion_discards_one_boundary_and_never_locates_its_prefix() {
+        let entities = [
+            Id::new([0x54; 16]).unwrap(),
+            Id::new([0x55; 16]).unwrap(),
+            Id::new([0x56; 16]).unwrap(),
+            Id::new([0x57; 16]).unwrap(),
+        ];
+        let attribute = Id::new([0x62; 16]).unwrap();
+        let archives = [
+            fixed_rows_archive(
+                &attribute,
+                [
+                    (entities[0], 20),
+                    (entities[1], 21),
+                    (entities[1], 22),
+                    (entities[1], 23),
+                    (entities[2], 31),
+                    (entities[3], 32),
+                ],
+            ),
+            fixed_rows_archive(&attribute, []),
+        ];
+        let union_archive = UnionArchive::new(&archives);
+        let entity = Variable::<GenId>::new(0);
+        let value = Variable::<UnknownInline>::new(1);
+        let attribute: Inline<GenId> = attribute.to_inline();
+        let constraint = union_archive.pattern(entity, attribute, value);
+        let vars = [entity.index];
+        let rows = entities
+            .into_iter()
+            .map(|entity| {
+                let entity: Inline<GenId> = entity.to_inline();
+                entity.raw
+            })
+            .collect::<Vec<_>>();
+        let view = RowsView::new(&vars, &rows);
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(value.index),
+            bound: VariableSet::new_singleton(entity.index),
+        };
+        let program = constraint.residual_program().unwrap();
+        let batch = ProgramCompleteBatch {
+            request,
+            route: program.route(request).unwrap(),
+            view,
+        };
+        let affinity = ProgramCompleteAffinity::new(&rows);
+
+        arm_union_complete_walk_counts();
+        let completion = program
+            .try_complete_bounded(batch, 2, &affinity)
+            .expect("the final two parents fit exactly");
+        let (first_parent, admission, raw_occurrence_count, occurrences) =
+            completion.into_parts_for(batch, &affinity, &rows);
+        let counts = take_union_complete_walk_counts();
+
+        assert_eq!(first_parent, 2);
+        assert_eq!(
+            admission,
+            ProgramCompleteAdmission::Exact {
+                drain_work_units: 2,
+                raw_occurrences: 2,
+            }
+        );
+        assert_eq!(raw_occurrence_count, 2);
+        assert_eq!(occurrences, [(0, raw_value(31)), (1, raw_value(32))]);
+        assert_eq!(
+            counts,
+            UnionCompleteWalkCounts {
+                located: 6,
+                consumed: 4,
+            },
+            "only the two admitted parents are consumed; one boundary is located and discarded"
         );
     }
 

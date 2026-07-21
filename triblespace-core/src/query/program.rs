@@ -376,6 +376,306 @@ impl TypedCompleteSink {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct TypedCompleteSelection {
+    first_parent: usize,
+    parent_count: usize,
+}
+
+impl TypedCompleteSelection {
+    pub(crate) fn first_parent(self) -> usize {
+        self.first_parent
+    }
+
+    fn tail(self, batch: ProgramCompleteBatch<'_>) -> ProgramCompleteBatch<'_> {
+        assert_eq!(
+            batch.view.len(),
+            self.parent_count,
+            "typed complete selection was applied to another parent cohort"
+        );
+        let completed_parent_count = self.parent_count - self.first_parent;
+        let row_offset = self
+            .first_parent
+            .checked_mul(batch.view.vars.len())
+            .expect("typed complete-action row offset overflow");
+        ProgramCompleteBatch {
+            view: RowsView::new_with_row_count(
+                batch.view.vars,
+                &batch.view.rows[row_offset..],
+                completed_parent_count,
+            ),
+            ..batch
+        }
+    }
+}
+
+struct TypedCompleteTail {
+    next_parent: Option<usize>,
+    stopped_at_boundary: bool,
+    quotes_reversed: Vec<ProgramCompleteWorkQuote>,
+    drain_work_units: usize,
+    raw_occurrences: usize,
+}
+
+enum TypedCompleteArbiterState {
+    Pending,
+    Tail(TypedCompleteTail),
+    Declined,
+    LegacyUnquoted,
+    Exact {
+        first_parent: usize,
+        drain_work_units: usize,
+        raw_occurrences: usize,
+        quotes: Vec<ProgramCompleteWorkQuote>,
+    },
+}
+
+/// Engine-owned one-shot admission and validation transaction for a complete
+/// action.
+///
+/// The constructor, admission operations, selected suffix, and retained quote
+/// state are crate-private. Public typed families inherit the legacy default
+/// path; a crate-owned physical family may prepare work tail-first without
+/// exposing quotes to scheduler state.
+#[doc(hidden)]
+pub struct TypedCompleteArbiter {
+    parent_count: usize,
+    capacity: usize,
+    state: TypedCompleteArbiterState,
+    effects: TypedCompleteSink,
+}
+
+impl TypedCompleteArbiter {
+    fn new(parent_count: usize, capacity: usize) -> Self {
+        Self {
+            parent_count,
+            capacity,
+            state: TypedCompleteArbiterState::Pending,
+            effects: TypedCompleteSink {
+                occurrences: Vec::new(),
+            },
+        }
+    }
+
+    fn begin_tail(&mut self) -> &mut TypedCompleteTail {
+        if matches!(self.state, TypedCompleteArbiterState::Pending) {
+            self.state = TypedCompleteArbiterState::Tail(TypedCompleteTail {
+                next_parent: self.parent_count.checked_sub(1),
+                stopped_at_boundary: false,
+                quotes_reversed: Vec::new(),
+                drain_work_units: 0,
+                raw_occurrences: 0,
+            });
+        }
+        let TypedCompleteArbiterState::Tail(tail) = &mut self.state else {
+            panic!("typed complete arbiter admission was not one-shot")
+        };
+        assert!(
+            !tail.stopped_at_boundary,
+            "typed complete tail continued after its first rejected boundary"
+        );
+        tail
+    }
+
+    fn check_tail_parent(tail: &TypedCompleteTail, parent: usize) {
+        assert_eq!(
+            tail.next_parent,
+            Some(parent),
+            "typed complete tail parents were not submitted in strict descending order"
+        );
+    }
+
+    /// Attempts exactly the next descending parent against both physical
+    /// bounds. A rejection closes the tail at that first boundary.
+    pub(crate) fn try_admit_tail_parent(
+        &mut self,
+        parent: usize,
+        quote: ProgramCompleteWorkQuote,
+    ) -> bool {
+        let capacity = self.capacity;
+        let tail = self.begin_tail();
+        Self::check_tail_parent(tail, parent);
+        let Some(next_drain) = tail.drain_work_units.checked_add(quote.drain_work_units) else {
+            tail.stopped_at_boundary = true;
+            return false;
+        };
+        let Some(next_raw) = tail.raw_occurrences.checked_add(quote.raw_occurrences) else {
+            tail.stopped_at_boundary = true;
+            return false;
+        };
+        if next_drain > capacity || next_raw > capacity {
+            tail.stopped_at_boundary = true;
+            return false;
+        }
+        tail.drain_work_units = next_drain;
+        tail.raw_occurrences = next_raw;
+        tail.quotes_reversed.push(quote);
+        tail.next_parent = parent.checked_sub(1);
+        true
+    }
+
+    /// Closes an unrepresentable exact parent at the same first-boundary seam.
+    pub(crate) fn reject_tail_parent(&mut self, parent: usize) {
+        let tail = self.begin_tail();
+        Self::check_tail_parent(tail, parent);
+        tail.stopped_at_boundary = true;
+    }
+
+    /// Seals a maximal tail after every parent through either zero or the
+    /// first rejected boundary has been visited.
+    pub(crate) fn seal_tail_admission(&mut self) -> Option<TypedCompleteSelection> {
+        if matches!(self.state, TypedCompleteArbiterState::Pending) {
+            self.begin_tail();
+        }
+        let state = std::mem::replace(&mut self.state, TypedCompleteArbiterState::Declined);
+        let TypedCompleteArbiterState::Tail(mut tail) = state else {
+            panic!("typed complete tail admission was sealed more than once")
+        };
+        assert!(
+            tail.stopped_at_boundary || tail.next_parent.is_none(),
+            "typed complete tail stopped before reaching a rejected boundary"
+        );
+        if tail.quotes_reversed.len() < 2 {
+            return None;
+        }
+        let first_parent = self.parent_count - tail.quotes_reversed.len();
+        tail.quotes_reversed.reverse();
+        self.state = TypedCompleteArbiterState::Exact {
+            first_parent,
+            drain_work_units: tail.drain_work_units,
+            raw_occurrences: tail.raw_occurrences,
+            quotes: tail.quotes_reversed,
+        };
+        Some(TypedCompleteSelection {
+            first_parent,
+            parent_count: self.parent_count,
+        })
+    }
+
+    fn try_admit_evidence(
+        &mut self,
+        evidence: ProgramCompleteWorkEvidence,
+    ) -> Option<TypedCompleteSelection> {
+        match evidence {
+            ProgramCompleteWorkEvidence::Unquoted => {
+                assert!(
+                    matches!(self.state, TypedCompleteArbiterState::Pending),
+                    "typed complete arbiter admission was not one-shot"
+                );
+                self.state = TypedCompleteArbiterState::LegacyUnquoted;
+                Some(TypedCompleteSelection {
+                    first_parent: 0,
+                    parent_count: self.parent_count,
+                })
+            }
+            ProgramCompleteWorkEvidence::Declined => {
+                assert!(
+                    matches!(self.state, TypedCompleteArbiterState::Pending),
+                    "typed complete arbiter admission was not one-shot"
+                );
+                self.state = TypedCompleteArbiterState::Declined;
+                None
+            }
+            ProgramCompleteWorkEvidence::Quoted(quotes) => {
+                assert_eq!(
+                    quotes.len(),
+                    self.parent_count,
+                    "typed complete-action quote did not cover every parent exactly once"
+                );
+                for (parent, quote) in quotes.into_iter().enumerate().rev() {
+                    if !self.try_admit_tail_parent(parent, quote) {
+                        break;
+                    }
+                }
+                self.seal_tail_admission()
+            }
+        }
+    }
+
+    pub(crate) fn effects_mut(&mut self) -> &mut TypedCompleteSink {
+        assert!(
+            matches!(
+                self.state,
+                TypedCompleteArbiterState::LegacyUnquoted | TypedCompleteArbiterState::Exact { .. }
+            ),
+            "typed complete effects were requested before admission"
+        );
+        &mut self.effects
+    }
+
+    fn finish(mut self) -> Option<BoundedCompleteEffects> {
+        let (first_parent, admission, quotes) = match self.state {
+            TypedCompleteArbiterState::Pending | TypedCompleteArbiterState::Tail(_) => {
+                panic!("typed complete action returned without sealing admission")
+            }
+            TypedCompleteArbiterState::Declined => return None,
+            TypedCompleteArbiterState::LegacyUnquoted => {
+                (0, ProgramCompleteAdmission::LegacyUnquoted, None)
+            }
+            TypedCompleteArbiterState::Exact {
+                first_parent,
+                drain_work_units,
+                raw_occurrences,
+                quotes,
+            } => (
+                first_parent,
+                ProgramCompleteAdmission::Exact {
+                    drain_work_units,
+                    raw_occurrences,
+                },
+                Some(quotes),
+            ),
+        };
+        let completed_parent_count = self.parent_count - first_parent;
+        let mut previous = 0u32;
+        for (position, &(parent, _)) in self.effects.occurrences.iter().enumerate() {
+            assert!(
+                (parent as usize) < completed_parent_count,
+                "typed complete action parent tag is out of range"
+            );
+            assert!(
+                position == 0 || parent >= previous,
+                "typed complete action parent tags are not grouped in ascending order"
+            );
+            previous = parent;
+        }
+
+        let raw_occurrence_count = self.effects.occurrences.len();
+        if let Some(quotes) = &quotes {
+            assert_eq!(quotes.len(), completed_parent_count);
+            let mut occurrence = 0usize;
+            for (parent, quote) in quotes.iter().enumerate() {
+                let begin = occurrence;
+                while occurrence < raw_occurrence_count
+                    && self.effects.occurrences[occurrence].0 as usize == parent
+                {
+                    occurrence += 1;
+                }
+                assert_eq!(
+                    occurrence - begin,
+                    quote.raw_occurrences,
+                    "typed complete action disagreed with parent {parent}'s exact raw-occurrence quote"
+                );
+            }
+            assert_eq!(
+                occurrence, raw_occurrence_count,
+                "typed complete action emitted an unquoted parent occurrence"
+            );
+        }
+
+        let mut admitted = AHashSet::with_capacity(raw_occurrence_count);
+        self.effects
+            .occurrences
+            .retain(|occurrence| admitted.insert(*occurrence));
+        Some(BoundedCompleteEffects {
+            first_parent,
+            admission,
+            raw_occurrence_count,
+            occurrences: self.effects.occurrences,
+        })
+    }
+}
+
 /// Row block used to construct initial typed work handles.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
@@ -790,6 +1090,23 @@ pub trait TypedProgramSpec {
         _batch: ProgramCompleteBatch<'_>,
     ) -> ProgramCompleteWorkEvidence {
         ProgramCompleteWorkEvidence::Unquoted
+    }
+
+    /// Runs the engine-owned bounded complete-action transaction.
+    ///
+    /// The default keeps legacy quote and completion hooks distinct. A
+    /// crate-owned physical family may override this hidden seam to retain
+    /// prepared work while the arbiter alone selects the admissible tail.
+    #[doc(hidden)]
+    fn complete_bounded_typed(
+        &self,
+        batch: ProgramCompleteBatch<'_>,
+        arbiter: &mut TypedCompleteArbiter,
+    ) {
+        let Some(selection) = arbiter.try_admit_evidence(self.quote_complete_typed(batch)) else {
+            return;
+        };
+        self.complete_typed(selection.tail(batch), arbiter.effects_mut());
     }
 }
 
@@ -1813,113 +2130,9 @@ where
             "typed complete action proposal variable was already bound"
         );
 
-        let (first_parent, admission, quoted) = match self.quote_complete_typed(batch) {
-            ProgramCompleteWorkEvidence::Unquoted => {
-                (0, ProgramCompleteAdmission::LegacyUnquoted, None)
-            }
-            ProgramCompleteWorkEvidence::Declined => return None,
-            ProgramCompleteWorkEvidence::Quoted(quotes) => {
-                assert_eq!(
-                    quotes.len(),
-                    batch.view.len(),
-                    "typed complete-action quote did not cover every parent exactly once"
-                );
-                let mut first_parent = quotes.len();
-                let mut drain_work_units = 0usize;
-                let mut raw_occurrences = 0usize;
-                for quote in quotes.iter().rev() {
-                    let Some(next_drain) = drain_work_units.checked_add(quote.drain_work_units)
-                    else {
-                        break;
-                    };
-                    let Some(next_raw) = raw_occurrences.checked_add(quote.raw_occurrences) else {
-                        break;
-                    };
-                    if next_drain > capacity || next_raw > capacity {
-                        break;
-                    }
-                    first_parent -= 1;
-                    drain_work_units = next_drain;
-                    raw_occurrences = next_raw;
-                }
-                if quotes.len() - first_parent < 2 {
-                    return None;
-                }
-                (
-                    first_parent,
-                    ProgramCompleteAdmission::Exact {
-                        drain_work_units,
-                        raw_occurrences,
-                    },
-                    Some(quotes),
-                )
-            }
-        };
-
-        let completed_parent_count = batch.view.len() - first_parent;
-        let stride = batch.view.vars.len();
-        let row_offset = first_parent
-            .checked_mul(stride)
-            .expect("typed complete-action row offset overflow");
-        let completed_batch = ProgramCompleteBatch {
-            view: RowsView::new_with_row_count(
-                batch.view.vars,
-                &batch.view.rows[row_offset..],
-                completed_parent_count,
-            ),
-            ..batch
-        };
-        let mut typed = TypedCompleteSink {
-            occurrences: Vec::new(),
-        };
-        self.complete_typed(completed_batch, &mut typed);
-
-        let mut previous = 0u32;
-        for (position, &(parent, _)) in typed.occurrences.iter().enumerate() {
-            assert!(
-                (parent as usize) < completed_parent_count,
-                "typed complete action parent tag is out of range"
-            );
-            assert!(
-                position == 0 || parent >= previous,
-                "typed complete action parent tags are not grouped in ascending order"
-            );
-            previous = parent;
-        }
-
-        let raw_occurrence_count = typed.occurrences.len();
-        if let Some(quotes) = &quoted {
-            let selected = &quotes[first_parent..];
-            let mut occurrence = 0usize;
-            for (parent, quote) in selected.iter().enumerate() {
-                let begin = occurrence;
-                while occurrence < raw_occurrence_count
-                    && typed.occurrences[occurrence].0 as usize == parent
-                {
-                    occurrence += 1;
-                }
-                assert_eq!(
-                    occurrence - begin,
-                    quote.raw_occurrences,
-                    "typed complete action disagreed with parent {parent}'s exact raw-occurrence quote"
-                );
-            }
-            assert_eq!(
-                occurrence, raw_occurrence_count,
-                "typed complete action emitted an unquoted parent occurrence"
-            );
-        }
-
-        let mut admitted = AHashSet::with_capacity(raw_occurrence_count);
-        typed
-            .occurrences
-            .retain(|occurrence| admitted.insert(*occurrence));
-        Some(BoundedCompleteEffects {
-            first_parent,
-            admission,
-            raw_occurrence_count,
-            occurrences: typed.occurrences,
-        })
+        let mut arbiter = TypedCompleteArbiter::new(batch.view.len(), capacity);
+        self.complete_bounded_typed(batch, &mut arbiter);
+        arbiter.finish()
     }
 
     fn retire_activations(
@@ -2920,11 +3133,13 @@ mod tests {
         static DRAIN_LIMITED: &[(usize, usize)] = &[(9, 1), (2, 1), (1, 1), (1, 1)];
         static RAW_LIMITED: &[(usize, usize)] = &[(1, 1), (1, 3), (1, 1), (1, 1)];
         static OVERFLOW_BOUNDARY: &[(usize, usize)] = &[(usize::MAX, 1), (1, 1), (1, 1)];
+        static RAW_OVERFLOW_BOUNDARY: &[(usize, usize)] = &[(1, usize::MAX), (1, 1), (1, 1)];
 
         for (quotes, capacity, expected_first, expected_drain) in [
             (DRAIN_LIMITED, 4, 1, 4),
             (RAW_LIMITED, 3, 2, 2),
             (OVERFLOW_BOUNDARY, 2, 1, 2),
+            (RAW_OVERFLOW_BOUNDARY, 2, 1, 2),
         ] {
             let calls = Arc::new(Mutex::new(BoundedQuoteCalls::default()));
             let probe = BoundedQuoteProbe {
