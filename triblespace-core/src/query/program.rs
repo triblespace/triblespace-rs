@@ -9,6 +9,7 @@
 use std::any::{type_name, Any, TypeId};
 use std::collections::hash_map::Entry;
 use std::hash::Hash;
+use std::time::Instant;
 
 use ahash::{AHashMap, AHashSet};
 
@@ -387,6 +388,17 @@ pub struct ProgramBatchEffects {
     /// the ordinary typed implementation, including immediate fallback after
     /// a physical attempt declined or failed before effect commit.
     pub placement: Option<ProgramPhysicalReceipt>,
+    /// Probe-only wall time spent taking and checking the erased typed inputs
+    /// before the family executor runs.
+    pub diagnostic_prepare_ns: u128,
+    /// Probe-only wall time spent inside the family-owned typed executor.
+    pub diagnostic_family_ns: u128,
+    /// Probe-only wall time spent validating the complete typed receipt before
+    /// any outward effect is committed.
+    pub diagnostic_validate_ns: u128,
+    /// Probe-only wall time spent allocating replacement handles and moving the
+    /// already-validated effects into their erased receipt.
+    pub diagnostic_commit_ns: u128,
 }
 
 struct TypedSeedWork<State, NoveltyKey> {
@@ -1295,6 +1307,7 @@ where
         batch: ProgramBatch<'_>,
         effects: &mut ProgramBatchEffects,
     ) {
+        let adapter_started = Instant::now();
         assert_eq!(
             key.arm,
             ProgramRouteArm::Direct,
@@ -1340,6 +1353,7 @@ where
                 "typed program work entered an incompatible pacing cohort"
             );
         }
+        let family_started = Instant::now();
 
         let typed_batch = TypedProgramBatch {
             stratum: batch.stratum,
@@ -1359,6 +1373,7 @@ where
                 (typed, None)
             }
         };
+        let validation_started = Instant::now();
         assert_eq!(
             typed.pages.len(),
             input_count,
@@ -1499,6 +1514,7 @@ where
         );
 
         drop(batch_novelty);
+        let commit_started = Instant::now();
         let TypedEffectSink {
             pages,
             children,
@@ -1591,6 +1607,13 @@ where
         effects.transition_pages += transition_pages;
         effects.transition_examined += transition_examined;
         effects.placement = placement;
+        let committed = Instant::now();
+        effects.diagnostic_prepare_ns += family_started.duration_since(adapter_started).as_nanos();
+        effects.diagnostic_family_ns +=
+            validation_started.duration_since(family_started).as_nanos();
+        effects.diagnostic_validate_ns +=
+            commit_started.duration_since(validation_started).as_nanos();
+        effects.diagnostic_commit_ns += committed.duration_since(commit_started).as_nanos();
     }
 
     fn complete_batch(
