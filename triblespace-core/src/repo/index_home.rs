@@ -1413,6 +1413,18 @@ where
             .any(|shard| shard.support_row(view, row))
     }
 
+    fn typed_proposal_shard_start_cursor(
+        &self,
+        shard_index: usize,
+        variable: VariableId,
+        view: &RowsView<'_>,
+    ) -> ResidualDeltaSourceCursor {
+        self.shards
+            .get(shard_index)
+            .expect("typed UnionArchive proposal named a missing shard")
+            .typed_proposal_source_start_cursor(variable, view)
+    }
+
     /// One exact page of the globally ordered, duplicate-free shard union.
     /// Every shard contributes at most its first value after `cursor`; the
     /// minimum head is emitted once and becomes the next value cursor.
@@ -1593,8 +1605,9 @@ where
                         rank[2] = u64::MAX - 1;
                         rank[3..].copy_from_slice(&complemented_value_words(value));
                     }
-                    ResidualDeltaSourceCursor::Offset(_) => {
-                        panic!("ordinal cursor crossed into a typed UnionArchive source")
+                    ResidualDeltaSourceCursor::Offset(offset) => {
+                        rank[2] = u64::MAX - 2;
+                        rank[3] = u64::MAX - offset;
                     }
                 }
             }
@@ -1618,7 +1631,7 @@ where
                 UnionArchiveProgramState::Propose {
                     variable,
                     shard_index: 0,
-                    cursor: ResidualDeltaSourceCursor::Start,
+                    cursor: self.typed_proposal_shard_start_cursor(0, variable, &batch.view),
                 }
             }
             ProgramAction::Confirm(variable) => {
@@ -1707,7 +1720,13 @@ where
                             cursor = next;
                         } else {
                             shard_index += 1;
-                            cursor = ResidualDeltaSourceCursor::Start;
+                            if shard_index < self.shards.len() {
+                                cursor = self.typed_proposal_shard_start_cursor(
+                                    shard_index,
+                                    variable,
+                                    &view,
+                                );
+                            }
                         }
                     }
                     let input = u32::try_from(input)
@@ -2732,6 +2751,21 @@ mod tests {
             shard_index: 1,
             cursor: ResidualDeltaSourceCursor::After(raw_value(2)),
         };
+        let ordinal_zero = UnionArchiveProgramState::Propose {
+            variable: entity.index,
+            shard_index: 0,
+            cursor: ResidualDeltaSourceCursor::Offset(0),
+        };
+        let ordinal_one = UnionArchiveProgramState::Propose {
+            variable: entity.index,
+            shard_index: 0,
+            cursor: ResidualDeltaSourceCursor::Offset(1),
+        };
+        let ordinal_next_shard = UnionArchiveProgramState::Propose {
+            variable: entity.index,
+            shard_index: 1,
+            cursor: ResidualDeltaSourceCursor::Offset(0),
+        };
         let confirm_zero = UnionArchiveProgramState::Confirm {
             variable: entity.index,
             offset: 0,
@@ -2743,12 +2777,28 @@ mod tests {
         assert!(constraint.progress(&start) > constraint.progress(&after_one));
         assert!(constraint.progress(&after_one) > constraint.progress(&next_shard));
         assert!(constraint.progress(&next_shard) > constraint.progress(&after_two));
+        assert!(constraint.progress(&ordinal_zero) > constraint.progress(&ordinal_one));
+        assert!(
+            constraint.progress(&ordinal_one) > constraint.progress(&ordinal_next_shard),
+            "crossing a shard must descend even when the local ordinal restarts"
+        );
         assert!(constraint.progress(&confirm_zero) > constraint.progress(&confirm_one));
         assert!(constraint.progress(&after_two) > constraint.progress(&confirm_zero));
         assert!(
             constraint.progress(&confirm_one)
                 > constraint.progress(&UnionArchiveProgramState::Support)
         );
+        for shard_index in 0..archives.len() {
+            assert_eq!(
+                constraint.typed_proposal_shard_start_cursor(
+                    shard_index,
+                    entity.index,
+                    &RowsView::EMPTY,
+                ),
+                ResidualDeltaSourceCursor::Start,
+                "top-level Union domain enumeration must remain value based"
+            );
+        }
     }
 
     #[test]
@@ -2765,6 +2815,18 @@ mod tests {
         let attribute: Inline<GenId> = attribute.to_inline();
         let constraint = union_archive.pattern(entity, attribute, value);
 
+        for shard_index in 0..archives.len() {
+            assert_eq!(
+                constraint.typed_proposal_shard_start_cursor(
+                    shard_index,
+                    value.index,
+                    &RowsView::EMPTY,
+                ),
+                ResidualDeltaSourceCursor::Offset(0),
+                "each fixed-pair shard must restart its private ordinal"
+            );
+        }
+
         let (values, examined) = drain_union_proposal(&constraint, value.index, 1);
 
         assert_eq!(
@@ -2779,6 +2841,14 @@ mod tests {
         let (wide_values, wide_examined) = drain_union_proposal(&constraint, value.index, 4);
         assert_eq!(wide_values, values, "physical grants changed shard order");
         assert_eq!(wide_examined, [4, 2]);
+
+        let (boundary_values, boundary_examined) =
+            drain_union_proposal(&constraint, value.index, 3);
+        assert_eq!(
+            boundary_values, values,
+            "an exact shard-boundary resume replayed or skipped a value"
+        );
+        assert_eq!(boundary_examined, [3, 3]);
 
         let mut admitted: Vec<_> = Query::new(constraint, project_first)
             .solve_residual_state_lazy_with(ResidualLowering::FULL)
@@ -2802,6 +2872,18 @@ mod tests {
         let entity: Inline<GenId> = entity.to_inline();
         let attribute: Inline<GenId> = attribute.to_inline();
         let constraint = union_archive.pattern(entity, attribute, value);
+
+        for shard_index in 0..archives.len() {
+            assert_eq!(
+                constraint.typed_proposal_shard_start_cursor(
+                    shard_index,
+                    value.index,
+                    &RowsView::EMPTY,
+                ),
+                ResidualDeltaSourceCursor::Offset(0),
+                "empty and nonempty fixed-pair shards must share ordinal mode"
+            );
+        }
 
         let (values, examined) = drain_union_proposal(&constraint, value.index, 4);
 

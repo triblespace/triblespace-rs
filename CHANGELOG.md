@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Typed Succinct proposal pages retain exact indexed ordinals.** Unfiltered
+  fixed-first and fixed-pair Program sources seed a private local offset and
+  resume at the first unexamined archive position, avoiding a raw-value binary
+  seek on every geometric page. Top-level domain enumeration, repeated-target
+  filters, and public residual source cursors remain value based. UnionArchive
+  proposals restart the matching private cursor mode at every immutable shard.
 - **Typed Program activation retirement scans its arena at most once per
   cohort.** A fully drained arena retires immediately; singleton receipts keep
   their allocation-free scalar scan, while wider live arenas build activation

@@ -232,6 +232,29 @@ impl Positions {
     fn target_count(&self) -> usize {
         usize::from(self.e_var) + usize::from(self.a_var) + usize::from(self.v_var)
     }
+
+    #[inline]
+    fn resolved_count(&self) -> usize {
+        usize::from(self.pe.is_some())
+            + usize::from(self.pa.is_some())
+            + usize::from(self.pv.is_some())
+    }
+
+    /// Chooses the private typed continuation for this proposal shape.
+    ///
+    /// With one target and at least one resolved trible position, dispatch
+    /// reaches an unfiltered `page_middle` or `page_last` indexed driver. Its
+    /// local physical index is immutable and already unique, so typed work can
+    /// resume directly by ordinal. Top-level domain enumeration and every
+    /// repeated-target filtered arm retain public raw-value cursors.
+    #[inline]
+    fn typed_proposal_start_cursor(&self) -> ResidualDeltaSourceCursor {
+        if self.target_count() == 1 && self.resolved_count() > 0 {
+            ResidualDeltaSourceCursor::Offset(0)
+        } else {
+            ResidualDeltaSourceCursor::Start
+        }
+    }
 }
 
 /// Finds the first position whose decoded value is strictly greater than
@@ -267,7 +290,11 @@ fn upper_bound_indexed(
 /// resumes strictly after the last value examined rather than the last emitted
 /// candidate. Page entry binary-seeks the public value cursor once; within the
 /// page duplicate runs advance linearly, matching the dense proposal sweep
-/// instead of paying another binary search for every distinct value.
+/// instead of paying another binary search for every distinct value. Private
+/// typed callers may instead provide an exact local `Offset`: those pages do
+/// no seek and preserve the first unexamined physical index in their next
+/// cursor. Public residual sources reject ordinal cursors before reaching this
+/// helper.
 fn page_indexed_distinct_filtered(
     len: usize,
     at: impl Fn(usize) -> RawInline,
@@ -277,13 +304,17 @@ fn page_indexed_distinct_filtered(
     mut accept: impl FnMut(&RawInline) -> bool,
 ) -> ResidualDeltaSourcePage {
     assert!(limit > 0, "residual source pages require positive demand");
+    let ordinal = matches!(cursor, ResidualDeltaSourceCursor::Offset(_));
     let mut index = match cursor {
         ResidualDeltaSourceCursor::Start => 0,
         ResidualDeltaSourceCursor::After(after) => upper_bound_indexed(0, len, &after, &at),
-        ResidualDeltaSourceCursor::Offset(_) => {
-            panic!("SuccinctArchive source received an ordinal cursor")
-        }
+        ResidualDeltaSourceCursor::Offset(offset) => usize::try_from(offset)
+            .expect("SuccinctArchive source offset exceeds addressable memory"),
     };
+    assert!(
+        index <= len,
+        "SuccinctArchive source offset exceeds its indexed driver"
+    );
     let mut examined = 0usize;
     let mut last = None;
     let mut buffered = None;
@@ -305,14 +336,18 @@ fn page_indexed_distinct_filtered(
             index += 1;
         }
     }
-    ResidualDeltaSourcePage {
-        next: (index < len).then(|| {
+    let next = (index < len).then(|| {
+        if ordinal {
+            ResidualDeltaSourceCursor::Offset(
+                u64::try_from(index).expect("SuccinctArchive source offset exceeds cursor width"),
+            )
+        } else {
             ResidualDeltaSourceCursor::After(
                 last.expect("a nonterminal positive page examined a candidate"),
             )
-        }),
-        examined,
-    }
+        }
+    });
+    ResidualDeltaSourcePage { next, examined }
 }
 
 fn page_indexed_distinct(
@@ -1149,6 +1184,29 @@ where
             accepted,
         )
     }
+
+    /// Initial cursor for one private typed proposal continuation.
+    ///
+    /// The returned ordinal is meaningful only to this exact immutable
+    /// archive and row schema. Public residual sources continue to start with
+    /// [`ResidualDeltaSourceCursor::Start`] and resume by raw value.
+    pub(crate) fn typed_proposal_source_start_cursor(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+    ) -> ResidualDeltaSourceCursor {
+        assert!(
+            view.col(variable).is_none(),
+            "Succinct proposal target is already bound"
+        );
+        let positions = self.positions(variable, view);
+        assert_ne!(
+            positions.target_count(),
+            0,
+            "Succinct proposal target is absent"
+        );
+        positions.typed_proposal_start_cursor()
+    }
 }
 
 impl<U> TypedProgramSpec for SuccinctArchiveConstraint<'_, U>
@@ -1230,8 +1288,9 @@ where
                         rank[1] = u64::MAX - 1;
                         rank[2..].copy_from_slice(&complemented_value_words(value));
                     }
-                    ResidualDeltaSourceCursor::Offset(_) => {
-                        panic!("ordinal cursor crossed into a typed SuccinctArchive source")
+                    ResidualDeltaSourceCursor::Offset(offset) => {
+                        rank[1] = u64::MAX - 2;
+                        rank[2] = u64::MAX - offset;
                     }
                 }
             }
@@ -1254,7 +1313,7 @@ where
                 assert_ne!(self.variable_position_mask(variable), 0);
                 SuccinctArchiveProgramState::Propose {
                     variable,
-                    cursor: ResidualDeltaSourceCursor::Start,
+                    cursor: self.typed_proposal_source_start_cursor(variable, &batch.view),
                 }
             }
             ProgramAction::Confirm(variable) => {
@@ -1755,6 +1814,9 @@ where
         {
             return None;
         }
+        if matches!(cursor, ResidualDeltaSourceCursor::Offset(_)) {
+            panic!("SuccinctArchive source received an ordinal cursor");
+        }
         let p = self.positions(variable, view);
         Some(self.proposal_source_page_row(&p, view.row(0), cursor, limit, accepted))
     }
@@ -1885,6 +1947,34 @@ mod typed_program_tests {
         assert_eq!(suffix, [inline_value(3), inline_value(5)]);
         assert_eq!(suffix_page.examined, suffix.len());
         assert_eq!(suffix_page.next, None);
+
+        let mut ordinal_prefix = Vec::new();
+        let ordinal_prefix_page = page_indexed_distinct(
+            sequence.len(),
+            |index| sequence[index],
+            ResidualDeltaSourceCursor::Offset(0),
+            2,
+            &mut ordinal_prefix,
+        );
+        assert_eq!(ordinal_prefix, [inline_value(1), inline_value(2)]);
+        assert_eq!(ordinal_prefix_page.examined, 2);
+        assert_eq!(
+            ordinal_prefix_page.next,
+            Some(ResidualDeltaSourceCursor::Offset(5)),
+            "the ordinal continuation must name the first unexamined physical occurrence"
+        );
+
+        let mut ordinal_suffix = Vec::new();
+        let ordinal_suffix_page = page_indexed_distinct(
+            sequence.len(),
+            |index| sequence[index],
+            ordinal_prefix_page.next.unwrap(),
+            usize::MAX,
+            &mut ordinal_suffix,
+        );
+        assert_eq!(ordinal_suffix, [inline_value(3), inline_value(5)]);
+        assert_eq!(ordinal_suffix_page.examined, ordinal_suffix.len());
+        assert_eq!(ordinal_suffix_page.next, None);
 
         let mut cursor = ResidualDeltaSourceCursor::Start;
         let mut resumed = Vec::new();
@@ -2244,6 +2334,147 @@ mod typed_program_tests {
             constraint
                 .action_unit_classes(value.index, VariableSet::new_singleton(value.index))
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn typed_proposal_uses_ordinals_only_for_unfiltered_indexed_shapes() {
+        let set: TribleSet = [
+            trible(1, 11, inline_value(21)),
+            trible(1, 12, inline_value(22)),
+            trible(2, 11, inline_value(23)),
+        ]
+        .into_iter()
+        .collect();
+        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+        let e = Variable::<GenId>::new(0);
+        let a = Variable::<GenId>::new(1);
+        let v = Variable::<UnknownInline>::new(2);
+        let unconstrained = SuccinctArchiveConstraint::new(e, a, v, &archive);
+
+        assert_eq!(
+            unconstrained.typed_proposal_source_start_cursor(v.index, &RowsView::EMPTY),
+            ResidualDeltaSourceCursor::Start,
+            "top-level domain enumeration must retain a raw-value cursor"
+        );
+
+        let vars = [e.index];
+        let rows = [id_value(1)];
+        let one_bound = RowsView::new(&vars, &rows);
+        assert_eq!(
+            unconstrained.typed_proposal_source_start_cursor(v.index, &one_bound),
+            ResidualDeltaSourceCursor::Offset(0),
+            "an unfiltered fixed-first indexed driver can resume by local ordinal"
+        );
+
+        let fixed_pair = SuccinctArchiveConstraint::new(
+            Inline::<GenId>::new(id_value(1)),
+            Inline::<GenId>::new(id_value(11)),
+            v,
+            &archive,
+        );
+        assert_eq!(
+            fixed_pair.typed_proposal_source_start_cursor(v.index, &RowsView::EMPTY),
+            ResidualDeltaSourceCursor::Offset(0),
+            "an unfiltered fixed-pair indexed driver can resume by local ordinal"
+        );
+        let ordinal_zero = SuccinctArchiveProgramState::Propose {
+            variable: v.index,
+            cursor: ResidualDeltaSourceCursor::Offset(0),
+        };
+        let ordinal_one = SuccinctArchiveProgramState::Propose {
+            variable: v.index,
+            cursor: ResidualDeltaSourceCursor::Offset(1),
+        };
+        assert!(fixed_pair.progress(&ordinal_zero) > fixed_pair.progress(&ordinal_one));
+
+        let x = Variable::<GenId>::new(3);
+        let repeated =
+            SuccinctArchiveConstraint::new(x, Inline::<GenId>::new(id_value(11)), x, &archive);
+        assert_eq!(
+            repeated.typed_proposal_source_start_cursor(x.index, &RowsView::EMPTY),
+            ResidualDeltaSourceCursor::Start,
+            "a repeated target has an exact secondary filter and must remain value based"
+        );
+    }
+
+    #[test]
+    fn typed_proposal_cursor_matrix_covers_every_structural_rotation() {
+        fn cursor(target_mask: u8, resolved_mask: u8) -> ResidualDeltaSourceCursor {
+            assert_eq!(target_mask & resolved_mask, 0);
+            Positions {
+                e_var: target_mask & 0b001 != 0,
+                a_var: target_mask & 0b010 != 0,
+                v_var: target_mask & 0b100 != 0,
+                pe: (resolved_mask & 0b001 != 0)
+                    .then(|| Src::Const(RawInline::default())),
+                pa: (resolved_mask & 0b010 != 0)
+                    .then(|| Src::Const(RawInline::default())),
+                pv: (resolved_mask & 0b100 != 0)
+                    .then(|| Src::Const(RawInline::default())),
+            }
+            .typed_proposal_start_cursor()
+        }
+
+        for target_mask in [0b001, 0b010, 0b100] {
+            let remaining = 0b111 ^ target_mask;
+            assert_eq!(
+                cursor(target_mask, 0),
+                ResidualDeltaSourceCursor::Start,
+                "each zero-bound top-level domain rotation stays value based"
+            );
+            for resolved_mask in 1..=0b111 {
+                if resolved_mask & !remaining == 0 {
+                    assert_eq!(
+                        cursor(target_mask, resolved_mask),
+                        ResidualDeltaSourceCursor::Offset(0),
+                        "all one-bound middle and two-bound last rotations are ordinal"
+                    );
+                }
+            }
+        }
+
+        for target_mask in [0b011, 0b101, 0b110] {
+            let remaining = 0b111 ^ target_mask;
+            assert_eq!(
+                cursor(target_mask, 0),
+                ResidualDeltaSourceCursor::Start
+            );
+            assert_eq!(
+                cursor(target_mask, remaining),
+                ResidualDeltaSourceCursor::Start,
+                "repeated-target filters remain value based even when the other axis is resolved"
+            );
+        }
+        assert_eq!(
+            cursor(0b111, 0),
+            ResidualDeltaSourceCursor::Start,
+            "the all-equal target remains a filtered value source"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "SuccinctArchive source received an ordinal cursor")]
+    fn public_succinct_source_rejects_private_ordinal_cursors() {
+        let set: TribleSet = [trible(1, 11, inline_value(21))].into_iter().collect();
+        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+        let value = Variable::<UnknownInline>::new(0);
+        let constraint = SuccinctArchiveConstraint::new(
+            Inline::<GenId>::new(id_value(1)),
+            Inline::<GenId>::new(id_value(11)),
+            value,
+            &archive,
+        );
+        let mut roots = Vec::new();
+        let mut accepted = Vec::new();
+        let _ = constraint.residual_delta_source_page(
+            value.index,
+            &RowsView::EMPTY,
+            None,
+            ResidualDeltaSourceCursor::Offset(0),
+            1,
+            &mut roots,
+            &mut accepted,
         );
     }
 
