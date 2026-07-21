@@ -773,6 +773,9 @@ impl ProgramPhysicalReceipt {
 }
 
 /// Effects returned by one typed cohort call.
+///
+/// The erased adapter publishes this receipt only after validating every tag
+/// and static page law across the complete cohort.
 #[doc(hidden)]
 #[derive(Default)]
 pub struct ProgramBatchEffects {
@@ -2069,6 +2072,10 @@ where
                 position == 0 || *input >= previous,
                 "typed support observations are not grouped in ascending order"
             );
+            assert!(
+                position == 0 || *input != previous,
+                "one typed input page reported Boolean support more than once"
+            );
             previous = *input;
             scratch.raw_effects[*input as usize] += 1;
         }
@@ -2079,6 +2086,13 @@ where
                 .zip(&scratch.examined)
                 .all(|(&outputs, &spent)| outputs <= spent),
             "typed program emitted more raw effects than its examined-work receipt"
+        );
+        assert!(
+            typed
+                .pages
+                .iter()
+                .all(|page| page.examined > 0 || page.resume.is_none()),
+            "typed program scheduled zero-examined continuation work without a positive work receipt"
         );
 
         scratch.batch_novelty.clear();
@@ -2343,6 +2357,8 @@ mod tests {
         Complete,
         OverBudget,
         LateRawAmplification,
+        LateDuplicateSupport,
+        LateZeroExaminedResume,
     }
 
     struct PhysicalProbe {
@@ -2370,7 +2386,12 @@ mod tests {
             Some(ProgramRoute {
                 key: ProgramKey::new(0),
                 variable: 0,
-                stratum: if matches!(self.mode, PhysicalProbeMode::LateRawAmplification) {
+                stratum: if matches!(
+                    self.mode,
+                    PhysicalProbeMode::LateRawAmplification
+                        | PhysicalProbeMode::LateDuplicateSupport
+                        | PhysicalProbeMode::LateZeroExaminedResume
+                ) {
                     ProgramStratum::Fixpoint
                 } else {
                     ProgramStratum::Finite
@@ -2398,7 +2419,12 @@ mod tests {
                 let state = NonComparableState {
                     exact_cursor: parent + 10,
                 };
-                if matches!(self.mode, PhysicalProbeMode::LateRawAmplification) {
+                if matches!(
+                    self.mode,
+                    PhysicalProbeMode::LateRawAmplification
+                        | PhysicalProbeMode::LateDuplicateSupport
+                        | PhysicalProbeMode::LateZeroExaminedResume
+                ) {
                     effects.fixpoint_root(parent as u32, state, Key(parent as u8), None);
                 } else {
                     effects.finite_root(parent as u32, state, None);
@@ -2479,7 +2505,9 @@ mod tests {
                 }
                 PhysicalProbeMode::Complete
                 | PhysicalProbeMode::OverBudget
-                | PhysicalProbeMode::LateRawAmplification => {
+                | PhysicalProbeMode::LateRawAmplification
+                | PhysicalProbeMode::LateDuplicateSupport
+                | PhysicalProbeMode::LateZeroExaminedResume => {
                     let placement = ProgramPhysicalReceipt::new(
                         "test-physical",
                         "dense-page",
@@ -2489,11 +2517,21 @@ mod tests {
                             PhysicalProbeMode::Complete => 1,
                             PhysicalProbeMode::OverBudget => batch.limits[input] + 1,
                             PhysicalProbeMode::LateRawAmplification => 1,
+                            PhysicalProbeMode::LateDuplicateSupport if input == 1 => 2,
+                            PhysicalProbeMode::LateDuplicateSupport => 1,
+                            PhysicalProbeMode::LateZeroExaminedResume if input == 1 => 0,
+                            PhysicalProbeMode::LateZeroExaminedResume => 1,
                             PhysicalProbeMode::Decline
                             | PhysicalProbeMode::SpeculativeDecline
                             | PhysicalProbeMode::NativeWideReceipt => unreachable!(),
                         };
-                        let resume = matches!(self.mode, PhysicalProbeMode::LateRawAmplification)
+                        let resume = (matches!(
+                            self.mode,
+                            PhysicalProbeMode::LateRawAmplification
+                        ) || (matches!(
+                            self.mode,
+                            PhysicalProbeMode::LateZeroExaminedResume
+                        ) && input == 1))
                             .then(|| {
                                 TypedResume::Immediate(NonComparableState {
                                     exact_cursor: state.exact_cursor - 1,
@@ -2510,6 +2548,27 @@ mod tests {
                                 None,
                             );
                             effects.direct(input as u32, RawInline::default());
+                        }
+                        if matches!(
+                            self.mode,
+                            PhysicalProbeMode::LateDuplicateSupport
+                                | PhysicalProbeMode::LateZeroExaminedResume
+                        ) && input == 0
+                        {
+                            effects.fixpoint_child(
+                                0,
+                                NonComparableState {
+                                    exact_cursor: state.exact_cursor - 1,
+                                },
+                                Key(91),
+                                Some(raw(0x91)),
+                            );
+                        }
+                        if matches!(self.mode, PhysicalProbeMode::LateDuplicateSupport)
+                            && input == 1
+                        {
+                            effects.support(1);
+                            effects.support(1);
                         }
                     }
                     Some(placement)
@@ -4300,83 +4359,105 @@ mod tests {
 
     #[test]
     fn late_invalid_physical_receipt_commits_no_output_prefix() {
-        let spec = PhysicalProbe::new(PhysicalProbeMode::LateRawAmplification);
-        let program = ProgramRef::new(&spec);
-        let request = ProgramRequest {
-            action: ProgramAction::Propose(0),
-            bound: VariableSet::new_empty(),
-        };
-        let route = program.route(request).unwrap();
-        let activations = [ProgramActivation(1)];
-        let view = RowsView::new_with_row_count(&[], &[], 1);
-        let mut runtime = program.new_runtime();
-        let mut seeded = ProgramSeedEffects::default();
-        program.seed_batch(
-            &mut runtime,
-            ProgramSeedBatch {
-                request,
-                route,
-                view,
-                activations: &activations,
-            },
-            &mut seeded,
-        );
-        let work: Vec<_> = seeded.work.into_iter().map(|seed| seed.work).collect();
-        let novelty_before = runtime
-            .erased
-            .as_mut()
-            .as_any_mut()
-            .downcast_mut::<TypedProgramRuntime<NonComparableState, Key, u64>>()
-            .unwrap()
-            .novelty
-            .clone();
-        let candidate_sets: [Option<&[RawInline]>; 1] = [None];
-        let mut effects = ProgramBatchEffects::default();
+        let cases: &[(PhysicalProbeMode, &[usize], &str)] = &[
+            (
+                PhysicalProbeMode::LateRawAmplification,
+                &[1],
+                "more raw effects than its examined-work receipt",
+            ),
+            (
+                PhysicalProbeMode::LateDuplicateSupport,
+                &[1, 2],
+                "reported Boolean support more than once",
+            ),
+            (
+                PhysicalProbeMode::LateZeroExaminedResume,
+                &[1, 1],
+                "zero-examined continuation work",
+            ),
+        ];
 
-        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            program.step_batch(
+        for &(mode, limits, expected) in cases {
+            let spec = PhysicalProbe::new(mode);
+            let program = ProgramRef::new(&spec);
+            let request = ProgramRequest {
+                action: ProgramAction::Propose(0),
+                bound: VariableSet::new_empty(),
+            };
+            let route = program.route(request).unwrap();
+            let activations: Vec<_> = (0..limits.len())
+                .map(|input| ProgramActivation(input as u64 + 1))
+                .collect();
+            let view = RowsView::new_with_row_count(&[], &[], activations.len());
+            let mut runtime = program.new_runtime();
+            let mut seeded = ProgramSeedEffects::default();
+            program.seed_batch(
                 &mut runtime,
-                ProgramBatch {
-                    stratum: route.stratum,
+                ProgramSeedBatch {
+                    request,
+                    route,
                     view,
-                    candidate_sets: &candidate_sets,
                     activations: &activations,
-                    work: &work,
-                    limits: &[1],
                 },
-                &mut effects,
-            )
-        }));
-        let message = panic_text(rejected.expect_err("amplified physical receipt must fail"));
-        assert!(message.contains("more raw effects than its examined-work receipt"));
+                &mut seeded,
+            );
+            let work: Vec<_> = seeded.work.into_iter().map(|seed| seed.work).collect();
+            let novelty_before = runtime
+                .erased
+                .as_mut()
+                .as_any_mut()
+                .downcast_mut::<TypedProgramRuntime<NonComparableState, Key, u64>>()
+                .unwrap()
+                .novelty
+                .clone();
+            let candidate_sets: Vec<Option<&[RawInline]>> = vec![None; limits.len()];
+            let mut effects = ProgramBatchEffects::default();
 
-        assert!(effects.pages.is_empty());
-        assert!(effects.children.is_empty());
-        assert!(effects.direct.is_empty());
-        assert!(effects.accepted.is_empty());
-        assert!(effects.supported.is_empty());
-        assert_eq!(effects.source_pages, 0);
-        assert_eq!(effects.source_examined, 0);
-        assert_eq!(effects.source_roots, 0);
-        assert_eq!(effects.transition_pages, 0);
-        assert_eq!(effects.transition_examined, 0);
-        assert_eq!(effects.placement, None);
+            let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                program.step_batch(
+                    &mut runtime,
+                    ProgramBatch {
+                        stratum: route.stratum,
+                        view,
+                        candidate_sets: &candidate_sets,
+                        activations: &activations,
+                        work: &work,
+                        limits,
+                    },
+                    &mut effects,
+                )
+            }));
+            let message = panic_text(rejected.expect_err("late-invalid receipt must fail"));
+            assert!(message.contains(expected), "unexpected panic: {message}");
 
-        let typed_runtime = runtime
-            .erased
-            .as_mut()
-            .as_any_mut()
-            .downcast_mut::<TypedProgramRuntime<NonComparableState, Key, u64>>()
-            .unwrap();
-        assert!(
-            typed_runtime.slots.iter().all(|slot| slot.value.is_none()),
-            "late validation committed a resume or child handle"
-        );
-        assert!(
-            typed_runtime.novelty == novelty_before,
-            "late validation admitted an output novelty key"
-        );
-        assert!(spec.native_states.lock().unwrap().is_empty());
+            assert!(effects.pages.is_empty());
+            assert!(effects.children.is_empty());
+            assert!(effects.direct.is_empty());
+            assert!(effects.accepted.is_empty());
+            assert!(effects.supported.is_empty());
+            assert_eq!(effects.source_pages, 0);
+            assert_eq!(effects.source_examined, 0);
+            assert_eq!(effects.source_roots, 0);
+            assert_eq!(effects.transition_pages, 0);
+            assert_eq!(effects.transition_examined, 0);
+            assert_eq!(effects.placement, None);
+
+            let typed_runtime = runtime
+                .erased
+                .as_mut()
+                .as_any_mut()
+                .downcast_mut::<TypedProgramRuntime<NonComparableState, Key, u64>>()
+                .unwrap();
+            assert!(
+                typed_runtime.slots.iter().all(|slot| slot.value.is_none()),
+                "late validation committed a resume or child handle"
+            );
+            assert!(
+                typed_runtime.novelty == novelty_before,
+                "late validation admitted an output novelty key"
+            );
+            assert!(spec.native_states.lock().unwrap().is_empty());
+        }
     }
 
     #[test]
