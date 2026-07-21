@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Confirm, and Support routes participate in ordinary hybrid lowering, keeping
   their typed paging and physical-backend seam available without requiring
   maximally exposed `ResidualLowering::FULL`.
+- **Typed `UnionArchive` paging is production-qualified.** Propose and Confirm
+  now join Support in ordinary hybrid lowering; their route keys, paging
+  contracts, and normalized relational SET semantics are unchanged.
 - **Specialized `UnionArchiveConstraint`s can now retain per-shard execution
   attachments.** `from_shards` accepts already-constructed Succinct archive
   constraints, validates their exact ordered entity/attribute/value terms, and
@@ -62,8 +65,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   selector distinguishes an absent route from a policy-deferred route: absence
   may still use legacy transition hooks, while deferral uses the stable
   ordinary action and never its legacy pager, seeds, grouping, or stronger
-  Program receipt. UnionArchive's page-producing Propose and Confirm streams
-  are explicit while the finite Support route remains production-qualified.
+  Program receipt.
   `ResidualLowering::new` now takes a `ProgramScope` instead of a boolean
   (`false` maps to `Disabled`, `true` to `All`), and `program_scope()` replaces
   the old `transition_programs()` getter. Custom typed Program specs must also
