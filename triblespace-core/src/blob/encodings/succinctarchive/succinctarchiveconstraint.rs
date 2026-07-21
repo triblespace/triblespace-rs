@@ -1172,7 +1172,10 @@ where
             stratum: ProgramStratum::Finite,
             grouping: ProgramGrouping::PageLocal,
             completion: ProgramCompletion::PageableOnly,
-            exposure: ProgramExposure::Production,
+            exposure: match request.action {
+                ProgramAction::Propose(_) | ProgramAction::Confirm(_) => ProgramExposure::Explicit,
+                ProgramAction::Support => ProgramExposure::Production,
+            },
         })
     }
 
@@ -1963,6 +1966,12 @@ mod typed_program_tests {
                 bound: empty,
             })
             .unwrap();
+        let support = program
+            .route(ProgramRequest {
+                action: ProgramAction::Support,
+                bound: empty,
+            })
+            .unwrap();
         let mut attribute_bound = empty;
         attribute_bound.set(a.index);
         let resolved = program
@@ -2016,6 +2025,9 @@ mod typed_program_tests {
         assert_eq!(propose.stratum, ProgramStratum::Finite);
         assert_eq!(propose.grouping, ProgramGrouping::PageLocal);
         assert_eq!(propose.completion, ProgramCompletion::PageableOnly);
+        assert_eq!(propose.exposure, ProgramExposure::Explicit);
+        assert_eq!(confirm.exposure, ProgramExposure::Explicit);
+        assert_eq!(support.exposure, ProgramExposure::Production);
         assert!(program
             .route(ProgramRequest {
                 action: ProgramAction::Propose(e.index),

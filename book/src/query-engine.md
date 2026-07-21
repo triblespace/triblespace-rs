@@ -263,9 +263,18 @@ query starts no worklist at all. Production lowering flattens exposed
 associative AND regions, keeps other finite logical composites such as Union as
 fused constraint kernels inside that substrate, and enables
 production-qualified typed Programs for RPQs and other heterogeneous actions.
-Explicit page-producing routes, including UnionArchive Propose and Confirm,
-require `ProgramScope::All` (provided by `ResidualLowering::FULL`). The explicit
-lazy DAG remains the comparison path.
+Canonical SuccinctArchive and UnionArchive Propose and Confirm routes are
+explicit and require `ProgramScope::All` (provided by
+`ResidualLowering::FULL`). Their ordinary block-native methods already preserve
+whole-frontier batching; selecting the pageable typed form under production
+instead creates one activation per parent and can turn cheap CPU or batched
+rank work into scheduler overhead. Their finite Support routes remain
+production-qualified. A resident WGPU two-bound proposal is a distinct
+exception: the wrapper's preferred accelerator-capable family stays
+production-qualified, while a structurally declined action falls back to the
+canonical explicit Succinct route. Thus hybrid lowering keeps the genuinely
+heterogeneous route without forcing every archive action through typed paging.
+The explicit lazy DAG remains the comparison path.
 
 [`Query::residual_state_scheduler`](triblespace::core::query::Query::residual_state_scheduler)
 selects the residual cursor for any root while preserving the query's chosen

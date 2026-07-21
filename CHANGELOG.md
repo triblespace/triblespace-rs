@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Canonical Succinct archive paging is now an explicit lowering choice.**
+  Controlled single-shard runs showed that selecting the pageable Propose and
+  Confirm Programs under ordinary hybrid lowering opened one activation per
+  parent and let scheduler overhead dominate work that the block-native
+  constraint already batches. Those two routes now require
+  `ResidualLowering::FULL`; finite Support remains production-qualified. The
+  resident WGPU two-bound proposal stays production-qualified as the
+  left-biased preferred family, while structurally declined actions select the
+  canonical explicit fallback. This keeps genuinely heterogeneous accelerator
+  work available without routing every Succinct action through typed paging.
 - **Flattened residual AND planning can price directed backend work instead of
   raw proposal width alone.** Lawful leaves may publish immutable logarithmic
   proposal and confirmation unit classes while their existing estimates quote
