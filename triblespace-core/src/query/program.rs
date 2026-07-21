@@ -231,15 +231,88 @@ pub struct ProgramCompleteBatch<'v> {
     pub view: RowsView<'v>,
 }
 
-/// Set-admitted parent-tagged Propose values returned by a complete action.
+/// Exact parent-local admission evidence for one complete action.
 ///
-/// `raw_occurrence_count` preserves physical work accounting from the exact
-/// family occurrence bag before action-boundary admission.
+/// Quotes are physical evidence only. They never name Program work handles,
+/// enter canonical identity, or grant execution; the erased adapter consumes
+/// them in the same call that either completes one bounded tail or declines.
 #[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProgramCompleteWorkQuote {
+    /// Exact physical units examined by an unbounded drain for this parent.
+    pub drain_work_units: usize,
+    /// Exact raw occurrences emitted before parent-local SET admission.
+    pub raw_occurrences: usize,
+}
+
+/// Physical admission policy returned by a typed complete-action family.
+#[doc(hidden)]
+#[derive(Debug, Eq, PartialEq)]
+pub enum ProgramCompleteWorkEvidence {
+    /// This family predates exact quoting. Preserve its established semantic
+    /// whole-batch completion policy after independent scheduler admission.
+    Unquoted,
+    /// One exact quote per parent, in batch order.
+    Quoted(Vec<ProgramCompleteWorkQuote>),
+    /// Exact evidence is unavailable for this batch; use pageable execution.
+    Declined,
+}
+
+#[cfg(test)]
 #[derive(Default)]
 pub struct ProgramCompleteEffects {
     pub occurrences: Vec<(u32, RawInline)>,
     pub raw_occurrence_count: usize,
+}
+
+/// Admission receipt retained only until the originating batch is consumed.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ProgramCompleteAdmission {
+    LegacyUnquoted,
+    Exact {
+        drain_work_units: usize,
+        raw_occurrences: usize,
+    },
+}
+
+/// Non-cloneable completion result affined to its exact borrowed input batch.
+///
+/// The fields stay private so quote evidence cannot become scheduler state.
+/// `into_parts_for` checks the original slice identity before releasing owned
+/// effects to the one cold residual transaction that owns those rows.
+pub(crate) struct ProgramBoundedCompletion<'v> {
+    batch: ProgramCompleteBatch<'v>,
+    first_parent: usize,
+    admission: ProgramCompleteAdmission,
+    raw_occurrence_count: usize,
+    occurrences: Vec<(u32, RawInline)>,
+}
+
+impl<'v> ProgramBoundedCompletion<'v> {
+    pub(crate) fn into_parts_for(
+        self,
+        batch: ProgramCompleteBatch<'v>,
+    ) -> (
+        usize,
+        ProgramCompleteAdmission,
+        usize,
+        Vec<(u32, RawInline)>,
+    ) {
+        assert_eq!(self.batch.request, batch.request);
+        assert_eq!(self.batch.route, batch.route);
+        assert_eq!(self.batch.view.len(), batch.view.len());
+        assert!(
+            std::ptr::eq(self.batch.view.vars, batch.view.vars)
+                && std::ptr::eq(self.batch.view.rows, batch.view.rows),
+            "bounded Program completion was paired with another row batch"
+        );
+        (
+            self.first_parent,
+            self.admission,
+            self.raw_occurrence_count,
+            self.occurrences,
+        )
+    }
 }
 
 /// Family-facing complete-action sink.
@@ -664,6 +737,19 @@ pub trait TypedProgramSpec {
     fn complete_typed(&self, _batch: ProgramCompleteBatch<'_>, _effects: &mut TypedCompleteSink) {
         panic!("typed Program certified a complete action without implementing it")
     }
+
+    /// Returns exact parent-local physical admission evidence for `batch`.
+    ///
+    /// A quoted family must return exactly one quote per parent. The evidence
+    /// is consumed privately by the erased adapter and is deliberately not
+    /// passed back to [`Self::complete_typed`]. `Declined` performs no complete
+    /// action work; `Unquoted` retains the pre-quote whole-batch policy.
+    fn quote_complete_typed(
+        &self,
+        _batch: ProgramCompleteBatch<'_>,
+    ) -> ProgramCompleteWorkEvidence {
+        ProgramCompleteWorkEvidence::Unquoted
+    }
 }
 
 trait ErasedProgramRuntime: Any + Send {
@@ -767,7 +853,11 @@ trait ErasedProgramSpec {
         effects: &mut ProgramBatchEffects,
     );
 
-    fn complete_batch(&self, batch: ProgramCompleteBatch<'_>, effects: &mut ProgramCompleteEffects);
+    fn try_complete_bounded(
+        &self,
+        batch: ProgramCompleteBatch<'_>,
+        capacity: usize,
+    ) -> Option<BoundedCompleteEffects>;
 
     fn retire_activations(
         &self,
@@ -775,6 +865,13 @@ trait ErasedProgramSpec {
         key: ProgramKey,
         activations: &[ProgramActivation],
     );
+}
+
+struct BoundedCompleteEffects {
+    first_parent: usize,
+    admission: ProgramCompleteAdmission,
+    raw_occurrence_count: usize,
+    occurrences: Vec<(u32, RawInline)>,
 }
 
 /// Borrowed immutable typed program behind a private erased vtable.
@@ -794,9 +891,7 @@ impl<'a> ProgramRef<'a> {
         Self { erased: spec }
     }
 
-    pub fn preferred<Preferred, Fallback>(
-        spec: &'a PreferredProgram<Preferred, Fallback>,
-    ) -> Self
+    pub fn preferred<Preferred, Fallback>(spec: &'a PreferredProgram<Preferred, Fallback>) -> Self
     where
         Preferred: TypedProgramSpec,
         Fallback: TypedProgramSpec,
@@ -844,12 +939,39 @@ impl<'a> ProgramRef<'a> {
         self.erased.step_batch(runtime, key, batch, effects);
     }
 
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn try_complete_bounded<'v>(
+        self,
+        batch: ProgramCompleteBatch<'v>,
+        capacity: usize,
+    ) -> Option<ProgramBoundedCompletion<'v>> {
+        self.erased
+            .try_complete_bounded(batch, capacity)
+            .map(|effects| ProgramBoundedCompletion {
+                batch,
+                first_parent: effects.first_parent,
+                admission: effects.admission,
+                raw_occurrence_count: effects.raw_occurrence_count,
+                occurrences: effects.occurrences,
+            })
+    }
+
+    #[cfg(test)]
     pub(crate) fn complete_batch(
         self,
         batch: ProgramCompleteBatch<'_>,
         effects: &mut ProgramCompleteEffects,
     ) {
-        self.erased.complete_batch(batch, effects);
+        let completion = self
+            .try_complete_bounded(batch, usize::MAX)
+            .expect("test complete action declined");
+        let (_, _, raw_occurrence_count, occurrences) = completion.into_parts_for(batch);
+        effects.raw_occurrence_count = effects
+            .raw_occurrence_count
+            .checked_add(raw_occurrence_count)
+            .expect("typed complete action occurrence count overflow");
+        effects.occurrences.extend(occurrences);
     }
 
     pub(crate) fn retire_activations(
@@ -1174,13 +1296,15 @@ where
         selected.step_batch(runtime, child_key, batch, effects);
     }
 
-    fn complete_batch(
+    #[cold]
+    #[inline(never)]
+    fn try_complete_bounded(
         &self,
         batch: ProgramCompleteBatch<'_>,
-        effects: &mut ProgramCompleteEffects,
-    ) {
+        capacity: usize,
+    ) -> Option<BoundedCompleteEffects> {
         let (selected, child_key) = self.selected(batch.route.key);
-        selected.complete_batch(
+        selected.try_complete_bounded(
             ProgramCompleteBatch {
                 route: ProgramRoute {
                     key: child_key,
@@ -1188,8 +1312,8 @@ where
                 },
                 ..batch
             },
-            effects,
-        );
+            capacity,
+        )
     }
 
     fn retire_activations(
@@ -1593,11 +1717,13 @@ where
         effects.placement = placement;
     }
 
-    fn complete_batch(
+    #[cold]
+    #[inline(never)]
+    fn try_complete_bounded(
         &self,
         batch: ProgramCompleteBatch<'_>,
-        effects: &mut ProgramCompleteEffects,
-    ) {
+        capacity: usize,
+    ) -> Option<BoundedCompleteEffects> {
         assert_eq!(
             batch.route.key.arm,
             ProgramRouteArm::Direct,
@@ -1641,15 +1767,71 @@ where
             "typed complete action proposal variable was already bound"
         );
 
+        let (first_parent, admission, quoted) = match self.quote_complete_typed(batch) {
+            ProgramCompleteWorkEvidence::Unquoted => {
+                (0, ProgramCompleteAdmission::LegacyUnquoted, None)
+            }
+            ProgramCompleteWorkEvidence::Declined => return None,
+            ProgramCompleteWorkEvidence::Quoted(quotes) => {
+                assert_eq!(
+                    quotes.len(),
+                    batch.view.len(),
+                    "typed complete-action quote did not cover every parent exactly once"
+                );
+                let mut first_parent = quotes.len();
+                let mut drain_work_units = 0usize;
+                let mut raw_occurrences = 0usize;
+                for quote in quotes.iter().rev() {
+                    let Some(next_drain) = drain_work_units.checked_add(quote.drain_work_units)
+                    else {
+                        return None;
+                    };
+                    let Some(next_raw) = raw_occurrences.checked_add(quote.raw_occurrences) else {
+                        return None;
+                    };
+                    if next_drain > capacity || next_raw > capacity {
+                        break;
+                    }
+                    first_parent -= 1;
+                    drain_work_units = next_drain;
+                    raw_occurrences = next_raw;
+                }
+                if quotes.len() - first_parent < 2 {
+                    return None;
+                }
+                (
+                    first_parent,
+                    ProgramCompleteAdmission::Exact {
+                        drain_work_units,
+                        raw_occurrences,
+                    },
+                    Some(quotes),
+                )
+            }
+        };
+
+        let completed_parent_count = batch.view.len() - first_parent;
+        let stride = batch.view.vars.len();
+        let row_offset = first_parent
+            .checked_mul(stride)
+            .expect("typed complete-action row offset overflow");
+        let completed_batch = ProgramCompleteBatch {
+            view: RowsView::new_with_row_count(
+                batch.view.vars,
+                &batch.view.rows[row_offset..],
+                completed_parent_count,
+            ),
+            ..batch
+        };
         let mut typed = TypedCompleteSink {
             occurrences: Vec::new(),
         };
-        self.complete_typed(batch, &mut typed);
+        self.complete_typed(completed_batch, &mut typed);
 
         let mut previous = 0u32;
         for (position, &(parent, _)) in typed.occurrences.iter().enumerate() {
             assert!(
-                (parent as usize) < batch.view.len(),
+                (parent as usize) < completed_parent_count,
                 "typed complete action parent tag is out of range"
             );
             assert!(
@@ -1660,15 +1842,38 @@ where
         }
 
         let raw_occurrence_count = typed.occurrences.len();
+        if let Some(quotes) = &quoted {
+            let selected = &quotes[first_parent..];
+            let mut occurrence = 0usize;
+            for (parent, quote) in selected.iter().enumerate() {
+                let begin = occurrence;
+                while occurrence < raw_occurrence_count
+                    && typed.occurrences[occurrence].0 as usize == parent
+                {
+                    occurrence += 1;
+                }
+                assert_eq!(
+                    occurrence - begin,
+                    quote.raw_occurrences,
+                    "typed complete action disagreed with parent {parent}'s exact raw-occurrence quote"
+                );
+            }
+            assert_eq!(
+                occurrence, raw_occurrence_count,
+                "typed complete action emitted an unquoted parent occurrence"
+            );
+        }
+
         let mut admitted = AHashSet::with_capacity(raw_occurrence_count);
         typed
             .occurrences
             .retain(|occurrence| admitted.insert(*occurrence));
-        effects.raw_occurrence_count = effects
-            .raw_occurrence_count
-            .checked_add(raw_occurrence_count)
-            .expect("typed complete action occurrence count overflow");
-        effects.occurrences.extend(typed.occurrences);
+        Some(BoundedCompleteEffects {
+            first_parent,
+            admission,
+            raw_occurrence_count,
+            occurrences: typed.occurrences,
+        })
     }
 
     fn retire_activations(
@@ -1930,6 +2135,7 @@ mod tests {
         preferred_physical: usize,
         preferred_native: usize,
         fallback_native: usize,
+        preferred_quote: usize,
         preferred_complete: usize,
     }
 
@@ -2003,14 +2209,27 @@ mod tests {
             None
         }
 
-        fn complete_typed(
-            &self,
-            batch: ProgramCompleteBatch<'_>,
-            effects: &mut TypedCompleteSink,
-        ) {
+        fn complete_typed(&self, batch: ProgramCompleteBatch<'_>, effects: &mut TypedCompleteSink) {
             assert_eq!(batch.route.key, ProgramKey::new(7));
             self.calls.lock().unwrap().preferred_complete += 1;
-            effects.push(0, RawInline::default());
+            for parent in 0..batch.view.len() {
+                effects.push(parent as u32, RawInline::default());
+            }
+        }
+
+        fn quote_complete_typed(
+            &self,
+            batch: ProgramCompleteBatch<'_>,
+        ) -> ProgramCompleteWorkEvidence {
+            assert_eq!(batch.route.key, ProgramKey::new(7));
+            self.calls.lock().unwrap().preferred_quote += 1;
+            ProgramCompleteWorkEvidence::Quoted(vec![
+                ProgramCompleteWorkQuote {
+                    drain_work_units: 1,
+                    raw_occurrences: 1,
+                };
+                batch.view.len()
+            ])
         }
     }
 
@@ -2268,6 +2487,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum CompleteTagProbe {
         RepeatedInOrder,
+        MisattributedQuote,
         OutOfRange,
         Descending,
     }
@@ -2317,7 +2537,7 @@ mod tests {
             effects: &mut TypedCompleteSink,
         ) {
             match self {
-                Self::RepeatedInOrder => {
+                Self::RepeatedInOrder | Self::MisattributedQuote => {
                     effects.push(0, raw(1));
                     effects.push(0, raw(2));
                     effects.push(0, raw(1));
@@ -2329,6 +2549,119 @@ mod tests {
                     effects.push(1, raw(1));
                     effects.push(0, raw(2));
                 }
+            }
+        }
+
+        fn quote_complete_typed(
+            &self,
+            _batch: ProgramCompleteBatch<'_>,
+        ) -> ProgramCompleteWorkEvidence {
+            match self {
+                Self::MisattributedQuote => ProgramCompleteWorkEvidence::Quoted(vec![
+                    ProgramCompleteWorkQuote {
+                        drain_work_units: 2,
+                        raw_occurrences: 2,
+                    },
+                    ProgramCompleteWorkQuote {
+                        drain_work_units: 3,
+                        raw_occurrences: 3,
+                    },
+                ]),
+                Self::RepeatedInOrder | Self::OutOfRange | Self::Descending => {
+                    ProgramCompleteWorkEvidence::Unquoted
+                }
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum BoundedQuoteMode {
+        Quoted(&'static [(usize, usize)]),
+        Declined,
+    }
+
+    #[derive(Default)]
+    struct BoundedQuoteCalls {
+        quotes: usize,
+        completions: usize,
+        completed_rows: Vec<u8>,
+    }
+
+    struct BoundedQuoteProbe {
+        mode: BoundedQuoteMode,
+        calls: Arc<Mutex<BoundedQuoteCalls>>,
+    }
+
+    impl TypedProgramSpec for BoundedQuoteProbe {
+        type State = ();
+        type NoveltyKey = ();
+        type Rank = u8;
+
+        fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+            matches!(request.action, ProgramAction::Propose(1)).then_some(ProgramRoute {
+                key: ProgramKey::new(11),
+                variable: 1,
+                stratum: ProgramStratum::Finite,
+                grouping: ProgramGrouping::PageLocal,
+                completion: ProgramCompletion::CompleteActionEquivalent,
+                exposure: ProgramExposure::Production,
+            })
+        }
+
+        fn dispatch(&self, _state: &Self::State) -> DispatchClass {
+            DispatchClass::new(0)
+        }
+
+        fn progress(&self, _state: &Self::State) -> Self::Rank {
+            0
+        }
+
+        fn seed_typed(
+            &self,
+            _batch: ProgramSeedBatch<'_>,
+            _effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+        ) {
+        }
+
+        fn step_typed(
+            &self,
+            _states: Vec<Self::State>,
+            _batch: TypedProgramBatch<'_>,
+            _effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+        ) {
+        }
+
+        fn complete_typed(&self, batch: ProgramCompleteBatch<'_>, effects: &mut TypedCompleteSink) {
+            let mut calls = self.calls.lock().unwrap();
+            calls.completions += 1;
+            calls.completed_rows = batch.view.iter().map(|row| row[0][0]).collect();
+            drop(calls);
+            for (parent, row) in batch.view.iter().enumerate() {
+                effects.push(parent as u32, raw(row[0][0]));
+            }
+        }
+
+        fn quote_complete_typed(
+            &self,
+            batch: ProgramCompleteBatch<'_>,
+        ) -> ProgramCompleteWorkEvidence {
+            self.calls.lock().unwrap().quotes += 1;
+            match self.mode {
+                BoundedQuoteMode::Quoted(quotes) => {
+                    assert_eq!(quotes.len(), batch.view.len());
+                    ProgramCompleteWorkEvidence::Quoted(
+                        quotes
+                            .iter()
+                            .map(
+                                |&(drain_work_units, raw_occurrences)| ProgramCompleteWorkQuote {
+                                    drain_work_units,
+                                    raw_occurrences,
+                                },
+                            )
+                            .collect(),
+                    )
+                }
+                BoundedQuoteMode::Declined => ProgramCompleteWorkEvidence::Declined,
             }
         }
     }
@@ -2485,11 +2818,26 @@ mod tests {
             },
             &mut effects,
         );
-        assert_eq!(
-            effects.occurrences,
-            [(0, raw(1)), (0, raw(2)), (1, raw(1))]
-        );
+        assert_eq!(effects.occurrences, [(0, raw(1)), (0, raw(2)), (1, raw(1))]);
         assert_eq!(effects.raw_occurrence_count, 5);
+
+        let misattributed = CompleteTagProbe::MisattributedQuote;
+        let program = ProgramRef::new(&misattributed);
+        let route = program.route(request).unwrap();
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            program.complete_batch(
+                ProgramCompleteBatch {
+                    request,
+                    route,
+                    view,
+                },
+                &mut ProgramCompleteEffects::default(),
+            );
+        }));
+        assert!(
+            panic_text(rejected.expect_err("misattributed parent quotes must fail closed"))
+                .contains("parent 0's exact raw-occurrence quote")
+        );
 
         for attack in [CompleteTagProbe::OutOfRange, CompleteTagProbe::Descending] {
             let program = ProgramRef::new(&attack);
@@ -2510,9 +2858,140 @@ mod tests {
                 CompleteTagProbe::Descending => {
                     assert!(message.contains("not grouped in ascending order"))
                 }
-                CompleteTagProbe::RepeatedInOrder => unreachable!(),
+                CompleteTagProbe::RepeatedInOrder | CompleteTagProbe::MisattributedQuote => {
+                    unreachable!()
+                }
             }
         }
+    }
+
+    #[test]
+    fn bounded_completion_selects_the_maximal_tail_under_both_exact_bounds() {
+        static DRAIN_LIMITED: &[(usize, usize)] = &[(9, 1), (2, 1), (1, 1), (1, 1)];
+        static RAW_LIMITED: &[(usize, usize)] = &[(1, 1), (1, 3), (1, 1), (1, 1)];
+
+        for (quotes, capacity, expected_first, expected_drain) in
+            [(DRAIN_LIMITED, 4, 1, 4), (RAW_LIMITED, 3, 2, 2)]
+        {
+            let calls = Arc::new(Mutex::new(BoundedQuoteCalls::default()));
+            let probe = BoundedQuoteProbe {
+                mode: BoundedQuoteMode::Quoted(quotes),
+                calls: Arc::clone(&calls),
+            };
+            let program = ProgramRef::new(&probe);
+            let request = ProgramRequest {
+                action: ProgramAction::Propose(1),
+                bound: VariableSet::new_singleton(0),
+            };
+            let vars = [0];
+            let rows = [raw(10), raw(11), raw(12), raw(13)];
+            let batch = ProgramCompleteBatch {
+                request,
+                route: program.route(request).unwrap(),
+                view: RowsView::new(&vars, &rows),
+            };
+            let completion = program
+                .try_complete_bounded(batch, capacity)
+                .expect("a multi-parent exact tail fits");
+            let (first, admission, raw_occurrence_count, occurrences) =
+                completion.into_parts_for(batch);
+            assert_eq!(first, expected_first);
+            assert_eq!(
+                admission,
+                ProgramCompleteAdmission::Exact {
+                    drain_work_units: expected_drain,
+                    raw_occurrences: 4 - expected_first,
+                }
+            );
+            assert_eq!(raw_occurrence_count, 4 - expected_first);
+            assert_eq!(
+                occurrences,
+                rows[expected_first..]
+                    .iter()
+                    .enumerate()
+                    .map(|(parent, value)| (parent as u32, *value))
+                    .collect::<Vec<_>>()
+            );
+            let calls = calls.lock().unwrap();
+            assert_eq!((calls.quotes, calls.completions), (1, 1));
+            assert_eq!(
+                calls.completed_rows,
+                rows[expected_first..]
+                    .iter()
+                    .map(|value| value[0])
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_completion_decline_singleton_and_overflow_do_no_complete_work() {
+        static SINGLETON: &[(usize, usize)] = &[(1, 1), (5, 1), (1, 1)];
+        static OVERFLOW: &[(usize, usize)] = &[(usize::MAX, 1), (1, 1), (1, 1)];
+
+        for (mode, capacity) in [
+            (BoundedQuoteMode::Declined, 8),
+            (BoundedQuoteMode::Quoted(SINGLETON), 1),
+            (BoundedQuoteMode::Quoted(OVERFLOW), usize::MAX),
+        ] {
+            let calls = Arc::new(Mutex::new(BoundedQuoteCalls::default()));
+            let probe = BoundedQuoteProbe {
+                mode,
+                calls: Arc::clone(&calls),
+            };
+            let program = ProgramRef::new(&probe);
+            let request = ProgramRequest {
+                action: ProgramAction::Propose(1),
+                bound: VariableSet::new_singleton(0),
+            };
+            let vars = [0];
+            let rows = [raw(10), raw(11), raw(12)];
+            let batch = ProgramCompleteBatch {
+                request,
+                route: program.route(request).unwrap(),
+                view: RowsView::new(&vars, &rows),
+            };
+            assert!(program.try_complete_bounded(batch, capacity).is_none());
+            let calls = calls.lock().unwrap();
+            assert_eq!((calls.quotes, calls.completions), (1, 0));
+            assert!(calls.completed_rows.is_empty());
+        }
+    }
+
+    #[test]
+    fn bounded_completion_result_rejects_an_equal_width_foreign_batch() {
+        static QUOTES: &[(usize, usize)] = &[(1, 1), (1, 1)];
+        let probe = BoundedQuoteProbe {
+            mode: BoundedQuoteMode::Quoted(QUOTES),
+            calls: Arc::new(Mutex::new(BoundedQuoteCalls::default())),
+        };
+        let program = ProgramRef::new(&probe);
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(1),
+            bound: VariableSet::new_singleton(0),
+        };
+        let vars = [0];
+        let original_rows = [raw(10), raw(11)];
+        let foreign_rows = [raw(20), raw(21)];
+        let route = program.route(request).unwrap();
+        let original = ProgramCompleteBatch {
+            request,
+            route,
+            view: RowsView::new(&vars, &original_rows),
+        };
+        let foreign = ProgramCompleteBatch {
+            request,
+            route,
+            view: RowsView::new(&vars, &foreign_rows),
+        };
+        let completion = program.try_complete_bounded(original, 2).unwrap();
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            completion.into_parts_for(foreign)
+        }));
+        assert!(
+            panic_text(rejected.expect_err("completion affinity must reject another batch"))
+                .contains("paired with another row batch")
+        );
     }
 
     #[test]
@@ -3040,11 +3519,7 @@ mod tests {
             assert_eq!(calls.preferred_native, 1);
             assert_eq!(calls.fallback_native, 0);
         }
-        program.retire_activations(
-            &mut preferred_runtime,
-            preferred_route.key,
-            &activations,
-        );
+        program.retire_activations(&mut preferred_runtime, preferred_route.key, &activations);
 
         let fallback_request = ProgramRequest {
             action: ProgramAction::Confirm(0),
@@ -3087,11 +3562,7 @@ mod tests {
         );
         assert_eq!(fallback_effects.pages.len(), 1);
         assert_eq!(calls.lock().unwrap().fallback_native, 1);
-        program.retire_activations(
-            &mut fallback_runtime,
-            fallback_route.key,
-            &activations,
-        );
+        program.retire_activations(&mut fallback_runtime, fallback_route.key, &activations);
 
         let complete_request = ProgramRequest {
             action: ProgramAction::Propose(1),
@@ -3099,18 +3570,71 @@ mod tests {
         };
         let complete_route = program.route(complete_request).unwrap();
         assert_eq!(complete_route.key.arm, ProgramRouteArm::Preferred);
+        let complete_view = RowsView::new_with_row_count(&[], &[], 2);
         let mut complete = ProgramCompleteEffects::default();
         program.complete_batch(
             ProgramCompleteBatch {
                 request: complete_request,
                 route: complete_route,
-                view,
+                view: complete_view,
             },
             &mut complete,
         );
-        assert_eq!(complete.occurrences, [(0, RawInline::default())]);
-        assert_eq!(complete.raw_occurrence_count, 1);
-        assert_eq!(calls.lock().unwrap().preferred_complete, 1);
+        assert_eq!(
+            complete.occurrences,
+            [(0, RawInline::default()), (1, RawInline::default())]
+        );
+        assert_eq!(complete.raw_occurrence_count, 2);
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.preferred_quote, 1);
+        assert_eq!(calls.preferred_complete, 1);
+    }
+
+    #[test]
+    fn preferred_bounded_completion_remaps_once_without_touching_fallback() {
+        let calls = Arc::new(Mutex::new(ChoiceCalls::default()));
+        let choice = PreferredProgram::new(
+            PreferredChoiceProbe {
+                calls: Arc::clone(&calls),
+            },
+            FallbackChoiceProbe {
+                calls: Arc::clone(&calls),
+            },
+        );
+        let program = ProgramRef::preferred(&choice);
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(1),
+            bound: VariableSet::new_empty(),
+        };
+        let batch = ProgramCompleteBatch {
+            request,
+            route: program.route(request).unwrap(),
+            view: RowsView::new_with_row_count(&[], &[], 2),
+        };
+        assert_eq!(batch.route.key.arm, ProgramRouteArm::Preferred);
+        let completion = program
+            .try_complete_bounded(batch, 2)
+            .expect("preferred child has an exact two-parent completion");
+        let (first, admission, raw_occurrences, occurrences) = completion.into_parts_for(batch);
+        assert_eq!(first, 0);
+        assert_eq!(
+            admission,
+            ProgramCompleteAdmission::Exact {
+                drain_work_units: 2,
+                raw_occurrences: 2,
+            }
+        );
+        assert_eq!(raw_occurrences, 2);
+        assert_eq!(
+            occurrences,
+            [(0, RawInline::default()), (1, RawInline::default())]
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.preferred_quote, 1);
+        assert_eq!(calls.preferred_complete, 1);
+        assert_eq!(calls.preferred_physical, 0);
+        assert_eq!(calls.preferred_native, 0);
+        assert_eq!(calls.fallback_native, 0);
     }
 
     #[test]

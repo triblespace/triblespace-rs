@@ -29,11 +29,12 @@ use crate::prelude::{attributes, entity, pattern};
 use crate::query::unionconstraint::UnionConstraint;
 use crate::query::{
     ActionUnitClasses, CandidateSink, Candidates, Constraint, DispatchClass, EstimateSink,
-    ProgramAction, ProgramCompleteBatch, ProgramCompletion, ProgramExposure, ProgramGrouping,
-    ProgramKey, ProgramPacing, ProgramRef, ProgramRequest, ProgramRoute, ProgramSeedBatch,
-    ProgramStratum, ProposalCoverage, RawTerm, ResidualDeltaOutput, ResidualDeltaSourceCursor,
-    ResidualDeltaSourcePage, RowsView, Term, TriblePattern, TypedCompleteSink, TypedEffectSink,
-    TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink, VariableId, VariableSet,
+    ProgramAction, ProgramCompleteBatch, ProgramCompleteWorkEvidence, ProgramCompleteWorkQuote,
+    ProgramCompletion, ProgramExposure, ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef,
+    ProgramRequest, ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage, RawTerm,
+    ResidualDeltaOutput, ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, Term,
+    TriblePattern, TypedCompleteSink, TypedEffectSink, TypedProgramBatch, TypedProgramSpec,
+    TypedResume, TypedSeedSink, VariableId, VariableSet,
 };
 use crate::repo::index_range::{
     convex_union, is_ancestor, validate_exact_frontier_cover, RangeRecord, RangeRecordError,
@@ -1630,6 +1631,43 @@ where
         self.for_each_complete_proposal_occurrence(variable, &batch.view, |parent, value| {
             effects.push(parent, value)
         });
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn quote_complete_typed(&self, batch: ProgramCompleteBatch<'_>) -> ProgramCompleteWorkEvidence {
+        let ProgramAction::Propose(variable) = batch.request.action else {
+            return ProgramCompleteWorkEvidence::Declined;
+        };
+        assert_eq!(variable, batch.route.variable);
+
+        let locators: Vec<_> = self
+            .shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .proposal_walk_locator_single_target(variable, &batch.view)
+                    .expect("one-target Succinct shard has no proposal locator")
+            })
+            .collect();
+        let mut quotes = Vec::with_capacity(batch.view.len());
+        for row in batch.view.iter() {
+            let mut raw_occurrences = 0usize;
+            for locator in &locators {
+                let Some(total) = raw_occurrences.checked_add(locator.locate(row).exact_len())
+                else {
+                    return ProgramCompleteWorkEvidence::Declined;
+                };
+                raw_occurrences = total;
+            }
+            // One-target Succinct walks emit every examined Ring value, so
+            // Union's drain and raw bag counts are equal, including overlaps.
+            quotes.push(ProgramCompleteWorkQuote {
+                drain_work_units: raw_occurrences,
+                raw_occurrences,
+            });
+        }
+        ProgramCompleteWorkEvidence::Quoted(quotes)
     }
 
     fn progress(&self, state: &Self::State) -> Self::Rank {

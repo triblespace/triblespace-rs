@@ -10282,37 +10282,133 @@ impl ResidualStateMachine {
         self.terminal_admission_width(task.state, rows.row_count) == 0
     }
 
-    /// Executes a fresh demand-wide terminal parent cohort through the
-    /// Program family's certified complete action. The physical planner has
-    /// independently proved that committing its candidate binds the full row
-    /// and that every remaining relevant occurrence has been checked, so no
-    /// Program runtime, activation, or sparse product-state task is opened.
-    fn complete_terminal_program_proposal(
+    /// Cold arbitration for one demand-admitted terminal Program cohort.
+    ///
+    /// The erased adapter quotes, selects, completes, and validates one exact
+    /// tail before returning. A decline leaves `rows` untouched and opens the
+    /// ordinary sparse route. Only a successful transaction permits this
+    /// method to split/refile a quote-rejected prefix or reserve receipts.
+    #[cold]
+    #[inline(never)]
+    fn seed_complete_terminal_program_candidate<'a>(
         &mut self,
-        program: ProgramRef<'_>,
+        program: ProgramRef<'a>,
         request: ProgramRequest,
         route: ProgramRoute,
         family: StateId,
-        rows: RowBatch,
+        desc: StateDesc,
+        delta_desc: DeltaDesc,
+        successor: StateDesc,
+        mut rows: RowBatch,
+        direct_terminal_publication_full: Option<VariableSet>,
+        plan: &ResidualPlan,
     ) -> DeltaSeedOutcome {
         assert!(rows.row_count > 1, "eager terminal phase requires a cohort");
-        let seeded_parents = rows.row_count;
-        let bound = request.bound;
-        let variable = route.variable;
-
-        let vars: Vec<VariableId> = bound.into_iter().collect();
-        let view = rows_view(&vars, &rows.rows, rows.row_count);
-        let mut effects = ProgramCompleteEffects::default();
-        program.complete_batch(
-            ProgramCompleteBatch {
+        let capacity = self.width.max(1);
+        let completion = {
+            let vars: Vec<VariableId> = request.bound.into_iter().collect();
+            let batch = ProgramCompleteBatch {
                 request,
                 route,
-                view,
-            },
-            &mut effects,
-        );
-        let raw_occurrence_count = effects.raw_occurrence_count;
-        let candidates = CandidatePayload::from_tagged(effects.occurrences, rows.row_count);
+                view: rows_view(&vars, &rows.rows, rows.row_count),
+            };
+            program
+                .try_complete_bounded(batch, capacity)
+                .map(|completion| completion.into_parts_for(batch))
+        };
+
+        let Some((first_parent, admission, raw_occurrence_count, occurrences)) = completion else {
+            let admitted_parent_count = rows.row_count;
+            self.stats.delta_terminal_admissions += 1;
+            self.stats.delta_terminal_admitted_parents += admitted_parent_count;
+            self.stats.max_delta_terminal_admission_parents = self
+                .stats
+                .max_delta_terminal_admission_parents
+                .max(admitted_parent_count);
+            self.stats.delta_terminal_demand_wide_admissions +=
+                usize::from(admitted_parent_count > 1);
+            self.stats.propose_action_pops += 1;
+            self.stats.propose_calls += 1;
+            self.stats.propose_rows += admitted_parent_count;
+            self.stats.max_propose_rows = self.stats.max_propose_rows.max(admitted_parent_count);
+
+            let mut outcome = self.delta.seed_program_proposals_with_full(
+                program,
+                delta_desc,
+                request,
+                route,
+                successor,
+                rows,
+                self.full,
+                direct_terminal_publication_full,
+                plan,
+                &mut self.worklist,
+                &mut self.interner,
+                &mut self.stats,
+            );
+            if self.uses_direct_terminal_publication() {
+                outcome.terminal_family = Some(family);
+            } else {
+                outcome.terminal_activations.clear();
+            }
+            return outcome;
+        };
+
+        match admission {
+            ProgramCompleteAdmission::LegacyUnquoted => {
+                assert_eq!(
+                    first_parent, 0,
+                    "legacy unquoted completion did not retain its whole batch"
+                );
+            }
+            ProgramCompleteAdmission::Exact {
+                drain_work_units,
+                raw_occurrences,
+            } => {
+                debug_assert!(drain_work_units <= capacity);
+                debug_assert!(raw_occurrences <= capacity);
+                assert_eq!(raw_occurrences, raw_occurrence_count);
+            }
+        }
+
+        if first_parent > 0 {
+            let completed_parent_count = rows.row_count - first_parent;
+            let mut deferred = StateBucket::Rows(rows);
+            let completed = deferred.take_tail(desc.bound.count(), completed_parent_count, false);
+            let deferred_parents = deferred.row_count();
+            let receipt = file_with_plan(
+                &mut self.worklist,
+                &mut self.interner,
+                plan,
+                desc,
+                deferred,
+                &mut self.stats,
+            )
+            .expect("bounded complete-action prefix is nonempty");
+            debug_assert_eq!(receipt.state, family);
+            let StateBucket::Rows(completed) = completed else {
+                unreachable!("bounded terminal split preserved row payloads")
+            };
+            rows = completed;
+            self.stats.delta_terminal_admission_remainders += deferred_parents;
+        }
+
+        let seeded_parents = rows.row_count;
+        self.stats.delta_terminal_admissions += 1;
+        self.stats.delta_terminal_admitted_parents += seeded_parents;
+        self.stats.max_delta_terminal_admission_parents = self
+            .stats
+            .max_delta_terminal_admission_parents
+            .max(seeded_parents);
+        self.stats.delta_terminal_demand_wide_admissions += usize::from(seeded_parents > 1);
+        self.stats.propose_action_pops += 1;
+        self.stats.propose_calls += 1;
+        self.stats.propose_rows += seeded_parents;
+        self.stats.max_propose_rows = self.stats.max_propose_rows.max(seeded_parents);
+
+        let bound = request.bound;
+        let variable = route.variable;
+        let candidates = CandidatePayload::from_tagged(occurrences, seeded_parents);
         candidates.debug_assert_valid_for(rows.row_count);
         debug_assert!(
             {
@@ -10330,10 +10426,8 @@ impl ResidualStateMachine {
             .iter()
             .all(|&receipt| !self.delta.receipt_has_live_activation(receipt)));
         self.stats.candidates_proposed += raw_occurrence_count;
-        self.stats.max_propose_candidates = self
-            .stats
-            .max_propose_candidates
-            .max(raw_occurrence_count);
+        self.stats.max_propose_candidates =
+            self.stats.max_propose_candidates.max(raw_occurrence_count);
 
         let mut origins = SmallVec::with_capacity(candidates.len());
         let (next_bound, published) = committed_candidate_rows_mapped(
@@ -10438,7 +10532,7 @@ impl ResidualStateMachine {
         } else {
             selected_parent_count
         };
-        let complete_terminal_phase = terminal_streaming
+        let complete_terminal_candidate = terminal_streaming
             && admitted_parent_count > 1
             && self.uses_eager_terminal_phase()
             && program.is_some_and(|(_, route)| {
@@ -10472,7 +10566,7 @@ impl ResidualStateMachine {
         };
         debug_assert_eq!(selected_parent_count, selected_rows.row_count);
         let first_admitted = selected_parent_count - admitted_parent_count;
-        if terminal_streaming {
+        if terminal_streaming && !complete_terminal_candidate {
             self.stats.delta_terminal_admissions += 1;
             self.stats.delta_terminal_admitted_parents += admitted_parent_count;
             self.stats.max_delta_terminal_admission_parents = self
@@ -10509,20 +10603,25 @@ impl ResidualStateMachine {
             unreachable!("terminal admission preserved proposal rows")
         };
         let direct_terminal_publication_full = self.direct_terminal_publication_full();
-        self.stats.propose_action_pops += 1;
-        self.stats.propose_calls += 1;
-        self.stats.propose_rows += rows.row_count;
-        self.stats.max_propose_rows = self.stats.max_propose_rows.max(rows.row_count);
         if let Some((spec, route)) = program {
-            if complete_terminal_phase {
-                return Ok(self.complete_terminal_program_proposal(
+            if complete_terminal_candidate {
+                return Ok(self.seed_complete_terminal_program_candidate(
                     spec,
                     program_request,
                     route,
                     state,
+                    desc,
+                    DeltaDesc::leaf(variable, proposer),
+                    successor,
                     rows,
+                    direct_terminal_publication_full,
+                    plan,
                 ));
             }
+            self.stats.propose_action_pops += 1;
+            self.stats.propose_calls += 1;
+            self.stats.propose_rows += rows.row_count;
+            self.stats.max_propose_rows = self.stats.max_propose_rows.max(rows.row_count);
             let mut outcome = self.delta.seed_program_proposals_with_full(
                 spec,
                 DeltaDesc::leaf(variable, proposer),
@@ -10544,6 +10643,10 @@ impl ResidualStateMachine {
             }
             return Ok(outcome);
         }
+        self.stats.propose_action_pops += 1;
+        self.stats.propose_calls += 1;
+        self.stats.propose_rows += rows.row_count;
+        self.stats.max_propose_rows = self.stats.max_propose_rows.max(rows.row_count);
         if paged {
             let mut outcome = self.delta.seed_source_proposals_with_full_receipt(
                 DeltaDesc::leaf(variable, proposer),
@@ -13322,6 +13425,8 @@ mod tests {
         Equivalent,
         Repeated,
         Divergent,
+        Declined,
+        QuotedSingleton,
         Empty,
         Panic,
         OutOfRange,
@@ -13386,11 +13491,7 @@ mod tests {
                 )
                 .then_some(value);
                 let repeated = (self.mode == TerminalProgramMode::Repeated).then_some(value);
-                effects.finite_root(
-                    parent as u32,
-                    TerminalProgramState { repeated },
-                    accepted,
-                );
+                effects.finite_root(parent as u32, TerminalProgramState { repeated }, accepted);
             }
         }
 
@@ -13424,6 +13525,9 @@ mod tests {
                     }
                 }
                 TerminalProgramMode::Divergent | TerminalProgramMode::Empty => {}
+                TerminalProgramMode::Declined | TerminalProgramMode::QuotedSingleton => {
+                    panic!("declined complete action was executed")
+                }
                 TerminalProgramMode::Panic => {
                     panic!("intentional complete Program action panic")
                 }
@@ -13434,6 +13538,36 @@ mod tests {
                     effects.push(1, raw(1));
                     effects.push(0, raw(2));
                 }
+            }
+        }
+
+        fn quote_complete_typed(
+            &self,
+            batch: ProgramCompleteBatch<'_>,
+        ) -> ProgramCompleteWorkEvidence {
+            match self.mode {
+                TerminalProgramMode::Declined => ProgramCompleteWorkEvidence::Declined,
+                TerminalProgramMode::QuotedSingleton => ProgramCompleteWorkEvidence::Quoted(vec![
+                        ProgramCompleteWorkQuote {
+                            drain_work_units: 1,
+                            raw_occurrences: 0,
+                        };
+                        batch.view.len()
+                    ]),
+                TerminalProgramMode::Panic => ProgramCompleteWorkEvidence::Quoted(
+                    (0..batch.view.len())
+                        .map(|parent| ProgramCompleteWorkQuote {
+                            drain_work_units: if parent + 2 < batch.view.len() { 9 } else { 1 },
+                            raw_occurrences: 1,
+                        })
+                        .collect(),
+                ),
+                TerminalProgramMode::Equivalent
+                | TerminalProgramMode::Repeated
+                | TerminalProgramMode::Divergent
+                | TerminalProgramMode::Empty
+                | TerminalProgramMode::OutOfRange
+                | TerminalProgramMode::Descending => ProgramCompleteWorkEvidence::Unquoted,
             }
         }
     }
@@ -14562,6 +14696,199 @@ mod tests {
     }
 
     #[test]
+    fn union_complete_work_quotes_bound_skew_and_preserve_fitting_cohorts() {
+        use crate::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
+        use crate::id::Id;
+        use crate::inline::encodings::UnknownInline;
+        use crate::repo::index_home::UnionArchive;
+        use crate::trible::{Trible, TribleSet};
+
+        const WIDE: usize = 16;
+
+        fn fixture(fanouts: &[usize]) -> IntersectionConstraint<ShapeConstraint> {
+            let entities: Vec<_> = (0..fanouts.len())
+                .map(|index| Id::new([201 + index as u8; crate::id::ID_LEN]).unwrap())
+                .collect();
+            let attribute = Id::new([250; crate::id::ID_LEN]).unwrap();
+            let mut facts = TribleSet::new();
+            for ((entity, base), fanout) in entities
+                .iter()
+                .zip((0..fanouts.len()).map(|index| {
+                    if index == 0 {
+                        1u8
+                    } else {
+                        u8::try_from(index * 32).unwrap()
+                    }
+                }))
+                .zip(fanouts.iter().copied())
+            {
+                for offset in 0..fanout {
+                    facts.insert(&Trible::force(
+                        entity,
+                        &attribute,
+                        &Inline::<UnknownInline>::new(raw(base + offset as u8)),
+                    ));
+                }
+            }
+
+            let archive: SuccinctArchive<OrderedUniverse> = (&facts).into();
+            let archives: &'static [SuccinctArchive<OrderedUniverse>] =
+                Box::leak(vec![archive].into_boxed_slice());
+            let union = Box::leak(Box::new(UnionArchive::new(archives)));
+            let entity = Variable::<GenId>::new(0);
+            let value = Variable::<UnknownInline>::new(1);
+            let attribute: Inline<GenId> = attribute.to_inline();
+            let archive_pattern = union.pattern(entity, attribute, value);
+            // Candidate scheduling is tail-first. Reverse the source bag so
+            // the singleton-yield parent establishes the first exact sample.
+            let parents = entities
+                .iter()
+                .rev()
+                .map(|entity| {
+                    let entity: Inline<GenId> = entity.to_inline();
+                    entity.raw
+                })
+                .collect();
+
+            IntersectionConstraint::new(vec![
+                preferred_fanout(entity.index, parents, 0),
+                Box::new(archive_pattern) as ShapeConstraint,
+            ])
+        }
+
+        let project = |binding: &Binding| Some((*binding.get(0)?, *binding.get(1)?));
+        let mut eager = Query::new(fixture(&[1, WIDE, WIDE]), project)
+            .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+            .cap(64)
+            .start_width(1)
+            .growth(2);
+
+        let first = eager.next().expect("the singleton parent has one result");
+        assert_eq!(first.1, raw(1));
+        assert_eq!(eager.state.stats.delta_terminal_eager_cohort_admissions, 0);
+        assert_eq!(eager.state.emit_next, eager.state.emit_count);
+
+        let raw_before = eager.state.stats.candidates_proposed;
+        let _second = eager
+            .next()
+            .expect("continued demand pages the two wide parents");
+        assert_eq!(eager.state.width, 2);
+        assert_eq!(eager.state.stats.delta_terminal_eager_cohort_admissions, 0);
+        assert!(
+            eager.state.stats.candidates_proposed - raw_before <= eager.state.width,
+            "exact quote evidence must not count as query work"
+        );
+        assert!(
+            eager.state.emit_count - eager.state.emit_next < eager.state.width,
+            "an over-capacity quoted cohort must remain pageable"
+        );
+
+        let mut fitting = Query::new(fixture(&[1, 1, 1]), project)
+            .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+            .cap(64)
+            .start_width(1)
+            .growth(2);
+        let mut fitting_output = vec![fitting.next().unwrap()];
+        let raw_before = fitting.state.stats.candidates_proposed;
+        fitting_output.push(fitting.next().unwrap());
+        assert_eq!(
+            fitting.state.stats.delta_terminal_eager_cohort_admissions,
+            1
+        );
+        assert_eq!(fitting.state.stats.delta_terminal_eager_cohort_parents, 2);
+        assert_eq!(fitting.state.stats.delta_terminal_eager_cohort_rows, 2);
+        assert_eq!(fitting.state.stats.candidates_proposed - raw_before, 2);
+        assert_eq!(fitting.state.emit_count - fitting.state.emit_next, 1);
+        fitting_output.extend(&mut fitting);
+        assert_eq!(fitting_output.len(), 3);
+        assert_eq!(fitting_output[0].1, raw(1));
+        assert_eq!(fitting_output[1].1, raw(64));
+        assert_eq!(fitting_output[2].1, raw(32));
+
+        let mut fitting_pageable = Query::new(fixture(&[1, 1, 1]), project)
+            .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+            .cap(64)
+            .start_width(1)
+            .growth(2);
+        fitting_pageable.state.eager_terminal_phase_enabled = false;
+        let mut fitting_set = fitting_output.clone();
+        fitting_set.sort_unstable();
+        let mut pageable_set = fitting_pageable.collect::<Vec<_>>();
+        pageable_set.sort_unstable();
+        assert_eq!(
+            fitting_set, pageable_set,
+            "quoted completion must preserve the exact pageable result set"
+        );
+
+        // The next demand window admits [wide, one, one]. Only its contiguous
+        // fitting tail may complete; the wide prefix is refiled untouched.
+        let mut mixed = Query::new(fixture(&[1, 1, 1, 1, 1, WIDE]), project)
+            .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+            .cap(64)
+            .start_width(1)
+            .growth(2);
+        let mut mixed_output = vec![mixed.next().unwrap()];
+        mixed_output.push(mixed.next().unwrap());
+        mixed_output.push(mixed.next().unwrap());
+        assert_eq!(mixed_output[0].1, raw(1));
+        assert_eq!(mixed_output[1].1, raw(64));
+        assert_eq!(mixed_output[2].1, raw(32));
+        assert_eq!(mixed.state.stats.delta_terminal_eager_cohort_admissions, 1);
+        let raw_before = mixed.state.stats.candidates_proposed;
+        let remainders_before = mixed.state.stats.delta_terminal_admission_remainders;
+        mixed_output.push(mixed.next().unwrap());
+        assert_eq!(mixed.state.width, 4);
+        assert_eq!(mixed_output[3].1, raw(128));
+        assert_eq!(mixed.state.stats.candidates_proposed - raw_before, 2);
+        assert_eq!(mixed.state.stats.delta_terminal_eager_cohort_admissions, 2);
+        assert_eq!(mixed.state.stats.delta_terminal_eager_cohort_parents, 4);
+        assert_eq!(
+            mixed.state.stats.delta_terminal_admission_remainders,
+            remainders_before + 1
+        );
+        mixed_output.extend(&mut mixed);
+
+        let mut mixed_pageable = Query::new(fixture(&[1, 1, 1, 1, 1, WIDE]), project)
+            .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+            .cap(64)
+            .start_width(1)
+            .growth(2);
+        mixed_pageable.state.eager_terminal_phase_enabled = false;
+        let mut mixed_set = mixed_output;
+        mixed_set.sort_unstable();
+        let mut mixed_pageable_set = mixed_pageable.collect::<Vec<_>>();
+        mixed_pageable_set.sort_unstable();
+        assert_eq!(mixed_set, mixed_pageable_set);
+
+        let mut blocked = Query::new(fixture(&[1, WIDE, 1]), project)
+            .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+            .cap(64)
+            .start_width(1)
+            .growth(2);
+        let mut blocked_output = vec![blocked.next().unwrap()];
+        let raw_before = blocked.state.stats.candidates_proposed;
+        blocked_output.push(blocked.next().unwrap());
+        assert_eq!(
+            blocked.state.stats.delta_terminal_eager_cohort_admissions,
+            0
+        );
+        assert!(blocked.state.stats.candidates_proposed - raw_before <= blocked.state.width);
+        blocked_output.extend(&mut blocked);
+
+        let mut blocked_pageable = Query::new(fixture(&[1, WIDE, 1]), project)
+            .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+            .cap(64)
+            .start_width(1)
+            .growth(2);
+        blocked_pageable.state.eager_terminal_phase_enabled = false;
+        assert_eq!(
+            blocked_output,
+            blocked_pageable.collect::<Vec<_>>(),
+            "a fitting parent behind an oversized tail must page without reordering"
+        );
+    }
+
+    #[test]
     fn demand_wide_terminal_admission_eagerly_evaluates_exact_suffix_receipts() {
         let root = IntersectionConstraint::new(vec![
             Box::new(ShapeLeaf(0)) as ShapeConstraint,
@@ -14797,6 +15124,83 @@ mod tests {
         assert_eq!(remainder.row_count, 2);
     }
 
+    #[test]
+    fn complete_quote_decline_or_singleton_preserves_the_admitted_batch_for_sparse_fallback() {
+        for mode in [
+            TerminalProgramMode::Declined,
+            TerminalProgramMode::QuotedSingleton,
+        ] {
+            let root = IntersectionConstraint::new(vec![
+                Box::new(ShapeLeaf(0)) as ShapeConstraint,
+                Box::new(TerminalProgramLeaf { variable: 1, mode }) as ShapeConstraint,
+            ]);
+            let plan = ResidualPlan::compile_lowering(
+                &root,
+                ResidualLowering::new(FormulaScope::OpaqueLeaves, ProgramScope::All),
+            );
+            let mut relevant = ChildSet::empty(plan.len());
+            relevant.insert(1);
+            let desc = StateDesc {
+                bound: VariableSet::new_singleton(0),
+                phase: ResidualPhase::Propose {
+                    variable: 1,
+                    relevant,
+                    proposer: 1,
+                },
+            };
+            let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+            assert_eq!(machine.width, 1);
+            let (state, _) = machine
+                .interner
+                .intern_with_status(desc.clone(), &mut machine.stats);
+            machine.terminal_yield.families.insert(
+                state,
+                TerminalFamilyYield {
+                    admitted: 1,
+                    live: 0,
+                    completed: 1,
+                    projected: 64,
+                },
+            );
+            machine.terminal_projected_rows = 64;
+            machine.terminal_demand_width = 192;
+
+            let outcome = machine
+                .seed_delta_proposal(
+                    &root,
+                    &plan,
+                    SelectedResidualTask {
+                        state,
+                        desc,
+                        bucket: StateBucket::Rows(RowBatch {
+                            rows: (10..15).map(raw).collect(),
+                            row_count: 5,
+                        }),
+                    },
+                )
+                .expect("declined complete candidate remains sparse");
+
+            assert_eq!(outcome.seeded_parents, 3);
+            assert_eq!(outcome.terminal_activations.len(), 3);
+            assert!(outcome.completed_activation_ids.is_empty());
+            assert!(outcome.active.is_some());
+            assert_eq!(machine.stats.delta_terminal_eager_cohort_admissions, 0);
+            assert_eq!(machine.stats.delta_terminal_admitted_parents, 3);
+            assert_eq!(machine.stats.delta_terminal_admission_remainders, 2);
+
+            let remainder = machine
+                .worklist
+                .values()
+                .find_map(|level| level.get(&state))
+                .expect("only the prior demand-admission prefix was refiled");
+            let StateBucket::Rows(remainder) = remainder else {
+                panic!("terminal proposal remainder changed payload shape")
+            };
+            assert_eq!(remainder.rows, [raw(10), raw(11)]);
+            assert_eq!(remainder.row_count, 2);
+        }
+    }
+
     fn eager_terminal_test_iter<P, R>(
         mode: TerminalProgramMode,
         postprocessing: P,
@@ -14806,10 +15210,7 @@ mod tests {
     {
         let root = IntersectionConstraint::new(vec![
             Box::new(ShapeLeaf(0)) as ShapeConstraint,
-            Box::new(TerminalProgramLeaf {
-                variable: 1,
-                mode,
-            }) as ShapeConstraint,
+            Box::new(TerminalProgramLeaf { variable: 1, mode }) as ShapeConstraint,
         ]);
         let mut iter = Query::new(root, postprocessing).solve_residual_state_lazy_with(
             ResidualLowering::new(FormulaScope::OpaqueLeaves, ProgramScope::All),
@@ -14828,15 +15229,41 @@ mod tests {
         let route = program
             .route(request)
             .expect("terminal test Program supports the proposal");
-        let eager = iter.state.complete_terminal_program_proposal(
+        let mut relevant = ChildSet::empty(iter.plan.len());
+        relevant.insert(1);
+        let bound = VariableSet::new_singleton(0);
+        let checked = iter.plan.initial_proposal_checked(&iter.root, 1, 1, bound);
+        let desc = StateDesc {
+            bound,
+            phase: ResidualPhase::Propose {
+                variable: 1,
+                relevant: relevant.clone(),
+                proposer: 1,
+            },
+        };
+        let successor = StateDesc {
+            bound,
+            phase: ResidualPhase::Candidate {
+                variable: 1,
+                relevant,
+                checked,
+            },
+        };
+        let direct_terminal_publication_full = iter.state.direct_terminal_publication_full();
+        let eager = iter.state.seed_complete_terminal_program_candidate(
             program,
             request,
             route,
             family,
+            desc,
+            DeltaDesc::leaf(1, 1),
+            successor,
             RowBatch {
                 rows: (12..15).map(raw).collect(),
                 row_count: 3,
             },
+            direct_terminal_publication_full,
+            &iter.plan,
         );
         let DeltaSeedOutcome {
             continuation,
@@ -14861,10 +15288,10 @@ mod tests {
 
     #[test]
     fn eager_complete_set_admission_preserves_raw_proposal_accounting() {
-        let mut repeated = eager_terminal_test_iter(
-            TerminalProgramMode::Repeated,
-            |binding: &Binding| Some((binding.get(0).copied()?, binding.get(1).copied()?)),
-        );
+        let mut repeated =
+            eager_terminal_test_iter(TerminalProgramMode::Repeated, |binding: &Binding| {
+                Some((binding.get(0).copied()?, binding.get(1).copied()?))
+            });
 
         assert_eq!(repeated.state.stats.candidates_proposed, 6);
         assert_eq!(repeated.state.stats.max_propose_candidates, 6);
@@ -14903,14 +15330,12 @@ mod tests {
             (3, 0, 3, 3)
         );
 
-        let mut filtered = eager_terminal_test_iter(
-            TerminalProgramMode::Equivalent,
-            |binding: &Binding| {
+        let mut filtered =
+            eager_terminal_test_iter(TerminalProgramMode::Equivalent, |binding: &Binding| {
                 let left = binding.get(0).copied()?;
                 let right = binding.get(1).copied()?;
                 (left != raw(13)).then_some((left, right))
-            },
-        );
+            });
         assert_eq!(
             filtered.by_ref().collect::<Vec<_>>(),
             [(raw(12), raw(102)), (raw(14), raw(104))]
@@ -14928,16 +15353,14 @@ mod tests {
 
         let panic_once = Arc::new(AtomicBool::new(true));
         let panic_projection = Arc::clone(&panic_once);
-        let mut unwound = eager_terminal_test_iter(
-            TerminalProgramMode::Equivalent,
-            move |binding: &Binding| {
+        let mut unwound =
+            eager_terminal_test_iter(TerminalProgramMode::Equivalent, move |binding: &Binding| {
                 let result = Some((binding.get(0).copied()?, binding.get(1).copied()?));
                 if panic_projection.swap(false, Ordering::SeqCst) {
                     panic!("intentional eager-terminal projection panic");
                 }
                 result
-            },
-        );
+            });
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unwound.next()));
         assert!(panic.is_err());
         assert_eq!(
@@ -14955,41 +15378,12 @@ mod tests {
             (3, 0, 3, 2)
         );
 
-        let mut empty = ResidualStateMachine::new(
-            VariableSet::new_singleton(0).union(VariableSet::new_singleton(1)),
-            1,
-            Search::Done,
-        );
-        let empty_program = TerminalProgramLeaf {
-            variable: 1,
-            mode: TerminalProgramMode::Empty,
-        };
-        let empty_request = ProgramRequest {
-            action: ProgramAction::Propose(1),
-            bound: VariableSet::new_singleton(0),
-        };
-        let empty_route = TypedProgramSpec::route(&empty_program, empty_request).unwrap();
-        let zero = empty.complete_terminal_program_proposal(
-            ProgramRef::new(&empty_program),
-            empty_request,
-            empty_route,
-            StateId(u32::MAX),
-            RowBatch {
-                rows: vec![raw(1), raw(2), raw(3)],
-                row_count: 3,
-            },
-        );
-        assert!(zero.publication.is_none());
-        empty.accept_delta_seed(
-            zero.continuation,
-            zero.publication,
-            zero.active,
-            zero.seeded_parents,
-            zero.terminal_family,
-            zero.terminal_activations,
-            zero.completed_activation_ids,
-        );
-        let family = &empty.terminal_yield.families[&StateId(u32::MAX)];
+        let mut empty =
+            eager_terminal_test_iter(TerminalProgramMode::Empty, |binding: &Binding| {
+                Some((binding.get(0).copied()?, binding.get(1).copied()?))
+            });
+        assert!(empty.next().is_none());
+        let family = &empty.state.terminal_yield.families[&StateId(u32::MAX)];
         assert_eq!(
             (
                 family.admitted,
@@ -14999,37 +15393,79 @@ mod tests {
             ),
             (3, 0, 3, 0)
         );
-        assert!(empty.delta.is_empty());
+        assert!(empty.state.delta.is_empty());
+    }
 
-        let mut panicking = ResidualStateMachine::new(
-            VariableSet::new_singleton(0).union(VariableSet::new_singleton(1)),
-            1,
-            Search::Done,
+    #[test]
+    fn complete_terminal_panic_precedes_quote_prefix_receipts_and_ledger() {
+        let panic_root = IntersectionConstraint::new(vec![
+            Box::new(ShapeLeaf(0)) as ShapeConstraint,
+            Box::new(TerminalProgramLeaf {
+                variable: 1,
+                mode: TerminalProgramMode::Panic,
+            }) as ShapeConstraint,
+        ]);
+        let panic_plan = ResidualPlan::compile_lowering(
+            &panic_root,
+            ResidualLowering::new(FormulaScope::OpaqueLeaves, ProgramScope::All),
         );
-        let panic_program = TerminalProgramLeaf {
-            variable: 1,
-            mode: TerminalProgramMode::Panic,
-        };
+        let mut panicking =
+            ResidualStateMachine::new_for_plan(panic_root.variables(), &panic_plan, Search::Done);
+        panicking.width = 2;
         let panic_request = ProgramRequest {
             action: ProgramAction::Propose(1),
             bound: VariableSet::new_singleton(0),
         };
-        let panic_route = TypedProgramSpec::route(&panic_program, panic_request).unwrap();
+        let panic_constraint = panic_plan.resolve(&panic_root, 1);
+        let panic_program = panic_constraint.residual_program().unwrap();
+        let panic_route = panic_program.route(panic_request).unwrap();
+        let mut relevant = ChildSet::empty(panic_plan.len());
+        relevant.insert(1);
+        let bound = VariableSet::new_singleton(0);
+        let checked = panic_plan.initial_proposal_checked(&panic_root, 1, 1, bound);
+        let panic_desc = StateDesc {
+            bound,
+            phase: ResidualPhase::Propose {
+                variable: 1,
+                relevant: relevant.clone(),
+                proposer: 1,
+            },
+        };
+        let panic_successor = StateDesc {
+            bound,
+            phase: ResidualPhase::Candidate {
+                variable: 1,
+                relevant,
+                checked,
+            },
+        };
+        let (panic_family, _) = panicking
+            .interner
+            .intern_with_status(panic_desc.clone(), &mut panicking.stats);
+        let direct_terminal_publication_full = panicking.direct_terminal_publication_full();
         let proposal_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            panicking.complete_terminal_program_proposal(
-                ProgramRef::new(&panic_program),
+            panicking.seed_complete_terminal_program_candidate(
+                panic_program,
                 panic_request,
                 panic_route,
-                StateId(u32::MAX),
+                panic_family,
+                panic_desc,
+                DeltaDesc::leaf(1, 1),
+                panic_successor,
                 RowBatch {
                     rows: vec![raw(1), raw(2), raw(3)],
                     row_count: 3,
                 },
+                direct_terminal_publication_full,
+                &panic_plan,
             )
         }));
         assert!(proposal_panic.is_err());
+        assert!(panicking.worklist.is_empty());
         assert!(panicking.terminal_yield.families.is_empty());
         assert!(panicking.delta.is_empty());
+        assert_eq!(panicking.stats.delta_terminal_admissions, 0);
+        assert_eq!(panicking.stats.delta_terminal_eager_cohort_admissions, 0);
         assert_eq!(
             panicking.delta.reserve_terminal_receipts(1),
             [DeltaActivationId::test(0)],
@@ -15052,17 +15488,15 @@ mod tests {
             let mut machine = ResidualStateMachine::new(full, 1, Search::Done);
             let malformed = TerminalProgramLeaf { variable: 1, mode };
             let route = TypedProgramSpec::route(&malformed, request).unwrap();
+            let vars = [0];
+            let rows = [raw(1), raw(2), raw(3)];
+            let batch = ProgramCompleteBatch {
+                request,
+                route,
+                view: RowsView::new(&vars, &rows),
+            };
             let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                machine.complete_terminal_program_proposal(
-                    ProgramRef::new(&malformed),
-                    request,
-                    route,
-                    StateId(u32::MAX),
-                    RowBatch {
-                        rows: vec![raw(1), raw(2), raw(3)],
-                        row_count: 3,
-                    },
-                )
+                ProgramRef::new(&malformed).try_complete_bounded(batch, usize::MAX)
             }));
 
             assert!(rejected.is_err(), "malformed complete output was accepted");
