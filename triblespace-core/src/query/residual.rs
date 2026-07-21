@@ -14562,6 +14562,124 @@ mod tests {
     }
 
     #[test]
+    fn skewed_union_complete_cohort_exposes_post_prefix_raw_work_and_buffering() {
+        use crate::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
+        use crate::id::Id;
+        use crate::inline::encodings::UnknownInline;
+        use crate::repo::index_home::UnionArchive;
+        use crate::trible::{Trible, TribleSet};
+
+        const WIDE: usize = 16;
+
+        fn fixture() -> IntersectionConstraint<ShapeConstraint> {
+            let entities = [
+                Id::new([201; crate::id::ID_LEN]).unwrap(),
+                Id::new([202; crate::id::ID_LEN]).unwrap(),
+                Id::new([203; crate::id::ID_LEN]).unwrap(),
+            ];
+            let attribute = Id::new([204; crate::id::ID_LEN]).unwrap();
+            let mut facts = TribleSet::new();
+            facts.insert(&Trible::force(
+                &entities[0],
+                &attribute,
+                &Inline::<UnknownInline>::new(raw(1)),
+            ));
+            for (entity, base) in [(&entities[1], 32u8), (&entities[2], 96u8)] {
+                for offset in 0..WIDE {
+                    facts.insert(&Trible::force(
+                        entity,
+                        &attribute,
+                        &Inline::<UnknownInline>::new(raw(base + offset as u8)),
+                    ));
+                }
+            }
+
+            let archive: SuccinctArchive<OrderedUniverse> = (&facts).into();
+            let archives: &'static [SuccinctArchive<OrderedUniverse>] =
+                Box::leak(vec![archive].into_boxed_slice());
+            let union = Box::leak(Box::new(UnionArchive::new(archives)));
+            let entity = Variable::<GenId>::new(0);
+            let value = Variable::<UnknownInline>::new(1);
+            let attribute: Inline<GenId> = attribute.to_inline();
+            let archive_pattern = union.pattern(entity, attribute, value);
+            // Candidate scheduling is tail-first. Reverse the source bag so
+            // the singleton-yield parent establishes the first exact sample.
+            let parents = entities
+                .iter()
+                .rev()
+                .map(|entity| {
+                    let entity: Inline<GenId> = entity.to_inline();
+                    entity.raw
+                })
+                .collect();
+
+            IntersectionConstraint::new(vec![
+                preferred_fanout(entity.index, parents, 0),
+                Box::new(archive_pattern) as ShapeConstraint,
+            ])
+        }
+
+        let project = |binding: &Binding| Some((*binding.get(0)?, *binding.get(1)?));
+        let mut eager = Query::new(fixture(), project)
+            .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+            .cap(64)
+            .start_width(1)
+            .growth(2);
+
+        let first = eager.next().expect("the singleton parent has one result");
+        assert_eq!(first.1, raw(1));
+        assert_eq!(eager.state.stats.delta_terminal_eager_cohort_admissions, 0);
+        assert_eq!(eager.state.emit_next, eager.state.emit_count);
+
+        let raw_before = eager.state.stats.candidates_proposed;
+        let _second = eager
+            .next()
+            .expect("continued demand admits the two wide parents");
+        assert_eq!(eager.state.width, 2);
+        assert_eq!(
+            eager.state.stats.candidates_proposed - raw_before,
+            2 * WIDE,
+            "the complete phase drains both fresh parents before returning"
+        );
+        assert_eq!(eager.state.stats.delta_terminal_eager_cohort_admissions, 1);
+        assert_eq!(eager.state.stats.delta_terminal_eager_cohort_parents, 2);
+        assert_eq!(eager.state.stats.delta_terminal_eager_cohort_rows, 2 * WIDE);
+        assert_eq!(
+            eager.state.emit_count - eager.state.emit_next,
+            2 * WIDE - 1,
+            "one returned row leaves the complete cohort staged"
+        );
+
+        let mut competing = Query::new(fixture(), project)
+            .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+            .cap(64)
+            .start_width(1)
+            .growth(2);
+        assert_eq!(competing.next().unwrap().1, raw(1));
+        assert_eq!(competing.state.terminal_yield.families.len(), 1);
+        competing.state.terminal_yield.families.insert(
+            StateId(u32::MAX),
+            TerminalFamilyYield {
+                admitted: 1,
+                live: 0,
+                completed: 1,
+                projected: 1,
+            },
+        );
+        let raw_before = competing.state.stats.candidates_proposed;
+        let _second = competing
+            .next()
+            .expect("the known competing family keeps one parent live");
+        let raw_work = competing.state.stats.candidates_proposed - raw_before;
+        assert_eq!(competing.state.stats.delta_terminal_eager_cohort_admissions, 0);
+        assert!(raw_work <= competing.state.width);
+        assert!(
+            competing.state.emit_count - competing.state.emit_next < competing.state.width,
+            "the pageable path stages at most its current search-width page"
+        );
+    }
+
+    #[test]
     fn demand_wide_terminal_admission_eagerly_evaluates_exact_suffix_receipts() {
         let root = IntersectionConstraint::new(vec![
             Box::new(ShapeLeaf(0)) as ShapeConstraint,
