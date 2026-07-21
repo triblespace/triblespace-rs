@@ -531,6 +531,7 @@ enum LocatedProposalHead<'a> {
     Domain {
         prefix: &'a BitVector<Rank9SelIndex>,
         code_range: Range<usize>,
+        len: usize,
     },
     /// The middle component of a fixed-first rotation. `changed_pair` has one
     /// bit per distinct `(first, middle)` pair, so this indexed driver is
@@ -564,6 +565,20 @@ impl<U> LocatedProposalWalk<'_, U>
 where
     U: Universe,
 {
+    /// Exact physical values examined by an unbounded consumption of this
+    /// already-located head. The length is part of the same navigation object
+    /// used by [`Self::consume`], so quote evidence cannot drift onto a
+    /// parallel estimator call graph.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn exact_len(&self) -> usize {
+        match &self.head {
+            LocatedProposalHead::Domain { len, .. }
+            | LocatedProposalHead::Middle { len, .. } => *len,
+            LocatedProposalHead::Last { range, .. } => range.len(),
+        }
+    }
+
     /// Consume this already-located ordered walk. `Start` plus an unbounded
     /// budget is the dense proposal; a finite budget plus `After(value)` is
     /// its bounded infix. Both feed the caller's sink directly.
@@ -574,7 +589,11 @@ where
         emit: impl FnMut(RawInline),
     ) -> ResidualDeltaSourcePage {
         match &self.head {
-            LocatedProposalHead::Domain { prefix, code_range } => consume_domain_filtered(
+            LocatedProposalHead::Domain {
+                prefix,
+                code_range,
+                ..
+            } => consume_domain_filtered(
                 self.archive,
                 prefix,
                 code_range.clone(),
@@ -652,20 +671,6 @@ where
             .located_proposal_walk(&self.positions, row)
             .expect("single-target Succinct proposal locator lost its walk")
     }
-
-    /// Exact number of values examined and emitted by an unbounded walk for
-    /// this row. Single-target Ring estimates are rank/select counts over the
-    /// same located source, so this does no proposal traversal.
-    #[cold]
-    #[inline(never)]
-    pub(crate) fn exact_len(&self, row: &[RawInline]) -> usize {
-        assert_eq!(
-            row.len(),
-            self.row_width,
-            "Succinct proposal row disagrees with its locator schema"
-        );
-        self.constraint.estimate_row(&self.positions, row)
-    }
 }
 
 impl<'a, U> SuccinctArchiveConstraint<'a, U>
@@ -683,12 +688,17 @@ where
         }
     }
 
-    fn domain_walk(&self, prefix: &'a BitVector<Rank9SelIndex>) -> LocatedProposalWalk<'a, U> {
+    fn domain_walk(
+        &self,
+        prefix: &'a BitVector<Rank9SelIndex>,
+        len: usize,
+    ) -> LocatedProposalWalk<'a, U> {
         LocatedProposalWalk {
             archive: self.archive,
             head: LocatedProposalHead::Domain {
                 prefix,
                 code_range: 0..self.archive.domain.len(),
+                len,
             },
         }
     }
@@ -749,9 +759,15 @@ where
         let v_bound = p.v(row);
 
         Some(match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
-            (None, None, None, true, false, false) => self.domain_walk(&self.archive.e_a),
-            (None, None, None, false, true, false) => self.domain_walk(&self.archive.a_a),
-            (None, None, None, false, false, true) => self.domain_walk(&self.archive.v_a),
+            (None, None, None, true, false, false) => {
+                self.domain_walk(&self.archive.e_a, self.archive.entity_count)
+            }
+            (None, None, None, false, true, false) => {
+                self.domain_walk(&self.archive.a_a, self.archive.attribute_count)
+            }
+            (None, None, None, false, false, true) => {
+                self.domain_walk(&self.archive.v_a, self.archive.value_count)
+            }
             (Some(e), None, None, false, true, false) => self.middle_walk(
                 &self.archive.changed_e_a,
                 base_range(&self.archive.domain, &self.archive.e_a, e),
@@ -2116,8 +2132,8 @@ mod typed_program_tests {
             .expect("test shape must have one target position");
         for parent in 0..view.len() {
             let row = view.row(parent);
-            let exact_len = locator.exact_len(row);
             let walk = locator.locate(row);
+            let exact_len = walk.exact_len();
             let mut emitted = 0usize;
             let page = walk.consume(ResidualDeltaSourceCursor::Start, usize::MAX, |value| {
                 emitted += 1;

@@ -1660,7 +1660,7 @@ where
                 .map(|row| {
                     let raw_occurrences = locators.iter().fold(0usize, |total, locator| {
                         total
-                            .checked_add(locator.exact_len(row))
+                            .checked_add(locator.locate(row).exact_len())
                             .expect("UnionArchive complete-action quote overflow")
                     });
                     // An unfiltered one-target Succinct walk emits every

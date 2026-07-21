@@ -3484,7 +3484,7 @@ mod tests {
         assert_eq!(complete.occurrences, [(0, RawInline::default())]);
         assert_eq!(complete.raw_occurrence_count, 1);
         let calls = calls.lock().unwrap();
-        assert_eq!(calls.preferred_quote, 2);
+        assert_eq!(calls.preferred_quote, 1);
         assert_eq!(calls.preferred_complete, 1);
         assert_eq!(calls.fallback_native, 1);
     }
