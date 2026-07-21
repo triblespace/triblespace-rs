@@ -1047,6 +1047,12 @@ pub trait TypedProgramSpec {
         effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
     );
 
+    /// Executes the Native cohort against affinely taken typed inputs.
+    ///
+    /// Implementations may drain or otherwise move states when convenient,
+    /// but they may also borrow them to construct a complete receipt. The
+    /// adapter discards any states left in the vector after this call while
+    /// retaining its allocation for the next cohort.
     fn step_typed(
         &self,
         states: &mut Vec<Self::State>,
@@ -2331,6 +2337,8 @@ mod tests {
     #[derive(Clone, Copy)]
     enum PhysicalProbeMode {
         Decline,
+        SpeculativeDecline,
+        NativeWideReceipt,
         Complete,
         OverBudget,
         LateRawAmplification,
@@ -2407,8 +2415,29 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(states.iter().map(|state| state.exact_cursor).collect());
-            for _ in states {
+            let rich = matches!(self.mode, PhysicalProbeMode::NativeWideReceipt)
+                && states.len() > 1;
+            for (input, state) in states.iter().enumerate() {
                 effects.page(1, None);
+                if rich {
+                    match input {
+                        0 => effects.finite_child(
+                            0,
+                            NonComparableState {
+                                exact_cursor: state.exact_cursor - 1,
+                            },
+                            None,
+                        ),
+                        1 => effects.direct(1, RawInline::default()),
+                        2 => effects.accept(2, RawInline::default()),
+                        3 => effects.support(3),
+                        _ => {}
+                    }
+                }
+            }
+            if rich {
+                effects.account_source(states.len(), 1);
+                effects.account_transition(states.len());
             }
         }
 
@@ -2423,7 +2452,30 @@ mod tests {
                 .unwrap()
                 .push(states.iter().map(|state| state.exact_cursor).collect());
             match self.mode {
-                PhysicalProbeMode::Decline => None,
+                PhysicalProbeMode::Decline | PhysicalProbeMode::NativeWideReceipt => None,
+                PhysicalProbeMode::SpeculativeDecline => {
+                    for (input, state) in states.iter().enumerate() {
+                        effects.page(
+                            batch.limits[input],
+                            Some(TypedResume::Immediate(NonComparableState {
+                                exact_cursor: state.exact_cursor - 1,
+                            })),
+                        );
+                        effects.finite_child(
+                            input as u32,
+                            NonComparableState {
+                                exact_cursor: state.exact_cursor - 2,
+                            },
+                            Some(RawInline::default()),
+                        );
+                        effects.direct(input as u32, RawInline::default());
+                        effects.accept(input as u32, RawInline::default());
+                        effects.support(input as u32);
+                        effects.account_source(batch.limits[input], 1);
+                        effects.account_transition(batch.limits[input]);
+                    }
+                    None
+                }
                 PhysicalProbeMode::Complete
                 | PhysicalProbeMode::OverBudget
                 | PhysicalProbeMode::LateRawAmplification => {
@@ -2436,7 +2488,9 @@ mod tests {
                             PhysicalProbeMode::Complete => 1,
                             PhysicalProbeMode::OverBudget => batch.limits[input] + 1,
                             PhysicalProbeMode::LateRawAmplification => 1,
-                            PhysicalProbeMode::Decline => unreachable!(),
+                            PhysicalProbeMode::Decline
+                            | PhysicalProbeMode::SpeculativeDecline
+                            | PhysicalProbeMode::NativeWideReceipt => unreachable!(),
                         };
                         let resume = matches!(self.mode, PhysicalProbeMode::LateRawAmplification)
                             .then(|| {
@@ -3870,6 +3924,170 @@ mod tests {
     }
 
     #[test]
+    fn declined_physical_step_discards_every_speculative_effect_before_native_fallback() {
+        let spec = PhysicalProbe::new(PhysicalProbeMode::SpeculativeDecline);
+        let effects = step_physical_probe(&spec, &[1, 1]);
+
+        assert_eq!(*spec.physical_states.lock().unwrap(), vec![vec![10, 11]]);
+        assert_eq!(*spec.native_states.lock().unwrap(), vec![vec![10, 11]]);
+        assert_eq!(effects.pages.len(), 2);
+        assert!(effects
+            .pages
+            .iter()
+            .all(|page| page.examined == 1 && page.resume.is_none()));
+        assert!(effects.children.is_empty());
+        assert!(effects.direct.is_empty());
+        assert!(effects.accepted.is_empty());
+        assert!(effects.supported.is_empty());
+        assert_eq!(effects.source_pages, 0);
+        assert_eq!(effects.source_examined, 0);
+        assert_eq!(effects.source_roots, 0);
+        assert_eq!(effects.transition_pages, 0);
+        assert_eq!(effects.transition_examined, 0);
+        assert_eq!(effects.placement, None);
+    }
+
+    #[test]
+    fn typed_program_scratch_reuse_clears_a_wide_receipt_before_a_narrow_step() {
+        let spec = PhysicalProbe::new(PhysicalProbeMode::NativeWideReceipt);
+        let program = ProgramRef::new(&spec);
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(0),
+            bound: VariableSet::new_empty(),
+        };
+        let route = program.route(request).unwrap();
+        let mut runtime = program.new_runtime();
+
+        let wide_activations = [
+            ProgramActivation(1),
+            ProgramActivation(2),
+            ProgramActivation(3),
+            ProgramActivation(4),
+        ];
+        let wide_view = RowsView::new_with_row_count(&[], &[], wide_activations.len());
+        let mut seeded = ProgramSeedEffects::default();
+        program.seed_batch(
+            &mut runtime,
+            ProgramSeedBatch {
+                request,
+                route,
+                view: wide_view,
+                activations: &wide_activations,
+            },
+            &mut seeded,
+        );
+        let wide_work: Vec<_> = seeded.work.into_iter().map(|seed| seed.work).collect();
+        let wide_candidates = [None, None, None, None];
+        let mut wide = ProgramBatchEffects::default();
+        program.step_batch(
+            &mut runtime,
+            ProgramBatch {
+                stratum: route.stratum,
+                view: wide_view,
+                candidate_sets: &wide_candidates,
+                activations: &wide_activations,
+                work: &wide_work,
+                limits: &[1, 1, 1, 1],
+            },
+            &mut wide,
+        );
+        assert_eq!(wide.pages.len(), 4);
+        assert_eq!(wide.children.len(), 1);
+        assert_eq!(wide.direct.len(), 1);
+        assert_eq!(wide.accepted.len(), 1);
+        assert_eq!(wide.supported.len(), 1);
+        assert_eq!(wide.source_pages, 1);
+        assert_eq!(wide.source_examined, 4);
+        assert_eq!(wide.source_roots, 1);
+        assert_eq!(wide.transition_pages, 1);
+        assert_eq!(wide.transition_examined, 4);
+
+        let wide_capacities = {
+            let typed = runtime
+                .erased
+                .as_mut()
+                .as_any_mut()
+                .downcast_mut::<TypedProgramRuntime<NonComparableState, Key, u64>>()
+                .unwrap();
+            let scratch = typed.scratch.as_ref().expect("wide step warmed scratch");
+            assert!(scratch.states.is_empty());
+            assert!(scratch.input_ranks.is_empty());
+            assert!(scratch.effects.pages.is_empty());
+            assert!(scratch.effects.children.is_empty());
+            assert!(scratch.effects.direct.is_empty());
+            assert!(scratch.effects.accepted.is_empty());
+            assert!(scratch.effects.supported.is_empty());
+            assert!(scratch.examined.is_empty());
+            assert!(scratch.raw_effects.is_empty());
+            assert!(scratch.resume_physical.is_empty());
+            assert!(scratch.batch_novelty.is_empty());
+            assert!(scratch.child_admitted.is_empty());
+            assert!(scratch.child_physical.is_empty());
+            (
+                scratch.states.capacity(),
+                scratch.effects.pages.capacity(),
+                scratch.effects.children.capacity(),
+            )
+        };
+
+        let narrow_activations = [ProgramActivation(5)];
+        let narrow_view = RowsView::new_with_row_count(&[], &[], 1);
+        let mut seeded = ProgramSeedEffects::default();
+        program.seed_batch(
+            &mut runtime,
+            ProgramSeedBatch {
+                request,
+                route,
+                view: narrow_view,
+                activations: &narrow_activations,
+            },
+            &mut seeded,
+        );
+        let narrow_work: Vec<_> = seeded.work.into_iter().map(|seed| seed.work).collect();
+        let mut narrow = ProgramBatchEffects::default();
+        program.step_batch(
+            &mut runtime,
+            ProgramBatch {
+                stratum: route.stratum,
+                view: narrow_view,
+                candidate_sets: &[None],
+                activations: &narrow_activations,
+                work: &narrow_work,
+                limits: &[1],
+            },
+            &mut narrow,
+        );
+        assert_eq!(narrow.pages.len(), 1);
+        assert!(narrow.children.is_empty());
+        assert!(narrow.direct.is_empty());
+        assert!(narrow.accepted.is_empty());
+        assert!(narrow.supported.is_empty());
+        assert_eq!(narrow.source_pages, 0);
+        assert_eq!(narrow.source_examined, 0);
+        assert_eq!(narrow.source_roots, 0);
+        assert_eq!(narrow.transition_pages, 0);
+        assert_eq!(narrow.transition_examined, 0);
+        assert_eq!(narrow.placement, None);
+
+        let typed = runtime
+            .erased
+            .as_mut()
+            .as_any_mut()
+            .downcast_mut::<TypedProgramRuntime<NonComparableState, Key, u64>>()
+            .unwrap();
+        let scratch = typed.scratch.as_ref().expect("narrow step returned scratch");
+        assert!(scratch.states.is_empty());
+        assert!(scratch.effects.pages.is_empty());
+        assert!(scratch.effects.children.is_empty());
+        assert!(scratch.effects.direct.is_empty());
+        assert!(scratch.effects.accepted.is_empty());
+        assert!(scratch.effects.supported.is_empty());
+        assert!(scratch.states.capacity() >= wide_capacities.0);
+        assert!(scratch.effects.pages.capacity() >= wide_capacities.1);
+        assert!(scratch.effects.children.capacity() >= wide_capacities.2);
+    }
+
+    #[test]
     fn preferred_program_seals_route_arm_and_keeps_child_native_state() {
         assert_eq!(
             std::mem::size_of::<ProgramRef<'static>>(),
@@ -4161,7 +4379,7 @@ mod tests {
     }
 
     #[test]
-    fn erased_adapter_clones_live_handles_and_steps_one_dense_typed_cohort() {
+    fn erased_adapter_clones_live_handles_and_warm_runtime_clones_scratch_cold() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let spec = DenseProbe {
             calls: Arc::clone(&calls),
@@ -4217,6 +4435,29 @@ mod tests {
             assert_eq!(effects.pages.len(), 3);
         }
         assert_eq!(*calls.lock().unwrap(), vec![vec![10, 11, 12]; 2]);
+
+        let original_scratch = runtime
+            .erased
+            .as_mut()
+            .as_any_mut()
+            .downcast_mut::<TypedProgramRuntime<NonComparableState, Key, u64>>()
+            .unwrap()
+            .scratch
+            .as_ref()
+            .expect("successful step warmed the typed runtime scratch")
+            .states
+            .capacity();
+        assert!(original_scratch >= 3);
+        let mut warm_clone = runtime.clone();
+        let cloned_scratch = warm_clone
+            .erased
+            .as_mut()
+            .as_any_mut()
+            .downcast_mut::<TypedProgramRuntime<NonComparableState, Key, u64>>()
+            .unwrap()
+            .scratch
+            .as_ref();
+        assert!(cloned_scratch.is_none());
     }
 
     #[test]
