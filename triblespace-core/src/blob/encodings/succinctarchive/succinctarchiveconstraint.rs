@@ -72,6 +72,12 @@ where
         constraint.ring_batch = Some(ring_batch);
         constraint
     }
+
+    /// Returns the exact ordered entity, attribute, and value terms stored by
+    /// this constraint.
+    pub(crate) fn raw_terms(&self) -> [RawTerm; 3] {
+        [self.term_e, self.term_a, self.term_v]
+    }
 }
 
 pub(super) fn base_range<U>(

@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   left-biased preferred family, while structurally declined actions select the
   canonical explicit fallback. This keeps genuinely heterogeneous accelerator
   work available without routing every Succinct action through typed paging.
+- **Specialized `UnionArchiveConstraint`s can now retain per-shard execution
+  attachments.** `from_shards` accepts already-constructed Succinct archive
+  constraints, validates their exact ordered entity/attribute/value terms, and
+  preserves normalized union ordering, duplicate, tag, and Program semantics.
 - **Flattened residual AND planning can price directed backend work instead of
   raw proposal width alone.** Lawful leaves may publish immutable logarithmic
   proposal and confirmation unit classes while their existing estimates quote

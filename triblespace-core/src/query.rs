@@ -254,7 +254,7 @@ impl<T: InlineEncoding> Term<T> {
 /// [`is_var`](RawTerm::is_var) / [`bound`](RawTerm::bound) in place of the
 /// raw `VariableId` comparison and `Binding::get` lookup — a constant term
 /// then flows through the existing bound-position dispatch for free.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RawTerm {
     /// A variable slot index.
     Var(VariableId),

@@ -1336,6 +1336,37 @@ impl<'a, U> UnionArchiveConstraint<'a, U>
 where
     U: Universe,
 {
+    /// Normalizes already-constructed Succinct constraints into one atomic
+    /// archive union.
+    ///
+    /// This constructor preserves each shard's execution attachments, such
+    /// as a [`crate::blob::encodings::succinctarchive::RingBatchQuery`], while
+    /// retaining this type's specialized set-union proposal, confirmation,
+    /// ordering, duplicate, tag, and typed-Program semantics. `first` makes an
+    /// empty physical union unrepresentable.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any shard does not store exactly the same ordered entity,
+    /// attribute, and value terms as `first`. Merely naming the same variables
+    /// is insufficient: swapping their trible positions changes the relation.
+    pub fn from_shards(
+        first: SuccinctArchiveConstraint<'a, U>,
+        rest: impl IntoIterator<Item = SuccinctArchiveConstraint<'a, U>>,
+    ) -> Self {
+        let terms = first.raw_terms();
+        let mut constraints = vec![first];
+        for constraint in rest {
+            assert_eq!(
+                constraint.raw_terms(),
+                terms,
+                "UnionArchive shards must use identical ordered entity, attribute, and value terms"
+            );
+            constraints.push(constraint);
+        }
+        Self::new(constraints, terms[0], terms[1], terms[2])
+    }
+
     fn new(
         constraints: Vec<SuccinctArchiveConstraint<'a, U>>,
         term_e: RawTerm,
@@ -2007,6 +2038,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blob::encodings::succinctarchive::{RingBatchQuery, SuccinctRotation};
     use crate::blob::IntoBlob;
     use crate::examples::literature;
     use crate::id::fucid;
@@ -2023,6 +2055,7 @@ mod tests {
     use crate::trible::Trible;
     use ed25519_dalek::SigningKey;
     use std::convert::Infallible;
+    use std::sync::Mutex;
 
     fn commit(byte: u8) -> CommitHandle {
         Inline::new([byte; 32])
@@ -2053,6 +2086,29 @@ mod tests {
         (&facts).into()
     }
 
+    struct RecordingRingBatch<'a> {
+        archive: &'a SuccinctArchive<OrderedUniverse>,
+        calls: Mutex<Vec<(SuccinctRotation, usize)>>,
+    }
+
+    impl RingBatchQuery for RecordingRingBatch<'_> {
+        fn rank_batch(
+            &self,
+            rotation: SuccinctRotation,
+            positions: &[usize],
+            values: &[usize],
+        ) -> Vec<usize> {
+            assert_eq!(positions.len(), values.len());
+            self.calls.lock().unwrap().push((rotation, positions.len()));
+            let column = self.archive.ring_col(rotation);
+            positions
+                .iter()
+                .zip(values)
+                .map(|(&position, &value)| column.rank(position, value).unwrap())
+                .collect()
+        }
+    }
+
     #[test]
     fn union_archive_reports_its_physical_segment_count() {
         let entity = Id::new([0x30; 16]).unwrap();
@@ -2063,6 +2119,111 @@ mod tests {
         ];
 
         assert_eq!(UnionArchive::new(&archives).segment_count(), 2);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "UnionArchive shards must use identical ordered entity, attribute, and value terms"
+    )]
+    fn union_archive_factory_rejects_same_variables_in_swapped_positions() {
+        let entity = Id::new([0x38; 16]).unwrap();
+        let attribute = Id::new([0x48; 16]).unwrap();
+        let archive = fixed_archive(&entity, &attribute, [1]);
+        let e = Variable::<GenId>::new(0);
+        let a = Variable::<GenId>::new(1);
+        let v = Variable::<UnknownInline>::new(2);
+        let first = SuccinctArchiveConstraint::new(e, a, v, &archive);
+        let swapped = SuccinctArchiveConstraint::new(a, e, v, &archive);
+
+        let _ = UnionArchiveConstraint::from_shards(first, [swapped]);
+    }
+
+    #[test]
+    fn union_archive_factory_preserves_distinct_ring_attachments_and_candidate_bags() {
+        let entity_id = Id::new([0x39; 16]).unwrap();
+        let attribute_id = Id::new([0x49; 16]).unwrap();
+        let first_archive = fixed_archive(&entity_id, &attribute_id, [1]);
+        let second_archive = fixed_archive(&entity_id, &attribute_id, [2]);
+        let first_backend = RecordingRingBatch {
+            archive: &first_archive,
+            calls: Mutex::new(Vec::new()),
+        };
+        let second_backend = RecordingRingBatch {
+            archive: &second_archive,
+            calls: Mutex::new(Vec::new()),
+        };
+        let entity: Inline<GenId> = entity_id.to_inline();
+        let attribute: Inline<GenId> = attribute_id.to_inline();
+        let value = Variable::<UnknownInline>::new(0);
+        let first = SuccinctArchiveConstraint::with_ring_batch(
+            entity,
+            attribute,
+            value,
+            &first_archive,
+            &first_backend,
+        );
+        let second = SuccinctArchiveConstraint::with_ring_batch(
+            entity,
+            attribute,
+            value,
+            &second_archive,
+            &second_backend,
+        );
+        let union = UnionArchiveConstraint::from_shards(first, [second]);
+
+        let mut values: Vec<_> = (0..4_095)
+            .map(|index| raw_value([1, 3, 2][index % 3]))
+            .collect();
+        let expected_values: Vec<_> = values
+            .iter()
+            .copied()
+            .filter(|candidate| *candidate != raw_value(3))
+            .collect();
+        union.confirm(
+            value.index,
+            &RowsView::EMPTY,
+            &mut CandidateSink::Values(&mut values),
+        );
+        assert_eq!(values, expected_values);
+        assert_eq!(
+            first_backend.calls.lock().unwrap().as_slice(),
+            &[(SuccinctRotation::Aev, 2_730)]
+        );
+        assert_eq!(
+            second_backend.calls.lock().unwrap().as_slice(),
+            &[(SuccinctRotation::Aev, 2_730)]
+        );
+
+        first_backend.calls.lock().unwrap().clear();
+        second_backend.calls.lock().unwrap().clear();
+        let view = RowsView::new_with_row_count(&[], &[], 2);
+        let mut tagged: Vec<(u32, RawInline)> = (0..4_096)
+            .map(|index| {
+                (
+                    if index < 2_048 { 0 } else { 1 },
+                    raw_value([1, 3, 2, 3][index % 4]),
+                )
+            })
+            .collect();
+        let expected_tagged: Vec<_> = tagged
+            .iter()
+            .copied()
+            .filter(|(_, candidate)| *candidate != raw_value(3))
+            .collect();
+        union.confirm(
+            value.index,
+            &view,
+            &mut CandidateSink::Tagged(&mut tagged),
+        );
+        assert_eq!(tagged, expected_tagged);
+        assert_eq!(
+            first_backend.calls.lock().unwrap().as_slice(),
+            &[(SuccinctRotation::Aev, 2_048)]
+        );
+        assert_eq!(
+            second_backend.calls.lock().unwrap().as_slice(),
+            &[(SuccinctRotation::Aev, 2_048)]
+        );
     }
 
     #[test]
