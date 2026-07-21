@@ -704,8 +704,9 @@ pub trait TypedProgramSpec {
     /// A family that returns quotes must return exactly one quote per parent.
     /// The quote carries no continuation identity and is deliberately not
     /// passed to [`Self::complete_typed`]. Evidence must be deterministic for
-    /// identical batches over the immutable family; the erased adapter may
-    /// re-quote immediately before completion to validate the raw count.
+    /// identical batches over the immutable family. The scheduler preserves
+    /// the exact parent-local evidence slice that selected a restricted
+    /// completion, and the erased adapter validates the resulting raw count.
     fn quote_complete_typed(
         &self,
         _batch: ProgramCompleteBatch<'_>,
@@ -910,9 +911,10 @@ impl<'a> ProgramRef<'a> {
         self.erased.complete_batch(batch, None, effects);
     }
 
-    /// Completes after the adapter proves that its exact restricted re-quote
-    /// matches the broader scheduler evidence that selected this suffix. The
-    /// evidence never enters [`TypedProgramSpec::complete_typed`].
+    /// Completes with the exact parent-local evidence slice that selected this
+    /// restricted suffix. The adapter validates the completed raw occurrence
+    /// bag against that evidence, but never turns it into family execution
+    /// state or passes it to [`TypedProgramSpec::complete_typed`].
     pub(crate) fn complete_batch_restricted(
         self,
         batch: ProgramCompleteBatch<'_>,
@@ -1735,13 +1737,13 @@ where
             "typed complete action proposal variable was already bound"
         );
 
-        let evidence = self.quote_complete_typed(batch);
-        if let Some(expected) = expected {
-            assert_eq!(
-                evidence, expected,
-                "complete-action quote changed when restricted to its selected suffix"
-            );
-        }
+        // A restricted completion carries the exact evidence slice already
+        // used by the scheduler. Re-quoting the same immutable rows here would
+        // repeat family rank/select work without strengthening c=1 admission:
+        // the adapter below independently validates every parent's emitted raw
+        // occurrence count. Unrestricted callers still quote themselves so a
+        // Declined family cannot bypass its admission contract.
+        let evidence = expected.unwrap_or_else(|| self.quote_complete_typed(batch));
         let quoted_work = match evidence {
             ProgramCompleteWorkEvidence::Unquoted => None,
             ProgramCompleteWorkEvidence::Declined => {
@@ -2839,7 +2841,7 @@ mod tests {
     }
 
     #[test]
-    fn restricted_quote_misattribution_fails_before_complete_query_work() {
+    fn restricted_completion_reuses_selected_evidence_without_requote() {
         let quote_calls = Arc::new(AtomicUsize::new(0));
         let complete_calls = Arc::new(AtomicUsize::new(0));
         let probe = RestrictionQuoteProbe {
@@ -2864,26 +2866,20 @@ mod tests {
         };
         let expected = ProgramCompleteWorkEvidence::Quoted(first[1..].to_vec());
         let mut effects = ProgramCompleteEffects::default();
-        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            program.complete_batch_restricted(
-                ProgramCompleteBatch {
-                    request,
-                    route,
-                    view: RowsView::new(&vars, &full_rows[1..]),
-                },
-                expected,
-                &mut effects,
-            );
-        }));
-
-        assert!(
-            panic_text(rejected.expect_err("restricted quote mismatch must fail closed"))
-                .contains("changed when restricted")
+        program.complete_batch_restricted(
+            ProgramCompleteBatch {
+                request,
+                route,
+                view: RowsView::new(&vars, &full_rows[1..]),
+            },
+            expected,
+            &mut effects,
         );
-        assert_eq!(quote_calls.load(Ordering::SeqCst), 2);
-        assert_eq!(complete_calls.load(Ordering::SeqCst), 0);
-        assert!(effects.occurrences.is_empty());
-        assert_eq!(effects.raw_occurrence_count, 0);
+
+        assert_eq!(quote_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(complete_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(effects.occurrences, [(0, raw(0)), (1, raw(1))]);
+        assert_eq!(effects.raw_occurrence_count, 2);
     }
 
     #[test]
