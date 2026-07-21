@@ -1697,11 +1697,26 @@ where
         );
         let shard_count = locators.len();
         let mut retained_walks = Vec::new();
+        let mut walk_states = vec![
+            0u8;
+            batch
+                .view
+                .len()
+                .checked_mul(shard_count)
+                .expect("diagnostic Union completion walk-state size overflow")
+        ];
+        let mut located_walks = 0usize;
+        let mut boundary_parent = None;
+        let mut boundary_overreads = 0usize;
         for parent in (0..batch.view.len()).rev() {
             let retained_start = retained_walks.len();
             let row = batch.view.row(parent);
             let mut raw_occurrences = Some(0usize);
-            for locator in &locators {
+            for (shard, locator) in locators.iter().enumerate() {
+                let state = &mut walk_states[parent * shard_count + shard];
+                assert_eq!(*state, 0, "a parent-shard walk was relocated");
+                *state = 1;
+                located_walks += 1;
                 #[cfg(test)]
                 record_union_complete_walk_located();
                 let walk = locator.locate(row);
@@ -1724,21 +1739,41 @@ where
                 false
             };
             if !admitted {
+                boundary_parent = Some(parent);
+                boundary_overreads = retained_walks.len() - retained_start;
                 retained_walks.truncate(retained_start);
                 break;
             }
         }
 
         let Some(selection) = arbiter.seal_tail_admission() else {
+            eprintln!(
+                "WALK_INVARIANT status=declined batch_parents={} shards={} locates={} consumes=0 boundary_parent={:?} boundary_overreads={}",
+                batch.view.len(),
+                shard_count,
+                located_walks,
+                boundary_parent,
+                boundary_overreads,
+            );
             return;
         };
         let retained_parent_count = batch.view.len() - selection.first_parent();
         debug_assert_eq!(retained_walks.len(), retained_parent_count * shard_count);
         let effects = arbiter.effects_mut();
-        for (parent, walks) in retained_walks.chunks_exact(shard_count).rev().enumerate() {
-            let parent =
-                u32::try_from(parent).expect("too many UnionArchive complete-action parents");
-            for walk in walks {
+        let mut consumed_walks = 0usize;
+        for (selected_parent, walks) in retained_walks
+            .chunks_exact(shard_count)
+            .rev()
+            .enumerate()
+        {
+            let original_parent = selection.first_parent() + selected_parent;
+            let parent = u32::try_from(selected_parent)
+                .expect("too many UnionArchive complete-action parents");
+            for (shard, walk) in walks.iter().enumerate() {
+                let state = &mut walk_states[original_parent * shard_count + shard];
+                assert_eq!(*state, 1, "an admitted parent-shard walk was not retained once");
+                *state = 2;
+                consumed_walks += 1;
                 #[cfg(test)]
                 record_union_complete_walk_consumed();
                 let mut emitted = 0usize;
@@ -1756,6 +1791,61 @@ where
                 );
             }
         }
+        let admitted_parent_shards = retained_parent_count * shard_count;
+        assert_eq!(
+            consumed_walks, admitted_parent_shards,
+            "an admitted parent-shard walk was not consumed exactly once"
+        );
+        assert_eq!(
+            located_walks,
+            admitted_parent_shards + boundary_overreads,
+            "a located walk was neither admitted nor the single boundary overread"
+        );
+        assert!(
+            boundary_overreads <= shard_count,
+            "more than one rejected boundary parent was located"
+        );
+        if let Some(parent) = boundary_parent {
+            assert_eq!(
+                boundary_overreads, shard_count,
+                "the rejected boundary did not locate exactly one walk per shard"
+            );
+            assert_eq!(
+                Some(parent),
+                selection.first_parent().checked_sub(1),
+                "the located boundary was not immediately before the admitted suffix"
+            );
+        } else {
+            assert_eq!(boundary_overreads, 0);
+            assert_eq!(selection.first_parent(), 0);
+        }
+        for parent in 0..batch.view.len() {
+            for shard in 0..shard_count {
+                let expected = if parent >= selection.first_parent() {
+                    2
+                } else if Some(parent) == boundary_parent {
+                    1
+                } else {
+                    0
+                };
+                assert_eq!(
+                    walk_states[parent * shard_count + shard],
+                    expected,
+                    "a parent-shard walk violated the unique locate/consume state machine"
+                );
+            }
+        }
+        eprintln!(
+            "WALK_INVARIANT status=admitted batch_parents={} first_parent={} admitted_parents={} shards={} locates={} consumes={} boundary_parent={:?} boundary_overreads={} unique_locates=true unique_consumes=true",
+            batch.view.len(),
+            selection.first_parent(),
+            retained_parent_count,
+            shard_count,
+            located_walks,
+            consumed_walks,
+            boundary_parent,
+            boundary_overreads,
+        );
     }
 
     fn progress(&self, state: &Self::State) -> Self::Rank {
