@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Typed Program activation retirement scans its arena at most once per
+  cohort.** A fully drained arena retires immediately; singleton receipts keep
+  their allocation-free scalar scan, while wider live arenas build activation
+  membership once. Every checked path validates owners before deleting novelty
+  in original receipt order, removing the activation-count multiplier without
+  taxing insert/take.
 - **Canonical Succinct archive paging is now an explicit lowering choice.**
   Controlled single-shard runs showed that selecting the pageable Propose and
   Confirm Programs under ordinary hybrid lowering opened one activation per
