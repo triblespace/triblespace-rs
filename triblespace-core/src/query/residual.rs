@@ -110,6 +110,24 @@ use delta::{
 /// an adaptive tuning knob.
 const COMPLETE_QUOTE_APPETITE_FACTOR: usize = 1;
 
+/// Ephemeral evidence retained between broad-cohort admission and the exact
+/// restricted completion call. This is physical scheduler state only; it is
+/// never interned, persisted, or passed into family execution.
+#[derive(Debug)]
+enum CompleteTerminalAdmission {
+    Unquoted,
+    Quoted(Vec<ProgramCompleteWorkQuote>),
+}
+
+impl CompleteTerminalAdmission {
+    fn parent_count(&self, unquoted_parent_count: usize) -> usize {
+        match self {
+            Self::Unquoted => unquoted_parent_count,
+            Self::Quoted(quotes) => quotes.len(),
+        }
+    }
+}
+
 /// One deterministic route from the owned root to an opaque residual leaf.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ConstraintPath(Box<[usize]>);
@@ -10285,13 +10303,13 @@ impl ResidualStateMachine {
     /// suffix contiguous lets the caller refile the untouched prefix without
     /// changing affine parent order. A singleton suffix is not worth splitting
     /// from the pageable cohort.
-    fn complete_terminal_quote_tail_width(
+    fn complete_terminal_quote_admission(
         &self,
         program: ProgramRef<'_>,
         request: ProgramRequest,
         route: ProgramRoute,
         rows: &RowBatch,
-    ) -> Option<usize> {
+    ) -> Option<CompleteTerminalAdmission> {
         debug_assert!(rows.row_count > 1);
         let vars: Vec<VariableId> = request.bound.into_iter().collect();
         let view = rows_view(&vars, &rows.rows, rows.row_count);
@@ -10300,9 +10318,9 @@ impl ResidualStateMachine {
             route,
             view,
         }) {
-            ProgramCompleteWorkEvidence::Unquoted => Some(rows.row_count),
+            ProgramCompleteWorkEvidence::Unquoted => Some(CompleteTerminalAdmission::Unquoted),
             ProgramCompleteWorkEvidence::Declined => None,
-            ProgramCompleteWorkEvidence::Quoted(quotes) => {
+            ProgramCompleteWorkEvidence::Quoted(mut quotes) => {
                 let capacity = self
                     .width
                     .max(1)
@@ -10329,7 +10347,10 @@ impl ResidualStateMachine {
                     raw_occurrences = next_raw_occurrences;
                     suffix += 1;
                 }
-                (suffix > 1).then_some(suffix)
+                (suffix > 1).then(|| {
+                    let first = quotes.len() - suffix;
+                    CompleteTerminalAdmission::Quoted(quotes.split_off(first))
+                })
             }
         }
     }
@@ -10356,6 +10377,7 @@ impl ResidualStateMachine {
         program: ProgramRef<'_>,
         request: ProgramRequest,
         route: ProgramRoute,
+        admission: CompleteTerminalAdmission,
         family: StateId,
         rows: RowBatch,
     ) -> DeltaSeedOutcome {
@@ -10366,15 +10388,22 @@ impl ResidualStateMachine {
 
         let vars: Vec<VariableId> = bound.into_iter().collect();
         let view = rows_view(&vars, &rows.rows, rows.row_count);
+        let batch = ProgramCompleteBatch {
+            request,
+            route,
+            view,
+        };
         let mut effects = ProgramCompleteEffects::default();
-        program.complete_batch(
-            ProgramCompleteBatch {
-                request,
-                route,
-                view,
-            },
-            &mut effects,
-        );
+        // Admission evidence is intentionally absent from the family call.
+        // After this boundary the complete action owns an unsuspendable drain.
+        match admission {
+            CompleteTerminalAdmission::Unquoted => program.complete_batch(batch, &mut effects),
+            CompleteTerminalAdmission::Quoted(quotes) => program.complete_batch_restricted(
+                batch,
+                ProgramCompleteWorkEvidence::Quoted(quotes),
+                &mut effects,
+            ),
+        }
         let raw_occurrence_count = effects.raw_occurrence_count;
         let candidates = CandidatePayload::from_tagged(effects.occurrences, rows.row_count);
         candidates.debug_assert_valid_for(rows.row_count);
@@ -10562,10 +10591,10 @@ impl ResidualStateMachine {
         let StateBucket::Rows(mut rows) = bucket else {
             unreachable!("terminal admission preserved proposal rows")
         };
-        let complete_parent_count = complete_terminal_candidate
+        let complete_admission = complete_terminal_candidate
             .then(|| {
                 let (spec, route) = program.expect("complete candidate lost its Program route");
-                self.complete_terminal_quote_tail_width(
+                self.complete_terminal_quote_admission(
                     spec,
                     program_request,
                     route,
@@ -10573,6 +10602,9 @@ impl ResidualStateMachine {
                 )
             })
             .flatten();
+        let complete_parent_count = complete_admission
+            .as_ref()
+            .map(|admission| admission.parent_count(rows.row_count));
         if let Some(complete_parent_count) = complete_parent_count {
             debug_assert!(complete_parent_count > 1);
             debug_assert!(complete_parent_count <= rows.row_count);
@@ -10618,11 +10650,12 @@ impl ResidualStateMachine {
         self.stats.propose_rows += rows.row_count;
         self.stats.max_propose_rows = self.stats.max_propose_rows.max(rows.row_count);
         if let Some((spec, route)) = program {
-            if complete_parent_count.is_some() {
+            if let Some(admission) = complete_admission {
                 return Ok(self.complete_terminal_program_proposal(
                     spec,
                     program_request,
                     route,
+                    admission,
                     state,
                     rows,
                 ));
@@ -15153,6 +15186,7 @@ mod tests {
             program,
             request,
             route,
+            CompleteTerminalAdmission::Unquoted,
             family,
             RowBatch {
                 rows: (12..15).map(raw).collect(),
@@ -15294,6 +15328,7 @@ mod tests {
             ProgramRef::new(&empty_program),
             empty_request,
             empty_route,
+            CompleteTerminalAdmission::Unquoted,
             StateId(u32::MAX),
             RowBatch {
                 rows: vec![raw(1), raw(2), raw(3)],
@@ -15341,6 +15376,7 @@ mod tests {
                 ProgramRef::new(&panic_program),
                 panic_request,
                 panic_route,
+                CompleteTerminalAdmission::Unquoted,
                 StateId(u32::MAX),
                 RowBatch {
                     rows: vec![raw(1), raw(2), raw(3)],
@@ -15378,6 +15414,7 @@ mod tests {
                     ProgramRef::new(&malformed),
                     request,
                     route,
+                    CompleteTerminalAdmission::Unquoted,
                     StateId(u32::MAX),
                     RowBatch {
                         rows: vec![raw(1), raw(2), raw(3)],

@@ -1661,6 +1661,9 @@ where
                             .checked_add(locator.exact_len(row))
                             .expect("UnionArchive complete-action quote overflow")
                     });
+                    // An unfiltered one-target Succinct walk emits every
+                    // examined Ring value, so Union's work and raw bag counts
+                    // are exactly equal (including cross-shard duplicates).
                     ProgramCompleteWorkQuote {
                         drain_work_units: raw_occurrences,
                         raw_occurrences,
