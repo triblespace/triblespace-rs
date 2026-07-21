@@ -5603,6 +5603,22 @@ impl DeltaScheduler {
         Some(ActiveDeltaContinuation { state, activation })
     }
 
+    /// Removes the empty sentinel left by an exhausted directed Program pop.
+    ///
+    /// `step_program` synchronously files every nested and replacement task
+    /// before returning, so an empty bucket here proves that the directed
+    /// state genuinely drained. Global Program selection does not use this
+    /// path: it retains the ordinary remove/reinsert scheduler boundary.
+    fn clear_drained_active_program_state(&mut self, state: DeltaStateId) {
+        let drained = self
+            .program_worklist
+            .get(&state)
+            .is_some_and(ProgramBucket::is_empty);
+        if drained {
+            self.program_worklist.remove(&state);
+        }
+    }
+
     fn has_active_source(&self, active: ActiveDeltaContinuation) -> bool {
         self.source_worklist
             .get(&active.state)
@@ -5747,17 +5763,14 @@ impl DeltaScheduler {
         active: ActiveDeltaContinuation,
         search_width: usize,
     ) -> (DeltaStateId, Vec<ProgramTask>, PhysicalDispatch) {
-        let (selection, empty, remainder_tasks) = {
+        let (selection, remainder_tasks) = {
             let bucket = self
                 .program_worklist
                 .get_mut(&active.state)
                 .expect("active typed program state remains live");
             let selection = bucket.take_active(&self.registry, active.activation, search_width);
-            (selection, bucket.is_empty(), bucket.len())
+            (selection, bucket.len())
         };
-        if empty {
-            self.program_worklist.remove(&active.state);
-        }
         let ProgramSelection { key, tasks, limits } = selection;
         let kind = match key.class.pacing() {
             ProgramPacing::Search => PhysicalDispatchKind::Source,
@@ -6004,6 +6017,7 @@ impl DeltaScheduler {
                 stable_interner,
                 stats,
             );
+            self.clear_drained_active_program_state(state);
             let retired_search_receipt = physical.retired_search_receipt;
             let mut outcome = physical.outcome;
             let physical_allows_global_width_growth = self.account_physical_dispatch(
@@ -9780,6 +9794,118 @@ mod tests {
         assert_eq!(
             scheduler.program_worklist[&state].tasks[0].activation,
             second
+        );
+    }
+
+    #[test]
+    fn exhausted_active_program_bucket_reuses_its_parked_storage_for_replacement() {
+        let mut scheduler = DeltaScheduler::new();
+        let state = test_program_state(&mut scheduler);
+        let activation = scheduler.registry.open_program_activation(
+            DeltaReducer::StreamProposal,
+            stable_return(Vec::new()),
+            None,
+            None,
+        );
+        let mut tasks = install_program_tasks(
+            &mut scheduler.registry,
+            activation,
+            [0, 1],
+            DispatchClass::new(0),
+            ProgramPacing::Activation,
+        )
+        .into_iter();
+        let popped = tasks.next().unwrap();
+        let replacement = tasks.next().unwrap();
+        let replacement_nonce = replacement.credit.key.nonce;
+        let active = scheduler.file_program_state(state, vec![popped]).unwrap();
+
+        let (popped_state, selected, _) = scheduler.pop_active_program(active, 1);
+        assert_eq!(popped_state, state);
+        assert_eq!(selected.len(), 1);
+        assert!(scheduler.program_worklist[&state].is_empty());
+
+        // This is the same filing performed at the end of `step_program`.
+        let _ = scheduler.file_program_state(state, vec![replacement]);
+        scheduler.clear_drained_active_program_state(state);
+
+        assert_eq!(scheduler.program_worklist[&state].len(), 1);
+        assert_eq!(
+            scheduler.program_worklist[&state].tasks[0]
+                .credit
+                .key
+                .nonce,
+            replacement_nonce
+        );
+    }
+
+    #[test]
+    fn drained_active_program_step_removes_its_parked_bucket() {
+        let mut scheduler = DeltaScheduler::new();
+        let state = test_program_state(&mut scheduler);
+        let activation = scheduler.registry.open_program_activation(
+            DeltaReducer::StreamProposal,
+            stable_return(Vec::new()),
+            None,
+            None,
+        );
+        let tasks = install_program_tasks(
+            &mut scheduler.registry,
+            activation,
+            [0],
+            DispatchClass::new(0),
+            ProgramPacing::Activation,
+        );
+        let active = scheduler.file_program_state(state, tasks).unwrap();
+
+        let _ = scheduler.pop_active_program(active, 1);
+        assert!(scheduler.program_worklist[&state].is_empty());
+        scheduler.clear_drained_active_program_state(state);
+
+        assert!(!scheduler.program_worklist.contains_key(&state));
+    }
+
+    #[test]
+    fn parked_active_program_bucket_keeps_nested_filings_before_replacements() {
+        let mut scheduler = DeltaScheduler::new();
+        let state = test_program_state(&mut scheduler);
+        let activation = scheduler.registry.open_program_activation(
+            DeltaReducer::StreamProposal,
+            stable_return(Vec::new()),
+            None,
+            None,
+        );
+        let mut tasks = install_program_tasks(
+            &mut scheduler.registry,
+            activation,
+            [0, 1, 2],
+            DispatchClass::new(0),
+            ProgramPacing::Activation,
+        )
+        .into_iter();
+        let popped = tasks.next().unwrap();
+        let nested = tasks.next().unwrap();
+        let replacement = tasks.next().unwrap();
+        let nested_nonce = nested.credit.key.nonce;
+        let replacement_nonce = replacement.credit.key.nonce;
+        let active = scheduler.file_program_state(state, vec![popped]).unwrap();
+
+        let _ = scheduler.pop_active_program(active, 1);
+        assert!(scheduler.program_worklist[&state].is_empty());
+
+        // A reducer may synchronously file nested work before the popped
+        // receipt's own replacement reaches the common Program filing seam.
+        let _ = scheduler.file_program_state(state, vec![nested]);
+        let _ = scheduler.file_program_state(state, vec![replacement]);
+        scheduler.clear_drained_active_program_state(state);
+
+        assert_eq!(
+            scheduler.program_worklist[&state]
+                .tasks
+                .iter()
+                .map(|task| task.credit.key.nonce)
+                .collect::<Vec<_>>(),
+            [nested_nonce, replacement_nonce]
         );
     }
 
