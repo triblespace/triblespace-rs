@@ -7866,6 +7866,7 @@ mod tests {
         DuplicateChronology,
         DuplicateDeadTail,
         TransitionThenSourceDead,
+        PhysicalBoundary,
         ZeroExaminedChild,
     }
 
@@ -7904,6 +7905,7 @@ mod tests {
                 | ReceiptProbeMode::DuplicateChronology
                 | ReceiptProbeMode::DuplicateDeadTail
                 | ReceiptProbeMode::TransitionThenSourceDead
+                | ReceiptProbeMode::PhysicalBoundary
                 | ReceiptProbeMode::ZeroExaminedChild => 0,
             };
             DispatchClass::new(class)
@@ -8058,7 +8060,8 @@ mod tests {
                         ReceiptProbeMode::Linear
                         | ReceiptProbeMode::EffectBoundary
                         | ReceiptProbeMode::ImmediateBoundary
-                        | ReceiptProbeMode::AlternatingDispatch,
+                        | ReceiptProbeMode::AlternatingDispatch
+                        | ReceiptProbeMode::PhysicalBoundary,
                         remaining,
                     ) => {
                         let next = remaining - 1;
@@ -8088,6 +8091,29 @@ mod tests {
                     }
                 }
             }
+        }
+
+        fn try_step_physical(
+            &self,
+            states: &[Self::State],
+            batch: TypedProgramBatch<'_>,
+            effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+        ) -> Option<ProgramPhysicalReceipt> {
+            if self.mode != ReceiptProbeMode::PhysicalBoundary
+                || !matches!(states, [ReceiptProbeState(1)])
+            {
+                return None;
+            }
+            assert_eq!(batch.limits.len(), 1);
+            assert!(batch.limits[0] >= 1);
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            effects.fixpoint_child(0, ReceiptProbeState(0), 0, Some(value(1)));
+            effects.account_transition(1);
+            effects.page(1, None);
+            Some(ProgramPhysicalReceipt::new(
+                "receipt-probe-physical",
+                "placement-boundary",
+            ))
         }
     }
 
@@ -8449,6 +8475,110 @@ mod tests {
         assert_eq!(
             fused_feedback.stats.delta_source_negative_steps,
             unfused_feedback.stats.delta_source_negative_steps
+        );
+    }
+
+    #[test]
+    fn receipt_local_program_chain_clone_preserves_committed_prefix_bag_and_chronology() {
+        let mut original = ReceiptProbeHarness::new(ReceiptProbeMode::DuplicateChronology, 4);
+        let prefix = original.step(3);
+        let active = prefix
+            .resume
+            .expect("the grant boundary must leave the final child live");
+
+        assert_eq!(prefix.status, ActiveDeltaStatus::Yielded);
+        assert_eq!(original.stable_candidate_values(), [value(2), value(1)]);
+        assert_eq!(original.root.calls.load(Ordering::Relaxed), 3);
+        assert_eq!(original.stats.delta_program_receipt_local_fused_steps, 2);
+        assert_eq!(original.stats.delta_program_receipt_local_refiles_avoided, 2);
+        assert_eq!(original.stats.max_delta_program_receipt_local_chain, 3);
+        let tasks = &original.scheduler.program_worklist[&active.state].tasks;
+        assert_eq!(tasks.len(), 1);
+        assert!(original
+            .scheduler
+            .registry
+            .program_credit_is_unjoined_unique(&tasks[0].credit));
+
+        let mut cloned = ReceiptProbeHarness {
+            root: original.root.clone(),
+            plan: original.plan.clone(),
+            scheduler: original.scheduler.clone(),
+            stable: original.stable.clone(),
+            stable_interner: original.stable_interner.clone(),
+            stats: original.stats.clone(),
+            active: original.active,
+        };
+        let cloned_tasks = &cloned.scheduler.program_worklist[&active.state].tasks;
+        assert_eq!(cloned_tasks.len(), 1);
+        assert!(cloned
+            .scheduler
+            .registry
+            .program_credit_is_unjoined_unique(&cloned_tasks[0].credit));
+
+        let original_tail = original.step(8);
+        let cloned_tail = cloned.step(8);
+        assert_eq!(original_tail.status, ActiveDeltaStatus::Yielded);
+        assert_eq!(cloned_tail.status, ActiveDeltaStatus::Yielded);
+        assert!(original_tail.resume.is_none());
+        assert!(cloned_tail.resume.is_none());
+        assert!(original.scheduler.is_empty());
+        assert!(cloned.scheduler.is_empty());
+
+        let expected = [value(2), value(1), value(3), value(4)];
+        assert_eq!(original.stable_candidate_values(), expected);
+        assert_eq!(cloned.stable_candidate_values(), expected);
+        assert_eq!(original.stats, cloned.stats);
+        assert_eq!(original.stats.candidates_proposed, 7);
+        assert_eq!(original.stats.delta_transition_candidates_examined, 7);
+    }
+
+    #[test]
+    fn receipt_local_program_chain_stops_at_a_physical_placement_boundary() {
+        let mut probe = ReceiptProbeHarness::new(ReceiptProbeMode::PhysicalBoundary, 3);
+        let placement = probe.step(4);
+        let active = placement
+            .resume
+            .expect("the placement page's child must remain scheduled");
+
+        assert_eq!(placement.status, ActiveDeltaStatus::Yielded);
+        assert_eq!(probe.root.calls.load(Ordering::Relaxed), 3);
+        assert_eq!(probe.stats.delta_program_receipt_local_fused_steps, 2);
+        assert_eq!(probe.stats.delta_program_receipt_local_refiles_avoided, 2);
+        assert_eq!(probe.stats.max_delta_program_receipt_local_chain, 3);
+        assert_eq!(probe.stats.delta_program_physical_cohorts, 1);
+        assert_eq!(probe.stats.delta_program_physical_rows, 1);
+        assert_eq!(probe.stats.delta_program_physical_granted_work, 2);
+        assert_eq!(probe.stats.max_delta_program_physical_cohort, 1);
+        assert_eq!(probe.stats.max_delta_program_physical_granted_work, 2);
+        assert_eq!(probe.stats.delta_transition_pages, 3);
+        assert_eq!(probe.stats.delta_transition_cohorts, 3);
+        assert_eq!(probe.stats.delta_transition_candidates_examined, 3);
+        assert!(probe.scheduler.has_active_program(active));
+        let tasks = &probe.scheduler.program_worklist[&active.state].tasks;
+        assert_eq!(tasks.len(), 1);
+        assert!(probe
+            .scheduler
+            .registry
+            .program_credit_is_unjoined_unique(&tasks[0].credit));
+        assert_eq!(
+            probe.stable_candidate_values(),
+            [value(3), value(2), value(1)]
+        );
+
+        let finished = probe.step(1);
+        assert_eq!(finished.status, ActiveDeltaStatus::Quiescent);
+        assert!(finished.resume.is_none());
+        assert!(probe.scheduler.is_empty());
+        assert_eq!(probe.root.calls.load(Ordering::Relaxed), 4);
+        assert_eq!(probe.stats.delta_program_receipt_local_fused_steps, 2);
+        assert_eq!(probe.stats.delta_program_physical_cohorts, 1);
+        assert_eq!(probe.stats.delta_program_physical_granted_work, 2);
+        assert_eq!(probe.stats.delta_transition_pages, 3);
+        assert_eq!(probe.stats.delta_transition_candidates_examined, 3);
+        assert_eq!(probe.stats.candidates_proposed, 3);
+        assert_eq!(
+            probe.stable_candidate_values(),
+            [value(3), value(2), value(1)]
         );
     }
 
