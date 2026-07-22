@@ -2118,10 +2118,11 @@ where
 /// `examined` values were passed to the page callback. `last` is the last of
 /// those values, and `exhausted` says whether the bounded range ended there.
 /// When `exhausted` is false, resuming strictly after `last` continues the
-/// range without replay.
+/// range without replay. This remains crate-private because its continuation
+/// contract is an RPQ execution seam, not a stable external PATCH API.
 #[must_use = "inspect the page receipt to preserve exact continuation state"]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PATCHInfixPage<const INFIX_LEN: usize> {
+pub(crate) struct PATCHInfixPage<const INFIX_LEN: usize> {
     examined: usize,
     last: Option<[u8; INFIX_LEN]>,
     exhausted: bool,
@@ -2135,22 +2136,23 @@ impl<const INFIX_LEN: usize> PATCHInfixPage<INFIX_LEN> {
     };
 
     /// Number of distinct infixes passed to the callback.
-    pub fn examined(&self) -> usize {
+    pub(crate) fn examined(&self) -> usize {
         self.examined
     }
 
     /// Last infix passed to the callback, if the page was non-empty.
-    pub fn last(&self) -> Option<[u8; INFIX_LEN]> {
+    pub(crate) fn last(&self) -> Option<[u8; INFIX_LEN]> {
         self.last
     }
 
     /// Whether no matching infix remains after this page.
-    pub fn is_exhausted(&self) -> bool {
+    pub(crate) fn is_exhausted(&self) -> bool {
         self.exhausted
     }
 
     /// Exact strict-after cursor when another matching infix remains.
-    pub fn resume_after(&self) -> Option<[u8; INFIX_LEN]> {
+    #[cfg(test)]
+    pub(crate) fn resume_after(&self) -> Option<[u8; INFIX_LEN]> {
         (!self.exhausted).then(|| self.last.expect("a live infix page must examine a value"))
     }
 }
@@ -2517,7 +2519,7 @@ where
     /// resumable width-one page the same cursor semantics as repeated
     /// [`Self::next_infix_after`] calls without restarting at the root for
     /// every candidate.
-    pub fn infixes_page_after<const PREFIX_LEN: usize, const INFIX_LEN: usize, F>(
+    pub(crate) fn infixes_page_after<const PREFIX_LEN: usize, const INFIX_LEN: usize, F>(
         &self,
         prefix: &[u8; PREFIX_LEN],
         after: Option<&[u8; INFIX_LEN]>,
@@ -3181,6 +3183,51 @@ mod tests {
     use std::iter::FromIterator;
     use std::mem;
 
+    crate::key_segmentation!(PagingTestSegments, 12, [4, 4, 4]);
+    crate::key_schema!(PagingPermutedSchema, PagingTestSegments, 12, [1, 2, 0]);
+
+    type PagingPatch = PATCH<12, PagingPermutedSchema, ()>;
+
+    fn paging_key(prefix: [u8; 4], infix: [u8; 4], suffix: [u8; 4]) -> [u8; 12] {
+        let mut key = [0u8; 12];
+        key[..4].copy_from_slice(&suffix);
+        key[4..8].copy_from_slice(&prefix);
+        key[8..].copy_from_slice(&infix);
+        key
+    }
+
+    fn assert_width_one_paging(patch: &PagingPatch, prefix: &[u8; 4], expected: &[[u8; 4]]) {
+        let mut cursor = None;
+        let mut actual = Vec::new();
+        loop {
+            let begin = actual.len();
+            let page =
+                patch.infixes_page_after(prefix, cursor.as_ref(), &[u8::MAX; 4], 1, |infix| {
+                    actual.push(*infix)
+                });
+            assert!(page.examined() <= 1);
+            assert_eq!(page.examined(), actual.len() - begin);
+            assert_eq!(
+                page.last(),
+                actual
+                    .get(begin..)
+                    .and_then(|values| values.last())
+                    .copied()
+            );
+            assert_eq!(page.is_exhausted(), actual.len() == expected.len());
+            if page.is_exhausted() {
+                assert_eq!(page.resume_after(), None);
+                break;
+            }
+            let resume = page
+                .resume_after()
+                .expect("a live width-one page must own its emitted value");
+            assert_eq!(Some(resume), page.last());
+            cursor = Some(resume);
+        }
+        assert_eq!(actual, expected);
+    }
+
     #[test]
     fn head_tag() {
         let head = Head::<64, IdentitySchema, ()>::new::<Leaf<64, ()>>(0, NonNull::dangling());
@@ -3259,6 +3306,104 @@ mod tests {
         );
         assert_eq!(tree.next_infix_after(&[], &[0xff; 4], &[0xff; 4]), None,);
         assert_eq!(tree.first_infix_range(&[], &[0xff; 4], &[0x00; 4]), None,);
+    }
+
+    #[test]
+    fn infix_page_receipt_distinguishes_exact_limit_from_limit_plus_one() {
+        let low = [0x10; 8];
+        let middle = [0x20; 8];
+        let high = [0x30; 8];
+        let mut tree = PATCH::<8, IdentitySchema, ()>::new();
+        for key in [high, low, middle] {
+            tree.insert(&Entry::new(&key));
+        }
+
+        let mut exact = Vec::new();
+        let exact_page = tree.infixes_page_after(&[], None, &middle, 2, |infix| exact.push(*infix));
+        assert_eq!(exact, vec![low, middle]);
+        assert!(exact_page.examined() <= 2);
+        assert_eq!(exact_page.examined(), 2);
+        assert_eq!(exact_page.last(), Some(middle));
+        assert!(exact_page.is_exhausted());
+        assert_eq!(exact_page.resume_after(), None);
+
+        let mut bounded = Vec::new();
+        let bounded_page =
+            tree.infixes_page_after(&[], None, &high, 2, |infix| bounded.push(*infix));
+        assert_eq!(bounded, vec![low, middle], "lookahead must not be emitted");
+        assert!(bounded_page.examined() <= 2);
+        assert_eq!(bounded_page.examined(), 2);
+        assert_eq!(bounded_page.last(), Some(middle));
+        assert!(!bounded_page.is_exhausted());
+        assert_eq!(bounded_page.resume_after(), Some(middle));
+
+        let mut tail = Vec::new();
+        let tail_page = tree.infixes_page_after(
+            &[],
+            bounded_page.resume_after().as_ref(),
+            &high,
+            2,
+            |infix| tail.push(*infix),
+        );
+        assert_eq!(tail, vec![high]);
+        assert!(tail_page.examined() <= 2);
+        assert_eq!(tail_page.examined(), 1);
+        assert_eq!(tail_page.last(), Some(high));
+        assert!(tail_page.is_exhausted());
+        assert_eq!(tail_page.resume_after(), None);
+    }
+
+    #[test]
+    fn permuted_segment_pages_select_prefix_and_collapse_repeated_infixes() {
+        let selected = [0x10; 4];
+        let other = [0x20; 4];
+        let first = [0x11; 4];
+        let second = [0x22; 4];
+        let outside = [0x33; 4];
+        let suffix_a = [0x44; 4];
+        let suffix_b = [0x55; 4];
+        let mut patch = PagingPatch::new();
+        for key in [
+            paging_key(other, outside, suffix_a),
+            paging_key(selected, second, suffix_a),
+            paging_key(selected, first, suffix_b),
+            paging_key(selected, first, suffix_a),
+        ] {
+            patch.insert(&Entry::new(&key));
+        }
+
+        assert_eq!(patch.segmented_len(&selected), 2);
+        assert_width_one_paging(&patch, &selected, &[first, second]);
+    }
+
+    #[test]
+    fn permuted_segment_pages_cover_archive_local_leaves() {
+        #[repr(C, align(16))]
+        struct AlignedKey([u8; 12]);
+
+        let selected = [0x10; 4];
+        let other = [0x20; 4];
+        let first = [0x11; 4];
+        let second = [0x22; 4];
+        let outside = [0x33; 4];
+        let suffix_a = [0x44; 4];
+        let suffix_b = [0x55; 4];
+        let storage = std::sync::Arc::new([
+            AlignedKey(paging_key(other, outside, suffix_a)),
+            AlignedKey(paging_key(selected, second, suffix_a)),
+            AlignedKey(paging_key(selected, first, suffix_b)),
+            AlignedKey(paging_key(selected, first, suffix_a)),
+        ]);
+        let owner: std::sync::Arc<dyn ArchiveOwner> = storage.clone();
+        let mut patch = PagingPatch::new();
+        for key in storage.iter() {
+            let entry = unsafe { ArchiveEntry::new(NonNull::from(&key.0), &owner) };
+            patch.insert_archive(&entry);
+        }
+
+        assert!(patch.node_stats().3 > 0, "fixture must contain a LocalLeaf");
+        assert_eq!(patch.segmented_len(&selected), 2);
+        assert_width_one_paging(&patch, &selected, &[first, second]);
     }
 
     #[test]
@@ -3519,6 +3664,131 @@ mod tests {
     // `proptest!` macro below.
 
     proptest! {
+        #[test]
+        fn paged_full_key_receipts_match_strict_ordered_slice(
+            keys in prop::collection::vec(prop::array::uniform8(any::<u8>()), 0..80),
+            after in prop::option::of(prop::array::uniform8(any::<u8>())),
+            max in prop::array::uniform8(any::<u8>()),
+            limit in 1usize..10,
+        ) {
+            let mut patch = PATCH::<8, IdentitySchema, ()>::new();
+            for key in keys {
+                patch.insert(&Entry::new(&key));
+            }
+            let mut expected = patch
+                .iter()
+                .copied()
+                .filter(|key| after.as_ref().is_none_or(|after| key > after) && key <= &max)
+                .collect::<Vec<_>>();
+            expected.sort_unstable();
+
+            let mut actual = Vec::new();
+            let mut cursor = after;
+            loop {
+                let begin = actual.len();
+                let page = patch.infixes_page_after(
+                    &[],
+                    cursor.as_ref(),
+                    &max,
+                    limit,
+                    |infix| actual.push(*infix),
+                );
+                let expected_examined = (expected.len() - begin).min(limit);
+                prop_assert!(page.examined() <= limit);
+                prop_assert_eq!(page.examined(), expected_examined);
+                prop_assert_eq!(actual.len() - begin, expected_examined);
+                prop_assert_eq!(
+                    &actual[begin..],
+                    &expected[begin..begin + expected_examined]
+                );
+                prop_assert_eq!(
+                    page.last(),
+                    actual.get(begin..).and_then(|values| values.last()).copied()
+                );
+                let expected_exhausted = actual.len() == expected.len();
+                prop_assert_eq!(page.is_exhausted(), expected_exhausted);
+                if expected_exhausted {
+                    prop_assert_eq!(page.resume_after(), None);
+                    break;
+                }
+                let resume = page
+                    .resume_after()
+                    .expect("a live page must own its last emitted value");
+                prop_assert_eq!(Some(resume), page.last());
+                cursor = Some(resume);
+            }
+            prop_assert_eq!(actual, expected);
+        }
+
+        #[test]
+        fn paged_permuted_segments_match_distinct_multi_prefix_oracle(
+            selected in prop::array::uniform4(0u8..=7),
+            alternate in prop::array::uniform4(0u8..=7),
+            entries in prop::collection::vec(
+                (
+                    any::<bool>(),
+                    prop::array::uniform4(0u8..=7),
+                    prop::array::uniform4(0u8..=7),
+                ),
+                0..80,
+            ),
+            after in prop::option::of(prop::array::uniform4(0u8..=7)),
+            max in prop::array::uniform4(0u8..=7),
+            limit in 1usize..10,
+        ) {
+            let mut patch = PagingPatch::new();
+            let mut expected = HashSet::new();
+            for (use_selected, infix, suffix) in entries {
+                let prefix = if use_selected { selected } else { alternate };
+                patch.insert(&Entry::new(&paging_key(prefix, infix, suffix)));
+                if prefix == selected
+                    && after.as_ref().is_none_or(|after| &infix > after)
+                    && infix <= max
+                {
+                    expected.insert(infix);
+                }
+            }
+            let mut expected = expected.into_iter().collect::<Vec<_>>();
+            expected.sort_unstable();
+
+            let mut actual = Vec::new();
+            let mut cursor = after;
+            loop {
+                let begin = actual.len();
+                let page = patch.infixes_page_after(
+                    &selected,
+                    cursor.as_ref(),
+                    &max,
+                    limit,
+                    |infix| actual.push(*infix),
+                );
+                let expected_examined = (expected.len() - begin).min(limit);
+                prop_assert!(page.examined() <= limit);
+                prop_assert_eq!(page.examined(), expected_examined);
+                prop_assert_eq!(actual.len() - begin, expected_examined);
+                prop_assert_eq!(
+                    &actual[begin..],
+                    &expected[begin..begin + expected_examined]
+                );
+                prop_assert_eq!(
+                    page.last(),
+                    actual.get(begin..).and_then(|values| values.last()).copied()
+                );
+                let expected_exhausted = actual.len() == expected.len();
+                prop_assert_eq!(page.is_exhausted(), expected_exhausted);
+                if expected_exhausted {
+                    prop_assert_eq!(page.resume_after(), None);
+                    break;
+                }
+                let resume = page
+                    .resume_after()
+                    .expect("a live page must own its last emitted value");
+                prop_assert_eq!(Some(resume), page.last());
+                cursor = Some(resume);
+            }
+            prop_assert_eq!(actual, expected);
+        }
+
         #[test]
         fn tree_insert(keys in prop::collection::vec(prop::collection::vec(0u8..=255, 64), 1..1024)) {
             let mut tree = PATCH::<64, IdentitySchema, ()>::new();
