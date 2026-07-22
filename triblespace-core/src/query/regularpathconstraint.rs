@@ -3175,9 +3175,8 @@ impl TypedProgramSpec for RegularPathConstraint {
         // grant. Planning is atomic across the cohort: one resumed cursor,
         // negated branch, or oversized fanout discards the borrowed plans and
         // preserves the ordinary affine pageable protocol for every input.
-        let mut plans: SmallVec<
-            [(u32, RpqNode, u32, bool, PositiveDeltaInfixes<'_>); 1],
-        > = SmallVec::new();
+        let mut plans: SmallVec<[(u32, RpqNode, u32, bool, bool, PositiveDeltaInfixes<'_>); 1]> =
+            SmallVec::new();
         let mut fanouts: SmallVec<[usize; 1]> = SmallVec::new();
         fanouts.reserve(states.len());
         let mut all_fit = true;
@@ -3224,6 +3223,8 @@ impl TypedProgramSpec for RegularPathConstraint {
                     *node,
                     program.encode(target),
                     program.accepting[target as usize],
+                    batch.stratum == ProgramStratum::Finite
+                        && program.steps[target as usize].is_empty(),
                     infixes,
                 ));
             }
@@ -3232,9 +3233,24 @@ impl TypedProgramSpec for RegularPathConstraint {
         if all_fit {
             #[cfg(test)]
             BULK_TRANSITION_COHORTS.with(|cohorts| cohorts.set(cohorts.get() + 1));
-            effects.reserve_children(fanouts.iter().sum());
-            for (input, node, pc, target_accepting, infixes) in plans {
+            effects.reserve_children(
+                plans
+                    .iter()
+                    .filter_map(|(_, _, _, _, terminal, infixes)| {
+                        (!terminal).then_some(infixes.len())
+                    })
+                    .sum(),
+            );
+            for (input, node, pc, target_accepting, terminal, infixes) in plans {
                 infixes.for_each(|value| {
+                    let accepted =
+                        target_accepting && node.source.is_none_or(|anchor| value == anchor);
+                    if terminal {
+                        if accepted {
+                            effects.accept(input, value);
+                        }
+                        return;
+                    }
                     let child = RpqNode {
                         source: node.source,
                         value,
@@ -3248,9 +3264,7 @@ impl TypedProgramSpec for RegularPathConstraint {
                         child,
                         RpqExpandCursor::Start,
                     );
-                    let accepted = (target_accepting
-                        && node.source.is_none_or(|anchor| value == anchor))
-                    .then_some(value);
+                    let accepted = accepted.then_some(value);
                     match batch.stratum {
                         ProgramStratum::Finite => effects.finite_child(input, state, accepted),
                         ProgramStratum::Fixpoint => effects.fixpoint_child(
@@ -3301,6 +3315,14 @@ impl TypedProgramSpec for RegularPathConstraint {
             let input_tag = u32::try_from(input).expect("too many typed RPQ transition inputs");
             for output in successors {
                 let child = output.node;
+                if batch.stratum == ProgramStratum::Finite
+                    && program.steps[program.decode(child.pc)].is_empty()
+                {
+                    if output.accepted {
+                        effects.accept(input_tag, child.value);
+                    }
+                    continue;
+                }
                 let state = RpqState::transition(variable, child, RpqExpandCursor::Start);
                 let accepted = output.accepted.then_some(child.value);
                 match batch.stratum {
@@ -4288,8 +4310,8 @@ mod seeded_frame_tests {
             effects.pages[0].resume,
             Some(crate::query::ProgramResume::Immediate(_))
         ));
-        assert_eq!(effects.children.len(), 1);
-        assert_eq!(effects.children[0].accepted, Some(target));
+        assert!(effects.children.is_empty());
+        assert_eq!(effects.accepted, vec![(0, target)]);
         assert_eq!(effects.transition_pages, 1);
         assert_eq!(effects.transition_examined, 1);
     }
@@ -4345,13 +4367,252 @@ mod seeded_frame_tests {
         (effects, take_bulk_transition_cohorts())
     }
 
+    fn drain_bound_finite_program(
+        path: &RegularPathConstraint,
+        source: RawInline,
+        limit: usize,
+    ) -> HashSet<RawInline> {
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(path.end),
+            bound: VariableSet::new_singleton(path.start),
+        };
+        let program = path.residual_program().unwrap();
+        let route = program.route(request).unwrap();
+        assert_eq!(route.stratum, ProgramStratum::Finite);
+        let vars = [path.start];
+        let rows = [source];
+        let view = RowsView::new(&vars, &rows);
+        let activations = [ProgramActivation(1)];
+        let mut runtime = program.new_runtime();
+        let mut seed = ProgramSeedEffects::default();
+        program.seed_batch(
+            &mut runtime,
+            ProgramSeedBatch {
+                request,
+                route,
+                view,
+                activations: &activations,
+            },
+            &mut seed,
+        );
+
+        let mut accepted = HashSet::new();
+        let mut pending = VecDeque::new();
+        for root in seed.work {
+            if let Some(value) = root.accepted {
+                accepted.insert(value);
+            }
+            pending.push_back(root.work);
+        }
+        let candidates = [None];
+        let limits = [limit];
+        let mut steps = 0usize;
+        while let Some(work) = pending.pop_front() {
+            steps += 1;
+            assert!(steps < 10_000, "finite RPQ program failed to terminate");
+            let work = [work];
+            let mut effects = ProgramBatchEffects::default();
+            program.step_batch(
+                &mut runtime,
+                ProgramBatch {
+                    stratum: route.stratum,
+                    view,
+                    candidate_sets: &candidates,
+                    activations: &activations,
+                    work: &work,
+                    limits: &limits,
+                },
+                &mut effects,
+            );
+            assert!(effects.direct.is_empty());
+            assert!(effects.supported.is_empty());
+            accepted.extend(effects.accepted.into_iter().map(|(_, value)| value));
+            for child in effects.children {
+                if let Some(value) = child.accepted {
+                    accepted.insert(value);
+                }
+                pending.push_back(child.work);
+            }
+            let page = effects.pages.pop().expect("one input must return one page");
+            assert!(effects.pages.is_empty());
+            match page.resume {
+                Some(
+                    crate::query::ProgramResume::Immediate(work)
+                    | crate::query::ProgramResume::AfterChildren(work),
+                ) => pending.push_back(work),
+                Some(crate::query::ProgramResume::AfterChildrenDone) | None => {}
+            }
+        }
+        accepted
+    }
+
+    #[test]
+    fn typed_one_hop_endpoints_are_direct_terminal_observations() {
+        let source = rngid();
+        let attribute = rngid();
+        let mut destinations: Vec<_> = (0..32).map(|_| id_into_value(&rngid().id.raw())).collect();
+        destinations.sort_unstable();
+        let mut set = TribleSet::new();
+        for destination in destinations.iter().copied() {
+            insert_edge(&mut set, &source, &attribute, destination);
+        }
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let path = RegularPathConstraint::new(set, start, end, &[PathOp::Attr(attribute.id.raw())]);
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(end.index),
+            bound: VariableSet::new_singleton(start.index),
+        };
+        let program = path.residual_program().unwrap();
+        let route = program.route(request).unwrap();
+        assert_eq!(route.stratum, ProgramStratum::Finite);
+        let vars = [start.index];
+        let rows = [id_into_value(&source.id.raw())];
+        let view = RowsView::new(&vars, &rows);
+        let activations = [ProgramActivation(1)];
+        let mut runtime = program.new_runtime();
+        let mut seed = ProgramSeedEffects::default();
+        program.seed_batch(
+            &mut runtime,
+            ProgramSeedBatch {
+                request,
+                route,
+                view,
+                activations: &activations,
+            },
+            &mut seed,
+        );
+        let work = [seed.work.pop().unwrap().work];
+        assert!(seed.work.is_empty());
+        let candidates = [None];
+        let limits = [destinations.len()];
+        let mut effects = ProgramBatchEffects::default();
+        program.step_batch(
+            &mut runtime,
+            ProgramBatch {
+                stratum: route.stratum,
+                view,
+                candidate_sets: &candidates,
+                activations: &activations,
+                work: &work,
+                limits: &limits,
+            },
+            &mut effects,
+        );
+
+        assert!(
+            effects.children.is_empty(),
+            "terminal nodes need no handles"
+        );
+        let mut actual: Vec<_> = effects
+            .accepted
+            .iter()
+            .map(|&(input, value)| {
+                assert_eq!(input, 0);
+                value
+            })
+            .collect();
+        actual.sort_unstable();
+        assert_eq!(actual, destinations);
+        assert_eq!(effects.pages.len(), 1);
+        assert_eq!(effects.pages[0].examined, destinations.len());
+        assert!(effects.pages[0].resume.is_none());
+        assert_eq!(effects.transition_pages, 1);
+        assert_eq!(effects.transition_examined, destinations.len());
+    }
+
+    #[test]
+    fn duplicate_terminal_accepts_still_project_once_end_to_end() {
+        let source = rngid();
+        let target = rngid();
+        let primary = rngid();
+        let secondary = rngid();
+        let source_value = id_into_value(&source.id.raw());
+        let target_value = id_into_value(&target.id.raw());
+        let mut graph = TribleSet::new();
+        insert_edge(&mut graph, &source, &primary, target_value);
+        insert_edge(&mut graph, &source, &secondary, target_value);
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let operations = [
+            PathOp::Attr(primary.id.raw()),
+            PathOp::Attr(secondary.id.raw()),
+            PathOp::Union,
+        ];
+
+        let support = RegularPathConstraint::new(graph.clone(), start, end, &operations);
+        let (effects, bulk_cohorts) =
+            one_support_transition_cohort(&support, &[source_value, target_value], &[2]);
+        assert_eq!(bulk_cohorts, 1);
+        assert!(effects.children.is_empty());
+        assert_eq!(
+            effects.accepted,
+            vec![(0, target_value), (0, target_value)],
+            "the two finite automaton arms reach the same terminal endpoint",
+        );
+
+        let root = IntersectionConstraint::new(vec![
+            Box::new(start.is(Inline::<GenId>::new(source_value))) as Box<dyn Constraint<'static>>,
+            Box::new(end.is(Inline::<GenId>::new(target_value))) as Box<dyn Constraint<'static>>,
+            Box::new(RegularPathConstraint::new(graph, start, end, &operations))
+                as Box<dyn Constraint<'static>>,
+        ]);
+        let mut query = Query::new(root, move |binding: &Binding| {
+            binding.get(end.index).copied()
+        })
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .cap(1)
+        .start_width(1);
+        let projected: Vec<_> = query.by_ref().collect();
+        assert_eq!(projected, vec![target_value]);
+        assert!(query.stats().confirm_action_pops > 0);
+        assert!(query.stats().delta_transition_pages > 0);
+    }
+
+    #[test]
+    fn finite_typed_product_differential_matches_expression_evaluator() {
+        let graph = GraphFixture::new();
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let cases = [
+            vec![PathOp::Attr(graph.primary)],
+            vec![PathOp::Attr(graph.primary), PathOp::Inverse],
+            vec![PathOp::NotAttr(graph.primary)],
+            vec![
+                PathOp::Attr(graph.primary),
+                PathOp::Attr(graph.secondary),
+                PathOp::Concat,
+            ],
+            vec![
+                PathOp::Attr(graph.primary),
+                PathOp::Attr(graph.secondary),
+                PathOp::Union,
+            ],
+            vec![PathOp::Attr(graph.primary), PathOp::Optional],
+        ];
+
+        for (case, operations) in cases.into_iter().enumerate() {
+            let path = RegularPathConstraint::new(graph.set.clone(), start, end, &operations);
+            for source in graph.nodes.iter().copied() {
+                assert_eq!(
+                    drain_bound_finite_program(&path, source, 2),
+                    eval_from(&path.set, &path.expr, &source),
+                    "finite typed product diverged in case {case} from source {source:?}",
+                );
+            }
+        }
+    }
+
     #[test]
     fn typed_bulk_transition_requires_every_fresh_frontier_to_fit_its_grant() {
         let attribute = rngid();
         let sources = [rngid(), rngid()];
-        let first_destinations: Vec<_> = (0..2).map(|_| id_into_value(&rngid().id.raw())).collect();
-        let second_destinations: Vec<_> =
+        let mut first_destinations: Vec<_> =
+            (0..2).map(|_| id_into_value(&rngid().id.raw())).collect();
+        let mut second_destinations: Vec<_> =
             (0..3).map(|_| id_into_value(&rngid().id.raw())).collect();
+        first_destinations.sort_unstable();
+        second_destinations.sort_unstable();
         let mut set = TribleSet::new();
         for destination in first_destinations.iter().copied() {
             insert_edge(&mut set, &sources[0], &attribute, destination);
@@ -4384,13 +4645,14 @@ mod seeded_frame_tests {
             vec![2, 2, 3],
         );
         assert!(complete.pages.iter().all(|page| page.resume.is_none()));
+        assert!(complete.children.is_empty());
         assert_eq!(
-            complete
-                .children
-                .iter()
-                .map(|child| child.input)
-                .collect::<Vec<_>>(),
-            vec![0, 0, 1, 1, 2, 2, 2],
+            complete.accepted,
+            vec![
+                (0, first_destinations[0]),
+                (1, first_destinations[0]),
+                (2, second_destinations[0]),
+            ],
         );
         assert_eq!(complete.transition_pages, 3);
         assert_eq!(complete.transition_examined, 7);
@@ -4414,13 +4676,14 @@ mod seeded_frame_tests {
             partial.pages[2].resume,
             Some(crate::query::ProgramResume::Immediate(_))
         ));
+        assert!(partial.children.is_empty());
         assert_eq!(
-            partial
-                .children
-                .iter()
-                .map(|child| child.input)
-                .collect::<Vec<_>>(),
-            vec![0, 0, 1, 1, 2, 2],
+            partial.accepted,
+            vec![
+                (0, first_destinations[0]),
+                (1, first_destinations[0]),
+                (2, second_destinations[0]),
+            ],
         );
         assert_eq!(partial.transition_pages, 3);
         assert_eq!(partial.transition_examined, 6);
@@ -4453,15 +4716,8 @@ mod seeded_frame_tests {
         assert_eq!(bulk_cohorts, 1);
         assert_eq!(inverse_effects.pages[0].examined, 2);
         assert!(inverse_effects.pages[0].resume.is_none());
-        assert_eq!(inverse_effects.children.len(), 2);
-        assert_eq!(
-            inverse_effects
-                .children
-                .iter()
-                .filter_map(|child| child.accepted)
-                .collect::<Vec<_>>(),
-            vec![source_values[0]],
-        );
+        assert!(inverse_effects.children.is_empty());
+        assert_eq!(inverse_effects.accepted, vec![(0, source_values[0])]);
 
         let excluded = rngid();
         let other = rngid();
@@ -4490,7 +4746,8 @@ mod seeded_frame_tests {
         assert_eq!(bulk_cohorts, 0);
         assert_eq!(forward_effects.pages[0].examined, 3);
         assert!(forward_effects.pages[0].resume.is_none());
-        assert_eq!(forward_effects.children.len(), 2);
+        assert!(forward_effects.children.is_empty());
+        assert_eq!(forward_effects.accepted, vec![(0, destinations[1])]);
 
         let inverse_target = rngid();
         let inverse_target_value = id_into_value(&inverse_target.id.raw());
@@ -4531,7 +4788,11 @@ mod seeded_frame_tests {
         assert_eq!(bulk_cohorts, 0);
         assert_eq!(inverse_effects.pages[0].examined, 3);
         assert!(inverse_effects.pages[0].resume.is_none());
-        assert_eq!(inverse_effects.children.len(), 2);
+        assert!(inverse_effects.children.is_empty());
+        assert_eq!(
+            inverse_effects.accepted,
+            vec![(0, id_into_value(&inverse_sources[1].id.raw()))],
+        );
     }
 
     #[test]

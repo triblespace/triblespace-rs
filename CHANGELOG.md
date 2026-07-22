@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Finite RPQ terminal transitions publish their endpoint directly.** An
+  accepting leaf no longer allocates a child state, runtime handle, or
+  producer credit; nonaccepting leaves disappear while page, examined-work,
+  and relational SET semantics remain unchanged.
 - **Selective production regions preserve guarded exactness through finite
   ORs.** Each affine parent now carries covering-only provenance and an
   explicit active-arm receipt through paging, partitioning, and online
