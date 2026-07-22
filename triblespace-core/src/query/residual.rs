@@ -20391,6 +20391,18 @@ mod tests {
             ResidualPlan::compile_lowering(&root, ResidualLowering::OPAQUE_PRODUCTION);
         let regional = ResidualPlan::compile_lowering(&root, ResidualLowering::PRODUCTION);
 
+        // The cfg-only probe retains the requested Formula scope as a
+        // diagnostic receipt even when it lowers no region. It is not part of
+        // the executable plan this adoption gate compares.
+        #[cfg(formula_delta_transport_probe)]
+        let regional = {
+            assert_eq!(opaque.probe_formula_scope, FormulaScope::OpaqueLeaves);
+            assert_eq!(regional.probe_formula_scope, FormulaScope::ProductionRegions);
+            let mut comparable = regional;
+            comparable.probe_formula_scope = opaque.probe_formula_scope;
+            comparable
+        };
+
         assert_eq!(
             opaque, regional,
             "ProductionRegions changed a plan with no production-qualified region"
@@ -21267,7 +21279,16 @@ mod tests {
         );
         assert_eq!(returned.bucket.row_count(), 1);
         assert_eq!(delta_calls.load(Ordering::Relaxed), 0);
-        assert_eq!(machine.stats, ResidualStateStats::default());
+        let expected = ResidualStateStats::default();
+        #[cfg(formula_delta_transport_probe)]
+        let expected = {
+            let mut expected = expected;
+            expected.probe_formula_delta_attempts = 1;
+            expected.probe_formula_support_attempts = 1;
+            expected.probe_formula_natural_stable_declines = 1;
+            expected
+        };
+        assert_eq!(machine.stats, expected);
     }
 
     #[test]

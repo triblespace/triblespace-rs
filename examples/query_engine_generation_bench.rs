@@ -15,7 +15,7 @@
 //!   --cfg engine_counter_only --cfg engine_counter_production" \
 //!   cargo run --release --example query_engine_generation_bench
 //! RUSTFLAGS="--cfg engine_current_residual --cfg engine_prefix_checkpoints \
-//!   --cfg formula_delta_transport_probe" \
+//!   --cfg formula_delta_transport_probe --cfg formula_prepared_continuation_probe" \
 //!   cargo run --release --example query_engine_generation_bench
 //! ```
 //!
@@ -39,7 +39,19 @@ compile_error!("engine_counter_only requires engine_current_residual");
 compile_error!("formula_delta_transport_probe requires current residual prefix mode");
 
 #[cfg(all(formula_delta_transport_probe, engine_counter_only))]
-compile_error!("formula_delta_transport_probe is its own untimed three-mode harness");
+compile_error!("formula_delta_transport_probe is its own three-mode harness");
+
+#[cfg(all(
+    formula_delta_transport_probe,
+    not(formula_prepared_continuation_probe)
+))]
+compile_error!("the Formula continuation panel requires formula_prepared_continuation_probe");
+
+#[cfg(all(
+    formula_prepared_continuation_probe,
+    not(formula_delta_transport_probe)
+))]
+compile_error!("formula_prepared_continuation_probe requires the Formula continuation panel");
 
 #[cfg(all(engine_counter_opaque_production, engine_counter_production))]
 compile_error!("select exactly one counter lowering");
@@ -199,7 +211,8 @@ mod allocation_probe {
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 #[cfg(formula_delta_transport_probe)]
 use triblespace::core::query::residual::{
-    formula_delta_transport_probe_select, FormulaDeltaTransportProbeSelector, FormulaScope,
+    formula_delta_transport_probe_select, formula_prepared_continuation_probe_select,
+    FormulaDeltaTransportProbeSelector, FormulaPreparedContinuationProbeSelector, FormulaScope,
     ProgramScope, ResidualLowering, ResidualStateStats,
 };
 use triblespace::core::query::TriblePattern;
@@ -250,44 +263,46 @@ type Pair = (Inline<GenId>, Inline<GenId>);
 #[cfg(formula_delta_transport_probe)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FormulaTransportProbeMode {
-    ProductionStableFormula,
-    ProductionStableProposeConfirm,
-    ProductionStablePropose,
+    StableFiled,
+    GFiled,
+    GOwned,
 }
 
 #[cfg(formula_delta_transport_probe)]
 impl FormulaTransportProbeMode {
-    const ALL: [Self; 3] = [
-        Self::ProductionStableFormula,
-        Self::ProductionStableProposeConfirm,
-        Self::ProductionStablePropose,
-    ];
+    const ALL: [Self; 3] = [Self::StableFiled, Self::GFiled, Self::GOwned];
 
     fn label(self) -> &'static str {
         match self {
-            Self::ProductionStableFormula => "D_PRODUCTION_STABLE_FORMULA",
-            Self::ProductionStableProposeConfirm => "G_PRODUCTION_STABLE_PROPOSE_CONFIRM",
-            Self::ProductionStablePropose => "E_PRODUCTION_STABLE_PROPOSE",
+            Self::StableFiled => "D_STABLE_FILED",
+            Self::GFiled => "GF_G_FILED",
+            Self::GOwned => "GO_G_OWNED",
         }
     }
 
     fn lowering(self) -> ResidualLowering {
         match self {
-            Self::ProductionStableFormula
-            | Self::ProductionStableProposeConfirm
-            | Self::ProductionStablePropose => ResidualLowering::PRODUCTION,
+            Self::StableFiled | Self::GFiled | Self::GOwned => ResidualLowering::PRODUCTION,
         }
     }
 
     fn arm(self) {
-        let selector = match self {
-            Self::ProductionStableFormula => FormulaDeltaTransportProbeSelector::StableAll,
-            Self::ProductionStableProposeConfirm => {
-                FormulaDeltaTransportProbeSelector::StableProposeConfirm
-            }
-            Self::ProductionStablePropose => FormulaDeltaTransportProbeSelector::StablePropose,
+        let (transport, continuation) = match self {
+            Self::StableFiled => (
+                FormulaDeltaTransportProbeSelector::StableAll,
+                FormulaPreparedContinuationProbeSelector::Filed,
+            ),
+            Self::GFiled => (
+                FormulaDeltaTransportProbeSelector::StableProposeConfirm,
+                FormulaPreparedContinuationProbeSelector::Filed,
+            ),
+            Self::GOwned => (
+                FormulaDeltaTransportProbeSelector::StableProposeConfirm,
+                FormulaPreparedContinuationProbeSelector::Owned,
+            ),
         };
-        formula_delta_transport_probe_select(selector);
+        formula_delta_transport_probe_select(transport);
+        formula_prepared_continuation_probe_select(continuation);
     }
 }
 
@@ -1538,7 +1553,11 @@ fn format_formula_transport_probe_stats(stats: &ResidualStateStats) -> String {
          formula_stable_confirm_calls={} formula_stable_confirm_rows={} \
          formula_stable_confirm_candidates_in={} formula_stable_confirm_candidates_out={} \
          quiescent_formula_complete_actions={} propose_calls={} propose_rows={} \
-         confirm_calls={} confirm_rows={} candidates_confirmed={}",
+         confirm_calls={} confirm_rows={} candidates_confirmed={} \
+         prepared_receipts={} prepared_rows={} prepared_candidates={} prepared_atoms={} \
+         prepared_equal_key_appends={} prepared_atoms_committed={} \
+         prepared_atoms_consumed={} prepared_atoms_owned={} prepared_split_flushes={} \
+         prepared_probe_one_pops={} prepared_cohort_pops={} prepared_identity_checks={}",
         stats.width_increases,
         stats.delta_activations_completed,
         stats.delta_source_pages,
@@ -1595,18 +1614,493 @@ fn format_formula_transport_probe_stats(stats: &ResidualStateStats) -> String {
         stats.confirm_calls,
         stats.confirm_rows,
         stats.candidates_confirmed,
+        stats.probe_formula_prepared_receipts,
+        stats.probe_formula_prepared_rows,
+        stats.probe_formula_prepared_candidates,
+        stats.probe_formula_prepared_atoms,
+        stats.probe_formula_prepared_equal_key_appends,
+        stats.probe_formula_prepared_atoms_committed,
+        stats.probe_formula_prepared_atoms_consumed,
+        formula_prepared_owned_atoms(stats),
+        stats.probe_formula_prepared_split_flushes,
+        stats.probe_formula_prepared_probe_one_pops,
+        stats.probe_formula_prepared_cohort_pops,
+        stats.probe_formula_prepared_identity_checks,
     )
 }
 
 #[cfg(formula_delta_transport_probe)]
-fn formula_transport_without_selector_accounting(stats: &ResidualStateStats) -> ResidualStateStats {
-    let mut receipt = stats.clone();
-    receipt.probe_formula_forced_stable_declines = 0;
-    receipt.probe_formula_forced_stable_support = 0;
-    receipt.probe_formula_forced_stable_propose = 0;
-    receipt.probe_formula_forced_stable_confirm = 0;
-    receipt.probe_formula_natural_stable_declines = 0;
-    receipt
+fn formula_prepared_owned_atoms(stats: &ResidualStateStats) -> usize {
+    stats
+        .probe_formula_prepared_atoms
+        .checked_sub(
+            stats
+                .probe_formula_prepared_atoms_committed
+                .checked_add(stats.probe_formula_prepared_atoms_consumed)
+                .expect("prepared Formula settled-atom count overflow"),
+        )
+        .expect("prepared Formula committed or consumed more atoms than it created")
+}
+
+#[cfg(formula_delta_transport_probe)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FormulaStageReceipt([usize; 29]);
+
+#[cfg(formula_delta_transport_probe)]
+fn formula_stage_receipt(stats: &ResidualStateStats) -> FormulaStageReceipt {
+    FormulaStageReceipt([
+        stats.probe_formula_delta_attempts,
+        stats.probe_formula_support_attempts,
+        stats.probe_formula_propose_attempts,
+        stats.probe_formula_confirm_attempts,
+        stats.probe_formula_forced_stable_declines,
+        stats.probe_formula_forced_stable_support,
+        stats.probe_formula_forced_stable_propose,
+        stats.probe_formula_forced_stable_confirm,
+        stats.probe_formula_natural_stable_declines,
+        stats.probe_formula_program_selected,
+        stats.probe_formula_support_program_selected,
+        stats.probe_formula_propose_program_selected,
+        stats.probe_formula_confirm_program_selected,
+        stats.probe_formula_program_seeded,
+        stats.probe_formula_program_seeded_parents,
+        stats.probe_formula_support_program_seeded,
+        stats.probe_formula_support_program_seeded_parents,
+        stats.probe_formula_propose_program_seeded,
+        stats.probe_formula_propose_program_seeded_parents,
+        stats.probe_formula_confirm_program_seeded,
+        stats.probe_formula_confirm_program_seeded_parents,
+        stats.probe_formula_source_seeded,
+        stats.probe_formula_source_seeded_parents,
+        stats.probe_formula_legacy_seeded,
+        stats.probe_formula_legacy_seeded_parents,
+        stats.probe_formula_stable_support_calls,
+        stats.probe_formula_stable_support_rows,
+        stats.probe_formula_stable_propose_calls,
+        stats.probe_formula_stable_confirm_calls,
+    ])
+}
+
+#[cfg(formula_delta_transport_probe)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FormulaCandidateReceipt([usize; 17]);
+
+#[cfg(formula_delta_transport_probe)]
+fn formula_candidate_receipt(stats: &ResidualStateStats) -> FormulaCandidateReceipt {
+    FormulaCandidateReceipt([
+        stats.probe_formula_stable_propose_rows,
+        stats.probe_formula_stable_propose_candidates,
+        stats.probe_formula_stable_confirm_rows,
+        stats.probe_formula_stable_confirm_candidates_in,
+        stats.probe_formula_stable_confirm_candidates_out,
+        stats.propose_calls,
+        stats.support_calls,
+        stats.confirm_calls,
+        stats.propose_rows,
+        stats.support_rows,
+        stats.confirm_rows,
+        stats.candidates_proposed,
+        stats.candidates_confirmed,
+        stats.max_propose_candidates,
+        stats.max_confirm_candidates,
+        stats.max_propose_rows,
+        stats.max_confirm_rows,
+    ])
+}
+
+#[cfg(formula_delta_transport_probe)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FormulaTransitionReceipt([usize; 23]);
+
+#[cfg(formula_delta_transport_probe)]
+fn formula_transition_receipt(stats: &ResidualStateStats) -> FormulaTransitionReceipt {
+    FormulaTransitionReceipt([
+        stats.delta_source_pages,
+        stats.delta_source_cohorts,
+        stats.max_delta_source_cohort,
+        stats.delta_source_candidates_examined,
+        stats.delta_source_roots,
+        stats.delta_transition_pages,
+        stats.delta_transition_cohorts,
+        stats.max_delta_transition_cohort,
+        stats.delta_transition_candidates_examined,
+        stats.delta_transition_dead_pages,
+        stats.delta_source_direct_candidates,
+        stats.delta_source_dead_pages,
+        stats.delta_source_negative_steps,
+        stats.delta_transition_negative_steps,
+        stats.delta_activations_completed,
+        stats.delta_activation_width_increases,
+        stats.delta_handoff_probe_pops,
+        stats.delta_quiescent_formula_complete_actions,
+        stats.delta_quiescent_formula_complete_parents,
+        stats.delta_quiescent_formula_complete_raw_occurrences,
+        stats.delta_quiescent_formula_exact_empty_or_transfers,
+        stats.delta_quiescent_formula_complete_declines,
+        stats.width_increases,
+    ])
+}
+
+#[cfg(formula_delta_transport_probe)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FormulaFilingReceipt {
+    filings: usize,
+    merges: usize,
+    reentries: usize,
+    rows_reentered: usize,
+}
+
+#[cfg(formula_delta_transport_probe)]
+fn formula_filing_receipt(stats: &ResidualStateStats) -> FormulaFilingReceipt {
+    FormulaFilingReceipt {
+        filings: stats.probe_formula_filings,
+        merges: stats.probe_formula_bucket_merges,
+        reentries: stats.probe_formula_state_reentries,
+        rows_reentered: stats.probe_formula_rows_reentered,
+    }
+}
+
+#[cfg(formula_delta_transport_probe)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct FormulaPreparedReceipt {
+    receipts: usize,
+    rows: usize,
+    candidates: usize,
+    atoms: usize,
+    equal_key_appends: usize,
+    committed: usize,
+    consumed: usize,
+    owned: usize,
+    split_flushes: usize,
+    probe_one_pops: usize,
+    cohort_pops: usize,
+    identity_checks: usize,
+}
+
+#[cfg(formula_delta_transport_probe)]
+fn formula_prepared_receipt(stats: &ResidualStateStats) -> FormulaPreparedReceipt {
+    FormulaPreparedReceipt {
+        receipts: stats.probe_formula_prepared_receipts,
+        rows: stats.probe_formula_prepared_rows,
+        candidates: stats.probe_formula_prepared_candidates,
+        atoms: stats.probe_formula_prepared_atoms,
+        equal_key_appends: stats.probe_formula_prepared_equal_key_appends,
+        committed: stats.probe_formula_prepared_atoms_committed,
+        consumed: stats.probe_formula_prepared_atoms_consumed,
+        owned: formula_prepared_owned_atoms(stats),
+        split_flushes: stats.probe_formula_prepared_split_flushes,
+        probe_one_pops: stats.probe_formula_prepared_probe_one_pops,
+        cohort_pops: stats.probe_formula_prepared_cohort_pops,
+        identity_checks: stats.probe_formula_prepared_identity_checks,
+    }
+}
+
+#[cfg(formula_delta_transport_probe)]
+fn expected_formula_physical_receipts(
+    backend: &str,
+    limit: Option<usize>,
+) -> (
+    FormulaFilingReceipt,
+    FormulaFilingReceipt,
+    FormulaPreparedReceipt,
+) {
+    let succinct = backend.starts_with("SuccinctArchive");
+    match (succinct, limit) {
+        (false, Some(63 | 64)) => (
+            FormulaFilingReceipt {
+                filings: 20,
+                merges: 0,
+                reentries: 0,
+                rows_reentered: 0,
+            },
+            FormulaFilingReceipt {
+                filings: 5,
+                merges: 0,
+                reentries: 0,
+                rows_reentered: 0,
+            },
+            FormulaPreparedReceipt {
+                receipts: 20,
+                rows: 20,
+                candidates: 0,
+                atoms: 20,
+                equal_key_appends: 0,
+                committed: 5,
+                consumed: 15,
+                owned: 0,
+                split_flushes: 0,
+                probe_one_pops: 2,
+                cohort_pops: 13,
+                identity_checks: 20,
+            },
+        ),
+        (false, Some(65 | 100)) => (
+            FormulaFilingReceipt {
+                filings: 60,
+                merges: 30,
+                reentries: 10,
+                rows_reentered: 160,
+            },
+            FormulaFilingReceipt {
+                filings: 6,
+                merges: 0,
+                reentries: 1,
+                rows_reentered: 30,
+            },
+            FormulaPreparedReceipt {
+                receipts: 60,
+                rows: 210,
+                candidates: 0,
+                atoms: 210,
+                equal_key_appends: 30,
+                committed: 35,
+                consumed: 175,
+                owned: 0,
+                split_flushes: 0,
+                probe_one_pops: 3,
+                cohort_pops: 22,
+                identity_checks: 60,
+            },
+        ),
+        (false, None) => (
+            FormulaFilingReceipt {
+                filings: 64,
+                merges: 30,
+                reentries: 14,
+                rows_reentered: 280,
+            },
+            FormulaFilingReceipt {
+                filings: 10,
+                merges: 0,
+                reentries: 5,
+                rows_reentered: 150,
+            },
+            FormulaPreparedReceipt {
+                receipts: 64,
+                rows: 330,
+                candidates: 0,
+                atoms: 330,
+                equal_key_appends: 30,
+                committed: 155,
+                consumed: 175,
+                owned: 0,
+                split_flushes: 0,
+                probe_one_pops: 3,
+                cohort_pops: 22,
+                identity_checks: 64,
+            },
+        ),
+        (true, Some(63 | 64)) => (
+            FormulaFilingReceipt {
+                filings: 20,
+                merges: 0,
+                reentries: 0,
+                rows_reentered: 0,
+            },
+            FormulaFilingReceipt {
+                filings: 3,
+                merges: 0,
+                reentries: 0,
+                rows_reentered: 0,
+            },
+            FormulaPreparedReceipt {
+                receipts: 20,
+                rows: 20,
+                candidates: 0,
+                atoms: 20,
+                equal_key_appends: 0,
+                committed: 3,
+                consumed: 17,
+                owned: 0,
+                split_flushes: 0,
+                probe_one_pops: 6,
+                cohort_pops: 11,
+                identity_checks: 20,
+            },
+        ),
+        (true, Some(65 | 100)) => (
+            FormulaFilingReceipt {
+                filings: 60,
+                merges: 30,
+                reentries: 10,
+                rows_reentered: 100,
+            },
+            FormulaFilingReceipt {
+                filings: 4,
+                merges: 0,
+                reentries: 1,
+                rows_reentered: 30,
+            },
+            FormulaPreparedReceipt {
+                receipts: 60,
+                rows: 150,
+                candidates: 0,
+                atoms: 150,
+                equal_key_appends: 30,
+                committed: 33,
+                consumed: 117,
+                owned: 0,
+                split_flushes: 0,
+                probe_one_pops: 9,
+                cohort_pops: 18,
+                identity_checks: 60,
+            },
+        ),
+        (true, None) => (
+            FormulaFilingReceipt {
+                filings: 128,
+                merges: 87,
+                reentries: 21,
+                rows_reentered: 223,
+            },
+            FormulaFilingReceipt {
+                filings: 10,
+                merges: 0,
+                reentries: 7,
+                rows_reentered: 203,
+            },
+            FormulaPreparedReceipt {
+                receipts: 128,
+                rows: 330,
+                candidates: 0,
+                atoms: 330,
+                equal_key_appends: 87,
+                committed: 206,
+                consumed: 124,
+                owned: 0,
+                split_flushes: 0,
+                probe_one_pops: 12,
+                cohort_pops: 22,
+                identity_checks: 128,
+            },
+        ),
+        (_, Some(other)) => panic!("unregistered Formula checkpoint {other}"),
+    }
+}
+
+#[cfg(formula_delta_transport_probe)]
+struct FormulaProbeObservation {
+    rows: Vec<Pair>,
+    plan: triblespace::core::query::residual::FormulaDeltaTransportProbePlanReceipt,
+    width: usize,
+    stats: ResidualStateStats,
+}
+
+#[cfg(formula_delta_transport_probe)]
+fn formula_probe_observe<S: TriblePattern>(
+    store: &S,
+    fixture: &Fixture,
+    mode: FormulaTransportProbeMode,
+    limit: Option<usize>,
+) -> FormulaProbeObservation {
+    let mut query = formula_transport_probe_query!(store, fixture, mode);
+    let plan = query.formula_delta_transport_probe_plan_receipt();
+    let rows: Vec<Pair> = match limit {
+        Some(limit) => query.by_ref().take(limit).collect(),
+        None => query.by_ref().collect(),
+    };
+    if let Some(limit) = limit {
+        assert_eq!(rows.len(), limit, "query ended before checkpoint {limit}");
+    }
+    FormulaProbeObservation {
+        rows,
+        plan,
+        width: query.current_width(),
+        stats: query.stats().clone(),
+    }
+}
+
+#[cfg(formula_delta_transport_probe)]
+fn assert_g_transport_seam(backend: &str, stats: &ResidualStateStats) {
+    assert_eq!(
+        stats.probe_formula_delta_attempts,
+        stats.probe_formula_support_attempts
+            + stats.probe_formula_propose_attempts
+            + stats.probe_formula_confirm_attempts,
+    );
+    assert_eq!(stats.probe_formula_forced_stable_support, 0);
+    assert!(stats.probe_formula_support_attempts > 0);
+    assert!(stats.probe_formula_propose_attempts > 0);
+    assert!(stats.probe_formula_confirm_attempts > 0);
+    assert_eq!(
+        stats.probe_formula_forced_stable_propose,
+        stats.probe_formula_propose_attempts,
+    );
+    assert_eq!(
+        stats.probe_formula_forced_stable_confirm,
+        stats.probe_formula_confirm_attempts,
+    );
+    assert_eq!(stats.probe_formula_propose_program_selected, 0);
+    assert_eq!(stats.probe_formula_confirm_program_selected, 0);
+    assert_eq!(stats.probe_formula_propose_program_seeded, 0);
+    assert_eq!(stats.probe_formula_confirm_program_seeded, 0);
+    if backend.starts_with("SuccinctArchive") {
+        assert_eq!(stats.probe_formula_natural_stable_declines, 0);
+        assert_eq!(
+            stats.probe_formula_support_program_selected,
+            stats.probe_formula_support_attempts,
+        );
+        assert_eq!(
+            stats.probe_formula_support_program_seeded,
+            stats.probe_formula_support_program_selected,
+        );
+        assert_eq!(stats.probe_formula_stable_support_calls, 0);
+    } else {
+        assert_eq!(stats.probe_formula_support_program_selected, 0);
+        assert_eq!(stats.probe_formula_support_program_seeded, 0);
+        assert_eq!(
+            stats.probe_formula_natural_stable_declines,
+            stats.probe_formula_support_attempts,
+        );
+        assert_eq!(
+            stats.probe_formula_stable_support_calls,
+            stats.probe_formula_support_attempts,
+        );
+    }
+}
+
+#[cfg(formula_delta_transport_probe)]
+fn assert_stable_transport_seam(stats: &ResidualStateStats) {
+    assert_eq!(
+        stats.probe_formula_delta_attempts,
+        stats.probe_formula_support_attempts
+            + stats.probe_formula_propose_attempts
+            + stats.probe_formula_confirm_attempts,
+    );
+    assert!(stats.probe_formula_support_attempts > 0);
+    assert!(stats.probe_formula_propose_attempts > 0);
+    assert!(stats.probe_formula_confirm_attempts > 0);
+    assert_eq!(
+        stats.probe_formula_forced_stable_declines,
+        stats.probe_formula_delta_attempts,
+    );
+    assert_eq!(
+        stats.probe_formula_forced_stable_support,
+        stats.probe_formula_support_attempts,
+    );
+    assert_eq!(
+        stats.probe_formula_forced_stable_propose,
+        stats.probe_formula_propose_attempts,
+    );
+    assert_eq!(
+        stats.probe_formula_forced_stable_confirm,
+        stats.probe_formula_confirm_attempts,
+    );
+    assert_eq!(stats.probe_formula_natural_stable_declines, 0);
+    assert_eq!(stats.probe_formula_program_selected, 0);
+    assert_eq!(stats.probe_formula_program_seeded, 0);
+    assert_eq!(
+        stats.probe_formula_stable_support_calls,
+        stats.probe_formula_support_attempts
+    );
+    assert_eq!(
+        stats.probe_formula_stable_propose_calls,
+        stats.probe_formula_propose_attempts
+    );
+    assert_eq!(
+        stats.probe_formula_stable_confirm_calls,
+        stats.probe_formula_confirm_attempts
+    );
 }
 
 #[cfg(formula_delta_transport_probe)]
@@ -1616,383 +2110,112 @@ fn formula_transport_probe_backend<S: TriblePattern>(
     fixture: &Fixture,
     expected: &[Pair],
 ) {
-    let mut full_stats = Vec::new();
-    for mode in FormulaTransportProbeMode::ALL {
-        let mut first = formula_transport_probe_query!(store, fixture, mode);
-        let first_plan_receipt = first.formula_delta_transport_probe_plan_receipt();
-        let first_rows: Vec<Pair> = first.by_ref().collect();
-        let first_stats = first.stats().clone();
-        let first_width = first.current_width();
-        exact_check(
-            first_rows.clone(),
-            expected,
-            mode.label(),
-            &format!("{backend} SET repetition 1"),
-        );
+    for limit in [Some(63), Some(64), Some(65), Some(100), None] {
+        let label = limit.map_or("full".to_owned(), |limit| limit.to_string());
+        let observations: Vec<_> = FormulaTransportProbeMode::ALL
+            .into_iter()
+            .map(|mode| formula_probe_observe(store, fixture, mode, limit))
+            .collect();
+        let [stable_filed, g_filed, g_owned] = observations.as_slice() else {
+            unreachable!("the panel has exactly three modes")
+        };
 
-        let mut second = formula_transport_probe_query!(store, fixture, mode);
-        let second_rows: Vec<Pair> = second.by_ref().collect();
-        exact_check(
-            second_rows.clone(),
-            expected,
-            mode.label(),
-            &format!("{backend} SET repetition 2"),
+        assert_eq!(stable_filed.plan, g_filed.plan);
+        assert_eq!(g_filed.plan, g_owned.plan);
+        assert_eq!(g_filed.plan.formula_scope, FormulaScope::ProductionRegions);
+        assert_eq!(g_filed.plan.program_scope, ProgramScope::Production);
+        assert!(g_filed.plan.production_formula_leaves > 0);
+        assert!(g_filed.plan.formula_nodes > 0);
+        assert!(g_filed.plan.production_region_marks > 0);
+        assert_eq!(g_filed.plan.opaque_production_program_leaves, 1);
+        assert_eq!(
+            g_filed.rows, g_owned.rows,
+            "{backend}/{label} GF != GO raw order"
         );
         assert_eq!(
-            first_rows,
-            second_rows,
-            "{backend}/{} changed raw result order between identical runs",
-            mode.label(),
+            g_filed.width, g_owned.width,
+            "{backend}/{label} GF != GO width"
         );
-        let (signature, ordered_digest) = formula_transport_order_receipt(&first_rows);
+        assert_eq!(
+            formula_stage_receipt(&g_filed.stats),
+            formula_stage_receipt(&g_owned.stats),
+            "{backend}/{label} GF != GO stage receipt",
+        );
+        assert_eq!(
+            formula_candidate_receipt(&g_filed.stats),
+            formula_candidate_receipt(&g_owned.stats),
+            "{backend}/{label} GF != GO candidate receipt",
+        );
+        assert_eq!(
+            formula_transition_receipt(&g_filed.stats),
+            formula_transition_receipt(&g_owned.stats),
+            "{backend}/{label} GF != GO transition receipt",
+        );
+
+        assert_eq!(
+            formula_prepared_receipt(&stable_filed.stats),
+            FormulaPreparedReceipt::default(),
+        );
+        assert_eq!(
+            formula_prepared_receipt(&g_filed.stats),
+            FormulaPreparedReceipt::default(),
+        );
+        let prepared = formula_prepared_receipt(&g_owned.stats);
+        assert_eq!(prepared.receipts, prepared.identity_checks);
+        assert_eq!(
+            prepared.atoms,
+            prepared.committed + prepared.consumed + prepared.owned
+        );
+        assert_stable_transport_seam(&stable_filed.stats);
+        assert_g_transport_seam(backend, &g_filed.stats);
+        assert_g_transport_seam(backend, &g_owned.stats);
+
+        let (expected_gf_filing, expected_go_filing, expected_go_prepared) =
+            expected_formula_physical_receipts(backend, limit);
+        // Filed G names every logical Formula successor at its transition
+        // boundary. Owned G names the same receipts before arbitration and
+        // counts equal-key coalescing at that boundary; its later physical
+        // filings and atom settlement are frozen separately below.
+        assert_eq!(formula_filing_receipt(&g_filed.stats), expected_gf_filing);
+        assert_eq!(formula_filing_receipt(&g_owned.stats), expected_go_filing);
+        assert_eq!(prepared, expected_go_prepared);
+        assert_eq!(expected_gf_filing.filings, prepared.receipts);
+        assert_eq!(expected_gf_filing.merges, prepared.equal_key_appends);
+
+        if limit.is_none() {
+            for (mode, observation) in FormulaTransportProbeMode::ALL
+                .into_iter()
+                .zip(&observations)
+            {
+                exact_check(
+                    observation.rows.clone(),
+                    expected,
+                    mode.label(),
+                    &format!("{backend} full SET"),
+                );
+            }
+            assert_eq!(prepared.owned, 0, "full solve retained a prepared tail");
+        }
+
+        let (signature, ordered_digest) = formula_transport_order_receipt(&g_filed.rows);
         println!(
-            "probe_order backend={backend:?} mode={} repetition_count=2 rows={} \
-             set_checksum={:#018x} ordered_digest={:#018x} repeat_order_equal=true",
-            mode.label(),
+            "probe_receipt backend={backend:?} checkpoint={label} rows={} checksum={:#018x} \
+             ordered_digest={:#018x} plan_equal=true gf_go_raw_equal=true \
+             gf_go_stage_equal=true gf_go_candidate_equal=true gf_go_transition_equal=true \
+             gf_filing={:?} go_filing={:?} go_prepared={:?}",
             signature.rows,
             signature.checksum,
             ordered_digest,
+            formula_filing_receipt(&g_filed.stats),
+            formula_filing_receipt(&g_owned.stats),
+            prepared,
         );
-        println!(
-            "probe_full backend={backend:?} mode={} rows={} current_width={} stats={}",
-            mode.label(),
-            first_rows.len(),
-            first_width,
-            format_formula_transport_probe_stats(&first_stats),
-        );
-        println!(
-            "probe_plan backend={backend:?} mode={} receipt={first_plan_receipt:?}",
-            mode.label(),
-        );
-
-        let label = format!("{} / {backend}", mode.label());
-        let query = formula_transport_probe_query!(store, fixture, mode);
-        residual_checkpoint_stats(&label, query, |query| {
-            (
-                query.current_width(),
-                format_formula_transport_probe_stats(query.stats()),
-            )
-        });
-        full_stats.push((mode, first_plan_receipt, first_width, first_stats));
     }
-
-    let stable_formula = &full_stats[0].3;
-    let stable_propose_confirm = &full_stats[1].3;
-    let stable_propose = &full_stats[2].3;
-    assert_eq!(
-        full_stats[0].0,
-        FormulaTransportProbeMode::ProductionStableFormula
-    );
-    assert_eq!(
-        full_stats[1].0,
-        FormulaTransportProbeMode::ProductionStableProposeConfirm
-    );
-    assert_eq!(
-        full_stats[2].0,
-        FormulaTransportProbeMode::ProductionStablePropose
-    );
-    assert_eq!(full_stats[0].1, full_stats[1].1);
-    assert_eq!(full_stats[0].1, full_stats[2].1);
-    let plan = full_stats[0].1;
-    assert_eq!(plan.formula_scope, FormulaScope::ProductionRegions);
-    assert_eq!(plan.program_scope, ProgramScope::Production);
-    assert!(plan.production_formula_leaves > 0);
-    assert!(plan.formula_nodes > 0);
-    assert!(plan.production_region_marks > 0);
-    assert_eq!(plan.opaque_production_program_leaves, 1);
-    for stats in [stable_formula, stable_propose_confirm, stable_propose] {
-        assert_eq!(
-            stats.probe_formula_delta_attempts,
-            stats.probe_formula_support_attempts
-                + stats.probe_formula_propose_attempts
-                + stats.probe_formula_confirm_attempts,
-        );
-        assert!(stats.probe_formula_support_attempts > 0);
-        assert!(stats.probe_formula_propose_attempts > 0);
-        assert!(stats.probe_formula_confirm_attempts > 0);
-    }
-    assert_eq!(
-        stable_formula.probe_formula_forced_stable_declines,
-        stable_formula.probe_formula_delta_attempts,
-    );
-    assert_eq!(
-        stable_formula.probe_formula_forced_stable_support,
-        stable_formula.probe_formula_support_attempts,
-    );
-    assert_eq!(
-        stable_formula.probe_formula_forced_stable_propose,
-        stable_formula.probe_formula_propose_attempts,
-    );
-    assert_eq!(
-        stable_formula.probe_formula_forced_stable_confirm,
-        stable_formula.probe_formula_confirm_attempts,
-    );
-    assert_eq!(stable_formula.probe_formula_natural_stable_declines, 0);
-    assert_eq!(stable_formula.probe_formula_program_selected, 0);
-    assert_eq!(stable_formula.probe_formula_program_seeded, 0);
-    assert_eq!(stable_formula.probe_formula_source_seeded, 0);
-    assert_eq!(stable_formula.probe_formula_legacy_seeded, 0);
-    assert_eq!(
-        stable_formula.probe_formula_stable_support_calls,
-        stable_formula.probe_formula_support_attempts,
-    );
-    assert_eq!(
-        stable_formula.probe_formula_stable_propose_calls,
-        stable_formula.probe_formula_propose_attempts,
-    );
-    assert_eq!(
-        stable_formula.probe_formula_stable_confirm_calls,
-        stable_formula.probe_formula_confirm_attempts,
-    );
-
-    assert_eq!(
-        stable_propose_confirm.probe_formula_forced_stable_declines,
-        stable_propose_confirm.probe_formula_propose_attempts
-            + stable_propose_confirm.probe_formula_confirm_attempts,
-    );
-    assert_eq!(
-        stable_propose_confirm.probe_formula_forced_stable_support,
-        0,
-    );
-    assert_eq!(
-        stable_propose_confirm.probe_formula_forced_stable_propose,
-        stable_propose_confirm.probe_formula_propose_attempts,
-    );
-    assert_eq!(
-        stable_propose_confirm.probe_formula_forced_stable_confirm,
-        stable_propose_confirm.probe_formula_confirm_attempts,
-    );
-    assert_eq!(
-        stable_propose_confirm.probe_formula_propose_program_selected,
-        0,
-    );
-    assert_eq!(
-        stable_propose_confirm.probe_formula_confirm_program_selected,
-        0,
-    );
-    assert_eq!(
-        stable_propose_confirm.probe_formula_propose_program_seeded,
-        0,
-    );
-    assert_eq!(
-        stable_propose_confirm.probe_formula_confirm_program_seeded,
-        0,
-    );
-    assert_eq!(
-        stable_propose_confirm.probe_formula_stable_propose_calls,
-        stable_propose_confirm.probe_formula_propose_attempts,
-    );
-    assert_eq!(
-        stable_propose_confirm.probe_formula_stable_confirm_calls,
-        stable_propose_confirm.probe_formula_confirm_attempts,
-    );
-
-    assert_eq!(stable_propose.probe_formula_forced_stable_support, 0);
-    assert_eq!(stable_propose.probe_formula_forced_stable_confirm, 0);
-    assert_eq!(
-        stable_propose.probe_formula_forced_stable_declines,
-        stable_propose.probe_formula_propose_attempts,
-    );
-    assert_eq!(
-        stable_propose.probe_formula_forced_stable_propose,
-        stable_propose.probe_formula_propose_attempts,
-    );
-    assert_eq!(stable_propose.probe_formula_propose_program_selected, 0);
-    assert_eq!(stable_propose.probe_formula_propose_program_seeded, 0);
-    assert_eq!(
-        stable_propose.probe_formula_stable_propose_calls,
-        stable_propose.probe_formula_propose_attempts,
-    );
-    for stats in [stable_formula, stable_propose_confirm, stable_propose] {
-        assert_eq!(stats.delta_source_pages, 0);
-        assert_eq!(stats.delta_source_cohorts, 0);
-        assert_eq!(stats.delta_source_candidates_examined, 0);
-        assert_eq!(stats.probe_formula_source_seeded, 0);
-        assert_eq!(stats.probe_formula_legacy_seeded, 0);
-    }
-    let receipts_at_65: Vec<_> = FormulaTransportProbeMode::ALL
-        .into_iter()
-        .map(|mode| {
-            let mut query = formula_transport_probe_query!(store, fixture, mode);
-            assert_eq!(query.by_ref().take(65).count(), 65);
-            (query.current_width(), query.stats().clone())
-        })
-        .collect();
-    for mode in FormulaTransportProbeMode::ALL {
-        assert_eq!(
-            mode.lowering().formula_scope(),
-            FormulaScope::ProductionRegions
-        );
-        assert_eq!(mode.lowering().program_scope(), ProgramScope::Production);
-    }
-    if backend.starts_with("TribleSet") {
-        assert_eq!(
-            stable_propose_confirm.probe_formula_support_program_selected,
-            0,
-        );
-        assert_eq!(
-            stable_propose_confirm.probe_formula_support_program_seeded,
-            0,
-        );
-        assert_eq!(
-            stable_propose_confirm.probe_formula_natural_stable_declines,
-            stable_propose_confirm.probe_formula_support_attempts,
-        );
-        assert_eq!(
-            stable_propose_confirm.probe_formula_stable_support_calls,
-            stable_propose_confirm.probe_formula_support_attempts,
-        );
-        assert_eq!(stable_propose_confirm.probe_formula_program_selected, 0);
-        assert_eq!(stable_propose_confirm.probe_formula_program_seeded, 0);
-        assert_eq!(stable_propose.probe_formula_program_selected, 0);
-        assert_eq!(stable_propose.probe_formula_program_seeded, 0);
-        assert_eq!(
-            stable_propose.probe_formula_natural_stable_declines,
-            stable_propose.probe_formula_support_attempts
-                + stable_propose.probe_formula_confirm_attempts,
-        );
-        assert_eq!(
-            stable_propose.probe_formula_stable_support_calls,
-            stable_propose.probe_formula_support_attempts,
-        );
-        assert_eq!(
-            stable_propose.probe_formula_stable_confirm_calls,
-            stable_propose.probe_formula_confirm_attempts,
-        );
-        let full_application_equal = formula_transport_without_selector_accounting(stable_formula)
-            == formula_transport_without_selector_accounting(stable_propose_confirm)
-            && formula_transport_without_selector_accounting(stable_formula)
-                == formula_transport_without_selector_accounting(stable_propose);
-        let prefix65_application_equal =
-            formula_transport_without_selector_accounting(&receipts_at_65[0].1)
-                == formula_transport_without_selector_accounting(&receipts_at_65[1].1)
-                && formula_transport_without_selector_accounting(&receipts_at_65[0].1)
-                    == formula_transport_without_selector_accounting(&receipts_at_65[2].1);
-        println!(
-            "probe_negative_control backend={backend:?} g_support_selected=0 \
-             g_support_seeded=0 g_natural_support_declines={} \
-             full_application_equal_observed={} prefix65_application_equal_observed={}",
-            stable_propose_confirm.probe_formula_natural_stable_declines,
-            full_application_equal,
-            prefix65_application_equal,
-        );
-    } else {
-        assert_eq!(
-            stable_propose_confirm.probe_formula_natural_stable_declines,
-            0,
-        );
-        assert_eq!(
-            stable_propose_confirm.probe_formula_support_program_selected,
-            stable_propose_confirm.probe_formula_support_attempts,
-        );
-        assert_eq!(
-            stable_propose_confirm.probe_formula_support_program_seeded,
-            stable_propose_confirm.probe_formula_support_program_selected,
-        );
-        assert_eq!(
-            stable_propose_confirm.probe_formula_program_selected,
-            stable_propose_confirm.probe_formula_support_program_selected,
-        );
-        assert_eq!(
-            stable_propose_confirm.probe_formula_program_seeded,
-            stable_propose_confirm.probe_formula_support_program_seeded,
-        );
-        assert!(stable_propose_confirm.probe_formula_support_program_seeded_parents > 0);
-        assert_eq!(stable_propose_confirm.probe_formula_stable_support_calls, 0);
-        println!(
-            "probe_positive_control backend={backend:?} g_support_attempts={} \
-             g_support_selected={} g_support_seeded={} g_support_seeded_parents={} \
-             g_stable_support_calls=0 g_forced_confirm={}",
-            stable_propose_confirm.probe_formula_support_attempts,
-            stable_propose_confirm.probe_formula_support_program_selected,
-            stable_propose_confirm.probe_formula_support_program_seeded,
-            stable_propose_confirm.probe_formula_support_program_seeded_parents,
-            stable_propose_confirm.probe_formula_forced_stable_confirm,
-        );
-        assert_eq!(stable_propose.probe_formula_natural_stable_declines, 0);
-        assert_eq!(
-            stable_propose.probe_formula_support_program_selected,
-            stable_propose.probe_formula_support_attempts,
-        );
-        assert_eq!(
-            stable_propose.probe_formula_confirm_program_selected,
-            stable_propose.probe_formula_confirm_attempts,
-        );
-        assert_eq!(
-            stable_propose.probe_formula_support_program_seeded,
-            stable_propose.probe_formula_support_program_selected,
-        );
-        assert_eq!(
-            stable_propose.probe_formula_confirm_program_seeded,
-            stable_propose.probe_formula_confirm_program_selected,
-        );
-        assert_eq!(stable_propose.probe_formula_stable_support_calls, 0);
-        assert_eq!(stable_propose.probe_formula_stable_confirm_calls, 0);
-    }
-    println!(
-        "probe_transport_seam backend={backend:?} d_g_e_formula_scope_equal=true \
-         d_g_e_program_scope_equal=true d_forced_all={} g_forced_support=0 \
-         g_forced_propose={} g_forced_confirm={} g_support_selected={} \
-         g_support_seeded={} e_forced_propose={} e_support_selected={} \
-         e_confirm_selected={}",
-        stable_formula.probe_formula_delta_attempts,
-        stable_propose_confirm.probe_formula_forced_stable_propose,
-        stable_propose_confirm.probe_formula_forced_stable_confirm,
-        stable_propose_confirm.probe_formula_support_program_selected,
-        stable_propose_confirm.probe_formula_support_program_seeded,
-        stable_propose.probe_formula_forced_stable_propose,
-        stable_propose.probe_formula_support_program_selected,
-        stable_propose.probe_formula_confirm_program_selected,
-    );
-    // Parent commit 5f4fbcb59ca2 froze F at 2,208 for both backends. Keeping
-    // that preregistered observation out of this D/G/E panel avoids adding a
-    // fourth timed cell while still completing the 2x2 interaction receipt.
-    const FROZEN_F_PREFIX65_CANDIDATES_CONFIRMED: usize = 2_208;
-    let d_prefix65 = receipts_at_65[0].1.candidates_confirmed as i128;
-    let f_prefix65 = FROZEN_F_PREFIX65_CANDIDATES_CONFIRMED as i128;
-    let g_prefix65 = receipts_at_65[1].1.candidates_confirmed as i128;
-    let e_prefix65 = receipts_at_65[2].1.candidates_confirmed as i128;
-    let confirm_effect_support_stable = f_prefix65 - d_prefix65;
-    let confirm_effect_support_typed = e_prefix65 - g_prefix65;
-    let support_effect_confirm_stable = g_prefix65 - d_prefix65;
-    let support_effect_confirm_typed = e_prefix65 - f_prefix65;
-    let interaction = e_prefix65 - g_prefix65 - f_prefix65 + d_prefix65;
-    let g_matches_e_width = receipts_at_65[1].0 == receipts_at_65[2].0;
-    let g_matches_e_candidates =
-        receipts_at_65[1].1.candidates_confirmed == receipts_at_65[2].1.candidates_confirmed;
-    let g_preserves_e_control_shape = g_matches_e_width && g_matches_e_candidates;
-    println!(
-        "probe_prefix65_factorial backend={backend:?} d_candidates_confirmed={} \
-         frozen_f_candidates_confirmed={} g_candidates_confirmed={} \
-         e_candidates_confirmed={} d_width={} g_width={} e_width={} \
-         g_matches_e_candidates={} g_matches_e_width={} \
-         g_preserves_e_control_shape={} g_preserves_e_288_candidates={} \
-         confirm_effect_support_stable={} confirm_effect_support_typed={} \
-         support_effect_confirm_stable={} support_effect_confirm_typed={} \
-         interaction={} additive_identity_observed={}",
-        d_prefix65,
-        f_prefix65,
-        g_prefix65,
-        e_prefix65,
-        receipts_at_65[0].0,
-        receipts_at_65[1].0,
-        receipts_at_65[2].0,
-        g_matches_e_candidates,
-        g_matches_e_width,
-        g_preserves_e_control_shape,
-        g_matches_e_candidates && receipts_at_65[2].1.candidates_confirmed == 288,
-        confirm_effect_support_stable,
-        confirm_effect_support_typed,
-        support_effect_confirm_stable,
-        support_effect_confirm_typed,
-        interaction,
-        d_prefix65 + e_prefix65 == f_prefix65 + g_prefix65,
-    );
 }
 
 #[cfg(formula_delta_transport_probe)]
 fn formula_transport_correctness_main() {
-    const PROBE_BASE: &str = "5f4fbcb59ca2535e0b5670e79bd5885412c2e11d";
+    const PROBE_BASE: &str = "d064dd23b2b1cb1c505caaad5ae64c9c9643eb70";
     const COMPONENT_COUNT: usize = 1;
     const RING_SIZE: usize = 64;
     const FANOUT: usize = 2;
@@ -2002,7 +2225,7 @@ fn formula_transport_correctness_main() {
     let expected = fixture.mixed_formula_rpq_oracle();
     assert_eq!(expected.len(), 2_048, "the original causal cell drifted");
 
-    println!("diagnostic: Formula Support conditional delta-transport probe; no timed samples");
+    println!("diagnostic: Formula Support prepared-continuation probe; no timed samples");
     println!("probe base: {PROBE_BASE}");
     println!("engine: {ENGINE}");
     println!("revision: {REVISION}");
@@ -2014,10 +2237,27 @@ fn formula_transport_correctness_main() {
     );
     println!("checkpoints: {PREFIX_CHECKPOINTS:?}");
 
+    let trible_plan = formula_transport_probe_query!(
+        &fixture.graph,
+        &fixture,
+        FormulaTransportProbeMode::StableFiled
+    )
+    .formula_delta_transport_probe_plan_receipt();
+    let succinct_plan =
+        formula_transport_probe_query!(&archive, &fixture, FormulaTransportProbeMode::StableFiled)
+            .formula_delta_transport_probe_plan_receipt();
+    assert_eq!(
+        trible_plan, succinct_plan,
+        "backend changed the compiled plan"
+    );
     formula_transport_probe_backend("TribleSet sibling", &fixture.graph, &fixture, &expected);
     formula_transport_probe_backend("SuccinctArchive sibling", &archive, &fixture, &expected);
     formula_delta_transport_probe_select(FormulaDeltaTransportProbeSelector::Typed);
-    println!("probe verdict: all six backend/mode cells have exact SET and repeat-order parity");
+    formula_prepared_continuation_probe_select(FormulaPreparedContinuationProbeSelector::Filed);
+    println!(
+        "probe verdict: all 30 backend/mode/checkpoint cells preserve SET; GF and GO preserve \
+         raw order plus plan/stage/candidate/transition receipts"
+    );
 }
 
 #[cfg(formula_delta_transport_probe)]
@@ -2132,7 +2372,7 @@ fn formula_transport_timing_order(round: usize, task_count: usize) -> Vec<usize>
 #[cfg(formula_delta_transport_probe)]
 fn assert_formula_transport_timing_balance(task_count: usize) {
     let mut positions = vec![vec![0usize; task_count]; task_count];
-    for round in 0..60 {
+    for round in 0..FORMULA_TRANSPORT_FORMAL_ROUNDS {
         for (position, task) in formula_transport_timing_order(round, task_count)
             .into_iter()
             .enumerate()
@@ -2143,8 +2383,11 @@ fn assert_formula_transport_timing_balance(task_count: usize) {
     assert!(positions
         .iter()
         .flatten()
-        .all(|&observations| observations == 2));
+        .all(|&observations| observations == FORMULA_TRANSPORT_FORMAL_ROUNDS / task_count));
 }
+
+#[cfg(formula_delta_transport_probe)]
+const FORMULA_TRANSPORT_FORMAL_ROUNDS: usize = 120;
 
 #[cfg(formula_delta_transport_probe)]
 fn run_formula_transport_timing_query<S: TriblePattern>(
@@ -2231,9 +2474,10 @@ fn percentile_duration(samples: &[Duration], quantile: f64) -> Duration {
 
 #[cfg(formula_delta_transport_probe)]
 fn print_formula_transport_timing_plan(tasks: &[FormulaTransportTimingTask], rounds: usize) {
+    assert_eq!(rounds, FORMULA_TRANSPORT_FORMAL_ROUNDS);
     assert_formula_transport_timing_balance(tasks.len());
     println!("timing panel: {rounds} rounds x {} tasks", tasks.len());
-    println!("balance: 60-round superblocks; every task occupies every ordinal exactly twice");
+    println!("balance: every task occupies every ordinal exactly four times over 120 rounds");
     println!("order: cyclic stride 7 over 30 tasks; mirrored after each 30 rounds");
     println!("timed fields: fresh time-to-N, drop-at-N, and total; fixture/archive excluded");
     for (task, cell) in tasks.iter().enumerate() {
@@ -2248,14 +2492,11 @@ fn print_formula_transport_timing_plan(tasks: &[FormulaTransportTimingTask], rou
 
 #[cfg(formula_delta_transport_probe)]
 fn formula_transport_timing_main(rounds: usize) {
-    const PROBE_BASE: &str = "5f4fbcb59ca2535e0b5670e79bd5885412c2e11d";
+    const PROBE_BASE: &str = "d064dd23b2b1cb1c505caaad5ae64c9c9643eb70";
     const COMPONENT_COUNT: usize = 1;
     const RING_SIZE: usize = 64;
     const FANOUT: usize = 2;
-    assert!(
-        rounds >= 60 && rounds % 60 == 0,
-        "rounds must be a multiple of 60"
-    );
+    assert_eq!(rounds, FORMULA_TRANSPORT_FORMAL_ROUNDS);
 
     let fixture = Fixture::new(COMPONENT_COUNT, RING_SIZE, FANOUT);
     let archive: SuccinctArchive<OrderedUniverse> = (&fixture.graph).into();
@@ -2263,7 +2504,7 @@ fn formula_transport_timing_main(rounds: usize) {
     assert_eq!(expected.len(), 2_048, "the original causal cell drifted");
     let tasks = formula_transport_timing_tasks();
 
-    println!("formal timing: Formula Support conditional delta-transport panel");
+    println!("formal timing: Formula Support prepared-continuation panel");
     println!("engine: {ENGINE}");
     println!("revision: {REVISION}");
     println!("probe base: {PROBE_BASE}");
@@ -2275,46 +2516,26 @@ fn formula_transport_timing_main(rounds: usize) {
     );
     print_formula_transport_timing_plan(&tasks, rounds);
 
-    // Independent SET checks occur before warmup and all timed samples.
-    let mut plan_receipt = None;
-    for mode in FormulaTransportProbeMode::ALL {
-        let trible_query = formula_transport_probe_query!(&fixture.graph, &fixture, mode);
-        let trible_plan = trible_query.formula_delta_transport_probe_plan_receipt();
-        if let Some(expected) = plan_receipt {
-            assert_eq!(trible_plan, expected);
-        } else {
-            plan_receipt = Some(trible_plan);
-        }
-        exact_check(
-            trible_query.collect(),
-            &expected,
-            mode.label(),
-            "TribleSet timing preflight",
-        );
-        let succinct_query = formula_transport_probe_query!(&archive, &fixture, mode);
-        assert_eq!(
-            succinct_query.formula_delta_transport_probe_plan_receipt(),
-            plan_receipt.expect("TribleSet preflight established the plan receipt"),
-        );
-        exact_check(
-            succinct_query.collect(),
-            &expected,
-            mode.label(),
-            "SuccinctArchive timing preflight",
-        );
-    }
-    println!("timing preflight: all six full SET cells exact; D/G/E plan receipts identical");
+    // All 30 correctness cells, including the frozen physical receipts, are
+    // discharged and dropped before any clock is read.
+    formula_transport_probe_backend("TribleSet sibling", &fixture.graph, &fixture, &expected);
+    formula_transport_probe_backend("SuccinctArchive sibling", &archive, &fixture, &expected);
+    println!(
+        "timing preflight: all 30 D/GF/GO cells exact; GF/GO raw and control receipts identical"
+    );
 
     // One untimed fresh pass per task both warms the exact path and freezes its
     // row/order receipt. Every formal observation must reproduce that receipt.
-    let expected_receipts: Vec<_> = tasks
-        .iter()
-        .copied()
-        .map(|task| run_formula_transport_timing_task(task, &fixture, &archive).0)
-        .collect();
+    let mut expected_receipts = Vec::with_capacity(tasks.len());
+    let expected_receipt_capacity = expected_receipts.capacity();
+    for task in tasks.iter().copied() {
+        expected_receipts.push(run_formula_transport_timing_task(task, &fixture, &archive).0);
+    }
+    assert_eq!(expected_receipts.capacity(), expected_receipt_capacity);
     println!("timing warmup: all 30 fresh task receipts frozen");
 
     let mut samples = Vec::with_capacity(rounds * tasks.len());
+    let sample_capacity = samples.capacity();
     for round in 0..rounds {
         for (position, task_index) in formula_transport_timing_order(round, tasks.len())
             .into_iter()
@@ -2336,7 +2557,13 @@ fn formula_transport_timing_main(rounds: usize) {
             });
         }
     }
+    assert_eq!(
+        samples.capacity(),
+        sample_capacity,
+        "formal sample storage grew"
+    );
     formula_delta_transport_probe_select(FormulaDeltaTransportProbeSelector::Typed);
+    formula_prepared_continuation_probe_select(FormulaPreparedContinuationProbeSelector::Filed);
 
     // Emit only after the measured panel so stdout cannot perturb later cells.
     for sample in &samples {
@@ -2393,19 +2620,19 @@ fn main() {
     match args.next().as_deref() {
         None => formula_transport_correctness_main(),
         Some("--timing-plan") => {
-            let rounds = args
-                .next()
-                .map(|raw| raw.parse().expect("round count must be an integer"))
-                .unwrap_or(120);
+            assert!(
+                args.next().is_none(),
+                "the frozen timing plan takes no arguments"
+            );
             let tasks = formula_transport_timing_tasks();
-            print_formula_transport_timing_plan(&tasks, rounds);
+            print_formula_transport_timing_plan(&tasks, FORMULA_TRANSPORT_FORMAL_ROUNDS);
         }
         Some("--timing") => {
-            let rounds = args
-                .next()
-                .map(|raw| raw.parse().expect("round count must be an integer"))
-                .unwrap_or(120);
-            formula_transport_timing_main(rounds);
+            assert!(
+                args.next().is_none(),
+                "the frozen timing panel takes no arguments"
+            );
+            formula_transport_timing_main(FORMULA_TRANSPORT_FORMAL_ROUNDS);
         }
         Some(other) => panic!("unknown Formula transport probe argument {other:?}"),
     }

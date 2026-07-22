@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The Formula Support probe has a frozen prepared-continuation panel.** Its
+  cfg-only D/GF/GO matrix keeps G's typed Support and stable Propose/Confirm
+  selectors orthogonal to filed versus owned Formula successors. Both
+  TribleSet and SuccinctArchive run checkpoints 63/64/65/100/full with exact
+  SET, raw-order, plan, stage, candidate, transition, conservation, and
+  physical filing receipts before the balanced 120-round timing panel.
 - **A cfg-only Formula continuation probe can delay physical worklist filing.**
   Formula-to-Formula successors still intern the same descriptor at the same
   transition boundary and retain the same rank, `StateId`, arbitration key,
