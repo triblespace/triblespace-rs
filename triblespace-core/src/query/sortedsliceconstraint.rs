@@ -667,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn quiescent_union_program_pages_keep_occurrences_private_until_normalization() {
+    fn direct_union_program_pages_normalize_occurrences_online() {
         let left = [value(1), value(1), value(2)];
         let right = [value(2), value(3)];
         let left = SortedSlice::new(&left).unwrap();
@@ -693,9 +693,9 @@ mod tests {
         assert_eq!(query.stats().delta_source_direct_candidates, 5);
         assert_eq!(query.stats().delta_source_roots, 0);
         assert_eq!(query.stats().delta_source_pages, 5);
-        // Each typed source page stays private to its Union arm;
-        // normalization emits the three distinct values only after both arms
-        // reach quiescence.
-        assert_eq!(query.stats().max_propose_candidates, 3);
+        // Each typed source page is normalized through the direct Union's
+        // master accumulator before publication, so duplicate occurrences
+        // never inflate a proposal page.
+        assert_eq!(query.stats().max_propose_candidates, 1);
     }
 }

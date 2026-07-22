@@ -565,6 +565,36 @@ fn formula_bound_start_root(set: TribleSet, start: Inline<GenId>, ops: &[PathOp]
     ]))
 }
 
+fn prefixed_formula_bound_start_root(
+    set: TribleSet,
+    start: Inline<GenId>,
+    prefix: Vec<RawInline>,
+    ops: &[PathOp],
+) -> Root {
+    let start_var = Variable::<GenId>::new(START);
+    let end_var = Variable::<GenId>::new(END);
+    let cyclic = Box::new(RegularPathConstraint::new(
+        set,
+        start_var,
+        end_var,
+        ops,
+    )) as DynConstraint;
+    let mut arms: Vec<DynConstraint> = prefix
+        .into_iter()
+        .map(|value| {
+            Box::new(IntersectionConstraint::new(vec![
+                Box::new(start_var.is(start)) as DynConstraint,
+                Box::new(end_var.is(Inline::<GenId>::new(value))) as DynConstraint,
+            ])) as DynConstraint
+        })
+        .collect();
+    arms.push(cyclic);
+    Arc::new(IntersectionConstraint::new(vec![
+        Box::new(start_var.is(start)) as DynConstraint,
+        Box::new(UnionConstraint::new(arms)) as DynConstraint,
+    ]))
+}
+
 fn bound_end_root(set: TribleSet, end: Inline<GenId>, ops: &[PathOp]) -> Root {
     let start_var = Variable::<GenId>::new(START);
     let end_var = Variable::<GenId>::new(END);
@@ -1732,27 +1762,84 @@ fn ordinary_shape_selected_query_composes_root_formula_union_and_cyclic_rpq() {
 }
 
 #[test]
-fn finite_or_keeps_cyclic_proposals_private_until_fixpoint_quiescence() {
+fn direct_finite_or_streams_the_first_cyclic_endpoint_before_fixpoint() {
     let graph = Graph::new(8, &[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)]);
     let ops = repeated(graph.attribute, false);
     let root = formula_bound_start_root(graph.set.clone(), graph.value(0), &ops);
     let mut query = Query::new(root, project_end)
-        .solve_residual_state_lazy_with(combined_effects())
+        .solve_residual_state_lazy_with(root_formula_effects())
         .cap(1)
         .start_width(1);
 
-    assert!(query.next().is_some());
+    let first = query.next().expect("the first direct-OR endpoint streamed");
+    assert_eq!(first, graph.value(1).raw);
     assert_eq!(
         query.stats().delta_transition_pages,
-        8,
-        "the finite OR waits for the complete cyclic arm"
+        1,
+        "the direct OR publishes from its first accepted transition page"
     );
     assert_eq!(
         query.stats().delta_transition_candidates_examined,
-        7,
-        "an OR arm must not publish a partial cyclic proposal"
+        1,
+        "the direct OR must not wait for cyclic fixpoint quiescence"
     );
-    drop(query);
+    let exact_clone = query.clone();
+    let cancelled = query.clone();
+    drop(cancelled);
+
+    let mut original = vec![first];
+    original.extend(query);
+    let mut cloned = vec![first];
+    cloned.extend(exact_clone);
+    original.sort_unstable();
+    cloned.sort_unstable();
+    assert_eq!(cloned, original);
+    let mut expected = (1..8)
+        .map(|node| graph.value(node).raw)
+        .collect::<Vec<_>>();
+    expected.sort_unstable();
+    assert_eq!(
+        original,
+        expected,
+        "online endpoints must not replay during final pending-only emission"
+    );
+}
+
+#[test]
+fn direct_or_preserves_set_semantics_with_empty_and_pending_finite_prefixes() {
+    let graph = Graph::new(4, &[(0, 1), (1, 2)]);
+    let ops = repeated(graph.attribute, false);
+    for (prefix, mut expected) in [
+        (Vec::new(), vec![graph.value(1).raw, graph.value(2).raw]),
+        (
+            vec![graph.value(1).raw, graph.value(3).raw],
+            vec![
+                graph.value(1).raw,
+                graph.value(2).raw,
+                graph.value(3).raw,
+            ],
+        ),
+    ] {
+        let root = prefixed_formula_bound_start_root(
+            graph.set.clone(),
+            graph.value(0),
+            prefix,
+            &ops,
+        );
+        let mut query = Query::new(root, project_end)
+            .solve_residual_state_lazy_with(root_formula_effects())
+            .cap(1)
+            .start_width(1);
+
+        let first = query.next().expect("the cyclic arm streamed after the finite arm");
+        assert_eq!(first, graph.value(1).raw);
+        assert_eq!(query.stats().delta_transition_candidates_examined, 1);
+        let mut actual = vec![first];
+        actual.extend(query);
+        actual.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+    }
 }
 
 #[test]
