@@ -11,6 +11,9 @@
 //! RUSTFLAGS="--cfg engine_current_residual" cargo run --release --example query_engine_generation_bench
 //! RUSTFLAGS="--cfg engine_current_residual --cfg engine_prefix_checkpoints" \
 //!   cargo run --release --example query_engine_generation_bench
+//! RUSTFLAGS="--cfg engine_current_residual --cfg engine_prefix_checkpoints \
+//!   --cfg engine_counter_only" \
+//!   cargo run --release --example query_engine_generation_bench
 //! ```
 //!
 //! Fixture/archive construction and the independent relational oracles are
@@ -19,6 +22,9 @@
 
 #![allow(unexpected_cfgs)]
 #![cfg_attr(engine_prefix_checkpoints, allow(dead_code))]
+
+#[cfg(all(engine_counter_only, not(engine_prefix_checkpoints)))]
+compile_error!("engine_counter_only requires engine_prefix_checkpoints");
 
 #[cfg(any(
     all(engine_legacy_binding, engine_current_scalar),
@@ -898,8 +904,11 @@ fn main() {
     );
 }
 
-#[cfg(engine_prefix_checkpoints)]
+#[cfg(all(engine_prefix_checkpoints, not(engine_counter_only)))]
 const PREFIX_CHECKPOINTS: [usize; 7] = [1, 10, 63, 64, 65, 100, 1_000];
+
+#[cfg(all(engine_prefix_checkpoints, engine_counter_only))]
+const PREFIX_CHECKPOINTS: [usize; 4] = [63, 64, 65, 100];
 
 #[cfg(engine_prefix_checkpoints)]
 #[derive(Clone, Copy, Debug)]
@@ -1002,6 +1011,26 @@ where
         "{label}: iterator ended before the final prefix checkpoint"
     );
     snapshots
+}
+
+#[cfg(all(engine_prefix_checkpoints, engine_counter_only))]
+fn print_counter_evidence<I>(label: &str, query: I)
+where
+    I: Iterator<Item = Pair>,
+{
+    for (checkpoint, evidence) in
+        PREFIX_CHECKPOINTS.into_iter().zip(checkpoint_evidence(label, query))
+    {
+        println!(
+            "evidence cell={label:?} checkpoint={checkpoint} count={} checksum={:#018x} \
+             ordered_digest={:#018x} last_pair={} distinct_sources={}",
+            evidence.rows,
+            evidence.checksum,
+            evidence.ordered_digest,
+            render_pair(evidence.last),
+            evidence.distinct_sources.len(),
+        );
+    }
 }
 
 #[cfg(engine_prefix_checkpoints)]
@@ -1203,12 +1232,22 @@ fn main() {
     let repetitions = parse_arg(4, 21);
     assert!(repetitions >= 3, "use at least three repetitions");
 
-    let fixture_start = Instant::now();
-    let fixture = Fixture::new(component_count, ring_size, fanout);
-    let fixture_elapsed = fixture_start.elapsed();
-    let archive_start = Instant::now();
-    let archive: SuccinctArchive<OrderedUniverse> = (&fixture.graph).into();
-    let archive_elapsed = archive_start.elapsed();
+    #[cfg(not(engine_counter_only))]
+    let (fixture, fixture_elapsed, archive, archive_elapsed) = {
+        let fixture_start = Instant::now();
+        let fixture = Fixture::new(component_count, ring_size, fanout);
+        let fixture_elapsed = fixture_start.elapsed();
+        let archive_start = Instant::now();
+        let archive: SuccinctArchive<OrderedUniverse> = (&fixture.graph).into();
+        let archive_elapsed = archive_start.elapsed();
+        (fixture, fixture_elapsed, archive, archive_elapsed)
+    };
+    #[cfg(engine_counter_only)]
+    let (fixture, archive) = {
+        let fixture = Fixture::new(component_count, ring_size, fanout);
+        let archive: SuccinctArchive<OrderedUniverse> = (&fixture.graph).into();
+        (fixture, archive)
+    };
 
     let rpq_expected = fixture.cyclic_rpq_oracle();
     let mixed_expected = fixture.mixed_formula_rpq_oracle();
@@ -1216,6 +1255,7 @@ fn main() {
     println!("diagnostic: source-identical prefix checkpoints");
     println!("engine: {ENGINE}");
     println!("revision: {REVISION}");
+    #[cfg(not(engine_counter_only))]
     println!(
         "fixture: {component_count} components x {ring_size} nodes, fanout {fanout}, \
          {} tribles; built in {:?}; archive built in {:?} (excluded)",
@@ -1223,7 +1263,16 @@ fn main() {
         fixture_elapsed,
         archive_elapsed,
     );
+    #[cfg(engine_counter_only)]
+    println!(
+        "fixture: {component_count} components x {ring_size} nodes, fanout {fanout}, \
+         {} tribles",
+        fixture.graph.len(),
+    );
+    #[cfg(not(engine_counter_only))]
     println!("samples: {repetitions}; hot cache; release profile");
+    #[cfg(engine_counter_only)]
+    println!("mode: counter-only; lowering: HYBRID; no timed samples");
     println!("checkpoints: {PREFIX_CHECKPOINTS:?}");
 
     exact_check(
@@ -1246,42 +1295,63 @@ fn main() {
     );
     println!("oracle parity: all three prefix-diagnostic cells exact");
 
+    #[cfg(engine_counter_only)]
+    {
+        print_counter_evidence("cyclic RPQ / TribleSet", cyclic_rpq_query!(&fixture));
+        print_counter_evidence(
+            "formula + cyclic RPQ / TribleSet sibling",
+            mixed_formula_rpq_query!(&fixture.graph, &fixture),
+        );
+        print_counter_evidence(
+            "formula + cyclic RPQ / SuccinctArchive sibling",
+            mixed_formula_rpq_query!(&archive, &fixture),
+        );
+    }
+
     #[cfg(engine_current_residual)]
     {
         use triblespace::core::query::residual::ResidualLowering;
 
+        #[cfg(not(engine_counter_only))]
+        const PREFIX_LOWERING: ResidualLowering = ResidualLowering::FULL;
+        #[cfg(engine_counter_only)]
+        const PREFIX_LOWERING: ResidualLowering = ResidualLowering::HYBRID;
+
         residual_checkpoint_stats(
             "cyclic RPQ / TribleSet",
-            cyclic_rpq_query!(&fixture).solve_residual_state_lazy_with(ResidualLowering::FULL),
+            cyclic_rpq_query!(&fixture).solve_residual_state_lazy_with(PREFIX_LOWERING),
             |query| (query.current_width(), format!("{:?}", query.stats())),
         );
         residual_checkpoint_stats(
             "formula + cyclic RPQ / TribleSet sibling",
             mixed_formula_rpq_query!(&fixture.graph, &fixture)
-                .solve_residual_state_lazy_with(ResidualLowering::FULL),
+                .solve_residual_state_lazy_with(PREFIX_LOWERING),
             |query| (query.current_width(), format!("{:?}", query.stats())),
         );
         residual_checkpoint_stats(
             "formula + cyclic RPQ / SuccinctArchive sibling",
             mixed_formula_rpq_query!(&archive, &fixture)
-                .solve_residual_state_lazy_with(ResidualLowering::FULL),
+                .solve_residual_state_lazy_with(PREFIX_LOWERING),
             |query| (query.current_width(), format!("{:?}", query.stats())),
         );
     }
 
-    bench_prefix_cell("cyclic RPQ / TribleSet", &rpq_expected, repetitions, || {
-        cyclic_rpq_query!(&fixture)
-    });
-    bench_prefix_cell(
-        "formula + cyclic RPQ / TribleSet sibling",
-        &mixed_expected,
-        repetitions,
-        || mixed_formula_rpq_query!(&fixture.graph, &fixture),
-    );
-    bench_prefix_cell(
-        "formula + cyclic RPQ / SuccinctArchive sibling",
-        &mixed_expected,
-        repetitions,
-        || mixed_formula_rpq_query!(&archive, &fixture),
-    );
+    #[cfg(not(engine_counter_only))]
+    {
+        bench_prefix_cell("cyclic RPQ / TribleSet", &rpq_expected, repetitions, || {
+            cyclic_rpq_query!(&fixture)
+        });
+        bench_prefix_cell(
+            "formula + cyclic RPQ / TribleSet sibling",
+            &mixed_expected,
+            repetitions,
+            || mixed_formula_rpq_query!(&fixture.graph, &fixture),
+        );
+        bench_prefix_cell(
+            "formula + cyclic RPQ / SuccinctArchive sibling",
+            &mixed_expected,
+            repetitions,
+            || mixed_formula_rpq_query!(&archive, &fixture),
+        );
+    }
 }
