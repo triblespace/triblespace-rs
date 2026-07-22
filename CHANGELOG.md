@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The cfg-only Formula transport probe can isolate typed Support.** Its
+  D/G/E panel holds the production plan and stable Propose path fixed while
+  moving Support, then Confirm, onto typed transport, with a frozen F receipt
+  completing the two-factor interaction report.
 - **The cfg-only Formula transport probe can isolate typed Confirm.** Its
   D/F/E panel now holds the production plan and stable Propose path fixed while
   moving Confirm, then Support, onto typed transport, with per-stage positive

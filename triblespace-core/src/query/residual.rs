@@ -124,8 +124,10 @@ pub enum FormulaDeltaTransportProbeSelector {
     StablePropose = 1,
     /// Decline Formula Propose and Support, leaving only Confirm eligible.
     StableProposeSupport = 2,
+    /// Decline Formula Propose and Confirm, leaving only Support eligible.
+    StableProposeConfirm = 3,
     /// Decline every focused Formula Atom stage before route selection.
-    StableAll = 3,
+    StableAll = 4,
 }
 
 #[cfg(formula_delta_transport_probe)]
@@ -147,6 +149,9 @@ fn formula_delta_transport_probe_forces(stage: FormulaStage) -> bool {
         }
         value if value == FormulaDeltaTransportProbeSelector::StableProposeSupport as u8 => {
             matches!(stage, FormulaStage::Propose | FormulaStage::Support)
+        }
+        value if value == FormulaDeltaTransportProbeSelector::StableProposeConfirm as u8 => {
+            matches!(stage, FormulaStage::Propose | FormulaStage::Confirm)
         }
         value if value == FormulaDeltaTransportProbeSelector::StableAll as u8 => true,
         value => panic!("invalid Formula delta-transport probe selector {value}"),

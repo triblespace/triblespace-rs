@@ -251,7 +251,7 @@ type Pair = (Inline<GenId>, Inline<GenId>);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FormulaTransportProbeMode {
     ProductionStableFormula,
-    ProductionStableProposeSupport,
+    ProductionStableProposeConfirm,
     ProductionStablePropose,
 }
 
@@ -259,14 +259,14 @@ enum FormulaTransportProbeMode {
 impl FormulaTransportProbeMode {
     const ALL: [Self; 3] = [
         Self::ProductionStableFormula,
-        Self::ProductionStableProposeSupport,
+        Self::ProductionStableProposeConfirm,
         Self::ProductionStablePropose,
     ];
 
     fn label(self) -> &'static str {
         match self {
             Self::ProductionStableFormula => "D_PRODUCTION_STABLE_FORMULA",
-            Self::ProductionStableProposeSupport => "F_PRODUCTION_STABLE_PROPOSE_SUPPORT",
+            Self::ProductionStableProposeConfirm => "G_PRODUCTION_STABLE_PROPOSE_CONFIRM",
             Self::ProductionStablePropose => "E_PRODUCTION_STABLE_PROPOSE",
         }
     }
@@ -274,7 +274,7 @@ impl FormulaTransportProbeMode {
     fn lowering(self) -> ResidualLowering {
         match self {
             Self::ProductionStableFormula
-            | Self::ProductionStableProposeSupport
+            | Self::ProductionStableProposeConfirm
             | Self::ProductionStablePropose => ResidualLowering::PRODUCTION,
         }
     }
@@ -282,8 +282,8 @@ impl FormulaTransportProbeMode {
     fn arm(self) {
         let selector = match self {
             Self::ProductionStableFormula => FormulaDeltaTransportProbeSelector::StableAll,
-            Self::ProductionStableProposeSupport => {
-                FormulaDeltaTransportProbeSelector::StableProposeSupport
+            Self::ProductionStableProposeConfirm => {
+                FormulaDeltaTransportProbeSelector::StableProposeConfirm
             }
             Self::ProductionStablePropose => FormulaDeltaTransportProbeSelector::StablePropose,
         };
@@ -1677,7 +1677,7 @@ fn formula_transport_probe_backend<S: TriblePattern>(
     }
 
     let stable_formula = &full_stats[0].3;
-    let stable_propose_support = &full_stats[1].3;
+    let stable_propose_confirm = &full_stats[1].3;
     let stable_propose = &full_stats[2].3;
     assert_eq!(
         full_stats[0].0,
@@ -1685,7 +1685,7 @@ fn formula_transport_probe_backend<S: TriblePattern>(
     );
     assert_eq!(
         full_stats[1].0,
-        FormulaTransportProbeMode::ProductionStableProposeSupport
+        FormulaTransportProbeMode::ProductionStableProposeConfirm
     );
     assert_eq!(
         full_stats[2].0,
@@ -1700,7 +1700,7 @@ fn formula_transport_probe_backend<S: TriblePattern>(
     assert!(plan.formula_nodes > 0);
     assert!(plan.production_region_marks > 0);
     assert_eq!(plan.opaque_production_program_leaves, 1);
-    for stats in [stable_formula, stable_propose_support, stable_propose] {
+    for stats in [stable_formula, stable_propose_confirm, stable_propose] {
         assert_eq!(
             stats.probe_formula_delta_attempts,
             stats.probe_formula_support_attempts
@@ -1746,45 +1746,45 @@ fn formula_transport_probe_backend<S: TriblePattern>(
     );
 
     assert_eq!(
-        stable_propose_support.probe_formula_forced_stable_declines,
-        stable_propose_support.probe_formula_support_attempts
-            + stable_propose_support.probe_formula_propose_attempts,
+        stable_propose_confirm.probe_formula_forced_stable_declines,
+        stable_propose_confirm.probe_formula_propose_attempts
+            + stable_propose_confirm.probe_formula_confirm_attempts,
     );
     assert_eq!(
-        stable_propose_support.probe_formula_forced_stable_support,
-        stable_propose_support.probe_formula_support_attempts,
-    );
-    assert_eq!(
-        stable_propose_support.probe_formula_forced_stable_propose,
-        stable_propose_support.probe_formula_propose_attempts,
-    );
-    assert_eq!(
-        stable_propose_support.probe_formula_forced_stable_confirm,
+        stable_propose_confirm.probe_formula_forced_stable_support,
         0,
     );
     assert_eq!(
-        stable_propose_support.probe_formula_support_program_selected,
+        stable_propose_confirm.probe_formula_forced_stable_propose,
+        stable_propose_confirm.probe_formula_propose_attempts,
+    );
+    assert_eq!(
+        stable_propose_confirm.probe_formula_forced_stable_confirm,
+        stable_propose_confirm.probe_formula_confirm_attempts,
+    );
+    assert_eq!(
+        stable_propose_confirm.probe_formula_propose_program_selected,
         0,
     );
     assert_eq!(
-        stable_propose_support.probe_formula_propose_program_selected,
+        stable_propose_confirm.probe_formula_confirm_program_selected,
         0,
     );
     assert_eq!(
-        stable_propose_support.probe_formula_support_program_seeded,
+        stable_propose_confirm.probe_formula_propose_program_seeded,
         0,
     );
     assert_eq!(
-        stable_propose_support.probe_formula_propose_program_seeded,
+        stable_propose_confirm.probe_formula_confirm_program_seeded,
         0,
     );
     assert_eq!(
-        stable_propose_support.probe_formula_stable_support_calls,
-        stable_propose_support.probe_formula_support_attempts,
+        stable_propose_confirm.probe_formula_stable_propose_calls,
+        stable_propose_confirm.probe_formula_propose_attempts,
     );
     assert_eq!(
-        stable_propose_support.probe_formula_stable_propose_calls,
-        stable_propose_support.probe_formula_propose_attempts,
+        stable_propose_confirm.probe_formula_stable_confirm_calls,
+        stable_propose_confirm.probe_formula_confirm_attempts,
     );
 
     assert_eq!(stable_propose.probe_formula_forced_stable_support, 0);
@@ -1803,19 +1803,19 @@ fn formula_transport_probe_backend<S: TriblePattern>(
         stable_propose.probe_formula_stable_propose_calls,
         stable_propose.probe_formula_propose_attempts,
     );
-    for stats in [stable_formula, stable_propose_support, stable_propose] {
+    for stats in [stable_formula, stable_propose_confirm, stable_propose] {
         assert_eq!(stats.delta_source_pages, 0);
         assert_eq!(stats.delta_source_cohorts, 0);
         assert_eq!(stats.delta_source_candidates_examined, 0);
         assert_eq!(stats.probe_formula_source_seeded, 0);
         assert_eq!(stats.probe_formula_legacy_seeded, 0);
     }
-    let stats_at_65: Vec<_> = FormulaTransportProbeMode::ALL
+    let receipts_at_65: Vec<_> = FormulaTransportProbeMode::ALL
         .into_iter()
         .map(|mode| {
             let mut query = formula_transport_probe_query!(store, fixture, mode);
             assert_eq!(query.by_ref().take(65).count(), 65);
-            query.stats().clone()
+            (query.current_width(), query.stats().clone())
         })
         .collect();
     for mode in FormulaTransportProbeMode::ALL {
@@ -1827,21 +1827,23 @@ fn formula_transport_probe_backend<S: TriblePattern>(
     }
     if backend.starts_with("TribleSet") {
         assert_eq!(
-            stable_propose_support.probe_formula_confirm_program_selected,
+            stable_propose_confirm.probe_formula_support_program_selected,
             0,
         );
         assert_eq!(
-            stable_propose_support.probe_formula_confirm_program_seeded,
+            stable_propose_confirm.probe_formula_support_program_seeded,
             0,
         );
         assert_eq!(
-            stable_propose_support.probe_formula_natural_stable_declines,
-            stable_propose_support.probe_formula_confirm_attempts,
+            stable_propose_confirm.probe_formula_natural_stable_declines,
+            stable_propose_confirm.probe_formula_support_attempts,
         );
         assert_eq!(
-            stable_propose_support.probe_formula_stable_confirm_calls,
-            stable_propose_support.probe_formula_confirm_attempts,
+            stable_propose_confirm.probe_formula_stable_support_calls,
+            stable_propose_confirm.probe_formula_support_attempts,
         );
+        assert_eq!(stable_propose_confirm.probe_formula_program_selected, 0);
+        assert_eq!(stable_propose_confirm.probe_formula_program_seeded, 0);
         assert_eq!(stable_propose.probe_formula_program_selected, 0);
         assert_eq!(stable_propose.probe_formula_program_seeded, 0);
         assert_eq!(
@@ -1857,47 +1859,56 @@ fn formula_transport_probe_backend<S: TriblePattern>(
             stable_propose.probe_formula_stable_confirm_calls,
             stable_propose.probe_formula_confirm_attempts,
         );
-        assert_eq!(full_stats[0].2, full_stats[1].2);
-        assert_eq!(full_stats[0].2, full_stats[2].2);
-        assert_eq!(
-            formula_transport_without_selector_accounting(stable_formula),
-            formula_transport_without_selector_accounting(stable_propose_support),
-        );
-        assert_eq!(
-            formula_transport_without_selector_accounting(stable_formula),
-            formula_transport_without_selector_accounting(stable_propose),
-        );
-        assert_eq!(
-            formula_transport_without_selector_accounting(&stats_at_65[0]),
-            formula_transport_without_selector_accounting(&stats_at_65[1]),
-        );
-        assert_eq!(
-            formula_transport_without_selector_accounting(&stats_at_65[0]),
-            formula_transport_without_selector_accounting(&stats_at_65[2]),
+        let full_application_equal = formula_transport_without_selector_accounting(stable_formula)
+            == formula_transport_without_selector_accounting(stable_propose_confirm)
+            && formula_transport_without_selector_accounting(stable_formula)
+                == formula_transport_without_selector_accounting(stable_propose);
+        let prefix65_application_equal =
+            formula_transport_without_selector_accounting(&receipts_at_65[0].1)
+                == formula_transport_without_selector_accounting(&receipts_at_65[1].1)
+                && formula_transport_without_selector_accounting(&receipts_at_65[0].1)
+                    == formula_transport_without_selector_accounting(&receipts_at_65[2].1);
+        println!(
+            "probe_negative_control backend={backend:?} g_support_selected=0 \
+             g_support_seeded=0 g_natural_support_declines={} \
+             full_application_equal_observed={} prefix65_application_equal_observed={}",
+            stable_propose_confirm.probe_formula_natural_stable_declines,
+            full_application_equal,
+            prefix65_application_equal,
         );
     } else {
         assert_eq!(
-            stable_propose_support.probe_formula_natural_stable_declines,
+            stable_propose_confirm.probe_formula_natural_stable_declines,
             0,
         );
         assert_eq!(
-            stable_propose_support.probe_formula_confirm_program_selected,
-            stable_propose_support.probe_formula_confirm_attempts,
+            stable_propose_confirm.probe_formula_support_program_selected,
+            stable_propose_confirm.probe_formula_support_attempts,
         );
         assert_eq!(
-            stable_propose_support.probe_formula_confirm_program_seeded,
-            stable_propose_support.probe_formula_confirm_program_selected,
+            stable_propose_confirm.probe_formula_support_program_seeded,
+            stable_propose_confirm.probe_formula_support_program_selected,
         );
         assert_eq!(
-            stable_propose_support.probe_formula_program_selected,
-            stable_propose_support.probe_formula_confirm_program_selected,
+            stable_propose_confirm.probe_formula_program_selected,
+            stable_propose_confirm.probe_formula_support_program_selected,
         );
         assert_eq!(
-            stable_propose_support.probe_formula_program_seeded,
-            stable_propose_support.probe_formula_confirm_program_seeded,
+            stable_propose_confirm.probe_formula_program_seeded,
+            stable_propose_confirm.probe_formula_support_program_seeded,
         );
-        assert!(stable_propose_support.probe_formula_confirm_program_seeded_parents > 0);
-        assert_eq!(stable_propose_support.probe_formula_stable_confirm_calls, 0);
+        assert!(stable_propose_confirm.probe_formula_support_program_seeded_parents > 0);
+        assert_eq!(stable_propose_confirm.probe_formula_stable_support_calls, 0);
+        println!(
+            "probe_positive_control backend={backend:?} g_support_attempts={} \
+             g_support_selected={} g_support_seeded={} g_support_seeded_parents={} \
+             g_stable_support_calls=0 g_forced_confirm={}",
+            stable_propose_confirm.probe_formula_support_attempts,
+            stable_propose_confirm.probe_formula_support_program_selected,
+            stable_propose_confirm.probe_formula_support_program_seeded,
+            stable_propose_confirm.probe_formula_support_program_seeded_parents,
+            stable_propose_confirm.probe_formula_forced_stable_confirm,
+        );
         assert_eq!(stable_propose.probe_formula_natural_stable_declines, 0);
         assert_eq!(
             stable_propose.probe_formula_support_program_selected,
@@ -1919,32 +1930,69 @@ fn formula_transport_probe_backend<S: TriblePattern>(
         assert_eq!(stable_propose.probe_formula_stable_confirm_calls, 0);
     }
     println!(
-        "probe_transport_seam backend={backend:?} d_f_e_formula_scope_equal=true \
-         d_f_e_program_scope_equal=true d_forced_all={} f_forced_support={} \
-         f_forced_propose={} f_forced_confirm=0 f_confirm_selected={} \
-         f_confirm_seeded={} e_forced_propose={} e_support_selected={} \
+        "probe_transport_seam backend={backend:?} d_g_e_formula_scope_equal=true \
+         d_g_e_program_scope_equal=true d_forced_all={} g_forced_support=0 \
+         g_forced_propose={} g_forced_confirm={} g_support_selected={} \
+         g_support_seeded={} e_forced_propose={} e_support_selected={} \
          e_confirm_selected={}",
         stable_formula.probe_formula_delta_attempts,
-        stable_propose_support.probe_formula_forced_stable_support,
-        stable_propose_support.probe_formula_forced_stable_propose,
-        stable_propose_support.probe_formula_confirm_program_selected,
-        stable_propose_support.probe_formula_confirm_program_seeded,
+        stable_propose_confirm.probe_formula_forced_stable_propose,
+        stable_propose_confirm.probe_formula_forced_stable_confirm,
+        stable_propose_confirm.probe_formula_support_program_selected,
+        stable_propose_confirm.probe_formula_support_program_seeded,
         stable_propose.probe_formula_forced_stable_propose,
         stable_propose.probe_formula_support_program_selected,
         stable_propose.probe_formula_confirm_program_selected,
     );
+    // Parent commit 5f4fbcb59ca2 froze F at 2,208 for both backends. Keeping
+    // that preregistered observation out of this D/G/E panel avoids adding a
+    // fourth timed cell while still completing the 2x2 interaction receipt.
+    const FROZEN_F_PREFIX65_CANDIDATES_CONFIRMED: usize = 2_208;
+    let d_prefix65 = receipts_at_65[0].1.candidates_confirmed as i128;
+    let f_prefix65 = FROZEN_F_PREFIX65_CANDIDATES_CONFIRMED as i128;
+    let g_prefix65 = receipts_at_65[1].1.candidates_confirmed as i128;
+    let e_prefix65 = receipts_at_65[2].1.candidates_confirmed as i128;
+    let confirm_effect_support_stable = f_prefix65 - d_prefix65;
+    let confirm_effect_support_typed = e_prefix65 - g_prefix65;
+    let support_effect_confirm_stable = g_prefix65 - d_prefix65;
+    let support_effect_confirm_typed = e_prefix65 - f_prefix65;
+    let interaction = e_prefix65 - g_prefix65 - f_prefix65 + d_prefix65;
+    let g_matches_e_width = receipts_at_65[1].0 == receipts_at_65[2].0;
+    let g_matches_e_candidates =
+        receipts_at_65[1].1.candidates_confirmed == receipts_at_65[2].1.candidates_confirmed;
+    let g_preserves_e_control_shape = g_matches_e_width && g_matches_e_candidates;
     println!(
-        "probe_prefix65_discriminator backend={backend:?} d_candidates_confirmed={} \
-         f_candidates_confirmed={} e_candidates_confirmed={}",
-        stats_at_65[0].candidates_confirmed,
-        stats_at_65[1].candidates_confirmed,
-        stats_at_65[2].candidates_confirmed,
+        "probe_prefix65_factorial backend={backend:?} d_candidates_confirmed={} \
+         frozen_f_candidates_confirmed={} g_candidates_confirmed={} \
+         e_candidates_confirmed={} d_width={} g_width={} e_width={} \
+         g_matches_e_candidates={} g_matches_e_width={} \
+         g_preserves_e_control_shape={} g_preserves_e_288_candidates={} \
+         confirm_effect_support_stable={} confirm_effect_support_typed={} \
+         support_effect_confirm_stable={} support_effect_confirm_typed={} \
+         interaction={} additive_identity_observed={}",
+        d_prefix65,
+        f_prefix65,
+        g_prefix65,
+        e_prefix65,
+        receipts_at_65[0].0,
+        receipts_at_65[1].0,
+        receipts_at_65[2].0,
+        g_matches_e_candidates,
+        g_matches_e_width,
+        g_preserves_e_control_shape,
+        g_matches_e_candidates && receipts_at_65[2].1.candidates_confirmed == 288,
+        confirm_effect_support_stable,
+        confirm_effect_support_typed,
+        support_effect_confirm_stable,
+        support_effect_confirm_typed,
+        interaction,
+        d_prefix65 + e_prefix65 == f_prefix65 + g_prefix65,
     );
 }
 
 #[cfg(formula_delta_transport_probe)]
 fn formula_transport_correctness_main() {
-    const PROBE_BASE: &str = "667272a67b724a820ec31a7c6a22540755cec5ad";
+    const PROBE_BASE: &str = "5f4fbcb59ca2535e0b5670e79bd5885412c2e11d";
     const COMPONENT_COUNT: usize = 1;
     const RING_SIZE: usize = 64;
     const FANOUT: usize = 2;
@@ -1954,7 +2002,7 @@ fn formula_transport_correctness_main() {
     let expected = fixture.mixed_formula_rpq_oracle();
     assert_eq!(expected.len(), 2_048, "the original causal cell drifted");
 
-    println!("diagnostic: Formula Confirm conditional delta-transport probe; no timed samples");
+    println!("diagnostic: Formula Support conditional delta-transport probe; no timed samples");
     println!("probe base: {PROBE_BASE}");
     println!("engine: {ENGINE}");
     println!("revision: {REVISION}");
@@ -2200,7 +2248,7 @@ fn print_formula_transport_timing_plan(tasks: &[FormulaTransportTimingTask], rou
 
 #[cfg(formula_delta_transport_probe)]
 fn formula_transport_timing_main(rounds: usize) {
-    const PROBE_BASE: &str = "667272a67b724a820ec31a7c6a22540755cec5ad";
+    const PROBE_BASE: &str = "5f4fbcb59ca2535e0b5670e79bd5885412c2e11d";
     const COMPONENT_COUNT: usize = 1;
     const RING_SIZE: usize = 64;
     const FANOUT: usize = 2;
@@ -2215,7 +2263,7 @@ fn formula_transport_timing_main(rounds: usize) {
     assert_eq!(expected.len(), 2_048, "the original causal cell drifted");
     let tasks = formula_transport_timing_tasks();
 
-    println!("formal timing: Formula Confirm conditional delta-transport panel");
+    println!("formal timing: Formula Support conditional delta-transport panel");
     println!("engine: {ENGINE}");
     println!("revision: {REVISION}");
     println!("probe base: {PROBE_BASE}");
@@ -2255,7 +2303,7 @@ fn formula_transport_timing_main(rounds: usize) {
             "SuccinctArchive timing preflight",
         );
     }
-    println!("timing preflight: all six full SET cells exact; D/F/E plan receipts identical");
+    println!("timing preflight: all six full SET cells exact; D/G/E plan receipts identical");
 
     // One untimed fresh pass per task both warms the exact path and freezes its
     // row/order receipt. Every formal observation must reproduce that receipt.
