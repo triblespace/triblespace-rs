@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Receipt-proved complete Program results can transfer directly through an
+  empty exact Formula OR.** When the completing direct arm is exact and no
+  earlier arm has admitted a value, the residual engine deterministically
+  orders the already-distinct parent-local result and reuses the existing OR
+  completion path, avoiding duplicate ordered-set insertion. Covering arms,
+  unfinished siblings, nonempty accumulators, and nested outer OR admission
+  retain their ordinary semantics.
 - **Fresh queries now use selective production-region lowering.**
   `ResidualLowering::PRODUCTION` combines `FormulaScope::ProductionRegions`
   with `ProgramScope::Production`, so ordinary `Query::new`, `find!`,

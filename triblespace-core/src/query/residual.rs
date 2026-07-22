@@ -2783,6 +2783,11 @@ pub struct ResidualStateStats {
     /// Raw proposal occurrences returned by those actions before the complete
     /// adapter's per-parent SET admission.
     pub delta_quiescent_formula_complete_raw_occurrences: usize,
+    /// Complete Program results transferred directly through a completing
+    /// Formula OR whose current arm is Exact and whose accumulator was still
+    /// globally empty. These results are already parent-local SETs at the
+    /// typed complete adapter boundary, so only deterministic ordering remains.
+    pub delta_quiescent_formula_exact_empty_or_transfers: usize,
     /// Eligible quiescent Formula complete-action transactions that admitted
     /// no suffix and therefore retained pageable execution. A prefix deferred
     /// by a successful partial-tail transaction counts only if its own later
@@ -5465,6 +5470,28 @@ impl CandidatePayload {
         }
     }
 
+    /// Orders an already-admitted affine SET for direct Formula OR emission.
+    ///
+    /// This is deliberately not a general candidate normalization operation:
+    /// the caller must hold independent evidence that every `(parent, value)`
+    /// pair is distinct. Sorting tagged pairs lexicographically preserves
+    /// ascending parent groups while ordering values within each parent.
+    fn sort_admitted_set(&mut self, parent_count: usize) {
+        self.debug_assert_valid_for(parent_count);
+        match self {
+            Self::Values(values) => values.sort_unstable(),
+            Self::Tagged(pairs) => pairs.sort_unstable(),
+            Self::Deferred(_) => {
+                panic!("a direct Formula OR SET transfer requires contiguous complete effects")
+            }
+        }
+        debug_assert!(match self {
+            Self::Values(values) => values.windows(2).all(|pair| pair[0] < pair[1]),
+            Self::Tagged(pairs) => pairs.windows(2).all(|pair| pair[0] < pair[1]),
+            Self::Deferred(_) => unreachable!(),
+        });
+    }
+
     /// Admits one occurrence of each `(parent, value)` while preserving the
     /// order observed by tail-first candidate scheduling.
     ///
@@ -6541,6 +6568,29 @@ impl FormulaBatch {
         active_arm
             .take()
             .expect("Formula OR completed an arm without its execution receipt")
+    }
+
+    /// Whether the current direct OR arm may replace first admission with an
+    /// algebraic SET transfer. Exactness belongs to the arm's proposal receipt;
+    /// emptiness covers every completed or online-published preceding arm.
+    fn current_or_arm_is_exact_with_empty_accumulator(&self) -> bool {
+        let Some(FormulaPayloadFrame::Or {
+            accumulator,
+            active_arm: Some(active_arm),
+            ..
+        }) = self.frames.last()
+        else {
+            return false;
+        };
+        debug_assert_eq!(
+            accumulator.unique_len,
+            accumulator.sets.iter().map(OrdSet::len).sum::<usize>()
+        );
+        debug_assert_eq!(
+            accumulator.pending_len,
+            accumulator.pending.iter().map(OrdSet::len).sum::<usize>()
+        );
+        active_arm.exact && accumulator.unique_len == 0
     }
 
     fn current_or_clean_parents(&self) -> Vec<bool> {
@@ -9041,6 +9091,75 @@ fn finish_formula_or_admission(
             )
         }
     }
+}
+
+/// Replaces first admission plus ordered-set materialization with a direct
+/// algebraic transfer from one receipt-specialized complete Program result.
+///
+/// The transfer is legal only for a direct Exact OR arm, before that OR has
+/// observed any other value, and when completing the focused action also
+/// completes the OR Plan. The current OR payload frame and the action's direct
+/// return to that Plan jointly prove there is no intervening connective. Every
+/// failed premise returns the untouched affine payload to the ordinary reducer
+/// path. Interning the speculative completed PCs on a structural decline is
+/// harmless: PCs are immutable query-local values and no work is filed for
+/// them.
+#[allow(clippy::too_many_arguments)]
+fn try_finish_exact_empty_formula_or_complete_result(
+    plan: &ResidualPlan,
+    bound: VariableSet,
+    counter: FormulaPcId,
+    mut batch: FormulaBatch,
+    mut result: CandidatePayload,
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+    reducer_seeds: &mut Vec<FormulaReducerSeed>,
+) -> Result<Option<ContinuationToken>, (FormulaBatch, CandidatePayload)> {
+    if !batch.current_or_arm_is_exact_with_empty_accumulator() {
+        return Err((batch, result));
+    }
+    result.debug_assert_valid_for(batch.parents.row_count);
+
+    let completed = interner.formula_pcs.complete(&plan.finite_formula, counter);
+    let Ok(InternedFormulaSuccessor::Formula(or_counter)) = interner
+        .formula_pcs
+        .resume_completed(&plan.finite_formula, completed)
+    else {
+        return Err((batch, result));
+    };
+    let completing_or = match &interner.formula(or_counter).focus {
+        FormulaFocus::Plan {
+            node,
+            stage: FormulaStage::Propose,
+            done,
+        } => match &plan.finite_formula.node(*node).kind {
+            FiniteFormulaNodeKind::Or { children } => done.count() == children.len(),
+            FiniteFormulaNodeKind::Atom | FiniteFormulaNodeKind::And { .. } => false,
+        },
+        FormulaFocus::Action { .. }
+        | FormulaFocus::Plan { .. }
+        | FormulaFocus::Complete { .. } => false,
+    };
+    if !completing_or {
+        return Err((batch, result));
+    }
+
+    batch.validate_tags();
+    batch.finish_current_or_arm();
+    result.sort_admitted_set(batch.parents.row_count);
+    stats.delta_quiescent_formula_exact_empty_or_transfers += 1;
+    Ok(finish_formula_or_emission(
+        plan,
+        bound,
+        or_counter,
+        batch,
+        result,
+        worklist,
+        interner,
+        stats,
+        reducer_seeds,
+    ))
 }
 
 /// Installs one ordered/distinct OR output only after its emission Program
@@ -11629,7 +11748,7 @@ impl ResidualStateMachine {
         );
 
         let mut reducer_seeds = Vec::new();
-        let continuation = finish_formula_action_result(
+        let continuation = match try_finish_exact_empty_formula_or_complete_result(
             plan,
             desc.bound,
             counter,
@@ -11639,7 +11758,20 @@ impl ResidualStateMachine {
             &mut self.interner,
             &mut self.stats,
             &mut reducer_seeds,
-        );
+        ) {
+            Ok(continuation) => continuation,
+            Err((batch, result)) => finish_formula_action_result(
+                plan,
+                desc.bound,
+                counter,
+                batch,
+                result,
+                &mut self.worklist,
+                &mut self.interner,
+                &mut self.stats,
+                &mut reducer_seeds,
+            ),
+        };
         let mut outcome = self.delta.seed_formula_reducers(
             reducer_seeds,
             plan,
@@ -20078,6 +20210,200 @@ mod tests {
     }
 
     #[test]
+    fn exact_empty_formula_or_complete_transfer_is_proof_gated_and_parent_ordered() {
+        fn setup(
+            child_count: usize,
+            parent_count: usize,
+            exact: bool,
+        ) -> (
+            ResidualPlan,
+            StateInterner,
+            FormulaPcId,
+            FormulaBatch,
+        ) {
+            let root = UnionConstraint::new(
+                (0..child_count)
+                    .map(|_| shape_leaf(0))
+                    .collect::<Vec<_>>(),
+            );
+            let plan = ResidualPlan::compile_finite_unions(&root);
+            let mut relevant = ChildSet::empty(plan.len());
+            relevant.insert(0);
+            let mut interner = StateInterner::default();
+            let parent = interner.start_formula(
+                &plan.finite_formula,
+                0,
+                0,
+                UnionVerb::Propose { relevant },
+            );
+            let action = interner.formula_pcs.select_child_as_action(
+                &plan.finite_formula,
+                parent,
+                0,
+            );
+            let root = plan.finite_formula.root(0).unwrap();
+            let mut batch = FormulaBatch::from_proposal(
+                RowBatch {
+                    rows: Vec::new(),
+                    row_count: parent_count,
+                },
+                (0..parent_count)
+                    .map(|activation| ActivationId(activation as u64))
+                    .collect(),
+                &plan.finite_formula.node(root).kind,
+            );
+            batch.begin_current_or_arm(FormulaOrActiveArmReceipt {
+                exact,
+                remaining_exact_after_false: true,
+            });
+            (plan, interner, action, batch)
+        }
+
+        let (plan, mut interner, action, batch) = setup(1, 2, true);
+        let mut worklist = Worklist::new();
+        let mut stats = ResidualStateStats::default();
+        let mut reducer_seeds = Vec::new();
+        let continuation = try_finish_exact_empty_formula_or_complete_result(
+            &plan,
+            VariableSet::new_empty(),
+            action,
+            batch,
+            CandidatePayload::Tagged(vec![
+                (0, raw(9)),
+                (0, raw(2)),
+                (1, raw(8)),
+                (1, raw(1)),
+            ]),
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+            &mut reducer_seeds,
+        )
+        .expect("the proved final OR arm should transfer")
+        .expect("the transferred root OR result should file its outer candidate state");
+        assert!(reducer_seeds.is_empty());
+        assert_eq!(stats.delta_quiescent_formula_exact_empty_or_transfers, 1);
+        let StateBucket::Candidates(filed) = worklist
+            .get(&continuation.rank)
+            .and_then(|level| level.get(&continuation.state))
+            .expect("the transferred result was not filed")
+        else {
+            panic!("the transferred result filed the wrong payload shape")
+        };
+        assert_eq!(
+            filed.candidates.iter().collect::<Vec<_>>(),
+            [(0, raw(2)), (0, raw(9)), (1, raw(1)), (1, raw(8))]
+        );
+
+        let (plan, mut interner, action, batch) = setup(1, 2, true);
+        let mut worklist = Worklist::new();
+        let mut stats = ResidualStateStats::default();
+        let mut reducer_seeds = Vec::new();
+        let continuation = try_finish_exact_empty_formula_or_complete_result(
+            &plan,
+            VariableSet::new_empty(),
+            action,
+            batch,
+            CandidatePayload::Tagged(Vec::new()),
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+            &mut reducer_seeds,
+        )
+        .expect("an exact empty result still completes the OR");
+        assert!(continuation.is_none());
+        assert_eq!(stats.delta_quiescent_formula_exact_empty_or_transfers, 1);
+        assert!(worklist.is_empty());
+        assert!(reducer_seeds.is_empty());
+
+        let (plan, mut interner, action, batch) = setup(1, 1, false);
+        let mut worklist = Worklist::new();
+        let mut stats = ResidualStateStats::default();
+        let mut reducer_seeds = Vec::new();
+        let (batch, result) = try_finish_exact_empty_formula_or_complete_result(
+            &plan,
+            VariableSet::new_empty(),
+            action,
+            batch,
+            CandidatePayload::Values(vec![raw(3)]),
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+            &mut reducer_seeds,
+        )
+        .expect_err("a Covering arm must retain ordinary admission");
+        assert!(!batch.current_or_arm_is_exact_with_empty_accumulator());
+        assert_eq!(result.one_parent_values(), [raw(3)]);
+        assert_eq!(stats.delta_quiescent_formula_exact_empty_or_transfers, 0);
+        assert!(worklist.is_empty());
+        assert!(reducer_seeds.is_empty());
+
+        let (plan, mut interner, action, batch) = setup(2, 1, true);
+        let mut worklist = Worklist::new();
+        let mut stats = ResidualStateStats::default();
+        let mut reducer_seeds = Vec::new();
+        let (batch, result) = try_finish_exact_empty_formula_or_complete_result(
+            &plan,
+            VariableSet::new_empty(),
+            action,
+            batch,
+            CandidatePayload::Values(vec![raw(4)]),
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+            &mut reducer_seeds,
+        )
+        .expect_err("an unfinished OR sibling must retain ordinary admission");
+        assert!(batch.current_or_arm_is_exact_with_empty_accumulator());
+        assert_eq!(result.one_parent_values(), [raw(4)]);
+        assert_eq!(stats.delta_quiescent_formula_exact_empty_or_transfers, 0);
+        assert!(worklist.is_empty());
+        assert!(reducer_seeds.is_empty());
+
+        let (plan, mut interner, first_action, mut batch) = setup(2, 1, true);
+        batch.admit_current_or_value(0, raw(5));
+        batch.finish_current_or_arm();
+        let completed = interner
+            .formula_pcs
+            .complete(&plan.finite_formula, first_action);
+        let Ok(InternedFormulaSuccessor::Formula(parent)) = interner
+            .formula_pcs
+            .resume_completed(&plan.finite_formula, completed)
+        else {
+            panic!("the first OR child did not return to its parent")
+        };
+        let second_action = interner.formula_pcs.select_child_as_action(
+            &plan.finite_formula,
+            parent,
+            1,
+        );
+        batch.begin_current_or_arm(FormulaOrActiveArmReceipt {
+            exact: true,
+            remaining_exact_after_false: true,
+        });
+        let mut worklist = Worklist::new();
+        let mut stats = ResidualStateStats::default();
+        let mut reducer_seeds = Vec::new();
+        let (batch, result) = try_finish_exact_empty_formula_or_complete_result(
+            &plan,
+            VariableSet::new_empty(),
+            second_action,
+            batch,
+            CandidatePayload::Values(vec![raw(6)]),
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+            &mut reducer_seeds,
+        )
+        .expect_err("a nonempty prior OR accumulator must retain ordinary admission");
+        assert!(!batch.current_or_arm_is_exact_with_empty_accumulator());
+        assert_eq!(result.one_parent_values(), [raw(6)]);
+        assert_eq!(stats.delta_quiescent_formula_exact_empty_or_transfers, 0);
+        assert!(worklist.is_empty());
+        assert!(reducer_seeds.is_empty());
+    }
+
+    #[test]
     fn formula_confirm_opening_keeps_legacy_ropes_structural_but_recoalesces_slice_consumers() {
         let mut segmented = deferred_candidate_payload(1, vec![(0, raw(1)), (0, raw(2))]);
         segmented.extend_same_domain(
@@ -24835,6 +25161,13 @@ mod tests {
             3
         );
         assert_eq!(query.stats().delta_quiescent_formula_complete_declines, 0);
+        assert_eq!(
+            query
+                .stats()
+                .delta_quiescent_formula_exact_empty_or_transfers,
+            0,
+            "the wrapper's Covering arm receipt must not be strengthened by its exact Program work receipt"
+        );
         assert_eq!(query.stats().delta_source_pages, 0);
         assert_eq!(query.stats().delta_transition_pages, 0);
         assert_program_fallbacks_unused(&counters);
@@ -24846,6 +25179,7 @@ mod tests {
 
         let mut left: Vec<_> = query.collect();
         let mut right: Vec<_> = sibling.collect();
+        assert_eq!(left, right, "a clone changed exact remainder order");
         left.sort_unstable();
         right.sort_unstable();
         assert_eq!(left, right, "a clone changed the staged exact remainder");
@@ -24905,6 +25239,13 @@ mod tests {
             2
         );
         assert_eq!(repeated.stats.delta_quiescent_formula_complete_declines, 0);
+        assert_eq!(
+            repeated
+                .stats
+                .delta_quiescent_formula_exact_empty_or_transfers,
+            0,
+            "complete-adapter SET admission must not strengthen a Covering Formula arm"
+        );
         assert_eq!(repeated.stats.delta_source_pages, 0);
         assert_eq!(repeated.stats.delta_transition_pages, 0);
 
@@ -24984,6 +25325,12 @@ mod tests {
             0
         );
         assert_eq!(empty.stats.delta_quiescent_formula_complete_declines, 0);
+        assert_eq!(
+            empty
+                .stats
+                .delta_quiescent_formula_exact_empty_or_transfers,
+            0
+        );
 
         let dead_calls = Arc::new(Mutex::new(Vec::new()));
         let dead = Query::new(
@@ -25005,6 +25352,10 @@ mod tests {
             0
         );
         assert_eq!(dead.stats.delta_quiescent_formula_complete_declines, 0);
+        assert_eq!(
+            dead.stats.delta_quiescent_formula_exact_empty_or_transfers,
+            0
+        );
         assert_eq!(dead.stats.dead_action_pops, 1);
         assert_eq!(
             dead.stats.width_increases, 1,

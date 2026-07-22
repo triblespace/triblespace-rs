@@ -2448,7 +2448,7 @@ fn nested_regional_or_remains_quiescent_until_the_live_program_reaches_eof() {
         .cap(1)
         .start_width(1);
 
-    assert!(query.next().is_some());
+    let first = query.next().expect("the nested live Program is nonempty");
     assert_eq!(
         query.stats().delta_transition_pages,
         0,
@@ -2461,6 +2461,32 @@ fn nested_regional_or_remains_quiescent_until_the_live_program_reaches_eof() {
             .stats()
             .delta_quiescent_formula_complete_raw_occurrences,
         7
+    );
+    assert_eq!(
+        query
+            .stats()
+            .delta_quiescent_formula_exact_empty_or_transfers,
+        1
+    );
+    let sibling = query.clone();
+    let cancelled = query.clone();
+    drop(cancelled);
+    let mut actual = vec![first];
+    let remainder = query.by_ref().collect::<Vec<_>>();
+    let sibling_remainder = sibling.collect::<Vec<_>>();
+    assert_eq!(
+        remainder, sibling_remainder,
+        "cloning after the exact transfer changed its deterministic remainder"
+    );
+    actual.extend(remainder);
+    actual.sort_unstable();
+    let mut expected = (1..8)
+        .map(|node| graph.value(node).raw)
+        .collect::<Vec<_>>();
+    expected.sort_unstable();
+    assert_eq!(
+        actual, expected,
+        "the inner transfer must still enter outer-OR SET admission"
     );
 }
 
@@ -2680,19 +2706,30 @@ fn formula_cyclic_activations_preserve_duplicate_outer_parents() {
         Box::new(UnionConstraint::new(vec![arm])) as DynConstraint,
     ]));
 
-    let mut lowered_query = Query::new(Arc::clone(&root), project_end)
-        .solve_residual_state_lazy_with(combined_effects());
+    let project = |binding: &Binding| {
+        Some((
+            binding.get(OUTER).copied()?,
+            binding.get(END).copied()?,
+        ))
+    };
+    let mut lowered_query = Query::new(Arc::clone(&root), project)
+        .solve_residual_state_lazy_with(combined_effects())
+        .cap(2)
+        .start_width(2)
+        .growth(1);
     let mut lowered: Vec<_> = lowered_query.by_ref().collect();
-    let mut sequential: Vec<_> = Query::new(root, project_end).sequential().collect();
+    let mut sequential: Vec<_> = Query::new(root, project).sequential().collect();
     lowered.sort_unstable();
     sequential.sort_unstable();
     assert_eq!(lowered, sequential);
-    let mut expected = vec![
-        graph.value(1).raw,
-        graph.value(1).raw,
-        graph.value(2).raw,
-        graph.value(2).raw,
-    ];
+    let mut expected = outer_values
+        .into_iter()
+        .flat_map(|outer| {
+            [graph.value(1).raw, graph.value(2).raw]
+                .into_iter()
+                .map(move |end| (outer, end))
+        })
+        .collect::<Vec<_>>();
     expected.sort_unstable();
     assert_eq!(lowered, expected);
     assert_eq!(lowered_query.stats().delta_transition_pages, 0);
@@ -2713,6 +2750,12 @@ fn formula_cyclic_activations_preserve_duplicate_outer_parents() {
             .stats()
             .delta_quiescent_formula_complete_raw_occurrences,
         4
+    );
+    assert_eq!(
+        lowered_query
+            .stats()
+            .delta_quiescent_formula_exact_empty_or_transfers,
+        2
     );
 }
 
