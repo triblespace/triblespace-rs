@@ -164,8 +164,12 @@ orthogonal three-level policy: `Disabled` admits no typed Programs,
 explicit routes. A structurally absent route may still use older transition
 hooks. A route deferred by policy instead uses the stable ordinary
 `Constraint` action; it never falls through to a legacy pager or strengthens
-an ordinary proposal receipt. The formula and Program scope chains therefore
-form nine scheduler-independent lowering combinations.
+an ordinary proposal receipt. `FormulaScope::ProductionRegions` selectively
+opens only the ancestor-closed AND/OR skeleton from an exposed Union leaf to
+hidden production Program atoms. Every off-path logical sibling remains as one
+opaque atom at its original structural path. This sits between opaque leaves
+and fully lowered Union leaves, so the four formula scopes and three Program
+scopes form twelve scheduler-independent lowering combinations.
 
 Each canonical descriptor includes the bound-variable schema and one of four
 phases:

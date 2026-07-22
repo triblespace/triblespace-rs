@@ -6,16 +6,18 @@
 //! opaque root is one leaf at the empty path. Union and regular-path constraints
 //! therefore remain ordinary indivisible leaves, as do custom constraints
 //! unless they explicitly expose structure.
-//! [`FormulaScope`] selects a chain of formula boundaries. `UnionLeaves`
-//! executes exposed Unions as arbitrary finite AND/OR trees through a canonical
-//! program counter and affine payload-frame stack. Candidate actions descend to
-//! Atom nodes. `WholeRoot` absorbs that scope and instead makes the maximal
-//! exposed root one synthetic formula occurrence after outer
-//! variable selection. It flattens only the maximal root AND region and retains
-//! candidate-occurrence paging once that AND's exact remaining confirmation
-//! suffix is page-local. The independent Program-scope chain admits disabled,
-//! production-qualified, or all typed routes; selected routes may be
-//! terminating finite automata or repeated least-fixpoint programs.
+//! [`FormulaScope`] selects a chain of formula boundaries. `ProductionRegions`
+//! exposes only the ancestor-closed AND/OR skeleton needed to reach hidden
+//! production Program atoms below Union leaves; off-path subtrees stay opaque.
+//! `UnionLeaves` executes every exposed Union as an arbitrary finite AND/OR tree
+//! through a canonical program counter and affine payload-frame stack.
+//! Candidate actions descend to Atom nodes. `WholeRoot` absorbs that scope and
+//! instead makes the maximal exposed root one synthetic formula occurrence
+//! after outer variable selection. It flattens only the maximal root AND region
+//! and retains candidate-occurrence paging once that AND's exact remaining
+//! confirmation suffix is page-local. The independent Program-scope chain
+//! admits disabled, production-qualified, or all typed routes; selected routes
+//! may be terminating finite automata or repeated least-fixpoint programs.
 //!
 //! Ready and Candidate descriptors are pure planning states: they estimate,
 //! partition rows by their exact uniform semantic action, and file explicit
@@ -159,6 +161,67 @@ fn select_program<'r, 'a>(
     } else {
         ProgramOffer::Deferred
     }
+}
+
+fn has_direct_production_program<'a>(constraint: &dyn Constraint<'a>) -> bool {
+    constraint
+        .residual_program()
+        .is_some_and(|program| program.exposures().contains(ProgramExposure::Production))
+}
+
+/// Marks one occurrence path exactly when it is a Production Program atom or
+/// an exposed AND/OR ancestor of such an atom. Direct Program nodes terminate
+/// the walk: their own route owns the subtree, so exposing structure below
+/// them would cross a declared execution boundary.
+fn production_region_marks<'a>(union: &dyn Constraint<'a>) -> AHashSet<FormulaPath> {
+    fn visit<'a>(
+        constraint: &dyn Constraint<'a>,
+        path: &mut Vec<FormulaStep>,
+        marks: &mut AHashSet<FormulaPath>,
+    ) -> bool {
+        if has_direct_production_program(constraint) {
+            marks.insert(FormulaPath(path.clone().into_boxed_slice()));
+            return true;
+        }
+
+        let mut marked = false;
+        if let Some(children) = constraint.residual_union_children() {
+            for child in 0..children.len() {
+                path.push(FormulaStep::Or(child));
+                marked |= visit(children.child(child), path, marks);
+                path.pop();
+            }
+        } else if let ConstraintShape::And(children) = constraint.residual_shape() {
+            for child in 0..children.len() {
+                path.push(FormulaStep::And(child));
+                marked |= visit(children.child(child), path, marks);
+                path.pop();
+            }
+        }
+        if marked {
+            marks.insert(FormulaPath(path.clone().into_boxed_slice()));
+        }
+        marked
+    }
+
+    let mut marks = AHashSet::new();
+    if has_direct_production_program(union) {
+        return marks;
+    }
+    let Some(children) = union.residual_union_children() else {
+        return marks;
+    };
+    let mut path = Vec::new();
+    let mut marked = false;
+    for child in 0..children.len() {
+        path.push(FormulaStep::Or(child));
+        marked |= visit(children.child(child), &mut path, &mut marks);
+        path.pop();
+    }
+    if marked {
+        marks.insert(FormulaPath(Box::new([])));
+    }
+    marks
 }
 
 impl FormulaNodeCapabilities {
@@ -414,6 +477,127 @@ impl FiniteFormulaProgram {
                 id
             }
 
+            fn compile_atom<'a>(
+                &mut self,
+                constraint: &dyn Constraint<'a>,
+                path: FormulaPath,
+            ) -> FormulaNodeId {
+                let id = self.reserve_node();
+                let kind = FiniteFormulaNodeKind::Atom;
+                let capabilities = FormulaNodeCapabilities {
+                    confirm_page_local: constraint.residual_confirm_is_page_local(),
+                    grouped_delta_confirm_requirements: compile_grouped_delta_confirm_requirements(
+                        constraint,
+                        self.program_scope,
+                    ),
+                };
+                let (support_span, execution_span) = self.spans(&kind);
+                self.nodes[id.0 as usize] = Some(FiniteFormulaNode {
+                    kind,
+                    path,
+                    capabilities,
+                    support_span,
+                    execution_span,
+                });
+                id
+            }
+
+            fn compile_production_node<'a>(
+                &mut self,
+                constraint: &dyn Constraint<'a>,
+                path: &mut Vec<FormulaStep>,
+                marks: &AHashSet<FormulaPath>,
+            ) -> FormulaNodeId {
+                let node_path = FormulaPath(path.clone().into_boxed_slice());
+                if has_direct_production_program(constraint) || !marks.contains(&node_path) {
+                    return self.compile_atom(constraint, node_path);
+                }
+
+                let id = self.reserve_node();
+                let capabilities = FormulaNodeCapabilities {
+                    confirm_page_local: constraint.residual_confirm_is_page_local(),
+                    grouped_delta_confirm_requirements: compile_grouped_delta_confirm_requirements(
+                        constraint,
+                        self.program_scope,
+                    ),
+                };
+                let kind = if constraint.residual_union_children().is_some() {
+                    let mut compiled = Vec::new();
+                    self.compile_production_or_children(
+                        constraint,
+                        path,
+                        marks,
+                        &mut compiled,
+                    );
+                    FiniteFormulaNodeKind::Or {
+                        children: compiled.into_boxed_slice(),
+                    }
+                } else {
+                    match constraint.residual_shape() {
+                        ConstraintShape::And(children) => {
+                            let mut compiled = Vec::with_capacity(children.len());
+                            for child in 0..children.len() {
+                                path.push(FormulaStep::And(child));
+                                compiled.push(self.compile_production_node(
+                                    children.child(child),
+                                    path,
+                                    marks,
+                                ));
+                                path.pop();
+                            }
+                            FiniteFormulaNodeKind::And {
+                                children: compiled.into_boxed_slice(),
+                            }
+                        }
+                        ConstraintShape::Opaque => FiniteFormulaNodeKind::Atom,
+                    }
+                };
+                let (support_span, execution_span) = self.spans(&kind);
+                self.nodes[id.0 as usize] = Some(FiniteFormulaNode {
+                    kind,
+                    path: node_path,
+                    capabilities,
+                    support_span,
+                    execution_span,
+                });
+                id
+            }
+
+            fn compile_production_or_children<'a>(
+                &mut self,
+                union: &dyn Constraint<'a>,
+                path: &mut Vec<FormulaStep>,
+                marks: &AHashSet<FormulaPath>,
+                compiled: &mut Vec<FormulaNodeId>,
+            ) {
+                let children = union
+                    .residual_union_children()
+                    .expect("production formula OR collection entered an opaque constraint");
+                assert!(
+                    children.len() > 0,
+                    "a production formula union must expose at least one arm"
+                );
+                for child in 0..children.len() {
+                    path.push(FormulaStep::Or(child));
+                    let constraint = children.child(child);
+                    let child_path = FormulaPath(path.clone().into_boxed_slice());
+                    if !has_direct_production_program(constraint)
+                        && marks.contains(&child_path)
+                        && constraint.residual_union_children().is_some()
+                    {
+                        self.compile_production_or_children(
+                            constraint,
+                            path,
+                            marks,
+                            compiled,
+                        );
+                    } else {
+                        compiled.push(self.compile_production_node(constraint, path, marks));
+                    }
+                    path.pop();
+                }
+            }
+
             /// Compiles one synthetic whole-query root. Only the maximal
             /// exposed AND region at the root is flattened: an AND below an
             /// OR remains inside that arm, preserving the union's private
@@ -541,15 +725,33 @@ impl FiniteFormulaProgram {
         }
         let mut roots = vec![None; leaves.len()];
         for (occurrence, leaf) in leaves.iter().enumerate() {
-            if leaf.lowering != LeafLowering::FiniteFormula {
-                continue;
-            }
             let constraint = resolve_leaf(root, leaf);
-            assert!(
-                constraint.residual_union_children().is_some(),
-                "a finite-formula root stopped being a Union"
-            );
-            roots[occurrence] = Some(builder.compile_node(constraint, &mut Vec::new()));
+            roots[occurrence] = match leaf.lowering {
+                LeafLowering::Opaque => None,
+                LeafLowering::ProductionFormula => {
+                    assert!(
+                        constraint.residual_union_children().is_some(),
+                        "a production-formula root stopped being a Union"
+                    );
+                    let marks = production_region_marks(constraint);
+                    assert!(
+                        marks.contains(&FormulaPath(Box::new([]))),
+                        "a production-formula root lost every Production Program descendant"
+                    );
+                    Some(builder.compile_production_node(
+                        constraint,
+                        &mut Vec::new(),
+                        &marks,
+                    ))
+                }
+                LeafLowering::FiniteFormula => {
+                    assert!(
+                        constraint.residual_union_children().is_some(),
+                        "a finite-formula root stopped being a Union"
+                    );
+                    Some(builder.compile_node(constraint, &mut Vec::new()))
+                }
+            };
         }
         Self {
             nodes: builder
@@ -1458,6 +1660,7 @@ enum FormulaSuccessor {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LeafLowering {
     Opaque,
+    ProductionFormula,
     FiniteFormula,
 }
 
@@ -1571,12 +1774,23 @@ impl ResidualPlan {
                     }
                 }
                 ConstraintShape::Opaque => {
-                    let lowering = if formula_scope == FormulaScope::UnionLeaves
-                        && constraint.residual_union_children().is_some()
-                    {
-                        LeafLowering::FiniteFormula
-                    } else {
-                        LeafLowering::Opaque
+                    let lowering = match formula_scope {
+                        FormulaScope::ProductionRegions
+                            if constraint.residual_union_children().is_some()
+                                && production_region_marks(constraint)
+                                    .contains(&FormulaPath(Box::new([]))) =>
+                        {
+                            LeafLowering::ProductionFormula
+                        }
+                        FormulaScope::UnionLeaves
+                            if constraint.residual_union_children().is_some() =>
+                        {
+                            LeafLowering::FiniteFormula
+                        }
+                        FormulaScope::OpaqueLeaves
+                        | FormulaScope::ProductionRegions
+                        | FormulaScope::UnionLeaves
+                        | FormulaScope::WholeRoot => LeafLowering::Opaque,
                     };
                     leaves.push(ResidualLeaf {
                         path: ConstraintPath(path.clone().into_boxed_slice()),
@@ -2185,6 +2399,11 @@ pub enum FormulaScope {
     /// Preserve every composite boundary except exposed associative ANDs.
     #[default]
     OpaqueLeaves,
+    /// Lower only ancestor-closed AND/OR regions needed to reach hidden
+    /// [`ProgramExposure::Production`] atoms below exposed Union leaves.
+    /// Logical siblings remain present but stay opaque unless they are on a
+    /// path to another Production atom.
+    ProductionRegions,
     /// Lower exposed Union leaves and their recursive AND/OR descendants.
     UnionLeaves,
     /// Lower the maximal exposed root as one synthetic formula occurrence.
@@ -2227,8 +2446,8 @@ impl ProgramScope {
 
 /// Orthogonal structural lowering selected for one residual solve.
 ///
-/// Formula scope and Program scope are independent three-element chains,
-/// giving exactly nine canonical lowering forms. `Default` is
+/// Formula scope and Program scope are independent four- and three-element
+/// chains, giving exactly twelve canonical lowering forms. `Default` is
 /// [`ResidualLowering::CONSERVATIVE`]; fresh [`Query`] values explicitly use
 /// [`ResidualLowering::HYBRID`] instead.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -2322,7 +2541,7 @@ impl ResidualLowering {
     /// Maximally exposed formula and transition-program lowering.
     pub const FULL: Self = Self::new(FormulaScope::WholeRoot, ProgramScope::All);
 
-    /// Constructs one of the nine canonical lowering forms.
+    /// Constructs one of the twelve canonical lowering forms.
     pub const fn new(formula_scope: FormulaScope, program_scope: ProgramScope) -> Self {
         Self {
             formula_scope,
@@ -13136,9 +13355,10 @@ mod tests {
     use std::sync::Mutex;
 
     #[test]
-    fn residual_lowering_has_exactly_nine_canonical_forms() {
+    fn residual_lowering_has_exactly_twelve_canonical_forms() {
         let forms: std::collections::HashSet<_> = [
             FormulaScope::OpaqueLeaves,
+            FormulaScope::ProductionRegions,
             FormulaScope::UnionLeaves,
             FormulaScope::WholeRoot,
         ]
@@ -13154,7 +13374,7 @@ mod tests {
         })
         .collect();
 
-        assert_eq!(forms.len(), 9);
+        assert_eq!(forms.len(), 12);
         assert_eq!(ResidualLowering::default(), ResidualLowering::CONSERVATIVE);
         assert_eq!(
             ResidualLowering::HYBRID,
@@ -13490,6 +13710,10 @@ mod tests {
         type NoveltyKey = ();
         type Rank = u8;
 
+        fn exposures(&self) -> ProgramExposureSet {
+            ProgramExposureSet::PRODUCTION
+        }
+
         fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
             let ProgramAction::Propose(variable) = request.action else {
                 return None;
@@ -13811,6 +14035,10 @@ mod tests {
         type State = ();
         type NoveltyKey = ();
         type Rank = ();
+
+        fn exposures(&self) -> ProgramExposureSet {
+            ProgramExposureSet::EXPLICIT
+        }
 
         fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
             matches!(request.action, ProgramAction::Propose(variable) if variable == self.variable)
@@ -17809,6 +18037,157 @@ mod tests {
             program.node(children[0]).path,
             program.node(children[1]).path
         );
+    }
+
+    #[test]
+    fn production_regions_compile_only_the_ancestor_closed_skeleton() {
+        let marked_arm = shape_and(vec![
+            shape_leaf(0),
+            Box::new(TerminalProgramLeaf {
+                variable: 0,
+                mode: TerminalProgramMode::Equivalent,
+            }),
+        ]);
+        let off_path_arm = shape_and(vec![
+            shape_leaf(0),
+            shape_and(vec![shape_leaf(0), shape_leaf(0)]),
+        ]);
+        let root = UnionConstraint::new(vec![marked_arm, off_path_arm]);
+        let plan = ResidualPlan::compile_lowering(
+            &root,
+            ResidualLowering::new(FormulaScope::ProductionRegions, ProgramScope::Production),
+        );
+
+        assert!(!plan.synthetic_root_formula);
+        assert_eq!(plan.leaves.len(), 1);
+        assert_eq!(plan.leaves[0].lowering, LeafLowering::ProductionFormula);
+        let program = &plan.finite_formula;
+        let root = program.root(0).expect("the marked Union was lowered");
+        let FiniteFormulaNodeKind::Or { children } = &program.node(root).kind else {
+            panic!("the marked Union did not compile as OR")
+        };
+        assert_eq!(children.len(), 2);
+
+        let FiniteFormulaNodeKind::And {
+            children: marked_children,
+        } = &program.node(children[0]).kind
+        else {
+            panic!("the path to the Production atom did not retain its AND")
+        };
+        assert_eq!(marked_children.len(), 2);
+        assert_eq!(
+            program.node(marked_children[0]).path,
+            FormulaPath(vec![FormulaStep::Or(0), FormulaStep::And(0)].into_boxed_slice())
+        );
+        assert_eq!(
+            program.node(marked_children[1]).path,
+            FormulaPath(vec![FormulaStep::Or(0), FormulaStep::And(1)].into_boxed_slice())
+        );
+        assert_eq!(program.node(children[1]).kind, FiniteFormulaNodeKind::Atom);
+        assert_eq!(
+            program.node(children[1]).path,
+            FormulaPath(vec![FormulaStep::Or(1)].into_boxed_slice()),
+            "the off-path composite must remain one opaque sibling"
+        );
+        assert_eq!(program.nodes.len(), 5);
+    }
+
+    #[test]
+    fn production_regions_name_repeated_arc_occurrences_by_path() {
+        let shared = Arc::new(TerminalProgramLeaf {
+            variable: 0,
+            mode: TerminalProgramMode::Equivalent,
+        });
+        let root = UnionConstraint::new(vec![Arc::clone(&shared), shared]);
+        let plan = ResidualPlan::compile_lowering(
+            &root,
+            ResidualLowering::new(FormulaScope::ProductionRegions, ProgramScope::Production),
+        );
+        let program = &plan.finite_formula;
+        let root = program.root(0).expect("the marked Union was lowered");
+        let FiniteFormulaNodeKind::Or { children } = &program.node(root).kind else {
+            panic!("the marked Union did not compile as OR")
+        };
+
+        assert_ne!(children[0], children[1]);
+        assert_eq!(
+            program.node(children[0]).path,
+            FormulaPath(vec![FormulaStep::Or(0)].into_boxed_slice())
+        );
+        assert_eq!(
+            program.node(children[1]).path,
+            FormulaPath(vec![FormulaStep::Or(1)].into_boxed_slice())
+        );
+    }
+
+    #[test]
+    fn production_regions_keep_explicit_siblings_on_the_ordinary_protocol() {
+        let ordinary_proposes = Arc::new(AtomicUsize::new(0));
+        let legacy_pages = Arc::new(AtomicUsize::new(0));
+        let program_seeds = Arc::new(AtomicUsize::new(0));
+        let variable = Variable::<GenId>::new(0);
+        let root = UnionConstraint::new(vec![
+            Box::new(variable.is(Inline::<GenId>::new(raw(41)))) as ShapeConstraint,
+            Box::new(ExplicitProgramPagedProposalLeaf {
+                variable: variable.index,
+                value: raw(42),
+                ordinary_proposes: Arc::clone(&ordinary_proposes),
+                legacy_pages: Arc::clone(&legacy_pages),
+                program_seeds: Arc::clone(&program_seeds),
+            }) as ShapeConstraint,
+        ]);
+        let lowering =
+            ResidualLowering::new(FormulaScope::ProductionRegions, ProgramScope::Production);
+        let plan = ResidualPlan::compile_lowering(&root, lowering);
+        let program = &plan.finite_formula;
+        let formula_root = program
+            .root(0)
+            .expect("the Production arm marked the Union");
+        let FiniteFormulaNodeKind::Or { children } = &program.node(formula_root).kind else {
+            panic!("the marked Union did not compile as OR")
+        };
+        assert_eq!(children.len(), 2);
+        assert_eq!(program.node(children[1]).kind, FiniteFormulaNodeKind::Atom);
+        assert_eq!(
+            program.node(children[1]).path,
+            FormulaPath(vec![FormulaStep::Or(1)].into_boxed_slice())
+        );
+
+        let mut results: Vec<_> = Query::new(root, move |binding: &Binding| {
+            binding.get(variable.index).copied()
+        })
+        .solve_residual_state_lazy_with(lowering)
+        .cap(1)
+        .start_width(1)
+        .collect();
+        results.sort_unstable();
+        assert_eq!(results, [raw(41), raw(42)]);
+        assert!(ordinary_proposes.load(Ordering::Relaxed) > 0);
+        assert_eq!(legacy_pages.load(Ordering::Relaxed), 0);
+        assert_eq!(program_seeds.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn production_regions_leave_explicit_only_unions_opaque() {
+        let counters = || Arc::new(AtomicUsize::new(0));
+        let leaf = |value| {
+            Box::new(ExplicitProgramPagedProposalLeaf {
+                variable: 0,
+                value,
+                ordinary_proposes: counters(),
+                legacy_pages: counters(),
+                program_seeds: counters(),
+            }) as ShapeConstraint
+        };
+        let root = UnionConstraint::new(vec![leaf(raw(1)), leaf(raw(2))]);
+        let plan = ResidualPlan::compile_lowering(
+            &root,
+            ResidualLowering::new(FormulaScope::ProductionRegions, ProgramScope::Production),
+        );
+
+        assert_eq!(plan.leaves.len(), 1);
+        assert_eq!(plan.leaves[0].lowering, LeafLowering::Opaque);
+        assert!(plan.finite_formula.root(0).is_none());
     }
 
     #[test]
@@ -22888,7 +23267,7 @@ mod tests {
         Support,
     }
 
-    fn assert_whole_root_production_oracle<C>(
+    fn assert_production_region_oracle<C>(
         make: impl Fn(&ProgramFallbackCounters, bool) -> C,
         projected: VariableId,
         mut expected: Vec<RawInline>,
@@ -22898,6 +23277,13 @@ mod tests {
     {
         expected.sort_unstable();
         let project = move |binding: &Binding| binding.get(projected).copied();
+
+        let sequential_counters = program_fallback_counters();
+        let mut sequential: Vec<_> = Query::new(make(&sequential_counters, true), project)
+            .sequential()
+            .collect();
+        sequential.sort_unstable();
+        assert_eq!(sequential, expected);
 
         let hybrid_counters = program_fallback_counters();
         let mut hybrid = Query::new(make(&hybrid_counters, true), project)
@@ -22919,6 +23305,35 @@ mod tests {
             hybrid_fallbacks.load(Ordering::Relaxed) > 0,
             "opaque HYBRID union never exercised its ordinary RPQ fallback"
         );
+
+        let region_counters = program_fallback_counters();
+        let mut region = Query::new(make(&region_counters, false), project)
+            .solve_residual_state_lazy_with(ResidualLowering::new(
+                FormulaScope::ProductionRegions,
+                ProgramScope::Production,
+            ))
+            .cap(1)
+            .start_width(1);
+        let region_first = region.next().expect("the semantic oracle is nonempty");
+        assert!(expected.contains(&region_first));
+        assert_program_fallbacks_unused(&region_counters);
+        let mut region_results = vec![region_first];
+        region_results.extend(region.by_ref());
+        region_results.sort_unstable();
+        assert_eq!(region_results, expected);
+        match action {
+            FormulaProgramOracleAction::Propose => {
+                assert!(region.stats().propose_action_pops > 0)
+            }
+            FormulaProgramOracleAction::GroupedConfirm => {
+                assert!(region.stats().confirm_action_pops > 0)
+            }
+            FormulaProgramOracleAction::Support => {
+                assert!(region.stats().support_action_pops > 0)
+            }
+        }
+        assert!(region.stats().delta_transition_pages > 0);
+        assert_program_fallbacks_unused(&region_counters);
 
         let production_counters = program_fallback_counters();
         let mut production = Query::new(make(&production_counters, false), project)
@@ -22951,7 +23366,7 @@ mod tests {
     }
 
     #[test]
-    fn whole_root_production_exposes_or_contained_rpq_propose() {
+    fn production_regions_expose_or_contained_rpq_propose() {
         use crate::id::id_into_value;
         use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
 
@@ -22982,7 +23397,7 @@ mod tests {
             ])
         };
 
-        assert_whole_root_production_oracle(
+        assert_production_region_oracle(
             make,
             end.index,
             vec![
@@ -22995,7 +23410,7 @@ mod tests {
     }
 
     #[test]
-    fn whole_root_production_exposes_or_contained_rpq_grouped_confirm() {
+    fn production_regions_expose_or_contained_rpq_grouped_confirm() {
         use crate::id::id_into_value;
         use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
 
@@ -23038,7 +23453,7 @@ mod tests {
             ])
         };
 
-        assert_whole_root_production_oracle(
+        assert_production_region_oracle(
             make,
             end.index,
             vec![
@@ -23051,7 +23466,7 @@ mod tests {
     }
 
     #[test]
-    fn whole_root_production_exposes_or_contained_rpq_support() {
+    fn production_regions_expose_or_contained_rpq_support() {
         use crate::id::id_into_value;
         use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
 
@@ -23092,7 +23507,7 @@ mod tests {
             ])
         };
 
-        assert_whole_root_production_oracle(
+        assert_production_region_oracle(
             make,
             marker.index,
             vec![guarded_marker, sibling_marker],

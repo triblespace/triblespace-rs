@@ -1746,9 +1746,10 @@ pub trait Constraint<'a> {
     ///
     /// [`residual::FormulaScope::OpaqueLeaves`] deliberately ignores this
     /// capability, so a union retains its existing indivisible [`Constraint`]
-    /// semantics. `UnionLeaves` and `WholeRoot` expose it to canonical formula
-    /// control. The child count and order are structural facts and must remain
-    /// stable for the solve.
+    /// semantics. `ProductionRegions` exposes only ancestor paths needed to
+    /// reach hidden production Program atoms; `UnionLeaves` and `WholeRoot`
+    /// expose it fully to canonical formula control. The child count and order
+    /// are structural facts and must remain stable for the solve.
     #[doc(hidden)]
     fn residual_union_children(&self) -> Option<&dyn ConstraintChildren<'a>> {
         None
@@ -3029,7 +3030,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// seed-rejected query still starts no worklist. The selector preserves the
     /// query's structural lowering. Use
     /// [`Query::residual_lowering`] before this method to choose another of the
-    /// nine canonical lowering forms. The runtime cursor remains behind
+    /// twelve canonical lowering forms. The runtime cursor remains behind
     /// `Query::next`, so cloning a started query
     /// snapshots its exact raw remainder. Ordinary Rayon conversion of an
     /// unstarted query still uses the established scalar splitter; use

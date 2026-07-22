@@ -521,15 +521,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cohorts use these retained views to prove every fresh positive branch fits
   the geometric page budget before emitting, eliminating the former count
   descent followed by a second enumeration descent.
-- **Residual lowering has nine canonical, scheduler-independent forms.**
+- **Residual lowering has twelve canonical, scheduler-independent forms.**
   `ResidualLowering` crosses the `FormulaScope` chain (`OpaqueLeaves`,
-  `UnionLeaves`, `WholeRoot`) with the independent `ProgramScope` chain
-  (`Disabled`, `Production`, `All`);
-  whole-root lowering structurally absorbs union-leaf lowering. Scheduler
-  setters no longer rewrite lowering, and `Query::residual_lowering` selects it
-  independently. Whole-root scope keeps variable selection and the commit
-  barrier outside a canonical AND/OR program, flattens only the maximal exposed
-  root conjunction, and preserves opaque scope and group-reducer boundaries.
+  `ProductionRegions`, `UnionLeaves`, `WholeRoot`) with the independent
+  `ProgramScope` chain (`Disabled`, `Production`, `All`);
+  whole-root lowering structurally absorbs union-leaf lowering.
+  `ProductionRegions` opens only the ancestor-closed AND/OR skeleton needed to
+  reach hidden production Program atoms below exposed Union leaves, preserving
+  every off-path sibling as one opaque action at its original structural path.
+  Scheduler setters no longer rewrite lowering, and `Query::residual_lowering`
+  selects it independently. Whole-root scope keeps variable selection and the
+  commit barrier outside a canonical AND/OR program, flattens only the maximal
+  exposed root conjunction, and preserves opaque scope and group-reducer
+  boundaries.
   Root-AND confirmations retain candidate-occurrence paging once the exact
   remaining suffix is page-local, including width-one and geometric
   first-result traces. Ordinary live queries use `ResidualLowering::HYBRID`;
