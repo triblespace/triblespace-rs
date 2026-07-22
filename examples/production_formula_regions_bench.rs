@@ -9,11 +9,15 @@
 //! Before timing, both modes must match fixture-generated SET oracles. The
 //! preflight also checks guarded-region action-count invariance, publication
 //! before cyclic EOF, a non-page-local barrier, exact clone/drop remainders,
-//! geometric width traces, and an identical ordinary-control action trace.
-//! The three-node guarded-region shape is enforced by the adjacent private
-//! plan test
-//! `production_regions_adoption_gate_keeps_off_path_formula_size_constant`;
-//! keeping that structural assertion inside `residual.rs` avoids adding a
+//! geometric width traces, and identical ordinary-control plans and action
+//! traces at both scales. The guarded-region shape and ordinary-control plan
+//! identity are enforced by the adjacent private plan tests
+//! `production_regions_adoption_gate_keeps_off_path_formula_size_constant`
+//! and
+//! `production_regions_adoption_gate_ordinary_control_has_identical_plans`;
+//! canceled-iterator destruction is separately pinned by
+//! `production_regions_adoption_gate_residual_iter_drop_is_structurally_inert`.
+//! Keeping those structural assertions inside `residual.rs` avoids adding a
 //! benchmark-only public plan-introspection API.
 //!
 //! Every timed workload runs exactly twenty paired rounds. Odd rounds use
@@ -21,6 +25,9 @@
 //! order-balanced superblocks in log-ratio space. The binary prints every raw
 //! sample, every superblock, and a geometric ratio with its one-sided 95%
 //! Student-t upper bound (`df=9`).
+//! Raw sample rows carry `stats_observed=false` for construct-and-drop and
+//! fresh drop-at-first: those cells stop their clocks only after destruction,
+//! so their diagnostic counter columns are deliberately zero sentinels.
 //! Guarded small/large and ordinary small/large arms are adjacent within every
 //! round, with their scale order reversed on even rounds; the drain-growth
 //! contrast therefore uses genuinely paired superblocks.
@@ -38,7 +45,7 @@
 //! Build and semantic preflight (no formal timing):
 //!
 //! ```text
-//! cargo test -p triblespace-core --lib production_regions_adoption_gate_keeps_off_path_formula_size_constant
+//! cargo test -p triblespace-core --lib production_regions_adoption_gate
 //! cargo test --example production_formula_regions_bench
 //! ```
 //!
@@ -621,6 +628,7 @@ struct Measurement {
     elapsed: Duration,
     signature: Signature,
     first: Option<RawInline>,
+    stats_observed: bool,
     stats: ResidualStateStats,
     final_width: usize,
 }
@@ -632,6 +640,7 @@ fn first_measurement(mut query: BenchIter, started: Instant) -> Measurement {
         elapsed,
         signature: tally(first),
         first,
+        stats_observed: true,
         stats: query.stats().clone(),
         final_width: query.current_width(),
     }
@@ -642,15 +651,15 @@ fn run_cell(fixture: &Fixture, cell: Cell, mode: Mode) -> Measurement {
         Cell::ConstructDrop => {
             let started = Instant::now();
             let query = black_box(fixture.make_iter(mode));
-            let stats = query.stats().clone();
-            let final_width = query.current_width();
             drop(query);
+            let elapsed = started.elapsed();
             Measurement {
-                elapsed: started.elapsed(),
+                elapsed,
                 signature: Signature::default(),
                 first: None,
-                stats,
-                final_width,
+                stats_observed: false,
+                stats: ResidualStateStats::default(),
+                final_width: 0,
             }
         }
         Cell::PullFirst => {
@@ -665,15 +674,15 @@ fn run_cell(fixture: &Fixture, cell: Cell, mode: Mode) -> Measurement {
             let started = Instant::now();
             let mut query = fixture.make_iter(mode);
             let first = black_box(query.next());
-            let stats = query.stats().clone();
-            let final_width = query.current_width();
             drop(query);
+            let elapsed = started.elapsed();
             Measurement {
-                elapsed: started.elapsed(),
+                elapsed,
                 signature: tally(first),
                 first,
-                stats,
-                final_width,
+                stats_observed: false,
+                stats: ResidualStateStats::default(),
+                final_width: 0,
             }
         }
         Cell::Full => {
@@ -685,6 +694,7 @@ fn run_cell(fixture: &Fixture, cell: Cell, mode: Mode) -> Measurement {
                 elapsed,
                 signature,
                 first: None,
+                stats_observed: true,
                 stats: query.stats().clone(),
                 final_width: query.current_width(),
             }
@@ -778,16 +788,32 @@ fn record_width_point(trace: &mut Vec<(usize, usize)>, query: &BenchIter) {
 }
 
 fn check_exact_clone_drop_and_geometry(fixture: &Fixture) -> Vec<(usize, usize)> {
-    let mut query = fixture.make_iter(Mode::C);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut query = fixture.make_iter_with_calls(Mode::C, Some(Arc::clone(&calls)));
     let mut widths = Vec::new();
     record_width_point(&mut widths, &query);
     let first = query.next().expect("positive fixture has a first row");
     record_width_point(&mut widths, &query);
-    let exact_clone = query.clone();
+    let clone_start = widths.len() - 1;
+    let mut exact_clone = query.clone();
     let cancelled = query.clone();
     assert_eq!(query.stats(), exact_clone.stats());
     assert_eq!(query.current_width(), exact_clone.current_width());
+    let survivor_stats = query.stats().clone();
+    let cloned_stats = exact_clone.stats().clone();
+    let calls_before_drop = calls.lock().expect("filter trace poisoned").len();
     drop(cancelled);
+    assert_eq!(query.stats(), &survivor_stats, "drop changed survivor work");
+    assert_eq!(
+        exact_clone.stats(),
+        &cloned_stats,
+        "drop changed cloned survivor work"
+    );
+    assert_eq!(
+        calls.lock().expect("filter trace poisoned").len(),
+        calls_before_drop,
+        "dropping a clone performed constraint work"
+    );
 
     let mut original_remainder = Vec::new();
     while let Some(row) = query.next() {
@@ -795,10 +821,22 @@ fn check_exact_clone_drop_and_geometry(fixture: &Fixture) -> Vec<(usize, usize)>
         record_width_point(&mut widths, &query);
     }
     record_width_point(&mut widths, &query);
-    let cloned_remainder: Vec<_> = exact_clone.collect();
+    let mut cloned_widths = Vec::new();
+    record_width_point(&mut cloned_widths, &exact_clone);
+    let mut cloned_remainder = Vec::new();
+    while let Some(row) = exact_clone.next() {
+        cloned_remainder.push(row);
+        record_width_point(&mut cloned_widths, &exact_clone);
+    }
+    record_width_point(&mut cloned_widths, &exact_clone);
     assert_eq!(
         original_remainder, cloned_remainder,
         "exact cloned remainder"
+    );
+    assert_eq!(
+        &widths[clone_start..],
+        cloned_widths,
+        "exact clone did not preserve geometric continuation state"
     );
 
     let mut complete = vec![first];
@@ -816,6 +854,16 @@ fn check_exact_clone_drop_and_geometry(fixture: &Fixture) -> Vec<(usize, usize)>
     assert!(
         widths.iter().all(|(width, _)| width.is_power_of_two()),
         "formal fixture caps are powers of two"
+    );
+    assert!(widths.len() > 1, "geometric growth receipt is vacuous");
+    assert!(
+        widths.last().expect("nonempty width trace").1 > 0,
+        "the positive fixture never widened"
+    );
+    assert_eq!(
+        widths.last().expect("nonempty width trace").0,
+        fixture.scale,
+        "a fully drained power-of-two fixture did not reach its exact width cap"
     );
     for pair in widths.windows(2) {
         let (previous_width, previous_increases) = pair[0];
@@ -956,19 +1004,25 @@ fn semantic_and_mechanism_preflight(fixtures: &[Fixture]) {
         ),
     );
 
-    let ordinary = fixtures
+    for ordinary in fixtures
         .iter()
-        .find(|fixture| fixture.label == "ordinary_small")
-        .expect("ordinary control");
-    let (b_results, b_trace, b_stats) = ordinary_trace(ordinary, Mode::B);
-    let (c_results, c_trace, c_stats) = ordinary_trace(ordinary, Mode::C);
-    assert_eq!(b_results, c_results);
-    assert_eq!(b_trace, c_trace, "ordinary B/C action traces diverged");
-    assert_eq!(b_stats, c_stats, "ordinary B/C scheduler stats diverged");
-    print_mechanism(
-        "ordinary_plan_action_identity",
-        format_args!("events={};stats_equal=true", b_trace.len()),
-    );
+        .filter(|fixture| matches!(fixture.label, "ordinary_small" | "ordinary_large"))
+    {
+        let (b_results, b_trace, b_stats) = ordinary_trace(ordinary, Mode::B);
+        let (c_results, c_trace, c_stats) = ordinary_trace(ordinary, Mode::C);
+        assert_eq!(b_results, c_results);
+        assert_eq!(b_trace, c_trace, "ordinary B/C action traces diverged");
+        assert_eq!(b_stats, c_stats, "ordinary B/C scheduler stats diverged");
+        print_mechanism(
+            "ordinary_plan_action_identity",
+            format_args!(
+                "fixture={};scale={};events={};stats_equal=true;private_test=production_regions_adoption_gate_ordinary_control_has_identical_plans",
+                ordinary.label,
+                ordinary.scale,
+                b_trace.len()
+            ),
+        );
+    }
 
     for fixture in fixtures
         .iter()
@@ -983,7 +1037,7 @@ fn semantic_and_mechanism_preflight(fixtures: &[Fixture]) {
         print_mechanism(
             "clone_drop_geometric_trace",
             format_args!(
-                "fixture={};widths={trace};exact_remainder=true",
+                "fixture={};widths={trace};exact_remainder=true;private_test=production_regions_adoption_gate_residual_iter_drop_is_structurally_inert",
                 fixture.label
             ),
         );
@@ -1028,7 +1082,7 @@ fn print_sample(
         .map(raw_hex)
         .unwrap_or_else(|| "-".to_owned());
     println!(
-        "sample\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:#018x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "sample\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:#018x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         fixture.label,
         fixture.scale,
         cell.label(),
@@ -1040,6 +1094,7 @@ fn print_sample(
         measured.signature.checksum,
         first,
         measured.final_width,
+        measured.stats_observed,
         stats.support_action_pops,
         stats.propose_action_pops,
         stats.confirm_action_pops,
@@ -1059,7 +1114,7 @@ fn print_sample(
 
 fn measure_series(fixtures: &[Fixture]) -> Vec<TimingSeries> {
     println!(
-        "columns\tsample\tfixture\tscale\tcell\tround\tarm\tmode\telapsed_ns\trows\tchecksum\tfirst_hex\tfinal_width\tsupport_actions\tpropose_actions\tconfirm_actions\tsupport_calls\tpropose_calls\tconfirm_calls\tsource_pages\ttransition_pages\tsource_examined\ttransition_examined\twidth_increases\tterminal_windows\tterminal_promotions\tprojected_rows"
+        "columns\tsample\tfixture\tscale\tcell\tround\tarm\tmode\telapsed_ns\trows\tchecksum\tfirst_hex\tfinal_width\tstats_observed\tsupport_actions\tpropose_actions\tconfirm_actions\tsupport_calls\tpropose_calls\tconfirm_calls\tsource_pages\ttransition_pages\tsource_examined\ttransition_examined\twidth_increases\tterminal_windows\tterminal_promotions\tprojected_rows"
     );
     assert_eq!(
         fixtures
@@ -1302,7 +1357,7 @@ fn formal_fixtures() -> Vec<Fixture> {
 fn main() {
     let fixtures = formal_fixtures();
     println!(
-        "meta\tformat=production-regions-adoption-gate-v1\trounds={FORMAL_ROUNDS}\tsuperblocks={SUPERBLOCKS}\todd=B-C-C-B\teven=C-B-B-C\tt95_df9={ONE_SIDED_T95_DF9}\tguarded_formula_nodes={GUARDED_FORMULA_NODES}"
+        "meta\tformat=production-regions-adoption-gate-v2\trounds={FORMAL_ROUNDS}\tsuperblocks={SUPERBLOCKS}\todd=B-C-C-B\teven=C-B-B-C\tt95_df9={ONE_SIDED_T95_DF9}\tguarded_formula_nodes={GUARDED_FORMULA_NODES}"
     );
     semantic_and_mechanism_preflight(&fixtures);
     warm(&fixtures);
@@ -1362,5 +1417,24 @@ mod tests {
             Fixture::ordinary("ordinary_large", 64, 250),
         ];
         semantic_and_mechanism_preflight(&fixtures);
+    }
+
+    #[test]
+    fn drop_cell_samples_mark_counters_as_unobserved() {
+        let fixture = Fixture::ordinary("ordinary_observation_boundary", 8, 260);
+        for mode in Mode::ALL {
+            for cell in [Cell::ConstructDrop, Cell::DropFirst] {
+                let measured = run_cell(&fixture, cell, mode);
+                validate_measurement(&fixture, cell, &measured);
+                assert!(!measured.stats_observed);
+                assert_eq!(measured.stats, ResidualStateStats::default());
+                assert_eq!(measured.final_width, 0);
+            }
+            for cell in [Cell::PullFirst, Cell::FreshFirst, Cell::Full] {
+                let measured = run_cell(&fixture, cell, mode);
+                validate_measurement(&fixture, cell, &measured);
+                assert!(measured.stats_observed);
+            }
+        }
     }
 }

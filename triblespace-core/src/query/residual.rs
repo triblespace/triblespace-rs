@@ -18816,6 +18816,42 @@ mod tests {
     }
 
     #[test]
+    fn production_regions_adoption_gate_ordinary_control_has_identical_plans() {
+        let root = IntersectionConstraint::new(vec![shape_leaf(0), shape_leaf(1)]);
+        let opaque =
+            ResidualPlan::compile_lowering(&root, ResidualLowering::OPAQUE_PRODUCTION);
+        let regional = ResidualPlan::compile_lowering(&root, ResidualLowering::PRODUCTION);
+
+        assert_eq!(
+            opaque, regional,
+            "ProductionRegions changed a plan with no production-qualified region"
+        );
+    }
+
+    #[test]
+    #[allow(drop_bounds)]
+    fn production_regions_adoption_gate_residual_iter_drop_is_structurally_inert() {
+        // Inference selects the blanket `()` implementation only while this
+        // concrete iterator has no explicit Drop implementation. Adding one
+        // makes the marker ambiguous and fails this test at compile time.
+        // Without an outer Drop hook, field destruction has no engine entry
+        // point that combines the owned root, plan, and scheduler state.
+        struct ExplicitDrop;
+        trait AmbiguousIfExplicitDrop<Marker> {
+            fn prove_absent() {}
+        }
+        impl<T: ?Sized> AmbiguousIfExplicitDrop<()> for T {}
+        impl<T: ?Sized + Drop> AmbiguousIfExplicitDrop<ExplicitDrop> for T {}
+
+        type GateIter = ResidualStateIter<
+            ShapeConstraint,
+            fn(&Binding) -> Option<RawInline>,
+            RawInline,
+        >;
+        let _ = <GateIter as AmbiguousIfExplicitDrop<_>>::prove_absent;
+    }
+
+    #[test]
     fn production_regions_adoption_gate_keeps_off_path_formula_size_constant() {
         use crate::id::id_into_value;
         use crate::query::equalityconstraint::EqualityConstraint;
@@ -24348,7 +24384,7 @@ mod tests {
             .any(|leaf| leaf.lowering == LeafLowering::ProductionFormula));
         assert_program_fallbacks_unused(&default_counters);
         let mut default_results = vec![default_first];
-        default_results.extend(default_query);
+        default_results.extend(default_query.by_ref());
         default_results.sort_unstable();
         assert_eq!(default_results, expected);
         assert_program_fallbacks_unused(&default_counters);
@@ -24359,9 +24395,7 @@ mod tests {
 
         let region_counters = program_fallback_counters();
         let mut region = Query::new(make(&region_counters, false), project)
-            .solve_residual_state_lazy_with(ResidualLowering::PRODUCTION)
-            .cap(1)
-            .start_width(1);
+            .solve_residual_state_lazy_with(ResidualLowering::PRODUCTION);
         let region_first = region.next().expect("the semantic oracle is nonempty");
         assert!(expected.contains(&region_first));
         assert_program_fallbacks_unused(&region_counters);
@@ -24381,6 +24415,16 @@ mod tests {
             }
         }
         assert!(region.stats().delta_transition_pages > 0);
+        assert_eq!(
+            &default_query
+                .residual
+                .as_ref()
+                .expect("the drained default query retains its residual cursor")
+                .machine
+                .stats,
+            region.stats(),
+            "implicit default and explicit PRODUCTION changed scheduler work"
+        );
         assert_program_fallbacks_unused(&region_counters);
 
         let production_counters = program_fallback_counters();

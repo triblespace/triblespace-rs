@@ -4196,14 +4196,25 @@ fn generated_combined_formula_rpq_matrix_matches_frozen_schedulers_and_is_monoto
                 let ops = program.ops(graph.primary, graph.secondary);
                 let make_root = || generated_formula_root(&graph, &ops, formula);
                 let expected = run(make_root(), Scheduler::Sequential, project_end);
+                let assert_set = |rows: &[RawInline], capability: &str| {
+                    assert!(
+                        rows.windows(2).all(|pair| pair[0] != pair[1]),
+                        "duplicate projected tuple: level={level} program={program:?} formula={formula:?} capability={capability}"
+                    );
+                };
+                assert_set(&expected, "sequential");
 
+                let ordinary = run(make_root(), Scheduler::Ordinary, project_end);
+                assert_set(&ordinary, "ordinary");
                 assert_eq!(
-                    run(make_root(), Scheduler::Ordinary, project_end),
+                    ordinary,
                     expected,
                     "level={level} program={program:?} formula={formula:?} ordinary"
                 );
+                let dag = run(make_root(), Scheduler::Dag, project_end);
+                assert_set(&dag, "LazyDag");
                 assert_eq!(
-                    run(make_root(), Scheduler::Dag, project_end),
+                    dag,
                     expected,
                     "level={level} program={program:?} formula={formula:?} LazyDag"
                 );
@@ -4215,6 +4226,7 @@ fn generated_combined_formula_rpq_matrix_matches_frozen_schedulers_and_is_monoto
                         .start_width(1);
                     let mut actual: Vec<_> = query.by_ref().collect();
                     actual.sort_unstable();
+                    assert_set(&actual, capability);
                     assert_eq!(
                         actual, expected,
                         "level={level} program={program:?} formula={formula:?} capability={capability}"
