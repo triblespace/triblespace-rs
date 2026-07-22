@@ -2498,7 +2498,7 @@ impl ProgramScope {
 /// Formula scope and Program scope are independent four- and three-element
 /// chains, giving exactly twelve canonical lowering forms. `Default` is
 /// [`ResidualLowering::CONSERVATIVE`]; fresh [`Query`] values explicitly use
-/// [`ResidualLowering::HYBRID`] instead.
+/// [`ResidualLowering::PRODUCTION`] instead.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 #[must_use]
 pub struct ResidualLowering {
@@ -2584,9 +2584,14 @@ pub(super) fn seed_survives<'a>(
 impl ResidualLowering {
     /// Conservative residual lowering used by explicit probe solvers.
     pub const CONSERVATIVE: Self = Self::new(FormulaScope::OpaqueLeaves, ProgramScope::Disabled);
-    /// Production lowering: retain fused formula kernels while enabling
+    /// Opaque production control: retain fused formula kernels while enabling
     /// production-qualified heterogeneous transition programs.
-    pub const HYBRID: Self = Self::new(FormulaScope::OpaqueLeaves, ProgramScope::Production);
+    pub const OPAQUE_PRODUCTION: Self =
+        Self::new(FormulaScope::OpaqueLeaves, ProgramScope::Production);
+    /// Ordinary production lowering: selectively expose the ancestor-closed
+    /// logical regions needed to reach production-qualified typed Programs.
+    pub const PRODUCTION: Self =
+        Self::new(FormulaScope::ProductionRegions, ProgramScope::Production);
     /// Maximally exposed formula and transition-program lowering.
     pub const FULL: Self = Self::new(FormulaScope::WholeRoot, ProgramScope::All);
 
@@ -13386,7 +13391,7 @@ mod parallel {
         /// independent shard atoms.
         ///
         /// The iterator preserves the query's selected [`ResidualLowering`].
-        /// Fresh queries use [`ResidualLowering::HYBRID`] by default; an explicit
+        /// Fresh queries use [`ResidualLowering::PRODUCTION`] by default; an explicit
         /// [`Query::residual_lowering`] override remains in force.
         ///
         /// # Panics
@@ -13771,8 +13776,15 @@ mod tests {
         assert_eq!(forms.len(), 12);
         assert_eq!(ResidualLowering::default(), ResidualLowering::CONSERVATIVE);
         assert_eq!(
-            ResidualLowering::HYBRID,
+            ResidualLowering::OPAQUE_PRODUCTION,
             ResidualLowering::new(FormulaScope::OpaqueLeaves, ProgramScope::Production)
+        );
+        assert_eq!(
+            ResidualLowering::PRODUCTION,
+            ResidualLowering::new(
+                FormulaScope::ProductionRegions,
+                ProgramScope::Production,
+            )
         );
         assert_eq!(
             ResidualLowering::FULL,
@@ -14985,8 +14997,8 @@ mod tests {
             )
         }
 
-        let hybrid = run(ResidualLowering::HYBRID);
-        assert_eq!(hybrid, (vec![raw(42)], 1, 0, 0));
+        let opaque_production = run(ResidualLowering::OPAQUE_PRODUCTION);
+        assert_eq!(opaque_production, (vec![raw(42)], 1, 0, 0));
 
         let full = run(ResidualLowering::FULL);
         assert_eq!(full, (vec![raw(42)], 0, 0, 1));
@@ -15514,7 +15526,7 @@ mod tests {
 
         let project = |binding: &Binding| Some((*binding.get(0)?, *binding.get(1)?));
         let mut eager = Query::new(fixture(&[1, WIDE, WIDE]), project)
-            .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+            .solve_residual_state_lazy_with(ResidualLowering::OPAQUE_PRODUCTION)
             .cap(64)
             .start_width(1)
             .growth(2);
@@ -15540,7 +15552,7 @@ mod tests {
         );
 
         let mut fitting = Query::new(fixture(&[1, 1, 1]), project)
-            .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+            .solve_residual_state_lazy_with(ResidualLowering::OPAQUE_PRODUCTION)
             .cap(64)
             .start_width(1)
             .growth(2);
@@ -15562,7 +15574,7 @@ mod tests {
         assert_eq!(fitting_output[2].1, raw(32));
 
         let mut fitting_pageable = Query::new(fixture(&[1, 1, 1]), project)
-            .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+            .solve_residual_state_lazy_with(ResidualLowering::OPAQUE_PRODUCTION)
             .cap(64)
             .start_width(1)
             .growth(2);
@@ -15579,7 +15591,7 @@ mod tests {
         // The next demand window admits [wide, one, one]. Only its contiguous
         // fitting tail may complete; the wide prefix is refiled untouched.
         let mut mixed = Query::new(fixture(&[1, 1, 1, 1, 1, WIDE]), project)
-            .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+            .solve_residual_state_lazy_with(ResidualLowering::OPAQUE_PRODUCTION)
             .cap(64)
             .start_width(1)
             .growth(2);
@@ -15605,7 +15617,7 @@ mod tests {
         mixed_output.extend(&mut mixed);
 
         let mut mixed_pageable = Query::new(fixture(&[1, 1, 1, 1, 1, WIDE]), project)
-            .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+            .solve_residual_state_lazy_with(ResidualLowering::OPAQUE_PRODUCTION)
             .cap(64)
             .start_width(1)
             .growth(2);
@@ -15617,7 +15629,7 @@ mod tests {
         assert_eq!(mixed_set, mixed_pageable_set);
 
         let mut blocked = Query::new(fixture(&[1, WIDE, 1]), project)
-            .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+            .solve_residual_state_lazy_with(ResidualLowering::OPAQUE_PRODUCTION)
             .cap(64)
             .start_width(1)
             .growth(2);
@@ -15632,7 +15644,7 @@ mod tests {
         blocked_output.extend(&mut blocked);
 
         let mut blocked_pageable = Query::new(fixture(&[1, WIDE, 1]), project)
-            .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+            .solve_residual_state_lazy_with(ResidualLowering::OPAQUE_PRODUCTION)
             .cap(64)
             .start_width(1)
             .growth(2);
@@ -18843,12 +18855,13 @@ mod tests {
         for equality_count in [1, 2, 7, 64] {
             let root = make_root(equality_count);
 
-            let hybrid = ResidualPlan::compile_lowering(&root, ResidualLowering::HYBRID);
-            assert!(!hybrid.synthetic_root_formula);
-            assert_eq!(hybrid.finite_formula.nodes.len(), 0);
-            assert_eq!(hybrid.finite_formula.roots, [None, None]);
+            let opaque =
+                ResidualPlan::compile_lowering(&root, ResidualLowering::OPAQUE_PRODUCTION);
+            assert!(!opaque.synthetic_root_formula);
+            assert_eq!(opaque.finite_formula.nodes.len(), 0);
+            assert_eq!(opaque.finite_formula.roots, [None, None]);
             assert_eq!(
-                hybrid.leaves,
+                opaque.leaves,
                 [
                     ResidualLeaf {
                         path: ConstraintPath(vec![0].into_boxed_slice()),
@@ -18860,7 +18873,7 @@ mod tests {
                     },
                 ]
             );
-            assert_eq!(hybrid.action_span(), 2);
+            assert_eq!(opaque.action_span(), 2);
 
             let regional = ResidualPlan::compile_lowering(
                 &root,
@@ -24166,6 +24179,93 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "parallel")]
+    fn guarded_default_regional_root() -> (ParallelShapeConstraint, Vec<RawInline>) {
+        use crate::id::id_into_value;
+        use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
+
+        let fixture = production_formula_rpq_fixture();
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let source = id_into_value(&fixture.source);
+        let absent = id_into_value(&fixture.absent);
+        let operations = [PathOp::Attr(fixture.attribute.raw()), PathOp::Plus];
+        let dead_arm = IntersectionConstraint::new(vec![
+            parallel_shape(start.is(Inline::<GenId>::new(source))),
+            parallel_shape(start.is(Inline::<GenId>::new(absent))),
+            parallel_shape(end.is(Inline::<GenId>::new(absent))),
+        ]);
+        let union = UnionConstraint::new(vec![
+            parallel_shape(dead_arm),
+            parallel_shape(RegularPathConstraint::new(
+                fixture.graph,
+                start,
+                end,
+                &operations,
+            )),
+        ]);
+        let root = IntersectionConstraint::new(vec![
+            parallel_shape(start.is(Inline::<GenId>::new(source))),
+            parallel_shape(union),
+        ]);
+        let expected = vec![
+            id_into_value(&fixture.direct),
+            id_into_value(&fixture.sibling),
+            id_into_value(&fixture.transitive),
+        ];
+        (parallel_shape(root), expected)
+    }
+
+    #[cfg(feature = "parallel")]
+    fn project_regional_end(binding: &Binding) -> Option<RawInline> {
+        binding.get(1).copied()
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn default_regional_query_clones_before_pull_with_independent_exact_results() {
+        let (root, mut expected) = guarded_default_regional_root();
+        let plan = ResidualPlan::compile_lowering(root.as_ref(), ResidualLowering::PRODUCTION);
+        assert!(plan
+            .leaves
+            .iter()
+            .any(|leaf| leaf.lowering == LeafLowering::ProductionFormula));
+        let query = Query::new(root, project_regional_end);
+        assert_eq!(query.residual_lowering, ResidualLowering::PRODUCTION);
+        let sibling = query.clone();
+
+        let mut left: Vec<_> = query.collect();
+        let mut right: Vec<_> = sibling.collect();
+        left.sort_unstable();
+        right.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(left, expected);
+        assert_eq!(right, expected);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn default_regional_query_clones_after_first_with_independent_exact_remainders() {
+        let (root, mut expected) = guarded_default_regional_root();
+        let mut query = Query::new(root, project_regional_end);
+        assert_eq!(query.residual_lowering, ResidualLowering::PRODUCTION);
+        let first = query.next().expect("the marked regional query is nonempty");
+        let sibling = query.clone();
+
+        let mut left: Vec<_> = query.collect();
+        let mut right: Vec<_> = sibling.collect();
+        left.sort_unstable();
+        right.sort_unstable();
+        let first_position = expected
+            .iter()
+            .position(|value| *value == first)
+            .expect("the first result belongs to the exact regional set");
+        expected.remove(first_position);
+        expected.sort_unstable();
+        assert_eq!(left, expected);
+        assert_eq!(right, expected);
+    }
+
     fn impossible_rpq_union_arm(
         start: Variable<GenId>,
         end: Variable<GenId>,
@@ -24205,33 +24305,61 @@ mod tests {
         sequential.sort_unstable();
         assert_eq!(sequential, expected);
 
-        let hybrid_counters = program_fallback_counters();
-        let mut hybrid = Query::new(make(&hybrid_counters, true), project)
-            .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+        let opaque_counters = program_fallback_counters();
+        let mut opaque = Query::new(make(&opaque_counters, true), project)
+            .solve_residual_state_lazy_with(ResidualLowering::OPAQUE_PRODUCTION)
             .cap(1)
             .start_width(1);
-        let hybrid_first = hybrid.next().expect("the semantic oracle is nonempty");
-        assert!(expected.contains(&hybrid_first));
-        let mut hybrid_results = vec![hybrid_first];
-        hybrid_results.extend(hybrid.by_ref());
-        hybrid_results.sort_unstable();
-        assert_eq!(hybrid_results, expected);
-        let hybrid_fallbacks = match action {
-            FormulaProgramOracleAction::Propose => &hybrid_counters.0,
-            FormulaProgramOracleAction::GroupedConfirm => &hybrid_counters.1,
-            FormulaProgramOracleAction::Support => &hybrid_counters.2,
+        let opaque_first = opaque.next().expect("the semantic oracle is nonempty");
+        assert!(expected.contains(&opaque_first));
+        let mut opaque_results = vec![opaque_first];
+        opaque_results.extend(opaque.by_ref());
+        opaque_results.sort_unstable();
+        assert_eq!(opaque_results, expected);
+        let opaque_fallbacks = match action {
+            FormulaProgramOracleAction::Propose => &opaque_counters.0,
+            FormulaProgramOracleAction::GroupedConfirm => &opaque_counters.1,
+            FormulaProgramOracleAction::Support => &opaque_counters.2,
         };
         assert!(
-            hybrid_fallbacks.load(Ordering::Relaxed) > 0,
-            "opaque HYBRID union never exercised its ordinary RPQ fallback"
+            opaque_fallbacks.load(Ordering::Relaxed) > 0,
+            "opaque production union never exercised its ordinary RPQ fallback"
         );
+
+        let default_counters = program_fallback_counters();
+        let mut default_query = Query::new(make(&default_counters, false), project);
+        assert_eq!(
+            default_query.residual_lowering,
+            ResidualLowering::PRODUCTION,
+            "fresh Query::new must select regional production lowering"
+        );
+        let default_first = default_query
+            .next()
+            .expect("the default-path semantic oracle is nonempty");
+        assert!(expected.contains(&default_first));
+        let default_plan = &default_query
+            .residual
+            .as_ref()
+            .expect("the ordinary query initialized its residual cursor")
+            .plan;
+        assert!(default_plan
+            .leaves
+            .iter()
+            .any(|leaf| leaf.lowering == LeafLowering::ProductionFormula));
+        assert_program_fallbacks_unused(&default_counters);
+        let mut default_results = vec![default_first];
+        default_results.extend(default_query);
+        default_results.sort_unstable();
+        assert_eq!(default_results, expected);
+        assert_program_fallbacks_unused(&default_counters);
+
+        let exists_counters = program_fallback_counters();
+        assert!(crate::exists!(make(&exists_counters, false)));
+        assert_program_fallbacks_unused(&exists_counters);
 
         let region_counters = program_fallback_counters();
         let mut region = Query::new(make(&region_counters, false), project)
-            .solve_residual_state_lazy_with(ResidualLowering::new(
-                FormulaScope::ProductionRegions,
-                ProgramScope::Production,
-            ))
+            .solve_residual_state_lazy_with(ResidualLowering::PRODUCTION)
             .cap(1)
             .start_width(1);
         let region_first = region.next().expect("the semantic oracle is nonempty");

@@ -2928,7 +2928,7 @@ mod tests {
         let query = Query::new(root, project_first);
         if residual {
             query
-                .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+                .solve_residual_state_lazy_with(ResidualLowering::OPAQUE_PRODUCTION)
                 .collect()
         } else {
             query.sequential().collect()
@@ -3178,7 +3178,7 @@ mod tests {
         assert_eq!(wide_examined, [4, 2]);
 
         let mut admitted: Vec<_> = Query::new(constraint, project_first)
-            .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+            .solve_residual_state_lazy_with(ResidualLowering::OPAQUE_PRODUCTION)
             .collect();
         admitted.sort_unstable();
         assert_eq!(admitted, (1..=5).map(raw_value).collect::<Vec<_>>());

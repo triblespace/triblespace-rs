@@ -745,7 +745,7 @@ fn root_formula_effects() -> ResidualLowering {
 }
 
 fn production_region_effects() -> ResidualLowering {
-    ResidualLowering::new(FormulaScope::ProductionRegions, ProgramScope::Production)
+    ResidualLowering::PRODUCTION
 }
 
 #[cfg(feature = "parallel")]

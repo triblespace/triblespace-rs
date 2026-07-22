@@ -1,6 +1,6 @@
 //! The real entry: actual `find!`/`pattern!` queries whose two-bound
 //! proposals run through the resident route inside the residual
-//! engine (production `ResidualLowering::HYBRID` and maximal
+//! engine (opaque production `ResidualLowering::OPAQUE_PRODUCTION` and maximal
 //! `ResidualLowering::FULL`).
 //!
 //! Serial and parallel solves are compared bag-for-bag against the
@@ -256,7 +256,7 @@ fn public_off_route_executes_all_three_two_bound_actions_exactly() {
             GenId::inline_from(value),
         )
     )
-    .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+    .solve_residual_state_lazy_with(ResidualLowering::OPAQUE_PRODUCTION)
     .cap(1)
     .start_width(1)
     .growth(2)
@@ -272,7 +272,7 @@ fn public_off_route_executes_all_three_two_bound_actions_exactly() {
             GenId::inline_from(value),
         )
     )
-    .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+    .solve_residual_state_lazy_with(ResidualLowering::OPAQUE_PRODUCTION)
     .cap(1)
     .start_width(1)
     .growth(2)
@@ -288,7 +288,7 @@ fn public_off_route_executes_all_three_two_bound_actions_exactly() {
             v,
         )
     )
-    .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+    .solve_residual_state_lazy_with(ResidualLowering::OPAQUE_PRODUCTION)
     .cap(1)
     .start_width(1)
     .growth(2)
@@ -305,7 +305,7 @@ fn public_off_route_executes_all_three_two_bound_actions_exactly() {
     assert_eq!(counters.declined_contract, 0);
     assert!(
         counters.declined_policy >= 3,
-        "HYBRID must select every production-qualified two-bound Program before Off declines physical placement"
+        "OPAQUE_PRODUCTION must select every production-qualified two-bound Program before Off declines physical placement"
     );
 }
 
@@ -446,7 +446,7 @@ fn parallel_forced_routing_places_physically_and_stays_set_identical() {
         pattern!(&route, [{ ?e @ ns::fanout: ?v }])
     );
     // The public parallel residual entry preserves the query's selected
-    // lowering (HYBRID for a fresh query), so production-qualified typed
+    // lowering (PRODUCTION for a fresh query), so production-qualified typed
     // Programs stay reachable.
     let mut results: Vec<(Id, Id)> = query.into_par_residual_state_iter().collect();
 

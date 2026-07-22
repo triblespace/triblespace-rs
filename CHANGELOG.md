@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Fresh queries now use selective production-region lowering.**
+  `ResidualLowering::PRODUCTION` combines `FormulaScope::ProductionRegions`
+  with `ProgramScope::Production`, so ordinary `Query::new`, `find!`,
+  `exists!`, `pattern_changes!`, and parallel residual inheritance can reach
+  production-qualified typed Programs below marked AND/OR regions. The
+  explicit `OPAQUE_PRODUCTION` control preserves fused formula kernels with
+  production Programs for comparisons; the unshipped `HYBRID` name has been
+  removed rather than retained as an alias.
 - **Selective production regions preserve guarded exactness through finite
   ORs.** Each affine parent now carries covering-only provenance and an
   explicit active-arm receipt through paging, partitioning, and online
@@ -35,11 +43,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in original receipt order, removing the activation-count multiplier without
   taxing insert/take.
 - **Canonical Succinct archive paging is production-qualified.** Propose,
-  Confirm, and Support routes participate in ordinary hybrid lowering, keeping
-  their typed paging and physical-backend seam available without requiring
-  maximally exposed `ResidualLowering::FULL`.
+  Confirm, and Support routes participate in production-scoped lowering,
+  keeping their typed paging and physical-backend seam available without
+  requiring maximally exposed `ResidualLowering::FULL`.
 - **Typed `UnionArchive` Propose and Support are `Production`; Confirm remains
-  `Explicit`.** Ordinary hybrid lowering keeps sparse, geometrically
+  `Explicit`.** Production-scoped lowering keeps sparse, geometrically
   widened paging for low-demand and nonterminal work. A fresh multi-parent
   terminal Propose cohort may instead use its `CompleteActionEquivalent`
   certificate, preserving the exact parent-major then shard-major raw
@@ -59,28 +67,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Succinct sources publish broad hash/sequential versus random-rank classes;
   finite-formula actions, repeated-position Succinct targets, and multi-shard
   UnionArchive constraints remain on legacy estimates.
-- **Finite equality work and pointwise TribleSet checks stay on the ordinary
-  hybrid path, while TribleSet proposal cursors remain production-resumable.**
+- **Finite equality work and pointwise TribleSet checks stay on ordinary
+  constraint actions under production-scoped lowering, while TribleSet
+  proposal cursors remain production-resumable.**
   Equality Propose, Confirm, and Support plus TribleSet Confirm and Support are
-  explicit Program routes: `ResidualLowering::HYBRID` executes their already
-  bounded ordinary kernels, while `FULL` retains typed representability.
+  explicit Program routes: `ResidualLowering::PRODUCTION` and the
+  `OPAQUE_PRODUCTION` comparison control execute their already bounded ordinary
+  kernels, while `FULL` retains typed representability.
   TribleSet Propose remains production-qualified and pageable for low-demand
   and high-fanout work. For multi-parent terminal cohorts, its exact complete
   occurrence-bag certificate lets the geometrically widened scheduler drain a
   batch without opening one Program activation per parent.
 - **Hash-set and hash-map membership filters stay on the ordinary production
   residual path.** Their pointwise Confirm and Support work is already bounded
-  by the scheduler's input page, so HYBRID no longer expands each cheap hash
-  lookup into a typed Program activation. The filter-only Program routes remain
-  available to `ResidualLowering::FULL` as explicit representability controls.
-- **Ordinary residual queries now use hybrid structural lowering.** Exposed
+  by the scheduler's input page, so production-scoped lowering does not expand
+  each cheap hash lookup into a typed Program activation. The filter-only
+  Program routes remain available to `ResidualLowering::FULL` as explicit
+  representability controls.
+- **Opaque production lowering preserves fused finite composites.** Exposed
   associative AND regions remain flattened into residual occurrences, while
   other finite logical composites, including Union, stay fused behind their
   certified constraint kernels. Production-qualified typed Programs such as
   regular-path execution remain enabled. Explicit Program routes stay on the
-  ordinary constraint protocol under `ResidualLowering::HYBRID`;
+  ordinary constraint protocol under `ResidualLowering::OPAQUE_PRODUCTION`;
   `ResidualLowering::FULL` opts into them together with the maximally exposed
-  formula interpreter.
+  formula interpreter. `PRODUCTION` uses the same Program admission tier but
+  selectively opens marked logical regions around production Programs.
 - **Typed Program selection now has an explicit exposure policy.** Every route
   is `Production` or `Explicit`, and the residual lowering's `ProgramScope`
   independently selects `Disabled`, `Production`, or `All`. The centralized
@@ -550,7 +562,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   boundaries.
   Root-AND confirmations retain candidate-occurrence paging once the exact
   remaining suffix is page-local, including width-one and geometric
-  first-result traces. Ordinary live queries use `ResidualLowering::HYBRID`;
+  first-result traces. Ordinary live queries use `ResidualLowering::PRODUCTION`;
   explicit residual probe solvers remain conservative by default.
 - **WGPU Succinct confirmation can opt into exact residual-action executor
   samples.** `WgpuSuccinctArchive::observe_residual_actions()` returns a
@@ -708,7 +720,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exposure policy.
 - **Explicit parallel residual queries preserve their selected lowering.**
   `Query::into_par_residual_state_iter` now carries the query's selected
-  lowering into its affine shards; fresh queries select `HYBRID`, while an
+  lowering into its affine shards; fresh queries select `PRODUCTION`, while an
   explicit conservative or intermediate `residual_lowering` remains honored.
 - **BM25 tokenization preserves non-ASCII symbols and emoji.**
   `hash_tokens` previously discarded every token without an alphanumeric

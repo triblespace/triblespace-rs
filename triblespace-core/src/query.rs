@@ -2727,9 +2727,9 @@ enum QueryScheduler {
 /// residual states. It starts with narrow, depth-first action cohorts and
 /// widens as the consumer keeps pulling, while histories with identical future
 /// computation can reconverge under one state identity. The production
-/// lowering flattens exposed associative AND regions, preserves other finite
-/// composites such as Union as fused constraint kernels, and executes
-/// production-qualified regular-path Programs as heterogeneous state actions.
+/// lowering flattens exposed associative AND regions, selectively opens the
+/// ancestor-closed AND/OR paths needed to reach production-qualified Programs,
+/// and preserves off-path logical siblings as fused constraint kernels.
 /// Explicit routes deferred by policy use the ordinary constraint action. A
 /// structurally absent route may instead retain the constraint's legacy pager
 /// or seed hooks. Seed-rejected queries start no runtime. Use
@@ -3052,7 +3052,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
 
     /// Select structural lowering independently from the physical scheduler.
     ///
-    /// Ordinary live queries start with [`residual::ResidualLowering::HYBRID`].
+    /// Ordinary live queries start with [`residual::ResidualLowering::PRODUCTION`].
     /// Explicit scheduler comparisons can request
     /// [`residual::ResidualLowering::CONSERVATIVE`] or any intermediate form
     /// without changing their scheduler.
@@ -3218,7 +3218,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             postprocessing,
             projection,
             scheduler,
-            residual_lowering: residual::ResidualLowering::HYBRID,
+            residual_lowering: residual::ResidualLowering::PRODUCTION,
             certified_denotation,
             mode,
             iteration_started: false,
@@ -5722,7 +5722,7 @@ mod tests {
         assert_eq!(ordinary.scheduler, QueryScheduler::ResidualState);
         assert_eq!(
             ordinary.residual_lowering,
-            residual::ResidualLowering::HYBRID
+            residual::ResidualLowering::PRODUCTION
         );
 
         let conservative = ordinary
@@ -5748,6 +5748,45 @@ mod tests {
         assert_eq!(
             dag.residual_lowering, intermediate,
             "selecting lowering must not rewrite the physical scheduler"
+        );
+    }
+
+    #[test]
+    fn pattern_changes_queries_inherit_regional_production_lowering() {
+        let author = ufoid();
+        let old_book = ufoid();
+        let new_book = ufoid();
+        let mut base = TribleSet::new();
+        base += entity! { &author @
+            literature::firstname: "Frank",
+            literature::lastname: "Herbert",
+        };
+        base += entity! { &old_book @
+            literature::author: &author,
+            literature::title: "Dune",
+        };
+        let mut delta = TribleSet::new();
+        delta += entity! { &new_book @
+            literature::author: &author,
+            literature::title: "Dune Messiah",
+        };
+        let full = base + delta.clone();
+
+        let query = find!(
+            (title: String),
+            pattern_changes!(&full, &delta, [
+                { _?author @ literature::firstname: "Frank" },
+                { _?book @ literature::author: _?author, literature::title: ?title },
+            ])
+        );
+        assert_eq!(
+            query.residual_lowering,
+            residual::ResidualLowering::PRODUCTION,
+            "macro-generated queries must inherit the ordinary lowering"
+        );
+        assert_eq!(
+            query.collect::<Vec<_>>(),
+            [("Dune Messiah".to_owned(),)]
         );
     }
 

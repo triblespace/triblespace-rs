@@ -1825,14 +1825,19 @@ fn custom_cyclic_delta_composes_with_recursive_root_formula() {
         0
     );
 
-    let hybrid_evidence = Arc::new(DeltaEvidence::default());
-    let hybrid = sorted(Query::new(fixture(Arc::clone(&hybrid_evidence)), project_end).collect());
-    assert_eq!(
-        hybrid_evidence.seeded_roots.load(Ordering::Relaxed),
-        0,
-        "hybrid lowering keeps the recursive formula fused"
+    let production_evidence = Arc::new(DeltaEvidence::default());
+    let production = sorted(
+        Query::new(fixture(Arc::clone(&production_evidence)), project_end).collect(),
     );
-    assert_eq!(hybrid_evidence.expanded_nodes.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        production_evidence.seeded_roots.load(Ordering::Relaxed),
+        0,
+        "production regions leave explicit-only recursive formulas fused"
+    );
+    assert_eq!(
+        production_evidence.expanded_nodes.load(Ordering::Relaxed),
+        0
+    );
 
     let residual_evidence = Arc::new(DeltaEvidence::default());
     let residual = Query::new(fixture(Arc::clone(&residual_evidence)), project_end)
@@ -1844,7 +1849,7 @@ fn custom_cyclic_delta_composes_with_recursive_root_formula() {
 
     let expected = sorted(vec![raw(2), raw(2), raw(6), raw(6)]);
     assert_eq!(sequential, expected);
-    assert_eq!(hybrid, sequential);
+    assert_eq!(production, sequential);
     assert_eq!(residual, sequential);
     assert!(residual_evidence.seeded_roots.load(Ordering::Relaxed) > 0);
     assert!(residual_evidence.expanded_nodes.load(Ordering::Relaxed) > 0);

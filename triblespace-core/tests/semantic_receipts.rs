@@ -1331,7 +1331,7 @@ fn deferred_exact_program_receipt_does_not_discharge_covering_ordinary_source() 
     );
 
     let results: Vec<_> = Query::new(proposer, project_x)
-        .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+        .solve_residual_state_lazy_with(ResidualLowering::OPAQUE_PRODUCTION)
         .collect();
 
     assert_eq!(results, vec![MEMBER]);
