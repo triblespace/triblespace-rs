@@ -347,6 +347,18 @@ where
         self.propose_with_mode(true, variable, view, candidates)
     }
 
+    fn propose_certified_with_receipt(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) -> ProposalLayout {
+        self.propose_with_mode(true, variable, view, candidates);
+        // `propose_with_mode` sorts and deduplicates each parent group after
+        // collecting every live arm into isolated buffers.
+        ProposalLayout::grouped_set()
+    }
+
     fn confirm_certified(
         &self,
         variable: VariableId,
