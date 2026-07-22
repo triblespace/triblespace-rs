@@ -228,13 +228,36 @@ fn grouped_delta_confirm_is_active(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FormulaProposalStreamability {
     Linear,
+    /// The focused Atom is a direct child of this OR Plan. Each novel
+    /// endpoint may leave through a completed clone of that Plan while the
+    /// master activation retains the original arm continuation until EOF.
+    OnlineDirectOr { parent: FormulaPcId },
     Barrier(FormulaProposalStreamBarrier),
+}
+
+/// Reducer policy obtained from the structural streamability proof.
+///
+/// The effect-only exit is deliberately a PC rather than a Boolean flag: a
+/// streaming reducer can only publish through the exact continuation whose
+/// skipped OR siblings have already been accounted for in the formula grade.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FormulaProposalStreaming {
+    Quiescent,
+    Linear,
+    OnlineDirectOr { exit: FormulaPcId },
+}
+
+impl FormulaProposalStreaming {
+    fn streams(self) -> bool {
+        !matches!(self, Self::Quiescent)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FormulaProposalStreamBarrier {
     NotSyntheticRoot,
     NotProposalAction,
+    UncertifiedDenotation,
     OrFrame,
     NonPageLocalConfirm,
     GroupedConfirm,
@@ -1257,6 +1280,7 @@ impl FiniteFormulaProgram {
         let resume = formula_pcs.resume(counter);
         let mut completed = focused;
         let mut current = counter;
+        let mut direct_or = None;
         while let Some(return_to) = formula_pcs.get(current).return_to {
             let address = formula_pcs.return_by_id(return_to);
             if address.kind != FormulaReturnKind::Child {
@@ -1276,20 +1300,30 @@ impl FiniteFormulaProgram {
                 );
             };
             let parent = self.node(*parent_node);
-            let FiniteFormulaNodeKind::And { children } = &parent.kind else {
-                return FormulaProposalStreamability::Barrier(
-                    FormulaProposalStreamBarrier::OrFrame,
-                );
-            };
-            assert_eq!(children[address.child], completed);
-            for (child, &node) in children.iter().enumerate() {
-                if child == address.child || done.contains(child) {
-                    continue;
+            match &parent.kind {
+                FiniteFormulaNodeKind::And { children } => {
+                    assert_eq!(children[address.child], completed);
+                    for (child, &node) in children.iter().enumerate() {
+                        if child == address.child || done.contains(child) {
+                            continue;
+                        }
+                        let streamability =
+                            self.confirm_subtree_streamability(node, resume.variable, bound);
+                        if streamability != FormulaProposalStreamability::Linear {
+                            return streamability;
+                        }
+                    }
                 }
-                let streamability =
-                    self.confirm_subtree_streamability(node, resume.variable, bound);
-                if streamability != FormulaProposalStreamability::Linear {
-                    return streamability;
+                FiniteFormulaNodeKind::Or { children }
+                    if current == counter && direct_or.is_none() =>
+                {
+                    assert_eq!(children[address.child], completed);
+                    direct_or = Some(address.parent);
+                }
+                FiniteFormulaNodeKind::Or { .. } | FiniteFormulaNodeKind::Atom => {
+                    return FormulaProposalStreamability::Barrier(
+                        FormulaProposalStreamBarrier::OrFrame,
+                    );
                 }
             }
             completed = *parent_node;
@@ -1300,7 +1334,9 @@ impl FiniteFormulaProgram {
             Some(completed),
             "formula proposal return stack did not reach its root"
         );
-        FormulaProposalStreamability::Linear
+        direct_or.map_or(FormulaProposalStreamability::Linear, |parent| {
+            FormulaProposalStreamability::OnlineDirectOr { parent }
+        })
     }
 }
 
@@ -1743,8 +1779,17 @@ impl ResidualPlan {
         let streamability =
             self.finite_formula
                 .interned_proposal_streamability(formula_pcs, counter, bound);
-        if streamability != FormulaProposalStreamability::Linear {
+        if matches!(streamability, FormulaProposalStreamability::Barrier(_)) {
             return streamability;
+        }
+        if matches!(
+            streamability,
+            FormulaProposalStreamability::OnlineDirectOr { .. }
+        ) && !self.certified_denotation
+        {
+            return FormulaProposalStreamability::Barrier(
+                FormulaProposalStreamBarrier::UncertifiedDenotation,
+            );
         }
 
         let resume = formula_pcs.resume(counter);
@@ -1764,7 +1809,7 @@ impl ResidualPlan {
                 FormulaProposalStreamBarrier::OuterContinuation,
             );
         }
-        FormulaProposalStreamability::Linear
+        streamability
     }
 
     fn resolve<'r, 'a>(
@@ -3908,6 +3953,37 @@ impl FormulaPcInterner {
         )
     }
 
+    /// Builds the effect-only exit for a streamable OR arm.
+    ///
+    /// The master activation keeps its original Action/Plan lineage. An early
+    /// endpoint resumes through this clone, whose unfinished siblings are
+    /// represented as structurally skipped work so the normal completion and
+    /// grade machinery can be reused unchanged.
+    fn skip_remaining_children(
+        &mut self,
+        program: &FiniteFormulaProgram,
+        mut counter: FormulaPcId,
+    ) -> FormulaPcId {
+        let (node, done) = {
+            let record = self.get(counter);
+            let FormulaFocus::Plan { node, done, .. } = &record.focus else {
+                panic!("only a residual formula Plan can skip its remaining children")
+            };
+            (*node, done.clone())
+        };
+        let child_count = program
+            .node(node)
+            .children()
+            .expect("a residual formula Plan named an Atom")
+            .len();
+        for child in 0..child_count {
+            if !done.contains(child) {
+                counter = self.skip_child(program, counter, child);
+            }
+        }
+        counter
+    }
+
     fn complete(&mut self, program: &FiniteFormulaProgram, counter: FormulaPcId) -> FormulaPcId {
         let (node, stage, return_to, resume, grade) = {
             let counter_record = self.get(counter);
@@ -5865,8 +5941,13 @@ fn debug_assert_candidates_grouped(candidates: &CandidatePayload, parent_count: 
 /// neither it nor the set roots participate in Formula PC identity.
 #[derive(Clone, Debug)]
 struct FormulaOrAccumulator {
+    /// Every value ever admitted by any completed or live arm.
     sets: Vector<OrdSet<RawInline>>,
+    /// Admitted values that have not already left through an online arm.
+    /// Final OR emission consumes only this channel.
+    pending: Vector<OrdSet<RawInline>>,
     unique_len: usize,
+    pending_len: usize,
 }
 
 impl FormulaOrAccumulator {
@@ -5875,7 +5956,11 @@ impl FormulaOrAccumulator {
             sets: std::iter::repeat_with(OrdSet::new)
                 .take(parent_count)
                 .collect(),
+            pending: std::iter::repeat_with(OrdSet::new)
+                .take(parent_count)
+                .collect(),
             unique_len: 0,
+            pending_len: 0,
         }
     }
 
@@ -5890,7 +5975,44 @@ impl FormulaOrAccumulator {
                 .unique_len
                 .checked_add(1)
                 .expect("Formula OR unique candidate count overflow");
+            assert!(
+                self.pending[parent].insert(value).is_none(),
+                "new Formula OR value was already pending"
+            );
+            self.pending_len = self
+                .pending_len
+                .checked_add(1)
+                .expect("Formula OR pending candidate count overflow");
         }
+    }
+
+    /// Performs master-accumulator first admission for an online arm.
+    ///
+    /// A value first seen by this arm is published immediately. A duplicate
+    /// of a value retained by an earlier finite arm promotes that pending
+    /// value into the online channel exactly once. Values already published
+    /// by another online arm are suppressed.
+    fn publish(&mut self, parent: u32, value: RawInline) -> bool {
+        let parent = parent as usize;
+        let set = self
+            .sets
+            .get_mut(parent)
+            .expect("Formula OR publication named an unknown parent");
+        if set.insert(value).is_none() {
+            self.unique_len = self
+                .unique_len
+                .checked_add(1)
+                .expect("Formula OR unique candidate count overflow");
+            return true;
+        }
+        if self.pending[parent].remove(&value).is_some() {
+            self.pending_len = self
+                .pending_len
+                .checked_sub(1)
+                .expect("Formula OR pending candidate count underflow");
+            return true;
+        }
+        false
     }
 
     fn append(&mut self, other: Self) {
@@ -5898,31 +6020,53 @@ impl FormulaOrAccumulator {
             .unique_len
             .checked_add(other.unique_len)
             .expect("Formula OR unique candidate count overflow");
+        self.pending_len = self
+            .pending_len
+            .checked_add(other.pending_len)
+            .expect("Formula OR pending candidate count overflow");
         self.sets.append(other.sets);
+        self.pending.append(other.pending);
     }
 
     fn take_tail(&mut self, first: usize) -> Self {
         assert!(first > 0 && first < self.sets.len());
         let sets = self.sets.split_off(first);
+        let pending = self.pending.split_off(first);
         let unique_len = sets.iter().map(OrdSet::len).sum();
+        let pending_len = pending.iter().map(OrdSet::len).sum();
         self.unique_len = self
             .unique_len
             .checked_sub(unique_len)
             .expect("Formula OR tail contained too many unique values");
-        Self { sets, unique_len }
+        self.pending_len = self
+            .pending_len
+            .checked_sub(pending_len)
+            .expect("Formula OR tail contained too many pending values");
+        Self {
+            sets,
+            pending,
+            unique_len,
+            pending_len,
+        }
     }
 
-    fn push_parent_set(&mut self, set: OrdSet<RawInline>) {
+    fn push_parent_sets(&mut self, set: OrdSet<RawInline>, pending: OrdSet<RawInline>) {
+        assert!(pending.is_subset(&set));
         self.unique_len = self
             .unique_len
             .checked_add(set.len())
             .expect("Formula OR unique candidate count overflow");
+        self.pending_len = self
+            .pending_len
+            .checked_add(pending.len())
+            .expect("Formula OR pending candidate count overflow");
         self.sets.push_back(set);
+        self.pending.push_back(pending);
     }
 
-    fn singleton_set(&self) -> OrdSet<RawInline> {
+    fn singleton_pending_set(&self) -> OrdSet<RawInline> {
         assert_eq!(self.sets.len(), 1, "Formula reducer requires one parent");
-        self.sets[0].clone()
+        self.pending[0].clone()
     }
 }
 
@@ -6098,6 +6242,17 @@ impl FormulaBatch {
         accumulator.insert(parent, value);
     }
 
+    fn publish_current_or_value(&mut self, parent: u32, value: RawInline) -> bool {
+        let FormulaPayloadFrame::Or { accumulator, .. } = self
+            .frames
+            .last_mut()
+            .expect("Formula OR publication lost its reducer frame")
+        else {
+            panic!("Formula OR publication resumed into a non-OR frame")
+        };
+        accumulator.publish(parent, value)
+    }
+
     fn current_or_set(&self) -> OrdSet<RawInline> {
         let FormulaPayloadFrame::Or { accumulator, .. } = self
             .frames
@@ -6106,7 +6261,7 @@ impl FormulaBatch {
         else {
             panic!("Formula OR emission resumed from a non-OR frame")
         };
-        accumulator.singleton_set()
+        accumulator.singleton_pending_set()
     }
 
     /// Pops a completed non-OR child before its result enters an enclosing
@@ -6210,8 +6365,16 @@ impl FormulaBatch {
                 } => {
                     source.all_parents_in(self.parents.row_count)
                         && accumulator.sets.len() == self.parents.row_count
+                        && accumulator.pending.len() == self.parents.row_count
                         && accumulator.unique_len
                             == accumulator.sets.iter().map(OrdSet::len).sum::<usize>()
+                        && accumulator.pending_len
+                            == accumulator.pending.iter().map(OrdSet::len).sum::<usize>()
+                        && accumulator
+                            .pending
+                            .iter()
+                            .zip(accumulator.sets.iter())
+                            .all(|(pending, set)| pending.is_subset(set))
                 }
                 FormulaPayloadFrame::And { current } => {
                     current.all_parents_in(self.parents.row_count)
@@ -6537,7 +6700,13 @@ impl FormulaBatch {
                 } => {
                     partition_values(source, assignment, &remap, &mut groups, frame, 0);
                     assert_eq!(accumulator.sets.len(), row_count);
-                    for (parent, set) in accumulator.sets.into_iter().enumerate() {
+                    assert_eq!(accumulator.pending.len(), row_count);
+                    for (parent, (set, pending)) in accumulator
+                        .sets
+                        .into_iter()
+                        .zip(accumulator.pending)
+                        .enumerate()
+                    {
                         let target = groups
                             .get_mut(&assignment[parent])
                             .expect("every Formula assignment created its group");
@@ -6546,7 +6715,7 @@ impl FormulaBatch {
                         else {
                             panic!("Formula accumulator disagrees with its structural frame")
                         };
-                        accumulator.push_parent_set(set);
+                        accumulator.push_parent_sets(set, pending);
                     }
                 }
                 FormulaPayloadFrame::And { current } => {
@@ -10949,20 +11118,48 @@ impl ResidualStateMachine {
         if !matches!(formula_node.kind, FiniteFormulaNodeKind::Atom) {
             return Err(task);
         }
-        let stream_proposal = stage == FormulaStage::Propose
-            && plan.interned_formula_proposal_streamability(
+        let proposal_streaming = if stage != FormulaStage::Propose {
+            FormulaProposalStreaming::Quiescent
+        } else {
+            match plan.interned_formula_proposal_streamability(
                 &self.interner.formula_pcs,
                 counter,
                 task.desc.bound,
-            ) == FormulaProposalStreamability::Linear;
-        if stream_proposal {
-            assert!(
+            ) {
+                FormulaProposalStreamability::Linear => FormulaProposalStreaming::Linear,
+                FormulaProposalStreamability::OnlineDirectOr { parent } => {
+                    let exit = self.interner.formula_pcs.skip_remaining_children(
+                        &plan.finite_formula,
+                        parent,
+                    );
+                    FormulaProposalStreaming::OnlineDirectOr { exit }
+                }
+                FormulaProposalStreamability::Barrier(_) => {
+                    FormulaProposalStreaming::Quiescent
+                }
+            }
+        };
+        match proposal_streaming {
+            FormulaProposalStreaming::Linear => assert!(
                 batch
                     .frames
                     .iter()
                     .all(|frame| matches!(frame, FormulaPayloadFrame::And { .. })),
                 "a certified linear formula proposal carried a non-AND payload frame"
-            );
+            ),
+            FormulaProposalStreaming::OnlineDirectOr { .. } => {
+                let Some((current, outer)) = batch.frames.split_last() else {
+                    panic!("an online OR proposal carried no payload frame")
+                };
+                assert!(matches!(current, FormulaPayloadFrame::Or { .. }));
+                assert!(
+                    outer
+                        .iter()
+                        .all(|frame| matches!(frame, FormulaPayloadFrame::And { .. })),
+                    "an online direct-OR proposal carried a nested OR frame"
+                );
+            }
+            FormulaProposalStreaming::Quiescent => {}
         }
         let vars: Vec<VariableId> = task.desc.bound.into_iter().collect();
         let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
@@ -11013,7 +11210,7 @@ impl ResidualStateMachine {
             if proposal_paged
                 && !transition_paged
                 && !proposal_has_transition_roots
-                && !stream_proposal
+                && !proposal_streaming.streams()
                 && !plan.has_paged_transition_source(root, variable, &view)
             {
                 // A quiescent formula reducer cannot publish direct proposal
@@ -11083,7 +11280,7 @@ impl ResidualStateMachine {
                 counter,
                 stage,
                 batch,
-                stream_proposal,
+                proposal_streaming,
                 plan,
                 &mut self.worklist,
                 &mut self.interner,
@@ -11098,7 +11295,7 @@ impl ResidualStateMachine {
                 counter,
                 stage,
                 batch,
-                stream_proposal,
+                proposal_streaming,
             );
             return Ok(DeltaSeedOutcome {
                 continuation: None,
@@ -11117,7 +11314,7 @@ impl ResidualStateMachine {
             stage,
             batch,
             seeds,
-            stream_proposal,
+            proposal_streaming,
             plan,
             &mut self.worklist,
             &mut self.interner,
@@ -18652,6 +18849,31 @@ mod tests {
     }
 
     #[test]
+    fn formula_or_online_admission_promotes_pending_values_once_and_clones_independently() {
+        let pending = raw(7);
+        let online = raw(8);
+        let mut accumulator = FormulaOrAccumulator::empty(1);
+        accumulator.insert(0, pending);
+        let mut cloned = accumulator.clone();
+
+        assert!(accumulator.publish(0, pending));
+        assert!(!accumulator.publish(0, pending));
+        assert!(accumulator.publish(0, online));
+        assert!(!accumulator.publish(0, online));
+        assert_eq!(accumulator.unique_len, 2);
+        assert_eq!(accumulator.pending_len, 0);
+        assert!(accumulator.singleton_pending_set().is_empty());
+
+        assert_eq!(cloned.pending_len, 1);
+        assert!(cloned.publish(0, pending));
+        assert_eq!(cloned.pending_len, 0);
+        assert_eq!(
+            cloned.sets[0].iter().copied().collect::<Vec<_>>(),
+            [pending]
+        );
+    }
+
+    #[test]
     fn formula_or_structural_singletons_preserve_parent_order_and_persistent_sets() {
         let mut batch = FormulaBatch::from_confirmation(
             CandidateBatch {
@@ -18694,7 +18916,11 @@ mod tests {
                 _ => unreachable!(),
             };
             assert_eq!(
-                accumulator.singleton_set().iter().copied().collect::<Vec<_>>(),
+                accumulator
+                    .singleton_pending_set()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
                 expected
             );
         }
@@ -23526,7 +23752,7 @@ mod tests {
         let focused_first = focused.next().expect("the ring has a path result");
         let focused_first_stats = focused.stats().clone();
         assert_eq!(
-            focused_first_stats.propose_rows, 3,
+            focused_first_stats.propose_rows, 2,
             "{focused_first_stats:#?}"
         );
         assert_eq!(focused_first_stats.max_propose_rows, 1);
@@ -23534,8 +23760,8 @@ mod tests {
             focused_first_stats.support_action_pops
                 + focused_first_stats.propose_action_pops
                 + focused_first_stats.confirm_action_pops,
-            10,
-            "the singleton path seed must reach target confirmation before the cold source remainder"
+            8,
+            "the singleton path seed reaches target confirmation without proposing or guarding a skipped OR sibling"
         );
 
         let mut cold = Query::new(make(), project)

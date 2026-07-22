@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Certified direct finite-OR arms can publish cyclic proposal endpoints
+  online.** A typed streamability receipt preserves nested-OR, grouped, and
+  non-page-local barriers; first admission happens in the master persistent
+  union accumulator, effect clones skip sibling arms without advancing master
+  control, EOF advances that control exactly once, and final emission contains
+  only values not already published online.
 - **Typed Program activation retirement scans its arena at most once per
   cohort.** A fully drained arena retires immediately; singleton receipts keep
   their allocation-free scalar scan, while wider live arenas build activation
