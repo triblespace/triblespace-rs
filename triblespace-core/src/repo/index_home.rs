@@ -3364,7 +3364,7 @@ mod tests {
         let completion = program
             .try_complete_bounded(batch, 4, &affinity)
             .expect("the forwarded hooks admit the final two parents");
-        let (first_parent, admission, raw_occurrence_count, occurrences) =
+        let (first_parent, admission, raw_occurrence_count, occurrences, _layout) =
             completion.into_parts_for(batch, &affinity, &rows);
 
         assert_eq!(first_parent, 1);
@@ -3424,7 +3424,7 @@ mod tests {
         let completion = program
             .try_complete_bounded(batch, 3, &affinity)
             .expect("the three exact parents fit");
-        let (first_parent, admission, raw_occurrence_count, occurrences) =
+        let (first_parent, admission, raw_occurrence_count, occurrences, _layout) =
             completion.into_parts_for(batch, &affinity, &rows);
         let counts = take_union_complete_walk_counts();
 
@@ -3504,7 +3504,7 @@ mod tests {
         let completion = program
             .try_complete_bounded(batch, 2, &affinity)
             .expect("the final two parents fit exactly");
-        let (first_parent, admission, raw_occurrence_count, occurrences) =
+        let (first_parent, admission, raw_occurrence_count, occurrences, _layout) =
             completion.into_parts_for(batch, &affinity, &rows);
         let counts = take_union_complete_walk_counts();
 

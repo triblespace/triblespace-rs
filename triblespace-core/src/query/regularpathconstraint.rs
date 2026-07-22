@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::collections::VecDeque;
 
+use indexmap::IndexSet;
 use smallvec::SmallVec;
 
 use crate::id::id_into_value;
@@ -2533,15 +2534,17 @@ impl RegularPathConstraint {
     /// Repeated sparse routes keep this `(value, pc)` novelty domain in an
     /// activation-local registry; finite sparse routes instead terminate by
     /// descending program rank. A complete action has no activation, so it
-    /// owns the equivalent set and work queue directly. Collapsing convergent
-    /// finite histories is valid because proposals denote distinct endpoints.
-    /// Separate parent rows still run independent drains and retain their outer
-    /// bag multiplicity.
+    /// owns the equivalent set and work queue directly. The insertion-ordered
+    /// endpoint set retains first-witness order while collapsing convergent
+    /// finite histories. (Negated-property enumeration is itself unordered,
+    /// so this is a stable buffer-layout property, not a cross-run order
+    /// promise.) Separate parent rows still run independent drains and retain
+    /// their outer bag multiplicity.
     fn complete_bound_endpoint(
         &self,
         program: &DeltaProgram,
         source: RawInline,
-    ) -> HashSet<RawInline> {
+    ) -> IndexSet<RawInline, ahash::RandomState> {
         let root = RpqNode {
             source: None,
             value: source,
@@ -2549,7 +2552,7 @@ impl RegularPathConstraint {
         };
         let mut seen = HashSet::new();
         let mut pending = VecDeque::new();
-        let mut accepted = HashSet::new();
+        let mut accepted = IndexSet::with_hasher(ahash::RandomState::default());
 
         seen.insert((root.value, root.pc));
         pending.push_back(root);
@@ -2972,7 +2975,7 @@ impl TypedProgramSpec for RegularPathConstraint {
 
         for (parent, row) in batch.view.iter().enumerate() {
             let accepted = self.complete_bound_endpoint(program, row[source_column]);
-            effects.extend_parent(parent as u32, accepted);
+            effects.extend_parent_first_witness_set(parent as u32, accepted);
         }
     }
 
@@ -4259,7 +4262,8 @@ mod seeded_frame_tests {
     use crate::query::ProgramActivation;
     use crate::query::ProgramBatch;
     use crate::query::ProgramBatchEffects;
-    use crate::query::ProgramCompleteEffects;
+    use crate::query::ProgramCompleteAdmission;
+    use crate::query::ProgramCompleteAffinity;
     use crate::query::ProgramSeedEffects;
     use crate::query::Query;
     use crate::trible::Trible;
@@ -5175,16 +5179,27 @@ mod seeded_frame_tests {
             ProgramCompletion::CompleteActionEquivalent
         );
         let vars = [bound];
-        let mut effects = ProgramCompleteEffects::default();
-        path.residual_program().unwrap().complete_batch(
-            ProgramCompleteBatch {
-                request,
-                route,
-                view: RowsView::new(&vars, rows),
-            },
-            &mut effects,
+        let batch = ProgramCompleteBatch {
+            request,
+            route,
+            view: RowsView::new(&vars, rows),
+        };
+        let affinity = ProgramCompleteAffinity::new(&rows);
+        let completion = path
+            .residual_program()
+            .unwrap()
+            .try_complete_bounded(batch, usize::MAX, &affinity)
+            .expect("the RPQ whole-group completion must not decline");
+        let (first_parent, admission, raw_occurrence_count, occurrences, layout) =
+            completion.into_parts_for(batch, &affinity, &rows);
+        assert_eq!(first_parent, 0);
+        assert_eq!(admission, ProgramCompleteAdmission::LegacyUnquoted);
+        assert_eq!(raw_occurrence_count, occurrences.len());
+        assert!(
+            layout.is_grouped_set_first_witness(),
+            "the RPQ whole-group endpoint set lost its private layout proof"
         );
-        effects.occurrences
+        occurrences
     }
 
     #[test]

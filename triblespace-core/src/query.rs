@@ -74,7 +74,9 @@ pub use program::{
     TypedCompleteArbiter, TypedCompleteSink, TypedEffectSink, TypedProgramBatch, TypedProgramSpec,
     TypedResume, TypedSeedSink,
 };
-pub(crate) use program::{ProgramCompleteAdmission, ProgramCompleteAffinity};
+pub(crate) use program::{
+    ProgramCompleteAdmission, ProgramCompleteAffinity, ProgramCompleteLayout,
+};
 /// Re-export of [`PathOp`].
 pub use regularpathconstraint::PathOp;
 /// Re-export of [`RegularPathConstraint`].

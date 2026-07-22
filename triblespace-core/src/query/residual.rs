@@ -2780,13 +2780,15 @@ pub struct ResidualStateStats {
     pub delta_quiescent_formula_complete_actions: usize,
     /// Exact affine parents evaluated by those complete Formula actions.
     pub delta_quiescent_formula_complete_parents: usize,
-    /// Raw proposal occurrences returned by those actions before the complete
-    /// adapter's per-parent SET admission.
+    /// Raw proposal occurrences returned by those actions. Public grouped-bag
+    /// actions count occurrences before adapter SET admission; an engine-owned
+    /// grouped SET has already admitted them, so raw and distinct counts match.
     pub delta_quiescent_formula_complete_raw_occurrences: usize,
     /// Complete Program results transferred directly through a completing
     /// Formula OR whose current arm is Exact and whose accumulator was still
     /// globally empty. These results are already parent-local SETs at the
-    /// typed complete adapter boundary, so only deterministic ordering remains.
+    /// typed complete adapter boundary; physical ordering remains an
+    /// independent layout concern.
     pub delta_quiescent_formula_exact_empty_or_transfers: usize,
     /// Eligible quiescent Formula complete-action transactions that admitted
     /// no suffix and therefore retained pageable execution. A prefix deferred
@@ -6661,7 +6663,7 @@ impl FormulaBatch {
             .result(self.parents.row_count)
     }
 
-    /// Installs an already ordered/distinct OR result after its emission
+    /// Installs an already distinct, layout-stable OR result after its emission
     /// receipt reaches EOF.  A parent OR receives the result through a second
     /// admission receipt; a parent AND may consume it immediately, and a root
     /// result waits for the ordinary outer candidate continuation.
@@ -9111,6 +9113,7 @@ fn try_finish_exact_empty_formula_or_complete_result(
     counter: FormulaPcId,
     mut batch: FormulaBatch,
     mut result: CandidatePayload,
+    layout: ProgramCompleteLayout,
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
@@ -9147,7 +9150,14 @@ fn try_finish_exact_empty_formula_or_complete_result(
 
     batch.validate_tags();
     batch.finish_current_or_arm();
-    result.sort_admitted_set(batch.parents.row_count);
+    // A certified denotation promises only the projected raw SET, so the
+    // RPQ producer's first-witness order can pass through unchanged.
+    // Action-defined/uncertified plans may expose candidate order
+    // to an enclosing whole-group confirmer; retain Formula OR's historical
+    // value-ascending physical order there even when the producer was a SET.
+    if !layout.is_grouped_set_first_witness() || !plan.certified_denotation {
+        result.sort_admitted_set(batch.parents.row_count);
+    }
     stats.delta_quiescent_formula_exact_empty_or_transfers += 1;
     Ok(finish_formula_or_emission(
         plan,
@@ -9162,7 +9172,7 @@ fn try_finish_exact_empty_formula_or_complete_result(
     ))
 }
 
-/// Installs one ordered/distinct OR output only after its emission Program
+/// Installs one distinct, layout-stable OR output only after its emission Program
 /// reaches EOF. A nested parent OR receives a fresh admission receipt; an AND
 /// or the outer candidate continuation observes the completed payload
 /// directly.
@@ -11050,7 +11060,9 @@ impl ResidualStateMachine {
                 .map(|completion| completion.into_parts_for(batch, &affinity, &rows))
         };
 
-        let Some((first_parent, admission, raw_occurrence_count, occurrences)) = completion else {
+        let Some((first_parent, admission, raw_occurrence_count, occurrences, _layout)) =
+            completion
+        else {
             let admitted_parent_count = rows.row_count;
             self.stats.delta_terminal_admissions += 1;
             self.stats.delta_terminal_admitted_parents += admitted_parent_count;
@@ -11682,7 +11694,8 @@ impl ResidualStateMachine {
                 })
         };
 
-        let Some((first_parent, admission, raw_occurrence_count, occurrences)) = completion else {
+        let Some((first_parent, admission, raw_occurrence_count, occurrences, layout)) = completion
+        else {
             self.stats.delta_quiescent_formula_complete_declines += 1;
             return Err(batch);
         };
@@ -11754,6 +11767,7 @@ impl ResidualStateMachine {
             counter,
             batch,
             result,
+            layout,
             &mut self.worklist,
             &mut self.interner,
             &mut self.stats,
@@ -20259,7 +20273,8 @@ mod tests {
             (plan, interner, action, batch)
         }
 
-        let (plan, mut interner, action, batch) = setup(1, 2, true);
+        let (mut plan, mut interner, action, batch) = setup(1, 2, true);
+        plan.certified_denotation = true;
         let mut worklist = Worklist::new();
         let mut stats = ResidualStateStats::default();
         let mut reducer_seeds = Vec::new();
@@ -20274,6 +20289,7 @@ mod tests {
                 (1, raw(8)),
                 (1, raw(1)),
             ]),
+            ProgramCompleteLayout::grouped_bag_for_test(),
             &mut worklist,
             &mut interner,
             &mut stats,
@@ -20292,7 +20308,82 @@ mod tests {
         };
         assert_eq!(
             filed.candidates.iter().collect::<Vec<_>>(),
-            [(0, raw(2)), (0, raw(9)), (1, raw(1)), (1, raw(8))]
+            [(0, raw(2)), (0, raw(9)), (1, raw(1)), (1, raw(8))],
+            "a grouped bag retains ascending order even under a certified plan"
+        );
+
+        let (plan, mut interner, action, batch) = setup(1, 2, true);
+        assert!(!plan.certified_denotation);
+        let mut worklist = Worklist::new();
+        let mut stats = ResidualStateStats::default();
+        let mut reducer_seeds = Vec::new();
+        let continuation = try_finish_exact_empty_formula_or_complete_result(
+            &plan,
+            VariableSet::new_empty(),
+            action,
+            batch,
+            CandidatePayload::Tagged(vec![
+                (0, raw(9)),
+                (0, raw(2)),
+                (1, raw(8)),
+                (1, raw(1)),
+            ]),
+            ProgramCompleteLayout::grouped_set_for_test(),
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+            &mut reducer_seeds,
+        )
+        .expect("the grouped SET still transfers under an action-defined plan")
+        .expect("the transferred root OR result should file its outer candidate state");
+        let StateBucket::Candidates(filed) = worklist
+            .get(&continuation.rank)
+            .and_then(|level| level.get(&continuation.state))
+            .expect("the action-defined grouped SET was not filed")
+        else {
+            panic!("the action-defined grouped SET filed the wrong payload shape")
+        };
+        assert_eq!(
+            filed.candidates.iter().collect::<Vec<_>>(),
+            [(0, raw(2)), (0, raw(9)), (1, raw(1)), (1, raw(8))],
+            "an uncertified whole-group observer retains Formula OR's ascending order"
+        );
+
+        let (mut plan, mut interner, action, batch) = setup(1, 2, true);
+        plan.certified_denotation = true;
+        let mut worklist = Worklist::new();
+        let mut stats = ResidualStateStats::default();
+        let mut reducer_seeds = Vec::new();
+        let continuation = try_finish_exact_empty_formula_or_complete_result(
+            &plan,
+            VariableSet::new_empty(),
+            action,
+            batch,
+            CandidatePayload::Tagged(vec![
+                (0, raw(9)),
+                (0, raw(2)),
+                (1, raw(8)),
+                (1, raw(1)),
+            ]),
+            ProgramCompleteLayout::grouped_set_for_test(),
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+            &mut reducer_seeds,
+        )
+        .expect("the certified grouped SET should transfer without reordering")
+        .expect("the certified grouped SET should file its outer candidate state");
+        let StateBucket::Candidates(filed) = worklist
+            .get(&continuation.rank)
+            .and_then(|level| level.get(&continuation.state))
+            .expect("the certified grouped SET was not filed")
+        else {
+            panic!("the certified grouped SET filed the wrong payload shape")
+        };
+        assert_eq!(
+            filed.candidates.iter().collect::<Vec<_>>(),
+            [(0, raw(9)), (0, raw(2)), (1, raw(8)), (1, raw(1))],
+            "certified SET semantics should preserve the producer's first-witness buffer"
         );
 
         let (plan, mut interner, action, batch) = setup(1, 2, true);
@@ -20305,6 +20396,7 @@ mod tests {
             action,
             batch,
             CandidatePayload::Tagged(Vec::new()),
+            ProgramCompleteLayout::grouped_bag_for_test(),
             &mut worklist,
             &mut interner,
             &mut stats,
@@ -20326,6 +20418,7 @@ mod tests {
             action,
             batch,
             CandidatePayload::Values(vec![raw(3)]),
+            ProgramCompleteLayout::grouped_bag_for_test(),
             &mut worklist,
             &mut interner,
             &mut stats,
@@ -20348,6 +20441,7 @@ mod tests {
             action,
             batch,
             CandidatePayload::Values(vec![raw(4)]),
+            ProgramCompleteLayout::grouped_bag_for_test(),
             &mut worklist,
             &mut interner,
             &mut stats,
@@ -20390,6 +20484,7 @@ mod tests {
             second_action,
             batch,
             CandidatePayload::Values(vec![raw(6)]),
+            ProgramCompleteLayout::grouped_bag_for_test(),
             &mut worklist,
             &mut interner,
             &mut stats,

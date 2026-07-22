@@ -10,12 +10,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Receipt-proved complete Program results can transfer directly through an
-  empty exact Formula OR.** When the completing direct arm is exact and no
-  earlier arm has admitted a value, the residual engine deterministically
-  orders the already-distinct parent-local result and reuses the existing OR
-  completion path, avoiding duplicate ordered-set insertion. Covering arms,
-  unfinished siblings, nonempty accumulators, and nested outer OR admission
-  retain their ordinary semantics.
+  empty exact Formula OR.** RPQ whole-group completion now carries its
+  insertion-ordered parent-local SET proof through the typed arbiter, avoiding
+  a second hash admission. When the completing direct arm is exact, no earlier
+  arm has admitted a value, and the plan has a certified denotation, that
+  first-witness buffer also avoids an unnecessary sort. Public/custom Program
+  bags retain defensive validation, deduplication, and ascending Formula OR
+  order; Covering arms, uncertified whole-group observers, unfinished siblings,
+  nonempty accumulators, and nested outer OR admission retain their ordinary
+  semantics.
 - **Fresh queries now use selective production-region lowering.**
   `ResidualLowering::PRODUCTION` combines `FormulaScope::ProductionRegions`
   with `ProgramScope::Production`, so ordinary `Query::new`, `find!`,

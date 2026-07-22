@@ -12,6 +12,7 @@ use std::hash::Hash;
 use std::marker::PhantomData;
 
 use ahash::{AHashMap, AHashSet};
+use indexmap::IndexSet;
 
 use super::{RawInline, RowsView, VariableId, VariableSet};
 
@@ -191,9 +192,11 @@ pub enum ProgramCompletion {
     /// The route must be evaluated through its budgeted affine continuation.
     PageableOnly,
     /// [`TypedProgramSpec::complete_typed`] returns the exact complete raw
-    /// per-parent Propose occurrence bag produced by draining this route. The
-    /// erased adapter validates that whole bag before admitting each distinct
-    /// `(parent, value)` once at the completed action boundary.
+    /// per-parent Propose relation produced by draining this route. Public
+    /// family output remains a grouped bag which the erased adapter validates
+    /// before admitting each distinct `(parent, value)`. A crate-owned family
+    /// may instead submit an insertion-ordered SET through the private sink
+    /// lane and carry that structural proof across the same boundary.
     CompleteActionEquivalent,
 }
 
@@ -279,7 +282,10 @@ pub struct ProgramCompleteBatch<'v> {
 pub struct ProgramCompleteWorkQuote {
     /// Exact physical units examined by an unbounded drain for this parent.
     pub drain_work_units: usize,
-    /// Exact raw occurrences emitted before parent-local SET admission.
+    /// Exact raw occurrences emitted by the family for this parent. On the
+    /// public grouped-bag lane this is the count before adapter SET admission;
+    /// on the engine-owned grouped-SET lane family admission already happened,
+    /// so the raw and distinct counts are equal.
     pub raw_occurrences: usize,
 }
 
@@ -311,6 +317,67 @@ pub(crate) enum ProgramCompleteAdmission {
         drain_work_units: usize,
         raw_occurrences: usize,
     },
+}
+
+/// Semantic multiplicity of one typed complete-action producer result before
+/// the erased adapter releases it to the residual engine.
+///
+/// Public/custom Programs can produce only [`Self::GroupedBag`] through the
+/// public sink methods. The crate-private grouped-SET lane accepts an actual
+/// insertion-ordered set collection, so its proof is carried by construction
+/// rather than by a family-provided claim bit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProgramCompleteMultiplicity {
+    GroupedBag,
+    GroupedSet,
+}
+
+/// Physical order retained by the adapter after semantic SET admission.
+///
+/// This stays separate from multiplicity: SETness says which pairs may occur,
+/// while first-witness order says how their affine occurrence buffer is laid
+/// out. It preserves one completed result across lazy clones and remainders;
+/// it does not promise that an unordered producer discovers witnesses in the
+/// same order across independent runs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProgramCompleteOrder {
+    FirstWitness,
+}
+
+/// Private result-layout receipt consumed with one affine completion result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ProgramCompleteLayout {
+    multiplicity: ProgramCompleteMultiplicity,
+    order: ProgramCompleteOrder,
+}
+
+impl ProgramCompleteLayout {
+    const GROUPED_BAG_FIRST_WITNESS: Self = Self {
+        multiplicity: ProgramCompleteMultiplicity::GroupedBag,
+        order: ProgramCompleteOrder::FirstWitness,
+    };
+
+    const GROUPED_SET_FIRST_WITNESS: Self = Self {
+        multiplicity: ProgramCompleteMultiplicity::GroupedSet,
+        order: ProgramCompleteOrder::FirstWitness,
+    };
+
+    /// Whether the producer's own collection proves grouped distinctness and
+    /// preserves first-witness order, so a consumer need not reconstruct
+    /// either property when physical order is not otherwise observable.
+    pub(crate) fn is_grouped_set_first_witness(self) -> bool {
+        self == Self::GROUPED_SET_FIRST_WITNESS
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn grouped_bag_for_test() -> Self {
+        Self::GROUPED_BAG_FIRST_WITNESS
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn grouped_set_for_test() -> Self {
+        Self::GROUPED_SET_FIRST_WITNESS
+    }
 }
 
 /// Unique non-zero-sized identity for one cold completion transaction.
@@ -354,6 +421,7 @@ pub(crate) struct ProgramBoundedCompletion<'v, 'affinity, 'owner> {
     admission: ProgramCompleteAdmission,
     raw_occurrence_count: usize,
     occurrences: Vec<(u32, RawInline)>,
+    layout: ProgramCompleteLayout,
 }
 
 impl<'v> ProgramBoundedCompletion<'v, '_, '_> {
@@ -367,6 +435,7 @@ impl<'v> ProgramBoundedCompletion<'v, '_, '_> {
         ProgramCompleteAdmission,
         usize,
         Vec<(u32, RawInline)>,
+        ProgramCompleteLayout,
     ) {
         assert!(
             std::ptr::eq(self.affinity, affinity),
@@ -389,6 +458,7 @@ impl<'v> ProgramBoundedCompletion<'v, '_, '_> {
             self.admission,
             self.raw_occurrence_count,
             self.occurrences,
+            self.layout,
         )
     }
 }
@@ -400,14 +470,70 @@ impl<'v> ProgramBoundedCompletion<'v, '_, '_> {
 #[doc(hidden)]
 pub struct TypedCompleteSink {
     occurrences: Vec<(u32, RawInline)>,
+    mode: TypedCompleteSinkMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TypedCompleteSinkMode {
+    Undecided,
+    GroupedBag,
+    /// The next parent that must be sealed, including parents whose set is
+    /// empty. Requiring every group exactly once prevents two individually
+    /// distinct collections for one parent from forging global distinctness.
+    GroupedSet { next_parent: u32 },
 }
 
 impl TypedCompleteSink {
+    fn select_grouped_bag(&mut self) {
+        match self.mode {
+            TypedCompleteSinkMode::Undecided | TypedCompleteSinkMode::GroupedBag => {
+                self.mode = TypedCompleteSinkMode::GroupedBag;
+            }
+            TypedCompleteSinkMode::GroupedSet { .. } => {
+                panic!("typed complete action mixed grouped-SET and grouped-bag effects")
+            }
+        }
+    }
+
     pub fn push(&mut self, parent: u32, value: RawInline) {
+        self.select_grouped_bag();
         self.occurrences.push((parent, value));
     }
 
     pub fn extend_parent(&mut self, parent: u32, values: impl IntoIterator<Item = RawInline>) {
+        self.select_grouped_bag();
+        self.occurrences
+            .extend(values.into_iter().map(|value| (parent, value)));
+    }
+
+    /// Seals one engine-owned, insertion-ordered parent SET.
+    ///
+    /// The method is crate-private so external/custom Programs cannot replace
+    /// defensive bag admission with an unchecked semantic promise. Requiring
+    /// an [`IndexSet`] makes per-parent distinctness structural, and consuming
+    /// parents exactly once in ascending order makes the concatenated affine
+    /// buffer grouped and globally distinct by `(parent, value)`.
+    pub(crate) fn extend_parent_first_witness_set<S>(
+        &mut self,
+        parent: u32,
+        values: IndexSet<RawInline, S>,
+    ) {
+        let expected = match self.mode {
+            TypedCompleteSinkMode::Undecided => 0,
+            TypedCompleteSinkMode::GroupedSet { next_parent } => next_parent,
+            TypedCompleteSinkMode::GroupedBag => {
+                panic!("typed complete action mixed grouped-bag and grouped-SET effects")
+            }
+        };
+        assert_eq!(
+            parent, expected,
+            "typed grouped-SET complete parents were not sealed exactly once in ascending order"
+        );
+        self.mode = TypedCompleteSinkMode::GroupedSet {
+            next_parent: parent
+                .checked_add(1)
+                .expect("typed grouped-SET parent count overflow"),
+        };
         self.occurrences
             .extend(values.into_iter().map(|value| (parent, value)));
     }
@@ -490,6 +616,7 @@ impl TypedCompleteArbiter {
             state: TypedCompleteArbiterState::Pending,
             effects: TypedCompleteSink {
                 occurrences: Vec::new(),
+                mode: TypedCompleteSinkMode::Undecided,
             },
         }
     }
@@ -664,6 +791,18 @@ impl TypedCompleteArbiter {
             ),
         };
         let completed_parent_count = self.parent_count - first_parent;
+        let layout = match self.effects.mode {
+            TypedCompleteSinkMode::Undecided | TypedCompleteSinkMode::GroupedBag => {
+                ProgramCompleteLayout::GROUPED_BAG_FIRST_WITNESS
+            }
+            TypedCompleteSinkMode::GroupedSet { next_parent } => {
+                assert_eq!(
+                    next_parent as usize, completed_parent_count,
+                    "typed grouped-SET complete action did not seal every selected parent"
+                );
+                ProgramCompleteLayout::GROUPED_SET_FIRST_WITNESS
+            }
+        };
         let mut previous = 0u32;
         for (position, &(parent, _)) in self.effects.occurrences.iter().enumerate() {
             assert!(
@@ -700,15 +839,22 @@ impl TypedCompleteArbiter {
             );
         }
 
-        let mut admitted = AHashSet::with_capacity(raw_occurrence_count);
-        self.effects
-            .occurrences
-            .retain(|occurrence| admitted.insert(*occurrence));
+        if !layout.is_grouped_set_first_witness() {
+            // Public/custom complete actions expose a raw grouped bag. Keep
+            // their defensive adapter boundary exactly as before: validate
+            // the entire quoted bag first, then retain its first witness for
+            // every distinct affine `(parent, value)` pair.
+            let mut admitted = AHashSet::with_capacity(raw_occurrence_count);
+            self.effects
+                .occurrences
+                .retain(|occurrence| admitted.insert(*occurrence));
+        }
         Some(BoundedCompleteEffects {
             first_parent,
             admission,
             raw_occurrence_count,
             occurrences: self.effects.occurrences,
+            layout,
         })
     }
 }
@@ -1292,6 +1438,7 @@ struct BoundedCompleteEffects {
     admission: ProgramCompleteAdmission,
     raw_occurrence_count: usize,
     occurrences: Vec<(u32, RawInline)>,
+    layout: ProgramCompleteLayout,
 }
 
 /// Borrowed immutable typed program behind a private erased vtable.
@@ -1391,6 +1538,7 @@ impl<'a> ProgramRef<'a> {
                 admission: effects.admission,
                 raw_occurrence_count: effects.raw_occurrence_count,
                 occurrences: effects.occurrences,
+                layout: effects.layout,
             })
     }
 
@@ -1405,7 +1553,7 @@ impl<'a> ProgramRef<'a> {
         let completion = self
             .try_complete_bounded(batch, usize::MAX, &affinity)
             .expect("test complete action declined");
-        let (_, _, raw_occurrence_count, occurrences) =
+        let (_, _, raw_occurrence_count, occurrences, _) =
             completion.into_parts_for(batch, &affinity, &owner);
         effects.raw_occurrence_count = effects
             .raw_occurrence_count
@@ -3188,6 +3336,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum BoundedQuoteMode {
         Quoted(&'static [(usize, usize)]),
+        GroupedSet(&'static [(usize, usize)]),
         Declined,
     }
 
@@ -3252,7 +3401,20 @@ mod tests {
                 .collect();
             drop(calls);
             for (parent, row) in batch.view.iter().enumerate() {
-                effects.push(parent as u32, row.first().copied().unwrap_or_default());
+                if let BoundedQuoteMode::GroupedSet(quotes) = self.mode {
+                    let original_parent = row
+                        .first()
+                        .map_or(0, |value| usize::from(value[0].saturating_sub(10)));
+                    let raw_occurrences = quotes[original_parent].1;
+                    let mut values =
+                        IndexSet::with_hasher(ahash::RandomState::default());
+                    for offset in 0..raw_occurrences {
+                        values.insert(raw(200u8.wrapping_sub(offset as u8)));
+                    }
+                    effects.extend_parent_first_witness_set(parent as u32, values);
+                } else {
+                    effects.push(parent as u32, row.first().copied().unwrap_or_default());
+                }
             }
         }
 
@@ -3262,7 +3424,7 @@ mod tests {
         ) -> ProgramCompleteWorkEvidence {
             self.calls.lock().unwrap().quotes += 1;
             match self.mode {
-                BoundedQuoteMode::Quoted(quotes) => {
+                BoundedQuoteMode::Quoted(quotes) | BoundedQuoteMode::GroupedSet(quotes) => {
                     assert_eq!(quotes.len(), batch.view.len());
                     ProgramCompleteWorkEvidence::Quoted(
                         quotes
@@ -3424,17 +3586,23 @@ mod tests {
         let valid = CompleteTagProbe::RepeatedInOrder;
         let program = ProgramRef::new(&valid);
         let route = program.route(request).unwrap();
-        let mut effects = ProgramCompleteEffects::default();
-        program.complete_batch(
-            ProgramCompleteBatch {
-                request,
-                route,
-                view,
-            },
-            &mut effects,
+        let batch = ProgramCompleteBatch {
+            request,
+            route,
+            view,
+        };
+        let affinity = ProgramCompleteAffinity::new(&rows);
+        let completion = program
+            .try_complete_bounded(batch, usize::MAX, &affinity)
+            .expect("the external-style grouped bag completes");
+        let (_, _, raw_occurrence_count, occurrences, layout) =
+            completion.into_parts_for(batch, &affinity, &rows);
+        assert_eq!(occurrences, [(0, raw(1)), (0, raw(2)), (1, raw(1))]);
+        assert_eq!(raw_occurrence_count, 5);
+        assert!(
+            !layout.is_grouped_set_first_witness(),
+            "public sink pushes must retain defensive grouped-bag provenance"
         );
-        assert_eq!(effects.occurrences, [(0, raw(1)), (0, raw(2)), (1, raw(1))]);
-        assert_eq!(effects.raw_occurrence_count, 5);
 
         let misattributed = CompleteTagProbe::MisattributedQuote;
         let program = ProgramRef::new(&misattributed);
@@ -3516,7 +3684,7 @@ mod tests {
             let completion = program
                 .try_complete_bounded(batch, capacity, &affinity)
                 .expect("a multi-parent exact tail fits");
-            let (first, admission, raw_occurrence_count, occurrences) =
+            let (first, admission, raw_occurrence_count, occurrences, _layout) =
                 completion.into_parts_for(batch, &affinity, &rows);
             assert_eq!(first, expected_first);
             assert_eq!(
@@ -3544,6 +3712,148 @@ mod tests {
                     .map(|value| value[0])
                     .collect::<Vec<_>>()
             );
+        }
+    }
+
+    #[test]
+    fn grouped_set_completion_preserves_partial_tail_proof_and_local_parent_groups() {
+        // The final three original parents fit. Original parent 2 is an empty
+        // middle group which must still be sealed; parents 1 and 3 carry equal
+        // values which remain distinct by their rebased affine parent tags.
+        static QUOTES: &[(usize, usize)] = &[(9, 1), (1, 2), (1, 0), (1, 2)];
+        let probe = BoundedQuoteProbe {
+            mode: BoundedQuoteMode::GroupedSet(QUOTES),
+            calls: Arc::new(Mutex::new(BoundedQuoteCalls::default())),
+        };
+        let program = ProgramRef::new(&probe);
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(1),
+            bound: VariableSet::new_singleton(0),
+        };
+        let vars = [0];
+        let rows: Vec<_> = (0..QUOTES.len())
+            .map(|offset| raw(10 + offset as u8))
+            .collect();
+        let batch = ProgramCompleteBatch {
+            request,
+            route: program.route(request).unwrap(),
+            view: RowsView::new(&vars, &rows),
+        };
+        let affinity = ProgramCompleteAffinity::new(&rows);
+        let completion = program
+            .try_complete_bounded(batch, 4, &affinity)
+            .expect("the grouped-SET suffix fits both exact bounds");
+        let (first, admission, raw_occurrence_count, occurrences, layout) =
+            completion.into_parts_for(batch, &affinity, &rows);
+
+        assert_eq!(first, 1);
+        assert_eq!(
+            admission,
+            ProgramCompleteAdmission::Exact {
+                drain_work_units: 3,
+                raw_occurrences: 4,
+            }
+        );
+        assert_eq!(raw_occurrence_count, 4);
+        assert!(layout.is_grouped_set_first_witness());
+        assert_eq!(
+            occurrences,
+            [
+                (0, raw(200)),
+                (0, raw(199)),
+                (2, raw(200)),
+                (2, raw(199)),
+            ],
+            "the empty middle parent is represented by the sealed layout, while equal values under distinct parents survive"
+        );
+    }
+
+    #[test]
+    fn grouped_set_sink_rejects_missing_repeated_out_of_order_and_mixed_seals() {
+        fn set(values: &[u8]) -> IndexSet<RawInline, ahash::RandomState> {
+            let mut set = IndexSet::with_hasher(ahash::RandomState::default());
+            set.extend(values.iter().copied().map(raw));
+            set
+        }
+
+        let missing = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut arbiter = TypedCompleteArbiter::new(2, usize::MAX);
+            assert!(arbiter
+                .try_admit_evidence(ProgramCompleteWorkEvidence::Unquoted)
+                .is_some());
+            arbiter
+                .effects_mut()
+                .extend_parent_first_witness_set(0, set(&[2, 1]));
+            let _ = arbiter.finish();
+        }));
+        assert!(panic_text(missing.expect_err("a missing final SET parent must fail"))
+            .contains("did not seal every selected parent"));
+
+        let quote_mismatch =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut arbiter = TypedCompleteArbiter::new(2, usize::MAX);
+                assert!(arbiter
+                    .try_admit_evidence(ProgramCompleteWorkEvidence::Quoted(vec![
+                        ProgramCompleteWorkQuote {
+                            drain_work_units: 1,
+                            raw_occurrences: 1,
+                        },
+                        ProgramCompleteWorkQuote {
+                            drain_work_units: 0,
+                            raw_occurrences: 0,
+                        },
+                    ]))
+                    .is_some());
+                arbiter
+                    .effects_mut()
+                    .extend_parent_first_witness_set(0, set(&[2, 1]));
+                arbiter
+                    .effects_mut()
+                    .extend_parent_first_witness_set(1, set(&[]));
+                let _ = arbiter.finish();
+            }));
+        assert!(
+            panic_text(quote_mismatch.expect_err("a grouped SET must match its raw quote"))
+                .contains("parent 0's exact raw-occurrence quote")
+        );
+
+        for (name, attack) in [
+            (
+                "out-of-order",
+                Box::new(|sink: &mut TypedCompleteSink| {
+                    sink.extend_parent_first_witness_set(1, set(&[1]));
+                }) as Box<dyn FnOnce(&mut TypedCompleteSink)>,
+            ),
+            (
+                "repeated",
+                Box::new(|sink: &mut TypedCompleteSink| {
+                    sink.extend_parent_first_witness_set(0, set(&[1]));
+                    sink.extend_parent_first_witness_set(0, set(&[2]));
+                }),
+            ),
+            (
+                "bag-then-set",
+                Box::new(|sink: &mut TypedCompleteSink| {
+                    sink.push(0, raw(1));
+                    sink.extend_parent_first_witness_set(0, set(&[2]));
+                }),
+            ),
+            (
+                "set-then-bag",
+                Box::new(|sink: &mut TypedCompleteSink| {
+                    sink.extend_parent_first_witness_set(0, set(&[1]));
+                    sink.push(0, raw(2));
+                }),
+            ),
+        ] {
+            let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut arbiter = TypedCompleteArbiter::new(2, usize::MAX);
+                assert!(arbiter
+                    .try_admit_evidence(ProgramCompleteWorkEvidence::Unquoted)
+                    .is_some());
+                attack(arbiter.effects_mut());
+            }));
+            assert!(rejected.is_err(), "{name} grouped-SET seal was accepted");
         }
     }
 
@@ -4463,7 +4773,7 @@ mod tests {
         let completion = program
             .try_complete_bounded(batch, 2, &affinity)
             .expect("preferred child has an exact two-parent completion");
-        let (first, admission, raw_occurrences, occurrences) =
+        let (first, admission, raw_occurrences, occurrences, _layout) =
             completion.into_parts_for(batch, &affinity, &batch);
         assert_eq!(first, 0);
         assert_eq!(
