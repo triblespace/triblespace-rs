@@ -1177,6 +1177,45 @@ pub enum ProposalCoverage {
     Exact,
 }
 
+/// Physical multiplicity layout of one completed proposal action.
+///
+/// Every [`CandidateSink`] is grouped by parent row. `GroupedSet` strengthens
+/// that representation fact by proving that the concrete result contains at
+/// most one occurrence of each `(parent, value)` pair. `GroupedBag` makes no
+/// multiplicity claim. This receipt is affine execution evidence about the
+/// sink just filled; it is independent of the static denotational
+/// [`ProposalCoverage`] receipt. In particular, an `Exact` proposal may still
+/// contain duplicate physical occurrences.
+///
+/// Any lawful [`Constraint::confirm_certified`] subbag preserves
+/// `GroupedSet`: deleting occurrences cannot introduce a duplicate. Appending,
+/// merging, or otherwise introducing occurrences requires a fresh receipt.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[must_use]
+pub struct ProposalLayout(ProposalLayoutKind);
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+enum ProposalLayoutKind {
+    #[default]
+    GroupedBag,
+    GroupedSet,
+}
+
+impl ProposalLayout {
+    /// Construction proof available only to trusted in-crate issuers. Keeping
+    /// this constructor private to the crate lets the receipt evolve without
+    /// making a strong physical-layout claim part of the public Constraint
+    /// implementation surface.
+    pub(crate) const fn grouped_set() -> Self {
+        Self(ProposalLayoutKind::GroupedSet)
+    }
+
+    pub(crate) const fn is_grouped_set(self) -> bool {
+        matches!(self.0, ProposalLayoutKind::GroupedSet)
+    }
+}
+
 /// Logarithmic unit-work tier for one proposal candidate occurrence.
 ///
 /// Rank `r` in `0..=63` represents the broad capability class `2^r`. Ranks are
@@ -1663,6 +1702,30 @@ pub trait Constraint<'a> {
         self.propose(variable, view, candidates)
     }
 
+    /// Proposes and reports the physical layout of this concrete result.
+    ///
+    /// This action-relative receipt is available only on the certified
+    /// protocol. The conservative default executes the ordinary certified
+    /// proposal and reports the conservative grouped-bag layout. Trusted
+    /// in-crate implementations may report the stronger grouped-set layout
+    /// only when construction of this exact sink proves that every
+    /// `(parent, value)` pair is unique.
+    /// Static proposal coverage, estimates, and the set-valued denotation do
+    /// not imply that physical fact.
+    ///
+    /// The method remains object-safe so logical composites can propagate a
+    /// selected child's concrete receipt without changing [`CandidateSink`].
+    #[doc(hidden)]
+    fn propose_certified_with_receipt(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) -> ProposalLayout {
+        self.propose_certified(variable, view, candidates);
+        ProposalLayout::default()
+    }
+
     /// Confirms through the relational-SET execution protocol.
     ///
     /// This has the same whole-root activation rule as
@@ -2126,11 +2189,12 @@ fn propose_constraint<'a, C: Constraint<'a> + ?Sized>(
     variable: VariableId,
     view: &RowsView<'_>,
     candidates: &mut CandidateSink<'_>,
-) {
+) -> ProposalLayout {
     if certified {
-        constraint.propose_certified(variable, view, candidates);
+        constraint.propose_certified_with_receipt(variable, view, candidates)
     } else {
         constraint.propose(variable, view, candidates);
+        ProposalLayout::default()
     }
 }
 
@@ -2325,6 +2389,16 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
     ) {
         let inner: &T = self;
         inner.propose_certified(variable, view, candidates)
+    }
+
+    fn propose_certified_with_receipt(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) -> ProposalLayout {
+        let inner: &T = self;
+        inner.propose_certified_with_receipt(variable, view, candidates)
     }
 
     fn confirm_certified(
@@ -2555,6 +2629,16 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     ) {
         let inner: &T = self;
         inner.propose_certified(variable, view, candidates)
+    }
+
+    fn propose_certified_with_receipt(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) -> ProposalLayout {
+        let inner: &T = self;
+        inner.propose_certified_with_receipt(variable, view, candidates)
     }
 
     fn confirm_certified(
@@ -2940,7 +3024,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         // growth is the only lawful default until the protocol exposes a
         // separate occurrence-count receipt.
         let view = RowsView::new_indexed(&self.stack, &self.row, &self.cols);
-        propose_constraint(
+        let layout = propose_constraint(
             &self.constraint,
             self.certified_denotation,
             variable,
@@ -2956,10 +3040,12 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
                 &mut CandidateSink::Values(values),
             );
         }
-        // `values` is a tail-popped action stack. Keep each value's last
-        // stored occurrence so the first-seen DFS order remains unchanged:
-        // `[a, b, a] -> [b, a]`, then pop yields `a, b`.
-        admit_reverse_stable_set(values, &mut self.value_admission);
+        if !layout.is_grouped_set() {
+            // `values` is a tail-popped action stack. Keep each value's last
+            // stored occurrence so the first-seen DFS order remains unchanged:
+            // `[a, b, a] -> [b, a]`, then pop yields `a, b`.
+            admit_reverse_stable_set(values, &mut self.value_admission);
+        }
         self.cols[variable] = self.stack.len() as u8;
         self.stack.push(variable);
         self.row.push([0; 32]);
@@ -4500,7 +4586,7 @@ impl DagState {
                 order_trace::record(stride, variable, c_rows as u64);
             }
             scratch.pairs.clear();
-            propose_constraint(
+            _ = propose_constraint(
                 constraint,
                 self.certified_denotation,
                 variable,
@@ -4634,7 +4720,7 @@ impl DagState {
                 order_trace::record(stride, variable, g_count as u64);
             }
             scratch.pairs.clear();
-            propose_constraint(
+            _ = propose_constraint(
                 constraint,
                 self.certified_denotation,
                 variable,
@@ -5440,6 +5526,9 @@ macro_rules! temp {
 }
 /// Re-export of the [`temp!`] macro.
 pub use temp;
+
+#[cfg(test)]
+mod proposal_layout_tests;
 
 #[cfg(test)]
 mod tests {

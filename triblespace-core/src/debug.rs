@@ -6,6 +6,7 @@ pub mod query {
     use crate::query::EstimateSink;
     use crate::query::ProgramRef;
     use crate::query::ProposalCoverage;
+    use crate::query::ProposalLayout;
     use crate::query::ResidualDeltaExpandBatch;
     use crate::query::ResidualDeltaExpandCursor;
     use crate::query::ResidualDeltaExpandPage;
@@ -95,6 +96,17 @@ pub mod query {
             self.record.borrow_mut().push(variable);
             self.constraint
                 .propose_certified(variable, view, candidates);
+        }
+
+        fn propose_certified_with_receipt(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) -> ProposalLayout {
+            self.record.borrow_mut().push(variable);
+            self.constraint
+                .propose_certified_with_receipt(variable, view, candidates)
         }
 
         fn confirm_certified(
@@ -219,6 +231,16 @@ pub mod query {
         ) {
             self.constraint
                 .propose_certified(variable, view, candidates);
+        }
+
+        fn propose_certified_with_receipt(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) -> ProposalLayout {
+            self.constraint
+                .propose_certified_with_receipt(variable, view, candidates)
         }
 
         fn confirm_certified(

@@ -7322,7 +7322,7 @@ fn propose_leaf<'a>(
     view: &RowsView<'_>,
     candidates: &mut CandidateSink<'_>,
 ) {
-    propose_constraint(
+    _ = propose_constraint(
         plan.resolve(root, leaf),
         plan.certified_denotation,
         variable,
@@ -9080,7 +9080,7 @@ fn formula_action_transition<'a>(
     match stage {
         FormulaStage::Support => unreachable!("support returned above"),
         FormulaStage::Propose => {
-            propose_constraint(
+            _ = propose_constraint(
                 constraint,
                 plan.certified_denotation,
                 variable,

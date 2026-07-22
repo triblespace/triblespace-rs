@@ -139,10 +139,10 @@ where
         variable: VariableId,
         view: &RowsView<'_>,
         candidates: &mut CandidateSink<'_>,
-    ) {
+    ) -> ProposalLayout {
         let sources = self.target_sources(variable, view.bound());
         if sources.is_empty() || view.is_empty() {
-            return;
+            return ProposalLayout::default();
         }
 
         if matches!(candidates, CandidateSink::Values(_)) {
@@ -158,12 +158,16 @@ where
                     (estimate, index)
                 })
                 .expect("non-empty certified sources");
-            self.constraints[proposer].propose_certified(variable, view, candidates);
+            let layout = self.constraints[proposer].propose_certified_with_receipt(
+                variable,
+                view,
+                candidates,
+            );
             let skip = (coverage == ProposalCoverage::Exact).then_some(proposer);
             for (_, index) in self.certified_validator_order(variable, view, skip) {
                 self.constraints[index].confirm_certified(variable, view, candidates);
             }
-            return;
+            return layout;
         }
 
         let n_rows = view.len();
@@ -192,21 +196,31 @@ where
         }
 
         let uniform = (0..sources.len()).find(|&source| propose_counts[source] == n_rows);
-        if let Some(source) = uniform {
-            self.constraints[sources[source].0].propose_certified(variable, view, candidates);
+        let layout = if let Some(source) = uniform {
+            self.constraints[sources[source].0].propose_certified_with_receipt(
+                variable,
+                view,
+                candidates,
+            )
         } else {
             let mut scratch = Vec::new();
+            let mut layout = ProposalLayout::grouped_set();
             for (row, &source) in proposers.iter().enumerate() {
                 let row_view = view.row_view(row);
                 scratch.clear();
-                self.constraints[sources[source as usize].0].propose_certified(
-                    variable,
-                    &row_view,
-                    &mut CandidateSink::Values(&mut scratch),
-                );
+                let row_layout = self.constraints[sources[source as usize].0]
+                    .propose_certified_with_receipt(
+                        variable,
+                        &row_view,
+                        &mut CandidateSink::Values(&mut scratch),
+                    );
+                if !row_layout.is_grouped_set() {
+                    layout = ProposalLayout::default();
+                }
                 candidates.extend_row(row as u32, scratch.iter().copied());
             }
-        }
+            layout
+        };
 
         let skip = uniform.and_then(|source| {
             (sources[source].1 == ProposalCoverage::Exact).then_some(sources[source].0)
@@ -215,6 +229,7 @@ where
         for (_, index) in self.certified_validator_order(variable, &first, skip) {
             self.constraints[index].confirm_certified(variable, view, candidates);
         }
+        layout
     }
 
     fn certified_confirm(
@@ -488,6 +503,15 @@ where
         view: &RowsView<'_>,
         candidates: &mut CandidateSink<'_>,
     ) {
+        _ = self.certified_propose(variable, view, candidates);
+    }
+
+    fn propose_certified_with_receipt(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) -> ProposalLayout {
         self.certified_propose(variable, view, candidates)
     }
 
