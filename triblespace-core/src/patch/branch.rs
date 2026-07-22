@@ -839,6 +839,32 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         min_infix: &[u8; INFIX_LEN],
         max_infix: &[u8; INFIX_LEN],
     ) -> Option<[u8; INFIX_LEN]> {
+        let mut first = None;
+        self.ordered_infixes_range_while(prefix, at_depth, min_infix, max_infix, &mut |infix| {
+            first = Some(*infix);
+            false
+        });
+        first
+    }
+
+    /// Visit distinct infixes in lexicographic order inside the inclusive
+    /// range, stopping immediately when `f` returns `false`.
+    ///
+    /// PATCH child tables are cuckoo ordered, so this probes child byte keys
+    /// in lexical order instead of walking physical slots. A bounded caller
+    /// can therefore descend the lower boundary once and continue through the
+    /// adjacent subtrees without restarting from the root for every value.
+    pub fn ordered_infixes_range_while<const PREFIX_LEN: usize, const INFIX_LEN: usize, F>(
+        &self,
+        prefix: &[u8; PREFIX_LEN],
+        at_depth: usize,
+        min_infix: &[u8; INFIX_LEN],
+        max_infix: &[u8; INFIX_LEN],
+        f: &mut F,
+    ) -> bool
+    where
+        F: FnMut(&[u8; INFIX_LEN]) -> bool,
+    {
         let node_end_depth = self.end_depth as usize;
         let limit = std::cmp::min(PREFIX_LEN, node_end_depth);
         if !super::leaf::key_ops::has_prefix::<KEY_LEN, O>(
@@ -846,30 +872,40 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             at_depth,
             &prefix[..limit],
         ) {
-            return None;
+            return true;
         }
 
-        // The complete infix lies on this compressed path, so every
-        // descendant represents the same infix value.
+        // The whole infix is fixed by this compressed path. Every descendant
+        // therefore represents the same distinct segment value.
         if PREFIX_LEN + INFIX_LEN <= node_end_depth {
             let infix: [u8; INFIX_LEN] =
                 core::array::from_fn(|i| self.childleaf_key()[O::TREE_TO_KEY[PREFIX_LEN + i]]);
-            return (&infix >= min_infix && &infix <= max_infix).then_some(infix);
+            return if &infix >= min_infix && &infix <= max_infix {
+                f(&infix)
+            } else {
+                true
+            };
         }
 
-        // The prefix fixes the one child that can contain a result.
+        // The fixed prefix selects one child before the infix begins.
         if PREFIX_LEN > node_end_depth {
             return self
                 .child_table
                 .table_get(prefix[node_end_depth])
-                .and_then(|child| {
-                    child.first_infix_range(prefix, node_end_depth, min_infix, max_infix)
+                .is_none_or(|child| {
+                    child.ordered_infixes_range_while(
+                        prefix,
+                        node_end_depth,
+                        min_infix,
+                        max_infix,
+                        f,
+                    )
                 });
         }
 
-        // The fixed part of this compressed path must be compatible with the
-        // range. Track whether the next branching byte is still constrained
-        // by either boundary.
+        // The prefix ends in this node and the infix continues through its
+        // children. Reconstruct boundary tightness across the compressed path
+        // so whole out-of-range subtrees are skipped.
         let infix_byte_idx = node_end_depth - PREFIX_LEN;
         let mut min_tight = true;
         let mut max_tight = true;
@@ -877,7 +913,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             let path_byte = self.childleaf_key()[O::TREE_TO_KEY[PREFIX_LEN + i]];
             if min_tight {
                 if path_byte < min_infix[i] {
-                    return None;
+                    return true;
                 }
                 if path_byte > min_infix[i] {
                     min_tight = false;
@@ -885,7 +921,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             }
             if max_tight {
                 if path_byte > max_infix[i] {
-                    return None;
+                    return true;
                 }
                 if path_byte < max_infix[i] {
                     max_tight = false;
@@ -903,18 +939,15 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         } else {
             u8::MAX
         };
-
         for child_byte in lower..=upper {
             let Some(child) = self.child_table.table_get(child_byte) else {
                 continue;
             };
-            if let Some(infix) =
-                child.first_infix_range(prefix, node_end_depth, min_infix, max_infix)
-            {
-                return Some(infix);
+            if !child.ordered_infixes_range_while(prefix, node_end_depth, min_infix, max_infix, f) {
+                return false;
             }
         }
-        None
+        true
     }
 
     /// Count leaves whose infix falls within [min_infix, max_infix].

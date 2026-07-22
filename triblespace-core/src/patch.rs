@@ -43,6 +43,32 @@ compile_error!("PATCH tagged pointers require 64-bit targets");
 static mut SIP_KEY: [u8; 16] = [0; 16];
 static INIT: Once = Once::new();
 
+#[cfg(test)]
+std::thread_local! {
+    static INFIX_PAGE_DESCENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_infix_page_descents() -> usize {
+    INFIX_PAGE_DESCENTS.with(|descents| descents.replace(0))
+}
+
+fn strict_lexicographic_successor<const LEN: usize>(value: &[u8; LEN]) -> Option<[u8; LEN]> {
+    let mut successor = *value;
+    let mut cursor = LEN;
+    loop {
+        if cursor == 0 {
+            return None;
+        }
+        cursor -= 1;
+        if successor[cursor] != u8::MAX {
+            successor[cursor] += 1;
+            successor[cursor + 1..].fill(u8::MIN);
+            return Some(successor);
+        }
+    }
+}
+
 /// Minimum `other.leaf_count` at which [`Head::par_union`] takes the
 /// scatter + bitset + rayon::scope-spawn path on the equal-depth-
 /// branch arm. Below this, the per-key `modify_child` loop wins
@@ -1599,6 +1625,36 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         }
     }
 
+    pub(crate) fn ordered_infixes_range_while<const PREFIX_LEN: usize, const INFIX_LEN: usize, F>(
+        &self,
+        prefix: &[u8; PREFIX_LEN],
+        at_depth: usize,
+        min_infix: &[u8; INFIX_LEN],
+        max_infix: &[u8; INFIX_LEN],
+        f: &mut F,
+    ) -> bool
+    where
+        F: FnMut(&[u8; INFIX_LEN]) -> bool,
+    {
+        match self.body_ref() {
+            BodyRef::Leaf(leaf) => leaf
+                .first_infix_range::<PREFIX_LEN, INFIX_LEN, O>(
+                    prefix, at_depth, min_infix, max_infix,
+                )
+                .is_none_or(|infix| f(&infix)),
+            BodyRef::LocalLeaf(bytes) => {
+                leaf::key_ops::first_infix_range::<KEY_LEN, PREFIX_LEN, INFIX_LEN, O>(
+                    bytes, prefix, at_depth, min_infix, max_infix,
+                )
+                .is_none_or(|infix| f(&infix))
+            }
+            BodyRef::Branch(branch) => branch
+                .ordered_infixes_range_while::<PREFIX_LEN, INFIX_LEN, F>(
+                    prefix, at_depth, min_infix, max_infix, f,
+                ),
+        }
+    }
+
     pub(crate) fn count_range<const PREFIX_LEN: usize, const INFIX_LEN: usize>(
         &self,
         prefix: &[u8; PREFIX_LEN],
@@ -2057,6 +2113,48 @@ where
     root: Option<Head<KEY_LEN, O, V>>,
 }
 
+/// Receipt for one bounded lexicographic infix page.
+///
+/// `examined` values were passed to the page callback. `last` is the last of
+/// those values, and `exhausted` says whether the bounded range ended there.
+/// When `exhausted` is false, resuming strictly after `last` continues the
+/// range without replay.
+#[must_use = "inspect the page receipt to preserve exact continuation state"]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PATCHInfixPage<const INFIX_LEN: usize> {
+    examined: usize,
+    last: Option<[u8; INFIX_LEN]>,
+    exhausted: bool,
+}
+
+impl<const INFIX_LEN: usize> PATCHInfixPage<INFIX_LEN> {
+    const EMPTY: Self = Self {
+        examined: 0,
+        last: None,
+        exhausted: true,
+    };
+
+    /// Number of distinct infixes passed to the callback.
+    pub fn examined(&self) -> usize {
+        self.examined
+    }
+
+    /// Last infix passed to the callback, if the page was non-empty.
+    pub fn last(&self) -> Option<[u8; INFIX_LEN]> {
+        self.last
+    }
+
+    /// Whether no matching infix remains after this page.
+    pub fn is_exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    /// Exact strict-after cursor when another matching infix remains.
+    pub fn resume_after(&self) -> Option<[u8; INFIX_LEN]> {
+        (!self.exhausted).then(|| self.last.expect("a live infix page must examine a value"))
+    }
+}
+
 /// A prefix-located PATCH infix traversal whose exact cardinality has already
 /// been proved to fit a caller-supplied bound.
 ///
@@ -2405,22 +2503,85 @@ where
         after: &[u8; INFIX_LEN],
         max_infix: &[u8; INFIX_LEN],
     ) -> Option<[u8; INFIX_LEN]> {
-        let mut lower = *after;
-        let mut cursor = INFIX_LEN;
-        loop {
-            if cursor == 0 {
-                return None;
-            }
-            cursor -= 1;
-            if lower[cursor] != u8::MAX {
-                lower[cursor] += 1;
-                for byte in &mut lower[cursor + 1..] {
-                    *byte = u8::MIN;
-                }
-                break;
-            }
-        }
+        let lower = strict_lexicographic_successor(after)?;
         self.first_infix_range(prefix, &lower, max_infix)
+    }
+
+    /// Visit at most `limit` distinct infixes in lexicographic order, strictly
+    /// after `after` and no greater than `max_infix`.
+    ///
+    /// The traversal descends the strict lower bound once, then walks adjacent
+    /// trie subtrees in order. It may inspect one additional infix to prove an
+    /// exact continuation exists, but that lookahead is neither passed to
+    /// `for_each` nor included in [`PATCHInfixPage::examined`]. This gives a
+    /// resumable width-one page the same cursor semantics as repeated
+    /// [`Self::next_infix_after`] calls without restarting at the root for
+    /// every candidate.
+    pub fn infixes_page_after<const PREFIX_LEN: usize, const INFIX_LEN: usize, F>(
+        &self,
+        prefix: &[u8; PREFIX_LEN],
+        after: Option<&[u8; INFIX_LEN]>,
+        max_infix: &[u8; INFIX_LEN],
+        limit: usize,
+        mut for_each: F,
+    ) -> PATCHInfixPage<INFIX_LEN>
+    where
+        F: FnMut(&[u8; INFIX_LEN]),
+    {
+        const {
+            assert!(PREFIX_LEN + INFIX_LEN <= KEY_LEN);
+        }
+        assert!(
+            O::same_segment_tree(PREFIX_LEN, PREFIX_LEN + INFIX_LEN - 1)
+                && (PREFIX_LEN + INFIX_LEN == KEY_LEN
+                    || !O::same_segment_tree(PREFIX_LEN + INFIX_LEN - 1, PREFIX_LEN + INFIX_LEN)),
+            "INFIX_LEN must cover a whole segment"
+        );
+        assert!(limit > 0, "bounded infix pages require positive demand");
+
+        let lower = match after {
+            Some(after) => {
+                let Some(lower) = strict_lexicographic_successor(after) else {
+                    return PATCHInfixPage::EMPTY;
+                };
+                lower
+            }
+            None => [u8::MIN; INFIX_LEN],
+        };
+        if &lower > max_infix {
+            return PATCHInfixPage::EMPTY;
+        }
+
+        let Some(root) = &self.root else {
+            return PATCHInfixPage::EMPTY;
+        };
+        #[cfg(test)]
+        INFIX_PAGE_DESCENTS.with(|descents| descents.set(descents.get() + 1));
+
+        let mut remaining = limit;
+        let mut last = None;
+        let mut has_more = false;
+        root.ordered_infixes_range_while(
+            prefix,
+            0,
+            &lower,
+            max_infix,
+            &mut |infix: &[u8; INFIX_LEN]| {
+                if remaining == 0 {
+                    has_more = true;
+                    return false;
+                }
+                for_each(infix);
+                last = Some(*infix);
+                remaining -= 1;
+                true
+            },
+        );
+        PATCHInfixPage {
+            examined: limit - remaining,
+            last,
+            exhausted: !has_more,
+        }
     }
 
     /// Count entries whose infix falls within [min_infix, max_infix].
@@ -3126,6 +3287,21 @@ mod tests {
             tree.next_infix_after(&[], &[0x20; 16], &[0xff; 16]),
             Some([0xf0; 16]),
         );
+
+        let _ = take_infix_page_descents();
+        let mut cursor = None;
+        let mut actual = Vec::new();
+        loop {
+            let page = tree.infixes_page_after(&[], cursor.as_ref(), &[u8::MAX; 16], 1, |infix| {
+                actual.push(*infix)
+            });
+            if page.is_exhausted() {
+                break;
+            }
+            cursor = page.resume_after();
+        }
+        assert_eq!(actual, vec![[0x10; 16], [0x20; 16], [0xf0; 16]]);
+        assert_eq!(take_infix_page_descents(), actual.len());
     }
 
     #[test]

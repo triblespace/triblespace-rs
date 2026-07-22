@@ -187,6 +187,44 @@ proptest! {
     }
 
     #[test]
+    fn bounded_full_key_pages_match_strict_ordered_slice(
+        keys in vec(arb_key(), 0..80),
+        after in prop::option::of(arb_key()),
+        max in arb_key(),
+        limit in 1usize..10,
+    ) {
+        let mut patch = TestPatch::new();
+        for key in keys {
+            patch.insert(&Entry::new(&key));
+        }
+        let mut expected = patch
+            .iter()
+            .copied()
+            .filter(|key| after.as_ref().is_none_or(|after| key > after) && key <= &max)
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+
+        let mut actual = Vec::new();
+        let mut cursor = after;
+        loop {
+            let begin = actual.len();
+            let page = patch.infixes_page_after(&[], cursor.as_ref(), &max, limit, |infix| {
+                actual.push(*infix)
+            });
+            prop_assert_eq!(page.examined(), actual.len() - begin);
+            prop_assert_eq!(page.last(), actual.get(begin..).and_then(|page| page.last()).copied());
+            if page.is_exhausted() {
+                prop_assert_eq!(page.resume_after(), None);
+                break;
+            }
+            let resume = page.resume_after().expect("a live page has a cursor");
+            prop_assert_eq!(Some(resume), page.last());
+            cursor = Some(resume);
+        }
+        prop_assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn segmented_compressed_path_lower_bound_matches_eager_minimum(
         prefix in prop::array::uniform4(any::<u8>()),
         entries in vec(
@@ -217,6 +255,51 @@ proptest! {
             patch.first_infix_range(&prefix, &min, &max),
             eager.into_iter().min(),
         );
+    }
+
+    #[test]
+    fn bounded_segment_pages_emit_each_infix_once_in_order(
+        prefix in prop::array::uniform4(any::<u8>()),
+        entries in vec(
+            (
+                prop::array::uniform4(any::<u8>()),
+                prop::array::uniform4(any::<u8>()),
+            ),
+            0..80,
+        ),
+        after in prop::option::of(prop::array::uniform4(any::<u8>())),
+        max in prop::array::uniform4(any::<u8>()),
+        limit in 1usize..10,
+    ) {
+        let mut patch = SegmentedPatch::new();
+        for (infix, suffix) in entries {
+            let mut key = [0u8; 12];
+            key[..4].copy_from_slice(&prefix);
+            key[4..8].copy_from_slice(&infix);
+            key[8..].copy_from_slice(&suffix);
+            patch.insert(&Entry::new(&key));
+        }
+        let mut expected = std::collections::HashSet::new();
+        patch.infixes(&prefix, |infix: &[u8; 4]| {
+            if after.as_ref().is_none_or(|after| infix > after) && infix <= &max {
+                expected.insert(*infix);
+            }
+        });
+        let mut expected = expected.into_iter().collect::<Vec<_>>();
+        expected.sort_unstable();
+
+        let mut actual = Vec::new();
+        let mut cursor = after;
+        loop {
+            let page = patch.infixes_page_after(&prefix, cursor.as_ref(), &max, limit, |infix| {
+                actual.push(*infix)
+            });
+            if page.is_exhausted() {
+                break;
+            }
+            cursor = page.resume_after();
+        }
+        prop_assert_eq!(actual, expected);
     }
 
     #[test]
