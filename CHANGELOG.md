@@ -19,7 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-page-local barriers; first admission happens in the master persistent
   union accumulator, effect clones skip sibling arms without advancing master
   control, EOF advances that control exactly once, and final emission contains
-  only values not already published online.
+  only values not already published online. Selective `ProductionRegions`
+  formula leaves use the same receipt and reducer without widening legacy
+  `UnionLeaves` execution.
 - **Typed Program activation retirement scans its arena at most once per
   cohort.** A fully drained arena retires immediately; singleton receipts keep
   their allocation-free scalar scan, while wider live arenas build activation

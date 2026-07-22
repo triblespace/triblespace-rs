@@ -318,7 +318,7 @@ impl FormulaProposalStreaming {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FormulaProposalStreamBarrier {
-    NotSyntheticRoot,
+    NotAdmittedFormulaBoundary,
     NotProposalAction,
     UncertifiedDenotation,
     OrFrame,
@@ -1949,9 +1949,11 @@ impl ResidualPlan {
         counter: &FormulaProgramCounter,
         bound: VariableSet,
     ) -> FormulaProposalStreamability {
-        if !self.synthetic_root_formula {
+        if !self.synthetic_root_formula
+            && self.leaves[counter.resume.occurrence].lowering != LeafLowering::ProductionFormula
+        {
             return FormulaProposalStreamability::Barrier(
-                FormulaProposalStreamBarrier::NotSyntheticRoot,
+                FormulaProposalStreamBarrier::NotAdmittedFormulaBoundary,
             );
         }
         let streamability = self.finite_formula.proposal_streamability(counter, bound);
@@ -1985,9 +1987,12 @@ impl ResidualPlan {
         counter: FormulaPcId,
         bound: VariableSet,
     ) -> FormulaProposalStreamability {
-        if !self.synthetic_root_formula {
+        let resume = formula_pcs.resume(counter);
+        if !self.synthetic_root_formula
+            && self.leaves[resume.occurrence].lowering != LeafLowering::ProductionFormula
+        {
             return FormulaProposalStreamability::Barrier(
-                FormulaProposalStreamBarrier::NotSyntheticRoot,
+                FormulaProposalStreamBarrier::NotAdmittedFormulaBoundary,
             );
         }
         let streamability =
@@ -2006,7 +2011,6 @@ impl ResidualPlan {
             );
         }
 
-        let resume = formula_pcs.resume(counter);
         let UnionVerb::Propose { relevant } = &resume.verb else {
             return FormulaProposalStreamability::Barrier(
                 FormulaProposalStreamBarrier::NotProposalAction,
@@ -18615,7 +18619,9 @@ mod tests {
         assert_eq!(
             old_formula_plan
                 .formula_proposal_streamability(&old_formula_action, VariableSet::new_empty(),),
-            FormulaProposalStreamability::Barrier(FormulaProposalStreamBarrier::NotSyntheticRoot)
+            FormulaProposalStreamability::Barrier(
+                FormulaProposalStreamBarrier::NotAdmittedFormulaBoundary
+            )
         );
     }
 

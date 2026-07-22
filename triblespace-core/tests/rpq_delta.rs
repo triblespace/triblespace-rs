@@ -13,7 +13,7 @@ use triblespace_core::query::residual::{
 };
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
-    Binding, CandidateSink, Constraint, EstimateSink, PathOp, ProgramRef, Query,
+    Binding, CandidateSink, Constraint, EstimateSink, PathOp, ProgramRef, ProposalCoverage, Query,
     RegularPathConstraint, RowsView, Variable, VariableId, VariableSet,
 };
 use triblespace_core::trible::{Trible, TribleSet};
@@ -417,6 +417,152 @@ impl<'a> Constraint<'a> for PageTraceFilter {
 }
 
 #[derive(Clone)]
+struct CertifiedOuterFilter {
+    variable: VariableId,
+    accepted: Arc<Vec<RawInline>>,
+    page_local: bool,
+    grouped: bool,
+    certified: bool,
+    calls: Arc<Mutex<Vec<usize>>>,
+}
+
+impl<'a> Constraint<'a> for CertifiedOuterFilter {
+    fn variables(&self) -> VariableSet {
+        VariableSet::new_singleton(self.variable)
+    }
+
+    fn fixed_denotation(&self) -> bool {
+        self.certified
+    }
+
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        if variable != self.variable {
+            return false;
+        }
+        out.fill(usize::MAX, view.len());
+        true
+    }
+
+    fn propose(
+        &self,
+        variable: VariableId,
+        _view: &RowsView<'_>,
+        _candidates: &mut CandidateSink<'_>,
+    ) {
+        assert_ne!(
+            variable, self.variable,
+            "the outer validation-only filter unexpectedly became the proposer"
+        );
+    }
+
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        assert_eq!(variable, self.variable);
+        self.calls.lock().unwrap().push(candidates.len());
+        candidates.retain(|_, value| self.accepted.contains(value));
+    }
+
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        view.col(self.variable).is_none_or(|column| {
+            view.iter()
+                .all(|row| self.accepted.contains(&row[column]))
+        })
+    }
+
+    fn residual_confirm_is_page_local(&self) -> bool {
+        self.page_local
+    }
+
+    fn residual_delta_confirm_grouping_requirements(
+        &self,
+        variable: VariableId,
+    ) -> Option<VariableSet> {
+        (self.grouped && variable == self.variable).then_some(VariableSet::new_empty())
+    }
+}
+
+#[derive(Clone)]
+struct CoveringRejector {
+    proposed: RawInline,
+    confirms: Arc<AtomicUsize>,
+}
+
+impl<'a> Constraint<'a> for CoveringRejector {
+    fn variables(&self) -> VariableSet {
+        VariableSet::new_singleton(START).union(VariableSet::new_singleton(END))
+    }
+
+    fn fixed_denotation(&self) -> bool {
+        true
+    }
+
+    fn proposal_coverage(
+        &self,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> ProposalCoverage {
+        if variable == END && bound.is_set(START) && !bound.is_set(END) {
+            ProposalCoverage::Covering
+        } else {
+            ProposalCoverage::None
+        }
+    }
+
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        if variable != END {
+            return false;
+        }
+        out.fill(1, view.len());
+        true
+    }
+
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        assert_eq!(variable, END);
+        for parent in 0..view.len() {
+            candidates.push(parent as u32, self.proposed);
+        }
+    }
+
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        assert!(variable == START || variable == END);
+        self.confirms.fetch_add(1, Ordering::Relaxed);
+        candidates.retain(|_, _| false);
+    }
+
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        view.col(END).is_none()
+    }
+
+    fn residual_confirm_is_page_local(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Clone)]
 struct SupportPageTraceFilter {
     trace: Arc<Mutex<Vec<usize>>>,
 }
@@ -533,6 +679,10 @@ fn root_formula_effects() -> ResidualLowering {
     ResidualLowering::FULL
 }
 
+fn production_region_effects() -> ResidualLowering {
+    ResidualLowering::new(FormulaScope::ProductionRegions, ProgramScope::Production)
+}
+
 #[cfg(feature = "parallel")]
 fn all_formula_effects() -> ResidualLowering {
     ResidualLowering::FULL
@@ -592,6 +742,38 @@ fn prefixed_formula_bound_start_root(
     Arc::new(IntersectionConstraint::new(vec![
         Box::new(start_var.is(start)) as DynConstraint,
         Box::new(UnionConstraint::new(arms)) as DynConstraint,
+    ]))
+}
+
+fn filtered_prefixed_formula_bound_start_root(
+    set: TribleSet,
+    start: Inline<GenId>,
+    prefix: Vec<RawInline>,
+    ops: &[PathOp],
+    filter: CertifiedOuterFilter,
+) -> Root {
+    let start_var = Variable::<GenId>::new(START);
+    let end_var = Variable::<GenId>::new(END);
+    let cyclic = Box::new(RegularPathConstraint::new(
+        set,
+        start_var,
+        end_var,
+        ops,
+    )) as DynConstraint;
+    let mut arms: Vec<DynConstraint> = prefix
+        .into_iter()
+        .map(|value| {
+            Box::new(IntersectionConstraint::new(vec![
+                Box::new(start_var.is(start)) as DynConstraint,
+                Box::new(end_var.is(Inline::<GenId>::new(value))) as DynConstraint,
+            ])) as DynConstraint
+        })
+        .collect();
+    arms.push(cyclic);
+    Arc::new(IntersectionConstraint::new(vec![
+        Box::new(start_var.is(start)) as DynConstraint,
+        Box::new(UnionConstraint::new(arms)) as DynConstraint,
+        Box::new(filter) as DynConstraint,
     ]))
 }
 
@@ -1765,81 +1947,404 @@ fn ordinary_shape_selected_query_composes_root_formula_union_and_cyclic_rpq() {
 fn direct_finite_or_streams_the_first_cyclic_endpoint_before_fixpoint() {
     let graph = Graph::new(8, &[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)]);
     let ops = repeated(graph.attribute, false);
-    let root = formula_bound_start_root(graph.set.clone(), graph.value(0), &ops);
-    let mut query = Query::new(root, project_end)
-        .solve_residual_state_lazy_with(root_formula_effects())
-        .cap(1)
-        .start_width(1);
+    for (name, lowering) in [
+        ("whole root", root_formula_effects()),
+        ("production region", production_region_effects()),
+    ] {
+        let root = formula_bound_start_root(graph.set.clone(), graph.value(0), &ops);
+        let mut query = Query::new(root, project_end)
+            .solve_residual_state_lazy_with(lowering)
+            .cap(1)
+            .start_width(1);
 
-    let first = query.next().expect("the first direct-OR endpoint streamed");
-    assert_eq!(first, graph.value(1).raw);
-    assert_eq!(
-        query.stats().delta_transition_pages,
-        1,
-        "the direct OR publishes from its first accepted transition page"
-    );
-    assert_eq!(
-        query.stats().delta_transition_candidates_examined,
-        1,
-        "the direct OR must not wait for cyclic fixpoint quiescence"
-    );
-    let exact_clone = query.clone();
-    let cancelled = query.clone();
-    drop(cancelled);
+        let first = query.next().expect("the first direct-OR endpoint streamed");
+        assert_eq!(first, graph.value(1).raw, "{name}");
+        assert_eq!(
+            query.stats().delta_transition_pages,
+            1,
+            "the {name} direct OR publishes from its first accepted transition page"
+        );
+        assert_eq!(
+            query.stats().delta_transition_candidates_examined,
+            1,
+            "the {name} direct OR must not wait for cyclic fixpoint quiescence"
+        );
+        let exact_clone = query.clone();
+        let cancelled = query.clone();
+        drop(cancelled);
 
-    let mut original = vec![first];
-    original.extend(query);
-    let mut cloned = vec![first];
-    cloned.extend(exact_clone);
-    original.sort_unstable();
-    cloned.sort_unstable();
-    assert_eq!(cloned, original);
-    let mut expected = (1..8)
-        .map(|node| graph.value(node).raw)
-        .collect::<Vec<_>>();
-    expected.sort_unstable();
-    assert_eq!(
-        original,
-        expected,
-        "online endpoints must not replay during final pending-only emission"
-    );
+        let mut original = vec![first];
+        original.extend(query);
+        let mut cloned = vec![first];
+        cloned.extend(exact_clone);
+        original.sort_unstable();
+        cloned.sort_unstable();
+        assert_eq!(cloned, original, "{name}");
+        let mut expected = (1..8)
+            .map(|node| graph.value(node).raw)
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        assert_eq!(
+            original, expected,
+            "{name} online endpoints must not replay during final pending-only emission"
+        );
+    }
 }
 
 #[test]
 fn direct_or_preserves_set_semantics_with_empty_and_pending_finite_prefixes() {
     let graph = Graph::new(4, &[(0, 1), (1, 2)]);
     let ops = repeated(graph.attribute, false);
-    for (prefix, mut expected) in [
-        (Vec::new(), vec![graph.value(1).raw, graph.value(2).raw]),
-        (
-            vec![graph.value(1).raw, graph.value(3).raw],
-            vec![
-                graph.value(1).raw,
-                graph.value(2).raw,
-                graph.value(3).raw,
-            ],
-        ),
+    for (name, lowering) in [
+        ("whole root", root_formula_effects()),
+        ("production region", production_region_effects()),
     ] {
-        let root = prefixed_formula_bound_start_root(
+        for (prefix, mut expected) in [
+            (Vec::new(), vec![graph.value(1).raw, graph.value(2).raw]),
+            (
+                vec![graph.value(1).raw, graph.value(3).raw],
+                vec![
+                    graph.value(1).raw,
+                    graph.value(2).raw,
+                    graph.value(3).raw,
+                ],
+            ),
+        ] {
+            let root = prefixed_formula_bound_start_root(
+                graph.set.clone(),
+                graph.value(0),
+                prefix,
+                &ops,
+            );
+            let mut query = Query::new(root, project_end)
+                .solve_residual_state_lazy_with(lowering)
+                .cap(1)
+                .start_width(1);
+
+            let first = query
+                .next()
+                .expect("the cyclic arm streamed after the finite arm");
+            assert_eq!(first, graph.value(1).raw, "{name}");
+            assert_eq!(
+                query.stats().delta_transition_candidates_examined,
+                1,
+                "{name}"
+            );
+            let mut actual = vec![first];
+            actual.extend(query);
+            actual.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(actual, expected, "{name}");
+        }
+    }
+}
+
+#[test]
+fn production_region_direct_or_streams_through_a_page_local_outer_filter() {
+    let graph = Graph::new(8, &[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)]);
+    let ops = repeated(graph.attribute, false);
+    let allowed = Arc::new(vec![
+        graph.value(1).raw,
+        graph.value(3).raw,
+        graph.value(7).raw,
+    ]);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let root = filtered_prefixed_formula_bound_start_root(
+        graph.set.clone(),
+        graph.value(0),
+        vec![graph.value(1).raw],
+        &ops,
+        CertifiedOuterFilter {
+            variable: END,
+            accepted: Arc::clone(&allowed),
+            page_local: true,
+            grouped: false,
+            certified: true,
+            calls: Arc::clone(&calls),
+        },
+    );
+    let mut query = Query::new(Arc::clone(&root), project_end)
+        .solve_residual_state_lazy_with(production_region_effects())
+        .cap(1)
+        .start_width(1);
+
+    let first = query
+        .next()
+        .expect("the regional direct OR did not publish its first accepted endpoint");
+    assert_eq!(first, graph.value(1).raw);
+    assert_eq!(query.stats().delta_transition_pages, 1);
+    assert_eq!(query.stats().delta_transition_candidates_examined, 1);
+    assert_eq!(
+        *calls.lock().unwrap(),
+        [1],
+        "the outer filter did not consume the early singleton page"
+    );
+
+    let mut actual = vec![first];
+    actual.extend(query.by_ref());
+    actual.sort_unstable();
+    let mut expected: Vec<_> = Query::new(root, project_end).sequential().collect();
+    expected.sort_unstable();
+    let mut allowed = Arc::unwrap_or_clone(allowed);
+    allowed.sort_unstable();
+    assert_eq!(actual, allowed);
+    assert_eq!(actual, expected);
+    assert_eq!(
+        actual.iter().filter(|&&value| value == first).count(),
+        1,
+        "the finite prefix and live Program arm replayed their shared value"
+    );
+}
+
+#[test]
+fn production_region_direct_or_retains_outer_streaming_barriers() {
+    let graph = Graph::new(8, &[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)]);
+    let ops = repeated(graph.attribute, false);
+    for (name, page_local, grouped, certified) in [
+        ("non-page-local", false, false, true),
+        ("grouped", true, true, true),
+        ("uncertified", true, false, false),
+    ] {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let root = filtered_prefixed_formula_bound_start_root(
             graph.set.clone(),
             graph.value(0),
-            prefix,
+            Vec::new(),
             &ops,
+            CertifiedOuterFilter {
+                variable: END,
+                accepted: Arc::new(vec![graph.value(1).raw]),
+                page_local,
+                grouped,
+                certified,
+                calls: Arc::clone(&calls),
+            },
         );
         let mut query = Query::new(root, project_end)
-            .solve_residual_state_lazy_with(root_formula_effects())
+            .solve_residual_state_lazy_with(production_region_effects())
             .cap(1)
             .start_width(1);
 
-        let first = query.next().expect("the cyclic arm streamed after the finite arm");
-        assert_eq!(first, graph.value(1).raw);
-        assert_eq!(query.stats().delta_transition_candidates_examined, 1);
-        let mut actual = vec![first];
-        actual.extend(query);
-        actual.sort_unstable();
-        expected.sort_unstable();
-        assert_eq!(actual, expected);
+        assert_eq!(query.next(), Some(graph.value(1).raw), "{name}");
+        assert_eq!(
+            query.stats().delta_transition_pages,
+            8,
+            "the {name} suffix admitted an endpoint before Program EOF"
+        );
+        assert_eq!(
+            query.stats().delta_transition_candidates_examined,
+            7,
+            "the {name} suffix did not drain the complete live Program"
+        );
+        assert_eq!(query.next(), None, "{name}");
+        assert!(!calls.lock().unwrap().is_empty(), "{name}");
     }
+}
+
+#[test]
+fn production_region_direct_or_respects_a_parent_atomic_typed_outer_confirm() {
+    let graph = Graph::new(8, &[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)]);
+    let start = Variable::<GenId>::new(START);
+    let end = Variable::<GenId>::new(END);
+    let ops = repeated(graph.attribute, false);
+    let live = Box::new(RegularPathConstraint::new(
+        graph.set.clone(),
+        start,
+        end,
+        &ops,
+    )) as DynConstraint;
+    let mut confirming_set = graph.set.clone();
+    for target in 2..8 {
+        confirming_set.insert(&Trible::new(
+            &graph.nodes[0],
+            &graph.attribute,
+            &graph.value(target),
+        ));
+    }
+    let grouped_confirm = Box::new(RegularPathConstraint::new(
+        confirming_set,
+        start,
+        end,
+        &ops,
+    )) as DynConstraint;
+    let root = Arc::new(IntersectionConstraint::new(vec![
+        Box::new(start.is(graph.value(0))) as DynConstraint,
+        Box::new(UnionConstraint::new(vec![live])) as DynConstraint,
+        grouped_confirm,
+    ]));
+    let mut query = Query::new(root, project_end)
+        .solve_residual_state_lazy_with(production_region_effects())
+        .cap(1)
+        .start_width(1);
+
+    let first = query.next().expect("the filtered relation is nonempty");
+    assert!(
+        query.stats().delta_transition_pages >= 8,
+        "a parent-atomic typed Confirm observed an early singleton clone"
+    );
+    let mut actual = vec![first];
+    actual.extend(query.by_ref());
+    actual.sort_unstable();
+    let mut expected = (1..8)
+        .map(|node| graph.value(node).raw)
+        .collect::<Vec<_>>();
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
+    assert!(query.stats().confirm_action_pops > 0);
+}
+
+#[test]
+fn covering_regional_formula_self_confirms_before_any_online_publication() {
+    let graph = Graph::new(8, &[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)]);
+    let start = Variable::<GenId>::new(START);
+    let end = Variable::<GenId>::new(END);
+    let rejected = genid(&rngid().id).raw;
+    let confirms = Arc::new(AtomicUsize::new(0));
+    let covering = Box::new(CoveringRejector {
+        proposed: rejected,
+        confirms: Arc::clone(&confirms),
+    }) as DynConstraint;
+    let live = Box::new(RegularPathConstraint::new(
+        graph.set.clone(),
+        start,
+        end,
+        &repeated(graph.attribute, false),
+    )) as DynConstraint;
+    let root = Arc::new(IntersectionConstraint::new(vec![
+        Box::new(start.is(graph.value(0))) as DynConstraint,
+        Box::new(UnionConstraint::new(vec![covering, live])) as DynConstraint,
+    ]));
+    let mut query = Query::new(root, project_end)
+        .solve_residual_state_lazy_with(production_region_effects())
+        .cap(1)
+        .start_width(1);
+
+    let first = query.next().expect("the live Program arm is nonempty");
+    assert_ne!(first, rejected);
+    assert!(
+        query.stats().delta_transition_pages >= 8,
+        "a covering regional formula streamed before its self-confirm receipt"
+    );
+    assert!(query.stats().delta_transition_candidates_examined >= 7);
+    let mut actual = vec![first];
+    actual.extend(query);
+    assert!(!actual.contains(&rejected));
+    actual.sort_unstable();
+    let mut expected = (1..8)
+        .map(|node| graph.value(node).raw)
+        .collect::<Vec<_>>();
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
+    assert!(confirms.load(Ordering::Relaxed) > 0);
+}
+
+#[test]
+fn nested_regional_or_remains_quiescent_until_the_live_program_reaches_eof() {
+    let graph = Graph::new(8, &[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)]);
+    let start = Variable::<GenId>::new(START);
+    let end = Variable::<GenId>::new(END);
+    let live = Box::new(RegularPathConstraint::new(
+        graph.set.clone(),
+        start,
+        end,
+        &repeated(graph.attribute, false),
+    )) as DynConstraint;
+    let nested = Box::new(UnionConstraint::new(vec![live])) as DynConstraint;
+    let guarded = Box::new(IntersectionConstraint::new(vec![
+        nested,
+        Box::new(CertifiedOuterFilter {
+            variable: END,
+            accepted: Arc::new((1..8).map(|node| graph.value(node).raw).collect()),
+            page_local: true,
+            grouped: false,
+            certified: true,
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }) as DynConstraint,
+    ])) as DynConstraint;
+    let duplicate = Box::new(IntersectionConstraint::new(vec![
+        Box::new(start.is(graph.value(0))) as DynConstraint,
+        Box::new(end.is(graph.value(1))) as DynConstraint,
+    ])) as DynConstraint;
+    let root = Arc::new(IntersectionConstraint::new(vec![
+        Box::new(start.is(graph.value(0))) as DynConstraint,
+        Box::new(UnionConstraint::new(vec![guarded, duplicate])) as DynConstraint,
+    ]));
+    let mut query = Query::new(root, project_end)
+        .solve_residual_state_lazy_with(production_region_effects())
+        .cap(1)
+        .start_width(1);
+
+    assert!(query.next().is_some());
+    assert_eq!(
+        query.stats().delta_transition_pages,
+        8,
+        "a second OR ancestor failed to retain the structural barrier"
+    );
+    assert_eq!(query.stats().delta_transition_candidates_examined, 7);
+}
+
+#[test]
+fn regional_online_or_keeps_cross_arm_admission_scoped_per_affine_parent() {
+    let graph = Graph::new(8, &[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)]);
+    let start = Variable::<GenId>::new(START);
+    let end = Variable::<GenId>::new(END);
+    let outer = Variable::<GenId>::new(OUTER);
+    let outer_values = [genid(&rngid().id), genid(&rngid().id)];
+    let after_eof = genid(&rngid().id).raw;
+    let live = Box::new(RegularPathConstraint::new(
+        graph.set.clone(),
+        start,
+        end,
+        &repeated(graph.attribute, false),
+    )) as DynConstraint;
+    let finite_arm = |value| {
+        Box::new(IntersectionConstraint::new(vec![
+            Box::new(start.is(graph.value(0))) as DynConstraint,
+            Box::new(end.is(Inline::<GenId>::new(value))) as DynConstraint,
+        ])) as DynConstraint
+    };
+    let outer_domain = Box::new(UnionConstraint::new(vec![
+        Box::new(outer.is(outer_values[0])) as DynConstraint,
+        Box::new(outer.is(outer_values[1])) as DynConstraint,
+    ])) as DynConstraint;
+    let root = Arc::new(IntersectionConstraint::new(vec![
+        outer_domain,
+        Box::new(start.is(graph.value(0))) as DynConstraint,
+        Box::new(UnionConstraint::new(vec![
+            live,
+            finite_arm(graph.value(1).raw),
+            finite_arm(after_eof),
+        ])) as DynConstraint,
+    ]));
+    let project = |binding: &Binding| {
+        Some((
+            binding.get(OUTER).copied()?,
+            binding.get(END).copied()?,
+        ))
+    };
+    let mut query = Query::new(root, project)
+        .solve_residual_state_lazy_with(production_region_effects())
+        .cap(1)
+        .start_width(1);
+
+    let first = query
+        .next()
+        .expect("neither affine parent published its first endpoint");
+    assert_eq!(query.stats().delta_transition_candidates_examined, 1);
+    let mut actual = vec![first];
+    actual.extend(query);
+    actual.sort_unstable();
+
+    let endpoints = (1..8)
+        .map(|node| graph.value(node).raw)
+        .chain(std::iter::once(after_eof));
+    let mut expected = outer_values
+        .into_iter()
+        .flat_map(|parent| endpoints.clone().map(move |endpoint| (parent.raw, endpoint)))
+        .collect::<Vec<_>>();
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
+    assert!(actual.windows(2).all(|pair| pair[0] != pair[1]));
 }
 
 #[test]
