@@ -68,6 +68,10 @@ impl TypedProgramSpec for InlineRange {
     type NoveltyKey = ();
     type Rank = [u64; 2];
 
+    fn exposures(&self) -> crate::query::ProgramExposureSet {
+        crate::query::ProgramExposureSet::PRODUCTION
+    }
+
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
         let (key, variable) = match request.action {
             // InlineRange is intentionally a filter-only atom. Treating the

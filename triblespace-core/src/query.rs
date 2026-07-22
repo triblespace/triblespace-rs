@@ -67,12 +67,12 @@ pub use program::ProgramCompleteEffects;
 pub use program::{
     DispatchClass, PreferredProgram, ProgramAction, ProgramActivation, ProgramBatch,
     ProgramBatchEffects, ProgramChild, ProgramCompleteBatch, ProgramCompleteWorkEvidence,
-    ProgramCompleteWorkQuote, ProgramCompletion, ProgramExposure, ProgramGrouping, ProgramKey,
-    ProgramPacing, ProgramPage, ProgramPhysicalReceipt, ProgramRef, ProgramRequest, ProgramResume,
-    ProgramRoute, ProgramRuntime, ProgramSeedBatch, ProgramSeedEffects, ProgramSeedWork,
-    ProgramStratum, ProgramWork, ProgramWorkHandle, TypedCompleteArbiter, TypedCompleteSink,
-    TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedResume,
-    TypedSeedSink,
+    ProgramCompleteWorkQuote, ProgramCompletion, ProgramExposure, ProgramExposureSet,
+    ProgramGrouping, ProgramKey, ProgramPacing, ProgramPage, ProgramPhysicalReceipt, ProgramRef,
+    ProgramRequest, ProgramResume, ProgramRoute, ProgramRuntime, ProgramSeedBatch,
+    ProgramSeedEffects, ProgramSeedWork, ProgramStratum, ProgramWork, ProgramWorkHandle,
+    TypedCompleteArbiter, TypedCompleteSink, TypedEffectSink, TypedProgramBatch, TypedProgramSpec,
+    TypedResume, TypedSeedSink,
 };
 pub(crate) use program::{ProgramCompleteAdmission, ProgramCompleteAffinity};
 /// Re-export of [`PathOp`].

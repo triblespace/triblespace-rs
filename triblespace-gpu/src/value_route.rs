@@ -1076,6 +1076,10 @@ impl<'a, U: Universe> TypedProgramSpec for SuccinctTwoBoundFamily<'a, U> {
     /// measure; the route never emits children.
     type Rank = u64;
 
+    fn exposures(&self) -> triblespace_core::query::ProgramExposureSet {
+        triblespace_core::query::ProgramExposureSet::PRODUCTION
+    }
+
     /// Selects exactly one of the three semantic two-bound Propose actions.
     /// Every Confirm, Support, already-bound target, or insufficiently bound
     /// peer schema is structurally declined. The resident wrapper composes

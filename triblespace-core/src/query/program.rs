@@ -207,6 +207,43 @@ pub enum ProgramExposure {
     Explicit,
 }
 
+/// Immutable upper bound on the exposure tiers a typed Program may route.
+///
+/// This summary is independent of any particular action or bound schema. It
+/// may conservatively include tiers that no request reaches, but every route
+/// returned by [`TypedProgramSpec::route`] must belong to the declared set.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ProgramExposureSet(u8);
+
+impl ProgramExposureSet {
+    const PRODUCTION_BIT: u8 = 1 << 0;
+    const EXPLICIT_BIT: u8 = 1 << 1;
+
+    /// No routed exposure tier.
+    pub const EMPTY: Self = Self(0);
+    /// Only ordinary production routes.
+    pub const PRODUCTION: Self = Self(Self::PRODUCTION_BIT);
+    /// Only explicitly enabled routes.
+    pub const EXPLICIT: Self = Self(Self::EXPLICIT_BIT);
+    /// Every currently defined exposure tier.
+    pub const ALL: Self = Self(Self::PRODUCTION_BIT | Self::EXPLICIT_BIT);
+
+    /// Returns whether this upper bound includes `exposure`.
+    pub const fn contains(self, exposure: ProgramExposure) -> bool {
+        let bit = match exposure {
+            ProgramExposure::Production => Self::PRODUCTION_BIT,
+            ProgramExposure::Explicit => Self::EXPLICIT_BIT,
+        };
+        self.0 & bit != 0
+    }
+
+    /// Returns the immutable union of two exposure bounds.
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
 /// Structural route selected by an immutable program spec for one action.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1030,6 +1067,17 @@ pub trait TypedProgramSpec {
     /// [`ProgramGrouping`]'s V1 family-local planning contract.
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute>;
 
+    /// Returns an action-independent upper bound on routed exposure tiers.
+    ///
+    /// The conservative default preserves compatibility for external and
+    /// test-only specs. Production families should override it with the
+    /// narrowest truthful immutable summary. A family reached only through
+    /// the engine's private state-insertion seam declares [`ProgramExposureSet::EMPTY`];
+    /// private insertion is orthogonal to structural route exposure.
+    fn exposures(&self) -> ProgramExposureSet {
+        ProgramExposureSet::ALL
+    }
+
     fn dispatch(&self, state: &Self::State) -> DispatchClass;
 
     /// Selects the physical budget source for this continuation.
@@ -1206,6 +1254,8 @@ impl<Preferred, Fallback> PreferredProgram<Preferred, Fallback> {
 trait ErasedProgramSpec {
     fn new_runtime(&self, key: ProgramKey) -> ProgramRuntime;
 
+    fn exposures(&self) -> ProgramExposureSet;
+
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute>;
 
     fn seed_batch(
@@ -1277,8 +1327,22 @@ impl<'a> ProgramRef<'a> {
         self.erased.new_runtime(key)
     }
 
+    pub(crate) fn exposures(self) -> ProgramExposureSet {
+        self.erased.exposures()
+    }
+
     pub(crate) fn route(self, request: ProgramRequest) -> Option<ProgramRoute> {
-        self.erased.route(request)
+        let exposures = self.exposures();
+        let route = self.erased.route(request);
+        if let Some(route) = route {
+            assert!(
+                exposures.contains(route.exposure),
+                "typed Program route exposure {:?} is absent from declared summary {:?}",
+                route.exposure,
+                exposures
+            );
+        }
+        route
     }
 
     pub(crate) fn seed_batch(
@@ -1681,6 +1745,11 @@ where
         selected.new_runtime(child_key)
     }
 
+    fn exposures(&self) -> ProgramExposureSet {
+        TypedProgramSpec::exposures(&self.preferred)
+            .union(TypedProgramSpec::exposures(&self.fallback))
+    }
+
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
         if let Some(mut route) = TypedProgramSpec::route(&self.preferred, request) {
             route.key = route.key.in_arm(ProgramRouteArm::Preferred);
@@ -1770,6 +1839,10 @@ where
             family: TypeId::of::<TypedProgramRuntime<T::State, T::NoveltyKey, T::Rank>>(),
             family_name: type_name::<TypedProgramRuntime<T::State, T::NoveltyKey, T::Rank>>(),
         }
+    }
+
+    fn exposures(&self) -> ProgramExposureSet {
+        TypedProgramSpec::exposures(self)
     }
 
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
@@ -2289,6 +2362,76 @@ mod tests {
     #[derive(Clone, Eq, Hash, PartialEq)]
     struct Key(u8);
 
+    struct MismatchedExposureProbe;
+
+    impl TypedProgramSpec for MismatchedExposureProbe {
+        type State = ();
+        type NoveltyKey = ();
+        type Rank = ();
+
+        fn exposures(&self) -> ProgramExposureSet {
+            ProgramExposureSet::PRODUCTION
+        }
+
+        fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
+            Some(ProgramRoute {
+                key: ProgramKey::new(0),
+                variable: 0,
+                stratum: ProgramStratum::Finite,
+                grouping: ProgramGrouping::PageLocal,
+                completion: ProgramCompletion::PageableOnly,
+                exposure: ProgramExposure::Explicit,
+            })
+        }
+
+        fn dispatch(&self, _state: &Self::State) -> DispatchClass {
+            unreachable!("the mismatch is rejected before dispatch")
+        }
+
+        fn progress(&self, _state: &Self::State) -> Self::Rank {}
+
+        fn seed_typed(
+            &self,
+            _batch: ProgramSeedBatch<'_>,
+            _effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+        ) {
+            unreachable!("the mismatch is rejected before seeding")
+        }
+
+        fn step_typed(
+            &self,
+            _states: &mut Vec<Self::State>,
+            _batch: TypedProgramBatch<'_>,
+            _effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+        ) {
+            unreachable!("the mismatch is rejected before stepping")
+        }
+    }
+
+    #[test]
+    fn exposure_sets_compose_const_and_specs_default_conservatively() {
+        const MIXED: ProgramExposureSet =
+            ProgramExposureSet::PRODUCTION.union(ProgramExposureSet::EXPLICIT);
+        assert_eq!(MIXED, ProgramExposureSet::ALL);
+        assert!(MIXED.contains(ProgramExposure::Production));
+        assert!(MIXED.contains(ProgramExposure::Explicit));
+        assert!(!ProgramExposureSet::EMPTY.contains(ProgramExposure::Production));
+
+        let probe = DenseProbe {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        assert_eq!(ProgramRef::new(&probe).exposures(), ProgramExposureSet::ALL);
+    }
+
+    #[test]
+    #[should_panic(expected = "is absent from declared summary")]
+    fn route_rejects_an_exposure_missing_from_its_summary() {
+        ProgramRef::new(&MismatchedExposureProbe).route(ProgramRequest {
+            action: ProgramAction::Support,
+            bound: VariableSet::new_empty(),
+        });
+    }
+
     struct DenseProbe {
         calls: Arc<Mutex<Vec<Vec<usize>>>>,
     }
@@ -2607,6 +2750,10 @@ mod tests {
         type NoveltyKey = PreferredChoiceKey;
         type Rank = u8;
 
+        fn exposures(&self) -> ProgramExposureSet {
+            ProgramExposureSet::PRODUCTION
+        }
+
         fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
             let ProgramAction::Propose(variable) = request.action else {
                 return None;
@@ -2702,6 +2849,10 @@ mod tests {
         type NoveltyKey = FallbackChoiceKey;
         type Rank = u8;
 
+        fn exposures(&self) -> ProgramExposureSet {
+            ProgramExposureSet::EXPLICIT
+        }
+
         fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
             let ProgramAction::Confirm(variable) = request.action else {
                 return None;
@@ -2714,7 +2865,7 @@ mod tests {
                 stratum: ProgramStratum::Finite,
                 grouping: ProgramGrouping::PageLocal,
                 completion: ProgramCompletion::PageableOnly,
-                exposure: ProgramExposure::Production,
+                exposure: ProgramExposure::Explicit,
             })
         }
 
@@ -4164,6 +4315,7 @@ mod tests {
             },
         );
         let program = ProgramRef::preferred(&choice);
+        assert_eq!(program.exposures(), ProgramExposureSet::ALL);
         let view = RowsView::new_with_row_count(&[], &[], 1);
         let activations = [ProgramActivation(41)];
         let candidate = [RawInline::default()];
@@ -4173,6 +4325,7 @@ mod tests {
             bound: VariableSet::new_empty(),
         };
         let preferred_route = program.route(preferred_request).unwrap();
+        assert_eq!(preferred_route.exposure, ProgramExposure::Production);
         assert_eq!(preferred_route.key.arm, ProgramRouteArm::Preferred);
         let mut preferred_runtime = program.new_runtime_for(preferred_route.key);
         let mut preferred_seed = ProgramSeedEffects::default();
@@ -4219,6 +4372,7 @@ mod tests {
             bound: VariableSet::new_empty(),
         };
         let fallback_route = program.route(fallback_request).unwrap();
+        assert_eq!(fallback_route.exposure, ProgramExposure::Explicit);
         assert_eq!(fallback_route.key.arm, ProgramRouteArm::Fallback);
         assert_eq!(preferred_route.key.local, fallback_route.key.local);
         assert_ne!(preferred_route.key, fallback_route.key);

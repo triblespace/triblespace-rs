@@ -1622,6 +1622,10 @@ where
     type NoveltyKey = ();
     type Rank = [u64; 7];
 
+    fn exposures(&self) -> crate::query::ProgramExposureSet {
+        crate::query::ProgramExposureSet::ALL
+    }
+
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
         let resolved_positions = self.resolved_position_mask(request.bound);
         let (key, variable) = match request.action {

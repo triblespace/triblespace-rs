@@ -527,6 +527,10 @@ impl<'p, 'a, U: Universe> TypedProgramSpec for SuccinctProgramFamily<'p, 'a, U> 
     /// resumes keep the schema and strictly decrease the second.
     type Rank = [u64; 2];
 
+    fn exposures(&self) -> triblespace_core::query::ProgramExposureSet {
+        triblespace_core::query::ProgramExposureSet::EMPTY
+    }
+
     /// The family is not yet engine-routed: integration of route selection
     /// (and seeding) into the residual engine is the engine owner's landing.
     /// Declining every request keeps this module a strict no-op for the

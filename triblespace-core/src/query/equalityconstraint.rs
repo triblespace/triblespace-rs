@@ -82,6 +82,10 @@ impl TypedProgramSpec for EqualityConstraint {
     type NoveltyKey = ();
     type Rank = [u64; 2];
 
+    fn exposures(&self) -> crate::query::ProgramExposureSet {
+        crate::query::ProgramExposureSet::EXPLICIT
+    }
+
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
         let bound_mask = self.bound_mask(request.bound);
         let (action, variable) = match request.action {

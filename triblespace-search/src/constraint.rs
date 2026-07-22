@@ -239,6 +239,10 @@ where
     type NoveltyKey = ();
     type Rank = [u64; 6];
 
+    fn exposures(&self) -> triblespace_core::query::ProgramExposureSet {
+        triblespace_core::query::ProgramExposureSet::PRODUCTION
+    }
+
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
         finiteunaryprogram::route(self.doc.index, request)
     }
@@ -711,6 +715,10 @@ impl<I: CosineSimilarity + ?Sized> TypedProgramSpec for CosineAtLeast<'_, I> {
     type NoveltyKey = ();
     type Rank = [u64; 2];
 
+    fn exposures(&self) -> triblespace_core::query::ProgramExposureSet {
+        triblespace_core::query::ProgramExposureSet::PRODUCTION
+    }
+
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
         let bound_mask = self.bound_mask(request.bound);
         let (key, variable) = match request.action {
@@ -1025,6 +1033,10 @@ impl TypedProgramSpec for SimilarTo {
     type State = finiteunaryprogram::FiniteUnaryProgramState;
     type NoveltyKey = ();
     type Rank = [u64; 6];
+
+    fn exposures(&self) -> triblespace_core::query::ProgramExposureSet {
+        triblespace_core::query::ProgramExposureSet::PRODUCTION
+    }
 
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
         finiteunaryprogram::route(self.var.index, request)

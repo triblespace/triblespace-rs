@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Typed Programs now publish an immutable exposure summary.** The
+  conservative external default covers every exposure tier, production
+  families narrow that bound where possible, and `PreferredProgram` unions
+  its two children. The erased route boundary rejects any returned route whose
+  exposure is absent from its declared summary.
 - **Typed Program activation retirement scans its arena at most once per
   cohort.** A fully drained arena retires immediately; singleton receipts keep
   their allocation-free scalar scan, while wider live arenas build activation

@@ -1091,6 +1091,10 @@ impl TypedProgramSpec for TribleSetConstraint {
     type NoveltyKey = ();
     type Rank = [u64; 6];
 
+    fn exposures(&self) -> crate::query::ProgramExposureSet {
+        crate::query::ProgramExposureSet::ALL
+    }
+
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
         let bound_positions = self.bound_position_mask(request.bound);
         let (key, variable, completion, exposure) = match request.action {

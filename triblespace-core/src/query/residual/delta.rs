@@ -168,6 +168,10 @@ impl TypedProgramSpec for ConfirmFinalizerProgram {
     type NoveltyKey = ();
     type Rank = usize;
 
+    fn exposures(&self) -> crate::query::ProgramExposureSet {
+        crate::query::ProgramExposureSet::EMPTY
+    }
+
     fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
         // Engine-owned reducer states are opened only through the private
         // runtime seam; they are never routes offered by a Constraint.
@@ -237,6 +241,10 @@ impl TypedProgramSpec for SetAdmissionProgram {
     type NoveltyKey = ();
     type Rank = u128;
 
+    fn exposures(&self) -> crate::query::ProgramExposureSet {
+        crate::query::ProgramExposureSet::EMPTY
+    }
+
     fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
         None
     }
@@ -299,6 +307,10 @@ impl TypedProgramSpec for FormulaOrAdmissionProgram {
     type State = FormulaOrAdmissionState;
     type NoveltyKey = ();
     type Rank = usize;
+
+    fn exposures(&self) -> crate::query::ProgramExposureSet {
+        crate::query::ProgramExposureSet::EMPTY
+    }
 
     fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
         None
@@ -369,6 +381,10 @@ impl TypedProgramSpec for FormulaOrEmissionProgram {
     type State = FormulaOrEmissionState;
     type NoveltyKey = ();
     type Rank = usize;
+
+    fn exposures(&self) -> crate::query::ProgramExposureSet {
+        crate::query::ProgramExposureSet::EMPTY
+    }
 
     fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
         None
@@ -453,6 +469,10 @@ impl TypedProgramSpec for ProposalMaterializerProgram {
     type State = ProposalMaterializerState;
     type NoveltyKey = ();
     type Rank = u128;
+
+    fn exposures(&self) -> crate::query::ProgramExposureSet {
+        crate::query::ProgramExposureSet::EMPTY
+    }
 
     fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
         None

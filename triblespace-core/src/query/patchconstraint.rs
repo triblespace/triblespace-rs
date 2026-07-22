@@ -330,6 +330,10 @@ impl<S: InlineEncoding> super::TypedProgramSpec for PatchValueConstraint<'_, S> 
     type NoveltyKey = ();
     type Rank = [u64; 6];
 
+    fn exposures(&self) -> super::ProgramExposureSet {
+        super::ProgramExposureSet::PRODUCTION
+    }
+
     fn route(&self, request: super::ProgramRequest) -> Option<super::ProgramRoute> {
         patch_program_route(self.variable.index, request)
     }
@@ -537,6 +541,10 @@ impl<S: InlineEncoding> super::TypedProgramSpec for PatchIdConstraint<S> {
     type State = PatchProgramState;
     type NoveltyKey = ();
     type Rank = [u64; 6];
+
+    fn exposures(&self) -> super::ProgramExposureSet {
+        super::ProgramExposureSet::PRODUCTION
+    }
 
     fn route(&self, request: super::ProgramRequest) -> Option<super::ProgramRoute> {
         patch_program_route(self.variable.index, request)

@@ -60,6 +60,10 @@ where
     type NoveltyKey = ();
     type Rank = [u64; 6];
 
+    fn exposures(&self) -> crate::query::ProgramExposureSet {
+        crate::query::ProgramExposureSet::EXPLICIT
+    }
+
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
         finiteunaryprogram::route_filter_only(self.variable.index, request)
     }

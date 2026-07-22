@@ -2634,6 +2634,10 @@ impl TypedProgramSpec for RegularPathConstraint {
     type NoveltyKey = RpqNoveltyKey;
     type Rank = [u64; 8];
 
+    fn exposures(&self) -> crate::query::ProgramExposureSet {
+        crate::query::ProgramExposureSet::PRODUCTION
+    }
+
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
         let repeated = has_repetition(&self.expr);
         let stratum = if repeated {

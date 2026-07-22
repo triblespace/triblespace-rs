@@ -73,6 +73,10 @@ impl TypedProgramSpec for EntityRangeConstraint {
     type NoveltyKey = ();
     type Rank = [u64; 6];
 
+    fn exposures(&self) -> crate::query::ProgramExposureSet {
+        crate::query::ProgramExposureSet::PRODUCTION
+    }
+
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
         crate::query::finiteunaryprogram::route(self.variable_e, request)
     }
@@ -264,6 +268,10 @@ impl TypedProgramSpec for AttributeRangeConstraint {
     type State = crate::query::finiteunaryprogram::FiniteUnaryProgramState;
     type NoveltyKey = ();
     type Rank = [u64; 6];
+
+    fn exposures(&self) -> crate::query::ProgramExposureSet {
+        crate::query::ProgramExposureSet::PRODUCTION
+    }
 
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
         crate::query::finiteunaryprogram::route(self.variable_a, request)
