@@ -17,6 +17,8 @@
 //! RUSTFLAGS="--cfg engine_current_residual --cfg engine_prefix_checkpoints \
 //!   --cfg rpq_confirm_admission_probe" \
 //!   cargo run --release --example query_engine_generation_bench
+//! RPQ_FRAGMENT_HYBRID_TIMING=FLEET_IDLE_RELEASED \
+//!   target/release/examples/query_engine_generation_bench 60
 //! ```
 //!
 //! Fixture/archive construction and the independent relational oracles are
@@ -199,14 +201,16 @@ mod allocation_probe {
     }
 }
 
+#[cfg(not(rpq_confirm_admission_probe))]
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 #[cfg(rpq_confirm_admission_probe)]
 use triblespace::core::query::regularpathconstraint::{
     rpq_confirm_admission_probe_bound_confirm_batches, rpq_confirm_admission_probe_force_ordinary,
+    rpq_confirm_admission_probe_force_singleton_ordinary,
     rpq_confirm_admission_probe_forced_confirm_batches,
     rpq_confirm_admission_probe_record_receipts, rpq_confirm_admission_probe_reset_callbacks,
     rpq_confirm_admission_probe_snapshot, rpq_confirm_admission_probe_target_action,
-    RpqConfirmAdmissionProbeSnapshot,
+    rpq_confirm_admission_probe_target_decisions, RpqConfirmAdmissionProbeSnapshot,
 };
 #[cfg(rpq_confirm_admission_probe)]
 use triblespace::core::query::residual::{ResidualLowering, ResidualStateStats};
@@ -261,16 +265,18 @@ const COUNTER_LOWERING_LABEL: &str = "PRODUCTION";
 enum ProbeMode {
     Certified,
     Ordinary,
+    Hybrid,
 }
 
 #[cfg(rpq_confirm_admission_probe)]
 impl ProbeMode {
-    const ALL: [Self; 2] = [Self::Certified, Self::Ordinary];
+    const ALL: [Self; 3] = [Self::Certified, Self::Ordinary, Self::Hybrid];
 
     fn label(self) -> &'static str {
         match self {
             Self::Certified => "C_TYPED_CERTIFIED",
             Self::Ordinary => "O_FORCED_ORDINARY",
+            Self::Hybrid => "H_SINGLETON_ORDINARY",
         }
     }
 
@@ -280,6 +286,7 @@ impl ProbeMode {
 
     fn arm(self) {
         rpq_confirm_admission_probe_force_ordinary(matches!(self, Self::Ordinary));
+        rpq_confirm_admission_probe_force_singleton_ordinary(matches!(self, Self::Hybrid));
     }
 }
 
@@ -605,6 +612,37 @@ const CROSSOVER_CORE_FANOUT_PER_ATTRIBUTE: usize = 16;
 const CROSSOVER_WIDTHS: [usize; 4] = [2, 4, 8, 16];
 #[cfg(rpq_confirm_admission_probe)]
 const CROSSOVER_PARENT_COUNT: usize = CROSSOVER_COMPONENTS * CROSSOVER_SOURCES_PER_COMPONENT;
+#[cfg(rpq_confirm_admission_probe)]
+const HYBRID_WIDTH: usize = 4;
+#[cfg(rpq_confirm_admission_probe)]
+const FROZEN_C_K4_FRAGMENTS: &[(usize, usize)] = &[(1, 4), (1, 4), (254, 1016)];
+#[cfg(rpq_confirm_admission_probe)]
+const FROZEN_O_K4_FRAGMENTS: &[(usize, usize)] = &[
+    (1, 4),
+    (1, 4),
+    (1, 4),
+    (1, 4),
+    (3, 12),
+    (1, 4),
+    (1, 4),
+    (1, 4),
+    (15, 60),
+    (1, 4),
+    (1, 4),
+    (31, 124),
+    (1, 4),
+    (1, 4),
+    (63, 252),
+    (1, 4),
+    (1, 4),
+    (127, 508),
+    (1, 4),
+    (3, 12),
+];
+#[cfg(rpq_confirm_admission_probe)]
+const FROZEN_C_K4_ORDER_DIGEST: u64 = 0x593f_683d_9cf6_af36;
+#[cfg(rpq_confirm_admission_probe)]
+const FROZEN_O_K4_ORDER_DIGEST: u64 = 0x2ef2_942e_a64d_dbef;
 
 /// One fixed graph shared by every width cell.
 ///
@@ -1404,16 +1442,16 @@ impl PrefixEvidence {
 
 #[cfg(all(engine_prefix_checkpoints, rpq_confirm_admission_probe))]
 fn main() {
-    let repetitions = parse_arg(1, 11);
+    let repetitions = parse_arg(1, 12);
     assert!(
-        repetitions >= 3,
-        "use at least three balanced timing repetitions"
+        repetitions >= 6 && repetitions % 6 == 0,
+        "use a positive multiple of six balanced timing repetitions"
     );
-    let timing_request = std::env::var("RPQ_CROSSOVER_TIMING").ok();
+    let timing_request = std::env::var("RPQ_FRAGMENT_HYBRID_TIMING").ok();
     let run_timing = timing_request.as_deref() == Some("FLEET_IDLE_RELEASED");
     assert!(
         timing_request.is_none() || run_timing,
-        "RPQ_CROSSOVER_TIMING must equal FLEET_IDLE_RELEASED; correctness-only is the default"
+        "RPQ_FRAGMENT_HYBRID_TIMING must equal FLEET_IDLE_RELEASED; correctness-only is the default"
     );
     println!("engine: {ENGINE}");
     println!("revision: {REVISION}");
@@ -2260,10 +2298,12 @@ fn run_rpq_confirm_admission_probe(
 #[derive(Clone)]
 struct CrossoverRun {
     rows: Vec<Pair>,
+    order_digest: u64,
     stats: ResidualStateStats,
     callbacks: RpqConfirmAdmissionProbeSnapshot,
     bound_confirm_batches: Vec<(u32, usize, usize)>,
     forced_confirm_batches: Vec<(u32, usize, usize)>,
+    target_decisions: Vec<(u32, usize, usize, bool)>,
 }
 
 #[cfg(rpq_confirm_admission_probe)]
@@ -2392,6 +2432,7 @@ fn run_crossover_mode<S: TriblePattern>(
     let callbacks = rpq_confirm_admission_probe_snapshot();
     let bound_confirm_batches = rpq_confirm_admission_probe_bound_confirm_batches();
     let forced_confirm_batches = rpq_confirm_admission_probe_forced_confirm_batches();
+    let target_decisions = rpq_confirm_admission_probe_target_decisions();
     let (signature, order_digest) = probe_order_receipt(&rows);
     println!(
         "crossover_order backend={backend:?} width={} mode={} repeat={repeat} rows={} \
@@ -2416,7 +2457,7 @@ fn run_crossover_mode<S: TriblePattern>(
          rpq_ordinary_propose_calls={} route_bound_confirm_calls={} route_forced_calls={} \
          target_batch_route_calls={} bound_estimate_samples={} bound_estimate_min={} \
          bound_estimate_max={} target_batch_parents={} target_batch_candidates={} \
-         bound_confirm_batches={:?} forced_confirm_batches={:?}",
+         bound_confirm_batches={:?} forced_confirm_batches={:?} target_decisions={:?}",
         cell.width,
         mode.label(),
         stats.probe_formula_fingerprint,
@@ -2451,14 +2492,17 @@ fn run_crossover_mode<S: TriblePattern>(
         callbacks.target_batch_candidates,
         bound_confirm_batches,
         forced_confirm_batches,
+        target_decisions,
     );
 
     CrossoverRun {
         rows,
+        order_digest,
         stats,
         callbacks,
         bound_confirm_batches,
         forced_confirm_batches,
+        target_decisions,
     }
 }
 
@@ -2594,12 +2638,166 @@ fn assert_natural_candidate_route(
 }
 
 #[cfg(rpq_confirm_admission_probe)]
+fn assert_fragment_hybrid_route(
+    backend: &str,
+    cell: &CrossoverCell,
+    target_token: u32,
+    certified: &CrossoverRun,
+    ordinary: &CrossoverRun,
+    hybrid: &CrossoverRun,
+) {
+    let fragments = crossover_target_fragments_for(hybrid, target_token);
+    let decisions: Vec<_> = hybrid
+        .target_decisions
+        .iter()
+        .map(|&(token, parents, candidates, forced)| {
+            assert_eq!(token, target_token, "H recorded a non-target decision");
+            (parents, candidates, forced)
+        })
+        .collect();
+    assert_eq!(
+        decisions
+            .iter()
+            .map(|&(parents, candidates, _)| (parents, candidates))
+            .collect::<Vec<_>>(),
+        fragments,
+        "H decision trace diverged from its concrete CandidateBatch trace",
+    );
+    assert!(
+        decisions
+            .iter()
+            .all(|&(parents, candidates, _)| candidates == parents * cell.width),
+        "H received a non-uniform target candidate group",
+    );
+    assert!(
+        decisions
+            .iter()
+            .all(|&(parents, _, forced)| forced == (parents == 1)),
+        "H violated its preregistered singleton-only ordinary rule",
+    );
+
+    let first_typed = decisions
+        .iter()
+        .position(|&(_, _, forced)| !forced)
+        .expect("H FALSIFIED: no multi-parent typed tail emerged");
+    assert!(
+        first_typed > 0,
+        "H did not expose an ordinary latency prefix"
+    );
+    let &(tail_parents, _, tail_forced) = decisions
+        .last()
+        .expect("H did not execute the request-local target action");
+    assert!(
+        !tail_forced && tail_parents > 1,
+        "H FALSIFIED: the final fragment was not a multi-parent typed tail",
+    );
+    assert!(
+        fragments.len() <= crossover_target_fragments_for(ordinary, target_token).len(),
+        "H FALSIFIED: hybrid fragmentation exceeded the frozen all-ordinary baseline",
+    );
+
+    let forced: Vec<_> = decisions
+        .iter()
+        .filter_map(|&(parents, candidates, forced)| {
+            forced.then_some((target_token, parents, candidates))
+        })
+        .collect();
+    assert_eq!(hybrid.forced_confirm_batches, forced);
+    let ordinary_parents = forced.iter().map(|batch| batch.1).sum::<usize>();
+    let ordinary_candidates = forced.iter().map(|batch| batch.2).sum::<usize>();
+    let typed_parents = CROSSOVER_PARENT_COUNT - ordinary_parents;
+    let ordinary_fragments = decisions.iter().filter(|decision| decision.2).count();
+    let typed_fragments = decisions.len() - ordinary_fragments;
+    let late_singletons = decisions[first_typed..]
+        .iter()
+        .filter(|decision| decision.2)
+        .count();
+    let decision_switches = decisions
+        .windows(2)
+        .filter(|pair| pair[0].2 != pair[1].2)
+        .count();
+    assert!(typed_parents > 1, "H did not retain a real typed cohort");
+    assert_eq!(hybrid.callbacks.ordinary_confirm_calls, forced.len());
+    assert_eq!(hybrid.callbacks.ordinary_confirm_rows, ordinary_parents);
+    assert_eq!(
+        hybrid.callbacks.ordinary_confirm_candidates_in,
+        ordinary_candidates,
+    );
+    assert_eq!(
+        hybrid.callbacks.ordinary_confirm_candidates_out,
+        ordinary_candidates / 2,
+    );
+    assert_eq!(hybrid.callbacks.route_forced_calls, forced.len());
+    assert_eq!(hybrid.stats.probe_forced_rpq_confirm_declines, forced.len(),);
+
+    assert_eq!(
+        crossover_formula_shape(&certified.stats),
+        crossover_formula_shape(&hybrid.stats),
+        "H changed the frozen Production/ParentAtomic formula topology",
+    );
+    assert_eq!(
+        crossover_formula_shape(&ordinary.stats),
+        crossover_formula_shape(&hybrid.stats),
+        "H formula topology diverged from O",
+    );
+    assert_eq!(
+        hybrid.stats.candidates_confirmed,
+        certified.stats.candidates_confirmed,
+    );
+    assert_eq!(
+        hybrid.stats.candidates_confirmed,
+        ordinary.stats.candidates_confirmed,
+    );
+    assert_eq!(
+        hybrid.stats.delta_source_candidates_examined,
+        certified.stats.delta_source_candidates_examined,
+    );
+    assert_eq!(
+        hybrid.stats.delta_source_candidates_examined,
+        ordinary.stats.delta_source_candidates_examined,
+    );
+    assert_eq!(
+        certified.stats.delta_transition_candidates_examined % CROSSOVER_PARENT_COUNT,
+        0,
+        "frozen C transition work was not parent-affine",
+    );
+    let typed_work_per_parent =
+        certified.stats.delta_transition_candidates_examined / CROSSOVER_PARENT_COUNT;
+    assert_eq!(
+        hybrid.stats.delta_transition_candidates_examined,
+        typed_work_per_parent * typed_parents,
+        "H typed graph work did not equal frozen C's exact per-parent work on its typed tail",
+    );
+
+    println!(
+        "hybrid_fragment_verdict backend={backend:?} width={} token={} decisions={decisions:?} \
+         first_typed_fragment={} ordinary_fragments={} typed_fragments={} late_singletons={} \
+         decision_switches={} final_typed_tail_parents={} ordinary_parents={} \
+         typed_parents={} typed_work_per_parent={} fragments_vs_ordinary={}/{} \
+         formula_fingerprint_equal=true counters_affine=true non_target_forces=0",
+        cell.width,
+        target_token,
+        first_typed,
+        ordinary_fragments,
+        typed_fragments,
+        late_singletons,
+        decision_switches,
+        tail_parents,
+        ordinary_parents,
+        typed_parents,
+        typed_work_per_parent,
+        fragments.len(),
+        crossover_target_fragments_for(ordinary, target_token).len(),
+    );
+}
+
+#[cfg(rpq_confirm_admission_probe)]
 fn correctness_backend<S: TriblePattern>(
     backend: &str,
     store: &S,
     fixture: &CrossoverFixture,
     cell: &CrossoverCell,
-) -> (CrossoverRun, CrossoverRun, u32) {
+) -> (CrossoverRun, CrossoverRun, CrossoverRun, u32) {
     let certified_discovery =
         run_crossover_mode(backend, store, fixture, cell, ProbeMode::Certified, 0, None);
     let target_token = discover_crossover_target_token(backend, cell, &certified_discovery);
@@ -2618,6 +2816,14 @@ fn correctness_backend<S: TriblePattern>(
         cell.width
     );
     let certified_fragments = crossover_target_fragments_for(&certified_discovery, target_token);
+    assert_eq!(
+        certified_fragments, FROZEN_C_K4_FRAGMENTS,
+        "sealed C k=4 fragment receipt changed",
+    );
+    assert_eq!(
+        certified_discovery.order_digest, FROZEN_C_K4_ORDER_DIGEST,
+        "sealed C k=4 order digest changed",
+    );
     assert_crossover_target_receipt(
         backend,
         cell,
@@ -2636,6 +2842,14 @@ fn correctness_backend<S: TriblePattern>(
         Some(target_token),
     );
     let ordinary_fragments = crossover_target_fragments_for(&ordinary, target_token);
+    assert_eq!(
+        ordinary_fragments, FROZEN_O_K4_FRAGMENTS,
+        "sealed O k=4 fragment receipt changed",
+    );
+    assert_eq!(
+        ordinary.order_digest, FROZEN_O_K4_ORDER_DIGEST,
+        "sealed O k=4 order digest changed",
+    );
     let ordinary_repeat = run_crossover_mode(
         backend,
         store,
@@ -2668,18 +2882,67 @@ fn correctness_backend<S: TriblePattern>(
         &ordinary_repeat,
         &ordinary_fragments,
     );
+
+    let hybrid = run_crossover_mode(
+        backend,
+        store,
+        fixture,
+        cell,
+        ProbeMode::Hybrid,
+        0,
+        Some(target_token),
+    );
+    let hybrid_fragments = crossover_target_fragments_for(&hybrid, target_token);
+    let hybrid_repeat = run_crossover_mode(
+        backend,
+        store,
+        fixture,
+        cell,
+        ProbeMode::Hybrid,
+        1,
+        Some(target_token),
+    );
+    assert_eq!(
+        hybrid.rows, hybrid_repeat.rows,
+        "same-cell H physical order changed on repeat for {backend}/k={}",
+        cell.width,
+    );
+    assert_eq!(
+        hybrid.target_decisions, hybrid_repeat.target_decisions,
+        "same-cell H route decisions changed on repeat",
+    );
+    assert_crossover_target_receipt(backend, cell, target_token, &hybrid, &hybrid_fragments);
+    assert_crossover_target_receipt(
+        backend,
+        cell,
+        target_token,
+        &hybrid_repeat,
+        &hybrid_fragments,
+    );
     println!(
         "crossover_fragment_receipt backend={backend:?} width={} token={} \
-         certified={certified_fragments:?} ordinary={ordinary_fragments:?} repeat_stable=true",
+         certified={certified_fragments:?} ordinary={ordinary_fragments:?} \
+         hybrid={hybrid_fragments:?} repeat_stable=true",
         cell.width, target_token,
     );
     assert_natural_candidate_route(backend, cell, &certified, &ordinary);
+    assert_fragment_hybrid_route(backend, cell, target_token, &certified, &ordinary, &hybrid);
     println!(
         "crossover_cross_route_order backend={backend:?} width={} equal={}",
         cell.width,
         certified.rows == ordinary.rows,
     );
-    (certified, ordinary, target_token)
+    println!(
+        "hybrid_order_equivalence backend={backend:?} width={} h_equals_c={} h_equals_o={} \
+         h_digest={:#018x} c_digest={:#018x} o_digest={:#018x} repeat_stable=true",
+        cell.width,
+        hybrid.rows == certified.rows,
+        hybrid.rows == ordinary.rows,
+        hybrid.order_digest,
+        certified.order_digest,
+        ordinary.order_digest,
+    );
+    (certified, ordinary, hybrid, target_token)
 }
 
 #[cfg(rpq_confirm_admission_probe)]
@@ -2723,17 +2986,13 @@ fn timing_backend<S: TriblePattern>(
     // from the measured route-policy total effect.
     rpq_confirm_admission_probe_record_receipts(false);
     let expected_signature = tally(cell.expected.iter().copied());
-    let order_a = [
-        ProbeMode::Certified,
-        ProbeMode::Ordinary,
-        ProbeMode::Ordinary,
-        ProbeMode::Certified,
-    ];
-    let order_b = [
-        ProbeMode::Ordinary,
-        ProbeMode::Certified,
-        ProbeMode::Certified,
-        ProbeMode::Ordinary,
+    const BALANCED_ORDERS: [[ProbeMode; 3]; 6] = [
+        [ProbeMode::Certified, ProbeMode::Ordinary, ProbeMode::Hybrid],
+        [ProbeMode::Certified, ProbeMode::Hybrid, ProbeMode::Ordinary],
+        [ProbeMode::Ordinary, ProbeMode::Certified, ProbeMode::Hybrid],
+        [ProbeMode::Ordinary, ProbeMode::Hybrid, ProbeMode::Certified],
+        [ProbeMode::Hybrid, ProbeMode::Certified, ProbeMode::Ordinary],
+        [ProbeMode::Hybrid, ProbeMode::Ordinary, ProbeMode::Certified],
     ];
 
     for mode in ProbeMode::ALL {
@@ -2756,13 +3015,9 @@ fn timing_backend<S: TriblePattern>(
         }
     }
 
-    let mut samples = Vec::with_capacity(repetitions * 16);
+    let mut samples = Vec::with_capacity(repetitions * 6);
     for repetition in 0..repetitions {
-        let order = if repetition % 2 == 0 {
-            order_a
-        } else {
-            order_b
-        };
+        let order = BALANCED_ORDERS[repetition % BALANCED_ORDERS.len()];
         let points = if repetition % 2 == 0 {
             CrossoverTimingPoint::ALL
         } else {
@@ -2799,7 +3054,7 @@ fn timing_backend<S: TriblePattern>(
 
     for (sample, value) in samples.iter().enumerate() {
         println!(
-            "crossover_raw backend={backend:?} width={} sample={sample} mode={} point={} ns={}",
+            "hybrid_timing_raw backend={backend:?} width={} sample={sample} mode={} point={} ns={}",
             cell.width,
             value.mode.label(),
             value.point.label(),
@@ -2814,7 +3069,7 @@ fn timing_backend<S: TriblePattern>(
                 .map(|sample| sample.duration.as_secs_f64())
                 .collect();
             println!(
-                "crossover_summary backend={backend:?} width={} mode={} point={} primary={} \
+                "hybrid_timing_summary backend={backend:?} width={} mode={} point={} primary={} \
                  samples={} p50_us={:.3} p95_us={:.3}",
                 cell.width,
                 mode.label(),
@@ -2839,7 +3094,7 @@ fn run_rpq_confirm_crossover_probe(repetitions: usize, run_timing: bool) {
         .components
         .iter()
         .all(|component| component.len() == CROSSOVER_CORE_NODES));
-    println!("probe: honest RPQ Confirm candidate-width crossover");
+    println!("probe: RPQ Confirm fragment-local singleton/typed hybrid");
     println!(
         "fixture: components={} core_nodes={} selected_parents={} graph_tribles={} \
          graph_digest={:#018x} built_ms={:.3}",
@@ -2851,96 +3106,66 @@ fn run_rpq_confirm_crossover_probe(repetitions: usize, run_timing: bool) {
         fixture_elapsed.as_secs_f64() * 1e3,
     );
     println!(
-        "invariant: C and O both use Production lowering; O changes only an executed \
-         bound-endpoint RPQ Confirm route to ordinary. No estimate override exists."
+        "invariant: C, O, and H all compile the same Production route and ParentAtomic \
+         grouping. H changes only the concrete request-local target CandidateBatch: \
+         parent_rows == 1 selects ordinary; parent_rows > 1 retains typed."
     );
 
-    let mut typed_work = BTreeMap::<&'static str, (usize, usize)>::new();
-    for width in CROSSOVER_WIDTHS {
-        let cell = fixture.cell(width);
-        let archive_started = Instant::now();
-        let archive: SuccinctArchive<OrderedUniverse> = (&cell.candidates).into();
-        let archive_elapsed = archive_started.elapsed();
-        println!(
-            "crossover_geometry width={} candidate_facts={} distinct_targets={} \
-             forward_groups={} forward_group_width={} inverse_group_width=1 \
-             local={} remote={} expected_survivors={} candidate_store_tribles={} \
-             graph_digest={:#018x} archive_build_ms={:.3}",
-            width,
-            CROSSOVER_PARENT_COUNT * width,
-            CROSSOVER_PARENT_COUNT * width,
-            CROSSOVER_PARENT_COUNT,
-            width,
-            CROSSOVER_PARENT_COUNT * width / 2,
-            CROSSOVER_PARENT_COUNT * width / 2,
-            cell.expected.len(),
-            cell.candidates.len(),
-            fixture.graph_digest,
-            archive_elapsed.as_secs_f64() * 1e3,
-        );
+    let cell = fixture.cell(HYBRID_WIDTH);
+    println!(
+        "hybrid_geometry backend=\"TribleSet\" width={} candidate_facts={} \
+         distinct_targets={} forward_groups={} forward_group_width={} \
+         inverse_group_width=1 local={} remote={} expected_survivors={} \
+         candidate_store_tribles={} graph_digest={:#018x}",
+        HYBRID_WIDTH,
+        CROSSOVER_PARENT_COUNT * HYBRID_WIDTH,
+        CROSSOVER_PARENT_COUNT * HYBRID_WIDTH,
+        CROSSOVER_PARENT_COUNT,
+        HYBRID_WIDTH,
+        CROSSOVER_PARENT_COUNT * HYBRID_WIDTH / 2,
+        CROSSOVER_PARENT_COUNT * HYBRID_WIDTH / 2,
+        cell.expected.len(),
+        cell.candidates.len(),
+        fixture.graph_digest,
+    );
 
-        let (trible_c, trible_o, trible_token) =
-            correctness_backend("TribleSet", &cell.candidates, &fixture, &cell);
-        let (archive_c, archive_o, archive_token) =
-            correctness_backend("SuccinctArchive", &archive, &fixture, &cell);
-        println!(
-            "crossover_cross_backend_order width={} mode={} equal={}",
-            width,
-            ProbeMode::Certified.label(),
-            trible_c.rows == archive_c.rows,
-        );
-        println!(
-            "crossover_cross_backend_order width={} mode={} equal={}",
-            width,
-            ProbeMode::Ordinary.label(),
-            trible_o.rows == archive_o.rows,
-        );
+    let (certified, ordinary, hybrid, target_token) =
+        correctness_backend("TribleSet", &cell.candidates, &fixture, &cell);
+    println!(
+        "hybrid_counter_equivalence backend=\"TribleSet\" width={} \
+         candidates_confirmed_c={} candidates_confirmed_o={} candidates_confirmed_h={} \
+         source_examined_c={} source_examined_o={} source_examined_h={} \
+         transition_examined_c={} transition_examined_o={} transition_examined_h={}",
+        cell.width,
+        certified.stats.candidates_confirmed,
+        ordinary.stats.candidates_confirmed,
+        hybrid.stats.candidates_confirmed,
+        certified.stats.delta_source_candidates_examined,
+        ordinary.stats.delta_source_candidates_examined,
+        hybrid.stats.delta_source_candidates_examined,
+        certified.stats.delta_transition_candidates_examined,
+        ordinary.stats.delta_transition_candidates_examined,
+        hybrid.stats.delta_transition_candidates_examined,
+    );
 
-        for (backend, run) in [("TribleSet", &trible_c), ("SuccinctArchive", &archive_c)] {
-            let work = crossover_graph_work(&run.stats);
-            match typed_work.get(backend) {
-                Some(&baseline) => assert_eq!(
-                    work, baseline,
-                    "typed RPQ graph work changed across widths for {backend}: \
-                     baseline={baseline:?}, k={width} work={work:?}"
-                ),
-                None => {
-                    typed_work.insert(backend, work);
-                }
-            }
-            println!(
-                "crossover_typed_graph_work backend={backend:?} width={} \
-                 transition_examined={} source_examined={} constant_so_far=true",
-                width, work.0, work.1,
-            );
-        }
-
-        if run_timing {
-            timing_backend(
-                "TribleSet",
-                &cell.candidates,
-                &fixture,
-                &cell,
-                trible_token,
-                repetitions,
-            );
-            timing_backend(
-                "SuccinctArchive",
-                &archive,
-                &fixture,
-                &cell,
-                archive_token,
-                repetitions,
-            );
-        }
+    if run_timing {
+        timing_backend(
+            "TribleSet",
+            &cell.candidates,
+            &fixture,
+            &cell,
+            target_token,
+            repetitions,
+        );
     }
     if !run_timing {
         println!(
-            "timing withheld: set RPQ_CROSSOVER_TIMING=FLEET_IDLE_RELEASED only after an \
-             explicit fleet-idle release"
+            "timing withheld: set RPQ_FRAGMENT_HYBRID_TIMING=FLEET_IDLE_RELEASED only \
+             after an explicit fleet-idle release"
         );
     }
     rpq_confirm_admission_probe_force_ordinary(false);
+    rpq_confirm_admission_probe_force_singleton_ordinary(false);
 }
 
 #[cfg(all(engine_prefix_checkpoints, not(rpq_confirm_admission_probe)))]

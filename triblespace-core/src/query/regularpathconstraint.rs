@@ -1602,6 +1602,7 @@ const RPQ_SUPPORT_TRUE: ProgramKey = ProgramKey::new(7);
 #[cfg(rpq_confirm_admission_probe)]
 thread_local! {
     static FORCE_BOUND_CONFIRM_ORDINARY: Cell<bool> = const { Cell::new(false) };
+    static FORCE_SINGLETON_CONFIRM_ORDINARY: Cell<bool> = const { Cell::new(false) };
     static RECORD_PROBE_RECEIPTS: Cell<bool> = const { Cell::new(true) };
     static TARGET_CONFIRM_TOKEN: Cell<Option<u32>> = const { Cell::new(None) };
     static TARGET_CONFIRM_PARENTS: Cell<usize> = const { Cell::new(0) };
@@ -1614,6 +1615,7 @@ thread_local! {
     static TARGET_BATCH_ROUTE_CALLS: Cell<usize> = const { Cell::new(0) };
     static BOUND_CONFIRM_BATCHES: RefCell<Vec<(u32, usize, usize)>> = const { RefCell::new(Vec::new()) };
     static FORCED_CONFIRM_BATCHES: RefCell<Vec<(u32, usize, usize)>> = const { RefCell::new(Vec::new()) };
+    static TARGET_CONFIRM_DECISIONS: RefCell<Vec<(u32, usize, usize, bool)>> = const { RefCell::new(Vec::new()) };
     static LAST_ROUTE_WAS_FORCED: Cell<bool> = const { Cell::new(false) };
     static ORDINARY_CONFIRM_CALLS: Cell<usize> = const { Cell::new(0) };
     static ORDINARY_CONFIRM_ROWS: Cell<usize> = const { Cell::new(0) };
@@ -1682,6 +1684,12 @@ pub fn rpq_confirm_admission_probe_force_ordinary(force: bool) {
 
 #[cfg(rpq_confirm_admission_probe)]
 #[doc(hidden)]
+pub fn rpq_confirm_admission_probe_force_singleton_ordinary(force: bool) {
+    FORCE_SINGLETON_CONFIRM_ORDINARY.with(|armed| armed.set(force));
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+#[doc(hidden)]
 pub fn rpq_confirm_admission_probe_record_receipts(record: bool) {
     RECORD_PROBE_RECEIPTS.with(|enabled| enabled.set(record));
 }
@@ -1731,6 +1739,12 @@ pub fn rpq_confirm_admission_probe_forced_confirm_batches() -> Vec<(u32, usize, 
 
 #[cfg(rpq_confirm_admission_probe)]
 #[doc(hidden)]
+pub fn rpq_confirm_admission_probe_target_decisions() -> Vec<(u32, usize, usize, bool)> {
+    TARGET_CONFIRM_DECISIONS.with(|decisions| decisions.borrow().clone())
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+#[doc(hidden)]
 pub fn rpq_confirm_admission_probe_reset_callbacks() {
     TARGET_CONFIRM_TOKEN.with(|value| value.set(None));
     TARGET_CONFIRM_PARENTS.with(|value| value.set(0));
@@ -1743,6 +1757,7 @@ pub fn rpq_confirm_admission_probe_reset_callbacks() {
     TARGET_BATCH_ROUTE_CALLS.with(|value| value.set(0));
     BOUND_CONFIRM_BATCHES.with(|batches| batches.borrow_mut().clear());
     FORCED_CONFIRM_BATCHES.with(|batches| batches.borrow_mut().clear());
+    TARGET_CONFIRM_DECISIONS.with(|decisions| decisions.borrow_mut().clear());
     ORDINARY_CONFIRM_CALLS.with(|value| value.set(0));
     ORDINARY_CONFIRM_ROWS.with(|value| value.set(0));
     ORDINARY_CONFIRM_CANDIDATES_IN.with(|value| value.set(0));
@@ -1840,7 +1855,19 @@ fn probe_forces_bound_confirm_ordinary() -> bool {
             TARGET_CONFIRM_CANDIDATES_SEEN.with(|value| value.set(candidates));
             TARGET_BATCH_ROUTE_CALLS.with(|value| value.set(value.get() + 1));
         }
-        let force = target && FORCE_BOUND_CONFIRM_ORDINARY.with(Cell::get);
+        let force = target
+            && (FORCE_BOUND_CONFIRM_ORDINARY.with(Cell::get)
+                || (FORCE_SINGLETON_CONFIRM_ORDINARY.with(Cell::get) && current.1 == 1));
+        if target && record {
+            let token = current
+                .0
+                .expect("a targeted RPQ probe route lost its request token");
+            TARGET_CONFIRM_DECISIONS.with(|decisions| {
+                decisions
+                    .borrow_mut()
+                    .push((token, current.1, current.2, force));
+            });
+        }
         if force && record {
             let token = current
                 .0

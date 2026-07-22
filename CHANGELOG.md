@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The sealed RPQ Confirm crossover now has a fragment-local hybrid
+  diagnostic.** On the frozen TribleSet `k=4` cell, the structural Production
+  route and ParentAtomic grouping remain fixed while a request-local physical
+  policy sends only concrete singleton CandidateBatches through ordinary
+  Confirm and retains typed execution for larger batches. Exact decision and
+  fragmentation traces, frozen C/O receipts, SET/order checks, affine work
+  counters, and a three-mode balanced timing panel test whether scheduler
+  geometry can recover latency and throughput without a consumer-mode bit.
 - **The RPQ Confirm admission probe now has an honest candidate-width
   crossover panel.** A fixed eight-component graph, independent nested SET
   oracle, and separate TribleSet/SuccinctArchive candidate stores cover widths
