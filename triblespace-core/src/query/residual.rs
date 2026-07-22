@@ -22823,6 +22823,283 @@ mod tests {
         assert_eq!(counters.2.load(Ordering::Relaxed), 0);
     }
 
+    struct ProductionFormulaRpqFixture {
+        graph: crate::trible::TribleSet,
+        attribute: crate::id::Id,
+        source: crate::id::Id,
+        direct: crate::id::Id,
+        sibling: crate::id::Id,
+        transitive: crate::id::Id,
+        absent: crate::id::Id,
+    }
+
+    fn production_formula_rpq_fixture() -> ProductionFormulaRpqFixture {
+        use crate::id::{ExclusiveId, Id};
+        use crate::trible::{Trible, TribleSet};
+
+        let attribute = Id::new([91; crate::id::ID_LEN]).unwrap();
+        let source = Id::new([92; crate::id::ID_LEN]).unwrap();
+        let direct = Id::new([93; crate::id::ID_LEN]).unwrap();
+        let sibling = Id::new([94; crate::id::ID_LEN]).unwrap();
+        let transitive = Id::new([95; crate::id::ID_LEN]).unwrap();
+        let absent = Id::new([96; crate::id::ID_LEN]).unwrap();
+        let mut graph = TribleSet::new();
+        for (from, to) in [
+            (&source, &direct),
+            (&source, &sibling),
+            (&direct, &transitive),
+        ] {
+            graph.insert(&Trible::new::<GenId>(
+                ExclusiveId::force_ref(from),
+                &attribute,
+                &to.to_inline(),
+            ));
+        }
+
+        ProductionFormulaRpqFixture {
+            graph,
+            attribute,
+            source,
+            direct,
+            sibling,
+            transitive,
+            absent,
+        }
+    }
+
+    fn impossible_rpq_union_arm(
+        start: Variable<GenId>,
+        end: Variable<GenId>,
+        absent: &crate::id::Id,
+    ) -> ShapeConstraint {
+        use crate::id::id_into_value;
+
+        let absent = id_into_value(absent);
+        Box::new(IntersectionConstraint::new(vec![
+            Box::new(start.is(Inline::<GenId>::new(absent))) as ShapeConstraint,
+            Box::new(end.is(Inline::<GenId>::new(absent))) as ShapeConstraint,
+        ]))
+    }
+
+    #[derive(Clone, Copy)]
+    enum FormulaProgramOracleAction {
+        Propose,
+        GroupedConfirm,
+        Support,
+    }
+
+    fn assert_whole_root_production_oracle<C>(
+        make: impl Fn(&ProgramFallbackCounters, bool) -> C,
+        projected: VariableId,
+        mut expected: Vec<RawInline>,
+        action: FormulaProgramOracleAction,
+    ) where
+        C: Constraint<'static> + 'static,
+    {
+        expected.sort_unstable();
+        let project = move |binding: &Binding| binding.get(projected).copied();
+
+        let hybrid_counters = program_fallback_counters();
+        let mut hybrid = Query::new(make(&hybrid_counters, true), project)
+            .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+            .cap(1)
+            .start_width(1);
+        let hybrid_first = hybrid.next().expect("the semantic oracle is nonempty");
+        assert!(expected.contains(&hybrid_first));
+        let mut hybrid_results = vec![hybrid_first];
+        hybrid_results.extend(hybrid.by_ref());
+        hybrid_results.sort_unstable();
+        assert_eq!(hybrid_results, expected);
+        let hybrid_fallbacks = match action {
+            FormulaProgramOracleAction::Propose => &hybrid_counters.0,
+            FormulaProgramOracleAction::GroupedConfirm => &hybrid_counters.1,
+            FormulaProgramOracleAction::Support => &hybrid_counters.2,
+        };
+        assert!(
+            hybrid_fallbacks.load(Ordering::Relaxed) > 0,
+            "opaque HYBRID union never exercised its ordinary RPQ fallback"
+        );
+
+        let production_counters = program_fallback_counters();
+        let mut production = Query::new(make(&production_counters, false), project)
+            .solve_residual_state_lazy_with(ResidualLowering::new(
+                FormulaScope::WholeRoot,
+                ProgramScope::Production,
+            ))
+            .cap(1)
+            .start_width(1);
+        let production_first = production.next().expect("the semantic oracle is nonempty");
+        assert!(expected.contains(&production_first));
+        assert_program_fallbacks_unused(&production_counters);
+        let mut production_results = vec![production_first];
+        production_results.extend(production.by_ref());
+        production_results.sort_unstable();
+        assert_eq!(production_results, expected);
+        match action {
+            FormulaProgramOracleAction::Propose => {
+                assert!(production.stats().propose_action_pops > 0)
+            }
+            FormulaProgramOracleAction::GroupedConfirm => {
+                assert!(production.stats().confirm_action_pops > 0)
+            }
+            FormulaProgramOracleAction::Support => {
+                assert!(production.stats().support_action_pops > 0)
+            }
+        }
+        assert!(production.stats().delta_transition_pages > 0);
+        assert_program_fallbacks_unused(&production_counters);
+    }
+
+    #[test]
+    fn whole_root_production_exposes_or_contained_rpq_propose() {
+        use crate::id::id_into_value;
+        use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
+
+        let fixture = production_formula_rpq_fixture();
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let operations = [PathOp::Attr(fixture.attribute.raw()), PathOp::Plus];
+        let source = id_into_value(&fixture.source);
+        let absent = fixture.absent;
+        let make = |counters: &ProgramFallbackCounters, allow_ordinary_fallback| {
+            let path = RegularPathConstraint::new(
+                fixture.graph.clone(),
+                start,
+                end,
+                &operations,
+            );
+            let path = if allow_ordinary_fallback {
+                program_fallback_rpq(path, counters)
+            } else {
+                program_only_rpq(path, counters)
+            };
+            IntersectionConstraint::new(vec![
+                preferred_fanout(start.index, vec![source], 0),
+                Box::new(UnionConstraint::new(vec![
+                    Box::new(path) as ShapeConstraint,
+                    impossible_rpq_union_arm(start, end, &absent),
+                ])) as ShapeConstraint,
+            ])
+        };
+
+        assert_whole_root_production_oracle(
+            make,
+            end.index,
+            vec![
+                id_into_value(&fixture.direct),
+                id_into_value(&fixture.sibling),
+                id_into_value(&fixture.transitive),
+            ],
+            FormulaProgramOracleAction::Propose,
+        );
+    }
+
+    #[test]
+    fn whole_root_production_exposes_or_contained_rpq_grouped_confirm() {
+        use crate::id::id_into_value;
+        use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
+
+        let fixture = production_formula_rpq_fixture();
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let operations = [PathOp::Attr(fixture.attribute.raw()), PathOp::Plus];
+        let source = id_into_value(&fixture.source);
+        let absent = fixture.absent;
+        let candidates = vec![
+            id_into_value(&fixture.transitive),
+            id_into_value(&fixture.direct),
+            id_into_value(&fixture.transitive),
+            id_into_value(&fixture.absent),
+            id_into_value(&fixture.sibling),
+            id_into_value(&fixture.direct),
+        ];
+        let make = |counters: &ProgramFallbackCounters, allow_ordinary_fallback| {
+            let path = RegularPathConstraint::new(
+                fixture.graph.clone(),
+                start,
+                end,
+                &operations,
+            );
+            let path = if allow_ordinary_fallback {
+                program_fallback_rpq(path, counters)
+            } else {
+                program_only_rpq(path, counters)
+            };
+            let guarded = Box::new(IntersectionConstraint::new(vec![
+                preferred_fanout(end.index, candidates.clone(), 0),
+                Box::new(path) as ShapeConstraint,
+            ])) as ShapeConstraint;
+            IntersectionConstraint::new(vec![
+                preferred_fanout(start.index, vec![source], 0),
+                Box::new(UnionConstraint::new(vec![
+                    guarded,
+                    impossible_rpq_union_arm(start, end, &absent),
+                ])) as ShapeConstraint,
+            ])
+        };
+
+        assert_whole_root_production_oracle(
+            make,
+            end.index,
+            vec![
+                id_into_value(&fixture.direct),
+                id_into_value(&fixture.sibling),
+                id_into_value(&fixture.transitive),
+            ],
+            FormulaProgramOracleAction::GroupedConfirm,
+        );
+    }
+
+    #[test]
+    fn whole_root_production_exposes_or_contained_rpq_support() {
+        use crate::id::id_into_value;
+        use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
+
+        let fixture = production_formula_rpq_fixture();
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let marker = Variable::<GenId>::new(2);
+        let operations = [PathOp::Attr(fixture.attribute.raw()), PathOp::Plus];
+        let source = id_into_value(&fixture.source);
+        let target = id_into_value(&fixture.direct);
+        let guarded_marker = raw(71);
+        let sibling_marker = raw(72);
+        let make = |counters: &ProgramFallbackCounters, allow_ordinary_fallback| {
+            let path = RegularPathConstraint::new(
+                fixture.graph.clone(),
+                start,
+                end,
+                &operations,
+            );
+            let path = if allow_ordinary_fallback {
+                program_fallback_rpq(path, counters)
+            } else {
+                program_only_rpq(path, counters)
+            };
+            let guarded = Box::new(IntersectionConstraint::new(vec![
+                Box::new(path) as ShapeConstraint,
+                preferred_fanout(marker.index, vec![guarded_marker], 1),
+            ])) as ShapeConstraint;
+            let sibling = Box::new(IntersectionConstraint::new(vec![
+                Box::new(start.is(Inline::<GenId>::new(source))) as ShapeConstraint,
+                Box::new(end.is(Inline::<GenId>::new(target))) as ShapeConstraint,
+                preferred_fanout(marker.index, vec![sibling_marker], 1),
+            ])) as ShapeConstraint;
+            IntersectionConstraint::new(vec![
+                preferred_fanout(start.index, vec![source], 0),
+                preferred_fanout(end.index, vec![target], 0),
+                Box::new(UnionConstraint::new(vec![guarded, sibling])) as ShapeConstraint,
+            ])
+        };
+
+        assert_whole_root_production_oracle(
+            make,
+            marker.index,
+            vec![guarded_marker, sibling_marker],
+            FormulaProgramOracleAction::Support,
+        );
+    }
+
     /// Keeps adaptive planning visible while proving selected actions execute
     /// through the typed Program route rather than the ordinary protocol.
     struct ProgramActionTrap<C> {
