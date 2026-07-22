@@ -1,5 +1,5 @@
 #[cfg(rpq_confirm_admission_probe)]
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::collections::VecDeque;
 
@@ -1602,7 +1602,18 @@ const RPQ_SUPPORT_TRUE: ProgramKey = ProgramKey::new(7);
 #[cfg(rpq_confirm_admission_probe)]
 thread_local! {
     static FORCE_BOUND_CONFIRM_ORDINARY: Cell<bool> = const { Cell::new(false) };
-    static PREFER_EXTERNAL_BOUND_PROPOSER: Cell<bool> = const { Cell::new(false) };
+    static RECORD_PROBE_RECEIPTS: Cell<bool> = const { Cell::new(true) };
+    static TARGET_CONFIRM_TOKEN: Cell<Option<u32>> = const { Cell::new(None) };
+    static TARGET_CONFIRM_PARENTS: Cell<usize> = const { Cell::new(0) };
+    static TARGET_CONFIRM_CANDIDATES: Cell<usize> = const { Cell::new(0) };
+    static TARGET_CONFIRM_PARENTS_SEEN: Cell<usize> = const { Cell::new(0) };
+    static TARGET_CONFIRM_CANDIDATES_SEEN: Cell<usize> = const { Cell::new(0) };
+    static CURRENT_CONFIRM_TOKEN: Cell<Option<u32>> = const { Cell::new(None) };
+    static CURRENT_CONFIRM_PARENTS: Cell<usize> = const { Cell::new(0) };
+    static CURRENT_CONFIRM_CANDIDATES: Cell<usize> = const { Cell::new(0) };
+    static TARGET_BATCH_ROUTE_CALLS: Cell<usize> = const { Cell::new(0) };
+    static BOUND_CONFIRM_BATCHES: RefCell<Vec<(u32, usize, usize)>> = const { RefCell::new(Vec::new()) };
+    static FORCED_CONFIRM_BATCHES: RefCell<Vec<(u32, usize, usize)>> = const { RefCell::new(Vec::new()) };
     static LAST_ROUTE_WAS_FORCED: Cell<bool> = const { Cell::new(false) };
     static ORDINARY_CONFIRM_CALLS: Cell<usize> = const { Cell::new(0) };
     static ORDINARY_CONFIRM_ROWS: Cell<usize> = const { Cell::new(0) };
@@ -1625,7 +1636,9 @@ thread_local! {
     static ROUTE_SUPPORT_CALLS: Cell<usize> = const { Cell::new(0) };
     static ROUTE_BOUND_CONFIRM_CALLS: Cell<usize> = const { Cell::new(0) };
     static ROUTE_FORCED_CALLS: Cell<usize> = const { Cell::new(0) };
-    static BIASED_BOUND_ESTIMATE_ROWS: Cell<usize> = const { Cell::new(0) };
+    static BOUND_ESTIMATE_SAMPLES: Cell<usize> = const { Cell::new(0) };
+    static BOUND_ESTIMATE_MIN: Cell<usize> = const { Cell::new(usize::MAX) };
+    static BOUND_ESTIMATE_MAX: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(rpq_confirm_admission_probe)]
@@ -1653,7 +1666,12 @@ pub struct RpqConfirmAdmissionProbeSnapshot {
     pub route_support_calls: usize,
     pub route_bound_confirm_calls: usize,
     pub route_forced_calls: usize,
-    pub biased_bound_estimate_rows: usize,
+    pub target_batch_route_calls: usize,
+    pub target_batch_parents: usize,
+    pub target_batch_candidates: usize,
+    pub bound_estimate_samples: usize,
+    pub bound_estimate_min: usize,
+    pub bound_estimate_max: usize,
 }
 
 #[cfg(rpq_confirm_admission_probe)]
@@ -1664,13 +1682,67 @@ pub fn rpq_confirm_admission_probe_force_ordinary(force: bool) {
 
 #[cfg(rpq_confirm_admission_probe)]
 #[doc(hidden)]
-pub fn rpq_confirm_admission_probe_prefer_external_bound_proposer(prefer: bool) {
-    PREFER_EXTERNAL_BOUND_PROPOSER.with(|armed| armed.set(prefer));
+pub fn rpq_confirm_admission_probe_record_receipts(record: bool) {
+    RECORD_PROBE_RECEIPTS.with(|enabled| enabled.set(record));
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+#[doc(hidden)]
+pub fn rpq_confirm_admission_probe_target_action(token: u32, parents: usize, candidates: usize) {
+    assert!(parents > 0);
+    assert!(candidates > 0);
+    TARGET_CONFIRM_TOKEN.with(|value| value.set(Some(token)));
+    TARGET_CONFIRM_PARENTS.with(|value| value.set(parents));
+    TARGET_CONFIRM_CANDIDATES.with(|value| value.set(candidates));
+    TARGET_CONFIRM_PARENTS_SEEN.with(|value| value.set(0));
+    TARGET_CONFIRM_CANDIDATES_SEEN.with(|value| value.set(0));
+    TARGET_BATCH_ROUTE_CALLS.with(|value| value.set(0));
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+pub(crate) fn rpq_confirm_admission_probe_enter_candidate_batch(
+    token: u32,
+    parents: usize,
+    candidates: usize,
+) {
+    CURRENT_CONFIRM_TOKEN.with(|value| value.set(Some(token)));
+    CURRENT_CONFIRM_PARENTS.with(|value| value.set(parents));
+    CURRENT_CONFIRM_CANDIDATES.with(|value| value.set(candidates));
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+pub(crate) fn rpq_confirm_admission_probe_leave_candidate_batch() {
+    CURRENT_CONFIRM_TOKEN.with(|value| value.set(None));
+    CURRENT_CONFIRM_PARENTS.with(|value| value.set(0));
+    CURRENT_CONFIRM_CANDIDATES.with(|value| value.set(0));
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+#[doc(hidden)]
+pub fn rpq_confirm_admission_probe_bound_confirm_batches() -> Vec<(u32, usize, usize)> {
+    BOUND_CONFIRM_BATCHES.with(|batches| batches.borrow().clone())
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+#[doc(hidden)]
+pub fn rpq_confirm_admission_probe_forced_confirm_batches() -> Vec<(u32, usize, usize)> {
+    FORCED_CONFIRM_BATCHES.with(|batches| batches.borrow().clone())
 }
 
 #[cfg(rpq_confirm_admission_probe)]
 #[doc(hidden)]
 pub fn rpq_confirm_admission_probe_reset_callbacks() {
+    TARGET_CONFIRM_TOKEN.with(|value| value.set(None));
+    TARGET_CONFIRM_PARENTS.with(|value| value.set(0));
+    TARGET_CONFIRM_CANDIDATES.with(|value| value.set(0));
+    TARGET_CONFIRM_PARENTS_SEEN.with(|value| value.set(0));
+    TARGET_CONFIRM_CANDIDATES_SEEN.with(|value| value.set(0));
+    CURRENT_CONFIRM_TOKEN.with(|value| value.set(None));
+    CURRENT_CONFIRM_PARENTS.with(|value| value.set(0));
+    CURRENT_CONFIRM_CANDIDATES.with(|value| value.set(0));
+    TARGET_BATCH_ROUTE_CALLS.with(|value| value.set(0));
+    BOUND_CONFIRM_BATCHES.with(|batches| batches.borrow_mut().clear());
+    FORCED_CONFIRM_BATCHES.with(|batches| batches.borrow_mut().clear());
     ORDINARY_CONFIRM_CALLS.with(|value| value.set(0));
     ORDINARY_CONFIRM_ROWS.with(|value| value.set(0));
     ORDINARY_CONFIRM_CANDIDATES_IN.with(|value| value.set(0));
@@ -1692,7 +1764,9 @@ pub fn rpq_confirm_admission_probe_reset_callbacks() {
     ROUTE_SUPPORT_CALLS.with(|value| value.set(0));
     ROUTE_BOUND_CONFIRM_CALLS.with(|value| value.set(0));
     ROUTE_FORCED_CALLS.with(|value| value.set(0));
-    BIASED_BOUND_ESTIMATE_ROWS.with(|value| value.set(0));
+    BOUND_ESTIMATE_SAMPLES.with(|value| value.set(0));
+    BOUND_ESTIMATE_MIN.with(|value| value.set(usize::MAX));
+    BOUND_ESTIMATE_MAX.with(|value| value.set(0));
 }
 
 #[cfg(rpq_confirm_admission_probe)]
@@ -1720,7 +1794,12 @@ pub fn rpq_confirm_admission_probe_snapshot() -> RpqConfirmAdmissionProbeSnapsho
         route_support_calls: ROUTE_SUPPORT_CALLS.with(Cell::get),
         route_bound_confirm_calls: ROUTE_BOUND_CONFIRM_CALLS.with(Cell::get),
         route_forced_calls: ROUTE_FORCED_CALLS.with(Cell::get),
-        biased_bound_estimate_rows: BIASED_BOUND_ESTIMATE_ROWS.with(Cell::get),
+        target_batch_route_calls: TARGET_BATCH_ROUTE_CALLS.with(Cell::get),
+        target_batch_parents: TARGET_CONFIRM_PARENTS_SEEN.with(Cell::get),
+        target_batch_candidates: TARGET_CONFIRM_CANDIDATES_SEEN.with(Cell::get),
+        bound_estimate_samples: BOUND_ESTIMATE_SAMPLES.with(Cell::get),
+        bound_estimate_min: BOUND_ESTIMATE_MIN.with(Cell::get),
+        bound_estimate_max: BOUND_ESTIMATE_MAX.with(Cell::get),
     }
 }
 
@@ -1728,31 +1807,63 @@ pub fn rpq_confirm_admission_probe_snapshot() -> RpqConfirmAdmissionProbeSnapsho
 fn probe_forces_bound_confirm_ordinary() -> bool {
     #[cfg(rpq_confirm_admission_probe)]
     {
-        return FORCE_BOUND_CONFIRM_ORDINARY.with(Cell::get);
+        let current = (
+            CURRENT_CONFIRM_TOKEN.with(Cell::get),
+            CURRENT_CONFIRM_PARENTS.with(Cell::get),
+            CURRENT_CONFIRM_CANDIDATES.with(Cell::get),
+        );
+        let record = RECORD_PROBE_RECEIPTS.with(Cell::get);
+        if let (true, Some(token)) = (record, current.0) {
+            BOUND_CONFIRM_BATCHES
+                .with(|batches| batches.borrow_mut().push((token, current.1, current.2)));
+        }
+        let target = TARGET_CONFIRM_TOKEN.with(Cell::get) == current.0 && current.0.is_some();
+        if target {
+            let parents = TARGET_CONFIRM_PARENTS_SEEN.with(|value| {
+                value
+                    .get()
+                    .checked_add(current.1)
+                    .expect("probe parent overflow")
+            });
+            let candidates = TARGET_CONFIRM_CANDIDATES_SEEN.with(|value| {
+                value
+                    .get()
+                    .checked_add(current.2)
+                    .expect("probe candidate overflow")
+            });
+            assert!(
+                parents <= TARGET_CONFIRM_PARENTS.with(Cell::get)
+                    && candidates <= TARGET_CONFIRM_CANDIDATES.with(Cell::get),
+                "the request-local RPQ probe token exceeded its configured logical action geometry"
+            );
+            TARGET_CONFIRM_PARENTS_SEEN.with(|value| value.set(parents));
+            TARGET_CONFIRM_CANDIDATES_SEEN.with(|value| value.set(candidates));
+            TARGET_BATCH_ROUTE_CALLS.with(|value| value.set(value.get() + 1));
+        }
+        let force = target && FORCE_BOUND_CONFIRM_ORDINARY.with(Cell::get);
+        if force && record {
+            let token = current
+                .0
+                .expect("a targeted RPQ probe route lost its request token");
+            FORCED_CONFIRM_BATCHES
+                .with(|batches| batches.borrow_mut().push((token, current.1, current.2)));
+        }
+        return force;
     }
     #[cfg(not(rpq_confirm_admission_probe))]
     false
 }
 
 #[inline]
-fn probe_prefers_external_bound_proposer() -> bool {
+fn probe_record_bound_estimate(estimate: usize) {
     #[cfg(rpq_confirm_admission_probe)]
     {
-        return PREFER_EXTERNAL_BOUND_PROPOSER.with(Cell::get);
+        BOUND_ESTIMATE_SAMPLES.with(|value| value.set(value.get() + 1));
+        BOUND_ESTIMATE_MIN.with(|value| value.set(value.get().min(estimate)));
+        BOUND_ESTIMATE_MAX.with(|value| value.set(value.get().max(estimate)));
     }
     #[cfg(not(rpq_confirm_admission_probe))]
-    false
-}
-
-#[inline]
-fn probe_bias_bound_estimate(estimate: usize) -> usize {
-    if probe_prefers_external_bound_proposer() {
-        #[cfg(rpq_confirm_admission_probe)]
-        BIASED_BOUND_ESTIMATE_ROWS.with(|value| value.set(value.get() + 1));
-        estimate.max(1 << 20)
-    } else {
-        estimate
-    }
+    let _ = estimate;
 }
 
 #[cfg(rpq_confirm_admission_probe)]
@@ -2838,9 +2949,9 @@ impl RegularPathConstraint {
         }
         if variable == self.end {
             if let Some(start_val) = start_val {
-                return probe_bias_bound_estimate(
-                    self.estimate_bound(&self.estimate, start_val).max(1),
-                );
+                let estimate = self.estimate_bound(&self.estimate, start_val).max(1);
+                probe_record_bound_estimate(estimate);
+                return estimate;
             }
             self.set.len()
         } else {
@@ -2849,9 +2960,9 @@ impl RegularPathConstraint {
                 // via the inverted expression from the bound end,
                 // giving a tight estimate instead of the
                 // conservative set-len fallback.
-                return probe_bias_bound_estimate(
-                    self.estimate_bound(&self.inverse_estimate, end_val).max(1),
-                );
+                let estimate = self.estimate_bound(&self.inverse_estimate, end_val).max(1);
+                probe_record_bound_estimate(estimate);
+                return estimate;
             }
             self.set.len()
         }

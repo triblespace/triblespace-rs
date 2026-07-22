@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The RPQ Confirm admission probe now has an honest candidate-width
+  crossover panel.** A fixed eight-component graph, independent nested SET
+  oracle, and separate TribleSet/SuccinctArchive candidate stores cover widths
+  2, 4, 8, and 16. A request-local diagnostic token changes only the selected
+  bound-endpoint RPQ Confirm action between its typed Production route and the
+  stable ordinary route, while exact aggregate geometry, repeat-stable page
+  fragments, planner estimates, graph work, and route-caused scheduling
+  feedback remain visible. Timing is sealed behind an explicit fleet-idle
+  release value.
 - **Receipt-proved complete Program results can transfer directly through an
   empty exact Formula OR.** RPQ whole-group completion now carries its
   insertion-ordered parent-local SET proof through the typed arbiter, avoiding

@@ -1919,6 +1919,21 @@ impl ResidualPlan {
         self.finite_formula.root(occurrence).is_some()
     }
 
+    #[cfg(rpq_confirm_admission_probe)]
+    fn probe_formula_fingerprint(&self) -> u64 {
+        let rendered = format!(
+            "{:?}",
+            (
+                &self.leaves,
+                &self.finite_formula,
+                self.synthetic_root_formula
+            )
+        );
+        rendered.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    }
+
     fn formula_action_occurrence(&self, outer: usize, node: FormulaNodeId) -> usize {
         if self.synthetic_root_formula {
             self.len()
@@ -2702,6 +2717,19 @@ pub struct ResidualStateStats {
     /// Parent rows carried by probe-only Formula state reentries.
     #[cfg(rpq_confirm_admission_probe)]
     pub probe_formula_rows_reentered: usize,
+    /// Deterministic debug-structural fingerprint of the compiled Formula and
+    /// its enclosing residual leaves. Probe-only; never used for scheduling.
+    #[cfg(rpq_confirm_admission_probe)]
+    pub probe_formula_fingerprint: u64,
+    /// Number of compiled finite Formula nodes in this exact plan.
+    #[cfg(rpq_confirm_admission_probe)]
+    pub probe_formula_nodes: usize,
+    /// Number of residual leaf occurrences carrying a Formula root.
+    #[cfg(rpq_confirm_admission_probe)]
+    pub probe_formula_roots: usize,
+    /// Number of residual leaf occurrences in the enclosing plan.
+    #[cfg(rpq_confirm_admission_probe)]
+    pub probe_residual_leaves: usize,
     /// Logical flattened-leaf proposal actions. A paged source activation
     /// counts once even though it bypasses the eager `Constraint::propose`
     /// verb.
@@ -10756,7 +10784,25 @@ impl ResidualStateMachine {
         mode: Search,
         seed: FrameSeedRow,
     ) -> Self {
-        Self::new_with_span_and_seed(full, plan.len(), plan.action_span(), mode, seed)
+        let state = Self::new_with_span_and_seed(full, plan.len(), plan.action_span(), mode, seed);
+        #[cfg(rpq_confirm_admission_probe)]
+        {
+            let mut state = state;
+            state.stats.probe_formula_fingerprint = plan.probe_formula_fingerprint();
+            state.stats.probe_formula_nodes = plan.finite_formula.nodes.len();
+            state.stats.probe_formula_roots = plan
+                .finite_formula
+                .roots
+                .iter()
+                .filter(|root| root.is_some())
+                .count();
+            state.stats.probe_residual_leaves = plan.leaves.len();
+            state
+        }
+        #[cfg(not(rpq_confirm_admission_probe))]
+        {
+            state
+        }
     }
 
     #[cfg(test)]
@@ -11573,7 +11619,20 @@ impl ResidualStateMachine {
             action: ProgramAction::Confirm(variable),
             bound: task.desc.bound,
         };
-        let program = match select_program(constraint, plan.program_scope, program_request) {
+        // The RPQ crossover probe deliberately selects its causal C/O seam
+        // only after a concrete candidate fragment exists. Compilation and
+        // every smaller incidental confirmation therefore see the unchanged
+        // Production route.
+        #[cfg(rpq_confirm_admission_probe)]
+        super::regularpathconstraint::rpq_confirm_admission_probe_enter_candidate_batch(
+            task.state.0,
+            batch.parents.row_count,
+            batch.candidate_count(),
+        );
+        let program_offer = select_program(constraint, plan.program_scope, program_request);
+        #[cfg(rpq_confirm_admission_probe)]
+        super::regularpathconstraint::rpq_confirm_admission_probe_leave_candidate_batch();
+        let program = match program_offer {
             ProgramOffer::Absent => None,
             ProgramOffer::Deferred {
                 probe_forced,

@@ -39,7 +39,7 @@ compile_error!("engine_counter_only requires engine_current_residual");
 compile_error!("rpq_confirm_admission_probe requires current residual prefix mode");
 
 #[cfg(all(rpq_confirm_admission_probe, engine_counter_only))]
-compile_error!("rpq_confirm_admission_probe is its own three-mode harness");
+compile_error!("rpq_confirm_admission_probe is its own C/O crossover harness");
 
 #[cfg(all(engine_counter_opaque_production, engine_counter_production))]
 compile_error!("select exactly one counter lowering");
@@ -65,6 +65,9 @@ compile_error!("select exactly one benchmark engine");
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
+
+#[cfg(rpq_confirm_admission_probe)]
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 #[cfg(engine_allocation_probe)]
 mod allocation_probe {
@@ -197,15 +200,17 @@ mod allocation_probe {
 }
 
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
-use triblespace::core::query::TriblePattern;
 #[cfg(rpq_confirm_admission_probe)]
 use triblespace::core::query::regularpathconstraint::{
-    RpqConfirmAdmissionProbeSnapshot, rpq_confirm_admission_probe_force_ordinary,
-    rpq_confirm_admission_probe_prefer_external_bound_proposer,
-    rpq_confirm_admission_probe_reset_callbacks, rpq_confirm_admission_probe_snapshot,
+    rpq_confirm_admission_probe_bound_confirm_batches, rpq_confirm_admission_probe_force_ordinary,
+    rpq_confirm_admission_probe_forced_confirm_batches,
+    rpq_confirm_admission_probe_record_receipts, rpq_confirm_admission_probe_reset_callbacks,
+    rpq_confirm_admission_probe_snapshot, rpq_confirm_admission_probe_target_action,
+    RpqConfirmAdmissionProbeSnapshot,
 };
 #[cfg(rpq_confirm_admission_probe)]
 use triblespace::core::query::residual::{ResidualLowering, ResidualStateStats};
+use triblespace::core::query::TriblePattern;
 use triblespace::core::trible::TribleSet;
 use triblespace::prelude::inlineencodings::GenId;
 use triblespace::prelude::*;
@@ -254,50 +259,27 @@ const COUNTER_LOWERING_LABEL: &str = "PRODUCTION";
 #[cfg(rpq_confirm_admission_probe)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProbeMode {
-    OpaqueProduction,
-    Production,
-    ProductionForcedOrdinaryConfirm,
+    Certified,
+    Ordinary,
 }
 
 #[cfg(rpq_confirm_admission_probe)]
 impl ProbeMode {
-    const ALL: [Self; 3] = [
-        Self::OpaqueProduction,
-        Self::Production,
-        Self::ProductionForcedOrdinaryConfirm,
-    ];
+    const ALL: [Self; 2] = [Self::Certified, Self::Ordinary];
 
     fn label(self) -> &'static str {
         match self {
-            Self::OpaqueProduction => "B_OPAQUE_PRODUCTION",
-            Self::Production => "C_PRODUCTION",
-            Self::ProductionForcedOrdinaryConfirm => "F_PRODUCTION_FORCE_RPQ_CONFIRM_ORDINARY",
+            Self::Certified => "C_TYPED_CERTIFIED",
+            Self::Ordinary => "O_FORCED_ORDINARY",
         }
     }
 
     fn lowering(self) -> ResidualLowering {
-        match self {
-            Self::OpaqueProduction => ResidualLowering::OPAQUE_PRODUCTION,
-            Self::Production | Self::ProductionForcedOrdinaryConfirm => {
-                ResidualLowering::PRODUCTION
-            }
-        }
+        ResidualLowering::PRODUCTION
     }
 
     fn arm(self) {
-        rpq_confirm_admission_probe_prefer_external_bound_proposer(true);
-        rpq_confirm_admission_probe_force_ordinary(matches!(
-            self,
-            Self::ProductionForcedOrdinaryConfirm
-        ));
-    }
-
-    fn arm_original_mixed(self) {
-        rpq_confirm_admission_probe_prefer_external_bound_proposer(false);
-        rpq_confirm_admission_probe_force_ordinary(matches!(
-            self,
-            Self::ProductionForcedOrdinaryConfirm
-        ));
+        rpq_confirm_admission_probe_force_ordinary(matches!(self, Self::Ordinary));
     }
 }
 
@@ -307,15 +289,6 @@ macro_rules! probe_mixed_query {
         let mode = $mode;
         mode.arm();
         probe_rpq_confirm_query!($store, $fixture).solve_residual_state_lazy_with(mode.lowering())
-    }};
-}
-
-#[cfg(rpq_confirm_admission_probe)]
-macro_rules! probe_original_mixed_query {
-    ($store:expr, $fixture:expr, $mode:expr) => {{
-        let mode = $mode;
-        mode.arm_original_mixed();
-        mixed_formula_rpq_query!($store, $fixture).solve_residual_state_lazy_with(mode.lowering())
     }};
 }
 
@@ -417,24 +390,18 @@ macro_rules! mixed_formula_rpq_query {
     };
 }
 
-// Causal fixture for the admission probe: after the source-side OR selects
-// half a component, the source-local candidate predicate proposes exactly one
-// endpoint per row. Even source positions point locally and survive; odd
-// source positions point into the next disconnected component and die. The
-// RPQ's bound estimate is probe-biased upward equally in B/C/F, so the
-// one-candidate predicate wins selection and makes RPQ Confirm do observable
-// filtering. The bias changes only this causal fixture's planner cost; it does
-// not claim a cardinality/action-unit receipt.
+// Causal crossover fixture: the source marker wins first, then the exact
+// source-local candidate predicate wins naturally over the wider bound RPQ
+// estimate. The RPQ consequently executes Confirm in both modes. C admits its
+// typed Production route; O forces only that already-selected route back to
+// the stable ordinary verb.
 #[cfg(rpq_confirm_admission_probe)]
 macro_rules! probe_rpq_confirm_query {
     ($store:expr, $fixture:expr) => {
         engine_query!(find!(
             (source: Inline<GenId>, target: Inline<GenId>),
             and!(
-                or!(
-                    pattern!($store, [{ ?source @ bench_schema::kind: (&($fixture).seed) }]),
-                    pattern!($store, [{ ?source @ bench_schema::kind: (&($fixture).alternate) }]),
-                ),
+                pattern!($store, [{ ?source @ bench_schema::kind: (&($fixture).seed) }]),
                 pattern!($store, [{ ?source @ bench_schema::confirm_candidate: ?target }]),
                 path!(
                     ($fixture).graph.clone(),
@@ -447,8 +414,6 @@ macro_rules! probe_rpq_confirm_query {
 
 struct Fixture {
     graph: TribleSet,
-    #[cfg(rpq_confirm_admission_probe)]
-    confirm_graph: TribleSet,
     components: Vec<Vec<Id>>,
     seed: Id,
     alternate: Id,
@@ -541,41 +506,8 @@ impl Fixture {
             }
         }
 
-        #[cfg(rpq_confirm_admission_probe)]
-        let confirm_graph = {
-            let mut confirm_graph = graph.clone();
-            // Every selected source gets one candidate. Position 0 mod 4 points
-            // to a local graph term; position 1 mod 4 points to the corresponding
-            // term in the next disconnected component. RPQ confirmation therefore
-            // retains exactly half of the one-candidate rows.
-            if components.len() >= 2 && ring_size >= 16 {
-                for (component_index, component) in components.iter().enumerate() {
-                    let remote = &components[(component_index + 1) % components.len()];
-                    for (position, source) in component.iter().enumerate() {
-                        if position % 4 > 1 {
-                            continue;
-                        }
-                        let target = if position % 4 == 0 {
-                            &component[(position + 1) % ring_size]
-                        } else {
-                            &remote[(position + 1) % ring_size]
-                        };
-                        insert_relation(
-                            &mut confirm_graph,
-                            source,
-                            &bench_schema::confirm_candidate,
-                            target,
-                        );
-                    }
-                }
-            }
-            confirm_graph
-        };
-
         Self {
             graph,
-            #[cfg(rpq_confirm_admission_probe)]
-            confirm_graph,
             components,
             seed,
             alternate,
@@ -657,27 +589,330 @@ impl Fixture {
         rows.sort_unstable();
         rows
     }
+}
 
-    #[cfg(rpq_confirm_admission_probe)]
-    fn rpq_confirm_admission_oracle(&self) -> Vec<Pair> {
-        assert!(
-            self.components.len() >= 2 && self.components[0].len() >= 16,
-            "RPQ confirm-admission probe needs >=2 components of >=16 nodes"
-        );
-        let mut rows = Vec::new();
-        for component in &self.components {
-            for (source_position, source) in component.iter().enumerate() {
-                if source_position % 4 != 0 {
-                    continue;
+#[cfg(rpq_confirm_admission_probe)]
+const CROSSOVER_COMPONENTS: usize = 8;
+#[cfg(rpq_confirm_admission_probe)]
+const CROSSOVER_CORE_NODES: usize = 64;
+#[cfg(rpq_confirm_admission_probe)]
+const CROSSOVER_SOURCES_PER_COMPONENT: usize = 32;
+#[cfg(rpq_confirm_admission_probe)]
+const CROSSOVER_CANDIDATES_PER_SIDE: usize = 8;
+#[cfg(rpq_confirm_admission_probe)]
+const CROSSOVER_CORE_FANOUT_PER_ATTRIBUTE: usize = 16;
+#[cfg(rpq_confirm_admission_probe)]
+const CROSSOVER_WIDTHS: [usize; 4] = [2, 4, 8, 16];
+#[cfg(rpq_confirm_admission_probe)]
+const CROSSOVER_PARENT_COUNT: usize = CROSSOVER_COMPONENTS * CROSSOVER_SOURCES_PER_COMPONENT;
+
+/// One fixed graph shared by every width cell.
+///
+/// Each of the eight disconnected components has a 64-node core whose `p`
+/// ring alone is strongly connected. Every selected core source owns eight
+/// reachable leaf targets. It also has eight decoy targets whose sole incoming
+/// graph edge comes from the corresponding source in the next component. A
+/// decoy therefore has byte-for-byte the same leaf geometry as a survivor but
+/// remains unreachable from the candidate's source.
+#[cfg(rpq_confirm_admission_probe)]
+struct CrossoverFixture {
+    graph: TribleSet,
+    components: Vec<Vec<Id>>,
+    sources: Vec<Id>,
+    local_targets: Vec<Vec<Id>>,
+    remote_targets: Vec<Vec<Id>>,
+    seed: Id,
+    graph_digest: u64,
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+struct CrossoverCell {
+    width: usize,
+    candidates: TribleSet,
+    expected: Vec<Pair>,
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+fn byte_digest<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> u64 {
+    chunks
+        .into_iter()
+        .fold(0xcbf2_9ce4_8422_2325, |mut hash, chunk| {
+            for &byte in chunk {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            hash
+        })
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+fn tribleset_byte_digest(set: &TribleSet) -> u64 {
+    let mut tribles: Vec<_> = set.iter().map(|trible| trible.data).collect();
+    tribles.sort_unstable();
+    byte_digest(tribles.iter().map(|trible| trible.as_slice()))
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+impl CrossoverFixture {
+    fn new() -> Self {
+        const CORE_NAMESPACE: u64 = 0xC055_0001_0000_0001;
+        const LOCAL_NAMESPACE: u64 = 0xC055_0001_0000_0002;
+        const REMOTE_NAMESPACE: u64 = 0xC055_0001_0000_0003;
+        const MARKER_NAMESPACE: u64 = 0xC055_0001_0000_0004;
+
+        let seed = fixture_id(MARKER_NAMESPACE, 0);
+        let components: Vec<Vec<Id>> = (0..CROSSOVER_COMPONENTS)
+            .map(|component| {
+                (0..CROSSOVER_CORE_NODES)
+                    .map(|position| {
+                        fixture_id(
+                            CORE_NAMESPACE,
+                            (component * CROSSOVER_CORE_NODES + position) as u64,
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        let sources: Vec<Id> = components
+            .iter()
+            .flat_map(|component| {
+                component
+                    .iter()
+                    .take(CROSSOVER_SOURCES_PER_COMPONENT)
+                    .copied()
+            })
+            .collect();
+        assert_eq!(sources.len(), CROSSOVER_PARENT_COUNT);
+
+        let target_table = |namespace| {
+            (0..CROSSOVER_PARENT_COUNT)
+                .map(|source| {
+                    (0..CROSSOVER_CANDIDATES_PER_SIDE)
+                        .map(|candidate| {
+                            fixture_id(
+                                namespace,
+                                (source * CROSSOVER_CANDIDATES_PER_SIDE + candidate) as u64,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let local_targets = target_table(LOCAL_NAMESPACE);
+        let remote_targets = target_table(REMOTE_NAMESPACE);
+
+        let mut graph = TribleSet::new();
+        for (component_index, component) in components.iter().enumerate() {
+            // `p` contains offset one, so each 64-node core is strongly
+            // connected. The disjoint p/q bands give every core node the same
+            // 32-way bound-endpoint estimate before its leaf edges.
+            for (position, source) in component.iter().enumerate() {
+                for offset in 1..=CROSSOVER_CORE_FANOUT_PER_ATTRIBUTE {
+                    insert_relation(
+                        &mut graph,
+                        source,
+                        &bench_schema::p,
+                        &component[(position + offset) % CROSSOVER_CORE_NODES],
+                    );
+                    insert_relation(
+                        &mut graph,
+                        source,
+                        &bench_schema::q,
+                        &component[(position + CROSSOVER_CORE_FANOUT_PER_ATTRIBUTE + offset)
+                            % CROSSOVER_CORE_NODES],
+                    );
                 }
-                rows.push((
-                    source.to_inline(),
-                    component[(source_position + 1) % component.len()].to_inline(),
-                ));
+            }
+
+            for source_position in 0..CROSSOVER_SOURCES_PER_COMPONENT {
+                let source_ordinal =
+                    component_index * CROSSOVER_SOURCES_PER_COMPONENT + source_position;
+                let source = &component[source_position];
+                let next_source =
+                    &components[(component_index + 1) % CROSSOVER_COMPONENTS][source_position];
+                for candidate in 0..CROSSOVER_CANDIDATES_PER_SIDE {
+                    let attribute = if candidate % 2 == 0 {
+                        &bench_schema::p
+                    } else {
+                        &bench_schema::q
+                    };
+                    insert_relation(
+                        &mut graph,
+                        source,
+                        attribute,
+                        &local_targets[source_ordinal][candidate],
+                    );
+                    // This decoy belongs to `source`'s candidate vocabulary,
+                    // but its sole graph parent is the corresponding source in
+                    // the next disconnected component.
+                    insert_relation(
+                        &mut graph,
+                        next_source,
+                        attribute,
+                        &remote_targets[source_ordinal][candidate],
+                    );
+                }
             }
         }
-        rows.sort_unstable();
-        rows
+
+        let all_targets: BTreeSet<_> = local_targets
+            .iter()
+            .chain(&remote_targets)
+            .flatten()
+            .map(|id| (*id).to_inline())
+            .collect();
+        assert_eq!(
+            all_targets.len(),
+            CROSSOVER_PARENT_COUNT * CROSSOVER_CANDIDATES_PER_SIDE * 2,
+            "leaf targets are not globally unique"
+        );
+        let mut graph_inverse_degree = BTreeMap::<Inline<GenId>, usize>::new();
+        for trible in graph.iter() {
+            let target = *trible.v::<GenId>();
+            if all_targets.contains(&target) {
+                *graph_inverse_degree.entry(target).or_default() += 1;
+            }
+        }
+        assert_eq!(graph_inverse_degree.len(), all_targets.len());
+        assert!(
+            graph_inverse_degree.values().all(|&degree| degree == 1),
+            "a leaf target does not have exact graph inverse degree one"
+        );
+
+        let graph_digest = tribleset_byte_digest(&graph);
+        Self {
+            graph,
+            components,
+            sources,
+            local_targets,
+            remote_targets,
+            seed,
+            graph_digest,
+        }
+    }
+
+    fn cell(&self, width: usize) -> CrossoverCell {
+        assert!(CROSSOVER_WIDTHS.contains(&width));
+        let side = width / 2;
+        let mut candidates = TribleSet::new();
+        let mut local_count = 0usize;
+        let mut remote_count = 0usize;
+
+        for (source_ordinal, source) in self.sources.iter().enumerate() {
+            insert_relation(&mut candidates, source, &bench_schema::kind, &self.seed);
+            for target in self.local_targets[source_ordinal].iter().take(side) {
+                insert_relation(
+                    &mut candidates,
+                    source,
+                    &bench_schema::confirm_candidate,
+                    target,
+                );
+                local_count += 1;
+            }
+            for target in self.remote_targets[source_ordinal].iter().take(side) {
+                insert_relation(
+                    &mut candidates,
+                    source,
+                    &bench_schema::confirm_candidate,
+                    target,
+                );
+                remote_count += 1;
+            }
+        }
+
+        let candidate_attribute = bench_schema::confirm_candidate.id();
+        let mut forward = BTreeMap::<Inline<GenId>, usize>::new();
+        let mut inverse = BTreeMap::<Inline<GenId>, usize>::new();
+        let mut candidate_facts = 0usize;
+        for trible in candidates.iter() {
+            if trible.a() != &candidate_attribute {
+                continue;
+            }
+            candidate_facts += 1;
+            *forward.entry(trible.e().to_inline()).or_default() += 1;
+            *inverse.entry(*trible.v::<GenId>()).or_default() += 1;
+        }
+        assert_eq!(candidate_facts, CROSSOVER_PARENT_COUNT * width);
+        assert_eq!(
+            inverse.len(),
+            candidate_facts,
+            "candidate targets are not distinct"
+        );
+        assert_eq!(forward.len(), CROSSOVER_PARENT_COUNT);
+        assert!(forward.values().all(|&count| count == width));
+        assert!(inverse.values().all(|&count| count == 1));
+        assert_eq!(local_count, CROSSOVER_PARENT_COUNT * side);
+        assert_eq!(remote_count, CROSSOVER_PARENT_COUNT * side);
+        assert_eq!(
+            tribleset_byte_digest(&self.graph),
+            self.graph_digest,
+            "a width cell mutated the fixed RPQ graph"
+        );
+        let expected = self.independent_oracle(&candidates);
+        assert_eq!(expected.len(), CROSSOVER_PARENT_COUNT * side);
+
+        CrossoverCell {
+            width,
+            candidates,
+            expected,
+        }
+    }
+
+    /// Direct nested reference semantics for the unchanged three-clause
+    /// query. This intentionally knows nothing about the local/remote target
+    /// tables used to construct the fixture: it reads marker and candidate
+    /// facts, computes graph reachability with a queue, and intersects the two
+    /// sets per source.
+    fn independent_oracle(&self, candidates: &TribleSet) -> Vec<Pair> {
+        let marker_attribute = bench_schema::kind.id();
+        let candidate_attribute = bench_schema::confirm_candidate.id();
+        let p = bench_schema::p.id();
+        let q = bench_schema::q.id();
+        let seed = self.seed.to_inline();
+
+        let mut marked = BTreeSet::new();
+        let mut proposed = BTreeMap::<Inline<GenId>, Vec<Inline<GenId>>>::new();
+        for trible in candidates.iter() {
+            let source = trible.e().to_inline();
+            if trible.a() == &marker_attribute && *trible.v::<GenId>() == seed {
+                marked.insert(source);
+            } else if trible.a() == &candidate_attribute {
+                proposed
+                    .entry(source)
+                    .or_default()
+                    .push(*trible.v::<GenId>());
+            }
+        }
+        assert_eq!(marked.len(), CROSSOVER_PARENT_COUNT);
+
+        let mut adjacency = BTreeMap::<Inline<GenId>, Vec<Inline<GenId>>>::new();
+        for trible in self.graph.iter() {
+            if trible.a() == &p || trible.a() == &q {
+                adjacency
+                    .entry(trible.e().to_inline())
+                    .or_default()
+                    .push(*trible.v::<GenId>());
+            }
+        }
+
+        let mut expected = BTreeSet::new();
+        for source in marked {
+            let mut reachable = BTreeSet::new();
+            let mut queue = VecDeque::from([source]);
+            while let Some(node) = queue.pop_front() {
+                for &target in adjacency.get(&node).into_iter().flatten() {
+                    if reachable.insert(target) {
+                        queue.push_back(target);
+                    }
+                }
+            }
+            for &target in proposed.get(&source).into_iter().flatten() {
+                if reachable.contains(&target) {
+                    expected.insert((source, target));
+                }
+            }
+        }
+        expected.into_iter().collect()
     }
 }
 
@@ -1167,6 +1402,25 @@ impl PrefixEvidence {
     }
 }
 
+#[cfg(all(engine_prefix_checkpoints, rpq_confirm_admission_probe))]
+fn main() {
+    let repetitions = parse_arg(1, 11);
+    assert!(
+        repetitions >= 3,
+        "use at least three balanced timing repetitions"
+    );
+    let timing_request = std::env::var("RPQ_CROSSOVER_TIMING").ok();
+    let run_timing = timing_request.as_deref() == Some("FLEET_IDLE_RELEASED");
+    assert!(
+        timing_request.is_none() || run_timing,
+        "RPQ_CROSSOVER_TIMING must equal FLEET_IDLE_RELEASED; correctness-only is the default"
+    );
+    println!("engine: {ENGINE}");
+    println!("revision: {REVISION}");
+    println!("timing_repetitions: {repetitions}; timing_enabled: {run_timing}");
+    run_rpq_confirm_crossover_probe(repetitions, run_timing);
+}
+
 #[cfg(engine_prefix_checkpoints)]
 fn pair_order_hash((left, right): &Pair) -> u64 {
     left.raw
@@ -1457,7 +1711,7 @@ fn probe_order_receipt(rows: &[Pair]) -> (Signature, u64) {
     (signature, ordered_digest)
 }
 
-#[cfg(rpq_confirm_admission_probe)]
+#[cfg(all(rpq_confirm_admission_probe, any()))]
 fn format_probe_stats(
     stats: &ResidualStateStats,
     callbacks: RpqConfirmAdmissionProbeSnapshot,
@@ -1533,7 +1787,7 @@ fn format_probe_stats(
     )
 }
 
-#[cfg(rpq_confirm_admission_probe)]
+#[cfg(all(rpq_confirm_admission_probe, any()))]
 fn probe_counter_cell<S: TriblePattern>(backend: &str, store: &S, fixture: &Fixture) {
     for mode in ProbeMode::ALL {
         mode.arm();
@@ -1549,7 +1803,7 @@ fn probe_counter_cell<S: TriblePattern>(backend: &str, store: &S, fixture: &Fixt
     }
 }
 
-#[cfg(rpq_confirm_admission_probe)]
+#[cfg(all(rpq_confirm_admission_probe, any()))]
 fn original_mixed_falsifier_cell<S: TriblePattern>(
     backend: &str,
     store: &S,
@@ -1613,7 +1867,7 @@ fn original_mixed_falsifier_cell<S: TriblePattern>(
     );
 }
 
-#[cfg(rpq_confirm_admission_probe)]
+#[cfg(all(rpq_confirm_admission_probe, any()))]
 fn causal_seam_assertion_cell<S: TriblePattern>(
     backend: &str,
     store: &S,
@@ -1688,7 +1942,7 @@ fn causal_seam_assertion_cell<S: TriblePattern>(
     );
 }
 
-#[cfg(rpq_confirm_admission_probe)]
+#[cfg(all(rpq_confirm_admission_probe, any()))]
 #[derive(Clone, Copy)]
 struct ProbeTimingSample {
     mode: ProbeMode,
@@ -1698,7 +1952,7 @@ struct ProbeTimingSample {
     total: Duration,
 }
 
-#[cfg(rpq_confirm_admission_probe)]
+#[cfg(all(rpq_confirm_admission_probe, any()))]
 fn probe_timing_cell<S: TriblePattern>(
     backend: &str,
     store: &S,
@@ -1831,7 +2085,7 @@ fn probe_timing_cell<S: TriblePattern>(
     }
 }
 
-#[cfg(rpq_confirm_admission_probe)]
+#[cfg(all(rpq_confirm_admission_probe, any()))]
 fn run_rpq_confirm_admission_probe(
     fixture: &Fixture,
     archive: &SuccinctArchive<OrderedUniverse>,
@@ -2000,10 +2254,696 @@ fn run_rpq_confirm_admission_probe(
         println!("probe timing skipped: RPQ_PROBE_COUNTER_ONLY is set");
     }
     rpq_confirm_admission_probe_force_ordinary(false);
-    rpq_confirm_admission_probe_prefer_external_bound_proposer(false);
 }
 
-#[cfg(engine_prefix_checkpoints)]
+#[cfg(rpq_confirm_admission_probe)]
+#[derive(Clone)]
+struct CrossoverRun {
+    rows: Vec<Pair>,
+    stats: ResidualStateStats,
+    callbacks: RpqConfirmAdmissionProbeSnapshot,
+    bound_confirm_batches: Vec<(u32, usize, usize)>,
+    forced_confirm_batches: Vec<(u32, usize, usize)>,
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+fn discover_crossover_target_token(backend: &str, cell: &CrossoverCell, run: &CrossoverRun) -> u32 {
+    let mut by_token = BTreeMap::<u32, Vec<(usize, usize)>>::new();
+    for &(token, parents, candidates) in &run.bound_confirm_batches {
+        by_token
+            .entry(token)
+            .or_default()
+            .push((parents, candidates));
+    }
+    let matches: Vec<_> = by_token
+        .iter()
+        .filter_map(|(&token, fragments)| {
+            let parents = fragments.iter().map(|fragment| fragment.0).sum::<usize>();
+            let candidates = fragments.iter().map(|fragment| fragment.1).sum::<usize>();
+            (parents == CROSSOVER_PARENT_COUNT
+                && candidates == CROSSOVER_PARENT_COUNT * cell.width
+                && fragments.iter().all(|&(parents, candidates)| {
+                    parents > 0 && candidates == parents * cell.width
+                }))
+            .then_some(token)
+        })
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "{backend}/k={}: expected exactly one request-local RPQ token with aggregate \
+         parents={} candidates={} and uniform width {}, observed {by_token:?}",
+        cell.width,
+        CROSSOVER_PARENT_COUNT,
+        CROSSOVER_PARENT_COUNT * cell.width,
+        cell.width,
+    );
+    matches[0]
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+fn assert_crossover_target_receipt(
+    backend: &str,
+    cell: &CrossoverCell,
+    token: u32,
+    run: &CrossoverRun,
+    expected_fragments: &[(usize, usize)],
+) {
+    let fragments: Vec<_> = run
+        .bound_confirm_batches
+        .iter()
+        .filter_map(|&(observed, parents, candidates)| {
+            (observed == token).then_some((parents, candidates))
+        })
+        .collect();
+    assert_eq!(
+        fragments, expected_fragments,
+        "{backend}/k={}: request-local target paging changed",
+        cell.width,
+    );
+    assert_eq!(
+        fragments.iter().map(|fragment| fragment.0).sum::<usize>(),
+        CROSSOVER_PARENT_COUNT,
+    );
+    assert_eq!(
+        fragments.iter().map(|fragment| fragment.1).sum::<usize>(),
+        CROSSOVER_PARENT_COUNT * cell.width,
+    );
+    assert_eq!(run.callbacks.target_batch_route_calls, fragments.len());
+    assert_eq!(run.callbacks.target_batch_parents, CROSSOVER_PARENT_COUNT);
+    assert_eq!(
+        run.callbacks.target_batch_candidates,
+        CROSSOVER_PARENT_COUNT * cell.width,
+    );
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+fn crossover_target_fragments_for(run: &CrossoverRun, token: u32) -> Vec<(usize, usize)> {
+    run.bound_confirm_batches
+        .iter()
+        .filter_map(|&(observed, parents, candidates)| {
+            (observed == token).then_some((parents, candidates))
+        })
+        .collect()
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+fn crossover_formula_shape(stats: &ResidualStateStats) -> (u64, usize, usize, usize) {
+    (
+        stats.probe_formula_fingerprint,
+        stats.probe_formula_nodes,
+        stats.probe_formula_roots,
+        stats.probe_residual_leaves,
+    )
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+fn crossover_graph_work(stats: &ResidualStateStats) -> (usize, usize) {
+    (
+        stats.delta_transition_candidates_examined,
+        stats.delta_source_candidates_examined,
+    )
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+fn run_crossover_mode<S: TriblePattern>(
+    backend: &str,
+    store: &S,
+    fixture: &CrossoverFixture,
+    cell: &CrossoverCell,
+    mode: ProbeMode,
+    repeat: usize,
+    target_token: Option<u32>,
+) -> CrossoverRun {
+    rpq_confirm_admission_probe_record_receipts(true);
+    rpq_confirm_admission_probe_reset_callbacks();
+    if let Some(token) = target_token {
+        rpq_confirm_admission_probe_target_action(
+            token,
+            CROSSOVER_PARENT_COUNT,
+            CROSSOVER_PARENT_COUNT * cell.width,
+        );
+    }
+    mode.arm();
+    let mut query = probe_mixed_query!(store, fixture, mode);
+    let rows: Vec<Pair> = query.by_ref().collect();
+    exact_check(rows.clone(), &cell.expected, mode.label(), backend);
+    let stats = query.stats().clone();
+    let callbacks = rpq_confirm_admission_probe_snapshot();
+    let bound_confirm_batches = rpq_confirm_admission_probe_bound_confirm_batches();
+    let forced_confirm_batches = rpq_confirm_admission_probe_forced_confirm_batches();
+    let (signature, order_digest) = probe_order_receipt(&rows);
+    println!(
+        "crossover_order backend={backend:?} width={} mode={} repeat={repeat} rows={} \
+         set_checksum={:#018x} order_digest={:#018x} first={} last={}",
+        cell.width,
+        mode.label(),
+        signature.rows,
+        signature.checksum,
+        order_digest,
+        render_pair(rows.first().copied()),
+        render_pair(rows.last().copied()),
+    );
+    println!(
+        "crossover_counters backend={backend:?} width={} mode={} \
+         formula_fingerprint={:#018x} formula_nodes={} formula_roots={} residual_leaves={} \
+         formula_filings={} formula_merges={} offers={} admissions={} deferred={} \
+         forced_declines={} activation_parents={} transition_pages={} \
+         transition_examined={} source_examined={} candidates_confirmed={} \
+         rpq_program_seed_confirm_calls={} rpq_program_seed_parents={} \
+         rpq_ordinary_confirm_calls={} rpq_ordinary_confirm_rows={} \
+         rpq_ordinary_candidates_in={} rpq_ordinary_candidates_out={} \
+         rpq_ordinary_propose_calls={} route_bound_confirm_calls={} route_forced_calls={} \
+         target_batch_route_calls={} bound_estimate_samples={} bound_estimate_min={} \
+         bound_estimate_max={} target_batch_parents={} target_batch_candidates={} \
+         bound_confirm_batches={:?} forced_confirm_batches={:?}",
+        cell.width,
+        mode.label(),
+        stats.probe_formula_fingerprint,
+        stats.probe_formula_nodes,
+        stats.probe_formula_roots,
+        stats.probe_residual_leaves,
+        stats.probe_formula_filings,
+        stats.probe_formula_bucket_merges,
+        stats.probe_program_offers,
+        stats.probe_program_admissions,
+        stats.probe_program_deferred,
+        stats.probe_forced_rpq_confirm_declines,
+        stats.probe_program_activation_parents_opened,
+        stats.delta_transition_pages,
+        stats.delta_transition_candidates_examined,
+        stats.delta_source_candidates_examined,
+        stats.candidates_confirmed,
+        callbacks.program_seed_confirm_calls,
+        callbacks.program_seed_parents,
+        callbacks.ordinary_confirm_calls,
+        callbacks.ordinary_confirm_rows,
+        callbacks.ordinary_confirm_candidates_in,
+        callbacks.ordinary_confirm_candidates_out,
+        callbacks.ordinary_propose_calls,
+        callbacks.route_bound_confirm_calls,
+        callbacks.route_forced_calls,
+        callbacks.target_batch_route_calls,
+        callbacks.bound_estimate_samples,
+        callbacks.bound_estimate_min,
+        callbacks.bound_estimate_max,
+        callbacks.target_batch_parents,
+        callbacks.target_batch_candidates,
+        bound_confirm_batches,
+        forced_confirm_batches,
+    );
+
+    CrossoverRun {
+        rows,
+        stats,
+        callbacks,
+        bound_confirm_batches,
+        forced_confirm_batches,
+    }
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+fn assert_natural_candidate_route(
+    backend: &str,
+    cell: &CrossoverCell,
+    certified: &CrossoverRun,
+    ordinary: &CrossoverRun,
+) {
+    let fail_selection = |mode: ProbeMode, run: &CrossoverRun, reason: &str| -> ! {
+        panic!(
+            "natural candidate selection failed for {backend}/k={}/{}: {reason}; \
+             exact candidate estimate={} observed bound-RPQ estimate samples={} min={} max={}",
+            cell.width,
+            mode.label(),
+            cell.width,
+            run.callbacks.bound_estimate_samples,
+            run.callbacks.bound_estimate_min,
+            run.callbacks.bound_estimate_max,
+        )
+    };
+
+    for (mode, run) in [
+        (ProbeMode::Certified, certified),
+        (ProbeMode::Ordinary, ordinary),
+    ] {
+        if run.callbacks.bound_estimate_samples == 0 {
+            fail_selection(
+                mode,
+                run,
+                "the planner never requested a bound RPQ estimate",
+            );
+        }
+        if run.callbacks.bound_estimate_min <= cell.width {
+            fail_selection(
+                mode,
+                run,
+                "the natural RPQ quote was not wider than the candidate predicate",
+            );
+        }
+        if run.callbacks.route_bound_confirm_calls == 0 {
+            fail_selection(mode, run, "no bound-endpoint RPQ Confirm route was offered");
+        }
+        if run.callbacks.ordinary_propose_calls != 0 {
+            fail_selection(
+                mode,
+                run,
+                "RPQ executed Propose, so the candidate predicate did not win",
+            );
+        }
+    }
+
+    assert_eq!(certified.stats.probe_forced_rpq_confirm_declines, 0);
+    assert_eq!(certified.callbacks.ordinary_confirm_calls, 0);
+    assert!(certified.forced_confirm_batches.is_empty());
+    let certified_fragments = certified.callbacks.target_batch_route_calls;
+    let ordinary_fragments = ordinary.callbacks.target_batch_route_calls;
+    assert_eq!(
+        certified.callbacks.target_batch_route_calls,
+        certified_fragments,
+    );
+    assert_eq!(
+        ordinary.callbacks.target_batch_route_calls,
+        ordinary_fragments
+    );
+    assert_eq!(ordinary.callbacks.route_forced_calls, ordinary_fragments);
+    assert_eq!(
+        ordinary.stats.probe_forced_rpq_confirm_declines,
+        ordinary_fragments,
+    );
+    let target_token = ordinary
+        .forced_confirm_batches
+        .first()
+        .map(|batch| batch.0)
+        .expect("O did not force the request-local target token");
+    assert!(
+        ordinary
+            .forced_confirm_batches
+            .iter()
+            .all(|batch| batch.0 == target_token),
+        "O forced more than one request-local token"
+    );
+    let targeted_batches: Vec<_> = ordinary
+        .bound_confirm_batches
+        .iter()
+        .copied()
+        .filter(|batch| batch.0 == target_token)
+        .collect();
+    assert_eq!(
+        ordinary.forced_confirm_batches, targeted_batches,
+        "O left a target fragment typed or forced a non-target fragment"
+    );
+    assert!(certified.callbacks.program_seed_confirm_calls >= certified_fragments);
+    assert!(certified.callbacks.program_seed_parents >= CROSSOVER_PARENT_COUNT);
+
+    assert_eq!(
+        ordinary.callbacks.ordinary_confirm_calls,
+        ordinary_fragments
+    );
+    assert_eq!(
+        ordinary.callbacks.ordinary_confirm_rows, CROSSOVER_PARENT_COUNT,
+        "O ordinary RPQ Confirm was not isolated to the exact selected-source batch"
+    );
+    assert_eq!(
+        ordinary.callbacks.ordinary_confirm_candidates_in,
+        CROSSOVER_PARENT_COUNT * cell.width,
+        "O did not receive the complete source-local candidate groups"
+    );
+    assert_eq!(
+        ordinary.callbacks.ordinary_confirm_candidates_out,
+        CROSSOVER_PARENT_COUNT * cell.width / 2,
+        "O did not retain exactly the local half"
+    );
+    assert_eq!(
+        crossover_formula_shape(&certified.stats),
+        crossover_formula_shape(&ordinary.stats),
+        "C/O compiled Formula topology diverged"
+    );
+    println!(
+        "crossover_route_verdict backend={backend:?} width={} candidate_estimate={} \
+         rpq_estimate_min={} rpq_estimate_max={} candidate_proposer_proven=true \
+         typed_confirm=true ordinary_confirm=true exact_half_survives=true \
+         formula_fingerprint_equal=true route_policy_total_effect=true \
+         certified_fragments={} ordinary_fragments={} non_target_forces=0",
+        cell.width,
+        cell.width,
+        certified.callbacks.bound_estimate_min,
+        certified.callbacks.bound_estimate_max,
+        certified_fragments,
+        ordinary_fragments,
+    );
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+fn correctness_backend<S: TriblePattern>(
+    backend: &str,
+    store: &S,
+    fixture: &CrossoverFixture,
+    cell: &CrossoverCell,
+) -> (CrossoverRun, CrossoverRun, u32) {
+    let certified_discovery =
+        run_crossover_mode(backend, store, fixture, cell, ProbeMode::Certified, 0, None);
+    let target_token = discover_crossover_target_token(backend, cell, &certified_discovery);
+    let certified = run_crossover_mode(
+        backend,
+        store,
+        fixture,
+        cell,
+        ProbeMode::Certified,
+        1,
+        Some(target_token),
+    );
+    assert_eq!(
+        certified_discovery.rows, certified.rows,
+        "same-cell C physical order changed on repeat for {backend}/k={}",
+        cell.width
+    );
+    let certified_fragments = crossover_target_fragments_for(&certified_discovery, target_token);
+    assert_crossover_target_receipt(
+        backend,
+        cell,
+        target_token,
+        &certified,
+        &certified_fragments,
+    );
+
+    let ordinary = run_crossover_mode(
+        backend,
+        store,
+        fixture,
+        cell,
+        ProbeMode::Ordinary,
+        0,
+        Some(target_token),
+    );
+    let ordinary_fragments = crossover_target_fragments_for(&ordinary, target_token);
+    let ordinary_repeat = run_crossover_mode(
+        backend,
+        store,
+        fixture,
+        cell,
+        ProbeMode::Ordinary,
+        1,
+        Some(target_token),
+    );
+    assert_eq!(
+        ordinary.rows, ordinary_repeat.rows,
+        "same-cell O physical order changed on repeat for {backend}/k={}",
+        cell.width
+    );
+    assert_crossover_target_receipt(backend, cell, target_token, &ordinary, &ordinary_fragments);
+    assert_eq!(
+        ordinary_repeat.forced_confirm_batches,
+        ordinary_repeat
+            .bound_confirm_batches
+            .iter()
+            .copied()
+            .filter(|batch| batch.0 == target_token)
+            .collect::<Vec<_>>(),
+        "repeat O force escaped or incompletely covered its request-local token"
+    );
+    assert_crossover_target_receipt(
+        backend,
+        cell,
+        target_token,
+        &ordinary_repeat,
+        &ordinary_fragments,
+    );
+    println!(
+        "crossover_fragment_receipt backend={backend:?} width={} token={} \
+         certified={certified_fragments:?} ordinary={ordinary_fragments:?} repeat_stable=true",
+        cell.width, target_token,
+    );
+    assert_natural_candidate_route(backend, cell, &certified, &ordinary);
+    println!(
+        "crossover_cross_route_order backend={backend:?} width={} equal={}",
+        cell.width,
+        certified.rows == ordinary.rows,
+    );
+    (certified, ordinary, target_token)
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CrossoverTimingPoint {
+    First,
+    Full,
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+impl CrossoverTimingPoint {
+    const ALL: [Self; 2] = [Self::First, Self::Full];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::First => "first",
+            Self::Full => "full",
+        }
+    }
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+#[derive(Clone, Copy)]
+struct CrossoverTimingSample {
+    mode: ProbeMode,
+    point: CrossoverTimingPoint,
+    duration: Duration,
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+fn timing_backend<S: TriblePattern>(
+    backend: &str,
+    store: &S,
+    fixture: &CrossoverFixture,
+    cell: &CrossoverCell,
+    target_token: u32,
+    repetitions: usize,
+) {
+    // Correctness has already frozen the request-token and fragment receipts.
+    // Keep the causal token switch armed, but remove diagnostic Vec growth
+    // from the measured route-policy total effect.
+    rpq_confirm_admission_probe_record_receipts(false);
+    let expected_signature = tally(cell.expected.iter().copied());
+    let order_a = [
+        ProbeMode::Certified,
+        ProbeMode::Ordinary,
+        ProbeMode::Ordinary,
+        ProbeMode::Certified,
+    ];
+    let order_b = [
+        ProbeMode::Ordinary,
+        ProbeMode::Certified,
+        ProbeMode::Certified,
+        ProbeMode::Ordinary,
+    ];
+
+    for mode in ProbeMode::ALL {
+        for point in CrossoverTimingPoint::ALL {
+            rpq_confirm_admission_probe_target_action(
+                target_token,
+                CROSSOVER_PARENT_COUNT,
+                CROSSOVER_PARENT_COUNT * cell.width,
+            );
+            mode.arm();
+            let mut query = probe_mixed_query!(store, fixture, mode);
+            match point {
+                CrossoverTimingPoint::First => {
+                    assert!(black_box(query.next()).is_some());
+                }
+                CrossoverTimingPoint::Full => {
+                    assert_eq!(black_box(tally(query.by_ref())), expected_signature);
+                }
+            }
+        }
+    }
+
+    let mut samples = Vec::with_capacity(repetitions * 16);
+    for repetition in 0..repetitions {
+        let order = if repetition % 2 == 0 {
+            order_a
+        } else {
+            order_b
+        };
+        let points = if repetition % 2 == 0 {
+            CrossoverTimingPoint::ALL
+        } else {
+            [CrossoverTimingPoint::Full, CrossoverTimingPoint::First]
+        };
+        for point in points {
+            for mode in order {
+                rpq_confirm_admission_probe_target_action(
+                    target_token,
+                    CROSSOVER_PARENT_COUNT,
+                    CROSSOVER_PARENT_COUNT * cell.width,
+                );
+                mode.arm();
+                let started = Instant::now();
+                let mut query = probe_mixed_query!(store, fixture, mode);
+                match point {
+                    CrossoverTimingPoint::First => {
+                        assert!(black_box(query.next()).is_some());
+                    }
+                    CrossoverTimingPoint::Full => {
+                        assert_eq!(black_box(tally(query.by_ref())), expected_signature);
+                    }
+                }
+                let duration = started.elapsed();
+                drop(query);
+                samples.push(CrossoverTimingSample {
+                    mode,
+                    point,
+                    duration,
+                });
+            }
+        }
+    }
+
+    for (sample, value) in samples.iter().enumerate() {
+        println!(
+            "crossover_raw backend={backend:?} width={} sample={sample} mode={} point={} ns={}",
+            cell.width,
+            value.mode.label(),
+            value.point.label(),
+            value.duration.as_nanos(),
+        );
+    }
+    for point in CrossoverTimingPoint::ALL {
+        for mode in ProbeMode::ALL {
+            let durations: Vec<_> = samples
+                .iter()
+                .filter(|sample| sample.mode == mode && sample.point == point)
+                .map(|sample| sample.duration.as_secs_f64())
+                .collect();
+            println!(
+                "crossover_summary backend={backend:?} width={} mode={} point={} primary={} \
+                 samples={} p50_us={:.3} p95_us={:.3}",
+                cell.width,
+                mode.label(),
+                point.label(),
+                point == CrossoverTimingPoint::Full,
+                durations.len(),
+                percentile(&durations, 0.50) * 1e6,
+                percentile(&durations, 0.95) * 1e6,
+            );
+        }
+    }
+    rpq_confirm_admission_probe_record_receipts(true);
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+fn run_rpq_confirm_crossover_probe(repetitions: usize, run_timing: bool) {
+    let built = Instant::now();
+    let fixture = CrossoverFixture::new();
+    let fixture_elapsed = built.elapsed();
+    assert_eq!(fixture.components.len(), CROSSOVER_COMPONENTS);
+    assert!(fixture
+        .components
+        .iter()
+        .all(|component| component.len() == CROSSOVER_CORE_NODES));
+    println!("probe: honest RPQ Confirm candidate-width crossover");
+    println!(
+        "fixture: components={} core_nodes={} selected_parents={} graph_tribles={} \
+         graph_digest={:#018x} built_ms={:.3}",
+        CROSSOVER_COMPONENTS,
+        CROSSOVER_CORE_NODES,
+        CROSSOVER_PARENT_COUNT,
+        fixture.graph.len(),
+        fixture.graph_digest,
+        fixture_elapsed.as_secs_f64() * 1e3,
+    );
+    println!(
+        "invariant: C and O both use Production lowering; O changes only an executed \
+         bound-endpoint RPQ Confirm route to ordinary. No estimate override exists."
+    );
+
+    let mut typed_work = BTreeMap::<&'static str, (usize, usize)>::new();
+    for width in CROSSOVER_WIDTHS {
+        let cell = fixture.cell(width);
+        let archive_started = Instant::now();
+        let archive: SuccinctArchive<OrderedUniverse> = (&cell.candidates).into();
+        let archive_elapsed = archive_started.elapsed();
+        println!(
+            "crossover_geometry width={} candidate_facts={} distinct_targets={} \
+             forward_groups={} forward_group_width={} inverse_group_width=1 \
+             local={} remote={} expected_survivors={} candidate_store_tribles={} \
+             graph_digest={:#018x} archive_build_ms={:.3}",
+            width,
+            CROSSOVER_PARENT_COUNT * width,
+            CROSSOVER_PARENT_COUNT * width,
+            CROSSOVER_PARENT_COUNT,
+            width,
+            CROSSOVER_PARENT_COUNT * width / 2,
+            CROSSOVER_PARENT_COUNT * width / 2,
+            cell.expected.len(),
+            cell.candidates.len(),
+            fixture.graph_digest,
+            archive_elapsed.as_secs_f64() * 1e3,
+        );
+
+        let (trible_c, trible_o, trible_token) =
+            correctness_backend("TribleSet", &cell.candidates, &fixture, &cell);
+        let (archive_c, archive_o, archive_token) =
+            correctness_backend("SuccinctArchive", &archive, &fixture, &cell);
+        println!(
+            "crossover_cross_backend_order width={} mode={} equal={}",
+            width,
+            ProbeMode::Certified.label(),
+            trible_c.rows == archive_c.rows,
+        );
+        println!(
+            "crossover_cross_backend_order width={} mode={} equal={}",
+            width,
+            ProbeMode::Ordinary.label(),
+            trible_o.rows == archive_o.rows,
+        );
+
+        for (backend, run) in [("TribleSet", &trible_c), ("SuccinctArchive", &archive_c)] {
+            let work = crossover_graph_work(&run.stats);
+            match typed_work.get(backend) {
+                Some(&baseline) => assert_eq!(
+                    work, baseline,
+                    "typed RPQ graph work changed across widths for {backend}: \
+                     baseline={baseline:?}, k={width} work={work:?}"
+                ),
+                None => {
+                    typed_work.insert(backend, work);
+                }
+            }
+            println!(
+                "crossover_typed_graph_work backend={backend:?} width={} \
+                 transition_examined={} source_examined={} constant_so_far=true",
+                width, work.0, work.1,
+            );
+        }
+
+        if run_timing {
+            timing_backend(
+                "TribleSet",
+                &cell.candidates,
+                &fixture,
+                &cell,
+                trible_token,
+                repetitions,
+            );
+            timing_backend(
+                "SuccinctArchive",
+                &archive,
+                &fixture,
+                &cell,
+                archive_token,
+                repetitions,
+            );
+        }
+    }
+    if !run_timing {
+        println!(
+            "timing withheld: set RPQ_CROSSOVER_TIMING=FLEET_IDLE_RELEASED only after an \
+             explicit fleet-idle release"
+        );
+    }
+    rpq_confirm_admission_probe_force_ordinary(false);
+}
+
+#[cfg(all(engine_prefix_checkpoints, not(rpq_confirm_admission_probe)))]
 fn main() {
     let component_count = parse_arg(1, 32);
     let ring_size = parse_arg(2, 64);
