@@ -83,6 +83,8 @@
 //! canonical descriptor and its stored paths a total description of the future
 //! computation while row values remain payload.
 
+#[cfg(all(test, formula_prepared_continuation_probe))]
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
@@ -145,6 +147,55 @@ fn formula_delta_transport_probe_forces(stage: FormulaStage) -> bool {
         }
         value if value == FormulaDeltaTransportProbeSelector::StableAll as u8 => true,
         value => panic!("invalid Formula delta-transport probe selector {value}"),
+    }
+}
+
+/// Runtime selector for the cfg-only prepared Formula-continuation probe.
+///
+/// `Filed` is the exact control: every Formula successor enters the canonical
+/// worklist at the transition boundary. `Owned` delays only the physical
+/// insertion of Formula-to-Formula tails while preserving descriptor
+/// interning, rank, and continuation arbitration at that same boundary.
+#[cfg(formula_prepared_continuation_probe)]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum FormulaPreparedContinuationProbeSelector {
+    Filed = 0,
+    Owned = 1,
+}
+
+#[cfg(all(formula_prepared_continuation_probe, not(test)))]
+static FORMULA_PREPARED_CONTINUATION_PROBE_SELECTOR: AtomicU8 =
+    AtomicU8::new(FormulaPreparedContinuationProbeSelector::Filed as u8);
+
+#[cfg(all(formula_prepared_continuation_probe, test))]
+thread_local! {
+    static FORMULA_PREPARED_CONTINUATION_PROBE_SELECTOR: Cell<u8> =
+        const { Cell::new(FormulaPreparedContinuationProbeSelector::Filed as u8) };
+}
+
+#[cfg(formula_prepared_continuation_probe)]
+#[doc(hidden)]
+pub fn formula_prepared_continuation_probe_select(
+    selector: FormulaPreparedContinuationProbeSelector,
+) {
+    #[cfg(not(test))]
+    FORMULA_PREPARED_CONTINUATION_PROBE_SELECTOR.store(selector as u8, Ordering::Relaxed);
+    #[cfg(test)]
+    FORMULA_PREPARED_CONTINUATION_PROBE_SELECTOR.with(|selected| selected.set(selector as u8));
+}
+
+#[cfg(formula_prepared_continuation_probe)]
+fn formula_prepared_continuation_probe_owns() -> bool {
+    #[cfg(not(test))]
+    let selected = FORMULA_PREPARED_CONTINUATION_PROBE_SELECTOR.load(Ordering::Relaxed);
+    #[cfg(test)]
+    let selected = FORMULA_PREPARED_CONTINUATION_PROBE_SELECTOR.with(Cell::get);
+    match selected {
+        value if value == FormulaPreparedContinuationProbeSelector::Filed as u8 => false,
+        value if value == FormulaPreparedContinuationProbeSelector::Owned as u8 => true,
+        value => panic!("invalid prepared Formula-continuation probe selector {value}"),
     }
 }
 
@@ -2765,6 +2816,39 @@ pub struct ResidualStateStats {
     /// Parent rows carried by probe-only Formula state reentries.
     #[cfg(formula_delta_transport_probe)]
     pub probe_formula_rows_reentered: usize,
+    /// Formula successor receipts physically retained outside the worklist.
+    #[cfg(formula_prepared_continuation_probe)]
+    pub probe_formula_prepared_receipts: usize,
+    /// Parent rows initially carried by prepared Formula receipts.
+    #[cfg(formula_prepared_continuation_probe)]
+    pub probe_formula_prepared_rows: usize,
+    /// Candidate occurrences initially carried by prepared Formula receipts.
+    #[cfg(formula_prepared_continuation_probe)]
+    pub probe_formula_prepared_candidates: usize,
+    /// Exact scheduling atoms initially carried by prepared Formula receipts.
+    #[cfg(formula_prepared_continuation_probe)]
+    pub probe_formula_prepared_atoms: usize,
+    /// Prepared receipts appended under an equal canonical `(rank, StateId)`.
+    #[cfg(formula_prepared_continuation_probe)]
+    pub probe_formula_prepared_equal_key_appends: usize,
+    /// Prepared scheduling atoms eventually inserted into the worklist.
+    #[cfg(formula_prepared_continuation_probe)]
+    pub probe_formula_prepared_atoms_committed: usize,
+    /// Prepared scheduling atoms transferred directly into executor tasks.
+    #[cfg(formula_prepared_continuation_probe)]
+    pub probe_formula_prepared_atoms_consumed: usize,
+    /// Prepared tails flushed before a parallel split negotiation.
+    #[cfg(formula_prepared_continuation_probe)]
+    pub probe_formula_prepared_split_flushes: usize,
+    /// ProbeOne pops served directly from a prepared Formula tail.
+    #[cfg(formula_prepared_continuation_probe)]
+    pub probe_formula_prepared_probe_one_pops: usize,
+    /// Cohort pops served directly from a prepared Formula tail.
+    #[cfg(formula_prepared_continuation_probe)]
+    pub probe_formula_prepared_cohort_pops: usize,
+    /// Preparation-time checks that retained the exact descriptor and rank.
+    #[cfg(formula_prepared_continuation_probe)]
+    pub probe_formula_prepared_identity_checks: usize,
     /// Focused Formula Atom actions offered to delta transport.
     #[cfg(formula_delta_transport_probe)]
     pub probe_formula_delta_attempts: usize,
@@ -7532,14 +7616,6 @@ impl SetAdmissionDestination {
         *destination = candidates;
     }
 
-    fn into_live_bucket(self, stride: usize) -> Option<StateBucket> {
-        match self {
-            Self::Formula(batch) => Some(StateBucket::Formula(batch)),
-            Self::Candidate(batch) => batch
-                .compact(stride)
-                .map(StateBucket::Candidates),
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -7879,13 +7955,55 @@ type Worklist = BTreeMap<usize, BTreeMap<StateId, StateBucket>>;
 /// receipts in one transition reduction are coalesced by occupancy, so the
 /// selected token names their complete appended tail without consuming older
 /// work already present under the same canonical key.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
+#[cfg_attr(not(formula_prepared_continuation_probe), derive(Copy, Eq, PartialEq))]
 struct ContinuationToken {
     rank: usize,
     state: StateId,
     rows: usize,
     candidates: usize,
+    #[cfg(formula_prepared_continuation_probe)]
+    storage: ContinuationStorage,
 }
+
+/// A Formula tail whose canonical identity already exists but whose affine
+/// payload has not entered the ordinary worklist.
+#[cfg(formula_prepared_continuation_probe)]
+#[derive(Clone, Debug)]
+struct PreparedFormulaContinuation {
+    batch: FormulaBatch,
+    /// Whether the descriptor was already interned at the original filing
+    /// point. Delayed insertion must not turn a genuinely new state into a
+    /// physical reentry merely because preparation itself interned it.
+    known_at_prepare: bool,
+    candidate_pages: bool,
+    stride: usize,
+}
+
+#[cfg(formula_prepared_continuation_probe)]
+#[derive(Clone, Debug)]
+enum ContinuationStorage {
+    Filed,
+    Owned(PreparedFormulaContinuation),
+}
+
+#[cfg(formula_prepared_continuation_probe)]
+impl PartialEq for ContinuationToken {
+    fn eq(&self, other: &Self) -> bool {
+        self.rank == other.rank
+            && self.state == other.state
+            && self.rows == other.rows
+            && self.candidates == other.candidates
+            && matches!(
+                (&self.storage, &other.storage),
+                (ContinuationStorage::Filed, ContinuationStorage::Filed)
+                    | (ContinuationStorage::Owned(_), ContinuationStorage::Owned(_))
+            )
+    }
+}
+
+#[cfg(formula_prepared_continuation_probe)]
+impl Eq for ContinuationToken {}
 
 /// Physical scheduling policy for one exact continuation receipt.
 ///
@@ -7899,7 +8017,8 @@ enum ContinuationMode {
     ProbeOne,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(not(formula_prepared_continuation_probe), derive(Copy))]
 struct ActiveContinuation {
     token: ContinuationToken,
     mode: ContinuationMode,
@@ -7922,8 +8041,19 @@ impl ActiveContinuation {
 }
 
 impl ContinuationToken {
+    fn filed(rank: usize, state: StateId, rows: usize, candidates: usize) -> Self {
+        Self {
+            rank,
+            state,
+            rows,
+            candidates,
+            #[cfg(formula_prepared_continuation_probe)]
+            storage: ContinuationStorage::Filed,
+        }
+    }
+
     fn occupancy(
-        self,
+        &self,
         desc: &StateDesc,
         plan: &ResidualPlan,
         formula_pcs: &FormulaPcInterner,
@@ -7935,14 +8065,35 @@ impl ContinuationToken {
         }
     }
 
-    fn scheduling_key(self) -> (usize, StateId) {
+    fn scheduling_key(&self) -> (usize, StateId) {
         (self.rank, self.state)
+    }
+
+    #[cfg(formula_prepared_continuation_probe)]
+    fn owned_atoms(&self) -> usize {
+        match &self.storage {
+            ContinuationStorage::Filed => 0,
+            ContinuationStorage::Owned(prepared) => {
+                if prepared.candidate_pages {
+                    self.candidates
+                } else {
+                    self.rows
+                }
+            }
+        }
+    }
+
+    #[cfg(formula_prepared_continuation_probe)]
+    fn is_owned(&self) -> bool {
+        matches!(&self.storage, ContinuationStorage::Owned(_))
     }
 }
 
 fn prefer_continuation(
     selected: &mut Option<ContinuationToken>,
     candidate: Option<ContinuationToken>,
+    worklist: &mut Worklist,
+    stats: &mut ResidualStateStats,
 ) {
     let Some(candidate) = candidate else {
         return;
@@ -7952,8 +8103,13 @@ fn prefer_continuation(
         return;
     };
     match candidate.scheduling_key().cmp(&current.scheduling_key()) {
-        std::cmp::Ordering::Less => {}
-        std::cmp::Ordering::Greater => *current = candidate,
+        std::cmp::Ordering::Less => {
+            commit_prepared_continuation(candidate, worklist, stats);
+        }
+        std::cmp::Ordering::Greater => {
+            let old = std::mem::replace(current, candidate);
+            commit_prepared_continuation(old, worklist, stats);
+        }
         std::cmp::Ordering::Equal => {
             // No scheduler pop can interleave one continuation reduction.
             // Equal keys therefore name successive appends to the same bucket,
@@ -7966,10 +8122,132 @@ fn prefer_continuation(
                 .candidates
                 .checked_add(candidate.candidates)
                 .expect("continuation receipt candidate occupancy overflow");
-            current.rows = rows;
-            current.candidates = candidates;
+            merge_equal_continuations(current, candidate, rows, candidates, worklist, stats);
         }
     }
+}
+
+#[cfg(not(formula_prepared_continuation_probe))]
+#[inline]
+fn commit_prepared_continuation(
+    _continuation: ContinuationToken,
+    _worklist: &mut Worklist,
+    _stats: &mut ResidualStateStats,
+) {
+}
+
+#[cfg(not(formula_prepared_continuation_probe))]
+#[inline]
+fn merge_equal_continuations(
+    current: &mut ContinuationToken,
+    _candidate: ContinuationToken,
+    rows: usize,
+    candidates: usize,
+    _worklist: &mut Worklist,
+    _stats: &mut ResidualStateStats,
+) {
+    current.rows = rows;
+    current.candidates = candidates;
+}
+
+#[cfg(formula_prepared_continuation_probe)]
+fn insert_prepared_formula(
+    rank: usize,
+    state: StateId,
+    rows: usize,
+    candidates: usize,
+    prepared: PreparedFormulaContinuation,
+    worklist: &mut Worklist,
+    stats: &mut ResidualStateStats,
+) {
+    #[cfg(formula_delta_transport_probe)]
+    {
+        stats.probe_formula_filings += 1;
+    }
+    let level = worklist.entry(rank).or_default();
+    let bucket = StateBucket::Formula(prepared.batch);
+    if let Some(existing) = level.get_mut(&state) {
+        stats.bucket_merges += 1;
+        stats.rows_merged += rows;
+        #[cfg(formula_delta_transport_probe)]
+        {
+            stats.probe_formula_bucket_merges += 1;
+        }
+        existing.append(bucket);
+    } else {
+        if prepared.known_at_prepare {
+            stats.state_reentries += 1;
+            stats.rows_reentered += rows;
+            #[cfg(formula_delta_transport_probe)]
+            {
+                stats.probe_formula_state_reentries += 1;
+                stats.probe_formula_rows_reentered += rows;
+            }
+        }
+        level.insert(state, bucket);
+    }
+    let atoms = if prepared.candidate_pages {
+        candidates
+    } else {
+        rows
+    };
+    stats.probe_formula_prepared_atoms_committed = stats
+        .probe_formula_prepared_atoms_committed
+        .checked_add(atoms)
+        .expect("prepared Formula committed-atom count overflow");
+}
+
+#[cfg(formula_prepared_continuation_probe)]
+fn commit_prepared_continuation(
+    continuation: ContinuationToken,
+    worklist: &mut Worklist,
+    stats: &mut ResidualStateStats,
+) {
+    let ContinuationToken {
+        rank,
+        state,
+        rows,
+        candidates,
+        storage,
+    } = continuation;
+    if let ContinuationStorage::Owned(prepared) = storage {
+        insert_prepared_formula(rank, state, rows, candidates, prepared, worklist, stats);
+    }
+}
+
+#[cfg(formula_prepared_continuation_probe)]
+fn merge_equal_continuations(
+    current: &mut ContinuationToken,
+    candidate: ContinuationToken,
+    rows: usize,
+    candidates: usize,
+    _worklist: &mut Worklist,
+    stats: &mut ResidualStateStats,
+) {
+    use ContinuationStorage::{Filed, Owned};
+    let ContinuationToken {
+        rank: candidate_rank,
+        state: candidate_state,
+        storage: candidate_storage,
+        ..
+    } = candidate;
+    debug_assert_eq!((candidate_rank, candidate_state), current.scheduling_key());
+
+    match (&mut current.storage, candidate_storage) {
+        (Owned(left), Owned(right)) => {
+            assert_eq!(left.candidate_pages, right.candidate_pages);
+            assert_eq!(left.stride, right.stride);
+            left.batch.append(right.batch);
+            stats.probe_formula_prepared_equal_key_appends += 1;
+        }
+        (Filed, Filed) => {}
+        (Filed, Owned(_)) | (Owned(_), Filed) => panic!(
+            "Formula continuation storage changed during one query run; \
+             select Filed or Owned before constructing the query"
+        ),
+    }
+    current.rows = rows;
+    current.candidates = candidates;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -8031,12 +8309,7 @@ fn file_with_span(
         }
         level.insert(id, bucket);
     }
-    Some(ContinuationToken {
-        rank,
-        state: id,
-        rows,
-        candidates,
-    })
+    Some(ContinuationToken::filed(rank, id, rows, candidates))
 }
 
 fn file_with_plan(
@@ -8057,6 +8330,124 @@ fn file_with_plan(
         bucket,
         stats,
     )
+}
+
+/// Unified canonical Formula-successor sink. Direct Formula transitions and
+/// deferred SET-admission returns both cross this seam. The control mode
+/// delegates to ordinary filing. Probe mode interns the exact same descriptor
+/// at the exact same point, but retains the affine Formula payload in the
+/// returned receipt.
+fn file_formula_continuation_with_plan(
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    plan: &ResidualPlan,
+    desc: StateDesc,
+    batch: FormulaBatch,
+    stats: &mut ResidualStateStats,
+) -> Option<ContinuationToken> {
+    #[cfg(formula_prepared_continuation_probe)]
+    if formula_prepared_continuation_probe_owns() {
+        let rows = batch.parents.row_count;
+        if rows == 0 {
+            return None;
+        }
+        assert!(
+            matches!(&desc.phase, ResidualPhase::Formula { .. }),
+            "prepared Formula sink received a non-Formula descriptor"
+        );
+        let candidates = batch.page_candidate_count();
+        let candidate_pages = desc.uses_candidate_pages(plan, &interner.formula_pcs);
+        let atoms = if candidate_pages { candidates } else { rows };
+        assert!(
+            atoms > 0,
+            "prepared Formula continuation has no scheduling atoms"
+        );
+        let rank = desc.rank_with_span(
+            plan.len(),
+            plan.action_span(),
+            Some(&plan.finite_formula),
+            &interner.formula_pcs,
+        );
+        let expected_desc = desc.clone();
+        let (state, known_at_prepare) = interner.intern_with_status(desc, stats);
+        debug_assert_eq!(interner.get(state), &expected_desc);
+        debug_assert_eq!(
+            interner.get(state).rank_with_span(
+                plan.len(),
+                plan.action_span(),
+                Some(&plan.finite_formula),
+                &interner.formula_pcs,
+            ),
+            rank,
+            "prepared Formula continuation changed canonical rank"
+        );
+        stats.probe_formula_prepared_receipts += 1;
+        stats.probe_formula_prepared_rows = stats
+            .probe_formula_prepared_rows
+            .checked_add(rows)
+            .expect("prepared Formula row count overflow");
+        stats.probe_formula_prepared_candidates = stats
+            .probe_formula_prepared_candidates
+            .checked_add(candidates)
+            .expect("prepared Formula candidate count overflow");
+        stats.probe_formula_prepared_atoms = stats
+            .probe_formula_prepared_atoms
+            .checked_add(atoms)
+            .expect("prepared Formula atom count overflow");
+        stats.probe_formula_prepared_identity_checks += 1;
+        return Some(ContinuationToken {
+            rank,
+            state,
+            rows,
+            candidates,
+            storage: ContinuationStorage::Owned(PreparedFormulaContinuation {
+                batch,
+                known_at_prepare,
+                candidate_pages,
+                stride: expected_desc.bound.count(),
+            }),
+        });
+    }
+
+    file_with_plan(
+        worklist,
+        interner,
+        plan,
+        desc,
+        StateBucket::Formula(batch),
+        stats,
+    )
+}
+
+/// Files one completed SET-admission destination without erasing whether its
+/// stable successor is Formula work. The Formula arm must cross the same
+/// prepared-receipt seam as direct Formula-to-Formula transitions; otherwise
+/// one query run could manufacture mixed Filed/Owned continuation tokens.
+fn file_set_admission_destination_with_plan(
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    plan: &ResidualPlan,
+    successor: StateDesc,
+    destination: SetAdmissionDestination,
+    stats: &mut ResidualStateStats,
+) -> Option<ContinuationToken> {
+    match destination {
+        SetAdmissionDestination::Formula(batch) => file_formula_continuation_with_plan(
+            worklist, interner, plan, successor, batch, stats,
+        ),
+        SetAdmissionDestination::Candidate(batch) => batch
+            .compact(successor.bound.count())
+            .and_then(|batch| {
+                file_with_plan(
+                    worklist,
+                    interner,
+                    plan,
+                    successor,
+                    StateBucket::Candidates(batch),
+                    stats,
+                )
+            }),
+    }
 }
 
 #[cfg(test)]
@@ -8340,7 +8731,11 @@ fn ready_plan_transition<'a>(
     }
     stats.ready_proposal_groups += groups.len();
 
-    let mut file_propose_group = |action: ProposeAction, selected: RowBatch| {
+    let file_propose_group = |action: ProposeAction,
+                              selected: RowBatch,
+                              worklist: &mut Worklist,
+                              interner: &mut StateInterner,
+                              stats: &mut ResidualStateStats| {
         let variable_plan = &plans[action.variable_plan];
         file_with_plan(
             worklist,
@@ -8364,12 +8759,14 @@ fn ready_plan_transition<'a>(
         debug_assert_eq!(indices.len(), rows.row_count);
         // The common case transfers ownership of the whole parent block:
         // no row copy is necessary when every row chose the same action.
-        file_propose_group(action, rows).expect("Ready planning filed an empty action")
+        file_propose_group(action, rows, worklist, interner, stats)
+            .expect("Ready planning filed an empty action")
     } else {
         let mut continuation = None;
         for (action, indices) in groups {
             let selected = rows.selected(vars.len(), &indices);
-            prefer_continuation(&mut continuation, file_propose_group(action, selected));
+            let candidate = file_propose_group(action, selected, worklist, interner, stats);
+            prefer_continuation(&mut continuation, candidate, worklist, stats);
         }
         continuation.expect("Ready planning filed no action")
     }
@@ -8411,7 +8808,7 @@ fn propose_action_transition<'a>(
             },
             proposer_checked,
         );
-        return file_with_plan(
+        return file_formula_continuation_with_plan(
             worklist,
             interner,
             plan,
@@ -8419,11 +8816,11 @@ fn propose_action_transition<'a>(
                 bound: desc.bound,
                 phase: ResidualPhase::Formula { counter },
             },
-            StateBucket::Formula(FormulaBatch::from_proposal(
+            FormulaBatch::from_proposal(
                 rows,
                 activations,
                 &plan.finite_formula.node(formula_root).kind,
-            )),
+            ),
             stats,
         );
     }
@@ -8646,7 +9043,11 @@ fn candidate_plan_transition<'a>(
     }
     stats.candidate_confirmation_groups += confirmer_groups.count();
 
-    let mut file_confirm_group = |confirmer: usize, selected: CandidateBatch| {
+    let file_confirm_group = |confirmer: usize,
+                              selected: CandidateBatch,
+                              worklist: &mut Worklist,
+                              interner: &mut StateInterner,
+                              stats: &mut ResidualStateStats| {
         file_with_plan(
             worklist,
             interner,
@@ -8669,11 +9070,13 @@ fn candidate_plan_transition<'a>(
     if confirmers.iter().all(|&leaf| leaf == first) {
         // The common case keeps ownership of the whole ragged block: no
         // parent copy, candidate rescan, or row-tag remap is necessary.
-        file_confirm_group(first, batch).expect("Candidate planning filed an empty action")
+        file_confirm_group(first, batch, worklist, interner, stats)
+            .expect("Candidate planning filed an empty action")
     } else {
         let mut continuation = None;
         for (leaf, selected) in batch.partition(vars.len(), &confirmers) {
-            prefer_continuation(&mut continuation, file_confirm_group(leaf, selected));
+            let candidate = file_confirm_group(leaf, selected, worklist, interner, stats);
+            prefer_continuation(&mut continuation, candidate, worklist, stats);
         }
         continuation.expect("Candidate planning filed no action")
     }
@@ -8727,12 +9130,12 @@ fn confirm_action_transition<'a>(
             }));
             return None;
         }
-        return file_with_plan(
+        return file_formula_continuation_with_plan(
             worklist,
             interner,
             plan,
             successor,
-            StateBucket::Formula(formula_batch),
+            formula_batch,
             stats,
         );
     }
@@ -8944,7 +9347,7 @@ fn propagate_formula_support(
                     reducer_seeds,
                 );
             }
-            file_with_plan(
+            file_formula_continuation_with_plan(
                 worklist,
                 interner,
                 plan,
@@ -8952,7 +9355,7 @@ fn propagate_formula_support(
                     bound: desc.bound,
                     phase: ResidualPhase::Formula { counter: parent },
                 },
-                StateBucket::Formula(batch),
+                batch,
                 stats,
             )
         }
@@ -9018,19 +9421,17 @@ fn propagate_formula_support(
                 } else {
                     next
                 };
-                prefer_continuation(
-                    &mut continuation,
-                    continue_formula_transition(
-                        plan,
-                        desc,
-                        next,
-                        batch,
-                        worklist,
-                        interner,
-                        stats,
-                        reducer_seeds,
-                    ),
+                let candidate = continue_formula_transition(
+                    plan,
+                    desc,
+                    next,
+                    batch,
+                    worklist,
+                    interner,
+                    stats,
+                    reducer_seeds,
                 );
+                prefer_continuation(&mut continuation, candidate, worklist, stats);
             }
             continuation
         }
@@ -9098,19 +9499,17 @@ fn continue_formula_transition(
             if live.iter().any(|&is_live| is_live != first) {
                 let mut continuation = None;
                 for (_, batch) in batch.partition(desc.bound.count(), &live) {
-                    prefer_continuation(
-                        &mut continuation,
-                        continue_formula_transition(
-                            plan,
-                            desc,
-                            counter,
-                            batch,
-                            worklist,
-                            interner,
-                            stats,
-                            reducer_seeds,
-                        ),
+                    let candidate = continue_formula_transition(
+                        plan,
+                        desc,
+                        counter,
+                        batch,
+                        worklist,
+                        interner,
+                        stats,
+                        reducer_seeds,
                     );
+                    prefer_continuation(&mut continuation, candidate, worklist, stats);
                 }
                 return continuation;
             }
@@ -9169,13 +9568,8 @@ fn continue_formula_transition(
             }));
             return None;
         }
-        return file_with_plan(
-            worklist,
-            interner,
-            plan,
-            successor,
-            StateBucket::Formula(batch),
-            stats,
+        return file_formula_continuation_with_plan(
+            worklist, interner, plan, successor, batch, stats,
         );
     }
 
@@ -9691,19 +10085,17 @@ fn formula_or_plan_transition<'a>(
         let next = interner
             .formula_pcs
             .guard_child(&plan.finite_formula, counter, child);
-        prefer_continuation(
-            &mut continuation,
-            continue_formula_transition(
-                plan,
-                desc,
-                next,
-                batch,
-                worklist,
-                interner,
-                stats,
-                reducer_seeds,
-            ),
+        let candidate = continue_formula_transition(
+            plan,
+            desc,
+            next,
+            batch,
+            worklist,
+            interner,
+            stats,
+            reducer_seeds,
         );
+        prefer_continuation(&mut continuation, candidate, worklist, stats);
     }
     continuation
 }
@@ -9869,19 +10261,17 @@ fn formula_and_plan_transition<'a>(
             child,
         );
         enter_selected_formula_frame(&plan.finite_formula, interner.formula(selected), &mut batch);
-        prefer_continuation(
-            &mut continuation,
-            continue_formula_transition(
-                plan,
-                desc,
-                selected,
-                batch,
-                worklist,
-                interner,
-                stats,
-                reducer_seeds,
-            ),
+        let candidate = continue_formula_transition(
+            plan,
+            desc,
+            selected,
+            batch,
+            worklist,
+            interner,
+            stats,
+            reducer_seeds,
         );
+        prefer_continuation(&mut continuation, candidate, worklist, stats);
     }
     continuation
 }
@@ -9993,20 +10383,18 @@ fn formula_action_transition<'a>(
         let completed = interner.formula_pcs.complete(&plan.finite_formula, counter);
         let mut continuation = None;
         for (truth, batch) in batch.partition(vars.len(), &support) {
-            prefer_continuation(
-                &mut continuation,
-                propagate_formula_support(
-                    plan,
-                    desc,
-                    completed,
-                    truth,
-                    batch,
-                    worklist,
-                    interner,
-                    stats,
-                    reducer_seeds,
-                ),
+            let candidate = propagate_formula_support(
+                plan,
+                desc,
+                completed,
+                truth,
+                batch,
+                worklist,
+                interner,
+                stats,
+                reducer_seeds,
             );
+            prefer_continuation(&mut continuation, candidate, worklist, stats);
         }
         return continuation;
     }
@@ -11136,6 +11524,10 @@ impl ResidualStateMachine {
         width: usize,
     ) -> SelectedResidualTask {
         let ActiveContinuation { token, mode } = active;
+        #[cfg(formula_prepared_continuation_probe)]
+        if token.is_owned() {
+            return self.take_owned_formula_continuation(plan, token, mode, width);
+        }
         let desc = self.interner.get(token.state).clone();
         assert_eq!(
             desc.rank_with_span(
@@ -11205,6 +11597,111 @@ impl ResidualStateMachine {
         }
     }
 
+    /// Executes the selected tail directly from a prepared Formula receipt.
+    /// Any unselected prefix is committed before the selected tail crosses the
+    /// executor boundary, so no logical work remains detached except the
+    /// currently directed continuation itself.
+    #[cfg(formula_prepared_continuation_probe)]
+    fn take_owned_formula_continuation(
+        &mut self,
+        plan: &ResidualPlan,
+        token: ContinuationToken,
+        mode: ContinuationMode,
+        width: usize,
+    ) -> SelectedResidualTask {
+        let ContinuationToken {
+            rank,
+            state,
+            rows,
+            candidates,
+            storage,
+        } = token;
+        let ContinuationStorage::Owned(mut prepared) = storage else {
+            unreachable!("owned Formula continuation lost its payload")
+        };
+        let desc = self.interner.get(state).clone();
+        assert_eq!(
+            desc.rank_with_span(
+                self.leaf_count,
+                self.action_span,
+                Some(&plan.finite_formula),
+                &self.interner.formula_pcs,
+            ),
+            rank,
+            "prepared continuation disagrees with canonical state rank"
+        );
+        let candidate_pages = desc.uses_candidate_pages(plan, &self.interner.formula_pcs);
+        assert_eq!(candidate_pages, prepared.candidate_pages);
+        assert_eq!(prepared.stride, desc.bound.count());
+        assert_eq!(prepared.batch.parents.row_count, rows);
+        assert_eq!(prepared.batch.page_candidate_count(), candidates);
+        let cohort_occupancy = if candidate_pages { candidates } else { rows };
+        assert!(
+            cohort_occupancy > 0,
+            "prepared continuation cohort is empty"
+        );
+        let take = match mode {
+            ContinuationMode::Cohort => cohort_occupancy.min(width.max(1)),
+            ContinuationMode::ProbeOne => 1,
+        };
+
+        let chunk = if candidate_pages {
+            prepared.batch.take_candidate_tail(prepared.stride, take)
+        } else {
+            prepared.batch.take_tail(prepared.stride, take)
+        };
+        let remainder_rows = prepared.batch.parents.row_count;
+        let remainder_candidates = prepared.batch.page_candidate_count();
+        let remainder_atoms = if candidate_pages {
+            remainder_candidates
+        } else {
+            remainder_rows
+        };
+        if remainder_atoms != 0 {
+            self.stats.partial_pops += 1;
+            insert_prepared_formula(
+                rank,
+                state,
+                remainder_rows,
+                remainder_candidates,
+                prepared,
+                &mut self.worklist,
+                &mut self.stats,
+            );
+        }
+        let chunk_atoms = if candidate_pages {
+            chunk.page_candidate_count()
+        } else {
+            chunk.parents.row_count
+        };
+        assert_eq!(chunk_atoms, take);
+        self.stats.probe_formula_prepared_atoms_consumed = self
+            .stats
+            .probe_formula_prepared_atoms_consumed
+            .checked_add(chunk_atoms)
+            .expect("prepared Formula consumed-atom count overflow");
+        self.stats.state_pops += 1;
+        self.stats.continuation_pops += 1;
+        self.last_selection = SelectionKind::Continuation(mode);
+        match mode {
+            ContinuationMode::ProbeOne => {
+                self.stats.delta_handoff_probe_pops += 1;
+                self.stats.probe_formula_prepared_probe_one_pops += 1;
+            }
+            ContinuationMode::Cohort => {
+                self.stats.probe_formula_prepared_cohort_pops += 1;
+            }
+        }
+        if cohort_occupancy < width.max(1) {
+            self.stats.underfilled_continuation_pops += 1;
+        }
+        SelectedResidualTask {
+            state,
+            desc,
+            bucket: StateBucket::Formula(chunk),
+        }
+    }
+
     /// Whether ordinary acyclic work can fill the current search width
     /// without invoking the minimum-rank readiness lemma.
     fn has_full_stable(&self, plan: &ResidualPlan, width: usize) -> bool {
@@ -11217,6 +11714,35 @@ impl ResidualStateMachine {
             })
         })
     }
+
+    /// Authoritative acyclic liveness. A filed continuation is already
+    /// represented by `worklist`; an owned Formula continuation is not, so the
+    /// physical receipt must participate explicitly in exhaustion checks.
+    fn has_stable_work(&self) -> bool {
+        !self.worklist.is_empty() || self.continuation.is_some()
+    }
+
+    #[cfg(formula_prepared_continuation_probe)]
+    fn debug_assert_prepared_formula_conservation(&self) {
+        let owned = self
+            .continuation
+            .as_ref()
+            .map(|active| active.token.owned_atoms())
+            .unwrap_or(0);
+        debug_assert_eq!(
+            self.stats.probe_formula_prepared_atoms,
+            self.stats
+                .probe_formula_prepared_atoms_committed
+                .checked_add(self.stats.probe_formula_prepared_atoms_consumed)
+                .and_then(|settled| settled.checked_add(owned))
+                .expect("prepared Formula conservation count overflow"),
+            "prepared Formula atoms were lost or counted twice"
+        );
+    }
+
+    #[cfg(not(formula_prepared_continuation_probe))]
+    #[inline]
+    fn debug_assert_prepared_formula_conservation(&self) {}
 
     fn terminal_admission_width(&self, family: StateId, reservoir: usize) -> usize {
         assert!(reservoir > 0, "terminal admission reservoir is empty");
@@ -12028,7 +12554,12 @@ impl ResidualStateMachine {
             &mut self.interner,
             &mut self.stats,
         );
-        prefer_continuation(&mut outcome.continuation, continuation);
+        prefer_continuation(
+            &mut outcome.continuation,
+            continuation,
+            &mut self.worklist,
+            &mut self.stats,
+        );
         outcome.seeded_parents = seeded_parents;
         Ok(outcome)
     }
@@ -12492,7 +13023,12 @@ impl ResidualStateMachine {
             &mut self.stats,
         );
         if let Some(continuation) = seeded.continuation.take() {
-            prefer_continuation(&mut stable_continuation, Some(continuation));
+            prefer_continuation(
+                &mut stable_continuation,
+                Some(continuation),
+                &mut self.worklist,
+                &mut self.stats,
+            );
         }
         MachineStep::DeltaSeeded {
             continuation: stable_continuation,
@@ -12670,33 +13206,40 @@ impl ResidualStateMachine {
     }
 
     fn continuation_after_advanced(
-        &self,
+        &mut self,
         plan: &ResidualPlan,
         width: usize,
         continuation: ContinuationToken,
     ) -> Option<ActiveContinuation> {
         #[cfg(test)]
         if !self.continuation_sprint_enabled {
+            commit_prepared_continuation(continuation, &mut self.worklist, &mut self.stats);
             return None;
         }
         let desc = self.interner.get(continuation.state);
         let successor_is_underfilled =
             continuation.occupancy(desc, plan, &self.interner.formula_pcs) < width.max(1);
-        match self.last_selection {
+        let mode = match self.last_selection {
             // ProbeOne governs exactly the delta-filed handoff atom. Once it
             // advances, its ordered fanout is an ordinary semantic cohort;
             // probing that tail again could reverse observable result order.
             SelectionKind::Continuation(ContinuationMode::ProbeOne) => {
-                Some(ActiveContinuation::cohort(continuation))
+                Some(ContinuationMode::Cohort)
             }
-            SelectionKind::Continuation(ContinuationMode::Cohort) => {
-                Some(ActiveContinuation::cohort(continuation))
-            }
+            SelectionKind::Continuation(ContinuationMode::Cohort) => Some(ContinuationMode::Cohort),
             SelectionKind::Full if self.last_was_action && successor_is_underfilled => {
-                Some(ActiveContinuation::cohort(continuation))
+                Some(ContinuationMode::Cohort)
             }
             SelectionKind::Full | SelectionKind::Readiness => None,
+        };
+        if let Some(mode) = mode {
+            return Some(ActiveContinuation {
+                token: continuation,
+                mode,
+            });
         }
+        commit_prepared_continuation(continuation, &mut self.worklist, &mut self.stats);
+        None
     }
 
     fn selected_singleton_delta_lane(&self, seeded_parents: usize) -> bool {
@@ -12896,12 +13439,13 @@ impl ResidualStateMachine {
         base_estimates: &[usize; 128],
     ) -> PullAdvance {
         loop {
+            self.debug_assert_prepared_formula_conservation();
             // Direct terminal publication can stage the final rows while also
             // exhausting the cyclic frontier. Observe staged output first.
             if self.emit_next < self.emit_count {
                 return PullAdvance::EmitReady;
             }
-            if self.worklist.is_empty() && self.delta.is_empty() {
+            if !self.has_stable_work() && self.delta.is_empty() {
                 return PullAdvance::Exhausted;
             }
 
@@ -13056,10 +13600,8 @@ impl ResidualStateMachine {
         // for a wider terminal window. This matters for an elided zero-variable
         // full head: its single semantic seed needs no claim table, and after
         // that seed is consumed there is no remaining work to promote.
-        if self.emit_next >= self.emit_count
-            && self.worklist.is_empty()
-            && self.delta.is_empty()
-        {
+        self.debug_assert_prepared_formula_conservation();
+        if self.emit_next >= self.emit_count && !self.has_stable_work() && self.delta.is_empty() {
             return None;
         }
         self.confirm_terminal_demand();
@@ -13250,9 +13792,16 @@ impl ResidualStateMachine {
             // retire the named bucket before returning a shard. Clear those
             // physical hints on every iteration; all affine work remains in
             // the stable/delta queues.
-            self.continuation = None;
+            if let Some(active) = self.continuation.take() {
+                #[cfg(formula_prepared_continuation_probe)]
+                if active.token.is_owned() {
+                    self.stats.probe_formula_prepared_split_flushes += 1;
+                }
+                commit_prepared_continuation(active.token, &mut self.worklist, &mut self.stats);
+            }
             self.active_delta = None;
             self.active_delta_after_yield = false;
+            self.debug_assert_prepared_formula_conservation();
             debug_assert_eq!(
                 self.emit_next, 0,
                 "parallel residual splits before fold consumption"
@@ -13362,7 +13911,7 @@ impl ResidualStateMachine {
             // rather than manufacturing a second query from the seed.
             let width = self.width.max(1);
             if !self.delta.is_empty() && !self.has_full_stable(plan, width) {
-                let outcome = self.delta.step_bounded(
+                let mut outcome = self.delta.step_bounded(
                     root,
                     plan,
                     width,
@@ -13375,6 +13924,21 @@ impl ResidualStateMachine {
                 // in the cold worklist; it only consumes the same geometric
                 // feedback as the serial scheduler.
                 self.account_delta_feedback(&outcome);
+                if let Some(continuation) = outcome.continuation.take() {
+                    commit_prepared_continuation(
+                        continuation,
+                        &mut self.worklist,
+                        &mut self.stats,
+                    );
+                }
+                // Direct terminal publication was disabled for this step,
+                // and split negotiation refuses a machine that ever admitted
+                // a terminal family. A future path that violates either law
+                // must fail rather than discard raw rows in release builds.
+                assert!(
+                    outcome.publication.is_none(),
+                    "parallel split negotiation cannot publish terminal rows"
+                );
                 continue;
             }
             if self.worklist.is_empty() {
@@ -13392,7 +13956,9 @@ impl ResidualStateMachine {
                 // every successor normally and deliberately does not arm the
                 // first-result continuation sprint before the frontier has
                 // been partitioned.
-                MachineStep::Stable(StepOutcome::Advanced(_)) => {}
+                MachineStep::Stable(StepOutcome::Advanced(continuation)) => {
+                    commit_prepared_continuation(continuation, &mut self.worklist, &mut self.stats);
+                }
                 MachineStep::DeltaSeeded {
                     continuation,
                     publication,
@@ -13939,7 +14505,7 @@ where
 fn solve<'a, P, R>(
     root: &dyn Constraint<'a>,
     postprocessing: P,
-    mut projection: ProjectionGate,
+    projection: ProjectionGate,
     influences: [VariableSet; 128],
     base_estimates: [usize; 128],
     mode: Search,
@@ -13947,8 +14513,31 @@ fn solve<'a, P, R>(
 where
     P: Fn(&Binding) -> Option<R>,
 {
-    let full = root.variables();
     let plan = ResidualPlan::compile(root);
+    solve_with_plan(
+        root,
+        postprocessing,
+        projection,
+        influences,
+        base_estimates,
+        mode,
+        plan,
+    )
+}
+
+fn solve_with_plan<'a, P, R>(
+    root: &dyn Constraint<'a>,
+    postprocessing: P,
+    mut projection: ProjectionGate,
+    influences: [VariableSet; 128],
+    base_estimates: [usize; 128],
+    mode: Search,
+    plan: ResidualPlan,
+) -> ResidualStateSolve<R>
+where
+    P: Fn(&Binding) -> Option<R>,
+{
+    let full = root.variables();
     let leaf_count = plan.len();
     let mut stats = ResidualStateStats::default();
     let mut interner = StateInterner::default();
@@ -14012,7 +14601,10 @@ where
                 "the opaque eager solver unexpectedly produced a pageable Formula reducer"
             );
             match execution.stable {
-                StepOutcome::Advanced(_) | StepOutcome::Dead => {}
+                StepOutcome::Advanced(continuation) => {
+                    commit_prepared_continuation(continuation, &mut worklist, &mut stats);
+                }
+                StepOutcome::Dead => {}
                 StepOutcome::Emit(rows) => {
                     let vars: Vec<VariableId> = emit_bound.into_iter().collect();
                     let view = rows_view(&vars, &rows.rows, rows.row_count);
@@ -14590,6 +15182,28 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
 
+    #[cfg(formula_prepared_continuation_probe)]
+    struct FormulaPreparedProbeReset;
+
+    #[cfg(formula_prepared_continuation_probe)]
+    impl Drop for FormulaPreparedProbeReset {
+        fn drop(&mut self) {
+            formula_prepared_continuation_probe_select(
+                FormulaPreparedContinuationProbeSelector::Filed,
+            );
+        }
+    }
+
+    #[cfg(formula_prepared_continuation_probe)]
+    fn with_formula_prepared_probe<T>(
+        selector: FormulaPreparedContinuationProbeSelector,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        formula_prepared_continuation_probe_select(selector);
+        let _reset = FormulaPreparedProbeReset;
+        f()
+    }
+
     #[test]
     fn residual_lowering_has_exactly_twelve_canonical_forms() {
         let forms: std::collections::HashSet<_> = [
@@ -14674,6 +15288,51 @@ mod tests {
             _view: &RowsView<'_>,
             _candidates: &mut CandidateSink<'_>,
         ) {
+        }
+    }
+
+    #[cfg(formula_prepared_continuation_probe)]
+    fn prepared_formula_fixture() -> (
+        IntersectionConstraint<ShapeLeaf>,
+        ResidualPlan,
+        ResidualStateMachine,
+        StateDesc,
+    ) {
+        let root = IntersectionConstraint::new(vec![ShapeLeaf(0), ShapeLeaf(0)]);
+        let plan = ResidualPlan::compile_lowering(
+            &root,
+            ResidualLowering::new(FormulaScope::WholeRoot, ProgramScope::Disabled),
+        );
+        let mut relevant = ChildSet::empty(plan.len());
+        relevant.insert(0);
+        let mut machine = ResidualStateMachine::new_for_plan(root.variables(), &plan, Search::Done);
+        let counter = machine.interner.start_formula(
+            &plan.finite_formula,
+            0,
+            0,
+            UnionVerb::Propose { relevant },
+        );
+        let desc = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Formula { counter },
+        };
+        assert!(!desc.uses_candidate_pages(&plan, &machine.interner.formula_pcs));
+        (root, plan, machine, desc)
+    }
+
+    #[cfg(formula_prepared_continuation_probe)]
+    fn prepared_formula_batch(activations: impl IntoIterator<Item = u64>) -> FormulaBatch {
+        let activations: Vec<_> = activations.into_iter().map(ActivationId).collect();
+        let parent_count = activations.len();
+        FormulaBatch {
+            activations,
+            parents: RowBatch {
+                rows: Vec::new(),
+                row_count: parent_count,
+            },
+            frames: vec![FormulaPayloadFrame::And {
+                current: CandidatePayload::empty(parent_count),
+            }],
         }
     }
 
@@ -28818,8 +29477,18 @@ mod tests {
         )
         .expect("fixture files the equal-key continuation receipt");
         let mut continuation = None;
-        prefer_continuation(&mut continuation, Some(first));
-        prefer_continuation(&mut continuation, Some(second));
+        prefer_continuation(
+            &mut continuation,
+            Some(first),
+            &mut machine.worklist,
+            &mut machine.stats,
+        );
+        prefer_continuation(
+            &mut continuation,
+            Some(second),
+            &mut machine.worklist,
+            &mut machine.stats,
+        );
         let continuation = continuation.expect("equal receipts coalesce");
         assert_eq!(continuation.rows, expected.len());
         machine.continuation = Some(ActiveContinuation::probe_one(continuation));
@@ -29099,62 +29768,655 @@ mod tests {
         assert_eq!(machine.stats.readiness_pops, 0);
     }
 
+    #[cfg(formula_prepared_continuation_probe)]
+    #[derive(Debug, Eq, PartialEq)]
+    struct PreparedFormulaOrderSnapshot {
+        rank: usize,
+        state: StateId,
+        desc: StateDesc,
+        state_count: usize,
+        interner_hits: usize,
+        hot_activations: Vec<u64>,
+        cold_activations: Vec<u64>,
+    }
+
+    #[cfg(formula_prepared_continuation_probe)]
+    fn prepared_formula_order_snapshot(
+        selector: FormulaPreparedContinuationProbeSelector,
+    ) -> PreparedFormulaOrderSnapshot {
+        with_formula_prepared_probe(selector, || {
+            let (_root, plan, mut machine, desc) = prepared_formula_fixture();
+            let mut selected = None;
+            // Program Search completes parents in reverse traversal order.
+            // These four receipts therefore arrive as 3,2,1,0, and the
+            // continuation tail must still select parent zero first.
+            for activation in [3, 2, 1, 0] {
+                let candidate = file_formula_continuation_with_plan(
+                    &mut machine.worklist,
+                    &mut machine.interner,
+                    &plan,
+                    desc.clone(),
+                    prepared_formula_batch([activation]),
+                    &mut machine.stats,
+                )
+                .expect("one Formula completion produces one receipt");
+                prefer_continuation(
+                    &mut selected,
+                    Some(candidate),
+                    &mut machine.worklist,
+                    &mut machine.stats,
+                );
+            }
+            let receipt = selected.expect("completion receipts have one preferred tail");
+            let rank = receipt.rank;
+            let state = receipt.state;
+            assert_eq!((receipt.rows, receipt.candidates), (4, 0));
+            assert_eq!(machine.interner.get(state), &desc);
+            assert_eq!(
+                machine.worklist.is_empty(),
+                selector == FormulaPreparedContinuationProbeSelector::Owned,
+                "only the candidate mode may retain the Formula payload outside the worklist"
+            );
+
+            let task = machine.take_continuation(&plan, ActiveContinuation::probe_one(receipt), 8);
+            let StateBucket::Formula(hot) = task.bucket else {
+                panic!("prepared Formula receipt changed payload shape")
+            };
+            let hot_activations = hot
+                .activations
+                .iter()
+                .map(|activation| activation.0)
+                .collect::<Vec<_>>();
+            let StateBucket::Formula(cold) = machine
+                .worklist
+                .get(&rank)
+                .and_then(|level| level.get(&state))
+                .expect("the unselected Formula prefix remains canonical work")
+            else {
+                panic!("prepared Formula prefix changed payload shape")
+            };
+            let cold_activations = cold
+                .activations
+                .iter()
+                .map(|activation| activation.0)
+                .collect::<Vec<_>>();
+            machine.debug_assert_prepared_formula_conservation();
+
+            match selector {
+                FormulaPreparedContinuationProbeSelector::Filed => {
+                    assert_eq!(machine.stats.probe_formula_prepared_receipts, 0);
+                    assert_eq!(machine.stats.probe_formula_prepared_atoms, 0);
+                }
+                FormulaPreparedContinuationProbeSelector::Owned => {
+                    assert_eq!(machine.stats.probe_formula_prepared_receipts, 4);
+                    assert_eq!(machine.stats.probe_formula_prepared_rows, 4);
+                    assert_eq!(machine.stats.probe_formula_prepared_candidates, 0);
+                    assert_eq!(machine.stats.probe_formula_prepared_atoms, 4);
+                    assert_eq!(machine.stats.probe_formula_prepared_equal_key_appends, 3);
+                    assert_eq!(machine.stats.probe_formula_prepared_atoms_committed, 3);
+                    assert_eq!(machine.stats.probe_formula_prepared_atoms_consumed, 1);
+                    assert_eq!(machine.stats.probe_formula_prepared_probe_one_pops, 1);
+                    assert_eq!(machine.stats.probe_formula_prepared_identity_checks, 4);
+                }
+            }
+
+            PreparedFormulaOrderSnapshot {
+                rank,
+                state,
+                desc: machine.interner.get(state).clone(),
+                state_count: machine.interner.descs.len(),
+                interner_hits: machine.stats.interner_hits,
+                hot_activations,
+                cold_activations,
+            }
+        })
+    }
+
+    #[cfg(formula_prepared_continuation_probe)]
     #[test]
-    fn continuation_preference_coalesces_equal_keys_across_interleaved_receipts() {
-        let first = ContinuationToken {
-            rank: 7,
-            state: StateId(3),
-            rows: 2,
-            candidates: 5,
-        };
-        let lower = ContinuationToken {
-            rank: 6,
-            state: StateId(99),
-            rows: 100,
-            candidates: 101,
-        };
-        let equal = ContinuationToken {
-            rank: 7,
-            state: StateId(3),
-            rows: 3,
-            candidates: 7,
-        };
-        let higher = ContinuationToken {
-            rank: 8,
-            state: StateId(1),
-            rows: 11,
-            candidates: 13,
-        };
-        let higher_equal = ContinuationToken {
-            rank: 8,
-            state: StateId(1),
-            rows: 17,
-            candidates: 19,
+    fn prepared_formula_receipts_preserve_identity_ties_and_lifo_completion_order() {
+        let filed =
+            prepared_formula_order_snapshot(FormulaPreparedContinuationProbeSelector::Filed);
+        let owned =
+            prepared_formula_order_snapshot(FormulaPreparedContinuationProbeSelector::Owned);
+
+        assert_eq!(owned, filed, "delayed filing changed canonical arbitration");
+        assert_eq!(owned.hot_activations, [0]);
+        assert_eq!(owned.cold_activations, [3, 2, 1]);
+        assert_eq!(owned.state_count, 1);
+        assert_eq!(owned.interner_hits, 3);
+    }
+
+    #[cfg(formula_prepared_continuation_probe)]
+    #[test]
+    fn prepared_formula_distinct_key_loser_is_cold_committed_exactly_once() {
+        with_formula_prepared_probe(FormulaPreparedContinuationProbeSelector::Owned, || {
+            let (_root, plan, mut machine, first_desc) = prepared_formula_fixture();
+            let ResidualPhase::Formula {
+                counter: first_counter,
+            } = &first_desc.phase
+            else {
+                unreachable!()
+            };
+            let second_counter = machine.interner.formula_pcs.select_child_as_action(
+                &plan.finite_formula,
+                *first_counter,
+                0,
+            );
+            let second_desc = StateDesc {
+                bound: VariableSet::new_empty(),
+                phase: ResidualPhase::Formula {
+                    counter: second_counter,
+                },
+            };
+            let first = file_formula_continuation_with_plan(
+                &mut machine.worklist,
+                &mut machine.interner,
+                &plan,
+                first_desc,
+                prepared_formula_batch([10]),
+                &mut machine.stats,
+            )
+            .expect("the first distinct Formula receipt is live");
+            let second = file_formula_continuation_with_plan(
+                &mut machine.worklist,
+                &mut machine.interner,
+                &plan,
+                second_desc,
+                prepared_formula_batch([20]),
+                &mut machine.stats,
+            )
+            .expect("the second distinct Formula receipt is live");
+            assert_ne!(first.scheduling_key(), second.scheduling_key());
+
+            let mut selected = Some(first);
+            prefer_continuation(
+                &mut selected,
+                Some(second),
+                &mut machine.worklist,
+                &mut machine.stats,
+            );
+            assert!(selected.as_ref().is_some_and(ContinuationToken::is_owned));
+            assert_eq!(machine.stats.probe_formula_prepared_atoms, 2);
+            assert_eq!(machine.stats.probe_formula_prepared_atoms_committed, 1);
+            assert_eq!(machine.stats.probe_formula_prepared_atoms_consumed, 0);
+
+            commit_prepared_continuation(
+                selected.expect("one distinct Formula receipt remains preferred"),
+                &mut machine.worklist,
+                &mut machine.stats,
+            );
+            assert_eq!(machine.stats.probe_formula_prepared_atoms_committed, 2);
+            let mut activations = machine
+                .worklist
+                .values()
+                .flat_map(BTreeMap::values)
+                .filter_map(|bucket| match bucket {
+                    StateBucket::Formula(batch) => Some(batch.activations.as_slice()),
+                    StateBucket::Rows(_) | StateBucket::Candidates(_) => None,
+                })
+                .flatten()
+                .map(|activation| activation.0)
+                .collect::<Vec<_>>();
+            activations.sort_unstable();
+            assert_eq!(activations, [10, 20]);
+            machine.debug_assert_prepared_formula_conservation();
+        });
+    }
+
+    #[cfg(formula_prepared_continuation_probe)]
+    #[test]
+    fn formula_set_admission_return_uses_the_unified_owned_sink() {
+        with_formula_prepared_probe(FormulaPreparedContinuationProbeSelector::Owned, || {
+            let (_root, plan, mut machine, desc) = prepared_formula_fixture();
+            let receipt = file_set_admission_destination_with_plan(
+                &mut machine.worklist,
+                &mut machine.interner,
+                &plan,
+                desc,
+                SetAdmissionDestination::Formula(prepared_formula_batch([31])),
+                &mut machine.stats,
+            )
+            .expect("the Formula SET-admission return is live");
+            assert!(receipt.is_owned());
+            assert!(machine.worklist.is_empty());
+            assert_eq!(machine.stats.probe_formula_prepared_receipts, 1);
+            assert_eq!(machine.stats.probe_formula_prepared_atoms, 1);
+
+            commit_prepared_continuation(
+                receipt,
+                &mut machine.worklist,
+                &mut machine.stats,
+            );
+            assert_eq!(machine.stats.probe_formula_prepared_atoms_committed, 1);
+            machine.debug_assert_prepared_formula_conservation();
+        });
+    }
+
+    #[cfg(formula_prepared_continuation_probe)]
+    #[test]
+    fn eager_formula_solve_cold_commits_owned_advanced_receipts_in_control_order() {
+        let run = |selector| {
+            with_formula_prepared_probe(selector, || {
+                let root = IntersectionConstraint::new(vec![
+                    FanoutLeaf {
+                        variable: 0,
+                        values: Arc::new(vec![raw(1), raw(2)]),
+                    },
+                    FanoutLeaf {
+                        variable: 0,
+                        values: Arc::new(vec![raw(2), raw(3)]),
+                    },
+                ]);
+                let full = root.variables();
+                let influences = std::array::from_fn(|variable| root.influence(variable));
+                let plan = ResidualPlan::compile_lowering(
+                    &root,
+                    ResidualLowering::new(FormulaScope::WholeRoot, ProgramScope::Disabled),
+                );
+                solve_with_plan(
+                    &root,
+                    |binding: &Binding| binding.get(0).copied(),
+                    ProjectionGate::full(full),
+                    influences,
+                    [1; 128],
+                    Search::NextVariable,
+                    plan,
+                )
+            })
         };
 
+        let filed = run(FormulaPreparedContinuationProbeSelector::Filed);
+        let owned = run(FormulaPreparedContinuationProbeSelector::Owned);
+        assert_eq!(owned.results, filed.results);
+        assert_eq!(owned.results, [raw(1), raw(2)]);
+        assert!(owned.stats.probe_formula_prepared_receipts > 0);
+        assert_eq!(
+            owned.stats.probe_formula_prepared_atoms,
+            owned.stats.probe_formula_prepared_atoms_committed
+        );
+        assert_eq!(owned.stats.probe_formula_prepared_atoms_consumed, 0);
+    }
+
+    #[cfg(formula_prepared_continuation_probe)]
+    #[test]
+    fn prepared_formula_cohort_pages_candidate_atoms_without_losing_the_prefix() {
+        with_formula_prepared_probe(FormulaPreparedContinuationProbeSelector::Owned, || {
+            let root = IntersectionConstraint::new(vec![
+                CapabilityLeaf {
+                    variable: 0,
+                    page_local: false,
+                },
+                CapabilityLeaf {
+                    variable: 0,
+                    page_local: true,
+                },
+            ]);
+            let plan = ResidualPlan::compile_lowering(
+                &root,
+                ResidualLowering::new(FormulaScope::WholeRoot, ProgramScope::Disabled),
+            );
+            let relevant = ChildSet::empty(plan.len()).with_inserted(0);
+            let mut machine =
+                ResidualStateMachine::new_for_plan(root.variables(), &plan, Search::Done);
+            let start = machine.interner.start_formula(
+                &plan.finite_formula,
+                0,
+                0,
+                UnionVerb::Propose { relevant },
+            );
+            let action =
+                machine
+                    .interner
+                    .formula_pcs
+                    .select_child_as_action(&plan.finite_formula, start, 0);
+            let completed = machine
+                .interner
+                .formula_pcs
+                .complete(&plan.finite_formula, action);
+            let Ok(InternedFormulaSuccessor::Formula(counter)) = machine
+                .interner
+                .formula_pcs
+                .resume_completed(&plan.finite_formula, completed)
+            else {
+                panic!("root AND proposer did not expose its pageable confirm suffix")
+            };
+            let desc = StateDesc {
+                bound: VariableSet::new_empty(),
+                phase: ResidualPhase::Formula { counter },
+            };
+            assert!(desc.uses_candidate_pages(&plan, &machine.interner.formula_pcs));
+            let receipt = file_formula_continuation_with_plan(
+                &mut machine.worklist,
+                &mut machine.interner,
+                &plan,
+                desc,
+                FormulaBatch {
+                    activations: vec![ActivationId(0)],
+                    parents: RowBatch {
+                        rows: Vec::new(),
+                        row_count: 1,
+                    },
+                    frames: vec![FormulaPayloadFrame::And {
+                        current: CandidatePayload::Values([raw(1), raw(2), raw(3)].into()),
+                    }],
+                },
+                &mut machine.stats,
+            )
+            .expect("three pageable candidates produce one prepared receipt");
+            assert_eq!((receipt.rows, receipt.candidates), (1, 3));
+            assert!(machine.worklist.is_empty());
+            let rank = receipt.rank;
+            let state = receipt.state;
+            let task = machine.take_continuation(&plan, ActiveContinuation::cohort(receipt), 2);
+            let StateBucket::Formula(page) = task.bucket else {
+                panic!("prepared candidate page changed payload shape")
+            };
+            let [FormulaPayloadFrame::And { current }] = page.frames.as_slice() else {
+                panic!("prepared candidate page lost its root AND frame")
+            };
+            assert_eq!(current.one_parent_values(), [raw(2), raw(3)]);
+            let StateBucket::Formula(prefix) = machine
+                .worklist
+                .get(&rank)
+                .and_then(|level| level.get(&state))
+                .expect("the unselected candidate prefix remains canonical work")
+            else {
+                panic!("prepared candidate prefix changed payload shape")
+            };
+            let [FormulaPayloadFrame::And { current }] = prefix.frames.as_slice() else {
+                panic!("prepared candidate prefix lost its root AND frame")
+            };
+            assert_eq!(current.one_parent_values(), [raw(1)]);
+            assert_eq!(machine.stats.probe_formula_prepared_atoms, 3);
+            assert_eq!(machine.stats.probe_formula_prepared_atoms_consumed, 2);
+            assert_eq!(machine.stats.probe_formula_prepared_atoms_committed, 1);
+            assert_eq!(machine.stats.probe_formula_prepared_cohort_pops, 1);
+            machine.debug_assert_prepared_formula_conservation();
+        });
+    }
+
+    #[cfg(formula_prepared_continuation_probe)]
+    #[test]
+    fn prepared_formula_is_live_until_executed_and_repeated_eof_freezes_demand() {
+        with_formula_prepared_probe(FormulaPreparedContinuationProbeSelector::Owned, || {
+            let (root, plan, mut machine, desc) = prepared_formula_fixture();
+            let receipt = file_formula_continuation_with_plan(
+                &mut machine.worklist,
+                &mut machine.interner,
+                &plan,
+                desc,
+                prepared_formula_batch([0]),
+                &mut machine.stats,
+            )
+            .expect("one live Formula parent produces a receipt");
+            assert!(machine.worklist.is_empty());
+            machine.continuation = Some(ActiveContinuation::probe_one(receipt));
+            assert!(machine.has_stable_work());
+
+            let influences = std::array::from_fn(|variable| root.influence(variable));
+            let base_estimates = [1; 128];
+            let mut projection = ProjectionGate::full(root.variables());
+            let project = |_binding: &Binding| Some(());
+            assert_eq!(
+                machine.pull(
+                    &root,
+                    &plan,
+                    &project,
+                    &mut projection,
+                    &influences,
+                    &base_estimates,
+                ),
+                None,
+                "the empty Formula should execute to semantic death"
+            );
+            assert!(!machine.has_stable_work());
+            assert!(machine.stats.propose_action_pops > 0);
+            assert!(machine.stats.probe_formula_prepared_atoms_consumed > 0);
+            machine.debug_assert_prepared_formula_conservation();
+
+            let frozen = (
+                machine.width,
+                machine.terminal_demand_width,
+                machine.terminal_demand_consumed,
+                machine.terminal_demand_exhausted,
+                machine.stats.terminal_demand_width_promotions,
+                machine.stats.terminal_demand_windows_opened,
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    machine.pull(
+                        &root,
+                        &plan,
+                        &project,
+                        &mut projection,
+                        &influences,
+                        &base_estimates,
+                    ),
+                    None
+                );
+                assert_eq!(
+                    (
+                        machine.width,
+                        machine.terminal_demand_width,
+                        machine.terminal_demand_consumed,
+                        machine.terminal_demand_exhausted,
+                        machine.stats.terminal_demand_width_promotions,
+                        machine.stats.terminal_demand_windows_opened,
+                    ),
+                    frozen,
+                    "a pull after proven exhaustion must not promote demand"
+                );
+            }
+        });
+    }
+
+    #[cfg(all(formula_prepared_continuation_probe, feature = "parallel"))]
+    #[test]
+    fn parallel_split_flushes_prepared_formula_before_partition_without_loss() {
+        with_formula_prepared_probe(FormulaPreparedContinuationProbeSelector::Owned, || {
+            let (root, plan, mut machine, desc) = prepared_formula_fixture();
+            let receipt = file_formula_continuation_with_plan(
+                &mut machine.worklist,
+                &mut machine.interner,
+                &plan,
+                desc,
+                prepared_formula_batch(0..6),
+                &mut machine.stats,
+            )
+            .expect("six Formula parents produce a prepared receipt");
+            machine.continuation = Some(ActiveContinuation::probe_one(receipt));
+
+            let influences = std::array::from_fn(|variable| root.influence(variable));
+            let base_estimates = [1; 128];
+            let right = machine
+                .split_for_parallel(&root, &plan, &influences, &base_estimates)
+                .expect("six Formula parents are splittable");
+            assert!(machine.continuation.is_none());
+            assert!(right.continuation.is_none());
+            assert_eq!(machine.stats.probe_formula_prepared_split_flushes, 1);
+            assert_eq!(machine.stats.probe_formula_prepared_atoms, 6);
+            assert_eq!(machine.stats.probe_formula_prepared_atoms_committed, 6);
+            assert_eq!(machine.stats.probe_formula_prepared_atoms_consumed, 0);
+            machine.debug_assert_prepared_formula_conservation();
+            right.debug_assert_prepared_formula_conservation();
+
+            let live_activations = |machine: &ResidualStateMachine| {
+                machine
+                    .worklist
+                    .values()
+                    .flat_map(BTreeMap::values)
+                    .flat_map(|bucket| match bucket {
+                        StateBucket::Formula(batch) => batch
+                            .activations
+                            .iter()
+                            .map(|activation| activation.0)
+                            .collect::<Vec<_>>(),
+                        StateBucket::Rows(_) | StateBucket::Candidates(_) => Vec::new(),
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let left = live_activations(&machine);
+            let right = live_activations(&right);
+            assert!(!left.is_empty());
+            assert!(!right.is_empty());
+            let mut all = left;
+            all.extend(right);
+            all.sort_unstable();
+            assert_eq!(all, (0..6).collect::<Vec<_>>());
+        });
+    }
+
+    #[cfg(all(formula_prepared_continuation_probe, feature = "parallel"))]
+    #[test]
+    fn parallel_split_cold_commits_delta_produced_owned_formula_receipt() {
+        with_formula_prepared_probe(FormulaPreparedContinuationProbeSelector::Owned, || {
+            let proposes = Arc::new(AtomicUsize::new(0));
+            let pages = Arc::new(AtomicUsize::new(0));
+            let leaf = || PagedProposalLeaf {
+                variable: 0,
+                values: Arc::new(vec![raw(7)]),
+                transition_source: true,
+                proposes: Arc::clone(&proposes),
+                pages: Arc::clone(&pages),
+                action_log: None,
+            };
+            let root = IntersectionConstraint::new(vec![leaf(), leaf()]);
+            let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+            let formula_root = plan
+                .finite_formula
+                .root(0)
+                .expect("the synthetic AND has a Formula root");
+            let relevant = ChildSet::empty(plan.len()).with_inserted(0);
+            let mut machine =
+                ResidualStateMachine::new_for_plan(root.variables(), &plan, Search::Done);
+            let start = machine.interner.start_formula(
+                &plan.finite_formula,
+                0,
+                0,
+                UnionVerb::Propose { relevant },
+            );
+            let action = machine.interner.formula_pcs.select_child_as_action(
+                &plan.finite_formula,
+                start,
+                0,
+            );
+            file_with_plan(
+                &mut machine.worklist,
+                &mut machine.interner,
+                &plan,
+                StateDesc {
+                    bound: VariableSet::new_empty(),
+                    phase: ResidualPhase::Formula { counter: action },
+                },
+                StateBucket::Formula(FormulaBatch::from_proposal(
+                    RowBatch::seed(),
+                    vec![ActivationId(41)],
+                    &plan.finite_formula.node(formula_root).kind,
+                )),
+                &mut machine.stats,
+            )
+            .expect("the Formula action seed is live");
+
+            let influences = std::array::from_fn(|variable| root.influence(variable));
+            let base_estimates = [1; 128];
+            let MachineStep::DeltaSeeded {
+                continuation,
+                publication,
+                active,
+                seeded_parents,
+                terminal_family,
+                terminal_activations,
+                completed_activation_ids,
+            } = machine.pop_once(&root, &plan, &influences, &base_estimates, 1)
+            else {
+                panic!("the Formula proposal did not seed its one delta atom")
+            };
+            machine.accept_delta_seed(
+                continuation,
+                publication,
+                active,
+                seeded_parents,
+                terminal_family,
+                terminal_activations,
+                completed_activation_ids,
+            );
+            assert!(!machine.delta.is_empty());
+
+            // One separate unsplittable stable atom makes the returned
+            // Formula receipt observable as the second affine component.
+            file_with_plan(
+                &mut machine.worklist,
+                &mut machine.interner,
+                &plan,
+                StateDesc {
+                    bound: VariableSet::new_empty(),
+                    phase: ResidualPhase::Ready,
+                },
+                StateBucket::Rows(RowBatch::seed()),
+                &mut machine.stats,
+            )
+            .expect("the control affine atom is live");
+            machine.width = 2;
+
+            let right = machine
+                .split_for_parallel(&root, &plan, &influences, &base_estimates)
+                .expect("the delta-produced Formula receipt creates a second component");
+            assert!(pages.load(Ordering::Relaxed) > 0);
+            assert_eq!(proposes.load(Ordering::Relaxed), 0);
+            assert_eq!(machine.stats.probe_formula_prepared_receipts, 1);
+            assert_eq!(machine.stats.probe_formula_prepared_atoms, 1);
+            assert_eq!(machine.stats.probe_formula_prepared_atoms_committed, 1);
+            assert_eq!(machine.stats.probe_formula_prepared_atoms_consumed, 0);
+            machine.debug_assert_prepared_formula_conservation();
+            right.debug_assert_prepared_formula_conservation();
+
+            let mut activations = [&machine, &right]
+                .into_iter()
+                .flat_map(|shard| shard.worklist.values())
+                .flat_map(BTreeMap::values)
+                .filter_map(|bucket| match bucket {
+                    StateBucket::Formula(batch) => Some(batch.activations.as_slice()),
+                    StateBucket::Rows(_) | StateBucket::Candidates(_) => None,
+                })
+                .flatten()
+                .map(|activation| activation.0)
+                .collect::<Vec<_>>();
+            activations.sort_unstable();
+            assert_eq!(activations, [41]);
+        });
+    }
+
+    #[test]
+    fn continuation_preference_coalesces_equal_keys_across_interleaved_receipts() {
+        let first = ContinuationToken::filed(7, StateId(3), 2, 5);
+        let lower = ContinuationToken::filed(6, StateId(99), 100, 101);
+        let equal = ContinuationToken::filed(7, StateId(3), 3, 7);
+        let higher = ContinuationToken::filed(8, StateId(1), 11, 13);
+        let higher_equal = ContinuationToken::filed(8, StateId(1), 17, 19);
+
         let mut selected = None;
-        for receipt in [first, lower, equal] {
-            prefer_continuation(&mut selected, Some(receipt));
+        let mut worklist = Worklist::new();
+        let mut stats = ResidualStateStats::default();
+        for receipt in [first.clone(), lower.clone(), equal] {
+            prefer_continuation(&mut selected, Some(receipt), &mut worklist, &mut stats);
         }
         assert_eq!(
             selected,
-            Some(ContinuationToken {
-                rows: 5,
-                candidates: 12,
-                ..first
-            })
+            Some(ContinuationToken::filed(7, StateId(3), 5, 12))
         );
 
-        prefer_continuation(&mut selected, Some(higher));
-        prefer_continuation(&mut selected, Some(lower));
-        prefer_continuation(&mut selected, Some(higher_equal));
+        prefer_continuation(
+            &mut selected,
+            Some(higher.clone()),
+            &mut worklist,
+            &mut stats,
+        );
+        prefer_continuation(&mut selected, Some(lower), &mut worklist, &mut stats);
+        prefer_continuation(&mut selected, Some(higher_equal), &mut worklist, &mut stats);
         assert_eq!(
             selected,
-            Some(ContinuationToken {
-                rows: 28,
-                candidates: 32,
-                ..higher
-            })
+            Some(ContinuationToken::filed(8, StateId(1), 28, 32))
         );
     }
 
@@ -29162,20 +30424,19 @@ mod tests {
     fn continuation_receipt_coalescing_checks_both_occupancy_dimensions() {
         for (rows, candidates) in [(usize::MAX, 0), (0, usize::MAX)] {
             let result = std::panic::catch_unwind(|| {
-                let mut selected = Some(ContinuationToken {
-                    rank: 1,
-                    state: StateId(0),
-                    rows,
-                    candidates,
-                });
+                let mut selected = Some(ContinuationToken::filed(1, StateId(0), rows, candidates));
+                let mut worklist = Worklist::new();
+                let mut stats = ResidualStateStats::default();
                 prefer_continuation(
                     &mut selected,
-                    Some(ContinuationToken {
-                        rank: 1,
-                        state: StateId(0),
-                        rows: usize::from(rows != 0),
-                        candidates: usize::from(candidates != 0),
-                    }),
+                    Some(ContinuationToken::filed(
+                        1,
+                        StateId(0),
+                        usize::from(rows != 0),
+                        usize::from(candidates != 0),
+                    )),
+                    &mut worklist,
+                    &mut stats,
                 );
             });
             assert!(result.is_err());
@@ -29212,8 +30473,18 @@ mod tests {
             &mut machine.stats,
         );
         let mut receipt = None;
-        prefer_continuation(&mut receipt, first);
-        prefer_continuation(&mut receipt, second);
+        prefer_continuation(
+            &mut receipt,
+            first,
+            &mut machine.worklist,
+            &mut machine.stats,
+        );
+        prefer_continuation(
+            &mut receipt,
+            second,
+            &mut machine.worklist,
+            &mut machine.stats,
+        );
         let receipt = receipt.expect("virtual rows produce a physical receipt");
         assert_eq!(receipt.rows, 7);
 
@@ -29231,8 +30502,10 @@ mod tests {
     fn coalesced_candidate_page_receipts_track_candidate_and_formula_tails() {
         let coalesce = |first, second| {
             let mut receipt = None;
-            prefer_continuation(&mut receipt, first);
-            prefer_continuation(&mut receipt, second);
+            let mut worklist = Worklist::new();
+            let mut stats = ResidualStateStats::default();
+            prefer_continuation(&mut receipt, first, &mut worklist, &mut stats);
+            prefer_continuation(&mut receipt, second, &mut worklist, &mut stats);
             receipt.expect("equal candidate-page receipts coalesce")
         };
 
@@ -29297,7 +30570,7 @@ mod tests {
 
         let task = candidate_machine.take_continuation(
             &candidate_plan,
-            ActiveContinuation::cohort(candidate_receipt),
+            ActiveContinuation::cohort(candidate_receipt.clone()),
             4,
         );
         let StateBucket::Candidates(page) = task.bucket else {
@@ -29509,7 +30782,7 @@ mod tests {
             &mut machine.stats,
         );
 
-        let task = machine.take_continuation(&plan, ActiveContinuation::cohort(hot), 8);
+        let task = machine.take_continuation(&plan, ActiveContinuation::cohort(hot.clone()), 8);
         assert_eq!(task.state, hot.state);
         assert_eq!(task.desc, desc);
         let StateBucket::Candidates(chunk) = task.bucket else {
@@ -29586,8 +30859,18 @@ mod tests {
         )
         .expect("equal-key hot receipt is nonempty");
         let mut hot = None;
-        prefer_continuation(&mut hot, Some(first_hot));
-        prefer_continuation(&mut hot, Some(second_hot));
+        prefer_continuation(
+            &mut hot,
+            Some(first_hot),
+            &mut machine.worklist,
+            &mut machine.stats,
+        );
+        prefer_continuation(
+            &mut hot,
+            Some(second_hot),
+            &mut machine.worklist,
+            &mut machine.stats,
+        );
         let hot = hot.expect("equal-key hot receipts coalesce");
         assert_eq!(hot.rows, 8);
         machine.continuation = Some(ActiveContinuation::probe_one(hot));
@@ -29623,7 +30906,7 @@ mod tests {
         )
         .unwrap();
         let resumed = machine
-            .continuation_after_advanced(&plan, machine.width, successor)
+            .continuation_after_advanced(&plan, machine.width, successor.clone())
             .expect("the probe hit has an ordered successor");
         assert_eq!(resumed, ActiveContinuation::cohort(successor));
         let resumed = machine.take_continuation(&plan, resumed, machine.width);
@@ -29677,15 +30960,10 @@ mod tests {
             },
             &mut machine.stats,
         );
-        let token = ContinuationToken {
-            rank: 7,
-            state,
-            rows: 2,
-            candidates: 0,
-        };
+        let token = ContinuationToken::filed(7, state, 2, 0);
 
         machine.accept_delta_step(DeltaStepOutcome {
-            continuation: Some(token),
+            continuation: Some(token.clone()),
             publication: None,
             completed_activation_ids: Vec::new(),
             retargeted: Default::default(),
@@ -29700,11 +30978,11 @@ mod tests {
         assert_eq!(machine.stats.delta_source_negative_steps, 0);
         assert_eq!(
             machine.continuation,
-            Some(ActiveContinuation::probe_one(token))
+            Some(ActiveContinuation::probe_one(token.clone()))
         );
 
         machine.accept_delta_step(DeltaStepOutcome {
-            continuation: Some(token),
+            continuation: Some(token.clone()),
             publication: None,
             completed_activation_ids: Vec::new(),
             retargeted: Default::default(),
@@ -29717,7 +30995,7 @@ mod tests {
         });
         assert_eq!(
             machine.continuation,
-            Some(ActiveContinuation::cohort(token))
+            Some(ActiveContinuation::cohort(token.clone()))
         );
 
         let (terminal_state, _) = machine.interner.intern_with_status(
@@ -29731,12 +31009,9 @@ mod tests {
             },
             &mut machine.stats,
         );
-        let terminal = ContinuationToken {
-            state: terminal_state,
-            ..token
-        };
+        let terminal = ContinuationToken::filed(7, terminal_state, 2, 0);
         machine.accept_delta_step(DeltaStepOutcome {
-            continuation: Some(terminal),
+            continuation: Some(terminal.clone()),
             publication: None,
             completed_activation_ids: Vec::new(),
             retargeted: Default::default(),
@@ -29861,7 +31136,7 @@ mod tests {
         )
         .expect("one stable seed effect was filed");
         machine.accept_delta_seed(
-            Some(stable),
+            Some(stable.clone()),
             None,
             Some(active),
             1,

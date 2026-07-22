@@ -1058,8 +1058,8 @@ struct DeltaStreamingRelease {
 }
 
 impl DeltaStableEffects {
-    fn absorb(&mut self, mut other: Self) {
-        prefer_continuation(&mut self.continuation, other.continuation);
+    fn absorb(&mut self, mut other: Self, stable: &mut Worklist, stats: &mut ResidualStateStats) {
+        prefer_continuation(&mut self.continuation, other.continuation, stable, stats);
         if let Some(rows) = other.publication.take() {
             if let Some(existing) = &mut self.publication {
                 existing.append(rows);
@@ -4485,7 +4485,7 @@ impl DeltaScheduler {
                     released.active.is_none(),
                     "ordinary typed proposal seed opened a Formula reducer"
                 );
-                effects.absorb(released.stable);
+                effects.absorb(released.stable, stable, stats);
             }
             tasks.extend(
                 installed
@@ -4708,6 +4708,8 @@ impl DeltaScheduler {
                     prefer_continuation(
                         &mut continuation,
                         released.stable.continuation,
+                        stable,
+                        stats,
                     );
                     if released.active.is_some() {
                         finalizer_active = released.active;
@@ -4737,17 +4739,8 @@ impl DeltaScheduler {
         let graph_active = self.file_program_state(state, tasks);
         let mut active = finalizer_active.or(graph_active);
         for completed in completed {
-            let released = self.release_completion(
-                completed,
-                plan,
-                stable,
-                stable_interner,
-                stats,
-            );
-            prefer_continuation(
-                &mut continuation,
-                released.continuation,
-            );
+            let released = self.release_completion(completed, plan, stable, stable_interner, stats);
+            prefer_continuation(&mut continuation, released.continuation, stable, stats);
             if released.active.is_some() {
                 active = released.active;
             }
@@ -4861,7 +4854,7 @@ impl DeltaScheduler {
                     released.active.is_none(),
                     "ordinary proposal seed opened a Formula reducer"
                 );
-                effects.absorb(released.stable);
+                effects.absorb(released.stable, stable, stats);
             }
             tasks.extend(started.roots.into_iter().map(|(node, credit)| DeltaTask {
                 activation: started.activation,
@@ -5105,6 +5098,8 @@ impl DeltaScheduler {
                     prefer_continuation(
                         &mut continuation,
                         released.stable.continuation,
+                        stable,
+                        stats,
                     );
                     if released.active.is_some() {
                         finalizer_active = released.active;
@@ -5130,17 +5125,8 @@ impl DeltaScheduler {
         let mut active = finalizer_active.or(graph_active);
 
         for completed in completed {
-            let released = self.release_completion(
-                completed,
-                plan,
-                stable,
-                stable_interner,
-                stats,
-            );
-            prefer_continuation(
-                &mut continuation,
-                released.continuation,
-            );
+            let released = self.release_completion(completed, plan, stable, stable_interner, stats);
+            prefer_continuation(&mut continuation, released.continuation, stable, stats);
             if released.active.is_some() {
                 active = released.active;
             }
@@ -5249,22 +5235,20 @@ impl DeltaScheduler {
                     let input = seed.destination.take_candidates();
                     input.debug_assert_valid_for(1);
                     let Some(program_state) = SetAdmissionState::start(input) else {
-                        if let Some(bucket) = seed
-                            .destination
-                            .into_live_bucket(seed.successor.bound.count())
-                        {
-                            prefer_continuation(
-                                &mut drained.continuation,
-                                file_with_plan(
-                                    stable,
-                                    stable_interner,
-                                    plan,
-                                    seed.successor,
-                                    bucket,
-                                    stats,
-                                ),
-                            );
-                        }
+                        let candidate = file_set_admission_destination_with_plan(
+                            stable,
+                            stable_interner,
+                            plan,
+                            seed.successor,
+                            seed.destination,
+                            stats,
+                        );
+                        prefer_continuation(
+                            &mut drained.continuation,
+                            candidate,
+                            stable,
+                            stats,
+                        );
                         continue;
                     };
 
@@ -5322,19 +5306,17 @@ impl DeltaScheduler {
                     seed.input.debug_assert_valid_for(1);
                     if seed.input.is_empty() {
                         let mut generated = Vec::new();
-                        prefer_continuation(
-                            &mut drained.continuation,
-                            finish_formula_or_admission(
-                                plan,
-                                seed.bound,
-                                seed.batch,
-                                seed.continuation,
-                                stable,
-                                stable_interner,
-                                stats,
-                                &mut generated,
-                            ),
+                        let candidate = finish_formula_or_admission(
+                            plan,
+                            seed.bound,
+                            seed.batch,
+                            seed.continuation,
+                            stable,
+                            stable_interner,
+                            stats,
+                            &mut generated,
                         );
+                        prefer_continuation(&mut drained.continuation, candidate, stable, stats);
                         for seed in generated.into_iter().rev() {
                             queue.push_front(seed);
                         }
@@ -5397,20 +5379,18 @@ impl DeltaScheduler {
                         let mut result = CandidatePayload::empty(1);
                         result.defer_for_shared_activation(1);
                         let mut generated = Vec::new();
-                        prefer_continuation(
-                            &mut drained.continuation,
-                            finish_formula_or_emission(
-                                plan,
-                                seed.bound,
-                                seed.counter,
-                                seed.batch,
-                                result,
-                                stable,
-                                stable_interner,
-                                stats,
-                                &mut generated,
-                            ),
+                        let candidate = finish_formula_or_emission(
+                            plan,
+                            seed.bound,
+                            seed.counter,
+                            seed.batch,
+                            result,
+                            stable,
+                            stable_interner,
+                            stats,
+                            &mut generated,
                         );
+                        prefer_continuation(&mut drained.continuation, candidate, stable, stats);
                         for seed in generated.into_iter().rev() {
                             queue.push_front(seed);
                         }
@@ -5580,18 +5560,14 @@ impl DeltaScheduler {
                 DeltaCompletion::Candidates(result),
             ) => {
                 destination.install_candidates(result);
-                let continuation = destination
-                    .into_live_bucket(successor.bound.count())
-                    .and_then(|bucket| {
-                        file_with_plan(
-                            stable,
-                            stable_interner,
-                            plan,
-                            successor,
-                            bucket,
-                            stats,
-                        )
-                    });
+                let continuation = file_set_admission_destination_with_plan(
+                    stable,
+                    stable_interner,
+                    plan,
+                    successor,
+                    destination,
+                    stats,
+                );
                 FormulaReducerDrain {
                     continuation,
                     active: None,
@@ -5627,14 +5603,9 @@ impl DeltaScheduler {
                     stats,
                     &mut seeds,
                 );
-                let mut drained = self.drain_formula_reducer_seeds(
-                    seeds,
-                    plan,
-                    stable,
-                    stable_interner,
-                    stats,
-                );
-                prefer_continuation(&mut drained.continuation, continuation);
+                let mut drained =
+                    self.drain_formula_reducer_seeds(seeds, plan, stable, stable_interner, stats);
+                prefer_continuation(&mut drained.continuation, continuation, stable, stats);
                 drained
             }
             (
@@ -5656,14 +5627,9 @@ impl DeltaScheduler {
                     stats,
                     &mut seeds,
                 );
-                let mut drained = self.drain_formula_reducer_seeds(
-                    seeds,
-                    plan,
-                    stable,
-                    stable_interner,
-                    stats,
-                );
-                prefer_continuation(&mut drained.continuation, continuation);
+                let mut drained =
+                    self.drain_formula_reducer_seeds(seeds, plan, stable, stable_interner, stats);
+                prefer_continuation(&mut drained.continuation, continuation, stable, stats);
                 drained
             }
             (
@@ -5686,14 +5652,9 @@ impl DeltaScheduler {
                     stats,
                     &mut seeds,
                 );
-                let mut drained = self.drain_formula_reducer_seeds(
-                    seeds,
-                    plan,
-                    stable,
-                    stable_interner,
-                    stats,
-                );
-                prefer_continuation(&mut drained.continuation, continuation);
+                let mut drained =
+                    self.drain_formula_reducer_seeds(seeds, plan, stable, stable_interner, stats);
+                prefer_continuation(&mut drained.continuation, continuation, stable, stats);
                 drained
             }
             (DeltaReturn::FormulaOrAdmit { .. }, effect)
@@ -5834,7 +5795,7 @@ impl DeltaScheduler {
                 stable_interner,
                 stats,
             );
-            prefer_continuation(&mut drained.continuation, continuation);
+            prefer_continuation(&mut drained.continuation, continuation, stable, stats);
             return DeltaStreamingRelease {
                 stable: DeltaStableEffects {
                     continuation: drained.continuation,
@@ -5937,14 +5898,9 @@ impl DeltaScheduler {
             stats,
             &mut reducer_seeds,
         );
-        let mut drained = self.drain_formula_reducer_seeds(
-            reducer_seeds,
-            plan,
-            stable,
-            stable_interner,
-            stats,
-        );
-        prefer_continuation(&mut drained.continuation, continuation);
+        let mut drained =
+            self.drain_formula_reducer_seeds(reducer_seeds, plan, stable, stable_interner, stats);
+        prefer_continuation(&mut drained.continuation, continuation, stable, stats);
         drained
     }
 
@@ -6786,7 +6742,7 @@ impl DeltaScheduler {
                         stable_interner,
                         stats,
                     );
-                    task_effects.absorb(released.stable);
+                    task_effects.absorb(released.stable, stable, stats);
                     if let Some(active) = released.active {
                         assert!(retargeted.insert(task.activation, active).is_none());
                     }
@@ -6811,6 +6767,8 @@ impl DeltaScheduler {
                         prefer_continuation(
                             &mut task_effects.continuation,
                             released.continuation,
+                            stable,
+                            stats,
                         );
                         if let Some(active) = released.active {
                             assert!(retargeted.insert(old_activation, active).is_none());
@@ -6833,7 +6791,7 @@ impl DeltaScheduler {
             if terminal && task_effects.has_effect() {
                 let _ = terminal_publications.insert(task.activation);
             }
-            effects.absorb(task_effects);
+            effects.absorb(task_effects, stable, stats);
         }
         let _ = self.file(desc.clone(), next_tasks);
         let _ = self.file_source(desc, resumed_sources);
@@ -7258,7 +7216,7 @@ impl DeltaScheduler {
                         stable_interner,
                         stats,
                     );
-                    task_effects.absorb(released.stable);
+                    task_effects.absorb(released.stable, stable, stats);
                     if let Some(active) = released.active {
                         assert!(retargeted.insert(activation, active).is_none());
                     }
@@ -7277,7 +7235,7 @@ impl DeltaScheduler {
                         stable_interner,
                         stats,
                     );
-                    task_effects.absorb(released.stable);
+                    task_effects.absorb(released.stable, stable, stats);
                     if let Some(active) = released.active {
                         assert!(retargeted.insert(activation, active).is_none());
                     }
@@ -7302,6 +7260,8 @@ impl DeltaScheduler {
                         prefer_continuation(
                             &mut task_effects.continuation,
                             released.continuation,
+                            stable,
+                            stats,
                         );
                         if let Some(active) = released.active {
                             assert!(retargeted.insert(old_activation, active).is_none());
@@ -7347,7 +7307,7 @@ impl DeltaScheduler {
             if terminal && task_effects.has_effect() {
                 let _ = terminal_publications.insert(activation);
             }
-            effects.absorb(task_effects);
+            effects.absorb(task_effects, stable, stats);
             debug_assert!(input < row_count);
         }
 
@@ -7573,7 +7533,7 @@ impl DeltaScheduler {
                         stable_interner,
                         stats,
                     );
-                    task_effects.absorb(released.stable);
+                    task_effects.absorb(released.stable, stable, stats);
                     if let Some(active) = released.active {
                         assert!(retargeted.insert(task.activation, active).is_none());
                     }
@@ -7598,6 +7558,8 @@ impl DeltaScheduler {
                         prefer_continuation(
                             &mut task_effects.continuation,
                             released.continuation,
+                            stable,
+                            stats,
                         );
                         if let Some(active) = released.active {
                             assert!(retargeted.insert(old_activation, active).is_none());
@@ -7616,7 +7578,7 @@ impl DeltaScheduler {
             if terminal && task_effects.has_effect() {
                 let _ = terminal_publications.insert(task.activation);
             }
-            effects.absorb(task_effects);
+            effects.absorb(task_effects, stable, stats);
         }
         let _ = self.file(desc.clone(), traversal);
         let _ = self.file_source(desc, resumed_sources);

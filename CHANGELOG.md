@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A cfg-only Formula continuation probe can delay physical worklist filing.**
+  Formula-to-Formula successors still intern the same descriptor at the same
+  transition boundary and retain the same rank, `StateId`, arbitration key,
+  append order, and ProbeOne/Cohort policy, while the candidate mode owns the
+  exact affine tail until selection. Losing or declined receipts commit
+  immediately, parallel splitting flushes ownership before partitioning, and
+  conservation counters prove every prepared scheduling atom is either owned,
+  consumed, or committed. The ordinary build remains the filed control.
 - **The cfg-only Formula transport probe can isolate the Propose stage.** Its
   C/E/D panel now compares the ordinary typed route, stable-only Propose, and
   stable execution for every Formula stage with per-stage route receipts and

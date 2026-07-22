@@ -81,7 +81,7 @@ wasm = ["dep:wasmi"]
 parallel = ["dep:rayon", "blake3/rayon"]
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(nightly)', 'cfg(kani)', 'cfg(formula_delta_transport_probe)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(nightly)', 'cfg(kani)', 'cfg(formula_delta_transport_probe)', 'cfg(formula_prepared_continuation_probe)'] }
 
 [package.metadata.kani.flags]
 default-unwind = "1"
