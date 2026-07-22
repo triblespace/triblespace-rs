@@ -1,3 +1,5 @@
+#[cfg(rpq_confirm_admission_probe)]
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 
@@ -1592,6 +1594,193 @@ const RPQ_CONFIRM_FIRST_FORWARD: ProgramKey = ProgramKey::new(5);
 const RPQ_CONFIRM_FIRST_INVERSE: ProgramKey = ProgramKey::new(6);
 const RPQ_SUPPORT_TRUE: ProgramKey = ProgramKey::new(7);
 
+// Probe-only causal switch.  Production-region compilation still sees this
+// family's normal Production exposure summary; only an executed bound-endpoint
+// Confirm offer is demoted to Explicit while the switch is armed.  Keeping the
+// switch here makes it impossible for the probe to decline another Program
+// family accidentally.
+#[cfg(rpq_confirm_admission_probe)]
+thread_local! {
+    static FORCE_BOUND_CONFIRM_ORDINARY: Cell<bool> = const { Cell::new(false) };
+    static PREFER_EXTERNAL_BOUND_PROPOSER: Cell<bool> = const { Cell::new(false) };
+    static LAST_ROUTE_WAS_FORCED: Cell<bool> = const { Cell::new(false) };
+    static ORDINARY_CONFIRM_CALLS: Cell<usize> = const { Cell::new(0) };
+    static ORDINARY_CONFIRM_ROWS: Cell<usize> = const { Cell::new(0) };
+    static ORDINARY_CONFIRM_CANDIDATES_IN: Cell<usize> = const { Cell::new(0) };
+    static ORDINARY_CONFIRM_CANDIDATES_OUT: Cell<usize> = const { Cell::new(0) };
+    static ORDINARY_PROPOSE_CALLS: Cell<usize> = const { Cell::new(0) };
+    static ORDINARY_PROPOSE_ROWS: Cell<usize> = const { Cell::new(0) };
+    static ORDINARY_PROPOSE_CANDIDATES: Cell<usize> = const { Cell::new(0) };
+    static SATISFIED_CALLS: Cell<usize> = const { Cell::new(0) };
+    static SATISFIED_ROWS: Cell<usize> = const { Cell::new(0) };
+    static SATISFIED_FALSE_CALLS: Cell<usize> = const { Cell::new(0) };
+    static PROGRAM_SEED_CALLS: Cell<usize> = const { Cell::new(0) };
+    static PROGRAM_SEED_PARENTS: Cell<usize> = const { Cell::new(0) };
+    static PROGRAM_SEED_PROPOSE_CALLS: Cell<usize> = const { Cell::new(0) };
+    static PROGRAM_SEED_CONFIRM_CALLS: Cell<usize> = const { Cell::new(0) };
+    static PROGRAM_SEED_SUPPORT_CALLS: Cell<usize> = const { Cell::new(0) };
+    static ROUTE_CALLS: Cell<usize> = const { Cell::new(0) };
+    static ROUTE_PROPOSE_CALLS: Cell<usize> = const { Cell::new(0) };
+    static ROUTE_CONFIRM_CALLS: Cell<usize> = const { Cell::new(0) };
+    static ROUTE_SUPPORT_CALLS: Cell<usize> = const { Cell::new(0) };
+    static ROUTE_BOUND_CONFIRM_CALLS: Cell<usize> = const { Cell::new(0) };
+    static ROUTE_FORCED_CALLS: Cell<usize> = const { Cell::new(0) };
+    static BIASED_BOUND_ESTIMATE_ROWS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RpqConfirmAdmissionProbeSnapshot {
+    pub ordinary_confirm_calls: usize,
+    pub ordinary_confirm_rows: usize,
+    pub ordinary_confirm_candidates_in: usize,
+    pub ordinary_confirm_candidates_out: usize,
+    pub ordinary_propose_calls: usize,
+    pub ordinary_propose_rows: usize,
+    pub ordinary_propose_candidates: usize,
+    pub satisfied_calls: usize,
+    pub satisfied_rows: usize,
+    pub satisfied_false_calls: usize,
+    pub program_seed_calls: usize,
+    pub program_seed_parents: usize,
+    pub program_seed_propose_calls: usize,
+    pub program_seed_confirm_calls: usize,
+    pub program_seed_support_calls: usize,
+    pub route_calls: usize,
+    pub route_propose_calls: usize,
+    pub route_confirm_calls: usize,
+    pub route_support_calls: usize,
+    pub route_bound_confirm_calls: usize,
+    pub route_forced_calls: usize,
+    pub biased_bound_estimate_rows: usize,
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+#[doc(hidden)]
+pub fn rpq_confirm_admission_probe_force_ordinary(force: bool) {
+    FORCE_BOUND_CONFIRM_ORDINARY.with(|armed| armed.set(force));
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+#[doc(hidden)]
+pub fn rpq_confirm_admission_probe_prefer_external_bound_proposer(prefer: bool) {
+    PREFER_EXTERNAL_BOUND_PROPOSER.with(|armed| armed.set(prefer));
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+#[doc(hidden)]
+pub fn rpq_confirm_admission_probe_reset_callbacks() {
+    ORDINARY_CONFIRM_CALLS.with(|value| value.set(0));
+    ORDINARY_CONFIRM_ROWS.with(|value| value.set(0));
+    ORDINARY_CONFIRM_CANDIDATES_IN.with(|value| value.set(0));
+    ORDINARY_CONFIRM_CANDIDATES_OUT.with(|value| value.set(0));
+    ORDINARY_PROPOSE_CALLS.with(|value| value.set(0));
+    ORDINARY_PROPOSE_ROWS.with(|value| value.set(0));
+    ORDINARY_PROPOSE_CANDIDATES.with(|value| value.set(0));
+    SATISFIED_CALLS.with(|value| value.set(0));
+    SATISFIED_ROWS.with(|value| value.set(0));
+    SATISFIED_FALSE_CALLS.with(|value| value.set(0));
+    PROGRAM_SEED_CALLS.with(|value| value.set(0));
+    PROGRAM_SEED_PARENTS.with(|value| value.set(0));
+    PROGRAM_SEED_PROPOSE_CALLS.with(|value| value.set(0));
+    PROGRAM_SEED_CONFIRM_CALLS.with(|value| value.set(0));
+    PROGRAM_SEED_SUPPORT_CALLS.with(|value| value.set(0));
+    ROUTE_CALLS.with(|value| value.set(0));
+    ROUTE_PROPOSE_CALLS.with(|value| value.set(0));
+    ROUTE_CONFIRM_CALLS.with(|value| value.set(0));
+    ROUTE_SUPPORT_CALLS.with(|value| value.set(0));
+    ROUTE_BOUND_CONFIRM_CALLS.with(|value| value.set(0));
+    ROUTE_FORCED_CALLS.with(|value| value.set(0));
+    BIASED_BOUND_ESTIMATE_ROWS.with(|value| value.set(0));
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+#[doc(hidden)]
+pub fn rpq_confirm_admission_probe_snapshot() -> RpqConfirmAdmissionProbeSnapshot {
+    RpqConfirmAdmissionProbeSnapshot {
+        ordinary_confirm_calls: ORDINARY_CONFIRM_CALLS.with(Cell::get),
+        ordinary_confirm_rows: ORDINARY_CONFIRM_ROWS.with(Cell::get),
+        ordinary_confirm_candidates_in: ORDINARY_CONFIRM_CANDIDATES_IN.with(Cell::get),
+        ordinary_confirm_candidates_out: ORDINARY_CONFIRM_CANDIDATES_OUT.with(Cell::get),
+        ordinary_propose_calls: ORDINARY_PROPOSE_CALLS.with(Cell::get),
+        ordinary_propose_rows: ORDINARY_PROPOSE_ROWS.with(Cell::get),
+        ordinary_propose_candidates: ORDINARY_PROPOSE_CANDIDATES.with(Cell::get),
+        satisfied_calls: SATISFIED_CALLS.with(Cell::get),
+        satisfied_rows: SATISFIED_ROWS.with(Cell::get),
+        satisfied_false_calls: SATISFIED_FALSE_CALLS.with(Cell::get),
+        program_seed_calls: PROGRAM_SEED_CALLS.with(Cell::get),
+        program_seed_parents: PROGRAM_SEED_PARENTS.with(Cell::get),
+        program_seed_propose_calls: PROGRAM_SEED_PROPOSE_CALLS.with(Cell::get),
+        program_seed_confirm_calls: PROGRAM_SEED_CONFIRM_CALLS.with(Cell::get),
+        program_seed_support_calls: PROGRAM_SEED_SUPPORT_CALLS.with(Cell::get),
+        route_calls: ROUTE_CALLS.with(Cell::get),
+        route_propose_calls: ROUTE_PROPOSE_CALLS.with(Cell::get),
+        route_confirm_calls: ROUTE_CONFIRM_CALLS.with(Cell::get),
+        route_support_calls: ROUTE_SUPPORT_CALLS.with(Cell::get),
+        route_bound_confirm_calls: ROUTE_BOUND_CONFIRM_CALLS.with(Cell::get),
+        route_forced_calls: ROUTE_FORCED_CALLS.with(Cell::get),
+        biased_bound_estimate_rows: BIASED_BOUND_ESTIMATE_ROWS.with(Cell::get),
+    }
+}
+
+#[inline]
+fn probe_forces_bound_confirm_ordinary() -> bool {
+    #[cfg(rpq_confirm_admission_probe)]
+    {
+        return FORCE_BOUND_CONFIRM_ORDINARY.with(Cell::get);
+    }
+    #[cfg(not(rpq_confirm_admission_probe))]
+    false
+}
+
+#[inline]
+fn probe_prefers_external_bound_proposer() -> bool {
+    #[cfg(rpq_confirm_admission_probe)]
+    {
+        return PREFER_EXTERNAL_BOUND_PROPOSER.with(Cell::get);
+    }
+    #[cfg(not(rpq_confirm_admission_probe))]
+    false
+}
+
+#[inline]
+fn probe_bias_bound_estimate(estimate: usize) -> usize {
+    if probe_prefers_external_bound_proposer() {
+        #[cfg(rpq_confirm_admission_probe)]
+        BIASED_BOUND_ESTIMATE_ROWS.with(|value| value.set(value.get() + 1));
+        estimate.max(1 << 20)
+    } else {
+        estimate
+    }
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+fn probe_begin_route() {
+    LAST_ROUTE_WAS_FORCED.with(|forced| forced.set(false));
+}
+
+#[cfg(not(rpq_confirm_admission_probe))]
+fn probe_begin_route() {}
+
+#[cfg(rpq_confirm_admission_probe)]
+fn probe_mark_route_forced() {
+    LAST_ROUTE_WAS_FORCED.with(|forced| forced.set(true));
+}
+
+#[cfg(not(rpq_confirm_admission_probe))]
+fn probe_mark_route_forced() {}
+
+#[cfg(rpq_confirm_admission_probe)]
+pub(crate) fn rpq_confirm_admission_probe_take_route_forced() -> bool {
+    LAST_ROUTE_WAS_FORCED.with(|forced| forced.replace(false))
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+pub(crate) fn rpq_confirm_admission_probe_clear_route_forced() {
+    LAST_ROUTE_WAS_FORCED.with(|forced| forced.set(false));
+}
+
 const RPQ_SOURCE_START: DispatchClass = DispatchClass::new(0);
 const RPQ_SOURCE_AFTER: DispatchClass = DispatchClass::new(1);
 const RPQ_TRANSITION_START: DispatchClass = DispatchClass::new(2);
@@ -2649,7 +2838,9 @@ impl RegularPathConstraint {
         }
         if variable == self.end {
             if let Some(start_val) = start_val {
-                return self.estimate_bound(&self.estimate, start_val).max(1);
+                return probe_bias_bound_estimate(
+                    self.estimate_bound(&self.estimate, start_val).max(1),
+                );
             }
             self.set.len()
         } else {
@@ -2658,7 +2849,9 @@ impl RegularPathConstraint {
                 // via the inverted expression from the bound end,
                 // giving a tight estimate instead of the
                 // conservative set-len fallback.
-                return self.estimate_bound(&self.inverse_estimate, end_val).max(1);
+                return probe_bias_bound_estimate(
+                    self.estimate_bound(&self.inverse_estimate, end_val).max(1),
+                );
             }
             self.set.len()
         }
@@ -2832,10 +3025,34 @@ impl TypedProgramSpec for RegularPathConstraint {
     type Rank = [u64; 8];
 
     fn exposures(&self) -> crate::query::ProgramExposureSet {
+        #[cfg(rpq_confirm_admission_probe)]
+        {
+            // The probe-only Explicit demotion below must remain within this
+            // immutable family summary. Production is still present, so
+            // ProductionRegions marks are byte-for-byte unchanged.
+            return crate::query::ProgramExposureSet::ALL;
+        }
+        #[cfg(not(rpq_confirm_admission_probe))]
         crate::query::ProgramExposureSet::PRODUCTION
     }
 
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+        probe_begin_route();
+        #[cfg(rpq_confirm_admission_probe)]
+        {
+            ROUTE_CALLS.with(|value| value.set(value.get() + 1));
+            match request.action {
+                ProgramAction::Propose(_) => {
+                    ROUTE_PROPOSE_CALLS.with(|value| value.set(value.get() + 1));
+                }
+                ProgramAction::Confirm(_) => {
+                    ROUTE_CONFIRM_CALLS.with(|value| value.set(value.get() + 1));
+                }
+                ProgramAction::Support => {
+                    ROUTE_SUPPORT_CALLS.with(|value| value.set(value.get() + 1));
+                }
+            }
+        }
         let repeated = has_repetition(&self.expr);
         let stratum = if repeated {
             ProgramStratum::Fixpoint
@@ -2910,6 +3127,16 @@ impl TypedProgramSpec for RegularPathConstraint {
                             )
                         };
                     if request.bound.is_set(opposite) {
+                        #[cfg(rpq_confirm_admission_probe)]
+                        if confirming {
+                            ROUTE_BOUND_CONFIRM_CALLS.with(|value| value.set(value.get() + 1));
+                        }
+                        let force_ordinary = confirming && probe_forces_bound_confirm_ordinary();
+                        if force_ordinary {
+                            probe_mark_route_forced();
+                            #[cfg(rpq_confirm_admission_probe)]
+                            ROUTE_FORCED_CALLS.with(|value| value.set(value.get() + 1));
+                        }
                         ProgramRoute {
                             key: bound_key,
                             variable,
@@ -2924,7 +3151,11 @@ impl TypedProgramSpec for RegularPathConstraint {
                             } else {
                                 ProgramCompletion::CompleteActionEquivalent
                             },
-                            exposure: ProgramExposure::Production,
+                            exposure: if force_ordinary {
+                                ProgramExposure::Explicit
+                            } else {
+                                ProgramExposure::Production
+                            },
                         }
                     } else if matches!(request.action, ProgramAction::Propose(_)) {
                         // First-endpoint paging is a finite direct observation
@@ -3081,6 +3312,22 @@ impl TypedProgramSpec for RegularPathConstraint {
         batch: ProgramSeedBatch<'_>,
         effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
     ) {
+        #[cfg(rpq_confirm_admission_probe)]
+        {
+            PROGRAM_SEED_CALLS.with(|value| value.set(value.get() + 1));
+            PROGRAM_SEED_PARENTS.with(|value| value.set(value.get() + batch.view.len()));
+            match batch.request.action {
+                ProgramAction::Propose(_) => {
+                    PROGRAM_SEED_PROPOSE_CALLS.with(|value| value.set(value.get() + 1));
+                }
+                ProgramAction::Confirm(_) => {
+                    PROGRAM_SEED_CONFIRM_CALLS.with(|value| value.set(value.get() + 1));
+                }
+                ProgramAction::Support => {
+                    PROGRAM_SEED_SUPPORT_CALLS.with(|value| value.set(value.get() + 1));
+                }
+            }
+        }
         debug_assert_eq!(batch.view.len(), batch.activations.len());
         if batch.route.key == RPQ_SUPPORT_TRUE {
             for parent in 0..batch.view.len() {
@@ -3551,9 +3798,18 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         view: &RowsView<'_>,
         candidates: &mut CandidateSink<'_>,
     ) {
+        #[cfg(rpq_confirm_admission_probe)]
+        let candidates_before = candidates.len();
         self.for_each_proposal_row(variable, view, |parent, values| {
             candidates.extend_row(parent, values.iter().copied());
         });
+        #[cfg(rpq_confirm_admission_probe)]
+        {
+            ORDINARY_PROPOSE_CALLS.with(|value| value.set(value.get() + 1));
+            ORDINARY_PROPOSE_ROWS.with(|value| value.set(value.get() + view.len()));
+            ORDINARY_PROPOSE_CANDIDATES
+                .with(|value| value.set(value.get() + candidates.len() - candidates_before));
+        }
     }
 
     fn confirm(
@@ -3565,11 +3821,20 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         if variable != self.start && variable != self.end {
             return;
         }
+        #[cfg(rpq_confirm_admission_probe)]
+        let candidates_in = candidates.len();
         let ps = view.col(self.start);
         let pe = view.col(self.end);
         confirm_per_row(view, candidates, |row, values| {
             self.confirm_row(variable, ps.map(|c| &row[c]), pe.map(|c| &row[c]), values);
         });
+        #[cfg(rpq_confirm_admission_probe)]
+        {
+            ORDINARY_CONFIRM_CALLS.with(|value| value.set(value.get() + 1));
+            ORDINARY_CONFIRM_ROWS.with(|value| value.set(value.get() + view.len()));
+            ORDINARY_CONFIRM_CANDIDATES_IN.with(|value| value.set(value.get() + candidates_in));
+            ORDINARY_CONFIRM_CANDIDATES_OUT.with(|value| value.set(value.get() + candidates.len()));
+        }
     }
 
     fn residual_confirm_is_page_local(&self) -> bool {
@@ -3603,12 +3868,21 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
     /// endpoint is unbound. The same-variable case (`?x expr ?x`) is
     /// covered naturally — both lookups read the same column.
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
-        match (view.col(self.start), view.col(self.end)) {
+        let satisfied = match (view.col(self.start), view.col(self.end)) {
             (Some(cs), Some(ce)) => view
                 .iter()
                 .all(|row| has_path_gated(&self.set, &self.expr, &row[cs], &row[ce])),
             _ => true,
+        };
+        #[cfg(rpq_confirm_admission_probe)]
+        {
+            SATISFIED_CALLS.with(|value| value.set(value.get() + 1));
+            SATISFIED_ROWS.with(|value| value.set(value.get() + view.len()));
+            if !satisfied {
+                SATISFIED_FALSE_CALLS.with(|value| value.set(value.get() + 1));
+            }
         }
+        satisfied
     }
 }
 

@@ -14,6 +14,9 @@
 //! RUSTFLAGS="--cfg engine_current_residual --cfg engine_prefix_checkpoints \
 //!   --cfg engine_counter_only --cfg engine_counter_production" \
 //!   cargo run --release --example query_engine_generation_bench
+//! RUSTFLAGS="--cfg engine_current_residual --cfg engine_prefix_checkpoints \
+//!   --cfg rpq_confirm_admission_probe" \
+//!   cargo run --release --example query_engine_generation_bench
 //! ```
 //!
 //! Fixture/archive construction and the independent relational oracles are
@@ -28,6 +31,15 @@ compile_error!("engine_counter_only requires engine_prefix_checkpoints");
 
 #[cfg(all(engine_counter_only, not(engine_current_residual)))]
 compile_error!("engine_counter_only requires engine_current_residual");
+
+#[cfg(all(
+    rpq_confirm_admission_probe,
+    not(all(engine_prefix_checkpoints, engine_current_residual))
+))]
+compile_error!("rpq_confirm_admission_probe requires current residual prefix mode");
+
+#[cfg(all(rpq_confirm_admission_probe, engine_counter_only))]
+compile_error!("rpq_confirm_admission_probe is its own three-mode harness");
 
 #[cfg(all(engine_counter_opaque_production, engine_counter_production))]
 compile_error!("select exactly one counter lowering");
@@ -186,6 +198,14 @@ mod allocation_probe {
 
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use triblespace::core::query::TriblePattern;
+#[cfg(rpq_confirm_admission_probe)]
+use triblespace::core::query::regularpathconstraint::{
+    RpqConfirmAdmissionProbeSnapshot, rpq_confirm_admission_probe_force_ordinary,
+    rpq_confirm_admission_probe_prefer_external_bound_proposer,
+    rpq_confirm_admission_probe_reset_callbacks, rpq_confirm_admission_probe_snapshot,
+};
+#[cfg(rpq_confirm_admission_probe)]
+use triblespace::core::query::residual::{ResidualLowering, ResidualStateStats};
 use triblespace::core::trible::TribleSet;
 use triblespace::prelude::inlineencodings::GenId;
 use triblespace::prelude::*;
@@ -199,6 +219,9 @@ mod bench_schema {
         "522EB8351DA60956D2D16E6ED9745BA7" as kind: inlineencodings::GenId;
         "FDD49F6E08AC2CCB79EE6C8B1256AD02" as p: inlineencodings::GenId;
         "A4D08AA59273B336F5B977CE1511D141" as q: inlineencodings::GenId;
+        // Probe-local source-to-candidate predicate. Minted with
+        // `trible genid` for this causal branch.
+        "94E9C866F2979CFE08864577938A14BA" as confirm_candidate: inlineencodings::GenId;
     }
 }
 
@@ -227,6 +250,74 @@ const COUNTER_LOWERING: triblespace::core::query::residual::ResidualLowering =
 const COUNTER_LOWERING_LABEL: &str = "OPAQUE_PRODUCTION";
 #[cfg(all(engine_counter_only, engine_counter_production))]
 const COUNTER_LOWERING_LABEL: &str = "PRODUCTION";
+
+#[cfg(rpq_confirm_admission_probe)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProbeMode {
+    OpaqueProduction,
+    Production,
+    ProductionForcedOrdinaryConfirm,
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+impl ProbeMode {
+    const ALL: [Self; 3] = [
+        Self::OpaqueProduction,
+        Self::Production,
+        Self::ProductionForcedOrdinaryConfirm,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::OpaqueProduction => "B_OPAQUE_PRODUCTION",
+            Self::Production => "C_PRODUCTION",
+            Self::ProductionForcedOrdinaryConfirm => "F_PRODUCTION_FORCE_RPQ_CONFIRM_ORDINARY",
+        }
+    }
+
+    fn lowering(self) -> ResidualLowering {
+        match self {
+            Self::OpaqueProduction => ResidualLowering::OPAQUE_PRODUCTION,
+            Self::Production | Self::ProductionForcedOrdinaryConfirm => {
+                ResidualLowering::PRODUCTION
+            }
+        }
+    }
+
+    fn arm(self) {
+        rpq_confirm_admission_probe_prefer_external_bound_proposer(true);
+        rpq_confirm_admission_probe_force_ordinary(matches!(
+            self,
+            Self::ProductionForcedOrdinaryConfirm
+        ));
+    }
+
+    fn arm_original_mixed(self) {
+        rpq_confirm_admission_probe_prefer_external_bound_proposer(false);
+        rpq_confirm_admission_probe_force_ordinary(matches!(
+            self,
+            Self::ProductionForcedOrdinaryConfirm
+        ));
+    }
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+macro_rules! probe_mixed_query {
+    ($store:expr, $fixture:expr, $mode:expr) => {{
+        let mode = $mode;
+        mode.arm();
+        probe_rpq_confirm_query!($store, $fixture).solve_residual_state_lazy_with(mode.lowering())
+    }};
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+macro_rules! probe_original_mixed_query {
+    ($store:expr, $fixture:expr, $mode:expr) => {{
+        let mode = $mode;
+        mode.arm_original_mixed();
+        mixed_formula_rpq_query!($store, $fixture).solve_residual_state_lazy_with(mode.lowering())
+    }};
+}
 
 type Pair = (Inline<GenId>, Inline<GenId>);
 
@@ -326,8 +417,38 @@ macro_rules! mixed_formula_rpq_query {
     };
 }
 
+// Causal fixture for the admission probe: after the source-side OR selects
+// half a component, the source-local candidate predicate proposes exactly one
+// endpoint per row. Even source positions point locally and survive; odd
+// source positions point into the next disconnected component and die. The
+// RPQ's bound estimate is probe-biased upward equally in B/C/F, so the
+// one-candidate predicate wins selection and makes RPQ Confirm do observable
+// filtering. The bias changes only this causal fixture's planner cost; it does
+// not claim a cardinality/action-unit receipt.
+#[cfg(rpq_confirm_admission_probe)]
+macro_rules! probe_rpq_confirm_query {
+    ($store:expr, $fixture:expr) => {
+        engine_query!(find!(
+            (source: Inline<GenId>, target: Inline<GenId>),
+            and!(
+                or!(
+                    pattern!($store, [{ ?source @ bench_schema::kind: (&($fixture).seed) }]),
+                    pattern!($store, [{ ?source @ bench_schema::kind: (&($fixture).alternate) }]),
+                ),
+                pattern!($store, [{ ?source @ bench_schema::confirm_candidate: ?target }]),
+                path!(
+                    ($fixture).graph.clone(),
+                    source (bench_schema::p | bench_schema::q)+ target
+                ),
+            )
+        ))
+    };
+}
+
 struct Fixture {
     graph: TribleSet,
+    #[cfg(rpq_confirm_admission_probe)]
+    confirm_graph: TribleSet,
     components: Vec<Vec<Id>>,
     seed: Id,
     alternate: Id,
@@ -420,8 +541,41 @@ impl Fixture {
             }
         }
 
+        #[cfg(rpq_confirm_admission_probe)]
+        let confirm_graph = {
+            let mut confirm_graph = graph.clone();
+            // Every selected source gets one candidate. Position 0 mod 4 points
+            // to a local graph term; position 1 mod 4 points to the corresponding
+            // term in the next disconnected component. RPQ confirmation therefore
+            // retains exactly half of the one-candidate rows.
+            if components.len() >= 2 && ring_size >= 16 {
+                for (component_index, component) in components.iter().enumerate() {
+                    let remote = &components[(component_index + 1) % components.len()];
+                    for (position, source) in component.iter().enumerate() {
+                        if position % 4 > 1 {
+                            continue;
+                        }
+                        let target = if position % 4 == 0 {
+                            &component[(position + 1) % ring_size]
+                        } else {
+                            &remote[(position + 1) % ring_size]
+                        };
+                        insert_relation(
+                            &mut confirm_graph,
+                            source,
+                            &bench_schema::confirm_candidate,
+                            target,
+                        );
+                    }
+                }
+            }
+            confirm_graph
+        };
+
         Self {
             graph,
+            #[cfg(rpq_confirm_admission_probe)]
+            confirm_graph,
             components,
             seed,
             alternate,
@@ -498,6 +652,28 @@ impl Fixture {
                 for target in component {
                     rows.push((source.to_inline(), target.to_inline()));
                 }
+            }
+        }
+        rows.sort_unstable();
+        rows
+    }
+
+    #[cfg(rpq_confirm_admission_probe)]
+    fn rpq_confirm_admission_oracle(&self) -> Vec<Pair> {
+        assert!(
+            self.components.len() >= 2 && self.components[0].len() >= 16,
+            "RPQ confirm-admission probe needs >=2 components of >=16 nodes"
+        );
+        let mut rows = Vec::new();
+        for component in &self.components {
+            for (source_position, source) in component.iter().enumerate() {
+                if source_position % 4 != 0 {
+                    continue;
+                }
+                rows.push((
+                    source.to_inline(),
+                    component[(source_position + 1) % component.len()].to_inline(),
+                ));
             }
         }
         rows.sort_unstable();
@@ -766,7 +942,7 @@ where
     allocation_probe::Snapshot::now().report_since(&before, label, repetitions);
 }
 
-#[cfg(not(engine_prefix_checkpoints))]
+#[cfg(all(not(engine_prefix_checkpoints), not(rpq_confirm_admission_probe)))]
 fn main() {
     let component_count = parse_arg(1, 32);
     let ring_size = parse_arg(2, 64);
@@ -934,10 +1110,17 @@ fn main() {
     );
 }
 
-#[cfg(all(engine_prefix_checkpoints, not(engine_counter_only)))]
+#[cfg(all(
+    engine_prefix_checkpoints,
+    not(engine_counter_only),
+    not(rpq_confirm_admission_probe)
+))]
 const PREFIX_CHECKPOINTS: [usize; 7] = [1, 10, 63, 64, 65, 100, 1_000];
 
-#[cfg(all(engine_prefix_checkpoints, engine_counter_only))]
+#[cfg(all(
+    engine_prefix_checkpoints,
+    any(engine_counter_only, rpq_confirm_admission_probe)
+))]
 const PREFIX_CHECKPOINTS: [usize; 4] = [63, 64, 65, 100];
 
 #[cfg(engine_prefix_checkpoints)]
@@ -1043,7 +1226,10 @@ where
     snapshots
 }
 
-#[cfg(all(engine_prefix_checkpoints, engine_counter_only))]
+#[cfg(all(
+    engine_prefix_checkpoints,
+    any(engine_counter_only, rpq_confirm_admission_probe)
+))]
 fn print_counter_evidence<I>(label: &str, query: I)
 where
     I: Iterator<Item = Pair>,
@@ -1255,6 +1441,568 @@ where
     );
 }
 
+#[cfg(rpq_confirm_admission_probe)]
+fn probe_order_receipt(rows: &[Pair]) -> (Signature, u64) {
+    let signature = tally(rows.iter().copied());
+    let ordered_digest =
+        rows.iter()
+            .enumerate()
+            .fold(0x6A09_E667_F3BC_C909, |digest, (index, row)| {
+                mix64(
+                    digest
+                        ^ pair_order_hash(row)
+                        ^ ((index + 1) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                )
+            });
+    (signature, ordered_digest)
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+fn format_probe_stats(
+    stats: &ResidualStateStats,
+    callbacks: RpqConfirmAdmissionProbeSnapshot,
+) -> String {
+    format!(
+        "offers={} admissions={} deferred={} forced_rpq_confirm_declines={} \
+         program_activation_parents_opened={} activations_completed={} \
+         transition_pages={} transition_cohorts={} transition_examined={} \
+         source_pages={} source_cohorts={} source_examined={} \
+         state_reentries={} rows_reentered={} bucket_merges={} rows_merged={} \
+         formula_filings={} formula_bucket_merges={} formula_state_reentries={} \
+         formula_rows_reentered={} receipt_local_fused_steps={} \
+         receipt_local_refiles_avoided={} confirm_calls={} confirm_rows={} \
+         candidates_confirmed={} rpq_ordinary_confirm_calls={} \
+         rpq_ordinary_confirm_rows={} rpq_ordinary_candidates_in={} \
+         rpq_ordinary_candidates_out={} rpq_ordinary_propose_calls={} \
+         rpq_ordinary_propose_rows={} rpq_ordinary_propose_candidates={} \
+         rpq_satisfied_calls={} rpq_satisfied_rows={} \
+         rpq_satisfied_false_calls={} rpq_program_seed_calls={} \
+         rpq_program_seed_parents={} rpq_program_seed_propose_calls={} \
+         rpq_program_seed_confirm_calls={} rpq_program_seed_support_calls={} \
+         rpq_route_calls={} \
+         rpq_route_propose_calls={} rpq_route_confirm_calls={} \
+         rpq_route_support_calls={} rpq_route_bound_confirm_calls={} \
+         rpq_route_forced_calls={} rpq_biased_bound_estimate_rows={}",
+        stats.probe_program_offers,
+        stats.probe_program_admissions,
+        stats.probe_program_deferred,
+        stats.probe_forced_rpq_confirm_declines,
+        stats.probe_program_activation_parents_opened,
+        stats.delta_activations_completed,
+        stats.delta_transition_pages,
+        stats.delta_transition_cohorts,
+        stats.delta_transition_candidates_examined,
+        stats.delta_source_pages,
+        stats.delta_source_cohorts,
+        stats.delta_source_candidates_examined,
+        stats.state_reentries,
+        stats.rows_reentered,
+        stats.bucket_merges,
+        stats.rows_merged,
+        stats.probe_formula_filings,
+        stats.probe_formula_bucket_merges,
+        stats.probe_formula_state_reentries,
+        stats.probe_formula_rows_reentered,
+        stats.delta_program_receipt_local_fused_steps,
+        stats.delta_program_receipt_local_refiles_avoided,
+        stats.confirm_calls,
+        stats.confirm_rows,
+        stats.candidates_confirmed,
+        callbacks.ordinary_confirm_calls,
+        callbacks.ordinary_confirm_rows,
+        callbacks.ordinary_confirm_candidates_in,
+        callbacks.ordinary_confirm_candidates_out,
+        callbacks.ordinary_propose_calls,
+        callbacks.ordinary_propose_rows,
+        callbacks.ordinary_propose_candidates,
+        callbacks.satisfied_calls,
+        callbacks.satisfied_rows,
+        callbacks.satisfied_false_calls,
+        callbacks.program_seed_calls,
+        callbacks.program_seed_parents,
+        callbacks.program_seed_propose_calls,
+        callbacks.program_seed_confirm_calls,
+        callbacks.program_seed_support_calls,
+        callbacks.route_calls,
+        callbacks.route_propose_calls,
+        callbacks.route_confirm_calls,
+        callbacks.route_support_calls,
+        callbacks.route_bound_confirm_calls,
+        callbacks.route_forced_calls,
+        callbacks.biased_bound_estimate_rows,
+    )
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+fn probe_counter_cell<S: TriblePattern>(backend: &str, store: &S, fixture: &Fixture) {
+    for mode in ProbeMode::ALL {
+        mode.arm();
+        rpq_confirm_admission_probe_reset_callbacks();
+        let label = format!("{} / {backend}", mode.label());
+        let query = probe_mixed_query!(store, fixture, mode);
+        residual_checkpoint_stats(&label, query, |query| {
+            (
+                query.current_width(),
+                format_probe_stats(query.stats(), rpq_confirm_admission_probe_snapshot()),
+            )
+        });
+    }
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+fn original_mixed_falsifier_cell<S: TriblePattern>(
+    backend: &str,
+    store: &S,
+    fixture: &Fixture,
+    expected: &[Pair],
+) {
+    let mut production = None;
+    let mut forced = None;
+    for mode in ProbeMode::ALL {
+        mode.arm_original_mixed();
+        rpq_confirm_admission_probe_reset_callbacks();
+        let mut query = probe_original_mixed_query!(store, fixture, mode);
+        let rows: Vec<Pair> = query.by_ref().collect();
+        exact_check(rows, expected, mode.label(), "original mixed falsifier SET");
+        let stats = query.stats().clone();
+        let callbacks = rpq_confirm_admission_probe_snapshot();
+        assert_eq!(
+            stats.probe_forced_rpq_confirm_declines, 0,
+            "original mixed fixture unexpectedly executed a forced RPQ Confirm decline"
+        );
+        assert_eq!(
+            callbacks.ordinary_confirm_calls, 0,
+            "original mixed fixture unexpectedly invoked ordinary RPQ Confirm"
+        );
+        match mode {
+            ProbeMode::Production => production = Some((stats.clone(), callbacks)),
+            ProbeMode::ProductionForcedOrdinaryConfirm => {
+                forced = Some((stats.clone(), callbacks));
+            }
+            ProbeMode::OpaqueProduction => {}
+        }
+        println!(
+            "probe_original_mixed_falsifier backend={backend:?} mode={} rows={} \
+             current_width={} stats={}",
+            mode.label(),
+            expected.len(),
+            query.current_width(),
+            format_probe_stats(&stats, callbacks),
+        );
+    }
+    let (production_stats, production_callbacks) = production.unwrap();
+    let (forced_stats, forced_callbacks) = forced.unwrap();
+    assert_eq!(
+        production_stats, forced_stats,
+        "original mixed C/F execution stats diverged despite zero executed bound Confirm"
+    );
+    assert_eq!(
+        production_callbacks.program_seed_confirm_calls,
+        forced_callbacks.program_seed_confirm_calls,
+        "original mixed C/F RPQ Program callback count diverged"
+    );
+    assert!(
+        forced_callbacks.route_forced_calls > 0,
+        "original mixed compile scan never observed the structurally available bound Confirm route"
+    );
+    println!(
+        "probe_original_mixed_verdict backend={backend:?} c_f_stats_equal=true \
+         executed_forced_declines=0 ordinary_rpq_confirm_callbacks=0 \
+         compile_only_forced_routes={}",
+        forced_callbacks.route_forced_calls,
+    );
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+fn causal_seam_assertion_cell<S: TriblePattern>(
+    backend: &str,
+    store: &S,
+    fixture: &Fixture,
+    expected: &[Pair],
+) {
+    let run = |mode: ProbeMode| {
+        mode.arm();
+        rpq_confirm_admission_probe_reset_callbacks();
+        let mut query = probe_mixed_query!(store, fixture, mode);
+        let rows: Vec<Pair> = query.by_ref().collect();
+        exact_check(rows, expected, mode.label(), "causal seam assertion SET");
+        (
+            query.stats().clone(),
+            rpq_confirm_admission_probe_snapshot(),
+        )
+    };
+    let (production_stats, production_callbacks) = run(ProbeMode::Production);
+    let (forced_stats, forced_callbacks) = run(ProbeMode::ProductionForcedOrdinaryConfirm);
+
+    assert_eq!(production_stats.probe_forced_rpq_confirm_declines, 0);
+    assert_eq!(production_callbacks.ordinary_confirm_calls, 0);
+    assert!(forced_stats.probe_forced_rpq_confirm_declines > 0);
+    assert!(forced_callbacks.ordinary_confirm_calls > 0);
+    assert_eq!(
+        forced_callbacks.ordinary_confirm_candidates_in, forced_callbacks.ordinary_confirm_rows,
+        "causal fixture lost its one-candidate-per-parent geometry"
+    );
+    assert!(
+        forced_callbacks.ordinary_confirm_candidates_in
+            > forced_callbacks.ordinary_confirm_candidates_out,
+        "forced ordinary RPQ Confirm did not filter the mixed local/remote candidate batch"
+    );
+    assert!(production_stats.delta_transition_pages > 0);
+    assert_eq!(forced_stats.delta_transition_pages, 0);
+    assert!(
+        production_callbacks.program_seed_confirm_calls
+            > forced_callbacks.program_seed_confirm_calls,
+        "F did not replace any RPQ Program Confirm seeds"
+    );
+    assert_eq!(
+        forced_callbacks.ordinary_confirm_candidates_in,
+        forced_callbacks.ordinary_confirm_candidates_out * 2,
+        "causal fixture did not retain exactly its reachable local half"
+    );
+    let formula_shape = |stats: &ResidualStateStats| {
+        (
+            stats.probe_formula_filings,
+            stats.probe_formula_bucket_merges,
+            stats.probe_formula_state_reentries,
+            stats.probe_formula_rows_reentered,
+        )
+    };
+    assert_eq!(
+        formula_shape(&production_stats),
+        formula_shape(&forced_stats),
+        "C/F formula topology counters diverged; route isolation was not structural"
+    );
+    println!(
+        "probe_causal_seam_verdict backend={backend:?} c_transition_pages={} \
+         f_transition_pages={} f_forced_declines={} f_ordinary_callbacks={} \
+         candidates_in={} candidates_out={} c_rpq_program_confirm_seeds={} \
+         f_rpq_program_confirm_seeds={} formula_topology_equal=true",
+        production_stats.delta_transition_pages,
+        forced_stats.delta_transition_pages,
+        forced_stats.probe_forced_rpq_confirm_declines,
+        forced_callbacks.ordinary_confirm_calls,
+        forced_callbacks.ordinary_confirm_candidates_in,
+        forced_callbacks.ordinary_confirm_candidates_out,
+        production_callbacks.program_seed_confirm_calls,
+        forced_callbacks.program_seed_confirm_calls,
+    );
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+#[derive(Clone, Copy)]
+struct ProbeTimingSample {
+    mode: ProbeMode,
+    point: usize,
+    time_to_n: Duration,
+    drop_at_n: Duration,
+    total: Duration,
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+fn probe_timing_cell<S: TriblePattern>(
+    backend: &str,
+    store: &S,
+    fixture: &Fixture,
+    expected_rows: usize,
+    repetitions: usize,
+) {
+    let points = [63usize, 64, 65, 100, expected_rows];
+    assert!(expected_rows > 100);
+    let order_a = [
+        ProbeMode::OpaqueProduction,
+        ProbeMode::Production,
+        ProbeMode::ProductionForcedOrdinaryConfirm,
+        ProbeMode::ProductionForcedOrdinaryConfirm,
+        ProbeMode::Production,
+        ProbeMode::OpaqueProduction,
+    ];
+    let order_b = [
+        ProbeMode::ProductionForcedOrdinaryConfirm,
+        ProbeMode::Production,
+        ProbeMode::OpaqueProduction,
+        ProbeMode::OpaqueProduction,
+        ProbeMode::Production,
+        ProbeMode::ProductionForcedOrdinaryConfirm,
+    ];
+
+    // One untimed hot-cache visit per mode and point.
+    for mode in ProbeMode::ALL {
+        for &point in &points {
+            let mut query = probe_mixed_query!(store, fixture, mode);
+            let signature = if point == expected_rows {
+                tally(query.by_ref())
+            } else {
+                tally(query.by_ref().take(point))
+            };
+            assert_eq!(signature.rows, point);
+            black_box(signature);
+        }
+    }
+
+    let mut samples = Vec::with_capacity(repetitions * points.len() * order_a.len());
+    for repetition in 0..repetitions {
+        let order = if repetition % 2 == 0 {
+            order_a
+        } else {
+            order_b
+        };
+        for offset in 0..points.len() {
+            let point = points[(repetition + offset) % points.len()];
+            for mode in order {
+                let started = Instant::now();
+                let mut query = probe_mixed_query!(store, fixture, mode);
+                let signature = if point == expected_rows {
+                    tally(query.by_ref())
+                } else {
+                    tally(query.by_ref().take(point))
+                };
+                assert_eq!(signature.rows, point);
+                black_box(signature);
+                let time_to_n = started.elapsed();
+                let drop_started = Instant::now();
+                drop(query);
+                let drop_at_n = drop_started.elapsed();
+                let total = started.elapsed();
+                samples.push(ProbeTimingSample {
+                    mode,
+                    point,
+                    time_to_n,
+                    drop_at_n,
+                    total,
+                });
+            }
+        }
+    }
+
+    for (sample_index, sample) in samples.iter().enumerate() {
+        let point = if sample.point == expected_rows {
+            "full".to_owned()
+        } else {
+            sample.point.to_string()
+        };
+        println!(
+            "probe_raw backend={backend:?} sample={sample_index} mode={} point={} \
+             time_to_n_ns={} drop_at_n_ns={} total_ns={}",
+            sample.mode.label(),
+            point,
+            sample.time_to_n.as_nanos(),
+            sample.drop_at_n.as_nanos(),
+            sample.total.as_nanos(),
+        );
+    }
+
+    for mode in ProbeMode::ALL {
+        for &point in &points {
+            let selected: Vec<_> = samples
+                .iter()
+                .filter(|sample| sample.mode == mode && sample.point == point)
+                .copied()
+                .collect();
+            let durations = |project: fn(ProbeTimingSample) -> Duration| {
+                selected
+                    .iter()
+                    .map(|sample| project(*sample).as_secs_f64())
+                    .collect::<Vec<_>>()
+            };
+            let time_to_n = durations(|sample| sample.time_to_n);
+            let drop_at_n = durations(|sample| sample.drop_at_n);
+            let total = durations(|sample| sample.total);
+            let point = if point == expected_rows {
+                "full".to_owned()
+            } else {
+                point.to_string()
+            };
+            println!(
+                "probe_summary backend={backend:?} mode={} point={} samples={} \
+                 time_to_n_p50_us={:.3} time_to_n_p95_us={:.3} \
+                 drop_at_n_p50_us={:.3} drop_at_n_p95_us={:.3} \
+                 total_p50_us={:.3} total_p95_us={:.3}",
+                mode.label(),
+                point,
+                selected.len(),
+                percentile(&time_to_n, 0.50) * 1e6,
+                percentile(&time_to_n, 0.95) * 1e6,
+                percentile(&drop_at_n, 0.50) * 1e6,
+                percentile(&drop_at_n, 0.95) * 1e6,
+                percentile(&total, 0.50) * 1e6,
+                percentile(&total, 0.95) * 1e6,
+            );
+        }
+    }
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+fn run_rpq_confirm_admission_probe(
+    fixture: &Fixture,
+    archive: &SuccinctArchive<OrderedUniverse>,
+    original_mixed_expected: &[Pair],
+    expected: &[Pair],
+    repetitions: usize,
+) {
+    let confirm_archive: SuccinctArchive<OrderedUniverse> = (&fixture.confirm_graph).into();
+    println!("probe: RPQ bound-endpoint Confirm route admission");
+    println!(
+        "invariant: B uses OpaqueLeaves; C and F both use ProductionRegions; \
+         F changes only the already-fixed RPQ Confirm route exposure at execution"
+    );
+    println!(
+        "original mixed falsifier: ordinary estimator, no selector bias; \
+         this tests whether the historical cliff executed bound RPQ Confirm"
+    );
+    original_mixed_falsifier_cell(
+        "TribleSet sibling",
+        &fixture.graph,
+        fixture,
+        original_mixed_expected,
+    );
+    original_mixed_falsifier_cell(
+        "SuccinctArchive sibling",
+        archive,
+        fixture,
+        original_mixed_expected,
+    );
+    println!(
+        "causal selector fixture: bound RPQ proposal cost is probe-biased equally in B/C/F; \
+         only F changes Confirm route admission"
+    );
+    println!(
+        "causal fixture store: {} tribles; original mixed store: {} tribles",
+        fixture.confirm_graph.len(),
+        fixture.graph.len(),
+    );
+
+    // Independent exact SET oracle plus raw physical-order receipts. Order is
+    // reported (including a same-cell repeat), rather than asserted across
+    // runs, backends, or lowerings: equal-cost state buckets may legitimately
+    // use a different hash iteration order while denoting the same SET.
+    for mode in ProbeMode::ALL {
+        mode.arm();
+        let tribleset_rows: Vec<Pair> =
+            probe_mixed_query!(&fixture.confirm_graph, fixture, mode).collect();
+        mode.arm();
+        let tribleset_repeat: Vec<Pair> =
+            probe_mixed_query!(&fixture.confirm_graph, fixture, mode).collect();
+        mode.arm();
+        let archive_rows: Vec<Pair> = probe_mixed_query!(&confirm_archive, fixture, mode).collect();
+        mode.arm();
+        let archive_repeat: Vec<Pair> =
+            probe_mixed_query!(&confirm_archive, fixture, mode).collect();
+
+        exact_check(
+            tribleset_rows.clone(),
+            expected,
+            mode.label(),
+            "TribleSet SET",
+        );
+        exact_check(
+            archive_rows.clone(),
+            expected,
+            mode.label(),
+            "SuccinctArchive SET",
+        );
+        exact_check(
+            tribleset_repeat.clone(),
+            expected,
+            mode.label(),
+            "TribleSet repeat SET",
+        );
+        exact_check(
+            archive_repeat.clone(),
+            expected,
+            mode.label(),
+            "SuccinctArchive repeat SET",
+        );
+        for (backend, rows) in [
+            ("TribleSet", tribleset_rows.as_slice()),
+            ("SuccinctArchive", archive_rows.as_slice()),
+        ] {
+            let (signature, ordered_digest) = probe_order_receipt(rows);
+            println!(
+                "probe_order_oracle mode={} backend={backend:?} rows={} \
+                 set_checksum={:#018x} ordered_digest={:#018x} first={} last={}",
+                mode.label(),
+                signature.rows,
+                signature.checksum,
+                ordered_digest,
+                render_pair(rows.first().copied()),
+                render_pair(rows.last().copied()),
+            );
+        }
+        println!(
+            "probe_cross_backend_order mode={} equal={}",
+            mode.label(),
+            tribleset_rows == archive_rows,
+        );
+        for (backend, first, repeat) in [
+            (
+                "TribleSet",
+                tribleset_rows.as_slice(),
+                tribleset_repeat.as_slice(),
+            ),
+            (
+                "SuccinctArchive",
+                archive_rows.as_slice(),
+                archive_repeat.as_slice(),
+            ),
+        ] {
+            let (_, first_digest) = probe_order_receipt(first);
+            let (_, repeat_digest) = probe_order_receipt(repeat);
+            println!(
+                "probe_order_repeat mode={} backend={backend:?} equal={} \
+                 first_digest={first_digest:#018x} repeat_digest={repeat_digest:#018x}",
+                mode.label(),
+                first == repeat,
+            );
+        }
+    }
+    println!("probe oracle parity: exact SET pass; raw physical order receipts recorded");
+
+    for mode in ProbeMode::ALL {
+        let label = format!("{} / TribleSet sibling", mode.label());
+        print_counter_evidence(
+            &label,
+            probe_mixed_query!(&fixture.confirm_graph, fixture, mode),
+        );
+        let label = format!("{} / SuccinctArchive sibling", mode.label());
+        print_counter_evidence(&label, probe_mixed_query!(&confirm_archive, fixture, mode));
+    }
+
+    probe_counter_cell("TribleSet sibling", &fixture.confirm_graph, fixture);
+    probe_counter_cell("SuccinctArchive sibling", &confirm_archive, fixture);
+    causal_seam_assertion_cell(
+        "TribleSet sibling",
+        &fixture.confirm_graph,
+        fixture,
+        expected,
+    );
+    causal_seam_assertion_cell(
+        "SuccinctArchive sibling",
+        &confirm_archive,
+        fixture,
+        expected,
+    );
+    if std::env::var_os("RPQ_PROBE_COUNTER_ONLY").is_none() {
+        probe_timing_cell(
+            "TribleSet sibling",
+            &fixture.confirm_graph,
+            fixture,
+            expected.len(),
+            repetitions,
+        );
+        probe_timing_cell(
+            "SuccinctArchive sibling",
+            &confirm_archive,
+            fixture,
+            expected.len(),
+            repetitions,
+        );
+    } else {
+        println!("probe timing skipped: RPQ_PROBE_COUNTER_ONLY is set");
+    }
+    rpq_confirm_admission_probe_force_ordinary(false);
+    rpq_confirm_admission_probe_prefer_external_bound_proposer(false);
+}
+
 #[cfg(engine_prefix_checkpoints)]
 fn main() {
     let component_count = parse_arg(1, 32);
@@ -1280,6 +2028,7 @@ fn main() {
         (fixture, archive)
     };
 
+    #[cfg(not(rpq_confirm_admission_probe))]
     let rpq_expected = fixture.cyclic_rpq_oracle();
     let mixed_expected = fixture.mixed_formula_rpq_oracle();
 
@@ -1306,118 +2055,133 @@ fn main() {
     println!("mode: counter-only; lowering: {COUNTER_LOWERING_LABEL}; no timed samples");
     println!("checkpoints: {PREFIX_CHECKPOINTS:?}");
 
-    #[cfg(not(engine_counter_only))]
+    #[cfg(rpq_confirm_admission_probe)]
     {
-        exact_check(
-            rpq_collect(&fixture),
-            &rpq_expected,
-            "cyclic RPQ",
-            "TribleSet",
-        );
-        exact_check(
-            mixed_collect(&fixture.graph, &fixture),
+        let probe_expected = fixture.rpq_confirm_admission_oracle();
+        run_rpq_confirm_admission_probe(
+            &fixture,
+            &archive,
             &mixed_expected,
-            "formula + cyclic RPQ",
-            "TribleSet sibling",
-        );
-        exact_check(
-            mixed_collect(&archive, &fixture),
-            &mixed_expected,
-            "formula + cyclic RPQ",
-            "SuccinctArchive sibling",
-        );
-    }
-    #[cfg(engine_counter_only)]
-    {
-        exact_check(
-            cyclic_rpq_query!(&fixture)
-                .solve_residual_state_lazy_with(COUNTER_LOWERING)
-                .collect(),
-            &rpq_expected,
-            "cyclic RPQ",
-            "TribleSet",
-        );
-        exact_check(
-            mixed_formula_rpq_query!(&fixture.graph, &fixture)
-                .solve_residual_state_lazy_with(COUNTER_LOWERING)
-                .collect(),
-            &mixed_expected,
-            "formula + cyclic RPQ",
-            "TribleSet sibling",
-        );
-        exact_check(
-            mixed_formula_rpq_query!(&archive, &fixture)
-                .solve_residual_state_lazy_with(COUNTER_LOWERING)
-                .collect(),
-            &mixed_expected,
-            "formula + cyclic RPQ",
-            "SuccinctArchive sibling",
-        );
-    }
-    println!("oracle parity: all three prefix-diagnostic cells exact");
-
-    #[cfg(engine_counter_only)]
-    {
-        print_counter_evidence(
-            "cyclic RPQ / TribleSet",
-            cyclic_rpq_query!(&fixture).solve_residual_state_lazy_with(COUNTER_LOWERING),
-        );
-        print_counter_evidence(
-            "formula + cyclic RPQ / TribleSet sibling",
-            mixed_formula_rpq_query!(&fixture.graph, &fixture)
-                .solve_residual_state_lazy_with(COUNTER_LOWERING),
-        );
-        print_counter_evidence(
-            "formula + cyclic RPQ / SuccinctArchive sibling",
-            mixed_formula_rpq_query!(&archive, &fixture)
-                .solve_residual_state_lazy_with(COUNTER_LOWERING),
+            &probe_expected,
+            repetitions,
         );
     }
 
-    #[cfg(engine_current_residual)]
+    #[cfg(not(rpq_confirm_admission_probe))]
     {
-        use triblespace::core::query::residual::ResidualLowering;
+        #[cfg(not(engine_counter_only))]
+        {
+            exact_check(
+                rpq_collect(&fixture),
+                &rpq_expected,
+                "cyclic RPQ",
+                "TribleSet",
+            );
+            exact_check(
+                mixed_collect(&fixture.graph, &fixture),
+                &mixed_expected,
+                "formula + cyclic RPQ",
+                "TribleSet sibling",
+            );
+            exact_check(
+                mixed_collect(&archive, &fixture),
+                &mixed_expected,
+                "formula + cyclic RPQ",
+                "SuccinctArchive sibling",
+            );
+        }
+        #[cfg(engine_counter_only)]
+        {
+            exact_check(
+                cyclic_rpq_query!(&fixture)
+                    .solve_residual_state_lazy_with(COUNTER_LOWERING)
+                    .collect(),
+                &rpq_expected,
+                "cyclic RPQ",
+                "TribleSet",
+            );
+            exact_check(
+                mixed_formula_rpq_query!(&fixture.graph, &fixture)
+                    .solve_residual_state_lazy_with(COUNTER_LOWERING)
+                    .collect(),
+                &mixed_expected,
+                "formula + cyclic RPQ",
+                "TribleSet sibling",
+            );
+            exact_check(
+                mixed_formula_rpq_query!(&archive, &fixture)
+                    .solve_residual_state_lazy_with(COUNTER_LOWERING)
+                    .collect(),
+                &mixed_expected,
+                "formula + cyclic RPQ",
+                "SuccinctArchive sibling",
+            );
+        }
+        println!("oracle parity: all three prefix-diagnostic cells exact");
+
+        #[cfg(engine_counter_only)]
+        {
+            print_counter_evidence(
+                "cyclic RPQ / TribleSet",
+                cyclic_rpq_query!(&fixture).solve_residual_state_lazy_with(COUNTER_LOWERING),
+            );
+            print_counter_evidence(
+                "formula + cyclic RPQ / TribleSet sibling",
+                mixed_formula_rpq_query!(&fixture.graph, &fixture)
+                    .solve_residual_state_lazy_with(COUNTER_LOWERING),
+            );
+            print_counter_evidence(
+                "formula + cyclic RPQ / SuccinctArchive sibling",
+                mixed_formula_rpq_query!(&archive, &fixture)
+                    .solve_residual_state_lazy_with(COUNTER_LOWERING),
+            );
+        }
+
+        #[cfg(engine_current_residual)]
+        {
+            use triblespace::core::query::residual::ResidualLowering;
+
+            #[cfg(not(engine_counter_only))]
+            const PREFIX_LOWERING: ResidualLowering = ResidualLowering::FULL;
+            #[cfg(engine_counter_only)]
+            const PREFIX_LOWERING: ResidualLowering = COUNTER_LOWERING;
+
+            residual_checkpoint_stats(
+                "cyclic RPQ / TribleSet",
+                cyclic_rpq_query!(&fixture).solve_residual_state_lazy_with(PREFIX_LOWERING),
+                |query| (query.current_width(), format!("{:?}", query.stats())),
+            );
+            residual_checkpoint_stats(
+                "formula + cyclic RPQ / TribleSet sibling",
+                mixed_formula_rpq_query!(&fixture.graph, &fixture)
+                    .solve_residual_state_lazy_with(PREFIX_LOWERING),
+                |query| (query.current_width(), format!("{:?}", query.stats())),
+            );
+            residual_checkpoint_stats(
+                "formula + cyclic RPQ / SuccinctArchive sibling",
+                mixed_formula_rpq_query!(&archive, &fixture)
+                    .solve_residual_state_lazy_with(PREFIX_LOWERING),
+                |query| (query.current_width(), format!("{:?}", query.stats())),
+            );
+        }
 
         #[cfg(not(engine_counter_only))]
-        const PREFIX_LOWERING: ResidualLowering = ResidualLowering::FULL;
-        #[cfg(engine_counter_only)]
-        const PREFIX_LOWERING: ResidualLowering = COUNTER_LOWERING;
-
-        residual_checkpoint_stats(
-            "cyclic RPQ / TribleSet",
-            cyclic_rpq_query!(&fixture).solve_residual_state_lazy_with(PREFIX_LOWERING),
-            |query| (query.current_width(), format!("{:?}", query.stats())),
-        );
-        residual_checkpoint_stats(
-            "formula + cyclic RPQ / TribleSet sibling",
-            mixed_formula_rpq_query!(&fixture.graph, &fixture)
-                .solve_residual_state_lazy_with(PREFIX_LOWERING),
-            |query| (query.current_width(), format!("{:?}", query.stats())),
-        );
-        residual_checkpoint_stats(
-            "formula + cyclic RPQ / SuccinctArchive sibling",
-            mixed_formula_rpq_query!(&archive, &fixture)
-                .solve_residual_state_lazy_with(PREFIX_LOWERING),
-            |query| (query.current_width(), format!("{:?}", query.stats())),
-        );
-    }
-
-    #[cfg(not(engine_counter_only))]
-    {
-        bench_prefix_cell("cyclic RPQ / TribleSet", &rpq_expected, repetitions, || {
-            cyclic_rpq_query!(&fixture)
-        });
-        bench_prefix_cell(
-            "formula + cyclic RPQ / TribleSet sibling",
-            &mixed_expected,
-            repetitions,
-            || mixed_formula_rpq_query!(&fixture.graph, &fixture),
-        );
-        bench_prefix_cell(
-            "formula + cyclic RPQ / SuccinctArchive sibling",
-            &mixed_expected,
-            repetitions,
-            || mixed_formula_rpq_query!(&archive, &fixture),
-        );
+        {
+            bench_prefix_cell("cyclic RPQ / TribleSet", &rpq_expected, repetitions, || {
+                cyclic_rpq_query!(&fixture)
+            });
+            bench_prefix_cell(
+                "formula + cyclic RPQ / TribleSet sibling",
+                &mixed_expected,
+                repetitions,
+                || mixed_formula_rpq_query!(&fixture.graph, &fixture),
+            );
+            bench_prefix_cell(
+                "formula + cyclic RPQ / SuccinctArchive sibling",
+                &mixed_expected,
+                repetitions,
+                || mixed_formula_rpq_query!(&archive, &fixture),
+            );
+        }
     }
 }

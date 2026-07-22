@@ -139,7 +139,10 @@ struct FormulaNodeCapabilities {
 #[derive(Clone, Copy)]
 enum ProgramOffer<'a> {
     Absent,
-    Deferred,
+    Deferred {
+        /// True only for the compile-time RPQ admission causal probe.
+        probe_forced: bool,
+    },
     Selected(ProgramRef<'a>, ProgramRoute),
 }
 
@@ -153,13 +156,20 @@ fn select_program<'r, 'a>(
     let Some(program) = constraint.residual_program() else {
         return ProgramOffer::Absent;
     };
+    #[cfg(rpq_confirm_admission_probe)]
+    super::regularpathconstraint::rpq_confirm_admission_probe_clear_route_forced();
     let Some(route) = program.route(request) else {
         return ProgramOffer::Absent;
     };
+    #[cfg(rpq_confirm_admission_probe)]
+    let probe_forced =
+        super::regularpathconstraint::rpq_confirm_admission_probe_take_route_forced();
+    #[cfg(not(rpq_confirm_admission_probe))]
+    let probe_forced = false;
     if scope.admits(route.exposure) {
         ProgramOffer::Selected(program, route)
     } else {
-        ProgramOffer::Deferred
+        ProgramOffer::Deferred { probe_forced }
     }
 }
 
@@ -259,7 +269,7 @@ fn compile_grouped_delta_confirm_requirements<'a>(
                 }
                 // A policy-deferred route executes through the ordinary
                 // protocol, not through either legacy transition substrate.
-                ProgramOffer::Deferred => return None,
+                ProgramOffer::Deferred { .. } => return None,
                 ProgramOffer::Absent => {}
             }
             constraint
@@ -2084,7 +2094,7 @@ impl ResidualPlan {
             ProgramOffer::Selected(_, _) => {
                 ordinary.max(constraint.residual_program_proposal_coverage(variable, bound))
             }
-            ProgramOffer::Absent | ProgramOffer::Deferred => ordinary,
+            ProgramOffer::Absent | ProgramOffer::Deferred { .. } => ordinary,
         }
     }
 
@@ -2307,7 +2317,7 @@ impl ResidualPlan {
                 },
             ) {
                 ProgramOffer::Selected(_, _) => true,
-                ProgramOffer::Deferred => false,
+                ProgramOffer::Deferred { .. } => false,
                 ProgramOffer::Absent => {
                     constraint.residual_delta_source_is_paged(variable, view)
                         || constraint.residual_proposal_source_has_transition_roots(variable, view)
@@ -2335,7 +2345,7 @@ impl ResidualPlan {
                         },
                     ) {
                         ProgramOffer::Selected(_, _) => true,
-                        ProgramOffer::Deferred => false,
+                        ProgramOffer::Deferred { .. } => false,
                         ProgramOffer::Absent => {
                             constraint.residual_delta_source_is_paged(variable, view)
                                 || constraint
@@ -2679,6 +2689,19 @@ pub struct ResidualStateStats {
     pub state_reentries: usize,
     /// Parent rows carried by [`state_reentries`](Self::state_reentries).
     pub rows_reentered: usize,
+    /// Probe-only count of nonempty Formula bucket filings, including fresh
+    /// insertions, live merges, and reopened canonical states.
+    #[cfg(rpq_confirm_admission_probe)]
+    pub probe_formula_filings: usize,
+    /// Probe-only Formula filings appended to an already-live bucket.
+    #[cfg(rpq_confirm_admission_probe)]
+    pub probe_formula_bucket_merges: usize,
+    /// Probe-only Formula filings that reopened an interned state.
+    #[cfg(rpq_confirm_admission_probe)]
+    pub probe_formula_state_reentries: usize,
+    /// Parent rows carried by probe-only Formula state reentries.
+    #[cfg(rpq_confirm_admission_probe)]
+    pub probe_formula_rows_reentered: usize,
     /// Logical flattened-leaf proposal actions. A paged source activation
     /// counts once even though it bypasses the eager `Constraint::propose`
     /// verb.
@@ -2714,6 +2737,22 @@ pub struct ResidualStateStats {
     /// whether from geometric negative-work feedback or a confirmed projected-
     /// demand floor. Saturated attempts do not increment this counter.
     pub width_increases: usize,
+    /// Probe-only action-level typed Program routes offered to execution.
+    #[cfg(rpq_confirm_admission_probe)]
+    pub probe_program_offers: usize,
+    /// Probe-only offered routes admitted by the selected Program scope.
+    #[cfg(rpq_confirm_admission_probe)]
+    pub probe_program_admissions: usize,
+    /// Probe-only offered routes deliberately deferred by Program policy.
+    #[cfg(rpq_confirm_admission_probe)]
+    pub probe_program_deferred: usize,
+    /// Probe-only bound-endpoint RPQ Confirm offers causally forced ordinary.
+    #[cfg(rpq_confirm_admission_probe)]
+    pub probe_forced_rpq_confirm_declines: usize,
+    /// Affine parent activations opened by probe-observed admitted Program
+    /// actions. Complete-action phase changes do not contribute.
+    #[cfg(rpq_confirm_admission_probe)]
+    pub probe_program_activation_parents_opened: usize,
     /// Successful non-Native typed Program cohort placements.
     pub delta_program_physical_cohorts: usize,
     /// Affine Program inputs carried by successful non-Native placements.
@@ -7809,6 +7848,12 @@ fn file_with_span(
     if rows == 0 {
         return None;
     }
+    #[cfg(rpq_confirm_admission_probe)]
+    let probe_formula = matches!(&desc.phase, ResidualPhase::Formula { .. });
+    #[cfg(rpq_confirm_admission_probe)]
+    if probe_formula {
+        stats.probe_formula_filings += 1;
+    }
     let candidates = match &bucket {
         StateBucket::Rows(_) => 0,
         StateBucket::Candidates(batch) => batch.candidate_count(),
@@ -7820,11 +7865,20 @@ fn file_with_span(
     if let Some(existing) = level.get_mut(&id) {
         stats.bucket_merges += 1;
         stats.rows_merged += rows;
+        #[cfg(rpq_confirm_admission_probe)]
+        if probe_formula {
+            stats.probe_formula_bucket_merges += 1;
+        }
         existing.append(bucket);
     } else {
         if known {
             stats.state_reentries += 1;
             stats.rows_reentered += rows;
+            #[cfg(rpq_confirm_admission_probe)]
+            if probe_formula {
+                stats.probe_formula_state_reentries += 1;
+                stats.probe_formula_rows_reentered += rows;
+            }
         }
         level.insert(id, bucket);
     }
@@ -11282,8 +11336,27 @@ impl ResidualStateMachine {
         // it must never fall through to a legacy pager or seed adapter.
         let program = match select_program(constraint, plan.program_scope, program_request) {
             ProgramOffer::Absent => None,
-            ProgramOffer::Deferred => return Err(task),
-            ProgramOffer::Selected(spec, route) => Some((spec, route)),
+            ProgramOffer::Deferred {
+                probe_forced,
+            } => {
+                #[cfg(rpq_confirm_admission_probe)]
+                {
+                    self.stats.probe_program_offers += 1;
+                    self.stats.probe_program_deferred += 1;
+                    self.stats.probe_forced_rpq_confirm_declines += usize::from(probe_forced);
+                }
+                #[cfg(not(rpq_confirm_admission_probe))]
+                let _ = probe_forced;
+                return Err(task);
+            }
+            ProgramOffer::Selected(spec, route) => {
+                #[cfg(rpq_confirm_admission_probe)]
+                {
+                    self.stats.probe_program_offers += 1;
+                    self.stats.probe_program_admissions += 1;
+                }
+                Some((spec, route))
+            }
         };
         let selected_parent_count = rows.row_count;
         let admitted_parent_count = if terminal_streaming {
@@ -11395,6 +11468,10 @@ impl ResidualStateMachine {
                 &mut self.interner,
                 &mut self.stats,
             );
+            #[cfg(rpq_confirm_admission_probe)]
+            {
+                self.stats.probe_program_activation_parents_opened += outcome.seeded_parents;
+            }
             if terminal_streaming && self.uses_direct_terminal_publication() {
                 outcome.terminal_family = Some(state);
             } else {
@@ -11498,8 +11575,27 @@ impl ResidualStateMachine {
         };
         let program = match select_program(constraint, plan.program_scope, program_request) {
             ProgramOffer::Absent => None,
-            ProgramOffer::Deferred => return Err(task),
-            ProgramOffer::Selected(spec, route) => Some((spec, route)),
+            ProgramOffer::Deferred {
+                probe_forced,
+            } => {
+                #[cfg(rpq_confirm_admission_probe)]
+                {
+                    self.stats.probe_program_offers += 1;
+                    self.stats.probe_program_deferred += 1;
+                    self.stats.probe_forced_rpq_confirm_declines += usize::from(probe_forced);
+                }
+                #[cfg(not(rpq_confirm_admission_probe))]
+                let _ = probe_forced;
+                return Err(task);
+            }
+            ProgramOffer::Selected(spec, route) => {
+                #[cfg(rpq_confirm_admission_probe)]
+                {
+                    self.stats.probe_program_offers += 1;
+                    self.stats.probe_program_admissions += 1;
+                }
+                Some((spec, route))
+            }
         };
         if let Some((spec, route)) = program {
             if route.grouping == ProgramGrouping::ParentAtomic {
@@ -11541,6 +11637,10 @@ impl ResidualStateMachine {
                 &self.interner.formula_pcs,
             );
             let seeded_parents = batch.parents.row_count;
+            #[cfg(rpq_confirm_admission_probe)]
+            {
+                self.stats.probe_program_activation_parents_opened += seeded_parents;
+            }
             let active = self.delta.seed_program_confirms(
                 spec,
                 DeltaDesc::leaf(variable, confirmer),
@@ -11903,8 +12003,25 @@ impl ResidualStateMachine {
         };
         let program = match select_program(constraint, plan.program_scope, program_request) {
             ProgramOffer::Absent => None,
-            ProgramOffer::Deferred => return Err(task),
+            ProgramOffer::Deferred {
+                probe_forced,
+            } => {
+                #[cfg(rpq_confirm_admission_probe)]
+                {
+                    self.stats.probe_program_offers += 1;
+                    self.stats.probe_program_deferred += 1;
+                    self.stats.probe_forced_rpq_confirm_declines += usize::from(probe_forced);
+                }
+                #[cfg(not(rpq_confirm_admission_probe))]
+                let _ = probe_forced;
+                return Err(task);
+            }
             ProgramOffer::Selected(spec, route) => {
+                #[cfg(rpq_confirm_admission_probe)]
+                {
+                    self.stats.probe_program_offers += 1;
+                    self.stats.probe_program_admissions += 1;
+                }
                 if stage == FormulaStage::Confirm && route.grouping == ProgramGrouping::ParentAtomic
                 {
                     assert!(
@@ -12028,7 +12145,7 @@ impl ResidualStateMachine {
             }
         }
         if let Some((spec, route)) = program {
-            return Ok(self.delta.seed_program_formula(
+            let outcome = self.delta.seed_program_formula(
                 spec,
                 DeltaDesc::formula(variable, occurrence, node),
                 program_request,
@@ -12042,7 +12159,12 @@ impl ResidualStateMachine {
                 &mut self.worklist,
                 &mut self.interner,
                 &mut self.stats,
-            ));
+            );
+            #[cfg(rpq_confirm_admission_probe)]
+            {
+                self.stats.probe_program_activation_parents_opened += outcome.seeded_parents;
+            }
+            return Ok(outcome);
         }
         if paged {
             let seeded_parents = batch.parents.row_count;
