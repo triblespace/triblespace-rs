@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A probe-only scalar 2×2 separates validation discharge from SET-layout
+  admission.** A unary finite intersection can independently bypass its
+  redundant outer confirmation and its hash-based SET admission under an
+  exact-action test receipt. Raw projected-tuple SET oracles, action counters,
+  and balanced ABBA timing cover N/selectivity controls without changing the
+  production protocol or public API.
 - **Directed singleton Program chains can spend one scheduler grant locally.**
   An unjoined streaming activation may consume exact same-cohort sole children
   inside its producing receipt until the original work budget is exhausted or

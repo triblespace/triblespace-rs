@@ -2816,6 +2816,66 @@ pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
     /// a borrow-free lowering plan plus raw machine state; `constraint` and
     /// `postprocessing` remain owned by this `Query`.
     residual: Option<Box<residual::ResidualQueryState>>,
+    /// Probe-only receipt attached to the exact unary scalar proposal action.
+    ///
+    /// This deliberately does not reuse [`ProposalCoverage`]: source coverage,
+    /// concrete result layout, and validation discharge are independent proof
+    /// dimensions. The field does not exist in ordinary library builds.
+    #[cfg(test)]
+    scalar_action_probe: Option<ScalarActionProbe>,
+}
+
+/// Multiplicity/layout proof for one concrete scalar proposal result.
+///
+/// `GroupedSet` is an affine fact about the returned one-parent value vector;
+/// it is not implied by static [`ProposalCoverage::Exact`].
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ScalarResultLayout {
+    #[default]
+    GroupedBag,
+    GroupedSet,
+}
+
+/// Validation work already performed by one concrete scalar proposal action.
+///
+/// This is action-relative execution evidence, not a denotational coverage
+/// claim. In particular, a certified intersection may have static `Covering`
+/// proposal coverage while its composite proposal has already run every
+/// target validator for the concrete result it returned.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ScalarValidation {
+    #[default]
+    Pending,
+    Discharged,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ScalarActionResultReceipt {
+    layout: ScalarResultLayout,
+    validation: ScalarValidation,
+}
+
+/// Probe-local counters for the outer scalar SET-admission boundary.
+///
+/// The benchmark leaves this absent while timing and enables it only for an
+/// untimed structural pass, so atomic observation is not folded into either
+/// factorial axis.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct ScalarActionProbeTelemetry {
+    hash_calls: std::sync::atomic::AtomicUsize,
+    hash_occurrences: std::sync::atomic::AtomicUsize,
+    grouped_set_skips: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct ScalarActionProbe {
+    receipt: ScalarActionResultReceipt,
+    telemetry: Option<Arc<ScalarActionProbeTelemetry>>,
 }
 
 // Manual `Clone` impl, because `#[derive(Clone)]` would require `R: Clone`
@@ -2857,6 +2917,8 @@ where
             binding: self.binding.clone(),
             dag: self.dag.clone(),
             residual: self.residual.clone(),
+            #[cfg(test)]
+            scalar_action_probe: self.scalar_action_probe.clone(),
         }
     }
 }
@@ -2873,6 +2935,8 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// [`UnindexedProducer::split`](crate::query::QueryParIter) implementation
     /// — the "push + propose" dance is identical in both.
     fn push_next_variable(&mut self) {
+        #[cfg(test)]
+        let scalar_action_probe = self.scalar_action_probe.clone();
         let (variable, coverage) = if self.certified_denotation {
             // Coverage is structural in the complete bound schema and may be
             // enabled by any newly bound peer (Equality is the smallest
@@ -2947,7 +3011,13 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             &view,
             &mut CandidateSink::Values(values),
         );
-        if coverage == ProposalCoverage::Covering {
+        #[cfg(test)]
+        let validation_discharged = scalar_action_probe
+            .as_ref()
+            .is_some_and(|probe| probe.receipt.validation == ScalarValidation::Discharged);
+        #[cfg(not(test))]
+        let validation_discharged = false;
+        if coverage == ProposalCoverage::Covering && !validation_discharged {
             confirm_constraint(
                 &self.constraint,
                 true,
@@ -2956,10 +3026,44 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
                 &mut CandidateSink::Values(values),
             );
         }
-        // `values` is a tail-popped action stack. Keep each value's last
-        // stored occurrence so the first-seen DFS order remains unchanged:
-        // `[a, b, a] -> [b, a]`, then pop yields `a, b`.
-        admit_reverse_stable_set(values, &mut self.value_admission);
+        // A lawful confirm is an order-preserving subbag filter: it can only
+        // delete occurrences, never introduce or duplicate them. Therefore a
+        // concrete `GroupedSet` layout receipt remains valid after the pending
+        // confirmation in factorial arm C.
+        #[cfg(test)]
+        let layout_is_grouped_set = scalar_action_probe
+            .as_ref()
+            .is_some_and(|probe| probe.receipt.layout == ScalarResultLayout::GroupedSet);
+        #[cfg(not(test))]
+        let layout_is_grouped_set = false;
+        if layout_is_grouped_set {
+            #[cfg(test)]
+            if let Some(telemetry) = scalar_action_probe
+                .as_ref()
+                .and_then(|probe| probe.telemetry.as_ref())
+            {
+                telemetry
+                    .grouped_set_skips
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        } else {
+            #[cfg(test)]
+            if let Some(telemetry) = scalar_action_probe
+                .as_ref()
+                .and_then(|probe| probe.telemetry.as_ref())
+            {
+                telemetry
+                    .hash_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                telemetry
+                    .hash_occurrences
+                    .fetch_add(values.len(), std::sync::atomic::Ordering::Relaxed);
+            }
+            // `values` is a tail-popped action stack. Keep each value's last
+            // stored occurrence so the first-seen DFS order remains unchanged:
+            // `[a, b, a] -> [b, a]`, then pop yields `a, b`.
+            admit_reverse_stable_set(values, &mut self.value_admission);
+        }
         self.cols[variable] = self.stack.len() as u8;
         self.stack.push(variable);
         self.row.push([0; 32]);
@@ -3017,6 +3121,30 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             "cannot select the sequential query scheduler after iteration has started"
         );
         self.scheduler = QueryScheduler::Sequential;
+        self
+    }
+
+    /// Attaches one exact-action receipt to the unary scalar proposal probe.
+    ///
+    /// This is deliberately test-only and query-owned: it cannot leak across
+    /// concurrent queries and does not commit the production protocol to a
+    /// receipt representation before the causal experiment earns one.
+    #[cfg(test)]
+    fn with_scalar_action_probe(
+        mut self,
+        receipt: ScalarActionResultReceipt,
+        telemetry: Option<Arc<ScalarActionProbeTelemetry>>,
+    ) -> Self {
+        assert!(
+            !self.iteration_started && self.dag.is_none() && self.residual.is_none(),
+            "cannot attach a scalar action probe after iteration has started"
+        );
+        assert_eq!(
+            self.constraint.variables().count(),
+            1,
+            "the scalar action receipt probe is intentionally unary"
+        );
+        self.scalar_action_probe = Some(ScalarActionProbe { receipt, telemetry });
         self
     }
 
@@ -3235,6 +3363,8 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             binding: Binding::default(),
             dag: None,
             residual: None,
+            #[cfg(test)]
+            scalar_action_probe: None,
         }
     }
 }
@@ -5440,6 +5570,9 @@ macro_rules! temp {
 }
 /// Re-export of the [`temp!`] macro.
 pub use temp;
+
+#[cfg(test)]
+mod receipt_factorial_probe;
 
 #[cfg(test)]
 mod tests {
