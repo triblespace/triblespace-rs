@@ -12,7 +12,7 @@
 //! RUSTFLAGS="--cfg engine_current_residual --cfg engine_prefix_checkpoints" \
 //!   cargo run --release --example query_engine_generation_bench
 //! RUSTFLAGS="--cfg engine_current_residual --cfg engine_prefix_checkpoints \
-//!   --cfg engine_counter_only" \
+//!   --cfg engine_counter_only --cfg engine_counter_production" \
 //!   cargo run --release --example query_engine_generation_bench
 //! ```
 //!
@@ -25,6 +25,24 @@
 
 #[cfg(all(engine_counter_only, not(engine_prefix_checkpoints)))]
 compile_error!("engine_counter_only requires engine_prefix_checkpoints");
+
+#[cfg(all(engine_counter_only, not(engine_current_residual)))]
+compile_error!("engine_counter_only requires engine_current_residual");
+
+#[cfg(all(engine_counter_opaque_production, engine_counter_production))]
+compile_error!("select exactly one counter lowering");
+
+#[cfg(all(
+    engine_counter_only,
+    not(any(engine_counter_opaque_production, engine_counter_production))
+))]
+compile_error!("engine_counter_only requires an explicit counter lowering");
+
+#[cfg(all(
+    any(engine_counter_opaque_production, engine_counter_production),
+    not(engine_counter_only)
+))]
+compile_error!("counter lowering selectors require engine_counter_only");
 
 #[cfg(any(
     all(engine_legacy_binding, engine_current_scalar),
@@ -197,6 +215,18 @@ const REVISION: &str = match option_env!("ENGINE_REVISION") {
     Some(revision) => revision,
     None => "unknown",
 };
+
+#[cfg(all(engine_counter_only, engine_counter_opaque_production))]
+const COUNTER_LOWERING: triblespace::core::query::residual::ResidualLowering =
+    triblespace::core::query::residual::ResidualLowering::OPAQUE_PRODUCTION;
+#[cfg(all(engine_counter_only, engine_counter_production))]
+const COUNTER_LOWERING: triblespace::core::query::residual::ResidualLowering =
+    triblespace::core::query::residual::ResidualLowering::PRODUCTION;
+
+#[cfg(all(engine_counter_only, engine_counter_opaque_production))]
+const COUNTER_LOWERING_LABEL: &str = "OPAQUE_PRODUCTION";
+#[cfg(all(engine_counter_only, engine_counter_production))]
+const COUNTER_LOWERING_LABEL: &str = "PRODUCTION";
 
 type Pair = (Inline<GenId>, Inline<GenId>);
 
@@ -1018,8 +1048,9 @@ fn print_counter_evidence<I>(label: &str, query: I)
 where
     I: Iterator<Item = Pair>,
 {
-    for (checkpoint, evidence) in
-        PREFIX_CHECKPOINTS.into_iter().zip(checkpoint_evidence(label, query))
+    for (checkpoint, evidence) in PREFIX_CHECKPOINTS
+        .into_iter()
+        .zip(checkpoint_evidence(label, query))
     {
         println!(
             "evidence cell={label:?} checkpoint={checkpoint} count={} checksum={:#018x} \
@@ -1272,39 +1303,74 @@ fn main() {
     #[cfg(not(engine_counter_only))]
     println!("samples: {repetitions}; hot cache; release profile");
     #[cfg(engine_counter_only)]
-    println!("mode: counter-only; lowering: HYBRID; no timed samples");
+    println!("mode: counter-only; lowering: {COUNTER_LOWERING_LABEL}; no timed samples");
     println!("checkpoints: {PREFIX_CHECKPOINTS:?}");
 
-    exact_check(
-        rpq_collect(&fixture),
-        &rpq_expected,
-        "cyclic RPQ",
-        "TribleSet",
-    );
-    exact_check(
-        mixed_collect(&fixture.graph, &fixture),
-        &mixed_expected,
-        "formula + cyclic RPQ",
-        "TribleSet sibling",
-    );
-    exact_check(
-        mixed_collect(&archive, &fixture),
-        &mixed_expected,
-        "formula + cyclic RPQ",
-        "SuccinctArchive sibling",
-    );
+    #[cfg(not(engine_counter_only))]
+    {
+        exact_check(
+            rpq_collect(&fixture),
+            &rpq_expected,
+            "cyclic RPQ",
+            "TribleSet",
+        );
+        exact_check(
+            mixed_collect(&fixture.graph, &fixture),
+            &mixed_expected,
+            "formula + cyclic RPQ",
+            "TribleSet sibling",
+        );
+        exact_check(
+            mixed_collect(&archive, &fixture),
+            &mixed_expected,
+            "formula + cyclic RPQ",
+            "SuccinctArchive sibling",
+        );
+    }
+    #[cfg(engine_counter_only)]
+    {
+        exact_check(
+            cyclic_rpq_query!(&fixture)
+                .solve_residual_state_lazy_with(COUNTER_LOWERING)
+                .collect(),
+            &rpq_expected,
+            "cyclic RPQ",
+            "TribleSet",
+        );
+        exact_check(
+            mixed_formula_rpq_query!(&fixture.graph, &fixture)
+                .solve_residual_state_lazy_with(COUNTER_LOWERING)
+                .collect(),
+            &mixed_expected,
+            "formula + cyclic RPQ",
+            "TribleSet sibling",
+        );
+        exact_check(
+            mixed_formula_rpq_query!(&archive, &fixture)
+                .solve_residual_state_lazy_with(COUNTER_LOWERING)
+                .collect(),
+            &mixed_expected,
+            "formula + cyclic RPQ",
+            "SuccinctArchive sibling",
+        );
+    }
     println!("oracle parity: all three prefix-diagnostic cells exact");
 
     #[cfg(engine_counter_only)]
     {
-        print_counter_evidence("cyclic RPQ / TribleSet", cyclic_rpq_query!(&fixture));
+        print_counter_evidence(
+            "cyclic RPQ / TribleSet",
+            cyclic_rpq_query!(&fixture).solve_residual_state_lazy_with(COUNTER_LOWERING),
+        );
         print_counter_evidence(
             "formula + cyclic RPQ / TribleSet sibling",
-            mixed_formula_rpq_query!(&fixture.graph, &fixture),
+            mixed_formula_rpq_query!(&fixture.graph, &fixture)
+                .solve_residual_state_lazy_with(COUNTER_LOWERING),
         );
         print_counter_evidence(
             "formula + cyclic RPQ / SuccinctArchive sibling",
-            mixed_formula_rpq_query!(&archive, &fixture),
+            mixed_formula_rpq_query!(&archive, &fixture)
+                .solve_residual_state_lazy_with(COUNTER_LOWERING),
         );
     }
 
@@ -1315,7 +1381,7 @@ fn main() {
         #[cfg(not(engine_counter_only))]
         const PREFIX_LOWERING: ResidualLowering = ResidualLowering::FULL;
         #[cfg(engine_counter_only)]
-        const PREFIX_LOWERING: ResidualLowering = ResidualLowering::HYBRID;
+        const PREFIX_LOWERING: ResidualLowering = COUNTER_LOWERING;
 
         residual_checkpoint_stats(
             "cyclic RPQ / TribleSet",
