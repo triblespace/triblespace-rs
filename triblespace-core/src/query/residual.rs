@@ -6169,6 +6169,10 @@ struct FormulaOrAccumulator {
     /// Admitted values that have not already left through an online arm.
     /// Final OR emission consumes only this channel.
     pending: Vector<OrdSet<RawInline>>,
+    /// Pending values whose completed witnesses have all come from Covering
+    /// proposal routes. An Exact duplicate discharges the value without
+    /// changing SET identity.
+    covering_only: Vector<OrdSet<RawInline>>,
     unique_len: usize,
     pending_len: usize,
 }
@@ -6182,12 +6186,15 @@ impl FormulaOrAccumulator {
             pending: std::iter::repeat_with(OrdSet::new)
                 .take(parent_count)
                 .collect(),
+            covering_only: std::iter::repeat_with(OrdSet::new)
+                .take(parent_count)
+                .collect(),
             unique_len: 0,
             pending_len: 0,
         }
     }
 
-    fn insert(&mut self, parent: u32, value: RawInline) {
+    fn insert(&mut self, parent: u32, value: RawInline, exact: bool) {
         let parent = parent as usize;
         let set = self
             .sets
@@ -6206,6 +6213,14 @@ impl FormulaOrAccumulator {
                 .pending_len
                 .checked_add(1)
                 .expect("Formula OR pending candidate count overflow");
+            if !exact {
+                assert!(
+                    self.covering_only[parent].insert(value).is_none(),
+                    "new Formula OR value already had Covering-only provenance"
+                );
+            }
+        } else if exact {
+            self.covering_only[parent].remove(&value);
         }
     }
 
@@ -6217,6 +6232,8 @@ impl FormulaOrAccumulator {
     /// by another online arm are suppressed.
     fn publish(&mut self, parent: u32, value: RawInline) -> bool {
         let parent = parent as usize;
+        // Online publication is admitted only for an Exact proposal route.
+        self.covering_only[parent].remove(&value);
         let set = self
             .sets
             .get_mut(parent)
@@ -6249,12 +6266,14 @@ impl FormulaOrAccumulator {
             .expect("Formula OR pending candidate count overflow");
         self.sets.append(other.sets);
         self.pending.append(other.pending);
+        self.covering_only.append(other.covering_only);
     }
 
     fn take_tail(&mut self, first: usize) -> Self {
         assert!(first > 0 && first < self.sets.len());
         let sets = self.sets.split_off(first);
         let pending = self.pending.split_off(first);
+        let covering_only = self.covering_only.split_off(first);
         let unique_len = sets.iter().map(OrdSet::len).sum();
         let pending_len = pending.iter().map(OrdSet::len).sum();
         self.unique_len = self
@@ -6268,13 +6287,20 @@ impl FormulaOrAccumulator {
         Self {
             sets,
             pending,
+            covering_only,
             unique_len,
             pending_len,
         }
     }
 
-    fn push_parent_sets(&mut self, set: OrdSet<RawInline>, pending: OrdSet<RawInline>) {
+    fn push_parent_sets(
+        &mut self,
+        set: OrdSet<RawInline>,
+        pending: OrdSet<RawInline>,
+        covering_only: OrdSet<RawInline>,
+    ) {
         assert!(pending.is_subset(&set));
+        assert!(covering_only.is_subset(&pending));
         self.unique_len = self
             .unique_len
             .checked_add(set.len())
@@ -6285,12 +6311,27 @@ impl FormulaOrAccumulator {
             .expect("Formula OR pending candidate count overflow");
         self.sets.push_back(set);
         self.pending.push_back(pending);
+        self.covering_only.push_back(covering_only);
+    }
+
+    fn clean_parents(&self) -> Vec<bool> {
+        self.covering_only.iter().map(OrdSet::is_empty).collect()
     }
 
     fn singleton_pending_set(&self) -> OrdSet<RawInline> {
         assert_eq!(self.sets.len(), 1, "Formula reducer requires one parent");
         self.pending[0].clone()
     }
+}
+
+/// Batch-uniform proof attached to one guarded or executing OR arm.
+///
+/// The selected child already belongs to the canonical Formula PC. These
+/// semantic receipts remain affine payload and travel with every row split.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FormulaOrActiveArmReceipt {
+    exact: bool,
+    remaining_exact_after_false: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -6302,6 +6343,7 @@ enum FormulaPayloadFrame {
     Or {
         source: CandidatePayload,
         accumulator: FormulaOrAccumulator,
+        active_arm: Option<FormulaOrActiveArmReceipt>,
     },
     /// AND threads one ascending-parent-grouped candidate stream through its
     /// selected proposer and remaining confirmers. Empty current streams
@@ -6312,9 +6354,10 @@ enum FormulaPayloadFrame {
 impl FormulaPayloadFrame {
     fn empty_like(&self, parent_count: usize) -> Self {
         match self {
-            Self::Or { .. } => Self::Or {
+            Self::Or { active_arm, .. } => Self::Or {
                 source: CandidatePayload::empty(parent_count),
                 accumulator: FormulaOrAccumulator::empty(parent_count),
+                active_arm: *active_arm,
             },
             Self::And { .. } => Self::And {
                 current: CandidatePayload::empty(parent_count),
@@ -6367,6 +6410,7 @@ impl FormulaBatch {
                 FormulaPayloadFrame::Or {
                     source,
                     accumulator: FormulaOrAccumulator::empty(parent_count),
+                    active_arm: None,
                 }
             }
             // A root Atom uses the same single-stream payload as a one-child
@@ -6454,25 +6498,76 @@ impl FormulaBatch {
             .is_some_and(|frame| matches!(frame, FormulaPayloadFrame::Or { .. }))
     }
 
-    fn admit_current_or_value(&mut self, parent: u32, value: RawInline) {
-        let FormulaPayloadFrame::Or { accumulator, .. } = self
+    fn begin_current_or_arm(&mut self, receipt: FormulaOrActiveArmReceipt) {
+        let FormulaPayloadFrame::Or { active_arm, .. } = self
             .frames
             .last_mut()
-            .expect("Formula OR admission lost its reducer frame")
+            .expect("Formula OR guard lost its reducer frame")
+        else {
+            panic!("Formula OR guard resumed into a non-OR frame")
+        };
+        assert!(
+            active_arm.replace(receipt).is_none(),
+            "Formula OR selected a second arm before retiring the first"
+        );
+    }
+
+    fn finish_current_or_arm(&mut self) -> FormulaOrActiveArmReceipt {
+        let FormulaPayloadFrame::Or { active_arm, .. } = self
+            .frames
+            .last_mut()
+            .expect("Formula OR completion lost its reducer frame")
+        else {
+            panic!("Formula OR completion resumed into a non-OR frame")
+        };
+        active_arm
+            .take()
+            .expect("Formula OR completed an arm without its execution receipt")
+    }
+
+    fn current_or_clean_parents(&self) -> Vec<bool> {
+        let FormulaPayloadFrame::Or { accumulator, .. } = self
+            .frames
+            .last()
+            .expect("Formula OR provenance check lost its reducer frame")
+        else {
+            panic!("Formula OR provenance check resumed into a non-OR frame")
+        };
+        accumulator.clean_parents()
+    }
+
+    fn admit_current_or_value(&mut self, parent: u32, value: RawInline) {
+        let FormulaPayloadFrame::Or {
+            accumulator,
+            active_arm,
+            ..
+        } = self.frames.last_mut().expect("Formula OR admission lost its reducer frame")
         else {
             panic!("Formula OR admission resumed into a non-OR frame")
         };
-        accumulator.insert(parent, value);
+        let exact = active_arm
+            .as_ref()
+            .expect("Formula OR admission lost its active-arm receipt")
+            .exact;
+        accumulator.insert(parent, value, exact);
     }
 
     fn publish_current_or_value(&mut self, parent: u32, value: RawInline) -> bool {
-        let FormulaPayloadFrame::Or { accumulator, .. } = self
-            .frames
-            .last_mut()
-            .expect("Formula OR publication lost its reducer frame")
+        let FormulaPayloadFrame::Or {
+            accumulator,
+            active_arm,
+            ..
+        } = self.frames.last_mut().expect("Formula OR publication lost its reducer frame")
         else {
             panic!("Formula OR publication resumed into a non-OR frame")
         };
+        assert!(
+            active_arm
+                .as_ref()
+                .expect("Formula OR publication lost its active-arm receipt")
+                .exact,
+            "a Covering Formula OR arm attempted online publication"
+        );
         accumulator.publish(parent, value)
     }
 
@@ -6504,9 +6599,17 @@ impl FormulaBatch {
     /// result waits for the ordinary outer candidate continuation.
     fn return_emitted_or(&mut self, result: CandidatePayload) -> FormulaFrameDestination {
         assert!(self.current_frame_is_or());
-        self.frames
+        let frame = self
+            .frames
             .pop()
             .expect("emitted Formula OR lost its payload frame");
+        let FormulaPayloadFrame::Or { active_arm, .. } = frame else {
+            unreachable!("current Formula frame changed shape while being popped")
+        };
+        assert!(
+            active_arm.is_none(),
+            "Formula OR emitted before its active arm reached EOF"
+        );
         match self.frames.last_mut() {
             None => FormulaFrameDestination::Root(result),
             Some(FormulaPayloadFrame::And { current }) => {
@@ -6585,10 +6688,12 @@ impl FormulaBatch {
                 FormulaPayloadFrame::Or {
                     source,
                     accumulator,
+                    ..
                 } => {
                     source.all_parents_in(self.parents.row_count)
                         && accumulator.sets.len() == self.parents.row_count
                         && accumulator.pending.len() == self.parents.row_count
+                        && accumulator.covering_only.len() == self.parents.row_count
                         && accumulator.unique_len
                             == accumulator.sets.iter().map(OrdSet::len).sum::<usize>()
                         && accumulator.pending_len
@@ -6598,6 +6703,11 @@ impl FormulaBatch {
                             .iter()
                             .zip(accumulator.sets.iter())
                             .all(|(pending, set)| pending.is_subset(set))
+                        && accumulator
+                            .covering_only
+                            .iter()
+                            .zip(accumulator.pending.iter())
+                            .all(|(covering_only, pending)| covering_only.is_subset(pending))
                 }
                 FormulaPayloadFrame::And { current } => {
                     current.all_parents_in(self.parents.row_count)
@@ -6628,6 +6738,7 @@ impl FormulaBatch {
             FiniteFormulaNodeKind::Or { .. } => FormulaPayloadFrame::Or {
                 source: input,
                 accumulator: FormulaOrAccumulator::empty(parent_count),
+                active_arm: None,
             },
             FiniteFormulaNodeKind::Atom => panic!("an Atom cannot own a formula payload frame"),
         });
@@ -6701,12 +6812,18 @@ impl FormulaBatch {
                     FormulaPayloadFrame::Or {
                         source: left_source,
                         accumulator: left_accumulator,
+                        active_arm: left_active_arm,
                     },
                     FormulaPayloadFrame::Or {
                         source: right_source,
                         accumulator: right_accumulator,
+                        active_arm: right_active_arm,
                     },
                 ) => {
+                    assert_eq!(
+                        *left_active_arm, right_active_arm,
+                        "one Formula PC received incompatible active-arm receipts"
+                    );
                     left_source.append_disjoint(right_source, left_parents, right_parents);
                     left_accumulator.append(right_accumulator);
                 }
@@ -6757,9 +6874,11 @@ impl FormulaBatch {
                 FormulaPayloadFrame::Or {
                     source,
                     accumulator,
+                    active_arm,
                 } => FormulaPayloadFrame::Or {
                     source: source.take_parent_tail(first, old_parent_count),
                     accumulator: accumulator.take_tail(first),
+                    active_arm: *active_arm,
                 },
                 FormulaPayloadFrame::And { current } => FormulaPayloadFrame::And {
                     current: current.take_parent_tail(first, old_parent_count),
@@ -6920,14 +7039,17 @@ impl FormulaBatch {
                 FormulaPayloadFrame::Or {
                     source,
                     accumulator,
+                    ..
                 } => {
                     partition_values(source, assignment, &remap, &mut groups, frame, 0);
                     assert_eq!(accumulator.sets.len(), row_count);
                     assert_eq!(accumulator.pending.len(), row_count);
-                    for (parent, (set, pending)) in accumulator
+                    assert_eq!(accumulator.covering_only.len(), row_count);
+                    for (parent, ((set, pending), covering_only)) in accumulator
                         .sets
                         .into_iter()
                         .zip(accumulator.pending)
+                        .zip(accumulator.covering_only)
                         .enumerate()
                     {
                         let target = groups
@@ -6938,7 +7060,7 @@ impl FormulaBatch {
                         else {
                             panic!("Formula accumulator disagrees with its structural frame")
                         };
-                        accumulator.push_parent_sets(set, pending);
+                        accumulator.push_parent_sets(set, pending, covering_only);
                     }
                 }
                 FormulaPayloadFrame::And { current } => {
@@ -8548,33 +8670,82 @@ fn propagate_formula_support(
             )
         }
         Ok(InternedFormulaSuccessor::Guard { parent, child }) => {
-            let next = if truth {
-                interner
-                    .formula_pcs
-                    .select_supported_child(&plan.finite_formula, parent, child)
-            } else {
-                interner
-                    .formula_pcs
-                    .skip_child(&plan.finite_formula, parent, child)
-            };
             let mut batch = batch;
             if truth {
+                let next = interner
+                    .formula_pcs
+                    .select_supported_child(&plan.finite_formula, parent, child);
                 enter_selected_formula_frame(
                     &plan.finite_formula,
                     interner.formula(next),
                     &mut batch,
                 );
+                return continue_formula_transition(
+                    plan,
+                    desc,
+                    next,
+                    batch,
+                    worklist,
+                    interner,
+                    stats,
+                    reducer_seeds,
+                );
             }
-            continue_formula_transition(
-                plan,
-                desc,
-                next,
-                batch,
-                worklist,
-                interner,
-                stats,
-                reducer_seeds,
-            )
+
+            let receipt = batch.finish_current_or_arm();
+            let next = interner
+                .formula_pcs
+                .skip_child(&plan.finite_formula, parent, child);
+            let resume = interner.formula_resume(next);
+            let root = plan.finite_formula.root(resume.occurrence);
+            let guarded_root_is_selective_proposal = plan.certified_denotation
+                && !resume.proposer_checked
+                && plan.leaves[resume.occurrence].lowering == LeafLowering::ProductionFormula
+                && interner.formula(next).return_to.is_none()
+                && matches!(
+                    &interner.formula(next).focus,
+                    FormulaFocus::Plan {
+                        node,
+                        stage: FormulaStage::Propose,
+                        ..
+                    } if Some(*node) == root
+                );
+            if !guarded_root_is_selective_proposal || !receipt.remaining_exact_after_false {
+                return continue_formula_transition(
+                    plan,
+                    desc,
+                    next,
+                    batch,
+                    worklist,
+                    interner,
+                    stats,
+                    reducer_seeds,
+                );
+            }
+
+            let clean = batch.current_or_clean_parents();
+            let mut continuation = None;
+            for (clean, batch) in batch.partition(desc.bound.count(), &clean) {
+                let next = if clean {
+                    interner.formula_pcs.with_proposer_checked(next)
+                } else {
+                    next
+                };
+                prefer_continuation(
+                    &mut continuation,
+                    continue_formula_transition(
+                        plan,
+                        desc,
+                        next,
+                        batch,
+                        worklist,
+                        interner,
+                        stats,
+                        reducer_seeds,
+                    ),
+                );
+            }
+            continuation
         }
         Err(_) => {
             unreachable!("support traversal escaped without an OR guard")
@@ -8790,7 +8961,7 @@ fn continue_formula_transition(
 fn finish_formula_or_admission(
     plan: &ResidualPlan,
     bound: VariableSet,
-    batch: FormulaBatch,
+    mut batch: FormulaBatch,
     continuation: FormulaReducerContinuation,
     worklist: &mut Worklist,
     interner: &mut StateInterner,
@@ -8798,6 +8969,7 @@ fn finish_formula_or_admission(
     reducer_seeds: &mut Vec<FormulaReducerSeed>,
 ) -> Option<ContinuationToken> {
     batch.validate_tags();
+    batch.finish_current_or_arm();
     match continuation {
         FormulaReducerContinuation::Complete(counter) => {
             let completed = interner.formula_pcs.complete(&plan.finite_formula, counter);
@@ -9076,8 +9248,10 @@ fn formula_or_plan_transition<'a>(
     reducer_seeds: &mut Vec<FormulaReducerSeed>,
 ) -> Option<ContinuationToken> {
     let resume = interner.formula_resume(counter);
-    let (done, occurrence, variable) = match &interner.formula(counter).focus {
-        FormulaFocus::Plan { done, .. } => (done.clone(), resume.occurrence, resume.variable),
+    let (stage, done, occurrence, variable) = match &interner.formula(counter).focus {
+        FormulaFocus::Plan { stage, done, .. } => {
+            (*stage, done.clone(), resume.occurrence, resume.variable)
+        }
         _ => unreachable!("OR planning received an action continuation"),
     };
     assert!(matches!(
@@ -9097,6 +9271,19 @@ fn formula_or_plan_transition<'a>(
         .expect("unfinished formula has an enabled child");
     let mut assignments = vec![first_undone; batch.parents.row_count];
     let mut estimates = vec![usize::MAX; batch.parents.row_count];
+    let exact_by_child: Vec<bool> = children
+        .iter()
+        .map(|&child| {
+            stage == FormulaStage::Confirm
+                || plan.formula_execution_proposal_coverage(
+                    root,
+                    occurrence,
+                    child,
+                    variable,
+                    desc.bound,
+                ) == ProposalCoverage::Exact
+        })
+        .collect();
     let mut column = Vec::with_capacity(batch.parents.row_count);
     for child in 0..child_count {
         if done.contains(child) {
@@ -9130,7 +9317,13 @@ fn formula_or_plan_transition<'a>(
     }
 
     let mut continuation = None;
-    for (child, batch) in batch.partition(vars.len(), &assignments) {
+    for (child, mut batch) in batch.partition(vars.len(), &assignments) {
+        let remaining_exact_after_false = (0..child_count)
+            .all(|other| done.contains(other) || other == child || exact_by_child[other]);
+        batch.begin_current_or_arm(FormulaOrActiveArmReceipt {
+            exact: exact_by_child[child],
+            remaining_exact_after_false,
+        });
         let next = interner
             .formula_pcs
             .guard_child(&plan.finite_formula, counter, child);
@@ -13689,6 +13882,79 @@ mod tests {
             _view: &RowsView<'_>,
             _candidates: &mut CandidateSink<'_>,
         ) {
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct GuardReceiptLeaf {
+        source: VariableId,
+        target: VariableId,
+        coverage: ProposalCoverage,
+    }
+
+    impl Constraint<'static> for GuardReceiptLeaf {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(self.source)
+                .union(VariableSet::new_singleton(self.target))
+        }
+
+        fn fixed_denotation(&self) -> bool {
+            true
+        }
+
+        fn proposal_coverage(
+            &self,
+            variable: VariableId,
+            bound: VariableSet,
+        ) -> ProposalCoverage {
+            if variable == self.target
+                && bound.is_set(self.source)
+                && !bound.is_set(self.target)
+            {
+                self.coverage
+            } else {
+                ProposalCoverage::None
+            }
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != self.target {
+                return false;
+            }
+            out.fill(0, view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+            assert_eq!(variable, self.target);
+        }
+
+        fn confirm(
+            &self,
+            variable: VariableId,
+            _view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            assert!(variable == self.source || variable == self.target);
+            candidates.retain(|_, _| false);
+        }
+
+        fn satisfied(&self, _view: &RowsView<'_>) -> bool {
+            false
+        }
+
+        fn residual_confirm_is_page_local(&self) -> bool {
+            true
         }
     }
 
@@ -18294,6 +18560,152 @@ mod tests {
     }
 
     #[test]
+    fn false_root_guard_promotes_only_parents_without_covering_only_history() {
+        use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
+
+        let fixture = production_formula_rpq_fixture();
+        let source = Variable::<GenId>::new(0);
+        let target = Variable::<GenId>::new(1);
+        let operations = [PathOp::Attr(fixture.attribute.raw()), PathOp::Plus];
+        let covering = || {
+            Box::new(GuardReceiptLeaf {
+                source: source.index,
+                target: target.index,
+                coverage: ProposalCoverage::Covering,
+            }) as ShapeConstraint
+        };
+        let root = UnionConstraint::new(vec![
+            covering(),
+            covering(),
+            Box::new(RegularPathConstraint::new(
+                fixture.graph,
+                source,
+                target,
+                &operations,
+            )) as ShapeConstraint,
+        ]);
+        let plan = ResidualPlan::compile_lowering(
+            &root,
+            ResidualLowering::new(FormulaScope::ProductionRegions, ProgramScope::Production),
+        );
+        assert!(plan.certified_denotation);
+        assert_eq!(plan.leaves[0].lowering, LeafLowering::ProductionFormula);
+        let formula_root = plan.finite_formula.root(0).expect("the RPQ marked its Union");
+        let FiniteFormulaNodeKind::Or { children } = &plan.finite_formula.node(formula_root).kind
+        else {
+            panic!("the selective formula root is not OR")
+        };
+        assert_eq!(plan.finite_formula.nodes.len(), 4);
+        assert_eq!(
+            plan.formula_execution_proposal_coverage(
+                &root,
+                0,
+                children[2],
+                target.index,
+                VariableSet::new_singleton(source.index),
+            ),
+            ProposalCoverage::Exact
+        );
+
+        let mut relevant = ChildSet::empty(plan.len());
+        relevant.insert(0);
+        let mut interner = StateInterner::default();
+        let start = interner.start_formula_with_proposer_checked(
+            &plan.finite_formula,
+            target.index,
+            0,
+            UnionVerb::Propose { relevant },
+            false,
+        );
+        let after_first = interner
+            .formula_pcs
+            .skip_child(&plan.finite_formula, start, 0);
+        let guard = interner
+            .formula_pcs
+            .guard_child(&plan.finite_formula, after_first, 1);
+        let completed = interner.formula_pcs.complete(&plan.finite_formula, guard);
+
+        let mut batch = FormulaBatch::from_proposal(
+            RowBatch {
+                rows: vec![raw(10), raw(11)],
+                row_count: 2,
+            },
+            vec![ActivationId(10), ActivationId(11)],
+            &plan.finite_formula.node(formula_root).kind,
+        );
+        batch.begin_current_or_arm(FormulaOrActiveArmReceipt {
+            exact: false,
+            remaining_exact_after_false: false,
+        });
+        batch.admit_current_or_value(1, raw(77));
+        batch.finish_current_or_arm();
+        batch.begin_current_or_arm(FormulaOrActiveArmReceipt {
+            exact: false,
+            remaining_exact_after_false: true,
+        });
+
+        let desc = StateDesc {
+            bound: VariableSet::new_singleton(source.index),
+            phase: ResidualPhase::Formula { counter: guard },
+        };
+        let mut worklist = Worklist::new();
+        let mut stats = ResidualStateStats::default();
+        let mut reducer_seeds = Vec::new();
+        assert!(propagate_formula_support(
+            &plan,
+            &desc,
+            completed,
+            false,
+            batch,
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+            &mut reducer_seeds,
+        )
+        .is_some());
+        assert!(reducer_seeds.is_empty());
+
+        let mut observed = BTreeMap::new();
+        for (&state, bucket) in worklist.values().flat_map(BTreeMap::iter) {
+            let StateDesc {
+                phase: ResidualPhase::Formula { counter },
+                ..
+            } = interner.get(state)
+            else {
+                panic!("guarded promotion filed a non-Formula state")
+            };
+            let StateBucket::Formula(batch) = bucket else {
+                panic!("guarded promotion filed a non-Formula payload")
+            };
+            let FormulaPayloadFrame::Or {
+                accumulator,
+                active_arm,
+                ..
+            } = &batch.frames[0]
+            else {
+                panic!("guarded promotion lost its OR accumulator")
+            };
+            assert!(active_arm.is_none());
+            let checked = interner.formula_resume(*counter).proposer_checked;
+            observed.insert(
+                batch.activations[0],
+                (checked, accumulator.covering_only[0].clone()),
+            );
+        }
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[&ActivationId(10)], (true, OrdSet::new()));
+        assert_eq!(
+            observed[&ActivationId(11)]
+                .1
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            [raw(77)]
+        );
+        assert!(!observed[&ActivationId(11)].0);
+    }
+
+    #[test]
     fn production_regions_name_repeated_arc_occurrences_by_path() {
         let shared = Arc::new(TerminalProgramLeaf {
             variable: 0,
@@ -19331,6 +19743,10 @@ mod tests {
                 FormulaPayloadFrame::Or {
                     source: CandidatePayload::Values(vec![raw(9)]),
                     accumulator: FormulaOrAccumulator::empty(1),
+                    active_arm: Some(FormulaOrActiveArmReceipt {
+                        exact: true,
+                        remaining_exact_after_false: true,
+                    }),
                 },
             ],
         };
@@ -19338,6 +19754,7 @@ mod tests {
         batch.admit_current_or_value(0, raw(2));
         batch.admit_current_or_value(0, raw(1));
         batch.admit_current_or_value(0, raw(2));
+        batch.finish_current_or_arm();
         let emitted = CandidatePayload::Values(
             batch.current_or_set().iter().copied().collect(),
         );
@@ -19458,10 +19875,10 @@ mod tests {
     fn formula_or_deduplicates_within_an_affine_parent_but_not_across_parents() {
         let candidate = raw(7);
         let mut accumulator = FormulaOrAccumulator::empty(2);
-        accumulator.insert(0, candidate);
-        accumulator.insert(0, candidate);
-        accumulator.insert(1, candidate);
-        accumulator.insert(1, candidate);
+        accumulator.insert(0, candidate, true);
+        accumulator.insert(0, candidate, true);
+        accumulator.insert(1, candidate, true);
+        accumulator.insert(1, candidate, true);
 
         assert_eq!(accumulator.unique_len, 2);
         assert_eq!(accumulator.sets.len(), 2);
@@ -19474,7 +19891,7 @@ mod tests {
         let pending = raw(7);
         let online = raw(8);
         let mut accumulator = FormulaOrAccumulator::empty(1);
-        accumulator.insert(0, pending);
+        accumulator.insert(0, pending, false);
         let mut cloned = accumulator.clone();
 
         assert!(accumulator.publish(0, pending));
@@ -19484,6 +19901,7 @@ mod tests {
         assert_eq!(accumulator.unique_len, 2);
         assert_eq!(accumulator.pending_len, 0);
         assert!(accumulator.singleton_pending_set().is_empty());
+        assert!(accumulator.covering_only[0].is_empty());
 
         assert_eq!(cloned.pending_len, 1);
         assert!(cloned.publish(0, pending));
@@ -19492,6 +19910,33 @@ mod tests {
             cloned.sets[0].iter().copied().collect::<Vec<_>>(),
             [pending]
         );
+    }
+
+    #[test]
+    fn formula_or_covering_only_provenance_distinguishes_equal_set_histories() {
+        let value = raw(7);
+        let mut exact_history = FormulaOrAccumulator::empty(1);
+        exact_history.insert(0, value, true);
+        let mut covering_history = FormulaOrAccumulator::empty(1);
+        covering_history.insert(0, value, false);
+
+        assert_eq!(exact_history.sets, covering_history.sets);
+        assert_eq!(exact_history.pending, covering_history.pending);
+        assert!(exact_history.covering_only[0].is_empty());
+        assert_eq!(
+            covering_history.covering_only[0]
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            [value]
+        );
+
+        covering_history.insert(0, value, false);
+        assert_eq!(covering_history.clean_parents(), [false]);
+        covering_history.insert(0, value, true);
+        assert_eq!(covering_history.clean_parents(), [true]);
+        assert_eq!(covering_history.sets, exact_history.sets);
+        assert_eq!(covering_history.pending, exact_history.pending);
     }
 
     #[test]
@@ -19512,6 +19957,10 @@ mod tests {
                 children: Vec::new().into_boxed_slice(),
             },
         );
+        batch.begin_current_or_arm(FormulaOrActiveArmReceipt {
+            exact: false,
+            remaining_exact_after_false: true,
+        });
         batch.admit_current_or_value(0, raw(2));
         batch.admit_current_or_value(0, raw(1));
         batch.admit_current_or_value(1, raw(4));
@@ -19525,6 +19974,7 @@ mod tests {
             let FormulaPayloadFrame::Or {
                 source: CandidatePayload::Deferred(source),
                 accumulator,
+                ..
             } = &batch.frames[0]
             else {
                 panic!("Formula reducer singleton materialized its OR source")
@@ -19618,9 +20068,10 @@ mod tests {
                     source: candidate_payload(3, vec![(0, raw(20)), (2, raw(21))]),
                     accumulator: {
                         let mut accumulator = FormulaOrAccumulator::empty(3);
-                        accumulator.insert(1, raw(22));
+                        accumulator.insert(1, raw(22), false);
                         accumulator
                     },
+                    active_arm: None,
                 },
                 FormulaPayloadFrame::And {
                     current: candidate_payload(3, vec![(0, raw(30)), (1, raw(31)), (2, raw(32))]),
@@ -19639,6 +20090,7 @@ mod tests {
         let [FormulaPayloadFrame::Or {
             source,
             accumulator,
+            ..
         }, FormulaPayloadFrame::And { current }] = group.frames.as_slice()
         else {
             panic!("uniform partition changed formula frame shapes")

@@ -5762,9 +5762,18 @@ impl DeltaScheduler {
             };
         }
         if let DeltaStreamingEffect::FormulaOrCandidates { exit } = effect {
-            let DeltaReturn::Formula { bound, batch, .. } = return_to else {
+            let DeltaReturn::Formula {
+                bound,
+                mut batch,
+                ..
+            } = return_to
+            else {
                 panic!("an online Formula OR effect lost its Formula return")
             };
+            // The publication clone exits the OR immediately, while the
+            // activation's master payload retains this receipt until actual
+            // producer EOF. Retire only the clone before ordered emission.
+            batch.finish_current_or_arm();
             let mut reducer_seeds = Vec::new();
             let continuation = finish_formula_or_emission(
                 plan,
@@ -8362,6 +8371,10 @@ mod tests {
                 children: Box::new([]),
             },
         );
+        batch.begin_current_or_arm(FormulaOrActiveArmReceipt {
+            exact: true,
+            remaining_exact_after_false: true,
+        });
         for &candidate in values {
             batch.admit_current_or_value(0, value(candidate));
         }
@@ -8463,9 +8476,17 @@ mod tests {
     fn online_or_direct_source_publishes_before_same_receipt_quiescence() {
         let exit = FormulaPcId(13);
         let mut registry = ProducerRegistry::new();
+        let mut return_to = support_formula_return();
+        let DeltaReturn::Formula { batch, .. } = &mut return_to else {
+            unreachable!("the online fixture lost its Formula return")
+        };
+        batch.begin_current_or_arm(FormulaOrActiveArmReceipt {
+            exact: true,
+            remaining_exact_after_false: true,
+        });
         let (activation, generator) = registry.start_source(
             DeltaReducer::StreamFormulaOrProposal { exit },
-            support_formula_return(),
+            return_to,
             None,
         );
         let outcome = registry.replace_source(
@@ -8948,14 +8969,19 @@ mod tests {
         );
         assert_eq!(children.len(), 1);
 
+        let mut batch = FormulaBatch::from_proposal(
+            RowBatch::seed(),
+            vec![super::super::ActivationId(11)],
+            &plan.finite_formula.node(formula_root).kind,
+        );
+        batch.begin_current_or_arm(FormulaOrActiveArmReceipt {
+            exact: true,
+            remaining_exact_after_false: true,
+        });
         let seeded = scheduler.seed_formula_reducers(
             vec![FormulaReducerSeed::Admit(FormulaOrAdmissionSeed {
                 bound: VariableSet::new_empty(),
-                batch: FormulaBatch::from_proposal(
-                    RowBatch::seed(),
-                    vec![super::super::ActivationId(11)],
-                    &plan.finite_formula.node(formula_root).kind,
-                ),
+                batch,
                 input: CandidatePayload::Values(Vec::new()),
                 continuation: FormulaReducerContinuation::Complete(action),
             })],
@@ -9029,11 +9055,15 @@ mod tests {
         let exit = stable_interner
             .formula_pcs
             .skip_remaining_children(&plan.finite_formula, parent);
-        let batch = FormulaBatch::from_proposal(
+        let mut batch = FormulaBatch::from_proposal(
             RowBatch::seed(),
             vec![super::super::ActivationId(11)],
             &plan.finite_formula.node(formula_root).kind,
         );
+        batch.begin_current_or_arm(FormulaOrActiveArmReceipt {
+            exact: true,
+            remaining_exact_after_false: true,
+        });
 
         let seeded = scheduler.seed_formula(
             DeltaDesc::formula(0, 0, children[0]),
@@ -11798,6 +11828,10 @@ mod tests {
                 frames.push(FormulaPayloadFrame::Or {
                     source: original.clone(),
                     accumulator: FormulaOrAccumulator::empty(1),
+                    active_arm: Some(FormulaOrActiveArmReceipt {
+                        exact: true,
+                        remaining_exact_after_false: true,
+                    }),
                 });
             } else {
                 frames.push(FormulaPayloadFrame::And {

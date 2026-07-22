@@ -562,6 +562,71 @@ impl<'a> Constraint<'a> for CoveringRejector {
     }
 }
 
+#[derive(Clone, Copy)]
+struct EmptyCoveringArm;
+
+impl<'a> Constraint<'a> for EmptyCoveringArm {
+    fn variables(&self) -> VariableSet {
+        VariableSet::new_singleton(START).union(VariableSet::new_singleton(END))
+    }
+
+    fn fixed_denotation(&self) -> bool {
+        true
+    }
+
+    fn proposal_coverage(
+        &self,
+        variable: VariableId,
+        bound: VariableSet,
+    ) -> ProposalCoverage {
+        if variable == END && bound.is_set(START) && !bound.is_set(END) {
+            ProposalCoverage::Covering
+        } else {
+            ProposalCoverage::None
+        }
+    }
+
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        if variable != END {
+            return false;
+        }
+        out.fill(0, view.len());
+        true
+    }
+
+    fn propose(
+        &self,
+        variable: VariableId,
+        _view: &RowsView<'_>,
+        _candidates: &mut CandidateSink<'_>,
+    ) {
+        assert_eq!(variable, END);
+    }
+
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        assert!(variable == START || variable == END);
+        candidates.retain(|_, _| false);
+    }
+
+    fn satisfied(&self, _view: &RowsView<'_>) -> bool {
+        false
+    }
+
+    fn residual_confirm_is_page_local(&self) -> bool {
+        true
+    }
+}
+
 #[derive(Clone)]
 struct SupportPageTraceFilter {
     trace: Arc<Mutex<Vec<usize>>>,
@@ -2191,6 +2256,48 @@ fn production_region_direct_or_respects_a_parent_atomic_typed_outer_confirm() {
     expected.sort_unstable();
     assert_eq!(actual, expected);
     assert!(query.stats().confirm_action_pops > 0);
+}
+
+#[test]
+fn false_covering_guard_promotes_the_exact_regional_suffix_before_first_publication() {
+    // Scale-reduced deterministic analogue of the 65,536-row regional gate:
+    // the structural fixture is the same (one opaque Covering arm plus one
+    // Production RPQ arm), while exact page counts replace wall-clock timing.
+    const NODE_COUNT: usize = 257;
+    let edges: Vec<_> = (0..NODE_COUNT - 1).map(|node| (node, node + 1)).collect();
+    let graph = Graph::new(NODE_COUNT, &edges);
+    let start = Variable::<GenId>::new(START);
+    let end = Variable::<GenId>::new(END);
+    let live = Box::new(RegularPathConstraint::new(
+        graph.set.clone(),
+        start,
+        end,
+        &repeated(graph.attribute, false),
+    )) as DynConstraint;
+    let root = Arc::new(IntersectionConstraint::new(vec![
+        Box::new(start.is(graph.value(0))) as DynConstraint,
+        Box::new(UnionConstraint::new(vec![
+            Box::new(EmptyCoveringArm) as DynConstraint,
+            live,
+        ])) as DynConstraint,
+    ]));
+    let mut query = Query::new(root, project_end)
+        .solve_residual_state_lazy_with(production_region_effects())
+        .cap(1)
+        .start_width(1);
+
+    assert_eq!(query.next(), Some(graph.value(1).raw));
+    assert_eq!(
+        query.stats().delta_transition_pages,
+        1,
+        "the false Covering guard failed to discharge the clean Formula parent"
+    );
+    assert_eq!(query.stats().delta_transition_candidates_examined, 1);
+
+    let mut actual = vec![graph.value(1).raw];
+    actual.extend(query);
+    let expected: Vec<_> = (1..NODE_COUNT).map(|node| graph.value(node).raw).collect();
+    assert_eq!(actual, expected);
 }
 
 #[test]

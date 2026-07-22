@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Selective production regions preserve guarded exactness through finite
+  ORs.** Each affine parent now carries covering-only provenance and an
+  explicit active-arm receipt through paging, partitioning, and online
+  publication. A false root guard promotes only clean parents whose remaining
+  suffix is certified exact, retaining conservative execution for every dirty
+  parent without widening the existing streaming barriers.
 - **Typed Programs now publish an immutable exposure summary.** The
   conservative external default covers every exposure tier, production
   families narrow that bound where possible, and `PreferredProgram` unions
