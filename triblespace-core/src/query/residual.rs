@@ -108,18 +108,44 @@ use delta::{
 
 /// Runtime selector for the cfg-only Formula delta-transport causal probe.
 ///
-/// The probe deliberately declines every focused Formula Atom before any
-/// typed Program, paged source, or legacy delta activation is created. The
-/// untouched task then reaches [`execute_task`], preserving the same Formula
-/// program counter, payload frames, and reducers while changing only the
-/// action transport.
+/// Selection happens only after a focused Formula Atom has been identified
+/// and before any typed Program, paged source, or legacy delta activation is
+/// created. A declined task therefore reaches [`execute_task`] intact with the
+/// same Formula program counter, payload frames, reducers, compiled topology,
+/// and non-Formula (notably RPQ) policy.
 #[cfg(formula_delta_transport_probe)]
-static FORMULA_DELTA_TRANSPORT_FORCE_STABLE: AtomicBool = AtomicBool::new(false);
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum FormulaDeltaTransportProbeSelector {
+    /// Leave every Formula stage eligible for its ordinary typed route.
+    Typed = 0,
+    /// Decline only Formula Propose before route selection.
+    StablePropose = 1,
+    /// Decline every focused Formula Atom stage before route selection.
+    StableAll = 2,
+}
+
+#[cfg(formula_delta_transport_probe)]
+static FORMULA_DELTA_TRANSPORT_PROBE_SELECTOR: AtomicU8 =
+    AtomicU8::new(FormulaDeltaTransportProbeSelector::Typed as u8);
 
 #[cfg(formula_delta_transport_probe)]
 #[doc(hidden)]
-pub fn formula_delta_transport_probe_force_stable(force: bool) {
-    FORMULA_DELTA_TRANSPORT_FORCE_STABLE.store(force, Ordering::Relaxed);
+pub fn formula_delta_transport_probe_select(selector: FormulaDeltaTransportProbeSelector) {
+    FORMULA_DELTA_TRANSPORT_PROBE_SELECTOR.store(selector as u8, Ordering::Relaxed);
+}
+
+#[cfg(formula_delta_transport_probe)]
+fn formula_delta_transport_probe_forces(stage: FormulaStage) -> bool {
+    match FORMULA_DELTA_TRANSPORT_PROBE_SELECTOR.load(Ordering::Relaxed) {
+        value if value == FormulaDeltaTransportProbeSelector::Typed as u8 => false,
+        value if value == FormulaDeltaTransportProbeSelector::StablePropose as u8 => {
+            stage == FormulaStage::Propose
+        }
+        value if value == FormulaDeltaTransportProbeSelector::StableAll as u8 => true,
+        value => panic!("invalid Formula delta-transport probe selector {value}"),
+    }
 }
 
 /// One deterministic route from the owned root to an opaque residual leaf.
@@ -1759,6 +1785,9 @@ struct ResidualPlan {
     /// The nontrivial exposed root is one formula occurrence. Whole-root
     /// identity shells around one opaque atom normalize to the flat plan.
     synthetic_root_formula: bool,
+    /// Structural Formula policy captured for the cfg-only transport probe.
+    #[cfg(formula_delta_transport_probe)]
+    probe_formula_scope: FormulaScope,
 }
 
 impl ResidualPlan {
@@ -1907,6 +1936,8 @@ impl ResidualPlan {
             program_scope,
             grouped_delta_confirm_requirements,
             synthetic_root_formula,
+            #[cfg(formula_delta_transport_probe)]
+            probe_formula_scope: formula_scope,
         }
     }
 
@@ -2630,6 +2661,33 @@ impl ResidualLowering {
     }
 }
 
+/// Structural control receipt for the cfg-only Formula transport probe.
+///
+/// The receipt deliberately excludes the runtime transport selector. Equal
+/// receipts prove that compared modes compiled the same Formula topology and
+/// Production-region marks and retained the same opaque production Program
+/// policy (the fixed mixed-query fixture has one such opaque leaf: its RPQ).
+#[cfg(formula_delta_transport_probe)]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FormulaDeltaTransportProbePlanReceipt {
+    pub formula_scope: FormulaScope,
+    pub program_scope: ProgramScope,
+    pub leaves: usize,
+    pub production_formula_leaves: usize,
+    pub formula_roots: usize,
+    pub formula_nodes: usize,
+    pub formula_atoms: usize,
+    pub formula_ands: usize,
+    pub formula_ors: usize,
+    pub production_region_marks: usize,
+    pub opaque_production_program_leaves: usize,
+    pub opaque_explicit_program_leaves: usize,
+    pub topology_fingerprint: u64,
+    pub production_marks_fingerprint: u64,
+    pub opaque_program_policy_fingerprint: u64,
+}
+
 /// Measurements from one residual-state solve.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
@@ -2710,21 +2768,66 @@ pub struct ResidualStateStats {
     /// Focused Formula Atom actions offered to delta transport.
     #[cfg(formula_delta_transport_probe)]
     pub probe_formula_delta_attempts: usize,
+    /// Formula Support actions offered to delta transport.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_support_attempts: usize,
+    /// Formula Propose actions offered to delta transport.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_propose_attempts: usize,
+    /// Formula Confirm actions offered to delta transport.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_confirm_attempts: usize,
     /// Formula Atom actions causally forced onto stable execution.
     #[cfg(formula_delta_transport_probe)]
     pub probe_formula_forced_stable_declines: usize,
+    /// Formula Support actions causally forced onto stable execution.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_forced_stable_support: usize,
+    /// Formula Propose actions causally forced onto stable execution.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_forced_stable_propose: usize,
+    /// Formula Confirm actions causally forced onto stable execution.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_forced_stable_confirm: usize,
     /// Formula Atom actions that naturally retained stable execution.
     #[cfg(formula_delta_transport_probe)]
     pub probe_formula_natural_stable_declines: usize,
     /// Formula Atom actions for which production policy selected a typed route.
     #[cfg(formula_delta_transport_probe)]
     pub probe_formula_program_selected: usize,
+    /// Formula Support actions for which production policy selected a typed route.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_support_program_selected: usize,
+    /// Formula Propose actions for which production policy selected a typed route.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_propose_program_selected: usize,
+    /// Formula Confirm actions for which production policy selected a typed route.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_confirm_program_selected: usize,
     /// Selected Formula Program actions that opened the delta scheduler.
     #[cfg(formula_delta_transport_probe)]
     pub probe_formula_program_seeded: usize,
     /// Affine parents opened by probe Formula Program seeds.
     #[cfg(formula_delta_transport_probe)]
     pub probe_formula_program_seeded_parents: usize,
+    /// Selected Formula Support Programs that opened the delta scheduler.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_support_program_seeded: usize,
+    /// Parents opened by Formula Support Program seeds.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_support_program_seeded_parents: usize,
+    /// Selected Formula Propose Programs that opened the delta scheduler.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_propose_program_seeded: usize,
+    /// Parents opened by Formula Propose Program seeds.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_propose_program_seeded_parents: usize,
+    /// Selected Formula Confirm Programs that opened the delta scheduler.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_confirm_program_seeded: usize,
+    /// Parents opened by Formula Confirm Program seeds.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_confirm_program_seeded_parents: usize,
     /// Formula actions transferred to the constraint-owned paged-source path.
     #[cfg(formula_delta_transport_probe)]
     pub probe_formula_source_seeded: usize,
@@ -11968,8 +12071,18 @@ impl ResidualStateMachine {
         #[cfg(formula_delta_transport_probe)]
         {
             self.stats.probe_formula_delta_attempts += 1;
-            if FORMULA_DELTA_TRANSPORT_FORCE_STABLE.load(Ordering::Relaxed) {
+            match stage {
+                FormulaStage::Support => self.stats.probe_formula_support_attempts += 1,
+                FormulaStage::Propose => self.stats.probe_formula_propose_attempts += 1,
+                FormulaStage::Confirm => self.stats.probe_formula_confirm_attempts += 1,
+            }
+            if formula_delta_transport_probe_forces(stage) {
                 self.stats.probe_formula_forced_stable_declines += 1;
+                match stage {
+                    FormulaStage::Support => self.stats.probe_formula_forced_stable_support += 1,
+                    FormulaStage::Propose => self.stats.probe_formula_forced_stable_propose += 1,
+                    FormulaStage::Confirm => self.stats.probe_formula_forced_stable_confirm += 1,
+                }
                 return Err(task);
             }
         }
@@ -12040,6 +12153,17 @@ impl ResidualStateMachine {
                 #[cfg(formula_delta_transport_probe)]
                 {
                     self.stats.probe_formula_program_selected += 1;
+                    match stage {
+                        FormulaStage::Support => {
+                            self.stats.probe_formula_support_program_selected += 1
+                        }
+                        FormulaStage::Propose => {
+                            self.stats.probe_formula_propose_program_selected += 1
+                        }
+                        FormulaStage::Confirm => {
+                            self.stats.probe_formula_confirm_program_selected += 1
+                        }
+                    }
                 }
                 if stage == FormulaStage::Confirm && route.grouping == ProgramGrouping::ParentAtomic
                 {
@@ -12180,6 +12304,23 @@ impl ResidualStateMachine {
             {
                 self.stats.probe_formula_program_seeded += 1;
                 self.stats.probe_formula_program_seeded_parents += batch.parents.row_count;
+                match stage {
+                    FormulaStage::Support => {
+                        self.stats.probe_formula_support_program_seeded += 1;
+                        self.stats.probe_formula_support_program_seeded_parents +=
+                            batch.parents.row_count;
+                    }
+                    FormulaStage::Propose => {
+                        self.stats.probe_formula_propose_program_seeded += 1;
+                        self.stats.probe_formula_propose_program_seeded_parents +=
+                            batch.parents.row_count;
+                    }
+                    FormulaStage::Confirm => {
+                        self.stats.probe_formula_confirm_program_seeded += 1;
+                        self.stats.probe_formula_confirm_program_seeded_parents +=
+                            batch.parents.row_count;
+                    }
+                }
             }
             return Ok(self.delta.seed_program_formula(
                 spec,
@@ -13531,6 +13672,184 @@ where
     C: Constraint<'a> + 'a,
     P: Fn(&Binding) -> Option<R>,
 {
+    /// Captures the selector-independent compiled control plane for the
+    /// cfg-only Formula transport probe.
+    #[cfg(formula_delta_transport_probe)]
+    #[doc(hidden)]
+    pub fn formula_delta_transport_probe_plan_receipt(
+        &self,
+    ) -> FormulaDeltaTransportProbePlanReceipt {
+        fn mix(state: &mut u64, value: u64) {
+            *state ^= value
+                .wrapping_add(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(*state << 6)
+                .wrapping_add(*state >> 2);
+            *state = state.rotate_left(17).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+        }
+
+        fn mix_variable_set(state: &mut u64, variables: VariableSet) {
+            mix(state, variables.count() as u64);
+            for variable in variables {
+                mix(state, variable as u64);
+            }
+        }
+
+        fn encoded_formula_path(path: &FormulaPath) -> Vec<u64> {
+            path.0
+                .iter()
+                .map(|step| match *step {
+                    FormulaStep::And(child) => (child as u64) << 1,
+                    FormulaStep::Or(child) => ((child as u64) << 1) | 1,
+                })
+                .collect()
+        }
+
+        let mut topology_fingerprint = 0x243F_6A88_85A3_08D3;
+        mix(&mut topology_fingerprint, self.plan.leaves.len() as u64);
+        for leaf in &self.plan.leaves {
+            mix(&mut topology_fingerprint, leaf.path.0.len() as u64);
+            for &child in leaf.path.0.iter() {
+                mix(&mut topology_fingerprint, child as u64);
+            }
+            mix(
+                &mut topology_fingerprint,
+                match leaf.lowering {
+                    LeafLowering::Opaque => 0,
+                    LeafLowering::ProductionFormula => 1,
+                    LeafLowering::FiniteFormula => 2,
+                },
+            );
+        }
+
+        let mut formula_atoms = 0;
+        let mut formula_ands = 0;
+        let mut formula_ors = 0;
+        for node in &self.plan.finite_formula.nodes {
+            mix(&mut topology_fingerprint, node.path.0.len() as u64);
+            for step in encoded_formula_path(&node.path) {
+                mix(&mut topology_fingerprint, step);
+            }
+            mix(&mut topology_fingerprint, node.support_span as u64);
+            mix(&mut topology_fingerprint, node.execution_span as u64);
+            mix(
+                &mut topology_fingerprint,
+                u64::from(node.capabilities.confirm_page_local),
+            );
+            mix(
+                &mut topology_fingerprint,
+                node.capabilities.grouped_delta_confirm_requirements.len() as u64,
+            );
+            for &(variable, bound) in node.capabilities.grouped_delta_confirm_requirements.iter() {
+                mix(&mut topology_fingerprint, variable as u64);
+                mix_variable_set(&mut topology_fingerprint, bound);
+            }
+            match &node.kind {
+                FiniteFormulaNodeKind::Atom => {
+                    formula_atoms += 1;
+                    mix(&mut topology_fingerprint, 0);
+                }
+                FiniteFormulaNodeKind::And { children } => {
+                    formula_ands += 1;
+                    mix(&mut topology_fingerprint, 1);
+                    mix(&mut topology_fingerprint, children.len() as u64);
+                    for child in children.iter() {
+                        mix(&mut topology_fingerprint, child.0 as u64);
+                    }
+                }
+                FiniteFormulaNodeKind::Or { children } => {
+                    formula_ors += 1;
+                    mix(&mut topology_fingerprint, 2);
+                    mix(&mut topology_fingerprint, children.len() as u64);
+                    for child in children.iter() {
+                        mix(&mut topology_fingerprint, child.0 as u64);
+                    }
+                }
+            }
+        }
+        for root in &self.plan.finite_formula.roots {
+            mix(
+                &mut topology_fingerprint,
+                root.map_or(u64::MAX, |root| root.0 as u64),
+            );
+        }
+
+        let mut encoded_marks = Vec::new();
+        let mut opaque_production_program_leaves = 0;
+        let mut opaque_explicit_program_leaves = 0;
+        let mut opaque_program_policy_fingerprint = 0x1319_8A2E_0370_7344;
+        for (occurrence, leaf) in self.plan.leaves.iter().enumerate() {
+            let constraint = self.plan.resolve(&self.root, occurrence);
+            if leaf.lowering == LeafLowering::ProductionFormula {
+                encoded_marks.extend(
+                    production_region_marks(constraint)
+                        .iter()
+                        .map(encoded_formula_path),
+                );
+            }
+            if leaf.lowering != LeafLowering::Opaque {
+                continue;
+            }
+            let Some(program) = constraint.residual_program() else {
+                continue;
+            };
+            let exposures = program.exposures();
+            let production = exposures.contains(ProgramExposure::Production);
+            let explicit = exposures.contains(ProgramExposure::Explicit);
+            opaque_production_program_leaves += usize::from(production);
+            opaque_explicit_program_leaves += usize::from(explicit);
+            mix(&mut opaque_program_policy_fingerprint, occurrence as u64);
+            mix(
+                &mut opaque_program_policy_fingerprint,
+                u64::from(production) | (u64::from(explicit) << 1),
+            );
+            mix_variable_set(
+                &mut opaque_program_policy_fingerprint,
+                constraint.variables(),
+            );
+            mix(
+                &mut opaque_program_policy_fingerprint,
+                u64::from(self.plan.page_local_confirms[occurrence]),
+            );
+            for &(variable, bound) in
+                self.plan.grouped_delta_confirm_requirements[occurrence].iter()
+            {
+                mix(&mut opaque_program_policy_fingerprint, variable as u64);
+                mix_variable_set(&mut opaque_program_policy_fingerprint, bound);
+            }
+        }
+        encoded_marks.sort_unstable();
+        let mut production_marks_fingerprint = 0xA409_3822_299F_31D0;
+        for path in &encoded_marks {
+            mix(&mut production_marks_fingerprint, path.len() as u64);
+            for &step in path {
+                mix(&mut production_marks_fingerprint, step);
+            }
+        }
+
+        FormulaDeltaTransportProbePlanReceipt {
+            formula_scope: self.plan.probe_formula_scope,
+            program_scope: self.plan.program_scope,
+            leaves: self.plan.leaves.len(),
+            production_formula_leaves: self
+                .plan
+                .leaves
+                .iter()
+                .filter(|leaf| leaf.lowering == LeafLowering::ProductionFormula)
+                .count(),
+            formula_roots: self.plan.finite_formula.roots.iter().flatten().count(),
+            formula_nodes: self.plan.finite_formula.nodes.len(),
+            formula_atoms,
+            formula_ands,
+            formula_ors,
+            production_region_marks: encoded_marks.len(),
+            opaque_production_program_leaves,
+            opaque_explicit_program_leaves,
+            topology_fingerprint,
+            production_marks_fingerprint,
+            opaque_program_policy_fingerprint,
+        }
+    }
+
     /// Fully drains the iterator and returns its results and final profile.
     pub fn collect_profiled(mut self) -> ResidualStateSolve<R> {
         let mut results = Vec::new();

@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The cfg-only Formula transport probe can isolate the Propose stage.** Its
+  C/E/D panel now compares the ordinary typed route, stable-only Propose, and
+  stable execution for every Formula stage with per-stage route receipts and
+  identical compiled-plan assertions.
 - **Receipt-proved complete Program results can transfer directly through an
   empty exact Formula OR.** RPQ whole-group completion now carries its
   insertion-ordered parent-local SET proof through the typed arbiter, avoiding

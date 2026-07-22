@@ -199,8 +199,8 @@ mod allocation_probe {
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 #[cfg(formula_delta_transport_probe)]
 use triblespace::core::query::residual::{
-    formula_delta_transport_probe_force_stable, FormulaScope, ProgramScope, ResidualLowering,
-    ResidualStateStats,
+    formula_delta_transport_probe_select, FormulaDeltaTransportProbeSelector, FormulaScope,
+    ProgramScope, ResidualLowering, ResidualStateStats,
 };
 use triblespace::core::query::TriblePattern;
 use triblespace::core::trible::TribleSet;
@@ -250,36 +250,42 @@ type Pair = (Inline<GenId>, Inline<GenId>);
 #[cfg(formula_delta_transport_probe)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FormulaTransportProbeMode {
-    OpaqueProduction,
     Production,
+    ProductionStablePropose,
     ProductionStableFormula,
 }
 
 #[cfg(formula_delta_transport_probe)]
 impl FormulaTransportProbeMode {
     const ALL: [Self; 3] = [
-        Self::OpaqueProduction,
         Self::Production,
+        Self::ProductionStablePropose,
         Self::ProductionStableFormula,
     ];
 
     fn label(self) -> &'static str {
         match self {
-            Self::OpaqueProduction => "B_OPAQUE_PRODUCTION",
             Self::Production => "C_PRODUCTION",
+            Self::ProductionStablePropose => "E_PRODUCTION_STABLE_PROPOSE",
             Self::ProductionStableFormula => "D_PRODUCTION_STABLE_FORMULA",
         }
     }
 
     fn lowering(self) -> ResidualLowering {
         match self {
-            Self::OpaqueProduction => ResidualLowering::OPAQUE_PRODUCTION,
-            Self::Production | Self::ProductionStableFormula => ResidualLowering::PRODUCTION,
+            Self::Production | Self::ProductionStablePropose | Self::ProductionStableFormula => {
+                ResidualLowering::PRODUCTION
+            }
         }
     }
 
     fn arm(self) {
-        formula_delta_transport_probe_force_stable(matches!(self, Self::ProductionStableFormula));
+        let selector = match self {
+            Self::Production => FormulaDeltaTransportProbeSelector::Typed,
+            Self::ProductionStablePropose => FormulaDeltaTransportProbeSelector::StablePropose,
+            Self::ProductionStableFormula => FormulaDeltaTransportProbeSelector::StableAll,
+        };
+        formula_delta_transport_probe_select(selector);
     }
 }
 
@@ -1514,9 +1520,15 @@ fn format_formula_transport_probe_stats(stats: &ResidualStateStats) -> String {
          source_examined={} transition_pages={} transition_cohorts={} transition_examined={} \
          state_reentries={} rows_reentered={} bucket_merges={} rows_merged={} \
          formula_filings={} formula_bucket_merges={} formula_state_reentries={} \
-         formula_rows_reentered={} formula_delta_attempts={} forced_stable_declines={} \
-         natural_stable_declines={} formula_program_selected={} formula_program_seeded={} \
-         formula_program_seeded_parents={} formula_source_seeded={} \
+         formula_rows_reentered={} formula_delta_attempts={} support_attempts={} \
+         propose_attempts={} confirm_attempts={} forced_stable_declines={} \
+         forced_support={} forced_propose={} forced_confirm={} natural_stable_declines={} \
+         formula_program_selected={} support_program_selected={} \
+         propose_program_selected={} confirm_program_selected={} formula_program_seeded={} \
+         formula_program_seeded_parents={} support_program_seeded={} \
+         support_program_seeded_parents={} propose_program_seeded={} \
+         propose_program_seeded_parents={} confirm_program_seeded={} \
+         confirm_program_seeded_parents={} formula_source_seeded={} \
          formula_source_seeded_parents={} formula_legacy_seeded={} \
          formula_legacy_seeded_parents={} formula_stable_support_calls={} \
          formula_stable_support_rows={} formula_stable_propose_calls={} \
@@ -1542,11 +1554,26 @@ fn format_formula_transport_probe_stats(stats: &ResidualStateStats) -> String {
         stats.probe_formula_state_reentries,
         stats.probe_formula_rows_reentered,
         stats.probe_formula_delta_attempts,
+        stats.probe_formula_support_attempts,
+        stats.probe_formula_propose_attempts,
+        stats.probe_formula_confirm_attempts,
         stats.probe_formula_forced_stable_declines,
+        stats.probe_formula_forced_stable_support,
+        stats.probe_formula_forced_stable_propose,
+        stats.probe_formula_forced_stable_confirm,
         stats.probe_formula_natural_stable_declines,
         stats.probe_formula_program_selected,
+        stats.probe_formula_support_program_selected,
+        stats.probe_formula_propose_program_selected,
+        stats.probe_formula_confirm_program_selected,
         stats.probe_formula_program_seeded,
         stats.probe_formula_program_seeded_parents,
+        stats.probe_formula_support_program_seeded,
+        stats.probe_formula_support_program_seeded_parents,
+        stats.probe_formula_propose_program_seeded,
+        stats.probe_formula_propose_program_seeded_parents,
+        stats.probe_formula_confirm_program_seeded,
+        stats.probe_formula_confirm_program_seeded_parents,
         stats.probe_formula_source_seeded,
         stats.probe_formula_source_seeded_parents,
         stats.probe_formula_legacy_seeded,
@@ -1579,6 +1606,7 @@ fn formula_transport_probe_backend<S: TriblePattern>(
     let mut full_stats = Vec::new();
     for mode in FormulaTransportProbeMode::ALL {
         let mut first = formula_transport_probe_query!(store, fixture, mode);
+        let first_plan_receipt = first.formula_delta_transport_probe_plan_receipt();
         let first_rows: Vec<Pair> = first.by_ref().collect();
         let first_stats = first.stats().clone();
         let first_width = first.current_width();
@@ -1619,6 +1647,10 @@ fn formula_transport_probe_backend<S: TriblePattern>(
             first_width,
             format_formula_transport_probe_stats(&first_stats),
         );
+        println!(
+            "probe_plan backend={backend:?} mode={} receipt={first_plan_receipt:?}",
+            mode.label(),
+        );
 
         let label = format!("{} / {backend}", mode.label());
         let query = formula_transport_probe_query!(store, fixture, mode);
@@ -1628,20 +1660,43 @@ fn formula_transport_probe_backend<S: TriblePattern>(
                 format_formula_transport_probe_stats(query.stats()),
             )
         });
-        full_stats.push((mode, first_stats));
+        full_stats.push((mode, first_plan_receipt, first_width, first_stats));
     }
 
-    let opaque = &full_stats[0].1;
-    let production = &full_stats[1].1;
-    let stable_formula = &full_stats[2].1;
-    assert_eq!(full_stats[1].0, FormulaTransportProbeMode::Production);
+    let production = &full_stats[0].3;
+    let stable_propose = &full_stats[1].3;
+    let stable_formula = &full_stats[2].3;
+    assert_eq!(full_stats[0].0, FormulaTransportProbeMode::Production);
+    assert_eq!(
+        full_stats[1].0,
+        FormulaTransportProbeMode::ProductionStablePropose
+    );
     assert_eq!(
         full_stats[2].0,
         FormulaTransportProbeMode::ProductionStableFormula
     );
-    assert_eq!(opaque.probe_formula_delta_attempts, 0);
+    assert_eq!(full_stats[0].1, full_stats[1].1);
+    assert_eq!(full_stats[0].1, full_stats[2].1);
+    let plan = full_stats[0].1;
+    assert_eq!(plan.formula_scope, FormulaScope::ProductionRegions);
+    assert_eq!(plan.program_scope, ProgramScope::Production);
+    assert!(plan.production_formula_leaves > 0);
+    assert!(plan.formula_nodes > 0);
+    assert!(plan.production_region_marks > 0);
+    assert_eq!(plan.opaque_production_program_leaves, 1);
     assert!(production.probe_formula_delta_attempts > 0);
     assert_eq!(production.probe_formula_forced_stable_declines, 0);
+    assert_eq!(stable_propose.probe_formula_forced_stable_support, 0);
+    assert_eq!(stable_propose.probe_formula_forced_stable_confirm, 0);
+    assert_eq!(stable_propose.probe_formula_forced_stable_propose, 2);
+    assert_eq!(stable_propose.probe_formula_propose_attempts, 2);
+    assert_eq!(stable_propose.probe_formula_propose_program_selected, 0);
+    assert_eq!(stable_propose.probe_formula_propose_program_seeded, 0);
+    assert_eq!(stable_propose.probe_formula_stable_propose_calls, 2);
+    assert_eq!(stable_propose.probe_formula_stable_propose_rows, 2);
+    assert_eq!(stable_propose.probe_formula_stable_propose_candidates, 32);
+    assert_eq!(stable_propose.delta_source_pages, 0);
+    assert_eq!(stable_propose.delta_source_candidates_examined, 0);
     assert_eq!(
         stable_formula.probe_formula_forced_stable_declines,
         stable_formula.probe_formula_delta_attempts,
@@ -1657,45 +1712,90 @@ fn formula_transport_probe_backend<S: TriblePattern>(
             + stable_formula.probe_formula_stable_confirm_calls
             > 0
     );
-    assert_eq!(
-        FormulaTransportProbeMode::Production
-            .lowering()
-            .formula_scope(),
-        FormulaScope::ProductionRegions,
-    );
-    assert_eq!(
-        FormulaTransportProbeMode::ProductionStableFormula
-            .lowering()
-            .formula_scope(),
-        FormulaScope::ProductionRegions,
-    );
-    assert_eq!(
-        FormulaTransportProbeMode::Production
-            .lowering()
-            .program_scope(),
-        ProgramScope::Production,
-    );
-    assert_eq!(
-        FormulaTransportProbeMode::ProductionStableFormula
-            .lowering()
-            .program_scope(),
-        ProgramScope::Production,
-    );
+    let stats_at_65: Vec<_> = FormulaTransportProbeMode::ALL
+        .into_iter()
+        .map(|mode| {
+            let mut query = formula_transport_probe_query!(store, fixture, mode);
+            assert_eq!(query.by_ref().take(65).count(), 65);
+            query.stats().clone()
+        })
+        .collect();
+    for mode in FormulaTransportProbeMode::ALL {
+        assert_eq!(
+            mode.lowering().formula_scope(),
+            FormulaScope::ProductionRegions
+        );
+        assert_eq!(mode.lowering().program_scope(), ProgramScope::Production);
+    }
+    if backend.starts_with("TribleSet") {
+        assert_eq!(
+            stable_propose.probe_formula_support_program_selected
+                + stable_propose.probe_formula_confirm_program_selected,
+            0,
+        );
+        assert_eq!(
+            stable_propose.delta_activations_completed,
+            stable_formula.delta_activations_completed
+        );
+        assert_eq!(
+            stable_propose.probe_formula_filings,
+            stable_formula.probe_formula_filings
+        );
+        assert_eq!(full_stats[1].2, full_stats[2].2);
+        assert_eq!(stats_at_65[0].candidates_confirmed, 2_208);
+        assert_eq!(stats_at_65[1].candidates_confirmed, 2_208);
+        assert_eq!(stats_at_65[2].candidates_confirmed, 2_208);
+    } else {
+        assert!(
+            stable_propose.probe_formula_support_program_selected
+                + stable_propose.probe_formula_confirm_program_selected
+                > 0
+        );
+        assert!(
+            stable_propose.probe_formula_support_program_seeded
+                + stable_propose.probe_formula_confirm_program_seeded
+                > 0
+        );
+        assert_eq!(
+            stable_propose.delta_activations_completed,
+            production.delta_activations_completed
+        );
+        assert_eq!(
+            stable_propose.probe_formula_filings,
+            production.probe_formula_filings
+        );
+        assert_eq!(full_stats[1].2, full_stats[0].2);
+        assert_eq!(stats_at_65[0].candidates_confirmed, 288);
+        assert_eq!(stats_at_65[1].candidates_confirmed, 288);
+        assert_eq!(stats_at_65[2].candidates_confirmed, 2_208);
+    }
     println!(
-        "probe_transport_seam backend={backend:?} c_d_formula_scope_equal=true \
-         c_d_program_scope_equal=true d_attempts={} d_forced_declines={} \
-         d_formula_delta_seeds=0 d_stable_child_callbacks={}",
+        "probe_transport_seam backend={backend:?} c_e_d_formula_scope_equal=true \
+         c_e_d_program_scope_equal=true e_propose_attempts={} e_forced_propose={} \
+         e_propose_selected=0 e_propose_seeded=0 e_stable_propose_calls={} \
+         d_attempts={} d_forced_declines={} d_formula_delta_seeds=0 \
+         d_stable_child_callbacks={}",
+        stable_propose.probe_formula_propose_attempts,
+        stable_propose.probe_formula_forced_stable_propose,
+        stable_propose.probe_formula_stable_propose_calls,
         stable_formula.probe_formula_delta_attempts,
         stable_formula.probe_formula_forced_stable_declines,
         stable_formula.probe_formula_stable_support_calls
             + stable_formula.probe_formula_stable_propose_calls
             + stable_formula.probe_formula_stable_confirm_calls,
     );
+    println!(
+        "probe_prefix65_discriminator backend={backend:?} c_candidates_confirmed={} \
+         e_candidates_confirmed={} d_candidates_confirmed={}",
+        stats_at_65[0].candidates_confirmed,
+        stats_at_65[1].candidates_confirmed,
+        stats_at_65[2].candidates_confirmed,
+    );
 }
 
 #[cfg(formula_delta_transport_probe)]
 fn formula_transport_correctness_main() {
-    const PROBE_BASE: &str = "eba817d8941e232e72d13fece5e4805af7fd0fb1";
+    const PROBE_BASE: &str = "71b9e34dcd90be9a948830460da2610dd62549dd";
     const COMPONENT_COUNT: usize = 1;
     const RING_SIZE: usize = 64;
     const FANOUT: usize = 2;
@@ -1719,7 +1819,7 @@ fn formula_transport_correctness_main() {
 
     formula_transport_probe_backend("TribleSet sibling", &fixture.graph, &fixture, &expected);
     formula_transport_probe_backend("SuccinctArchive sibling", &archive, &fixture, &expected);
-    formula_delta_transport_probe_force_stable(false);
+    formula_delta_transport_probe_select(FormulaDeltaTransportProbeSelector::Typed);
     println!("probe verdict: all six backend/mode cells have exact SET and repeat-order parity");
 }
 
@@ -1951,7 +2051,7 @@ fn print_formula_transport_timing_plan(tasks: &[FormulaTransportTimingTask], rou
 
 #[cfg(formula_delta_transport_probe)]
 fn formula_transport_timing_main(rounds: usize) {
-    const PROBE_BASE: &str = "eba817d8941e232e72d13fece5e4805af7fd0fb1";
+    const PROBE_BASE: &str = "71b9e34dcd90be9a948830460da2610dd62549dd";
     const COMPONENT_COUNT: usize = 1;
     const RING_SIZE: usize = 64;
     const FANOUT: usize = 2;
@@ -1979,21 +2079,34 @@ fn formula_transport_timing_main(rounds: usize) {
     print_formula_transport_timing_plan(&tasks, rounds);
 
     // Independent SET checks occur before warmup and all timed samples.
+    let mut plan_receipt = None;
     for mode in FormulaTransportProbeMode::ALL {
+        let trible_query = formula_transport_probe_query!(&fixture.graph, &fixture, mode);
+        let trible_plan = trible_query.formula_delta_transport_probe_plan_receipt();
+        if let Some(expected) = plan_receipt {
+            assert_eq!(trible_plan, expected);
+        } else {
+            plan_receipt = Some(trible_plan);
+        }
         exact_check(
-            formula_transport_probe_query!(&fixture.graph, &fixture, mode).collect(),
+            trible_query.collect(),
             &expected,
             mode.label(),
             "TribleSet timing preflight",
         );
+        let succinct_query = formula_transport_probe_query!(&archive, &fixture, mode);
+        assert_eq!(
+            succinct_query.formula_delta_transport_probe_plan_receipt(),
+            plan_receipt.expect("TribleSet preflight established the plan receipt"),
+        );
         exact_check(
-            formula_transport_probe_query!(&archive, &fixture, mode).collect(),
+            succinct_query.collect(),
             &expected,
             mode.label(),
             "SuccinctArchive timing preflight",
         );
     }
-    println!("timing preflight: all six full SET cells exact");
+    println!("timing preflight: all six full SET cells exact; C/E/D plan receipts identical");
 
     // One untimed fresh pass per task both warms the exact path and freezes its
     // row/order receipt. Every formal observation must reproduce that receipt.
@@ -2026,7 +2139,7 @@ fn formula_transport_timing_main(rounds: usize) {
             });
         }
     }
-    formula_delta_transport_probe_force_stable(false);
+    formula_delta_transport_probe_select(FormulaDeltaTransportProbeSelector::Typed);
 
     // Emit only after the measured panel so stdout cannot perturb later cells.
     for sample in &samples {
