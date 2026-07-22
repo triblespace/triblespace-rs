@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The sealed RPQ Confirm crossover now includes a request-local ProbeOne
+  diagnostic.** J sends exactly the first concrete target CandidateBatch
+  through ordinary Confirm, atomically consumes that request-local flag, and
+  retains typed execution for every later fragment. C/O/H remain frozen
+  controls; exact route, SET, order, physical-cohort, geometric-width, and
+  borrowed-bulk receipts accompany a four-mode permutation-balanced timing
+  panel whose execution remains gated on an explicit fleet-idle release.
 - **The sealed RPQ Confirm crossover now has a fragment-local hybrid
   diagnostic.** On the frozen TribleSet `k=4` cell, the structural Production
   route and ParentAtomic grouping remain fixed while a request-local physical

@@ -391,9 +391,13 @@ impl ChainFrameReducer for ExistsEq {
 #[cfg(test)]
 std::thread_local! {
     static SEEDED_CHAIN_FRAME_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static HOP_SET_MATERIALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, rpq_confirm_admission_probe))]
+std::thread_local! {
     static BULK_TRANSITION_COHORTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PAGEABLE_TRANSITION_PAGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static HOP_SET_MATERIALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -1603,6 +1607,9 @@ const RPQ_SUPPORT_TRUE: ProgramKey = ProgramKey::new(7);
 thread_local! {
     static FORCE_BOUND_CONFIRM_ORDINARY: Cell<bool> = const { Cell::new(false) };
     static FORCE_SINGLETON_CONFIRM_ORDINARY: Cell<bool> = const { Cell::new(false) };
+    static FORCE_FIRST_TARGET_CONFIRM_ORDINARY: Cell<bool> = const { Cell::new(false) };
+    static FIRST_TARGET_CONFIRM_PENDING: Cell<bool> = const { Cell::new(false) };
+    static FIRST_TARGET_CONFIRM_CONSUMPTIONS: Cell<usize> = const { Cell::new(0) };
     static RECORD_PROBE_RECEIPTS: Cell<bool> = const { Cell::new(true) };
     static TARGET_CONFIRM_TOKEN: Cell<Option<u32>> = const { Cell::new(None) };
     static TARGET_CONFIRM_PARENTS: Cell<usize> = const { Cell::new(0) };
@@ -1668,12 +1675,15 @@ pub struct RpqConfirmAdmissionProbeSnapshot {
     pub route_support_calls: usize,
     pub route_bound_confirm_calls: usize,
     pub route_forced_calls: usize,
+    pub first_target_confirm_consumptions: usize,
     pub target_batch_route_calls: usize,
     pub target_batch_parents: usize,
     pub target_batch_candidates: usize,
     pub bound_estimate_samples: usize,
     pub bound_estimate_min: usize,
     pub bound_estimate_max: usize,
+    pub bulk_transition_cohorts: usize,
+    pub pageable_transition_pages: usize,
 }
 
 #[cfg(rpq_confirm_admission_probe)]
@@ -1686,6 +1696,13 @@ pub fn rpq_confirm_admission_probe_force_ordinary(force: bool) {
 #[doc(hidden)]
 pub fn rpq_confirm_admission_probe_force_singleton_ordinary(force: bool) {
     FORCE_SINGLETON_CONFIRM_ORDINARY.with(|armed| armed.set(force));
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+#[doc(hidden)]
+pub fn rpq_confirm_admission_probe_force_first_target_ordinary(force: bool) {
+    FORCE_FIRST_TARGET_CONFIRM_ORDINARY.with(|armed| armed.set(force));
+    FIRST_TARGET_CONFIRM_PENDING.with(|pending| pending.set(force));
 }
 
 #[cfg(rpq_confirm_admission_probe)]
@@ -1705,6 +1722,10 @@ pub fn rpq_confirm_admission_probe_target_action(token: u32, parents: usize, can
     TARGET_CONFIRM_PARENTS_SEEN.with(|value| value.set(0));
     TARGET_CONFIRM_CANDIDATES_SEEN.with(|value| value.set(0));
     TARGET_BATCH_ROUTE_CALLS.with(|value| value.set(0));
+    FIRST_TARGET_CONFIRM_CONSUMPTIONS.with(|value| value.set(0));
+    FIRST_TARGET_CONFIRM_PENDING.with(|pending| {
+        pending.set(FORCE_FIRST_TARGET_CONFIRM_ORDINARY.with(Cell::get));
+    });
 }
 
 #[cfg(rpq_confirm_admission_probe)]
@@ -1755,6 +1776,8 @@ pub fn rpq_confirm_admission_probe_reset_callbacks() {
     CURRENT_CONFIRM_PARENTS.with(|value| value.set(0));
     CURRENT_CONFIRM_CANDIDATES.with(|value| value.set(0));
     TARGET_BATCH_ROUTE_CALLS.with(|value| value.set(0));
+    FIRST_TARGET_CONFIRM_PENDING.with(|value| value.set(false));
+    FIRST_TARGET_CONFIRM_CONSUMPTIONS.with(|value| value.set(0));
     BOUND_CONFIRM_BATCHES.with(|batches| batches.borrow_mut().clear());
     FORCED_CONFIRM_BATCHES.with(|batches| batches.borrow_mut().clear());
     TARGET_CONFIRM_DECISIONS.with(|decisions| decisions.borrow_mut().clear());
@@ -1782,6 +1805,8 @@ pub fn rpq_confirm_admission_probe_reset_callbacks() {
     BOUND_ESTIMATE_SAMPLES.with(|value| value.set(0));
     BOUND_ESTIMATE_MIN.with(|value| value.set(usize::MAX));
     BOUND_ESTIMATE_MAX.with(|value| value.set(0));
+    BULK_TRANSITION_COHORTS.with(|value| value.set(0));
+    PAGEABLE_TRANSITION_PAGES.with(|value| value.set(0));
 }
 
 #[cfg(rpq_confirm_admission_probe)]
@@ -1809,12 +1834,15 @@ pub fn rpq_confirm_admission_probe_snapshot() -> RpqConfirmAdmissionProbeSnapsho
         route_support_calls: ROUTE_SUPPORT_CALLS.with(Cell::get),
         route_bound_confirm_calls: ROUTE_BOUND_CONFIRM_CALLS.with(Cell::get),
         route_forced_calls: ROUTE_FORCED_CALLS.with(Cell::get),
+        first_target_confirm_consumptions: FIRST_TARGET_CONFIRM_CONSUMPTIONS.with(Cell::get),
         target_batch_route_calls: TARGET_BATCH_ROUTE_CALLS.with(Cell::get),
         target_batch_parents: TARGET_CONFIRM_PARENTS_SEEN.with(Cell::get),
         target_batch_candidates: TARGET_CONFIRM_CANDIDATES_SEEN.with(Cell::get),
         bound_estimate_samples: BOUND_ESTIMATE_SAMPLES.with(Cell::get),
         bound_estimate_min: BOUND_ESTIMATE_MIN.with(Cell::get),
         bound_estimate_max: BOUND_ESTIMATE_MAX.with(Cell::get),
+        bulk_transition_cohorts: BULK_TRANSITION_COHORTS.with(Cell::get),
+        pageable_transition_pages: PAGEABLE_TRANSITION_PAGES.with(Cell::get),
     }
 }
 
@@ -1855,9 +1883,16 @@ fn probe_forces_bound_confirm_ordinary() -> bool {
             TARGET_CONFIRM_CANDIDATES_SEEN.with(|value| value.set(candidates));
             TARGET_BATCH_ROUTE_CALLS.with(|value| value.set(value.get() + 1));
         }
+        let first_target = target
+            && FORCE_FIRST_TARGET_CONFIRM_ORDINARY.with(Cell::get)
+            && FIRST_TARGET_CONFIRM_PENDING.with(|pending| pending.replace(false));
+        if first_target {
+            FIRST_TARGET_CONFIRM_CONSUMPTIONS.with(|value| value.set(value.get() + 1));
+        }
         let force = target
             && (FORCE_BOUND_CONFIRM_ORDINARY.with(Cell::get)
-                || (FORCE_SINGLETON_CONFIRM_ORDINARY.with(Cell::get) && current.1 == 1));
+                || (FORCE_SINGLETON_CONFIRM_ORDINARY.with(Cell::get) && current.1 == 1)
+                || first_target);
         if target && record {
             let token = current
                 .0
@@ -2705,7 +2740,7 @@ impl RegularPathConstraint {
         limit: usize,
         successors: &mut Vec<RpqOutput>,
     ) -> Option<RpqExpandPage> {
-        #[cfg(test)]
+        #[cfg(any(test, rpq_confirm_admission_probe))]
         PAGEABLE_TRANSITION_PAGES.with(|pages| pages.set(pages.get() + 1));
         assert!(
             limit > 0,
@@ -3753,7 +3788,7 @@ impl TypedProgramSpec for RegularPathConstraint {
             fanouts.push(fanout);
         }
         if all_fit {
-            #[cfg(test)]
+            #[cfg(any(test, rpq_confirm_admission_probe))]
             BULK_TRANSITION_COHORTS.with(|cohorts| cohorts.set(cohorts.get() + 1));
             effects.reserve_children(
                 plans
