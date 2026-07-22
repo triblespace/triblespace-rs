@@ -1084,6 +1084,29 @@ struct TypedChild<State, NoveltyKey> {
     accepted: Option<RawInline>,
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TypedResumeTestSnapshot<State> {
+    Immediate(State),
+    AfterChildren(State),
+    AfterChildrenDone,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TypedEffectTestSnapshot<State, NoveltyKey> {
+    pub(crate) pages: Vec<(usize, Option<TypedResumeTestSnapshot<State>>)>,
+    pub(crate) children: Vec<(u32, State, Option<NoveltyKey>, Option<RawInline>)>,
+    pub(crate) direct: Vec<(u32, RawInline)>,
+    pub(crate) accepted: Vec<(u32, RawInline)>,
+    pub(crate) supported: Vec<(u32, ())>,
+    pub(crate) source_pages: usize,
+    pub(crate) source_examined: usize,
+    pub(crate) source_roots: usize,
+    pub(crate) transition_pages: usize,
+    pub(crate) transition_examined: usize,
+}
+
 /// Typed effect sink. Novelty admission and handle allocation happen only in
 /// the blanket erased adapter after the family call returns.
 #[doc(hidden)]
@@ -1188,6 +1211,54 @@ impl<State, NoveltyKey> TypedEffectSink<State, NoveltyKey> {
     pub fn account_transition(&mut self, examined: usize) {
         self.transition_pages += 1;
         self.transition_examined += examined;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_snapshot(&self) -> TypedEffectTestSnapshot<State, NoveltyKey>
+    where
+        State: Clone,
+        NoveltyKey: Clone,
+    {
+        TypedEffectTestSnapshot {
+            pages: self
+                .pages
+                .iter()
+                .map(|page| {
+                    let resume = page.resume.as_ref().map(|resume| match resume {
+                        TypedResume::Immediate(state) => {
+                            TypedResumeTestSnapshot::Immediate(state.clone())
+                        }
+                        TypedResume::AfterChildren(state) => {
+                            TypedResumeTestSnapshot::AfterChildren(state.clone())
+                        }
+                        TypedResume::AfterChildrenDone => {
+                            TypedResumeTestSnapshot::AfterChildrenDone
+                        }
+                    });
+                    (page.examined, resume)
+                })
+                .collect(),
+            children: self
+                .children
+                .iter()
+                .map(|child| {
+                    (
+                        child.input,
+                        child.state.clone(),
+                        child.novelty.clone(),
+                        child.accepted,
+                    )
+                })
+                .collect(),
+            direct: self.direct.clone(),
+            accepted: self.accepted.clone(),
+            supported: self.supported.clone(),
+            source_pages: self.source_pages,
+            source_examined: self.source_examined,
+            source_roots: self.source_roots,
+            transition_pages: self.transition_pages,
+            transition_examined: self.transition_examined,
+        }
     }
 }
 

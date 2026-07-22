@@ -17,7 +17,7 @@
 //! RUSTFLAGS="--cfg engine_current_residual --cfg engine_prefix_checkpoints \
 //!   --cfg rpq_confirm_admission_probe" \
 //!   cargo run --release --example query_engine_generation_bench
-//! RPQ_CONFIRM_PROBE_ONE_TIMING=FLEET_IDLE_RELEASED \
+//! RPQ_FIT_CLOSED_RUNS_TIMING=FLEET_IDLE_RELEASED \
 //!   target/release/examples/query_engine_generation_bench 48
 //! ```
 //!
@@ -205,7 +205,7 @@ mod allocation_probe {
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 #[cfg(rpq_confirm_admission_probe)]
 use triblespace::core::query::regularpathconstraint::{
-    rpq_confirm_admission_probe_bound_confirm_batches,
+    rpq_confirm_admission_probe_bound_confirm_batches, rpq_confirm_admission_probe_fit_closed_runs,
     rpq_confirm_admission_probe_force_first_target_ordinary,
     rpq_confirm_admission_probe_force_ordinary,
     rpq_confirm_admission_probe_force_singleton_ordinary,
@@ -269,6 +269,7 @@ enum ProbeMode {
     Ordinary,
     Hybrid,
     ProbeOne,
+    FitClosedRuns,
 }
 
 #[cfg(rpq_confirm_admission_probe)]
@@ -276,11 +277,18 @@ const PROBE_TIMING_ORDER_COUNT: usize = 24;
 
 #[cfg(rpq_confirm_admission_probe)]
 impl ProbeMode {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::Certified,
         Self::Ordinary,
         Self::Hybrid,
         Self::ProbeOne,
+        Self::FitClosedRuns,
+    ];
+    const TIMED: [Self; 4] = [
+        Self::Certified,
+        Self::Hybrid,
+        Self::ProbeOne,
+        Self::FitClosedRuns,
     ];
 
     fn label(self) -> &'static str {
@@ -289,6 +297,7 @@ impl ProbeMode {
             Self::Ordinary => "O_FORCED_ORDINARY",
             Self::Hybrid => "H_SINGLETON_ORDINARY",
             Self::ProbeOne => "J_PROBE_ONE_ORDINARY",
+            Self::FitClosedRuns => "K_FIT_CLOSED_RUNS",
         }
     }
 
@@ -298,8 +307,12 @@ impl ProbeMode {
 
     fn arm(self) {
         rpq_confirm_admission_probe_force_ordinary(matches!(self, Self::Ordinary));
-        rpq_confirm_admission_probe_force_singleton_ordinary(matches!(self, Self::Hybrid));
+        rpq_confirm_admission_probe_force_singleton_ordinary(matches!(
+            self,
+            Self::Hybrid | Self::FitClosedRuns
+        ));
         rpq_confirm_admission_probe_force_first_target_ordinary(matches!(self, Self::ProbeOne));
+        rpq_confirm_admission_probe_fit_closed_runs(matches!(self, Self::FitClosedRuns));
     }
 }
 
@@ -1479,11 +1492,11 @@ fn main() {
         repetitions >= PROBE_TIMING_ORDER_COUNT && repetitions % PROBE_TIMING_ORDER_COUNT == 0,
         "use a positive multiple of 24 balanced four-mode timing repetitions"
     );
-    let timing_request = std::env::var("RPQ_CONFIRM_PROBE_ONE_TIMING").ok();
+    let timing_request = std::env::var("RPQ_FIT_CLOSED_RUNS_TIMING").ok();
     let run_timing = timing_request.as_deref() == Some("FLEET_IDLE_RELEASED");
     assert!(
         timing_request.is_none() || run_timing,
-        "RPQ_CONFIRM_PROBE_ONE_TIMING must equal FLEET_IDLE_RELEASED; correctness-only is the default"
+        "RPQ_FIT_CLOSED_RUNS_TIMING must equal FLEET_IDLE_RELEASED; correctness-only is the default"
     );
     println!("engine: {ENGINE}");
     println!("revision: {REVISION}");
@@ -2547,6 +2560,30 @@ fn run_crossover_mode<S: TriblePattern>(
         forced_confirm_batches,
         target_decisions,
     );
+    if mode == ProbeMode::FitClosedRuns {
+        println!(
+            "fit_closed_run_receipt backend={backend:?} width={} repeat={repeat} \
+             original_mixed_cohorts={} bulk_runs={} bulk_inputs={} pageable_runs={} \
+             pageable_inputs={} salvaged_fit_inputs={} max_run_inputs={} \
+             max_bulk_run_inputs={} max_pageable_run_inputs={} \
+             nonfit_resumed={} nonfit_empty_program={} nonfit_non_positive={} \
+             nonfit_grant={}",
+            cell.width,
+            callbacks.fit_closed_original_mixed_cohorts,
+            callbacks.fit_closed_bulk_runs,
+            callbacks.fit_closed_bulk_inputs,
+            callbacks.fit_closed_pageable_runs,
+            callbacks.fit_closed_pageable_inputs,
+            callbacks.fit_closed_salvaged_fit_inputs,
+            callbacks.fit_closed_max_run_inputs,
+            callbacks.fit_closed_max_bulk_run_inputs,
+            callbacks.fit_closed_max_pageable_run_inputs,
+            callbacks.fit_closed_nonfit_resumed_inputs,
+            callbacks.fit_closed_nonfit_empty_program_inputs,
+            callbacks.fit_closed_nonfit_non_positive_inputs,
+            callbacks.fit_closed_nonfit_grant_inputs,
+        );
+    }
 
     CrossoverRun {
         rows,
@@ -2971,12 +3008,125 @@ fn assert_probe_one_route(
 }
 
 #[cfg(rpq_confirm_admission_probe)]
+fn nonplacement_callbacks(
+    mut callbacks: RpqConfirmAdmissionProbeSnapshot,
+) -> RpqConfirmAdmissionProbeSnapshot {
+    callbacks.bulk_transition_cohorts = 0;
+    callbacks.pageable_transition_pages = 0;
+    callbacks.fit_closed_original_mixed_cohorts = 0;
+    callbacks.fit_closed_bulk_runs = 0;
+    callbacks.fit_closed_bulk_inputs = 0;
+    callbacks.fit_closed_pageable_runs = 0;
+    callbacks.fit_closed_pageable_inputs = 0;
+    callbacks.fit_closed_salvaged_fit_inputs = 0;
+    callbacks.fit_closed_max_run_inputs = 0;
+    callbacks.fit_closed_max_bulk_run_inputs = 0;
+    callbacks.fit_closed_max_pageable_run_inputs = 0;
+    callbacks.fit_closed_nonfit_resumed_inputs = 0;
+    callbacks.fit_closed_nonfit_empty_program_inputs = 0;
+    callbacks.fit_closed_nonfit_non_positive_inputs = 0;
+    callbacks.fit_closed_nonfit_grant_inputs = 0;
+    callbacks
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+fn assert_fit_closed_runs_equivalence(
+    backend: &str,
+    cell: &CrossoverCell,
+    hybrid: &CrossoverRun,
+    fit_closed: &CrossoverRun,
+    fit_closed_repeat: &CrossoverRun,
+) {
+    assert_eq!(
+        fit_closed.rows, hybrid.rows,
+        "K FALSIFIED: raw result order diverged from H for {backend}/k={}",
+        cell.width,
+    );
+    assert_eq!(
+        fit_closed.order_digest, hybrid.order_digest,
+        "K FALSIFIED: physical order digest diverged from H",
+    );
+    assert_eq!(
+        fit_closed.stats, hybrid.stats,
+        "K FALSIFIED: scheduler, Formula, or semantic work receipt diverged from H",
+    );
+    assert_eq!(
+        fit_closed.bound_confirm_batches, hybrid.bound_confirm_batches,
+        "K FALSIFIED: target fragments diverged from H",
+    );
+    assert_eq!(
+        fit_closed.forced_confirm_batches, hybrid.forced_confirm_batches,
+        "K FALSIFIED: H admission decisions changed",
+    );
+    assert_eq!(
+        fit_closed.target_decisions, hybrid.target_decisions,
+        "K FALSIFIED: route-decision trace diverged from H",
+    );
+    assert_eq!(
+        nonplacement_callbacks(fit_closed.callbacks),
+        nonplacement_callbacks(hybrid.callbacks),
+        "K FALSIFIED: a non-placement callback receipt diverged from H",
+    );
+    assert_eq!(
+        fit_closed.callbacks.bulk_transition_cohorts, hybrid.callbacks.bulk_transition_cohorts,
+        "K changed the unchanged whole-cohort all-fit hit count",
+    );
+
+    assert_eq!(fit_closed_repeat.rows, fit_closed.rows);
+    assert_eq!(fit_closed_repeat.order_digest, fit_closed.order_digest);
+    assert_eq!(fit_closed_repeat.stats, fit_closed.stats);
+    assert_eq!(fit_closed_repeat.callbacks, fit_closed.callbacks);
+    assert_eq!(
+        fit_closed_repeat.bound_confirm_batches,
+        fit_closed.bound_confirm_batches,
+    );
+    assert_eq!(
+        fit_closed_repeat.forced_confirm_batches,
+        fit_closed.forced_confirm_batches,
+    );
+    assert_eq!(
+        fit_closed_repeat.target_decisions,
+        fit_closed.target_decisions,
+    );
+
+    let callbacks = fit_closed.callbacks;
+    assert!(callbacks.fit_closed_original_mixed_cohorts > 0);
+    assert!(callbacks.fit_closed_bulk_runs > 0);
+    assert!(callbacks.fit_closed_pageable_runs > 0);
+    assert!(callbacks.fit_closed_bulk_inputs > 0);
+    assert!(callbacks.fit_closed_pageable_inputs > 0);
+    assert_eq!(
+        callbacks.fit_closed_salvaged_fit_inputs,
+        callbacks.fit_closed_bulk_inputs,
+    );
+    assert!(callbacks.fit_closed_max_run_inputs > 0);
+    assert_eq!(
+        callbacks.fit_closed_nonfit_resumed_inputs
+            + callbacks.fit_closed_nonfit_empty_program_inputs
+            + callbacks.fit_closed_nonfit_non_positive_inputs
+            + callbacks.fit_closed_nonfit_grant_inputs,
+        callbacks.fit_closed_pageable_inputs,
+    );
+    assert!(
+        callbacks.pageable_transition_pages < hybrid.callbacks.pageable_transition_pages,
+        "K exercised mixed cohorts but salvaged no pageable transition pages",
+    );
+}
+
+#[cfg(rpq_confirm_admission_probe)]
 fn correctness_backend<S: TriblePattern>(
     backend: &str,
     store: &S,
     fixture: &CrossoverFixture,
     cell: &CrossoverCell,
-) -> (CrossoverRun, CrossoverRun, CrossoverRun, CrossoverRun, u32) {
+) -> (
+    CrossoverRun,
+    CrossoverRun,
+    CrossoverRun,
+    CrossoverRun,
+    CrossoverRun,
+    u32,
+) {
     let certified_discovery =
         run_crossover_mode(backend, store, fixture, cell, ProbeMode::Certified, 0, None);
     let target_token = discover_crossover_target_token(backend, cell, &certified_discovery);
@@ -3107,6 +3257,43 @@ fn correctness_backend<S: TriblePattern>(
         &hybrid_fragments,
     );
 
+    let fit_closed = run_crossover_mode(
+        backend,
+        store,
+        fixture,
+        cell,
+        ProbeMode::FitClosedRuns,
+        0,
+        Some(target_token),
+    );
+    let fit_closed_fragments = crossover_target_fragments_for(&fit_closed, target_token);
+    assert_eq!(
+        fit_closed_fragments, FROZEN_H_K4_FRAGMENTS,
+        "K FALSIFIED: target fragments diverged from frozen H",
+    );
+    assert_eq!(
+        fit_closed.order_digest, FROZEN_H_K4_ORDER_DIGEST,
+        "K FALSIFIED: order digest diverged from frozen H",
+    );
+    let fit_closed_repeat = run_crossover_mode(
+        backend,
+        store,
+        fixture,
+        cell,
+        ProbeMode::FitClosedRuns,
+        1,
+        Some(target_token),
+    );
+    assert_crossover_target_receipt(backend, cell, target_token, &fit_closed, &hybrid_fragments);
+    assert_crossover_target_receipt(
+        backend,
+        cell,
+        target_token,
+        &fit_closed_repeat,
+        &hybrid_fragments,
+    );
+    assert_fit_closed_runs_equivalence(backend, cell, &hybrid, &fit_closed, &fit_closed_repeat);
+
     let probe_one = run_crossover_mode(
         backend,
         store,
@@ -3161,7 +3348,12 @@ fn correctness_backend<S: TriblePattern>(
         &probe_one_repeat,
         &probe_one_fragments,
     );
-    for (label, control) in [("C", &certified), ("O", &ordinary), ("H", &hybrid)] {
+    for (label, control) in [
+        ("C", &certified),
+        ("O", &ordinary),
+        ("H", &hybrid),
+        ("K", &fit_closed),
+    ] {
         assert_eq!(
             control.callbacks.first_target_confirm_consumptions, 0,
             "{label} accidentally consumed J's request-local one-shot flag",
@@ -3172,6 +3364,7 @@ fn correctness_backend<S: TriblePattern>(
         ("O", &ordinary),
         ("H", &hybrid),
         ("J", &probe_one),
+        ("K", &fit_closed),
     ] {
         let signature = tally(run.rows.iter().copied());
         assert_eq!(signature.rows, cell.expected.len());
@@ -3183,7 +3376,8 @@ fn correctness_backend<S: TriblePattern>(
     println!(
         "crossover_fragment_receipt backend={backend:?} width={} token={} \
          certified={certified_fragments:?} ordinary={ordinary_fragments:?} \
-         hybrid={hybrid_fragments:?} probe_one={probe_one_fragments:?} repeat_stable=true",
+         hybrid={hybrid_fragments:?} probe_one={probe_one_fragments:?} \
+         fit_closed={fit_closed_fragments:?} repeat_stable=true",
         cell.width, target_token,
     );
     assert_natural_candidate_route(backend, cell, &certified, &ordinary);
@@ -3225,7 +3419,25 @@ fn correctness_backend<S: TriblePattern>(
         ordinary.order_digest,
         hybrid.order_digest,
     );
-    (certified, ordinary, hybrid, probe_one, target_token)
+    println!(
+        "fit_closed_order_equivalence backend={backend:?} width={} k_equals_h={} \
+         k_digest={:#018x} h_digest={:#018x} stats_equal={} callbacks_nonplacement_equal={} \
+         repeat_stable=true",
+        cell.width,
+        fit_closed.rows == hybrid.rows,
+        fit_closed.order_digest,
+        hybrid.order_digest,
+        fit_closed.stats == hybrid.stats,
+        nonplacement_callbacks(fit_closed.callbacks) == nonplacement_callbacks(hybrid.callbacks),
+    );
+    (
+        certified,
+        ordinary,
+        hybrid,
+        probe_one,
+        fit_closed,
+        target_token,
+    )
 }
 
 #[cfg(rpq_confirm_admission_probe)]
@@ -3258,16 +3470,16 @@ struct CrossoverTimingSample {
 #[cfg(rpq_confirm_admission_probe)]
 fn balanced_probe_orders() -> Vec<[ProbeMode; 4]> {
     let mut orders = Vec::with_capacity(PROBE_TIMING_ORDER_COUNT);
-    for first in ProbeMode::ALL {
-        for second in ProbeMode::ALL {
+    for first in ProbeMode::TIMED {
+        for second in ProbeMode::TIMED {
             if second == first {
                 continue;
             }
-            for third in ProbeMode::ALL {
+            for third in ProbeMode::TIMED {
                 if third == first || third == second {
                     continue;
                 }
-                for fourth in ProbeMode::ALL {
+                for fourth in ProbeMode::TIMED {
                     if fourth == first || fourth == second || fourth == third {
                         continue;
                     }
@@ -3277,14 +3489,14 @@ fn balanced_probe_orders() -> Vec<[ProbeMode; 4]> {
         }
     }
     assert_eq!(orders.len(), PROBE_TIMING_ORDER_COUNT);
-    for mode in ProbeMode::ALL {
-        for position in 0..ProbeMode::ALL.len() {
+    for mode in ProbeMode::TIMED {
+        for position in 0..ProbeMode::TIMED.len() {
             assert_eq!(
                 orders
                     .iter()
                     .filter(|order| order[position] == mode)
                     .count(),
-                PROBE_TIMING_ORDER_COUNT / ProbeMode::ALL.len(),
+                PROBE_TIMING_ORDER_COUNT / ProbeMode::TIMED.len(),
                 "four-mode timing orders were not position-balanced",
             );
         }
@@ -3308,7 +3520,7 @@ fn timing_backend<S: TriblePattern>(
     let expected_signature = tally(cell.expected.iter().copied());
     let balanced_orders = balanced_probe_orders();
 
-    for mode in ProbeMode::ALL {
+    for mode in ProbeMode::TIMED {
         for point in CrossoverTimingPoint::ALL {
             rpq_confirm_admission_probe_target_action(
                 target_token,
@@ -3364,11 +3576,11 @@ fn timing_backend<S: TriblePattern>(
             }
         }
     }
-    assert_eq!(samples.len(), repetitions * ProbeMode::ALL.len() * 2);
+    assert_eq!(samples.len(), repetitions * ProbeMode::TIMED.len() * 2);
 
     for (sample, value) in samples.iter().enumerate() {
         println!(
-            "probe_one_timing_raw backend={backend:?} width={} sample={sample} mode={} point={} ns={}",
+            "fit_closed_runs_timing_raw backend={backend:?} width={} sample={sample} mode={} point={} ns={}",
             cell.width,
             value.mode.label(),
             value.point.label(),
@@ -3376,14 +3588,14 @@ fn timing_backend<S: TriblePattern>(
         );
     }
     for point in CrossoverTimingPoint::ALL {
-        for mode in ProbeMode::ALL {
+        for mode in ProbeMode::TIMED {
             let durations: Vec<_> = samples
                 .iter()
                 .filter(|sample| sample.mode == mode && sample.point == point)
                 .map(|sample| sample.duration.as_secs_f64())
                 .collect();
             println!(
-                "probe_one_timing_summary backend={backend:?} width={} mode={} point={} primary={} \
+                "fit_closed_runs_timing_summary backend={backend:?} width={} mode={} point={} primary={} \
                  samples={} p50_us={:.3} p95_us={:.3}",
                 cell.width,
                 mode.label(),
@@ -3408,7 +3620,7 @@ fn run_rpq_confirm_crossover_probe(repetitions: usize, run_timing: bool) {
         .components
         .iter()
         .all(|component| component.len() == CROSSOVER_CORE_NODES));
-    println!("probe: RPQ Confirm request-local ProbeOne ordinary then typed");
+    println!("probe: RPQ H admission plus ordered bounded fit-closed transition runs");
     println!(
         "fixture: components={} core_nodes={} selected_parents={} graph_tribles={} \
          graph_digest={:#018x} built_ms={:.3}",
@@ -3420,10 +3632,9 @@ fn run_rpq_confirm_crossover_probe(repetitions: usize, run_timing: bool) {
         fixture_elapsed.as_secs_f64() * 1e3,
     );
     println!(
-        "invariant: C, O, H, and J all compile the same Production route and ParentAtomic \
-         grouping. H routes each target singleton ordinary. J consumes one request-local \
-         flag on the first concrete target CandidateBatch, then retains typed execution \
-         for every later target fragment including singletons."
+        "invariant: C, O, H, J, and K all compile the same Production route and ParentAtomic \
+         grouping. K retains H admission and scheduler cohorts exactly, changing only mixed \
+         transition inputs from pageable traversal to receipt-equivalent ordered bounded runs."
     );
 
     let cell = fixture.cell(HYBRID_WIDTH);
@@ -3444,33 +3655,39 @@ fn run_rpq_confirm_crossover_probe(repetitions: usize, run_timing: bool) {
         fixture.graph_digest,
     );
 
-    let (certified, ordinary, hybrid, probe_one, target_token) =
+    let (certified, ordinary, hybrid, probe_one, fit_closed, target_token) =
         correctness_backend("TribleSet", &cell.candidates, &fixture, &cell);
     println!(
         "probe_one_counter_equivalence backend=\"TribleSet\" width={} \
          candidates_confirmed_c={} candidates_confirmed_o={} candidates_confirmed_h={} \
-         candidates_confirmed_j={} source_examined_c={} source_examined_o={} \
-         source_examined_h={} source_examined_j={} transition_examined_c={} \
-         transition_examined_o={} transition_examined_h={} transition_examined_j={}",
+         candidates_confirmed_j={} candidates_confirmed_k={} source_examined_c={} \
+         source_examined_o={} \
+         source_examined_h={} source_examined_j={} source_examined_k={} transition_examined_c={} \
+         transition_examined_o={} transition_examined_h={} transition_examined_j={} \
+         transition_examined_k={}",
         cell.width,
         certified.stats.candidates_confirmed,
         ordinary.stats.candidates_confirmed,
         hybrid.stats.candidates_confirmed,
         probe_one.stats.candidates_confirmed,
+        fit_closed.stats.candidates_confirmed,
         certified.stats.delta_source_candidates_examined,
         ordinary.stats.delta_source_candidates_examined,
         hybrid.stats.delta_source_candidates_examined,
         probe_one.stats.delta_source_candidates_examined,
+        fit_closed.stats.delta_source_candidates_examined,
         certified.stats.delta_transition_candidates_examined,
         ordinary.stats.delta_transition_candidates_examined,
         hybrid.stats.delta_transition_candidates_examined,
         probe_one.stats.delta_transition_candidates_examined,
+        fit_closed.stats.delta_transition_candidates_examined,
     );
     for (mode, run) in [
         (ProbeMode::Certified, &certified),
         (ProbeMode::Ordinary, &ordinary),
         (ProbeMode::Hybrid, &hybrid),
         (ProbeMode::ProbeOne, &probe_one),
+        (ProbeMode::FitClosedRuns, &fit_closed),
     ] {
         println!(
             "probe_one_physical_receipt backend=\"TribleSet\" width={} mode={} \
@@ -3511,13 +3728,14 @@ fn run_rpq_confirm_crossover_probe(repetitions: usize, run_timing: bool) {
     }
     if !run_timing {
         println!(
-            "timing withheld: set RPQ_CONFIRM_PROBE_ONE_TIMING=FLEET_IDLE_RELEASED only \
+            "timing withheld: set RPQ_FIT_CLOSED_RUNS_TIMING=FLEET_IDLE_RELEASED only \
              after an explicit fleet-idle release"
         );
     }
     rpq_confirm_admission_probe_force_ordinary(false);
     rpq_confirm_admission_probe_force_singleton_ordinary(false);
     rpq_confirm_admission_probe_force_first_target_ordinary(false);
+    rpq_confirm_admission_probe_fit_closed_runs(false);
 }
 
 #[cfg(all(engine_prefix_checkpoints, not(rpq_confirm_admission_probe)))]

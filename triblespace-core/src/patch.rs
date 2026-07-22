@@ -1807,6 +1807,33 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         }
     }
 
+    /// Enumerate a whole already-matched infix segment in lexicographic byte
+    /// order rather than the PATCH branch table's physical cuckoo order.
+    #[cfg(any(test, rpq_confirm_admission_probe))]
+    fn ordered_infixes_from_matched_prefix<const PREFIX_LEN: usize, const INFIX_LEN: usize, F>(
+        &self,
+        for_each: &mut F,
+    ) where
+        F: FnMut(&[u8; INFIX_LEN]),
+    {
+        debug_assert!(PREFIX_LEN <= self.end_depth());
+        if PREFIX_LEN + INFIX_LEN <= self.end_depth() {
+            let infix: [u8; INFIX_LEN] =
+                core::array::from_fn(|i| self.childleaf_key()[O::TREE_TO_KEY[PREFIX_LEN + i]]);
+            for_each(&infix);
+            return;
+        }
+
+        let BodyRef::Branch(branch) = self.body_ref() else {
+            unreachable!("a leaf always covers the complete key");
+        };
+        for child_byte in u8::MIN..=u8::MAX {
+            if let Some(child) = branch.child_table.table_get(child_byte) {
+                child.ordered_infixes_from_matched_prefix::<PREFIX_LEN, INFIX_LEN, F>(for_each);
+            }
+        }
+    }
+
     /// Diagnostic: accumulate (branch nodes, total child-table slots,
     /// heap-`Leaf` nodes, `LocalLeaf` slots) over the subtree. Used to
     /// decompose a PATCH's *structural* byte size (vs resident RSS).
@@ -2202,6 +2229,22 @@ impl<
     {
         if let Some(located) = self.located {
             located.infixes_from_matched_prefix::<PREFIX_LEN, INFIX_LEN, F>(&mut for_each);
+        }
+    }
+
+    /// Enumerate the already-located subtree in lexicographic infix order.
+    ///
+    /// This retains the bounded view's single fixed-prefix descent while
+    /// avoiding the physical cuckoo-slot order used by [`Self::for_each`].
+    /// It is therefore byte-order equivalent to a complete
+    /// `infixes_page_after` page without cursor construction or root descent.
+    #[cfg(any(test, rpq_confirm_admission_probe))]
+    pub(crate) fn for_each_ordered<F>(self, mut for_each: F)
+    where
+        F: FnMut(&[u8; INFIX_LEN]),
+    {
+        if let Some(located) = self.located {
+            located.ordered_infixes_from_matched_prefix::<PREFIX_LEN, INFIX_LEN, F>(&mut for_each);
         }
     }
 }
@@ -3351,6 +3394,39 @@ mod tests {
         assert_eq!(tail_page.last(), Some(high));
         assert!(tail_page.is_exhausted());
         assert_eq!(tail_page.resume_after(), None);
+    }
+
+    #[test]
+    fn ordered_bounded_infixes_match_one_complete_ordered_page() {
+        let selected = [0x44; 4];
+        let other = [0x55; 4];
+        let infixes = [[0xf0; 4], [0x10; 4], [0x80; 4], [0x20; 4], [0xe0; 4]];
+        let mut patch = PagingPatch::new();
+        for (index, infix) in infixes.into_iter().enumerate() {
+            patch.insert(&Entry::new(&paging_key(selected, infix, [index as u8; 4])));
+            patch.insert(&Entry::new(&paging_key(
+                selected,
+                infix,
+                [(index + 16) as u8; 4],
+            )));
+            patch.insert(&Entry::new(&paging_key(other, infix, [index as u8; 4])));
+        }
+
+        let mut pageable = Vec::new();
+        let page =
+            patch.infixes_page_after(&selected, None, &[u8::MAX; 4], infixes.len(), |infix| {
+                pageable.push(*infix)
+            });
+        assert!(page.is_exhausted());
+        assert_eq!(page.examined(), infixes.len());
+
+        let bounded = patch
+            .bounded_infixes::<4, 4>(&selected, infixes.len() as u64)
+            .expect("the exact selected infix segment must fit");
+        let mut ordered = Vec::new();
+        bounded.for_each_ordered(|infix| ordered.push(*infix));
+        assert_eq!(ordered, pageable);
+        assert!(ordered.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
     #[test]

@@ -398,6 +398,82 @@ std::thread_local! {
 std::thread_local! {
     static BULK_TRANSITION_COHORTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PAGEABLE_TRANSITION_PAGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FIT_CLOSED_RUNS_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FIT_CLOSED_ORIGINAL_MIXED_COHORTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FIT_CLOSED_BULK_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FIT_CLOSED_BULK_INPUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FIT_CLOSED_PAGEABLE_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FIT_CLOSED_PAGEABLE_INPUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FIT_CLOSED_SALVAGED_FIT_INPUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FIT_CLOSED_MAX_RUN_INPUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FIT_CLOSED_MAX_BULK_RUN_INPUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FIT_CLOSED_MAX_PAGEABLE_RUN_INPUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FIT_CLOSED_NONFIT_RESUMED_INPUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FIT_CLOSED_NONFIT_EMPTY_PROGRAM_INPUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FIT_CLOSED_NONFIT_NON_POSITIVE_INPUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FIT_CLOSED_NONFIT_GRANT_INPUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, rpq_confirm_admission_probe))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct FitClosedRunProbeSnapshot {
+    original_mixed_cohorts: usize,
+    bulk_runs: usize,
+    bulk_inputs: usize,
+    pageable_runs: usize,
+    pageable_inputs: usize,
+    salvaged_fit_inputs: usize,
+    max_run_inputs: usize,
+    max_bulk_run_inputs: usize,
+    max_pageable_run_inputs: usize,
+    nonfit_resumed_inputs: usize,
+    nonfit_empty_program_inputs: usize,
+    nonfit_non_positive_inputs: usize,
+    nonfit_grant_inputs: usize,
+}
+
+#[cfg(any(test, rpq_confirm_admission_probe))]
+fn fit_closed_run_probe_snapshot() -> FitClosedRunProbeSnapshot {
+    FitClosedRunProbeSnapshot {
+        original_mixed_cohorts: FIT_CLOSED_ORIGINAL_MIXED_COHORTS.with(std::cell::Cell::get),
+        bulk_runs: FIT_CLOSED_BULK_RUNS.with(std::cell::Cell::get),
+        bulk_inputs: FIT_CLOSED_BULK_INPUTS.with(std::cell::Cell::get),
+        pageable_runs: FIT_CLOSED_PAGEABLE_RUNS.with(std::cell::Cell::get),
+        pageable_inputs: FIT_CLOSED_PAGEABLE_INPUTS.with(std::cell::Cell::get),
+        salvaged_fit_inputs: FIT_CLOSED_SALVAGED_FIT_INPUTS.with(std::cell::Cell::get),
+        max_run_inputs: FIT_CLOSED_MAX_RUN_INPUTS.with(std::cell::Cell::get),
+        max_bulk_run_inputs: FIT_CLOSED_MAX_BULK_RUN_INPUTS.with(std::cell::Cell::get),
+        max_pageable_run_inputs: FIT_CLOSED_MAX_PAGEABLE_RUN_INPUTS.with(std::cell::Cell::get),
+        nonfit_resumed_inputs: FIT_CLOSED_NONFIT_RESUMED_INPUTS.with(std::cell::Cell::get),
+        nonfit_empty_program_inputs: FIT_CLOSED_NONFIT_EMPTY_PROGRAM_INPUTS
+            .with(std::cell::Cell::get),
+        nonfit_non_positive_inputs: FIT_CLOSED_NONFIT_NON_POSITIVE_INPUTS
+            .with(std::cell::Cell::get),
+        nonfit_grant_inputs: FIT_CLOSED_NONFIT_GRANT_INPUTS.with(std::cell::Cell::get),
+    }
+}
+
+#[cfg(any(test, rpq_confirm_admission_probe))]
+fn reset_fit_closed_run_probe_counters() {
+    FIT_CLOSED_ORIGINAL_MIXED_COHORTS.with(|value| value.set(0));
+    FIT_CLOSED_BULK_RUNS.with(|value| value.set(0));
+    FIT_CLOSED_BULK_INPUTS.with(|value| value.set(0));
+    FIT_CLOSED_PAGEABLE_RUNS.with(|value| value.set(0));
+    FIT_CLOSED_PAGEABLE_INPUTS.with(|value| value.set(0));
+    FIT_CLOSED_SALVAGED_FIT_INPUTS.with(|value| value.set(0));
+    FIT_CLOSED_MAX_RUN_INPUTS.with(|value| value.set(0));
+    FIT_CLOSED_MAX_BULK_RUN_INPUTS.with(|value| value.set(0));
+    FIT_CLOSED_MAX_PAGEABLE_RUN_INPUTS.with(|value| value.set(0));
+    FIT_CLOSED_NONFIT_RESUMED_INPUTS.with(|value| value.set(0));
+    FIT_CLOSED_NONFIT_EMPTY_PROGRAM_INPUTS.with(|value| value.set(0));
+    FIT_CLOSED_NONFIT_NON_POSITIVE_INPUTS.with(|value| value.set(0));
+    FIT_CLOSED_NONFIT_GRANT_INPUTS.with(|value| value.set(0));
+}
+
+#[cfg(any(test, rpq_confirm_admission_probe))]
+#[doc(hidden)]
+pub fn rpq_confirm_admission_probe_fit_closed_runs(enabled: bool) {
+    FIT_CLOSED_RUNS_ENABLED.with(|value| value.set(enabled));
 }
 
 #[cfg(test)]
@@ -1437,6 +1513,73 @@ impl PositiveDeltaInfixes<'_> {
             }
         }
     }
+
+    #[cfg(any(test, rpq_confirm_admission_probe))]
+    fn for_each_ordered(self, mut for_each: impl FnMut(RawInline)) {
+        match self {
+            Self::Empty => {}
+            Self::Attr(infixes) => infixes.for_each_ordered(|value: &[u8; 32]| for_each(*value)),
+            Self::InverseAttr(infixes) => {
+                infixes.for_each_ordered(|entity: &[u8; ID_LEN]| for_each(id_into_value(entity)))
+            }
+        }
+    }
+}
+
+#[cfg(any(test, rpq_confirm_admission_probe))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FitClosedNonfitCause {
+    Resumed,
+    EmptyProgram,
+    NonPositive,
+    Grant,
+}
+
+#[cfg(any(test, rpq_confirm_admission_probe))]
+struct FitClosedBulkBranch<'a> {
+    pc: u32,
+    target_accepting: bool,
+    terminal: bool,
+    infixes: PositiveDeltaInfixes<'a>,
+}
+
+#[cfg(any(test, rpq_confirm_admission_probe))]
+struct FitClosedBulkInput<'a> {
+    variable: VariableId,
+    node: RpqNode,
+    fanout: usize,
+    child_capacity: usize,
+    branches: SmallVec<[FitClosedBulkBranch<'a>; 1]>,
+}
+
+#[cfg(any(test, rpq_confirm_admission_probe))]
+#[derive(Clone, Copy)]
+struct FitClosedPageableInput {
+    variable: VariableId,
+    node: RpqNode,
+    cursor: RpqExpandCursor,
+    cause: FitClosedNonfitCause,
+}
+
+#[cfg(any(test, rpq_confirm_admission_probe))]
+enum FitClosedPlacement<'a> {
+    Bulk(FitClosedBulkInput<'a>),
+    Pageable(FitClosedPageableInput),
+}
+
+#[cfg(any(test, rpq_confirm_admission_probe))]
+impl FitClosedPlacement<'_> {
+    fn is_bulk(&self) -> bool {
+        matches!(self, Self::Bulk(_))
+    }
+}
+
+#[cfg(any(test, rpq_confirm_admission_probe))]
+#[derive(Clone, Copy, Debug)]
+struct FitClosedRun {
+    bulk: bool,
+    inputs: usize,
+    child_capacity: usize,
 }
 
 #[derive(Default)]
@@ -1452,7 +1595,7 @@ struct DeltaProgram {
     finite_depth: Option<Box<[u32]>>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RpqNode {
     source: Option<RawInline>,
     value: RawInline,
@@ -1465,7 +1608,7 @@ struct RpqOutput {
     accepted: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RpqSourceCursor {
     Start,
     After(RawInline),
@@ -1525,10 +1668,10 @@ impl RpqDeltaValuePage {
 }
 
 #[doc(hidden)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RpqState(RpqStateKind);
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum RpqStateKind {
     Source {
         variable: VariableId,
@@ -1684,6 +1827,19 @@ pub struct RpqConfirmAdmissionProbeSnapshot {
     pub bound_estimate_max: usize,
     pub bulk_transition_cohorts: usize,
     pub pageable_transition_pages: usize,
+    pub fit_closed_original_mixed_cohorts: usize,
+    pub fit_closed_bulk_runs: usize,
+    pub fit_closed_bulk_inputs: usize,
+    pub fit_closed_pageable_runs: usize,
+    pub fit_closed_pageable_inputs: usize,
+    pub fit_closed_salvaged_fit_inputs: usize,
+    pub fit_closed_max_run_inputs: usize,
+    pub fit_closed_max_bulk_run_inputs: usize,
+    pub fit_closed_max_pageable_run_inputs: usize,
+    pub fit_closed_nonfit_resumed_inputs: usize,
+    pub fit_closed_nonfit_empty_program_inputs: usize,
+    pub fit_closed_nonfit_non_positive_inputs: usize,
+    pub fit_closed_nonfit_grant_inputs: usize,
 }
 
 #[cfg(rpq_confirm_admission_probe)]
@@ -1767,6 +1923,7 @@ pub fn rpq_confirm_admission_probe_target_decisions() -> Vec<(u32, usize, usize,
 #[cfg(rpq_confirm_admission_probe)]
 #[doc(hidden)]
 pub fn rpq_confirm_admission_probe_reset_callbacks() {
+    FIT_CLOSED_RUNS_ENABLED.with(|value| value.set(false));
     TARGET_CONFIRM_TOKEN.with(|value| value.set(None));
     TARGET_CONFIRM_PARENTS.with(|value| value.set(0));
     TARGET_CONFIRM_CANDIDATES.with(|value| value.set(0));
@@ -1807,11 +1964,13 @@ pub fn rpq_confirm_admission_probe_reset_callbacks() {
     BOUND_ESTIMATE_MAX.with(|value| value.set(0));
     BULK_TRANSITION_COHORTS.with(|value| value.set(0));
     PAGEABLE_TRANSITION_PAGES.with(|value| value.set(0));
+    reset_fit_closed_run_probe_counters();
 }
 
 #[cfg(rpq_confirm_admission_probe)]
 #[doc(hidden)]
 pub fn rpq_confirm_admission_probe_snapshot() -> RpqConfirmAdmissionProbeSnapshot {
+    let fit_closed = fit_closed_run_probe_snapshot();
     RpqConfirmAdmissionProbeSnapshot {
         ordinary_confirm_calls: ORDINARY_CONFIRM_CALLS.with(Cell::get),
         ordinary_confirm_rows: ORDINARY_CONFIRM_ROWS.with(Cell::get),
@@ -1843,6 +2002,19 @@ pub fn rpq_confirm_admission_probe_snapshot() -> RpqConfirmAdmissionProbeSnapsho
         bound_estimate_max: BOUND_ESTIMATE_MAX.with(Cell::get),
         bulk_transition_cohorts: BULK_TRANSITION_COHORTS.with(Cell::get),
         pageable_transition_pages: PAGEABLE_TRANSITION_PAGES.with(Cell::get),
+        fit_closed_original_mixed_cohorts: fit_closed.original_mixed_cohorts,
+        fit_closed_bulk_runs: fit_closed.bulk_runs,
+        fit_closed_bulk_inputs: fit_closed.bulk_inputs,
+        fit_closed_pageable_runs: fit_closed.pageable_runs,
+        fit_closed_pageable_inputs: fit_closed.pageable_inputs,
+        fit_closed_salvaged_fit_inputs: fit_closed.salvaged_fit_inputs,
+        fit_closed_max_run_inputs: fit_closed.max_run_inputs,
+        fit_closed_max_bulk_run_inputs: fit_closed.max_bulk_run_inputs,
+        fit_closed_max_pageable_run_inputs: fit_closed.max_pageable_run_inputs,
+        fit_closed_nonfit_resumed_inputs: fit_closed.nonfit_resumed_inputs,
+        fit_closed_nonfit_empty_program_inputs: fit_closed.nonfit_empty_program_inputs,
+        fit_closed_nonfit_non_positive_inputs: fit_closed.nonfit_non_positive_inputs,
+        fit_closed_nonfit_grant_inputs: fit_closed.nonfit_grant_inputs,
     }
 }
 
@@ -2702,6 +2874,122 @@ impl RegularPathConstraint {
                     .map(PositiveDeltaInfixes::InverseAttr)
             }
             DeltaStep::NotAttr(_) | DeltaStep::InverseNotAttr(_) => None,
+        }
+    }
+
+    #[cfg(any(test, rpq_confirm_admission_probe))]
+    fn fit_closed_transition_placement<'a>(
+        &'a self,
+        state: &RpqState,
+        stratum: ProgramStratum,
+        limit: usize,
+    ) -> FitClosedPlacement<'a> {
+        let RpqStateKind::Transition {
+            variable,
+            node,
+            cursor,
+        } = state.kind()
+        else {
+            panic!("one typed RPQ transition cohort mixed continuation variants")
+        };
+        let pageable = |cause| {
+            FitClosedPlacement::Pageable(FitClosedPageableInput {
+                variable: *variable,
+                node: *node,
+                cursor: *cursor,
+                cause,
+            })
+        };
+        if *cursor != RpqExpandCursor::Start {
+            return pageable(FitClosedNonfitCause::Resumed);
+        }
+        let program = match self
+            .program_for_variable(*variable)
+            .expect("typed RPQ transition lost its program")
+        {
+            RpqRoute::BoundEndpoint { program, .. } | RpqRoute::SameVariable { program } => program,
+        };
+        let program_state = program.decode(node.pc);
+        let steps = &program.steps[program_state];
+        if steps.is_empty() {
+            return pageable(FitClosedNonfitCause::EmptyProgram);
+        }
+        if steps
+            .iter()
+            .any(|(step, _)| matches!(step, DeltaStep::NotAttr(_) | DeltaStep::InverseNotAttr(_)))
+        {
+            return pageable(FitClosedNonfitCause::NonPositive);
+        }
+
+        let mut fanout = 0usize;
+        let mut child_capacity = 0usize;
+        let mut branches = SmallVec::new();
+        for &(step, target) in steps {
+            debug_assert!(fanout <= limit);
+            let Some(infixes) =
+                self.bounded_positive_delta_infixes(step, &node.value, limit - fanout)
+            else {
+                return pageable(FitClosedNonfitCause::Grant);
+            };
+            let branch_fanout = infixes.len();
+            fanout += branch_fanout;
+            let terminal =
+                stratum == ProgramStratum::Finite && program.steps[target as usize].is_empty();
+            if !terminal {
+                child_capacity += branch_fanout;
+            }
+            branches.push(FitClosedBulkBranch {
+                pc: program.encode(target),
+                target_accepting: program.accepting[target as usize],
+                terminal,
+                infixes,
+            });
+        }
+        FitClosedPlacement::Bulk(FitClosedBulkInput {
+            variable: *variable,
+            node: *node,
+            fanout,
+            child_capacity,
+            branches,
+        })
+    }
+
+    #[cfg(any(test, rpq_confirm_admission_probe))]
+    fn record_fit_closed_run_probe(runs: &[FitClosedRun], placements: &[FitClosedPlacement<'_>]) {
+        let bulk_inputs = placements
+            .iter()
+            .filter(|placement| placement.is_bulk())
+            .count();
+        let pageable_inputs = placements.len() - bulk_inputs;
+        if bulk_inputs > 0 && pageable_inputs > 0 {
+            FIT_CLOSED_ORIGINAL_MIXED_COHORTS.with(|value| value.set(value.get() + 1));
+        }
+        FIT_CLOSED_BULK_INPUTS.with(|value| value.set(value.get() + bulk_inputs));
+        FIT_CLOSED_PAGEABLE_INPUTS.with(|value| value.set(value.get() + pageable_inputs));
+        FIT_CLOSED_SALVAGED_FIT_INPUTS.with(|value| value.set(value.get() + bulk_inputs));
+
+        for run in runs {
+            FIT_CLOSED_MAX_RUN_INPUTS.with(|value| value.set(value.get().max(run.inputs)));
+            if run.bulk {
+                FIT_CLOSED_BULK_RUNS.with(|value| value.set(value.get() + 1));
+                FIT_CLOSED_MAX_BULK_RUN_INPUTS.with(|value| value.set(value.get().max(run.inputs)));
+            } else {
+                FIT_CLOSED_PAGEABLE_RUNS.with(|value| value.set(value.get() + 1));
+                FIT_CLOSED_MAX_PAGEABLE_RUN_INPUTS
+                    .with(|value| value.set(value.get().max(run.inputs)));
+            }
+        }
+        for placement in placements {
+            let FitClosedPlacement::Pageable(input) = placement else {
+                continue;
+            };
+            let counter = match input.cause {
+                FitClosedNonfitCause::Resumed => &FIT_CLOSED_NONFIT_RESUMED_INPUTS,
+                FitClosedNonfitCause::EmptyProgram => &FIT_CLOSED_NONFIT_EMPTY_PROGRAM_INPUTS,
+                FitClosedNonfitCause::NonPositive => &FIT_CLOSED_NONFIT_NON_POSITIVE_INPUTS,
+                FitClosedNonfitCause::Grant => &FIT_CLOSED_NONFIT_GRANT_INPUTS,
+            };
+            counter.with(|value| value.set(value.get() + 1));
         }
     }
 
@@ -3844,6 +4132,179 @@ impl TypedProgramSpec for RegularPathConstraint {
             return;
         }
 
+        #[cfg(any(test, rpq_confirm_admission_probe))]
+        if FIT_CLOSED_RUNS_ENABLED.with(std::cell::Cell::get) {
+            // The failed whole-cohort attempt may contain a valid prefix, but
+            // that prefix is not a complete placement partition. Discard it
+            // and classify every original state again under its immutable
+            // per-input grant before publishing any effect.
+            drop(plans);
+            drop(fanouts);
+            let mut placements = Vec::with_capacity(states.len());
+            let mut runs: SmallVec<[FitClosedRun; 4]> = SmallVec::new();
+            for (input, state) in states.iter().enumerate() {
+                let placement =
+                    self.fit_closed_transition_placement(state, batch.stratum, batch.limits[input]);
+                let bulk = placement.is_bulk();
+                let child_capacity = match &placement {
+                    FitClosedPlacement::Bulk(input) => input.child_capacity,
+                    FitClosedPlacement::Pageable(_) => 0,
+                };
+                match runs.last_mut() {
+                    Some(run) if run.bulk == bulk => {
+                        run.inputs += 1;
+                        run.child_capacity += child_capacity;
+                    }
+                    _ => runs.push(FitClosedRun {
+                        bulk,
+                        inputs: 1,
+                        child_capacity,
+                    }),
+                }
+                placements.push(placement);
+            }
+
+            let bulk_inputs = placements
+                .iter()
+                .filter(|placement| placement.is_bulk())
+                .count();
+            if bulk_inputs > 0 {
+                debug_assert!(bulk_inputs < placements.len());
+                Self::record_fit_closed_run_probe(&runs, &placements);
+                let mut placements = placements.into_iter().enumerate();
+                for run in runs {
+                    if run.bulk {
+                        effects.reserve_children(run.child_capacity);
+                    }
+                    for _ in 0..run.inputs {
+                        let (input, placement) = placements
+                            .next()
+                            .expect("fit-closed RPQ run exceeded its placement plan");
+                        let input_tag =
+                            u32::try_from(input).expect("too many typed RPQ transition inputs");
+                        match placement {
+                            FitClosedPlacement::Bulk(input) => {
+                                assert!(run.bulk, "fit-closed RPQ run mixed placements");
+                                for branch in input.branches {
+                                    branch.infixes.for_each_ordered(|value| {
+                                        let accepted = branch.target_accepting
+                                            && input
+                                                .node
+                                                .source
+                                                .is_none_or(|anchor| value == anchor);
+                                        if branch.terminal {
+                                            if accepted {
+                                                effects.accept(input_tag, value);
+                                            }
+                                            return;
+                                        }
+                                        let child = RpqNode {
+                                            source: input.node.source,
+                                            value,
+                                            pc: branch.pc,
+                                        };
+                                        let state = RpqState::transition(
+                                            input.variable,
+                                            child,
+                                            RpqExpandCursor::Start,
+                                        );
+                                        let accepted = accepted.then_some(value);
+                                        match batch.stratum {
+                                            ProgramStratum::Finite => {
+                                                effects.finite_child(input_tag, state, accepted)
+                                            }
+                                            ProgramStratum::Fixpoint => effects.fixpoint_child(
+                                                input_tag,
+                                                state,
+                                                RpqNoveltyKey {
+                                                    source: child.source,
+                                                    value: child.value,
+                                                    pc: child.pc,
+                                                },
+                                                accepted,
+                                            ),
+                                        }
+                                    });
+                                }
+                                effects.account_transition(input.fanout);
+                                effects.page(input.fanout, None);
+                            }
+                            FitClosedPlacement::Pageable(input) => {
+                                assert!(!run.bulk, "fit-closed RPQ run mixed placements");
+                                let program = match self
+                                    .program_for_variable(input.variable)
+                                    .expect("typed RPQ transition lost its program")
+                                {
+                                    RpqRoute::BoundEndpoint { program, .. }
+                                    | RpqRoute::SameVariable { program } => program,
+                                };
+                                let mut successors = Vec::new();
+                                let page = self.expand_delta_program_page(
+                                    program,
+                                    input.node,
+                                    input.cursor,
+                                    batch.limits[input_tag as usize],
+                                    &mut successors,
+                                );
+                                for output in successors {
+                                    let child = output.node;
+                                    if batch.stratum == ProgramStratum::Finite
+                                        && program.steps[program.decode(child.pc)].is_empty()
+                                    {
+                                        if output.accepted {
+                                            effects.accept(input_tag, child.value);
+                                        }
+                                        continue;
+                                    }
+                                    let state = RpqState::transition(
+                                        input.variable,
+                                        child,
+                                        RpqExpandCursor::Start,
+                                    );
+                                    let accepted = output.accepted.then_some(child.value);
+                                    match batch.stratum {
+                                        ProgramStratum::Finite => {
+                                            effects.finite_child(input_tag, state, accepted)
+                                        }
+                                        ProgramStratum::Fixpoint => effects.fixpoint_child(
+                                            input_tag,
+                                            state,
+                                            RpqNoveltyKey {
+                                                source: child.source,
+                                                value: child.value,
+                                                pc: child.pc,
+                                            },
+                                            accepted,
+                                        ),
+                                    }
+                                }
+                                let (examined, resume) = page.map_or((0, None), |page| {
+                                    effects.account_transition(page.examined);
+                                    (
+                                        page.examined,
+                                        page.next.map(|cursor| {
+                                            TypedResume::Immediate(RpqState::transition(
+                                                input.variable,
+                                                input.node,
+                                                cursor,
+                                            ))
+                                        }),
+                                    )
+                                });
+                                effects.page(examined, resume);
+                            }
+                        }
+                    }
+                }
+                assert!(
+                    placements.next().is_none(),
+                    "fit-closed RPQ runs did not consume every placement"
+                );
+                states.clear();
+                return;
+            }
+        }
+
         for (input, state) in states.drain(..).enumerate() {
             let RpqStateKind::Transition {
                 variable,
@@ -4907,7 +5368,20 @@ mod seeded_frame_tests {
         rows: &[RawInline],
         limits: &[usize],
     ) -> (ProgramBatchEffects, usize) {
+        let (effects, bulk_cohorts, _, _) =
+            one_support_transition_cohort_with_fit_closed(path, rows, limits, false);
+        (effects, bulk_cohorts)
+    }
+
+    fn one_support_transition_cohort_with_fit_closed(
+        path: &RegularPathConstraint,
+        rows: &[RawInline],
+        limits: &[usize],
+        fit_closed_runs: bool,
+    ) -> (ProgramBatchEffects, usize, usize, FitClosedRunProbeSnapshot) {
         assert_eq!(rows.len(), limits.len() * 2);
+        rpq_confirm_admission_probe_fit_closed_runs(fit_closed_runs);
+        reset_fit_closed_run_probe_counters();
         let mut bound = VariableSet::new_singleton(path.start);
         bound.set(path.end);
         let request = ProgramRequest {
@@ -4937,6 +5411,7 @@ mod seeded_frame_tests {
         assert_eq!(work.len(), limits.len());
         let candidate_sets = vec![None; limits.len()];
         let _ = take_bulk_transition_cohorts();
+        let _ = take_pageable_transition_pages();
         let mut effects = ProgramBatchEffects::default();
         program.step_batch(
             &mut runtime,
@@ -4950,7 +5425,134 @@ mod seeded_frame_tests {
             },
             &mut effects,
         );
-        (effects, take_bulk_transition_cohorts())
+        rpq_confirm_admission_probe_fit_closed_runs(false);
+        (
+            effects,
+            take_bulk_transition_cohorts(),
+            take_pageable_transition_pages(),
+            fit_closed_run_probe_snapshot(),
+        )
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    enum TransitionResumeSnapshot {
+        None,
+        Immediate(DispatchClass, ProgramPacing),
+        AfterChildren(DispatchClass, ProgramPacing),
+        AfterChildrenDone,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct TransitionEffectsSnapshot {
+        pages: Vec<(usize, TransitionResumeSnapshot)>,
+        children: Vec<(u32, Option<RawInline>, DispatchClass, ProgramPacing)>,
+        direct: Vec<(u32, RawInline)>,
+        accepted: Vec<(u32, RawInline)>,
+        supported: Vec<(u32, ())>,
+        source_pages: usize,
+        source_examined: usize,
+        source_roots: usize,
+        transition_pages: usize,
+        transition_examined: usize,
+        placement: Option<crate::query::ProgramPhysicalReceipt>,
+    }
+
+    fn transition_effects_snapshot(effects: &ProgramBatchEffects) -> TransitionEffectsSnapshot {
+        TransitionEffectsSnapshot {
+            pages: effects
+                .pages
+                .iter()
+                .map(|page| {
+                    let resume = match page.resume.as_ref() {
+                        None => TransitionResumeSnapshot::None,
+                        Some(crate::query::ProgramResume::Immediate(work)) => {
+                            TransitionResumeSnapshot::Immediate(work.dispatch, work.pacing)
+                        }
+                        Some(crate::query::ProgramResume::AfterChildren(work)) => {
+                            TransitionResumeSnapshot::AfterChildren(work.dispatch, work.pacing)
+                        }
+                        Some(crate::query::ProgramResume::AfterChildrenDone) => {
+                            TransitionResumeSnapshot::AfterChildrenDone
+                        }
+                    };
+                    (page.examined, resume)
+                })
+                .collect(),
+            children: effects
+                .children
+                .iter()
+                .map(|child| {
+                    (
+                        child.input,
+                        child.accepted,
+                        child.work.dispatch,
+                        child.work.pacing,
+                    )
+                })
+                .collect(),
+            direct: effects.direct.clone(),
+            accepted: effects.accepted.clone(),
+            supported: effects.supported.clone(),
+            source_pages: effects.source_pages,
+            source_examined: effects.source_examined,
+            source_roots: effects.source_roots,
+            transition_pages: effects.transition_pages,
+            transition_examined: effects.transition_examined,
+            placement: effects.placement,
+        }
+    }
+
+    fn typed_support_transition_snapshot(
+        path: &RegularPathConstraint,
+        rows: &[RawInline],
+        limits: &[usize],
+        fit_closed_runs: bool,
+    ) -> crate::query::program::TypedEffectTestSnapshot<RpqState, RpqNoveltyKey> {
+        assert_eq!(rows.len(), limits.len() * 2);
+        let mut bound = VariableSet::new_singleton(path.start);
+        bound.set(path.end);
+        let route = TypedProgramSpec::route(
+            path,
+            ProgramRequest {
+                action: ProgramAction::Support,
+                bound,
+            },
+        )
+        .expect("bound RPQ support lost its typed route");
+        let vars = [path.start, path.end];
+        let view = RowsView::new(&vars, rows);
+        let candidate_sets = vec![None; limits.len()];
+        let activations: Vec<_> = (0..limits.len())
+            .map(|index| ProgramActivation(index as u64 + 1))
+            .collect();
+        let mut states: Vec<_> = view
+            .iter()
+            .map(|row| {
+                let node = RpqNode {
+                    source: Some(row[1]),
+                    value: row[0],
+                    pc: path.delta_program.encode(path.delta_program.start),
+                };
+                RpqState::transition(route.variable, node, RpqExpandCursor::Start)
+            })
+            .collect();
+        let mut effects = TypedEffectSink::default();
+        reset_fit_closed_run_probe_counters();
+        rpq_confirm_admission_probe_fit_closed_runs(fit_closed_runs);
+        TypedProgramSpec::step_typed(
+            path,
+            &mut states,
+            TypedProgramBatch {
+                stratum: route.stratum,
+                view,
+                candidate_sets: &candidate_sets,
+                activations: &activations,
+                limits,
+            },
+            &mut effects,
+        );
+        rpq_confirm_admission_probe_fit_closed_runs(false);
+        effects.test_snapshot()
     }
 
     fn drain_bound_finite_program(
@@ -5334,6 +5936,20 @@ mod seeded_frame_tests {
         assert_eq!(complete.transition_pages, 3);
         assert_eq!(complete.transition_examined, 7);
 
+        let (fit_closed_all_fit, bulk_cohorts, pageable_pages, probe) =
+            one_support_transition_cohort_with_fit_closed(&path, &rows, &[2, 2, 3], true);
+        assert_eq!(
+            transition_effects_snapshot(&fit_closed_all_fit),
+            transition_effects_snapshot(&complete),
+        );
+        assert_eq!(bulk_cohorts, 1);
+        assert_eq!(pageable_pages, 0);
+        assert_eq!(
+            probe,
+            FitClosedRunProbeSnapshot::default(),
+            "the unchanged whole-all-fit hot path must not construct K runs",
+        );
+
         // One undersized grant rejects the borrowed plans for the *whole*
         // cohort before enumeration. Inputs zero and one still take the
         // ordinary cursor path even though each would fit independently.
@@ -5364,6 +5980,262 @@ mod seeded_frame_tests {
         );
         assert_eq!(partial.transition_pages, 3);
         assert_eq!(partial.transition_examined, 6);
+
+        // Probe K leaves the production/default whole-cohort law above
+        // unchanged, but salvages the two adjacent independently fitting
+        // inputs after the atomic attempt fails. The typed receipt remains
+        // exactly the pageable receipt; only iterator placement changes.
+        let (fit_closed, bulk_cohorts, pageable_pages, probe) =
+            one_support_transition_cohort_with_fit_closed(&path, &rows, &[2, 2, 2], true);
+        assert_eq!(bulk_cohorts, 0, "sub-runs are not whole bulk cohorts");
+        assert_eq!(pageable_pages, 1);
+        assert_eq!(
+            transition_effects_snapshot(&fit_closed),
+            transition_effects_snapshot(&partial),
+        );
+        assert_eq!(probe.original_mixed_cohorts, 1);
+        assert_eq!(probe.bulk_runs, 1);
+        assert_eq!(probe.bulk_inputs, 2);
+        assert_eq!(probe.pageable_runs, 1);
+        assert_eq!(probe.pageable_inputs, 1);
+        assert_eq!(probe.salvaged_fit_inputs, 2);
+        assert_eq!(probe.max_run_inputs, 2);
+        assert_eq!(probe.max_bulk_run_inputs, 2);
+        assert_eq!(probe.max_pageable_run_inputs, 1);
+        assert_eq!(probe.nonfit_grant_inputs, 1);
+        assert_eq!(probe.nonfit_resumed_inputs, 0);
+        assert_eq!(probe.nonfit_empty_program_inputs, 0);
+        assert_eq!(probe.nonfit_non_positive_inputs, 0);
+    }
+
+    #[test]
+    fn fit_closed_runs_preserve_pageable_receipts_with_nonfit_at_every_position() {
+        let attribute = rngid();
+        let sources: Vec<_> = (0..3).map(|_| rngid()).collect();
+        let fanouts = [3usize, 2, 2];
+        let mut destinations = Vec::new();
+        let mut set = TribleSet::new();
+        for (source, fanout) in sources.iter().zip(fanouts) {
+            let mut values: Vec<_> = (0..fanout)
+                .map(|_| id_into_value(&rngid().id.raw()))
+                .collect();
+            values.sort_unstable();
+            for value in values.iter().copied() {
+                insert_edge(&mut set, source, &attribute, value);
+            }
+            destinations.push(values);
+        }
+        let source_values: Vec<_> = sources
+            .iter()
+            .map(|source| id_into_value(&source.id.raw()))
+            .collect();
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let path = RegularPathConstraint::new(set, start, end, &[PathOp::Attr(attribute.id.raw())]);
+
+        let cases = [
+            ("first", [0usize, 1, 2], 1usize, 2usize),
+            ("middle", [1usize, 0, 2], 2usize, 1usize),
+            ("last", [1usize, 2, 0], 1usize, 2usize),
+        ];
+        for (label, order, expected_bulk_runs, expected_max_bulk_run) in cases {
+            let rows: Vec<_> = order
+                .into_iter()
+                .flat_map(|index| [source_values[index], destinations[index][0]])
+                .collect();
+            let (pageable, bulk_cohorts, pageable_pages, _) =
+                one_support_transition_cohort_with_fit_closed(&path, &rows, &[2, 2, 2], false);
+            assert_eq!(bulk_cohorts, 0, "{label}");
+            assert_eq!(pageable_pages, 3, "{label}");
+            let (fit_closed, bulk_cohorts, pageable_pages, probe) =
+                one_support_transition_cohort_with_fit_closed(&path, &rows, &[2, 2, 2], true);
+            assert_eq!(bulk_cohorts, 0, "{label}");
+            assert_eq!(pageable_pages, 1, "{label}");
+            assert_eq!(
+                transition_effects_snapshot(&fit_closed),
+                transition_effects_snapshot(&pageable),
+                "{label} nonfit changed the typed effect receipt",
+            );
+            assert_eq!(probe.original_mixed_cohorts, 1, "{label}");
+            assert_eq!(probe.bulk_runs, expected_bulk_runs, "{label}");
+            assert_eq!(probe.bulk_inputs, 2, "{label}");
+            assert_eq!(probe.pageable_runs, 1, "{label}");
+            assert_eq!(probe.pageable_inputs, 1, "{label}");
+            assert_eq!(probe.salvaged_fit_inputs, 2, "{label}");
+            assert_eq!(probe.max_bulk_run_inputs, expected_max_bulk_run, "{label}",);
+            assert_eq!(probe.nonfit_grant_inputs, 1, "{label}");
+        }
+    }
+
+    #[test]
+    fn fit_closed_runs_preserve_inverse_and_multibranch_effect_order() {
+        let inverse_attribute = rngid();
+        let inverse_targets: Vec<_> = (0..3).map(|_| rngid()).collect();
+        let inverse_fanouts = [2usize, 3, 2];
+        let mut inverse_sources = Vec::new();
+        let mut inverse_set = TribleSet::new();
+        for (target, fanout) in inverse_targets.iter().zip(inverse_fanouts) {
+            let mut values = Vec::new();
+            for _ in 0..fanout {
+                let source = rngid();
+                let source_value = id_into_value(&source.id.raw());
+                insert_edge(
+                    &mut inverse_set,
+                    &source,
+                    &inverse_attribute,
+                    id_into_value(&target.id.raw()),
+                );
+                values.push(source_value);
+            }
+            values.sort_unstable();
+            inverse_sources.push(values);
+        }
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let inverse = RegularPathConstraint::new(
+            inverse_set,
+            start,
+            end,
+            &[PathOp::Attr(inverse_attribute.id.raw()), PathOp::Inverse],
+        );
+        let inverse_rows: Vec<_> = (0..3)
+            .flat_map(|index| {
+                [
+                    id_into_value(&inverse_targets[index].id.raw()),
+                    inverse_sources[index][0],
+                ]
+            })
+            .collect();
+        let (inverse_pageable, _, inverse_pages, _) = one_support_transition_cohort_with_fit_closed(
+            &inverse,
+            &inverse_rows,
+            &[2, 2, 2],
+            false,
+        );
+        let (inverse_fit_closed, _, inverse_fit_pages, inverse_probe) =
+            one_support_transition_cohort_with_fit_closed(
+                &inverse,
+                &inverse_rows,
+                &[2, 2, 2],
+                true,
+            );
+        assert_eq!(inverse_pages, 3);
+        assert_eq!(inverse_fit_pages, 1);
+        assert_eq!(
+            transition_effects_snapshot(&inverse_fit_closed),
+            transition_effects_snapshot(&inverse_pageable),
+        );
+        assert_eq!(inverse_probe.bulk_runs, 2);
+        assert_eq!(inverse_probe.pageable_runs, 1);
+        assert_eq!(inverse_probe.nonfit_grant_inputs, 1);
+
+        let primary = rngid();
+        let secondary = rngid();
+        let sources: Vec<_> = (0..3).map(|_| rngid()).collect();
+        let mut graph = TribleSet::new();
+        let mut candidates = Vec::new();
+        for (index, source) in sources.iter().enumerate() {
+            let mut primary_values: Vec<_> = (0..if index == 1 { 2 } else { 1 })
+                .map(|_| id_into_value(&rngid().id.raw()))
+                .collect();
+            primary_values.sort_unstable();
+            let secondary_value = id_into_value(&rngid().id.raw());
+            for value in primary_values.iter().copied() {
+                insert_edge(&mut graph, source, &primary, value);
+            }
+            insert_edge(&mut graph, source, &secondary, secondary_value);
+            candidates.push(primary_values[0]);
+        }
+        let multibranch = RegularPathConstraint::new(
+            graph,
+            start,
+            end,
+            &[
+                PathOp::Attr(primary.id.raw()),
+                PathOp::Attr(secondary.id.raw()),
+                PathOp::Union,
+            ],
+        );
+        let multibranch_rows: Vec<_> = (0..3)
+            .flat_map(|index| [id_into_value(&sources[index].id.raw()), candidates[index]])
+            .collect();
+        let (multibranch_pageable, _, pageable_pages, _) =
+            one_support_transition_cohort_with_fit_closed(
+                &multibranch,
+                &multibranch_rows,
+                &[2, 2, 2],
+                false,
+            );
+        let (multibranch_fit_closed, _, fit_closed_pages, probe) =
+            one_support_transition_cohort_with_fit_closed(
+                &multibranch,
+                &multibranch_rows,
+                &[2, 2, 2],
+                true,
+            );
+        assert_eq!(pageable_pages, 3);
+        assert_eq!(fit_closed_pages, 1);
+        assert_eq!(
+            transition_effects_snapshot(&multibranch_fit_closed),
+            transition_effects_snapshot(&multibranch_pageable),
+        );
+        assert_eq!(probe.original_mixed_cohorts, 1);
+        assert_eq!(probe.bulk_runs, 2);
+        assert_eq!(probe.bulk_inputs, 2);
+        assert_eq!(probe.pageable_runs, 1);
+        assert_eq!(probe.pageable_inputs, 1);
+        assert_eq!(probe.nonfit_grant_inputs, 1);
+    }
+
+    #[test]
+    fn fit_closed_runs_are_exact_for_fixpoint_child_state_and_novelty_words() {
+        let attribute = rngid();
+        let sources: Vec<_> = (0..3).map(|_| rngid()).collect();
+        let fanouts = [2usize, 3, 2];
+        let mut destinations = Vec::new();
+        let mut graph = TribleSet::new();
+        for (source, fanout) in sources.iter().zip(fanouts) {
+            let mut values: Vec<_> = (0..fanout)
+                .map(|_| id_into_value(&rngid().id.raw()))
+                .collect();
+            values.sort_unstable();
+            for value in values.iter().copied() {
+                insert_edge(&mut graph, source, &attribute, value);
+            }
+            destinations.push(values);
+        }
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let path = RegularPathConstraint::new(
+            graph,
+            start,
+            end,
+            &[PathOp::Attr(attribute.id.raw()), PathOp::Plus],
+        );
+        let rows: Vec<_> = (0..3)
+            .flat_map(|index| {
+                [
+                    id_into_value(&sources[index].id.raw()),
+                    destinations[index][0],
+                ]
+            })
+            .collect();
+
+        let pageable = typed_support_transition_snapshot(&path, &rows, &[2, 2, 2], false);
+        let fit_closed = typed_support_transition_snapshot(&path, &rows, &[2, 2, 2], true);
+        assert_eq!(fit_closed, pageable);
+        assert_eq!(fit_closed.pages.len(), 3);
+        assert_eq!(fit_closed.children.len(), 6);
+        assert!(fit_closed
+            .children
+            .iter()
+            .all(|(_, _, novelty, _)| novelty.is_some()));
+        assert!(matches!(
+            &fit_closed.pages[1].1,
+            Some(crate::query::program::TypedResumeTestSnapshot::Immediate(_))
+        ));
+        assert!(fit_closed.pages[0].1.is_none());
+        assert!(fit_closed.pages[2].1.is_none());
     }
 
     #[test]
@@ -5425,6 +6297,24 @@ mod seeded_frame_tests {
         assert!(forward_effects.pages[0].resume.is_none());
         assert!(forward_effects.children.is_empty());
         assert_eq!(forward_effects.accepted, vec![(0, destinations[1])]);
+        let (forward_fit_closed, bulk_cohorts, pageable_pages, probe) =
+            one_support_transition_cohort_with_fit_closed(
+                &forward_negated,
+                &[id_into_value(&forward_source.id.raw()), destinations[1]],
+                &[3],
+                true,
+            );
+        assert_eq!(
+            transition_effects_snapshot(&forward_fit_closed),
+            transition_effects_snapshot(&forward_effects),
+        );
+        assert_eq!(bulk_cohorts, 0);
+        assert_eq!(pageable_pages, 1);
+        assert_eq!(
+            probe,
+            FitClosedRunProbeSnapshot::default(),
+            "an all-pageable cohort must retain the old fallback and record no mixed runs",
+        );
 
         let inverse_target = rngid();
         let inverse_target_value = id_into_value(&inverse_target.id.raw());
