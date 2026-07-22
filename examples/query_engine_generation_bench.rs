@@ -17,8 +17,8 @@
 //! RUSTFLAGS="--cfg engine_current_residual --cfg engine_prefix_checkpoints \
 //!   --cfg rpq_confirm_admission_probe" \
 //!   cargo run --release --example query_engine_generation_bench
-//! RPQ_FRAGMENT_HYBRID_TIMING=FLEET_IDLE_RELEASED \
-//!   target/release/examples/query_engine_generation_bench 60
+//! RPQ_PROGRAM_OWNED_DIRECT_TIMING=FLEET_IDLE_RELEASED \
+//!   target/release/examples/query_engine_generation_bench 64
 //! ```
 //!
 //! Fixture/archive construction and the independent relational oracles are
@@ -208,6 +208,8 @@ use triblespace::core::query::regularpathconstraint::{
     rpq_confirm_admission_probe_bound_confirm_batches, rpq_confirm_admission_probe_force_ordinary,
     rpq_confirm_admission_probe_force_singleton_ordinary,
     rpq_confirm_admission_probe_forced_confirm_batches,
+    rpq_confirm_admission_probe_program_owned_direct,
+    rpq_confirm_admission_probe_program_owned_direct_batches,
     rpq_confirm_admission_probe_record_receipts, rpq_confirm_admission_probe_reset_callbacks,
     rpq_confirm_admission_probe_snapshot, rpq_confirm_admission_probe_target_action,
     rpq_confirm_admission_probe_target_decisions, RpqConfirmAdmissionProbeSnapshot,
@@ -266,17 +268,24 @@ enum ProbeMode {
     Certified,
     Ordinary,
     Hybrid,
+    ProgramOwned,
 }
 
 #[cfg(rpq_confirm_admission_probe)]
 impl ProbeMode {
-    const ALL: [Self; 3] = [Self::Certified, Self::Ordinary, Self::Hybrid];
+    const ALL: [Self; 4] = [
+        Self::Certified,
+        Self::Ordinary,
+        Self::Hybrid,
+        Self::ProgramOwned,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             Self::Certified => "C_TYPED_CERTIFIED",
             Self::Ordinary => "O_FORCED_ORDINARY",
             Self::Hybrid => "H_SINGLETON_ORDINARY",
+            Self::ProgramOwned => "P_PROGRAM_OWNED_DIRECT",
         }
     }
 
@@ -287,6 +296,7 @@ impl ProbeMode {
     fn arm(self) {
         rpq_confirm_admission_probe_force_ordinary(matches!(self, Self::Ordinary));
         rpq_confirm_admission_probe_force_singleton_ordinary(matches!(self, Self::Hybrid));
+        rpq_confirm_admission_probe_program_owned_direct(matches!(self, Self::ProgramOwned));
     }
 }
 
@@ -617,6 +627,9 @@ const HYBRID_WIDTH: usize = 4;
 #[cfg(rpq_confirm_admission_probe)]
 const FROZEN_C_K4_FRAGMENTS: &[(usize, usize)] = &[(1, 4), (1, 4), (254, 1016)];
 #[cfg(rpq_confirm_admission_probe)]
+const FROZEN_P_K4_FRAGMENTS: &[(usize, usize)] =
+    &[(1, 4), (1, 4), (1, 4), (1, 4), (230, 920), (22, 88)];
+#[cfg(rpq_confirm_admission_probe)]
 const FROZEN_O_K4_FRAGMENTS: &[(usize, usize)] = &[
     (1, 4),
     (1, 4),
@@ -643,6 +656,8 @@ const FROZEN_O_K4_FRAGMENTS: &[(usize, usize)] = &[
 const FROZEN_C_K4_ORDER_DIGEST: u64 = 0x593f_683d_9cf6_af36;
 #[cfg(rpq_confirm_admission_probe)]
 const FROZEN_O_K4_ORDER_DIGEST: u64 = 0x2ef2_942e_a64d_dbef;
+#[cfg(rpq_confirm_admission_probe)]
+const FROZEN_P_K4_ORDER_DIGEST: u64 = 0x83e0_6215_9ed9_aadc;
 
 /// One fixed graph shared by every width cell.
 ///
@@ -1442,16 +1457,16 @@ impl PrefixEvidence {
 
 #[cfg(all(engine_prefix_checkpoints, rpq_confirm_admission_probe))]
 fn main() {
-    let repetitions = parse_arg(1, 12);
+    let repetitions = parse_arg(1, 16);
     assert!(
-        repetitions >= 6 && repetitions % 6 == 0,
-        "use a positive multiple of six balanced timing repetitions"
+        repetitions >= 8 && repetitions % 8 == 0,
+        "use a positive multiple of eight balanced timing repetitions"
     );
-    let timing_request = std::env::var("RPQ_FRAGMENT_HYBRID_TIMING").ok();
+    let timing_request = std::env::var("RPQ_PROGRAM_OWNED_DIRECT_TIMING").ok();
     let run_timing = timing_request.as_deref() == Some("FLEET_IDLE_RELEASED");
     assert!(
         timing_request.is_none() || run_timing,
-        "RPQ_FRAGMENT_HYBRID_TIMING must equal FLEET_IDLE_RELEASED; correctness-only is the default"
+        "RPQ_PROGRAM_OWNED_DIRECT_TIMING must equal FLEET_IDLE_RELEASED; correctness-only is the default"
     );
     println!("engine: {ENGINE}");
     println!("revision: {REVISION}");
@@ -2299,11 +2314,95 @@ fn run_rpq_confirm_admission_probe(
 struct CrossoverRun {
     rows: Vec<Pair>,
     order_digest: u64,
+    final_width: usize,
     stats: ResidualStateStats,
     callbacks: RpqConfirmAdmissionProbeSnapshot,
     bound_confirm_batches: Vec<(u32, usize, usize)>,
     forced_confirm_batches: Vec<(u32, usize, usize)>,
     target_decisions: Vec<(u32, usize, usize, bool)>,
+    program_owned_direct_batches: Vec<(u32, usize, usize)>,
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CrossoverPhysicalReceipt {
+    final_width: usize,
+    width_increases: usize,
+    full_pops: usize,
+    readiness_pops: usize,
+    continuation_pops: usize,
+    underfilled_continuation_pops: usize,
+    partial_pops: usize,
+    activation_width_increases: usize,
+    program_cohorts: usize,
+    program_rows: usize,
+    program_granted_work: usize,
+    max_program_cohort: usize,
+    max_program_granted_work: usize,
+    program_receipt_fused_steps: usize,
+    max_program_receipt_chain: usize,
+    source_pages: usize,
+    source_cohorts: usize,
+    max_source_cohort: usize,
+    transition_pages: usize,
+    transition_cohorts: usize,
+    max_transition_cohort: usize,
+    typed_bulk_transition_cohorts: usize,
+    typed_bulk_transition_inputs: usize,
+    typed_pageable_transition_cohorts: usize,
+    typed_pageable_transition_inputs: usize,
+    terminal_admissions: usize,
+    terminal_admitted_parents: usize,
+    max_terminal_admission_parents: usize,
+    terminal_eager_cohort_admissions: usize,
+    terminal_eager_cohort_parents: usize,
+    terminal_eager_cohort_rows: usize,
+    terminal_calls: usize,
+    nonterminal_calls: usize,
+    terminal_tasks: usize,
+    max_terminal_task_cohort: usize,
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+fn crossover_physical_receipt(run: &CrossoverRun) -> CrossoverPhysicalReceipt {
+    let stats = &run.stats;
+    CrossoverPhysicalReceipt {
+        final_width: run.final_width,
+        width_increases: stats.width_increases,
+        full_pops: stats.full_pops,
+        readiness_pops: stats.readiness_pops,
+        continuation_pops: stats.continuation_pops,
+        underfilled_continuation_pops: stats.underfilled_continuation_pops,
+        partial_pops: stats.partial_pops,
+        activation_width_increases: stats.delta_activation_width_increases,
+        program_cohorts: stats.delta_program_physical_cohorts,
+        program_rows: stats.delta_program_physical_rows,
+        program_granted_work: stats.delta_program_physical_granted_work,
+        max_program_cohort: stats.max_delta_program_physical_cohort,
+        max_program_granted_work: stats.max_delta_program_physical_granted_work,
+        program_receipt_fused_steps: stats.delta_program_receipt_local_fused_steps,
+        max_program_receipt_chain: stats.max_delta_program_receipt_local_chain,
+        source_pages: stats.delta_source_pages,
+        source_cohorts: stats.delta_source_cohorts,
+        max_source_cohort: stats.max_delta_source_cohort,
+        transition_pages: stats.delta_transition_pages,
+        transition_cohorts: stats.delta_transition_cohorts,
+        max_transition_cohort: stats.max_delta_transition_cohort,
+        typed_bulk_transition_cohorts: run.callbacks.typed_bulk_transition_cohorts,
+        typed_bulk_transition_inputs: run.callbacks.typed_bulk_transition_inputs,
+        typed_pageable_transition_cohorts: run.callbacks.typed_pageable_transition_cohorts,
+        typed_pageable_transition_inputs: run.callbacks.typed_pageable_transition_inputs,
+        terminal_admissions: stats.delta_terminal_admissions,
+        terminal_admitted_parents: stats.delta_terminal_admitted_parents,
+        max_terminal_admission_parents: stats.max_delta_terminal_admission_parents,
+        terminal_eager_cohort_admissions: stats.delta_terminal_eager_cohort_admissions,
+        terminal_eager_cohort_parents: stats.delta_terminal_eager_cohort_parents,
+        terminal_eager_cohort_rows: stats.delta_terminal_eager_cohort_rows,
+        terminal_calls: stats.delta_terminal_calls,
+        nonterminal_calls: stats.delta_nonterminal_calls,
+        terminal_tasks: stats.delta_terminal_tasks,
+        max_terminal_task_cohort: stats.max_delta_terminal_task_cohort,
+    }
 }
 
 #[cfg(rpq_confirm_admission_probe)]
@@ -2428,11 +2527,13 @@ fn run_crossover_mode<S: TriblePattern>(
     let mut query = probe_mixed_query!(store, fixture, mode);
     let rows: Vec<Pair> = query.by_ref().collect();
     exact_check(rows.clone(), &cell.expected, mode.label(), backend);
+    let final_width = query.current_width();
     let stats = query.stats().clone();
     let callbacks = rpq_confirm_admission_probe_snapshot();
     let bound_confirm_batches = rpq_confirm_admission_probe_bound_confirm_batches();
     let forced_confirm_batches = rpq_confirm_admission_probe_forced_confirm_batches();
     let target_decisions = rpq_confirm_admission_probe_target_decisions();
+    let program_owned_direct_batches = rpq_confirm_admission_probe_program_owned_direct_batches();
     let (signature, order_digest) = probe_order_receipt(&rows);
     println!(
         "crossover_order backend={backend:?} width={} mode={} repeat={repeat} rows={} \
@@ -2457,7 +2558,13 @@ fn run_crossover_mode<S: TriblePattern>(
          rpq_ordinary_propose_calls={} route_bound_confirm_calls={} route_forced_calls={} \
          target_batch_route_calls={} bound_estimate_samples={} bound_estimate_min={} \
          bound_estimate_max={} target_batch_parents={} target_batch_candidates={} \
-         bound_confirm_batches={:?} forced_confirm_batches={:?} target_decisions={:?}",
+         p_direct_seed_calls={} p_direct_seed_parents={} p_direct_seed_candidates={} \
+         p_direct_step_calls={} p_direct_step_parent_visits={} p_direct_candidates_in={} \
+         p_direct_candidates_out={} p_typed_target_parents={} p_non_target_direct={} \
+         p_multi_parent_direct={} typed_bulk_transition_cohorts={} \
+         typed_bulk_transition_inputs={} typed_pageable_transition_cohorts={} \
+         typed_pageable_transition_inputs={} bound_confirm_batches={:?} \
+         forced_confirm_batches={:?} target_decisions={:?} p_direct_batches={:?}",
         cell.width,
         mode.label(),
         stats.probe_formula_fingerprint,
@@ -2490,19 +2597,36 @@ fn run_crossover_mode<S: TriblePattern>(
         callbacks.bound_estimate_max,
         callbacks.target_batch_parents,
         callbacks.target_batch_candidates,
+        callbacks.program_owned_direct_seed_calls,
+        callbacks.program_owned_direct_seed_parents,
+        callbacks.program_owned_direct_seed_candidates,
+        callbacks.program_owned_direct_step_calls,
+        callbacks.program_owned_direct_step_parents,
+        callbacks.program_owned_direct_candidates_in,
+        callbacks.program_owned_direct_candidates_out,
+        callbacks.program_owned_typed_target_parents,
+        callbacks.program_owned_non_target_direct_parents,
+        callbacks.program_owned_multi_parent_direct_parents,
+        callbacks.typed_bulk_transition_cohorts,
+        callbacks.typed_bulk_transition_inputs,
+        callbacks.typed_pageable_transition_cohorts,
+        callbacks.typed_pageable_transition_inputs,
         bound_confirm_batches,
         forced_confirm_batches,
         target_decisions,
+        program_owned_direct_batches,
     );
 
     CrossoverRun {
         rows,
         order_digest,
+        final_width,
         stats,
         callbacks,
         bound_confirm_batches,
         forced_confirm_batches,
         target_decisions,
+        program_owned_direct_batches,
     }
 }
 
@@ -2792,12 +2916,153 @@ fn assert_fragment_hybrid_route(
 }
 
 #[cfg(rpq_confirm_admission_probe)]
+fn assert_program_owned_direct_route(
+    backend: &str,
+    cell: &CrossoverCell,
+    target_token: u32,
+    certified: &CrossoverRun,
+    ordinary: &CrossoverRun,
+    hybrid: &CrossoverRun,
+    program_owned: &CrossoverRun,
+) {
+    let fragments = crossover_target_fragments_for(program_owned, target_token);
+    assert_eq!(fragments, FROZEN_P_K4_FRAGMENTS);
+    assert_ne!(
+        fragments, FROZEN_C_K4_FRAGMENTS,
+        "P unexpectedly stopped falsifying the preregistered C-like geometry prediction",
+    );
+    assert_eq!(
+        program_owned.program_owned_direct_batches,
+        vec![(target_token, 1, cell.width), (target_token, 1, cell.width)],
+        "P did not select exactly the two request-local singleton fragments",
+    );
+    assert!(
+        program_owned
+            .program_owned_direct_batches
+            .iter()
+            .all(|&(token, parents, candidates)| {
+                token == target_token && parents == 1 && candidates == cell.width
+            }),
+        "P selected a non-target, multi-parent, or nonuniform fragment",
+    );
+    assert_eq!(program_owned.callbacks.program_owned_direct_seed_calls, 2);
+    assert_eq!(program_owned.callbacks.program_owned_direct_seed_parents, 2);
+    assert_eq!(
+        program_owned.callbacks.program_owned_direct_seed_candidates,
+        2 * cell.width,
+    );
+    assert_eq!(
+        program_owned.callbacks.program_owned_direct_candidates_in,
+        2 * cell.width,
+    );
+    assert_eq!(
+        program_owned.callbacks.program_owned_direct_candidates_out,
+        cell.width,
+    );
+    assert_eq!(
+        program_owned.callbacks.program_owned_typed_target_parents,
+        CROSSOVER_PARENT_COUNT - 2,
+    );
+    assert_eq!(
+        program_owned
+            .callbacks
+            .program_owned_non_target_direct_parents,
+        0,
+    );
+    assert_eq!(
+        program_owned
+            .callbacks
+            .program_owned_multi_parent_direct_parents,
+        0,
+    );
+
+    assert_eq!(program_owned.stats.probe_forced_rpq_confirm_declines, 0);
+    assert_eq!(program_owned.callbacks.route_forced_calls, 0);
+    assert!(program_owned.forced_confirm_batches.is_empty());
+    assert_eq!(program_owned.callbacks.ordinary_confirm_calls, 0);
+    assert_eq!(program_owned.callbacks.ordinary_confirm_rows, 0);
+    assert_eq!(program_owned.callbacks.ordinary_confirm_candidates_in, 0);
+    assert_eq!(program_owned.callbacks.ordinary_confirm_candidates_out, 0);
+    assert!(program_owned
+        .target_decisions
+        .iter()
+        .all(|&(token, _, _, forced)| token == target_token && !forced));
+    assert_eq!(
+        program_owned.callbacks.program_owned_direct_seed_parents
+            + program_owned.callbacks.program_owned_typed_target_parents,
+        CROSSOVER_PARENT_COUNT,
+        "P deferred or lost a request-local target parent",
+    );
+
+    let certified_work = certified.stats.delta_transition_candidates_examined;
+    assert_eq!(
+        certified_work,
+        CROSSOVER_PARENT_COUNT * 2_608,
+        "sealed C per-parent transition receipt changed",
+    );
+    assert_eq!(
+        program_owned.stats.delta_transition_candidates_examined,
+        (CROSSOVER_PARENT_COUNT - 2) * 2_608,
+        "P graph traversal did not remove exactly its two direct parents",
+    );
+    assert_eq!(
+        program_owned.stats.delta_transition_candidates_examined,
+        662_432,
+    );
+    for run in [certified, program_owned] {
+        assert_eq!(
+            run.callbacks.typed_bulk_transition_inputs
+                + run.callbacks.typed_pageable_transition_inputs,
+            run.stats.delta_transition_pages,
+            "typed bulk/pageable receipt did not cover every transition page",
+        );
+    }
+    assert_eq!(
+        program_owned.stats.delta_source_candidates_examined,
+        certified.stats.delta_source_candidates_examined,
+    );
+    assert_eq!(
+        program_owned.stats.candidates_confirmed,
+        certified.stats.candidates_confirmed,
+    );
+    assert_eq!(
+        crossover_formula_shape(&program_owned.stats),
+        crossover_formula_shape(&certified.stats),
+        "P changed the frozen Production/ParentAtomic formula topology",
+    );
+    assert_eq!(
+        crossover_formula_shape(&program_owned.stats),
+        crossover_formula_shape(&ordinary.stats),
+    );
+    assert_eq!(
+        crossover_formula_shape(&program_owned.stats),
+        crossover_formula_shape(&hybrid.stats),
+    );
+
+    println!(
+        "program_owned_direct_verdict backend={backend:?} width={} token={} \
+         fragments={fragments:?} direct_batches={:?} direct_parents=2 direct_candidates_in={} \
+         direct_candidates_out={} typed_parents={} typed_transition_examined={} \
+         exact_ordinary_predicate_reused=true ordinary_callbacks=0 target_policy_deferred=0 \
+         forced_fallbacks=0 non_target_direct=0 multi_parent_direct=0 \
+         c_like_fragment_prediction=false formula_fingerprint_equal=true",
+        cell.width,
+        target_token,
+        program_owned.program_owned_direct_batches,
+        program_owned.callbacks.program_owned_direct_candidates_in,
+        program_owned.callbacks.program_owned_direct_candidates_out,
+        program_owned.callbacks.program_owned_typed_target_parents,
+        program_owned.stats.delta_transition_candidates_examined,
+    );
+}
+
+#[cfg(rpq_confirm_admission_probe)]
 fn correctness_backend<S: TriblePattern>(
     backend: &str,
     store: &S,
     fixture: &CrossoverFixture,
     cell: &CrossoverCell,
-) -> (CrossoverRun, CrossoverRun, CrossoverRun, u32) {
+) -> (CrossoverRun, CrossoverRun, CrossoverRun, CrossoverRun, u32) {
     let certified_discovery =
         run_crossover_mode(backend, store, fixture, cell, ProbeMode::Certified, 0, None);
     let target_token = discover_crossover_target_token(backend, cell, &certified_discovery);
@@ -2815,6 +3080,11 @@ fn correctness_backend<S: TriblePattern>(
         "same-cell C physical order changed on repeat for {backend}/k={}",
         cell.width
     );
+    assert_eq!(
+        crossover_physical_receipt(&certified_discovery),
+        crossover_physical_receipt(&certified),
+        "same-cell C physical cohort/width/bulk receipt changed on repeat",
+    );
     let certified_fragments = crossover_target_fragments_for(&certified_discovery, target_token);
     assert_eq!(
         certified_fragments, FROZEN_C_K4_FRAGMENTS,
@@ -2830,6 +3100,59 @@ fn correctness_backend<S: TriblePattern>(
         target_token,
         &certified,
         &certified_fragments,
+    );
+
+    let program_owned = run_crossover_mode(
+        backend,
+        store,
+        fixture,
+        cell,
+        ProbeMode::ProgramOwned,
+        0,
+        Some(target_token),
+    );
+    let program_owned_fragments = crossover_target_fragments_for(&program_owned, target_token);
+    let program_owned_repeat = run_crossover_mode(
+        backend,
+        store,
+        fixture,
+        cell,
+        ProbeMode::ProgramOwned,
+        1,
+        Some(target_token),
+    );
+    assert_eq!(
+        program_owned.rows, program_owned_repeat.rows,
+        "same-cell P physical order changed on repeat for {backend}/k={}",
+        cell.width,
+    );
+    assert_eq!(
+        program_owned.program_owned_direct_batches,
+        program_owned_repeat.program_owned_direct_batches,
+        "same-cell P direct placement changed on repeat",
+    );
+    assert_eq!(
+        crossover_physical_receipt(&program_owned),
+        crossover_physical_receipt(&program_owned_repeat),
+        "same-cell P physical cohort/width/bulk receipt changed on repeat",
+    );
+    assert_eq!(
+        program_owned.order_digest, FROZEN_P_K4_ORDER_DIGEST,
+        "sealed P k=4 order digest changed",
+    );
+    assert_crossover_target_receipt(
+        backend,
+        cell,
+        target_token,
+        &program_owned,
+        &program_owned_fragments,
+    );
+    assert_crossover_target_receipt(
+        backend,
+        cell,
+        target_token,
+        &program_owned_repeat,
+        &program_owned_fragments,
     );
 
     let ordinary = run_crossover_mode(
@@ -2922,11 +3245,21 @@ fn correctness_backend<S: TriblePattern>(
     println!(
         "crossover_fragment_receipt backend={backend:?} width={} token={} \
          certified={certified_fragments:?} ordinary={ordinary_fragments:?} \
-         hybrid={hybrid_fragments:?} repeat_stable=true",
+         hybrid={hybrid_fragments:?} program_owned={program_owned_fragments:?} \
+         repeat_stable=true",
         cell.width, target_token,
     );
     assert_natural_candidate_route(backend, cell, &certified, &ordinary);
     assert_fragment_hybrid_route(backend, cell, target_token, &certified, &ordinary, &hybrid);
+    assert_program_owned_direct_route(
+        backend,
+        cell,
+        target_token,
+        &certified,
+        &ordinary,
+        &hybrid,
+        &program_owned,
+    );
     println!(
         "crossover_cross_route_order backend={backend:?} width={} equal={}",
         cell.width,
@@ -2942,7 +3275,23 @@ fn correctness_backend<S: TriblePattern>(
         certified.order_digest,
         ordinary.order_digest,
     );
-    (certified, ordinary, hybrid, target_token)
+    println!(
+        "program_owned_order_equivalence backend={backend:?} width={} p_equals_c={} \
+         p_equals_o={} p_equals_h={} p_digest={:#018x} repeat_stable=true",
+        cell.width,
+        program_owned.rows == certified.rows,
+        program_owned.rows == ordinary.rows,
+        program_owned.rows == hybrid.rows,
+        program_owned.order_digest,
+    );
+    println!(
+        "program_owned_physical_cp backend={backend:?} width={} c={:?} p={:?} \
+         repeat_stable=true",
+        cell.width,
+        crossover_physical_receipt(&certified),
+        crossover_physical_receipt(&program_owned),
+    );
+    (certified, ordinary, hybrid, program_owned, target_token)
 }
 
 #[cfg(rpq_confirm_admission_probe)]
@@ -2986,13 +3335,55 @@ fn timing_backend<S: TriblePattern>(
     // from the measured route-policy total effect.
     rpq_confirm_admission_probe_record_receipts(false);
     let expected_signature = tally(cell.expected.iter().copied());
-    const BALANCED_ORDERS: [[ProbeMode; 3]; 6] = [
-        [ProbeMode::Certified, ProbeMode::Ordinary, ProbeMode::Hybrid],
-        [ProbeMode::Certified, ProbeMode::Hybrid, ProbeMode::Ordinary],
-        [ProbeMode::Ordinary, ProbeMode::Certified, ProbeMode::Hybrid],
-        [ProbeMode::Ordinary, ProbeMode::Hybrid, ProbeMode::Certified],
-        [ProbeMode::Hybrid, ProbeMode::Certified, ProbeMode::Ordinary],
-        [ProbeMode::Hybrid, ProbeMode::Ordinary, ProbeMode::Certified],
+    const BALANCED_ORDERS: [[ProbeMode; 4]; 8] = [
+        [
+            ProbeMode::Certified,
+            ProbeMode::Ordinary,
+            ProbeMode::Hybrid,
+            ProbeMode::ProgramOwned,
+        ],
+        [
+            ProbeMode::Ordinary,
+            ProbeMode::Hybrid,
+            ProbeMode::ProgramOwned,
+            ProbeMode::Certified,
+        ],
+        [
+            ProbeMode::Hybrid,
+            ProbeMode::ProgramOwned,
+            ProbeMode::Certified,
+            ProbeMode::Ordinary,
+        ],
+        [
+            ProbeMode::ProgramOwned,
+            ProbeMode::Certified,
+            ProbeMode::Ordinary,
+            ProbeMode::Hybrid,
+        ],
+        [
+            ProbeMode::ProgramOwned,
+            ProbeMode::Hybrid,
+            ProbeMode::Ordinary,
+            ProbeMode::Certified,
+        ],
+        [
+            ProbeMode::Certified,
+            ProbeMode::ProgramOwned,
+            ProbeMode::Hybrid,
+            ProbeMode::Ordinary,
+        ],
+        [
+            ProbeMode::Ordinary,
+            ProbeMode::Certified,
+            ProbeMode::ProgramOwned,
+            ProbeMode::Hybrid,
+        ],
+        [
+            ProbeMode::Hybrid,
+            ProbeMode::Ordinary,
+            ProbeMode::Certified,
+            ProbeMode::ProgramOwned,
+        ],
     ];
 
     for mode in ProbeMode::ALL {
@@ -3015,7 +3406,7 @@ fn timing_backend<S: TriblePattern>(
         }
     }
 
-    let mut samples = Vec::with_capacity(repetitions * 6);
+    let mut samples = Vec::with_capacity(repetitions * 8);
     for repetition in 0..repetitions {
         let order = BALANCED_ORDERS[repetition % BALANCED_ORDERS.len()];
         let points = if repetition % 2 == 0 {
@@ -3094,7 +3485,7 @@ fn run_rpq_confirm_crossover_probe(repetitions: usize, run_timing: bool) {
         .components
         .iter()
         .all(|component| component.len() == CROSSOVER_CORE_NODES));
-    println!("probe: RPQ Confirm fragment-local singleton/typed hybrid");
+    println!("probe: RPQ Confirm fragment-local C/O/H/P placement panel");
     println!(
         "fixture: components={} core_nodes={} selected_parents={} graph_tribles={} \
          graph_digest={:#018x} built_ms={:.3}",
@@ -3106,9 +3497,10 @@ fn run_rpq_confirm_crossover_probe(repetitions: usize, run_timing: bool) {
         fixture_elapsed.as_secs_f64() * 1e3,
     );
     println!(
-        "invariant: C, O, and H all compile the same Production route and ParentAtomic \
-         grouping. H changes only the concrete request-local target CandidateBatch: \
-         parent_rows == 1 selects ordinary; parent_rows > 1 retains typed."
+        "invariant: C, O, H, and P all compile the same Production route and ParentAtomic \
+         grouping. H uses the stable ordinary fallback for target singletons; P leaves \
+         Program ownership, address, and Fixpoint stratum intact while those same singleton \
+         seeds enter a finite direct-Confirm state."
     );
 
     let cell = fixture.cell(HYBRID_WIDTH);
@@ -3129,23 +3521,27 @@ fn run_rpq_confirm_crossover_probe(repetitions: usize, run_timing: bool) {
         fixture.graph_digest,
     );
 
-    let (certified, ordinary, hybrid, target_token) =
+    let (certified, ordinary, hybrid, program_owned, target_token) =
         correctness_backend("TribleSet", &cell.candidates, &fixture, &cell);
     println!(
         "hybrid_counter_equivalence backend=\"TribleSet\" width={} \
          candidates_confirmed_c={} candidates_confirmed_o={} candidates_confirmed_h={} \
-         source_examined_c={} source_examined_o={} source_examined_h={} \
-         transition_examined_c={} transition_examined_o={} transition_examined_h={}",
+         candidates_confirmed_p={} source_examined_c={} source_examined_o={} \
+         source_examined_h={} source_examined_p={} transition_examined_c={} \
+         transition_examined_o={} transition_examined_h={} transition_examined_p={}",
         cell.width,
         certified.stats.candidates_confirmed,
         ordinary.stats.candidates_confirmed,
         hybrid.stats.candidates_confirmed,
+        program_owned.stats.candidates_confirmed,
         certified.stats.delta_source_candidates_examined,
         ordinary.stats.delta_source_candidates_examined,
         hybrid.stats.delta_source_candidates_examined,
+        program_owned.stats.delta_source_candidates_examined,
         certified.stats.delta_transition_candidates_examined,
         ordinary.stats.delta_transition_candidates_examined,
         hybrid.stats.delta_transition_candidates_examined,
+        program_owned.stats.delta_transition_candidates_examined,
     );
 
     if run_timing {
@@ -3160,12 +3556,13 @@ fn run_rpq_confirm_crossover_probe(repetitions: usize, run_timing: bool) {
     }
     if !run_timing {
         println!(
-            "timing withheld: set RPQ_FRAGMENT_HYBRID_TIMING=FLEET_IDLE_RELEASED only \
+            "timing withheld: set RPQ_PROGRAM_OWNED_DIRECT_TIMING=FLEET_IDLE_RELEASED only \
              after an explicit fleet-idle release"
         );
     }
     rpq_confirm_admission_probe_force_ordinary(false);
     rpq_confirm_admission_probe_force_singleton_ordinary(false);
+    rpq_confirm_admission_probe_program_owned_direct(false);
 }
 
 #[cfg(all(engine_prefix_checkpoints, not(rpq_confirm_admission_probe)))]

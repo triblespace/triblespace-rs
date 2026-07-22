@@ -11666,7 +11666,7 @@ impl ResidualStateMachine {
                 );
             }
             let SelectedResidualTask {
-                state: _,
+                state: _program_state,
                 desc,
                 bucket,
             } = task;
@@ -11700,6 +11700,18 @@ impl ResidualStateMachine {
             {
                 self.stats.probe_program_activation_parents_opened += seeded_parents;
             }
+            // P is a probe-only physical placement experiment.  The route,
+            // ProgramAddress, Fixpoint stratum, ParentAtomic grouping, and
+            // activation ownership above are already fixed.  This affine
+            // scope can therefore inform only this exact Program seed; it is
+            // cleared before any later stable action is selected.
+            #[cfg(rpq_confirm_admission_probe)]
+            let _program_owned_seed_scope = super::regularpathconstraint::
+                rpq_confirm_admission_probe_enter_program_owned_seed(
+                    _program_state.0,
+                    seeded_parents,
+                    candidates_before,
+                );
             let active = self.delta.seed_program_confirms(
                 spec,
                 DeltaDesc::leaf(variable, confirmer),

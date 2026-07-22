@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The sealed RPQ Confirm crossover now has a Program-owned direct-Confirm
+  diagnostic.** The Production route, Program address, Fixpoint stratum,
+  ParentAtomic grouping, and activation ownership remain fixed while exactly
+  the two request-local singleton batches enter a finite pageable state that
+  reuses the ordinary RPQ membership predicate. The frozen TribleSet `k=4`
+  run preserves exact SET semantics, repeat-stable order, two direct parents,
+  `8 -> 4` candidate filtering, and `254 * 2608` typed transition work, but
+  falsifies the preregistered C-like fragmentation prediction: faster direct
+  completion changes later stable scheduling to
+  `[(1,4),(1,4),(1,4),(1,4),(230,920),(22,88)]`. A balanced C/O/H/P first/full
+  panel remains timing-gated, with C/P cohort, width, and bulk-work receipts
+  recorded before any fleet-idle run.
 - **The sealed RPQ Confirm crossover now has a fragment-local hybrid
   diagnostic.** On the frozen TribleSet `k=4` cell, the structural Production
   route and ParentAtomic grouping remain fixed while a request-local physical

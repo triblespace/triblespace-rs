@@ -1540,6 +1540,10 @@ enum RpqStateKind {
         variable: VariableId,
         offset: usize,
     },
+    DirectBoundConfirm {
+        variable: VariableId,
+        offset: usize,
+    },
     Support,
 }
 
@@ -1562,6 +1566,10 @@ impl RpqState {
 
     fn candidate_filter(variable: VariableId, offset: usize) -> Self {
         Self(RpqStateKind::CandidateFilter { variable, offset })
+    }
+
+    fn direct_bound_confirm(variable: VariableId, offset: usize) -> Self {
+        Self(RpqStateKind::DirectBoundConfirm { variable, offset })
     }
 
     fn support() -> Self {
@@ -1603,6 +1611,14 @@ const RPQ_SUPPORT_TRUE: ProgramKey = ProgramKey::new(7);
 thread_local! {
     static FORCE_BOUND_CONFIRM_ORDINARY: Cell<bool> = const { Cell::new(false) };
     static FORCE_SINGLETON_CONFIRM_ORDINARY: Cell<bool> = const { Cell::new(false) };
+    static PROGRAM_OWNED_DIRECT_CONFIRM: Cell<bool> = const { Cell::new(false) };
+    static PROGRAM_OWNED_DIRECT_REMAINING: Cell<usize> = const { Cell::new(0) };
+    static PROGRAM_OWNED_SEED_SCOPE_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static PROGRAM_OWNED_SEED_SCOPE_TOKEN: Cell<Option<u32>> = const { Cell::new(None) };
+    static PROGRAM_OWNED_SEED_SCOPE_TARGET: Cell<bool> = const { Cell::new(false) };
+    static PROGRAM_OWNED_SEED_SCOPE_DIRECT: Cell<bool> = const { Cell::new(false) };
+    static PROGRAM_OWNED_SEED_SCOPE_PARENTS: Cell<usize> = const { Cell::new(0) };
+    static PROGRAM_OWNED_SEED_SCOPE_CANDIDATES: Cell<usize> = const { Cell::new(0) };
     static RECORD_PROBE_RECEIPTS: Cell<bool> = const { Cell::new(true) };
     static TARGET_CONFIRM_TOKEN: Cell<Option<u32>> = const { Cell::new(None) };
     static TARGET_CONFIRM_PARENTS: Cell<usize> = const { Cell::new(0) };
@@ -1641,6 +1657,21 @@ thread_local! {
     static BOUND_ESTIMATE_SAMPLES: Cell<usize> = const { Cell::new(0) };
     static BOUND_ESTIMATE_MIN: Cell<usize> = const { Cell::new(usize::MAX) };
     static BOUND_ESTIMATE_MAX: Cell<usize> = const { Cell::new(0) };
+    static PROGRAM_OWNED_DIRECT_SEED_CALLS: Cell<usize> = const { Cell::new(0) };
+    static PROGRAM_OWNED_DIRECT_SEED_PARENTS: Cell<usize> = const { Cell::new(0) };
+    static PROGRAM_OWNED_DIRECT_SEED_CANDIDATES: Cell<usize> = const { Cell::new(0) };
+    static PROGRAM_OWNED_DIRECT_STEP_CALLS: Cell<usize> = const { Cell::new(0) };
+    static PROGRAM_OWNED_DIRECT_STEP_PARENTS: Cell<usize> = const { Cell::new(0) };
+    static PROGRAM_OWNED_DIRECT_CANDIDATES_IN: Cell<usize> = const { Cell::new(0) };
+    static PROGRAM_OWNED_DIRECT_CANDIDATES_OUT: Cell<usize> = const { Cell::new(0) };
+    static PROGRAM_OWNED_TYPED_TARGET_PARENTS: Cell<usize> = const { Cell::new(0) };
+    static PROGRAM_OWNED_NON_TARGET_DIRECT_PARENTS: Cell<usize> = const { Cell::new(0) };
+    static PROGRAM_OWNED_MULTI_PARENT_DIRECT_PARENTS: Cell<usize> = const { Cell::new(0) };
+    static PROGRAM_OWNED_DIRECT_BATCHES: RefCell<Vec<(u32, usize, usize)>> = const { RefCell::new(Vec::new()) };
+    static TYPED_BULK_TRANSITION_COHORTS: Cell<usize> = const { Cell::new(0) };
+    static TYPED_BULK_TRANSITION_INPUTS: Cell<usize> = const { Cell::new(0) };
+    static TYPED_PAGEABLE_TRANSITION_COHORTS: Cell<usize> = const { Cell::new(0) };
+    static TYPED_PAGEABLE_TRANSITION_INPUTS: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(rpq_confirm_admission_probe)]
@@ -1674,6 +1705,20 @@ pub struct RpqConfirmAdmissionProbeSnapshot {
     pub bound_estimate_samples: usize,
     pub bound_estimate_min: usize,
     pub bound_estimate_max: usize,
+    pub program_owned_direct_seed_calls: usize,
+    pub program_owned_direct_seed_parents: usize,
+    pub program_owned_direct_seed_candidates: usize,
+    pub program_owned_direct_step_calls: usize,
+    pub program_owned_direct_step_parents: usize,
+    pub program_owned_direct_candidates_in: usize,
+    pub program_owned_direct_candidates_out: usize,
+    pub program_owned_typed_target_parents: usize,
+    pub program_owned_non_target_direct_parents: usize,
+    pub program_owned_multi_parent_direct_parents: usize,
+    pub typed_bulk_transition_cohorts: usize,
+    pub typed_bulk_transition_inputs: usize,
+    pub typed_pageable_transition_cohorts: usize,
+    pub typed_pageable_transition_inputs: usize,
 }
 
 #[cfg(rpq_confirm_admission_probe)]
@@ -1686,6 +1731,72 @@ pub fn rpq_confirm_admission_probe_force_ordinary(force: bool) {
 #[doc(hidden)]
 pub fn rpq_confirm_admission_probe_force_singleton_ordinary(force: bool) {
     FORCE_SINGLETON_CONFIRM_ORDINARY.with(|armed| armed.set(force));
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+#[doc(hidden)]
+pub fn rpq_confirm_admission_probe_program_owned_direct(force: bool) {
+    PROGRAM_OWNED_DIRECT_CONFIRM.with(|armed| armed.set(force));
+    // The sealed C receipt has exactly two request-local singleton fragments.
+    // Freeze that source-identical physical prefix so scheduler feedback from
+    // the diagnostic itself cannot silently widen the intervention.
+    PROGRAM_OWNED_DIRECT_REMAINING.with(|remaining| remaining.set(usize::from(force) * 2));
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+pub(crate) struct RpqProgramOwnedSeedScope;
+
+#[cfg(rpq_confirm_admission_probe)]
+impl Drop for RpqProgramOwnedSeedScope {
+    fn drop(&mut self) {
+        PROGRAM_OWNED_SEED_SCOPE_ACTIVE.with(|active| active.set(false));
+        PROGRAM_OWNED_SEED_SCOPE_TOKEN.with(|token| token.set(None));
+        PROGRAM_OWNED_SEED_SCOPE_TARGET.with(|target| target.set(false));
+        PROGRAM_OWNED_SEED_SCOPE_DIRECT.with(|direct| direct.set(false));
+        PROGRAM_OWNED_SEED_SCOPE_PARENTS.with(|parents| parents.set(0));
+        PROGRAM_OWNED_SEED_SCOPE_CANDIDATES.with(|candidates| candidates.set(0));
+    }
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+pub(crate) fn rpq_confirm_admission_probe_enter_program_owned_seed(
+    token: u32,
+    parents: usize,
+    candidates: usize,
+) -> RpqProgramOwnedSeedScope {
+    assert!(parents > 0);
+    assert!(candidates > 0);
+    let enabled = PROGRAM_OWNED_DIRECT_CONFIRM.with(Cell::get);
+    let target = enabled && TARGET_CONFIRM_TOKEN.with(Cell::get) == Some(token);
+    let direct = target
+        && parents == 1
+        && PROGRAM_OWNED_DIRECT_REMAINING.with(|remaining| {
+            let available = remaining.get();
+            if available == 0 {
+                false
+            } else {
+                remaining.set(available - 1);
+                true
+            }
+        });
+    PROGRAM_OWNED_SEED_SCOPE_ACTIVE.with(|active| {
+        assert!(
+            !active.replace(enabled),
+            "nested RPQ Program-owned seed scope"
+        );
+    });
+    PROGRAM_OWNED_SEED_SCOPE_TOKEN.with(|value| value.set(enabled.then_some(token)));
+    PROGRAM_OWNED_SEED_SCOPE_TARGET.with(|value| value.set(target));
+    PROGRAM_OWNED_SEED_SCOPE_DIRECT.with(|value| value.set(direct));
+    PROGRAM_OWNED_SEED_SCOPE_PARENTS.with(|value| value.set(parents));
+    PROGRAM_OWNED_SEED_SCOPE_CANDIDATES.with(|value| value.set(candidates));
+    RpqProgramOwnedSeedScope
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+#[doc(hidden)]
+pub fn rpq_confirm_admission_probe_program_owned_direct_batches() -> Vec<(u32, usize, usize)> {
+    PROGRAM_OWNED_DIRECT_BATCHES.with(|batches| batches.borrow().clone())
 }
 
 #[cfg(rpq_confirm_admission_probe)]
@@ -1782,6 +1893,27 @@ pub fn rpq_confirm_admission_probe_reset_callbacks() {
     BOUND_ESTIMATE_SAMPLES.with(|value| value.set(0));
     BOUND_ESTIMATE_MIN.with(|value| value.set(usize::MAX));
     BOUND_ESTIMATE_MAX.with(|value| value.set(0));
+    PROGRAM_OWNED_SEED_SCOPE_ACTIVE.with(|value| value.set(false));
+    PROGRAM_OWNED_SEED_SCOPE_TOKEN.with(|value| value.set(None));
+    PROGRAM_OWNED_SEED_SCOPE_TARGET.with(|value| value.set(false));
+    PROGRAM_OWNED_SEED_SCOPE_DIRECT.with(|value| value.set(false));
+    PROGRAM_OWNED_SEED_SCOPE_PARENTS.with(|value| value.set(0));
+    PROGRAM_OWNED_SEED_SCOPE_CANDIDATES.with(|value| value.set(0));
+    PROGRAM_OWNED_DIRECT_SEED_CALLS.with(|value| value.set(0));
+    PROGRAM_OWNED_DIRECT_SEED_PARENTS.with(|value| value.set(0));
+    PROGRAM_OWNED_DIRECT_SEED_CANDIDATES.with(|value| value.set(0));
+    PROGRAM_OWNED_DIRECT_STEP_CALLS.with(|value| value.set(0));
+    PROGRAM_OWNED_DIRECT_STEP_PARENTS.with(|value| value.set(0));
+    PROGRAM_OWNED_DIRECT_CANDIDATES_IN.with(|value| value.set(0));
+    PROGRAM_OWNED_DIRECT_CANDIDATES_OUT.with(|value| value.set(0));
+    PROGRAM_OWNED_TYPED_TARGET_PARENTS.with(|value| value.set(0));
+    PROGRAM_OWNED_NON_TARGET_DIRECT_PARENTS.with(|value| value.set(0));
+    PROGRAM_OWNED_MULTI_PARENT_DIRECT_PARENTS.with(|value| value.set(0));
+    PROGRAM_OWNED_DIRECT_BATCHES.with(|batches| batches.borrow_mut().clear());
+    TYPED_BULK_TRANSITION_COHORTS.with(|value| value.set(0));
+    TYPED_BULK_TRANSITION_INPUTS.with(|value| value.set(0));
+    TYPED_PAGEABLE_TRANSITION_COHORTS.with(|value| value.set(0));
+    TYPED_PAGEABLE_TRANSITION_INPUTS.with(|value| value.set(0));
 }
 
 #[cfg(rpq_confirm_admission_probe)]
@@ -1815,7 +1947,48 @@ pub fn rpq_confirm_admission_probe_snapshot() -> RpqConfirmAdmissionProbeSnapsho
         bound_estimate_samples: BOUND_ESTIMATE_SAMPLES.with(Cell::get),
         bound_estimate_min: BOUND_ESTIMATE_MIN.with(Cell::get),
         bound_estimate_max: BOUND_ESTIMATE_MAX.with(Cell::get),
+        program_owned_direct_seed_calls: PROGRAM_OWNED_DIRECT_SEED_CALLS.with(Cell::get),
+        program_owned_direct_seed_parents: PROGRAM_OWNED_DIRECT_SEED_PARENTS.with(Cell::get),
+        program_owned_direct_seed_candidates: PROGRAM_OWNED_DIRECT_SEED_CANDIDATES.with(Cell::get),
+        program_owned_direct_step_calls: PROGRAM_OWNED_DIRECT_STEP_CALLS.with(Cell::get),
+        program_owned_direct_step_parents: PROGRAM_OWNED_DIRECT_STEP_PARENTS.with(Cell::get),
+        program_owned_direct_candidates_in: PROGRAM_OWNED_DIRECT_CANDIDATES_IN.with(Cell::get),
+        program_owned_direct_candidates_out: PROGRAM_OWNED_DIRECT_CANDIDATES_OUT.with(Cell::get),
+        program_owned_typed_target_parents: PROGRAM_OWNED_TYPED_TARGET_PARENTS.with(Cell::get),
+        program_owned_non_target_direct_parents: PROGRAM_OWNED_NON_TARGET_DIRECT_PARENTS
+            .with(Cell::get),
+        program_owned_multi_parent_direct_parents: PROGRAM_OWNED_MULTI_PARENT_DIRECT_PARENTS
+            .with(Cell::get),
+        typed_bulk_transition_cohorts: TYPED_BULK_TRANSITION_COHORTS.with(Cell::get),
+        typed_bulk_transition_inputs: TYPED_BULK_TRANSITION_INPUTS.with(Cell::get),
+        typed_pageable_transition_cohorts: TYPED_PAGEABLE_TRANSITION_COHORTS.with(Cell::get),
+        typed_pageable_transition_inputs: TYPED_PAGEABLE_TRANSITION_INPUTS.with(Cell::get),
     }
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+#[derive(Clone, Copy)]
+struct RpqProgramOwnedSeedHint {
+    token: u32,
+    target: bool,
+    direct: bool,
+    parents: usize,
+    candidates: usize,
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+fn probe_program_owned_seed_hint() -> Option<RpqProgramOwnedSeedHint> {
+    PROGRAM_OWNED_SEED_SCOPE_ACTIVE
+        .with(Cell::get)
+        .then(|| RpqProgramOwnedSeedHint {
+            token: PROGRAM_OWNED_SEED_SCOPE_TOKEN
+                .with(Cell::get)
+                .expect("active RPQ Program-owned seed scope lost its token"),
+            target: PROGRAM_OWNED_SEED_SCOPE_TARGET.with(Cell::get),
+            direct: PROGRAM_OWNED_SEED_SCOPE_DIRECT.with(Cell::get),
+            parents: PROGRAM_OWNED_SEED_SCOPE_PARENTS.with(Cell::get),
+            candidates: PROGRAM_OWNED_SEED_SCOPE_CANDIDATES.with(Cell::get),
+        })
 }
 
 #[inline]
@@ -1926,6 +2099,7 @@ const RPQ_TRANSITION_AFTER: DispatchClass = DispatchClass::new(3);
 const RPQ_CANDIDATE_FILTER: DispatchClass = DispatchClass::new(4);
 const RPQ_SUPPORT: DispatchClass = DispatchClass::new(5);
 const RPQ_SOURCE_OFFSET: DispatchClass = DispatchClass::new(6);
+const RPQ_DIRECT_BOUND_CONFIRM: DispatchClass = DispatchClass::new(7);
 
 enum RpqRoute<'p> {
     BoundEndpoint {
@@ -3371,6 +3545,7 @@ impl TypedProgramSpec for RegularPathConstraint {
                 ..
             } => RPQ_TRANSITION_AFTER,
             RpqStateKind::CandidateFilter { .. } => RPQ_CANDIDATE_FILTER,
+            RpqStateKind::DirectBoundConfirm { .. } => RPQ_DIRECT_BOUND_CONFIRM,
             RpqStateKind::Support => RPQ_SUPPORT,
         }
     }
@@ -3380,7 +3555,9 @@ impl TypedProgramSpec for RegularPathConstraint {
             RpqStateKind::Source { .. }
             | RpqStateKind::CandidateFilter { .. }
             | RpqStateKind::Support => ProgramPacing::Search,
-            RpqStateKind::Transition { .. } => ProgramPacing::Activation,
+            RpqStateKind::Transition { .. } | RpqStateKind::DirectBoundConfirm { .. } => {
+                ProgramPacing::Activation
+            }
         }
     }
 
@@ -3399,6 +3576,13 @@ impl TypedProgramSpec for RegularPathConstraint {
                 rank[0] = 1;
                 rank[1] = u64::MAX
                     - u64::try_from(*offset).expect("RPQ candidate offset exceeds rank limb");
+            }
+            RpqStateKind::DirectBoundConfirm { offset, .. } => {
+                // Preserve the replaced bound transition's initial physical
+                // priority while retaining a strict finite-page descent.
+                rank[0] = 2;
+                rank[2] = u64::MAX
+                    - u64::try_from(*offset).expect("RPQ direct Confirm offset exceeds rank limb");
             }
             RpqStateKind::Transition {
                 variable,
@@ -3467,6 +3651,50 @@ impl TypedProgramSpec for RegularPathConstraint {
             }
         }
         debug_assert_eq!(batch.view.len(), batch.activations.len());
+        #[cfg(rpq_confirm_admission_probe)]
+        if matches!(batch.request.action, ProgramAction::Confirm(_))
+            && (batch.route.key == RPQ_BOUND_FORWARD || batch.route.key == RPQ_BOUND_INVERSE)
+        {
+            if let Some(hint) = probe_program_owned_seed_hint() {
+                assert_eq!(hint.parents, batch.view.len());
+                if hint.direct {
+                    PROGRAM_OWNED_DIRECT_SEED_CALLS.with(|value| value.set(value.get() + 1));
+                    PROGRAM_OWNED_DIRECT_SEED_PARENTS
+                        .with(|value| value.set(value.get() + batch.view.len()));
+                    PROGRAM_OWNED_DIRECT_SEED_CANDIDATES
+                        .with(|value| value.set(value.get() + hint.candidates));
+                    PROGRAM_OWNED_NON_TARGET_DIRECT_PARENTS.with(|value| {
+                        value.set(value.get() + usize::from(!hint.target) * batch.view.len())
+                    });
+                    PROGRAM_OWNED_MULTI_PARENT_DIRECT_PARENTS.with(|value| {
+                        value.set(
+                            value.get() + usize::from(batch.view.len() != 1) * batch.view.len(),
+                        )
+                    });
+                    if RECORD_PROBE_RECEIPTS.with(Cell::get) {
+                        PROGRAM_OWNED_DIRECT_BATCHES.with(|batches| {
+                            batches.borrow_mut().push((
+                                hint.token,
+                                batch.view.len(),
+                                hint.candidates,
+                            ))
+                        });
+                    }
+                    for parent in 0..batch.view.len() {
+                        effects.finite_root(
+                            u32::try_from(parent).expect("too many RPQ direct Confirm parents"),
+                            RpqState::direct_bound_confirm(batch.route.variable, 0),
+                            None,
+                        );
+                    }
+                    return;
+                }
+                if hint.target {
+                    PROGRAM_OWNED_TYPED_TARGET_PARENTS
+                        .with(|value| value.set(value.get() + batch.view.len()));
+                }
+            }
+        }
         if batch.route.key == RPQ_SUPPORT_TRUE {
             for parent in 0..batch.view.len() {
                 effects.finite_root(
@@ -3565,6 +3793,54 @@ impl TypedProgramSpec for RegularPathConstraint {
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
         assert_eq!(states.len(), batch.view.len());
+        if states
+            .first()
+            .is_some_and(|state| matches!(state.kind(), RpqStateKind::DirectBoundConfirm { .. }))
+        {
+            let start_column = batch.view.col(self.start);
+            let end_column = batch.view.col(self.end);
+            #[cfg(rpq_confirm_admission_probe)]
+            {
+                PROGRAM_OWNED_DIRECT_STEP_CALLS.with(|value| value.set(value.get() + 1));
+                PROGRAM_OWNED_DIRECT_STEP_PARENTS
+                    .with(|value| value.set(value.get() + states.len()));
+            }
+            for (input, (state, row)) in states.drain(..).zip(batch.view.iter()).enumerate() {
+                let RpqStateKind::DirectBoundConfirm { variable, offset } = state.into_kind()
+                else {
+                    panic!("one typed RPQ direct Confirm cohort mixed continuation variants")
+                };
+                let candidates = batch.candidate_sets[input]
+                    .expect("typed RPQ direct Confirm lost its immutable candidate set");
+                assert!(offset < candidates.len());
+                let end = offset
+                    .saturating_add(batch.limits[input])
+                    .min(candidates.len());
+                let mut accepted = candidates[offset..end].to_vec();
+                self.confirm_row(
+                    variable,
+                    start_column.map(|column| &row[column]),
+                    end_column.map(|column| &row[column]),
+                    &mut accepted,
+                );
+                let input_tag =
+                    u32::try_from(input).expect("too many typed RPQ direct Confirm inputs");
+                for candidate in accepted.iter().copied() {
+                    effects.accept(input_tag, candidate);
+                }
+                #[cfg(rpq_confirm_admission_probe)]
+                {
+                    PROGRAM_OWNED_DIRECT_CANDIDATES_IN
+                        .with(|value| value.set(value.get() + end - offset));
+                    PROGRAM_OWNED_DIRECT_CANDIDATES_OUT
+                        .with(|value| value.set(value.get() + accepted.len()));
+                }
+                let resume = (end < candidates.len())
+                    .then(|| TypedResume::Immediate(RpqState::direct_bound_confirm(variable, end)));
+                effects.page(end - offset, resume);
+            }
+            return;
+        }
         if states
             .first()
             .is_some_and(|state| matches!(state.kind(), RpqStateKind::Support))
@@ -3753,6 +4029,11 @@ impl TypedProgramSpec for RegularPathConstraint {
             fanouts.push(fanout);
         }
         if all_fit {
+            #[cfg(rpq_confirm_admission_probe)]
+            {
+                TYPED_BULK_TRANSITION_COHORTS.with(|value| value.set(value.get() + 1));
+                TYPED_BULK_TRANSITION_INPUTS.with(|value| value.set(value.get() + states.len()));
+            }
             #[cfg(test)]
             BULK_TRANSITION_COHORTS.with(|cohorts| cohorts.set(cohorts.get() + 1));
             effects.reserve_children(
@@ -3807,6 +4088,12 @@ impl TypedProgramSpec for RegularPathConstraint {
                 effects.page(fanout, None);
             }
             return;
+        }
+
+        #[cfg(rpq_confirm_admission_probe)]
+        {
+            TYPED_PAGEABLE_TRANSITION_COHORTS.with(|value| value.set(value.get() + 1));
+            TYPED_PAGEABLE_TRANSITION_INPUTS.with(|value| value.set(value.get() + states.len()));
         }
 
         for (input, state) in states.drain(..).enumerate() {
@@ -4760,6 +5047,114 @@ mod seeded_frame_tests {
             .unwrap();
         assert_eq!(same_route.grouping, ProgramGrouping::ParentAtomic);
         assert_eq!(same_route.stratum, ProgramStratum::Fixpoint);
+    }
+
+    #[cfg(rpq_confirm_admission_probe)]
+    #[test]
+    fn program_owned_direct_confirm_reuses_exact_ordinary_predicate_pageably() {
+        let source = rngid();
+        let first = rngid();
+        let second = rngid();
+        let remote_first = rngid();
+        let remote_second = rngid();
+        let attribute = rngid();
+        let source_value = id_into_value(&source.id.raw());
+        let first_value = id_into_value(&first.id.raw());
+        let second_value = id_into_value(&second.id.raw());
+        let remote_first_value = id_into_value(&remote_first.id.raw());
+        let remote_second_value = id_into_value(&remote_second.id.raw());
+        let mut set = TribleSet::new();
+        insert_edge(&mut set, &source, &attribute, first_value);
+        insert_edge(&mut set, &first, &attribute, second_value);
+        insert_edge(&mut set, &remote_first, &attribute, remote_second_value);
+
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let path = RegularPathConstraint::new(
+            set,
+            start,
+            end,
+            &[PathOp::Attr(attribute.id.raw()), PathOp::Plus],
+        );
+        let request = ProgramRequest {
+            action: ProgramAction::Confirm(end.index),
+            bound: VariableSet::new_singleton(start.index),
+        };
+        let program = path.residual_program().unwrap();
+        let route = program.route(request).unwrap();
+        assert_eq!(route.stratum, ProgramStratum::Fixpoint);
+        assert_eq!(route.grouping, ProgramGrouping::ParentAtomic);
+
+        rpq_confirm_admission_probe_reset_callbacks();
+        rpq_confirm_admission_probe_target_action(42, 1, 4);
+        rpq_confirm_admission_probe_program_owned_direct(true);
+        let scope = rpq_confirm_admission_probe_enter_program_owned_seed(42, 1, 4);
+        let vars = [start.index];
+        let rows = [source_value];
+        let view = RowsView::new(&vars, &rows);
+        let activations = [ProgramActivation(1)];
+        let mut runtime = program.new_runtime();
+        let mut seed = ProgramSeedEffects::default();
+        program.seed_batch(
+            &mut runtime,
+            ProgramSeedBatch {
+                request,
+                route,
+                view,
+                activations: &activations,
+            },
+            &mut seed,
+        );
+        drop(scope);
+        assert_eq!(seed.work.len(), 1);
+
+        let candidates = [
+            first_value,
+            remote_first_value,
+            second_value,
+            remote_second_value,
+        ];
+        let candidate_sets = [Some(candidates.as_slice())];
+        let limits = [2];
+        let mut pending = seed.work.pop().unwrap().work;
+        let mut accepted = Vec::new();
+        loop {
+            let work = [pending];
+            let mut effects = ProgramBatchEffects::default();
+            program.step_batch(
+                &mut runtime,
+                ProgramBatch {
+                    stratum: route.stratum,
+                    view,
+                    candidate_sets: &candidate_sets,
+                    activations: &activations,
+                    work: &work,
+                    limits: &limits,
+                },
+                &mut effects,
+            );
+            accepted.extend(effects.accepted.iter().map(|&(_, candidate)| candidate));
+            assert!(effects.children.is_empty());
+            assert!(effects.direct.is_empty());
+            assert!(effects.supported.is_empty());
+            let page = effects.pages.pop().unwrap();
+            assert!(effects.pages.is_empty());
+            match page.resume {
+                Some(crate::query::ProgramResume::Immediate(next)) => pending = next,
+                None => break,
+                Some(_) => panic!("direct Confirm used a non-immediate finite resume"),
+            }
+        }
+
+        assert_eq!(accepted, vec![first_value, second_value]);
+        let snapshot = rpq_confirm_admission_probe_snapshot();
+        assert_eq!(snapshot.program_owned_direct_seed_calls, 1);
+        assert_eq!(snapshot.program_owned_direct_seed_parents, 1);
+        assert_eq!(snapshot.program_owned_direct_seed_candidates, 4);
+        assert_eq!(snapshot.program_owned_direct_candidates_in, 4);
+        assert_eq!(snapshot.program_owned_direct_candidates_out, 2);
+        assert_eq!(snapshot.ordinary_confirm_calls, 0);
+        rpq_confirm_admission_probe_program_owned_direct(false);
     }
 
     #[test]
