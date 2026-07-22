@@ -4118,6 +4118,7 @@ mod seeded_frame_tests {
     use super::*;
     use crate::id::rngid;
     use crate::id::ExclusiveId;
+    use crate::id::Id;
     use crate::inline::encodings::UnknownInline;
     use crate::inline::Inline;
     use crate::query::Binding;
@@ -4567,6 +4568,97 @@ mod seeded_frame_tests {
         assert_eq!(projected, vec![target_value]);
         assert!(query.stats().confirm_action_pops > 0);
         assert!(query.stats().delta_transition_pages > 0);
+    }
+
+    #[test]
+    fn recurrent_empty_tail_remains_a_novelty_backed_child() {
+        let source = rngid();
+        let target = rngid();
+        let repeated = rngid();
+        let final_hop = rngid();
+        let source_value = id_into_value(&source.id.raw());
+        let target_value = id_into_value(&target.id.raw());
+        let mut graph = TribleSet::new();
+        insert_edge(&mut graph, &source, &repeated, source_value);
+        insert_edge(&mut graph, &source, &final_hop, target_value);
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let operations = [
+            PathOp::Attr(repeated.id.raw()),
+            PathOp::Star,
+            PathOp::Attr(final_hop.id.raw()),
+            PathOp::Concat,
+        ];
+        let path = RegularPathConstraint::new(graph, start, end, &operations);
+
+        let mut bound = VariableSet::new_singleton(start.index);
+        bound.set(end.index);
+        let route = TypedProgramSpec::route(
+            &path,
+            ProgramRequest {
+                action: ProgramAction::Support,
+                bound,
+            },
+        )
+        .unwrap();
+        assert_eq!(route.stratum, ProgramStratum::Fixpoint);
+
+        let (effects, bulk_cohorts) =
+            one_support_transition_cohort(&path, &[source_value, target_value], &[2]);
+        assert_eq!(bulk_cohorts, 1);
+        assert!(
+            effects.accepted.is_empty(),
+            "an empty-step tail in a recurrent route must not bypass novelty",
+        );
+        let accepted_children: Vec<_> = effects
+            .children
+            .iter()
+            .filter_map(|child| child.accepted)
+            .collect();
+        assert_eq!(accepted_children, vec![target_value]);
+        assert_eq!(effects.transition_pages, 1);
+        assert_eq!(effects.transition_examined, 2);
+    }
+
+    #[test]
+    fn same_variable_one_hop_resumes_past_a_rejected_neighbor() {
+        let source_id = Id::new([0x22; ID_LEN]).unwrap();
+        let non_loop_id = Id::new([0x11; ID_LEN]).unwrap();
+        let source = ExclusiveId::force_ref(&source_id);
+        let attribute = rngid();
+        let source_value = id_into_value(&source_id.raw());
+        let non_loop_value = id_into_value(&non_loop_id.raw());
+        assert!(non_loop_value < source_value);
+
+        let mut graph = TribleSet::new();
+        insert_edge(&mut graph, source, &attribute, non_loop_value);
+        insert_edge(&mut graph, source, &attribute, source_value);
+        let variable = Variable::<GenId>::new(0);
+        let path = RegularPathConstraint::new(
+            graph,
+            variable,
+            variable,
+            &[PathOp::Attr(attribute.id.raw())],
+        );
+        let mut query = Query::new(path, move |binding: &Binding| {
+            binding.get(variable.index).copied()
+        })
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .cap(1)
+        .start_width(1);
+
+        assert_eq!(query.next(), Some(source_value));
+        assert_eq!(query.stats().delta_source_pages, 1);
+        assert_eq!(query.stats().delta_source_candidates_examined, 1);
+        assert_eq!(query.stats().delta_source_roots, 1);
+        assert_eq!(query.stats().delta_transition_pages, 2);
+        assert_eq!(query.stats().delta_transition_candidates_examined, 2);
+
+        let after_result = query.stats().clone();
+        assert_eq!(query.next(), None);
+        assert_eq!(query.stats(), &after_result);
+        assert_eq!(query.next(), None);
+        assert_eq!(query.stats(), &after_result);
     }
 
     #[test]
