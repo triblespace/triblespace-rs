@@ -1191,11 +1191,11 @@ pub enum ProposalCoverage {
 /// `GroupedSet`: deleting occurrences cannot introduce a duplicate. Appending,
 /// merging, or otherwise introducing occurrences requires a fresh receipt.
 #[doc(hidden)]
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[derive(Default)]
 #[must_use]
 pub struct ProposalLayout(ProposalLayoutKind);
 
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[derive(Default)]
 enum ProposalLayoutKind {
     #[default]
     GroupedBag,
@@ -1211,8 +1211,8 @@ impl ProposalLayout {
         Self(ProposalLayoutKind::GroupedSet)
     }
 
-    pub(crate) const fn is_grouped_set(self) -> bool {
-        matches!(self.0, ProposalLayoutKind::GroupedSet)
+    pub(crate) const fn is_grouped_set(&self) -> bool {
+        matches!(&self.0, ProposalLayoutKind::GroupedSet)
     }
 }
 
