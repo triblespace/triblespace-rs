@@ -2775,6 +2775,19 @@ pub struct ResidualStateStats {
     /// One-atom continuation pops used to probe a delta-to-stable handoff
     /// before returning the rest of that cohort to global cold harvesting.
     pub delta_handoff_probe_pops: usize,
+    /// Quiescent Formula proposal actions evaluated through a certified
+    /// complete Program action instead of opening pageable cyclic work.
+    pub delta_quiescent_formula_complete_actions: usize,
+    /// Exact affine parents evaluated by those complete Formula actions.
+    pub delta_quiescent_formula_complete_parents: usize,
+    /// Raw proposal occurrences returned by those actions before the complete
+    /// adapter's per-parent SET admission.
+    pub delta_quiescent_formula_complete_raw_occurrences: usize,
+    /// Eligible quiescent Formula complete-action transactions that admitted
+    /// no suffix and therefore retained pageable execution. A prefix deferred
+    /// by a successful partial-tail transaction counts only if its own later
+    /// transaction declines.
+    pub delta_quiescent_formula_complete_declines: usize,
     /// Directed scalar steps spent following one exact cyclic activation.
     pub delta_active_lease_steps: usize,
     /// Stable yields after which the same cyclic activation remained live and
@@ -10340,6 +10353,8 @@ struct ResidualStateMachine {
     direct_terminal_publication_enabled: bool,
     #[cfg(test)]
     eager_terminal_phase_enabled: bool,
+    #[cfg(test)]
+    quiescent_formula_complete_enabled: bool,
     last_selection: SelectionKind,
     last_was_action: bool,
     /// Independent confirmed projected-result window. It advances only after
@@ -10590,6 +10605,8 @@ impl ResidualStateMachine {
             direct_terminal_publication_enabled: true,
             #[cfg(test)]
             eager_terminal_phase_enabled: true,
+            #[cfg(test)]
+            quiescent_formula_complete_enabled: true,
             last_selection: SelectionKind::Readiness,
             last_was_action: false,
             terminal_demand_width: 1,
@@ -11504,6 +11521,137 @@ impl ResidualStateMachine {
         })
     }
 
+    /// Evaluates one quiescent Formula proposal through a family-certified
+    /// complete action before opening its pageable graph.
+    ///
+    /// The Formula streamability proof is the independent physical evidence:
+    /// no candidate from this action may cross the surrounding continuation
+    /// before producer EOF. The Program completion receipt is the semantic
+    /// evidence: its complete per-parent occurrence bag is exactly the result
+    /// of draining the selected route. Together they permit a phase change
+    /// without weakening either the Formula barrier or the Program contract.
+    /// A bounded-completion decline leaves `batch` untouched so the caller can
+    /// seed the original pageable route.
+    #[cold]
+    #[inline(never)]
+    fn try_complete_quiescent_formula_program<'a>(
+        &mut self,
+        program: ProgramRef<'a>,
+        request: ProgramRequest,
+        route: ProgramRoute,
+        family: StateId,
+        desc: StateDesc,
+        counter: FormulaPcId,
+        mut batch: FormulaBatch,
+        plan: &ResidualPlan,
+    ) -> Result<DeltaSeedOutcome, FormulaBatch> {
+        assert!(matches!(request.action, ProgramAction::Propose(_)));
+        assert_eq!(route.completion, ProgramCompletion::CompleteActionEquivalent);
+        let capacity = self.width.max(1);
+        let completion = {
+            let affinity = ProgramCompleteAffinity::new(&batch);
+            let vars: Vec<VariableId> = request.bound.into_iter().collect();
+            let complete_batch = ProgramCompleteBatch {
+                request,
+                route,
+                view: rows_view(&vars, &batch.parents.rows, batch.parents.row_count),
+            };
+            program
+                .try_complete_bounded(complete_batch, capacity, &affinity)
+                .map(|completion| {
+                    completion.into_parts_for(complete_batch, &affinity, &batch)
+                })
+        };
+
+        let Some((first_parent, admission, raw_occurrence_count, occurrences)) = completion else {
+            self.stats.delta_quiescent_formula_complete_declines += 1;
+            return Err(batch);
+        };
+        match admission {
+            ProgramCompleteAdmission::LegacyUnquoted => {
+                assert_eq!(
+                    first_parent, 0,
+                    "legacy unquoted Formula completion did not retain its whole batch"
+                );
+            }
+            ProgramCompleteAdmission::Exact {
+                drain_work_units,
+                raw_occurrences,
+            } => {
+                debug_assert!(drain_work_units <= capacity);
+                debug_assert!(raw_occurrences <= capacity);
+                assert_eq!(raw_occurrences, raw_occurrence_count);
+            }
+        }
+
+        if first_parent > 0 {
+            let completed_parent_count = batch.parents.row_count - first_parent;
+            let completed = batch.take_tail(desc.bound.count(), completed_parent_count);
+            let deferred_parents = batch.parents.row_count;
+            let receipt = file_with_plan(
+                &mut self.worklist,
+                &mut self.interner,
+                plan,
+                desc.clone(),
+                StateBucket::Formula(batch),
+                &mut self.stats,
+            )
+            .expect("bounded Formula complete-action prefix is nonempty");
+            debug_assert_eq!(receipt.state, family);
+            batch = completed;
+            debug_assert_eq!(deferred_parents, first_parent);
+        }
+
+        let seeded_parents = batch.parents.row_count;
+        self.stats.delta_quiescent_formula_complete_actions += 1;
+        self.stats.delta_quiescent_formula_complete_parents += seeded_parents;
+        self.stats
+            .delta_quiescent_formula_complete_raw_occurrences += raw_occurrence_count;
+        self.stats.propose_action_pops += 1;
+        self.stats.propose_calls += 1;
+        self.stats.propose_rows += seeded_parents;
+        self.stats.max_propose_rows = self.stats.max_propose_rows.max(seeded_parents);
+        self.stats.candidates_proposed += raw_occurrence_count;
+        self.stats.max_propose_candidates = self
+            .stats
+            .max_propose_candidates
+            .max(raw_occurrence_count);
+
+        let result = CandidatePayload::from_tagged(occurrences, seeded_parents);
+        result.debug_assert_valid_for(seeded_parents);
+        debug_assert!(
+            {
+                let mut admitted = result.clone();
+                admitted.admit_set_forward_stable(seeded_parents)
+                    && admitted.len() == result.len()
+            },
+            "typed Formula complete adapter returned a duplicate candidate"
+        );
+
+        let mut reducer_seeds = Vec::new();
+        let continuation = finish_formula_action_result(
+            plan,
+            desc.bound,
+            counter,
+            batch,
+            result,
+            &mut self.worklist,
+            &mut self.interner,
+            &mut self.stats,
+            &mut reducer_seeds,
+        );
+        let mut outcome = self.delta.seed_formula_reducers(
+            reducer_seeds,
+            plan,
+            &mut self.worklist,
+            &mut self.interner,
+            &mut self.stats,
+        );
+        prefer_continuation(&mut outcome.continuation, continuation);
+        outcome.seeded_parents = seeded_parents;
+        Ok(outcome)
+    }
+
     /// Suspends a currently focused formula Atom behind one transition reducer
     /// activation per affine parent. The exact Action PC ID and every payload
     /// frame remain activation data; [`DeltaDesc`] names only the common
@@ -11657,13 +11805,41 @@ impl ResidualStateMachine {
         };
 
         let SelectedResidualTask {
-            state: _,
+            state,
             desc,
             bucket,
         } = task;
-        let StateBucket::Formula(batch) = bucket else {
+        let StateBucket::Formula(mut batch) = bucket else {
             unreachable!("formula delta action was checked above")
         };
+
+        #[cfg(test)]
+        let complete_enabled = self.quiescent_formula_complete_enabled;
+        #[cfg(not(test))]
+        let complete_enabled = true;
+        if complete_enabled
+            && stage == FormulaStage::Propose
+            && proposal_streaming == FormulaProposalStreaming::Quiescent
+        {
+            if let Some((spec, route)) = program {
+                if route.completion == ProgramCompletion::CompleteActionEquivalent {
+                    match self.try_complete_quiescent_formula_program(
+                        spec,
+                        program_request,
+                        route,
+                        state,
+                        desc.clone(),
+                        counter,
+                        batch,
+                        plan,
+                    ) {
+                        Ok(outcome) => return Ok(outcome),
+                        Err(returned) => batch = returned,
+                    }
+                }
+            }
+        }
+
         match stage {
             FormulaStage::Support => {
                 self.stats.support_action_pops += 1;
@@ -11948,6 +12124,15 @@ impl ResidualStateMachine {
         }
     }
 
+    /// Applies the common geometric response to one globally effectless
+    /// scheduler action. Stable actions report this as [`StepOutcome::Dead`];
+    /// delta seeds can discover the same fact only after their synchronous
+    /// seed effects and live activation token have both come back empty.
+    fn account_dead_scheduler_action(&mut self) {
+        self.increase_width();
+        self.increase_delta_activation_width();
+    }
+
     /// Applies geometric feedback from one delta scheduler step without
     /// confusing exact dead-page telemetry with a globally negative step.
     fn account_delta_feedback(&mut self, outcome: &DeltaStepOutcome) {
@@ -12104,6 +12289,8 @@ impl ResidualStateMachine {
         terminal_activations: Vec<DeltaActivationId>,
         completed_activation_ids: Vec<DeltaActivationId>,
     ) {
+        let made_progress =
+            continuation.is_some() || publication.is_some() || active.is_some();
         if let Some(family) = terminal_family {
             assert_eq!(
                 terminal_activations.len(),
@@ -12132,6 +12319,14 @@ impl ResidualStateMachine {
         }
         for activation in completed_activation_ids {
             self.terminal_yield.complete(activation);
+        }
+        if !made_progress {
+            // Seeding transferred the selected affine parents, but neither a
+            // stable effect nor live cyclic work survived. This is the exact
+            // delta analogue of an ordinary dead action, including when a
+            // synchronous complete-action transaction returned an empty bag.
+            self.stats.dead_action_pops += 1;
+            self.account_dead_scheduler_action();
         }
     }
 
@@ -12325,8 +12520,7 @@ impl ResidualStateMachine {
                 }
                 MachineStep::Stable(StepOutcome::Dead) => {
                     self.continuation = None;
-                    self.increase_width();
-                    self.increase_delta_activation_width();
+                    self.account_dead_scheduler_action();
                 }
                 MachineStep::Stable(StepOutcome::Emit(rows)) => {
                     self.continuation = None;
@@ -12544,6 +12738,8 @@ impl ResidualStateMachine {
             direct_terminal_publication_enabled: self.direct_terminal_publication_enabled,
             #[cfg(test)]
             eager_terminal_phase_enabled: self.eager_terminal_phase_enabled,
+            #[cfg(test)]
+            quiescent_formula_complete_enabled: self.quiescent_formula_complete_enabled,
             last_selection: SelectionKind::Readiness,
             last_was_action: false,
             terminal_demand_width: self.terminal_demand_width,
@@ -12751,8 +12947,7 @@ impl ResidualStateMachine {
                     completed_activation_ids,
                 ),
                 MachineStep::Stable(StepOutcome::Dead) => {
-                    self.increase_width();
-                    self.increase_delta_activation_width();
+                    self.account_dead_scheduler_action();
                 }
                 MachineStep::Stable(StepOutcome::Emit(rows)) => {
                     self.stage_emit(rows);
@@ -14166,6 +14361,8 @@ mod tests {
         Repeated,
         Divergent,
         Declined,
+        DeclinedEquivalent,
+        QuotedSuffix,
         QuotedSingleton,
         Empty,
         Panic,
@@ -14231,7 +14428,10 @@ mod tests {
                 let value = raw(90 + row[0][0]);
                 let accepted = matches!(
                     self.mode,
-                    TerminalProgramMode::Equivalent | TerminalProgramMode::Divergent
+                    TerminalProgramMode::Equivalent
+                        | TerminalProgramMode::Divergent
+                        | TerminalProgramMode::DeclinedEquivalent
+                        | TerminalProgramMode::QuotedSuffix
                 )
                 .then_some(value);
                 let repeated = (self.mode == TerminalProgramMode::Repeated).then_some(value);
@@ -14256,7 +14456,7 @@ mod tests {
 
         fn complete_typed(&self, batch: ProgramCompleteBatch<'_>, effects: &mut TypedCompleteSink) {
             match self.mode {
-                TerminalProgramMode::Equivalent => {
+                TerminalProgramMode::Equivalent | TerminalProgramMode::QuotedSuffix => {
                     for (parent, row) in batch.view.iter().enumerate() {
                         effects.push(parent as u32, raw(90 + row[0][0]));
                     }
@@ -14269,7 +14469,9 @@ mod tests {
                     }
                 }
                 TerminalProgramMode::Divergent | TerminalProgramMode::Empty => {}
-                TerminalProgramMode::Declined | TerminalProgramMode::QuotedSingleton => {
+                TerminalProgramMode::Declined
+                | TerminalProgramMode::DeclinedEquivalent
+                | TerminalProgramMode::QuotedSingleton => {
                     panic!("declined complete action was executed")
                 }
                 TerminalProgramMode::Panic => {
@@ -14291,7 +14493,19 @@ mod tests {
             batch: ProgramCompleteBatch<'_>,
         ) -> ProgramCompleteWorkEvidence {
             match self.mode {
-                TerminalProgramMode::Declined => ProgramCompleteWorkEvidence::Declined,
+                TerminalProgramMode::Declined | TerminalProgramMode::DeclinedEquivalent => {
+                    ProgramCompleteWorkEvidence::Declined
+                }
+                TerminalProgramMode::QuotedSuffix => ProgramCompleteWorkEvidence::Quoted(
+                    batch
+                        .view
+                        .iter()
+                        .map(|row| ProgramCompleteWorkQuote {
+                            drain_work_units: if row[0][0] == 10 { 9 } else { 1 },
+                            raw_occurrences: 1,
+                        })
+                        .collect(),
+                ),
                 TerminalProgramMode::QuotedSingleton => ProgramCompleteWorkEvidence::Quoted(vec![
                         ProgramCompleteWorkQuote {
                             drain_work_units: 1,
@@ -16897,6 +17111,50 @@ mod tests {
                 let minimum = values.iter().copied().min();
                 values.retain(|value| Some(*value) == minimum);
             });
+        }
+    }
+
+    #[derive(Clone)]
+    struct WholeGroupTraceLeaf {
+        variable: VariableId,
+        estimate: usize,
+        calls: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl Constraint<'static> for WholeGroupTraceLeaf {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(self.variable)
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != self.variable {
+                return false;
+            }
+            out.fill(self.estimate, view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn confirm(
+            &self,
+            variable: VariableId,
+            _view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            assert_eq!(variable, self.variable);
+            self.calls.lock().unwrap().push(candidates.len());
         }
     }
 
@@ -24405,16 +24663,27 @@ mod tests {
         assert_eq!(region_results, expected);
         match action {
             FormulaProgramOracleAction::Propose => {
-                assert!(region.stats().propose_action_pops > 0)
+                assert!(region.stats().propose_action_pops > 0);
+                assert_eq!(region.stats().delta_transition_pages, 0);
+                assert_eq!(region.stats().delta_source_pages, 0);
+                assert_eq!(region.stats().delta_quiescent_formula_complete_actions, 1);
+                assert_eq!(region.stats().delta_quiescent_formula_complete_parents, 1);
+                assert_eq!(
+                    region
+                        .stats()
+                        .delta_quiescent_formula_complete_raw_occurrences,
+                    expected.len()
+                );
             }
             FormulaProgramOracleAction::GroupedConfirm => {
-                assert!(region.stats().confirm_action_pops > 0)
+                assert!(region.stats().confirm_action_pops > 0);
+                assert!(region.stats().delta_transition_pages > 0);
             }
             FormulaProgramOracleAction::Support => {
-                assert!(region.stats().support_action_pops > 0)
+                assert!(region.stats().support_action_pops > 0);
+                assert!(region.stats().delta_transition_pages > 0);
             }
         }
-        assert!(region.stats().delta_transition_pages > 0);
         assert_eq!(
             &default_query
                 .residual
@@ -24444,16 +24713,33 @@ mod tests {
         assert_eq!(production_results, expected);
         match action {
             FormulaProgramOracleAction::Propose => {
-                assert!(production.stats().propose_action_pops > 0)
+                assert!(production.stats().propose_action_pops > 0);
+                assert_eq!(production.stats().delta_transition_pages, 0);
+                assert_eq!(production.stats().delta_source_pages, 0);
+                assert_eq!(
+                    production.stats().delta_quiescent_formula_complete_actions,
+                    1
+                );
+                assert_eq!(
+                    production.stats().delta_quiescent_formula_complete_parents,
+                    1
+                );
+                assert_eq!(
+                    production
+                        .stats()
+                        .delta_quiescent_formula_complete_raw_occurrences,
+                    expected.len()
+                );
             }
             FormulaProgramOracleAction::GroupedConfirm => {
-                assert!(production.stats().confirm_action_pops > 0)
+                assert!(production.stats().confirm_action_pops > 0);
+                assert!(production.stats().delta_transition_pages > 0);
             }
             FormulaProgramOracleAction::Support => {
-                assert!(production.stats().support_action_pops > 0)
+                assert!(production.stats().support_action_pops > 0);
+                assert!(production.stats().delta_transition_pages > 0);
             }
         }
-        assert!(production.stats().delta_transition_pages > 0);
         assert_program_fallbacks_unused(&production_counters);
     }
 
@@ -24499,6 +24785,277 @@ mod tests {
             ],
             FormulaProgramOracleAction::Propose,
         );
+    }
+
+    #[test]
+    fn quiescent_formula_complete_action_preserves_barrier_clone_and_drop() {
+        use crate::id::id_into_value;
+        use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
+
+        let fixture = production_formula_rpq_fixture();
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let operations = [PathOp::Attr(fixture.attribute.raw()), PathOp::Plus];
+        let counters = program_fallback_counters();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let path = program_only_rpq(
+            RegularPathConstraint::new(fixture.graph, start, end, &operations),
+            &counters,
+        );
+        let root = Arc::new(IntersectionConstraint::new(vec![
+            preferred_fanout(start.index, vec![id_into_value(&fixture.source)], 0),
+            Box::new(UnionConstraint::new(vec![
+                Box::new(path) as ShapeConstraint
+            ])) as ShapeConstraint,
+            Box::new(WholeGroupTraceLeaf {
+                variable: end.index,
+                estimate: usize::MAX,
+                calls: Arc::clone(&calls),
+            }) as ShapeConstraint,
+        ]));
+        let project = move |binding: &Binding| binding.get(end.index).copied();
+        let mut query = Query::new(root, project)
+            .solve_residual_state_lazy_with(ResidualLowering::PRODUCTION)
+            .cap(3)
+            .start_width(1)
+            .growth(2);
+
+        let first = query.next().expect("the complete RPQ action is nonempty");
+        assert_eq!(
+            &*calls.lock().unwrap(),
+            &[3],
+            "the non-page-local suffix observed a complete endpoint relation before publication"
+        );
+        assert_eq!(query.stats().delta_quiescent_formula_complete_actions, 1);
+        assert_eq!(query.stats().delta_quiescent_formula_complete_parents, 1);
+        assert_eq!(
+            query
+                .stats()
+                .delta_quiescent_formula_complete_raw_occurrences,
+            3
+        );
+        assert_eq!(query.stats().delta_quiescent_formula_complete_declines, 0);
+        assert_eq!(query.stats().delta_source_pages, 0);
+        assert_eq!(query.stats().delta_transition_pages, 0);
+        assert_program_fallbacks_unused(&counters);
+
+        let sibling = query.clone();
+        let cancelled = query.clone();
+        drop(cancelled);
+        assert_eq!(&*calls.lock().unwrap(), &[3]);
+
+        let mut left: Vec<_> = query.collect();
+        let mut right: Vec<_> = sibling.collect();
+        left.sort_unstable();
+        right.sort_unstable();
+        assert_eq!(left, right, "a clone changed the staged exact remainder");
+
+        let mut expected = vec![
+            id_into_value(&fixture.direct),
+            id_into_value(&fixture.sibling),
+            id_into_value(&fixture.transitive),
+        ];
+        let first_position = expected
+            .iter()
+            .position(|value| *value == first)
+            .expect("the first row belongs to the complete endpoint relation");
+        expected.remove(first_position);
+        expected.sort_unstable();
+        assert_eq!(left, expected);
+        assert_eq!(&*calls.lock().unwrap(), &[3]);
+        assert_program_fallbacks_unused(&counters);
+    }
+
+    #[test]
+    fn quiescent_formula_complete_action_deduplicates_and_declines_transactionally() {
+        let make = |mode, calls: Arc<Mutex<Vec<usize>>>| {
+            IntersectionConstraint::new(vec![
+                preferred_fanout(0, vec![raw(7)], 0),
+                Box::new(UnionConstraint::new(vec![
+                    Box::new(TerminalProgramLeaf { variable: 1, mode }) as ShapeConstraint,
+                ])) as ShapeConstraint,
+                Box::new(WholeGroupTraceLeaf {
+                    variable: 1,
+                    estimate: usize::MAX,
+                    calls,
+                }) as ShapeConstraint,
+            ])
+        };
+        let project = |binding: &Binding| {
+            Some((binding.get(0).copied()?, binding.get(1).copied()?))
+        };
+
+        let repeated_calls = Arc::new(Mutex::new(Vec::new()));
+        let repeated = Query::new(
+            make(TerminalProgramMode::Repeated, Arc::clone(&repeated_calls)),
+            project,
+        )
+        .solve_residual_state_lazy_with(ResidualLowering::PRODUCTION)
+        .cap(1)
+        .start_width(1)
+        .collect_profiled();
+        assert_eq!(repeated.results, [(raw(7), raw(97))]);
+        assert_eq!(&*repeated_calls.lock().unwrap(), &[1]);
+        assert_eq!(repeated.stats.delta_quiescent_formula_complete_actions, 1);
+        assert_eq!(repeated.stats.delta_quiescent_formula_complete_parents, 1);
+        assert_eq!(
+            repeated
+                .stats
+                .delta_quiescent_formula_complete_raw_occurrences,
+            2
+        );
+        assert_eq!(repeated.stats.delta_quiescent_formula_complete_declines, 0);
+        assert_eq!(repeated.stats.delta_source_pages, 0);
+        assert_eq!(repeated.stats.delta_transition_pages, 0);
+
+        let declined_calls = Arc::new(Mutex::new(Vec::new()));
+        let declined = Query::new(
+            make(
+                TerminalProgramMode::DeclinedEquivalent,
+                Arc::clone(&declined_calls),
+            ),
+            project,
+        )
+        .solve_residual_state_lazy_with(ResidualLowering::PRODUCTION)
+        .cap(1)
+        .start_width(1)
+        .collect_profiled();
+        assert_eq!(declined.results, [(raw(7), raw(97))]);
+        assert_eq!(&*declined_calls.lock().unwrap(), &[1]);
+        assert_eq!(declined.stats.delta_quiescent_formula_complete_actions, 0);
+        assert_eq!(declined.stats.delta_quiescent_formula_complete_parents, 0);
+        assert_eq!(
+            declined
+                .stats
+                .delta_quiescent_formula_complete_raw_occurrences,
+            0
+        );
+        assert_eq!(declined.stats.delta_quiescent_formula_complete_declines, 1);
+
+        let pageable_calls = Arc::new(Mutex::new(Vec::new()));
+        let pageable = Query::new(
+            make(
+                TerminalProgramMode::Divergent,
+                Arc::clone(&pageable_calls),
+            ),
+            project,
+        )
+        .solve_residual_state_lazy_with(ResidualLowering::PRODUCTION)
+        .cap(1)
+        .start_width(1)
+        .collect_profiled();
+        assert_eq!(pageable.results, [(raw(7), raw(97))]);
+        assert_eq!(&*pageable_calls.lock().unwrap(), &[1]);
+        assert_eq!(pageable.stats.delta_quiescent_formula_complete_actions, 0);
+        assert_eq!(pageable.stats.delta_quiescent_formula_complete_declines, 0);
+
+        let empty_calls = Arc::new(Mutex::new(Vec::new()));
+        let empty_root = IntersectionConstraint::new(vec![
+            preferred_fanout(0, vec![raw(7)], 0),
+            Box::new(UnionConstraint::new(vec![
+                Box::new(TerminalProgramLeaf {
+                    variable: 1,
+                    mode: TerminalProgramMode::Empty,
+                }) as ShapeConstraint,
+                Box::new(FanoutLeaf {
+                    variable: 1,
+                    values: Arc::new(vec![raw(55)]),
+                }) as ShapeConstraint,
+            ])) as ShapeConstraint,
+            Box::new(WholeGroupTraceLeaf {
+                variable: 1,
+                estimate: usize::MAX,
+                calls: Arc::clone(&empty_calls),
+            }) as ShapeConstraint,
+        ]);
+        let empty = Query::new(empty_root, project)
+            .solve_residual_state_lazy_with(ResidualLowering::PRODUCTION)
+            .cap(1)
+            .start_width(1)
+            .collect_profiled();
+        assert_eq!(empty.results, [(raw(7), raw(55))]);
+        assert_eq!(&*empty_calls.lock().unwrap(), &[1]);
+        assert_eq!(empty.stats.delta_quiescent_formula_complete_actions, 1);
+        assert_eq!(empty.stats.delta_quiescent_formula_complete_parents, 1);
+        assert_eq!(
+            empty
+                .stats
+                .delta_quiescent_formula_complete_raw_occurrences,
+            0
+        );
+        assert_eq!(empty.stats.delta_quiescent_formula_complete_declines, 0);
+
+        let dead_calls = Arc::new(Mutex::new(Vec::new()));
+        let dead = Query::new(
+            make(TerminalProgramMode::Empty, Arc::clone(&dead_calls)),
+            project,
+        )
+        .solve_residual_state_lazy_with(ResidualLowering::PRODUCTION)
+        .cap(2)
+        .start_width(1)
+        .growth(2)
+        .collect_profiled();
+        assert!(dead.results.is_empty());
+        assert!(dead_calls.lock().unwrap().is_empty());
+        assert_eq!(dead.stats.delta_quiescent_formula_complete_actions, 1);
+        assert_eq!(dead.stats.delta_quiescent_formula_complete_parents, 1);
+        assert_eq!(
+            dead.stats
+                .delta_quiescent_formula_complete_raw_occurrences,
+            0
+        );
+        assert_eq!(dead.stats.delta_quiescent_formula_complete_declines, 0);
+        assert_eq!(dead.stats.dead_action_pops, 1);
+        assert_eq!(
+            dead.stats.width_increases, 1,
+            "an effectless complete Formula seed shares ordinary dead-action widening"
+        );
+        assert_eq!(
+            dead.stats.delta_activation_width_increases, 1,
+            "an effectless complete Formula seed also widens the cyclic scheduler"
+        );
+
+        let suffix_calls = Arc::new(Mutex::new(Vec::new()));
+        let suffix_root = IntersectionConstraint::new(vec![
+            preferred_fanout(0, vec![raw(10), raw(11), raw(12)], 0),
+            Box::new(UnionConstraint::new(vec![
+                Box::new(TerminalProgramLeaf {
+                    variable: 1,
+                    mode: TerminalProgramMode::QuotedSuffix,
+                }) as ShapeConstraint,
+            ])) as ShapeConstraint,
+            Box::new(WholeGroupTraceLeaf {
+                variable: 1,
+                estimate: usize::MAX,
+                calls: Arc::clone(&suffix_calls),
+            }) as ShapeConstraint,
+        ]);
+        let mut suffix = Query::new(suffix_root, project)
+            .solve_residual_state_lazy_with(ResidualLowering::PRODUCTION)
+            .cap(3)
+            .start_width(3)
+            .growth(1)
+            .collect_profiled();
+        suffix.results.sort_unstable();
+        assert_eq!(
+            suffix.results,
+            [
+                (raw(10), raw(100)),
+                (raw(11), raw(101)),
+                (raw(12), raw(102)),
+            ]
+        );
+        assert_eq!(suffix.stats.delta_quiescent_formula_complete_actions, 1);
+        assert_eq!(suffix.stats.delta_quiescent_formula_complete_parents, 2);
+        assert_eq!(
+            suffix
+                .stats
+                .delta_quiescent_formula_complete_raw_occurrences,
+            2
+        );
+        assert_eq!(suffix.stats.delta_quiescent_formula_complete_declines, 1);
+        let suffix_calls = suffix_calls.lock().unwrap();
+        assert_eq!(suffix_calls.iter().sum::<usize>(), 3);
     }
 
     #[test]
@@ -24888,7 +25445,14 @@ mod tests {
         assert!(supported.contains(&(id_into_value(&nodes[0]), id_into_value(&nodes[1]))));
         assert!(supported.contains(&(id_into_value(&nodes[2]), id_into_value(&nodes[4]))));
         assert!(supported_query.stats().support_action_pops > 0);
-        assert!(supported_query.stats().delta_transition_pages > 0);
+        assert!(
+            supported_query
+                .stats()
+                .delta_quiescent_formula_complete_actions
+                > 0,
+            "the bound-endpoint proposals did not use their complete-action certificate"
+        );
+        assert_eq!(supported_query.stats().delta_transition_pages, 0);
         assert_program_fallbacks_unused(&support_counters);
     }
 
@@ -25307,6 +25871,10 @@ mod tests {
             .cap(64)
             .start_width(1)
             .growth(2);
+        // This is a sparse physical-focus regression. Keep the certified
+        // phase change disabled so it continues to measure the pageable
+        // scheduler rather than the newer quiescent complete-action route.
+        focused.state.quiescent_formula_complete_enabled = false;
         let focused_first = focused.next().expect("the ring has a path result");
         let focused_first_stats = focused.stats().clone();
         assert_eq!(
@@ -25327,6 +25895,7 @@ mod tests {
             .cap(64)
             .start_width(1)
             .growth(2);
+        cold.state.quiescent_formula_complete_enabled = false;
         cold.state.continuation_sprint_enabled = false;
         let cold_first = cold.next().expect("the control ring has a path result");
         let cold_first_stats = cold.stats().clone();

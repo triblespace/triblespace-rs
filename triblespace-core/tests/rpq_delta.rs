@@ -1628,7 +1628,19 @@ fn cyclic_rpq_runs_as_a_direct_finite_or_proposal_action() {
     let mut expected: Vec<_> = (1..4).map(|node| graph.value(node).raw).collect();
     expected.sort_unstable();
     assert_eq!(lowered, expected);
-    assert!(lowered_query.stats().delta_transition_pages > 0);
+    assert_eq!(lowered_query.stats().delta_transition_pages, 0);
+    assert_eq!(
+        lowered_query
+            .stats()
+            .delta_quiescent_formula_complete_actions,
+        1
+    );
+    assert_eq!(
+        lowered_query
+            .stats()
+            .delta_quiescent_formula_complete_raw_occurrences,
+        3
+    );
 }
 
 #[test]
@@ -1745,7 +1757,23 @@ fn cyclic_rpq_runs_in_a_finite_and_as_proposer_and_grouped_confirmer() {
         expected.sort_unstable();
         assert_eq!(lowered, sequential);
         assert_eq!(lowered, expected);
-        assert!(lowered_query.stats().delta_transition_pages > 0);
+        if path_estimate_wins {
+            assert_eq!(lowered_query.stats().delta_transition_pages, 0);
+            assert_eq!(
+                lowered_query
+                    .stats()
+                    .delta_quiescent_formula_complete_actions,
+                1
+            );
+        } else {
+            assert!(lowered_query.stats().delta_transition_pages > 0);
+            assert_eq!(
+                lowered_query
+                    .stats()
+                    .delta_quiescent_formula_complete_actions,
+                0
+            );
+        }
     }
 }
 
@@ -1800,7 +1828,17 @@ fn cyclic_rpq_resumes_through_recursive_or_and_or_frames() {
         expected.sort_unstable();
         assert_eq!(lowered, sequential);
         assert_eq!(lowered, expected);
-        assert!(lowered_query.stats().delta_transition_pages > 0);
+        if outer_confirmation {
+            assert!(lowered_query.stats().delta_transition_pages > 0);
+        } else {
+            assert_eq!(lowered_query.stats().delta_transition_pages, 0);
+            assert!(
+                lowered_query
+                    .stats()
+                    .delta_quiescent_formula_complete_actions
+                    > 0
+            );
+        }
     }
 }
 
@@ -2139,6 +2177,8 @@ fn production_region_direct_or_streams_through_a_page_local_outer_filter() {
     assert_eq!(first, graph.value(1).raw);
     assert_eq!(query.stats().delta_transition_pages, 1);
     assert_eq!(query.stats().delta_transition_candidates_examined, 1);
+    assert_eq!(query.stats().delta_quiescent_formula_complete_actions, 0);
+    assert_eq!(query.stats().delta_quiescent_formula_complete_declines, 0);
     assert_eq!(
         *calls.lock().unwrap(),
         [1],
@@ -2193,16 +2233,43 @@ fn production_region_direct_or_retains_outer_streaming_barriers() {
         assert_eq!(query.next(), Some(graph.value(1).raw), "{name}");
         assert_eq!(
             query.stats().delta_transition_pages,
-            8,
-            "the {name} suffix admitted an endpoint before Program EOF"
+            0,
+            "the {name} suffix opened pageable work despite its complete-action certificate"
         );
         assert_eq!(
             query.stats().delta_transition_candidates_examined,
-            7,
-            "the {name} suffix did not drain the complete live Program"
+            0,
+            "the {name} suffix traversed after its complete-action phase change"
         );
+        assert_eq!(
+            query.stats().delta_quiescent_formula_complete_actions,
+            1,
+            "the {name} suffix did not use its certified complete action"
+        );
+        assert_eq!(query.stats().delta_quiescent_formula_complete_parents, 1);
+        assert_eq!(
+            query
+                .stats()
+                .delta_quiescent_formula_complete_raw_occurrences,
+            7
+        );
+        assert_eq!(query.stats().delta_quiescent_formula_complete_declines, 0);
         assert_eq!(query.next(), None, "{name}");
-        assert!(!calls.lock().unwrap().is_empty(), "{name}");
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.iter().sum::<usize>(), 7, "{name}");
+        if certified {
+            assert_eq!(
+                &*calls,
+                &[7],
+                "the {name} suffix did not receive one complete endpoint relation"
+            );
+        } else {
+            assert_eq!(
+                &*calls,
+                &[1, 1, 1, 1, 1, 1, 1],
+                "the action-defined suffix changed its per-occurrence confirmation shape"
+            );
+        }
     }
 }
 
@@ -2384,10 +2451,17 @@ fn nested_regional_or_remains_quiescent_until_the_live_program_reaches_eof() {
     assert!(query.next().is_some());
     assert_eq!(
         query.stats().delta_transition_pages,
-        8,
-        "a second OR ancestor failed to retain the structural barrier"
+        0,
+        "the nested barrier opened pageable work despite its complete-action certificate"
     );
-    assert_eq!(query.stats().delta_transition_candidates_examined, 7);
+    assert_eq!(query.stats().delta_transition_candidates_examined, 0);
+    assert_eq!(query.stats().delta_quiescent_formula_complete_actions, 1);
+    assert_eq!(
+        query
+            .stats()
+            .delta_quiescent_formula_complete_raw_occurrences,
+        7
+    );
 }
 
 #[test]
@@ -2473,6 +2547,14 @@ fn clone_and_drop_preserve_a_live_formula_cyclic_remainder() {
             unbound_estimate: 0,
             values: vec![graph.value(0).raw, graph.value(4).raw],
         }) as DynConstraint,
+        Box::new(OrderedDomain {
+            variable: END,
+            gate: START,
+            unbound_estimate: usize::MAX,
+            values: [1, 2, 3, 5, 6, 7]
+                .map(|node| graph.value(node).raw)
+                .to_vec(),
+        }) as DynConstraint,
         Box::new(UnionConstraint::new(vec![cyclic])) as DynConstraint,
     ]));
     let mut query = Query::new(root, project_pair)
@@ -2481,12 +2563,9 @@ fn clone_and_drop_preserve_a_live_formula_cyclic_remainder() {
         .start_width(1);
 
     let first = query.next().expect("one source activation quiesced");
-    assert_eq!(query.stats().delta_transition_pages, 4);
-    assert_eq!(
-        query.stats().delta_transition_candidates_examined,
-        3,
-        "the other source activation must remain live"
-    );
+    assert!(query.stats().delta_transition_pages > 0);
+    assert!(query.stats().delta_transition_candidates_examined > 0);
+    assert_eq!(query.stats().delta_quiescent_formula_complete_actions, 0);
     let exact_clone = query.clone();
     let cancelled = query.clone();
     drop(cancelled);
@@ -2530,7 +2609,14 @@ fn formula_transition_lowering_remains_capability_and_shape_gated() {
     let mut query =
         Query::new(root, project_end).solve_residual_state_lazy_with(combined_effects());
     assert_eq!(query.by_ref().collect::<Vec<_>>(), vec![graph.value(1).raw]);
-    assert!(query.stats().delta_transition_pages > 0);
+    assert_eq!(query.stats().delta_transition_pages, 0);
+    assert_eq!(query.stats().delta_quiescent_formula_complete_actions, 1);
+    assert_eq!(
+        query
+            .stats()
+            .delta_quiescent_formula_complete_raw_occurrences,
+        1
+    );
 }
 
 #[test]
@@ -2609,7 +2695,25 @@ fn formula_cyclic_activations_preserve_duplicate_outer_parents() {
     ];
     expected.sort_unstable();
     assert_eq!(lowered, expected);
-    assert!(lowered_query.stats().delta_transition_pages > 0);
+    assert_eq!(lowered_query.stats().delta_transition_pages, 0);
+    assert!(
+        lowered_query
+            .stats()
+            .delta_quiescent_formula_complete_actions
+            > 0
+    );
+    assert_eq!(
+        lowered_query
+            .stats()
+            .delta_quiescent_formula_complete_parents,
+        2
+    );
+    assert_eq!(
+        lowered_query
+            .stats()
+            .delta_quiescent_formula_complete_raw_occurrences,
+        4
+    );
 }
 
 #[cfg(feature = "parallel")]

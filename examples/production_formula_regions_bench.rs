@@ -990,16 +990,25 @@ fn semantic_and_mechanism_preflight(fixtures: &[Fixture]) {
     let mut query = barrier.make_iter_with_calls(Mode::C, Some(Arc::clone(&calls)));
     let first = query.next().expect("barrier fixture has a result");
     assert!(barrier.expected.contains(&first));
+    assert_eq!(query.stats().delta_source_pages, 0);
+    assert_eq!(query.stats().delta_transition_pages, 0);
+    assert_eq!(query.stats().delta_transition_candidates_examined, 0);
+    assert_eq!(query.stats().delta_quiescent_formula_complete_actions, 1);
+    assert_eq!(query.stats().delta_quiescent_formula_complete_parents, 1);
     assert_eq!(
-        query.stats().delta_transition_candidates_examined,
-        barrier.scale,
-        "non-page-local barrier published before cyclic EOF"
+        query
+            .stats()
+            .delta_quiescent_formula_complete_raw_occurrences,
+        barrier.scale
     );
-    assert!(!calls.lock().expect("filter trace poisoned").is_empty());
+    assert_eq!(query.stats().delta_quiescent_formula_complete_declines, 0);
+    let filter_calls = calls.lock().expect("filter trace poisoned");
+    assert_eq!(filter_calls.as_slice(), [barrier.scale]);
+    drop(filter_calls);
     print_mechanism(
         "barrier_quiescence",
         format_args!(
-            "fixture={};examined={};eof={}",
+            "fixture={};complete_actions=1;parents=1;raw={};graph_pages=0;eof={}",
             barrier.label, barrier.scale, barrier.scale
         ),
     );
