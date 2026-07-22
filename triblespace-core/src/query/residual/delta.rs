@@ -1749,6 +1749,12 @@ impl ProducerRegistry {
 
     /// Replaces one opaque typed producer through the single affine law.
     ///
+    /// `prior_observed` contains accepting child endpoints from earlier pages
+    /// fused into this receipt. Streaming SET admission visits that prefix
+    /// before this page's direct and observed values, preserving the exact
+    /// page chronology without classifying those endpoints as source-direct
+    /// effects.
+    ///
     /// Immediate resumes are siblings of admitted children. `AfterChildren`
     /// creates a receipt-local join whose final descendant releases exactly
     /// that resume; the engine never inspects the typed state that requested
@@ -1758,6 +1764,7 @@ impl ProducerRegistry {
         parent: ProducerCredit,
         state: DeltaStateId,
         children: &[ProgramChild],
+        prior_observed: impl IntoIterator<Item = RawInline>,
         observed: impl IntoIterator<Item = RawInline>,
         direct: impl IntoIterator<Item = RawInline>,
         reported_support: bool,
@@ -1783,6 +1790,7 @@ impl ProducerRegistry {
             }
         };
 
+        let mut prior_observed: SmallVec<[RawInline; 1]> = prior_observed.into_iter().collect();
         let observed: SmallVec<[RawInline; 1]> = observed.into_iter().collect();
         let mut direct: SmallVec<[RawInline; 1]> = direct.into_iter().collect();
         let raw_stream_occurrences = {
@@ -1794,7 +1802,8 @@ impl ProducerRegistry {
             if activation.reducer.streams() {
                 direct
                     .len()
-                    .checked_add(observed.len())
+                    .checked_add(prior_observed.len())
+                    .and_then(|count| count.checked_add(observed.len()))
                     .and_then(|count| {
                         count.checked_add(
                             children
@@ -1821,7 +1830,7 @@ impl ProducerRegistry {
                     DeltaReducer::StreamProposal | DeltaReducer::StreamFormulaProposal,
                     _,
                 ) => {
-                    for value in direct.drain(..) {
+                    for value in prior_observed.drain(..).chain(direct.drain(..)) {
                         if activation.accepted.insert(value) {
                             accepted.push(value);
                         }
@@ -1912,11 +1921,15 @@ impl ProducerRegistry {
                 }
                 (DeltaReducer::Support { .. } | DeltaReducer::Confirm { .. }, _) => {
                     assert!(
-                        direct.is_empty(),
-                        "a non-proposal program reducer observed direct candidates"
+                        prior_observed.is_empty() && direct.is_empty(),
+                        "a non-proposal program reducer observed proposal candidates"
                     )
                 }
             }
+            assert!(
+                prior_observed.is_empty(),
+                "only streaming proposal reducers may receive prior observations"
+            );
             for value in observed
                 .into_iter()
                 .chain(children.iter().filter_map(|child| child.accepted))
@@ -2207,6 +2220,23 @@ impl ProducerRegistry {
             .expect("unknown delta activation")
             .reducer
             .streams()
+    }
+
+    /// Whether one Program credit is the activation's complete unjoined
+    /// producer frontier. A receipt-local child may reuse this ownership only
+    /// while no sibling or structured join can observe an intermediate
+    /// replacement boundary.
+    fn program_credit_is_unjoined_unique(&self, credit: &ProducerCredit) -> bool {
+        let activation = self
+            .state
+            .activations
+            .get(&credit.key.activation)
+            .expect("unknown program activation");
+        activation.live.len() == 1
+            && matches!(
+                activation.live.get(&credit.key.nonce),
+                Some(CreditKind::Program { join: None })
+            )
     }
 
     fn physical_activation_class(&self, activation: ActivationId) -> DeltaPhysicalClass {
@@ -2780,6 +2810,8 @@ struct ProgramSchedulerScratch {
     task_receipts: Vec<ProgramTaskReceipt>,
     work: Vec<ProgramWork>,
     receipt: ProgramBatchEffects,
+    fused_receipt: ProgramBatchEffects,
+    receipt_local_observed_prefix: Vec<RawInline>,
     child_ranges: Vec<std::ops::Range<usize>>,
     direct_ranges: Vec<std::ops::Range<usize>>,
     accepted_ranges: Vec<std::ops::Range<usize>>,
@@ -2804,14 +2836,18 @@ enum ProgramCohortClass {
 }
 
 impl ProgramCohortClass {
-    fn of(registry: &ProducerRegistry, task: &ProgramTask) -> Self {
-        let physical = registry.physical_activation_class(task.activation);
-        match task.work.pacing {
+    fn of_work(
+        registry: &ProducerRegistry,
+        activation: ActivationId,
+        pacing: ProgramPacing,
+    ) -> Self {
+        let physical = registry.physical_activation_class(activation);
+        match pacing {
             ProgramPacing::Search => Self::Search { physical },
             ProgramPacing::Activation if physical == DeltaPhysicalClass::TerminalStreaming => {
                 Self::ActivationTerminalStreaming
             }
-            ProgramPacing::Activation if registry.activation_streams(task.activation) => {
+            ProgramPacing::Activation if registry.activation_streams(activation) => {
                 Self::ActivationStreaming
             }
             ProgramPacing::Activation => Self::ActivationQuiescent,
@@ -2842,12 +2878,17 @@ struct ProgramCohortKey {
 
 impl ProgramCohortKey {
     fn of(registry: &ProducerRegistry, task: &ProgramTask) -> Self {
-        let (bound, has_candidates) = registry.source_dispatch_shape(task.activation);
+        Self::of_work(registry, task.activation, &task.work)
+    }
+
+    fn of_work(registry: &ProducerRegistry, activation: ActivationId, work: &ProgramWork) -> Self {
+        let (bound, has_candidates) = registry.source_dispatch_shape(activation);
+        let class = ProgramCohortClass::of_work(registry, activation, work.pacing);
         Self {
-            dispatch: task.work.dispatch,
+            dispatch: work.dispatch,
             bound,
             has_candidates,
-            class: ProgramCohortClass::of(registry, task),
+            class,
         }
     }
 }
@@ -6195,6 +6236,7 @@ impl DeltaScheduler {
                 state,
                 tasks,
                 &dispatch.task_limits,
+                true,
                 direct_terminal_full,
                 stable,
                 stable_interner,
@@ -6346,6 +6388,7 @@ impl DeltaScheduler {
                 state,
                 tasks,
                 &dispatch.task_limits,
+                false,
                 direct_terminal_publication_full,
                 stable,
                 stable_interner,
@@ -6666,9 +6709,11 @@ impl DeltaScheduler {
     }
 
     /// Executes one physically compatible cohort of opaque typed
-    /// continuations. The erased family boundary is crossed once: handles are
-    /// affinely taken into a dense typed vector, and the adapter returns one
-    /// replacement receipt per input in scheduler order.
+    /// continuations. Handles are affinely taken into a dense typed vector,
+    /// and the adapter returns one replacement receipt per input in scheduler
+    /// order. A directed singleton may cross the same erased family boundary
+    /// again for exact sole children while spending the original grant; the
+    /// registry still observes one final replacement receipt.
     #[allow(clippy::too_many_arguments)]
     fn step_program<'a>(
         &mut self,
@@ -6677,6 +6722,7 @@ impl DeltaScheduler {
         state: DeltaStateId,
         mut tasks: Vec<ProgramTask>,
         limits: &[usize],
+        directed_active: bool,
         direct_terminal_full: Option<VariableSet>,
         stable: &mut Worklist,
         stable_interner: &mut StateInterner,
@@ -6752,7 +6798,6 @@ impl DeltaScheduler {
             },
             &mut scratch.receipt,
         );
-        drop(candidate_sets);
         assert_eq!(
             scratch.receipt.pages.len(),
             row_count,
@@ -6764,6 +6809,132 @@ impl DeltaScheduler {
                 "typed program exceeded one input's physical work budget"
             );
         }
+
+        // A directed streaming activation with one unjoined producer may
+        // consume an exact sole child before publishing the replacement
+        // receipt. This is not parked work: every additional typed call spends
+        // the original input's still-unspent grant, and the original registry
+        // credit remains authoritative until the final receipt commits once.
+        // The child handle has already passed ordinary typed validation and
+        // novelty admission, so taking it here preserves fixpoint semantics.
+        let receipt_local_fusion = directed_active
+            && row_count == 1
+            && matches!(&address, ProgramAddress::Constraint { .. })
+            && cohort_key.class == ProgramCohortClass::ActivationStreaming
+            && self
+                .registry
+                .program_credit_is_unjoined_unique(&scratch.task_receipts[0].credit);
+        scratch.receipt_local_observed_prefix.clear();
+        scratch.fused_receipt.clear();
+        let mut total_examined = scratch.receipt.pages[0].examined;
+        let mut fused_steps = 0usize;
+        let mut source_cohorts = usize::from(scratch.receipt.source_pages > 0);
+        let mut max_source_cohort = scratch.receipt.source_pages;
+        let mut source_pages = scratch.receipt.source_pages;
+        let mut source_examined = scratch.receipt.source_examined;
+        let mut source_roots = scratch.receipt.source_roots;
+        let mut transition_cohorts = usize::from(scratch.receipt.transition_pages > 0);
+        let mut max_transition_cohort = scratch.receipt.transition_pages;
+        let mut transition_pages = scratch.receipt.transition_pages;
+        let mut transition_examined = scratch.receipt.transition_examined;
+        let mut placement_granted_work = scratch
+            .receipt
+            .placement
+            .map(|_| limits.iter().sum::<usize>());
+        while receipt_local_fusion && total_examined < limits[0] {
+            let exact_tail = scratch.receipt.placement.is_none()
+                && scratch.receipt.pages.len() == 1
+                && scratch.receipt.pages[0].examined > 0
+                && scratch.receipt.pages[0].resume.is_none()
+                && scratch.receipt.children.len() == 1
+                && scratch.receipt.children[0].input == 0
+                && scratch.receipt.direct.is_empty()
+                && scratch.receipt.accepted.is_empty()
+                && scratch.receipt.supported.is_empty()
+                && ProgramCohortKey::of_work(
+                    &self.registry,
+                    scratch.task_receipts[0].activation,
+                    &scratch.receipt.children[0].work,
+                ) == cohort_key;
+            if !exact_tail {
+                break;
+            }
+
+            let child = scratch
+                .receipt
+                .children
+                .pop()
+                .expect("receipt-local Program tail lost its sole child");
+            if let Some(accepted) = child.accepted {
+                scratch.receipt_local_observed_prefix.push(accepted);
+            }
+            let remaining = limits[0]
+                .checked_sub(total_examined)
+                .expect("receipt-local Program chain overspent its grant");
+            assert!(remaining > 0);
+            scratch.work.clear();
+            scratch.work.push(child.work);
+            let fused_limits = [remaining];
+            spec.step_batch_for(
+                self.program_runtimes
+                    .get_mut(&state)
+                    .expect("typed program state lost its runtime during receipt-local fusion"),
+                address_key,
+                ProgramBatch {
+                    stratum: address.stratum(),
+                    view,
+                    candidate_sets: &candidate_sets,
+                    activations: &scratch.activations,
+                    work: &scratch.work,
+                    limits: &fused_limits,
+                },
+                &mut scratch.fused_receipt,
+            );
+            assert_eq!(
+                scratch.fused_receipt.pages.len(),
+                1,
+                "receipt-local typed Program returned the wrong page count"
+            );
+            let examined = scratch.fused_receipt.pages[0].examined;
+            assert!(
+                examined <= remaining,
+                "receipt-local typed Program exceeded its remaining work budget"
+            );
+            total_examined = total_examined
+                .checked_add(examined)
+                .expect("receipt-local Program examined-work count overflow");
+            source_cohorts += usize::from(scratch.fused_receipt.source_pages > 0);
+            max_source_cohort = max_source_cohort.max(scratch.fused_receipt.source_pages);
+            source_pages += scratch.fused_receipt.source_pages;
+            source_examined += scratch.fused_receipt.source_examined;
+            source_roots += scratch.fused_receipt.source_roots;
+            transition_cohorts += usize::from(scratch.fused_receipt.transition_pages > 0);
+            max_transition_cohort =
+                max_transition_cohort.max(scratch.fused_receipt.transition_pages);
+            transition_pages += scratch.fused_receipt.transition_pages;
+            transition_examined += scratch.fused_receipt.transition_examined;
+            if scratch.fused_receipt.placement.is_some() {
+                placement_granted_work = Some(remaining);
+            }
+            std::mem::swap(&mut scratch.receipt, &mut scratch.fused_receipt);
+            scratch.fused_receipt.clear();
+            fused_steps += 1;
+        }
+        let final_source_telemetry_cohort = scratch.receipt.source_pages > 0
+            && scratch.receipt.transition_pages == 0;
+        scratch.receipt.source_pages = source_pages;
+        scratch.receipt.source_examined = source_examined;
+        scratch.receipt.source_roots = source_roots;
+        scratch.receipt.transition_pages = transition_pages;
+        scratch.receipt.transition_examined = transition_examined;
+        if fused_steps > 0 {
+            stats.delta_program_receipt_local_fused_steps += fused_steps;
+            stats.delta_program_receipt_local_refiles_avoided += fused_steps;
+            stats.max_delta_program_receipt_local_chain = stats
+                .max_delta_program_receipt_local_chain
+                .max(fused_steps + 1);
+        }
+        drop(candidate_sets);
         program_child_ranges_into(
             &scratch.receipt.children,
             row_count,
@@ -6791,7 +6962,8 @@ impl DeltaScheduler {
         // Placement is observation only. Static executor labels deliberately
         // stay out of the ordinary hot-path aggregate and never feed dispatch.
         if scratch.receipt.placement.is_some() {
-            let granted_work = limits.iter().sum();
+            let granted_work =
+                placement_granted_work.expect("non-Native Program placement lost its exact grant");
             stats.delta_program_physical_cohorts += 1;
             stats.delta_program_physical_rows += row_count;
             stats.delta_program_physical_granted_work += granted_work;
@@ -6811,26 +6983,22 @@ impl DeltaScheduler {
             stats.delta_source_direct_candidates += scratch.receipt.direct.len();
         }
         if scratch.receipt.source_pages > 0 {
-            stats.delta_source_cohorts += 1;
-            stats.max_delta_source_cohort = stats
-                .max_delta_source_cohort
-                .max(scratch.receipt.source_pages);
+            stats.delta_source_cohorts += source_cohorts;
+            stats.max_delta_source_cohort = stats.max_delta_source_cohort.max(max_source_cohort);
         }
         stats.delta_transition_pages += scratch.receipt.transition_pages;
         stats.delta_transition_candidates_examined += scratch.receipt.transition_examined;
         if scratch.receipt.transition_pages > 0 {
-            stats.delta_transition_cohorts += 1;
-            stats.max_delta_transition_cohort = stats
-                .max_delta_transition_cohort
-                .max(scratch.receipt.transition_pages);
+            stats.delta_transition_cohorts += transition_cohorts;
+            stats.max_delta_transition_cohort =
+                stats.max_delta_transition_cohort.max(max_transition_cohort);
         }
 
         // Physical pacing is revalidated by the typed adapter from canonical
         // state before this receipt is produced. Family-reported source and
         // transition counts remain telemetry only.
         let search_cohort = cohort_key.class.pacing() == ProgramPacing::Search;
-        let source_telemetry_cohort =
-            scratch.receipt.source_pages > 0 && scratch.receipt.transition_pages == 0;
+        let source_telemetry_cohort = final_source_telemetry_cohort;
         let mut effects = DeltaStableEffects::default();
         let mut completed_activation_ids = Vec::new();
         let mut retargeted = RetargetedActivations::default();
@@ -6849,6 +7017,7 @@ impl DeltaScheduler {
             direct_ranges,
             accepted_ranges,
             supported_ranges,
+            receipt_local_observed_prefix,
             retired_activations,
             ..
         } = &mut *scratch;
@@ -6892,9 +7061,8 @@ impl DeltaScheduler {
                 credit,
                 state,
                 &children[child_range],
-                accepted[accepted_range]
-                    .iter()
-                    .map(|(_, value)| *value),
+                receipt_local_observed_prefix.iter().copied(),
+                accepted[accepted_range].iter().map(|(_, value)| *value),
                 direct[direct_range].iter().map(|(_, value)| *value),
                 !supported_range.is_empty(),
                 search_cohort,
@@ -7048,11 +7216,13 @@ impl DeltaScheduler {
         direct.clear();
         accepted.clear();
         supported.clear();
+        receipt_local_observed_prefix.clear();
         scratch.parents.clear();
         scratch.vars.clear();
         scratch.activations.clear();
         scratch.work.clear();
         scratch.receipt.clear();
+        scratch.fused_receipt.clear();
         scratch.retired_activations.clear();
         self.program_scratch = Some(scratch);
         stats.delta_source_dead_pages += source_dead_pages;
@@ -7686,6 +7856,700 @@ mod tests {
         );
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ReceiptProbeMode {
+        Linear,
+        EffectBoundary,
+        ImmediateBoundary,
+        AlternatingDispatch,
+        AfterChildrenBoundary,
+        DuplicateChronology,
+        DuplicateDeadTail,
+        TransitionThenSourceDead,
+        ZeroExaminedChild,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct ReceiptProbeState(u8);
+
+    #[derive(Clone)]
+    struct ReceiptProbeProgram {
+        mode: ReceiptProbeMode,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl TypedProgramSpec for ReceiptProbeProgram {
+        type State = ReceiptProbeState;
+        type NoveltyKey = u8;
+        type Rank = u8;
+
+        fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+            matches!(request.action, ProgramAction::Propose(0)).then_some(ProgramRoute {
+                key: ProgramKey::new(0),
+                variable: 0,
+                stratum: ProgramStratum::Fixpoint,
+                grouping: ProgramGrouping::PageLocal,
+                completion: ProgramCompletion::PageableOnly,
+                exposure: ProgramExposure::Production,
+            })
+        }
+
+        fn dispatch(&self, state: &Self::State) -> DispatchClass {
+            let class = match self.mode {
+                ReceiptProbeMode::AlternatingDispatch => u32::from(state.0 & 1),
+                ReceiptProbeMode::Linear
+                | ReceiptProbeMode::EffectBoundary
+                | ReceiptProbeMode::ImmediateBoundary
+                | ReceiptProbeMode::AfterChildrenBoundary
+                | ReceiptProbeMode::DuplicateChronology
+                | ReceiptProbeMode::DuplicateDeadTail
+                | ReceiptProbeMode::TransitionThenSourceDead
+                | ReceiptProbeMode::ZeroExaminedChild => 0,
+            };
+            DispatchClass::new(class)
+        }
+
+        fn pacing(&self, _state: &Self::State) -> ProgramPacing {
+            ProgramPacing::Activation
+        }
+
+        fn progress(&self, state: &Self::State) -> Self::Rank {
+            state.0
+        }
+
+        fn seed_typed(
+            &self,
+            _batch: ProgramSeedBatch<'_>,
+            _effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+        ) {
+            panic!("receipt probe is installed through its private runtime")
+        }
+
+        fn step_typed(
+            &self,
+            states: &mut Vec<Self::State>,
+            batch: TypedProgramBatch<'_>,
+            effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+        ) {
+            assert_eq!(states.len(), batch.limits.len());
+            for (input, state) in states.drain(..).enumerate() {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                let input = u32::try_from(input).expect("too many receipt probe inputs");
+                match (self.mode, state.0) {
+                    (_, 0) => effects.page(0, None),
+                    (ReceiptProbeMode::EffectBoundary, 1) => {
+                        effects.accept(input, value(1));
+                        effects.account_transition(1);
+                        effects.page(1, None);
+                    }
+                    (ReceiptProbeMode::ImmediateBoundary, 1) => {
+                        effects.accept(input, value(1));
+                        effects.account_transition(1);
+                        effects.page(
+                            1,
+                            Some(TypedResume::Immediate(ReceiptProbeState(0))),
+                        );
+                    }
+                    (ReceiptProbeMode::AfterChildrenBoundary, 4) => {
+                        effects.fixpoint_child(input, ReceiptProbeState(3), 3, Some(value(4)));
+                        effects.account_transition(1);
+                        effects.page(
+                            1,
+                            Some(TypedResume::AfterChildren(ReceiptProbeState(1))),
+                        );
+                    }
+                    (ReceiptProbeMode::AfterChildrenBoundary, 3) => {
+                        effects.fixpoint_child(input, ReceiptProbeState(2), 2, Some(value(3)));
+                        effects.account_transition(1);
+                        effects.page(1, None);
+                    }
+                    (ReceiptProbeMode::AfterChildrenBoundary, 2) => effects.page(0, None),
+                    (ReceiptProbeMode::AfterChildrenBoundary, 1) => {
+                        effects.accept(input, value(1));
+                        effects.account_transition(1);
+                        effects.page(1, None);
+                    }
+                    (ReceiptProbeMode::DuplicateChronology, 4) => {
+                        effects.fixpoint_child(
+                            input,
+                            ReceiptProbeState(3),
+                            3,
+                            Some(value(2)),
+                        );
+                        effects.account_transition(1);
+                        effects.page(1, None);
+                    }
+                    (ReceiptProbeMode::DuplicateChronology, 3) => {
+                        effects.fixpoint_child(
+                            input,
+                            ReceiptProbeState(2),
+                            2,
+                            Some(value(1)),
+                        );
+                        effects.account_transition(1);
+                        effects.page(1, None);
+                    }
+                    (ReceiptProbeMode::DuplicateChronology, 2) => {
+                        effects.fixpoint_child(
+                            input,
+                            ReceiptProbeState(1),
+                            1,
+                            Some(value(2)),
+                        );
+                        effects.account_transition(1);
+                        effects.page(1, None);
+                    }
+                    (ReceiptProbeMode::DuplicateChronology, 1) => {
+                        effects.direct(input, value(3));
+                        effects.direct(input, value(1));
+                        effects.accept(input, value(4));
+                        effects.accept(input, value(3));
+                        effects.account_transition(4);
+                        effects.page(4, None);
+                    }
+                    (ReceiptProbeMode::DuplicateDeadTail, 2) => {
+                        effects.fixpoint_child(
+                            input,
+                            ReceiptProbeState(1),
+                            1,
+                            Some(value(2)),
+                        );
+                        effects.account_transition(1);
+                        effects.page(1, None);
+                    }
+                    (ReceiptProbeMode::DuplicateDeadTail, 1) => {
+                        effects.account_transition(1);
+                        effects.page(1, None);
+                    }
+                    (ReceiptProbeMode::TransitionThenSourceDead, 2) => {
+                        effects.fixpoint_child(
+                            input,
+                            ReceiptProbeState(1),
+                            1,
+                            None,
+                        );
+                        effects.account_transition(1);
+                        effects.page(1, None);
+                    }
+                    (ReceiptProbeMode::TransitionThenSourceDead, 1) => {
+                        effects.account_source(1, 0);
+                        effects.page(1, None);
+                    }
+                    (ReceiptProbeMode::ZeroExaminedChild, 2) => {
+                        effects.fixpoint_child(
+                            input,
+                            ReceiptProbeState(1),
+                            1,
+                            None,
+                        );
+                        effects.account_transition(1);
+                        effects.page(1, None);
+                    }
+                    (ReceiptProbeMode::ZeroExaminedChild, 1) => {
+                        effects.fixpoint_child(
+                            input,
+                            ReceiptProbeState(0),
+                            0,
+                            None,
+                        );
+                        effects.page(0, None);
+                    }
+                    (
+                        ReceiptProbeMode::Linear
+                        | ReceiptProbeMode::EffectBoundary
+                        | ReceiptProbeMode::ImmediateBoundary
+                        | ReceiptProbeMode::AlternatingDispatch,
+                        remaining,
+                    ) => {
+                        let next = remaining - 1;
+                        effects.fixpoint_child(
+                            input,
+                            ReceiptProbeState(next),
+                            next,
+                            Some(value(remaining)),
+                        );
+                        effects.account_transition(1);
+                        effects.page(1, None);
+                    }
+                    (ReceiptProbeMode::AfterChildrenBoundary, _) => {
+                        panic!("invalid AfterChildren receipt probe state")
+                    }
+                    (ReceiptProbeMode::DuplicateChronology, _) => {
+                        panic!("invalid duplicate-chronology receipt probe state")
+                    }
+                    (ReceiptProbeMode::DuplicateDeadTail, _) => {
+                        panic!("invalid duplicate-dead-tail receipt probe state")
+                    }
+                    (ReceiptProbeMode::TransitionThenSourceDead, _) => {
+                        panic!("invalid transition-source receipt probe state")
+                    }
+                    (ReceiptProbeMode::ZeroExaminedChild, _) => {
+                        panic!("invalid zero-examined receipt probe state")
+                    }
+                }
+            }
+        }
+    }
+
+    impl Constraint<'static> for ReceiptProbeProgram {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(0)
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != 0 {
+                return false;
+            }
+            out.fill(1, view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+            panic!("receipt probe unexpectedly used ordinary proposal")
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn residual_program(&self) -> Option<ProgramRef<'_>> {
+            Some(ProgramRef::new(self))
+        }
+    }
+
+    struct ReceiptProbeHarness {
+        root: ReceiptProbeProgram,
+        plan: ResidualPlan,
+        scheduler: DeltaScheduler,
+        stable: Worklist,
+        stable_interner: StateInterner,
+        stats: ResidualStateStats,
+        active: Option<ActiveDeltaContinuation>,
+    }
+
+    impl ReceiptProbeHarness {
+        fn new(mode: ReceiptProbeMode, initial: u8) -> Self {
+            let root = ReceiptProbeProgram {
+                mode,
+                calls: Arc::new(AtomicUsize::new(0)),
+            };
+            let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+            let mut scheduler = DeltaScheduler::new();
+            let request = ProgramRequest {
+                action: ProgramAction::Propose(0),
+                bound: VariableSet::new_empty(),
+            };
+            let spec = ProgramRef::new(&root);
+            let route = spec.route(request).expect("receipt probe route declined");
+            let state = scheduler.prepare_program(DeltaDesc::leaf(0, 0), route, spec);
+            let activation = scheduler.registry.open_program_activation(
+                DeltaReducer::StreamProposal,
+                candidate_return(Vec::new()),
+                None,
+                None,
+            );
+            let credit = scheduler
+                .registry
+                .issue_credit(activation, CreditKind::Program { join: None });
+            let work = insert_engine_program_state(
+                &root,
+                scheduler
+                    .program_runtimes
+                    .get_mut(&state)
+                    .expect("prepared receipt probe lost its runtime"),
+                ProgramActivation(activation.0),
+                ReceiptProbeState(initial),
+            );
+            let active = scheduler
+                .file_program_state(
+                    state,
+                    vec![ProgramTask {
+                        activation,
+                        credit,
+                        work,
+                    }],
+                )
+                .expect("receipt probe filed no active continuation");
+            Self {
+                root,
+                plan,
+                scheduler,
+                stable: Worklist::new(),
+                stable_interner: StateInterner::default(),
+                stats: ResidualStateStats::default(),
+                active: Some(active),
+            }
+        }
+
+        fn step(&mut self, width: usize) -> ActiveDeltaStepOutcome {
+            let active = self.active.take().expect("receipt probe lost its lease");
+            let outcome = self.scheduler.step_active(
+                &self.root,
+                &self.plan,
+                active,
+                width,
+                &mut self.stable,
+                &mut self.stable_interner,
+                &mut self.stats,
+            );
+            self.active = outcome.resume;
+            outcome
+        }
+
+        fn add_unjoined_sibling(&mut self, initial: u8) {
+            let active = self.active.expect("receipt probe lost its active lineage");
+            let credit = self.scheduler.registry.issue_credit(
+                active.activation,
+                CreditKind::Program { join: None },
+            );
+            let work = insert_engine_program_state(
+                &self.root,
+                self.scheduler
+                    .program_runtimes
+                    .get_mut(&active.state)
+                    .expect("prepared receipt probe lost its runtime"),
+                ProgramActivation(active.activation.0),
+                ReceiptProbeState(initial),
+            );
+            let sibling = self
+                .scheduler
+                .file_program_state(
+                    active.state,
+                    vec![ProgramTask {
+                        activation: active.activation,
+                        credit,
+                        work,
+                    }],
+                )
+                .expect("unjoined receipt probe sibling was not filed");
+            assert_eq!(sibling, active);
+        }
+
+        fn preaccept(&mut self, value: RawInline) {
+            let active = self.active.expect("receipt probe lost its active lineage");
+            assert!(self
+                .scheduler
+                .registry
+                .state
+                .activations
+                .get_mut(&active.activation)
+                .expect("receipt probe lost its activation")
+                .accepted
+                .insert(value));
+        }
+
+        fn step_global(&mut self, width: usize) -> DeltaStepOutcome {
+            self.active = None;
+            self.scheduler.step_bounded(
+                &self.root,
+                &self.plan,
+                width,
+                None,
+                &mut self.stable,
+                &mut self.stable_interner,
+                &mut self.stats,
+            )
+        }
+
+        fn stable_candidate_values(&self) -> Vec<RawInline> {
+            let mut values = Vec::new();
+            for bucket in self
+                .stable
+                .values()
+                .flat_map(std::collections::BTreeMap::values)
+            {
+                let StateBucket::Candidates(batch) = bucket else {
+                    panic!("receipt probe returned the wrong stable payload")
+                };
+                values.extend(batch.candidates.iter().map(|(_, value)| value));
+            }
+            values
+        }
+    }
+
+    #[test]
+    fn receipt_local_program_chain_spends_one_grant_and_keeps_one_final_credit() {
+        let mut probe = ReceiptProbeHarness::new(ReceiptProbeMode::Linear, 4);
+        let outcome = probe.step(4);
+
+        assert_eq!(outcome.status, ActiveDeltaStatus::Yielded);
+        let active = outcome.resume.expect("linear chain lost its final child");
+        assert!(probe.scheduler.has_active_program(active));
+        assert_eq!(probe.root.calls.load(Ordering::Relaxed), 4);
+        assert_eq!(probe.stats.delta_transition_pages, 4);
+        assert_eq!(probe.stats.delta_transition_candidates_examined, 4);
+        assert_eq!(probe.stats.delta_transition_cohorts, 4);
+        assert_eq!(probe.stats.max_delta_transition_cohort, 1);
+        assert_eq!(probe.stats.delta_program_receipt_local_fused_steps, 3);
+        assert_eq!(probe.stats.delta_program_receipt_local_refiles_avoided, 3);
+        assert_eq!(probe.stats.max_delta_program_receipt_local_chain, 4);
+
+        let mut cloned = probe.scheduler.clone();
+        assert!(cloned.has_active_program(active));
+        drop(probe.scheduler);
+        assert!(cloned.has_active_program(active));
+        let finished = cloned.step_active(
+            &probe.root,
+            &probe.plan,
+            active,
+            1,
+            &mut probe.stable,
+            &mut probe.stable_interner,
+            &mut probe.stats,
+        );
+        assert_eq!(finished.status, ActiveDeltaStatus::Quiescent);
+        assert!(finished.resume.is_none());
+        assert!(cloned.is_empty());
+    }
+
+    #[test]
+    fn receipt_local_program_chain_commits_the_first_outward_effect_as_its_boundary() {
+        let mut probe = ReceiptProbeHarness::new(ReceiptProbeMode::EffectBoundary, 2);
+        let outcome = probe.step(4);
+
+        assert_eq!(outcome.status, ActiveDeltaStatus::Yielded);
+        assert!(outcome.resume.is_none());
+        assert_eq!(probe.root.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(probe.stats.delta_program_receipt_local_fused_steps, 1);
+        assert_eq!(probe.stats.max_delta_program_receipt_local_chain, 2);
+        assert!(probe.scheduler.is_empty());
+        assert!(!probe.stable.is_empty());
+    }
+
+    #[test]
+    fn receipt_local_program_chain_refiles_immediate_and_cross_dispatch_boundaries() {
+        let mut immediate = ReceiptProbeHarness::new(ReceiptProbeMode::ImmediateBoundary, 2);
+        let immediate_outcome = immediate.step(4);
+        assert_eq!(immediate.stats.delta_program_receipt_local_fused_steps, 1);
+        assert!(immediate_outcome.resume.is_some());
+        assert!(immediate
+            .scheduler
+            .has_active_program(immediate_outcome.resume.unwrap()));
+
+        let mut cross_dispatch = ReceiptProbeHarness::new(ReceiptProbeMode::AlternatingDispatch, 4);
+        let cross_outcome = cross_dispatch.step(4);
+        assert_eq!(
+            cross_dispatch
+                .stats
+                .delta_program_receipt_local_fused_steps,
+            0
+        );
+        assert_eq!(cross_dispatch.root.calls.load(Ordering::Relaxed), 1);
+        assert!(cross_outcome.resume.is_some());
+    }
+
+    #[test]
+    fn receipt_local_program_chain_leaves_global_cohorts_unchanged() {
+        let mut probe = ReceiptProbeHarness::new(ReceiptProbeMode::Linear, 4);
+        let outcome = probe.step_global(4);
+
+        assert_eq!(probe.stats.delta_program_receipt_local_fused_steps, 0);
+        assert_eq!(probe.root.calls.load(Ordering::Relaxed), 1);
+        assert!(outcome.has_stable_effect());
+        assert!(!probe.scheduler.is_empty());
+    }
+
+    #[test]
+    fn receipt_local_program_chain_requires_the_only_live_unjoined_credit() {
+        let mut probe = ReceiptProbeHarness::new(ReceiptProbeMode::Linear, 4);
+        probe.add_unjoined_sibling(2);
+        let outcome = probe.step(1);
+
+        assert_eq!(probe.stats.delta_program_receipt_local_fused_steps, 0);
+        assert_eq!(probe.root.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(outcome.status, ActiveDeltaStatus::Yielded);
+        assert!(outcome.resume.is_some());
+        assert!(probe.scheduler.has_active_program(outcome.resume.unwrap()));
+    }
+
+    #[test]
+    fn receipt_local_program_chain_never_crosses_after_children_join() {
+        let mut probe = ReceiptProbeHarness::new(ReceiptProbeMode::AfterChildrenBoundary, 4);
+        let first = probe.step(4);
+        assert_eq!(probe.stats.delta_program_receipt_local_fused_steps, 0);
+        assert_eq!(first.status, ActiveDeltaStatus::Yielded);
+        assert!(first.resume.is_some());
+
+        let child = probe.step(4);
+        assert_eq!(probe.stats.delta_program_receipt_local_fused_steps, 0);
+        assert_eq!(child.status, ActiveDeltaStatus::Yielded);
+        assert!(child.resume.is_some());
+
+        let join = probe.step(4);
+        assert_eq!(probe.stats.delta_program_receipt_local_fused_steps, 0);
+        assert_eq!(join.status, ActiveDeltaStatus::Pending);
+        assert!(join.resume.is_some());
+
+        let resume = probe.step(4);
+        assert_eq!(probe.stats.delta_program_receipt_local_fused_steps, 0);
+        assert_eq!(resume.status, ActiveDeltaStatus::Yielded);
+        assert!(resume.resume.is_none());
+        assert!(probe.scheduler.is_empty());
+    }
+
+    #[test]
+    fn receipt_local_program_chain_preserves_observation_order_set_admission_and_feedback() {
+        let mut fused = ReceiptProbeHarness::new(ReceiptProbeMode::DuplicateChronology, 4);
+        let fused_outcome = fused.step(8);
+        assert_eq!(fused_outcome.status, ActiveDeltaStatus::Yielded);
+        assert!(fused_outcome.resume.is_none());
+        assert!(fused.scheduler.is_empty());
+
+        let mut fused_feedback =
+            ResidualStateMachine::new(fused.root.variables(), fused.plan.len(), Search::Done);
+        fused_feedback.width = 8;
+        fused_feedback.cap = 64;
+        fused_feedback.account_delta_feedback(&fused_outcome.outcome);
+
+        let mut unfused = ReceiptProbeHarness::new(ReceiptProbeMode::DuplicateChronology, 4);
+        let mut unfused_feedback =
+            ResidualStateMachine::new(unfused.root.variables(), unfused.plan.len(), Search::Done);
+        unfused_feedback.width = 8;
+        unfused_feedback.cap = 64;
+        for _ in 0..8 {
+            if unfused.scheduler.is_empty() {
+                break;
+            }
+            let outcome = unfused.step_global(8);
+            unfused_feedback.account_delta_feedback(&outcome);
+        }
+        assert!(unfused.scheduler.is_empty());
+
+        let expected = [value(2), value(1), value(3), value(4)];
+        assert_eq!(fused.stable_candidate_values(), expected);
+        assert_eq!(unfused.stable_candidate_values(), expected);
+        assert_eq!(fused.stats.candidates_proposed, 7);
+        assert_eq!(unfused.stats.candidates_proposed, 7);
+        assert_eq!(fused.stats.delta_transition_pages, 4);
+        assert_eq!(unfused.stats.delta_transition_pages, 4);
+        assert_eq!(fused.stats.delta_transition_candidates_examined, 7);
+        assert_eq!(unfused.stats.delta_transition_candidates_examined, 7);
+        assert_eq!(fused.stats.delta_transition_cohorts, 4);
+        assert_eq!(unfused.stats.delta_transition_cohorts, 4);
+        assert_eq!(fused_feedback.width, unfused_feedback.width);
+        assert_eq!(fused_feedback.width, 8);
+        assert_eq!(
+            fused_feedback.stats.delta_transition_negative_steps,
+            unfused_feedback.stats.delta_transition_negative_steps
+        );
+        assert_eq!(
+            fused_feedback.stats.delta_source_negative_steps,
+            unfused_feedback.stats.delta_source_negative_steps
+        );
+    }
+
+    #[test]
+    fn receipt_local_program_chain_keeps_a_duplicate_prefix_final_dead_page_visible() {
+        let mut fused = ReceiptProbeHarness::new(ReceiptProbeMode::DuplicateDeadTail, 2);
+        fused.preaccept(value(2));
+        let fused_outcome = fused.step(2);
+        assert_eq!(fused.stats.delta_program_receipt_local_fused_steps, 1);
+        assert_eq!(fused_outcome.outcome.dead_pages, 1);
+        assert_eq!(fused_outcome.outcome.transition_dead_pages, 1);
+
+        let mut fused_feedback =
+            ResidualStateMachine::new(fused.root.variables(), fused.plan.len(), Search::Done);
+        fused_feedback.width = 2;
+        fused_feedback.cap = 64;
+        fused_feedback.account_delta_feedback(&fused_outcome.outcome);
+
+        let mut unfused = ReceiptProbeHarness::new(ReceiptProbeMode::DuplicateDeadTail, 2);
+        unfused.preaccept(value(2));
+        let mut unfused_feedback =
+            ResidualStateMachine::new(unfused.root.variables(), unfused.plan.len(), Search::Done);
+        unfused_feedback.width = 2;
+        unfused_feedback.cap = 64;
+        for _ in 0..4 {
+            if unfused.scheduler.is_empty() {
+                break;
+            }
+            let outcome = unfused.step_global(2);
+            unfused_feedback.account_delta_feedback(&outcome);
+        }
+        assert!(unfused.scheduler.is_empty());
+
+        assert_eq!(fused.stats.delta_transition_dead_pages, 1);
+        assert_eq!(unfused.stats.delta_transition_dead_pages, 1);
+        assert_eq!(fused.stats.candidates_proposed, 1);
+        assert_eq!(unfused.stats.candidates_proposed, 1);
+        assert_eq!(fused_feedback.width, unfused_feedback.width);
+        assert_eq!(fused_feedback.width, 4);
+        assert_eq!(
+            fused_feedback.stats.delta_transition_negative_steps,
+            unfused_feedback.stats.delta_transition_negative_steps
+        );
+        assert_eq!(fused_feedback.stats.delta_transition_negative_steps, 1);
+    }
+
+    #[test]
+    fn receipt_local_program_chain_classifies_deadness_from_the_final_page() {
+        let mut fused = ReceiptProbeHarness::new(ReceiptProbeMode::TransitionThenSourceDead, 2);
+        let fused_outcome = fused.step(2);
+        assert_eq!(fused.stats.delta_program_receipt_local_fused_steps, 1);
+        assert_eq!(fused_outcome.outcome.dead_pages, 1);
+        assert_eq!(fused_outcome.outcome.source_dead_pages, 1);
+        assert_eq!(fused_outcome.outcome.transition_dead_pages, 0);
+
+        let mut fused_feedback =
+            ResidualStateMachine::new(fused.root.variables(), fused.plan.len(), Search::Done);
+        fused_feedback.width = 2;
+        fused_feedback.cap = 64;
+        fused_feedback.account_delta_feedback(&fused_outcome.outcome);
+
+        let mut unfused = ReceiptProbeHarness::new(ReceiptProbeMode::TransitionThenSourceDead, 2);
+        let mut unfused_feedback =
+            ResidualStateMachine::new(unfused.root.variables(), unfused.plan.len(), Search::Done);
+        unfused_feedback.width = 2;
+        unfused_feedback.cap = 64;
+        for _ in 0..4 {
+            if unfused.scheduler.is_empty() {
+                break;
+            }
+            let outcome = unfused.step_global(2);
+            unfused_feedback.account_delta_feedback(&outcome);
+        }
+        assert!(unfused.scheduler.is_empty());
+
+        assert_eq!(fused.stats.delta_source_dead_pages, 1);
+        assert_eq!(unfused.stats.delta_source_dead_pages, 1);
+        assert_eq!(fused.stats.delta_transition_dead_pages, 0);
+        assert_eq!(unfused.stats.delta_transition_dead_pages, 0);
+        assert_eq!(fused.stats.delta_source_pages, 1);
+        assert_eq!(unfused.stats.delta_source_pages, 1);
+        assert_eq!(fused.stats.delta_transition_pages, 1);
+        assert_eq!(unfused.stats.delta_transition_pages, 1);
+        assert_eq!(fused_feedback.width, unfused_feedback.width);
+        assert_eq!(fused_feedback.width, 4);
+        assert_eq!(
+            fused_feedback.stats.delta_source_negative_steps,
+            unfused_feedback.stats.delta_source_negative_steps
+        );
+        assert_eq!(fused_feedback.stats.delta_source_negative_steps, 1);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "typed program emitted more raw effects than its examined-work receipt"
+    )]
+    fn receipt_local_program_chain_does_not_mask_a_zero_examined_child_page() {
+        let mut probe = ReceiptProbeHarness::new(ReceiptProbeMode::ZeroExaminedChild, 2);
+        let _ = probe.step(8);
+    }
+
     #[derive(Clone, Copy)]
     struct MixedExpansion;
 
@@ -8114,6 +8978,7 @@ mod tests {
             DeltaStateId(0),
             &[],
             std::iter::empty(),
+            std::iter::empty(),
             emitted,
             false,
             true,
@@ -8429,6 +9294,7 @@ mod tests {
                 work: work(1),
                 accepted: Some(value(2)),
             }],
+            std::iter::empty(),
             [value(3), value(2)],
             [value(3), value(3), value(1)],
             false,
@@ -8447,6 +9313,7 @@ mod tests {
             child_credit,
             DeltaStateId(0),
             &[],
+            std::iter::empty(),
             [value(4), value(5), value(5)],
             [value(2)],
             false,
@@ -9623,6 +10490,7 @@ mod tests {
             first_credit,
             DeltaStateId(0),
             &[],
+            std::iter::empty(),
             [value(8), value(9), value(9)],
             [value(7), value(7), value(8)],
             false,
@@ -9638,6 +10506,7 @@ mod tests {
             second_credit,
             DeltaStateId(0),
             &[],
+            std::iter::empty(),
             [value(7), value(11), value(11)],
             [value(8), value(10), value(10)],
             false,
@@ -9671,6 +10540,7 @@ mod tests {
             sibling_credit,
             DeltaStateId(0),
             &[],
+            std::iter::empty::<RawInline>(),
             std::iter::empty::<RawInline>(),
             [value(7)],
             false,
@@ -9712,6 +10582,7 @@ mod tests {
             &[],
             std::iter::empty::<RawInline>(),
             std::iter::empty::<RawInline>(),
+            std::iter::empty::<RawInline>(),
             false,
             false,
             false,
@@ -9731,6 +10602,7 @@ mod tests {
                 credit,
                 DeltaStateId(0),
                 &[],
+                std::iter::empty::<RawInline>(),
                 std::iter::empty::<RawInline>(),
                 std::iter::empty::<RawInline>(),
                 false,
@@ -9788,6 +10660,7 @@ mod tests {
             }],
             std::iter::empty::<RawInline>(),
             std::iter::empty::<RawInline>(),
+            std::iter::empty::<RawInline>(),
             false,
             false,
             false,
@@ -9802,6 +10675,7 @@ mod tests {
             child,
             DeltaStateId(0),
             &[],
+            std::iter::empty::<RawInline>(),
             std::iter::empty::<RawInline>(),
             std::iter::empty::<RawInline>(),
             false,
@@ -9824,6 +10698,7 @@ mod tests {
             resume,
             DeltaStateId(0),
             &[],
+            std::iter::empty::<RawInline>(),
             std::iter::empty::<RawInline>(),
             std::iter::empty::<RawInline>(),
             false,
@@ -9876,6 +10751,7 @@ mod tests {
                 }],
                 std::iter::empty::<RawInline>(),
                 std::iter::empty::<RawInline>(),
+                std::iter::empty::<RawInline>(),
                 false,
                 true,
                 true,
@@ -9890,6 +10766,7 @@ mod tests {
                 child,
                 DeltaStateId(0),
                 &[],
+                std::iter::empty::<RawInline>(),
                 observed,
                 std::iter::empty::<RawInline>(),
                 false,
@@ -10300,6 +11177,7 @@ mod tests {
             dormant_task.credit,
             dormant_state,
             &[],
+            std::iter::empty::<RawInline>(),
             std::iter::empty::<RawInline>(),
             std::iter::empty::<RawInline>(),
             false,
