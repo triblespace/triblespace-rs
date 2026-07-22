@@ -389,6 +389,7 @@ std::thread_local! {
     static SEEDED_CHAIN_FRAME_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static BULK_TRANSITION_COHORTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PAGEABLE_TRANSITION_PAGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static HOP_SET_MATERIALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -404,6 +405,11 @@ fn take_bulk_transition_cohorts() -> usize {
 #[cfg(test)]
 fn take_pageable_transition_pages() -> usize {
     PAGEABLE_TRANSITION_PAGES.with(|pages| pages.replace(0))
+}
+
+#[cfg(test)]
+fn take_hop_set_materializations() -> usize {
+    HOP_SET_MATERIALIZATIONS.with(|materializations| materializations.replace(0))
 }
 
 fn run_chain_frame<C, R>(root: C, seed: FrameSeedRow, mut reducer: R) -> R::Output
@@ -454,11 +460,92 @@ fn value_as_entity(value: &RawInline) -> Option<RawId> {
     }
 }
 
+/// Exact membership for one forward attribute hop. A full EAV prefix is a
+/// complete trible key, so this performs one PATCH lookup without enumerating
+/// or materializing the source's adjacency set.
+fn has_attr(set: &TribleSet, attr: &RawId, from: &RawInline, to: &RawInline) -> bool {
+    let Some(entity) = value_as_entity(from) else {
+        return false;
+    };
+    let mut key = [0u8; ID_LEN * 2 + 32];
+    key[..ID_LEN].copy_from_slice(&entity);
+    key[ID_LEN..ID_LEN * 2].copy_from_slice(attr);
+    key[ID_LEN * 2..].copy_from_slice(to);
+    set.eav.has_prefix(&key)
+}
+
+/// Exact membership for one inverse attribute hop. The inverse destination
+/// must be entity-shaped because only entities may occupy the subject slot;
+/// the source remains a full value and may therefore be a literal.
+fn has_attr_inverse(set: &TribleSet, attr: &RawId, from: &RawInline, to: &RawInline) -> bool {
+    let Some(entity) = value_as_entity(to) else {
+        return false;
+    };
+    let mut key = [0u8; 32 + ID_LEN * 2];
+    key[..32].copy_from_slice(from);
+    key[32..32 + ID_LEN].copy_from_slice(attr);
+    key[32 + ID_LEN..].copy_from_slice(&entity);
+    set.vae.has_prefix(&key)
+}
+
+/// Whether `(entity, attribute, value)` exists for any attribute other than
+/// `excluded`. EVA makes the pair `(entity, value)` a prefix. With one
+/// excluded attribute, the first attribute and (only when it is excluded) its
+/// strict successor decide the existential exactly.
+fn has_forward_not_attr(
+    set: &TribleSet,
+    entity: &RawId,
+    value: &RawInline,
+    excluded: &RawId,
+) -> bool {
+    let mut prefix = [0u8; ID_LEN + 32];
+    prefix[..ID_LEN].copy_from_slice(entity);
+    prefix[ID_LEN..].copy_from_slice(value);
+    let Some(first) = set
+        .eva
+        .first_infix_range(&prefix, &[u8::MIN; ID_LEN], &[u8::MAX; ID_LEN])
+    else {
+        return false;
+    };
+    first != *excluded
+        || set
+            .eva
+            .next_infix_after(&prefix, excluded, &[u8::MAX; ID_LEN])
+            .is_some()
+}
+
+/// Inverse counterpart of [`has_forward_not_attr`]. VEA makes the pair
+/// `(value, entity)` a prefix, so the same at-most-two-infix decision applies.
+fn has_inverse_not_attr(
+    set: &TribleSet,
+    value: &RawInline,
+    entity: &RawId,
+    excluded: &RawId,
+) -> bool {
+    let mut prefix = [0u8; 32 + ID_LEN];
+    prefix[..32].copy_from_slice(value);
+    prefix[32..].copy_from_slice(entity);
+    let Some(first) = set
+        .vea
+        .first_infix_range(&prefix, &[u8::MIN; ID_LEN], &[u8::MAX; ID_LEN])
+    else {
+        return false;
+    };
+    first != *excluded
+        || set
+            .vea
+            .next_infix_after(&prefix, excluded, &[u8::MAX; ID_LEN])
+            .is_some()
+}
+
 /// Single-attribute hop via direct index scan. No query engine
 /// overhead. Emits every destination value regardless of shape —
 /// paths may END at a literal (`?x p "lit"` is a SPARQL match); the
 /// closure walkers simply find no outgoing edges there.
 fn eval_attr(set: &TribleSet, attr: &RawId, start: &RawInline) -> HashSet<RawInline> {
+    #[cfg(test)]
+    HOP_SET_MATERIALIZATIONS.with(|count| count.set(count.get() + 1));
+
     let mut results = HashSet::new();
     let Some(start_id) = value_as_entity(start) else {
         return results;
@@ -482,6 +569,9 @@ fn eval_attr(set: &TribleSet, attr: &RawId, start: &RawInline) -> HashSet<RawInl
 ///      values via EAV prefix `[start, attr]` and collect their
 ///      id-portion as the destination.
 fn eval_not_attr(set: &TribleSet, excluded: &RawId, start: &RawInline) -> HashSet<RawInline> {
+    #[cfg(test)]
+    HOP_SET_MATERIALIZATIONS.with(|count| count.set(count.get() + 1));
+
     let mut results = HashSet::new();
     let Some(start_id) = value_as_entity(start) else {
         return results;
@@ -520,6 +610,9 @@ fn eval_not_attr_inverse(
     excluded: &RawId,
     start: &RawInline,
 ) -> HashSet<RawInline> {
+    #[cfg(test)]
+    HOP_SET_MATERIALIZATIONS.with(|count| count.set(count.get() + 1));
+
     // Inverse hops take the full 32-byte value directly — walking
     // backward from a literal is the same probe as from an entity.
     let mut results = HashSet::new();
@@ -547,6 +640,9 @@ fn eval_not_attr_inverse(
 /// Entity ordering) so the prefix `[start_as_value (32B), attr
 /// (16B)]` lands directly at the slice of matching entity bytes.
 fn eval_attr_inverse(set: &TribleSet, attr: &RawId, start: &RawInline) -> HashSet<RawInline> {
+    #[cfg(test)]
+    HOP_SET_MATERIALIZATIONS.with(|count| count.set(count.get() + 1));
+
     let mut results = HashSet::new();
     let mut prefix = [0u8; 32 + ID_LEN];
     prefix[..32].copy_from_slice(start);
@@ -660,12 +756,12 @@ fn eval_from(set: &TribleSet, expr: &PathExpr, start: &RawInline) -> HashSet<Raw
 
 fn has_path(set: &TribleSet, expr: &PathExpr, from: &RawInline, to: &RawInline) -> bool {
     match expr {
-        PathExpr::Attr(attr) => eval_attr(set, attr, from).contains(to),
-        PathExpr::InverseAttr(attr) => eval_attr_inverse(set, attr, from).contains(to),
-        PathExpr::NotAttr(excluded) => eval_not_attr(set, excluded, from).contains(to),
-        PathExpr::InverseNotAttr(excluded) => {
-            eval_not_attr_inverse(set, excluded, from).contains(to)
-        }
+        PathExpr::Attr(attr) => has_attr(set, attr, from, to),
+        PathExpr::InverseAttr(attr) => has_attr_inverse(set, attr, from, to),
+        PathExpr::NotAttr(excluded) => value_as_entity(from)
+            .is_some_and(|entity| has_forward_not_attr(set, &entity, to, excluded)),
+        PathExpr::InverseNotAttr(excluded) => value_as_entity(to)
+            .is_some_and(|entity| has_inverse_not_attr(set, from, &entity, excluded)),
         PathExpr::Concat(lhs, rhs) if has_unbounded_closure(lhs) || has_unbounded_closure(rhs) => {
             // Per-mid fallback (matches eval_from arm).
             for mid in eval_from(set, lhs, from) {
@@ -2008,44 +2104,6 @@ impl RegularPathConstraint {
         }
     }
 
-    fn has_forward_not_attr(&self, entity: &RawId, value: &RawInline, excluded: &RawId) -> bool {
-        let mut prefix = [0u8; ID_LEN + 32];
-        prefix[..ID_LEN].copy_from_slice(entity);
-        prefix[ID_LEN..].copy_from_slice(value);
-        let Some(first) =
-            self.set
-                .eva
-                .first_infix_range(&prefix, &[u8::MIN; ID_LEN], &[u8::MAX; ID_LEN])
-        else {
-            return false;
-        };
-        first != *excluded
-            || self
-                .set
-                .eva
-                .next_infix_after(&prefix, excluded, &[u8::MAX; ID_LEN])
-                .is_some()
-    }
-
-    fn has_inverse_not_attr(&self, value: &RawInline, entity: &RawId, excluded: &RawId) -> bool {
-        let mut prefix = [0u8; 32 + ID_LEN];
-        prefix[..32].copy_from_slice(value);
-        prefix[32..].copy_from_slice(entity);
-        let Some(first) =
-            self.set
-                .vea
-                .first_infix_range(&prefix, &[u8::MIN; ID_LEN], &[u8::MAX; ID_LEN])
-        else {
-            return false;
-        };
-        first != *excluded
-            || self
-                .set
-                .vea
-                .next_infix_after(&prefix, excluded, &[u8::MAX; ID_LEN])
-                .is_some()
-    }
-
     /// Returns the next distinct destination considered by one automaton
     /// branch without evaluating that destination's branch predicate.
     ///
@@ -2175,9 +2233,9 @@ impl RegularPathConstraint {
         match step {
             DeltaStep::Attr(_) | DeltaStep::InverseAttr(_) => true,
             DeltaStep::NotAttr(excluded) => value_as_entity(source)
-                .is_some_and(|entity| self.has_forward_not_attr(&entity, value, &excluded)),
+                .is_some_and(|entity| has_forward_not_attr(&self.set, &entity, value, &excluded)),
             DeltaStep::InverseNotAttr(excluded) => value_as_entity(value)
-                .is_some_and(|entity| self.has_inverse_not_attr(source, &entity, &excluded)),
+                .is_some_and(|entity| has_inverse_not_attr(&self.set, source, &entity, &excluded)),
         }
     }
 
@@ -2409,7 +2467,8 @@ impl RegularPathConstraint {
                 self.set
                     .eva
                     .infixes::<ID_LEN, 32, _>(&entity, |value: &[u8; 32]| {
-                        count += usize::from(self.has_forward_not_attr(&entity, value, &excluded));
+                        count +=
+                            usize::from(has_forward_not_attr(&self.set, &entity, value, &excluded));
                     });
                 count
             }
@@ -2418,7 +2477,8 @@ impl RegularPathConstraint {
                 self.set
                     .vea
                     .infixes::<32, ID_LEN, _>(source, |entity: &[u8; ID_LEN]| {
-                        count += usize::from(self.has_inverse_not_attr(source, entity, &excluded));
+                        count +=
+                            usize::from(has_inverse_not_attr(&self.set, source, entity, &excluded));
                     });
                 count
             }
@@ -3840,6 +3900,193 @@ mod estimate_tests {
         assert_eq!(
             reverse_tail.estimate.as_ref(),
             &[BoundEstimateAtom::Global(BoundEstimateAxis::Entities)],
+        );
+    }
+}
+
+#[cfg(test)]
+mod atomic_membership_tests {
+    use super::*;
+    use crate::id::{rngid, ExclusiveId};
+    use crate::inline::encodings::UnknownInline;
+    use crate::inline::Inline;
+    use crate::trible::Trible;
+
+    fn entity_value(id: &ExclusiveId) -> RawInline {
+        id_into_value(&id.id.raw())
+    }
+
+    fn insert_raw(set: &mut TribleSet, from: &ExclusiveId, attribute: &ExclusiveId, to: RawInline) {
+        set.insert(&Trible::new(
+            from,
+            attribute,
+            &Inline::<UnknownInline>::new(to),
+        ));
+    }
+
+    #[test]
+    fn atomic_membership_is_exact_without_materializing_adjacency_sets() {
+        let mut attributes: Vec<_> = (0..3).map(|_| rngid()).collect();
+        attributes.sort_unstable_by_key(|attribute| attribute.id.raw());
+        let included_before = &attributes[0];
+        let excluded = &attributes[1];
+        let included_after = &attributes[2];
+        let source_id = rngid();
+        let excluded_only_source_id = rngid();
+        let target_id = rngid();
+        let excluded_only_target_id = rngid();
+
+        let source = entity_value(&source_id);
+        let excluded_only_source = entity_value(&excluded_only_source_id);
+        let target = entity_value(&target_id);
+        let excluded_only_target = entity_value(&excluded_only_target_id);
+        let literal = [0xA5; 32];
+
+        let mut set = TribleSet::new();
+        insert_raw(&mut set, &source_id, included_before, target);
+        insert_raw(&mut set, &source_id, excluded, target);
+        insert_raw(&mut set, &source_id, excluded, excluded_only_target);
+        insert_raw(&mut set, &source_id, excluded, literal);
+        insert_raw(&mut set, &source_id, included_after, literal);
+        insert_raw(&mut set, &excluded_only_source_id, excluded, literal);
+
+        let cases = [
+            (
+                "forward entity endpoint",
+                PathExpr::Attr(included_before.id.raw()),
+                source,
+                target,
+                true,
+            ),
+            (
+                "forward absent edge",
+                PathExpr::Attr(included_before.id.raw()),
+                source,
+                excluded_only_target,
+                false,
+            ),
+            (
+                "forward literal endpoint",
+                PathExpr::Attr(included_after.id.raw()),
+                source,
+                literal,
+                true,
+            ),
+            (
+                "literal cannot be a forward subject",
+                PathExpr::Attr(included_before.id.raw()),
+                literal,
+                target,
+                false,
+            ),
+            (
+                "inverse entity endpoint",
+                PathExpr::InverseAttr(included_before.id.raw()),
+                target,
+                source,
+                true,
+            ),
+            (
+                "inverse from a literal",
+                PathExpr::InverseAttr(included_after.id.raw()),
+                literal,
+                source,
+                true,
+            ),
+            (
+                "inverse absent edge",
+                PathExpr::InverseAttr(included_before.id.raw()),
+                target,
+                excluded_only_source,
+                false,
+            ),
+            (
+                "inverse rejects a literal subject",
+                PathExpr::InverseAttr(included_after.id.raw()),
+                literal,
+                literal,
+                false,
+            ),
+            (
+                "negated hop accepts an overlapping nonexcluded witness",
+                PathExpr::NotAttr(excluded.id.raw()),
+                source,
+                target,
+                true,
+            ),
+            (
+                "negated hop rejects an excluded-only witness",
+                PathExpr::NotAttr(excluded.id.raw()),
+                source,
+                excluded_only_target,
+                false,
+            ),
+            (
+                "negated hop reaches a literal",
+                PathExpr::NotAttr(excluded.id.raw()),
+                source,
+                literal,
+                true,
+            ),
+            (
+                "literal cannot start a negated forward hop",
+                PathExpr::NotAttr(excluded.id.raw()),
+                literal,
+                target,
+                false,
+            ),
+            (
+                "changing the excluded predicate changes membership",
+                PathExpr::NotAttr(included_before.id.raw()),
+                source,
+                excluded_only_target,
+                true,
+            ),
+            (
+                "inverse negation accepts an overlapping nonexcluded witness",
+                PathExpr::InverseNotAttr(excluded.id.raw()),
+                target,
+                source,
+                true,
+            ),
+            (
+                "inverse negation rejects an excluded-only witness",
+                PathExpr::InverseNotAttr(excluded.id.raw()),
+                excluded_only_target,
+                source,
+                false,
+            ),
+            (
+                "inverse negation starts from a literal",
+                PathExpr::InverseNotAttr(excluded.id.raw()),
+                literal,
+                source,
+                true,
+            ),
+            (
+                "inverse negation rejects a different excluded-only subject",
+                PathExpr::InverseNotAttr(excluded.id.raw()),
+                literal,
+                excluded_only_source,
+                false,
+            ),
+            (
+                "inverse negation rejects a literal subject",
+                PathExpr::InverseNotAttr(excluded.id.raw()),
+                literal,
+                literal,
+                false,
+            ),
+        ];
+
+        take_hop_set_materializations();
+        for (label, expr, from, to, expected) in cases {
+            assert_eq!(has_path(&set, &expr, &from, &to), expected, "{label}");
+        }
+        assert_eq!(
+            take_hop_set_materializations(),
+            0,
+            "atomic confirmation must use exact PATCH membership, not adjacency-set enumeration"
         );
     }
 }
