@@ -211,6 +211,10 @@ therefore inspect one distinct destination of a high-degree node, file both its
 affine expansion continuation and any novel child, and descend toward a result
 without first materializing the complete adjacency. Branch-qualified cursors
 keep distinct NFA futures separate even when they produce the same graph value.
+Within one automaton branch, each bounded page is a single ordered PATCH range
+walk: it descends strictly after the owned cursor once, visits adjacent infixes,
+and uses one non-emitted lookahead to certify whether the returned cursor is
+live. No borrowed trie iterator crosses suspension.
 For `!p`, EVA pages distinct forward destinations and VEA pages distinct
 inverse subjects. The destination's attribute suffix then answers `exists a !=
 p`; because the current path algebra excludes one attribute, the exact inner

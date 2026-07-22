@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Resumable regular-path transitions page PATCH infixes with one ordered
+  traversal per automaton branch page.** The trie descends the strict lower
+  bound once, walks adjacent infixes lexicographically, and returns an owned
+  last-value cursor plus exact exhaustion receipt. Positive, inverse, and
+  negated transitions retain their existing examined-candidate budgets and
+  width-one behavior without restarting PATCH for every candidate.
 - **Selective production regions preserve guarded exactness through finite
   ORs.** Each affine parent now carries covering-only provenance and an
   explicit active-arm receipt through paging, partitioning, and online

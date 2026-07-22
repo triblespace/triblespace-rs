@@ -10,6 +10,7 @@ use crate::inline::encodings::genid::GenId;
 use crate::inline::IntoInline;
 use crate::inline::RawInline;
 use crate::patch::PATCHBoundedInfixes;
+use crate::patch::PATCHInfixPage;
 use crate::query::confirm_per_row;
 use crate::query::intersectionconstraint::IntersectionConstraint;
 use crate::query::residual::FrameSeedRow;
@@ -1485,6 +1486,37 @@ struct RpqExpandPage {
     examined: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RpqDeltaValuePage {
+    examined: usize,
+    last: Option<RawInline>,
+    exhausted: bool,
+}
+
+impl RpqDeltaValuePage {
+    const EMPTY: Self = Self {
+        examined: 0,
+        last: None,
+        exhausted: true,
+    };
+
+    fn raw(page: PATCHInfixPage<32>) -> Self {
+        Self {
+            examined: page.examined(),
+            last: page.last(),
+            exhausted: page.is_exhausted(),
+        }
+    }
+
+    fn entities(page: PATCHInfixPage<ID_LEN>) -> Self {
+        Self {
+            examined: page.examined(),
+            last: page.last().map(|entity| id_into_value(&entity)),
+            exhausted: page.is_exhausted(),
+        }
+    }
+}
+
 #[doc(hidden)]
 #[derive(Clone, Debug)]
 pub struct RpqState(RpqStateKind);
@@ -2188,6 +2220,92 @@ impl RegularPathConstraint {
         }
     }
 
+    /// Visits one bounded, ordered destination page for a single automaton
+    /// branch. PATCH owns the traversal for the whole page, so the durable RPQ
+    /// cursor stays an affine `(branch, last value)` while adjacent candidates
+    /// no longer repeat the prefix/lower-bound descent.
+    fn pageable_delta_values_page(
+        &self,
+        step: DeltaStep,
+        source: &RawInline,
+        after: Option<&RawInline>,
+        limit: usize,
+        mut emit: impl FnMut(RawInline),
+    ) -> RpqDeltaValuePage {
+        match step {
+            DeltaStep::Attr(attribute) => {
+                let Some(entity) = value_as_entity(source) else {
+                    return RpqDeltaValuePage::EMPTY;
+                };
+                let mut prefix = [0u8; ID_LEN * 2];
+                prefix[..ID_LEN].copy_from_slice(&entity);
+                prefix[ID_LEN..].copy_from_slice(&attribute);
+                let page = self.set.eav.infixes_page_after(
+                    &prefix,
+                    after,
+                    &[u8::MAX; 32],
+                    limit,
+                    |value: &[u8; 32]| emit(*value),
+                );
+                RpqDeltaValuePage::raw(page)
+            }
+            DeltaStep::InverseAttr(attribute) => {
+                let mut prefix = [0u8; 32 + ID_LEN];
+                prefix[..32].copy_from_slice(source);
+                prefix[32..].copy_from_slice(&attribute);
+                let after = match after {
+                    Some(value) => {
+                        let Some(entity) = value_as_entity(value) else {
+                            return RpqDeltaValuePage::EMPTY;
+                        };
+                        Some(entity)
+                    }
+                    None => None,
+                };
+                let page = self.set.vae.infixes_page_after(
+                    &prefix,
+                    after.as_ref(),
+                    &[u8::MAX; ID_LEN],
+                    limit,
+                    |entity: &[u8; ID_LEN]| emit(id_into_value(entity)),
+                );
+                RpqDeltaValuePage::entities(page)
+            }
+            DeltaStep::NotAttr(_) => {
+                let Some(entity) = value_as_entity(source) else {
+                    return RpqDeltaValuePage::EMPTY;
+                };
+                let page = self.set.eva.infixes_page_after(
+                    &entity,
+                    after,
+                    &[u8::MAX; 32],
+                    limit,
+                    |value: &[u8; 32]| emit(*value),
+                );
+                RpqDeltaValuePage::raw(page)
+            }
+            DeltaStep::InverseNotAttr(_) => {
+                let after = match after {
+                    Some(value) => {
+                        let Some(entity) = value_as_entity(value) else {
+                            return RpqDeltaValuePage::EMPTY;
+                        };
+                        Some(entity)
+                    }
+                    None => None,
+                };
+                let page = self.set.vea.infixes_page_after(
+                    source,
+                    after.as_ref(),
+                    &[u8::MAX; ID_LEN],
+                    limit,
+                    |entity: &[u8; ID_LEN]| emit(id_into_value(entity)),
+                );
+                RpqDeltaValuePage::entities(page)
+            }
+        }
+    }
+
     /// Locates a complete positive transition branch only when it fits in the
     /// remaining physical grant. Negated branches retain cursor paging because
     /// their destination predicate makes raw and accepted fanout differ.
@@ -2239,36 +2357,16 @@ impl RegularPathConstraint {
         }
     }
 
-    fn next_pageable_delta_successor(
+    fn later_pageable_delta_branch_exists(
         &self,
-        program: &DeltaProgram,
+        steps: &[(DeltaStep, u32)],
         node: RpqNode,
-        cursor: RpqExpandCursor,
-    ) -> Option<(u32, DeltaStep, RawInline, u32)> {
-        let state = program.decode(node.pc);
-        let steps = &program.steps[state];
-        let (start_branch, after) = match cursor {
-            RpqExpandCursor::Start => (0usize, None),
-            RpqExpandCursor::After { branch, value } => {
-                let branch = usize::try_from(branch).expect("RPQ branch index does not fit usize");
-                assert!(branch < steps.len(), "invalid RPQ transition-page cursor");
-                (branch, Some(value))
-            }
-        };
-        for (branch, &(step, target)) in steps.iter().enumerate().skip(start_branch) {
-            let branch_after = (branch == start_branch).then_some(after).flatten();
-            if let Some(value) =
-                self.next_pageable_delta_value(step, &node.value, branch_after.as_ref())
-            {
-                return Some((
-                    u32::try_from(branch).expect("too many RPQ transition branches"),
-                    step,
-                    value,
-                    target,
-                ));
-            }
-        }
-        None
+        branch: usize,
+    ) -> bool {
+        steps.iter().skip(branch + 1).any(|&(step, _)| {
+            self.next_pageable_delta_value(step, &node.value, None)
+                .is_some()
+        })
     }
 
     fn expand_delta_program_page(
@@ -2295,36 +2393,72 @@ impl RegularPathConstraint {
             return None;
         }
 
+        let steps = &program.steps[state];
+        let (start_branch, start_after) = match cursor {
+            RpqExpandCursor::Start => (0usize, None),
+            RpqExpandCursor::After { branch, value } => {
+                let branch = usize::try_from(branch).expect("RPQ branch index does not fit usize");
+                assert!(branch < steps.len(), "invalid RPQ transition-page cursor");
+                (branch, Some(value))
+            }
+        };
         let begin = successors.len();
-        let mut resume = cursor;
         let mut examined = 0usize;
+        let mut next = None;
 
-        while examined < limit {
-            let Some((branch, step, value, target)) =
-                self.next_pageable_delta_successor(program, node, resume)
-            else {
-                break;
+        for (branch, &(step, target)) in steps.iter().enumerate().skip(start_branch) {
+            let after = if branch == start_branch {
+                start_after
+            } else {
+                None
             };
-            examined += 1;
-            resume = RpqExpandCursor::After { branch, value };
-            if self.pageable_delta_value_is_included(step, &node.value, &value) {
-                successors.push(RpqOutput {
-                    node: RpqNode {
-                        source: node.source,
-                        value,
-                        pc: program.encode(target),
-                    },
-                    accepted: program.accepting[target as usize]
-                        && node.source.is_none_or(|anchor| value == anchor),
-                });
+            let remaining = limit - examined;
+            debug_assert!(remaining > 0);
+            let pc = program.encode(target);
+            let target_accepting = program.accepting[target as usize];
+            let page = self.pageable_delta_values_page(
+                step,
+                &node.value,
+                after.as_ref(),
+                remaining,
+                |value| {
+                    if self.pageable_delta_value_is_included(step, &node.value, &value) {
+                        successors.push(RpqOutput {
+                            node: RpqNode {
+                                source: node.source,
+                                value,
+                                pc,
+                            },
+                            accepted: target_accepting
+                                && node.source.is_none_or(|anchor| value == anchor),
+                        });
+                    }
+                },
+            );
+            examined += page.examined;
+            let Some(last) = page.last else {
+                debug_assert!(page.exhausted);
+                continue;
+            };
+            let branch_index = branch;
+            let branch = u32::try_from(branch_index).expect("too many RPQ transition branches");
+            let resume = RpqExpandCursor::After {
+                branch,
+                value: last,
+            };
+            if !page.exhausted {
+                debug_assert_eq!(examined, limit);
+                next = Some(resume);
+                break;
+            }
+            if examined == limit {
+                next = self
+                    .later_pageable_delta_branch_exists(steps, node, branch_index)
+                    .then_some(resume);
+                break;
             }
         }
         debug_assert!(successors.len() - begin <= examined);
-        let next = (examined == limit
-            && self
-                .next_pageable_delta_successor(program, node, resume)
-                .is_some())
-        .then_some(resume);
         Some(RpqExpandPage { next, examined })
     }
 
@@ -5203,6 +5337,7 @@ mod seeded_frame_tests {
         let mut offset = 0usize;
         let mut examined_pages = Vec::new();
         let mut positive_values = Vec::new();
+        let _ = crate::patch::take_infix_page_descents();
         loop {
             let mut outputs = Vec::new();
             let page = positive
@@ -5245,6 +5380,11 @@ mod seeded_frame_tests {
         }
         assert_eq!(positive_values, destinations);
         assert_eq!(examined_pages, vec![2, 2, 1]);
+        assert_eq!(
+            crate::patch::take_infix_page_descents(),
+            examined_pages.len(),
+            "one positive PATCH lower-bound descent must serve each whole transition page"
+        );
 
         let excluded = rngid();
         let other = rngid();
@@ -5280,6 +5420,7 @@ mod seeded_frame_tests {
         let expected_output_counts = [0, 1, 1, 0, 1];
         let mut cursor = RpqExpandCursor::Start;
         let mut negated_values = Vec::new();
+        let _ = crate::patch::take_infix_page_descents();
         for (index, expected_count) in expected_output_counts.into_iter().enumerate() {
             let mut outputs = Vec::new();
             let page = negated
@@ -5314,5 +5455,157 @@ mod seeded_frame_tests {
                 negated_destinations[4],
             ]
         );
+        assert_eq!(
+            crate::patch::take_infix_page_descents(),
+            expected_output_counts.len(),
+            "rejected negated candidates must not restart PATCH inside a width-one page"
+        );
+    }
+
+    #[test]
+    fn typed_transition_page_cursor_crosses_ordered_automaton_branches_exactly() {
+        let source = rngid();
+        let first_attribute = rngid();
+        let second_attribute = rngid();
+        let first_values = [[0x10; 32], [0x20; 32]];
+        let second_values = [[0x05; 32], [0x15; 32]];
+        let mut set = TribleSet::new();
+        for value in first_values {
+            insert_edge(&mut set, &source, &first_attribute, value);
+        }
+        for value in second_values {
+            insert_edge(&mut set, &source, &second_attribute, value);
+        }
+        let start = Variable::<UnknownInline>::new(0);
+        let end = Variable::<UnknownInline>::new(1);
+        let path = RegularPathConstraint::new(
+            set,
+            start,
+            end,
+            &[
+                PathOp::Attr(first_attribute.id.raw()),
+                PathOp::Attr(second_attribute.id.raw()),
+                PathOp::Union,
+            ],
+        );
+        let node = RpqNode {
+            source: None,
+            value: id_into_value(&source.id.raw()),
+            pc: path.delta_program.start,
+        };
+
+        let mut outputs = Vec::new();
+        let first = path
+            .expand_delta_program_page(
+                &path.delta_program,
+                node,
+                RpqExpandCursor::Start,
+                2,
+                &mut outputs,
+            )
+            .unwrap();
+        assert_eq!(
+            outputs
+                .iter()
+                .map(|output| output.node.value)
+                .collect::<Vec<_>>(),
+            first_values
+        );
+        let Some(RpqExpandCursor::After { branch: 0, value }) = first.next else {
+            panic!("an exact branch boundary lost its later-branch continuation")
+        };
+        assert_eq!(value, first_values[1]);
+
+        outputs.clear();
+        let second = path
+            .expand_delta_program_page(
+                &path.delta_program,
+                node,
+                first.next.unwrap(),
+                1,
+                &mut outputs,
+            )
+            .unwrap();
+        assert_eq!(
+            outputs
+                .iter()
+                .map(|output| output.node.value)
+                .collect::<Vec<_>>(),
+            vec![second_values[0]]
+        );
+        assert_eq!(
+            second.next,
+            Some(RpqExpandCursor::After {
+                branch: 1,
+                value: second_values[0],
+            })
+        );
+
+        outputs.clear();
+        let third = path
+            .expand_delta_program_page(
+                &path.delta_program,
+                node,
+                second.next.unwrap(),
+                2,
+                &mut outputs,
+            )
+            .unwrap();
+        assert_eq!(
+            outputs
+                .iter()
+                .map(|output| output.node.value)
+                .collect::<Vec<_>>(),
+            vec![second_values[1]]
+        );
+        assert_eq!(third.examined, 1);
+        assert!(third.next.is_none());
+    }
+
+    #[test]
+    fn typed_inverse_width_one_pages_keep_raw_value_cursors() {
+        let attribute = rngid();
+        let target = rngid();
+        let target_value = id_into_value(&target.id.raw());
+        let mut sources = (0..4).map(|_| rngid()).collect::<Vec<_>>();
+        sources.sort_unstable_by_key(|source| source.id.raw());
+        let source_values = sources
+            .iter()
+            .map(|source| id_into_value(&source.id.raw()))
+            .collect::<Vec<_>>();
+        let mut set = TribleSet::new();
+        for source in &sources {
+            insert_edge(&mut set, source, &attribute, target_value);
+        }
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let path = RegularPathConstraint::new(
+            set,
+            start,
+            end,
+            &[PathOp::Attr(attribute.id.raw()), PathOp::Inverse],
+        );
+        let node = RpqNode {
+            source: None,
+            value: target_value,
+            pc: path.delta_program.start,
+        };
+        let _ = crate::patch::take_infix_page_descents();
+        let mut cursor = RpqExpandCursor::Start;
+        let mut actual = Vec::new();
+        loop {
+            let mut outputs = Vec::new();
+            let page = path
+                .expand_delta_program_page(&path.delta_program, node, cursor, 1, &mut outputs)
+                .unwrap();
+            assert_eq!(page.examined, 1);
+            actual.push(outputs[0].node.value);
+            let Some(next) = page.next else {
+                break;
+            };
+            cursor = next;
+        }
+        assert_eq!(actual, source_values);
+        assert_eq!(crate::patch::take_infix_page_descents(), sources.len());
     }
 }
