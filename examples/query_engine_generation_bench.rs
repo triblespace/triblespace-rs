@@ -1694,7 +1694,7 @@ fn formula_transport_probe_backend<S: TriblePattern>(
 }
 
 #[cfg(formula_delta_transport_probe)]
-fn main() {
+fn formula_transport_correctness_main() {
     const PROBE_BASE: &str = "eba817d8941e232e72d13fece5e4805af7fd0fb1";
     const COMPONENT_COUNT: usize = 1;
     const RING_SIZE: usize = 64;
@@ -1721,4 +1721,382 @@ fn main() {
     formula_transport_probe_backend("SuccinctArchive sibling", &archive, &fixture, &expected);
     formula_delta_transport_probe_force_stable(false);
     println!("probe verdict: all six backend/mode cells have exact SET and repeat-order parity");
+}
+
+#[cfg(formula_delta_transport_probe)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FormulaTransportTimingBackend {
+    TribleSet,
+    SuccinctArchive,
+}
+
+#[cfg(formula_delta_transport_probe)]
+impl FormulaTransportTimingBackend {
+    const ALL: [Self; 2] = [Self::TribleSet, Self::SuccinctArchive];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::TribleSet => "TribleSet sibling",
+            Self::SuccinctArchive => "SuccinctArchive sibling",
+        }
+    }
+}
+
+#[cfg(formula_delta_transport_probe)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FormulaTransportTimingPoint {
+    Prefix(usize),
+    Full,
+}
+
+#[cfg(formula_delta_transport_probe)]
+impl FormulaTransportTimingPoint {
+    const ALL: [Self; 5] = [
+        Self::Prefix(63),
+        Self::Prefix(64),
+        Self::Prefix(65),
+        Self::Prefix(100),
+        Self::Full,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Prefix(63) => "63",
+            Self::Prefix(64) => "64",
+            Self::Prefix(65) => "65",
+            Self::Prefix(100) => "100",
+            Self::Full => "full",
+            Self::Prefix(_) => unreachable!("the formal panel has fixed checkpoints"),
+        }
+    }
+}
+
+#[cfg(formula_delta_transport_probe)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FormulaTransportTimingTask {
+    backend: FormulaTransportTimingBackend,
+    mode: FormulaTransportProbeMode,
+    point: FormulaTransportTimingPoint,
+}
+
+#[cfg(formula_delta_transport_probe)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FormulaTransportTimingReceipt {
+    signature: Signature,
+    ordered_digest: u64,
+}
+
+#[cfg(formula_delta_transport_probe)]
+#[derive(Clone, Copy, Debug)]
+struct FormulaTransportTimingSample {
+    round: usize,
+    position: usize,
+    task: usize,
+    time_to_n: Duration,
+    drop_at_n: Duration,
+    total: Duration,
+}
+
+#[cfg(formula_delta_transport_probe)]
+fn formula_transport_timing_tasks() -> Vec<FormulaTransportTimingTask> {
+    let mut tasks = Vec::with_capacity(30);
+    // Interleave backends inside modes inside checkpoints. The formal order
+    // then rotates this base by a stride coprime to 30 and mirrors every
+    // second 30-round half, rather than privileging this construction order.
+    for point in FormulaTransportTimingPoint::ALL {
+        for mode in FormulaTransportProbeMode::ALL {
+            for backend in FormulaTransportTimingBackend::ALL {
+                tasks.push(FormulaTransportTimingTask {
+                    backend,
+                    mode,
+                    point,
+                });
+            }
+        }
+    }
+    assert_eq!(tasks.len(), 30);
+    tasks
+}
+
+#[cfg(formula_delta_transport_probe)]
+fn formula_transport_timing_order(round: usize, task_count: usize) -> Vec<usize> {
+    assert_eq!(task_count, 30);
+    const STRIDE: usize = 7;
+    let start = (round % task_count) * STRIDE % task_count;
+    let mut order: Vec<_> = (0..task_count)
+        .map(|position| (start + position) % task_count)
+        .collect();
+    if (round / task_count) % 2 == 1 {
+        order.reverse();
+    }
+    order
+}
+
+#[cfg(formula_delta_transport_probe)]
+fn assert_formula_transport_timing_balance(task_count: usize) {
+    let mut positions = vec![vec![0usize; task_count]; task_count];
+    for round in 0..60 {
+        for (position, task) in formula_transport_timing_order(round, task_count)
+            .into_iter()
+            .enumerate()
+        {
+            positions[task][position] += 1;
+        }
+    }
+    assert!(positions
+        .iter()
+        .flatten()
+        .all(|&observations| observations == 2));
+}
+
+#[cfg(formula_delta_transport_probe)]
+fn run_formula_transport_timing_query<S: TriblePattern>(
+    store: &S,
+    fixture: &Fixture,
+    mode: FormulaTransportProbeMode,
+    point: FormulaTransportTimingPoint,
+) -> (FormulaTransportTimingReceipt, Duration, Duration, Duration) {
+    mode.arm();
+    let start = Instant::now();
+    let mut query =
+        mixed_formula_rpq_query!(store, fixture).solve_residual_state_lazy_with(mode.lowering());
+    let mut signature = Signature {
+        rows: 0,
+        checksum: 0,
+    };
+    let mut ordered_digest = 0x6A09_E667_F3BC_C909;
+    let mut observe = |row: Pair| {
+        signature.rows += 1;
+        signature.checksum = signature.checksum.wrapping_add(pair_checksum(&row));
+        ordered_digest = mix64(
+            ordered_digest
+                ^ pair_checksum(&row)
+                ^ (signature.rows as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        );
+        black_box(row);
+    };
+    match point {
+        FormulaTransportTimingPoint::Prefix(limit) => {
+            for _ in 0..limit {
+                observe(
+                    query
+                        .next()
+                        .unwrap_or_else(|| panic!("timed query ended before checkpoint {limit}")),
+                );
+            }
+        }
+        FormulaTransportTimingPoint::Full => {
+            for row in query.by_ref() {
+                observe(row);
+            }
+        }
+    }
+    drop(observe);
+    let time_to_n = start.elapsed();
+    let drop_start = Instant::now();
+    drop(query);
+    let drop_at_n = drop_start.elapsed();
+    let total = start.elapsed();
+    (
+        FormulaTransportTimingReceipt {
+            signature,
+            ordered_digest,
+        },
+        time_to_n,
+        drop_at_n,
+        total,
+    )
+}
+
+#[cfg(formula_delta_transport_probe)]
+fn run_formula_transport_timing_task(
+    task: FormulaTransportTimingTask,
+    fixture: &Fixture,
+    archive: &SuccinctArchive<OrderedUniverse>,
+) -> (FormulaTransportTimingReceipt, Duration, Duration, Duration) {
+    match task.backend {
+        FormulaTransportTimingBackend::TribleSet => {
+            run_formula_transport_timing_query(&fixture.graph, fixture, task.mode, task.point)
+        }
+        FormulaTransportTimingBackend::SuccinctArchive => {
+            run_formula_transport_timing_query(archive, fixture, task.mode, task.point)
+        }
+    }
+}
+
+#[cfg(formula_delta_transport_probe)]
+fn percentile_duration(samples: &[Duration], quantile: f64) -> Duration {
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let index = ((sorted.len() - 1) as f64 * quantile).round() as usize;
+    sorted[index]
+}
+
+#[cfg(formula_delta_transport_probe)]
+fn print_formula_transport_timing_plan(tasks: &[FormulaTransportTimingTask], rounds: usize) {
+    assert_formula_transport_timing_balance(tasks.len());
+    println!("timing panel: {rounds} rounds x {} tasks", tasks.len());
+    println!("balance: 60-round superblocks; every task occupies every ordinal exactly twice");
+    println!("order: cyclic stride 7 over 30 tasks; mirrored after each 30 rounds");
+    println!("timed fields: fresh time-to-N, drop-at-N, and total; fixture/archive excluded");
+    for (task, cell) in tasks.iter().enumerate() {
+        println!(
+            "timing_task task={task} backend={:?} mode={} checkpoint={}",
+            cell.backend.label(),
+            cell.mode.label(),
+            cell.point.label(),
+        );
+    }
+}
+
+#[cfg(formula_delta_transport_probe)]
+fn formula_transport_timing_main(rounds: usize) {
+    const PROBE_BASE: &str = "eba817d8941e232e72d13fece5e4805af7fd0fb1";
+    const COMPONENT_COUNT: usize = 1;
+    const RING_SIZE: usize = 64;
+    const FANOUT: usize = 2;
+    assert!(
+        rounds >= 60 && rounds % 60 == 0,
+        "rounds must be a multiple of 60"
+    );
+
+    let fixture = Fixture::new(COMPONENT_COUNT, RING_SIZE, FANOUT);
+    let archive: SuccinctArchive<OrderedUniverse> = (&fixture.graph).into();
+    let expected = fixture.mixed_formula_rpq_oracle();
+    assert_eq!(expected.len(), 2_048, "the original causal cell drifted");
+    let tasks = formula_transport_timing_tasks();
+
+    println!("formal timing: Formula delta-transport causal panel");
+    println!("engine: {ENGINE}");
+    println!("revision: {REVISION}");
+    println!("probe base: {PROBE_BASE}");
+    println!(
+        "fixture: {COMPONENT_COUNT} component x {RING_SIZE} nodes, fanout {FANOUT}, \
+         {} tribles; expected rows: {}",
+        fixture.graph.len(),
+        expected.len(),
+    );
+    print_formula_transport_timing_plan(&tasks, rounds);
+
+    // Independent SET checks occur before warmup and all timed samples.
+    for mode in FormulaTransportProbeMode::ALL {
+        exact_check(
+            formula_transport_probe_query!(&fixture.graph, &fixture, mode).collect(),
+            &expected,
+            mode.label(),
+            "TribleSet timing preflight",
+        );
+        exact_check(
+            formula_transport_probe_query!(&archive, &fixture, mode).collect(),
+            &expected,
+            mode.label(),
+            "SuccinctArchive timing preflight",
+        );
+    }
+    println!("timing preflight: all six full SET cells exact");
+
+    // One untimed fresh pass per task both warms the exact path and freezes its
+    // row/order receipt. Every formal observation must reproduce that receipt.
+    let expected_receipts: Vec<_> = tasks
+        .iter()
+        .copied()
+        .map(|task| run_formula_transport_timing_task(task, &fixture, &archive).0)
+        .collect();
+    println!("timing warmup: all 30 fresh task receipts frozen");
+
+    let mut samples = Vec::with_capacity(rounds * tasks.len());
+    for round in 0..rounds {
+        for (position, task_index) in formula_transport_timing_order(round, tasks.len())
+            .into_iter()
+            .enumerate()
+        {
+            let (receipt, time_to_n, drop_at_n, total) =
+                run_formula_transport_timing_task(tasks[task_index], &fixture, &archive);
+            assert_eq!(
+                receipt, expected_receipts[task_index],
+                "formal timing changed a frozen row/order receipt for task {task_index}"
+            );
+            samples.push(FormulaTransportTimingSample {
+                round,
+                position,
+                task: task_index,
+                time_to_n,
+                drop_at_n,
+                total,
+            });
+        }
+    }
+    formula_delta_transport_probe_force_stable(false);
+
+    // Emit only after the measured panel so stdout cannot perturb later cells.
+    for sample in &samples {
+        let task = tasks[sample.task];
+        let receipt = expected_receipts[sample.task];
+        println!(
+            "timing_raw round={} position={} task={} backend={:?} mode={} checkpoint={} \
+             time_to_n_ns={} drop_at_n_ns={} total_ns={} rows={} checksum={:#018x} \
+             ordered_digest={:#018x}",
+            sample.round,
+            sample.position,
+            sample.task,
+            task.backend.label(),
+            task.mode.label(),
+            task.point.label(),
+            sample.time_to_n.as_nanos(),
+            sample.drop_at_n.as_nanos(),
+            sample.total.as_nanos(),
+            receipt.signature.rows,
+            receipt.signature.checksum,
+            receipt.ordered_digest,
+        );
+    }
+    for (task_index, task) in tasks.iter().copied().enumerate() {
+        let cell: Vec<_> = samples
+            .iter()
+            .filter(|sample| sample.task == task_index)
+            .collect();
+        let time_to_n: Vec<_> = cell.iter().map(|sample| sample.time_to_n).collect();
+        let drop_at_n: Vec<_> = cell.iter().map(|sample| sample.drop_at_n).collect();
+        let total: Vec<_> = cell.iter().map(|sample| sample.total).collect();
+        println!(
+            "timing_summary task={task_index} backend={:?} mode={} checkpoint={} samples={} \
+             time_to_n_p50_ns={} time_to_n_p95_ns={} drop_p50_ns={} drop_p95_ns={} \
+             total_p50_ns={} total_p95_ns={}",
+            task.backend.label(),
+            task.mode.label(),
+            task.point.label(),
+            cell.len(),
+            percentile_duration(&time_to_n, 0.50).as_nanos(),
+            percentile_duration(&time_to_n, 0.95).as_nanos(),
+            percentile_duration(&drop_at_n, 0.50).as_nanos(),
+            percentile_duration(&drop_at_n, 0.95).as_nanos(),
+            percentile_duration(&total, 0.50).as_nanos(),
+            percentile_duration(&total, 0.95).as_nanos(),
+        );
+    }
+    println!("timing verdict: all formal samples preserved their frozen row/order receipts");
+}
+
+#[cfg(formula_delta_transport_probe)]
+fn main() {
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        None => formula_transport_correctness_main(),
+        Some("--timing-plan") => {
+            let rounds = args
+                .next()
+                .map(|raw| raw.parse().expect("round count must be an integer"))
+                .unwrap_or(120);
+            let tasks = formula_transport_timing_tasks();
+            print_formula_transport_timing_plan(&tasks, rounds);
+        }
+        Some("--timing") => {
+            let rounds = args
+                .next()
+                .map(|raw| raw.parse().expect("round count must be an integer"))
+                .unwrap_or(120);
+            formula_transport_timing_main(rounds);
+        }
+        Some(other) => panic!("unknown Formula transport probe argument {other:?}"),
+    }
 }
