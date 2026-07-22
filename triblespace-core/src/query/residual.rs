@@ -18191,6 +18191,242 @@ mod tests {
     }
 
     #[test]
+    fn production_regions_adoption_gate_keeps_off_path_formula_size_constant() {
+        use crate::id::id_into_value;
+        use crate::query::equalityconstraint::EqualityConstraint;
+        use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
+
+        fn make_root(equality_count: usize) -> IntersectionConstraint<ShapeConstraint> {
+            let fixture = production_formula_rpq_fixture();
+            let start = Variable::<GenId>::new(0);
+            let end = Variable::<GenId>::new(1);
+            let counters = program_fallback_counters();
+            let operations = [PathOp::Attr(fixture.attribute.raw()), PathOp::Plus];
+            let path = program_only_rpq(
+                RegularPathConstraint::new(fixture.graph, start, end, &operations),
+                &counters,
+            );
+
+            let mut dead_arm = Vec::with_capacity(equality_count + 1);
+            for _ in 0..equality_count {
+                dead_arm.push(Box::new(EqualityConstraint::new(start.index, end.index))
+                    as ShapeConstraint);
+            }
+            dead_arm.push(Box::new(ZeroVariableTruth(false)) as ShapeConstraint);
+
+            IntersectionConstraint::new(vec![
+                preferred_fanout(
+                    start.index,
+                    vec![id_into_value(&fixture.source)],
+                    0,
+                ),
+                Box::new(UnionConstraint::new(vec![
+                    Box::new(IntersectionConstraint::new(dead_arm)) as ShapeConstraint,
+                    Box::new(path) as ShapeConstraint,
+                ])) as ShapeConstraint,
+            ])
+        }
+
+        for equality_count in [1, 2, 7, 64] {
+            let root = make_root(equality_count);
+
+            let hybrid = ResidualPlan::compile_lowering(&root, ResidualLowering::HYBRID);
+            assert!(!hybrid.synthetic_root_formula);
+            assert_eq!(hybrid.finite_formula.nodes.len(), 0);
+            assert_eq!(hybrid.finite_formula.roots, [None, None]);
+            assert_eq!(
+                hybrid.leaves,
+                [
+                    ResidualLeaf {
+                        path: ConstraintPath(vec![0].into_boxed_slice()),
+                        lowering: LeafLowering::Opaque,
+                    },
+                    ResidualLeaf {
+                        path: ConstraintPath(vec![1].into_boxed_slice()),
+                        lowering: LeafLowering::Opaque,
+                    },
+                ]
+            );
+            assert_eq!(hybrid.action_span(), 2);
+
+            let regional = ResidualPlan::compile_lowering(
+                &root,
+                ResidualLowering::new(FormulaScope::ProductionRegions, ProgramScope::Production),
+            );
+            assert!(!regional.synthetic_root_formula);
+            assert_eq!(regional.finite_formula.nodes.len(), 3);
+            assert_eq!(
+                regional.leaves,
+                [
+                    ResidualLeaf {
+                        path: ConstraintPath(vec![0].into_boxed_slice()),
+                        lowering: LeafLowering::Opaque,
+                    },
+                    ResidualLeaf {
+                        path: ConstraintPath(vec![1].into_boxed_slice()),
+                        lowering: LeafLowering::ProductionFormula,
+                    },
+                ]
+            );
+            assert_eq!(regional.finite_formula.root(0), None);
+            let regional_root = regional
+                .finite_formula
+                .root(1)
+                .expect("the hidden Production RPQ marks its Union");
+            let FiniteFormulaNodeKind::Or {
+                children: regional_arms,
+            } = &regional.finite_formula.node(regional_root).kind
+            else {
+                panic!("the selective region root is not OR")
+            };
+            assert_eq!(regional_arms.len(), 2);
+            assert_eq!(
+                regional.finite_formula.node(regional_arms[0]).kind,
+                FiniteFormulaNodeKind::Atom
+            );
+            assert_eq!(
+                regional.finite_formula.node(regional_arms[0]).path,
+                FormulaPath(vec![FormulaStep::Or(0)].into_boxed_slice()),
+                "the arbitrarily wide dead AND must remain one off-path atom"
+            );
+            assert_eq!(
+                regional.finite_formula.node(regional_arms[1]).kind,
+                FiniteFormulaNodeKind::Atom
+            );
+            assert_eq!(
+                regional.finite_formula.node(regional_arms[1]).path,
+                FormulaPath(vec![FormulaStep::Or(1)].into_boxed_slice())
+            );
+            assert_eq!(regional.action_span(), 18);
+
+            let mut regional_relevant = ChildSet::empty(regional.len());
+            regional_relevant.insert(1);
+            let mut regional_pcs = FormulaPcInterner::default();
+            let regional_start = regional_pcs.start(
+                &regional.finite_formula,
+                1,
+                1,
+                UnionVerb::Propose {
+                    relevant: regional_relevant,
+                },
+            );
+            assert_eq!(regional_pcs.len(), 1);
+            assert_eq!(regional_pcs.resume_len(), 1);
+            assert_eq!(regional_pcs.return_len(), 0);
+            assert_eq!(regional_pcs.grade(regional_start), 1);
+            assert_eq!(
+                regional_pcs.get(regional_start).focus,
+                FormulaFocus::Plan {
+                    node: regional_root,
+                    stage: FormulaStage::Propose,
+                    done: ChildSet::empty(2),
+                }
+            );
+
+            let whole = ResidualPlan::compile_lowering(
+                &root,
+                ResidualLowering::new(FormulaScope::WholeRoot, ProgramScope::Production),
+            );
+            assert!(whole.synthetic_root_formula);
+            assert_eq!(whole.finite_formula.nodes.len(), equality_count + 6);
+            assert_eq!(
+                whole.leaves,
+                [ResidualLeaf {
+                    path: ConstraintPath(Box::new([])),
+                    lowering: LeafLowering::FiniteFormula,
+                }]
+            );
+            let whole_root = whole.finite_formula.root(0).expect("whole root was lowered");
+            let FiniteFormulaNodeKind::And {
+                children: whole_children,
+            } = &whole.finite_formula.node(whole_root).kind
+            else {
+                panic!("the whole-root formula is not AND")
+            };
+            assert_eq!(whole_children.len(), 2);
+            assert_eq!(
+                whole.finite_formula.node(whole_children[0]).path,
+                FormulaPath(vec![FormulaStep::And(0)].into_boxed_slice())
+            );
+            let whole_union = whole_children[1];
+            assert_eq!(
+                whole.finite_formula.node(whole_union).path,
+                FormulaPath(vec![FormulaStep::And(1)].into_boxed_slice())
+            );
+            let FiniteFormulaNodeKind::Or {
+                children: whole_arms,
+            } = &whole.finite_formula.node(whole_union).kind
+            else {
+                panic!("the whole-root child is not OR")
+            };
+            assert_eq!(whole_arms.len(), 2);
+            let FiniteFormulaNodeKind::And {
+                children: dead_children,
+            } = &whole.finite_formula.node(whole_arms[0]).kind
+            else {
+                panic!("whole-root lowering did not expand the off-path AND")
+            };
+            assert_eq!(dead_children.len(), equality_count + 1);
+            assert_eq!(
+                whole.finite_formula.node(whole_arms[0]).path,
+                FormulaPath(
+                    vec![FormulaStep::And(1), FormulaStep::Or(0)].into_boxed_slice()
+                )
+            );
+            for (child, &node) in dead_children.iter().enumerate() {
+                assert_eq!(
+                    whole.finite_formula.node(node).kind,
+                    FiniteFormulaNodeKind::Atom
+                );
+                assert_eq!(
+                    whole.finite_formula.node(node).path,
+                    FormulaPath(
+                        vec![
+                            FormulaStep::And(1),
+                            FormulaStep::Or(0),
+                            FormulaStep::And(child),
+                        ]
+                        .into_boxed_slice()
+                    )
+                );
+            }
+            assert_eq!(
+                whole.finite_formula.node(whole_arms[1]).kind,
+                FiniteFormulaNodeKind::Atom
+            );
+            assert_eq!(
+                whole.finite_formula.node(whole_arms[1]).path,
+                FormulaPath(vec![FormulaStep::And(1), FormulaStep::Or(1)].into_boxed_slice())
+            );
+            assert_eq!(whole.action_span(), equality_count * 8 + 34);
+
+            let mut whole_relevant = ChildSet::empty(whole.len());
+            whole_relevant.insert(0);
+            let mut whole_pcs = FormulaPcInterner::default();
+            let whole_start = whole_pcs.start(
+                &whole.finite_formula,
+                1,
+                0,
+                UnionVerb::Propose {
+                    relevant: whole_relevant,
+                },
+            );
+            assert_eq!(whole_pcs.len(), 1);
+            assert_eq!(whole_pcs.resume_len(), 1);
+            assert_eq!(whole_pcs.return_len(), 0);
+            assert_eq!(whole_pcs.grade(whole_start), 1);
+            assert_eq!(
+                whole_pcs.get(whole_start).focus,
+                FormulaFocus::Plan {
+                    node: whole_root,
+                    stage: FormulaStage::Propose,
+                    done: ChildSet::empty(2),
+                }
+            );
+        }
+    }
+
+    #[test]
     fn compiled_formula_receipts_discharge_only_fully_exact_proposal_routes() {
         let leaf = |coverage| {
             Box::new(ReceiptLeaf {
