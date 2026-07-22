@@ -4182,6 +4182,7 @@ fn generated_combined_formula_rpq_matrix_matches_frozen_schedulers_and_is_monoto
             "union-leaves-transitions",
             ResidualLowering::new(FormulaScope::UnionLeaves, ProgramScope::All),
         ),
+        ("production-regions", ResidualLowering::PRODUCTION),
         ("whole-root-transitions", ResidualLowering::FULL),
     ];
     let mut saw_root_cyclic_probe_one = false;

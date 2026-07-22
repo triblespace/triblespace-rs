@@ -883,12 +883,37 @@ fn semantic_and_mechanism_preflight(fixtures: &[Fixture]) {
     assert_eq!(wide_first.stats.delta_transition_pages, 1);
     assert!(narrow_first.stats.delta_transition_candidates_examined < narrow.scale);
     assert!(wide_first.stats.delta_transition_candidates_examined < wide.scale);
+    assert_eq!(
+        narrow_first.stats.delta_transition_candidates_examined,
+        wide_first.stats.delta_transition_candidates_examined,
+        "first-page work must be independent of total guarded fanout"
+    );
     print_mechanism(
         "guarded_region_shape",
         format_args!(
-            "formula_nodes={GUARDED_FORMULA_NODES};private_test=production_regions_adoption_gate_keeps_off_path_formula_size_constant;counts={narrow_counts:?}"
+            "formula_nodes={GUARDED_FORMULA_NODES};private_test=production_regions_adoption_gate_keeps_off_path_formula_size_constant;counts={narrow_counts:?};examined={}",
+            narrow_first.stats.delta_transition_candidates_examined
         ),
     );
+
+    for guarded in fixtures
+        .iter()
+        .filter(|fixture| matches!(fixture.label, "guarded_small" | "guarded_large"))
+    {
+        let full = run_cell(guarded, Cell::Full, Mode::C);
+        validate_measurement(guarded, Cell::Full, &full);
+        assert_eq!(
+            full.stats.delta_transition_candidates_examined, guarded.scale,
+            "full guarded work must follow result cardinality"
+        );
+        print_mechanism(
+            "guarded_full_cardinality",
+            format_args!(
+                "fixture={};examined={};rows={}",
+                guarded.label, full.stats.delta_transition_candidates_examined, guarded.scale
+            ),
+        );
+    }
 
     let streaming = fixtures
         .iter()

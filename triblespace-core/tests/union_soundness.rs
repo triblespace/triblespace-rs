@@ -182,6 +182,7 @@ fn pattern_changes_monotone_growth_keeps_results() {
             ResidualLowering::new(FormulaScope::WholeRoot, ProgramScope::Disabled),
             true,
         ),
+        ("production-regions", ResidualLowering::PRODUCTION, false),
     ];
 
     let raw_set = |results: &[Inline<GenId>]| -> HashSet<[u8; 32]> {
