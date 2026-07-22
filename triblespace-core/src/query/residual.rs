@@ -106,6 +106,22 @@ use delta::{
     DeltaScheduler, DeltaSeedOutcome, DeltaStepOutcome, TerminalPublicationBatch,
 };
 
+/// Runtime selector for the cfg-only Formula delta-transport causal probe.
+///
+/// The probe deliberately declines every focused Formula Atom before any
+/// typed Program, paged source, or legacy delta activation is created. The
+/// untouched task then reaches [`execute_task`], preserving the same Formula
+/// program counter, payload frames, and reducers while changing only the
+/// action transport.
+#[cfg(formula_delta_transport_probe)]
+static FORMULA_DELTA_TRANSPORT_FORCE_STABLE: AtomicBool = AtomicBool::new(false);
+
+#[cfg(formula_delta_transport_probe)]
+#[doc(hidden)]
+pub fn formula_delta_transport_probe_force_stable(force: bool) {
+    FORMULA_DELTA_TRANSPORT_FORCE_STABLE.store(force, Ordering::Relaxed);
+}
+
 /// One deterministic route from the owned root to an opaque residual leaf.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ConstraintPath(Box<[usize]>);
@@ -2679,6 +2695,75 @@ pub struct ResidualStateStats {
     pub state_reentries: usize,
     /// Parent rows carried by [`state_reentries`](Self::state_reentries).
     pub rows_reentered: usize,
+    /// Probe-only count of nonempty Formula bucket filings.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_filings: usize,
+    /// Probe-only Formula filings appended to an already-live bucket.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_bucket_merges: usize,
+    /// Probe-only Formula filings that reopened an interned state.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_state_reentries: usize,
+    /// Parent rows carried by probe-only Formula state reentries.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_rows_reentered: usize,
+    /// Focused Formula Atom actions offered to delta transport.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_delta_attempts: usize,
+    /// Formula Atom actions causally forced onto stable execution.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_forced_stable_declines: usize,
+    /// Formula Atom actions that naturally retained stable execution.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_natural_stable_declines: usize,
+    /// Formula Atom actions for which production policy selected a typed route.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_program_selected: usize,
+    /// Selected Formula Program actions that opened the delta scheduler.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_program_seeded: usize,
+    /// Affine parents opened by probe Formula Program seeds.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_program_seeded_parents: usize,
+    /// Formula actions transferred to the constraint-owned paged-source path.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_source_seeded: usize,
+    /// Affine parents opened by probe Formula source seeds.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_source_seeded_parents: usize,
+    /// Formula actions transferred through legacy eager delta seeds.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_legacy_seeded: usize,
+    /// Affine parents opened by probe Formula legacy seeds.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_legacy_seeded_parents: usize,
+    /// Stable Formula child Boolean callbacks.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_stable_support_calls: usize,
+    /// Parent rows observed by stable Formula child Boolean callbacks.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_stable_support_rows: usize,
+    /// Stable Formula child proposal callbacks.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_stable_propose_calls: usize,
+    /// Parent rows observed by stable Formula child proposal callbacks.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_stable_propose_rows: usize,
+    /// Candidate occurrences returned by stable Formula child proposals.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_stable_propose_candidates: usize,
+    /// Stable Formula child confirmation callbacks.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_stable_confirm_calls: usize,
+    /// Parent rows observed by stable Formula child confirmations.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_stable_confirm_rows: usize,
+    /// Candidate occurrences entering stable Formula child confirmations.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_stable_confirm_candidates_in: usize,
+    /// Candidate occurrences surviving stable Formula child confirmations.
+    #[cfg(formula_delta_transport_probe)]
+    pub probe_formula_stable_confirm_candidates_out: usize,
     /// Logical flattened-leaf proposal actions. A paged source activation
     /// counts once even though it bypasses the eager `Constraint::propose`
     /// verb.
@@ -7809,6 +7894,12 @@ fn file_with_span(
     if rows == 0 {
         return None;
     }
+    #[cfg(formula_delta_transport_probe)]
+    let probe_formula = matches!(&desc.phase, ResidualPhase::Formula { .. });
+    #[cfg(formula_delta_transport_probe)]
+    if probe_formula {
+        stats.probe_formula_filings += 1;
+    }
     let candidates = match &bucket {
         StateBucket::Rows(_) => 0,
         StateBucket::Candidates(batch) => batch.candidate_count(),
@@ -7820,11 +7911,20 @@ fn file_with_span(
     if let Some(existing) = level.get_mut(&id) {
         stats.bucket_merges += 1;
         stats.rows_merged += rows;
+        #[cfg(formula_delta_transport_probe)]
+        if probe_formula {
+            stats.probe_formula_bucket_merges += 1;
+        }
         existing.append(bucket);
     } else {
         if known {
             stats.state_reentries += 1;
             stats.rows_reentered += rows;
+            #[cfg(formula_delta_transport_probe)]
+            if probe_formula {
+                stats.probe_formula_state_reentries += 1;
+                stats.probe_formula_rows_reentered += rows;
+            }
         }
         level.insert(id, bucket);
     }
@@ -9776,6 +9876,11 @@ fn formula_action_transition<'a>(
     let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
     let constraint = plan.resolve_formula_node(root, occurrence, node);
     if stage == FormulaStage::Support {
+        #[cfg(formula_delta_transport_probe)]
+        {
+            stats.probe_formula_stable_support_calls += 1;
+            stats.probe_formula_stable_support_rows += batch.parents.row_count;
+        }
         let support: Vec<bool> = (0..batch.parents.row_count)
             .map(|parent| constraint.satisfied(&view.row_view(parent)))
             .collect();
@@ -9821,6 +9926,12 @@ fn formula_action_transition<'a>(
             );
             stats.candidates_proposed += result.len();
             stats.max_propose_candidates = stats.max_propose_candidates.max(result.len());
+            #[cfg(formula_delta_transport_probe)]
+            {
+                stats.probe_formula_stable_propose_calls += 1;
+                stats.probe_formula_stable_propose_rows += batch.parents.row_count;
+                stats.probe_formula_stable_propose_candidates += result.len();
+            }
         }
         FormulaStage::Confirm => {
             confirm_constraint(
@@ -9832,6 +9943,13 @@ fn formula_action_transition<'a>(
             );
             stats.candidates_confirmed += candidates_before;
             stats.max_confirm_candidates = stats.max_confirm_candidates.max(candidates_before);
+            #[cfg(formula_delta_transport_probe)]
+            {
+                stats.probe_formula_stable_confirm_calls += 1;
+                stats.probe_formula_stable_confirm_rows += batch.parents.row_count;
+                stats.probe_formula_stable_confirm_candidates_in += candidates_before;
+                stats.probe_formula_stable_confirm_candidates_out += result.len();
+            }
         }
     }
     match stage {
@@ -11847,6 +11965,14 @@ impl ResidualStateMachine {
         if !matches!(formula_node.kind, FiniteFormulaNodeKind::Atom) {
             return Err(task);
         }
+        #[cfg(formula_delta_transport_probe)]
+        {
+            self.stats.probe_formula_delta_attempts += 1;
+            if FORMULA_DELTA_TRANSPORT_FORCE_STABLE.load(Ordering::Relaxed) {
+                self.stats.probe_formula_forced_stable_declines += 1;
+                return Err(task);
+            }
+        }
         let proposal_streaming = if stage != FormulaStage::Propose {
             FormulaProposalStreaming::Quiescent
         } else {
@@ -11903,8 +12029,18 @@ impl ResidualStateMachine {
         };
         let program = match select_program(constraint, plan.program_scope, program_request) {
             ProgramOffer::Absent => None,
-            ProgramOffer::Deferred => return Err(task),
+            ProgramOffer::Deferred => {
+                #[cfg(formula_delta_transport_probe)]
+                {
+                    self.stats.probe_formula_natural_stable_declines += 1;
+                }
+                return Err(task);
+            }
             ProgramOffer::Selected(spec, route) => {
+                #[cfg(formula_delta_transport_probe)]
+                {
+                    self.stats.probe_formula_program_selected += 1;
+                }
                 if stage == FormulaStage::Confirm && route.grouping == ProgramGrouping::ParentAtomic
                 {
                     assert!(
@@ -11926,6 +12062,10 @@ impl ResidualStateMachine {
                     seeds.is_empty(),
                     "unsupported formula support seed hook mutated its output"
                 );
+                #[cfg(formula_delta_transport_probe)]
+                {
+                    self.stats.probe_formula_natural_stable_declines += 1;
+                }
                 return Err(task);
             };
             (route, false)
@@ -11948,6 +12088,10 @@ impl ResidualStateMachine {
                 // machinery. When any sibling owns a true transition source,
                 // keep the heterogeneous frontier uniformly pageable so its
                 // work can still be interleaved.
+                #[cfg(formula_delta_transport_probe)]
+                {
+                    self.stats.probe_formula_natural_stable_declines += 1;
+                }
                 return Err(task);
             }
             let paged = transition_paged || proposal_paged;
@@ -11958,6 +12102,10 @@ impl ResidualStateMachine {
                         seeds.is_empty(),
                         "unsupported formula delta seed hook mutated its output"
                     );
+                    #[cfg(formula_delta_transport_probe)]
+                    {
+                        self.stats.probe_formula_natural_stable_declines += 1;
+                    }
                     return Err(task);
                 }
             }
@@ -12028,6 +12176,11 @@ impl ResidualStateMachine {
             }
         }
         if let Some((spec, route)) = program {
+            #[cfg(formula_delta_transport_probe)]
+            {
+                self.stats.probe_formula_program_seeded += 1;
+                self.stats.probe_formula_program_seeded_parents += batch.parents.row_count;
+            }
             return Ok(self.delta.seed_program_formula(
                 spec,
                 DeltaDesc::formula(variable, occurrence, node),
@@ -12046,6 +12199,11 @@ impl ResidualStateMachine {
         }
         if paged {
             let seeded_parents = batch.parents.row_count;
+            #[cfg(formula_delta_transport_probe)]
+            {
+                self.stats.probe_formula_source_seeded += 1;
+                self.stats.probe_formula_source_seeded_parents += seeded_parents;
+            }
             let active = self.delta.seed_source_formula(
                 DeltaDesc::formula(variable, occurrence, node),
                 desc.bound,
@@ -12063,6 +12221,11 @@ impl ResidualStateMachine {
                 terminal_family: None,
                 seeded_parents,
             });
+        }
+        #[cfg(formula_delta_transport_probe)]
+        {
+            self.stats.probe_formula_legacy_seeded += 1;
+            self.stats.probe_formula_legacy_seeded_parents += batch.parents.row_count;
         }
         Ok(self.delta.seed_formula(
             DeltaDesc::formula(variable, occurrence, node),
