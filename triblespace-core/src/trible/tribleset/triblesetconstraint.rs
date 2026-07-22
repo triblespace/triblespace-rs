@@ -2656,7 +2656,7 @@ mod tests {
         let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
         let mut ordinary: Vec<_> = Query::new(make(), project).collect();
         let mut query = Query::new(make(), project)
-            .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+            .solve_residual_state_lazy_with(ResidualLowering::OPAQUE_PRODUCTION)
             .start_width(1)
             .growth(2)
             .cap(256);

@@ -317,9 +317,9 @@ shared device service. Until a device-wide cooperative submission gate exists,
 automatic placement would still make a latency claim the runtime cannot uphold.
 
 The public parallel entry preserves the query's selected residual lowering,
-so fresh queries retain full formula and transition-Program lowering through
-`Query::into_par_residual_state_iter`; an explicit conservative selection
-continues to use the ordinary constraint path.
+so fresh queries retain selective production-region and transition-Program
+lowering through `Query::into_par_residual_state_iter`; an explicit
+conservative selection continues to use the ordinary constraint path.
 
 The production rollup type is
 `triblespace_core::repo::index_home::AcceleratedSuccinctRollup<WgpuWaveletFreeze>`:

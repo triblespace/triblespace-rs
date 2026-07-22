@@ -165,12 +165,12 @@ struct Mode {
 
 const MODES: [Mode; 3] = [
     Mode {
-        label: "hybrid-opaque",
-        lowering: ResidualLowering::HYBRID,
+        label: "opaque-production",
+        lowering: ResidualLowering::OPAQUE_PRODUCTION,
     },
     Mode {
         label: "production-regions",
-        lowering: ResidualLowering::new(FormulaScope::ProductionRegions, ProgramScope::Production),
+        lowering: ResidualLowering::PRODUCTION,
     },
     Mode {
         label: "whole-root",
