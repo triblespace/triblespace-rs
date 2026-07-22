@@ -27,6 +27,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   last-value cursor plus exact exhaustion receipt. Positive, inverse, and
   negated transitions retain their existing examined-candidate budgets and
   width-one behavior without restarting PATCH for every candidate.
+- **Selective Production formula regions have a preregistered adoption gate.**
+  One binary compares opaque-production and regional-production lowering over
+  guarded-star, recursive streaming, barrier, and plan-identical ordinary
+  controls. Independent SET and mechanism receipts precede five timing cells;
+  twenty order-balanced paired rounds produce ten log-ratio superblocks and
+  one-sided 95% bounds. Two interleaved power-of-two drain scales are judged
+  against the ordinary A/A scale-growth envelope while their absolute ratios
+  remain visible.
 - **Selective production regions preserve guarded exactness through finite
   ORs.** Each affine parent now carries covering-only provenance and an
   explicit active-arm receipt through paging, partitioning, and online
