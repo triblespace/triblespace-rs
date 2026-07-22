@@ -64,6 +64,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only values not already published online. Selective `ProductionRegions`
   formula leaves use the same receipt and reducer without widening legacy
   `UnionLeaves` execution.
+- **Directed singleton Program chains can spend one scheduler grant locally.**
+  An unjoined streaming activation may consume exact same-cohort sole children
+  inside its producing receipt until the original work budget is exhausted or
+  a direct page effect, resume, placement, dispatch change, or join boundary
+  is reached. Accepting sole-child endpoints are SET-admitted at the final
+  receipt in their original page order. The producer registry still observes
+  one affine replacement, while global cohorts retain their existing
+  scheduling behavior.
 - **Typed Program activation retirement scans its arena at most once per
   cohort.** A fully drained arena retires immediately; singleton receipts keep
   their allocation-free scalar scan, while wider live arenas build activation
