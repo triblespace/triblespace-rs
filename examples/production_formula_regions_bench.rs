@@ -1,4 +1,5 @@
-//! Preregistered adoption gate for selective Production formula regions.
+//! Preregistered V3 held-out adoption gate for selective Production formula
+//! regions.
 //!
 //! This binary compares the existing opaque-production lowering (`B`) with
 //! `ProductionRegions + Production` (`C`) inside one process. It deliberately
@@ -21,26 +22,52 @@
 //! benchmark-only public plan-introspection API.
 //!
 //! Every timed workload runs exactly twenty paired rounds. Odd rounds use
-//! `B-C-C-B`; even rounds use `C-B-B-C`. Adjacent rounds form ten
-//! order-balanced superblocks in log-ratio space. The binary prints every raw
-//! sample, every superblock, and a geometric ratio with its one-sided 95%
-//! Student-t upper bound (`df=9`).
+//! `B-C-C-B`; even rounds use `C-B-B-C`. The odd fixture order is guarded
+//! small, guarded large, recursive streaming, non-page-local barrier, its
+//! matched ordinary A/A control, ordinary small, ordinary large; even rounds
+//! use the exact reverse. Adjacent rounds form ten order-balanced superblocks.
+//! The binary prints every raw sample, every superblock, every point ratio,
+//! bound, envelope, individual decision, and overall verdict.
 //! Raw sample rows carry `stats_observed=false` for construct-and-drop and
 //! fresh drop-at-first: those cells stop their clocks only after destruction,
 //! so their diagnostic counter columns are deliberately zero sentinels.
-//! Guarded small/large and ordinary small/large arms are adjacent within every
-//! round, with their scale order reversed on even rounds; the drain-growth
-//! contrast therefore uses genuinely paired superblocks.
+//! Guarded small/large, barrier/A-A, and ordinary small/large arms are adjacent
+//! within every round, with their pair order reversed on even rounds.
 //!
 //! `GO` requires both positive streaming fixtures to have `C/B upper95 < 1`
-//! in the three first/drop cells. Guarded full-drain ratios are measured at
-//! two power-of-two scales. Their scale growth may not exceed the ordinary
-//! plan-identical A/A noise envelope. Absolute guarded drain ratios are always
-//! printed and are never hidden by that relative-growth criterion.
-//! Concretely, each scale-growth sample is `large_y[j] - small_y[j]`. The
-//! guarded one-sided upper log bound is compared with
-//! `abs(mean(ordinary_growth)) + t95 * se(ordinary_growth)`; equality passes.
-//! This definition is fixed here before any formal timing is observed.
+//! in the three first/drop cells and guarded-large full drain to have
+//! `C/B upper95 < 1`. Guarded marginal drain cost is the ratio of paired
+//! arithmetic time increments between the two formal scales; its one-sided
+//! upper bound may not exceed the corresponding plan-identical A/A envelope.
+//! Every scale increment must be positive. The non-page-local barrier's four
+//! execution cells may likewise not exceed their matched ordinary A/A noise
+//! envelopes. Absolute guarded drain ratios remain mandatory disclosure, not
+//! an added percentage cap.
+//! Here "matched" means an ordinary no-region fixture at the barrier's scale,
+//! timed adjacent to it with reversed pair order; the barrier envelope uses
+//! that fixture's ordinary point log-ratio superblocks. A nonpositive B or C
+//! increment in either the guarded or ordinary marginal pair forces `STOP`.
+//!
+//! Warmup remains V2 exactly and is outside timed ordering: visit fixtures in
+//! their stored order, then cells in construct/prebuilt/fresh/drop/full order,
+//! and run B once followed by C once. Formal timing uses that same outer cell
+//! order before applying the round and fixture reversals described above.
+//!
+//! The two formal guarded scales are complemented by a diagnostic-only phase
+//! profile on at least four non-held-out powers of two (recommended `2^12`,
+//! `2^14`, `2^16`, and `2^18`) and separate domains. That profile may guide
+//! implementation before candidate freeze but never contributes to this
+//! verdict and must not use the reserved formal pairs below.
+//!
+//! Freeze this protocol, the candidate commit, and the release-binary hash
+//! before formal timing. Exactly one formal invocation is allowed on an idle,
+//! plugged-in host. Preserve its complete raw output regardless of verdict.
+//! There is no peeking, adaptive stopping, extension, outlier deletion, or
+//! rerun for noise or `STOP`. A host failure before the first sample may be
+//! rescheduled. After the first sample, interruption leaves the candidate
+//! unadmitted and forbids a same-candidate retry; another attempt needs a new
+//! preregistration and a materially changed candidate. No revised rule
+//! retroactively reinterprets an earlier receipt.
 //!
 //! Build and semantic preflight (no formal timing):
 //!
@@ -49,15 +76,19 @@
 //! cargo test --example production_formula_regions_bench
 //! ```
 //!
-//! Formal run, on an otherwise idle host:
+//! Formal run, once, on an otherwise idle host with stdout redirected so the
+//! complete receipt is not inspected adaptively:
 //!
 //! ```text
-//! cargo run --release --example production_formula_regions_bench
+//! cargo build --release --example production_formula_regions_bench
+//! shasum -a 256 target/release/examples/production_formula_regions_bench
+//! target/release/examples/production_formula_regions_bench > "$FROZEN_RECEIPT" 2>&1
 //! ```
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::hint::black_box;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -81,14 +112,32 @@ use triblespace::prelude::*;
 
 const START: VariableId = 0;
 const END: VariableId = 1;
+const PROTOCOL_VERSION: &str = "BE6594AF7634F74ACD46A83CF6E67283";
 const FORMAL_ROUNDS: usize = 20;
 const SUPERBLOCKS: usize = FORMAL_ROUNDS / 2;
 const ONE_SIDED_T95_DF9: f64 = 1.833_112_932_653_633_5;
-const GUARDED_SMALL: usize = 16_384;
-const GUARDED_LARGE: usize = 65_536;
-const RECURSIVE_SCALE: usize = 4_096;
+const GUARDED_SMALL: usize = 1 << 15;
+const GUARDED_LARGE: usize = 1 << 17;
+const STREAMING_SCALE: usize = 1 << 11;
+const BARRIER_SCALE: usize = 1 << 13;
 const GUARD_WIDTH: usize = 32;
 const GUARDED_FORMULA_NODES: usize = 3;
+const GUARDED_SMALL_DOMAIN: u32 = 300;
+const GUARDED_LARGE_DOMAIN: u32 = 310;
+const STREAMING_DOMAIN: u32 = 320;
+const BARRIER_DOMAIN: u32 = 330;
+const ORDINARY_BARRIER_DOMAIN: u32 = 340;
+const ORDINARY_SMALL_DOMAIN: u32 = 350;
+const ORDINARY_LARGE_DOMAIN: u32 = 360;
+const FORMAL_LABELS: [&str; 7] = [
+    "guarded_small",
+    "guarded_large",
+    "streaming_filter",
+    "barrier_control",
+    "ordinary_barrier",
+    "ordinary_small",
+    "ordinary_large",
+];
 
 type OwnedConstraint = Box<dyn Constraint<'static> + Send + Sync>;
 type Root = Arc<IntersectionConstraint<OwnedConstraint>>;
@@ -136,6 +185,12 @@ impl Cell {
         Self::Full,
     ];
     const FIRST_DROP: [Self; 3] = [Self::PullFirst, Self::FreshFirst, Self::DropFirst];
+    const BARRIER_GUARD: [Self; 4] = [
+        Self::PullFirst,
+        Self::FreshFirst,
+        Self::DropFirst,
+        Self::Full,
+    ];
 
     fn label(self) -> &'static str {
         match self {
@@ -164,6 +219,15 @@ fn round_order(round: usize) -> [Mode; 4] {
         [Mode::B, Mode::C, Mode::C, Mode::B]
     } else {
         [Mode::C, Mode::B, Mode::B, Mode::C]
+    }
+}
+
+fn fixture_order(round: usize) -> [usize; 7] {
+    assert!((1..=FORMAL_ROUNDS).contains(&round));
+    if round % 2 == 1 {
+        [0, 1, 2, 3, 4, 5, 6]
+    } else {
+        [6, 5, 4, 3, 2, 1, 0]
     }
 }
 
@@ -1015,7 +1079,7 @@ fn semantic_and_mechanism_preflight(fixtures: &[Fixture]) {
 
     for ordinary in fixtures
         .iter()
-        .filter(|fixture| matches!(fixture.label, "ordinary_small" | "ordinary_large"))
+        .filter(|fixture| matches!(&fixture.kind, FixtureKind::Ordinary { .. }))
     {
         let (b_results, b_trace, b_stats) = ordinary_trace(ordinary, Mode::B);
         let (c_results, c_trace, c_stats) = ordinary_trace(ordinary, Mode::C);
@@ -1064,6 +1128,7 @@ fn warm(fixtures: &[Fixture]) {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct RoundSample {
     b: [f64; 2],
     c: [f64; 2],
@@ -1130,14 +1195,7 @@ fn measure_series(fixtures: &[Fixture]) -> Vec<TimingSeries> {
             .iter()
             .map(|fixture| fixture.label)
             .collect::<Vec<_>>(),
-        [
-            "guarded_small",
-            "guarded_large",
-            "streaming_filter",
-            "barrier_control",
-            "ordinary_small",
-            "ordinary_large",
-        ],
+        FORMAL_LABELS,
         "fixture order is part of the scale-pairing protocol"
     );
     let mut series = fixtures
@@ -1154,17 +1212,10 @@ fn measure_series(fixtures: &[Fixture]) -> Vec<TimingSeries> {
 
     for cell in Cell::ALL {
         for round in 1..=FORMAL_ROUNDS {
-            // The two guarded scales and the two ordinary A/A scales are
-            // adjacent inside every logical round. Their order reverses on
-            // even rounds, so same-index superblock subtraction is a real
-            // temporally paired contrast rather than a comparison of distant
-            // fixture blocks. The two non-scale fixtures reverse as well.
-            let fixture_order = if round % 2 == 1 {
-                [0, 1, 2, 3, 4, 5]
-            } else {
-                [1, 0, 3, 2, 5, 4]
-            };
-            for fixture_index in fixture_order {
+            // The exact fixture reversal keeps both scale pairs and the
+            // barrier/A-A pair adjacent while reversing their temporal order
+            // in the even half of every superblock.
+            for fixture_index in fixture_order(round) {
                 let fixture = &fixtures[fixture_index];
                 let mut b = Vec::with_capacity(2);
                 let mut c = Vec::with_capacity(2);
@@ -1172,7 +1223,10 @@ fn measure_series(fixtures: &[Fixture]) -> Vec<TimingSeries> {
                     let measured = run_cell(fixture, cell, mode);
                     validate_measurement(fixture, cell, &measured);
                     print_sample(fixture, cell, round, arm + 1, mode, &measured);
-                    let seconds = measured.elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
+                    // Zero is retained as invalid evidence rather than
+                    // silently clamped: a completed nonpositive/nonfinite
+                    // sample must force STOP under the frozen protocol.
+                    let seconds = measured.elapsed.as_secs_f64();
                     match mode {
                         Mode::B => b.push(seconds),
                         Mode::C => c.push(seconds),
@@ -1201,6 +1255,7 @@ struct Analysis {
     scale: usize,
     cell: Cell,
     superblocks: [f64; SUPERBLOCKS],
+    valid: bool,
     geometric_ratio: f64,
     upper95: f64,
 }
@@ -1226,15 +1281,24 @@ fn upper95_log(values: &[f64]) -> (f64, f64) {
     (mean, mean + ONE_SIDED_T95_DF9 * standard_error)
 }
 
-fn analyze(series: TimingSeries) -> Analysis {
+fn analyze(series: &TimingSeries) -> Analysis {
     assert_eq!(series.rounds.len(), FORMAL_ROUNDS);
     let round_ratios: Vec<_> = series
         .rounds
         .iter()
         .map(|round| {
-            (round.c.iter().map(|value| value.ln()).sum::<f64>()
-                - round.b.iter().map(|value| value.ln()).sum::<f64>())
-                / 2.0
+            let valid = round
+                .b
+                .iter()
+                .chain(&round.c)
+                .all(|value| value.is_finite() && *value > 0.0);
+            if valid {
+                (round.c.iter().map(|value| value.ln()).sum::<f64>()
+                    - round.b.iter().map(|value| value.ln()).sum::<f64>())
+                    / 2.0
+            } else {
+                f64::NAN
+            }
         })
         .collect();
     let superblocks: [f64; SUPERBLOCKS] = round_ratios
@@ -1243,36 +1307,206 @@ fn analyze(series: TimingSeries) -> Analysis {
         .collect::<Vec<_>>()
         .try_into()
         .expect("ten superblocks");
-    let (mean, upper) = upper95_log(&superblocks);
+    let valid = superblocks.iter().all(|value| value.is_finite());
+    let (mean, upper) = if valid {
+        upper95_log(&superblocks)
+    } else {
+        (f64::NAN, f64::NAN)
+    };
     Analysis {
         fixture: series.fixture,
         scale: series.scale,
         cell: series.cell,
         superblocks,
+        valid,
         geometric_ratio: mean.exp(),
         upper95: upper.exp(),
     }
 }
 
+fn metric(value: f64) -> String {
+    if value.is_finite() {
+        format!("{value:.12}")
+    } else {
+        "INVALID".to_owned()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SuperblockModeMeans {
+    b: f64,
+    c: f64,
+}
+
+fn superblock_mode_means(series: &TimingSeries) -> [SuperblockModeMeans; SUPERBLOCKS] {
+    assert_eq!(series.rounds.len(), FORMAL_ROUNDS);
+    series
+        .rounds
+        .chunks_exact(2)
+        .map(|pair| SuperblockModeMeans {
+            b: pair.iter().flat_map(|round| round.b).sum::<f64>() / 4.0,
+            c: pair.iter().flat_map(|round| round.c).sum::<f64>() / 4.0,
+        })
+        .collect::<Vec<_>>()
+        .try_into()
+        .expect("ten superblock mode means")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MarginalPoint {
+    b_small: f64,
+    b_large: f64,
+    b_delta: f64,
+    c_small: f64,
+    c_large: f64,
+    c_delta: f64,
+    log_ratio: Option<f64>,
+}
+
+struct MarginalAnalysis {
+    label: &'static str,
+    points: [MarginalPoint; SUPERBLOCKS],
+    valid: bool,
+    geometric_ratio: Option<f64>,
+    upper95: Option<f64>,
+}
+
+fn analyze_marginal(
+    label: &'static str,
+    small: &TimingSeries,
+    large: &TimingSeries,
+) -> MarginalAnalysis {
+    assert_eq!(small.cell, Cell::Full);
+    assert_eq!(large.cell, Cell::Full);
+    assert!(small.scale < large.scale);
+    let points: [MarginalPoint; SUPERBLOCKS] = superblock_mode_means(small)
+        .into_iter()
+        .zip(superblock_mode_means(large))
+        .map(|(small, large)| {
+            let b_delta = large.b - small.b;
+            let c_delta = large.c - small.c;
+            let valid = [small.b, large.b, b_delta, small.c, large.c, c_delta]
+                .into_iter()
+                .all(f64::is_finite)
+                && b_delta > 0.0
+                && c_delta > 0.0;
+            let log_ratio = if valid {
+                let log_ratio = (c_delta / b_delta).ln();
+                log_ratio.is_finite().then_some(log_ratio)
+            } else {
+                None
+            };
+            MarginalPoint {
+                b_small: small.b,
+                b_large: large.b,
+                b_delta,
+                c_small: small.c,
+                c_large: large.c,
+                c_delta,
+                log_ratio,
+            }
+        })
+        .collect::<Vec<_>>()
+        .try_into()
+        .expect("ten marginal superblocks");
+    let valid = points.iter().all(|point| point.log_ratio.is_some());
+    let (geometric_ratio, upper95) = if valid {
+        let logs: Vec<_> = points
+            .iter()
+            .map(|point| point.log_ratio.expect("validated marginal point"))
+            .collect();
+        let (mean, upper) = upper95_log(&logs);
+        (Some(mean.exp()), Some(upper.exp()))
+    } else {
+        (None, None)
+    };
+    MarginalAnalysis {
+        label,
+        points,
+        valid,
+        geometric_ratio,
+        upper95,
+    }
+}
+
+fn noise_envelope(superblocks: &[f64]) -> f64 {
+    assert_eq!(superblocks.len(), SUPERBLOCKS);
+    let mean = sample_mean(superblocks);
+    (mean.abs()
+        + ONE_SIDED_T95_DF9 * sample_stddev(superblocks, mean) / (superblocks.len() as f64).sqrt())
+    .exp()
+}
+
+fn strict_upper_bound_pass(valid: bool, upper95: f64) -> bool {
+    valid && upper95.is_finite() && upper95 < 1.0
+}
+
+fn envelope_pass(valid: bool, upper95: f64, envelope: f64) -> bool {
+    valid && upper95.is_finite() && envelope.is_finite() && upper95 <= envelope
+}
+
+fn emit_marginal(analysis: &MarginalAnalysis) {
+    println!(
+        "columns\tmarginal_superblock\tseries\tsuperblock\tB_small\tB_large\tdB\tC_small\tC_large\tdC\tlog_ratio\tratio"
+    );
+    for (index, point) in analysis.points.iter().enumerate() {
+        let log_ratio = point
+            .log_ratio
+            .map(metric)
+            .unwrap_or_else(|| "INVALID".to_owned());
+        let ratio = point
+            .log_ratio
+            .map(|value| metric(value.exp()))
+            .unwrap_or_else(|| "INVALID".to_owned());
+        println!(
+            "marginal_superblock\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            analysis.label,
+            index + 1,
+            metric(point.b_small),
+            metric(point.b_large),
+            metric(point.b_delta),
+            metric(point.c_small),
+            metric(point.c_large),
+            metric(point.c_delta),
+            log_ratio,
+            ratio,
+        );
+    }
+    println!(
+        "marginal_summary\t{}\t{}\t{}\t{}",
+        analysis.label,
+        analysis
+            .geometric_ratio
+            .map(metric)
+            .unwrap_or_else(|| "INVALID".to_owned()),
+        analysis
+            .upper95
+            .map(metric)
+            .unwrap_or_else(|| "INVALID".to_owned()),
+        if analysis.valid { "VALID" } else { "STOP" },
+    );
+}
+
 fn emit_analysis(analysis: &Analysis) {
     for (index, &log_ratio) in analysis.superblocks.iter().enumerate() {
         println!(
-            "superblock\t{}\t{}\t{}\t{}\t{:.12}\t{:.12}",
+            "superblock\t{}\t{}\t{}\t{}\t{}\t{}",
             analysis.fixture,
             analysis.scale,
             analysis.cell.label(),
             index + 1,
-            log_ratio,
-            log_ratio.exp(),
+            metric(log_ratio),
+            metric(log_ratio.exp()),
         );
     }
     println!(
-        "summary\t{}\t{}\t{}\t{:.12}\t{:.12}",
+        "summary\t{}\t{}\t{}\t{}\t{}\t{}",
         analysis.fixture,
         analysis.scale,
         analysis.cell.label(),
-        analysis.geometric_ratio,
-        analysis.upper95,
+        metric(analysis.geometric_ratio),
+        metric(analysis.upper95),
+        if analysis.valid { "VALID" } else { "STOP" },
     );
 }
 
@@ -1285,22 +1519,50 @@ fn lookup<'a>(analyses: &'a [Analysis], fixture: &str, scale: usize, cell: Cell)
         .expect("registered analysis")
 }
 
-fn decide(analyses: &[Analysis]) -> bool {
-    let mut go = true;
+fn lookup_series<'a>(
+    series: &'a [TimingSeries],
+    fixture: &str,
+    scale: usize,
+    cell: Cell,
+) -> &'a TimingSeries {
+    series
+        .iter()
+        .find(|series| series.fixture == fixture && series.scale == scale && series.cell == cell)
+        .expect("registered timing series")
+}
+
+fn all_completed_samples_valid(analyses: &[Analysis]) -> bool {
+    analyses.len() == FORMAL_LABELS.len() * Cell::ALL.len()
+        && analyses.iter().all(|analysis| analysis.valid)
+}
+
+fn decide(analyses: &[Analysis], series: &[TimingSeries]) -> bool {
+    let all_completed_samples_valid = all_completed_samples_valid(analyses);
+    println!(
+        "decision\tcompleted_samples\tanalyses={}\texpected={}\t{}",
+        analyses.len(),
+        FORMAL_LABELS.len() * Cell::ALL.len(),
+        if all_completed_samples_valid {
+            "PASS"
+        } else {
+            "STOP"
+        },
+    );
+    let mut go = all_completed_samples_valid;
     for (fixture, scale) in [
         ("guarded_large", GUARDED_LARGE),
-        ("streaming_filter", RECURSIVE_SCALE),
+        ("streaming_filter", STREAMING_SCALE),
     ] {
         for cell in Cell::FIRST_DROP {
             let analysis = lookup(analyses, fixture, scale, cell);
-            let pass = analysis.upper95 < 1.0;
+            let pass = strict_upper_bound_pass(analysis.valid, analysis.upper95);
             go &= pass;
             println!(
-                "decision\tstreaming_upper95\t{}\t{}\t{}\t{:.12}\t{}",
+                "decision\tstreaming_upper95\t{}\t{}\t{}\t{}\t{}",
                 fixture,
                 scale,
                 cell.label(),
-                analysis.upper95,
+                metric(analysis.upper95),
                 if pass { "PASS" } else { "STOP" },
             );
         }
@@ -1308,73 +1570,169 @@ fn decide(analyses: &[Analysis]) -> bool {
 
     let guarded_small = lookup(analyses, "guarded_small", GUARDED_SMALL, Cell::Full);
     let guarded_large = lookup(analyses, "guarded_large", GUARDED_LARGE, Cell::Full);
-    let ordinary_small = lookup(analyses, "ordinary_small", GUARDED_SMALL, Cell::Full);
-    let ordinary_large = lookup(analyses, "ordinary_large", GUARDED_LARGE, Cell::Full);
     println!(
-        "drain_absolute\tguarded_small\t{}\t{:.12}\t{:.12}",
-        GUARDED_SMALL, guarded_small.geometric_ratio, guarded_small.upper95
+        "drain_absolute\tguarded_small\t{}\t{}\t{}",
+        GUARDED_SMALL,
+        metric(guarded_small.geometric_ratio),
+        metric(guarded_small.upper95)
     );
     println!(
-        "drain_absolute\tguarded_large\t{}\t{:.12}\t{:.12}",
-        GUARDED_LARGE, guarded_large.geometric_ratio, guarded_large.upper95
+        "drain_absolute\tguarded_large\t{}\t{}\t{}",
+        GUARDED_LARGE,
+        metric(guarded_large.geometric_ratio),
+        metric(guarded_large.upper95)
     );
 
-    let guarded_growth: Vec<_> = guarded_large
-        .superblocks
-        .iter()
-        .zip(guarded_small.superblocks)
-        .map(|(large, small)| large - small)
-        .collect();
-    let ordinary_growth: Vec<_> = ordinary_large
-        .superblocks
-        .iter()
-        .zip(ordinary_small.superblocks)
-        .map(|(large, small)| large - small)
-        .collect();
-    let (_, guarded_growth_upper_log) = upper95_log(&guarded_growth);
-    let ordinary_mean = sample_mean(&ordinary_growth);
-    let ordinary_noise_log = ordinary_mean.abs()
-        + ONE_SIDED_T95_DF9 * sample_stddev(&ordinary_growth, ordinary_mean)
-            / (ordinary_growth.len() as f64).sqrt();
-    let guarded_growth_upper = guarded_growth_upper_log.exp();
-    let ordinary_noise_envelope = ordinary_noise_log.exp();
-    let pass = guarded_growth_upper <= ordinary_noise_envelope;
+    let pass = strict_upper_bound_pass(guarded_large.valid, guarded_large.upper95);
     go &= pass;
     println!(
-        "decision\tdrain_scale_growth\tguarded_upper95={:.12}\tordinary_aa_envelope={:.12}\t{}",
-        guarded_growth_upper,
-        ordinary_noise_envelope,
+        "decision\tlargest_drain_upper95\tguarded_large\t{}\t{}\t{}",
+        GUARDED_LARGE,
+        metric(guarded_large.upper95),
         if pass { "PASS" } else { "STOP" },
     );
+
+    let guarded_marginal = analyze_marginal(
+        "guarded",
+        lookup_series(series, "guarded_small", GUARDED_SMALL, Cell::Full),
+        lookup_series(series, "guarded_large", GUARDED_LARGE, Cell::Full),
+    );
+    let ordinary_marginal = analyze_marginal(
+        "ordinary_aa",
+        lookup_series(series, "ordinary_small", GUARDED_SMALL, Cell::Full),
+        lookup_series(series, "ordinary_large", GUARDED_LARGE, Cell::Full),
+    );
+    emit_marginal(&guarded_marginal);
+    emit_marginal(&ordinary_marginal);
+    let ordinary_marginal_logs: Vec<_> = ordinary_marginal
+        .points
+        .iter()
+        .filter_map(|point| point.log_ratio)
+        .collect();
+    let ordinary_marginal_envelope = if ordinary_marginal.valid {
+        Some(noise_envelope(&ordinary_marginal_logs))
+    } else {
+        None
+    };
+    let pass = guarded_marginal.valid
+        && ordinary_marginal.valid
+        && guarded_marginal
+            .upper95
+            .zip(ordinary_marginal_envelope)
+            .is_some_and(|(upper, envelope)| envelope_pass(true, upper, envelope));
+    go &= pass;
+    println!(
+        "decision\tmarginal_drain_cost\tguarded_ratio={}\tguarded_upper95={}\tordinary_aa_envelope={}\t{}",
+        guarded_marginal
+            .geometric_ratio
+            .map(metric)
+            .unwrap_or_else(|| "INVALID".to_owned()),
+        guarded_marginal
+            .upper95
+            .map(metric)
+            .unwrap_or_else(|| "INVALID".to_owned()),
+        ordinary_marginal_envelope
+            .map(metric)
+            .unwrap_or_else(|| "INVALID".to_owned()),
+        if pass { "PASS" } else { "STOP" },
+    );
+
+    for cell in Cell::BARRIER_GUARD {
+        let barrier = lookup(analyses, "barrier_control", BARRIER_SCALE, cell);
+        let ordinary = lookup(analyses, "ordinary_barrier", BARRIER_SCALE, cell);
+        let ordinary_envelope = if ordinary.valid {
+            noise_envelope(&ordinary.superblocks)
+        } else {
+            f64::NAN
+        };
+        let pass = envelope_pass(
+            barrier.valid && ordinary.valid,
+            barrier.upper95,
+            ordinary_envelope,
+        );
+        go &= pass;
+        println!(
+            "decision\tbarrier_upper95\tbarrier_control\t{}\t{}\tbarrier_ratio={}\tbarrier_upper95={}\tordinary_aa_envelope={}\t{}",
+            BARRIER_SCALE,
+            cell.label(),
+            metric(barrier.geometric_ratio),
+            metric(barrier.upper95),
+            metric(ordinary_envelope),
+            if pass { "PASS" } else { "STOP" },
+        );
+    }
     go
 }
 
 fn formal_fixtures() -> Vec<Fixture> {
     assert!(GUARDED_SMALL.is_power_of_two());
     assert!(GUARDED_LARGE.is_power_of_two());
+    assert!(STREAMING_SCALE.is_power_of_two());
+    assert!(BARRIER_SCALE.is_power_of_two());
     assert!(GUARDED_SMALL < GUARDED_LARGE);
     vec![
-        Fixture::guarded_star("guarded_small", GUARDED_SMALL, GUARD_WIDTH, 100),
-        Fixture::guarded_star("guarded_large", GUARDED_LARGE, GUARD_WIDTH, 110),
-        Fixture::recursive_filter("streaming_filter", RECURSIVE_SCALE, true, true, 120),
-        Fixture::recursive_filter("barrier_control", RECURSIVE_SCALE, false, false, 130),
-        Fixture::ordinary("ordinary_small", GUARDED_SMALL, 140),
-        Fixture::ordinary("ordinary_large", GUARDED_LARGE, 150),
+        Fixture::guarded_star(
+            "guarded_small",
+            GUARDED_SMALL,
+            GUARD_WIDTH,
+            GUARDED_SMALL_DOMAIN,
+        ),
+        Fixture::guarded_star(
+            "guarded_large",
+            GUARDED_LARGE,
+            GUARD_WIDTH,
+            GUARDED_LARGE_DOMAIN,
+        ),
+        Fixture::recursive_filter(
+            "streaming_filter",
+            STREAMING_SCALE,
+            true,
+            true,
+            STREAMING_DOMAIN,
+        ),
+        Fixture::recursive_filter(
+            "barrier_control",
+            BARRIER_SCALE,
+            false,
+            false,
+            BARRIER_DOMAIN,
+        ),
+        Fixture::ordinary("ordinary_barrier", BARRIER_SCALE, ORDINARY_BARRIER_DOMAIN),
+        Fixture::ordinary("ordinary_small", GUARDED_SMALL, ORDINARY_SMALL_DOMAIN),
+        Fixture::ordinary("ordinary_large", GUARDED_LARGE, ORDINARY_LARGE_DOMAIN),
     ]
 }
 
 fn main() {
     let fixtures = formal_fixtures();
     println!(
-        "meta\tformat=production-regions-adoption-gate-v2\trounds={FORMAL_ROUNDS}\tsuperblocks={SUPERBLOCKS}\todd=B-C-C-B\teven=C-B-B-C\tt95_df9={ONE_SIDED_T95_DF9}\tguarded_formula_nodes={GUARDED_FORMULA_NODES}"
+        "meta\tformat=production-regions-adoption-gate-v3\tprotocol_version={PROTOCOL_VERSION}\tformal_holdout=true\trounds={FORMAL_ROUNDS}\tsuperblocks={SUPERBLOCKS}\tcells=construct_drop,prebuilt_first,fresh_first,drop_first,full_drain\twarm=fixture_order_then_cells_then_B,C_once\todd=B-C-C-B\teven=C-B-B-C\todd_fixtures=Gs,Gl,S,H,Ah,As,Al\teven_fixtures=Al,As,Ah,H,S,Gl,Gs\tt95_df9={ONE_SIDED_T95_DF9}\tguarded_formula_nodes={GUARDED_FORMULA_NODES}\tanti_adaptation=one_formal_invocation"
     );
-    semantic_and_mechanism_preflight(&fixtures);
-    warm(&fixtures);
-    let analyses: Vec<_> = measure_series(&fixtures).into_iter().map(analyze).collect();
+    println!(
+        "holdouts\tGs={GUARDED_SMALL}@{GUARDED_SMALL_DOMAIN}\tGl={GUARDED_LARGE}@{GUARDED_LARGE_DOMAIN}\tS={STREAMING_SCALE}@{STREAMING_DOMAIN}\tH={BARRIER_SCALE}@{BARRIER_DOMAIN}\tAh={BARRIER_SCALE}@{ORDINARY_BARRIER_DOMAIN}\tAs={GUARDED_SMALL}@{ORDINARY_SMALL_DOMAIN}\tAl={GUARDED_LARGE}@{ORDINARY_LARGE_DOMAIN}\tguard_width={GUARD_WIDTH}"
+    );
+    if catch_unwind(AssertUnwindSafe(|| {
+        semantic_and_mechanism_preflight(&fixtures)
+    }))
+    .is_err()
+    {
+        println!("decision\tsemantic_mechanism_preflight\tSTOP");
+        println!("verdict\tSTOP");
+        std::process::exit(3);
+    }
+    println!("decision\tsemantic_mechanism_preflight\tPASS");
+    if catch_unwind(AssertUnwindSafe(|| warm(&fixtures))).is_err() {
+        println!("decision\tfixed_warmup\tSTOP");
+        println!("verdict\tSTOP");
+        std::process::exit(3);
+    }
+    println!("decision\tfixed_warmup\tPASS");
+    let series = measure_series(&fixtures);
+    let analyses: Vec<_> = series.iter().map(analyze).collect();
     for analysis in &analyses {
         emit_analysis(analysis);
     }
-    let go = decide(&analyses);
+    let go = decide(&analyses, &series);
     println!("verdict\t{}", if go { "GO" } else { "STOP" });
     if !go {
         std::process::exit(3);
@@ -1387,10 +1745,39 @@ mod tests {
 
     #[test]
     fn paired_order_is_exactly_preregistered() {
+        assert_eq!(Mode::ALL, [Mode::B, Mode::C]);
+        assert_eq!(
+            Cell::ALL,
+            [
+                Cell::ConstructDrop,
+                Cell::PullFirst,
+                Cell::FreshFirst,
+                Cell::DropFirst,
+                Cell::Full,
+            ]
+        );
         assert_eq!(round_order(1), [Mode::B, Mode::C, Mode::C, Mode::B]);
         assert_eq!(round_order(2), [Mode::C, Mode::B, Mode::B, Mode::C]);
         assert_eq!(round_order(19), [Mode::B, Mode::C, Mode::C, Mode::B]);
         assert_eq!(round_order(20), [Mode::C, Mode::B, Mode::B, Mode::C]);
+        assert_eq!(fixture_order(1), [0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(fixture_order(2), [6, 5, 4, 3, 2, 1, 0]);
+        assert_eq!(fixture_order(19), [0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(fixture_order(20), [6, 5, 4, 3, 2, 1, 0]);
+        assert_eq!(
+            Cell::FIRST_DROP,
+            [Cell::PullFirst, Cell::FreshFirst, Cell::DropFirst]
+        );
+        assert_eq!(
+            Cell::BARRIER_GUARD,
+            [
+                Cell::PullFirst,
+                Cell::FreshFirst,
+                Cell::DropFirst,
+                Cell::Full,
+            ]
+        );
+        assert!(!Cell::BARRIER_GUARD.contains(&Cell::ConstructDrop));
     }
 
     #[test]
@@ -1401,7 +1788,7 @@ mod tests {
                 c: [1.0, 4.0],
             })
             .collect();
-        let analysis = analyze(TimingSeries {
+        let analysis = analyze(&TimingSeries {
             fixture: "synthetic",
             scale: 1,
             cell: Cell::Full,
@@ -1416,21 +1803,198 @@ mod tests {
     }
 
     #[test]
+    fn zero_or_nonfinite_point_samples_are_explicit_stop_evidence() {
+        let zero = constant_series("zero", 1, Cell::Full, 0.0, 1.0);
+        let zero_analysis = analyze(&zero);
+        assert!(!zero_analysis.valid);
+        assert_eq!(metric(zero_analysis.upper95), "INVALID");
+        assert!(!strict_upper_bound_pass(
+            zero_analysis.valid,
+            zero_analysis.upper95
+        ));
+
+        let infinite = constant_series("infinite", 1, Cell::Full, 1.0, f64::INFINITY);
+        assert!(!analyze(&infinite).valid);
+    }
+
+    #[test]
+    fn every_completed_cell_must_be_valid_even_when_it_has_no_performance_gate() {
+        let mut analyses: Vec<_> = FORMAL_LABELS
+            .into_iter()
+            .flat_map(|fixture| {
+                Cell::ALL
+                    .into_iter()
+                    .map(move |cell| analyze(&constant_series(fixture, 1, cell, 1.0, 0.5)))
+            })
+            .collect();
+        assert!(all_completed_samples_valid(&analyses));
+
+        analyses[0].valid = false;
+        assert_eq!(analyses[0].cell, Cell::ConstructDrop);
+        assert!(!all_completed_samples_valid(&analyses));
+        analyses[0].valid = true;
+
+        analyses.pop();
+        assert!(!all_completed_samples_valid(&analyses));
+    }
+
+    #[test]
+    fn nonzero_variance_upper_bound_uses_sample_sd_and_df9_t() {
+        let values: Vec<_> = (0..SUPERBLOCKS).map(|index| index as f64 / 100.0).collect();
+        let (mean, upper) = upper95_log(&values);
+        let expected_mean = 0.045;
+        let known_sample_sd = (82.5f64 / 9.0).sqrt() / 100.0;
+        let expected_upper =
+            expected_mean + ONE_SIDED_T95_DF9 * known_sample_sd / (SUPERBLOCKS as f64).sqrt();
+        assert!((mean - expected_mean).abs() < 1e-12);
+        assert!((upper - expected_upper).abs() < 1e-12);
+    }
+
+    fn constant_series(
+        fixture: &'static str,
+        scale: usize,
+        cell: Cell,
+        b: f64,
+        c: f64,
+    ) -> TimingSeries {
+        TimingSeries {
+            fixture,
+            scale,
+            cell,
+            rounds: (0..FORMAL_ROUNDS)
+                .map(|_| RoundSample {
+                    b: [b, b],
+                    c: [c, c],
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn marginal_estimator_uses_arithmetic_scale_increments() {
+        let small = constant_series("small", 1, Cell::Full, 10.0, 8.0);
+        let large = constant_series("large", 4, Cell::Full, 30.0, 18.0);
+        let analysis = analyze_marginal("synthetic", &small, &large);
+        assert!(analysis.valid);
+        assert!((analysis.geometric_ratio.expect("valid ratio") - 0.5).abs() < 1e-12);
+        assert!((analysis.upper95.expect("valid bound") - 0.5).abs() < 1e-12);
+        assert!(analysis.points.iter().all(|point| {
+            (point.b_delta - 20.0).abs() < 1e-12
+                && (point.c_delta - 10.0).abs() < 1e-12
+                && (point.log_ratio.expect("valid point") - 0.5f64.ln()).abs() < 1e-12
+        }));
+    }
+
+    #[test]
+    fn superblock_mode_means_pair_only_adjacent_odd_even_rounds() {
+        let series = TimingSeries {
+            fixture: "tagged",
+            scale: 1,
+            cell: Cell::Full,
+            rounds: (0..FORMAL_ROUNDS)
+                .map(|round| {
+                    let base = round as f64 * 100.0;
+                    RoundSample {
+                        b: [base + 1.0, base + 3.0],
+                        c: [base + 5.0, base + 7.0],
+                    }
+                })
+                .collect(),
+        };
+        let means = superblock_mode_means(&series);
+        for (index, mean) in means.into_iter().enumerate() {
+            assert_eq!(mean.b, index as f64 * 200.0 + 52.0);
+            assert_eq!(mean.c, index as f64 * 200.0 + 56.0);
+        }
+    }
+
+    #[test]
+    fn marginal_estimator_stops_on_nonpositive_or_nonfinite_increments() {
+        let small = constant_series("small", 1, Cell::Full, 10.0, 8.0);
+        let flat_b = constant_series("large", 4, Cell::Full, 10.0, 18.0);
+        assert!(!analyze_marginal("flat_b", &small, &flat_b).valid);
+
+        let negative_b = constant_series("large", 4, Cell::Full, 9.0, 18.0);
+        assert!(!analyze_marginal("negative_b", &small, &negative_b).valid);
+
+        let flat_c = constant_series("large", 4, Cell::Full, 30.0, 8.0);
+        assert!(!analyze_marginal("flat_c", &small, &flat_c).valid);
+
+        let negative_c = constant_series("large", 4, Cell::Full, 30.0, 7.0);
+        assert!(!analyze_marginal("negative_c", &small, &negative_c).valid);
+
+        let nan_c = constant_series("large", 4, Cell::Full, 30.0, f64::NAN);
+        assert!(!analyze_marginal("nan_c", &small, &nan_c).valid);
+
+        let zero = constant_series("zero", 1, Cell::Full, 0.0, 0.0);
+        let overflow = constant_series("overflow", 4, Cell::Full, f64::MIN_POSITIVE, f64::MAX);
+        assert!(!analyze_marginal("overflow", &zero, &overflow).valid);
+    }
+
+    #[test]
+    fn aa_envelope_is_absolute_mean_plus_one_sided_error() {
+        let logs = [1.25f64.ln(); SUPERBLOCKS];
+        assert!((noise_envelope(&logs) - 1.25).abs() < 1e-12);
+        let negative = [0.8f64.ln(); SUPERBLOCKS];
+        assert!((noise_envelope(&negative) - 1.25).abs() < 1e-12);
+        assert!(envelope_pass(true, 1.25, 1.25));
+        assert!(!envelope_pass(true, 1.250_000_000_001, 1.25));
+        assert!(!strict_upper_bound_pass(true, 1.0));
+        assert!(strict_upper_bound_pass(true, 0.999_999_999_999));
+        assert!(!strict_upper_bound_pass(false, 0.5));
+    }
+
+    #[test]
+    fn formal_constants_pin_reserved_holdout_without_building_it() {
+        assert_eq!(PROTOCOL_VERSION, "BE6594AF7634F74ACD46A83CF6E67283");
+        assert_eq!(GUARDED_SMALL, 1 << 15);
+        assert_eq!(GUARDED_LARGE, 1 << 17);
+        assert_eq!(STREAMING_SCALE, 1 << 11);
+        assert_eq!(BARRIER_SCALE, 1 << 13);
+        assert_eq!(GUARD_WIDTH, 32);
+        assert_eq!(
+            FORMAL_LABELS,
+            [
+                "guarded_small",
+                "guarded_large",
+                "streaming_filter",
+                "barrier_control",
+                "ordinary_barrier",
+                "ordinary_small",
+                "ordinary_large",
+            ]
+        );
+        assert_eq!(
+            [
+                GUARDED_SMALL_DOMAIN,
+                GUARDED_LARGE_DOMAIN,
+                STREAMING_DOMAIN,
+                BARRIER_DOMAIN,
+                ORDINARY_BARRIER_DOMAIN,
+                ORDINARY_SMALL_DOMAIN,
+                ORDINARY_LARGE_DOMAIN,
+            ],
+            [300, 310, 320, 330, 340, 350, 360]
+        );
+    }
+
+    #[test]
     fn reduced_fixtures_match_oracles_and_mechanism_contracts() {
         let fixtures = vec![
             Fixture::guarded_star("guarded_small", 32, 5, 200),
             Fixture::guarded_star("guarded_large", 64, 5, 210),
             Fixture::recursive_filter("streaming_filter", 32, true, true, 220),
             Fixture::recursive_filter("barrier_control", 32, false, false, 230),
-            Fixture::ordinary("ordinary_small", 32, 240),
-            Fixture::ordinary("ordinary_large", 64, 250),
+            Fixture::ordinary("ordinary_barrier", 32, 240),
+            Fixture::ordinary("ordinary_small", 32, 250),
+            Fixture::ordinary("ordinary_large", 64, 260),
         ];
         semantic_and_mechanism_preflight(&fixtures);
     }
 
     #[test]
     fn drop_cell_samples_mark_counters_as_unobserved() {
-        let fixture = Fixture::ordinary("ordinary_observation_boundary", 8, 260);
+        let fixture = Fixture::ordinary("ordinary_observation_boundary", 8, 270);
         for mode in Mode::ALL {
             for cell in [Cell::ConstructDrop, Cell::DropFirst] {
                 let measured = run_cell(&fixture, cell, mode);
