@@ -2805,7 +2805,7 @@ impl ProducerRegistry {
             Proposal,
         }
 
-        let handoff = {
+        let (handoff, positive_authority) = {
             let activation = self
                 .state
                 .activations
@@ -2820,17 +2820,58 @@ impl ProducerRegistry {
                 | DeltaReturn::FormulaOrEmit { .. }
                 | DeltaReturn::SetAdmission { .. } => false,
             };
-            match &activation.reducer {
+            let handoff = match &activation.reducer {
                 DeltaReducer::QuiescentProposal { occurrences }
                     if !occurrences.is_empty() => Handoff::Proposal,
                 DeltaReducer::Confirm { original }
                     if eligible_return && !original.is_empty() => Handoff::Confirm,
                 _ => Handoff::Complete,
-            }
+            };
+            let positive_authority = match (
+                &activation.reducer,
+                activation.positive_publication.as_deref(),
+            ) {
+                (
+                    DeltaReducer::Confirm { .. },
+                    Some(PositivePublicationRegistration::Eligible(ledger)),
+                ) => {
+                    assert!(
+                        ledger.open,
+                        "authoritative Confirm reached settlement behind a closed positive ledger"
+                    );
+                    assert!(
+                        ledger.certificate.eligible(),
+                        "eligible registration retained an ineligible publication certificate"
+                    );
+                    Some((
+                        PositiveConfirmParentId {
+                            brand: self.brand,
+                            activation: proof.activation,
+                        },
+                        ledger.generation,
+                    ))
+                }
+                _ => None,
+            };
+            (handoff, positive_authority)
         };
 
+        let positive = positive_authority.map(|(parent, generation)| {
+            self.close_and_snapshot_positive_publication(parent, generation)
+                .expect("live positive settlement authority failed to close")
+        });
+
         match handoff {
-            Handoff::Complete => RegistrySettlement::Completed(self.finish(proof)),
+            Handoff::Complete => {
+                if let Some(ledger) = positive {
+                    assert!(!ledger.open, "positive settlement snapshot remained open");
+                    assert!(
+                        ledger.published.is_empty(),
+                        "positive Confirm without a finalizer retained publications"
+                    );
+                }
+                RegistrySettlement::Completed(self.finish(proof))
+            }
             Handoff::Proposal => {
                 let state = {
                     let activation = self
@@ -2875,6 +2916,16 @@ impl ProducerRegistry {
                 })
             }
             Handoff::Confirm => {
+                // Publication owns the relational values in P. Close and
+                // freeze that set before replacing the authoritative Confirm,
+                // then transfer only the residual G \ P to the unchanged
+                // finalizer. Multiplicity in raw B is an internal
+                // representation detail: every occurrence of a published
+                // value must disappear from the late path.
+                let published = positive.map(|ledger| {
+                    assert!(!ledger.open, "positive settlement snapshot remained open");
+                    ledger.published
+                });
                 let state = {
                     let activation = self
                         .state
@@ -2889,6 +2940,30 @@ impl ProducerRegistry {
                         activation.suspended_source_page.is_none(),
                         "Confirm graph quiesced with a suspended source page"
                     );
+                    if let Some(published) = published {
+                        assert!(
+                            published
+                                .iter()
+                                .all(|value| activation.accepted.contains(value)),
+                            "positive Confirm publication contradicted authoritative acceptance"
+                        );
+                        let registration = activation
+                            .positive_publication
+                            .take()
+                            .expect("closed positive registration disappeared at handoff");
+                        assert!(matches!(
+                            registration.as_ref(),
+                            PositivePublicationRegistration::Eligible(
+                                PositivePublicationLedger { open: false, .. }
+                            )
+                        ));
+                        for value in &published {
+                            assert!(
+                                activation.accepted.remove(value),
+                                "validated positive publication disappeared from acceptance"
+                            );
+                        }
+                    }
                     let reducer = std::mem::replace(
                         &mut activation.reducer,
                         DeltaReducer::FinalizingConfirm {
@@ -9570,6 +9645,26 @@ mod tests {
         (activation, parent)
     }
 
+    fn quiesce_confirm_with_accepted(
+        registry: &mut ProducerRegistry,
+        activation: ActivationId,
+        accepted: impl IntoIterator<Item = RawInline>,
+    ) -> QuiescenceProof {
+        let activation_state = registry
+            .state
+            .activations
+            .get_mut(&activation)
+            .expect("test Confirm activation disappeared");
+        assert!(matches!(
+            &activation_state.reducer,
+            DeltaReducer::Confirm { .. }
+        ));
+        assert!(activation_state.live.is_empty());
+        activation_state.accepted = accepted.into_iter().collect();
+        activation_state.status = ActivationStatus::Quiescent;
+        QuiescenceProof { activation }
+    }
+
     fn formula_or_reducer_batch(values: &[u8]) -> FormulaBatch {
         let mut batch = FormulaBatch::from_proposal(
             RowBatch::seed(),
@@ -10730,6 +10825,235 @@ mod tests {
                 .published,
             BTreeSet::from([candidate])
         );
+    }
+
+    #[test]
+    fn positive_settlement_partitions_the_accepted_set_before_finalization() {
+        let published_one = value(31);
+        let published_two = value(32);
+        let remainder = value(33);
+        let rejected = value(34);
+        let mut registry = ProducerRegistry::new();
+        let original = shared_one_parent_candidates(vec![
+            published_one,
+            remainder,
+            published_two,
+            published_one,
+            rejected,
+            published_two,
+            remainder,
+        ]);
+        let started = registry.start_many(
+            DeltaReducer::Confirm { original },
+            stable_return(Vec::new()),
+            [output(31, 0, true), output(32, 1, true), output(33, 2, true)],
+        );
+        let activation = started.activation;
+        let parent = registry
+            .open_positive_publication(
+                activation,
+                StateId(17),
+                terminal_positive_certificate(),
+            )
+            .expect("Confirm activation should register a semantic parent");
+        for published in [published_one, published_two] {
+            let address = registry
+                .positive_child_address(parent, published)
+                .expect("published test value belongs to original B");
+            assert!(registry.commit_positive_publication(parent, address));
+        }
+
+        let mut proof = None;
+        for (_, credit) in started.roots {
+            if let Some(quiescence) = registry.replace_traversal(credit, []).quiescence {
+                assert!(
+                    proof.replace(quiescence).is_none(),
+                    "one affine activation produced two quiescence receipts"
+                );
+            }
+        }
+        let proof = proof.expect("retiring every real Confirm credit must prove quiescence");
+        let RegistrySettlement::ConfirmFinalizer(seed) =
+            registry.settle_quiescence(proof)
+        else {
+            panic!("nonempty positive Confirm did not open its ordinary finalizer")
+        };
+
+        assert_eq!(
+            seed.state.accepted.as_ref(),
+            &AHashSet::from_iter([remainder]),
+            "the unchanged finalizer must own exactly G minus P"
+        );
+        let cloned_finalizer = seed.state.clone();
+        assert!(
+            Arc::ptr_eq(&seed.state.accepted, &cloned_finalizer.accepted),
+            "post-handoff clones may share only immutable residual G minus P"
+        );
+        assert!(
+            registry.state.activations[&activation]
+                .positive_publication
+                .is_none(),
+            "graph-dead publication evidence must not survive finalizer handoff"
+        );
+        assert!(
+            registry
+                .positive_child_address(parent, published_one)
+                .is_none(),
+            "the finalizer handoff must fence every stale positive address"
+        );
+    }
+
+    #[test]
+    fn positive_empty_partition_preserves_ordinary_acceptance() {
+        let accepted = value(41);
+        let rejected = value(42);
+        let mut registry = ProducerRegistry::new();
+        let (activation, _parent) = open_positive_confirm(
+            &mut registry,
+            [accepted, rejected, accepted],
+            terminal_positive_certificate(),
+        );
+        let proof = quiesce_confirm_with_accepted(&mut registry, activation, [accepted]);
+        let RegistrySettlement::ConfirmFinalizer(seed) =
+            registry.settle_quiescence(proof)
+        else {
+            panic!("nonempty positive Confirm did not open its ordinary finalizer")
+        };
+
+        assert_eq!(
+            seed.state.accepted.as_ref(),
+            &AHashSet::from_iter([accepted])
+        );
+        assert!(
+            registry.state.activations[&activation]
+                .positive_publication
+                .is_none(),
+            "an empty closed ledger must not burden the ordinary finalizer"
+        );
+    }
+
+    #[test]
+    fn positive_settlement_rejects_contradictory_publication_before_handoff() {
+        let published = value(51);
+        let accepted = value(52);
+        let mut registry = ProducerRegistry::new();
+        let (activation, parent) = open_positive_confirm(
+            &mut registry,
+            [published, accepted],
+            terminal_positive_certificate(),
+        );
+        let address = registry
+            .positive_child_address(parent, published)
+            .expect("published test value belongs to original B");
+        assert!(registry.commit_positive_publication(parent, address));
+        let proof = quiesce_confirm_with_accepted(&mut registry, activation, [accepted]);
+
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                registry.settle_quiescence(proof);
+            }))
+            .is_err(),
+            "P outside authoritative G must fail before opening finalizer work"
+        );
+        let activation = registry
+            .state
+            .activations
+            .get(&activation)
+            .expect("contradictory settlement removed its authoritative parent");
+        assert!(matches!(
+            &activation.reducer,
+            DeltaReducer::Confirm { .. }
+        ));
+        assert_eq!(activation.status, ActivationStatus::Quiescent);
+        assert!(activation.live.is_empty());
+        assert_eq!(activation.accepted, AHashSet::from_iter([accepted]));
+        let closed = registry
+            .positive_publication_snapshot(parent)
+            .expect("contradictory publication lost its frozen evidence");
+        assert!(!closed.open);
+        assert_eq!(closed.published, BTreeSet::from([published]));
+    }
+
+    #[test]
+    fn positive_partition_is_clone_local_before_handoff() {
+        let one = value(61);
+        let two = value(62);
+        let mut original = ProducerRegistry::new();
+        let (activation, parent) =
+            open_positive_confirm(&mut original, [one, two], terminal_positive_certificate());
+        let (mut cloned, remap) = original.deep_clone();
+        assert!(remap.is_empty());
+        let cloned_parent = cloned
+            .positive_parent(activation)
+            .expect("cloned Confirm retained its affine parent");
+
+        let original_address = original.positive_child_address(parent, one).unwrap();
+        let cloned_address = cloned
+            .positive_child_address(cloned_parent, two)
+            .unwrap();
+        assert!(original.commit_positive_publication(parent, original_address));
+        assert!(cloned.commit_positive_publication(cloned_parent, cloned_address));
+
+        let original_proof =
+            quiesce_confirm_with_accepted(&mut original, activation, [one, two]);
+        let cloned_proof = quiesce_confirm_with_accepted(&mut cloned, activation, [one, two]);
+        let RegistrySettlement::ConfirmFinalizer(original_seed) =
+            original.settle_quiescence(original_proof)
+        else {
+            panic!("original positive parent did not open its finalizer")
+        };
+        let RegistrySettlement::ConfirmFinalizer(cloned_seed) =
+            cloned.settle_quiescence(cloned_proof)
+        else {
+            panic!("cloned positive parent did not open its finalizer")
+        };
+
+        assert_eq!(
+            original_seed.state.accepted.as_ref(),
+            &AHashSet::from_iter([two])
+        );
+        assert_eq!(
+            cloned_seed.state.accepted.as_ref(),
+            &AHashSet::from_iter([one])
+        );
+        assert!(original.state.activations[&activation]
+            .positive_publication
+            .is_none());
+        assert!(cloned.state.activations[&activation]
+            .positive_publication
+            .is_none());
+    }
+
+    #[test]
+    fn positive_empty_confirm_fences_before_eager_completion() {
+        let candidate = value(71);
+        let mut registry = ProducerRegistry::new();
+        let (activation, parent) =
+            open_positive_confirm(&mut registry, [], terminal_positive_certificate());
+        let open = registry
+            .positive_publication_snapshot(parent)
+            .expect("empty eligible Confirm should still own an open ledger");
+        let stale = PositiveChildAddress {
+            parent,
+            generation: open.generation,
+            value: candidate,
+        };
+        let proof = quiesce_confirm_with_accepted(&mut registry, activation, []);
+
+        let RegistrySettlement::Completed(completed) = registry.settle_quiescence(proof)
+        else {
+            panic!("empty Confirm unexpectedly opened finalizer work")
+        };
+        assert!(matches!(
+            completed.effect,
+            DeltaCompletion::Candidates(ref candidates) if candidates.is_empty()
+        ));
+        assert!(!registry.is_live(activation));
+        assert!(
+            registry.state.next_positive_generation > open.generation,
+            "eager completion must generation-fence its empty publication domain"
+        );
+        assert!(!registry.commit_positive_publication(parent, stale));
     }
 
     #[test]
