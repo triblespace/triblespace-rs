@@ -6519,6 +6519,7 @@ impl DeltaScheduler {
                 full,
                 registration,
             } => {
+                stats.delta_positive_support_terminal_commits += 1;
                 let ResidualPhase::Candidate { variable, .. } = &desc.phase else {
                     unreachable!("a preflighted Terminal publication lost its Candidate return")
                 };
@@ -6541,6 +6542,7 @@ impl DeltaScheduler {
                 }
             }
             PositivePublicationRoute::ChunkHomomorphic => {
+                stats.delta_positive_support_chunk_homomorphic_commits += 1;
                 // Preflight proved a Stable Candidate descriptor, and this
                 // function constructs exactly one parent with one candidate.
                 // `file_with_plan` can therefore return `None` only if that
@@ -12093,6 +12095,8 @@ mod tests {
         assert_eq!(family.projected, 2);
         assert!(machine.terminal_yield.samples[parent.activation.index()].is_none());
         assert!(stable.is_empty());
+        assert_eq!(stats.delta_positive_support_terminal_commits, 2);
+        assert_eq!(stats.delta_positive_support_chunk_homomorphic_commits, 0);
     }
 
     #[test]
@@ -12193,6 +12197,8 @@ mod tests {
         );
         assert_eq!(token.rows, 1);
         assert_eq!(token.candidates, 1);
+        assert_eq!(stats.delta_positive_support_terminal_commits, 0);
+        assert_eq!(stats.delta_positive_support_chunk_homomorphic_commits, 1);
         assert_eq!(
             registry
                 .positive_publication_snapshot(parent)

@@ -659,6 +659,100 @@ impl<'a> Constraint<'a> for PageTraceFilter {
 }
 
 #[derive(Clone)]
+struct CandidateValueTraceFilter {
+    variable: VariableId,
+    accepted: RawInline,
+    calls: Arc<Mutex<Vec<Vec<RawInline>>>>,
+}
+
+impl<'a> Constraint<'a> for CandidateValueTraceFilter {
+    fn variables(&self) -> VariableSet {
+        VariableSet::new_singleton(self.variable)
+    }
+
+    fn fixed_denotation(&self) -> bool {
+        true
+    }
+
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        if variable != self.variable {
+            return false;
+        }
+        out.fill(usize::MAX, view.len());
+        true
+    }
+
+    fn propose(
+        &self,
+        variable: VariableId,
+        _view: &RowsView<'_>,
+        _candidates: &mut CandidateSink<'_>,
+    ) {
+        assert_ne!(
+            variable, self.variable,
+            "the audit-only suffix unexpectedly became the proposer"
+        );
+    }
+
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        assert_eq!(variable, self.variable);
+        let mut call = Vec::with_capacity(candidates.len());
+        candidates.for_each(|_, value| call.push(*value));
+        self.calls
+            .lock()
+            .expect("candidate-value trace poisoned")
+            .push(call);
+        candidates.retain(|_, value| *value == self.accepted);
+    }
+
+    fn estimate_certified(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        self.estimate(variable, view, out)
+    }
+
+    fn propose_certified(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.propose(variable, view, candidates);
+    }
+
+    fn confirm_certified(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.confirm(variable, view, candidates);
+    }
+
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        view.col(self.variable)
+            .is_none_or(|column| view.iter().all(|row| row[column] == self.accepted))
+    }
+
+    fn residual_confirm_is_page_local(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Clone)]
 struct SupportPageTraceFilter {
     trace: Arc<Mutex<Vec<usize>>>,
 }
@@ -878,6 +972,38 @@ fn certified_target_confirm_root(
             ),
             covering_proposals: false,
         }) as DynConstraint,
+    ]))
+}
+
+fn certified_chunk_target_confirm_root(
+    set: TribleSet,
+    bound: Inline<GenId>,
+    candidates: Vec<RawInline>,
+    ops: &[PathOp],
+    support_routes: Arc<AtomicUsize>,
+    suffix: DynConstraint,
+) -> Root {
+    let start = Variable::<GenId>::new(START);
+    let end = Variable::<GenId>::new(END);
+    let rpq = RegularPathConstraint::new(set, start, end, ops);
+    Arc::new(IntersectionConstraint::new(vec![
+        Box::new(start.is(bound)) as DynConstraint,
+        Box::new(CertifiedOrderedDomain(OrderedDomain {
+            variable: END,
+            gate: START,
+            unbound_estimate: 4,
+            values: candidates,
+        })) as DynConstraint,
+        Box::new(ProbedConfirmRpq {
+            program: PreferredProgram::new(
+                SupportRouteProbe {
+                    calls: support_routes,
+                },
+                rpq,
+            ),
+            covering_proposals: false,
+        }) as DynConstraint,
+        suffix,
     ]))
 }
 
@@ -3354,6 +3480,13 @@ fn target_confirm_positive_support_yields_occurrence_zero_then_exactly_drains() 
         1,
         "one positive witness must publish exactly one row"
     );
+    assert_eq!(query.stats().delta_positive_support_terminal_commits, 1);
+    assert_eq!(
+        query
+            .stats()
+            .delta_positive_support_chunk_homomorphic_commits,
+        0
+    );
     assert_eq!(support_routes.load(Ordering::Relaxed), 1);
     let early_examined = query.stats().delta_transition_candidates_examined;
 
@@ -3418,8 +3551,158 @@ fn target_confirm_positive_support_does_not_feed_past_false_occurrence_zero() {
         0,
         "v1 must not feed occurrence one after occurrence-zero Support is false"
     );
+    assert_eq!(query.stats().delta_positive_support_terminal_commits, 0);
+    assert_eq!(
+        query
+            .stats()
+            .delta_positive_support_chunk_homomorphic_commits,
+        0
+    );
     assert!(actual.contains(&graph.value(1).raw));
     assert!(query.stats().delta_transition_candidates_examined > 0);
+}
+
+#[test]
+fn target_confirm_positive_support_classifies_a_chunk_homomorphic_commit() {
+    let graph = Graph::new(4, &[(0, 1), (1, 2), (2, 3)]);
+    let absent = [u8::MAX; 32];
+    let candidates = vec![
+        graph.value(1).raw,
+        graph.value(3).raw,
+        absent,
+        graph.value(2).raw,
+    ];
+    let support_routes = Arc::new(AtomicUsize::new(0));
+    let make = || {
+        certified_chunk_target_confirm_root(
+            graph.set.clone(),
+            graph.value(0),
+            candidates.clone(),
+            &repeated(graph.attribute, false),
+            Arc::clone(&support_routes),
+            // This exact page-local sibling remains after the grouped RPQ
+            // confirmer, making the successful hedge's continuation
+            // ChunkHomomorphic rather than Terminal.
+            Box::new(CertifiedOrderedDomain(OrderedDomain {
+                variable: END,
+                gate: START,
+                unbound_estimate: 4,
+                values: vec![graph.value(1).raw, graph.value(2).raw, graph.value(3).raw],
+            })) as DynConstraint,
+        )
+    };
+    let mut control: Vec<_> = Query::new(make(), project_end)
+        .solve_residual_state_lazy_with(ResidualLowering::new(
+            FormulaScope::OpaqueLeaves,
+            ProgramScope::Disabled,
+        ))
+        .start_width(1)
+        .cap(1)
+        .collect();
+    control.sort_unstable();
+
+    let mut query = Query::new(make(), project_end)
+        .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+        .start_width(1)
+        .cap(1);
+    let first = query
+        .next()
+        .expect("the positive chunk must survive its page-local suffix");
+    assert_eq!(query.stats().delta_positive_support_terminal_commits, 0);
+    assert_eq!(
+        query
+            .stats()
+            .delta_positive_support_chunk_homomorphic_commits,
+        1
+    );
+    assert_eq!(query.stats().delta_direct_terminal_publication_rows, 0);
+    let early_examined = query.stats().delta_transition_candidates_examined;
+
+    let mut actual = vec![first];
+    actual.extend(query.by_ref());
+    actual.sort_unstable();
+    assert_eq!(actual, control);
+    assert!(
+        query.stats().delta_transition_candidates_examined > early_examined,
+        "the exact Confirm remainder must stay live after the chunk yield"
+    );
+    assert_eq!(
+        support_routes.load(Ordering::Relaxed),
+        1,
+        "the production policy must select occurrence-zero Support once"
+    );
+}
+
+#[test]
+fn target_confirm_positive_chunk_that_dies_in_suffix_is_not_retried() {
+    let graph = Graph::new(4, &[(0, 1), (1, 2), (2, 3)]);
+    let first = graph.value(1).raw;
+    let survivor = graph.value(3).raw;
+    let candidates = vec![first, survivor, [u8::MAX; 32]];
+    let support_routes = Arc::new(AtomicUsize::new(0));
+    let make = |calls| {
+        certified_chunk_target_confirm_root(
+            graph.set.clone(),
+            graph.value(0),
+            candidates.clone(),
+            &repeated(graph.attribute, false),
+            Arc::clone(&support_routes),
+            Box::new(CandidateValueTraceFilter {
+                variable: END,
+                accepted: survivor,
+                calls,
+            }) as DynConstraint,
+        )
+    };
+
+    let mut control: Vec<_> = Query::new(make(Arc::new(Mutex::new(Vec::new()))), project_end)
+        .solve_residual_state_lazy_with(ResidualLowering::new(
+            FormulaScope::OpaqueLeaves,
+            ProgramScope::Disabled,
+        ))
+        .start_width(1)
+        .cap(1)
+        .collect();
+    control.sort_unstable();
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut query = Query::new(make(Arc::clone(&calls)), project_end)
+        .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+        .start_width(1)
+        .cap(1);
+    let mut actual: Vec<_> = query.by_ref().collect();
+    actual.sort_unstable();
+    assert_eq!(actual, control);
+    assert_eq!(actual, [survivor]);
+    assert_eq!(
+        support_routes.load(Ordering::Relaxed),
+        1,
+        "only original occurrence zero may open a Support hedge"
+    );
+    assert_eq!(query.stats().delta_positive_support_terminal_commits, 0);
+    assert_eq!(
+        query
+            .stats()
+            .delta_positive_support_chunk_homomorphic_commits,
+        1
+    );
+
+    let calls = calls.lock().expect("candidate-value trace poisoned");
+    let first_visits = calls
+        .iter()
+        .flatten()
+        .filter(|&&value| value == first)
+        .count();
+    let survivor_visits = calls
+        .iter()
+        .flatten()
+        .filter(|&&value| value == survivor)
+        .count();
+    assert_eq!(
+        first_visits, 1,
+        "B[0] committed into K, died in the suffix, and must not reappear from G minus P"
+    );
+    assert_eq!(survivor_visits, 1);
 }
 
 #[test]
