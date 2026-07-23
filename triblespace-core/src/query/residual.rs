@@ -100,6 +100,8 @@ use super::*;
 mod competitive;
 mod delta;
 mod materialize;
+#[cfg(test)]
+mod positive_hedge;
 mod set_admit;
 use delta::{
     ActivationId as DeltaActivationId, ActiveDeltaContinuation, ActiveDeltaStatus, DeltaDesc,

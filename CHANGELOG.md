@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A separate residual test model now specifies asymmetric positive hedging.**
+  One shared Confirm spine alone settles its frozen candidate bag from exact
+  evidence, while an eligible fixed-denotation Confirm parent may create
+  Support children only behind its own terminal or chunk-homomorphic
+  continuation receipt. A scheduler-owned affine registry commits at most one
+  representative per value across racing physical children, as either a
+  semantic terminal publication or a singleton input to the chunk suffix.
+  Exact finalization preserves raw occurrence accounting by skipping one
+  congruent occurrence; only certified SET-crossing transitions preclaim early
+  values in a separate admission layer, without relying on terminal projection
+  to deduplicate full heads.
 - **A residual test-harness prototype now specifies lazy-domain monotone
   evidence joins.** Each parent freezes its raw candidate occurrence bag while
   a budgeted cursor exposes distinct members into `seen`, positive, negative,
