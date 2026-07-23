@@ -7,33 +7,24 @@
 //! fallback `RegularPathConstraint` Confirm Program, while the control masks
 //! only the fully-bound Support route behind `ProgramExposure::Explicit`.
 //!
-//! A separate untimed support-trace lane delegates Support to an otherwise
-//! identical `RegularPathConstraint` and counts its real typed seed/step
-//! calls, input states, and granted work. This establishes whether Support
-//! does any work after the first published positive without changing engine
-//! code or the timed production lane.
-//!
 //! Run with:
-//! `cargo run --release --example rpq_inverse_samevar_positive_probe -- [nodes=4096] [reps=9]`
+//! `cargo run --release --example rpq_inverse_samevar_positive_probe -- [nodes=4096] [reps=51] [warmups=5]`
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::hint::black_box;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use triblespace::core::id::Id;
 use triblespace::core::inline::RawInline;
 use triblespace::core::query::intersectionconstraint::IntersectionConstraint;
-use triblespace::core::query::regularpathconstraint::{RpqNoveltyKey, RpqState};
 use triblespace::core::query::residual::{
     FormulaScope, ProgramScope, ResidualLowering, ResidualStateIter, ResidualStateStats,
 };
 use triblespace::core::query::{
     Binding, CandidateSink, Constraint, DispatchClass, EstimateSink, PathOp, PreferredProgram,
-    ProgramAction, ProgramExposure, ProgramPacing, ProgramRef, ProgramRequest, ProgramRoute,
-    ProgramSeedBatch, ProposalCoverage, Query, RegularPathConstraint, RowsView, TypedEffectSink,
-    TypedProgramBatch, TypedProgramSpec, TypedSeedSink, Variable, VariableId, VariableSet,
+    ProgramAction, ProgramExposure, ProgramRef, ProgramRequest, ProgramRoute, ProgramSeedBatch,
+    ProposalCoverage, Query, RegularPathConstraint, RowsView, TypedEffectSink, TypedProgramBatch,
+    TypedProgramSpec, TypedSeedSink, Variable, VariableId, VariableSet,
 };
 use triblespace::core::trible::{Trible, TribleSet};
 use triblespace::prelude::inlineencodings::GenId;
@@ -169,111 +160,6 @@ struct Samples {
     first: Vec<Duration>,
     b0: Vec<Duration>,
     full: Vec<Duration>,
-}
-
-#[derive(Default)]
-struct SupportTrace {
-    seed_calls: AtomicUsize,
-    seed_rows: AtomicUsize,
-    step_calls: AtomicUsize,
-    step_inputs: AtomicUsize,
-    granted_work: AtomicUsize,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct SupportTraceSnapshot {
-    seed_calls: usize,
-    seed_rows: usize,
-    step_calls: usize,
-    step_inputs: usize,
-    granted_work: usize,
-}
-
-impl SupportTrace {
-    fn snapshot(&self) -> SupportTraceSnapshot {
-        SupportTraceSnapshot {
-            seed_calls: self.seed_calls.load(Ordering::Relaxed),
-            seed_rows: self.seed_rows.load(Ordering::Relaxed),
-            step_calls: self.step_calls.load(Ordering::Relaxed),
-            step_inputs: self.step_inputs.load(Ordering::Relaxed),
-            granted_work: self.granted_work.load(Ordering::Relaxed),
-        }
-    }
-}
-
-impl std::ops::Sub for SupportTraceSnapshot {
-    type Output = Self;
-
-    fn sub(self, rhs: Self) -> Self::Output {
-        Self {
-            seed_calls: self.seed_calls - rhs.seed_calls,
-            seed_rows: self.seed_rows - rhs.seed_rows,
-            step_calls: self.step_calls - rhs.step_calls,
-            step_inputs: self.step_inputs - rhs.step_inputs,
-            granted_work: self.granted_work - rhs.granted_work,
-        }
-    }
-}
-
-/// Production-equivalent RPQ Support arm with harness-only counters.
-struct TracedSupportRpq {
-    inner: RegularPathConstraint,
-    trace: Arc<SupportTrace>,
-}
-
-impl TypedProgramSpec for TracedSupportRpq {
-    type State = RpqState;
-    type NoveltyKey = RpqNoveltyKey;
-    type Rank = [u64; 8];
-
-    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-        if request.action == ProgramAction::Support {
-            TypedProgramSpec::route(&self.inner, request)
-        } else {
-            None
-        }
-    }
-
-    fn dispatch(&self, state: &Self::State) -> DispatchClass {
-        TypedProgramSpec::dispatch(&self.inner, state)
-    }
-
-    fn pacing(&self, state: &Self::State) -> ProgramPacing {
-        TypedProgramSpec::pacing(&self.inner, state)
-    }
-
-    fn progress(&self, state: &Self::State) -> Self::Rank {
-        TypedProgramSpec::progress(&self.inner, state)
-    }
-
-    fn seed_typed(
-        &self,
-        batch: ProgramSeedBatch<'_>,
-        effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
-    ) {
-        assert_eq!(batch.request.action, ProgramAction::Support);
-        self.trace.seed_calls.fetch_add(1, Ordering::Relaxed);
-        self.trace
-            .seed_rows
-            .fetch_add(batch.view.len(), Ordering::Relaxed);
-        TypedProgramSpec::seed_typed(&self.inner, batch, effects);
-    }
-
-    fn step_typed(
-        &self,
-        states: &mut Vec<Self::State>,
-        batch: TypedProgramBatch<'_>,
-        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
-    ) {
-        self.trace.step_calls.fetch_add(1, Ordering::Relaxed);
-        self.trace
-            .step_inputs
-            .fetch_add(states.len(), Ordering::Relaxed);
-        self.trace
-            .granted_work
-            .fetch_add(batch.limits.iter().sum::<usize>(), Ordering::Relaxed);
-        TypedProgramSpec::step_typed(&self.inner, states, batch, effects);
-    }
 }
 
 /// Structurally present Support route that production policy deliberately
@@ -682,31 +568,8 @@ fn make_query(fixture: &Fixture, mode: Mode) -> Query<Root<'_>, Project, RawInli
     Query::new(make_root(fixture, path), project_start as Project)
 }
 
-fn make_traced_query(
-    fixture: &Fixture,
-    trace: Arc<SupportTrace>,
-) -> Query<Root<'_>, Project, RawInline> {
-    let fallback = regular_path(fixture);
-    let preferred = TracedSupportRpq {
-        inner: regular_path(fixture),
-        trace,
-    };
-    let path: DynConstraint<'_> = Box::new(PreferredSupportRpq {
-        program: PreferredProgram::new(preferred, fallback),
-    });
-    Query::new(make_root(fixture, path), project_start as Project)
-}
-
 fn make_iter(fixture: &Fixture, mode: Mode, width: usize) -> ProbeIter<'_> {
     make_query(fixture, mode)
-        .solve_residual_state_lazy_with(LOWERING)
-        .cap(width)
-        .start_width(width)
-        .growth(2)
-}
-
-fn make_traced_iter(fixture: &Fixture, trace: Arc<SupportTrace>, width: usize) -> ProbeIter<'_> {
-    make_traced_query(fixture, trace)
         .solve_residual_state_lazy_with(LOWERING)
         .cap(width)
         .start_width(width)
@@ -842,53 +705,6 @@ fn profile(
     }
 }
 
-struct SupportAudit {
-    first: SupportTraceSnapshot,
-    full_after_first: SupportTraceSnapshot,
-    first_stats: Attribution,
-    full_stats: Attribution,
-}
-
-fn support_audit(
-    fixture: &Fixture,
-    width: usize,
-    oracle: &[RawInline],
-    oracle_signature: Signature,
-) -> SupportAudit {
-    let trace = Arc::new(SupportTrace::default());
-    let mut query = make_traced_iter(fixture, Arc::clone(&trace), width);
-    let first = query
-        .next()
-        .unwrap_or_else(|| panic!("{} traced Support returned no row", fixture.label()));
-    let first_trace = trace.snapshot();
-    let first_stats = attribution(query.stats());
-    let mut full = vec![first];
-    full.extend(query.by_ref());
-    let full_trace = trace.snapshot();
-    let full_stats = attribution(query.stats());
-    assert_eq!(signature(full.iter().copied()), oracle_signature);
-    full.sort_unstable();
-    assert_eq!(full, oracle);
-    assert_eq!(
-        first_trace.seed_calls,
-        1,
-        "{} width {width}: expected one occurrence-zero Support seed",
-        fixture.label()
-    );
-    assert_eq!(
-        full_trace.seed_calls,
-        1,
-        "{} width {width}: Support fed beyond occurrence zero",
-        fixture.label()
-    );
-    SupportAudit {
-        first: first_trace,
-        full_after_first: full_trace - first_trace,
-        first_stats,
-        full_stats,
-    }
-}
-
 fn percentile(samples: &[Duration], percentile: usize) -> Duration {
     let mut sorted = samples.to_vec();
     sorted.sort_unstable();
@@ -900,26 +716,36 @@ fn signed_delta(lhs: usize, rhs: usize) -> i128 {
     lhs as i128 - rhs as i128
 }
 
-fn measure(fixture: &Fixture, width: usize, reps: usize) {
+fn measure(fixture: &Fixture, width: usize, reps: usize, warmups: usize) {
     let (oracle, oracle_signature) = oracle(fixture);
     let profiles: Vec<_> = MODES
         .iter()
         .copied()
         .map(|mode| profile(fixture, mode, width, &oracle, oracle_signature))
         .collect();
-    let support = support_audit(fixture, width, &oracle, oracle_signature);
-    assert_eq!(
-        support.first_stats,
-        profiles[0].first_stats,
-        "{} width {width}: traced Support changed first-result engine statistics",
-        fixture.label()
-    );
-    assert_eq!(
-        support.full_stats,
-        profiles[0].full_stats,
-        "{} width {width}: traced Support changed full-drain engine statistics",
-        fixture.label()
-    );
+
+    for repetition in 0..warmups {
+        for offset in 0..MODES.len() {
+            let index = (repetition + offset) % MODES.len();
+            let mode = MODES[index];
+            let mut first_iter = make_iter(fixture, mode, width);
+            assert!(black_box(first_iter.next()).is_some());
+            if fixture.case.is_positive() {
+                let mut b0_iter = make_iter(fixture, mode, width);
+                assert!(
+                    black_box(b0_iter.by_ref().position(|value| value == fixture.b0)).is_some()
+                );
+            }
+            let mut full_iter = make_iter(fixture, mode, width);
+            assert_eq!(
+                black_box(signature(full_iter.by_ref())),
+                oracle_signature,
+                "{} {} width {width}: warmup disagrees with oracle",
+                fixture.label(),
+                mode.label()
+            );
+        }
+    }
 
     let mut samples: [Samples; MODES.len()] = std::array::from_fn(|_| Samples {
         first: Vec::with_capacity(reps),
@@ -1040,20 +866,6 @@ fn measure(fixture: &Fixture, width: usize, reps: usize) {
     let production = &profiles[0];
     let confirm_only = &profiles[1];
     println!(
-        "  support trace at first: seeds/rows {}/{} steps/inputs {} / {} granted_work {}; \
-         after first: seeds/rows {}/{} steps/inputs {} / {} granted_work {}",
-        support.first.seed_calls,
-        support.first.seed_rows,
-        support.first.step_calls,
-        support.first.step_inputs,
-        support.first.granted_work,
-        support.full_after_first.seed_calls,
-        support.full_after_first.seed_rows,
-        support.full_after_first.step_calls,
-        support.full_after_first.step_inputs,
-        support.full_after_first.granted_work,
-    );
-    println!(
         "  production - exact-only full actual-work delta: \
          source_pages {:+} source_examined {:+} transition_pages {:+} \
          transition_examined {:+} terminal_dispatches {:+} nonterminal_dispatches {:+}",
@@ -1090,7 +902,8 @@ fn main() {
         .get(1)
         .and_then(|arg| arg.parse().ok())
         .unwrap_or(4_096);
-    let reps = args.get(2).and_then(|arg| arg.parse().ok()).unwrap_or(9);
+    let reps = args.get(2).and_then(|arg| arg.parse().ok()).unwrap_or(51);
+    let warmups = args.get(3).and_then(|arg| arg.parse().ok()).unwrap_or(5);
     assert!(
         node_count >= DISTINCT_HITS * 2,
         "nodes must leave room for distinct sampled witnesses"
@@ -1101,19 +914,16 @@ fn main() {
     fixtures.extend(build_same_variable_fixtures(node_count));
     println!(
         "RPQ inverse/same-variable positive-publication probe: \
-         nodes={node_count} reps={reps} distinct_hits={DISTINCT_HITS} widths={WIDTHS:?}"
+         nodes={node_count} reps={reps} warmups={warmups} \
+         distinct_hits={DISTINCT_HITS} widths={WIDTHS:?}"
     );
     println!(
         "production is the unwrapped OpaqueLeaves+Production lane; exact-only keeps \
          the same fallback exact Confirm Program but policy-defers only Support."
     );
-    println!(
-        "ordinary support_calls excludes the internal occurrence-zero Support feeder; \
-         the support-trace line counts that real typed RPQ arm directly."
-    );
     for fixture in &fixtures {
         for width in WIDTHS {
-            measure(fixture, width, reps);
+            measure(fixture, width, reps, warmups);
         }
     }
 }
