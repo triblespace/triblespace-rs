@@ -1848,7 +1848,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         F,
     >(
         &self,
-        stats: &mut PATCHPresentChildOrderedStats,
+        stats: &mut PATCHPresentChildTraversalStats,
         for_each: &mut F,
     ) where
         F: FnMut(&[u8; INFIX_LEN]),
@@ -1881,6 +1881,48 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 stats, for_each,
             );
         }
+    }
+
+    /// Enumerate a whole already-matched infix segment in the PATCH branch
+    /// table's physical cuckoo-slot order while recording structural work.
+    ///
+    /// This is the instrumented counterpart of
+    /// [`Self::infixes_from_matched_prefix`]. It exists only for the
+    /// order-insensitive present-child probe, so the live physical traversal
+    /// remains the already-shipped [`PATCHBoundedInfixes::for_each`] primitive.
+    #[cfg(any(test, rpq_confirm_admission_probe))]
+    fn physical_child_infixes_from_matched_prefix<
+        const PREFIX_LEN: usize,
+        const INFIX_LEN: usize,
+        F,
+    >(
+        &self,
+        stats: &mut PATCHPresentChildTraversalStats,
+        for_each: &mut F,
+    ) where
+        F: FnMut(&[u8; INFIX_LEN]),
+    {
+        debug_assert!(PREFIX_LEN <= self.end_depth());
+        if PREFIX_LEN + INFIX_LEN <= self.end_depth() {
+            let infix: [u8; INFIX_LEN] =
+                core::array::from_fn(|i| self.childleaf_key()[O::TREE_TO_KEY[PREFIX_LEN + i]]);
+            for_each(&infix);
+            return;
+        }
+
+        let BodyRef::Branch(branch) = self.body_ref() else {
+            unreachable!("a leaf always covers the complete key");
+        };
+        stats.branch_slot_scans += branch.child_table.len();
+        let mut present_count = 0usize;
+        for child in branch.child_table.iter().flatten() {
+            present_count += 1;
+            child.physical_child_infixes_from_matched_prefix::<PREFIX_LEN, INFIX_LEN, F>(
+                stats, for_each,
+            );
+        }
+        stats.physical_child_visits += present_count;
+        stats.absent_child_lookups_eliminated += 256 - present_count;
     }
 
     /// Diagnostic: accumulate (branch nodes, total child-table slots,
@@ -2210,9 +2252,10 @@ pub(crate) struct PATCHInfixPage<const INFIX_LEN: usize> {
 /// distinct probe traversal and is absent from production builds.
 #[cfg(any(test, rpq_confirm_admission_probe))]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct PATCHPresentChildOrderedStats {
+pub(crate) struct PATCHPresentChildTraversalStats {
     pub(crate) branch_slot_scans: usize,
     pub(crate) present_child_lookups: usize,
+    pub(crate) physical_child_visits: usize,
     pub(crate) absent_child_lookups_eliminated: usize,
 }
 
@@ -2316,13 +2359,37 @@ impl<
     pub(crate) fn for_each_present_child_ordered<F>(
         self,
         mut for_each: F,
-    ) -> PATCHPresentChildOrderedStats
+    ) -> PATCHPresentChildTraversalStats
     where
         F: FnMut(&[u8; INFIX_LEN]),
     {
-        let mut stats = PATCHPresentChildOrderedStats::default();
+        let mut stats = PATCHPresentChildTraversalStats::default();
         if let Some(located) = self.located {
             located.present_child_ordered_infixes_from_matched_prefix::<PREFIX_LEN, INFIX_LEN, F>(
+                &mut stats,
+                &mut for_each,
+            );
+        }
+        stats
+    }
+
+    /// Enumerate the already-located subtree in physical cuckoo-slot order
+    /// while returning probe-only structural receipts.
+    ///
+    /// The callback order is exactly [`Self::for_each`]; unlike
+    /// [`Self::for_each_present_child_ordered`], this performs no `ByteSet`
+    /// construction, ascending drain, or second child-table lookup.
+    #[cfg(any(test, rpq_confirm_admission_probe))]
+    pub(crate) fn for_each_physical_children<F>(
+        self,
+        mut for_each: F,
+    ) -> PATCHPresentChildTraversalStats
+    where
+        F: FnMut(&[u8; INFIX_LEN]),
+    {
+        let mut stats = PATCHPresentChildTraversalStats::default();
+        if let Some(located) = self.located {
+            located.physical_child_infixes_from_matched_prefix::<PREFIX_LEN, INFIX_LEN, F>(
                 &mut stats,
                 &mut for_each,
             );
@@ -3518,12 +3585,33 @@ mod tests {
         assert_eq!(present_child_ordered, ordered);
         assert!(stats.branch_slot_scans > 0);
         assert!(stats.present_child_lookups > 0);
+        assert_eq!(stats.physical_child_visits, 0);
         assert!(stats.absent_child_lookups_eliminated > 0);
+
+        let mut native_physical = Vec::new();
+        patch
+            .bounded_infixes::<4, 4>(&selected, infixes.len() as u64)
+            .expect("the exact selected infix segment must fit")
+            .for_each(|infix| native_physical.push(*infix));
+        let mut measured_physical = Vec::new();
+        let physical_stats = patch
+            .bounded_infixes::<4, 4>(&selected, infixes.len() as u64)
+            .expect("the exact selected infix segment must fit")
+            .for_each_physical_children(|infix| measured_physical.push(*infix));
+        assert_eq!(measured_physical, native_physical);
+        measured_physical.sort_unstable();
+        assert_eq!(measured_physical, ordered);
+        assert_eq!(physical_stats.present_child_lookups, 0);
+        assert!(physical_stats.physical_child_visits > 0);
+        assert_eq!(
+            physical_stats.absent_child_lookups_eliminated,
+            stats.absent_child_lookups_eliminated,
+        );
     }
 
     fn assert_identity_present_child_order<const KEY_LEN: usize>(
         patch: &PATCH<KEY_LEN, IdentitySchema, ()>,
-    ) -> (Vec<[u8; KEY_LEN]>, PATCHPresentChildOrderedStats) {
+    ) -> (Vec<[u8; KEY_LEN]>, PATCHPresentChildTraversalStats) {
         let count = patch.len();
         let mut frozen = Vec::new();
         patch
@@ -3543,6 +3631,36 @@ mod tests {
         assert_eq!(
             stats.present_child_lookups + stats.absent_child_lookups_eliminated,
             branches as usize * 256,
+        );
+
+        let mut native_physical = Vec::new();
+        patch
+            .bounded_infixes::<0, KEY_LEN>(&[], count)
+            .expect("the exact full-key segment must fit")
+            .for_each(|infix| native_physical.push(*infix));
+        let mut measured_physical = Vec::new();
+        let physical_stats = patch
+            .bounded_infixes::<0, KEY_LEN>(&[], count)
+            .expect("the exact full-key segment must fit")
+            .for_each_physical_children(|infix| measured_physical.push(*infix));
+        assert_eq!(
+            measured_physical, native_physical,
+            "instrumented physical traversal diverged from the live primitive",
+        );
+        measured_physical.sort_unstable();
+        assert_eq!(
+            measured_physical, frozen,
+            "physical traversal changed the raw key set",
+        );
+        assert_eq!(physical_stats.branch_slot_scans, stats.branch_slot_scans);
+        assert_eq!(
+            physical_stats.physical_child_visits,
+            stats.present_child_lookups,
+        );
+        assert_eq!(physical_stats.present_child_lookups, 0);
+        assert_eq!(
+            physical_stats.absent_child_lookups_eliminated,
+            stats.absent_child_lookups_eliminated,
         );
         (present_child, stats)
     }

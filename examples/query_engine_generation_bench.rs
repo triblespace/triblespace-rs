@@ -204,8 +204,11 @@ mod allocation_probe {
 #[cfg(not(rpq_confirm_admission_probe))]
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 #[cfg(rpq_confirm_admission_probe)]
+use triblespace::core::inline::RawInline;
+#[cfg(rpq_confirm_admission_probe)]
 use triblespace::core::query::regularpathconstraint::{
     rpq_confirm_admission_probe_bound_confirm_batches,
+    rpq_confirm_admission_probe_fit_closed_physical_children,
     rpq_confirm_admission_probe_fit_closed_present_child_ordered,
     rpq_confirm_admission_probe_fit_closed_runs,
     rpq_confirm_admission_probe_force_first_target_ordinary,
@@ -273,6 +276,7 @@ enum ProbeMode {
     ProbeOne,
     FitClosedRuns,
     FitClosedPresentChild,
+    FitClosedPhysicalChild,
 }
 
 #[cfg(rpq_confirm_admission_probe)]
@@ -280,13 +284,14 @@ const PROBE_TIMING_ORDER_COUNT: usize = 24;
 
 #[cfg(rpq_confirm_admission_probe)]
 impl ProbeMode {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Certified,
         Self::Ordinary,
         Self::Hybrid,
         Self::ProbeOne,
         Self::FitClosedRuns,
         Self::FitClosedPresentChild,
+        Self::FitClosedPhysicalChild,
     ];
     const TIMED: [Self; 4] = [
         Self::Certified,
@@ -303,6 +308,7 @@ impl ProbeMode {
             Self::ProbeOne => "J_PROBE_ONE_ORDINARY",
             Self::FitClosedRuns => "K_FIT_CLOSED_RUNS",
             Self::FitClosedPresentChild => "KP_PRESENT_CHILD_ORDERED",
+            Self::FitClosedPhysicalChild => "KU_PHYSICAL_CHILDREN",
         }
     }
 
@@ -314,16 +320,23 @@ impl ProbeMode {
         rpq_confirm_admission_probe_force_ordinary(matches!(self, Self::Ordinary));
         rpq_confirm_admission_probe_force_singleton_ordinary(matches!(
             self,
-            Self::Hybrid | Self::FitClosedRuns | Self::FitClosedPresentChild
+            Self::Hybrid
+                | Self::FitClosedRuns
+                | Self::FitClosedPresentChild
+                | Self::FitClosedPhysicalChild
         ));
         rpq_confirm_admission_probe_force_first_target_ordinary(matches!(self, Self::ProbeOne));
         rpq_confirm_admission_probe_fit_closed_runs(matches!(
             self,
-            Self::FitClosedRuns | Self::FitClosedPresentChild
+            Self::FitClosedRuns | Self::FitClosedPresentChild | Self::FitClosedPhysicalChild
         ));
         rpq_confirm_admission_probe_fit_closed_present_child_ordered(matches!(
             self,
             Self::FitClosedPresentChild
+        ));
+        rpq_confirm_admission_probe_fit_closed_physical_children(matches!(
+            self,
+            Self::FitClosedPhysicalChild
         ));
     }
 }
@@ -1045,6 +1058,25 @@ fn tally(rows: impl IntoIterator<Item = Pair>) -> Signature {
     signature
 }
 
+#[cfg(rpq_confirm_admission_probe)]
+fn per_parent_raw_bags(rows: &[Pair]) -> BTreeMap<RawInline, Vec<RawInline>> {
+    let mut bags = BTreeMap::<RawInline, Vec<RawInline>>::new();
+    for (parent, value) in rows {
+        bags.entry(parent.raw).or_default().push(value.raw);
+    }
+    for bag in bags.values_mut() {
+        bag.sort_unstable();
+    }
+    bags
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+fn projected_raw_tuple_set(rows: &[Pair]) -> BTreeSet<(RawInline, RawInline)> {
+    rows.iter()
+        .map(|(parent, value)| (parent.raw, value.raw))
+        .collect()
+}
+
 fn finite_collect<S: TriblePattern>(store: &S, fixture: &Fixture) -> Vec<Pair> {
     finite_union_query!(store, fixture).collect()
 }
@@ -1506,14 +1538,27 @@ fn main() {
     );
     let timing_request = std::env::var("RPQ_FIT_CLOSED_RUNS_TIMING").ok();
     let run_timing = timing_request.as_deref() == Some("FLEET_IDLE_RELEASED");
+    let physical_timing_request = std::env::var("RPQ_PHYSICAL_CHILD_TIMING").ok();
+    let run_physical_timing = physical_timing_request.as_deref() == Some("FLEET_IDLE_RELEASED");
     assert!(
         timing_request.is_none() || run_timing,
         "RPQ_FIT_CLOSED_RUNS_TIMING must equal FLEET_IDLE_RELEASED; correctness-only is the default"
     );
+    assert!(
+        physical_timing_request.is_none() || run_physical_timing,
+        "RPQ_PHYSICAL_CHILD_TIMING must equal FLEET_IDLE_RELEASED; correctness-only is the default"
+    );
+    assert!(
+        !(run_timing && run_physical_timing),
+        "run the retired-K timing panel and physical-child panel separately",
+    );
     println!("engine: {ENGINE}");
     println!("revision: {REVISION}");
-    println!("timing_repetitions: {repetitions}; timing_enabled: {run_timing}");
-    run_rpq_confirm_crossover_probe(repetitions, run_timing);
+    println!(
+        "timing_repetitions: {repetitions}; timing_enabled: {run_timing}; \
+         physical_timing_enabled: {run_physical_timing}"
+    );
+    run_rpq_confirm_crossover_probe(repetitions, run_timing, run_physical_timing);
 }
 
 #[cfg(engine_prefix_checkpoints)]
@@ -2574,7 +2619,9 @@ fn run_crossover_mode<S: TriblePattern>(
     );
     if matches!(
         mode,
-        ProbeMode::FitClosedRuns | ProbeMode::FitClosedPresentChild
+        ProbeMode::FitClosedRuns
+            | ProbeMode::FitClosedPresentChild
+            | ProbeMode::FitClosedPhysicalChild
     ) {
         println!(
             "fit_closed_run_receipt backend={backend:?} width={} repeat={repeat} \
@@ -2583,7 +2630,8 @@ fn run_crossover_mode<S: TriblePattern>(
              max_bulk_run_inputs={} max_pageable_run_inputs={} \
              nonfit_resumed={} nonfit_empty_program={} nonfit_non_positive={} \
              nonfit_grant={} present_child_branch_slot_scans={} \
-             present_child_lookups={} absent_child_lookups_eliminated={}",
+             present_child_lookups={} physical_child_visits={} \
+             absent_child_lookups_eliminated={}",
             cell.width,
             callbacks.fit_closed_original_mixed_cohorts,
             callbacks.fit_closed_bulk_runs,
@@ -2600,6 +2648,7 @@ fn run_crossover_mode<S: TriblePattern>(
             callbacks.fit_closed_nonfit_grant_inputs,
             callbacks.fit_closed_present_child_branch_slot_scans,
             callbacks.fit_closed_present_child_lookups,
+            callbacks.fit_closed_physical_child_visits,
             callbacks.fit_closed_absent_child_lookups_eliminated,
         );
     }
@@ -3047,6 +3096,7 @@ fn nonplacement_callbacks(
     callbacks.fit_closed_nonfit_grant_inputs = 0;
     callbacks.fit_closed_present_child_branch_slot_scans = 0;
     callbacks.fit_closed_present_child_lookups = 0;
+    callbacks.fit_closed_physical_child_visits = 0;
     callbacks.fit_closed_absent_child_lookups_eliminated = 0;
     callbacks
 }
@@ -3396,6 +3446,122 @@ fn correctness_backend<S: TriblePattern>(
             > 0
     );
 
+    let fit_closed_physical = run_crossover_mode(
+        backend,
+        store,
+        fixture,
+        cell,
+        ProbeMode::FitClosedPhysicalChild,
+        0,
+        Some(target_token),
+    );
+    let fit_closed_physical_repeat = run_crossover_mode(
+        backend,
+        store,
+        fixture,
+        cell,
+        ProbeMode::FitClosedPhysicalChild,
+        1,
+        Some(target_token),
+    );
+    assert_eq!(
+        crossover_target_fragments_for(&fit_closed_physical, target_token),
+        FROZEN_H_K4_FRAGMENTS,
+        "physical child traversal changed the frozen target grouping",
+    );
+    assert_crossover_target_receipt(
+        backend,
+        cell,
+        target_token,
+        &fit_closed_physical,
+        &hybrid_fragments,
+    );
+    assert_eq!(
+        per_parent_raw_bags(&fit_closed_physical.rows),
+        per_parent_raw_bags(&fit_closed_present.rows),
+        "physical child traversal changed a raw per-parent occurrence bag",
+    );
+    assert_eq!(
+        per_parent_raw_bags(&fit_closed_physical_repeat.rows),
+        per_parent_raw_bags(&fit_closed_present.rows),
+        "repeat physical child traversal changed a raw per-parent occurrence bag",
+    );
+    assert_eq!(
+        projected_raw_tuple_set(&fit_closed_physical.rows),
+        projected_raw_tuple_set(&fit_closed_present.rows),
+        "physical child traversal changed the projected raw-tuple SET",
+    );
+    assert_eq!(
+        projected_raw_tuple_set(&fit_closed_physical_repeat.rows),
+        projected_raw_tuple_set(&fit_closed_present.rows),
+        "repeat physical child traversal changed the projected raw-tuple SET",
+    );
+    assert_eq!(
+        fit_closed_physical
+            .callbacks
+            .fit_closed_present_child_lookups,
+        0,
+        "physical traversal unexpectedly performed ordered child lookups",
+    );
+    assert!(
+        fit_closed_physical
+            .callbacks
+            .fit_closed_physical_child_visits
+            > 0,
+        "physical traversal did not visit a present child",
+    );
+    assert_eq!(
+        fit_closed_physical
+            .callbacks
+            .fit_closed_present_child_branch_slot_scans,
+        fit_closed_present
+            .callbacks
+            .fit_closed_present_child_branch_slot_scans,
+        "physical and ordered-present traversals did not scan the same child-table slots",
+    );
+    assert_eq!(
+        fit_closed_physical
+            .callbacks
+            .fit_closed_physical_child_visits,
+        fit_closed_present
+            .callbacks
+            .fit_closed_present_child_lookups,
+        "physical and ordered-present traversals did not visit the same present children",
+    );
+    assert_eq!(
+        fit_closed_physical
+            .callbacks
+            .fit_closed_absent_child_lookups_eliminated,
+        fit_closed_present
+            .callbacks
+            .fit_closed_absent_child_lookups_eliminated,
+        "physical and ordered-present traversals disagree on eliminated absent probes",
+    );
+    println!(
+        "physical_child_semantic_gate backend={backend:?} width={} \
+         raw_parent_bags_equal=true projected_raw_tuple_set_equal=true \
+         ordered_digest={:#018x} physical_digest={:#018x} \
+         repeat_physical_digest={:#018x} order_is_telemetry_only=true \
+         branch_slots={} ordered_present_lookups={} physical_present_visits={} \
+         absent_lookups_eliminated={}",
+        cell.width,
+        fit_closed_present.order_digest,
+        fit_closed_physical.order_digest,
+        fit_closed_physical_repeat.order_digest,
+        fit_closed_physical
+            .callbacks
+            .fit_closed_present_child_branch_slot_scans,
+        fit_closed_present
+            .callbacks
+            .fit_closed_present_child_lookups,
+        fit_closed_physical
+            .callbacks
+            .fit_closed_physical_child_visits,
+        fit_closed_physical
+            .callbacks
+            .fit_closed_absent_child_lookups_eliminated,
+    );
+
     let probe_one = run_crossover_mode(
         backend,
         store,
@@ -3456,6 +3622,7 @@ fn correctness_backend<S: TriblePattern>(
         ("H", &hybrid),
         ("K", &fit_closed),
         ("KP", &fit_closed_present),
+        ("KU", &fit_closed_physical),
     ] {
         assert_eq!(
             control.callbacks.first_target_confirm_consumptions, 0,
@@ -3469,6 +3636,7 @@ fn correctness_backend<S: TriblePattern>(
         ("J", &probe_one),
         ("K", &fit_closed),
         ("KP", &fit_closed_present),
+        ("KU", &fit_closed_physical),
     ] {
         let signature = tally(run.rows.iter().copied());
         assert_eq!(signature.rows, cell.expected.len());
@@ -3715,7 +3883,152 @@ fn timing_backend<S: TriblePattern>(
 }
 
 #[cfg(rpq_confirm_admission_probe)]
-fn run_rpq_confirm_crossover_probe(repetitions: usize, run_timing: bool) {
+fn present_child_physical_timing_backend<S: TriblePattern>(
+    backend: &str,
+    store: &S,
+    fixture: &CrossoverFixture,
+    cell: &CrossoverCell,
+    target_token: u32,
+    repetitions: usize,
+) {
+    const MODES: [ProbeMode; 2] = [
+        ProbeMode::FitClosedPresentChild,
+        ProbeMode::FitClosedPhysicalChild,
+    ];
+
+    rpq_confirm_admission_probe_record_receipts(false);
+    let expected_signature = tally(cell.expected.iter().copied());
+
+    for mode in MODES {
+        for point in CrossoverTimingPoint::ALL {
+            rpq_confirm_admission_probe_target_action(
+                target_token,
+                CROSSOVER_PARENT_COUNT,
+                CROSSOVER_PARENT_COUNT * cell.width,
+            );
+            mode.arm();
+            let mut query = probe_mixed_query!(store, fixture, mode);
+            match point {
+                CrossoverTimingPoint::First => {
+                    assert!(black_box(query.next()).is_some());
+                }
+                CrossoverTimingPoint::Full => {
+                    assert_eq!(black_box(tally(query.by_ref())), expected_signature);
+                }
+            }
+        }
+    }
+
+    let mut pairs = Vec::with_capacity(repetitions * CrossoverTimingPoint::ALL.len());
+    for repetition in 0..repetitions {
+        let points = if repetition % 2 == 0 {
+            CrossoverTimingPoint::ALL
+        } else {
+            [CrossoverTimingPoint::Full, CrossoverTimingPoint::First]
+        };
+        for point in points {
+            let order =
+                if (repetition + usize::from(matches!(point, CrossoverTimingPoint::Full))) % 2 == 0
+                {
+                    MODES
+                } else {
+                    [MODES[1], MODES[0]]
+                };
+            let mut ordered = Duration::ZERO;
+            let mut physical = Duration::ZERO;
+            for mode in order {
+                rpq_confirm_admission_probe_target_action(
+                    target_token,
+                    CROSSOVER_PARENT_COUNT,
+                    CROSSOVER_PARENT_COUNT * cell.width,
+                );
+                mode.arm();
+                let started = Instant::now();
+                let mut query = probe_mixed_query!(store, fixture, mode);
+                match point {
+                    CrossoverTimingPoint::First => {
+                        assert!(black_box(query.next()).is_some());
+                    }
+                    CrossoverTimingPoint::Full => {
+                        assert_eq!(black_box(tally(query.by_ref())), expected_signature);
+                    }
+                }
+                let duration = started.elapsed();
+                drop(query);
+                match mode {
+                    ProbeMode::FitClosedPresentChild => ordered = duration,
+                    ProbeMode::FitClosedPhysicalChild => physical = duration,
+                    _ => unreachable!("physical traversal panel admitted an unrelated mode"),
+                }
+            }
+            pairs.push((repetition, point, order[0], ordered, physical));
+        }
+    }
+
+    for &(repetition, point, first_mode, ordered, physical) in &pairs {
+        println!(
+            "present_child_physical_timing_raw backend={backend:?} width={} \
+             repetition={repetition} point={} first_mode={} \
+             ordered_ns={} physical_ns={} physical_over_ordered={:.9}",
+            cell.width,
+            point.label(),
+            first_mode.label(),
+            ordered.as_nanos(),
+            physical.as_nanos(),
+            physical.as_secs_f64() / ordered.as_secs_f64(),
+        );
+    }
+
+    for point in CrossoverTimingPoint::ALL {
+        let selected: Vec<_> = pairs
+            .iter()
+            .filter(|(_, observed, _, _, _)| *observed == point)
+            .collect();
+        let ordered: Vec<_> = selected
+            .iter()
+            .map(|(_, _, _, ordered, _)| ordered.as_secs_f64())
+            .collect();
+        let physical: Vec<_> = selected
+            .iter()
+            .map(|(_, _, _, _, physical)| physical.as_secs_f64())
+            .collect();
+        let ratios: Vec<_> = selected
+            .iter()
+            .map(|(_, _, _, ordered, physical)| physical.as_secs_f64() / ordered.as_secs_f64())
+            .collect();
+        let physical_wins = selected
+            .iter()
+            .filter(|(_, _, _, ordered, physical)| physical < ordered)
+            .count();
+        println!(
+            "present_child_physical_timing_summary backend={backend:?} width={} \
+             point={} primary={} pairs={} balanced_orders=true \
+             ordered_p50_us={:.3} ordered_p95_us={:.3} \
+             physical_p50_us={:.3} physical_p95_us={:.3} \
+             paired_ratio_p50={:.9} paired_ratio_p95={:.9} \
+             physical_wins={physical_wins}/{}",
+            cell.width,
+            point.label(),
+            point == CrossoverTimingPoint::Full,
+            selected.len(),
+            percentile(&ordered, 0.50) * 1e6,
+            percentile(&ordered, 0.95) * 1e6,
+            percentile(&physical, 0.50) * 1e6,
+            percentile(&physical, 0.95) * 1e6,
+            percentile(&ratios, 0.50),
+            percentile(&ratios, 0.95),
+            selected.len(),
+        );
+    }
+    rpq_confirm_admission_probe_record_receipts(true);
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+fn run_rpq_confirm_crossover_probe(
+    repetitions: usize,
+    run_timing: bool,
+    run_physical_timing: bool,
+) {
     let built = Instant::now();
     let fixture = CrossoverFixture::new();
     let fixture_elapsed = built.elapsed();
@@ -3724,7 +4037,9 @@ fn run_rpq_confirm_crossover_probe(repetitions: usize, run_timing: bool) {
         .components
         .iter()
         .all(|component| component.len() == CROSSOVER_CORE_NODES));
-    println!("probe: RPQ H admission plus ordered bounded fit-closed transition runs");
+    println!(
+        "probe: frozen fit-closed carrier for ordered-present versus physical PATCH traversal"
+    );
     println!(
         "fixture: components={} core_nodes={} selected_parents={} graph_tribles={} \
          graph_digest={:#018x} built_ms={:.3}",
@@ -3736,9 +4051,10 @@ fn run_rpq_confirm_crossover_probe(repetitions: usize, run_timing: bool) {
         fixture_elapsed.as_secs_f64() * 1e3,
     );
     println!(
-        "invariant: C, O, H, J, and K all compile the same Production route and ParentAtomic \
-         grouping. K retains H admission and scheduler cohorts exactly, changing only mixed \
-         transition inputs from pageable traversal to receipt-equivalent ordered bounded runs."
+        "scope: retired K is only the available end-to-end carrier. KP and KU keep its route, \
+         grouping, and placement fixed; they differ only in ordered-present ByteSet traversal \
+         versus the existing physical PATCH cuckoo-slot walk. Correctness is raw per-parent bags \
+         and projected raw-tuple SET; output order is telemetry."
     );
 
     let cell = fixture.cell(HYBRID_WIDTH);
@@ -3830,16 +4146,29 @@ fn run_rpq_confirm_crossover_probe(repetitions: usize, run_timing: bool) {
             repetitions,
         );
     }
-    if !run_timing {
+    if run_physical_timing {
+        present_child_physical_timing_backend(
+            "TribleSet",
+            &cell.candidates,
+            &fixture,
+            &cell,
+            target_token,
+            repetitions,
+        );
+    }
+    if !run_timing && !run_physical_timing {
         println!(
-            "timing withheld: set RPQ_FIT_CLOSED_RUNS_TIMING=FLEET_IDLE_RELEASED only \
-             after an explicit fleet-idle release"
+            "timing withheld: set RPQ_FIT_CLOSED_RUNS_TIMING=FLEET_IDLE_RELEASED or \
+             RPQ_PHYSICAL_CHILD_TIMING=FLEET_IDLE_RELEASED only after an explicit \
+             fleet-idle release"
         );
     }
     rpq_confirm_admission_probe_force_ordinary(false);
     rpq_confirm_admission_probe_force_singleton_ordinary(false);
     rpq_confirm_admission_probe_force_first_target_ordinary(false);
     rpq_confirm_admission_probe_fit_closed_runs(false);
+    rpq_confirm_admission_probe_fit_closed_present_child_ordered(false);
+    rpq_confirm_admission_probe_fit_closed_physical_children(false);
 }
 
 #[cfg(all(engine_prefix_checkpoints, not(rpq_confirm_admission_probe)))]

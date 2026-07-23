@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The PATCH present-child probe now measures order-free physical traversal.**
+  A dedicated residual carrier compares the ordered `ByteSet` walk with the
+  existing physical cuckoo-slot traversal under raw per-parent bag and
+  projected raw-tuple SET gates; physical order is retained only as telemetry.
 - **PATCH now has an order-preserving present-child traversal probe.** A
   prefix-located bounded view can scan each physical child table once into the
   existing 256-bit `ByteSet`, drain only present keys in ascending order, and
