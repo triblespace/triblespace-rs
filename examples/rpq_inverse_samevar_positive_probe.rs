@@ -8,7 +8,7 @@
 //! only the fully-bound Support route behind `ProgramExposure::Explicit`.
 //!
 //! Run with:
-//! `cargo run --release --example rpq_inverse_samevar_positive_probe -- [nodes=4096] [reps=51] [warmups=5]`
+//! `cargo run --release --example rpq_inverse_samevar_positive_probe -- [nodes=4096] [reps=51] [warmups=5] [run-id] [revision]`
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::hint::black_box;
@@ -128,6 +128,13 @@ struct Signature {
 struct Attribution {
     positive_terminal: usize,
     positive_chunk_homomorphic: usize,
+    exact_wins: usize,
+    support_wins: usize,
+    demand_assigned: usize,
+    support_examined: usize,
+    exact_examined_total: usize,
+    exact_credited: usize,
+    credit_retired: usize,
     direct_terminal_rows: usize,
     support_action_pops: usize,
     support_calls: usize,
@@ -146,12 +153,23 @@ impl Attribution {
     fn positive_commits(self) -> usize {
         self.positive_terminal + self.positive_chunk_homomorphic
     }
+
+    fn credited_work(self) -> usize {
+        self.demand_assigned + self.exact_credited
+    }
+
+    fn bound_slack(self) -> usize {
+        self.credited_work()
+            .checked_sub(self.support_examined)
+            .expect("Support examined beyond D + C")
+    }
 }
 
 struct Profile {
     first: RawInline,
     b0_position: Option<usize>,
     first_stats: Attribution,
+    b0_stats: Option<Attribution>,
     full_stats: Attribution,
 }
 
@@ -160,6 +178,14 @@ struct Samples {
     first: Vec<Duration>,
     b0: Vec<Duration>,
     full: Vec<Duration>,
+}
+
+struct BenchmarkContext<'a> {
+    nodes: usize,
+    reps: usize,
+    warmups: usize,
+    run_id: &'a str,
+    revision: &'a str,
 }
 
 /// Structurally present Support route that production policy deliberately
@@ -591,6 +617,13 @@ fn attribution(stats: &ResidualStateStats) -> Attribution {
     Attribution {
         positive_terminal: stats.delta_positive_publication_terminal_commits,
         positive_chunk_homomorphic: stats.delta_positive_publication_chunk_homomorphic_commits,
+        exact_wins: stats.delta_positive_publication_exact_wins,
+        support_wins: stats.delta_positive_publication_support_wins,
+        demand_assigned: stats.delta_positive_support_demand_assigned,
+        support_examined: stats.delta_positive_support_examined,
+        exact_examined_total: stats.delta_positive_support_exact_paired_examined,
+        exact_credited: stats.delta_positive_support_exact_credited,
+        credit_retired: stats.delta_positive_support_credit_retired,
         direct_terminal_rows: stats.delta_direct_terminal_publication_rows,
         support_action_pops: stats.support_action_pops,
         support_calls: stats.support_calls,
@@ -619,6 +652,56 @@ fn oracle(fixture: &Fixture) -> (Vec<RawInline>, Signature) {
     (actual, oracle_signature)
 }
 
+fn assert_accounting(
+    fixture: &Fixture,
+    mode: Mode,
+    width: usize,
+    phase: &str,
+    stats: Attribution,
+    completed: bool,
+) {
+    assert!(
+        stats.support_examined <= stats.credited_work(),
+        "{} {} width {width} {phase}: S={} exceeded D+C={}",
+        fixture.label(),
+        mode.label(),
+        stats.support_examined,
+        stats.credited_work()
+    );
+    assert!(
+        stats.exact_credited <= stats.exact_examined_total,
+        "{} {} width {width} {phase}: C={} exceeded paired Exact={}",
+        fixture.label(),
+        mode.label(),
+        stats.exact_credited,
+        stats.exact_examined_total
+    );
+    if completed {
+        assert_eq!(
+            stats.credited_work(),
+            stats.support_examined + stats.credit_retired,
+            "{} {} width {width}: completed hedge violated D+C=S+retired",
+            fixture.label(),
+            mode.label()
+        );
+    }
+    if matches!(mode, Mode::ExactOnly) {
+        assert_eq!(
+            (
+                stats.demand_assigned,
+                stats.support_examined,
+                stats.exact_examined_total,
+                stats.exact_credited,
+                stats.credit_retired,
+                stats.support_wins,
+            ),
+            (0, 0, 0, 0, 0, 0),
+            "{} exact-only width {width} {phase}: masked Support accrued hedge accounting",
+            fixture.label()
+        );
+    }
+}
+
 fn profile(
     fixture: &Fixture,
     mode: Mode,
@@ -631,11 +714,31 @@ fn profile(
         .next()
         .unwrap_or_else(|| panic!("{} {} returned no first row", fixture.label(), mode.label()));
     let first_stats = attribution(first_iter.stats());
+    assert_accounting(fixture, mode, width, "first", first_stats, false);
+
+    let (b0_position, b0_stats) = if fixture.case.is_positive() {
+        let mut b0_iter = make_iter(fixture, mode, width);
+        let position = b0_iter
+            .by_ref()
+            .position(|value| value == fixture.b0)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} {} width {width}: B[0] is absent",
+                    fixture.label(),
+                    mode.label()
+                )
+            });
+        let stats = attribution(b0_iter.stats());
+        assert_accounting(fixture, mode, width, "B0", stats, false);
+        (Some(position), Some(stats))
+    } else {
+        (None, None)
+    };
 
     let mut full_iter = make_iter(fixture, mode, width);
     let mut full: Vec<_> = full_iter.by_ref().collect();
     let full_stats = attribution(full_iter.stats());
-    let b0_position = full.iter().position(|value| *value == fixture.b0);
+    assert_accounting(fixture, mode, width, "full", full_stats, true);
     assert_eq!(
         signature(full.iter().copied()),
         oracle_signature,
@@ -655,8 +758,11 @@ fn profile(
     match mode {
         Mode::Production if fixture.case.is_positive() => {
             assert_eq!(
-                full_stats.positive_commits(),
-                1,
+                (
+                    full_stats.positive_commits(),
+                    full_stats.exact_wins + full_stats.support_wins,
+                ),
+                (1, 1),
                 "{} width {width}: neither Exact nor Support published positive B[0]",
                 fixture.label()
             );
@@ -668,16 +774,24 @@ fn profile(
         }
         Mode::Production => {
             assert_eq!(
-                full_stats.positive_commits(),
-                0,
+                (
+                    full_stats.positive_commits(),
+                    full_stats.exact_wins,
+                    full_stats.support_wins,
+                ),
+                (0, 0, 0),
                 "{} width {width}: miss B[0] fed a later candidate",
                 fixture.label()
             );
         }
         Mode::ExactOnly if fixture.case.is_positive() => {
             assert_eq!(
-                full_stats.positive_commits(),
-                1,
+                (
+                    full_stats.positive_commits(),
+                    full_stats.exact_wins,
+                    full_stats.support_wins,
+                ),
+                (1, 1, 0),
                 "{} width {width}: authoritative Exact tap did not publish positive B[0]",
                 fixture.label()
             );
@@ -689,8 +803,12 @@ fn profile(
         }
         Mode::ExactOnly => {
             assert_eq!(
-                full_stats.positive_commits(),
-                0,
+                (
+                    full_stats.positive_commits(),
+                    full_stats.exact_wins,
+                    full_stats.support_wins,
+                ),
+                (0, 0, 0),
                 "{} width {width}: miss B[0] acquired a positive publication",
                 fixture.label()
             );
@@ -701,6 +819,7 @@ fn profile(
         first,
         b0_position,
         first_stats,
+        b0_stats,
         full_stats,
     }
 }
@@ -716,7 +835,78 @@ fn signed_delta(lhs: usize, rhs: usize) -> i128 {
     lhs as i128 - rhs as i128
 }
 
-fn measure(fixture: &Fixture, width: usize, reps: usize, warmups: usize) {
+fn total_nanoseconds(samples: &[Duration]) -> u128 {
+    samples.iter().map(Duration::as_nanos).sum()
+}
+
+fn print_tsv_header() {
+    println!(
+        "schema\trun_id\trevision\tnodes\tshape\tcase\tdistance\twidth\tmode\tphase\t\
+         warmups\treps\trows\tp50_ns\tp95_ns\ttotal_sample_ns\tops_per_sec\t\
+         rows_per_sec\tfirst_is_b0\tpositive_total\texact_wins\tsupport_wins\t\
+         demand_assigned\texact_examined_total\texact_credited\tsupport_examined\t\
+         credit_retired\tbound_slack\tsource_examined\ttransition_examined\t\
+         terminal_calls\tnonterminal_calls"
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_tsv_row(
+    context: &BenchmarkContext<'_>,
+    fixture: &Fixture,
+    width: usize,
+    mode: Mode,
+    phase: &str,
+    samples: &[Duration],
+    rows: usize,
+    first_is_b0: bool,
+    stats: Attribution,
+) {
+    let total_ns = total_nanoseconds(samples);
+    let operations_per_second = context.reps as f64 * 1_000_000_000.0 / total_ns as f64;
+    let rows_per_second = context.reps as f64 * rows as f64 * 1_000_000_000.0 / total_ns as f64;
+    println!(
+        "rpq-hedge-v1\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t\
+         {:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        context.run_id,
+        context.revision,
+        context.nodes,
+        fixture.shape.label(),
+        fixture.case.label(),
+        fixture
+            .b0_distance
+            .map_or_else(|| "n/a".to_owned(), |distance| distance.to_string()),
+        width,
+        mode.label(),
+        phase,
+        context.warmups,
+        context.reps,
+        rows,
+        percentile(samples, 50).as_nanos(),
+        percentile(samples, 95).as_nanos(),
+        total_ns,
+        operations_per_second,
+        rows_per_second,
+        first_is_b0,
+        stats.positive_commits(),
+        stats.exact_wins,
+        stats.support_wins,
+        stats.demand_assigned,
+        stats.exact_examined_total,
+        stats.exact_credited,
+        stats.support_examined,
+        stats.credit_retired,
+        stats.bound_slack(),
+        stats.source_candidates_examined,
+        stats.transition_candidates_examined,
+        stats.terminal_calls,
+        stats.nonterminal_calls,
+    );
+}
+
+fn measure(fixture: &Fixture, width: usize, context: &BenchmarkContext<'_>) {
+    let reps = context.reps;
+    let warmups = context.warmups;
     let (oracle, oracle_signature) = oracle(fixture);
     let profiles: Vec<_> = MODES
         .iter()
@@ -789,7 +979,7 @@ fn measure(fixture: &Fixture, width: usize, reps: usize, warmups: usize) {
         }
     }
 
-    println!(
+    eprintln!(
         "\n{} width={width} B0={} distance={} candidates={} oracle=count:{} hash:{:016x}",
         fixture.label(),
         if fixture.case.is_positive() {
@@ -806,7 +996,7 @@ fn measure(fixture: &Fixture, width: usize, reps: usize, warmups: usize) {
     );
     for (index, mode) in MODES.iter().enumerate() {
         let profile = &profiles[index];
-        println!(
+        eprintln!(
             "  {:<13} ttfr p50/p95 {:>10?}/{:>10?}  full p50/p95 {:>10?}/{:>10?}",
             mode.label(),
             percentile(&samples[index].first, 50),
@@ -815,7 +1005,7 @@ fn measure(fixture: &Fixture, width: usize, reps: usize, warmups: usize) {
             percentile(&samples[index].full, 95),
         );
         if fixture.case.is_positive() {
-            println!(
+            eprintln!(
                 "    B0 position={} first_is_B0={} time-to-B0 p50/p95 {:>10?}/{:>10?}",
                 profile
                     .b0_position
@@ -825,10 +1015,11 @@ fn measure(fixture: &Fixture, width: usize, reps: usize, warmups: usize) {
                 percentile(&samples[index].b0, 95),
             );
         }
-        println!(
+        eprintln!(
             "    first: positive {}/{} direct_rows {} ordinary_support calls/rows {}/{} \
              confirm calls/rows {}/{} source pages/examined {}/{} \
-             transition pages/examined {}/{} dispatches terminal/nonterminal {}/{}",
+             transition pages/examined {}/{} dispatches terminal/nonterminal {}/{} \
+             D/C/S/retired {}/{}/{}/{} wins exact/support {}/{}",
             profile.first_stats.positive_terminal,
             profile.first_stats.positive_chunk_homomorphic,
             profile.first_stats.direct_terminal_rows,
@@ -842,11 +1033,18 @@ fn measure(fixture: &Fixture, width: usize, reps: usize, warmups: usize) {
             profile.first_stats.transition_candidates_examined,
             profile.first_stats.terminal_calls,
             profile.first_stats.nonterminal_calls,
+            profile.first_stats.demand_assigned,
+            profile.first_stats.exact_credited,
+            profile.first_stats.support_examined,
+            profile.first_stats.credit_retired,
+            profile.first_stats.exact_wins,
+            profile.first_stats.support_wins,
         );
-        println!(
+        eprintln!(
             "    full:  positive {}/{} direct_rows {} ordinary_support calls/rows {}/{} \
              confirm calls/rows {}/{} source pages/examined {}/{} \
-             transition pages/examined {}/{} dispatches terminal/nonterminal {}/{}",
+             transition pages/examined {}/{} dispatches terminal/nonterminal {}/{} \
+             D/C/S/retired {}/{}/{}/{} wins exact/support {}/{}",
             profile.full_stats.positive_terminal,
             profile.full_stats.positive_chunk_homomorphic,
             profile.full_stats.direct_terminal_rows,
@@ -860,12 +1058,60 @@ fn measure(fixture: &Fixture, width: usize, reps: usize, warmups: usize) {
             profile.full_stats.transition_candidates_examined,
             profile.full_stats.terminal_calls,
             profile.full_stats.nonterminal_calls,
+            profile.full_stats.demand_assigned,
+            profile.full_stats.exact_credited,
+            profile.full_stats.support_examined,
+            profile.full_stats.credit_retired,
+            profile.full_stats.exact_wins,
+            profile.full_stats.support_wins,
+        );
+
+        let first_is_b0 = profile.first == fixture.b0;
+        print_tsv_row(
+            context,
+            fixture,
+            width,
+            *mode,
+            "first",
+            &samples[index].first,
+            1,
+            first_is_b0,
+            profile.first_stats,
+        );
+        if fixture.case.is_positive() {
+            print_tsv_row(
+                context,
+                fixture,
+                width,
+                *mode,
+                "b0",
+                &samples[index].b0,
+                profile
+                    .b0_position
+                    .expect("positive fixture profile omitted B[0]")
+                    + 1,
+                first_is_b0,
+                profile
+                    .b0_stats
+                    .expect("positive fixture profile omitted B[0] accounting"),
+            );
+        }
+        print_tsv_row(
+            context,
+            fixture,
+            width,
+            *mode,
+            "full",
+            &samples[index].full,
+            oracle_signature.count,
+            first_is_b0,
+            profile.full_stats,
         );
     }
 
     let production = &profiles[0];
     let confirm_only = &profiles[1];
-    println!(
+    eprintln!(
         "  production - exact-only full actual-work delta: \
          source_pages {:+} source_examined {:+} transition_pages {:+} \
          transition_examined {:+} terminal_dispatches {:+} nonterminal_dispatches {:+}",
@@ -904,6 +1150,8 @@ fn main() {
         .unwrap_or(4_096);
     let reps = args.get(2).and_then(|arg| arg.parse().ok()).unwrap_or(51);
     let warmups = args.get(3).and_then(|arg| arg.parse().ok()).unwrap_or(5);
+    let run_id = args.get(4).map(String::as_str).unwrap_or("run-1");
+    let revision = args.get(5).map(String::as_str).unwrap_or("unknown");
     assert!(
         node_count >= DISTINCT_HITS * 2,
         "nodes must leave room for distinct sampled witnesses"
@@ -912,18 +1160,26 @@ fn main() {
 
     let mut fixtures = build_inverse_fixtures(node_count);
     fixtures.extend(build_same_variable_fixtures(node_count));
-    println!(
+    let context = BenchmarkContext {
+        nodes: node_count,
+        reps,
+        warmups,
+        run_id,
+        revision,
+    };
+    print_tsv_header();
+    eprintln!(
         "RPQ inverse/same-variable positive-publication probe: \
          nodes={node_count} reps={reps} warmups={warmups} \
-         distinct_hits={DISTINCT_HITS} widths={WIDTHS:?}"
+         distinct_hits={DISTINCT_HITS} widths={WIDTHS:?} run={run_id} revision={revision}"
     );
-    println!(
+    eprintln!(
         "production is the unwrapped OpaqueLeaves+Production lane; exact-only keeps \
          the same fallback exact Confirm Program but policy-defers only Support."
     );
     for fixture in &fixtures {
         for width in WIDTHS {
-            measure(fixture, width, reps, warmups);
+            measure(fixture, width, &context);
         }
     }
 }
