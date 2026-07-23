@@ -3933,10 +3933,34 @@ fn present_child_physical_timing_backend<S: TriblePattern>(
                     MODES
                 } else {
                     [MODES[1], MODES[0]]
-                };
+            };
             let mut ordered = Duration::ZERO;
             let mut physical = Duration::ZERO;
             for mode in order {
+                // Prime the exact mode/endpoint immediately before its timed
+                // query. Without this local prime, the second member of an
+                // AB/BA pair inherits the first member's hot PATCH frontier;
+                // that carryover dominates sub-millisecond first-row timing.
+                rpq_confirm_admission_probe_target_action(
+                    target_token,
+                    CROSSOVER_PARENT_COUNT,
+                    CROSSOVER_PARENT_COUNT * cell.width,
+                );
+                mode.arm();
+                let mut priming_query = probe_mixed_query!(store, fixture, mode);
+                match point {
+                    CrossoverTimingPoint::First => {
+                        assert!(black_box(priming_query.next()).is_some());
+                    }
+                    CrossoverTimingPoint::Full => {
+                        assert_eq!(
+                            black_box(tally(priming_query.by_ref())),
+                            expected_signature
+                        );
+                    }
+                }
+                drop(priming_query);
+
                 rpq_confirm_admission_probe_target_action(
                     target_token,
                     CROSSOVER_PARENT_COUNT,
@@ -4003,6 +4027,7 @@ fn present_child_physical_timing_backend<S: TriblePattern>(
         println!(
             "present_child_physical_timing_summary backend={backend:?} width={} \
              point={} primary={} pairs={} balanced_orders=true \
+             same_mode_self_prime=true \
              ordered_p50_us={:.3} ordered_p95_us={:.3} \
              physical_p50_us={:.3} physical_p95_us={:.3} \
              paired_ratio_p50={:.9} paired_ratio_p95={:.9} \
