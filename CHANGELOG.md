@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **An ignored RPQ candidate-slicing falsifier exercises the existing typed
+  Support Program without changing production policy.** It reuses the frozen
+  256-parent, half-reachable crossover fixture at candidate widths 2, 4, 8,
+  and 16 across TribleSet and SuccinctArchive predicates. The isolated arm
+  lazily admits one complete source group, drives one BOTH-BOUND Support
+  activation per distinct raw candidate under positive geometric grants, and
+  separates first witness, first exact parent, all-candidate classification,
+  and physical cleanup. Raw SET correctness, candidate multiplicity, fixed
+  graph digest, generic Program pages, and RPQ transition telemetry are
+  checked independently of physical output order.
 - **Directed singleton Program chains can spend one scheduler grant locally.**
   An unjoined streaming activation may consume exact same-cohort sole children
   inside its producing receipt until the original work budget is exhausted or

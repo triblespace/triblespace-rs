@@ -3841,6 +3841,9 @@ mod estimate_tests {
 }
 
 #[cfg(test)]
+mod anchored_sliced_probe;
+
+#[cfg(test)]
 mod seeded_frame_tests {
     use super::*;
     use crate::id::rngid;
