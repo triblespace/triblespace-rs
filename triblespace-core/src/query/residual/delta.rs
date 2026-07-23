@@ -6396,6 +6396,14 @@ pub(super) struct DeltaScheduler {
     /// product expansion are family-private states distinguished only by
     /// opaque physical dispatch classes.
     program_worklist: ProgramWorklist,
+    /// Exact physical count of runnable PositiveSupport tasks per semantic
+    /// parent.
+    ///
+    /// This is a noncanonical index over `program_worklist`, maintained for
+    /// both scheduling policies. It owns no admission or semantic authority;
+    /// it only answers whether ordinary runnable custody already exists
+    /// without repeatedly scanning every Program bucket.
+    runnable_positive_support_tasks: AHashMap<PositiveConfirmParentId, usize>,
     /// Affine PositiveSupport custody that is live but not runnable.
     ///
     /// Parked hedges do not own semantic completeness: their exact Confirm
@@ -6472,6 +6480,7 @@ impl DeltaScheduler {
             worklist: BTreeMap::new(),
             source_worklist: BTreeMap::new(),
             program_worklist: ProgramWorklist::default(),
+            runnable_positive_support_tasks: AHashMap::new(),
             parked_positive_support_worklist: ProgramWorklist::default(),
             program_lane_selection: ProgramLaneSelection::Unrestricted,
             next_program_lane: None,
@@ -8356,6 +8365,83 @@ impl DeltaScheduler {
         })
     }
 
+    fn index_runnable_positive_support_tasks(&mut self, tasks: &[ProgramTask]) {
+        for task in tasks {
+            let Some(parent) = self
+                .registry
+                .positive_support_parent_for_child(task.activation)
+            else {
+                continue;
+            };
+            let count = self
+                .runnable_positive_support_tasks
+                .entry(parent)
+                .or_default();
+            *count = count
+                .checked_add(1)
+                .expect("runnable PositiveSupport task count overflow");
+        }
+    }
+
+    fn unindex_runnable_positive_support_tasks(&mut self, tasks: &[ProgramTask]) {
+        for task in tasks {
+            let Some(parent) = self
+                .registry
+                .positive_support_parent_for_child(task.activation)
+            else {
+                continue;
+            };
+            let remove = {
+                let count = self
+                    .runnable_positive_support_tasks
+                    .get_mut(&parent)
+                    .expect("runnable PositiveSupport task was absent from its parent index");
+                *count = count
+                    .checked_sub(1)
+                    .expect("runnable PositiveSupport task count underflow");
+                *count == 0
+            };
+            if remove {
+                assert_eq!(
+                    self.runnable_positive_support_tasks.remove(&parent),
+                    Some(0),
+                    "empty runnable PositiveSupport parent index disappeared"
+                );
+            }
+        }
+    }
+
+    fn take_runnable_program_activations(
+        &mut self,
+        activations: &AHashSet<ActivationId>,
+    ) -> Vec<(DeltaStateId, Vec<ProgramTask>)> {
+        let groups = self.program_worklist.take_activations(activations);
+        for (_, tasks) in &groups {
+            self.unindex_runnable_positive_support_tasks(tasks);
+        }
+        groups
+    }
+
+    #[cfg(test)]
+    fn assert_runnable_positive_support_task_index(&self) {
+        let mut actual = AHashMap::<PositiveConfirmParentId, usize>::new();
+        for (_, bucket) in self.program_worklist.iter() {
+            for task in &bucket.tasks {
+                let Some(parent) = self
+                    .registry
+                    .positive_support_parent_for_child(task.activation)
+                else {
+                    continue;
+                };
+                *actual.entry(parent).or_default() += 1;
+            }
+        }
+        assert_eq!(
+            self.runnable_positive_support_tasks, actual,
+            "runnable PositiveSupport parent index diverged from Program custody"
+        );
+    }
+
     fn file_program_state(
         &mut self,
         state: DeltaStateId,
@@ -8366,6 +8452,7 @@ impl DeltaScheduler {
             self.interner.program(state).is_some(),
             "typed program task was filed under a legacy delta state"
         );
+        self.index_runnable_positive_support_tasks(&tasks);
         self.program_worklist.append(state, &mut tasks);
         Some(ActiveDeltaContinuation { state, activation })
     }
@@ -8429,13 +8516,7 @@ impl DeltaScheduler {
     }
 
     fn has_runnable_positive_support_parent(&self, parent: PositiveConfirmParentId) -> bool {
-        self.program_worklist.iter().any(|(_, bucket)| {
-            bucket.tasks.iter().any(|task| {
-                self.registry
-                    .positive_support_parent_for_child(task.activation)
-                    == Some(parent)
-            })
-        })
+        self.runnable_positive_support_tasks.contains_key(&parent)
     }
 
     /// Moves at most one parked task for this semantic parent onto the
@@ -8463,8 +8544,9 @@ impl DeltaScheduler {
                 registry.positive_support_parent_for_child(task.activation) == Some(parent)
             })?;
         let activation = task.activation;
-        let mut tasks = vec![task];
-        self.program_worklist.append(state, &mut tasks);
+        let active = self
+            .file_program_state(state, vec![task])
+            .expect("one parked PositiveSupport task failed to become runnable");
         if self.lane_selection_is_active() {
             debug_assert_eq!(
                 ProgramServiceLane::of(&self.registry, activation),
@@ -8473,7 +8555,8 @@ impl DeltaScheduler {
             self.next_program_lane = Some(ProgramServiceLane::Support);
             self.next_program_state = Some(state);
         }
-        Some(ActiveDeltaContinuation { state, activation })
+        debug_assert_eq!(active.activation, activation);
+        Some(active)
     }
 
     /// Consumes the query's one unassigned pull token into one concrete
@@ -8747,7 +8830,7 @@ impl DeltaScheduler {
                 "only live PositiveSupport activations may be parked"
             );
         }
-        let groups = self.program_worklist.take_activations(activations);
+        let groups = self.take_runnable_program_activations(activations);
         for (state, tasks) in groups {
             let _ = self.file_parked_positive_support_state(state, tasks);
         }
@@ -8781,15 +8864,11 @@ impl DeltaScheduler {
             .collect();
 
         let mut groups = BTreeMap::<DeltaStateId, Vec<ProgramTask>>::new();
-        for (state, mut tasks) in self
-            .program_worklist
-            .take_activations(&live)
-            .into_iter()
-            .chain(
-                self.parked_positive_support_worklist
-                    .take_activations(&live),
-            )
-        {
+        let runnable = self.take_runnable_program_activations(&live);
+        let parked = self
+            .parked_positive_support_worklist
+            .take_activations(&live);
+        for (state, mut tasks) in runnable.into_iter().chain(parked) {
             groups.entry(state).or_default().append(&mut tasks);
         }
         let mut completed = Vec::with_capacity(live.len());
@@ -9031,6 +9110,7 @@ impl DeltaScheduler {
             tasks,
             mut limits,
         } = selection;
+        self.unindex_runnable_positive_support_tasks(&tasks);
         let support_grants = self.reserve_positive_support_selection(&tasks, &mut limits);
         let kind = match key.class.pacing() {
             ProgramPacing::Search => PhysicalDispatchKind::Source,
@@ -9107,6 +9187,7 @@ impl DeltaScheduler {
             tasks,
             mut limits,
         } = selection;
+        self.unindex_runnable_positive_support_tasks(&tasks);
         let support_grants = self.reserve_positive_support_selection(&tasks, &mut limits);
         if self.positive_support_scheduling == PositiveSupportScheduling::GlobalServiceDebt
             && lane == Some(ProgramServiceLane::Support)
@@ -10864,6 +10945,7 @@ impl DeltaScheduler {
             source_worklist.insert(id, SourceBucket { tasks });
         }
         let mut program_worklist = ProgramWorklist::default();
+        let mut runnable_positive_support_tasks = AHashMap::new();
         for (id, bucket) in self.program_worklist.iter() {
             let mut tasks = Vec::with_capacity(bucket.tasks.len());
             for task in &bucket.tasks {
@@ -10875,6 +10957,9 @@ impl DeltaScheduler {
                     credit,
                     work: task.work.clone(),
                 });
+                if let Some(parent) = registry.positive_support_parent_for_child(task.activation) {
+                    *runnable_positive_support_tasks.entry(parent).or_default() += 1;
+                }
             }
             program_worklist.append(id, &mut tasks);
         }
@@ -10924,6 +11009,7 @@ impl DeltaScheduler {
             worklist,
             source_worklist,
             program_worklist,
+            runnable_positive_support_tasks,
             parked_positive_support_worklist,
             program_lane_selection: self.program_lane_selection,
             next_program_lane: self.next_program_lane,
@@ -12124,7 +12210,13 @@ mod tests {
             open_tapped_confirm_with_support(&mut scheduler.registry, [candidate], None, true);
         let (support, _) =
             queue_one_shot_positive_support(&mut scheduler, &root, parent, candidate, false);
+        scheduler.assert_runnable_positive_support_task_index();
+        assert_eq!(scheduler.runnable_positive_support_tasks[&parent], 1);
         scheduler.park_positive_support_activations(&AHashSet::from_iter([support]));
+        scheduler.assert_runnable_positive_support_task_index();
+        assert!(!scheduler
+            .runnable_positive_support_tasks
+            .contains_key(&parent));
 
         let mut stats = ResidualStateStats::default();
         assert!(
@@ -12164,10 +12256,12 @@ mod tests {
         );
 
         scheduler.arm_global_service_lane();
+        scheduler.assert_runnable_positive_support_task_index();
         assert_eq!(
             scheduler.next_program_lane,
             Some(ProgramServiceLane::Support)
         );
+        assert_eq!(scheduler.runnable_positive_support_tasks[&parent], 1);
         assert!(scheduler.has_runnable_positive_support_parent(parent));
     }
 
@@ -12219,11 +12313,15 @@ mod tests {
                 queue_one_shot_positive_support(&mut scheduler, &root, parent, candidate, false).0
             })
             .collect::<Vec<_>>();
+        scheduler.assert_runnable_positive_support_task_index();
+        assert_eq!(scheduler.runnable_positive_support_tasks[&parent], 65);
         let final_runnable = children
             .pop()
             .expect("the fixture retained one runnable sibling");
 
         scheduler.park_positive_support_activations(&children.into_iter().collect());
+        scheduler.assert_runnable_positive_support_task_index();
+        assert_eq!(scheduler.runnable_positive_support_tasks[&parent], 1);
         assert_eq!(
             scheduler.positive_support_service_locator_boundary_probes, 1,
             "one filing batch must probe a shared semantic parent once"
@@ -12232,6 +12330,10 @@ mod tests {
         assert!(scheduler.has_runnable_positive_support_parent(parent));
 
         scheduler.park_positive_support_activations(&AHashSet::from_iter([final_runnable]));
+        scheduler.assert_runnable_positive_support_task_index();
+        assert!(!scheduler
+            .runnable_positive_support_tasks
+            .contains_key(&parent));
         assert_eq!(
             scheduler.positive_support_service_locator_boundary_probes, 2,
             "filing the final sibling must retry exactly one parent probe"
@@ -12330,6 +12432,8 @@ mod tests {
             scheduler.positive_support_service_debt.lease,
             PositiveSupportServiceLease::Idle
         );
+        scheduler.assert_runnable_positive_support_task_index();
+        assert!(scheduler.runnable_positive_support_tasks.is_empty());
     }
 
     #[test]
@@ -12792,6 +12896,45 @@ mod tests {
             assert!(current.positive_support_service_demand_queue.is_empty());
             assert!(current.positive_support_service_demand_queued.is_empty());
         }
+    }
+
+    #[test]
+    fn runnable_positive_support_index_rebrands_and_diverges_across_clone() {
+        let root = OneShotSupportProgram;
+        let mut scheduler = DeltaScheduler::new();
+        scheduler.enable_positive_support_global_service_debt();
+        let candidate = value(85);
+        let (exact, parent, exact_credit, _) =
+            open_tapped_confirm_with_support(&mut scheduler.registry, [candidate], None, true);
+        let (first, active) =
+            queue_one_shot_positive_support(&mut scheduler, &root, parent, candidate, false);
+        let (second, _) =
+            queue_one_shot_positive_support(&mut scheduler, &root, parent, candidate, false);
+        let _ = queue_exact_confirm_credit(&mut scheduler, active.state, exact, exact_credit);
+        scheduler.assert_runnable_positive_support_task_index();
+        assert_eq!(scheduler.runnable_positive_support_tasks[&parent], 2);
+
+        let mut cloned = scheduler.deep_clone();
+        let cloned_parent = PositiveConfirmParentId {
+            brand: cloned.registry.brand,
+            activation: parent.activation,
+        };
+        cloned.assert_runnable_positive_support_task_index();
+        assert_eq!(cloned.runnable_positive_support_tasks[&cloned_parent], 2);
+        assert!(!cloned.runnable_positive_support_tasks.contains_key(&parent));
+
+        cloned.park_positive_support_activations(&AHashSet::from_iter([first]));
+        cloned.assert_runnable_positive_support_task_index();
+        assert_eq!(cloned.runnable_positive_support_tasks[&cloned_parent], 1);
+        assert!(cloned.has_runnable_positive_support_parent(cloned_parent));
+        assert!(cloned.registry.is_live_positive_support(second));
+
+        scheduler.assert_runnable_positive_support_task_index();
+        assert_eq!(scheduler.runnable_positive_support_tasks[&parent], 2);
+        assert!(
+            scheduler.has_active_program(active),
+            "parking clone-local custody mutated the original worklist"
+        );
     }
 
     #[test]
@@ -15849,13 +15992,19 @@ mod tests {
         assert!(initial.is_empty());
         let (child, initially_active) =
             queue_one_shot_positive_support(&mut scheduler, &root, parent, candidate, true);
+        scheduler.assert_runnable_positive_support_task_index();
+        assert_eq!(scheduler.runnable_positive_support_tasks[&parent], 1);
         let mut stable = Worklist::new();
         let mut stable_interner = StateInterner::default();
         let mut stats = ResidualStateStats::default();
         scheduler.park_positive_support_activations(&AHashSet::from_iter([child]));
+        scheduler.assert_runnable_positive_support_task_index();
+        assert!(scheduler.runnable_positive_support_tasks.is_empty());
         let active = scheduler
             .begin_public_pull_demand(&mut stats)
             .expect("public demand should wake the parked Support child");
+        scheduler.assert_runnable_positive_support_task_index();
+        assert_eq!(scheduler.runnable_positive_support_tasks[&parent], 1);
         assert_eq!(active, initially_active);
         let state = active.state;
         let stepped = scheduler.step_active_bounded(
@@ -15868,6 +16017,8 @@ mod tests {
             &mut stable_interner,
             &mut stats,
         );
+        scheduler.assert_runnable_positive_support_task_index();
+        assert!(scheduler.runnable_positive_support_tasks.is_empty());
 
         assert_eq!(stepped.status, ActiveDeltaStatus::Yielded);
         assert!(stepped.resume.is_none());
@@ -15979,6 +16130,8 @@ mod tests {
         assert!(initial.is_empty());
         let (child, support_active) =
             queue_one_shot_positive_support(&mut scheduler, &root, parent, candidate, false);
+        scheduler.assert_runnable_positive_support_task_index();
+        assert_eq!(scheduler.runnable_positive_support_tasks[&parent], 1);
 
         let mut exact_page = scheduler.registry.replace_program(
             exact_credit,
@@ -16006,6 +16159,8 @@ mod tests {
             .into_iter()
             .collect();
         let (completed, _) = scheduler.retire_positive_support_activations(&root, &plan, &targets);
+        scheduler.assert_runnable_positive_support_task_index();
+        assert!(scheduler.runnable_positive_support_tasks.is_empty());
 
         assert_eq!(completed, [child]);
         assert!(
