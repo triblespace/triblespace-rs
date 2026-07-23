@@ -197,6 +197,9 @@ struct Samples {
     first: Vec<Duration>,
     b0: Vec<Duration>,
     full: Vec<Duration>,
+    first_stats: Vec<Attribution>,
+    b0_stats: Vec<Attribution>,
+    full_stats: Vec<Attribution>,
 }
 
 struct BenchmarkContext<'a> {
@@ -980,6 +983,43 @@ fn percentile(samples: &[Duration], percentile: usize) -> Duration {
     sorted[index]
 }
 
+fn attribution_range(
+    samples: &[Attribution],
+    field: impl Fn(Attribution) -> usize,
+) -> (usize, usize, usize) {
+    assert!(!samples.is_empty());
+    let mut values: Vec<_> = samples.iter().copied().map(field).collect();
+    values.sort_unstable();
+    let middle = ((values.len() - 1) * 50 + 50) / 100;
+    (values[0], values[middle], values[values.len() - 1])
+}
+
+fn print_timed_attribution_summary(phase: &str, samples: &[Attribution]) {
+    let exact_wins: usize = samples.iter().map(|sample| sample.exact_wins).sum();
+    let support_wins: usize = samples.iter().map(|sample| sample.support_wins).sum();
+    let transitions = attribution_range(samples, |sample| sample.transition_candidates_examined);
+    let support = attribution_range(samples, |sample| sample.support_examined);
+    let exact_credit = attribution_range(samples, |sample| sample.exact_credited);
+    let deferrals = attribution_range(samples, |sample| sample.service_deferrals);
+    eprintln!(
+        "    timed {phase}: winner exact/support {exact_wins}/{support_wins}; \
+         transition_examined min/p50/max {}/{}/{}; S {}/{}/{}; C {}/{}/{}; \
+         service deferrals {}/{}/{}",
+        transitions.0,
+        transitions.1,
+        transitions.2,
+        support.0,
+        support.1,
+        support.2,
+        exact_credit.0,
+        exact_credit.1,
+        exact_credit.2,
+        deferrals.0,
+        deferrals.1,
+        deferrals.2,
+    );
+}
+
 fn signed_delta(lhs: usize, rhs: usize) -> i128 {
     lhs as i128 - rhs as i128
 }
@@ -1100,6 +1140,9 @@ fn measure(fixture: &Fixture, width: usize, context: &BenchmarkContext<'_>) {
         first: Vec::with_capacity(reps),
         b0: Vec::with_capacity(reps),
         full: Vec::with_capacity(reps),
+        first_stats: Vec::with_capacity(reps),
+        b0_stats: Vec::with_capacity(reps),
+        full_stats: Vec::with_capacity(reps),
     });
     for repetition in 0..reps {
         for offset in 0..MODES.len() {
@@ -1116,6 +1159,9 @@ fn measure(fixture: &Fixture, width: usize, context: &BenchmarkContext<'_>) {
                 fixture.label(),
                 mode.label()
             );
+            let first_stats = attribution(first_iter.stats());
+            assert_accounting(fixture, mode, width, "timed-first", first_stats, false);
+            samples[index].first_stats.push(first_stats);
 
             if fixture.case.is_positive() {
                 let mut b0_iter = make_iter(fixture, mode, width);
@@ -1128,6 +1174,9 @@ fn measure(fixture: &Fixture, width: usize, context: &BenchmarkContext<'_>) {
                     fixture.label(),
                     mode.label()
                 );
+                let b0_stats = attribution(b0_iter.stats());
+                assert_accounting(fixture, mode, width, "timed-B0", b0_stats, false);
+                samples[index].b0_stats.push(b0_stats);
             }
 
             let mut full_iter = make_iter(fixture, mode, width);
@@ -1135,6 +1184,9 @@ fn measure(fixture: &Fixture, width: usize, context: &BenchmarkContext<'_>) {
             let full_signature = black_box(signature(full_iter.by_ref()));
             samples[index].full.push(began.elapsed());
             assert_eq!(full_signature, oracle_signature);
+            let full_stats = attribution(full_iter.stats());
+            assert_accounting(fixture, mode, width, "timed-full", full_stats, true);
+            samples[index].full_stats.push(full_stats);
         }
     }
 
@@ -1242,6 +1294,11 @@ fn measure(fixture: &Fixture, width: usize, context: &BenchmarkContext<'_>) {
             profile.full_stats.service_wakes,
             profile.full_stats.service_deferrals,
         );
+        print_timed_attribution_summary("first", &samples[index].first_stats);
+        if fixture.case.is_positive() {
+            print_timed_attribution_summary("B0", &samples[index].b0_stats);
+        }
+        print_timed_attribution_summary("full", &samples[index].full_stats);
 
         let first_is_b0 = profile.first == fixture.b0;
         print_tsv_row(
