@@ -96,6 +96,8 @@ use smallvec::SmallVec;
 
 use super::*;
 
+#[cfg(test)]
+mod competitive;
 mod delta;
 mod materialize;
 mod set_admit;
