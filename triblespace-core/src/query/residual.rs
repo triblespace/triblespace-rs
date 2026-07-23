@@ -12141,6 +12141,13 @@ impl ResidualStateMachine {
         influences: &[VariableSet; 128],
         base_estimates: &[usize; 128],
     ) -> Option<Self> {
+        // The experimental debt theorem owns one scalar next-dispatch
+        // account for the whole query. Independent Rayon shards would each
+        // mint an initial Support packet; sharing only the totals would still
+        // lack the global dispatcher needed to serialize lane admission.
+        if self.delta.uses_positive_support_global_service_debt() {
+            return None;
+        }
         // StateId is a machine-local family key. Once a terminal admission
         // exists, splitting would require either a shared projected-yield
         // ledger or origin propagation through every stable bucket.
@@ -12557,7 +12564,10 @@ impl<C, P: Fn(&Binding) -> Option<R>, R> ResidualStateIter<C, P, R> {
     /// lane-pure, gives Support one initial bounded packet, and thereafter
     /// dispatches it only while its cumulative validated examined work is
     /// strictly behind Exact. Exact owns ties. The policy changes physical
-    /// order only; raw projected tuple SET semantics are unchanged.
+    /// order only; raw projected tuple SET semantics are unchanged. Parallel
+    /// iteration currently remains one unsplit producer so the stated debt
+    /// bound is genuinely query-global rather than one initial allowance per
+    /// shard.
     pub fn positive_support_global_service_debt(mut self) -> Self {
         assert!(
             !self.iteration_started,
@@ -25891,6 +25901,35 @@ mod tests {
         assert!(right.emit_origins.is_none());
         assert!(machine.worklist.is_empty());
         assert!(right.worklist.is_empty());
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn global_service_debt_keeps_one_query_global_parallel_producer() {
+        let root = FanoutLeaf {
+            variable: 0,
+            values: Arc::new(Vec::new()),
+        };
+        let plan = ResidualPlan::compile(&root);
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        machine.delta.enable_positive_support_global_service_debt();
+        machine.emit_vars = vec![0];
+        machine.emit_rows = (0..7).map(raw).collect();
+        machine.emit_count = 7;
+
+        assert!(
+            machine
+                .split_for_parallel(
+                    &root,
+                    &plan,
+                    &[VariableSet::new_empty(); 128],
+                    &[usize::MAX; 128],
+                )
+                .is_none(),
+            "fresh parallel shards would each mint an initial Support bypass"
+        );
+        assert_eq!(machine.emit_count, 7);
+        assert_eq!(machine.emit_rows, (0..7).map(raw).collect::<Vec<_>>());
     }
 
     #[cfg(feature = "parallel")]

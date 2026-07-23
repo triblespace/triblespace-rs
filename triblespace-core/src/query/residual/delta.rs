@@ -2307,6 +2307,7 @@ impl ProducerRegistry {
                 || !ledger
                     .authorization
                     .authorizes(PositivePublicationSource::SupportHedge)
+                || ledger.service_support_started
                 || !ledger.certificate.eligible()
             {
                 return false;
@@ -5671,6 +5672,9 @@ struct DeltaPhysicalOutcome {
     /// A Search-paced receipt completed under a descendant's physical
     /// Activation dispatch. It still owns outer geometric feedback.
     retired_search_receipt: bool,
+    /// Authoritative per-input Program work validated from typed page
+    /// receipts. Family source/transition counters are telemetry only.
+    validated_program_examined: usize,
 }
 
 enum DeltaSettlement {
@@ -6501,6 +6505,11 @@ impl DeltaScheduler {
         );
         self.positive_support_scheduling = PositiveSupportScheduling::GlobalServiceDebt;
         self.program_lane_selection = ProgramLaneSelection::LanePure;
+    }
+
+    #[cfg(feature = "parallel")]
+    pub(super) fn uses_positive_support_global_service_debt(&self) -> bool {
+        self.positive_support_scheduling == PositiveSupportScheduling::GlobalServiceDebt
     }
 
     pub(super) fn global_service_epoch_is_active(&self) -> bool {
@@ -9513,15 +9522,10 @@ impl DeltaScheduler {
                 stable_interner,
                 stats,
             );
-            let examined_after = stats
-                .delta_source_candidates_examined
-                .saturating_add(stats.delta_transition_candidates_examined);
             self.settle_global_service_packet(
                 service_lane,
                 service_reservation,
-                examined_after
-                    .checked_sub(examined_before)
-                    .expect("Program examined-work telemetry moved backwards"),
+                physical.validated_program_examined,
                 stats,
             );
             let retired_search_receipt = physical.retired_search_receipt;
@@ -9834,6 +9838,7 @@ impl DeltaScheduler {
             },
             terminal_publications,
             retired_search_receipt: false,
+            validated_program_examined: 0,
         }
     }
 
@@ -10058,6 +10063,11 @@ impl DeltaScheduler {
             &scratch.receipt.pages,
             receipt_local_fusion.then_some(total_examined),
         );
+        let validated_program_examined = validated_examined
+            .iter()
+            .copied()
+            .try_fold(0usize, usize::checked_add)
+            .expect("validated Program examined-work count overflow");
         let final_source_telemetry_cohort =
             scratch.receipt.source_pages > 0 && scratch.receipt.transition_pages == 0;
         scratch.receipt.source_pages = source_pages;
@@ -10514,6 +10524,7 @@ impl DeltaScheduler {
             },
             terminal_publications,
             retired_search_receipt: retired_search_receipts > 0,
+            validated_program_examined,
         }
     }
 
@@ -10758,6 +10769,7 @@ impl DeltaScheduler {
             },
             terminal_publications,
             retired_search_receipt: false,
+            validated_program_examined: 0,
         }
     }
 
@@ -11345,6 +11357,7 @@ mod tests {
         keep_cleanup_live: bool,
         accept_candidate: bool,
         report_support: bool,
+        examined: usize,
     }
 
     #[derive(Clone, Copy)]
@@ -11405,12 +11418,13 @@ mod tests {
                     effects.support(input);
                 }
                 effects.page(
-                    1,
+                    state.examined,
                     state.keep_cleanup_live.then_some(TypedResume::Immediate(
                         OneShotSupportState {
                             keep_cleanup_live: false,
                             accept_candidate: state.accept_candidate,
                             report_support: state.report_support,
+                            examined: state.examined,
                         },
                     )),
                 );
@@ -11478,6 +11492,27 @@ mod tests {
         keep_cleanup_live: bool,
         report_support: bool,
     ) -> (ActivationId, ActiveDeltaContinuation) {
+        queue_positive_support_with_examined(
+            scheduler,
+            root,
+            parent,
+            candidate,
+            keep_cleanup_live,
+            report_support,
+            1,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn queue_positive_support_with_examined(
+        scheduler: &mut DeltaScheduler,
+        root: &OneShotSupportProgram,
+        parent: PositiveConfirmParentId,
+        candidate: RawInline,
+        keep_cleanup_live: bool,
+        report_support: bool,
+        examined: usize,
+    ) -> (ActivationId, ActiveDeltaContinuation) {
         let child = scheduler
             .registry
             .open_positive_support_activation(
@@ -11511,6 +11546,7 @@ mod tests {
                 keep_cleanup_live,
                 accept_candidate: false,
                 report_support,
+                examined,
             },
         );
         let active = scheduler
@@ -11554,6 +11590,7 @@ mod tests {
                 keep_cleanup_live,
                 accept_candidate,
                 report_support: false,
+                examined: 1,
             },
         );
         scheduler
@@ -11937,6 +11974,100 @@ mod tests {
         assert_eq!(
             scheduler.positive_support_service_debt.lease,
             PositiveSupportServiceLease::Retired
+        );
+    }
+
+    #[test]
+    fn global_service_charges_validated_pages_not_family_telemetry() {
+        let root = OneShotSupportProgram;
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let mut scheduler = DeltaScheduler::new();
+        scheduler.enable_positive_support_global_service_debt();
+        let candidate = value(71);
+        let (_, parent, _, _) =
+            open_tapped_confirm_with_support(&mut scheduler.registry, [candidate], None, true);
+        let (support, _) = queue_positive_support_with_examined(
+            &mut scheduler,
+            &root,
+            parent,
+            candidate,
+            false,
+            true,
+            7,
+        );
+        scheduler.park_positive_support_activations(&AHashSet::from_iter([support]));
+        let mut stats = ResidualStateStats::default();
+        assert!(scheduler.begin_public_pull_demand(&mut stats).is_none());
+
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let outcome = scheduler.step_bounded(
+            &root,
+            &plan,
+            7,
+            Some(terminal_positive_full()),
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert!(outcome.has_stable_effect());
+        assert_eq!(
+            (
+                stats.delta_source_candidates_examined,
+                stats.delta_transition_candidates_examined,
+            ),
+            (0, 0),
+            "family counters remain optional placement telemetry"
+        );
+        assert_eq!(stats.delta_positive_support_service_support_examined, 7);
+        assert_eq!(
+            stats.delta_positive_support_service_support_packet_allowance,
+            7
+        );
+        assert_eq!(scheduler.positive_support_service_debt.support_service, 7);
+    }
+
+    #[test]
+    fn later_global_service_demand_starts_a_distinct_parked_parent() {
+        let root = OneShotSupportProgram;
+        let mut scheduler = DeltaScheduler::new();
+        scheduler.enable_positive_support_global_service_debt();
+        let mut parents = Vec::new();
+        let mut children = AHashSet::new();
+        for candidate in [value(72), value(73)] {
+            let (_, parent, _, _) =
+                open_tapped_confirm_with_support(&mut scheduler.registry, [candidate], None, true);
+            let (child, _) =
+                queue_one_shot_positive_support(&mut scheduler, &root, parent, candidate, false);
+            parents.push(parent);
+            children.insert(child);
+        }
+        scheduler.park_positive_support_activations(&children);
+
+        let mut stats = ResidualStateStats::default();
+        assert!(scheduler.begin_public_pull_demand(&mut stats).is_none());
+        assert_eq!(
+            parents
+                .iter()
+                .filter(|&&parent| scheduler
+                    .registry
+                    .positive_support_service_is_started(parent))
+                .count(),
+            1
+        );
+
+        scheduler.retire_unassigned_public_pull_demand();
+        assert!(scheduler.begin_public_pull_demand(&mut stats).is_none());
+        assert!(
+            parents.iter().all(|&parent| scheduler
+                .registry
+                .positive_support_service_is_started(parent)),
+            "a later pull must not be consumed by the already-started parent"
+        );
+        assert_eq!(stats.delta_positive_support_service_parents_started, 2);
+        assert_eq!(
+            stats.delta_positive_support_service_epochs, 1,
+            "adding a parent to a live service epoch must not mint a bypass"
         );
     }
 
@@ -14951,6 +15082,7 @@ mod tests {
                     keep_cleanup_live,
                     accept_candidate: false,
                     report_support: true,
+                    examined: 1,
                 },
             );
             let active = scheduler
