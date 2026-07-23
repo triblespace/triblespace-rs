@@ -12149,6 +12149,41 @@ mod tests {
     }
 
     #[test]
+    fn global_service_locator_waits_for_the_last_runnable_sibling() {
+        let root = OneShotSupportProgram;
+        let mut scheduler = DeltaScheduler::new();
+        scheduler.enable_positive_support_global_service_debt();
+        let candidate = value(83);
+        let (exact, parent, exact_credit, _) =
+            open_tapped_confirm_with_support(&mut scheduler.registry, [candidate], None, true);
+        let (first, first_active) =
+            queue_one_shot_positive_support(&mut scheduler, &root, parent, candidate, false);
+        let (second, second_active) =
+            queue_one_shot_positive_support(&mut scheduler, &root, parent, candidate, false);
+        assert_eq!(first_active.state, second_active.state);
+        let _ = queue_exact_confirm_credit(&mut scheduler, first_active.state, exact, exact_credit);
+
+        scheduler.park_positive_support_activations(&AHashSet::from_iter([first]));
+        assert!(
+            scheduler.positive_support_service_demand_queue.is_empty(),
+            "one parked sibling cannot expose a parent with runnable Support custody"
+        );
+        assert!(scheduler.has_runnable_positive_support_parent(parent));
+
+        scheduler.park_positive_support_activations(&AHashSet::from_iter([second]));
+        assert_eq!(scheduler.positive_support_service_demand_queue, [parent]);
+        assert!(!scheduler.has_runnable_positive_support_parent(parent));
+
+        let mut stats = ResidualStateStats::default();
+        assert!(scheduler.begin_public_pull_demand(&mut stats).is_none());
+        assert!(scheduler
+            .registry
+            .positive_support_service_is_started(parent));
+        assert_eq!(stats.delta_positive_support_service_parents_started, 1);
+        assert_eq!(stats.delta_positive_support_demand_discovery_task_visits, 0);
+    }
+
+    #[test]
     fn global_service_mode_keeps_pre_epoch_program_work_neutral() {
         let root = OneShotSupportProgram;
         let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
