@@ -5821,6 +5821,13 @@ impl SourceBucket {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublicPullDemandState {
+    Closed,
+    Unassigned,
+    Assigned,
+}
+
 /// Reopenable cyclic work kept outside the strict-rank stable worklist.
 pub(super) struct DeltaScheduler {
     registry: ProducerRegistry,
@@ -5838,10 +5845,12 @@ pub(super) struct DeltaScheduler {
     /// handles in the same state-indexed shape lets cancellation and cloning
     /// preserve their exact typed runtime without exposing them to global pop.
     parked_positive_support_worklist: ProgramWorklist,
-    /// One public pull may carry one unassigned demand token while the machine
-    /// searches for a concrete parked Support parent. Assignment consumes it
-    /// permanently into that parent's conservation ledger.
-    unassigned_public_pull_demand: bool,
+    /// One public pull may carry one demand token while the machine searches
+    /// for a concrete parked Support parent. Assignment consumes the token
+    /// permanently into that parent's conservation ledger, while retaining
+    /// the `Assigned` state until the public pull closes so repeated internal
+    /// begin calls cannot mint another D.
+    public_pull_demand: PublicPullDemandState,
     program_runtimes: AHashMap<DeltaStateId, ProgramRuntime>,
     /// Program-only cohort scratch is lazy so non-Program queries retain the
     /// baseline scheduler footprint. One allocation is amortized across all
@@ -5867,7 +5876,7 @@ impl DeltaScheduler {
             source_worklist: BTreeMap::new(),
             program_worklist: ProgramWorklist::default(),
             parked_positive_support_worklist: ProgramWorklist::default(),
-            unassigned_public_pull_demand: false,
+            public_pull_demand: PublicPullDemandState::Closed,
             program_runtimes: AHashMap::new(),
             program_scratch: None,
             activation_width: 1,
@@ -7779,7 +7788,7 @@ impl DeltaScheduler {
         &mut self,
         stats: &mut ResidualStateStats,
     ) -> Option<ActiveDeltaContinuation> {
-        if !self.unassigned_public_pull_demand {
+        if self.public_pull_demand != PublicPullDemandState::Unassigned {
             return None;
         }
         let mut parents = Vec::new();
@@ -7801,7 +7810,7 @@ impl DeltaScheduler {
             if !self.registry.mint_positive_support_demand(parent) {
                 continue;
             }
-            self.unassigned_public_pull_demand = false;
+            self.public_pull_demand = PublicPullDemandState::Assigned;
             stats.delta_positive_support_demand_assigned += 1;
             return Some(
                 self.wake_one_positive_support_parent(parent)
@@ -7818,18 +7827,22 @@ impl DeltaScheduler {
         &mut self,
         stats: &mut ResidualStateStats,
     ) -> Option<ActiveDeltaContinuation> {
-        self.unassigned_public_pull_demand = true;
+        if self.public_pull_demand == PublicPullDemandState::Closed {
+            self.public_pull_demand = PublicPullDemandState::Unassigned;
+        }
         self.assign_public_pull_demand(stats)
     }
 
-    /// Retires a token that was never assigned during the public pull.
+    /// Closes the current public-pull lifecycle. An unassigned token retires
+    /// here; an assigned token remains D in its parent ledger but cannot cause
+    /// a second assignment before this boundary.
     pub(super) fn retire_unassigned_public_pull_demand(&mut self) {
-        self.unassigned_public_pull_demand = false;
+        self.public_pull_demand = PublicPullDemandState::Closed;
     }
 
     #[cfg(test)]
     pub(super) fn has_unassigned_public_pull_demand(&self) -> bool {
-        self.unassigned_public_pull_demand
+        self.public_pull_demand == PublicPullDemandState::Unassigned
     }
 
     fn wake_positive_support_parents(
@@ -9921,7 +9934,7 @@ impl DeltaScheduler {
             source_worklist,
             program_worklist,
             parked_positive_support_worklist,
-            unassigned_public_pull_demand: self.unassigned_public_pull_demand,
+            public_pull_demand: self.public_pull_demand,
             program_runtimes: self.program_runtimes.clone(),
             program_scratch: None,
             activation_width: self.activation_width,
@@ -10546,7 +10559,7 @@ mod tests {
     }
 
     #[test]
-    fn one_public_demand_assigns_exactly_one_of_two_parked_parents() {
+    fn one_public_pull_assigns_once_and_a_later_pull_may_assign_another_parent() {
         let root = OneShotSupportProgram;
         let mut scheduler = DeltaScheduler::new();
         let first_value = value(31);
@@ -10613,6 +10626,47 @@ mod tests {
                 + usize::from(scheduler.has_active_parked_positive_support(second_active)),
             1,
             "the other parent's Support task must remain parked"
+        );
+
+        assert!(
+            scheduler.begin_public_pull_demand(&mut stats).is_none(),
+            "reopening an assigned token in the same pull must not mint another D"
+        );
+        assert_eq!(stats.delta_positive_support_demand_assigned, 1);
+        assert_eq!(
+            scheduler
+                .registry
+                .positive_publication_snapshot(unassigned_parent)
+                .unwrap()
+                .support_work,
+            PositiveSupportWorkBudget::default(),
+            "the second parent must remain creditless until a later public pull"
+        );
+
+        scheduler.retire_unassigned_public_pull_demand();
+        let second_preference = scheduler
+            .begin_public_pull_demand(&mut stats)
+            .expect("a later public pull may assign the remaining parked parent");
+        assert_eq!(
+            scheduler
+                .registry
+                .positive_support_parent_for_child(second_preference.activation),
+            Some(unassigned_parent)
+        );
+        assert_eq!(stats.delta_positive_support_demand_assigned, 2);
+        assert_eq!(
+            scheduler
+                .registry
+                .positive_publication_snapshot(unassigned_parent)
+                .unwrap()
+                .support_work
+                .demand_minted,
+            1
+        );
+        assert!(
+            !scheduler.has_active_parked_positive_support(first_active)
+                && !scheduler.has_active_parked_positive_support(second_active),
+            "the second pull should wake the sole remaining parked Support task"
         );
     }
 
@@ -10809,6 +10863,88 @@ mod tests {
             (1, 1, 0, 2, 0)
         );
         budget.assert_conservation();
+    }
+
+    #[test]
+    fn exact_negative_quiescence_retires_the_started_support_budget() {
+        let root = OneShotSupportProgram;
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let mut scheduler = DeltaScheduler::new();
+        let candidate = value(44);
+        let (parent_activation, parent, exact_credit, _) =
+            open_tapped_confirm_with_support(&mut scheduler.registry, [candidate], None, true);
+        let (child, support_active) =
+            queue_one_shot_positive_support(&mut scheduler, &root, parent, candidate, false);
+        scheduler.park_positive_support_activations(&AHashSet::from_iter([child]));
+        let mut stats = ResidualStateStats::default();
+        assert_eq!(
+            scheduler.begin_public_pull_demand(&mut stats),
+            Some(support_active)
+        );
+        scheduler.park_positive_support_activations(&AHashSet::from_iter([child]));
+        let exact_active = queue_exact_confirm_program(
+            &mut scheduler,
+            support_active.state,
+            parent_activation,
+            exact_credit,
+            false,
+            false,
+        );
+
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let stepped = scheduler.step_active_bounded(
+            &root,
+            &plan,
+            exact_active,
+            1,
+            Some(terminal_positive_full()),
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+
+        assert_eq!(stepped.status, ActiveDeltaStatus::Pending);
+        assert!(!stepped.outcome.has_stable_effect());
+        assert_eq!(
+            stats.delta_positive_support_demand_assigned
+                + stats.delta_positive_support_exact_credited,
+            stats.delta_positive_support_examined + stats.delta_positive_support_credit_retired,
+            "closed exact-negative custody must conserve D + C = S + retired"
+        );
+        let finalizer = stepped
+            .resume
+            .expect("exact-negative settlement should retain its ordinary finalizer");
+        let drained = scheduler.step_active_bounded(
+            &root,
+            &plan,
+            finalizer,
+            1,
+            Some(terminal_positive_full()),
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert_eq!(drained.status, ActiveDeltaStatus::Quiescent);
+        assert!(!drained.outcome.has_stable_effect());
+        assert!(stable.is_empty());
+        assert!(!scheduler.registry.is_live(parent_activation));
+        assert!(!scheduler.registry.is_live(child));
+        assert!(!scheduler.has_active_program(exact_active));
+        assert!(!scheduler.has_active_program(support_active));
+        assert!(!scheduler.has_active_parked_positive_support(support_active));
+        assert_eq!(stats.delta_positive_support_demand_assigned, 1);
+        assert_eq!(stats.delta_positive_support_exact_paired_examined, 1);
+        assert_eq!(stats.delta_positive_support_exact_credited, 1);
+        assert_eq!(stats.delta_positive_support_credit_retired, 2);
+        assert_eq!(stats.delta_positive_support_examined, 0);
+        assert!(
+            scheduler
+                .registry
+                .positive_publication_snapshot(parent)
+                .is_none(),
+            "the drained exact finalizer retained its closed publication ledger"
+        );
     }
 
     #[test]

@@ -3585,7 +3585,7 @@ fn target_confirm_traverses_once_and_set_admits_reachable_candidates() {
 }
 
 #[test]
-fn target_confirm_positive_support_yields_occurrence_zero_then_exactly_drains() {
+fn target_confirm_positive_support_publishes_early_then_exactly_drains() {
     let mut graph = Graph::new(5, &[]);
     let mut reachable: Vec<_> = (1..5).collect();
     reachable.sort_unstable_by_key(|&node| graph.value(node).raw);
@@ -3636,7 +3636,7 @@ fn target_confirm_positive_support_yields_occurrence_zero_then_exactly_drains() 
         .cap(1);
     let first = query
         .next()
-        .expect("occurrence-zero Support should publish its exact witness");
+        .expect("positive Support should publish an exact witness early");
     assert_eq!(
         query.stats().delta_direct_terminal_publication_batches,
         1,
@@ -3781,7 +3781,7 @@ fn mixed_arm_production_support_fallback_spends_one_public_demand_step() {
 }
 
 #[test]
-fn forward_exact_confirm_tap_publishes_b0_without_a_second_traversal() {
+fn forward_exact_confirm_tap_publishes_early_without_a_second_traversal() {
     let graph = Graph::new(6, &[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)]);
     let first = graph.value(1).raw;
     let later = graph.value(5).raw;
@@ -3822,8 +3822,7 @@ fn forward_exact_confirm_tap_publishes_b0_without_a_second_traversal() {
     .cap(1);
     let early = query
         .next()
-        .expect("the exact Confirm replacement should publish reachable B[0]");
-    assert_eq!(early, first);
+        .expect("the exact Confirm replacement should publish a reachable value early");
     assert_eq!(query.stats().delta_positive_publication_terminal_commits, 1);
     assert_eq!(query.stats().delta_direct_terminal_publication_rows, 1);
     assert!(
@@ -3836,9 +3835,9 @@ fn forward_exact_confirm_tap_publishes_b0_without_a_second_traversal() {
     actual.sort_unstable();
     assert_eq!(actual, expected);
     assert_eq!(
-        actual.iter().filter(|&&value| value == first).count(),
+        actual.iter().filter(|&&value| value == early).count(),
         1,
-        "duplicate B[0] occurrences must settle through one value-keyed P entry"
+        "the early value must settle through one value-keyed P entry"
     );
     assert_eq!(
         query.stats().delta_transition_candidates_examined,
