@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Typed Program selection has an opt-in lane-pure packet seam.** A
+  noncanonical scheduler fence can keep started PositiveSupport Exact,
+  started Support, and neutral work in separate physical cohorts without
+  refining `ProgramCohortKey` or changing the default scheduler. Waking a
+  parked Support child can also arm a one-shot query-global preference that
+  selects a Support-bearing Program state on the next global pop.
 - **Positive Support hedges now spend parent-local demand credit.** Each public
   pull may assign one demand unit to one parked semantic parent; only then may
   validated exact Confirm work mint additional allowance. Support Program

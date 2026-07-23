@@ -4443,6 +4443,71 @@ impl ProgramCohortKey {
     }
 }
 
+/// Scheduler-only service attribution for one queued Program activation.
+///
+/// This lane is deliberately absent from [`ProgramCohortKey`]. The latter
+/// remains the exact semantic/physical call identity, while this label is a
+/// noncanonical fence used only when an experimental query-global service
+/// scheduler needs an attributable packet. A PositiveSupport race starts when
+/// its parent consumes public demand; before that point both its dormant child
+/// and its exact parent remain ordinary neutral work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProgramServiceLane {
+    Neutral,
+    Exact,
+    Support,
+}
+
+impl ProgramServiceLane {
+    fn of(registry: &ProducerRegistry, activation: ActivationId) -> Self {
+        let Some(state) = registry.state.activations.get(&activation) else {
+            return Self::Neutral;
+        };
+        if let DeltaReducer::PositiveSupport { link, .. } = &state.reducer {
+            let started = registry
+                .state
+                .activations
+                .get(&link.parent)
+                .and_then(|parent| parent.positive_publication.as_deref())
+                .is_some_and(|registration| {
+                    matches!(
+                        registration,
+                        PositivePublicationRegistration::Eligible(ledger)
+                            if ledger.generation == link.generation
+                                && ledger.support_children.contains(&activation)
+                                && ledger.support_work.started
+                    )
+                });
+            return if started {
+                Self::Support
+            } else {
+                Self::Neutral
+            };
+        }
+        if matches!(
+            state.positive_publication.as_deref(),
+            Some(PositivePublicationRegistration::Eligible(ledger))
+                if ledger.support_work.started
+        ) {
+            Self::Exact
+        } else {
+            Self::Neutral
+        }
+    }
+}
+
+/// Opt-in physical selection policy for attributable Program packets.
+///
+/// `Unrestricted` is the production default and exactly preserves the
+/// established cohort selection. `LanePure` adds only a scheduler fence:
+/// compatible work in another service lane stays queued for a later pop.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ProgramLaneSelection {
+    #[default]
+    Unrestricted,
+    LanePure,
+}
+
 #[derive(Clone, Copy)]
 enum ProgramSelectionOrder {
     Lifo,
@@ -4564,6 +4629,22 @@ impl ProgramWorklist {
             }
         }
         None
+    }
+
+    fn last_id_in_lane(
+        &self,
+        registry: &ProducerRegistry,
+        lane: ProgramServiceLane,
+    ) -> Option<DeltaStateId> {
+        self.iter()
+            .filter_map(|(state, bucket)| {
+                bucket
+                    .tasks
+                    .iter()
+                    .any(|task| ProgramServiceLane::of(registry, task.activation) == lane)
+                    .then_some(state)
+            })
+            .last()
     }
 
     fn iter(&self) -> impl Iterator<Item = (DeltaStateId, &ProgramBucket)> {
@@ -4750,25 +4831,34 @@ impl ProgramBucket {
         registry: &ProducerRegistry,
         search_width: usize,
         activation_width: usize,
+        lane: Option<ProgramServiceLane>,
         terminal_selection_slots: &mut AHashMap<ActivationId, usize>,
         terminal_selections: &mut Vec<TerminalActivationSelection>,
     ) -> ProgramSelection {
-        let hot = self.last().expect("typed program bucket is nonempty");
+        let hot = match lane {
+            Some(lane) => self
+                .tasks
+                .iter()
+                .rev()
+                .find(|task| ProgramServiceLane::of(registry, task.activation) == lane)
+                .expect("selected typed Program state lost its preferred service lane"),
+            None => self.last().expect("typed program bucket is nonempty"),
+        };
         let key = ProgramCohortKey::of(registry, hot);
+        let matches = |task: &ProgramTask| {
+            ProgramCohortKey::of(registry, task) == key
+                && lane.is_none_or(|lane| ProgramServiceLane::of(registry, task.activation) == lane)
+        };
         match key.class {
             ProgramCohortClass::Search { .. } => {
                 let width = registry.source_dispatch_width(hot.activation, search_width);
-                let tasks = self.take_matching(width, ProgramSelectionOrder::Lifo, |task| {
-                    ProgramCohortKey::of(registry, task) == key
-                });
+                let tasks = self.take_matching(width, ProgramSelectionOrder::Lifo, matches);
                 let limits = even_limits(width, tasks.len());
                 ProgramSelection { key, tasks, limits }
             }
             ProgramCohortClass::ActivationStreaming => {
                 let width = registry.transition_dispatch_width(hot.activation, search_width);
-                let tasks = self.take_matching(width, ProgramSelectionOrder::Append, |task| {
-                    ProgramCohortKey::of(registry, task) == key
-                });
+                let tasks = self.take_matching(width, ProgramSelectionOrder::Append, matches);
                 let limits = even_limits(width, tasks.len());
                 ProgramSelection { key, tasks, limits }
             }
@@ -4777,7 +4867,7 @@ impl ProgramBucket {
                 let activation_width = activation_width.max(1);
                 let mut activations = AHashSet::new();
                 let tasks = self.take_matching(width, ProgramSelectionOrder::Append, |task| {
-                    if ProgramCohortKey::of(registry, task) != key {
+                    if !matches(task) {
                         return false;
                     }
                     activations.contains(&task.activation)
@@ -4790,6 +4880,7 @@ impl ProgramBucket {
             ProgramCohortClass::ActivationTerminalStreaming => self.take_terminal(
                 registry,
                 key,
+                lane,
                 search_width,
                 terminal_selection_slots,
                 terminal_selections,
@@ -4805,6 +4896,7 @@ impl ProgramBucket {
         &mut self,
         registry: &ProducerRegistry,
         key: ProgramCohortKey,
+        lane: Option<ProgramServiceLane>,
         search_width: usize,
         terminal_selection_slots: &mut AHashMap<ActivationId, usize>,
         terminal_selections: &mut Vec<TerminalActivationSelection>,
@@ -4816,6 +4908,8 @@ impl ProgramBucket {
         terminal_selections.clear();
         for task in tasks.iter().rev() {
             if ProgramCohortKey::of(registry, task) != key
+                || lane
+                    .is_some_and(|lane| ProgramServiceLane::of(registry, task.activation) != lane)
                 || terminal_selection_slots.contains_key(&task.activation)
             {
                 continue;
@@ -4840,9 +4934,11 @@ impl ProgramBucket {
         let mut selected = Vec::new();
         let mut retained = Vec::with_capacity(tasks.len());
         for task in tasks.into_iter().rev() {
-            let selection = (ProgramCohortKey::of(registry, &task) == key)
-                .then(|| terminal_selection_slots.get(&task.activation).copied())
-                .flatten();
+            let selection = (ProgramCohortKey::of(registry, &task) == key
+                && lane
+                    .is_none_or(|lane| ProgramServiceLane::of(registry, task.activation) == lane))
+            .then(|| terminal_selection_slots.get(&task.activation).copied())
+            .flatten();
             if let Some(slot) = selection.filter(|&slot| {
                 terminal_selections[slot].selected < terminal_selections[slot].budget
             }) {
@@ -5845,6 +5941,14 @@ pub(super) struct DeltaScheduler {
     /// handles in the same state-indexed shape lets cancellation and cloning
     /// preserve their exact typed runtime without exposing them to global pop.
     parked_positive_support_worklist: ProgramWorklist,
+    /// Noncanonical packet-attribution fence. The default is unrestricted;
+    /// the experimental query-global scheduler can opt in without refining a
+    /// canonical Program state or physical call key.
+    program_lane_selection: ProgramLaneSelection,
+    /// One-shot global lane preference armed when parked PositiveSupport work
+    /// becomes runnable. It is consumed only by a global Program pop, which
+    /// may select a different canonical state from the ordinary hot tail.
+    next_program_lane: Option<ProgramServiceLane>,
     /// One public pull may carry one demand token while the machine searches
     /// for a concrete parked Support parent. Assignment consumes the token
     /// permanently into that parent's conservation ledger, while retaining
@@ -5876,6 +5980,8 @@ impl DeltaScheduler {
             source_worklist: BTreeMap::new(),
             program_worklist: ProgramWorklist::default(),
             parked_positive_support_worklist: ProgramWorklist::default(),
+            program_lane_selection: ProgramLaneSelection::Unrestricted,
+            next_program_lane: None,
             public_pull_demand: PublicPullDemandState::Closed,
             program_runtimes: AHashMap::new(),
             program_scratch: None,
@@ -7778,6 +7884,13 @@ impl DeltaScheduler {
         let activation = task.activation;
         let mut tasks = vec![task];
         self.program_worklist.append(state, &mut tasks);
+        if self.program_lane_selection == ProgramLaneSelection::LanePure {
+            debug_assert_eq!(
+                ProgramServiceLane::of(&self.registry, activation),
+                ProgramServiceLane::Support
+            );
+            self.next_program_lane = Some(ProgramServiceLane::Support);
+        }
         Some(ActiveDeltaContinuation { state, activation })
     }
 
@@ -8175,10 +8288,27 @@ impl DeltaScheduler {
         Vec<Option<PositiveSupportWorkGrant>>,
         PhysicalDispatch,
     ) {
-        let id = self
-            .program_worklist
-            .last_id()
+        let preferred_lane = (self.program_lane_selection == ProgramLaneSelection::LanePure)
+            .then(|| self.next_program_lane.take())
+            .flatten();
+        let preferred_state = preferred_lane
+            .and_then(|lane| self.program_worklist.last_id_in_lane(&self.registry, lane));
+        let id = preferred_state
+            .or_else(|| self.program_worklist.last_id())
             .expect("typed program pop requires live work");
+        let lane = if self.program_lane_selection == ProgramLaneSelection::LanePure {
+            preferred_state
+                .zip(preferred_lane)
+                .map(|(_, lane)| lane)
+                .or_else(|| {
+                    self.program_worklist
+                        .get(&id)
+                        .and_then(ProgramBucket::last)
+                        .map(|task| ProgramServiceLane::of(&self.registry, task.activation))
+                })
+        } else {
+            None
+        };
         let (selection, empty, remainder_tasks) = {
             let bucket = self
                 .program_worklist
@@ -8188,6 +8318,7 @@ impl DeltaScheduler {
                 &self.registry,
                 search_width,
                 self.activation_width,
+                lane,
                 &mut self.terminal_selection_slots,
                 &mut self.terminal_selections,
             );
@@ -9934,6 +10065,8 @@ impl DeltaScheduler {
             source_worklist,
             program_worklist,
             parked_positive_support_worklist,
+            program_lane_selection: self.program_lane_selection,
+            next_program_lane: self.next_program_lane,
             public_pull_demand: self.public_pull_demand,
             program_runtimes: self.program_runtimes.clone(),
             program_scratch: None,
@@ -10406,6 +10539,283 @@ mod tests {
                 }],
             )
             .expect("the exact Confirm parent filed one affine task")
+    }
+
+    fn queue_neutral_confirm_program(
+        scheduler: &mut DeltaScheduler,
+        state: DeltaStateId,
+        candidate: RawInline,
+        slot: u32,
+    ) -> (ActivationId, ActiveDeltaContinuation) {
+        let activation = scheduler.registry.open_program_activation(
+            DeltaReducer::Confirm {
+                original: shared_one_parent_candidates(vec![candidate]),
+            },
+            terminal_positive_return(Vec::new()),
+            None,
+            None,
+        );
+        let task = install_program_tasks(
+            &mut scheduler.registry,
+            activation,
+            [slot],
+            DispatchClass::new(0),
+            ProgramPacing::Search,
+        )
+        .pop()
+        .expect("the neutral Confirm fixture installed one Program task");
+        let active = scheduler
+            .file_program_state(state, vec![task])
+            .expect("the neutral Confirm fixture filed one Program task");
+        (activation, active)
+    }
+
+    #[test]
+    fn program_service_lane_starts_at_demand_without_refining_the_cohort_key() {
+        let root = OneShotSupportProgram;
+        let mut scheduler = DeltaScheduler::new();
+        assert_eq!(
+            scheduler.program_lane_selection,
+            ProgramLaneSelection::Unrestricted
+        );
+        let candidate = value(60);
+        let (exact, parent, exact_credit, _) =
+            open_tapped_confirm_with_support(&mut scheduler.registry, [candidate], None, true);
+        let (support, support_active) =
+            queue_one_shot_positive_support(&mut scheduler, &root, parent, candidate, false);
+        let _ =
+            queue_exact_confirm_credit(&mut scheduler, support_active.state, exact, exact_credit);
+
+        assert_eq!(
+            ProgramServiceLane::of(&scheduler.registry, exact),
+            ProgramServiceLane::Neutral
+        );
+        assert_eq!(
+            ProgramServiceLane::of(&scheduler.registry, support),
+            ProgramServiceLane::Neutral
+        );
+        assert!(scheduler.registry.mint_positive_support_demand(parent));
+        assert_eq!(
+            ProgramServiceLane::of(&scheduler.registry, exact),
+            ProgramServiceLane::Exact
+        );
+        assert_eq!(
+            ProgramServiceLane::of(&scheduler.registry, support),
+            ProgramServiceLane::Support
+        );
+    }
+
+    #[test]
+    fn lane_pure_global_program_pop_batches_exact_parents_but_retains_neutral_peer() {
+        let root = OneShotSupportProgram;
+        let mut scheduler = DeltaScheduler::new();
+        scheduler.program_lane_selection = ProgramLaneSelection::LanePure;
+
+        let first_value = value(61);
+        let (first_exact, first_parent, first_credit, _) =
+            open_tapped_confirm_with_support(&mut scheduler.registry, [first_value], None, true);
+        let (_, first_support) = queue_one_shot_positive_support(
+            &mut scheduler,
+            &root,
+            first_parent,
+            first_value,
+            false,
+        );
+        assert!(scheduler
+            .registry
+            .mint_positive_support_demand(first_parent));
+        let (neutral, _) =
+            queue_neutral_confirm_program(&mut scheduler, first_support.state, value(62), 91);
+        let _ = queue_exact_confirm_credit(
+            &mut scheduler,
+            first_support.state,
+            first_exact,
+            first_credit,
+        );
+
+        let second_value = value(63);
+        let (second_exact, second_parent, second_credit, _) =
+            open_tapped_confirm_with_support(&mut scheduler.registry, [second_value], None, true);
+        let (_, second_support) = queue_one_shot_positive_support(
+            &mut scheduler,
+            &root,
+            second_parent,
+            second_value,
+            false,
+        );
+        assert_eq!(second_support.state, first_support.state);
+        assert!(scheduler
+            .registry
+            .mint_positive_support_demand(second_parent));
+        let _ = queue_exact_confirm_credit(
+            &mut scheduler,
+            first_support.state,
+            second_exact,
+            second_credit,
+        );
+
+        let bucket = &scheduler.program_worklist[&first_support.state];
+        let neutral_task = bucket
+            .tasks
+            .iter()
+            .find(|task| task.activation == neutral)
+            .expect("the neutral Confirm peer remained queued");
+        let exact_task = bucket
+            .tasks
+            .iter()
+            .find(|task| task.activation == first_exact)
+            .expect("the first exact parent remained queued");
+        assert_eq!(
+            ProgramCohortKey::of(&scheduler.registry, neutral_task),
+            ProgramCohortKey::of(&scheduler.registry, exact_task),
+            "the lane fence must not refine ProgramCohortKey"
+        );
+
+        let (state, selected, grants, _) = scheduler.pop_program_bounded(8);
+        assert_eq!(state, first_support.state);
+        assert!(grants.iter().all(Option::is_none));
+        assert_eq!(
+            selected
+                .iter()
+                .map(|task| task.activation)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([first_exact, second_exact])
+        );
+        assert!(selected.iter().all(|task| {
+            ProgramServiceLane::of(&scheduler.registry, task.activation)
+                == ProgramServiceLane::Exact
+        }));
+        assert!(scheduler.program_worklist[&state]
+            .tasks
+            .iter()
+            .any(|task| task.activation == neutral));
+    }
+
+    #[test]
+    fn lane_pure_global_program_pop_batches_support_parents_but_retains_dormant_peer() {
+        let root = OneShotSupportProgram;
+        let mut scheduler = DeltaScheduler::new();
+        scheduler.program_lane_selection = ProgramLaneSelection::LanePure;
+
+        let first_value = value(64);
+        let (_, first_parent, _, _) =
+            open_tapped_confirm_with_support(&mut scheduler.registry, [first_value], None, true);
+        let (first_support, first_active) = queue_one_shot_positive_support(
+            &mut scheduler,
+            &root,
+            first_parent,
+            first_value,
+            false,
+        );
+        assert!(scheduler
+            .registry
+            .mint_positive_support_demand(first_parent));
+
+        let dormant_value = value(65);
+        let (_, dormant_parent, _, _) =
+            open_tapped_confirm_with_support(&mut scheduler.registry, [dormant_value], None, true);
+        let (dormant_support, dormant_active) = queue_one_shot_positive_support(
+            &mut scheduler,
+            &root,
+            dormant_parent,
+            dormant_value,
+            false,
+        );
+        assert_eq!(dormant_active.state, first_active.state);
+
+        let second_value = value(66);
+        let (_, second_parent, _, _) =
+            open_tapped_confirm_with_support(&mut scheduler.registry, [second_value], None, true);
+        let (second_support, second_active) = queue_one_shot_positive_support(
+            &mut scheduler,
+            &root,
+            second_parent,
+            second_value,
+            false,
+        );
+        assert_eq!(second_active.state, first_active.state);
+        assert!(scheduler
+            .registry
+            .mint_positive_support_demand(second_parent));
+
+        let bucket = &scheduler.program_worklist[&first_active.state];
+        let dormant_task = bucket
+            .tasks
+            .iter()
+            .find(|task| task.activation == dormant_support)
+            .expect("the dormant Support peer remained queued");
+        let started_task = bucket
+            .tasks
+            .iter()
+            .find(|task| task.activation == first_support)
+            .expect("the started Support peer remained queued");
+        assert_eq!(
+            ProgramCohortKey::of(&scheduler.registry, dormant_task),
+            ProgramCohortKey::of(&scheduler.registry, started_task),
+            "the lane fence must not refine ProgramCohortKey"
+        );
+
+        scheduler.next_program_lane = Some(ProgramServiceLane::Support);
+        let (state, selected, grants, _) = scheduler.pop_program_bounded(8);
+        assert_eq!(state, first_active.state);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|task| task.activation)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([first_support, second_support])
+        );
+        assert!(selected.iter().all(|task| {
+            ProgramServiceLane::of(&scheduler.registry, task.activation)
+                == ProgramServiceLane::Support
+        }));
+        assert!(grants.iter().all(Option::is_some));
+        assert!(scheduler.program_worklist[&state]
+            .tasks
+            .iter()
+            .any(|task| task.activation == dormant_support));
+    }
+
+    #[test]
+    fn support_lane_preference_selects_a_lower_global_program_state_once() {
+        let root = OneShotSupportProgram;
+        let mut scheduler = DeltaScheduler::new();
+        scheduler.program_lane_selection = ProgramLaneSelection::LanePure;
+
+        let candidate = value(67);
+        let (_, parent, _, _) =
+            open_tapped_confirm_with_support(&mut scheduler.registry, [candidate], None, true);
+        let (support, support_active) =
+            queue_one_shot_positive_support(&mut scheduler, &root, parent, candidate, false);
+        scheduler.park_positive_support_activations(&AHashSet::from_iter([support]));
+
+        let higher_state = test_program_state(&mut scheduler);
+        assert!(higher_state > support_active.state);
+        let (_, neutral_active) =
+            queue_neutral_confirm_program(&mut scheduler, higher_state, value(68), 92);
+        assert_eq!(neutral_active.state, higher_state);
+        let mut stats = ResidualStateStats::default();
+        assert_eq!(
+            scheduler.begin_public_pull_demand(&mut stats),
+            Some(support_active)
+        );
+        assert_eq!(
+            scheduler.next_program_lane,
+            Some(ProgramServiceLane::Support)
+        );
+
+        let (preferred_state, preferred, grants, _) = scheduler.pop_program_bounded(1);
+        assert_eq!(preferred_state, support_active.state);
+        assert_eq!(preferred.len(), 1);
+        assert_eq!(preferred[0].activation, support);
+        assert!(grants[0].is_some());
+        assert_eq!(scheduler.next_program_lane, None);
+
+        let (ordinary_state, ordinary, grants, _) = scheduler.pop_program_bounded(1);
+        assert_eq!(ordinary_state, higher_state);
+        assert_eq!(ordinary.len(), 1);
+        assert_eq!(ordinary[0].activation, neutral_active.activation);
+        assert!(grants[0].is_none());
     }
 
     #[test]
