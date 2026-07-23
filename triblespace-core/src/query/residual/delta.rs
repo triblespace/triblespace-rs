@@ -6419,10 +6419,10 @@ pub(super) struct DeltaScheduler {
     /// packet but not yet selected. Zero is the allocation-free common path;
     /// a positive remainder is reparked after the selected receipt settles.
     global_service_woken_support_tasks: usize,
-    /// Reused deterministic parent set for one global Support wake. Sorting
-    /// and deduplicating this vector preserves the former `BTreeSet` order
-    /// without allocating a tree node for every unit packet.
-    global_service_parent_scratch: Vec<PositiveConfirmParentId>,
+    /// Reused parent scratch for service-locator filing and global Support
+    /// wakes. Both operations are serialized scheduler boundaries, so one
+    /// allocation can be amortized across them without becoming custody.
+    positive_support_parent_scratch: Vec<PositiveConfirmParentId>,
     /// Newly parked service parents that have not yet consumed public demand.
     ///
     /// This is noncanonical locator custody, not scheduling currency. Filing a
@@ -6432,6 +6432,12 @@ pub(super) struct DeltaScheduler {
     /// every parked task.
     positive_support_service_demand_queue: Vec<PositiveConfirmParentId>,
     positive_support_service_demand_queued: AHashSet<PositiveConfirmParentId>,
+    /// Boundary probes performed while filing service-locator parents.
+    ///
+    /// Test-only because this observes a physical optimization boundary, not
+    /// query semantics or production scheduling currency.
+    #[cfg(test)]
+    positive_support_service_locator_boundary_probes: usize,
     /// Mutually exclusive PositiveSupport admission currency.
     positive_support_scheduling: PositiveSupportScheduling,
     /// One aggregate affine lease for the opt-in global service policy.
@@ -6471,9 +6477,11 @@ impl DeltaScheduler {
             next_program_lane: None,
             next_program_state: None,
             global_service_woken_support_tasks: 0,
-            global_service_parent_scratch: Vec::new(),
+            positive_support_parent_scratch: Vec::new(),
             positive_support_service_demand_queue: Vec::new(),
             positive_support_service_demand_queued: AHashSet::new(),
+            #[cfg(test)]
+            positive_support_service_locator_boundary_probes: 0,
             positive_support_scheduling: PositiveSupportScheduling::CountCredit,
             positive_support_service_debt: PositiveSupportServiceDebtLedger::dormant(),
             public_pull_demand: PublicPullDemandState::Closed,
@@ -8382,6 +8390,7 @@ impl DeltaScheduler {
             "only live PositiveSupport Program tasks may enter the parked lane"
         );
         if self.positive_support_scheduling == PositiveSupportScheduling::GlobalServiceDebt {
+            self.positive_support_parent_scratch.clear();
             for task in &tasks {
                 let parent = self
                     .registry
@@ -8391,14 +8400,25 @@ impl DeltaScheduler {
                     && !self
                         .positive_support_service_demand_queued
                         .contains(&parent)
-                    // Preserve the old discovery precondition at the custody
-                    // transition: one parent is offered for demand only after
-                    // its final runnable sibling has joined parked custody.
-                    // If a sibling is still runnable, filing that sibling
-                    // later retries this registration.
-                    && !self.has_runnable_positive_support_parent(parent)
-                    && self.positive_support_service_demand_queued.insert(parent)
                 {
+                    self.positive_support_parent_scratch.push(parent);
+                }
+            }
+            self.positive_support_parent_scratch.sort_unstable();
+            self.positive_support_parent_scratch.dedup();
+            for index in 0..self.positive_support_parent_scratch.len() {
+                let parent = self.positive_support_parent_scratch[index];
+                #[cfg(test)]
+                {
+                    self.positive_support_service_locator_boundary_probes += 1;
+                }
+                // Preserve the old discovery precondition at the custody
+                // transition: one parent is offered for demand only after
+                // its final runnable sibling has joined parked custody.
+                if self.has_runnable_positive_support_parent(parent) {
+                    continue;
+                }
+                if self.positive_support_service_demand_queued.insert(parent) {
                     self.positive_support_service_demand_queue.push(parent);
                 }
             }
@@ -8557,7 +8577,7 @@ impl DeltaScheduler {
     /// packet can batch across parents without admitting a second task from
     /// any one semantic race.
     fn wake_global_service_support_lane(&mut self) -> usize {
-        self.global_service_parent_scratch.clear();
+        self.positive_support_parent_scratch.clear();
         for (_, bucket) in self.parked_positive_support_worklist.iter() {
             for task in &bucket.tasks {
                 let Some(parent) = self
@@ -8567,15 +8587,15 @@ impl DeltaScheduler {
                     continue;
                 };
                 if self.registry.positive_support_service_is_started(parent) {
-                    self.global_service_parent_scratch.push(parent);
+                    self.positive_support_parent_scratch.push(parent);
                 }
             }
         }
-        self.global_service_parent_scratch.sort_unstable();
-        self.global_service_parent_scratch.dedup();
+        self.positive_support_parent_scratch.sort_unstable();
+        self.positive_support_parent_scratch.dedup();
         let mut woke = 0;
-        for index in 0..self.global_service_parent_scratch.len() {
-            let parent = self.global_service_parent_scratch[index];
+        for index in 0..self.positive_support_parent_scratch.len() {
+            let parent = self.positive_support_parent_scratch[index];
             woke += usize::from(self.wake_one_positive_support_parent(parent).is_some());
         }
         woke
@@ -10909,9 +10929,12 @@ impl DeltaScheduler {
             next_program_lane: self.next_program_lane,
             next_program_state: self.next_program_state,
             global_service_woken_support_tasks: self.global_service_woken_support_tasks,
-            global_service_parent_scratch: Vec::new(),
+            positive_support_parent_scratch: Vec::new(),
             positive_support_service_demand_queue,
             positive_support_service_demand_queued,
+            #[cfg(test)]
+            positive_support_service_locator_boundary_probes: self
+                .positive_support_service_locator_boundary_probes,
             positive_support_scheduling: self.positive_support_scheduling,
             positive_support_service_debt: self
                 .positive_support_service_debt
@@ -12181,6 +12204,40 @@ mod tests {
             .positive_support_service_is_started(parent));
         assert_eq!(stats.delta_positive_support_service_parents_started, 1);
         assert_eq!(stats.delta_positive_support_demand_discovery_task_visits, 0);
+    }
+
+    #[test]
+    fn global_service_locator_probes_same_parent_once_per_filing_batch() {
+        let root = OneShotSupportProgram;
+        let mut scheduler = DeltaScheduler::new();
+        scheduler.enable_positive_support_global_service_debt();
+        let candidate = value(84);
+        let (_, parent, _, _) =
+            open_tapped_confirm_with_support(&mut scheduler.registry, [candidate], None, true);
+        let mut children = (0..65)
+            .map(|_| {
+                queue_one_shot_positive_support(&mut scheduler, &root, parent, candidate, false).0
+            })
+            .collect::<Vec<_>>();
+        let final_runnable = children
+            .pop()
+            .expect("the fixture retained one runnable sibling");
+
+        scheduler.park_positive_support_activations(&children.into_iter().collect());
+        assert_eq!(
+            scheduler.positive_support_service_locator_boundary_probes, 1,
+            "one filing batch must probe a shared semantic parent once"
+        );
+        assert!(scheduler.positive_support_service_demand_queue.is_empty());
+        assert!(scheduler.has_runnable_positive_support_parent(parent));
+
+        scheduler.park_positive_support_activations(&AHashSet::from_iter([final_runnable]));
+        assert_eq!(
+            scheduler.positive_support_service_locator_boundary_probes, 2,
+            "filing the final sibling must retry exactly one parent probe"
+        );
+        assert_eq!(scheduler.positive_support_service_demand_queue, [parent]);
+        assert!(!scheduler.has_runnable_positive_support_parent(parent));
     }
 
     #[test]
