@@ -2521,12 +2521,16 @@ pub struct ResidualStateStats {
     pub delta_direct_terminal_publication_batches: usize,
     /// Full-bound rows carried by direct-terminal publication batches.
     pub delta_direct_terminal_publication_rows: usize,
-    /// PositiveSupport values that won their semantic parent's SET ledger and
-    /// committed directly through a Terminal continuation.
-    pub delta_positive_support_terminal_commits: usize,
-    /// PositiveSupport values that won their semantic parent's SET ledger and
-    /// committed through a ChunkHomomorphic continuation.
-    pub delta_positive_support_chunk_homomorphic_commits: usize,
+    /// Positive-publication values that won their semantic parent's SET
+    /// ledger and committed directly through a Terminal continuation.
+    ///
+    /// This includes both exact Confirm taps and physical Support fallbacks.
+    pub delta_positive_publication_terminal_commits: usize,
+    /// Positive-publication values that won their semantic parent's SET
+    /// ledger and committed through a ChunkHomomorphic continuation.
+    ///
+    /// This includes both exact Confirm taps and physical Support fallbacks.
+    pub delta_positive_publication_chunk_homomorphic_commits: usize,
     /// Cold terminal-streaming proposal actions admitted into the cyclic
     /// scheduler.
     pub delta_terminal_admissions: usize,
@@ -10835,7 +10839,7 @@ impl ResidualStateMachine {
                 match select_program(constraint, plan.program_scope, support_request) {
                     ProgramOffer::Selected(support_spec, support_route) => {
                         if spec.same_spec(support_spec)
-                            && spec.certifies_confirm_positive_tap(
+                            && spec.certifies_confirm_support_positive_prefix(
                                 program_request,
                                 route,
                                 support_request,

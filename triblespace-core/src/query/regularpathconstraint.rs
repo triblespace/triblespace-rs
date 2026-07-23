@@ -2758,7 +2758,7 @@ impl TypedProgramSpec for RegularPathConstraint {
         Some(route)
     }
 
-    fn certifies_confirm_positive_tap(
+    fn certifies_confirm_support_positive_prefix(
         &self,
         confirm_request: ProgramRequest,
         confirm_route: ProgramRoute,
@@ -2783,11 +2783,6 @@ impl TypedProgramSpec for RegularPathConstraint {
             && support_route.key == RPQ_BOUND_FORWARD
             && confirm_route.variable == self.end
             && support_route.variable == self.end
-            && confirm_route.stratum == support_route.stratum
-            && confirm_route.completion == ProgramCompletion::PageableOnly
-            && support_route.completion == ProgramCompletion::PageableOnly
-            && confirm_route.exposure == ProgramExposure::Production
-            && support_route.exposure == ProgramExposure::Production
     }
 
     fn complete_typed(&self, batch: ProgramCompleteBatch<'_>, effects: &mut TypedCompleteSink) {
@@ -3481,7 +3476,7 @@ mod delta_program_tests {
     }
 
     #[test]
-    fn positive_tap_certificate_is_only_distinct_endpoint_bound_forward_confirm() {
+    fn confirm_support_positive_prefix_certificate_is_only_distinct_endpoint_forward() {
         let start = Variable::<GenId>::new(0);
         let end = Variable::<GenId>::new(1);
         let path =
@@ -3503,13 +3498,13 @@ mod delta_program_tests {
         let inverse_route = path.route(confirm_inverse).unwrap();
         let support_route = path.route(support).unwrap();
 
-        assert!(path.certifies_confirm_positive_tap(
+        assert!(path.certifies_confirm_support_positive_prefix(
             confirm_forward,
             forward_route,
             support,
             support_route,
         ));
-        assert!(!path.certifies_confirm_positive_tap(
+        assert!(!path.certifies_confirm_support_positive_prefix(
             confirm_inverse,
             inverse_route,
             support,
@@ -3530,7 +3525,7 @@ mod delta_program_tests {
             action: ProgramAction::Support,
             bound: VariableSet::new_singleton(start.index),
         };
-        assert!(!same.certifies_confirm_positive_tap(
+        assert!(!same.certifies_confirm_support_positive_prefix(
             same_confirm,
             same.route(same_confirm).unwrap(),
             same_support,

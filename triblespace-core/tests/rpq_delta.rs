@@ -14,8 +14,9 @@ use triblespace_core::query::residual::{
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, DispatchClass, EstimateSink, PathOp, PreferredProgram,
-    ProgramAction, ProgramRef, ProgramRequest, ProgramRoute, ProgramSeedBatch, ProposalCoverage,
-    Query, RegularPathConstraint, RowsView, TypedEffectSink, TypedProgramBatch, TypedProgramSpec,
+    ProgramAction, ProgramCompletion, ProgramExposure, ProgramGrouping, ProgramKey, ProgramRef,
+    ProgramRequest, ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage, Query,
+    RegularPathConstraint, RowsView, TypedEffectSink, TypedProgramBatch, TypedProgramSpec,
     TypedSeedSink, Variable, VariableId, VariableSet,
 };
 use triblespace_core::trible::{Trible, TribleSet};
@@ -477,18 +478,107 @@ impl TypedProgramSpec for SupportRouteProbe {
     }
 }
 
-/// Observes Support route selection without changing the selected RPQ arm.
+#[derive(Default)]
+struct PhysicalSupportCounters {
+    seed_calls: AtomicUsize,
+    step_calls: AtomicUsize,
+}
+
+#[derive(Clone, Copy)]
+struct PhysicalSupportState {
+    supported: bool,
+}
+
+/// A deliberately separate production Support arm.
 ///
-/// The preferred arm always declines after recording the request, so the real
-/// RPQ remains the exact typed executor. Most target-Confirm fixtures suppress
-/// its covering proposal certificate to isolate confirmation; the partial
-/// fixture retains it so the remaining endpoint can still be enumerated.
-struct ProbedConfirmRpq {
-    program: PreferredProgram<SupportRouteProbe, RegularPathConstraint>,
+/// The accepted endpoint set is the test oracle for one fixed source. This
+/// family owns real typed roots and replacements, making mixed-arm fallback
+/// observable without duplicating the RPQ implementation in the fixture.
+#[derive(Clone)]
+struct PhysicalSupportProbe {
+    accepted: Arc<Vec<RawInline>>,
+    counters: Arc<PhysicalSupportCounters>,
+}
+
+impl TypedProgramSpec for PhysicalSupportProbe {
+    type State = PhysicalSupportState;
+    type NoveltyKey = ();
+    type Rank = u8;
+
+    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+        (request.action == ProgramAction::Support).then_some(ProgramRoute {
+            key: ProgramKey::new(0),
+            variable: END,
+            stratum: ProgramStratum::Finite,
+            grouping: ProgramGrouping::PageLocal,
+            completion: ProgramCompletion::PageableOnly,
+            exposure: ProgramExposure::Production,
+        })
+    }
+
+    fn dispatch(&self, _state: &Self::State) -> DispatchClass {
+        DispatchClass::new(0)
+    }
+
+    fn progress(&self, _state: &Self::State) -> Self::Rank {
+        1
+    }
+
+    fn seed_typed(
+        &self,
+        batch: ProgramSeedBatch<'_>,
+        effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+    ) {
+        assert_eq!(batch.request.action, ProgramAction::Support);
+        assert_eq!(batch.route.variable, END);
+        let target = batch
+            .view
+            .col(END)
+            .expect("physical Support fixture lost its bound target");
+        self.counters.seed_calls.fetch_add(1, Ordering::Relaxed);
+        for (parent, row) in batch.view.iter().enumerate() {
+            effects.finite_root(
+                u32::try_from(parent).expect("too many physical Support parents"),
+                PhysicalSupportState {
+                    supported: self.accepted.contains(&row[target]),
+                },
+                None,
+            );
+        }
+    }
+
+    fn step_typed(
+        &self,
+        states: &mut Vec<Self::State>,
+        batch: TypedProgramBatch<'_>,
+        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+    ) {
+        assert_eq!(states.len(), batch.limits.len());
+        self.counters.step_calls.fetch_add(1, Ordering::Relaxed);
+        for (input, state) in states.drain(..).enumerate() {
+            if state.supported {
+                effects.support(u32::try_from(input).expect("too many physical Support inputs"));
+            }
+            effects.page(1, None);
+        }
+    }
+}
+
+/// Observes or owns Support through a preferred arm while the fallback RPQ
+/// remains the exact Confirm executor.
+///
+/// Most target-Confirm fixtures suppress the fallback RPQ's covering proposal
+/// certificate to isolate confirmation; the partial fixture retains it so the
+/// remaining endpoint can still be enumerated.
+struct ProbedConfirmRpq<Preferred> {
+    program: PreferredProgram<Preferred, RegularPathConstraint>,
     covering_proposals: bool,
 }
 
-impl<'a> Constraint<'a> for ProbedConfirmRpq {
+impl<'a, Preferred> Constraint<'a> for ProbedConfirmRpq<Preferred>
+where
+    Preferred: TypedProgramSpec + Send + Sync,
+{
     fn variables(&self) -> VariableSet {
         self.program.fallback().variables()
     }
@@ -967,6 +1057,38 @@ fn certified_target_confirm_root(
             program: PreferredProgram::new(
                 SupportRouteProbe {
                     calls: support_routes,
+                },
+                rpq,
+            ),
+            covering_proposals: false,
+        }) as DynConstraint,
+    ]))
+}
+
+fn physical_support_fallback_target_confirm_root(
+    set: TribleSet,
+    bound: Inline<GenId>,
+    candidates: Vec<RawInline>,
+    accepted: Vec<RawInline>,
+    ops: &[PathOp],
+    counters: Arc<PhysicalSupportCounters>,
+) -> Root {
+    let start = Variable::<GenId>::new(START);
+    let end = Variable::<GenId>::new(END);
+    let rpq = RegularPathConstraint::new(set, start, end, ops);
+    Arc::new(IntersectionConstraint::new(vec![
+        Box::new(start.is(bound)) as DynConstraint,
+        Box::new(CertifiedOrderedDomain(OrderedDomain {
+            variable: END,
+            gate: START,
+            unbound_estimate: 4,
+            values: candidates,
+        })) as DynConstraint,
+        Box::new(ProbedConfirmRpq {
+            program: PreferredProgram::new(
+                PhysicalSupportProbe {
+                    accepted: Arc::new(accepted),
+                    counters,
                 },
                 rpq,
             ),
@@ -3525,11 +3647,11 @@ fn target_confirm_positive_support_yields_occurrence_zero_then_exactly_drains() 
         1,
         "one positive witness must publish exactly one row"
     );
-    assert_eq!(query.stats().delta_positive_support_terminal_commits, 1);
+    assert_eq!(query.stats().delta_positive_publication_terminal_commits, 1);
     assert_eq!(
         query
             .stats()
-            .delta_positive_support_chunk_homomorphic_commits,
+            .delta_positive_publication_chunk_homomorphic_commits,
         0
     );
     assert_eq!(support_routes.load(Ordering::Relaxed), 1);
@@ -3596,15 +3718,60 @@ fn target_confirm_positive_support_does_not_feed_past_false_occurrence_zero() {
         0,
         "v1 must not feed occurrence one after occurrence-zero Support is false"
     );
-    assert_eq!(query.stats().delta_positive_support_terminal_commits, 0);
+    assert_eq!(query.stats().delta_positive_publication_terminal_commits, 0);
     assert_eq!(
         query
             .stats()
-            .delta_positive_support_chunk_homomorphic_commits,
+            .delta_positive_publication_chunk_homomorphic_commits,
         0
     );
     assert!(actual.contains(&graph.value(1).raw));
     assert!(query.stats().delta_transition_candidates_examined > 0);
+}
+
+#[test]
+fn mixed_arm_production_support_fallback_executes_real_seed_and_step() {
+    let graph = Graph::new(4, &[(0, 1), (1, 2), (2, 3)]);
+    let first = graph.value(1).raw;
+    let later = graph.value(3).raw;
+    let absent = [u8::MAX; 32];
+    let accepted = vec![first, graph.value(2).raw, later];
+    let ops = repeated(graph.attribute, false);
+    let lowering = ResidualLowering::new(FormulaScope::OpaqueLeaves, ProgramScope::All);
+
+    let mut expected = vec![first, later];
+    expected.sort_unstable();
+    for (candidates, expected_commits) in [
+        (vec![first, later, absent], 1),
+        (vec![absent, first, later], 0),
+    ] {
+        let counters = Arc::new(PhysicalSupportCounters::default());
+        let mut query = Query::new(
+            physical_support_fallback_target_confirm_root(
+                graph.set.clone(),
+                graph.value(0),
+                candidates,
+                accepted.clone(),
+                &ops,
+                Arc::clone(&counters),
+            ),
+            project_end,
+        )
+        .solve_residual_state_lazy_with(lowering)
+        .start_width(1)
+        .cap(1);
+        let mut actual: Vec<_> = query.by_ref().collect();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            query.stats().delta_positive_publication_terminal_commits,
+            expected_commits,
+            "only true B[0] may win the physical Support fallback ledger"
+        );
+        assert_eq!(counters.seed_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.step_calls.load(Ordering::Relaxed), 1);
+        assert!(query.stats().delta_transition_candidates_examined > 0);
+    }
 }
 
 #[test]
@@ -3651,7 +3818,7 @@ fn forward_exact_confirm_tap_publishes_b0_without_a_second_traversal() {
         .next()
         .expect("the exact Confirm replacement should publish reachable B[0]");
     assert_eq!(early, first);
-    assert_eq!(query.stats().delta_positive_support_terminal_commits, 1);
+    assert_eq!(query.stats().delta_positive_publication_terminal_commits, 1);
     assert_eq!(query.stats().delta_direct_terminal_publication_rows, 1);
     assert!(
         query.stats().delta_transition_candidates_examined < exact_work,
@@ -3707,7 +3874,9 @@ fn forward_exact_confirm_tap_publishes_b0_without_a_second_traversal() {
     false_actual.sort_unstable();
     assert_eq!(false_actual, false_expected);
     assert_eq!(
-        false_query.stats().delta_positive_support_terminal_commits,
+        false_query
+            .stats()
+            .delta_positive_publication_terminal_commits,
         0
     );
     assert_eq!(
@@ -3768,11 +3937,11 @@ fn forward_exact_confirm_chunk_tap_that_dies_is_not_replayed_from_g_minus_p() {
     let actual: Vec<_> = query.by_ref().collect();
     assert_eq!(actual, expected);
     assert_eq!(actual, [survivor]);
-    assert_eq!(query.stats().delta_positive_support_terminal_commits, 0);
+    assert_eq!(query.stats().delta_positive_publication_terminal_commits, 0);
     assert_eq!(
         query
             .stats()
-            .delta_positive_support_chunk_homomorphic_commits,
+            .delta_positive_publication_chunk_homomorphic_commits,
         1
     );
     assert_eq!(
@@ -3845,11 +4014,11 @@ fn target_confirm_positive_support_classifies_a_chunk_homomorphic_commit() {
     let first = query
         .next()
         .expect("the positive chunk must survive its page-local suffix");
-    assert_eq!(query.stats().delta_positive_support_terminal_commits, 0);
+    assert_eq!(query.stats().delta_positive_publication_terminal_commits, 0);
     assert_eq!(
         query
             .stats()
-            .delta_positive_support_chunk_homomorphic_commits,
+            .delta_positive_publication_chunk_homomorphic_commits,
         1
     );
     assert_eq!(query.stats().delta_direct_terminal_publication_rows, 0);
@@ -3916,11 +4085,11 @@ fn target_confirm_positive_chunk_that_dies_in_suffix_is_not_retried() {
         1,
         "only original occurrence zero may open a Support hedge"
     );
-    assert_eq!(query.stats().delta_positive_support_terminal_commits, 0);
+    assert_eq!(query.stats().delta_positive_publication_terminal_commits, 0);
     assert_eq!(
         query
             .stats()
-            .delta_positive_support_chunk_homomorphic_commits,
+            .delta_positive_publication_chunk_homomorphic_commits,
         1
     );
 
@@ -4009,7 +4178,7 @@ fn forward_exact_confirm_nullable_seed_stays_on_the_late_exact_path() {
         .start_width(1)
         .cap(1);
     assert_eq!(query.by_ref().collect::<Vec<_>>(), [start]);
-    assert_eq!(query.stats().delta_positive_support_terminal_commits, 0);
+    assert_eq!(query.stats().delta_positive_publication_terminal_commits, 0);
     assert_eq!(
         query.stats().delta_direct_terminal_publication_rows,
         0,

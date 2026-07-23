@@ -1030,18 +1030,26 @@ pub trait TypedProgramSpec {
     /// [`ProgramGrouping`]'s V1 family-local planning contract.
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute>;
 
-    /// Certifies that an accepted value reported by the selected exact
-    /// confirmation Program is already a sound positive witness for the
-    /// paired fully-bound Support route.
+    /// Certifies ordered positive-prefix trace equivalence between the
+    /// selected exact Confirm Program and its paired fully-bound Support
+    /// Program.
     ///
-    /// The residual engine uses this only for the first frozen candidate of
-    /// one authoritative Confirm activation, and only after a real Program
-    /// replacement has consumed its affine credit. Returning `true` must
-    /// therefore mean that an incremental `accepted(candidate)` effect from
-    /// `confirm_route` proves the same Boolean fact as draining
-    /// `support_route` with that candidate bound. The default is deliberately
-    /// conservative: route-key equality alone is not such a certificate.
-    fn certifies_confirm_positive_tap(
+    /// For the Confirm activation's immutable ordered candidate bag `B`, the
+    /// certificate is consumed only for `B[0]`, after a real exact Program
+    /// replacement spends its affine credit. Returning `true` promises more
+    /// than Boolean equivalence:
+    ///
+    /// - every incremental `accepted(B[0])` Confirm receipt implies that the
+    ///   paired Support route is true for the row with `B[0]` bound; and
+    /// - under the same ordered physical work prefix and page budgets, exact
+    ///   Confirm reports `accepted(B[0])` no later than the paired Support
+    ///   route could report its first positive receipt.
+    ///
+    /// This correctness implication plus no-later receipt law lets the engine
+    /// replace, rather than merely duplicate, the one-occurrence Support
+    /// feeder. The default is deliberately conservative: matching route keys
+    /// or Boolean denotations alone do not certify ordered trace equivalence.
+    fn certifies_confirm_support_positive_prefix(
         &self,
         _confirm_request: ProgramRequest,
         _confirm_route: ProgramRoute,
@@ -1229,7 +1237,7 @@ trait ErasedProgramSpec {
 
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute>;
 
-    fn certifies_confirm_positive_tap(
+    fn certifies_confirm_support_positive_prefix(
         &self,
         confirm_request: ProgramRequest,
         confirm_route: ProgramRoute,
@@ -1322,14 +1330,14 @@ impl<'a> ProgramRef<'a> {
         std::ptr::eq(self.erased, other.erased)
     }
 
-    pub(crate) fn certifies_confirm_positive_tap(
+    pub(crate) fn certifies_confirm_support_positive_prefix(
         self,
         confirm_request: ProgramRequest,
         confirm_route: ProgramRoute,
         support_request: ProgramRequest,
         support_route: ProgramRoute,
     ) -> bool {
-        self.erased.certifies_confirm_positive_tap(
+        self.erased.certifies_confirm_support_positive_prefix(
             confirm_request,
             confirm_route,
             support_request,
@@ -1765,7 +1773,7 @@ where
         }
     }
 
-    fn certifies_confirm_positive_tap(
+    fn certifies_confirm_support_positive_prefix(
         &self,
         confirm_request: ProgramRequest,
         confirm_route: ProgramRoute,
@@ -1777,7 +1785,7 @@ where
         }
         let (selected, confirm_key) = self.selected(confirm_route.key);
         let (_, support_key) = self.selected(support_route.key);
-        selected.certifies_confirm_positive_tap(
+        selected.certifies_confirm_support_positive_prefix(
             confirm_request,
             ProgramRoute {
                 key: confirm_key,
@@ -1885,7 +1893,7 @@ where
         TypedProgramSpec::route(self, request)
     }
 
-    fn certifies_confirm_positive_tap(
+    fn certifies_confirm_support_positive_prefix(
         &self,
         confirm_request: ProgramRequest,
         confirm_route: ProgramRoute,
@@ -1902,7 +1910,7 @@ where
             ProgramRouteArm::Direct,
             "a direct typed Program received a composed Support route arm"
         );
-        TypedProgramSpec::certifies_confirm_positive_tap(
+        TypedProgramSpec::certifies_confirm_support_positive_prefix(
             self,
             confirm_request,
             confirm_route,

@@ -801,14 +801,16 @@ struct PositiveSupportWitness {
 
 /// Affine proof that one exact Confirm Program replacement consumed a real
 /// current-registry credit and newly accepted its frozen first candidate.
+///
+/// The semantic parent carries branch-local authority; the occurrence is
+/// implicitly zero because no other member of the immutable bag is eligible
+/// for this feeder.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 #[must_use = "an exact Confirm witness must be committed or deliberately discarded"]
 struct PositiveConfirmWitness {
-    brand: RegistryBrand,
-    parent: ActivationId,
+    parent: PositiveConfirmParentId,
     generation: u64,
-    occurrence: usize,
     value: RawInline,
 }
 
@@ -1649,19 +1651,19 @@ impl ProducerRegistry {
         witness: PositiveConfirmWitness,
         direct_terminal_full: Option<VariableSet>,
     ) -> Option<PositivePublicationGrant> {
-        if witness.brand != self.brand {
+        if witness.parent.brand != self.brand {
             return None;
         }
-        let Some(activation) = self.state.activations.get(&witness.parent) else {
+        let Some(activation) = self.state.activations.get(&witness.parent.activation) else {
             return None;
         };
         if !activation.accepted.contains(&witness.value) {
             return None;
         }
         self.commit_positive_value(
-            witness.parent,
+            witness.parent.activation,
             witness.generation,
-            witness.occurrence,
+            0,
             witness.value,
             PositivePublicationSource::ExactConfirmTap,
             None,
@@ -1697,10 +1699,11 @@ impl ProducerRegistry {
             return None;
         }
         Some(PositiveConfirmWitness {
-            brand: self.brand,
-            parent,
+            parent: PositiveConfirmParentId {
+                brand: self.brand,
+                activation: parent,
+            },
             generation: ledger.generation,
-            occurrence: 0,
             value,
         })
     }
@@ -6737,7 +6740,7 @@ impl DeltaScheduler {
                 full,
                 registration,
             } => {
-                stats.delta_positive_support_terminal_commits += 1;
+                stats.delta_positive_publication_terminal_commits += 1;
                 let ResidualPhase::Candidate { variable, .. } = &desc.phase else {
                     unreachable!("a preflighted Terminal publication lost its Candidate return")
                 };
@@ -6760,7 +6763,7 @@ impl DeltaScheduler {
                 }
             }
             PositivePublicationRoute::ChunkHomomorphic => {
-                stats.delta_positive_support_chunk_homomorphic_commits += 1;
+                stats.delta_positive_publication_chunk_homomorphic_commits += 1;
                 // Preflight proved a Stable Candidate descriptor, and this
                 // function constructs exactly one parent with one candidate.
                 // `file_with_plan` can therefore return `None` only if that
@@ -12541,8 +12544,11 @@ mod tests {
         assert_eq!(family.projected, 2);
         assert!(machine.terminal_yield.samples[parent.activation.index()].is_none());
         assert!(stable.is_empty());
-        assert_eq!(stats.delta_positive_support_terminal_commits, 2);
-        assert_eq!(stats.delta_positive_support_chunk_homomorphic_commits, 0);
+        assert_eq!(stats.delta_positive_publication_terminal_commits, 2);
+        assert_eq!(
+            stats.delta_positive_publication_chunk_homomorphic_commits,
+            0
+        );
     }
 
     #[test]
@@ -12643,8 +12649,11 @@ mod tests {
         );
         assert_eq!(token.rows, 1);
         assert_eq!(token.candidates, 1);
-        assert_eq!(stats.delta_positive_support_terminal_commits, 0);
-        assert_eq!(stats.delta_positive_support_chunk_homomorphic_commits, 1);
+        assert_eq!(stats.delta_positive_publication_terminal_commits, 0);
+        assert_eq!(
+            stats.delta_positive_publication_chunk_homomorphic_commits,
+            1
+        );
         assert_eq!(
             registry
                 .positive_publication_snapshot(parent)

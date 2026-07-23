@@ -1,6 +1,6 @@
 #![allow(unexpected_cfgs)]
 
-//! Deterministic latency probe for PositiveSupport on target-confirm RPQs.
+//! Deterministic latency probe for positive publication on target-confirm RPQs.
 //!
 //! The candidate source is deliberately smaller than the bound-source RPQ
 //! estimate, so it proposes `end` and the RPQ is the exact confirmer. The two
@@ -11,14 +11,14 @@
 //! - `negative-first`: an unreachable low sentinel precedes that endpoint.
 //!
 //! `hybrid-production` exercises production Programs, including the
-//! PositiveSupport hedge on revisions that contain it. The identical source
-//! can measure a pre-caller revision with
-//! `RUSTFLAGS='--cfg baseline_without_positive_support_stats'`; there HYBRID's
-//! typed Confirm is the cross-revision control and the unavailable attribution
-//! fields print as `n/a`. `programs-disabled` is a secondary exact semantic
-//! control that keeps the residual scheduler and formula scope but disables
-//! all typed Programs; it is intentionally not presented as a
-//! PositiveSupport-only ablation.
+//! positive-publication path on revisions that contain it. The identical
+//! source can measure a pre-caller revision with
+//! `RUSTFLAGS='--cfg baseline_without_positive_publication_stats'`; there
+//! HYBRID's typed Confirm is the cross-revision control and the unavailable
+//! attribution fields print as `n/a`. `programs-disabled` is a secondary exact
+//! semantic control that keeps the residual scheduler and formula scope but
+//! disables all typed Programs; it is intentionally not presented as a
+//! positive-publication-only ablation.
 //!
 //! Run with:
 //! `cargo run --release --example rpq_bound_estimate_probe -- [nodes=4096] [reps=9]`
@@ -330,13 +330,13 @@ fn signature(items: impl IntoIterator<Item = RawInline>) -> Signature {
 
 fn attribution(stats: &ResidualStateStats) -> Attribution {
     Attribution {
-        #[cfg(not(baseline_without_positive_support_stats))]
-        positive_terminal: stats.delta_positive_support_terminal_commits,
-        #[cfg(baseline_without_positive_support_stats)]
+        #[cfg(not(baseline_without_positive_publication_stats))]
+        positive_terminal: stats.delta_positive_publication_terminal_commits,
+        #[cfg(baseline_without_positive_publication_stats)]
         positive_terminal: 0,
-        #[cfg(not(baseline_without_positive_support_stats))]
-        positive_chunk_homomorphic: stats.delta_positive_support_chunk_homomorphic_commits,
-        #[cfg(baseline_without_positive_support_stats)]
+        #[cfg(not(baseline_without_positive_publication_stats))]
+        positive_chunk_homomorphic: stats.delta_positive_publication_chunk_homomorphic_commits,
+        #[cfg(baseline_without_positive_publication_stats)]
         positive_chunk_homomorphic: 0,
         direct_terminal_rows: stats.delta_direct_terminal_publication_rows,
         support_calls: stats.support_calls,
@@ -387,28 +387,28 @@ fn profile(
     );
 
     let positive_commits = first_stats.positive_terminal + first_stats.positive_chunk_homomorphic;
-    #[cfg(not(baseline_without_positive_support_stats))]
+    #[cfg(not(baseline_without_positive_publication_stats))]
     let first_is_positive = oracle.binary_search(&fixture.candidates[0]).is_ok();
     if mode.lowering.program_scope() == ProgramScope::Disabled {
         assert_eq!(
             positive_commits, 0,
-            "programs-disabled control attributed a PositiveSupport commit"
+            "programs-disabled control attributed a positive-publication commit"
         );
         assert_eq!(
             full_stats.positive_terminal + full_stats.positive_chunk_homomorphic,
             0,
-            "programs-disabled full drain attributed a PositiveSupport commit"
+            "programs-disabled full drain attributed a positive-publication commit"
         );
     }
-    #[cfg(not(baseline_without_positive_support_stats))]
+    #[cfg(not(baseline_without_positive_publication_stats))]
     if mode.lowering.program_scope() != ProgramScope::Disabled && first_is_positive {
         assert_eq!(
             positive_commits, 1,
-            "positive-first HYBRID did not attribute its first row to PositiveSupport"
+            "positive-first HYBRID did not attribute its first row to positive publication"
         );
         assert_eq!(
             first, fixture.candidates[0],
-            "PositiveSupport did not publish candidate occurrence zero"
+            "positive publication did not publish candidate occurrence zero"
         );
         assert!(
             full_stats.transition_candidates_examined > first_stats.transition_candidates_examined,
@@ -417,12 +417,12 @@ fn profile(
     } else if mode.lowering.program_scope() != ProgramScope::Disabled {
         assert_eq!(
             positive_commits, 0,
-            "negative occurrence zero must not publish through PositiveSupport"
+            "negative occurrence zero must not publish through positive publication"
         );
         assert_eq!(
             full_stats.positive_terminal + full_stats.positive_chunk_homomorphic,
             0,
-            "negative-first full drain must not feed later candidates into PositiveSupport"
+            "negative-first full drain must not feed later candidates into positive publication"
         );
     }
 
@@ -433,7 +433,7 @@ fn profile(
     }
 }
 
-#[cfg(not(baseline_without_positive_support_stats))]
+#[cfg(not(baseline_without_positive_publication_stats))]
 fn positive_attribution(stats: Attribution) -> String {
     format!(
         "{}/{}",
@@ -441,7 +441,7 @@ fn positive_attribution(stats: Attribution) -> String {
     )
 }
 
-#[cfg(baseline_without_positive_support_stats)]
+#[cfg(baseline_without_positive_publication_stats)]
 fn positive_attribution(_stats: Attribution) -> String {
     "n/a".to_owned()
 }
@@ -543,16 +543,16 @@ fn main() {
     let graph = build_graph(node_count);
     let fixtures = [build_fixture(&graph, true), build_fixture(&graph, false)];
     println!(
-        "RPQ PositiveSupport probe: nodes={node_count} reps={reps} \
+        "RPQ positive-publication probe: nodes={node_count} reps={reps} \
          distinct_hits={DISTINCT_HITS} fixed_widths={WIDTHS:?}"
     );
     println!(
         "HYBRID is explicit OpaqueLeaves+Production; programs-disabled is \
          OpaqueLeaves+Disabled and disables every typed Program."
     );
-    #[cfg(baseline_without_positive_support_stats)]
+    #[cfg(baseline_without_positive_publication_stats)]
     println!(
-        "baseline_without_positive_support_stats: PositiveSupport attribution \
+        "baseline_without_positive_publication_stats: positive-publication attribution \
          is unavailable; HYBRID is the typed-Confirm cross-revision control."
     );
     for fixture in &fixtures {
