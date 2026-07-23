@@ -6455,6 +6455,10 @@ pub(super) struct DeltaScheduler {
     /// `next_program_lane`. Manual test policies may omit it and use the
     /// ordinary lane lookup fallback.
     next_program_state: Option<DeltaStateId>,
+    /// Support tasks moved out of parked custody for the current global
+    /// packet but not yet selected. Zero is the allocation-free common path;
+    /// a positive remainder is reparked after the selected receipt settles.
+    global_service_woken_support_tasks: usize,
     /// Mutually exclusive PositiveSupport admission currency.
     positive_support_scheduling: PositiveSupportScheduling,
     /// One aggregate affine lease for the opt-in global service policy.
@@ -6493,6 +6497,7 @@ impl DeltaScheduler {
             program_lane_selection: ProgramLaneSelection::Unrestricted,
             next_program_lane: None,
             next_program_state: None,
+            global_service_woken_support_tasks: 0,
             positive_support_scheduling: PositiveSupportScheduling::CountCredit,
             positive_support_service_debt: PositiveSupportServiceDebtLedger::dormant(),
             public_pull_demand: PublicPullDemandState::Closed,
@@ -8560,7 +8565,7 @@ impl DeltaScheduler {
     /// Makes one queued task per started parent runnable so a global Support
     /// packet can batch across parents without admitting a second task from
     /// any one semantic race.
-    fn wake_global_service_support_lane(&mut self) {
+    fn wake_global_service_support_lane(&mut self) -> usize {
         let mut parents = BTreeSet::new();
         for (_, bucket) in self.parked_positive_support_worklist.iter() {
             for task in &bucket.tasks {
@@ -8575,27 +8580,38 @@ impl DeltaScheduler {
                 }
             }
         }
+        let mut woke = 0;
         for parent in parents {
-            let _ = self.wake_one_positive_support_parent(parent);
+            woke += usize::from(self.wake_one_positive_support_parent(parent).is_some());
         }
+        woke
     }
 
     /// Chooses the next attributable global Program lane. Exact owns ties;
     /// Support receives one initial packet and thereafter only runs while its
     /// cumulative validated service is strictly behind.
     fn arm_global_service_lane(&mut self) {
+        if self.positive_support_scheduling != PositiveSupportScheduling::GlobalServiceDebt {
+            return;
+        }
         if !self.global_service_epoch_is_active() {
             self.next_program_lane = None;
             self.next_program_state = None;
+            self.global_service_woken_support_tasks = 0;
             return;
         }
         self.next_program_lane = None;
         self.next_program_state = None;
+        self.global_service_woken_support_tasks = 0;
         if self
             .positive_support_service_debt
             .support_is_admissible(true)
         {
-            self.wake_global_service_support_lane();
+            self.global_service_woken_support_tasks = self.wake_global_service_support_lane();
+            assert!(
+                self.global_service_woken_support_tasks > 0,
+                "admissible Support service lane had no parked task"
+            );
             let state = self
                 .program_worklist
                 .last_id_in_lane(&self.registry, ProgramServiceLane::Support)
@@ -8683,14 +8699,28 @@ impl DeltaScheduler {
                 stats.delta_positive_support_service_support_packet_allowance +=
                     charged.saturating_sub(prior_max as usize);
                 // `step_program` files every live PositiveSupport recurrence
-                // directly into parked custody before this settlement. No
-                // global runnable scan or second repark pass is required.
-                debug_assert!(self.program_worklist.iter().all(|(_, bucket)| {
-                    bucket.tasks.iter().all(|task| {
-                        ProgramServiceLane::of(&self.registry, task.activation)
-                            != ProgramServiceLane::Support
-                    })
-                }));
+                // directly into parked custody. Only tasks woken for another
+                // parent/state but excluded from this physical packet need a
+                // repark pass; the one-parent common path stays scan-free.
+                if self.global_service_woken_support_tasks > 0 {
+                    let runnable: AHashSet<_> = self
+                        .program_worklist
+                        .iter()
+                        .flat_map(|(_, bucket)| bucket.tasks.iter())
+                        .filter(|task| {
+                            ProgramServiceLane::of(&self.registry, task.activation)
+                                == ProgramServiceLane::Support
+                        })
+                        .map(|task| task.activation)
+                        .collect();
+                    assert_eq!(
+                        runnable.len(),
+                        self.global_service_woken_support_tasks,
+                        "global Support wake remainder lost affine custody"
+                    );
+                    self.park_positive_support_activations(&runnable);
+                }
+                self.global_service_woken_support_tasks = 0;
                 self.next_program_lane = None;
                 self.next_program_state = None;
             }
@@ -9069,6 +9099,14 @@ impl DeltaScheduler {
             mut limits,
         } = selection;
         let support_grants = self.reserve_positive_support_selection(&tasks, &mut limits);
+        if self.positive_support_scheduling == PositiveSupportScheduling::GlobalServiceDebt
+            && lane == Some(ProgramServiceLane::Support)
+        {
+            self.global_service_woken_support_tasks = self
+                .global_service_woken_support_tasks
+                .checked_sub(tasks.len())
+                .expect("global Support packet selected work outside the current wake");
+        }
         let kind = match key.class.pacing() {
             ProgramPacing::Search => PhysicalDispatchKind::Source,
             ProgramPacing::Activation => PhysicalDispatchKind::Program,
@@ -9499,12 +9537,13 @@ impl DeltaScheduler {
             {
                 let lane = dispatch
                     .program_service_lane
-                    .expect("global service packet lost its selected lane");
+                    .unwrap_or(ProgramServiceLane::Neutral);
                 assert!(
                     match lane {
                         ProgramServiceLane::Support => support_grants.iter().all(Option::is_some),
-                        ProgramServiceLane::Exact => support_grants.iter().all(Option::is_none),
-                        ProgramServiceLane::Neutral => false,
+                        ProgramServiceLane::Exact | ProgramServiceLane::Neutral => {
+                            support_grants.iter().all(Option::is_none)
+                        }
                     },
                     "global service packet crossed its selected lane"
                 );
@@ -10859,6 +10898,7 @@ impl DeltaScheduler {
             program_lane_selection: self.program_lane_selection,
             next_program_lane: self.next_program_lane,
             next_program_state: self.next_program_state,
+            global_service_woken_support_tasks: self.global_service_woken_support_tasks,
             positive_support_scheduling: self.positive_support_scheduling,
             positive_support_service_debt: self
                 .positive_support_service_debt
@@ -11891,6 +11931,79 @@ mod tests {
     }
 
     #[test]
+    fn count_lane_preference_survives_global_service_arming_hook() {
+        let root = OneShotSupportProgram;
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let mut scheduler = DeltaScheduler::new();
+        scheduler.program_lane_selection = ProgramLaneSelection::LanePure;
+
+        let support_candidate = value(75);
+        let (_, support_parent, _, _) = open_tapped_confirm_with_support(
+            &mut scheduler.registry,
+            [support_candidate],
+            None,
+            true,
+        );
+        let (support, support_active) = queue_one_shot_positive_support(
+            &mut scheduler,
+            &root,
+            support_parent,
+            support_candidate,
+            false,
+        );
+        scheduler.park_positive_support_activations(&AHashSet::from_iter([support]));
+
+        let request = ProgramRequest {
+            action: ProgramAction::Support,
+            bound: VariableSet::new_singleton(0),
+        };
+        let spec = ProgramRef::new(&root);
+        let route = spec
+            .route(request)
+            .expect("one-shot Program accepts Support");
+        let higher_state = scheduler.prepare_program(DeltaDesc::leaf(0, 1), route, spec);
+        assert!(higher_state > support_active.state);
+        let neutral_candidate = value(76);
+        let (neutral, _, neutral_credit, _) = open_tapped_confirm_with_support(
+            &mut scheduler.registry,
+            [neutral_candidate],
+            None,
+            true,
+        );
+        let _ = queue_exact_confirm_program(
+            &mut scheduler,
+            higher_state,
+            neutral,
+            neutral_credit,
+            false,
+            false,
+        );
+
+        let mut stats = ResidualStateStats::default();
+        assert_eq!(
+            scheduler.begin_public_pull_demand(&mut stats),
+            Some(support_active)
+        );
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let outcome = scheduler.step_bounded(
+            &root,
+            &plan,
+            1,
+            Some(terminal_positive_full()),
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert!(outcome.has_stable_effect());
+        assert_eq!(stats.delta_positive_publication_support_wins, 1);
+        assert!(
+            scheduler.program_worklist.contains_key(&higher_state),
+            "the higher neutral state ran after the count preference was erased"
+        );
+    }
+
+    #[test]
     fn global_service_demand_never_mints_count_credit_and_arms_a_lane() {
         let root = OneShotSupportProgram;
         let mut scheduler = DeltaScheduler::new();
@@ -11931,6 +12044,46 @@ mod tests {
             Some(ProgramServiceLane::Support)
         );
         assert!(scheduler.has_runnable_positive_support_parent(parent));
+    }
+
+    #[test]
+    fn global_service_mode_keeps_pre_epoch_program_work_neutral() {
+        let root = OneShotSupportProgram;
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let mut scheduler = DeltaScheduler::new();
+        scheduler.enable_positive_support_global_service_debt();
+        let candidate = value(74);
+        let (exact, parent, exact_credit, _) =
+            open_tapped_confirm_with_support(&mut scheduler.registry, [candidate], None, true);
+        let (support, support_active) =
+            queue_one_shot_positive_support(&mut scheduler, &root, parent, candidate, false);
+        scheduler.park_positive_support_activations(&AHashSet::from_iter([support]));
+        let _ =
+            queue_exact_confirm_credit(&mut scheduler, support_active.state, exact, exact_credit);
+
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let _ = scheduler.step_bounded(
+            &root,
+            &plan,
+            1,
+            Some(terminal_positive_full()),
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert_eq!(
+            (
+                stats.delta_positive_support_service_exact_packets,
+                stats.delta_positive_support_service_support_packets,
+            ),
+            (0, 0)
+        );
+        assert_eq!(
+            scheduler.positive_support_service_debt.lease,
+            PositiveSupportServiceLease::Dormant
+        );
     }
 
     #[test]
@@ -12076,6 +12229,61 @@ mod tests {
         assert_eq!(
             stats.delta_positive_support_service_epochs, 1,
             "adding a parent to a live service epoch must not mint a bypass"
+        );
+    }
+
+    #[test]
+    fn global_service_reparks_support_wake_remainders_after_a_narrow_packet() {
+        let root = OneShotSupportProgram;
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let mut scheduler = DeltaScheduler::new();
+        scheduler.enable_positive_support_global_service_debt();
+        let mut children = AHashSet::new();
+        for candidate in [value(77), value(78)] {
+            let (_, parent, _, _) =
+                open_tapped_confirm_with_support(&mut scheduler.registry, [candidate], None, true);
+            let (child, _) = queue_one_shot_positive_support_with_result(
+                &mut scheduler,
+                &root,
+                parent,
+                candidate,
+                false,
+                false,
+            );
+            children.insert(child);
+        }
+        scheduler.park_positive_support_activations(&children);
+        let mut stats = ResidualStateStats::default();
+        assert!(scheduler.begin_public_pull_demand(&mut stats).is_none());
+        scheduler.retire_unassigned_public_pull_demand();
+        assert!(scheduler.begin_public_pull_demand(&mut stats).is_none());
+
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let _ = scheduler.step_bounded(
+            &root,
+            &plan,
+            1,
+            Some(terminal_positive_full()),
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert_eq!(stats.delta_positive_support_service_support_packets, 1);
+        assert_eq!(scheduler.global_service_woken_support_tasks, 0);
+        assert!(
+            scheduler.program_worklist.iter().all(|(_, bucket)| {
+                bucket.tasks.iter().all(|task| {
+                    ProgramServiceLane::of(&scheduler.registry, task.activation)
+                        != ProgramServiceLane::Support
+                })
+            }),
+            "an unselected Support wake remainder stayed globally runnable"
+        );
+        assert_eq!(
+            scheduler.parked_positive_support_worklist.len(),
+            1,
+            "exactly one unselected parent must return to parked custody"
         );
     }
 
