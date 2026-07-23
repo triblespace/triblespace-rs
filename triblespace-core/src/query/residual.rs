@@ -2533,6 +2533,27 @@ pub struct ResidualStateStats {
     ///
     /// This includes both exact Confirm taps and physical Support fallbacks.
     pub delta_positive_publication_chunk_homomorphic_commits: usize,
+    /// Public-pull demand tokens assigned to one concrete parked
+    /// PositiveSupport parent. This is authoritative `D`, not a requested
+    /// dispatch limit.
+    pub delta_positive_support_demand_assigned: usize,
+    /// Validated examined work settled by PositiveSupport Program receipts.
+    /// This is authoritative `S`.
+    pub delta_positive_support_examined: usize,
+    /// Validated exact Confirm examined work belonging to a parent that was
+    /// opened with a Support hedge, whether or not the hedge had started.
+    pub delta_positive_support_exact_paired_examined: usize,
+    /// The subset of paired exact examined work minted as usable Support
+    /// credit while the parent was started, open, and still linked to a live
+    /// Support child. This is authoritative `C`.
+    pub delta_positive_support_exact_credited: usize,
+    /// Minted Support allowance burned on child exhaustion, cancellation, or
+    /// semantic-parent closure before physical examination.
+    pub delta_positive_support_credit_retired: usize,
+    /// Positive-publication SET races won by an exact Confirm receipt.
+    pub delta_positive_publication_exact_wins: usize,
+    /// Positive-publication SET races won by a physical Support receipt.
+    pub delta_positive_publication_support_wins: usize,
     /// Cold terminal-streaming proposal actions admitted into the cyclic
     /// scheduler.
     pub delta_terminal_admissions: usize,
@@ -10888,6 +10909,7 @@ impl ResidualStateMachine {
                 set_admit_result,
                 batch,
                 positive_publication,
+                &mut self.stats,
             );
             return Ok(outcome);
         }
@@ -11439,9 +11461,10 @@ impl ResidualStateMachine {
         debug_assert!(
             resume.is_none() || outcome.continuation.is_some() || outcome.publication.is_some()
         );
-        self.active_delta = resume;
-        self.active_delta_after_yield = resume.is_some();
-        self.stats.delta_active_live_yields_retained += usize::from(resume.is_some());
+        let retained_yielding_activation = resume.is_some();
+        self.active_delta = resume.or_else(|| outcome.demand_preference.take());
+        self.active_delta_after_yield = retained_yielding_activation;
+        self.stats.delta_active_live_yields_retained += usize::from(retained_yielding_activation);
         self.continuation = outcome.continuation.take().map(|token| {
             let desc = self.interner.get(token.state);
             let commits_terminal_candidates = match &desc.phase {
@@ -11744,8 +11767,10 @@ impl ResidualStateMachine {
                             self.accept_delta_step_with_resume(focused.outcome, focused.resume)
                         }
                         ActiveDeltaStatus::Pending => {
-                            debug_assert!(focused.outcome.completed_activation_ids.is_empty());
                             self.account_delta_feedback(&focused.outcome);
+                            for activation in focused.outcome.completed_activation_ids {
+                                self.terminal_yield.complete(activation);
+                            }
                             self.active_delta =
                                 Some(focused.resume.expect(
                                     "a pending affine activation has an exact continuation",
@@ -11760,6 +11785,21 @@ impl ResidualStateMachine {
                             debug_assert!(focused.outcome.completed_activation_ids.is_empty());
                             debug_assert!(!focused.outcome.has_stable_effect());
                             self.account_delta_feedback(&focused.outcome);
+                        }
+                        ActiveDeltaStatus::Released => {
+                            // Exact remains runnable, but a freshly credited
+                            // Support sibling must enter global arbitration.
+                            debug_assert!(focused.resume.is_none());
+                            debug_assert!(!focused.outcome.has_stable_effect());
+                            let mut outcome = focused.outcome;
+                            let demand_preference = outcome.demand_preference.take();
+                            self.account_delta_feedback(&outcome);
+                            for activation in std::mem::take(&mut outcome.completed_activation_ids)
+                            {
+                                self.terminal_yield.complete(activation);
+                            }
+                            self.active_delta = demand_preference;
+                            self.active_delta_after_yield = false;
                         }
                         ActiveDeltaStatus::Quiescent => {
                             // Quiescence carries the exact activation receipt
@@ -11870,6 +11910,10 @@ impl ResidualStateMachine {
     where
         P: Fn(&Binding) -> Option<R>,
     {
+        // A projection panic may be caught outside the iterator. The raw row
+        // is consumed before user code, and the next pull similarly retires
+        // any still-unassigned demand token before observing an early exit.
+        self.delta.retire_unassigned_public_pull_demand();
         if projection_gate.is_done() {
             self.retire_staged_projection_receipts();
             return None;
@@ -11880,6 +11924,13 @@ impl ResidualStateMachine {
         // that seed is consumed there is no remaining work to promote.
         if self.emit_next >= self.emit_count && self.worklist.is_empty() && self.delta.is_empty() {
             return None;
+        }
+        if let Some(support) = self.delta.begin_public_pull_demand(&mut self.stats) {
+            // Assigned public demand owns the latency preference. The exact
+            // Confirm lease remains ordinary runnable custody and returns to
+            // global arbitration.
+            self.active_delta = Some(support);
+            self.active_delta_after_yield = false;
         }
         self.confirm_terminal_demand();
         loop {
@@ -11907,12 +11958,14 @@ impl ResidualStateMachine {
                         if projection_gate.is_done() {
                             self.retire_staged_projection_receipts();
                         }
+                        self.delta.retire_unassigned_public_pull_demand();
                         return Some(result);
                     }
                     ProjectionStep::Skip => drop(projection),
                     ProjectionStep::Done => {
                         drop(projection);
                         self.retire_staged_projection_receipts();
+                        self.delta.retire_unassigned_public_pull_demand();
                         return None;
                     }
                 }
@@ -11931,7 +11984,10 @@ impl ResidualStateMachine {
                 base_estimates,
             ) {
                 PullAdvance::EmitReady => {}
-                PullAdvance::Exhausted => return None,
+                PullAdvance::Exhausted => {
+                    self.delta.retire_unassigned_public_pull_demand();
+                    return None;
+                }
             }
         }
     }
@@ -15983,8 +16039,16 @@ mod tests {
         assert_eq!((iter.state.emit_next, iter.state.emit_count), (1, 3));
         assert!(iter.state.emit_origins.is_none());
         assert_eq!(iter.stats().delta_direct_terminal_publication_batches, 0);
+        assert!(
+            iter.state.delta.has_unassigned_public_pull_demand(),
+            "caught projection panic should leave only the unassigned token for next-pull cleanup"
+        );
 
         assert_eq!(iter.next(), Some(raw(2)));
+        assert!(
+            !iter.state.delta.has_unassigned_public_pull_demand(),
+            "the resumed pull must retire stale demand before normal completion"
+        );
         assert_eq!(iter.next(), Some(raw(3)));
         assert_eq!(iter.next(), None);
         assert_eq!(*attempts.lock().unwrap(), [raw(1), raw(2), raw(3)]);
@@ -26731,6 +26795,8 @@ mod tests {
             completed_activations: 0,
             completed_transition_cohort: false,
             allows_global_width_growth: true,
+            release_directed_lease: false,
+            demand_preference: None,
         });
         assert_eq!(machine.width, 4);
         assert_eq!(machine.stats.delta_source_negative_steps, 0);
@@ -26750,6 +26816,8 @@ mod tests {
             completed_activations: 2,
             completed_transition_cohort: true,
             allows_global_width_growth: true,
+            release_directed_lease: false,
+            demand_preference: None,
         });
         assert_eq!(
             machine.continuation,
@@ -26782,6 +26850,8 @@ mod tests {
             completed_activations: 0,
             completed_transition_cohort: false,
             allows_global_width_growth: true,
+            release_directed_lease: false,
+            demand_preference: None,
         });
         assert_eq!(
             machine.continuation,
@@ -26800,6 +26870,8 @@ mod tests {
             completed_activations: 0,
             completed_transition_cohort: false,
             allows_global_width_growth: true,
+            release_directed_lease: false,
+            demand_preference: None,
         });
         assert_eq!(machine.width, 8);
         assert_eq!(machine.stats.delta_source_negative_steps, 1);
@@ -26816,6 +26888,8 @@ mod tests {
             completed_activations: 0,
             completed_transition_cohort: false,
             allows_global_width_growth: false,
+            release_directed_lease: false,
+            demand_preference: None,
         });
         assert_eq!(
             machine.width, 8,
@@ -26834,6 +26908,8 @@ mod tests {
             completed_activations: 1,
             completed_transition_cohort: false,
             allows_global_width_growth: true,
+            release_directed_lease: false,
+            demand_preference: None,
         });
         assert_eq!(machine.width, 8);
         assert_eq!(machine.delta.activation_width(), 2);
