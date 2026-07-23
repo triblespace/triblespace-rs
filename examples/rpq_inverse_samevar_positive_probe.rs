@@ -12,7 +12,7 @@
 //! `ProgramExposure::Explicit`.
 //!
 //! Run with:
-//! `cargo run --release --example rpq_inverse_samevar_positive_probe -- [nodes=4096] [reps=51] [warmups=5] [run-id] [revision] [suite=all|fanout]`
+//! `cargo run --release --example rpq_inverse_samevar_positive_probe -- [nodes=4096] [reps=51] [warmups=5] [run-id] [revision] [suite=all|far|fanout]`
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::hint::black_box;
@@ -1441,8 +1441,13 @@ fn main() {
             fixtures.extend(build_same_variable_fixtures(node_count));
             fixtures
         }
+        "far" => build_inverse_fixtures(node_count)
+            .into_iter()
+            .chain(build_same_variable_fixtures(node_count))
+            .filter(|fixture| fixture.case == Case::PositiveFar)
+            .collect(),
         "fanout" => build_inverse_fanout_fixtures(node_count),
-        _ => panic!("unknown suite {suite:?}; expected all or fanout"),
+        _ => panic!("unknown suite {suite:?}; expected all, far, or fanout"),
     };
     let context = BenchmarkContext {
         nodes: node_count,
