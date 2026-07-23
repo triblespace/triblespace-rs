@@ -6511,6 +6511,12 @@ impl DeltaScheduler {
             )
     }
 
+    fn lane_selection_is_active(&self) -> bool {
+        self.program_lane_selection == ProgramLaneSelection::LanePure
+            && (self.positive_support_scheduling == PositiveSupportScheduling::CountCredit
+                || self.global_service_epoch_is_active())
+    }
+
     /// Mints exact per-parent terminal receipts without filing sparse source
     /// or transition work. The caller returns each identity as both an
     /// admission registration and an immediate completion receipt.
@@ -8412,7 +8418,7 @@ impl DeltaScheduler {
         let activation = task.activation;
         let mut tasks = vec![task];
         self.program_worklist.append(state, &mut tasks);
-        if self.program_lane_selection == ProgramLaneSelection::LanePure {
+        if self.lane_selection_is_active() {
             debug_assert_eq!(
                 ProgramServiceLane::of(&self.registry, activation),
                 ProgramServiceLane::Support
@@ -9001,7 +9007,8 @@ impl DeltaScheduler {
         Vec<Option<PositiveSupportWorkGrant>>,
         PhysicalDispatch,
     ) {
-        let preferred_lane = (self.program_lane_selection == ProgramLaneSelection::LanePure)
+        let preferred_lane = self
+            .lane_selection_is_active()
             .then(|| self.next_program_lane.take())
             .flatten();
         let preferred_state = preferred_lane
@@ -9013,7 +9020,7 @@ impl DeltaScheduler {
         let id = preferred_state
             .or_else(|| self.program_worklist.last_id())
             .expect("typed program pop requires live work");
-        let lane = if self.program_lane_selection == ProgramLaneSelection::LanePure {
+        let lane = if self.lane_selection_is_active() {
             preferred_state
                 .zip(preferred_lane)
                 .map(|(_, lane)| lane)
