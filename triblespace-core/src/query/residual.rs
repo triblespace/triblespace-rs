@@ -2537,6 +2537,10 @@ pub struct ResidualStateStats {
     /// PositiveSupport parent. This is authoritative `D`, not a requested
     /// dispatch limit.
     pub delta_positive_support_demand_assigned: usize,
+    /// Parked PositiveSupport tasks inspected by the production CountCredit
+    /// demand-parent discovery scan. The query-global service policy uses an
+    /// incrementally maintained parent locator and therefore leaves this zero.
+    pub delta_positive_support_demand_discovery_task_visits: usize,
     /// Validated examined work settled by PositiveSupport Program receipts.
     /// This is authoritative `S`.
     pub delta_positive_support_examined: usize,

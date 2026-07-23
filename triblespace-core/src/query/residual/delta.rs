@@ -6423,6 +6423,15 @@ pub(super) struct DeltaScheduler {
     /// and deduplicating this vector preserves the former `BTreeSet` order
     /// without allocating a tree node for every unit packet.
     global_service_parent_scratch: Vec<PositiveConfirmParentId>,
+    /// Newly parked service parents that have not yet consumed public demand.
+    ///
+    /// This is noncanonical locator custody, not scheduling currency. Filing a
+    /// parked Support task registers its parent once; a public pull pops and
+    /// revalidates one candidate. Stale entries from cancellation are harmless,
+    /// while the ordinary no-candidate pull remains O(1) instead of rescanning
+    /// every parked task.
+    positive_support_service_demand_queue: Vec<PositiveConfirmParentId>,
+    positive_support_service_demand_queued: AHashSet<PositiveConfirmParentId>,
     /// Mutually exclusive PositiveSupport admission currency.
     positive_support_scheduling: PositiveSupportScheduling,
     /// One aggregate affine lease for the opt-in global service policy.
@@ -6463,6 +6472,8 @@ impl DeltaScheduler {
             next_program_state: None,
             global_service_woken_support_tasks: 0,
             global_service_parent_scratch: Vec::new(),
+            positive_support_service_demand_queue: Vec::new(),
+            positive_support_service_demand_queued: AHashSet::new(),
             positive_support_scheduling: PositiveSupportScheduling::CountCredit,
             positive_support_service_debt: PositiveSupportServiceDebtLedger::dormant(),
             public_pull_demand: PublicPullDemandState::Closed,
@@ -8370,6 +8381,28 @@ impl DeltaScheduler {
             }),
             "only live PositiveSupport Program tasks may enter the parked lane"
         );
+        if self.positive_support_scheduling == PositiveSupportScheduling::GlobalServiceDebt {
+            for task in &tasks {
+                let parent = self
+                    .registry
+                    .positive_support_parent_for_child(task.activation)
+                    .expect("live PositiveSupport task lost its semantic parent");
+                if !self.registry.positive_support_service_is_started(parent)
+                    && !self
+                        .positive_support_service_demand_queued
+                        .contains(&parent)
+                    // Preserve the old discovery precondition at the custody
+                    // transition: one parent is offered for demand only after
+                    // its final runnable sibling has joined parked custody.
+                    // If a sibling is still runnable, filing that sibling
+                    // later retries this registration.
+                    && !self.has_runnable_positive_support_parent(parent)
+                    && self.positive_support_service_demand_queued.insert(parent)
+                {
+                    self.positive_support_service_demand_queue.push(parent);
+                }
+            }
+        }
         self.parked_positive_support_worklist
             .append(state, &mut tasks);
         Some(ActiveDeltaContinuation { state, activation })
@@ -8433,10 +8466,31 @@ impl DeltaScheduler {
         if self.public_pull_demand != PublicPullDemandState::Unassigned {
             return None;
         }
+        if self.positive_support_scheduling == PositiveSupportScheduling::GlobalServiceDebt {
+            while let Some(parent) = self.positive_support_service_demand_queue.pop() {
+                assert!(
+                    self.positive_support_service_demand_queued.remove(&parent),
+                    "service-demand locator queue lost its unique membership"
+                );
+                if !self.registry.start_positive_support_service(parent) {
+                    continue;
+                }
+                self.public_pull_demand = PublicPullDemandState::Assigned;
+                stats.delta_positive_support_service_parents_started += 1;
+                let epoch_started = self.positive_support_service_debt.demand_arrived();
+                if epoch_started {
+                    stats.delta_positive_support_service_epochs += 1;
+                }
+                return None;
+            }
+            return None;
+        }
+
         let mut parents = Vec::new();
         let mut seen = AHashSet::new();
         for (_, bucket) in self.parked_positive_support_worklist.iter() {
             for task in &bucket.tasks {
+                stats.delta_positive_support_demand_discovery_task_visits += 1;
                 let Some(parent) = self
                     .registry
                     .positive_support_parent_for_child(task.activation)
@@ -8449,36 +8503,16 @@ impl DeltaScheduler {
             }
         }
         for parent in parents.into_iter().rev() {
-            let started = match self.positive_support_scheduling {
-                PositiveSupportScheduling::CountCredit => {
-                    self.registry.mint_positive_support_demand(parent)
-                }
-                PositiveSupportScheduling::GlobalServiceDebt => {
-                    self.registry.start_positive_support_service(parent)
-                }
-            };
+            let started = self.registry.mint_positive_support_demand(parent);
             if !started {
                 continue;
             }
             self.public_pull_demand = PublicPullDemandState::Assigned;
-            match self.positive_support_scheduling {
-                PositiveSupportScheduling::CountCredit => {
-                    stats.delta_positive_support_demand_assigned += 1;
-                    return Some(
-                        self.wake_one_positive_support_parent(parent).expect(
-                            "assigned positive Support demand failed to wake parked custody",
-                        ),
-                    );
-                }
-                PositiveSupportScheduling::GlobalServiceDebt => {
-                    stats.delta_positive_support_service_parents_started += 1;
-                    let epoch_started = self.positive_support_service_debt.demand_arrived();
-                    if epoch_started {
-                        stats.delta_positive_support_service_epochs += 1;
-                    }
-                    return None;
-                }
-            }
+            stats.delta_positive_support_demand_assigned += 1;
+            return Some(
+                self.wake_one_positive_support_parent(parent)
+                    .expect("assigned positive Support demand failed to wake parked custody"),
+            );
         }
         None
     }
@@ -10843,6 +10877,27 @@ impl DeltaScheduler {
             remap.is_empty(),
             "delta registry held a live credit without a scheduled task"
         );
+        let positive_support_service_demand_queue = self
+            .positive_support_service_demand_queue
+            .iter()
+            .map(|parent| PositiveConfirmParentId {
+                brand: registry.brand,
+                activation: parent.activation,
+            })
+            .collect::<Vec<_>>();
+        let positive_support_service_demand_queued = self
+            .positive_support_service_demand_queued
+            .iter()
+            .map(|parent| PositiveConfirmParentId {
+                brand: registry.brand,
+                activation: parent.activation,
+            })
+            .collect::<AHashSet<_>>();
+        assert_eq!(
+            positive_support_service_demand_queue.len(),
+            positive_support_service_demand_queued.len(),
+            "service-demand locator clone found duplicate or missing membership"
+        );
         Self {
             registry,
             interner: self.interner.clone(),
@@ -10855,6 +10910,8 @@ impl DeltaScheduler {
             next_program_state: self.next_program_state,
             global_service_woken_support_tasks: self.global_service_woken_support_tasks,
             global_service_parent_scratch: Vec::new(),
+            positive_support_service_demand_queue,
+            positive_support_service_demand_queued,
             positive_support_scheduling: self.positive_support_scheduling,
             positive_support_service_debt: self
                 .positive_support_service_debt
@@ -12068,6 +12125,20 @@ mod tests {
         );
         assert_eq!(stats.delta_positive_support_service_parents_started, 1);
         assert_eq!(stats.delta_positive_support_service_epochs, 1);
+        assert_eq!(
+            stats.delta_positive_support_demand_discovery_task_visits, 0,
+            "service demand must use its incremental parent locator"
+        );
+
+        scheduler.retire_unassigned_public_pull_demand();
+        assert!(
+            scheduler.begin_public_pull_demand(&mut stats).is_none(),
+            "an already-started parked parent must not consume later demand"
+        );
+        assert_eq!(
+            stats.delta_positive_support_demand_discovery_task_visits, 0,
+            "a no-candidate service pull must not rediscover parked tasks"
+        );
 
         scheduler.arm_global_service_lane();
         assert_eq!(
@@ -12260,6 +12331,12 @@ mod tests {
         assert_eq!(
             stats.delta_positive_support_service_epochs, 1,
             "adding a parent to a live service epoch must not mint a bypass"
+        );
+        scheduler.retire_unassigned_public_pull_demand();
+        assert!(scheduler.begin_public_pull_demand(&mut stats).is_none());
+        assert_eq!(
+            stats.delta_positive_support_demand_discovery_task_visits, 0,
+            "exhausted service-parent discovery must stay O(1)"
         );
     }
 
@@ -12583,6 +12660,46 @@ mod tests {
             .registry
             .positive_support_service_is_started(parent));
         assert_eq!(scheduler.parked_positive_support_worklist.len(), 1);
+    }
+
+    #[test]
+    fn global_service_pending_demand_locator_rebrands_across_clone() {
+        let root = OneShotSupportProgram;
+        let mut scheduler = DeltaScheduler::new();
+        scheduler.enable_positive_support_global_service_debt();
+        let candidate = value(82);
+        let (exact, parent, exact_credit, _) =
+            open_tapped_confirm_with_support(&mut scheduler.registry, [candidate], None, true);
+        let (support, support_active) =
+            queue_one_shot_positive_support(&mut scheduler, &root, parent, candidate, false);
+        let _ =
+            queue_exact_confirm_credit(&mut scheduler, support_active.state, exact, exact_credit);
+        scheduler.park_positive_support_activations(&AHashSet::from_iter([support]));
+        assert_eq!(scheduler.positive_support_service_demand_queue, [parent]);
+
+        let mut cloned = scheduler.deep_clone();
+        let cloned_parent = PositiveConfirmParentId {
+            brand: cloned.registry.brand,
+            activation: parent.activation,
+        };
+        assert_eq!(
+            cloned.positive_support_service_demand_queue,
+            [cloned_parent],
+            "clone-local demand custody must carry the cloned registry brand"
+        );
+
+        for (current, current_parent) in [(&mut scheduler, parent), (&mut cloned, cloned_parent)] {
+            let mut stats = ResidualStateStats::default();
+            assert!(current.begin_public_pull_demand(&mut stats).is_none());
+            assert!(current
+                .registry
+                .positive_support_service_is_started(current_parent));
+            assert_eq!(stats.delta_positive_support_service_parents_started, 1);
+            assert_eq!(stats.delta_positive_support_service_epochs, 1);
+            assert_eq!(stats.delta_positive_support_demand_discovery_task_visits, 0);
+            assert!(current.positive_support_service_demand_queue.is_empty());
+            assert!(current.positive_support_service_demand_queued.is_empty());
+        }
     }
 
     #[test]
