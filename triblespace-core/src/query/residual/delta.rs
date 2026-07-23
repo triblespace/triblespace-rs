@@ -8583,7 +8583,8 @@ impl DeltaScheduler {
     /// Support receives one initial packet and thereafter only runs while its
     /// cumulative validated service is strictly behind.
     fn arm_global_service_lane(&mut self) {
-        if self.positive_support_scheduling != PositiveSupportScheduling::GlobalServiceDebt {
+        if !self.global_service_epoch_is_active() {
+            self.next_program_lane = None;
             return;
         }
         self.next_program_lane = None;
