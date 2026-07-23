@@ -128,10 +128,7 @@ pub trait Transport: Clone + Send + Sync + 'static {
     ) -> impl std::future::Future<Output = anyhow::Result<Self::Conn>> + Send;
 
     /// Announce to the content-discovery layer that we hold `hash`.
-    fn dht_announce(
-        &self,
-        hash: [u8; 32],
-    ) -> impl std::future::Future<Output = ()> + Send;
+    fn dht_announce(&self, hash: [u8; 32]) -> impl std::future::Future<Output = ()> + Send;
 
     /// Ask the content-discovery layer who holds `hash`. Order is
     /// meaningful to callers only as a candidate list; may include

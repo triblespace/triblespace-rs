@@ -15,7 +15,7 @@
 
 use anybytes::Bytes;
 
-use crate::protocol::{RawPinId, RawHash};
+use crate::protocol::{RawHash, RawPinId};
 
 /// A 32-byte public key identifying a publisher.
 pub type PublisherKey = [u8; 32];
@@ -65,7 +65,11 @@ pub enum NetEvent {
     Blob(Bytes),
     /// A remote branch HEAD was learned (via gossip or fetch).
     /// Includes the publisher's public key for provenance.
-    Head { branch: RawPinId, head: RawHash, publisher: PublisherKey },
+    Head {
+        branch: RawPinId,
+        head: RawHash,
+        publisher: PublisherKey,
+    },
     /// A peer asked us to issue them a capability. The partial cap
     /// blob carries the subject they're requesting for (must match
     /// `requester` — verified at connection time via iroh's TLS),

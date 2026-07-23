@@ -30,12 +30,8 @@ use super::VariableId;
 #[doc(hidden)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FiniteUnaryProgramState {
-    Propose {
-        cursor: ResidualDeltaSourceCursor,
-    },
-    Confirm {
-        offset: usize,
-    },
+    Propose { cursor: ResidualDeltaSourceCursor },
+    Confirm { offset: usize },
     Support,
 }
 
@@ -90,10 +86,7 @@ pub fn route(variable: VariableId, request: ProgramRequest) -> Option<ProgramRou
 /// page, so the transition Program remains an explicit representability path
 /// instead of adding per-candidate activation overhead to production queries.
 #[doc(hidden)]
-pub fn route_filter_only(
-    variable: VariableId,
-    request: ProgramRequest,
-) -> Option<ProgramRoute> {
+pub fn route_filter_only(variable: VariableId, request: ProgramRequest) -> Option<ProgramRoute> {
     if matches!(request.action, ProgramAction::Propose(_)) {
         return None;
     }
@@ -218,12 +211,7 @@ pub fn step(
                     "ordered unary proposal received a candidate group"
                 );
                 let mut direct = Vec::new();
-                let page = proposal_page(
-                    input,
-                    cursor,
-                    batch.limits[input],
-                    &mut direct,
-                );
+                let page = proposal_page(input, cursor, batch.limits[input], &mut direct);
                 let input_tag =
                     u32::try_from(input).expect("too many ordered unary inputs in one cohort");
                 for value in direct {

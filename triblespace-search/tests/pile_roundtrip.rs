@@ -13,9 +13,9 @@
 use triblespace_core::blob::MemoryBlobStore;
 use triblespace_core::find;
 use triblespace_core::id::Id;
-use triblespace_core::repo::{BlobStoreGet, BlobStorePut};
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Inline;
+use triblespace_core::repo::{BlobStoreGet, BlobStorePut};
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::hnsw::HNSWBuilder;
@@ -45,8 +45,8 @@ fn succinct_bm25_survives_blob_store_roundtrip() {
         .expect("put should succeed");
 
     // Get → reloaded view.
-    let reader = <MemoryBlobStore as triblespace_core::repo::BlobStore>::reader(&mut store)
-        .expect("reader");
+    let reader =
+        <MemoryBlobStore as triblespace_core::repo::BlobStore>::reader(&mut store).expect("reader");
     let reloaded: SuccinctBM25Index = reader
         .get::<SuccinctBM25Index, SuccinctBM25Blob>(handle)
         .expect("get should succeed");
@@ -76,7 +76,7 @@ fn succinct_bm25_survives_blob_store_roundtrip() {
 #[test]
 fn succinct_hnsw_survives_blob_store_roundtrip() {
     use std::collections::HashSet;
-    
+
     use triblespace_search::schemas::put_embedding;
 
     // Build a small HNSW index.
@@ -99,8 +99,8 @@ fn succinct_hnsw_survives_blob_store_roundtrip() {
         .expect("put should succeed");
 
     // Get → reloaded view, then attach the reader for queries.
-    let reader = <MemoryBlobStore as triblespace_core::repo::BlobStore>::reader(&mut store)
-        .expect("reader");
+    let reader =
+        <MemoryBlobStore as triblespace_core::repo::BlobStore>::reader(&mut store).expect("reader");
     let reloaded: SuccinctHNSWIndex = reader
         .get::<SuccinctHNSWIndex, SuccinctHNSWBlob>(handle)
         .expect("get should succeed");
@@ -139,7 +139,7 @@ fn succinct_hnsw_survives_blob_store_roundtrip() {
 #[test]
 fn hnsw_indexes_share_embedding_blobs() {
     use triblespace_core::repo::BlobStore;
-    
+
     use triblespace_search::schemas::put_embedding;
 
     let vecs = [

@@ -1908,25 +1908,22 @@ where
             limits: batch.limits,
         };
         scratch.effects.clear();
-        let placement = match self.try_step_physical(
-            &scratch.states,
-            typed_batch,
-            &mut scratch.effects,
-        ) {
-            Some(placement) => {
-                scratch.states.clear();
-                Some(placement)
-            }
-            None => {
-                // A declined physical attempt has no committed prefix. Clear
-                // its borrowed transaction before executing the same Native
-                // kernel into the retained scratch sink.
-                scratch.effects.clear();
-                self.step_typed(&mut scratch.states, typed_batch, &mut scratch.effects);
-                scratch.states.clear();
-                None
-            }
-        };
+        let placement =
+            match self.try_step_physical(&scratch.states, typed_batch, &mut scratch.effects) {
+                Some(placement) => {
+                    scratch.states.clear();
+                    Some(placement)
+                }
+                None => {
+                    // A declined physical attempt has no committed prefix. Clear
+                    // its borrowed transaction before executing the same Native
+                    // kernel into the retained scratch sink.
+                    scratch.effects.clear();
+                    self.step_typed(&mut scratch.states, typed_batch, &mut scratch.effects);
+                    scratch.states.clear();
+                    None
+                }
+            };
         let typed = &mut scratch.effects;
         assert_eq!(
             typed.pages.len(),
@@ -1965,9 +1962,7 @@ where
                         .resume_physical
                         .push(Some((self.dispatch(state), self.pacing(state))));
                 }
-                Some(TypedResume::AfterChildrenDone) | None => {
-                    scratch.resume_physical.push(None)
-                }
+                Some(TypedResume::AfterChildrenDone) | None => scratch.resume_physical.push(None),
             }
         }
 
@@ -2008,10 +2003,7 @@ where
 
             let admitted = if let Some(novelty) = child.novelty.as_ref() {
                 let activation = batch.activations[child.input as usize];
-                match scratch
-                    .batch_novelty
-                    .entry((activation, novelty.clone()))
-                {
+                match scratch.batch_novelty.entry((activation, novelty.clone())) {
                     Entry::Occupied(previous) => {
                         assert_eq!(
                             *previous.get(),
@@ -2102,10 +2094,13 @@ where
         // exhaustion, or another panic remains fatal and non-rollback, exactly
         // like the affine input take above; recoverable backends return `None`
         // before reaching this commit phase.
-        effects
-            .pages
-            .extend(typed.pages.drain(..).zip(scratch.resume_physical.drain(..)).enumerate().map(
-                |(input, (page, physical))| {
+        effects.pages.extend(
+            typed
+                .pages
+                .drain(..)
+                .zip(scratch.resume_physical.drain(..))
+                .enumerate()
+                .map(|(input, (page, physical))| {
                     let activation = batch.activations[input];
                     let resume = match (page.resume, physical) {
                         (Some(TypedResume::Immediate(state)), Some((dispatch, pacing))) => {
@@ -2134,15 +2129,14 @@ where
                         examined: page.examined,
                         resume,
                     }
-                },
-            ));
+                }),
+        );
 
-        for ((child, (dispatch, pacing)), admitted) in
-            typed
-                .children
-                .drain(..)
-                .zip(scratch.child_physical.drain(..))
-                .zip(scratch.child_admitted.drain(..))
+        for ((child, (dispatch, pacing)), admitted) in typed
+            .children
+            .drain(..)
+            .zip(scratch.child_physical.drain(..))
+            .zip(scratch.child_admitted.drain(..))
         {
             if !admitted {
                 continue;
@@ -2442,8 +2436,8 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(states.iter().map(|state| state.exact_cursor).collect());
-            let rich = matches!(self.mode, PhysicalProbeMode::NativeWideReceipt)
-                && states.len() > 1;
+            let rich =
+                matches!(self.mode, PhysicalProbeMode::NativeWideReceipt) && states.len() > 1;
             for (input, state) in states.iter().enumerate() {
                 effects.page(1, None);
                 if rich {
@@ -2508,10 +2502,7 @@ mod tests {
                 | PhysicalProbeMode::LateRawAmplification
                 | PhysicalProbeMode::LateDuplicateSupport
                 | PhysicalProbeMode::LateZeroExaminedResume => {
-                    let placement = ProgramPhysicalReceipt::new(
-                        "test-physical",
-                        "dense-page",
-                    );
+                    let placement = ProgramPhysicalReceipt::new("test-physical", "dense-page");
                     for (input, state) in states.iter().enumerate() {
                         let examined = match self.mode {
                             PhysicalProbeMode::Complete => 1,
@@ -2525,13 +2516,9 @@ mod tests {
                             | PhysicalProbeMode::SpeculativeDecline
                             | PhysicalProbeMode::NativeWideReceipt => unreachable!(),
                         };
-                        let resume = (matches!(
-                            self.mode,
-                            PhysicalProbeMode::LateRawAmplification
-                        ) || (matches!(
-                            self.mode,
-                            PhysicalProbeMode::LateZeroExaminedResume
-                        ) && input == 1))
+                        let resume = (matches!(self.mode, PhysicalProbeMode::LateRawAmplification)
+                            || (matches!(self.mode, PhysicalProbeMode::LateZeroExaminedResume)
+                                && input == 1))
                             .then(|| {
                                 TypedResume::Immediate(NonComparableState {
                                     exact_cursor: state.exact_cursor - 1,
@@ -3939,8 +3926,7 @@ mod tests {
     fn novelty_transaction_scopes_equal_key_bytes_by_activation() {
         let activations = [ProgramActivation(23), ProgramActivation(24)];
         let endpoints = [Some([0xA1; 32]), None];
-        let (mut runtime, effects) =
-            run_novelty_scope_probe(&activations, endpoints.to_vec());
+        let (mut runtime, effects) = run_novelty_scope_probe(&activations, endpoints.to_vec());
 
         assert_eq!(effects.pages.len(), 2);
         assert_eq!(
@@ -4135,7 +4121,10 @@ mod tests {
             .as_any_mut()
             .downcast_mut::<TypedProgramRuntime<NonComparableState, Key, u64>>()
             .unwrap();
-        let scratch = typed.scratch.as_ref().expect("narrow step returned scratch");
+        let scratch = typed
+            .scratch
+            .as_ref()
+            .expect("narrow step returned scratch");
         assert!(scratch.states.is_empty());
         assert!(scratch.effects.pages.is_empty());
         assert!(scratch.effects.children.is_empty());

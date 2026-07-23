@@ -20,7 +20,8 @@ pub mod literature {
 fn main() {
     // ANCHOR: pattern_changes_example
     let storage = MemoryRepo::default();
-    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+    let mut repo =
+        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
     let branch_id = repo.create_branch("main", None).expect("branch");
 
     // ── commit initial data ──────────────────────────────────────────
@@ -28,14 +29,19 @@ fn main() {
     let dune = ufoid();
     let mut ws = repo.pull(*branch_id).expect("pull");
     let mut initial = TribleSet::new();
-    initial += entity! { &herbert @ literature::firstname: "Frank", literature::lastname: "Herbert" };
+    initial +=
+        entity! { &herbert @ literature::firstname: "Frank", literature::lastname: "Herbert" };
     initial += entity! { &dune @ literature::title: "Dune", literature::author: &herbert };
     ws.commit(initial, "initial");
     repo.push(&mut ws).unwrap();
 
     // ── first checkout: load everything ──────────────────────────────
     // `full` starts as a clone of the first checkout.
-    let mut changed = repo.pull(*branch_id).expect("pull").checkout(..).expect("checkout");
+    let mut changed = repo
+        .pull(*branch_id)
+        .expect("pull")
+        .checkout(..)
+        .expect("checkout");
     let mut full = changed.clone();
 
     // On the first iteration, everything is "new".
@@ -60,7 +66,11 @@ fn main() {
 
     // ── incremental update ───────────────────────────────────────────
     // Pull fresh, exclude all commits we've already processed.
-    changed = repo.pull(*branch_id).expect("pull").checkout(full.commits()..).expect("delta");
+    changed = repo
+        .pull(*branch_id)
+        .expect("pull")
+        .checkout(full.commits()..)
+        .expect("delta");
     full += &changed;
 
     // Only Dune Messiah shows up — Dune was in the previous checkout.

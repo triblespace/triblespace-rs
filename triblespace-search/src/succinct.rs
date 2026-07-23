@@ -30,7 +30,6 @@
 //! [`SuccinctGraph`] and the postings sections that *are*
 //! exposed.
 
-use triblespace_core::inline::Encodes;
 use anybytes::area::{SectionHandle, SectionWriter};
 use anybytes::view::View;
 use anybytes::{ByteArea, Bytes};
@@ -43,17 +42,18 @@ use triblespace_core::blob::encodings::succinctarchive::{
 use triblespace_core::blob::{Blob, BlobEncoding, TryFromBlob};
 use triblespace_core::id::ExclusiveId;
 use triblespace_core::id_hex;
+use triblespace_core::inline::Encodes;
+use triblespace_core::inline::{Inline, InlineEncoding, RawInline};
 use triblespace_core::macros::entity;
 use triblespace_core::metadata::{self, MetaDescribe};
 use triblespace_core::query::Variable;
 use triblespace_core::trible::Fragment;
-use triblespace_core::inline::{RawInline, Inline, InlineEncoding};
 
 use crate::schemas::{EmbHandle, Embedding};
 
+use crate::hnsw::HNSWIndex;
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use crate::hnsw::HNSWIndex;
 
 /// Errors produced by the succinct building blocks.
 #[derive(Debug)]
@@ -132,9 +132,7 @@ impl SuccinctDocLens {
     /// Production code uses [`Self::build_into`] inside the shared
     /// area driven by `SuccinctBM25Index::from_builder`.
     #[cfg(test)]
-    pub(crate) fn build(
-        lens: &[u32],
-    ) -> Result<(Bytes, CompactVectorMeta), SuccinctDocLensError> {
+    pub(crate) fn build(lens: &[u32]) -> Result<(Bytes, CompactVectorMeta), SuccinctDocLensError> {
         let mut area = ByteArea::new()?;
         let mut sections = area.sections();
         let meta = Self::build_into(&mut sections, lens)?;
@@ -252,9 +250,7 @@ pub(crate) struct SuccinctPostings {
 /// [`SuccinctBM25Meta`]). Field order is largest-alignment-first
 /// to avoid implicit padding; the trailing `_pad` rounds to an
 /// 8-byte multiple.
-#[derive(
-    Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable,
-)]
+#[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
 #[repr(C)]
 pub(crate) struct SuccinctPostingsMeta {
     /// Number of terms (== `offsets.len() - 1`).
@@ -393,8 +389,7 @@ impl SuccinctPostings {
         let doc_idx_width = width_for(n_docs as usize + 1);
         let offsets_width = width_for(total + 1);
 
-        let mut doc_idx_b =
-            CompactVectorBuilder::with_capacity(total, doc_idx_width, sections)?;
+        let mut doc_idx_b = CompactVectorBuilder::with_capacity(total, doc_idx_width, sections)?;
         let mut offsets_b =
             CompactVectorBuilder::with_capacity(n_terms + 1, offsets_width, sections)?;
         let mut scores_b = CompactVectorBuilder::with_capacity(total, SCORE_WIDTH, sections)?;
@@ -582,9 +577,7 @@ pub struct SuccinctGraph {
 /// Layout-stable so callers can embed this inside a parent meta
 /// stored as a typed section in a [`ByteArea`] (see
 /// [`SuccinctHNSWMeta`]).
-#[derive(
-    Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable,
-)]
+#[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
 #[repr(C)]
 pub struct SuccinctGraphMeta {
     /// Number of nodes in the graph.
@@ -745,9 +738,7 @@ impl SuccinctGraph {
 /// Largest-alignment-first ordering keeps the `repr(C)` layout
 /// padding-free, with a trailing `_pad` rounding the size to a
 /// multiple of 8.
-#[derive(
-    Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable,
-)]
+#[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
 #[repr(C)]
 pub struct SuccinctHNSWMeta {
     // All fields are crate-private: this struct is an opaque
@@ -930,10 +921,7 @@ impl SuccinctHNSWIndex {
     }
 
     /// Reconstruct from canonical bytes plus its decoded header.
-    pub fn from_bytes(
-        meta: SuccinctHNSWMeta,
-        bytes: Bytes,
-    ) -> Result<Self, SuccinctLoadError> {
+    pub fn from_bytes(meta: SuccinctHNSWMeta, bytes: Bytes) -> Result<Self, SuccinctLoadError> {
         let handles = meta
             .handles
             .view(&bytes)
@@ -1022,7 +1010,6 @@ impl SuccinctHNSWIndex {
             ef_search: 200,
         }
     }
-
 }
 
 /// A [`SuccinctHNSWIndex`] paired with the blob store its
@@ -1132,11 +1119,7 @@ where
             .collect())
     }
 
-    fn dist_to(
-        &self,
-        q: &[f32],
-        i: u32,
-    ) -> Result<f32, B::GetError<anybytes::view::ViewError>> {
+    fn dist_to(&self, q: &[f32], i: u32) -> Result<f32, B::GetError<anybytes::view::ViewError>> {
         let raw = *self.index.handles.get(i as usize).expect("in range");
         let handle: Inline<EmbHandle> = Inline::new(raw);
         let view = self.cache.get(handle)?;
@@ -1277,11 +1260,7 @@ impl<'a, B> crate::constraint::CosineSimilarity for AttachedSuccinctHNSWIndex<'a
 where
     B: triblespace_core::repo::BlobStoreGet,
 {
-    fn cosine_between(
-        &self,
-        a: Inline<EmbHandle>,
-        b: Inline<EmbHandle>,
-    ) -> Option<f32> {
+    fn cosine_between(&self, a: Inline<EmbHandle>, b: Inline<EmbHandle>) -> Option<f32> {
         let va = self.cache.get(a).ok()?;
         let vb = self.cache.get(b).ok()?;
         let a_slice: &[f32] = va.as_ref().as_ref();
@@ -1305,9 +1284,7 @@ where
 /// approach): any breaking layout change rotates the
 /// [`SuccinctBM25Blob`] schema id rather than carrying an
 /// in-band version field.
-#[derive(
-    Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable,
-)]
+#[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
 #[repr(C)]
 pub struct SuccinctBM25Meta {
     // All fields are crate-private: this struct is an opaque
@@ -1444,10 +1421,13 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
     /// accumulation directly — no insertion-order → universe-code
     /// remap, no per-term resort pass. `BM25Builder::build()`
     /// delegates here.
-    pub(crate) fn from_builder(
-        builder: crate::bm25::BM25Builder<D, T>,
-    ) -> Self {
-        let crate::bm25::BM25Builder { docs, k1, b, _phantom: _ } = builder;
+    pub(crate) fn from_builder(builder: crate::bm25::BM25Builder<D, T>) -> Self {
+        let crate::bm25::BM25Builder {
+            docs,
+            k1,
+            b,
+            _phantom: _,
+        } = builder;
 
         let mut area = ByteArea::new().expect("alloc ByteArea");
         let mut sections = area.sections();
@@ -1457,8 +1437,7 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
         // accumulation below; we rebuild a view from `bytes` once
         // the area is frozen, but the build-time universe is
         // self-contained and doesn't borrow `sections`.
-        let build_universe =
-            CompressedUniverse::with(docs.iter().map(|(k, _)| *k), &mut sections);
+        let build_universe = CompressedUniverse::with(docs.iter().map(|(k, _)| *k), &mut sections);
         let keys_meta = build_universe.metadata();
         let n_universe = build_universe.len();
 
@@ -1474,7 +1453,11 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
                 .expect("key just inserted into universe") as u32;
             doc_lens_vec[code as usize] = terms.len() as u32;
             for term in terms {
-                *term_to_tfs.entry(term).or_default().entry(code).or_insert(0) += 1;
+                *term_to_tfs
+                    .entry(term)
+                    .or_default()
+                    .entry(code)
+                    .or_insert(0) += 1;
             }
         }
         // Done with the build-time universe — its sections are
@@ -1484,20 +1467,18 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
         let avg_doc_len = if n_universe == 0 {
             0.0
         } else {
-            doc_lens_vec.iter().map(|&n| n as f64).sum::<f64>() as f32
-                / n_universe as f32
+            doc_lens_vec.iter().map(|&n| n as f64).sum::<f64>() as f32 / n_universe as f32
         };
 
         // ── 3. doc_lens → succinct CompactVector. ──────────────────
-        let doc_lens_meta = SuccinctDocLens::build_into(&mut sections, &doc_lens_vec)
-            .expect("build doc_lens");
+        let doc_lens_meta =
+            SuccinctDocLens::build_into(&mut sections, &doc_lens_vec).expect("build doc_lens");
 
         // ── 4. terms: sort ascending, write a [u8;32] section. ────
         let mut term_rows: Vec<RawInline> = term_to_tfs.keys().copied().collect();
         term_rows.sort_unstable();
         let n_terms = term_rows.len();
-        let terms_handle = pack_byte_table::<32>(&mut sections, &term_rows)
-            .expect("build terms");
+        let terms_handle = pack_byte_table::<32>(&mut sections, &term_rows).expect("build terms");
 
         // ── 5. per-term scored postings, streamed into the
         // shared area. We pre-compute `total` and `max_score`
@@ -1532,9 +1513,8 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
             let tfs = &term_to_tfs[term];
             let df = tfs.len() as f32;
             let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
-            tfs.iter().fold(acc, |m, (&code, &tf)| {
-                m.max(bm25_score(df, idf, tf, code))
-            })
+            tfs.iter()
+                .fold(acc, |m, (&code, &tf)| m.max(bm25_score(df, idf, tf, code)))
         });
 
         let postings_meta = SuccinctPostings::build_with_into(
@@ -1592,10 +1572,7 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
     /// [`TryFromBlob<SuccinctBM25Blob>`] is the standard path
     /// and pulls the suffix-meta out of `bytes` before calling
     /// this.
-    pub fn from_bytes(
-        meta: SuccinctBM25Meta,
-        bytes: Bytes,
-    ) -> Result<Self, SuccinctLoadError> {
+    pub fn from_bytes(meta: SuccinctBM25Meta, bytes: Bytes) -> Result<Self, SuccinctLoadError> {
         let keys = CompressedUniverse::from_bytes(meta.keys, bytes.clone())
             .map_err(|_| SuccinctLoadError::TruncatedSection("keys"))?;
         let doc_lens = SuccinctDocLens::from_bytes(meta.doc_lens, bytes.clone())
@@ -1718,15 +1695,16 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
     /// `(Inline<D>, f32)` pairs are sorted descending by score;
     /// no top-k truncation — caller slices what they need.
     pub fn query_multi(&self, terms: &[Inline<T>]) -> Vec<(Inline<D>, f32)> {
-        let mut acc: std::collections::HashMap<RawInline, f32> =
-            std::collections::HashMap::new();
+        let mut acc: std::collections::HashMap<RawInline, f32> = std::collections::HashMap::new();
         for term in terms {
             for (key, score) in self.query_term(term) {
                 *acc.entry(key.raw).or_insert(0.0) += score;
             }
         }
-        let mut out: Vec<(Inline<D>, f32)> =
-            acc.into_iter().map(|(raw, s)| (Inline::<D>::new(raw), s)).collect();
+        let mut out: Vec<(Inline<D>, f32)> = acc
+            .into_iter()
+            .map(|(raw, s)| (Inline::<D>::new(raw), s))
+            .collect();
         out.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         out
     }
@@ -2126,7 +2104,9 @@ impl MetaDescribe for SuccinctBM25Blob {
 }
 
 impl<D: InlineEncoding, T: InlineEncoding> Encodes<&SuccinctBM25Index<D, T>> for SuccinctBM25Blob
-where triblespace_core::inline::encodings::hash::Handle<SuccinctBM25Blob>: triblespace_core::inline::InlineEncoding,
+where
+    triblespace_core::inline::encodings::hash::Handle<SuccinctBM25Blob>:
+        triblespace_core::inline::InlineEncoding,
 {
     type Output = Blob<SuccinctBM25Blob>;
     fn encode(source: &SuccinctBM25Index<D, T>) -> Blob<SuccinctBM25Blob> {
@@ -2137,7 +2117,9 @@ where triblespace_core::inline::encodings::hash::Handle<SuccinctBM25Blob>: tribl
 }
 
 impl<D: InlineEncoding, T: InlineEncoding> Encodes<SuccinctBM25Index<D, T>> for SuccinctBM25Blob
-where triblespace_core::inline::encodings::hash::Handle<SuccinctBM25Blob>: triblespace_core::inline::InlineEncoding,
+where
+    triblespace_core::inline::encodings::hash::Handle<SuccinctBM25Blob>:
+        triblespace_core::inline::InlineEncoding,
 {
     type Output = Blob<SuccinctBM25Blob>;
     fn encode(source: SuccinctBM25Index<D, T>) -> Blob<SuccinctBM25Blob> {
@@ -2145,7 +2127,9 @@ where triblespace_core::inline::encodings::hash::Handle<SuccinctBM25Blob>: tribl
     }
 }
 
-impl<D: InlineEncoding, T: InlineEncoding> TryFromBlob<SuccinctBM25Blob> for SuccinctBM25Index<D, T> {
+impl<D: InlineEncoding, T: InlineEncoding> TryFromBlob<SuccinctBM25Blob>
+    for SuccinctBM25Index<D, T>
+{
     type Error = SuccinctLoadError;
 
     fn try_from_blob(blob: Blob<SuccinctBM25Blob>) -> Result<Self, Self::Error> {
@@ -2200,7 +2184,9 @@ impl MetaDescribe for SuccinctHNSWBlob {
 }
 
 impl Encodes<&SuccinctHNSWIndex> for SuccinctHNSWBlob
-where triblespace_core::inline::encodings::hash::Handle<SuccinctHNSWBlob>: triblespace_core::inline::InlineEncoding,
+where
+    triblespace_core::inline::encodings::hash::Handle<SuccinctHNSWBlob>:
+        triblespace_core::inline::InlineEncoding,
 {
     type Output = Blob<SuccinctHNSWBlob>;
     fn encode(source: &SuccinctHNSWIndex) -> Blob<SuccinctHNSWBlob> {
@@ -2210,7 +2196,9 @@ where triblespace_core::inline::encodings::hash::Handle<SuccinctHNSWBlob>: tribl
 }
 
 impl Encodes<SuccinctHNSWIndex> for SuccinctHNSWBlob
-where triblespace_core::inline::encodings::hash::Handle<SuccinctHNSWBlob>: triblespace_core::inline::InlineEncoding,
+where
+    triblespace_core::inline::encodings::hash::Handle<SuccinctHNSWBlob>:
+        triblespace_core::inline::InlineEncoding,
 {
     type Output = Blob<SuccinctHNSWBlob>;
     fn encode(source: SuccinctHNSWIndex) -> Blob<SuccinctHNSWBlob> {
@@ -2312,8 +2300,7 @@ mod tests {
         // returned SectionHandle. Slice methods on the resulting
         // `View<[[u8; 32]]>` are what BM25's term table and HNSW's
         // handle table use directly — no wrapper type.
-        let mut rows: Vec<[u8; 32]> =
-            vec![[5u8; 32], [1u8; 32], [9u8; 32], [3u8; 32]];
+        let mut rows: Vec<[u8; 32]> = vec![[5u8; 32], [1u8; 32], [9u8; 32], [3u8; 32]];
         rows.sort();
 
         let mut area = ByteArea::new().unwrap();
@@ -2485,7 +2472,8 @@ mod tests {
         }
         let mut b: BM25Builder = BM25Builder::new();
         b.insert(iid(1), hash_tokens("quick fox"));
-        b.insert(iid(2),
+        b.insert(
+            iid(2),
             hash_tokens("quick red rapid fox jumps high over fences"),
         );
         b.insert(iid(3), hash_tokens("slow brown dog"));
@@ -2699,7 +2687,6 @@ mod tests {
         use crate::hnsw::HNSWBuilder;
         use triblespace_core::blob::MemoryBlobStore;
         use triblespace_core::repo::BlobStore;
-        
 
         // Small deterministic corpus of 4-D vectors. with_seed
         // locks the level sampling so the graph is reproducible.
@@ -2728,10 +2715,16 @@ mod tests {
         let succinct_view = succinct.attach(&reader);
         let floor = 0.5f32;
         for probe in handles.iter().take(3) {
-            let n: std::collections::HashSet<_> =
-                naive_view.candidates_above(*probe, floor).unwrap().into_iter().collect();
-            let s: std::collections::HashSet<_> =
-                succinct_view.candidates_above(*probe, floor).unwrap().into_iter().collect();
+            let n: std::collections::HashSet<_> = naive_view
+                .candidates_above(*probe, floor)
+                .unwrap()
+                .into_iter()
+                .collect();
+            let s: std::collections::HashSet<_> = succinct_view
+                .candidates_above(*probe, floor)
+                .unwrap()
+                .into_iter()
+                .collect();
             assert_eq!(n, s, "mismatch for probe {probe:?}");
         }
     }
@@ -2741,15 +2734,13 @@ mod tests {
         triblespace_core::blob::MemoryBlobStore,
         Vec<
             triblespace_core::inline::Inline<
-                triblespace_core::inline::encodings::hash::Handle<
-                    crate::schemas::Embedding,
-                >,
+                triblespace_core::inline::encodings::hash::Handle<crate::schemas::Embedding>,
             >,
         >,
     ) {
         use crate::hnsw::HNSWBuilder;
         use triblespace_core::blob::MemoryBlobStore;
-        
+
         let mut store = MemoryBlobStore::new();
         let mut b = HNSWBuilder::new(4).with_seed(17);
         let mut handles = Vec::new();
@@ -2799,18 +2790,14 @@ mod tests {
         use crate::hnsw::HNSWBuilder;
         use triblespace_core::blob::{Blob, MemoryBlobStore, TryFromBlob};
         use triblespace_core::repo::BlobStore;
-        
+
         let idx = HNSWBuilder::new(3).build();
         let blob: Blob<SuccinctHNSWBlob> = Blob::new(idx.bytes.clone());
         let reloaded: SuccinctHNSWIndex =
             SuccinctHNSWIndex::try_from_blob(blob).expect("valid blob");
         assert_eq!(reloaded.doc_count(), 0);
         let mut store: MemoryBlobStore = MemoryBlobStore::new();
-        let probe = crate::schemas::put_embedding::<_>(
-            &mut store,
-            vec![1.0, 0.0, 0.0],
-        )
-        .unwrap();
+        let probe = crate::schemas::put_embedding::<_>(&mut store, vec![1.0, 0.0, 0.0]).unwrap();
         assert!(reloaded
             .attach(&store.reader().unwrap())
             .candidates_above(probe, 0.0)
@@ -2878,15 +2865,11 @@ mod tests {
         use crate::hnsw::HNSWBuilder;
         use triblespace_core::blob::MemoryBlobStore;
         use triblespace_core::repo::BlobStore;
-        
+
         let succinct = HNSWBuilder::new(3).build();
         assert_eq!(succinct.doc_count(), 0);
         let mut store: MemoryBlobStore = MemoryBlobStore::new();
-        let probe = crate::schemas::put_embedding::<_>(
-            &mut store,
-            vec![1.0, 0.0, 0.0],
-        )
-        .unwrap();
+        let probe = crate::schemas::put_embedding::<_>(&mut store, vec![1.0, 0.0, 0.0]).unwrap();
         assert!(succinct
             .attach(&store.reader().unwrap())
             .candidates_above(probe, 0.0)

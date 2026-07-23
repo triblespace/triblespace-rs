@@ -26,11 +26,11 @@ use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use iroh_base::EndpointId;
-use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
-use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+use rand::rngs::StdRng;
 use triblespace_core::blob::Blob;
+use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::clock::{self, VirtualClock};
 use triblespace_core::id::rngid::seed_ids;
 use triblespace_core::inline::encodings::time::NsTAIInterval;
@@ -42,8 +42,8 @@ use triblespace_core::repo::{BlobStoreList, BlobStorePut, Repository};
 use triblespace_core::trible::TribleSet;
 use triblespace_net::host;
 use triblespace_net::peer::{Peer, PeerConfig, SyncDirection};
-use triblespace_net::transport::sim::{SimConfig, SimNet};
 use triblespace_net::tracking;
+use triblespace_net::transport::sim::{SimConfig, SimNet};
 
 fn vclock() -> Arc<VirtualClock> {
     static CLOCK: OnceLock<Arc<VirtualClock>> = OnceLock::new();
@@ -61,8 +61,8 @@ fn admin_cap(
     root: &SigningKey,
     subject: &SigningKey,
 ) -> (Blob<SimpleArchive>, Blob<SimpleArchive>) {
-    use triblespace_core::id::ufoid;
     use triblespace_core::id::ExclusiveId;
+    use triblespace_core::id::ufoid;
     use triblespace_core::macros::entity;
     let scope_root = *ufoid();
     let scope_facts = TribleSet::from(entity! {
@@ -132,12 +132,7 @@ fn run_world(seed: u64, n_nodes: usize, n_ops: usize) -> WorldReport {
     rt.block_on(local.run_until(world_body(vc, seed, n_nodes, n_ops)))
 }
 
-async fn world_body(
-    vc: Arc<VirtualClock>,
-    seed: u64,
-    n_nodes: usize,
-    n_ops: usize,
-) -> WorldReport {
+async fn world_body(vc: Arc<VirtualClock>, seed: u64, n_nodes: usize, n_ops: usize) -> WorldReport {
     let start_ns = vc.now_ns();
     let net = SimNet::new(seed, SimConfig::default());
     // Script RNG is separate from the net's link RNG so adding ops
@@ -276,10 +271,7 @@ async fn world_body(
                 let nd = &mut nodes[*node];
                 if let Ok(Some(branch_id)) = nd.repo.lookup_branch("main") {
                     if let Ok(mut ws) = nd.repo.pull(branch_id) {
-                        let label = format!(
-                            "commit {} from node {}",
-                            nd.commits_made, node
-                        );
+                        let label = format!("commit {} from node {}", nd.commits_made, node);
                         ws.commit(TribleSet::new(), &label);
                         if nd.repo.push(&mut ws).is_ok() {
                             nd.commits_made += 1;
@@ -329,8 +321,7 @@ async fn world_body(
     let mut stable_since: Option<u64> = None;
     for round in 0..1_500u32 {
         tick(&vc, &mut nodes).await;
-        let heads: Vec<Option<[u8; 32]>> =
-            nodes.iter_mut().map(head_of).collect();
+        let heads: Vec<Option<[u8; 32]>> = nodes.iter_mut().map(head_of).collect();
         if round % 100 == 0 {
             let hp: Vec<String> = heads
                 .iter()
@@ -345,9 +336,8 @@ async fn world_body(
                 (vc.now_ns() - start_ns) / 1_000_000_000
             );
         }
-        let all_equal =
-            heads.first().map(|h| h.is_some()).unwrap_or(false)
-                && heads.windows(2).all(|w| w[0] == w[1]);
+        let all_equal = heads.first().map(|h| h.is_some()).unwrap_or(false)
+            && heads.windows(2).all(|w| w[0] == w[1]);
         if all_equal {
             let since = *stable_since.get_or_insert(vc.now_ns());
             // Stability must outlive one full 30s gossip rebroadcast
@@ -382,9 +372,7 @@ async fn world_body(
         let mut ws = node.repo.pull(branch_id).expect("pull");
         let _facts = ws
             .checkout(..)
-            .unwrap_or_else(|e| {
-                panic!("closure violated on node {i}: checkout failed: {e:?}")
-            });
+            .unwrap_or_else(|e| panic!("closure violated on node {i}: checkout failed: {e:?}"));
     }
 
     let blob_counts: Vec<usize> = nodes
@@ -425,7 +413,10 @@ fn three_node_fault_script_converges_and_replays() {
     );
 
     let second = run_world(0xDB, 3, 12);
-    assert_eq!(first.ops, second.ops, "same seed must replay the same script");
+    assert_eq!(
+        first.ops, second.ops,
+        "same seed must replay the same script"
+    );
     assert_eq!(
         first, second,
         "same seed must produce a bit-identical world report"

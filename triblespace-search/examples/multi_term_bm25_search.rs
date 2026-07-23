@@ -21,9 +21,9 @@ use triblespace_core::and;
 use triblespace_core::examples::literature;
 use triblespace_core::find;
 use triblespace_core::id::{ExclusiveId, Id};
+use triblespace_core::inline::IntoInline;
 use triblespace_core::macros::{entity, pattern};
 use triblespace_core::trible::TribleSet;
-use triblespace_core::inline::IntoInline;
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::tokens::hash_tokens;
@@ -128,11 +128,13 @@ fn main() {
     //   book 24 (other_author, high score)   → out  (author filter)
     //   book 25 (other_author, no match)     → out
     //   book 26 (target_author, no match)    → n/a
-    let hit_ids: std::collections::HashSet<Id> =
-        matches.iter().map(|(b, _)| *b).collect();
+    let hit_ids: std::collections::HashSet<Id> = matches.iter().map(|(b, _)| *b).collect();
     assert!(hit_ids.contains(&id(20)));
     assert!(hit_ids.contains(&id(21)));
-    assert!(!hit_ids.contains(&id(24)), "author filter must exclude book 24");
+    assert!(
+        !hit_ids.contains(&id(24)),
+        "author filter must exclude book 24"
+    );
     assert!(!hit_ids.contains(&id(25)));
 
     // The top match must be by target_author and have a positive

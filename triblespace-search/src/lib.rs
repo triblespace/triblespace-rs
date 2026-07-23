@@ -99,10 +99,10 @@
 //! [`jerky`]: https://docs.rs/jerky
 
 pub mod bm25;
-#[cfg(feature = "succinct")]
-pub mod index_bm25;
 pub mod constraint;
 pub mod hnsw;
+#[cfg(feature = "succinct")]
+pub mod index_bm25;
 #[cfg(feature = "succinct")]
 pub mod index_hnsw;
 #[cfg(feature = "succinct")]
@@ -142,7 +142,9 @@ pub mod testing {
     #[doc(inline)]
     pub use crate::bm25::BM25Index;
     #[doc(inline)]
-    pub use crate::hnsw::{AttachedFlatIndex, AttachedHNSWIndex, FlatBuilder, FlatIndex, HNSWIndex};
+    pub use crate::hnsw::{
+        AttachedFlatIndex, AttachedHNSWIndex, FlatBuilder, FlatIndex, HNSWIndex,
+    };
 }
 
 // Versioning policy: breaking byte-layout changes mint a new

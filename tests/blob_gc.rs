@@ -3,9 +3,9 @@ use std::collections::HashSet;
 
 use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::blob::{Blob, MemoryBlobStore};
+use triblespace::core::inline::INLINE_LEN;
 use triblespace::core::repo::BlobStore;
 use triblespace::core::repo::{reachable, transfer, BlobStoreGet};
-use triblespace::core::inline::INLINE_LEN;
 
 #[test]
 fn reachable_keep_and_transfer() {

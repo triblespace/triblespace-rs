@@ -1,8 +1,6 @@
-use triblespace_gpu::query_program::{
-    ProgramVariable, QueryPattern, QueryProgram,
-};
 use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use triblespace_core::trible::TribleSet;
+use triblespace_gpu::query_program::{ProgramVariable, QueryPattern, QueryProgram};
 use triblespace_gpu::{
     ResidentRoundError, ResidentRoundMetadata, ResidentRowChoice, ResidentRowPlanner, WgpuContext,
     WgpuResidentRowPlanner,

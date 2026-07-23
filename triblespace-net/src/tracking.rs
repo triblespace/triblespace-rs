@@ -15,18 +15,19 @@
 //! The tracking pin has its own local pin id. Repository can pull/merge
 //! it like any other commit-history pin (a Branch).
 
-
 use triblespace_core::blob::encodings::longstring::LongString;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::id::{Id, genid};
-use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut, PinStore, PushResult, Repository};
-use triblespace_core::trible::TribleSet;
-use triblespace_core::inline::encodings::time::NsTAIInterval;
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
-use triblespace_core::prelude::inlineencodings::{GenId, ED25519PublicKey};
+use triblespace_core::inline::encodings::time::NsTAIInterval;
+use triblespace_core::macros::{entity, find, pattern};
 use triblespace_core::prelude::attributes;
-use triblespace_core::macros::{find, pattern, entity};
+use triblespace_core::prelude::inlineencodings::{ED25519PublicKey, GenId};
+use triblespace_core::repo::{
+    BlobStore, BlobStoreGet, BlobStorePut, PinStore, PushResult, Repository,
+};
+use triblespace_core::trible::TribleSet;
 
 use crate::channel::PublisherKey;
 use crate::protocol::RawHash;
@@ -51,13 +52,21 @@ pub fn is_tracking_pin<S>(store: &mut S, branch_id: Id) -> bool
 where
     S: BlobStore + PinStore,
 {
-    let Ok(Some(head_handle)) = store.head(branch_id) else { return false; };
-    let Ok(reader) = store.reader() else { return false; };
-    let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(head_handle) else { return false; };
+    let Ok(Some(head_handle)) = store.head(branch_id) else {
+        return false;
+    };
+    let Ok(reader) = store.reader() else {
+        return false;
+    };
+    let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(head_handle) else {
+        return false;
+    };
     find!(
         v: Id,
         pattern!(&meta, [{ _?e @ tracking_remote_pin: ?v }])
-    ).next().is_some()
+    )
+    .next()
+    .is_some()
 }
 
 /// Returns true if the given pin is a *weak* tracking pin — its history
@@ -68,13 +77,21 @@ pub fn is_weak_tracking_pin<S>(store: &mut S, branch_id: Id) -> bool
 where
     S: BlobStore + PinStore,
 {
-    let Ok(Some(head_handle)) = store.head(branch_id) else { return false; };
-    let Ok(reader) = store.reader() else { return false; };
-    let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(head_handle) else { return false; };
+    let Ok(Some(head_handle)) = store.head(branch_id) else {
+        return false;
+    };
+    let Ok(reader) = store.reader() else {
+        return false;
+    };
+    let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(head_handle) else {
+        return false;
+    };
     find!(
         v: Id,
         pattern!(&meta, [{ _?e @ weak_tracking: ?v }])
-    ).next().is_some()
+    )
+    .next()
+    .is_some()
 }
 
 /// Information about a tracking pin.
@@ -102,25 +119,41 @@ where
     S: BlobStore + PinStore,
 {
     let mut result = Vec::new();
-    let Ok(iter) = store.pins() else { return result; };
+    let Ok(iter) = store.pins() else {
+        return result;
+    };
     let bids: Vec<Id> = iter.filter_map(|r| r.ok()).collect();
 
     for bid in bids {
-        let Ok(Some(meta_handle)) = store.head(bid) else { continue; };
-        let Ok(reader) = store.reader() else { continue; };
-        let Ok(meta): Result<TribleSet, _> = reader.get(meta_handle) else { continue; };
+        let Ok(Some(meta_handle)) = store.head(bid) else {
+            continue;
+        };
+        let Ok(reader) = store.reader() else {
+            continue;
+        };
+        let Ok(meta): Result<TribleSet, _> = reader.get(meta_handle) else {
+            continue;
+        };
 
         let Some(remote_branch_id) = find!(
             v: Id,
             pattern!(&meta, [{ _?e @ tracking_remote_pin: ?v }])
-        ).next() else { continue; };
+        )
+        .next() else {
+            continue;
+        };
 
         let Some(name_handle) = find!(
             h: Inline<Handle<LongString>>,
             pattern!(&meta, [{ _?e @ remote_name: ?h }])
-        ).next() else { continue; };
+        )
+        .next() else {
+            continue;
+        };
 
-        let Ok(name_view): Result<anybytes::View<str>, _> = reader.get(name_handle) else { continue; };
+        let Ok(name_view): Result<anybytes::View<str>, _> = reader.get(name_handle) else {
+            continue;
+        };
 
         result.push(TrackingPinInfo {
             local_id: bid,
@@ -134,10 +167,7 @@ where
 /// Find the local tracking pin for the given remote branch id, if any.
 /// Returns the pin id (the same `Id` used as the storage key in
 /// `PinStore`).
-pub fn find_tracking_pin<S>(
-    store: &mut S,
-    remote_branch_id: Id,
-) -> Option<Id>
+pub fn find_tracking_pin<S>(store: &mut S, remote_branch_id: Id) -> Option<Id>
 where
     S: BlobStore + PinStore,
 {
@@ -165,7 +195,8 @@ fn resolve_commit_in_branch_meta<S: BlobStore>(
     find!(
         h: Inline<Handle<SimpleArchive>>,
         pattern!(&meta, [{ _?e @ triblespace_core::repo::head: ?h }])
-    ).next()
+    )
+    .next()
 }
 
 /// Read the `metadata::updated_at` attribute from a branch metadata blob,
@@ -181,7 +212,8 @@ fn read_updated_at<S: BlobStore>(
     find!(
         ts: Inline<NsTAIInterval>,
         pattern!(&meta, [{ _?e @ triblespace_core::metadata::updated_at: ?ts }])
-    ).next()
+    )
+    .next()
 }
 
 /// Create a new tracking pin. Returns the local pin id.
@@ -286,7 +318,10 @@ where
 
     let meta_handle: Inline<Handle<SimpleArchive>> = store.put(meta_set).ok()?;
 
-    match store.update(tracking_pin_id, Some(old_meta), Some(meta_handle)).ok()? {
+    match store
+        .update(tracking_pin_id, Some(old_meta), Some(meta_handle))
+        .ok()?
+    {
         PushResult::Success() => Some(()),
         PushResult::Conflict(_) => None,
     }
@@ -306,10 +341,25 @@ where
     S: BlobStore + BlobStorePut + PinStore,
 {
     if let Some(tracking_id) = find_tracking_pin(store, remote_branch_id) {
-        update_tracking_pin(store, tracking_id, remote_branch_id, remote_head_hash, remote_name_str, publisher, weak);
+        update_tracking_pin(
+            store,
+            tracking_id,
+            remote_branch_id,
+            remote_head_hash,
+            remote_name_str,
+            publisher,
+            weak,
+        );
         Some(tracking_id)
     } else {
-        create_tracking_pin(store, remote_branch_id, remote_head_hash, remote_name_str, publisher, weak)
+        create_tracking_pin(
+            store,
+            remote_branch_id,
+            remote_head_hash,
+            remote_name_str,
+            publisher,
+            weak,
+        )
     }
 }
 
@@ -321,7 +371,9 @@ pub enum MergeOutcome {
     /// Local branch was already up-to-date with the tracking pin.
     UpToDate,
     /// Local branch advanced to `new_head` (fast-forward or merge commit).
-    Merged { new_head: Inline<Handle<SimpleArchive>> },
+    Merged {
+        new_head: Inline<Handle<SimpleArchive>>,
+    },
 }
 
 /// Merge a tracking pin into its same-named local branch.
@@ -395,7 +447,12 @@ mod tests {
         repo.push(&mut src_ws).unwrap();
 
         let outcome = merge_tracking_into_local(&mut repo, source_id, "main").unwrap();
-        assert_eq!(outcome, MergeOutcome::Merged { new_head: source_head });
+        assert_eq!(
+            outcome,
+            MergeOutcome::Merged {
+                new_head: source_head
+            }
+        );
 
         let main_id = repo.lookup_branch("main").unwrap().expect("main exists");
         let main_ws = repo.pull(main_id).unwrap();
@@ -450,7 +507,10 @@ mod tests {
             other => panic!("expected Merged, got {other:?}"),
         };
         assert_ne!(merge_head, commit_a, "merge commit must advance past local");
-        assert_ne!(merge_head, commit_b, "merge commit must not just fast-forward to remote");
+        assert_ne!(
+            merge_head, commit_b,
+            "merge commit must not just fast-forward to remote"
+        );
 
         // Local main should now be at the merge commit, and both
         // parents should appear in its ancestor set.
@@ -461,8 +521,14 @@ mod tests {
         let ancestor_set = triblespace_core::repo::ancestors(merge_head)
             .select(&mut main_ws)
             .expect("ancestors walk");
-        assert!(ancestor_set.get(&commit_a.raw).is_some(), "commit_a in ancestry");
-        assert!(ancestor_set.get(&commit_b.raw).is_some(), "commit_b in ancestry");
+        assert!(
+            ancestor_set.get(&commit_a.raw).is_some(),
+            "commit_a in ancestry"
+        );
+        assert!(
+            ancestor_set.get(&commit_b.raw).is_some(),
+            "commit_b in ancestry"
+        );
     }
 
     #[test]
@@ -490,9 +556,9 @@ mod tests {
 
         // Build a fake remote branch metadata blob first so we have something
         // to point to. Use branch_unsigned to avoid signing-key plumbing.
-        use triblespace_core::repo::branch::branch_unsigned;
         use triblespace_core::blob::IntoBlob;
         use triblespace_core::blob::encodings::longstring::LongString;
+        use triblespace_core::repo::branch::branch_unsigned;
         let name_blob = "remote-branch".to_string().to_blob();
         let name_handle: Inline<Handle<LongString>> = store.put(name_blob).unwrap();
         let remote_branch_id = genid();
@@ -508,21 +574,40 @@ mod tests {
 
         // Create the tracking pin.
         let tracking_id = create_tracking_pin(
-            &mut store, *remote_branch_id, &remote_head_hash, "remote-branch", &publisher, false,
-        ).expect("create");
+            &mut store,
+            *remote_branch_id,
+            &remote_head_hash,
+            "remote-branch",
+            &publisher,
+            false,
+        )
+        .expect("create");
 
         // Now find it.
         let found = find_tracking_pin(&mut store, *remote_branch_id);
-        assert_eq!(found, Some(tracking_id), "should find the tracking pin we just created");
+        assert_eq!(
+            found,
+            Some(tracking_id),
+            "should find the tracking pin we just created"
+        );
 
         // is_tracking_pin should return true for the tracking pin.
         assert!(is_tracking_pin(&mut store, tracking_id));
 
         // ensure should be idempotent.
         let same = ensure_tracking_pin(
-            &mut store, *remote_branch_id, &remote_head_hash, "remote-branch", &publisher, false,
+            &mut store,
+            *remote_branch_id,
+            &remote_head_hash,
+            "remote-branch",
+            &publisher,
+            false,
         );
-        assert_eq!(same, Some(tracking_id), "ensure should return the existing tracking pin");
+        assert_eq!(
+            same,
+            Some(tracking_id),
+            "ensure should return the existing tracking pin"
+        );
 
         // Verify the tracking pin resolved the inner commit, not the metadata blob.
         let mut store2 = store;
@@ -532,15 +617,19 @@ mod tests {
         let track_head: Inline<Handle<SimpleArchive>> = find!(
             h: Inline<Handle<SimpleArchive>>,
             pattern!(&track_meta, [{ _?e @ triblespace_core::repo::head: ?h }])
-        ).next().expect("tracking pin should have a head");
-        assert_eq!(track_head, commit_handle,
-            "tracking pin head should be the inner commit, not the branch metadata blob");
+        )
+        .next()
+        .expect("tracking pin should have a head");
+        assert_eq!(
+            track_head, commit_handle,
+            "tracking pin head should be the inner commit, not the branch metadata blob"
+        );
     }
 
     #[test]
     fn weak_marker_distinguishes_weak_from_strong_tracking() {
-        use triblespace_core::repo::branch::branch_unsigned;
         use triblespace_core::blob::IntoBlob;
+        use triblespace_core::repo::branch::branch_unsigned;
 
         let mut store = MemoryRepo::default();
 
@@ -563,25 +652,53 @@ mod tests {
         let (strong_remote, strong_head) = make_remote("strong-branch");
         let (weak_remote, weak_head) = make_remote("weak-branch");
 
-        let strong_id =
-            create_tracking_pin(&mut store, strong_remote, &strong_head, "strong-branch", &publisher, false)
-                .expect("create strong");
-        let weak_id =
-            create_tracking_pin(&mut store, weak_remote, &weak_head, "weak-branch", &publisher, true)
-                .expect("create weak");
+        let strong_id = create_tracking_pin(
+            &mut store,
+            strong_remote,
+            &strong_head,
+            "strong-branch",
+            &publisher,
+            false,
+        )
+        .expect("create strong");
+        let weak_id = create_tracking_pin(
+            &mut store,
+            weak_remote,
+            &weak_head,
+            "weak-branch",
+            &publisher,
+            true,
+        )
+        .expect("create weak");
 
         // Both are tracking pins...
         assert!(is_tracking_pin(&mut store, strong_id));
         assert!(is_tracking_pin(&mut store, weak_id));
 
         // ...but only the weak one carries the weak marker.
-        assert!(!is_weak_tracking_pin(&mut store, strong_id), "strong pin must not be weak");
-        assert!(is_weak_tracking_pin(&mut store, weak_id), "weak pin must be weak");
+        assert!(
+            !is_weak_tracking_pin(&mut store, strong_id),
+            "strong pin must not be weak"
+        );
+        assert!(
+            is_weak_tracking_pin(&mut store, weak_id),
+            "weak pin must be weak"
+        );
 
         // ensure_tracking_pin preserves weakness on update (idempotent
         // re-ensure with weak=true keeps the marker).
-        let same = ensure_tracking_pin(&mut store, weak_remote, &weak_head, "weak-branch", &publisher, true);
+        let same = ensure_tracking_pin(
+            &mut store,
+            weak_remote,
+            &weak_head,
+            "weak-branch",
+            &publisher,
+            true,
+        );
         assert_eq!(same, Some(weak_id));
-        assert!(is_weak_tracking_pin(&mut store, weak_id), "weak marker survives re-ensure");
+        assert!(
+            is_weak_tracking_pin(&mut store, weak_id),
+            "weak marker survives re-ensure"
+        );
     }
 }

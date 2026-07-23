@@ -24,12 +24,8 @@ use super::VariableSet;
 #[doc(hidden)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PatchProgramState {
-    Propose {
-        cursor: ResidualDeltaSourceCursor,
-    },
-    Confirm {
-        offset: usize,
-    },
+    Propose { cursor: ResidualDeltaSourceCursor },
+    Confirm { offset: usize },
     Support,
 }
 
@@ -317,10 +313,9 @@ impl<'a, T: InlineEncoding> PatchValueConstraint<'a, T> {
                 &[u8::MIN; INLINE_LEN],
                 &[u8::MAX; INLINE_LEN],
             ),
-            Some(value) => {
-                self.patch
-                    .next_infix_after(&[0; 0], value, &[u8::MAX; INLINE_LEN])
-            }
+            Some(value) => self
+                .patch
+                .next_infix_after(&[0; 0], value, &[u8::MAX; INLINE_LEN]),
         })
     }
 }
@@ -380,11 +375,7 @@ impl<'a, S: InlineEncoding> Constraint<'a> for PatchValueConstraint<'a, S> {
         true
     }
 
-    fn proposal_coverage(
-        &self,
-        variable: VariableId,
-        bound: VariableSet,
-    ) -> ProposalCoverage {
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
         if variable == self.variable.index && !bound.is_set(variable) {
             ProposalCoverage::Exact
         } else {
@@ -517,11 +508,10 @@ where
     ) -> ResidualDeltaSourcePage {
         direct_source_page(cursor, limit, accepted, |after| {
             let id = match after {
-                None => self.patch.first_infix_range(
-                    &[0; 0],
-                    &[u8::MIN; ID_LEN],
-                    &[u8::MAX; ID_LEN],
-                ),
+                None => {
+                    self.patch
+                        .first_infix_range(&[0; 0], &[u8::MIN; ID_LEN], &[u8::MAX; ID_LEN])
+                }
                 Some(value) => {
                     let id = id_from_value(value)?;
                     self.patch
@@ -591,11 +581,7 @@ where
         true
     }
 
-    fn proposal_coverage(
-        &self,
-        variable: VariableId,
-        bound: VariableSet,
-    ) -> ProposalCoverage {
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
         if variable == self.variable.index && !bound.is_set(variable) {
             ProposalCoverage::Exact
         } else {

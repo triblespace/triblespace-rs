@@ -24,17 +24,13 @@
 use ed25519_dalek::SigningKey;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::id::Id;
+use triblespace_core::inline::Inline;
+use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::prelude::{BlobStore, PinStore};
 use triblespace_core::repo::memoryrepo::MemoryRepo;
-use triblespace_core::repo::{
-    BlobStoreGet, BlobStoreList, BlobStorePut, Repository,
-};
+use triblespace_core::repo::{BlobStoreGet, BlobStoreList, BlobStorePut, Repository};
 use triblespace_core::trible::TribleSet;
-use triblespace_core::inline::encodings::hash::Handle;
-use triblespace_core::inline::Inline;
-use triblespace_net::tracking::{
-    ensure_tracking_pin, merge_tracking_into_local, MergeOutcome,
-};
+use triblespace_net::tracking::{MergeOutcome, ensure_tracking_pin, merge_tracking_into_local};
 
 fn new_repo(seed: u8) -> Repository<MemoryRepo> {
     let signing_key = SigningKey::from_bytes(&[seed; 32]);
@@ -47,10 +43,7 @@ fn new_repo(seed: u8) -> Repository<MemoryRepo> {
 /// from head" fetch.
 fn copy_all_blobs(src: &mut Repository<MemoryRepo>, dst: &mut Repository<MemoryRepo>) {
     let reader = src.storage_mut().reader().expect("src reader");
-    let handles: Vec<_> = reader
-        .blobs()
-        .filter_map(|r| r.ok())
-        .collect();
+    let handles: Vec<_> = reader.blobs().filter_map(|r| r.ok()).collect();
     for handle in handles {
         let bytes: anybytes::Bytes = reader
             .get::<anybytes::Bytes, triblespace_core::blob::encodings::UnknownBlob>(handle)
@@ -145,7 +138,10 @@ fn sequential_sync_converges_under_divergent_commits() {
     );
     let a_after_merge = head_commit(&mut a, "main");
     assert_ne!(a_after_merge, initial_a, "A's main should advance");
-    assert_ne!(a_after_merge, initial_b, "A's main must not equal B's commit");
+    assert_ne!(
+        a_after_merge, initial_b,
+        "A's main must not equal B's commit"
+    );
 
     // Second sync: B pulls A's state — which now includes AM — and
     // observes that its own local head (commit_B) is already in the
@@ -163,7 +159,10 @@ fn sequential_sync_converges_under_divergent_commits() {
         final_a, final_b,
         "sequential sync must converge in one round-pair"
     );
-    assert_eq!(final_a, a_after_merge, "B converges to A's merge, not a new one");
+    assert_eq!(
+        final_a, a_after_merge,
+        "B converges to A's merge, not a new one"
+    );
 
     // A third sync round is now a no-op on both sides.
     let a_again = sync_round(&mut a, &mut b, "main", &pub_b);
@@ -208,14 +207,10 @@ fn parallel_merges_produce_identical_commits() {
     let a_head = remote_head_hash(&mut a, "main");
     let b_head = remote_head_hash(&mut b, "main");
 
-    let tracking_in_a = ensure_tracking_pin(
-        a.storage_mut(), b_branch_id, &b_head, "main", &pub_b, false,
-    )
-    .unwrap();
-    let tracking_in_b = ensure_tracking_pin(
-        b.storage_mut(), a_branch_id, &a_head, "main", &pub_a, false,
-    )
-    .unwrap();
+    let tracking_in_a =
+        ensure_tracking_pin(a.storage_mut(), b_branch_id, &b_head, "main", &pub_b, false).unwrap();
+    let tracking_in_b =
+        ensure_tracking_pin(b.storage_mut(), a_branch_id, &a_head, "main", &pub_a, false).unwrap();
 
     // Parallel merge: both sides merge against their pre-merge views,
     // against the same parent set.

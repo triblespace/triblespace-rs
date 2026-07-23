@@ -51,8 +51,7 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use triblespace_core::inline::encodings::genid::GenId;
-use triblespace_core::inline::{RawInline, IntoInline, Inline, InlineEncoding};
-
+use triblespace_core::inline::{Inline, InlineEncoding, IntoInline, RawInline};
 
 /// Classic BM25 tuning. Defaults match Robertson & Zaragoza 2009.
 const DEFAULT_K1: f32 = 1.5;
@@ -201,7 +200,12 @@ impl<D: InlineEncoding, T: InlineEncoding> BM25Builder<D, T> {
     /// [`build_naive`][Self::build_naive]. Use [`build`][Self::build]
     /// for the production path.
     pub fn build_naive_with_threads(self, threads: usize) -> BM25Index<D, T> {
-        let Self { docs, k1, b, _phantom } = self;
+        let Self {
+            docs,
+            k1,
+            b,
+            _phantom,
+        } = self;
         let n_docs = docs.len();
 
         // Per-doc token count; average doc length for normalization.
@@ -327,7 +331,6 @@ impl<D: InlineEncoding, T: InlineEncoding> BM25Builder<D, T> {
     }
 }
 
-
 /// Accumulate token-frequency counts for one doc into `m`.
 fn accumulate_tfs(
     m: &mut HashMap<RawInline, HashMap<u32, u32>>,
@@ -438,8 +441,10 @@ impl<D: InlineEncoding, T: InlineEncoding> BM25Index<D, T> {
                 *acc.entry(doc.raw).or_insert(0.0) += score;
             }
         }
-        let mut out: Vec<(Inline<D>, f32)> =
-            acc.into_iter().map(|(raw, s)| (Inline::<D>::new(raw), s)).collect();
+        let mut out: Vec<(Inline<D>, f32)> = acc
+            .into_iter()
+            .map(|(raw, s)| (Inline::<D>::new(raw), s))
+            .collect();
         out.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         out
     }
@@ -546,7 +551,6 @@ impl<D: InlineEncoding, T: InlineEncoding> PartialEq for BM25Index<D, T> {
 
 impl<D: InlineEncoding, T: InlineEncoding> Eq for BM25Index<D, T> {}
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,7 +584,7 @@ mod tests {
     #[test]
     fn insert_indexes_by_string_key() {
         use triblespace_core::inline::encodings::shortstring::ShortString;
-        use triblespace_core::inline::{IntoInline, Inline};
+        use triblespace_core::inline::{Inline, IntoInline};
 
         let mut b: BM25Builder<ShortString> = BM25Builder::new();
         let red: Inline<ShortString> = "red".to_inline();
@@ -669,10 +673,8 @@ mod tests {
         let idx = b.build();
 
         let foo = hash_tokens("foo");
-        let scores: HashMap<RawInline, f32> = idx
-            .query_term(&foo[0])
-            .map(|(v, s)| (v.raw, s))
-            .collect();
+        let scores: HashMap<RawInline, f32> =
+            idx.query_term(&foo[0]).map(|(v, s)| (v.raw, s)).collect();
         let s1 = scores[&id_key(1)];
         let s2 = scores[&id_key(2)];
         assert!(s2 > s1);
@@ -777,8 +779,7 @@ mod tests {
 
     #[test]
     fn parallel_build_on_empty_corpus() {
-        let idx = BM25Builder::<GenId, crate::tokens::WordHash>::new()
-            .build_naive_with_threads(4);
+        let idx = BM25Builder::<GenId, crate::tokens::WordHash>::new().build_naive_with_threads(4);
         assert_eq!(idx.doc_count(), 0);
         assert_eq!(idx.term_count(), 0);
     }
@@ -814,8 +815,17 @@ mod tests {
         let q = ngram_tokens("fox", 3);
         let hits: Vec<_> = idx.query_multi(&q);
         let doc_ids: Vec<_> = hits.iter().map(|(d, _)| *d).collect();
-        assert!(doc_ids.iter().any(|v| v.raw == id_key(1)), "prefix should match 'foxes'");
-        assert!(doc_ids.iter().any(|v| v.raw == id_key(3)), "prefix should match 'fox'");
-        assert!(!doc_ids.iter().any(|v| v.raw == id_key(2)), "must not match 'dog'");
+        assert!(
+            doc_ids.iter().any(|v| v.raw == id_key(1)),
+            "prefix should match 'foxes'"
+        );
+        assert!(
+            doc_ids.iter().any(|v| v.raw == id_key(3)),
+            "prefix should match 'fox'"
+        );
+        assert!(
+            !doc_ids.iter().any(|v| v.raw == id_key(2)),
+            "must not match 'dog'"
+        );
     }
 }

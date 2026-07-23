@@ -15,7 +15,8 @@ use triblespace::prelude::*;
 #[test]
 fn workspace_commit_updates_head() {
     let storage = MemoryRepo::default();
-    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+    let mut repo =
+        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
@@ -27,7 +28,8 @@ fn workspace_commit_updates_head() {
 #[test]
 fn workspace_checkout_empty_branch_returns_empty_set() {
     let storage = MemoryRepo::default();
-    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+    let mut repo =
+        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
@@ -41,7 +43,8 @@ fn workspace_checkout_unions_commits() {
     use triblespace::core::inline::encodings::r256::R256;
 
     let storage = MemoryRepo::default();
-    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+    let mut repo =
+        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
@@ -78,7 +81,8 @@ fn workspace_checkout_single_commit() {
     use triblespace::core::inline::encodings::r256::R256;
 
     let storage = MemoryRepo::default();
-    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+    let mut repo =
+        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
@@ -102,7 +106,8 @@ fn workspace_checkout_vec_commits() {
     use triblespace::core::inline::encodings::r256::R256;
 
     let storage = MemoryRepo::default();
-    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+    let mut repo =
+        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
@@ -142,7 +147,8 @@ fn workspace_checkout_metadata_returns_repo_metadata() {
     meta.insert(&meta_t);
 
     let storage = MemoryRepo::default();
-    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), meta.clone()).unwrap();
+    let mut repo =
+        Repository::new(storage, SigningKey::generate(&mut OsRng), meta.clone()).unwrap();
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
@@ -170,7 +176,8 @@ fn workspace_checkout_with_metadata_returns_both() {
     meta.insert(&meta_t);
 
     let storage = MemoryRepo::default();
-    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), meta.clone()).unwrap();
+    let mut repo =
+        Repository::new(storage, SigningKey::generate(&mut OsRng), meta.clone()).unwrap();
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
@@ -204,7 +211,8 @@ fn workspace_commit_uses_repo_metadata() {
     meta.insert(&meta_t);
 
     let storage = MemoryRepo::default();
-    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), meta.clone()).unwrap();
+    let mut repo =
+        Repository::new(storage, SigningKey::generate(&mut OsRng), meta.clone()).unwrap();
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
@@ -231,7 +239,8 @@ fn workspace_checkout_range_variants() {
     use triblespace::core::inline::encodings::r256::R256;
 
     let storage = MemoryRepo::default();
-    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+    let mut repo =
+        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
@@ -270,15 +279,16 @@ fn workspace_checkout_range_stops_at_explicit_boundaries() {
 
     use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace::core::blob::Blob;
-    use triblespace::core::repo::commit::commit_metadata;
     use triblespace::core::inline::encodings::hash::Handle;
     use triblespace::core::inline::encodings::r256::R256;
     use triblespace::core::inline::Inline;
+    use triblespace::core::repo::commit::commit_metadata;
 
     type CommitHandle = Inline<Handle<SimpleArchive>>;
 
     let storage = MemoryRepo::default();
-    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+    let mut repo =
+        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
@@ -344,7 +354,8 @@ fn workspace_checkout_symmetric_diff() {
     use triblespace::core::inline::encodings::r256::R256;
 
     let storage = MemoryRepo::default();
-    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+    let mut repo =
+        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
@@ -374,7 +385,8 @@ fn workspace_checkout_set_operation_selectors() {
     use triblespace::core::inline::encodings::r256::R256;
 
     let storage = MemoryRepo::default();
-    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+    let mut repo =
+        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
@@ -419,7 +431,8 @@ fn workspace_get_local_and_base() {
     use triblespace::core::inline::encodings::r256::R256;
 
     let storage = MemoryRepo::default();
-    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+    let mut repo =
+        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
@@ -449,7 +462,8 @@ fn workspace_checkout_head_collects_history() {
     use triblespace::core::inline::encodings::r256::R256;
 
     let storage = MemoryRepo::default();
-    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+    let mut repo =
+        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
@@ -480,7 +494,8 @@ fn workspace_nth_ancestor_selector() {
     use triblespace::core::inline::encodings::r256::R256;
 
     let storage = MemoryRepo::default();
-    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+    let mut repo =
+        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
@@ -514,7 +529,8 @@ fn workspace_parents_selector() {
     use triblespace::core::inline::encodings::r256::R256;
 
     let storage = MemoryRepo::default();
-    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+    let mut repo =
+        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
 
     // Base commit so both workspaces share a common ancestor.
     let main_branch_id = repo.create_branch("main", None).expect("create branch");
@@ -567,7 +583,8 @@ fn workspace_history_of_entity() {
     use triblespace::core::inline::encodings::r256::R256;
 
     let storage = MemoryRepo::default();
-    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+    let mut repo =
+        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 

@@ -24,9 +24,9 @@ use std::time::Instant;
 use anybytes::area::ByteArea;
 
 use triblespace_core::blob::{BlobCache, MemoryBlobStore};
-use triblespace_core::repo::BlobStore;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Inline;
+use triblespace_core::repo::BlobStore;
 
 use triblespace_search::hnsw::HNSWBuilder;
 use triblespace_search::ring::RingGraph;
@@ -56,10 +56,7 @@ fn build_hnsw(
     n: usize,
     dim: usize,
     seed: u64,
-) -> (
-    triblespace_search::testing::HNSWIndex,
-    MemoryBlobStore,
-) {
+) -> (triblespace_search::testing::HNSWIndex, MemoryBlobStore) {
     let mut rng = Rng(seed);
     let mut store = MemoryBlobStore::new();
     let mut b = HNSWBuilder::new(dim).with_seed(seed);
@@ -73,13 +70,10 @@ fn build_hnsw(
 
 /// Encode the HNSW graph as the existing `SuccinctGraph`
 /// (CSR per (layer, node) with shared padding).
-fn encode_csr(
-    naive: &triblespace_search::testing::HNSWIndex,
-) -> (usize, SuccinctGraph) {
+fn encode_csr(naive: &triblespace_search::testing::HNSWIndex) -> (usize, SuccinctGraph) {
     let n = naive.doc_count();
     let n_layers = naive.max_level() as usize + 1;
-    let mut layers: Vec<Vec<Vec<u32>>> =
-        (0..n_layers).map(|_| vec![Vec::new(); n]).collect();
+    let mut layers: Vec<Vec<Vec<u32>>> = (0..n_layers).map(|_| vec![Vec::new(); n]).collect();
     for i in 0..n {
         let lvl = naive.node_level(i).unwrap() as usize;
         for l in 0..=lvl {
@@ -95,9 +89,7 @@ fn encode_csr(
 /// Encode the HNSW graph as one `RingGraph` per layer.
 /// Each layer's edge list is canonicalized to undirected
 /// `(low, high)` pairs, deduplicated, sorted.
-fn encode_ring(
-    naive: &triblespace_search::testing::HNSWIndex,
-) -> (usize, Vec<RingGraph>) {
+fn encode_ring(naive: &triblespace_search::testing::HNSWIndex) -> (usize, Vec<RingGraph>) {
     let n = naive.doc_count();
     let n_layers = naive.max_level() as usize + 1;
 
@@ -153,7 +145,9 @@ impl PartialOrd for MinDist {
 }
 impl Ord for MinDist {
     fn cmp(&self, o: &Self) -> std::cmp::Ordering {
-        o.dist.partial_cmp(&self.dist).unwrap_or(std::cmp::Ordering::Equal)
+        o.dist
+            .partial_cmp(&self.dist)
+            .unwrap_or(std::cmp::Ordering::Equal)
     }
 }
 #[derive(Clone, Copy)]
@@ -174,7 +168,9 @@ impl PartialOrd for MaxDist {
 }
 impl Ord for MaxDist {
     fn cmp(&self, o: &Self) -> std::cmp::Ordering {
-        self.dist.partial_cmp(&o.dist).unwrap_or(std::cmp::Ordering::Equal)
+        self.dist
+            .partial_cmp(&o.dist)
+            .unwrap_or(std::cmp::Ordering::Equal)
     }
 }
 
@@ -228,9 +224,15 @@ where
     visited.insert(curr);
     let d0 = dist(curr);
     let mut cands: BinaryHeap<MinDist> = BinaryHeap::new();
-    cands.push(MinDist { idx: curr, dist: d0 });
+    cands.push(MinDist {
+        idx: curr,
+        dist: d0,
+    });
     let mut results: BinaryHeap<MaxDist> = BinaryHeap::new();
-    results.push(MaxDist { idx: curr, dist: d0 });
+    results.push(MaxDist {
+        idx: curr,
+        dist: d0,
+    });
     while let Some(c) = cands.pop() {
         let farthest = results.peek().map(|r| r.dist).unwrap_or(f32::INFINITY);
         if c.dist > farthest && results.len() >= ef {
@@ -251,8 +253,7 @@ where
             }
         }
     }
-    let mut ranked: Vec<(u32, f32)> =
-        results.into_iter().map(|m| (m.idx, 1.0 - m.dist)).collect();
+    let mut ranked: Vec<(u32, f32)> = results.into_iter().map(|m| (m.idx, 1.0 - m.dist)).collect();
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     ranked.truncate(k);
     ranked
@@ -294,10 +295,7 @@ fn bench(n: usize, dim: usize, k: usize, ef: usize, seed: u64) {
 
     let (csr_size, csr) = encode_csr(&naive);
     let (ring_size, rings) = encode_ring(&naive);
-    println!(
-        "   CSR  graph blob: {}",
-        fmt_bytes(csr_size),
-    );
+    println!("   CSR  graph blob: {}", fmt_bytes(csr_size),);
     println!(
         "   Ring graph blob: {}   ({:.2}× CSR)",
         fmt_bytes(ring_size),
@@ -313,9 +311,8 @@ fn bench(n: usize, dim: usize, k: usize, ef: usize, seed: u64) {
 
     // ─ CSR run ─
     let cache_csr = BlobCache::new(reader.clone());
-    let neigh_csr = |v: u32, l: u8| -> Vec<u32> {
-        csr.neighbours(v as usize, l as usize).collect()
-    };
+    let neigh_csr =
+        |v: u32, l: u8| -> Vec<u32> { csr.neighbours(v as usize, l as usize).collect() };
     // Warm the cache (one query) before timing.
     {
         let q = &queries[0];
@@ -344,9 +341,8 @@ fn bench(n: usize, dim: usize, k: usize, ef: usize, seed: u64) {
 
     // ─ Ring run ─
     let cache_ring = BlobCache::new(reader.clone());
-    let neigh_ring = |v: u32, l: u8| -> Vec<u32> {
-        rings[l as usize].neighbours(v as usize).collect()
-    };
+    let neigh_ring =
+        |v: u32, l: u8| -> Vec<u32> { rings[l as usize].neighbours(v as usize).collect() };
     {
         let q = &queries[0];
         let dist = |i: u32| {
@@ -403,16 +399,14 @@ fn bench(n: usize, dim: usize, k: usize, ef: usize, seed: u64) {
         let v: &[f32] = view.as_ref().as_ref();
         1.0 - q.iter().zip(v.iter()).map(|(a, b)| a * b).sum::<f32>()
     };
-    let csr_top: HashSet<u32> =
-        walk(entry, max_level, q, k, ef, neigh_csr, dist_csr)
-            .into_iter()
-            .map(|(i, _)| i)
-            .collect();
-    let ring_top: HashSet<u32> =
-        walk(entry, max_level, q, k, ef, neigh_ring, dist_ring)
-            .into_iter()
-            .map(|(i, _)| i)
-            .collect();
+    let csr_top: HashSet<u32> = walk(entry, max_level, q, k, ef, neigh_csr, dist_csr)
+        .into_iter()
+        .map(|(i, _)| i)
+        .collect();
+    let ring_top: HashSet<u32> = walk(entry, max_level, q, k, ef, neigh_ring, dist_ring)
+        .into_iter()
+        .map(|(i, _)| i)
+        .collect();
     let overlap = csr_top.intersection(&ring_top).count();
     println!(
         "   top-{k} overlap on sample query: {overlap}/{}",

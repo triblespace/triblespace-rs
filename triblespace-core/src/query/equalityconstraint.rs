@@ -214,7 +214,10 @@ impl TypedProgramSpec for EqualityConstraint {
                         batch.candidate_sets[input].is_none(),
                         "typed equality proposal received a candidate group"
                     );
-                    assert!(batch.limits[input] > 0, "typed equality proposal has zero demand");
+                    assert!(
+                        batch.limits[input] > 0,
+                        "typed equality proposal has zero demand"
+                    );
                     effects.direct(
                         u32::try_from(input).expect("too many typed equality inputs"),
                         batch.view.row(input)[peer_column],
@@ -272,9 +275,8 @@ impl TypedProgramSpec for EqualityConstraint {
                         "typed equality support received a candidate group"
                     );
                     if self.support_row(&batch.view, batch.view.row(input)) {
-                        effects.support(
-                            u32::try_from(input).expect("too many typed equality inputs"),
-                        );
+                        effects
+                            .support(u32::try_from(input).expect("too many typed equality inputs"));
                     }
                     effects.page(1, None);
                 }
@@ -298,11 +300,7 @@ impl<'c> Constraint<'c> for EqualityConstraint {
     /// Equality becomes an exact finite source only after the peer variable is
     /// bound. With both variables free it remains a validator rather than
     /// pretending to own the universe of raw values.
-    fn proposal_coverage(
-        &self,
-        variable: VariableId,
-        bound: VariableSet,
-    ) -> ProposalCoverage {
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
         if bound.is_set(variable) {
             return ProposalCoverage::None;
         }

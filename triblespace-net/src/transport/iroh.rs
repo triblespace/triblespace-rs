@@ -94,8 +94,7 @@ impl Transport for IrohTransport {
     }
 
     async fn dial(&self, peer: PeerId, alpn: Alpn) -> anyhow::Result<Self::Conn> {
-        let id = EndpointId::from_bytes(&peer)
-            .map_err(|e| anyhow::anyhow!("peer id: {e}"))?;
+        let id = EndpointId::from_bytes(&peer).map_err(|e| anyhow::anyhow!("peer id: {e}"))?;
         let conn = self
             .ep
             .connect(id, alpn)
@@ -171,8 +170,8 @@ pub async fn bind(
     secret: iroh_base::SecretKey,
     config: &PeerConfig,
 ) -> Option<Harness<IrohTransport>> {
-    use iroh::endpoint::presets;
     use iroh::Endpoint;
+    use iroh::endpoint::presets;
 
     // Use the OS trust store (via rustls-platform-verifier) rather
     // than the compiled-in Mozilla webpki-roots bundle. The default
@@ -229,10 +228,7 @@ pub async fn bind(
 /// notably an `iroh::test_utils` `TestNetwork` endpoint for integration
 /// tests that wire two real `Peer`s over a virtual transport (no relays,
 /// no DNS), the way `auth_handshake_e2e` does for raw endpoints.
-pub async fn bind_with_endpoint(
-    ep: iroh::Endpoint,
-    config: &PeerConfig,
-) -> Harness<IrohTransport> {
+pub async fn bind_with_endpoint(ep: iroh::Endpoint, config: &PeerConfig) -> Harness<IrohTransport> {
     use iroh::protocol::Router;
     use iroh_gossip::Gossip;
 

@@ -6,9 +6,9 @@
 //! ```
 
 use triblespace_core::id::Id;
-use triblespace_core::macros::find;
 use triblespace_core::inline::encodings::genid::GenId;
-use triblespace_core::inline::{IntoInline, Inline};
+use triblespace_core::inline::{Inline, IntoInline};
+use triblespace_core::macros::find;
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::succinct::SuccinctBM25Index;
 use triblespace_search::tokens::hash_tokens;

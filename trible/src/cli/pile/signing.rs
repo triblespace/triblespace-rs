@@ -33,8 +33,8 @@ fn load_key_from_file(p: &Path) -> Result<SigningKey, anyhow::Error> {
             p.display()
         );
     }
-    let bytes = hex::decode(hexstr)
-        .map_err(|e| anyhow::anyhow!("invalid hex in signing key file: {e}"))?;
+    let bytes =
+        hex::decode(hexstr).map_err(|e| anyhow::anyhow!("invalid hex in signing key file: {e}"))?;
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes);
     Ok(SigningKey::from_bytes(&arr))

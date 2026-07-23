@@ -113,10 +113,7 @@ impl Parse for AttributesInput {
     }
 }
 
-pub fn attributes_impl(
-    input: TokenStream2,
-    base_path: &TokenStream2,
-) -> syn::Result<TokenStream2> {
+pub fn attributes_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result<TokenStream2> {
     let AttributesInput { attributes } = syn::parse2(input)?;
 
     let mut out: TokenStream2 = TokenStream2::new();

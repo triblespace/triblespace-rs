@@ -142,11 +142,7 @@ where
         true
     }
 
-    fn proposal_coverage(
-        &self,
-        variable: VariableId,
-        bound: VariableSet,
-    ) -> ProposalCoverage {
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
         if variable == self.variable.index && !bound.is_set(variable) {
             ProposalCoverage::Exact
         } else {

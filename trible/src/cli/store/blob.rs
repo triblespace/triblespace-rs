@@ -7,6 +7,8 @@ use crate::cli::util::parse_blob_handle;
 use object_store::parse_url;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::Bytes;
+use triblespace_core::inline::encodings::hash::Blake3;
+use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::async_store::Blocking;
 use triblespace_core::repo::objectstore::ObjectStoreRemote;
 use triblespace_core::repo::BlobStore;
@@ -14,8 +16,6 @@ use triblespace_core::repo::BlobStoreForget;
 use triblespace_core::repo::BlobStoreGet;
 use triblespace_core::repo::BlobStoreList;
 use triblespace_core::repo::BlobStoreMeta;
-use triblespace_core::inline::encodings::hash::Blake3;
-use triblespace_core::inline::encodings::hash::Handle;
 use url::Url;
 
 #[derive(Parser)]
@@ -116,8 +116,7 @@ pub fn run(cmd: Command) -> Result<()> {
             let url = Url::parse(&url)?;
             let mut remote = Blocking::new(ObjectStoreRemote::with_url(&url)?)?;
             let hash_val = parse_blob_handle(&handle)?;
-            let handle_val: triblespace_core::inline::Inline<Handle<UnknownBlob>> =
-                hash_val.into();
+            let handle_val: triblespace_core::inline::Inline<Handle<UnknownBlob>> = hash_val.into();
             let reader = remote
                 .reader()
                 .map_err(|e| anyhow::anyhow!("remote reader error: {e:?}"))?;
@@ -129,14 +128,13 @@ pub fn run(cmd: Command) -> Result<()> {
         Command::Inspect { url, handle } => {
             use file_type::FileType;
             use object_store::parse_url;
-            
+
             use triblespace_core::blob::Blob;
 
             let url = Url::parse(&url)?;
             let mut remote = Blocking::new(ObjectStoreRemote::with_url(&url)?)?;
             let hash_val = parse_blob_handle(&handle)?;
-            let handle_val: triblespace_core::inline::Inline<Handle<UnknownBlob>> =
-                hash_val.into();
+            let handle_val: triblespace_core::inline::Inline<Handle<UnknownBlob>> = hash_val.into();
             let handle_str: String = hash_val.clone().from_inline();
             let reader = remote
                 .reader()
@@ -177,8 +175,7 @@ pub fn run(cmd: Command) -> Result<()> {
             let mut remote = Blocking::new(ObjectStoreRemote::with_url(&url)?)?;
             let (_store, _path) = parse_url(&url)?;
             let hash_val = parse_blob_handle(&handle)?;
-            let handle_val: triblespace_core::inline::Inline<Handle<UnknownBlob>> =
-                hash_val.into();
+            let handle_val: triblespace_core::inline::Inline<Handle<UnknownBlob>> = hash_val.into();
             let blob_handle = handle_val;
             // forget is idempotent
             remote.forget(blob_handle)?;

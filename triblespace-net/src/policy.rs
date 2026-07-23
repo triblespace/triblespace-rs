@@ -129,24 +129,20 @@ pub const KIND_PENDING_REQUESTS: Id =
 /// Pin holds A's own cap chain for a specific team. The pin head
 /// metadata also carries `cap_for_team: <team_root_pubkey>` so a
 /// peer with membership in multiple teams can distinguish them.
-pub const KIND_TEAM_CAP: Id =
-    triblespace_core::id::id_hex!("9BB2E5027EDB67463CC6A7A85B6C362D");
+pub const KIND_TEAM_CAP: Id = triblespace_core::id::id_hex!("9BB2E5027EDB67463CC6A7A85B6C362D");
 
 // ── Request status tags ───────────────────────────────────────────────
 
 /// Request received, not yet acted on. CLI's `team list-pending`
 /// shows entries with this status.
-pub const STATUS_PENDING: Id =
-    triblespace_core::id::id_hex!("08A49DEBF036B127CF60D8B33A7B9B31");
+pub const STATUS_PENDING: Id = triblespace_core::id::id_hex!("08A49DEBF036B127CF60D8B33A7B9B31");
 
 /// Request approved; a cap was issued and dispatched via
 /// `OP_DELIVER_CAP`. The corresponding renewal-policy entry exists.
-pub const STATUS_APPROVED: Id =
-    triblespace_core::id::id_hex!("6186747FD38D84D23BA82F3ABE6D9952");
+pub const STATUS_APPROVED: Id = triblespace_core::id::id_hex!("6186747FD38D84D23BA82F3ABE6D9952");
 
 /// Request explicitly rejected. No cap issued.
-pub const STATUS_REJECTED: Id =
-    triblespace_core::id::id_hex!("3E54420C1F7EECFCED83203FA749C912");
+pub const STATUS_REJECTED: Id = triblespace_core::id::id_hex!("3E54420C1F7EECFCED83203FA749C912");
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
@@ -158,9 +154,15 @@ pub fn is_local_only_pin<S>(store: &mut S, branch_id: Id) -> bool
 where
     S: BlobStore + PinStore,
 {
-    let Ok(Some(head_handle)) = store.head(branch_id) else { return false; };
-    let Ok(reader) = store.reader() else { return false; };
-    let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(head_handle) else { return false; };
+    let Ok(Some(head_handle)) = store.head(branch_id) else {
+        return false;
+    };
+    let Ok(reader) = store.reader() else {
+        return false;
+    };
+    let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(head_handle) else {
+        return false;
+    };
     find!(
         kind: Id,
         pattern!(&meta, [{ _?e @ local_only_pin: ?kind }])
@@ -174,24 +176,23 @@ where
 /// `local_only_pin = KIND_TEAM_CAP` + `cap_for_team =
 /// team_root`. Returns the pin id (caller can fetch the head or
 /// list commits as needed).
-pub fn find_team_cap_pin<S>(
-    store: &mut S,
-    team_root: ed25519_dalek::VerifyingKey,
-) -> Option<Id>
+pub fn find_team_cap_pin<S>(store: &mut S, team_root: ed25519_dalek::VerifyingKey) -> Option<Id>
 where
     S: BlobStore + PinStore,
 {
     use triblespace_core::inline::IntoInline;
     let team_root_inline: Inline<ED25519PublicKey> = team_root.to_inline();
-    let bids: Vec<Id> = store
-        .pins()
-        .ok()?
-        .filter_map(|r| r.ok())
-        .collect();
+    let bids: Vec<Id> = store.pins().ok()?.filter_map(|r| r.ok()).collect();
     for bid in bids {
-        let Ok(Some(head)) = store.head(bid) else { continue; };
-        let Ok(reader) = store.reader() else { continue; };
-        let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(head) else { continue; };
+        let Ok(Some(head)) = store.head(bid) else {
+            continue;
+        };
+        let Ok(reader) = store.reader() else {
+            continue;
+        };
+        let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(head) else {
+            continue;
+        };
         let matches = find!(
             (kind: Id, team: Inline<ED25519PublicKey>),
             pattern!(&meta, [{
@@ -215,15 +216,17 @@ pub fn find_local_only_pin_of_kind<S>(store: &mut S, kind: Id) -> Option<Id>
 where
     S: BlobStore + PinStore,
 {
-    let bids: Vec<Id> = store
-        .pins()
-        .ok()?
-        .filter_map(|r| r.ok())
-        .collect();
+    let bids: Vec<Id> = store.pins().ok()?.filter_map(|r| r.ok()).collect();
     for bid in bids {
-        let Ok(Some(head)) = store.head(bid) else { continue; };
-        let Ok(reader) = store.reader() else { continue; };
-        let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(head) else { continue; };
+        let Ok(Some(head)) = store.head(bid) else {
+            continue;
+        };
+        let Ok(reader) = store.reader() else {
+            continue;
+        };
+        let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(head) else {
+            continue;
+        };
         let matches = find!(
             k: Id,
             pattern!(&meta, [{ _?e @ local_only_pin: ?k }])
@@ -262,9 +265,15 @@ where
     let Some(bid) = find_local_only_pin_of_kind(store, KIND_PENDING_REQUESTS) else {
         return Vec::new();
     };
-    let Ok(Some(head)) = store.head(bid) else { return Vec::new(); };
-    let Ok(reader) = store.reader() else { return Vec::new(); };
-    let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(head) else { return Vec::new(); };
+    let Ok(Some(head)) = store.head(bid) else {
+        return Vec::new();
+    };
+    let Ok(reader) = store.reader() else {
+        return Vec::new();
+    };
+    let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(head) else {
+        return Vec::new();
+    };
 
     find!(
         (
@@ -282,13 +291,15 @@ where
             request_status: ?status,
         }])
     )
-    .map(|(id, requester, partial_cap, received_at, status)| PendingRequest {
-        id,
-        requester,
-        partial_cap,
-        received_at,
-        status,
-    })
+    .map(
+        |(id, requester, partial_cap, received_at, status)| PendingRequest {
+            id,
+            requester,
+            partial_cap,
+            received_at,
+            status,
+        },
+    )
     .collect()
 }
 
@@ -312,10 +323,7 @@ where
     S: BlobStore + BlobStorePut + PinStore,
 {
     // Find or create the pending-requests pin.
-    let (bid, prev_head) = match find_local_only_pin_of_kind(
-        store,
-        KIND_PENDING_REQUESTS,
-    ) {
+    let (bid, prev_head) = match find_local_only_pin_of_kind(store, KIND_PENDING_REQUESTS) {
         Some(bid) => {
             let head = store.head(bid).ok().flatten();
             (bid, head)
@@ -476,9 +484,15 @@ where
     let Some(bid) = find_local_only_pin_of_kind(store, KIND_RENEWAL_POLICY) else {
         return Vec::new();
     };
-    let Ok(Some(head)) = store.head(bid) else { return Vec::new(); };
-    let Ok(reader) = store.reader() else { return Vec::new(); };
-    let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(head) else { return Vec::new(); };
+    let Ok(Some(head)) = store.head(bid) else {
+        return Vec::new();
+    };
+    let Ok(reader) = store.reader() else {
+        return Vec::new();
+    };
+    let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(head) else {
+        return Vec::new();
+    };
 
     // Required fields (issued_at, latest cap/sig, subject, scope).
     let core: Vec<(
@@ -562,10 +576,7 @@ where
 /// in the next hour or already has. The window should be > the
 /// daemon's tick cadence so a renewal isn't missed across one
 /// missed tick.
-pub fn renewable_within<S>(
-    store: &mut S,
-    renewal_window: hifitime::Duration,
-) -> Vec<PolicyEntry>
+pub fn renewable_within<S>(store: &mut S, renewal_window: hifitime::Duration) -> Vec<PolicyEntry>
 where
     S: BlobStore + PinStore,
 {
@@ -781,10 +792,7 @@ where
 /// on subsequent ticks; only renewable_within (near-expiry) picks
 /// it up again, and `update_policy_entry` clears the field when the
 /// daemon re-signs.
-pub fn mark_policy_delivered<S>(
-    store: &mut S,
-    entry_id: Id,
-) -> Option<()>
+pub fn mark_policy_delivered<S>(store: &mut S, entry_id: Id) -> Option<()>
 where
     S: BlobStore + BlobStorePut + PinStore,
 {
@@ -812,8 +820,7 @@ where
     }
 
     let now = crate::clock::epoch_now();
-    let delivered_at: Inline<NsTAIInterval> =
-        (now, now).try_to_inline().ok()?;
+    let delivered_at: Inline<NsTAIInterval> = (now, now).try_to_inline().ok()?;
 
     let trible: TribleSet = entity! {
         ExclusiveId::force_ref(&entry_id) @
@@ -854,10 +861,7 @@ where
 /// = now`). The daemon's `renewable_within` filter then skips it on
 /// subsequent ticks; the corresponding peer's chain dies naturally at
 /// the current cap's expiry.
-pub fn retract_policy_entry<S>(
-    store: &mut S,
-    entry_id: Id,
-) -> Option<()>
+pub fn retract_policy_entry<S>(store: &mut S, entry_id: Id) -> Option<()>
 where
     S: BlobStore + BlobStorePut + PinStore,
 {
@@ -870,8 +874,7 @@ where
     let mut meta: TribleSet = reader.get::<TribleSet, SimpleArchive>(prev_head).ok()?;
 
     let now = crate::clock::epoch_now();
-    let retracted_at: Inline<NsTAIInterval> =
-        (now, now).try_to_inline().ok()?;
+    let retracted_at: Inline<NsTAIInterval> = (now, now).try_to_inline().ok()?;
 
     let trible: TribleSet = entity! {
         ExclusiveId::force_ref(&entry_id) @
@@ -893,11 +896,7 @@ where
 /// This is what `team approve` and (eventually) `team reject` call
 /// after they've taken their respective external actions (e.g. for
 /// approve: signed + dispatched `OP_DELIVER_CAP`).
-pub fn set_request_status<S>(
-    store: &mut S,
-    request_id: Id,
-    new_status: Id,
-) -> Option<()>
+pub fn set_request_status<S>(store: &mut S, request_id: Id, new_status: Id) -> Option<()>
 where
     S: BlobStore + BlobStorePut + PinStore,
 {
@@ -905,9 +904,7 @@ where
     let prev_head = store.head(bid).ok()??;
 
     let reader = store.reader().ok()?;
-    let mut meta: TribleSet = reader
-        .get::<TribleSet, SimpleArchive>(prev_head)
-        .ok()?;
+    let mut meta: TribleSet = reader.get::<TribleSet, SimpleArchive>(prev_head).ok()?;
 
     // Find the existing status trible and remove it; insert a fresh
     // one with the new status value. TribleSet is a set, so we
@@ -957,9 +954,7 @@ mod tests {
         (now, now).try_to_inline().expect("point interval")
     }
 
-    fn empty_partial_cap_handle(
-        store: &mut MemoryRepo,
-    ) -> Inline<Handle<SimpleArchive>> {
+    fn empty_partial_cap_handle(store: &mut MemoryRepo) -> Inline<Handle<SimpleArchive>> {
         let set = TribleSet::new();
         let blob: Blob<SimpleArchive> = {
             use triblespace_core::blob::IntoBlob;
@@ -977,13 +972,8 @@ mod tests {
         let partial_cap = empty_partial_cap_handle(&mut store);
 
         let received_at = point_now();
-        let id = record_pending_request(
-            &mut store,
-            requester,
-            partial_cap,
-            received_at,
-        )
-        .expect("record");
+        let id = record_pending_request(&mut store, requester, partial_cap, received_at)
+            .expect("record");
 
         let listed = list_pending_requests(&mut store);
         assert_eq!(listed.len(), 1);
@@ -1000,16 +990,13 @@ mod tests {
         let req2 = SigningKey::generate(&mut OsRng).verifying_key();
         let partial = empty_partial_cap_handle(&mut store);
 
-        let id1 = record_pending_request(&mut store, req1, partial, point_now())
-            .expect("record 1");
-        let id2 = record_pending_request(&mut store, req2, partial, point_now())
-            .expect("record 2");
+        let id1 = record_pending_request(&mut store, req1, partial, point_now()).expect("record 1");
+        let id2 = record_pending_request(&mut store, req2, partial, point_now()).expect("record 2");
         assert_ne!(id1, id2);
 
         let listed = list_pending_requests(&mut store);
         assert_eq!(listed.len(), 2);
-        let ids: std::collections::HashSet<Id> =
-            listed.iter().map(|p| p.id).collect();
+        let ids: std::collections::HashSet<Id> = listed.iter().map(|p| p.id).collect();
         assert!(ids.contains(&id1));
         assert!(ids.contains(&id2));
     }
@@ -1020,8 +1007,8 @@ mod tests {
         let requester = SigningKey::generate(&mut OsRng).verifying_key();
         let partial = empty_partial_cap_handle(&mut store);
 
-        let id = record_pending_request(&mut store, requester, partial, point_now())
-            .expect("record");
+        let id =
+            record_pending_request(&mut store, requester, partial, point_now()).expect("record");
 
         // Initial status is PENDING.
         let before = list_pending_requests(&mut store);
@@ -1043,11 +1030,11 @@ mod tests {
         let requester = SigningKey::generate(&mut OsRng).verifying_key();
         let partial = empty_partial_cap_handle(&mut store);
 
-        let _ = record_pending_request(&mut store, requester, partial, point_now())
-            .expect("record");
+        let _ =
+            record_pending_request(&mut store, requester, partial, point_now()).expect("record");
 
-        let bid = find_local_only_pin_of_kind(&mut store, KIND_PENDING_REQUESTS)
-            .expect("branch exists");
+        let bid =
+            find_local_only_pin_of_kind(&mut store, KIND_PENDING_REQUESTS).expect("branch exists");
         assert!(is_local_only_pin(&mut store, bid));
     }
 }

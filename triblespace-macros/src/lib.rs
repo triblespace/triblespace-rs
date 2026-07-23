@@ -242,9 +242,9 @@ impl Parse for AttributeDefinitions {
 }
 
 fn emit_attribute_definitions(context: &mut MetadataContext<'_>) {
+    use triblespace_core::inline::encodings::genid::GenId;
     use triblespace_core::metadata;
     use triblespace_core::prelude::InlineEncoding;
-    use triblespace_core::inline::encodings::genid::GenId;
 
     let Ok(parsed) =
         syn::parse2::<AttributeDefinitions>(TokenStream2::from(context.tokens().clone()))

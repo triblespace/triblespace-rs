@@ -71,8 +71,7 @@ pub use program::{
     ProgramPacing, ProgramPage, ProgramPhysicalReceipt, ProgramRef, ProgramRequest, ProgramResume,
     ProgramRoute, ProgramRuntime, ProgramSeedBatch, ProgramSeedEffects, ProgramSeedWork,
     ProgramStratum, ProgramWork, ProgramWorkHandle, TypedCompleteArbiter, TypedCompleteSink,
-    TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedResume,
-    TypedSeedSink,
+    TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink,
 };
 pub(crate) use program::{ProgramCompleteAdmission, ProgramCompleteAffinity};
 /// Re-export of [`PathOp`].

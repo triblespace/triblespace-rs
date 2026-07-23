@@ -11,10 +11,10 @@
 use tempfile::tempdir;
 use triblespace_core::find;
 use triblespace_core::id::Id;
-use triblespace_core::repo::pile::Pile;
-use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut};
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Inline;
+use triblespace_core::repo::pile::Pile;
+use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut};
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::hnsw::HNSWBuilder;
@@ -43,8 +43,7 @@ fn succinct_bm25_survives_pile_round_trip() {
     let original = b.build();
 
     let handle = {
-        let mut pile = Pile::open(&pile_path)
-            .expect("open pile");
+        let mut pile = Pile::open(&pile_path).expect("open pile");
         pile.refresh().expect("refresh empty pile");
         let h = pile
             .put::<SuccinctBM25Blob, _>(&original)
@@ -54,8 +53,7 @@ fn succinct_bm25_survives_pile_round_trip() {
     };
 
     // Reopen — exercises the actual on-disk load path.
-    let mut pile = Pile::open(&pile_path)
-        .expect("reopen pile");
+    let mut pile = Pile::open(&pile_path).expect("reopen pile");
     pile.refresh().expect("refresh");
     let reader = pile.reader().expect("reader");
     let reloaded: SuccinctBM25Index = reader
@@ -80,7 +78,7 @@ fn succinct_bm25_survives_pile_round_trip() {
 #[test]
 fn succinct_hnsw_survives_pile_round_trip() {
     use std::collections::HashSet;
-    
+
     use triblespace_search::schemas::put_embedding;
 
     let dir = tempdir().expect("tempdir");

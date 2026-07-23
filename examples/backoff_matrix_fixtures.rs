@@ -379,7 +379,10 @@ fn main() {
     // F2 ring — P2 (novelty-saturated fixpoint) + K>1 control.
     let (ring, r0) = build_chain(chain_n.min(20_000), true, 4);
     let r0i: Inline<GenId> = r0.to_inline();
-    println!("\n-- F2 ring fixpoint (n={}, K=4 sources control) --", chain_n.min(20_000));
+    println!(
+        "\n-- F2 ring fixpoint (n={}, K=4 sources control) --",
+        chain_n.min(20_000)
+    );
     let q = find!(
         (x: Inline<GenId>),
         temp!((s), and!(s.is(r0i), path!(ring.clone(), s r1_schema::mp+ x)))
@@ -402,9 +405,7 @@ fn main() {
 
     // F3 oasis-last — P3: take(1) with the oasis in the last-explored slot.
     let (oasis, _o0) = build_oasis(oasis_k, oasis_fan, 20);
-    println!(
-        "\n-- F3 oasis-last: k={oasis_k}, fan={oasis_fan}, deaths=20, take({take_budget}) --"
-    );
+    println!("\n-- F3 oasis-last: k={oasis_k}, fan={oasis_fan}, deaths=20, take({take_budget}) --");
     let q = find!(
         (e: Inline<GenId>, y: Inline<GenId>, z: Inline<GenId>),
         and!(

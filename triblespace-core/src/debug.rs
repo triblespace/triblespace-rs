@@ -457,14 +457,11 @@ pub mod query {
             let wrapped = EstimateOverrideConstraint::new(RootProducingSource { variable });
 
             assert!(wrapped.residual_proposal_source_is_paged(variable, &RowsView::EMPTY));
-            assert!(wrapped.residual_proposal_source_has_transition_roots(
-                variable,
-                &RowsView::EMPTY
-            ));
-            assert!(!wrapped.residual_proposal_source_has_transition_roots(
-                variable + 1,
-                &RowsView::EMPTY
-            ));
+            assert!(
+                wrapped.residual_proposal_source_has_transition_roots(variable, &RowsView::EMPTY)
+            );
+            assert!(!wrapped
+                .residual_proposal_source_has_transition_roots(variable + 1, &RowsView::EMPTY));
         }
     }
 }

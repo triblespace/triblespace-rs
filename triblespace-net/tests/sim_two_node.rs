@@ -26,8 +26,8 @@ use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use iroh_base::EndpointId;
-use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::Blob;
+use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::clock::{self, VirtualClock};
 use triblespace_core::id::rngid::seed_ids;
 use triblespace_core::inline::encodings::time::NsTAIInterval;
@@ -39,8 +39,8 @@ use triblespace_core::repo::{BlobStoreGet, BlobStoreList, BlobStorePut, Reposito
 use triblespace_core::trible::TribleSet;
 use triblespace_net::host;
 use triblespace_net::peer::{Peer, PeerConfig, SyncDirection};
-use triblespace_net::transport::sim::{DhtMode, SimConfig, SimNet};
 use triblespace_net::tracking;
+use triblespace_net::transport::sim::{DhtMode, SimConfig, SimNet};
 
 thread_local! {
     /// Diagnostic blob-dump directory for nondeterminism diffing.
@@ -91,8 +91,8 @@ fn admin_cap(
     root: &SigningKey,
     subject: &SigningKey,
 ) -> (Blob<SimpleArchive>, Blob<SimpleArchive>) {
-    use triblespace_core::id::ufoid;
     use triblespace_core::id::ExclusiveId;
+    use triblespace_core::id::ufoid;
     use triblespace_core::macros::entity;
 
     let scope_root = *ufoid();
@@ -193,14 +193,9 @@ async fn sim_body(vc: Arc<VirtualClock>, seed: u64, config: SimConfig) -> RunRep
     };
 
     let harness_a = net.join(pk(&ka), true);
-    let (sender_a, receiver_a, wiring_a) = host::wire(
-        EndpointId::from_bytes(&pk(&ka)).expect("endpoint id"),
-    );
-    tokio::task::spawn_local(host::run_host(
-        harness_a,
-        config(self_cap_a),
-        wiring_a,
-    ));
+    let (sender_a, receiver_a, wiring_a) =
+        host::wire(EndpointId::from_bytes(&pk(&ka)).expect("endpoint id"));
+    tokio::task::spawn_local(host::run_host(harness_a, config(self_cap_a), wiring_a));
     let peer_a = Peer::with_wiring(
         store_a,
         ka.clone(),
@@ -211,14 +206,9 @@ async fn sim_body(vc: Arc<VirtualClock>, seed: u64, config: SimConfig) -> RunRep
     );
 
     let harness_b = net.join(pk(&kb), true);
-    let (sender_b, receiver_b, wiring_b) = host::wire(
-        EndpointId::from_bytes(&pk(&kb)).expect("endpoint id"),
-    );
-    tokio::task::spawn_local(host::run_host(
-        harness_b,
-        config(self_cap_b),
-        wiring_b,
-    ));
+    let (sender_b, receiver_b, wiring_b) =
+        host::wire(EndpointId::from_bytes(&pk(&kb)).expect("endpoint id"));
+    tokio::task::spawn_local(host::run_host(harness_b, config(self_cap_b), wiring_b));
     let peer_b = Peer::with_wiring(
         store_b,
         kb.clone(),
@@ -227,12 +217,10 @@ async fn sim_body(vc: Arc<VirtualClock>, seed: u64, config: SimConfig) -> RunRep
         sender_b,
         receiver_b,
     );
-    let mut repo_b =
-        Repository::new(peer_b, kb.clone(), TribleSet::new()).expect("repo b");
+    let mut repo_b = Repository::new(peer_b, kb.clone(), TribleSet::new()).expect("repo b");
 
     // ── A commits a fact on "main" ───────────────────────────────────
-    let mut repo_a =
-        Repository::new(peer_a, ka.clone(), TribleSet::new()).expect("repo a");
+    let mut repo_a = Repository::new(peer_a, ka.clone(), TribleSet::new()).expect("repo a");
     let branch_id = repo_a.ensure_branch("main", None).ok().expect("branch");
     {
         let mut ws = repo_a.pull(branch_id).expect("pull");
@@ -262,11 +250,8 @@ async fn sim_body(vc: Arc<VirtualClock>, seed: u64, config: SimConfig) -> RunRep
 
         let tracks = tracking::list_tracking_pins(repo_b.storage_mut());
         for info in tracks {
-            let _ = tracking::merge_tracking_into_local(
-                &mut repo_b,
-                info.local_id,
-                &info.remote_name,
-            );
+            let _ =
+                tracking::merge_tracking_into_local(&mut repo_b, info.local_id, &info.remote_name);
         }
 
         let b_head = repo_b
@@ -280,9 +265,8 @@ async fn sim_body(vc: Arc<VirtualClock>, seed: u64, config: SimConfig) -> RunRep
             break;
         }
     }
-    let converged_at_ns = converged_at_ns.expect(
-        "B's local main must reach A's head commit within the tick budget",
-    );
+    let converged_at_ns =
+        converged_at_ns.expect("B's local main must reach A's head commit within the tick budget");
 
     // ── Closure invariant: B holds A's head blob and every blob it
     //    references, transitively (stored blob ⇒ stored closure). ────
@@ -352,10 +336,7 @@ async fn sim_body(vc: Arc<VirtualClock>, seed: u64, config: SimConfig) -> RunRep
             if let Ok(bytes) = reader
                 .get::<anybytes::Bytes, triblespace_core::blob::encodings::UnknownBlob>(handle)
             {
-                let _ = std::fs::write(
-                    format!("{dir}/{}", hex::encode(h)),
-                    &bytes[..],
-                );
+                let _ = std::fs::write(format!("{dir}/{}", hex::encode(h)), &bytes[..]);
             }
         }
     }
@@ -400,7 +381,6 @@ fn two_nodes_converge_and_replay_identically() {
         "other-seed run converged (assertion lives in run_sim)"
     );
 }
-
 
 /// Fault scenario: a partition between A and B blocks convergence;
 /// healing it lets the (gossip-rebroadcast-driven) sync complete.
@@ -553,7 +533,6 @@ fn partition_blocks_then_heal_converges() {
     }));
 }
 
-
 /// Regression test for the 2026-06-10 production sync hang: a DHT
 /// with zero reachability (lookups never resolve) must not stall
 /// closure fetches, because `providers_for` asks the gossip frame's
@@ -580,7 +559,6 @@ fn converges_with_blackhole_dht() {
         "publisher-first fetching must converge without any DHT"
     );
 }
-
 
 /// Discriminator for "bug C" (organisation zooid, 2026-06-11): a
 /// receiver that GOT the gossip frame but whose closure fetch FAILED
@@ -652,8 +630,7 @@ fn fetch_failure_recovers_despite_gossip_dedupe() {
             sender_a,
             receiver_a,
         );
-        let mut repo_a =
-            Repository::new(peer_a, ka.clone(), TribleSet::new()).expect("repo a");
+        let mut repo_a = Repository::new(peer_a, ka.clone(), TribleSet::new()).expect("repo a");
 
         let harness_b = net.join(pk(&kb), true);
         let (sender_b, receiver_b, wiring_b) =
@@ -667,8 +644,7 @@ fn fetch_failure_recovers_despite_gossip_dedupe() {
             sender_b,
             receiver_b,
         );
-        let mut repo_b =
-            Repository::new(peer_b, kb.clone(), TribleSet::new()).expect("repo b");
+        let mut repo_b = Repository::new(peer_b, kb.clone(), TribleSet::new()).expect("repo b");
 
         // A commits while the link is still up...
         let branch_id = repo_a.ensure_branch("main", None).ok().expect("branch");
@@ -722,7 +698,10 @@ fn fetch_failure_recovers_despite_gossip_dedupe() {
                     &info.remote_name,
                 );
             }
-            if b_main_head(&mut repo_b).map(|h| h.raw == a_head).unwrap_or(false) {
+            if b_main_head(&mut repo_b)
+                .map(|h| h.raw == a_head)
+                .unwrap_or(false)
+            {
                 converged = true;
                 break;
             }
@@ -734,7 +713,6 @@ fn fetch_failure_recovers_despite_gossip_dedupe() {
         );
     }));
 }
-
 
 /// A peer that accepts dial attempts but never completes the
 /// handshake must not wedge the swarm: the connection-setup deadline
@@ -803,8 +781,7 @@ fn stalled_dial_does_not_wedge_the_pool() {
             sender_a,
             receiver_a,
         );
-        let mut repo_a =
-            Repository::new(peer_a, ka.clone(), TribleSet::new()).expect("repo a");
+        let mut repo_a = Repository::new(peer_a, ka.clone(), TribleSet::new()).expect("repo a");
 
         let harness_b = net.join(pk(&kb), true);
         let (sender_b, receiver_b, wiring_b) =
@@ -818,8 +795,7 @@ fn stalled_dial_does_not_wedge_the_pool() {
             sender_b,
             receiver_b,
         );
-        let mut repo_b =
-            Repository::new(peer_b, kb.clone(), TribleSet::new()).expect("repo b");
+        let mut repo_b = Repository::new(peer_b, kb.clone(), TribleSet::new()).expect("repo b");
 
         // Dials toward A stall BEFORE A commits: B hears the gossip
         // but every fetch attempt parks in connection setup until
@@ -861,7 +837,9 @@ fn stalled_dial_does_not_wedge_the_pool() {
             }
         }
         assert!(
-            b_main_head(&mut repo_b).map(|h| h.raw != a_head).unwrap_or(true),
+            b_main_head(&mut repo_b)
+                .map(|h| h.raw != a_head)
+                .unwrap_or(true),
             "B cannot have A's head while dials to A stall"
         );
 
@@ -882,7 +860,10 @@ fn stalled_dial_does_not_wedge_the_pool() {
                     &info.remote_name,
                 );
             }
-            if b_main_head(&mut repo_b).map(|h| h.raw == a_head).unwrap_or(false) {
+            if b_main_head(&mut repo_b)
+                .map(|h| h.raw == a_head)
+                .unwrap_or(false)
+            {
                 converged = true;
                 break;
             }

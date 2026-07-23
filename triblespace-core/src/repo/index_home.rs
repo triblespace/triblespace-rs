@@ -1553,7 +1553,10 @@ where
             1,
             "UnionArchive proposal target must occupy exactly one position"
         );
-        assert!(limit > 0, "UnionArchive source pages require positive demand");
+        assert!(
+            limit > 0,
+            "UnionArchive source pages require positive demand"
+        );
         if matches!(cursor, ResidualDeltaSourceCursor::Offset(_)) {
             panic!("UnionArchive source received an ordinal cursor");
         }
@@ -2093,11 +2096,7 @@ where
         true
     }
 
-    fn proposal_coverage(
-        &self,
-        variable: VariableId,
-        bound: VariableSet,
-    ) -> ProposalCoverage {
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
         if !bound.is_set(variable) && self.variables().is_set(variable) {
             ProposalCoverage::Exact
         } else {
@@ -2573,11 +2572,7 @@ mod tests {
             .copied()
             .filter(|(_, candidate)| *candidate != raw_value(3))
             .collect();
-        union.confirm(
-            value.index,
-            &view,
-            &mut CandidateSink::Tagged(&mut tagged),
-        );
+        union.confirm(value.index, &view, &mut CandidateSink::Tagged(&mut tagged));
         assert_eq!(tagged, expected_tagged);
         assert_eq!(
             first_backend.calls.lock().unwrap().as_slice(),
@@ -2902,9 +2897,8 @@ mod tests {
         }
 
         fn satisfied(&self, view: &RowsView<'_>) -> bool {
-            view.col(0).is_none_or(|column| {
-                view.iter().all(|row| self.values.contains(&row[column]))
-            })
+            view.col(0)
+                .is_none_or(|column| view.iter().all(|row| self.values.contains(&row[column])))
         }
     }
 
@@ -3943,11 +3937,7 @@ mod tests {
         assert!(union.residual_confirm_is_page_local());
 
         let mut whole = input.clone();
-        union.confirm(
-            value.index,
-            &view,
-            &mut CandidateSink::Tagged(&mut whole),
-        );
+        union.confirm(value.index, &view, &mut CandidateSink::Tagged(&mut whole));
         assert_eq!(
             whole,
             vec![
@@ -3961,11 +3951,7 @@ mod tests {
         );
 
         let mut empty = Vec::new();
-        union.confirm(
-            value.index,
-            &view,
-            &mut CandidateSink::Tagged(&mut empty),
-        );
+        union.confirm(value.index, &view, &mut CandidateSink::Tagged(&mut empty));
         assert!(empty.is_empty());
 
         for cuts in 0..(1usize << (input.len() - 1)) {
@@ -3976,20 +3962,12 @@ mod tests {
                     continue;
                 }
                 let mut page = input[start..=index].to_vec();
-                union.confirm(
-                    value.index,
-                    &view,
-                    &mut CandidateSink::Tagged(&mut page),
-                );
+                union.confirm(value.index, &view, &mut CandidateSink::Tagged(&mut page));
                 paged.extend(page);
                 start = index + 1;
             }
             let mut page = input[start..].to_vec();
-            union.confirm(
-                value.index,
-                &view,
-                &mut CandidateSink::Tagged(&mut page),
-            );
+            union.confirm(value.index, &view, &mut CandidateSink::Tagged(&mut page));
             paged.extend(page);
 
             assert_eq!(

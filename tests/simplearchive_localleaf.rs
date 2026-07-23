@@ -14,9 +14,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use std::time::Instant;
-use triblespace::core::blob::encodings::simplearchive::{
-    try_from_blob_heap_only, SimpleArchive,
-};
+use triblespace::core::blob::encodings::simplearchive::{try_from_blob_heap_only, SimpleArchive};
 use triblespace::core::blob::Blob;
 use triblespace::core::inline::Encodes;
 use triblespace::core::trible::Trible;
@@ -95,10 +93,8 @@ fn union_two_overlapping_archives() {
     drop(a_src);
     drop(b_src);
 
-    let a: TribleSet =
-        triblespace::core::blob::TryFromBlob::try_from_blob(a_blob).unwrap();
-    let b: TribleSet =
-        triblespace::core::blob::TryFromBlob::try_from_blob(b_blob).unwrap();
+    let a: TribleSet = triblespace::core::blob::TryFromBlob::try_from_blob(a_blob).unwrap();
+    let b: TribleSet = triblespace::core::blob::TryFromBlob::try_from_blob(b_blob).unwrap();
 
     let unioned = a + b;
     assert_eq!(
@@ -175,9 +171,8 @@ fn measure_at(n: usize) {
     // owner Arc is forced to None so every trible allocates a fresh
     // heap `Leaf`. This isolates the cost of the per-trible Leaf
     // alloc from any unrelated validation/iteration overhead.
-    let (heap_set, heap_allocs, heap_bytes) = measure(|| -> TribleSet {
-        try_from_blob_heap_only(archive.clone()).unwrap()
-    });
+    let (heap_set, heap_allocs, heap_bytes) =
+        measure(|| -> TribleSet { try_from_blob_heap_only(archive.clone()).unwrap() });
     assert_eq!(heap_set.len(), N);
 
     // LocalLeaf archive ingest: identical validation/iteration, but

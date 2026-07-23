@@ -13,14 +13,14 @@ use std::env;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use triblespace_gpu::query_program::{
-    ProgramFrontier, ProgramVariable, QueryPattern, QueryProgram,
-};
 use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::RawInline;
 use triblespace_core::prelude::*;
 use triblespace_core::query::{CandidateSink, Candidates, Constraint, RowsView, VariableContext};
+use triblespace_gpu::query_program::{
+    ProgramFrontier, ProgramVariable, QueryPattern, QueryProgram,
+};
 use triblespace_gpu::{WgpuQueryProgram, WgpuSuccinctArchive};
 
 const FANOUT: usize = 4;

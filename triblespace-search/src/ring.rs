@@ -104,8 +104,7 @@ impl RingGraph {
         // Invariant on entry: edges is sorted by (low, high),
         // so we advance a pointer through `edges` in lock-step
         // with v.
-        let mut low_runs_b =
-            BitVectorBuilder::with_capacity(n_edges + n_nodes, sections)?;
+        let mut low_runs_b = BitVectorBuilder::with_capacity(n_edges + n_nodes, sections)?;
         let mut pos = 0usize;
         let mut edge_cursor = 0usize;
         for v in 0..n_nodes {
@@ -153,10 +152,7 @@ impl RingGraph {
 
     /// Reload from a byte region previously produced by
     /// [`RingGraph::build`].
-    pub fn from_bytes(
-        meta: RingGraphMeta,
-        bytes: Bytes,
-    ) -> Result<Self, SuccinctDocLensError> {
+    pub fn from_bytes(meta: RingGraphMeta, bytes: Bytes) -> Result<Self, SuccinctDocLensError> {
         let low_runs = BitVector::<Rank9SelIndex>::from_bytes(meta.low_runs, bytes.clone())?;
         let high_column = WaveletMatrix::<Rank9SelIndex>::from_bytes(meta.high_column, bytes)?;
         Ok(Self {
@@ -214,10 +210,7 @@ impl RingGraph {
         // (edge_pos + 1)-th 1-bit in low_runs (0-indexed:
         // `select1(edge_pos)`). Count 0s before that bit
         // position — that's the low value.
-        let bit_pos = self
-            .low_runs
-            .select1(edge_pos)
-            .expect("edge_pos < n_edges");
+        let bit_pos = self.low_runs.select1(edge_pos).expect("edge_pos < n_edges");
         self.low_runs.rank0(bit_pos).expect("in range") as u32
     }
 }

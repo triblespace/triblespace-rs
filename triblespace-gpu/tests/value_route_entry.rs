@@ -185,8 +185,8 @@ fn repeated_pattern_uses_the_canonical_program_without_a_resident_family() {
             x,
         )
     )
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
-        .collect::<Vec<_>>();
+    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .collect::<Vec<_>>();
     assert_eq!(result, vec![(repeated,)]);
     assert_eq!(route.counters(), Default::default());
 }

@@ -1,9 +1,9 @@
 #![cfg(kani)]
 
 use super::util;
-use crate::prelude::*;
 use crate::inline::encodings::genid::GenId;
 use crate::inline::encodings::UnknownInline;
+use crate::prelude::*;
 
 /// Namespace used by the query harness with unconstrained values.
 pub mod qns {

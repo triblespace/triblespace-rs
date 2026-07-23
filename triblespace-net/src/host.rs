@@ -13,7 +13,7 @@ use std::thread;
 
 use ed25519_dalek::SigningKey;
 use iroh_base::{EndpointAddr, EndpointId};
-use tracing::{debug, debug_span, error, info, info_span, instrument, trace, warn, Instrument};
+use tracing::{Instrument, debug, debug_span, error, info, info_span, instrument, trace, warn};
 
 use crate::channel::{NetCommand, NetEvent, PublisherKey};
 use crate::identity::iroh_secret;
@@ -151,8 +151,7 @@ pub struct StoreSnapshot<R> {
 impl StoreSnapshot<()> {
     pub fn from_store<S>(store: &mut S) -> Option<StoreSnapshot<S::Reader>>
     where
-        S: triblespace_core::repo::BlobStore
-            + triblespace_core::repo::PinStore,
+        S: triblespace_core::repo::BlobStore + triblespace_core::repo::PinStore,
     {
         let branches = store.pin_snapshot().ok()?;
         let reader = store.reader().ok()?;
@@ -175,14 +174,18 @@ impl<R> AnySnapshot for StoreSnapshot<R>
 where
     R: triblespace_core::repo::BlobStoreGet
         + triblespace_core::repo::BlobStoreList
-        + Send + 'static,
+        + Send
+        + 'static,
 {
     fn get_blob(&self, hash: &RawHash) -> Option<Vec<u8>> {
         use triblespace_core::blob::encodings::UnknownBlob;
         use triblespace_core::inline::Inline;
         use triblespace_core::inline::encodings::hash::Handle;
         let handle = Inline::<Handle<UnknownBlob>>::new(*hash);
-        self.reader.get::<anybytes::Bytes, UnknownBlob>(handle).ok().map(|b| b.to_vec())
+        self.reader
+            .get::<anybytes::Bytes, UnknownBlob>(handle)
+            .ok()
+            .map(|b| b.to_vec())
     }
 
     fn has_blob(&self, hash: &RawHash) -> bool {
@@ -207,10 +210,7 @@ where
 pub trait NetCapability: Send + Sync {
     /// Swarm-addressed fetch of `hash` (DHT-routed, content-verified).
     /// `None` is Unavailable.
-    fn fetch_blob(
-        &self,
-        hash: RawHash,
-    ) -> futures::future::BoxFuture<'static, Option<Vec<u8>>>;
+    fn fetch_blob(&self, hash: RawHash) -> futures::future::BoxFuture<'static, Option<Vec<u8>>>;
 }
 
 /// Gossip-known publishers, most-recent-first. Every HEAD frame names
@@ -255,10 +255,7 @@ struct NetCap<T: Transport> {
 }
 
 impl<T: Transport> NetCapability for NetCap<T> {
-    fn fetch_blob(
-        &self,
-        hash: RawHash,
-    ) -> futures::future::BoxFuture<'static, Option<Vec<u8>>> {
+    fn fetch_blob(&self, hash: RawHash) -> futures::future::BoxFuture<'static, Option<Vec<u8>>> {
         let t = self.transport.clone();
         let pool = self.pool.clone();
         let self_cap = self.self_cap;
@@ -300,8 +297,7 @@ impl<T: Transport> NetCapability for NetCap<T> {
 /// Background work (the want-reconciler) passes its own, more generous
 /// budget; the want stays durably recorded either way, so an expired
 /// budget only defers the fetch, never loses the demand.
-pub const INTERACTIVE_FETCH_DEADLINE: std::time::Duration =
-    std::time::Duration::from_secs(5);
+pub const INTERACTIVE_FETCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Send fire-and-forget commands to the host loop, refresh the serving
 /// snapshot, and invoke inline request/response capabilities (the swarm
@@ -318,7 +314,9 @@ pub struct NetSender {
 }
 
 impl NetSender {
-    pub fn id(&self) -> EndpointId { self.id }
+    pub fn id(&self) -> EndpointId {
+        self.id
+    }
 
     pub fn announce(&self, hash: RawHash) {
         let _ = self.cmd_tx.send(NetCommand::Announce(hash));
@@ -363,11 +361,7 @@ impl NetSender {
     /// background reconcile ticks pass a longer one. Expiry has the
     /// same semantics as any other Unavailable — a recorded want stays
     /// recorded.
-    pub async fn fetch_blob(
-        &self,
-        hash: RawHash,
-        budget: std::time::Duration,
-    ) -> Option<Vec<u8>> {
+    pub async fn fetch_blob(&self, hash: RawHash, budget: std::time::Duration) -> Option<Vec<u8>> {
         match tokio::time::timeout(budget, self.fetch_blob_unbounded(hash)).await {
             Ok(result) => result,
             Err(_) => {
@@ -437,10 +431,8 @@ pub struct HostWiring {
 pub fn wire(id: EndpointId) -> (NetSender, NetReceiver, HostWiring) {
     let (cmd_tx, cmd_rx) = mpsc::channel::<NetCommand>();
     let (evt_tx, evt_rx) = mpsc::channel::<NetEvent>();
-    let snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>> =
-        Arc::new(Mutex::new(None));
-    let (cap_tx, cap_rx) =
-        tokio::sync::watch::channel::<Option<Arc<dyn NetCapability>>>(None);
+    let snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>> = Arc::new(Mutex::new(None));
+    let (cap_tx, cap_rx) = tokio::sync::watch::channel::<Option<Arc<dyn NetCapability>>>(None);
 
     let sender = NetSender {
         cmd_tx,
@@ -462,11 +454,7 @@ pub fn wire(id: EndpointId) -> (NetSender, NetReceiver, HostWiring) {
 /// This is the transport-generic entry point: production wraps it in
 /// a dedicated thread ([`spawn`]); the simulator spawns it as a local
 /// task per node on one shared deterministic runtime.
-pub async fn run_host<T: Transport>(
-    harness: Harness<T>,
-    config: PeerConfig,
-    wiring: HostWiring,
-) {
+pub async fn run_host<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring: HostWiring) {
     host_loop(
         harness,
         config,
@@ -529,17 +517,15 @@ async fn connect_authed<T: Transport>(
     peer: PeerId,
     self_cap: &RawHash,
 ) -> anyhow::Result<T::Conn> {
-    let conn = t.dial(peer, PILE_SYNC_ALPN).await
-        .map_err(|e| {
-            warn!(error = %e, "connect failed");
-            anyhow::anyhow!("connect: {e}")
-        })?;
+    let conn = t.dial(peer, PILE_SYNC_ALPN).await.map_err(|e| {
+        warn!(error = %e, "connect failed");
+        anyhow::anyhow!("connect: {e}")
+    })?;
     debug!(self_cap = %hex::encode(&self_cap[..4]), "connected; sending OP_AUTH");
-    op_auth(&conn, self_cap).await
-        .map_err(|e| {
-            warn!(error = %e, "auth handshake failed");
-            anyhow::anyhow!("auth: {e}")
-        })?;
+    op_auth(&conn, self_cap).await.map_err(|e| {
+        warn!(error = %e, "auth handshake failed");
+        anyhow::anyhow!("auth: {e}")
+    })?;
     info!("auth ok");
     Ok(conn)
 }
@@ -647,7 +633,10 @@ async fn host_loop<T: Transport>(
         tokio::spawn(async move {
             while let Some(event) = gossip_events.recv().await {
                 match event {
-                    GossipEvent::Received { bytes, delivered_from } => {
+                    GossipEvent::Received {
+                        bytes,
+                        delivered_from,
+                    } => {
                         // Gossip HEAD message, v1 (81B, 0x01) or
                         // v2 (89B, 0x02 + 8-byte nonce; the nonce is
                         // anti-dedupe padding — parsed fields are
@@ -692,7 +681,20 @@ async fn host_loop<T: Transport>(
                                     publisher = %hex::encode(&publisher[..4]),
                                     "gossip head update; fetching"
                                 );
-                                track_known_head(&t3, fetch_peer, branch, head, publisher, &events_tx2, &self_cap2, &snap2, &pool2, &retries2, 0).await;
+                                track_known_head(
+                                    &t3,
+                                    fetch_peer,
+                                    branch,
+                                    head,
+                                    publisher,
+                                    &events_tx2,
+                                    &self_cap2,
+                                    &snap2,
+                                    &pool2,
+                                    &retries2,
+                                    0,
+                                )
+                                .await;
                             });
                         }
                     }
@@ -768,7 +770,11 @@ async fn host_loop<T: Transport>(
                         });
                     }
                 }
-                NetCommand::DeliverCap { subject, cap_bytes, sig_bytes } => {
+                NetCommand::DeliverCap {
+                    subject,
+                    cap_bytes,
+                    sig_bytes,
+                } => {
                     // Open a fresh connection on the auth-handshake
                     // ALPN, send OP_DELIVER_CAP, close. On STATUS_OK
                     // ack we emit `NetEvent::CapDeliveryConfirmed`
@@ -793,10 +799,8 @@ async fn host_loop<T: Transport>(
                                 return;
                             }
                         };
-                        match crate::handshake::send_deliver_cap(
-                            &conn, &cap_bytes, &sig_bytes,
-                        )
-                        .await
+                        match crate::handshake::send_deliver_cap(&conn, &cap_bytes, &sig_bytes)
+                            .await
                         {
                             Ok(status) if status == crate::handshake::STATUS_OK => {
                                 debug!(
@@ -874,7 +878,10 @@ async fn host_loop<T: Transport>(
         }
 
         if crate::clock::mono_now().duration_since(last_rebroadcast) >= rebroadcast_period {
-            trace!(n = last_published.len(), "rebroadcast tick: replaying published heads");
+            trace!(
+                n = last_published.len(),
+                "rebroadcast tick: replaying published heads"
+            );
             if let Some(sender) = &gossip_sender {
                 for (branch, head) in &last_published {
                     let msg = gossip_frame(branch, head, &my_id);
@@ -1042,8 +1049,7 @@ async fn fetch_reachable<T: Transport>(
     // short-circuit on them and only re-fetch the still-missing
     // ancestors.
     for hash in to_fetch.iter().rev() {
-        let Some(data) = fetch_one(t, hash, pool, publisher_id, self_cap).await
-        else {
+        let Some(data) = fetch_one(t, hash, pool, publisher_id, self_cap).await else {
             warn!(
                 hash = %hex::encode(&hash[..4]),
                 "fetch aborted: blob unavailable; head not advanced (will retry on next gossip)"
@@ -1082,11 +1088,7 @@ async fn fetch_reachable<T: Transport>(
 /// error. If we have the blob, we'd have hit the `have_local`
 /// short-circuit upstream; if we're being asked to fetch, by
 /// definition we don't have it (yet) — so self is never useful here.
-async fn providers_for<T: Transport>(
-    t: &T,
-    hash: &RawHash,
-    publisher_id: PeerId,
-) -> Vec<PeerId> {
+async fn providers_for<T: Transport>(t: &T, hash: &RawHash, publisher_id: PeerId) -> Vec<PeerId> {
     let my_id = t.local_id();
     // Publisher-first: the gossip frame's publisher announced the
     // head, and the bottom-up insertion invariant says an announcer
@@ -1102,21 +1104,18 @@ async fn providers_for<T: Transport>(
         return vec![publisher_id];
     }
     trace!(hash = %hex::encode(&hash[..4]), "providers_for: DHT find_providers awaiting");
-    let mut providers: Vec<PeerId> = match tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        t.dht_providers(*hash),
-    )
-    .await
-    {
-        Ok(p) => p,
-        Err(_) => {
-            warn!(
-                hash = %hex::encode(&hash[..4]),
-                "dht_providers timed out; no provider candidates"
-            );
-            Vec::new()
-        }
-    };
+    let mut providers: Vec<PeerId> =
+        match tokio::time::timeout(std::time::Duration::from_secs(3), t.dht_providers(*hash)).await
+        {
+            Ok(p) => p,
+            Err(_) => {
+                warn!(
+                    hash = %hex::encode(&hash[..4]),
+                    "dht_providers timed out; no provider candidates"
+                );
+                Vec::new()
+            }
+        };
     trace!(hash = %hex::encode(&hash[..4]), n = providers.len(), "providers_for: DHT find_providers returned");
     providers.retain(|id| *id != my_id);
     providers
@@ -1136,9 +1135,8 @@ async fn providers_for<T: Transport>(
 /// `serve_stream` accepts unbounded sequential bi-streams per
 /// connection (auth state set on the first OP_AUTH stream, reused on
 /// every subsequent stream). So one connection per peer is enough.
-pub(crate) type SharedPool<C> = Arc<tokio::sync::Mutex<
-    HashMap<PeerId, Arc<tokio::sync::OnceCell<C>>>,
->>;
+pub(crate) type SharedPool<C> =
+    Arc<tokio::sync::Mutex<HashMap<PeerId, Arc<tokio::sync::OnceCell<C>>>>>;
 
 fn new_shared_pool<C>() -> SharedPool<C> {
     Arc::new(tokio::sync::Mutex::new(HashMap::new()))
@@ -1163,12 +1161,7 @@ async fn pool_get<T: Transport>(
             .clone()
     };
     let init = || async {
-        match tokio::time::timeout(
-            DIAL_DEADLINE,
-            connect_authed(t, provider, self_cap),
-        )
-        .await
-        {
+        match tokio::time::timeout(DIAL_DEADLINE, connect_authed(t, provider, self_cap)).await {
             Ok(r) => r,
             Err(_) => Err(anyhow::anyhow!(
                 "connection setup deadline ({DIAL_DEADLINE:?}) exceeded"
@@ -1242,9 +1235,11 @@ async fn fetch_from_providers<T: Transport>(
         };
         let op = tokio::time::timeout(OP_DEADLINE, op_get_blob(&conn, hash))
             .await
-            .unwrap_or_else(|_| Err(anyhow::anyhow!(
-                "OP_GET_BLOB deadline ({OP_DEADLINE:?}) exceeded"
-            )));
+            .unwrap_or_else(|_| {
+                Err(anyhow::anyhow!(
+                    "OP_GET_BLOB deadline ({OP_DEADLINE:?}) exceeded"
+                ))
+            });
         match op {
             Ok(Some(data)) => return Some(data),
             Ok(None) => {
@@ -1263,7 +1258,6 @@ async fn fetch_from_providers<T: Transport>(
     None
 }
 
-
 /// Swarm-fetch the closure rooted at `head` (a cap sig handle, in the
 /// OP_AUTH context) and return it as a `BTreeMap<RawHash, Vec<u8>>`
 /// (ordered, so draining it into NetEvent::Blob emissions is
@@ -1280,7 +1274,6 @@ async fn swarm_fetch_chain<T: Transport>(
     self_cap: &RawHash,
     pool: &SharedPool<T::Conn>,
 ) -> std::collections::BTreeMap<RawHash, Vec<u8>> {
-
     let mut fetched: std::collections::BTreeMap<RawHash, Vec<u8>> =
         std::collections::BTreeMap::new();
     let publisher_id = publisher;
@@ -1361,9 +1354,11 @@ async fn children_one<T: Transport>(
         trace!(parent = %hex::encode(&parent[..4]), provider = %hex::encode(&provider[..4]), "children_one: op_children awaiting");
         let op = tokio::time::timeout(OP_DEADLINE, op_children(&conn, parent))
             .await
-            .unwrap_or_else(|_| Err(anyhow::anyhow!(
-                "OP_CHILDREN deadline ({OP_DEADLINE:?}) exceeded"
-            )));
+            .unwrap_or_else(|_| {
+                Err(anyhow::anyhow!(
+                    "OP_CHILDREN deadline ({OP_DEADLINE:?}) exceeded"
+                ))
+            });
         match op {
             Ok(c) => return Some(c),
             Err(e) => {
@@ -1448,7 +1443,11 @@ async fn track_known_head<T: Transport>(
             },
         );
     } else {
-        let _ = events.send(NetEvent::Head { branch, head, publisher });
+        let _ = events.send(NetEvent::Head {
+            branch,
+            head,
+            publisher,
+        });
         // Success cancels any pending retry for this branch+head.
         let mut q = retries.lock().unwrap();
         if q.get(&branch).map(|e| e.head == head).unwrap_or(false) {
@@ -1795,9 +1794,9 @@ impl<T: Transport> SnapshotHandler<T> {
 
             // Per-connection auth state. Set by the first `OP_AUTH`
             // stream; read by every subsequent stream to gate access.
-            let auth_state: Arc<tokio::sync::RwLock<
-                Option<triblespace_core::repo::capability::VerifiedCapability>,
-            >> = Arc::new(tokio::sync::RwLock::new(None));
+            let auth_state: Arc<
+                tokio::sync::RwLock<Option<triblespace_core::repo::capability::VerifiedCapability>>,
+            > = Arc::new(tokio::sync::RwLock::new(None));
 
             loop {
                 let Some((mut send, mut recv)) = connection.accept_bi().await else {
@@ -1822,7 +1821,9 @@ impl<T: Transport> SnapshotHandler<T> {
                             &pool,
                             &mut send,
                             &mut recv,
-                        ).await {
+                        )
+                        .await
+                        {
                             error!(error = %e, "stream handler error");
                         }
                         let _ = send.shutdown().await;
@@ -1841,9 +1842,9 @@ async fn serve_stream<T: Transport>(
     snap_arc: &Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
     team_root: ed25519_dalek::VerifyingKey,
     peer_pubkey: ed25519_dalek::VerifyingKey,
-    auth_state: Arc<tokio::sync::RwLock<
-        Option<triblespace_core::repo::capability::VerifiedCapability>,
-    >>,
+    auth_state: Arc<
+        tokio::sync::RwLock<Option<triblespace_core::repo::capability::VerifiedCapability>>,
+    >,
     t: &T,
     self_cap: &RawHash,
     events: &mpsc::Sender<NetEvent>,
@@ -1853,8 +1854,8 @@ async fn serve_stream<T: Transport>(
 ) -> anyhow::Result<()> {
     use triblespace_core::blob::Blob;
     use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-    use triblespace_core::inline::encodings::hash::Handle;
     use triblespace_core::inline::Inline;
+    use triblespace_core::inline::encodings::hash::Handle;
 
     let op = recv_u8(recv).await?;
     let span = debug_span!("stream", op = op_name(op));
@@ -1863,8 +1864,7 @@ async fn serve_stream<T: Transport>(
     if op == OP_AUTH {
         let cap_handle_raw = recv_hash(recv).await?;
         debug!(cap_handle = %hex::encode(&cap_handle_raw[..4]), "auth: cap handle received");
-        let cap_handle: Inline<Handle<SimpleArchive>> =
-            Inline::new(cap_handle_raw);
+        let cap_handle: Inline<Handle<SimpleArchive>> = Inline::new(cap_handle_raw);
 
         // Brief sync read inside async — guard is dropped before any
         // .await runs so this never blocks an async worker.
@@ -1921,10 +1921,7 @@ async fn serve_stream<T: Transport>(
 
         match result {
             Ok(verified) => {
-                let granted = verified
-                    .granted_branches()
-                    .map(|s| s.len())
-                    .unwrap_or(0);
+                let granted = verified.granted_branches().map(|s| s.len()).unwrap_or(0);
                 let unrestricted = verified.granted_branches().is_none();
                 info!(branches = granted, unrestricted = unrestricted, "auth ok");
                 // Cache the swarm-fetched blobs into the local store so
@@ -1983,18 +1980,20 @@ async fn serve_stream<T: Transport>(
     // would be the obvious next optimisation.
 
     match op {
-
         OP_GET_BLOB => {
             let hash = recv_hash(recv).await?;
             let in_scope_flag;
             let data = {
                 let guard = snap_arc.lock().unwrap();
-                let scope_ok = guard.as_ref()
+                let scope_ok = guard
+                    .as_ref()
                     .map(|snap| blob_in_scope(snap.as_ref(), &verified, &hash))
                     .unwrap_or(false);
                 in_scope_flag = scope_ok;
                 guard.as_ref().and_then(|snap| {
-                    if !scope_ok { return None; }
+                    if !scope_ok {
+                        return None;
+                    }
                     snap.get_blob(&hash)
                 })
             };
@@ -2002,7 +2001,9 @@ async fn serve_stream<T: Transport>(
                 Some(data) => {
                     debug!(hash = %hex::encode(&hash[..4]), bytes = data.len(), "OP_GET_BLOB served");
                     send_u64_be(send, data.len() as u64).await?;
-                    send.write_all(&data).await.map_err(|e| anyhow::anyhow!("send: {e}"))?;
+                    send.write_all(&data)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("send: {e}"))?;
                 }
                 None => {
                     if !in_scope_flag {
@@ -2028,10 +2029,7 @@ async fn serve_stream<T: Transport>(
                         // and check membership against it for every
                         // candidate — avoids the previous O(K×N) BFS
                         // re-walk per child.
-                        let reachable = reachable_set_for(
-                            snap.as_ref(),
-                            &verified,
-                        );
+                        let reachable = reachable_set_for(snap.as_ref(), &verified);
                         let in_scope = |hash: &RawHash| -> bool {
                             if !snap.has_blob(hash) {
                                 return false;
@@ -2164,4 +2162,3 @@ fn blob_in_scope(
         Some(set) => set.contains(hash),
     }
 }
-

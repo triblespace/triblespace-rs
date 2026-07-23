@@ -1451,7 +1451,9 @@ where
                         offset,
                     } = state
                     else {
-                        panic!("one typed SuccinctArchive confirmation cohort mixed action variants")
+                        panic!(
+                            "one typed SuccinctArchive confirmation cohort mixed action variants"
+                        )
                     };
                     assert_eq!(state_variable, variable);
                     let candidates = batch.candidate_sets[input].expect(
@@ -1538,11 +1540,7 @@ where
         true
     }
 
-    fn proposal_coverage(
-        &self,
-        variable: VariableId,
-        bound: VariableSet,
-    ) -> ProposalCoverage {
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
         if !bound.is_set(variable) && self.variables().is_set(variable) {
             ProposalCoverage::Exact
         } else {
@@ -2502,12 +2500,8 @@ mod typed_program_tests {
                 bound: irrelevant_bound,
             })
             .unwrap();
-        let constant_attribute = SuccinctArchiveConstraint::new(
-            e,
-            Inline::<GenId>::new(id_value(11)),
-            v,
-            &archive,
-        );
+        let constant_attribute =
+            SuccinctArchiveConstraint::new(e, Inline::<GenId>::new(id_value(11)), v, &archive);
         let constant_resolved = constant_attribute
             .residual_program()
             .unwrap()
@@ -2516,12 +2510,8 @@ mod typed_program_tests {
                 bound: empty,
             })
             .unwrap();
-        let repeated = SuccinctArchiveConstraint::new(
-            e,
-            Inline::<GenId>::new(id_value(11)),
-            e,
-            &archive,
-        );
+        let repeated =
+            SuccinctArchiveConstraint::new(e, Inline::<GenId>::new(id_value(11)), e, &archive);
         let repeated_target = repeated
             .residual_program()
             .unwrap()
@@ -2610,11 +2600,9 @@ mod typed_program_tests {
                 .is_none(),
             "a repeated target uses a conservative estimate, not an occurrence count"
         );
-        assert!(
-            constraint
-                .action_unit_classes(value.index, VariableSet::new_singleton(value.index))
-                .is_none()
-        );
+        assert!(constraint
+            .action_unit_classes(value.index, VariableSet::new_singleton(value.index))
+            .is_none());
     }
 
     #[test]
@@ -2717,9 +2705,10 @@ mod typed_program_tests {
                 (1, id_value(12)),
             ]
         );
-        assert!(effects.pages.iter().all(|page| {
-            page.examined == 3 && page.resume.is_none()
-        }));
+        assert!(effects
+            .pages
+            .iter()
+            .all(|page| { page.examined == 3 && page.resume.is_none() }));
         let calls = backend.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, SuccinctRotation::Vea);

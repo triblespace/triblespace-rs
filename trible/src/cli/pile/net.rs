@@ -2,13 +2,13 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use clap::Parser;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use iroh_base::{EndpointAddr, EndpointId};
 
-use triblespace_net::peer::{Peer, PeerConfig, SyncDirection};
 use triblespace_net::identity::load_or_create_key;
+use triblespace_net::peer::{Peer, PeerConfig, SyncDirection};
 
 use triblespace_core::repo::pile::Pile;
 
@@ -43,14 +43,13 @@ fn key_dir(pile_path: &PathBuf) -> &std::path::Path {
 fn team_root_from_env(key: &SigningKey) -> Result<VerifyingKey> {
     match std::env::var("TRIBLE_TEAM_ROOT") {
         Ok(hex_str) => {
-            let bytes = hex::decode(hex_str.trim())
-                .map_err(|e| anyhow!("TRIBLE_TEAM_ROOT decode: {e}"))?;
+            let bytes =
+                hex::decode(hex_str.trim()).map_err(|e| anyhow!("TRIBLE_TEAM_ROOT decode: {e}"))?;
             let raw: [u8; 32] = bytes
                 .as_slice()
                 .try_into()
                 .map_err(|_| anyhow!("TRIBLE_TEAM_ROOT must be 32 bytes"))?;
-            VerifyingKey::from_bytes(&raw)
-                .map_err(|e| anyhow!("TRIBLE_TEAM_ROOT bad pubkey: {e}"))
+            VerifyingKey::from_bytes(&raw).map_err(|e| anyhow!("TRIBLE_TEAM_ROOT bad pubkey: {e}"))
         }
         Err(_) => Ok(key.verifying_key()),
     }
@@ -63,8 +62,8 @@ fn team_root_from_env(key: &SigningKey) -> Result<VerifyingKey> {
 fn self_cap_from_env() -> Result<[u8; 32]> {
     match std::env::var("TRIBLE_TEAM_CAP") {
         Ok(hex_str) => {
-            let bytes = hex::decode(hex_str.trim())
-                .map_err(|e| anyhow!("TRIBLE_TEAM_CAP decode: {e}"))?;
+            let bytes =
+                hex::decode(hex_str.trim()).map_err(|e| anyhow!("TRIBLE_TEAM_CAP decode: {e}"))?;
             let raw: [u8; 32] = bytes
                 .as_slice()
                 .try_into()
@@ -253,18 +252,29 @@ fn run_sync(
     let pile = open_pile(&pile_path)?;
     let team_root = team_root_from_env(&key)?;
     let self_cap = self_cap_from_env()?;
-    let peer = Peer::new(pile, key.clone(), PeerConfig {
-        peers,
-        gossip: true,
-        team_root,
-        self_cap,
-        direction,
-    });
-    let mut repo = Repository::new(peer, key.clone(), triblespace_core::trible::TribleSet::new())
-        .map_err(|e| anyhow!("repo: {e:?}"))?;
+    let peer = Peer::new(
+        pile,
+        key.clone(),
+        PeerConfig {
+            peers,
+            gossip: true,
+            team_root,
+            self_cap,
+            direction,
+        },
+    );
+    let mut repo = Repository::new(
+        peer,
+        key.clone(),
+        triblespace_core::trible::TribleSet::new(),
+    )
+    .map_err(|e| anyhow!("repo: {e:?}"))?;
 
     eprintln!("node: {}", repo.storage().id());
-    eprintln!("team_root: {}  (gossip topic)", hex::encode(team_root.to_bytes()));
+    eprintln!(
+        "team_root: {}  (gossip topic)",
+        hex::encode(team_root.to_bytes())
+    );
     let dir_label = match direction {
         SyncDirection::Bidirectional => "bidirectional",
         SyncDirection::ReadOnly => "read-only (no publish)",
@@ -282,11 +292,15 @@ fn run_sync(
     // ReadOnly — a leecher that only services wants is a legit workflow.
     let lazy = !no_lazy && direction != SyncDirection::WriteOnly;
     if lazy {
-        eprintln!("lazy: servicing weak-pin wants every {reconcile_interval}s (--no-lazy to disable)");
+        eprintln!(
+            "lazy: servicing weak-pin wants every {reconcile_interval}s (--no-lazy to disable)"
+        );
     } else if no_lazy {
         eprintln!("lazy: disabled (--no-lazy)");
     } else {
-        eprintln!("lazy: disabled under --write-only (servicing wants fetches; write-only never fetches)");
+        eprintln!(
+            "lazy: disabled under --write-only (servicing wants fetches; write-only never fetches)"
+        );
     }
     eprintln!("live sync active. (Ctrl-C to stop)\n");
 
@@ -325,7 +339,10 @@ fn run_sync(
         // republish_branches tick.
         if let Some(limit) = duration_limit {
             if started.elapsed() >= limit {
-                eprintln!("\nreached --duration limit ({}s); stopping", limit.as_secs());
+                eprintln!(
+                    "\nreached --duration limit ({}s); stopping",
+                    limit.as_secs()
+                );
                 break;
             }
         }
@@ -360,7 +377,9 @@ fn run_sync(
                 } = info;
 
                 match triblespace_net::tracking::merge_tracking_into_local(
-                    &mut repo, tracking_id, &name,
+                    &mut repo,
+                    tracking_id,
+                    &name,
                 ) {
                     Ok(triblespace_net::tracking::MergeOutcome::Merged { .. }) => {
                         eprintln!("  merged '{name}'");
@@ -434,4 +453,3 @@ fn run_sync(
     }
     Ok(())
 }
-

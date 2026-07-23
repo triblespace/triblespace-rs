@@ -186,13 +186,7 @@ fn main() {
 
     println!(
         "{:<48} {:>10} {:>10} {:>10} {:>10} {:>8} {:>8}  parity",
-        "query",
-        "rows",
-        "seq ms",
-        "blk ms",
-        "dag ms",
-        "blk/seq",
-        "dag/seq"
+        "query", "rows", "seq ms", "blk ms", "dag ms", "blk/seq", "dag/seq"
     );
     for (name, q) in &queries {
         let mut seq_times = Vec::new();

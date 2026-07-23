@@ -1354,13 +1354,8 @@ where
             self.admission,
             Arc::clone(&self.counters),
         );
-        let canonical = SuccinctArchiveConstraint::with_ring_batch(
-            e,
-            a,
-            v,
-            self.gpu.archive(),
-            self.gpu,
-        );
+        let canonical =
+            SuccinctArchiveConstraint::with_ring_batch(e, a, v, self.gpu.archive(), self.gpu);
         let program = match family {
             Some(preferred) => {
                 ResidentProgram::Preferred(PreferredProgram::new(preferred, canonical))
@@ -1382,9 +1377,7 @@ where
     U: Universe,
 {
     Canonical(SuccinctArchiveConstraint<'a, U>),
-    Preferred(
-        PreferredProgram<SuccinctTwoBoundFamily<'a, U>, SuccinctArchiveConstraint<'a, U>>,
-    ),
+    Preferred(PreferredProgram<SuccinctTwoBoundFamily<'a, U>, SuccinctArchiveConstraint<'a, U>>),
 }
 
 impl<U> Clone for ResidentProgram<'_, U>
@@ -1479,14 +1472,8 @@ where
         self.program.canonical().fixed_denotation()
     }
 
-    fn proposal_coverage(
-        &self,
-        variable: VariableId,
-        bound: VariableSet,
-    ) -> ProposalCoverage {
-        self.program
-            .canonical()
-            .proposal_coverage(variable, bound)
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+        self.program.canonical().proposal_coverage(variable, bound)
     }
 
     fn estimate(

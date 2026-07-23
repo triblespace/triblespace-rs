@@ -8,17 +8,17 @@
 //! `trible pile branch …`. This module is the lower-level surface
 //! that sees every pin regardless of role.
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use clap::Parser;
 use std::path::PathBuf;
 
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::id::Id;
-use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
+use triblespace_core::inline::Inline;
 use triblespace_core::macros::{find, pattern};
-use triblespace_core::repo::{BlobStore, BlobStoreGet, PinStore, PushResult};
 use triblespace_core::repo::pile::Pile;
+use triblespace_core::repo::{BlobStore, BlobStoreGet, PinStore, PushResult};
 use triblespace_core::trible::TribleSet;
 
 #[derive(Parser)]
@@ -148,14 +148,11 @@ fn parse_pin_hex(s: &str) -> Result<Id> {
 
 fn run_inspect(path: PathBuf, pin_hex: String) -> Result<()> {
     let pin_id = parse_pin_hex(&pin_hex)?;
-    let mut pile: Pile = Pile::open(&path)
-        .map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
+    let mut pile: Pile =
+        Pile::open(&path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
     let res = (|| -> Result<()> {
-        pile.refresh()
-            .map_err(|e| anyhow!("pile refresh: {e:?}"))?;
-        let reader = pile
-            .reader()
-            .map_err(|e| anyhow!("pile reader: {e:?}"))?;
+        pile.refresh().map_err(|e| anyhow!("pile refresh: {e:?}"))?;
+        let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
 
         let pin_bytes: [u8; 16] = pin_id.into();
         println!("pin:   {}", hex::encode(pin_bytes));
@@ -175,9 +172,7 @@ fn run_inspect(path: PathBuf, pin_hex: String) -> Result<()> {
                 (role, count)
             }
             Err(e) => {
-                println!(
-                    "state: head present but metadata blob unreadable: {e:?}"
-                );
+                println!("state: head present but metadata blob unreadable: {e:?}");
                 return Ok(());
             }
         };
@@ -188,19 +183,16 @@ fn run_inspect(path: PathBuf, pin_hex: String) -> Result<()> {
         println!("tribles in metadata blob: {trible_count}");
         Ok(())
     })();
-    let close_res = pile
-        .close()
-        .map_err(|e| anyhow!("pile close: {e:?}"));
+    let close_res = pile.close().map_err(|e| anyhow!("pile close: {e:?}"));
     res.and(close_res)
 }
 
 fn run_delete(path: PathBuf, pin_hex: String) -> Result<()> {
     let pin_id = parse_pin_hex(&pin_hex)?;
-    let mut pile: Pile = Pile::open(&path)
-        .map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
+    let mut pile: Pile =
+        Pile::open(&path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
     let res = (|| -> Result<()> {
-        pile.refresh()
-            .map_err(|e| anyhow!("pile refresh: {e:?}"))?;
+        pile.refresh().map_err(|e| anyhow!("pile refresh: {e:?}"))?;
         let current = pile
             .head(pin_id)
             .map_err(|e| anyhow!("read pin head: {e:?}"))?;
@@ -219,10 +211,7 @@ fn run_delete(path: PathBuf, pin_hex: String) -> Result<()> {
             .map_err(|e| anyhow!("tombstone pin: {e:?}"))?
         {
             PushResult::Success() => {
-                println!(
-                    "deleted pin {}",
-                    hex::encode(<[u8; 16]>::from(pin_id))
-                );
+                println!("deleted pin {}", hex::encode(<[u8; 16]>::from(pin_id)));
                 println!(
                     "(reachable blobs become unreachable; the next \
                      `pile squash` reclaims them)"
@@ -232,25 +221,22 @@ fn run_delete(path: PathBuf, pin_hex: String) -> Result<()> {
             PushResult::Conflict(current) => Err(anyhow!(
                 "CAS conflict — pin head advanced between read and delete \
                  (current head: {:?})",
-                current.map(|h| hex::encode(h.raw)).unwrap_or_else(|| "<deleted>".into())
+                current
+                    .map(|h| hex::encode(h.raw))
+                    .unwrap_or_else(|| "<deleted>".into())
             )),
         }
     })();
-    let close_res = pile
-        .close()
-        .map_err(|e| anyhow!("pile close: {e:?}"));
+    let close_res = pile.close().map_err(|e| anyhow!("pile close: {e:?}"));
     res.and(close_res)
 }
 
 fn run_list(path: PathBuf) -> Result<()> {
-    let mut pile: Pile = Pile::open(&path)
-        .map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
+    let mut pile: Pile =
+        Pile::open(&path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
     let res = (|| -> Result<()> {
-        pile.refresh()
-            .map_err(|e| anyhow!("pile refresh: {e:?}"))?;
-        let reader = pile
-            .reader()
-            .map_err(|e| anyhow!("pile reader: {e:?}"))?;
+        pile.refresh().map_err(|e| anyhow!("pile refresh: {e:?}"))?;
+        let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
 
         let pin_ids: Vec<Id> = pile
             .pins()
@@ -269,17 +255,11 @@ fn run_list(path: PathBuf) -> Result<()> {
             let head = match pile.head(pin_id) {
                 Ok(Some(h)) => h,
                 Ok(None) => {
-                    println!(
-                        "  {}  DELETED",
-                        hex::encode(pin_bytes),
-                    );
+                    println!("  {}  DELETED", hex::encode(pin_bytes),);
                     continue;
                 }
                 Err(e) => {
-                    println!(
-                        "  {}  ERROR ({e:?})",
-                        hex::encode(pin_bytes),
-                    );
+                    println!("  {}  ERROR ({e:?})", hex::encode(pin_bytes),);
                     continue;
                 }
             };
@@ -301,8 +281,6 @@ fn run_list(path: PathBuf) -> Result<()> {
         }
         Ok(())
     })();
-    let close_res = pile
-        .close()
-        .map_err(|e| anyhow!("pile close: {e:?}"));
+    let close_res = pile.close().map_err(|e| anyhow!("pile close: {e:?}"));
     res.and(close_res)
 }

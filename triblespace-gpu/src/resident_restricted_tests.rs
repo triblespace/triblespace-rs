@@ -1,8 +1,8 @@
 use super::*;
 
+use crate::query_program::{QueryPattern, QueryTerm};
 use crate::resident_round::ResidentRowChoice;
 use jerky::bit_vector::Select;
-use crate::query_program::{QueryPattern, QueryTerm};
 use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use triblespace_core::id::{ExclusiveId, Id};
 use triblespace_core::inline::encodings::genid::GenId;

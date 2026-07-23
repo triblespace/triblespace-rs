@@ -430,11 +430,7 @@ where
         true
     }
 
-    fn proposal_coverage(
-        &self,
-        variable: VariableId,
-        bound: VariableSet,
-    ) -> ProposalCoverage {
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
         if variable == self.doc.index && !bound.is_set(variable) {
             ProposalCoverage::Exact
         } else {
@@ -516,9 +512,7 @@ where
 
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match view.col(self.doc.index) {
-            Some(col) => view
-                .iter()
-                .all(|row| self.contains_raw(&row[col])),
+            Some(col) => view.iter().all(|row| self.contains_raw(&row[col])),
             None => true,
         }
     }
@@ -725,10 +719,7 @@ impl<I: CosineSimilarity + ?Sized> TypedProgramSpec for CosineAtLeast<'_, I> {
                     variable,
                 )
             }
-            ProgramAction::Support => (
-                COSINE_SUPPORT_ROUTE | bound_mask,
-                self.a.index,
-            ),
+            ProgramAction::Support => (COSINE_SUPPORT_ROUTE | bound_mask, self.a.index),
         };
         Some(ProgramRoute {
             key: ProgramKey::new(key),
@@ -857,9 +848,8 @@ impl<I: CosineSimilarity + ?Sized> TypedProgramSpec for CosineAtLeast<'_, I> {
                         "exact cosine support received a candidate group"
                     );
                     if self.support_row(&batch.view, batch.view.row(input)) {
-                        effects.support(
-                            u32::try_from(input).expect("too many exact cosine inputs"),
-                        );
+                        effects
+                            .support(u32::try_from(input).expect("too many exact cosine inputs"));
                     }
                     effects.page(1, None);
                 }
@@ -1078,11 +1068,7 @@ impl<'a> Constraint<'a> for SimilarTo {
         true
     }
 
-    fn proposal_coverage(
-        &self,
-        variable: VariableId,
-        bound: VariableSet,
-    ) -> ProposalCoverage {
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
         if variable == self.var.index && !bound.is_set(variable) {
             ProposalCoverage::Exact
         } else {
@@ -1164,9 +1150,7 @@ impl<'a> Constraint<'a> for SimilarTo {
 
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match view.col(self.var.index) {
-            Some(col) => view
-                .iter()
-                .all(|row| self.contains_raw(&row[col])),
+            Some(col) => view.iter().all(|row| self.contains_raw(&row[col])),
             None => true,
         }
     }
@@ -1934,9 +1918,7 @@ mod tests {
         let (constraint, mut expected) = {
             let (flat, _hnsw, mut store, handles) = sample_sim();
             let reader = store.reader().unwrap();
-            let constraint = flat
-                .attach(&reader)
-                .similar_to(handles[0], neighbour, 0.8);
+            let constraint = flat.attach(&reader).similar_to(handles[0], neighbour, 0.8);
             (constraint, vec![handles[0].raw, handles[2].raw])
         };
 
@@ -2066,12 +2048,12 @@ mod tests {
             &RowsView::new(&[a.index], &[handles[0].raw]),
             &mut CandidateSink::Tagged(&mut no_domain),
         );
-        assert!(no_domain.is_empty(), "exact cosine must never source an ANN domain");
+        assert!(
+            no_domain.is_empty(),
+            "exact cosine must never source an ANN domain"
+        );
 
-        let mut bind_b: Candidates = handles
-            .iter()
-            .map(|handle| (0, handle.raw))
-            .collect();
+        let mut bind_b: Candidates = handles.iter().map(|handle| (0, handle.raw)).collect();
         c.confirm(
             b.index,
             &RowsView::new(&[a.index], &[handles[0].raw]),
@@ -2082,10 +2064,7 @@ mod tests {
             [handles[0].raw, handles[2].raw],
         );
 
-        let mut bind_a: Candidates = handles
-            .iter()
-            .map(|handle| (0, handle.raw))
-            .collect();
+        let mut bind_a: Candidates = handles.iter().map(|handle| (0, handle.raw)).collect();
         c.confirm(
             a.index,
             &RowsView::new(&[b.index], &[handles[2].raw]),
@@ -2141,12 +2120,8 @@ mod tests {
     #[test]
     fn pairwise_cosine_divides_by_norms_for_raw_embedding_blobs() {
         let (flat, _hnsw, mut store, _handles) = sample_sim();
-        let a_handle = store
-            .put::<Embedding, _>(vec![2.0f32, 0.0, 0.0])
-            .unwrap();
-        let b_handle = store
-            .put::<Embedding, _>(vec![3.0f32, 0.0, 0.0])
-            .unwrap();
+        let a_handle = store.put::<Embedding, _>(vec![2.0f32, 0.0, 0.0]).unwrap();
+        let b_handle = store.put::<Embedding, _>(vec![3.0f32, 0.0, 0.0]).unwrap();
         let reader = store.reader().unwrap();
         let view = flat.attach(&reader);
         let a = Variable::<Handle<Embedding>>::new(0);
@@ -2158,7 +2133,10 @@ mod tests {
             &RowsView::new(&[a.index], &[a_handle.raw]),
             &mut CandidateSink::Tagged(&mut candidates),
         );
-        assert!(candidates.is_empty(), "parallel vectors have cosine one, not dot six");
+        assert!(
+            candidates.is_empty(),
+            "parallel vectors have cosine one, not dot six"
+        );
     }
 
     #[test]
@@ -2176,11 +2154,7 @@ mod tests {
         assert_eq!(est(&c, a.index, &RowsView::EMPTY), Some(usize::MAX));
         assert_eq!(est(&c, b.index, &RowsView::EMPTY), Some(usize::MAX));
         assert_eq!(
-            est(
-                &c,
-                b.index,
-                &RowsView::new(&[a.index], &[handles[0].raw]),
-            ),
+            est(&c, b.index, &RowsView::new(&[a.index], &[handles[0].raw]),),
             Some(usize::MAX),
         );
         assert_eq!(est(&c, unrelated.index, &RowsView::EMPTY), None);
@@ -2231,11 +2205,7 @@ mod tests {
                 bound: VariableSet::new_empty(),
             })
             .is_some());
-        let good = triblespace_core::and!(
-            a.is(handles[0]),
-            b.is(handles[2]),
-            exact,
-        );
+        let good = triblespace_core::and!(a.is(handles[0]), b.is(handles[2]), exact,);
         let rows: Vec<_> = Query::new(good, project_pair)
             .solve_residual_state_lazy_with(ResidualLowering::FULL)
             .cap(1)
@@ -2249,23 +2219,16 @@ mod tests {
             b.is(handles[1]),
             view.cosine_at_least(a, b, 0.8),
         );
-        assert!(
-            Query::new(bad, project_pair)
-                .solve_residual_state_lazy_with(ResidualLowering::FULL)
-                .next()
-                .is_none()
-        );
+        assert!(Query::new(bad, project_pair)
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .next()
+            .is_none());
 
-        let repeated = triblespace_core::and!(
-            a.is(handles[0]),
-            view.cosine_at_least(a, a, 1.01),
-        );
-        assert!(
-            Query::new(repeated, project_first)
-                .solve_residual_state_lazy_with(ResidualLowering::FULL)
-                .next()
-                .is_none()
-        );
+        let repeated = triblespace_core::and!(a.is(handles[0]), view.cosine_at_least(a, a, 1.01),);
+        assert!(Query::new(repeated, project_first)
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .next()
+            .is_none());
     }
 
     #[test]

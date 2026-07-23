@@ -154,7 +154,10 @@ impl TypedProgramSpec for ConstantConstraint {
                         batch.candidate_sets[input].is_none(),
                         "typed constant proposal received a candidate group"
                     );
-                    assert!(batch.limits[input] > 0, "typed constant proposal has zero demand");
+                    assert!(
+                        batch.limits[input] > 0,
+                        "typed constant proposal has zero demand"
+                    );
                     effects.direct(
                         u32::try_from(input).expect("too many typed constant inputs"),
                         self.constant,
@@ -201,9 +204,8 @@ impl TypedProgramSpec for ConstantConstraint {
                         "typed constant support received a candidate group"
                     );
                     if column.is_none_or(|column| batch.view.row(input)[column] == self.constant) {
-                        effects.support(
-                            u32::try_from(input).expect("too many typed constant inputs"),
-                        );
+                        effects
+                            .support(u32::try_from(input).expect("too many typed constant inputs"));
                     }
                     effects.page(1, None);
                 }
@@ -221,11 +223,7 @@ impl<'a> Constraint<'a> for ConstantConstraint {
         true
     }
 
-    fn proposal_coverage(
-        &self,
-        variable: VariableId,
-        bound: VariableSet,
-    ) -> ProposalCoverage {
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
         if variable == self.variable && !bound.is_set(variable) {
             ProposalCoverage::Exact
         } else {

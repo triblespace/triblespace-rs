@@ -1,8 +1,6 @@
 use super::*;
 
-use crate::query_program::{
-    ProgramFrontier, ProgramVariable, QueryPattern, QueryProgram,
-};
+use crate::query_program::{ProgramFrontier, ProgramVariable, QueryPattern, QueryProgram};
 use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use triblespace_core::trible::TribleSet;
 

@@ -38,11 +38,11 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
     use triblespace::prelude::{BlobStore, BlobStoreGet, PinStore};
 
     use triblespace_core::id::id_hex;
-    use triblespace_core::repo::BlobStoreMeta;
-    use triblespace_core::repo::pile::{Pile, ReadError};
-    use triblespace_core::trible::TribleSet;
     use triblespace_core::inline::encodings::hash::{Blake3, Handle, Hash};
     use triblespace_core::inline::Inline;
+    use triblespace_core::repo::pile::{Pile, ReadError};
+    use triblespace_core::repo::BlobStoreMeta;
+    use triblespace_core::trible::TribleSet;
 
     match Pile::open(pile_path) {
         Ok(mut pile) => {
@@ -191,14 +191,13 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                                         for t in meta.iter() {
                                             if t.a() == &name_attr {
                                                 let h: Inline<Handle<LongString>> = *t.v();
-                                                if let Ok(view) =
-                                                    reader.get::<triblespace::prelude::View<str>, _>(h)
+                                                if let Ok(view) = reader
+                                                    .get::<triblespace::prelude::View<str>, _>(h)
                                                 {
                                                     name_val = Some(view.as_ref().to_string());
                                                 }
                                             } else if t.a() == &repo_head_attr {
-                                                head_val =
-                                                    Some(*t.v::<Handle<SimpleArchive>>());
+                                                head_val = Some(*t.v::<Handle<SimpleArchive>>());
                                             }
                                         }
                                     }
@@ -244,8 +243,12 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                                 continue;
                             }
                             if let Some(head) = head_val {
-                                let (count, err) =
-                                    verify_chain(&reader, head, repo_parent_attr, repo_content_attr);
+                                let (count, err) = verify_chain(
+                                    &reader,
+                                    head,
+                                    repo_parent_attr,
+                                    repo_content_attr,
+                                );
                                 if let Some(e) = err {
                                     println!("  commit chain error: {e}");
                                     if fail_fast {

@@ -1,11 +1,11 @@
-use triblespace_gpu::query_program::{
-    ProgramFrontier, ProgramVariable, QueryPattern, QueryProgram, QueryTerm,
-};
 use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use triblespace_core::id::{ExclusiveId, Id};
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::InlineEncoding;
 use triblespace_core::trible::{Trible, TribleSet};
+use triblespace_gpu::query_program::{
+    ProgramFrontier, ProgramVariable, QueryPattern, QueryProgram, QueryTerm,
+};
 use triblespace_gpu::{
     ResidentRoundError, ResidentRowChoice, ResidentRowPlanner, ResidentSupportError,
     WgpuResidentRound, WgpuSuccinctArchive,

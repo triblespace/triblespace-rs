@@ -35,12 +35,12 @@
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
+use iroh::Endpoint;
 use iroh::endpoint::presets;
 use iroh::test_utils::test_transport::TestNetwork;
-use iroh::Endpoint;
 use iroh_base::{EndpointAddr, EndpointId, SecretKey};
-use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::UnknownBlob;
+use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::encodings::time::NsTAIInterval;
@@ -66,7 +66,7 @@ fn admin_cap(
     root: &SigningKey,
     subject: &SigningKey,
 ) -> (Blob<SimpleArchive>, Blob<SimpleArchive>) {
-    use triblespace_core::id::{ufoid, ExclusiveId};
+    use triblespace_core::id::{ExclusiveId, ufoid};
     use triblespace_core::macros::entity;
 
     let scope_root = *ufoid();
@@ -304,7 +304,7 @@ async fn weak_pin_want_fetches_from_holder_over_iroh() {
 
     // The lazy payload: a blob in pile A outside any branch history.
     let payload: TribleSet = {
-        use triblespace_core::id::{ufoid, ExclusiveId};
+        use triblespace_core::id::{ExclusiveId, ufoid};
         use triblespace_core::macros::entity;
         let e = *ufoid();
         let tag = *ufoid();
@@ -321,7 +321,8 @@ async fn weak_pin_want_fetches_from_holder_over_iroh() {
         mut repo_b,
         _dir,
     } = two_nodes(&network, &ka, &kb, |pile| {
-        pile.put::<SimpleArchive, _>(blob.clone()).expect("seed payload");
+        pile.put::<SimpleArchive, _>(blob.clone())
+            .expect("seed payload");
         pile.flush().expect("flush payload");
     })
     .await;
@@ -362,8 +363,9 @@ async fn weak_pin_want_fetches_from_holder_over_iroh() {
 
     // Service the want. Each tick diffs wants against presence and
     // drives the swarm fetch for the missing ones.
-    let mut reconciler = Reconciler::with_backoff(Duration::from_millis(200), Duration::from_secs(2))
-        .with_fetch_budget(Duration::from_secs(10));
+    let mut reconciler =
+        Reconciler::with_backoff(Duration::from_millis(200), Duration::from_secs(2))
+            .with_fetch_budget(Duration::from_secs(10));
     let mut fetched = false;
     for _ in 0..60u32 {
         repo_a.storage_mut().refresh(); // keep A serving a fresh snapshot

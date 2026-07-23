@@ -8,9 +8,7 @@
 //!     cargo build --release --example archive_load_profile
 //!     samply record ./target/release/examples/archive_load_profile
 
-use triblespace::core::blob::encodings::simplearchive::{
-    try_from_blob_heap_only, SimpleArchive,
-};
+use triblespace::core::blob::encodings::simplearchive::{try_from_blob_heap_only, SimpleArchive};
 use triblespace::core::blob::Blob;
 use triblespace::core::inline::Encodes;
 use triblespace::core::trible::{Trible, TribleSet};

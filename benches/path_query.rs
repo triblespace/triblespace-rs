@@ -4,12 +4,12 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::hint::black_box;
 use triblespace::core::id::{Id, RawId, ID_LEN};
+use triblespace::core::inline::encodings::genid::GenId;
+use triblespace::core::inline::IntoInline;
 use triblespace::core::patch::{Entry, IdentitySchema, PATCH};
 use triblespace::core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace::core::query::{Binding, Constraint, Query, TriblePattern, VariableContext};
 use triblespace::core::trible::{EAVOrder, TribleSet, TRIBLE_LEN};
-use triblespace::core::inline::encodings::genid::GenId;
-use triblespace::core::inline::IntoInline;
 use triblespace::prelude::*;
 
 mod bench_social {
@@ -463,9 +463,11 @@ fn bench_compare_tree(c: &mut Criterion) {
         let (set, root) = build_tree(depth);
         let start: RawId = root.id.into();
 
-        group.bench_with_input(BenchmarkId::new("nfa_materialized", depth), &depth, |b, _| {
-            b.iter(|| black_box(nfa_materialized::reachable_from(&set, &attr, &start)))
-        });
+        group.bench_with_input(
+            BenchmarkId::new("nfa_materialized", depth),
+            &depth,
+            |b, _| b.iter(|| black_box(nfa_materialized::reachable_from(&set, &attr, &start))),
+        );
         group.bench_with_input(BenchmarkId::new("nfa_lazy", depth), &depth, |b, _| {
             b.iter(|| black_box(nfa_lazy::reachable_from(&set, &attr, &start)))
         });
@@ -498,11 +500,9 @@ fn bench_compare_sparse(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("nfa_lazy", total), &total, |b, _| {
             b.iter(|| black_box(nfa_lazy::reachable_from(&set, &attr, &start)))
         });
-        group.bench_with_input(
-            BenchmarkId::new("recursive_join", total),
-            &total,
-            |b, _| b.iter(|| black_box(recursive_join::reachable_from(&set, &attr, &start))),
-        );
+        group.bench_with_input(BenchmarkId::new("recursive_join", total), &total, |b, _| {
+            b.iter(|| black_box(recursive_join::reachable_from(&set, &attr, &start)))
+        });
         group.bench_with_input(BenchmarkId::new("hybrid", total), &total, |b, _| {
             b.iter(|| black_box(hybrid::reachable_from(&set, &attr, &start)))
         });

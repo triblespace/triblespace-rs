@@ -66,10 +66,7 @@ impl iroh::protocol::ProtocolHandler for EventForwardingHandler {
 /// for production (dot-stripped relay + mDNS + DHT lookups), but
 /// strips all of those — the TestNetwork virtual transport is the
 /// only path that matters for the test.
-async fn test_endpoint(
-    network: &TestNetwork,
-    secret: SecretKey,
-) -> Endpoint {
+async fn test_endpoint(network: &TestNetwork, secret: SecretKey) -> Endpoint {
     let transport = network
         .create_transport(secret.public())
         .expect("create test transport");
@@ -119,7 +116,12 @@ async fn op_request_cap_round_trips() {
         .connect(custom_addr(admin_id), AUTH_HANDSHAKE_ALPN)
         .await
         .expect("connect");
-    let status = send_request_cap(&triblespace_net::transport::iroh::IrohConn(conn.clone()), &payload).await.expect("send");
+    let status = send_request_cap(
+        &triblespace_net::transport::iroh::IrohConn(conn.clone()),
+        &payload,
+    )
+    .await
+    .expect("send");
     assert_eq!(status, STATUS_OK, "admin should ACK the request");
     conn.close(0u32.into(), b"ok");
 
@@ -130,7 +132,11 @@ async fn op_request_cap_round_trips() {
         .expect("channel still open");
     match event {
         IncomingOp::Request { partial_cap_bytes } => {
-            assert_eq!(&partial_cap_bytes[..], &payload[..], "payload survives the wire");
+            assert_eq!(
+                &partial_cap_bytes[..],
+                &payload[..],
+                "payload survives the wire"
+            );
         }
         IncomingOp::Deliver { .. } => panic!("got Deliver, expected Request"),
     }
@@ -162,9 +168,13 @@ async fn op_deliver_cap_round_trips() {
         .connect(custom_addr(recipient_id), AUTH_HANDSHAKE_ALPN)
         .await
         .expect("connect");
-    let status = send_deliver_cap(&triblespace_net::transport::iroh::IrohConn(conn.clone()), &cap_bytes, &sig_bytes)
-        .await
-        .expect("send");
+    let status = send_deliver_cap(
+        &triblespace_net::transport::iroh::IrohConn(conn.clone()),
+        &cap_bytes,
+        &sig_bytes,
+    )
+    .await
+    .expect("send");
     assert_eq!(status, STATUS_OK, "recipient should ACK the delivery");
     conn.close(0u32.into(), b"ok");
 
@@ -173,7 +183,10 @@ async fn op_deliver_cap_round_trips() {
         .expect("event arrives within 2s")
         .expect("channel still open");
     match event {
-        IncomingOp::Deliver { cap_bytes: c, sig_bytes: s } => {
+        IncomingOp::Deliver {
+            cap_bytes: c,
+            sig_bytes: s,
+        } => {
             assert_eq!(&c[..], &cap_bytes[..], "cap payload survives the wire");
             assert_eq!(&s[..], &sig_bytes[..], "sig payload survives the wire");
         }

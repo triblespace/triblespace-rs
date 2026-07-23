@@ -112,7 +112,10 @@ where
         limit: usize,
         accepted: &mut Vec<RawInline>,
     ) -> ResidualDeltaSourcePage {
-        assert!(limit > 0, "sorted-slice source pages require positive demand");
+        assert!(
+            limit > 0,
+            "sorted-slice source pages require positive demand"
+        );
         assert!(
             begin <= self.slice.0.len(),
             "sorted-slice source cursor exceeds the immutable frontier"
@@ -199,8 +202,7 @@ where
             ],
             SortedSliceProgramState::Propose { offset } => [
                 3,
-                u64::MAX
-                    - u64::try_from(*offset).expect("sorted-slice offset exceeds rank limb"),
+                u64::MAX - u64::try_from(*offset).expect("sorted-slice offset exceeds rank limb"),
             ],
         }
     }
@@ -259,11 +261,8 @@ where
                         "typed sorted-slice proposal received a candidate group"
                     );
                     let mut direct = Vec::new();
-                    let page = self.proposal_page_from_offset(
-                        offset,
-                        batch.limits[input],
-                        &mut direct,
-                    );
+                    let page =
+                        self.proposal_page_from_offset(offset, batch.limits[input], &mut direct);
                     let input_tag = u32::try_from(input)
                         .expect("too many typed sorted-slice inputs in one cohort");
                     for value in direct {
@@ -319,8 +318,7 @@ where
                         batch.candidate_sets[input].is_none(),
                         "typed sorted-slice support received a candidate group"
                     );
-                    if column
-                        .is_none_or(|column| self.contains_raw(&batch.view.row(input)[column]))
+                    if column.is_none_or(|column| self.contains_raw(&batch.view.row(input)[column]))
                     {
                         effects.support(
                             u32::try_from(input).expect("too many typed sorted-slice inputs"),
@@ -346,11 +344,7 @@ where
         true
     }
 
-    fn proposal_coverage(
-        &self,
-        variable: VariableId,
-        bound: VariableSet,
-    ) -> ProposalCoverage {
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
         if variable == self.variable.index && !bound.is_set(variable) {
             ProposalCoverage::Exact
         } else {
@@ -437,9 +431,7 @@ where
     /// variable is unbound.
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match view.col(self.variable.index) {
-            Some(c) => view.iter().all(|row| {
-                self.contains_raw(&row[c])
-            }),
+            Some(c) => view.iter().all(|row| self.contains_raw(&row[c])),
             None => true,
         }
     }
@@ -575,12 +567,9 @@ mod tests {
         assert_eq!(second.examined, 2);
         assert_eq!(second.next, Some(ResidualDeltaSourceCursor::Offset(3)));
 
-        let mut expected: Vec<_> = Query::new(
-            SortedSliceConstraint::new(variable, slice),
-            project,
-        )
-        .sequential()
-        .collect();
+        let mut expected: Vec<_> = Query::new(SortedSliceConstraint::new(variable, slice), project)
+            .sequential()
+            .collect();
         let mut query = Query::new(SortedSliceConstraint::new(variable, slice), project)
             .solve_residual_state_lazy_with(ResidualLowering::FULL)
             .cap(1)
@@ -646,10 +635,9 @@ mod tests {
             .collect();
         assert!(encoded.windows(2).all(|pair| pair[0] > pair[1]));
 
-        let mut expected: Vec<_> =
-            Query::new(SortedSliceConstraint::new(variable, slice), project)
-                .sequential()
-                .collect();
+        let mut expected: Vec<_> = Query::new(SortedSliceConstraint::new(variable, slice), project)
+            .sequential()
+            .collect();
         let mut query = Query::new(SortedSliceConstraint::new(variable, slice), project)
             .solve_residual_state_lazy_with(ResidualLowering::FULL)
             .cap(1)

@@ -54,10 +54,10 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace::prelude::BlobStore;
             use triblespace::prelude::BlobStoreList;
             use triblespace_core::blob::encodings::UnknownBlob;
-            use triblespace_core::repo::pile::Pile;
             use triblespace_core::inline::encodings::hash::Blake3;
             use triblespace_core::inline::encodings::hash::Handle;
             use triblespace_core::inline::encodings::hash::Hash;
+            use triblespace_core::repo::pile::Pile;
 
             let mut pile: Pile = Pile::open(&path)?;
             let res = (|| -> Result<(), anyhow::Error> {
@@ -65,8 +65,7 @@ pub fn run(cmd: Command) -> Result<()> {
                     .reader()
                     .map_err(|e| anyhow::anyhow!("pile reader error: {e:?}"))?;
                 for handle in reader.blobs() {
-                    let handle: triblespace_core::inline::Inline<Handle<UnknownBlob>> =
-                        handle?;
+                    let handle: triblespace_core::inline::Inline<Handle<UnknownBlob>> = handle?;
                     let hash: triblespace_core::inline::Inline<Hash<Blake3>> =
                         Handle::to_hash(handle);
                     let string: String = hash.from_inline();
@@ -92,10 +91,10 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace::prelude::blobencodings::RawBytes;
             use triblespace::prelude::BlobStorePut;
             use triblespace_core::blob::Bytes;
-            use triblespace_core::repo::pile::Pile;
             use triblespace_core::inline::encodings::hash::Blake3;
             use triblespace_core::inline::encodings::hash::Handle;
             use triblespace_core::inline::encodings::hash::Hash;
+            use triblespace_core::repo::pile::Pile;
 
             let mut pile: Pile = Pile::open(&pile)?;
             let res = (|| -> Result<(), anyhow::Error> {
@@ -122,7 +121,7 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace_core::blob::encodings::UnknownBlob;
             use triblespace_core::blob::Bytes;
             use triblespace_core::repo::pile::Pile;
-            
+
             use triblespace_core::inline::encodings::hash::Handle;
 
             let mut pile: Pile = Pile::open(&pile)?;
@@ -154,7 +153,7 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace_core::blob::Blob;
             use triblespace_core::repo::pile::Pile;
             use triblespace_core::repo::BlobMetadata;
-            
+
             use triblespace_core::inline::encodings::hash::Handle;
 
             let mut pile: Pile = Pile::open(&pile)?;

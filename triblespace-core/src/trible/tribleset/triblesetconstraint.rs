@@ -1164,8 +1164,7 @@ impl TypedProgramSpec for TribleSetConstraint {
             TribleSetProgramState::Confirm { offset, .. } => {
                 rank[0] = 2;
                 rank[1] = u64::MAX
-                    - u64::try_from(*offset)
-                        .expect("TribleSet candidate offset exceeds rank limb");
+                    - u64::try_from(*offset).expect("TribleSet candidate offset exceeds rank limb");
             }
             TribleSetProgramState::Propose { cursor, .. } => {
                 rank[0] = 3;
@@ -1210,7 +1209,10 @@ impl TypedProgramSpec for TribleSetConstraint {
                 assert_eq!(batch.route.variable, variable);
                 assert!(!batch.request.bound.is_set(variable));
                 assert_ne!(self.variable_position_mask(variable), 0);
-                TribleSetProgramState::Confirm { variable, offset: 0 }
+                TribleSetProgramState::Confirm {
+                    variable,
+                    offset: 0,
+                }
             }
             ProgramAction::Support => {
                 assert_eq!(batch.route.completion, ProgramCompletion::PageableOnly);
@@ -1264,8 +1266,8 @@ impl TypedProgramSpec for TribleSetConstraint {
                         batch.limits[input],
                         &mut direct,
                     );
-                    let input =
-                        u32::try_from(input).expect("too many typed TribleSet inputs in one cohort");
+                    let input = u32::try_from(input)
+                        .expect("too many typed TribleSet inputs in one cohort");
                     for value in direct {
                         effects.direct(input, value);
                     }
@@ -1274,10 +1276,7 @@ impl TypedProgramSpec for TribleSetConstraint {
                         "typed TribleSet proposal resumed without examining its source"
                     );
                     let resume = page.next.map(|cursor| {
-                        TypedResume::Immediate(TribleSetProgramState::Propose {
-                            variable,
-                            cursor,
-                        })
+                        TypedResume::Immediate(TribleSetProgramState::Propose { variable, cursor })
                     });
                     effects.account_source(page.examined, 0);
                     effects.page(page.examined, resume);
@@ -1297,8 +1296,8 @@ impl TypedProgramSpec for TribleSetConstraint {
                     assert_eq!(state_variable, variable);
                     let candidates = batch.candidate_sets[input]
                         .expect("typed TribleSet confirmation lost its immutable candidate group");
-                    let input_tag =
-                        u32::try_from(input).expect("too many typed TribleSet inputs in one cohort");
+                    let input_tag = u32::try_from(input)
+                        .expect("too many typed TribleSet inputs in one cohort");
                     let end = self.confirm_page_row(
                         &positions,
                         batch.view.row(input),
@@ -1368,11 +1367,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
         true
     }
 
-    fn proposal_coverage(
-        &self,
-        variable: VariableId,
-        bound: VariableSet,
-    ) -> ProposalCoverage {
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
         if !bound.is_set(variable) && self.variables().is_set(variable) {
             ProposalCoverage::Exact
         } else {

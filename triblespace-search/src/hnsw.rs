@@ -40,9 +40,9 @@
 //! assert!(!hits.contains(&h2));
 //! ```
 
-use triblespace_core::query::Variable;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Inline;
+use triblespace_core::query::Variable;
 
 use crate::schemas::{EmbHandle, Embedding};
 
@@ -663,11 +663,7 @@ where
             .collect())
     }
 
-    fn dist_to(
-        &self,
-        q: &[f32],
-        i: u32,
-    ) -> Result<f32, B::GetError<anybytes::view::ViewError>> {
+    fn dist_to(&self, q: &[f32], i: u32) -> Result<f32, B::GetError<anybytes::view::ViewError>> {
         let handle = self.index.handles[i as usize];
         let view = self.cache.get(handle)?;
         Ok(cosine_dist(q, view.as_ref().as_ref()))
@@ -1150,10 +1146,7 @@ mod tests {
 
     /// Put `vec` into `store` as a normalized [`Embedding`] blob
     /// and return the handle.
-    fn put_emb(
-        store: &mut MemoryBlobStore,
-        vec: Vec<f32>,
-    ) -> Inline<Handle<Embedding>> {
+    fn put_emb(store: &mut MemoryBlobStore, vec: Vec<f32>) -> Inline<Handle<Embedding>> {
         crate::schemas::put_embedding::<_>(store, vec).unwrap()
     }
 
@@ -1163,11 +1156,7 @@ mod tests {
     fn build_flat(
         dim: usize,
         vecs: &[Vec<f32>],
-    ) -> (
-        FlatIndex,
-        MemoryBlobStore,
-        Vec<Inline<Handle<Embedding>>>,
-    ) {
+    ) -> (FlatIndex, MemoryBlobStore, Vec<Inline<Handle<Embedding>>>) {
         let mut store = MemoryBlobStore::new();
         let mut b = FlatBuilder::new(dim);
         let mut handles = Vec::with_capacity(vecs.len());
@@ -1181,9 +1170,7 @@ mod tests {
 
     /// Stable reader from an existing store — the writer must
     /// live for the reader to remain valid.
-    fn reader_of(
-        store: &mut MemoryBlobStore,
-    ) -> <MemoryBlobStore as BlobStore>::Reader {
+    fn reader_of(store: &mut MemoryBlobStore) -> <MemoryBlobStore as BlobStore>::Reader {
         store.reader().unwrap()
     }
 
@@ -1206,14 +1193,8 @@ mod tests {
 
     #[test]
     fn flat_threshold_selects_near_matches() {
-        let (idx, mut store, handles) = build_flat(
-            2,
-            &[
-                vec![1.0, 0.0],
-                vec![0.9, 0.1],
-                vec![0.0, 1.0],
-            ],
-        );
+        let (idx, mut store, handles) =
+            build_flat(2, &[vec![1.0, 0.0], vec![0.9, 0.1], vec![0.0, 1.0]]);
         let got: std::collections::HashSet<_> = idx
             .attach(&reader_of(&mut store))
             .candidates_above(handles[0], 0.8)
@@ -1229,10 +1210,7 @@ mod tests {
     fn flat_parallel_inputs_dedupe_at_put() {
         // Two parallel inputs normalise to the same unit vector —
         // `put_embedding` produces one handle for both.
-        let (_idx, _store, handles) = build_flat(
-            2,
-            &[vec![3.0, 0.0], vec![100.0, 0.0]],
-        );
+        let (_idx, _store, handles) = build_flat(2, &[vec![3.0, 0.0], vec![100.0, 0.0]]);
         assert_eq!(handles[0], handles[1]);
     }
 
@@ -1242,14 +1220,14 @@ mod tests {
         let idx = FlatBuilder::new(4).build();
         let probe = put_emb(&mut store, vec![1.0, 0.0, 0.0, 0.0]);
         let reader = store.reader().unwrap();
-        assert!(idx.attach(&reader).candidates_above(probe, 0.0).unwrap().is_empty());
+        assert!(idx
+            .attach(&reader)
+            .candidates_above(probe, 0.0)
+            .unwrap()
+            .is_empty());
     }
 
-    fn sample_flat() -> (
-        FlatIndex,
-        MemoryBlobStore,
-        Vec<Inline<Handle<Embedding>>>,
-    ) {
+    fn sample_flat() -> (FlatIndex, MemoryBlobStore, Vec<Inline<Handle<Embedding>>>) {
         build_flat(
             3,
             &[
@@ -1316,11 +1294,8 @@ mod tests {
 
     #[test]
     fn hnsw_threshold_excludes_orthogonal() {
-        let (idx, mut store, handles) = build_hnsw(
-            2,
-            42,
-            &[vec![1.0, 0.0], vec![0.9, 0.1], vec![0.0, 1.0]],
-        );
+        let (idx, mut store, handles) =
+            build_hnsw(2, 42, &[vec![1.0, 0.0], vec![0.9, 0.1], vec![0.0, 1.0]]);
         let got: std::collections::HashSet<_> = idx
             .attach(&reader_of(&mut store))
             .candidates_above(handles[0], 0.8)
@@ -1369,10 +1344,16 @@ mod tests {
         let mut total_hits = 0usize;
         let mut total_overlap = 0usize;
         for probe in fhandles.iter().take(5) {
-            let truth: std::collections::HashSet<_> =
-                flat_view.candidates_above(*probe, floor).unwrap().into_iter().collect();
-            let got: std::collections::HashSet<_> =
-                hnsw_view.candidates_above(*probe, floor).unwrap().into_iter().collect();
+            let truth: std::collections::HashSet<_> = flat_view
+                .candidates_above(*probe, floor)
+                .unwrap()
+                .into_iter()
+                .collect();
+            let got: std::collections::HashSet<_> = hnsw_view
+                .candidates_above(*probe, floor)
+                .unwrap()
+                .into_iter()
+                .collect();
             total_hits += truth.len();
             total_overlap += truth.intersection(&got).count();
         }
@@ -1418,11 +1399,7 @@ mod tests {
         assert_eq!(err.got, 2);
     }
 
-    fn sample_hnsw() -> (
-        HNSWIndex,
-        MemoryBlobStore,
-        Vec<Inline<Handle<Embedding>>>,
-    ) {
+    fn sample_hnsw() -> (HNSWIndex, MemoryBlobStore, Vec<Inline<Handle<Embedding>>>) {
         let mut store = MemoryBlobStore::new();
         let mut b = HNSWBuilder::new(3).with_seed(42);
         let vecs = [

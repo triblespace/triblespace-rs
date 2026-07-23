@@ -3111,9 +3111,8 @@ impl TypedProgramSpec for RegularPathConstraint {
         // grant. Planning is atomic across the cohort: one resumed cursor,
         // negated branch, or oversized fanout discards the borrowed plans and
         // preserves the ordinary affine pageable protocol for every input.
-        let mut plans: SmallVec<
-            [(u32, RpqNode, u32, bool, PositiveDeltaInfixes<'_>); 1],
-        > = SmallVec::new();
+        let mut plans: SmallVec<[(u32, RpqNode, u32, bool, PositiveDeltaInfixes<'_>); 1]> =
+            SmallVec::new();
         let mut fanouts: SmallVec<[usize; 1]> = SmallVec::new();
         fanouts.reserve(states.len());
         let mut all_fit = true;

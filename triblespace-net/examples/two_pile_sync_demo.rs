@@ -46,8 +46,8 @@ use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
 use iroh_base::{EndpointAddr, EndpointId, TransportAddr};
-use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::UnknownBlob;
+use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::encodings::time::NsTAIInterval;
@@ -95,7 +95,7 @@ fn admin_cap(
     root: &SigningKey,
     subject: &SigningKey,
 ) -> (Blob<SimpleArchive>, Blob<SimpleArchive>) {
-    use triblespace_core::id::{ufoid, ExclusiveId};
+    use triblespace_core::id::{ExclusiveId, ufoid};
     use triblespace_core::macros::entity;
 
     let scope_root = *ufoid();
@@ -145,9 +145,8 @@ fn bring_up(
             use iroh::address_lookup::{EndpointInfo, MemoryLookup};
             use iroh::endpoint::presets;
 
-            let lookup = MemoryLookup::from_endpoint_info(
-                known.iter().cloned().map(EndpointInfo::from),
-            );
+            let lookup =
+                MemoryLookup::from_endpoint_info(known.iter().cloned().map(EndpointInfo::from));
             let ep = iroh::Endpoint::builder(presets::N0)
                 .secret_key(secret)
                 .relay_mode(iroh::RelayMode::Disabled)
@@ -180,8 +179,7 @@ fn bring_up(
                 self_cap,
                 direction: SyncDirection::Bidirectional,
             };
-            let harness =
-                triblespace_net::transport::iroh::bind_with_endpoint(ep, &config).await;
+            let harness = triblespace_net::transport::iroh::bind_with_endpoint(ep, &config).await;
             host::run_host(harness, config, wiring).await;
         });
     });
@@ -234,10 +232,11 @@ fn run_a(dir: &Path) {
     // sync never ships it. Only a want can move it.
     let mut pile = fresh_pile(&dir.join("a.pile"));
     for blob in [&cap_a, &sig_a, &cap_b, &sig_b] {
-        pile.put::<SimpleArchive, _>(blob.clone()).expect("seed cap");
+        pile.put::<SimpleArchive, _>(blob.clone())
+            .expect("seed cap");
     }
     let payload: TribleSet = {
-        use triblespace_core::id::{ufoid, ExclusiveId};
+        use triblespace_core::id::{ExclusiveId, ufoid};
         use triblespace_core::macros::entity;
         let e = *ufoid();
         let tag = *ufoid();
@@ -248,7 +247,8 @@ fn run_a(dir: &Path) {
     };
     let payload_blob: Blob<SimpleArchive> = payload.to_blob();
     let payload_hash = payload_blob.get_handle().raw;
-    pile.put::<SimpleArchive, _>(payload_blob).expect("seed payload");
+    pile.put::<SimpleArchive, _>(payload_blob)
+        .expect("seed payload");
     pile.flush().expect("flush pile a");
 
     let (peer, my_addr) = bring_up(&ka, pile, team_root, self_cap_a, Vec::new());
@@ -292,7 +292,10 @@ fn run_a(dir: &Path) {
 
     println!("A: node {}", hex::encode(my_addr.id.as_bytes()));
     println!("A: head commit {}", hex::encode(a_head));
-    println!("A: payload blob {} (never committed)", hex::encode(payload_hash));
+    println!(
+        "A: payload blob {} (never committed)",
+        hex::encode(payload_hash)
+    );
     println!("A: serving; waiting for B's done-file…");
 
     // Serve until B reports success (or 300s).
@@ -340,7 +343,11 @@ fn run_b(dir: &Path) {
         }
         std::thread::sleep(Duration::from_millis(200));
     };
-    let field = |k: &str| handoff.get(k).unwrap_or_else(|| panic!("handoff field {k}"));
+    let field = |k: &str| {
+        handoff
+            .get(k)
+            .unwrap_or_else(|| panic!("handoff field {k}"))
+    };
     let hex32 = |k: &str| -> [u8; 32] {
         let v = hex::decode(field(k)).expect("hex field");
         v.as_slice().try_into().expect("32-byte field")
@@ -364,9 +371,7 @@ fn run_b(dir: &Path) {
     for k in ["cap_a", "sig_a", "cap_b", "sig_b"] {
         let bytes = hex::decode(field(k)).expect("cap blob hex");
         let blob: Blob<SimpleArchive> = Blob::new(anybytes::Bytes::from(bytes));
-        let handle = pile
-            .put::<SimpleArchive, _>(blob)
-            .expect("seed cap blob");
+        let handle = pile.put::<SimpleArchive, _>(blob).expect("seed cap blob");
         if k == "sig_b" {
             self_cap_b = handle.raw;
         }
@@ -423,8 +428,9 @@ fn run_b(dir: &Path) {
         .enable_all()
         .build()
         .expect("reconcile runtime");
-    let mut reconciler = Reconciler::with_backoff(Duration::from_millis(500), Duration::from_secs(5))
-        .with_fetch_budget(Duration::from_secs(15));
+    let mut reconciler =
+        Reconciler::with_backoff(Duration::from_millis(500), Duration::from_secs(5))
+            .with_fetch_budget(Duration::from_secs(15));
     let started = Instant::now();
     loop {
         if started.elapsed() > Duration::from_secs(120) {

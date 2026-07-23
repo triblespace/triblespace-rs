@@ -23,13 +23,13 @@ use triblespace_core::and;
 use triblespace_core::blob::MemoryBlobStore;
 use triblespace_core::find;
 use triblespace_core::id::{ExclusiveId, Id};
+use triblespace_core::inline::encodings::hash::Handle;
+use triblespace_core::inline::Inline;
+use triblespace_core::macros::attributes;
+use triblespace_core::macros::{entity, pattern};
 use triblespace_core::query::temp;
 use triblespace_core::repo::BlobStore;
 use triblespace_core::trible::TribleSet;
-use triblespace_core::inline::encodings::hash::Handle;
-use triblespace_core::inline::Inline;
-use triblespace_core::macros::{entity, pattern};
-use triblespace_core::macros::attributes;
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::hnsw::HNSWBuilder;
@@ -119,8 +119,7 @@ fn main() {
     let hnsw = hnsw_b.build();
 
     // Put the query vector into the store as the fixed ANN probe.
-    let query_handle =
-        put_embedding::<_>(&mut store, vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+    let query_handle = put_embedding::<_>(&mut store, vec![1.0, 0.0, 0.0, 0.0]).unwrap();
     let reader = store.reader().unwrap();
     let hnsw_view = hnsw.attach(&reader);
 

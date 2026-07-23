@@ -6,7 +6,12 @@ use triblespace::core::repo::Repository;
 #[test]
 fn repository_branch_creates_branch() {
     let storage = MemoryRepo::default();
-    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), triblespace::prelude::TribleSet::new()).unwrap();
+    let mut repo = Repository::new(
+        storage,
+        SigningKey::generate(&mut OsRng),
+        triblespace::prelude::TribleSet::new(),
+    )
+    .unwrap();
     let branch_id = repo.create_branch("main", None).expect("create branch");
 
     match repo.pull(*branch_id) {

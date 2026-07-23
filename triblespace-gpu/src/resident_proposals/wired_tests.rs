@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::*;
-use crate::resident_ordered_oracle::{witnessed_transition, OrderedSegment};
 use crate::query_program::{QueryPattern, QueryTerm};
+use crate::resident_ordered_oracle::{witnessed_transition, OrderedSegment};
 use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use triblespace_core::id::{ExclusiveId, Id};
 use triblespace_core::inline::encodings::genid::GenId;

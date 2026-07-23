@@ -17,17 +17,17 @@
 //! valid LongString-blob handles by construction, so there's
 //! no need for a bespoke "token hash" encoding.
 
-use triblespace_core::inline::Encodes;
 use std::convert::Infallible;
+use triblespace_core::inline::Encodes;
 
 use anybytes::View;
 use triblespace_core::blob::{Blob, BlobEncoding, TryFromBlob};
 use triblespace_core::id::ExclusiveId;
 use triblespace_core::id_hex;
+use triblespace_core::inline::{Inline, InlineEncoding, IntoInline, TryFromInline};
 use triblespace_core::macros::entity;
 use triblespace_core::metadata::{self, MetaDescribe};
 use triblespace_core::trible::Fragment;
-use triblespace_core::inline::{IntoInline, TryFromInline, Inline, InlineEncoding};
 
 /// 32-bit IEEE-754 little-endian float packed into a 32-byte
 /// triblespace `Inline`. Bytes `[0..4]` hold the raw f32 bytes;
@@ -59,8 +59,7 @@ impl InlineEncoding for F32LE {
     type Encoding = Self;
 }
 
-impl Encodes<f32> for F32LE
-{
+impl Encodes<f32> for F32LE {
     type Output = Inline<F32LE>;
     fn encode(source: f32) -> Inline<F32LE> {
         let mut raw = [0u8; 32];
@@ -69,8 +68,7 @@ impl Encodes<f32> for F32LE
     }
 }
 
-impl Encodes<&f32> for F32LE
-{
+impl Encodes<&f32> for F32LE {
     type Output = Inline<F32LE>;
     fn encode(source: &f32) -> Inline<F32LE> {
         (*source).to_inline()
@@ -84,7 +82,6 @@ impl TryFromInline<'_, F32LE> for f32 {
         Ok(f32::from_le_bytes(value.raw[0..4].try_into().unwrap()))
     }
 }
-
 
 /// An arbitrary-length `[f32]` (little-endian) stored as a blob.
 ///
@@ -150,7 +147,9 @@ impl TryFromBlob<Embedding> for View<[f32]> {
 }
 
 impl Encodes<View<[f32]>> for Embedding
-where triblespace_core::inline::encodings::hash::Handle<Embedding>: triblespace_core::inline::InlineEncoding,
+where
+    triblespace_core::inline::encodings::hash::Handle<Embedding>:
+        triblespace_core::inline::InlineEncoding,
 {
     type Output = Blob<Embedding>;
     fn encode(source: View<[f32]>) -> Blob<Embedding> {
@@ -159,7 +158,9 @@ where triblespace_core::inline::encodings::hash::Handle<Embedding>: triblespace_
 }
 
 impl Encodes<Vec<f32>> for Embedding
-where triblespace_core::inline::encodings::hash::Handle<Embedding>: triblespace_core::inline::InlineEncoding,
+where
+    triblespace_core::inline::encodings::hash::Handle<Embedding>:
+        triblespace_core::inline::InlineEncoding,
 {
     type Output = Blob<Embedding>;
     fn encode(source: Vec<f32>) -> Blob<Embedding> {
@@ -174,7 +175,9 @@ where triblespace_core::inline::encodings::hash::Handle<Embedding>: triblespace_
 }
 
 impl Encodes<&[f32]> for Embedding
-where triblespace_core::inline::encodings::hash::Handle<Embedding>: triblespace_core::inline::InlineEncoding,
+where
+    triblespace_core::inline::encodings::hash::Handle<Embedding>:
+        triblespace_core::inline::InlineEncoding,
 {
     type Output = Blob<Embedding>;
     fn encode(source: &[f32]) -> Blob<Embedding> {
@@ -210,7 +213,10 @@ pub fn l2_normalize(vec: &mut [f32]) {
 pub fn put_embedding<B>(
     store: &mut B,
     mut vec: Vec<f32>,
-) -> Result<triblespace_core::inline::Inline<triblespace_core::inline::encodings::hash::Handle<Embedding>>, B::PutError>
+) -> Result<
+    triblespace_core::inline::Inline<triblespace_core::inline::encodings::hash::Handle<Embedding>>,
+    B::PutError,
+>
 where
     B: triblespace_core::repo::BlobStorePut,
     triblespace_core::inline::encodings::hash::Handle<Embedding>:
@@ -284,7 +290,6 @@ mod tests {
     fn put_embedding_roundtrips_through_memory_store() {
         use triblespace_core::blob::MemoryBlobStore;
         use triblespace_core::repo::{BlobStore, BlobStoreGet};
-        
 
         let mut store = MemoryBlobStore::new();
         let vec = vec![1.0_f32, 0.0, 0.0];

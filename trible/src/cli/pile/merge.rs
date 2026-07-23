@@ -9,13 +9,13 @@ use triblespace::prelude::BlobStoreGet;
 use triblespace::prelude::PinStore;
 use triblespace::prelude::View;
 use triblespace_core::id::Id;
-use triblespace_core::repo::pile::Pile;
-use triblespace_core::repo::Repository;
-use triblespace_core::trible::TribleSet;
 use triblespace_core::inline::encodings::hash::Blake3;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::encodings::hash::Hash;
 use triblespace_core::inline::Inline;
+use triblespace_core::repo::pile::Pile;
+use triblespace_core::repo::Repository;
+use triblespace_core::trible::TribleSet;
 
 use super::signing::load_signing_key;
 

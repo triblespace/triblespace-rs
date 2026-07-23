@@ -31,16 +31,16 @@ use std::error::Error;
 
 use tempfile::tempdir;
 
+use anybytes::View;
 use triblespace_core::find;
 use triblespace_core::id::{ExclusiveId, Id};
+use triblespace_core::inline::encodings::hash::Handle;
+use triblespace_core::inline::Inline;
+use triblespace_core::macros::{entity, pattern};
+use triblespace_core::prelude::blobencodings;
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut};
 use triblespace_core::trible::TribleSet;
-use triblespace_core::inline::encodings::hash::Handle;
-use triblespace_core::inline::Inline;
-use anybytes::View;
-use triblespace_core::macros::{entity, pattern};
-use triblespace_core::prelude::blobencodings;
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::succinct::{SuccinctBM25Blob, SuccinctBM25Index};
@@ -48,8 +48,8 @@ use triblespace_search::tokens::hash_tokens;
 
 // ─ namespace ─ ids minted with `trible genid` on 2026-04-21.
 mod wiki {
-    use triblespace_core::prelude::*;
     use triblespace_core::macros::attributes;
+    use triblespace_core::prelude::*;
     use triblespace_search::succinct::SuccinctBM25Blob;
 
     attributes! {
@@ -88,9 +88,7 @@ fn fragment_id(byte: u8) -> Id {
 /// Seed step — stands in for "whatever populated the pile with
 /// wiki fragments". A real faculty wouldn't have this; it would
 /// inherit whatever the caller committed.
-fn seed(
-    pile: &mut Pile,
-) -> Result<TribleSet, Box<dyn Error>> {
+fn seed(pile: &mut Pile) -> Result<TribleSet, Box<dyn Error>> {
     let docs = [
         (
             fragment_id(1),
@@ -145,8 +143,7 @@ fn refresh(
     let reader = pile.reader()?;
     let mut builder: BM25Builder = BM25Builder::new();
     for (id, handle) in &body_handles {
-        let body: View<str> =
-            reader.get::<View<str>, blobencodings::LongString>(*handle)?;
+        let body: View<str> = reader.get::<View<str>, blobencodings::LongString>(*handle)?;
         builder.insert(*id, hash_tokens(body.as_ref()));
     }
     let idx: SuccinctBM25Index = builder.build();
@@ -183,8 +180,7 @@ fn query(
         .0;
 
     let reader = pile.reader()?;
-    let idx: SuccinctBM25Index =
-        reader.get::<SuccinctBM25Index, SuccinctBM25Blob>(handle)?;
+    let idx: SuccinctBM25Index = reader.get::<SuccinctBM25Index, SuccinctBM25Blob>(handle)?;
 
     // One engine pass: `matches` filters by score floor 0.0, the
     // trible pattern joins on the shared `?doc` to pick the
@@ -220,11 +216,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         pattern!(&kb, [{ ?id @ wiki::body: ?h }])
     )
     .count();
-    println!(
-        "seeded {} fragments into {}",
-        n_seeded,
-        pile_path.display(),
-    );
+    println!("seeded {} fragments into {}", n_seeded, pile_path.display(),);
 
     let handle = refresh(&mut pile, &mut kb)?;
     pile.flush()?;

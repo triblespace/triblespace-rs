@@ -38,7 +38,7 @@ pub fn run(cmd: BranchCommand) -> Result<()> {
             use triblespace_core::repo::async_store::Blocking;
             use triblespace_core::repo::objectstore::ObjectStoreRemote;
             use triblespace_core::repo::pile::Pile;
-            
+
             use url::Url;
 
             let url = Url::parse(&url)?;
@@ -79,7 +79,7 @@ pub fn run(cmd: BranchCommand) -> Result<()> {
             use triblespace_core::repo::async_store::Blocking;
             use triblespace_core::repo::objectstore::ObjectStoreRemote;
             use triblespace_core::repo::pile::Pile;
-            
+
             use url::Url;
 
             let url = Url::parse(&url)?;

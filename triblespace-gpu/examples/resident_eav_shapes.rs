@@ -19,12 +19,12 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use jerky::bit_vector::NumBits;
-use triblespace_gpu::query_program::{
-    ProgramFrontier, ProgramVariable, QueryPattern, QueryProgram,
-};
 use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::prelude::*;
+use triblespace_gpu::query_program::{
+    ProgramFrontier, ProgramVariable, QueryPattern, QueryProgram,
+};
 use triblespace_gpu::{WgpuQueryProgram, WgpuSuccinctArchive};
 
 const DEFAULT_TRIBLES: usize = 262_144;

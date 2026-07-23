@@ -2317,11 +2317,7 @@ fn same_variable_grouped_delta_confirm_filters_one_immutable_sequence() {
         ),
         (
             vec![PathOp::Attr(graph.attribute.raw()), PathOp::Star],
-            vec![
-                graph.value(0).raw,
-                graph.value(3).raw,
-                graph.value(1).raw,
-            ],
+            vec![graph.value(0).raw, graph.value(3).raw, graph.value(1).raw],
             4,
         ),
     ];
@@ -3041,11 +3037,7 @@ fn automaton_target_confirm_filters_then_set_admits_the_sequence() {
         absent.raw,
         graph.value(1).raw,
     ];
-    let expected = vec![
-        graph.value(2).raw,
-        graph.value(0).raw,
-        graph.value(1).raw,
-    ];
+    let expected = vec![graph.value(2).raw, graph.value(0).raw, graph.value(1).raw];
     let residual = run(
         target_confirm_root(
             graph.set.clone(),

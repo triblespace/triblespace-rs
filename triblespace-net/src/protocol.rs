@@ -86,40 +86,54 @@ pub async fn send_branch_id<W: AsyncWrite + Unpin>(send: &mut W, id: &RawPinId) 
 }
 
 pub async fn send_u32_be<W: AsyncWrite + Unpin>(send: &mut W, v: u32) -> Result<()> {
-    send.write_all(&v.to_be_bytes()).await.map_err(|e| anyhow!("send: {e}"))
+    send.write_all(&v.to_be_bytes())
+        .await
+        .map_err(|e| anyhow!("send: {e}"))
 }
 
 pub async fn send_u64_be<W: AsyncWrite + Unpin>(send: &mut W, v: u64) -> Result<()> {
-    send.write_all(&v.to_be_bytes()).await.map_err(|e| anyhow!("send: {e}"))
+    send.write_all(&v.to_be_bytes())
+        .await
+        .map_err(|e| anyhow!("send: {e}"))
 }
 
 pub async fn recv_u8<R: AsyncRead + Unpin>(recv: &mut R) -> Result<u8> {
     let mut buf = [0u8; 1];
-    recv.read_exact(&mut buf).await.map_err(|e| anyhow!("recv: {e}"))?;
+    recv.read_exact(&mut buf)
+        .await
+        .map_err(|e| anyhow!("recv: {e}"))?;
     Ok(buf[0])
 }
 
 pub async fn recv_hash<R: AsyncRead + Unpin>(recv: &mut R) -> Result<RawHash> {
     let mut buf = [0u8; 32];
-    recv.read_exact(&mut buf).await.map_err(|e| anyhow!("recv: {e}"))?;
+    recv.read_exact(&mut buf)
+        .await
+        .map_err(|e| anyhow!("recv: {e}"))?;
     Ok(buf)
 }
 
 pub async fn recv_branch_id<R: AsyncRead + Unpin>(recv: &mut R) -> Result<RawPinId> {
     let mut buf = [0u8; 16];
-    recv.read_exact(&mut buf).await.map_err(|e| anyhow!("recv: {e}"))?;
+    recv.read_exact(&mut buf)
+        .await
+        .map_err(|e| anyhow!("recv: {e}"))?;
     Ok(buf)
 }
 
 pub async fn recv_u32_be<R: AsyncRead + Unpin>(recv: &mut R) -> Result<u32> {
     let mut buf = [0u8; 4];
-    recv.read_exact(&mut buf).await.map_err(|e| anyhow!("recv: {e}"))?;
+    recv.read_exact(&mut buf)
+        .await
+        .map_err(|e| anyhow!("recv: {e}"))?;
     Ok(u32::from_be_bytes(buf))
 }
 
 pub async fn recv_u64_be<R: AsyncRead + Unpin>(recv: &mut R) -> Result<u64> {
     let mut buf = [0u8; 8];
-    recv.read_exact(&mut buf).await.map_err(|e| anyhow!("recv: {e}"))?;
+    recv.read_exact(&mut buf)
+        .await
+        .map_err(|e| anyhow!("recv: {e}"))?;
     Ok(u64::from_be_bytes(buf))
 }
 
@@ -151,17 +165,18 @@ pub async fn op_get_blob<C: Conn>(conn: &C, hash: &RawHash) -> Result<Option<Vec
     send.shutdown().await.map_err(|e| anyhow!("finish: {e}"))?;
 
     let len = recv_u64_be(&mut recv).await?;
-    if len == u64::MAX { return Ok(None); }
+    if len == u64::MAX {
+        return Ok(None);
+    }
     let mut data = vec![0u8; len as usize];
-    recv.read_exact(&mut data).await.map_err(|e| anyhow!("recv: {e}"))?;
+    recv.read_exact(&mut data)
+        .await
+        .map_err(|e| anyhow!("recv: {e}"))?;
     Ok(Some(data))
 }
 
 /// CHILDREN: get child hashes of a parent blob. Nil hash terminates.
-pub async fn op_children<C: Conn>(
-    conn: &C,
-    parent: &RawHash,
-) -> Result<Vec<RawHash>> {
+pub async fn op_children<C: Conn>(conn: &C, parent: &RawHash) -> Result<Vec<RawHash>> {
     let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
     send_u8(&mut send, OP_CHILDREN).await?;
     send_hash(&mut send, parent).await?;
@@ -170,7 +185,9 @@ pub async fn op_children<C: Conn>(
     let mut children = Vec::new();
     loop {
         let hash = recv_hash(&mut recv).await?;
-        if hash == NIL_HASH { break; }
+        if hash == NIL_HASH {
+            break;
+        }
         children.push(hash);
     }
     Ok(children)

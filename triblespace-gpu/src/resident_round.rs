@@ -26,11 +26,9 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
+use crate::query_program::{ProgramPattern, ProgramTerm, ProgramVariable, QueryProgram};
 use cubecl::prelude::*;
 use jerky::gpu::{DeviceU32Buffer, GpuContext};
-use crate::query_program::{
-    ProgramPattern, ProgramTerm, ProgramVariable, QueryProgram,
-};
 use triblespace_core::blob::encodings::succinctarchive::Universe;
 
 type WgpuRuntime = cubecl::wgpu::WgpuRuntime;
@@ -770,11 +768,9 @@ mod tests {
         checked_device_product, decode_choices, validate_rows, ResidentRoundError,
         ResidentRowChoice, ResidentRowPlanner, CHOICE_WORDS, RESIDENT_U32_SENTINEL,
     };
+    use crate::query_program::{ProgramVariable, QueryPattern, QueryProgram};
     use crate::succinct_query::WgpuContext;
     use std::sync::Arc;
-    use crate::query_program::{
-        ProgramVariable, QueryPattern, QueryProgram,
-    };
     use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
     use triblespace_core::trible::TribleSet;
 

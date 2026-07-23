@@ -18,13 +18,13 @@ use ed25519_dalek::SigningKey;
 use rand::{Rng, SeedableRng};
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::id::Id;
-use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Inline;
+use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::prelude::{BlobStore, PinStore};
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{BlobStoreGet, BlobStoreList, BlobStorePut, Repository};
 use triblespace_core::trible::TribleSet;
-use triblespace_net::tracking::{ensure_tracking_pin, merge_tracking_into_local, MergeOutcome};
+use triblespace_net::tracking::{MergeOutcome, ensure_tracking_pin, merge_tracking_into_local};
 
 // ── Helpers (mirrors two_peer_convergence's, kept self-contained) ──────
 
@@ -65,7 +65,11 @@ fn head_commit(repo: &mut Repository<MemoryRepo>, name: &str) -> Inline<Handle<S
 /// merges build different merge-commit trees).
 fn content(repo: &mut Repository<MemoryRepo>, name: &str) -> TribleSet {
     let id = lookup_id(repo, name);
-    repo.pull(id).unwrap().checkout(..).expect("checkout").into_facts()
+    repo.pull(id)
+        .unwrap()
+        .checkout(..)
+        .expect("checkout")
+        .into_facts()
 }
 
 /// One sync round: copy `from`'s blobs into `to`, point a tracking pin at
@@ -79,9 +83,15 @@ fn sync_round(
     copy_all_blobs(from, to);
     let from_branch_id = lookup_id(from, branch);
     let from_head = remote_head_hash(from, branch);
-    let tracking_id =
-        ensure_tracking_pin(to.storage_mut(), from_branch_id, &from_head, branch, from_pub, false)
-            .expect("ensure tracking");
+    let tracking_id = ensure_tracking_pin(
+        to.storage_mut(),
+        from_branch_id,
+        &from_head,
+        branch,
+        from_pub,
+        false,
+    )
+    .expect("ensure tracking");
     merge_tracking_into_local(to, tracking_id, branch).expect("merge")
 }
 
@@ -156,14 +166,15 @@ fn drain_to_quiescence(peers: &mut [Peer]) -> u32 {
         let mut all_uptodate = true;
         for to in 0..n {
             for from in 0..n {
-                if to != from
-                    && !matches!(sync(peers, to, from), MergeOutcome::UpToDate)
-                {
+                if to != from && !matches!(sync(peers, to, from), MergeOutcome::UpToDate) {
                     all_uptodate = false;
                 }
             }
         }
-        assert!(passes < 100, "drain failed to converge — non-monotonic merge?");
+        assert!(
+            passes < 100,
+            "drain failed to converge — non-monotonic merge?"
+        );
         if all_uptodate {
             return passes;
         }
@@ -276,7 +287,10 @@ fn merge_content_is_independent_of_remote_arrival_order() {
     let ascending = collapse_into_peer0(&[1, 2, 3]);
     let descending = collapse_into_peer0(&[3, 2, 1]);
     let shuffled = collapse_into_peer0(&[2, 1, 3]);
-    assert_eq!(ascending, descending, "arrival 1,2,3 vs 3,2,1 — same content");
+    assert_eq!(
+        ascending, descending,
+        "arrival 1,2,3 vs 3,2,1 — same content"
+    );
     assert_eq!(ascending, shuffled, "arrival 1,2,3 vs 2,1,3 — same content");
 }
 
@@ -382,7 +396,11 @@ fn convergence_under_ongoing_writes() {
 
     let full = content(&mut peers[0].repo, BRANCH);
     for i in 1..n {
-        assert_eq!(content(&mut peers[i].repo, BRANCH), full, "peer {i} content");
+        assert_eq!(
+            content(&mut peers[i].repo, BRANCH),
+            full,
+            "peer {i} content"
+        );
     }
     // The union includes the initial n commits plus every live write.
     assert_eq!(
@@ -417,9 +435,7 @@ fn late_joiner_converges_both_ways() {
         let mut changed = false;
         for to in 0..3 {
             for from in 0..3 {
-                if to != from
-                    && !matches!(sync(&mut peers, to, from), MergeOutcome::UpToDate)
-                {
+                if to != from && !matches!(sync(&mut peers, to, from), MergeOutcome::UpToDate) {
                     changed = true;
                 }
             }

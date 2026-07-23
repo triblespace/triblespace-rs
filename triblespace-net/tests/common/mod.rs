@@ -9,15 +9,15 @@ use std::sync::{Arc, OnceLock};
 
 use ed25519_dalek::SigningKey;
 use iroh_base::EndpointId;
-use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::Blob;
+use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::clock::{self, VirtualClock};
 use triblespace_core::id::rngid::seed_ids;
 use triblespace_core::inline::encodings::time::NsTAIInterval;
 use triblespace_core::inline::{Inline, TryToInline};
+use triblespace_core::repo::BlobStorePut;
 use triblespace_core::repo::capability::{self, PERM_ADMIN};
 use triblespace_core::repo::memoryrepo::MemoryRepo;
-use triblespace_core::repo::BlobStorePut;
 use triblespace_core::trible::TribleSet;
 use triblespace_net::host;
 use triblespace_net::peer::{Peer, PeerConfig, SyncDirection};
@@ -60,8 +60,8 @@ pub fn admin_cap(
     root: &SigningKey,
     subject: &SigningKey,
 ) -> (Blob<SimpleArchive>, Blob<SimpleArchive>) {
-    use triblespace_core::id::ufoid;
     use triblespace_core::id::ExclusiveId;
+    use triblespace_core::id::ufoid;
     use triblespace_core::macros::entity;
 
     let scope_root = *ufoid();
@@ -123,8 +123,7 @@ pub fn bring_up(
 ) -> Peer<MemoryRepo> {
     let id = pk(signing_key);
     let harness = net.join(id, gossip);
-    let (sender, receiver, wiring) =
-        host::wire(EndpointId::from_bytes(&id).expect("endpoint id"));
+    let (sender, receiver, wiring) = host::wire(EndpointId::from_bytes(&id).expect("endpoint id"));
     tokio::task::spawn_local(host::run_host(
         harness,
         PeerConfig {

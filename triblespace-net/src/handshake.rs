@@ -80,10 +80,7 @@ pub async fn send_request_cap<C: Conn>(conn: &C, partial_cap_bytes: &[u8]) -> Re
             MAX_BLOB_BYTES
         ));
     }
-    let (mut send, mut recv) = conn
-        .open_bi()
-        .await
-        .map_err(|e| anyhow!("open_bi: {e}"))?;
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
     send.write_all(&[OP_REQUEST_CAP])
         .await
         .map_err(|e| anyhow!("send op: {e}"))?;
@@ -104,20 +101,11 @@ pub async fn send_request_cap<C: Conn>(conn: &C, partial_cap_bytes: &[u8]) -> Re
 
 /// Send `OP_DELIVER_CAP` on a fresh stream of `conn`. Returns the
 /// recipient's status byte.
-pub async fn send_deliver_cap<C: Conn>(
-    conn: &C,
-    cap_bytes: &[u8],
-    sig_bytes: &[u8],
-) -> Result<u8> {
-    if cap_bytes.len() > MAX_BLOB_BYTES as usize
-        || sig_bytes.len() > MAX_BLOB_BYTES as usize
-    {
+pub async fn send_deliver_cap<C: Conn>(conn: &C, cap_bytes: &[u8], sig_bytes: &[u8]) -> Result<u8> {
+    if cap_bytes.len() > MAX_BLOB_BYTES as usize || sig_bytes.len() > MAX_BLOB_BYTES as usize {
         return Err(anyhow!("cap or sig exceeds MAX_BLOB_BYTES"));
     }
-    let (mut send, mut recv) = conn
-        .open_bi()
-        .await
-        .map_err(|e| anyhow!("open_bi: {e}"))?;
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
     send.write_all(&[OP_DELIVER_CAP])
         .await
         .map_err(|e| anyhow!("send op: {e}"))?;
@@ -236,9 +224,7 @@ pub async fn respond<W: AsyncWrite + Unpin>(send: &mut W, status: u8) -> Result<
 /// for the relay handshake, and is ready to call `connect`. Caller is
 /// responsible for dropping it after use — endpoint drop cleans up
 /// the relay subscription.
-pub async fn one_shot_endpoint(
-    key: ed25519_dalek::SigningKey,
-) -> Result<iroh::Endpoint> {
+pub async fn one_shot_endpoint(key: ed25519_dalek::SigningKey) -> Result<iroh::Endpoint> {
     use iroh::Endpoint;
     use iroh::endpoint::presets;
 
@@ -273,13 +259,17 @@ pub async fn one_shot_request_cap(
 ) -> Result<u8> {
     use iroh_base::EndpointId;
     let ep = one_shot_endpoint(key).await?;
-    let target_id = EndpointId::from_bytes(&target.to_bytes())
-        .map_err(|e| anyhow!("target pubkey: {e}"))?;
+    let target_id =
+        EndpointId::from_bytes(&target.to_bytes()).map_err(|e| anyhow!("target pubkey: {e}"))?;
     let conn = ep
         .connect(target_id, AUTH_HANDSHAKE_ALPN)
         .await
         .map_err(|e| anyhow!("connect: {e}"))?;
-    let status = send_request_cap(&crate::transport::iroh::IrohConn(conn.clone()), partial_cap_bytes).await;
+    let status = send_request_cap(
+        &crate::transport::iroh::IrohConn(conn.clone()),
+        partial_cap_bytes,
+    )
+    .await;
     conn.close(0u32.into(), b"ok");
     // Drop the endpoint last so the connection's relay route stays
     // alive through the close. iroh tears down a Connection's transport
@@ -287,4 +277,3 @@ pub async fn one_shot_request_cap(
     drop(ep);
     status
 }
-

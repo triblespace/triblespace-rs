@@ -158,11 +158,8 @@ where
                     (estimate, index)
                 })
                 .expect("non-empty certified sources");
-            let layout = self.constraints[proposer].propose_certified_with_receipt(
-                variable,
-                view,
-                candidates,
-            );
+            let layout = self.constraints[proposer]
+                .propose_certified_with_receipt(variable, view, candidates);
             let skip = (coverage == ProposalCoverage::Exact).then_some(proposer);
             for (_, index) in self.certified_validator_order(variable, view, skip) {
                 self.constraints[index].confirm_certified(variable, view, candidates);
@@ -197,11 +194,8 @@ where
 
         let uniform = (0..sources.len()).find(|&source| propose_counts[source] == n_rows);
         let layout = if let Some(source) = uniform {
-            self.constraints[sources[source].0].propose_certified_with_receipt(
-                variable,
-                view,
-                candidates,
-            )
+            self.constraints[sources[source].0]
+                .propose_certified_with_receipt(variable, view, candidates)
         } else {
             let mut scratch = Vec::new();
             let mut layout = ProposalLayout::grouped_set();

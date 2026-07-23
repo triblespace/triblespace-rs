@@ -120,11 +120,7 @@ where
         true
     }
 
-    fn proposal_coverage(
-        &self,
-        variable: VariableId,
-        bound: VariableSet,
-    ) -> ProposalCoverage {
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
         if variable == self.variable.index && !bound.is_set(variable) {
             ProposalCoverage::Exact
         } else {
@@ -241,8 +237,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inline::Inline;
     use crate::inline::encodings::UnknownInline;
+    use crate::inline::Inline;
 
     #[test]
     fn hash_set_action_classes_cover_exact_proposal_occurrences() {
@@ -277,10 +273,8 @@ mod tests {
         );
         assert_eq!(estimate, proposed.len());
         let bound = VariableSet::new_singleton(variable.index);
-        assert!(
-            constraint
-                .action_unit_classes(variable.index, bound)
-                .is_none()
-        );
+        assert!(constraint
+            .action_unit_classes(variable.index, bound)
+            .is_none());
     }
 }

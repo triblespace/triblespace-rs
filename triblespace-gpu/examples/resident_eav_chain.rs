@@ -20,12 +20,12 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use jerky::bit_vector::NumBits;
-use triblespace_gpu::query_program::{
-    ProgramFrontier, ProgramVariable, QueryPattern, QueryProgram,
-};
 use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::prelude::*;
+use triblespace_gpu::query_program::{
+    ProgramFrontier, ProgramVariable, QueryPattern, QueryProgram,
+};
 use triblespace_gpu::{WgpuQueryProgram, WgpuSuccinctArchive};
 
 const POINTS: [usize; 8] = [1, 2, 4, 8, 16, 32, 64, 100];

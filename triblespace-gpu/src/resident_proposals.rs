@@ -38,11 +38,9 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
+use crate::query_program::{ProgramFrontier, ProgramVariable, QueryProgram};
 use cubecl::prelude::*;
 use jerky::gpu::{DeviceBatchMeta, DeviceDispatch, DeviceU32Buffer, GpuContext};
-use crate::query_program::{
-    ProgramFrontier, ProgramVariable, QueryProgram,
-};
 use triblespace_core::blob::encodings::succinctarchive::Universe;
 
 use crate::resident_round::{

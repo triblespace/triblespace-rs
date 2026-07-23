@@ -5,13 +5,13 @@ use triblespace::core::blob::BlobEncoding;
 use triblespace::core::blob::TryFromBlob;
 use triblespace::core::id::id_hex;
 use triblespace::core::id::{ExclusiveId, Id};
-use triblespace::core::macros::entity;
-use triblespace::core::metadata::{self, MetaDescribe};
-use triblespace::core::inline::TryFromInline;
+use triblespace::core::inline::Encodes;
 use triblespace::core::inline::Inline;
 use triblespace::core::inline::InlineEncoding;
-use triblespace::core::inline::Encodes;
+use triblespace::core::inline::TryFromInline;
 use triblespace::core::inline::INLINE_LEN;
+use triblespace::core::macros::entity;
+use triblespace::core::metadata::{self, MetaDescribe};
 
 // ANCHOR: custom_schema
 
@@ -32,8 +32,7 @@ impl InlineEncoding for U64LE {
     type Encoding = Self;
 }
 
-impl Encodes<u64> for U64LE
-{
+impl Encodes<u64> for U64LE {
     type Output = Inline<U64LE>;
     fn encode(source: u64) -> Inline<U64LE> {
         let mut raw = [0u8; INLINE_LEN];
@@ -63,8 +62,7 @@ impl MetaDescribe for BytesBlob {
 
 impl BlobEncoding for BytesBlob {}
 
-impl Encodes<Bytes> for BytesBlob
-{
+impl Encodes<Bytes> for BytesBlob {
     type Output = Blob<BytesBlob>;
     fn encode(source: Bytes) -> Blob<BytesBlob> {
         Blob::new(source)

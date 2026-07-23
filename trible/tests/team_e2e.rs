@@ -63,10 +63,8 @@ fn team_full_lifecycle() {
         ])
         .assert()
         .success();
-    let create_stdout = String::from_utf8(create.get_output().stdout.clone())
-        .expect("utf8 stdout");
-    let (team_root_pubkey, team_root_secret, founder_cap_sig) =
-        parse_create_output(&create_stdout);
+    let create_stdout = String::from_utf8(create.get_output().stdout.clone()).expect("utf8 stdout");
+    let (team_root_pubkey, team_root_secret, founder_cap_sig) = parse_create_output(&create_stdout);
 
     assert_eq!(team_root_pubkey.len(), 64, "team root pubkey is 32 bytes");
     assert_eq!(team_root_secret.len(), 64, "team root SECRET is 32 bytes");
@@ -78,16 +76,10 @@ fn team_full_lifecycle() {
 
     let list1 = Command::cargo_bin("trible")
         .unwrap()
-        .args([
-            "team",
-            "list",
-            "--pile",
-            pile_path.to_str().unwrap(),
-        ])
+        .args(["team", "list", "--pile", pile_path.to_str().unwrap()])
         .assert()
         .success();
-    let list1_out =
-        String::from_utf8(list1.get_output().stdout.clone()).unwrap();
+    let list1_out = String::from_utf8(list1.get_output().stdout.clone()).unwrap();
     assert!(
         list1_out.contains("capabilities in pile:  1"),
         "post-create has one cap; got:\n{list1_out}"
@@ -112,11 +104,14 @@ fn team_full_lifecycle() {
         ])
         .assert()
         .success();
-    let identity_out =
-        String::from_utf8(identity.get_output().stdout.clone()).unwrap();
+    let identity_out = String::from_utf8(identity.get_output().stdout.clone()).unwrap();
     let invitee_pubkey = identity_out
         .lines()
-        .find_map(|line| line.trim().strip_prefix("node:").map(|s| s.trim().to_string()))
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("node:")
+                .map(|s| s.trim().to_string())
+        })
         .expect("identity prints `node:`");
     assert_eq!(invitee_pubkey.len(), 64, "invitee pubkey is 32 bytes");
 
@@ -140,8 +135,7 @@ fn team_full_lifecycle() {
         ])
         .assert()
         .success();
-    let invite_out =
-        String::from_utf8(invite.get_output().stdout.clone()).unwrap();
+    let invite_out = String::from_utf8(invite.get_output().stdout.clone()).unwrap();
     let invitee_cap_sig = parse_invite_output(&invite_out);
     assert_eq!(invitee_cap_sig.len(), 64);
     assert_ne!(
@@ -151,16 +145,10 @@ fn team_full_lifecycle() {
 
     let list2 = Command::cargo_bin("trible")
         .unwrap()
-        .args([
-            "team",
-            "list",
-            "--pile",
-            pile_path.to_str().unwrap(),
-        ])
+        .args(["team", "list", "--pile", pile_path.to_str().unwrap()])
         .assert()
         .success();
-    let list2_out =
-        String::from_utf8(list2.get_output().stdout.clone()).unwrap();
+    let list2_out = String::from_utf8(list2.get_output().stdout.clone()).unwrap();
     assert!(
         list2_out.contains("capabilities in pile:  2"),
         "post-invite has two caps; got:\n{list2_out}"
@@ -200,9 +188,8 @@ fn invite_rejects_invalid_issuer_cap() {
         ])
         .assert()
         .success();
-    let (_real_root, _real_secret, real_cap_sig) = parse_create_output(
-        std::str::from_utf8(&create.get_output().stdout).unwrap(),
-    );
+    let (_real_root, _real_secret, real_cap_sig) =
+        parse_create_output(std::str::from_utf8(&create.get_output().stdout).unwrap());
 
     let identity = Command::cargo_bin("trible")
         .unwrap()
@@ -218,7 +205,11 @@ fn invite_rejects_invalid_issuer_cap() {
     let invitee_pubkey = String::from_utf8(identity.get_output().stdout.clone())
         .unwrap()
         .lines()
-        .find_map(|line| line.trim().strip_prefix("node:").map(|s| s.trim().to_string()))
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("node:")
+                .map(|s| s.trim().to_string())
+        })
         .expect("identity prints `node:`");
 
     let fake_team_root = "00".repeat(32);
@@ -269,9 +260,7 @@ fn invite_with_branch_restriction_renders_in_list() {
         .assert()
         .success();
     let (team_root_pubkey, _team_root_secret, founder_cap_sig) =
-        parse_create_output(
-            std::str::from_utf8(&create.get_output().stdout).unwrap(),
-        );
+        parse_create_output(std::str::from_utf8(&create.get_output().stdout).unwrap());
 
     let identity = Command::cargo_bin("trible")
         .unwrap()
@@ -287,7 +276,11 @@ fn invite_with_branch_restriction_renders_in_list() {
     let invitee_pubkey = String::from_utf8(identity.get_output().stdout.clone())
         .unwrap()
         .lines()
-        .find_map(|line| line.trim().strip_prefix("node:").map(|s| s.trim().to_string()))
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("node:")
+                .map(|s| s.trim().to_string())
+        })
         .expect("identity prints `node:`");
 
     // Mint a fresh branch id via `trible genid` — same primitive
@@ -328,16 +321,10 @@ fn invite_with_branch_restriction_renders_in_list() {
 
     let list = Command::cargo_bin("trible")
         .unwrap()
-        .args([
-            "team",
-            "list",
-            "--pile",
-            pile_path.to_str().unwrap(),
-        ])
+        .args(["team", "list", "--pile", pile_path.to_str().unwrap()])
         .assert()
         .success();
-    let list_out =
-        String::from_utf8(list.get_output().stdout.clone()).unwrap();
+    let list_out = String::from_utf8(list.get_output().stdout.clone()).unwrap();
 
     assert!(
         list_out.contains("capabilities in pile:  2"),
@@ -374,23 +361,28 @@ fn show_walks_chain_end_to_end() {
     let create = Command::cargo_bin("trible")
         .unwrap()
         .args([
-            "team", "create",
-            "--pile", pile_path.to_str().unwrap(),
-            "--key", founder_key_path.to_str().unwrap(),
+            "team",
+            "create",
+            "--pile",
+            pile_path.to_str().unwrap(),
+            "--key",
+            founder_key_path.to_str().unwrap(),
         ])
         .assert()
         .success();
-    let (team_root_pubkey, _, founder_cap_sig) = parse_create_output(
-        std::str::from_utf8(&create.get_output().stdout).unwrap(),
-    );
+    let (team_root_pubkey, _, founder_cap_sig) =
+        parse_create_output(std::str::from_utf8(&create.get_output().stdout).unwrap());
 
     // Run show on the founder cap — should be length-1 (root).
     let show_root = Command::cargo_bin("trible")
         .unwrap()
         .args([
-            "team", "show",
-            "--pile", pile_path.to_str().unwrap(),
-            "--cap", &founder_cap_sig,
+            "team",
+            "show",
+            "--pile",
+            pile_path.to_str().unwrap(),
+            "--cap",
+            &founder_cap_sig,
         ])
         .assert()
         .success();
@@ -412,8 +404,11 @@ fn show_walks_chain_end_to_end() {
     let identity = Command::cargo_bin("trible")
         .unwrap()
         .args([
-            "pile", "net", "identity",
-            "--key", invitee_key_path.to_str().unwrap(),
+            "pile",
+            "net",
+            "identity",
+            "--key",
+            invitee_key_path.to_str().unwrap(),
         ])
         .assert()
         .success();
@@ -426,26 +421,35 @@ fn show_walks_chain_end_to_end() {
     let invite = Command::cargo_bin("trible")
         .unwrap()
         .args([
-            "team", "invite",
-            "--pile", pile_path.to_str().unwrap(),
-            "--team-root", &team_root_pubkey,
-            "--cap", &founder_cap_sig,
-            "--key", founder_key_path.to_str().unwrap(),
-            "--invitee", &invitee_pubkey,
-            "--scope", "read",
+            "team",
+            "invite",
+            "--pile",
+            pile_path.to_str().unwrap(),
+            "--team-root",
+            &team_root_pubkey,
+            "--cap",
+            &founder_cap_sig,
+            "--key",
+            founder_key_path.to_str().unwrap(),
+            "--invitee",
+            &invitee_pubkey,
+            "--scope",
+            "read",
         ])
         .assert()
         .success();
-    let invitee_cap_sig = parse_invite_output(
-        std::str::from_utf8(&invite.get_output().stdout).unwrap(),
-    );
+    let invitee_cap_sig =
+        parse_invite_output(std::str::from_utf8(&invite.get_output().stdout).unwrap());
 
     let show_chain = Command::cargo_bin("trible")
         .unwrap()
         .args([
-            "team", "show",
-            "--pile", pile_path.to_str().unwrap(),
-            "--cap", &invitee_cap_sig,
+            "team",
+            "show",
+            "--pile",
+            pile_path.to_str().unwrap(),
+            "--cap",
+            &invitee_cap_sig,
         ])
         .assert()
         .success();
@@ -497,21 +501,26 @@ fn show_verify_pass_and_fail() {
     let create = Command::cargo_bin("trible")
         .unwrap()
         .args([
-            "team", "create",
-            "--pile", pile_path.to_str().unwrap(),
-            "--key", founder_key_path.to_str().unwrap(),
+            "team",
+            "create",
+            "--pile",
+            pile_path.to_str().unwrap(),
+            "--key",
+            founder_key_path.to_str().unwrap(),
         ])
         .assert()
         .success();
-    let (team_root_pubkey, _, founder_cap_sig) = parse_create_output(
-        std::str::from_utf8(&create.get_output().stdout).unwrap(),
-    );
+    let (team_root_pubkey, _, founder_cap_sig) =
+        parse_create_output(std::str::from_utf8(&create.get_output().stdout).unwrap());
 
     let identity = Command::cargo_bin("trible")
         .unwrap()
         .args([
-            "pile", "net", "identity",
-            "--key", invitee_key_path.to_str().unwrap(),
+            "pile",
+            "net",
+            "identity",
+            "--key",
+            invitee_key_path.to_str().unwrap(),
         ])
         .assert()
         .success();
@@ -524,36 +533,45 @@ fn show_verify_pass_and_fail() {
     let invite = Command::cargo_bin("trible")
         .unwrap()
         .args([
-            "team", "invite",
-            "--pile", pile_path.to_str().unwrap(),
-            "--team-root", &team_root_pubkey,
-            "--cap", &founder_cap_sig,
-            "--key", founder_key_path.to_str().unwrap(),
-            "--invitee", &invitee_pubkey,
-            "--scope", "read",
+            "team",
+            "invite",
+            "--pile",
+            pile_path.to_str().unwrap(),
+            "--team-root",
+            &team_root_pubkey,
+            "--cap",
+            &founder_cap_sig,
+            "--key",
+            founder_key_path.to_str().unwrap(),
+            "--invitee",
+            &invitee_pubkey,
+            "--scope",
+            "read",
         ])
         .assert()
         .success();
-    let invitee_cap_sig = parse_invite_output(
-        std::str::from_utf8(&invite.get_output().stdout).unwrap(),
-    );
+    let invitee_cap_sig =
+        parse_invite_output(std::str::from_utf8(&invite.get_output().stdout).unwrap());
 
     // PASS: real team root.
     let pass = Command::cargo_bin("trible")
         .unwrap()
         .env_remove("TRIBLE_TEAM_ROOT")
         .args([
-            "team", "show",
-            "--pile", pile_path.to_str().unwrap(),
-            "--cap", &invitee_cap_sig,
-            "--verify", &team_root_pubkey,
+            "team",
+            "show",
+            "--pile",
+            pile_path.to_str().unwrap(),
+            "--cap",
+            &invitee_cap_sig,
+            "--verify",
+            &team_root_pubkey,
         ])
         .assert()
         .success();
     let pass_out = String::from_utf8(pass.get_output().stdout.clone()).unwrap();
     assert!(
-        pass_out.contains("== Verification ==")
-            && pass_out.contains("✓ VERIFIED"),
+        pass_out.contains("== Verification ==") && pass_out.contains("✓ VERIFIED"),
         "verify against the real team root prints ✓ VERIFIED; got:\n{pass_out}"
     );
     assert!(
@@ -568,17 +586,20 @@ fn show_verify_pass_and_fail() {
         .unwrap()
         .env_remove("TRIBLE_TEAM_ROOT")
         .args([
-            "team", "show",
-            "--pile", pile_path.to_str().unwrap(),
-            "--cap", &invitee_cap_sig,
-            "--verify", &zero_root,
+            "team",
+            "show",
+            "--pile",
+            pile_path.to_str().unwrap(),
+            "--cap",
+            &invitee_cap_sig,
+            "--verify",
+            &zero_root,
         ])
         .assert()
         .success();
     let fail_out = String::from_utf8(fail.get_output().stdout.clone()).unwrap();
     assert!(
-        fail_out.contains("== Verification ==")
-            && fail_out.contains("✗ FAILED"),
+        fail_out.contains("== Verification ==") && fail_out.contains("✗ FAILED"),
         "verify against all-zeros team root prints ✗ FAILED; got:\n{fail_out}"
     );
     assert!(

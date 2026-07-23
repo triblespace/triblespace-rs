@@ -138,9 +138,7 @@ fn fake_doc(rng: &mut Rng, vocab: usize, n_words: usize) -> String {
 }
 
 fn run(n_docs: usize, vocab: usize, doc_len: usize) {
-    println!(
-        "\n── n_docs = {n_docs}, vocab = {vocab}, avg_doc_len = {doc_len} ──"
-    );
+    println!("\n── n_docs = {n_docs}, vocab = {vocab}, avg_doc_len = {doc_len} ──");
 
     let mut rng = Rng(0xC0FFEE + n_docs as u64);
     let docs: Vec<(u64, String)> = (0..n_docs)
@@ -179,10 +177,10 @@ fn run(n_docs: usize, vocab: usize, doc_len: usize) {
     // is the small `Blob` wrapper itself).
     use triblespace_core::blob::{Blob, IntoBlob};
     use triblespace_search::succinct::SuccinctBM25Blob;
-    let blob: Blob<SuccinctBM25Blob> = measure(
-        "SuccinctBM25Index::to_blob (refcounted clone)",
-        || (&succinct).to_blob(),
-    );
+    let blob: Blob<SuccinctBM25Blob> =
+        measure("SuccinctBM25Index::to_blob (refcounted clone)", || {
+            (&succinct).to_blob()
+        });
 
     println!(
         "  naive byte_size = {}, SB25 blob = {}",

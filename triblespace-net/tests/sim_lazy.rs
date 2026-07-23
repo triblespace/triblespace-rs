@@ -17,12 +17,12 @@ mod common;
 
 use std::time::Duration;
 
-use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::IntoBlob;
-use triblespace_core::inline::encodings::hash::Handle;
+use triblespace_core::blob::encodings::UnknownBlob;
+use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::inline::Inline;
+use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::prelude::BlobStore;
 use triblespace_core::repo::async_store::AsyncBlobStoreGet;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
@@ -115,7 +115,10 @@ fn fetch_blob_pulls_from_the_holder() {
             peer_a.refresh();
         }
 
-        assert!(!holds_locally(&mut peer_b, hash), "precondition: B lacks the blob");
+        assert!(
+            !holds_locally(&mut peer_b, hash),
+            "precondition: B lacks the blob"
+        );
 
         let got = drive_future(peer_b.fetch_blob(hash), || peer_a.refresh(), 120)
             .await
@@ -155,8 +158,7 @@ fn lazy_read_lands_weak_pinned_in_store() {
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
         // B is a lazy node: no eager content.
-        let mut peer_b =
-            bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
 
         // Settle the mesh so A's blobs are announced to the DHT.
         for _ in 0..40u32 {
@@ -165,7 +167,10 @@ fn lazy_read_lands_weak_pinned_in_store() {
         }
 
         // Precondition: B holds nothing locally and has no weak pins.
-        assert!(peer_b.try_local(hash).is_none(), "precondition: B lacks the blob");
+        assert!(
+            peer_b.try_local(hash).is_none(),
+            "precondition: B lacks the blob"
+        );
         assert_eq!(weak_pin_count(&peer_b), 0, "precondition: no weak pins");
         let strong_before = peer_b.store().pins().unwrap().count();
 
@@ -183,14 +188,21 @@ fn lazy_read_lands_weak_pinned_in_store() {
         );
 
         // 1. The store now serves it locally.
-        let local = peer_b.try_local(hash).expect("the store serves the fetched blob");
+        let local = peer_b
+            .try_local(hash)
+            .expect("the store serves the fetched blob");
         assert_eq!(
             blake3::hash(&local).as_bytes(),
             &hash,
             "served bytes hash to the content id"
         );
         // 2. It is retained under a weak pin (the demand-born marker)...
-        let weak: Vec<_> = peer_b.store().weak_pins().unwrap().map(Result::unwrap).collect();
+        let weak: Vec<_> = peer_b
+            .store()
+            .weak_pins()
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
         assert_eq!(
             weak,
             vec![Inline::<Handle<UnknownBlob>>::new(hash)],
@@ -232,8 +244,7 @@ fn lazy_store_eviction_is_safe_and_refetches() {
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let mut peer_b =
-            bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -249,9 +260,16 @@ fn lazy_store_eviction_is_safe_and_refetches() {
                 .expect("swarm must serve each blob");
             assert_eq!(blake3::hash(&got).as_bytes(), hash);
         }
-        assert_eq!(weak_pin_count(&peer_b), 3, "each lazy read landed weak-pinned");
+        assert_eq!(
+            weak_pin_count(&peer_b),
+            3,
+            "each lazy read landed weak-pinned"
+        );
         for (_, hash) in &blobs {
-            assert!(peer_b.try_local(*hash).is_some(), "resident after the lazy read");
+            assert!(
+                peer_b.try_local(*hash).is_some(),
+                "resident after the lazy read"
+            );
         }
 
         // The store evicts the first blob: retract the weak pin and
@@ -274,10 +292,23 @@ fn lazy_store_eviction_is_safe_and_refetches() {
         }
 
         // The eviction retracted the pin and dropped the resident bytes.
-        assert_eq!(weak_pin_count(&peer_b), 2, "weak pin retracted by the eviction");
-        assert!(peer_b.try_local(blobs[0].1).is_none(), "oldest evicted from the store");
-        assert!(peer_b.try_local(blobs[1].1).is_some(), "second still resident");
-        assert!(peer_b.try_local(blobs[2].1).is_some(), "newest still resident");
+        assert_eq!(
+            weak_pin_count(&peer_b),
+            2,
+            "weak pin retracted by the eviction"
+        );
+        assert!(
+            peer_b.try_local(blobs[0].1).is_none(),
+            "oldest evicted from the store"
+        );
+        assert!(
+            peer_b.try_local(blobs[1].1).is_some(),
+            "second still resident"
+        );
+        assert!(
+            peer_b.try_local(blobs[2].1).is_some(),
+            "newest still resident"
+        );
 
         // The evicted blob is re-fetchable from the swarm.
         let refetched = drive_future(peer_b.fetch_blob(blobs[0].1), || peer_a.refresh(), 120)
@@ -311,14 +342,16 @@ fn async_lazy_read_awaits_swarm_and_lands_weak_pinned() {
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let mut peer_b =
-            bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
         }
-        assert!(peer_b.try_local(hash).is_none(), "precondition: B lacks the blob");
+        assert!(
+            peer_b.try_local(hash).is_none(),
+            "precondition: B lacks the blob"
+        );
 
         // Drive the async read: poll once, and on Pending step the sim so
         // the host can serve the reply. The future holds `&mut peer_b`
@@ -345,7 +378,10 @@ fn async_lazy_read_awaits_swarm_and_lands_weak_pinned() {
             "awaited bytes hash to the content id"
         );
         // Landed weak-pinned in the store, served locally on the next read.
-        assert!(peer_b.try_local(hash).is_some(), "now resident in the local store");
+        assert!(
+            peer_b.try_local(hash).is_some(),
+            "now resident in the local store"
+        );
         assert_eq!(weak_pin_count(&peer_b), 1, "landed under a weak pin");
     });
 }
@@ -374,14 +410,16 @@ fn transparent_async_get_fetches_through_reader() {
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let mut peer_b =
-            bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
         }
-        assert!(peer_b.try_local(hash).is_none(), "precondition: B lacks the blob");
+        assert!(
+            peer_b.try_local(hash).is_none(),
+            "precondition: B lacks the blob"
+        );
 
         // A generic async reader: it only knows `AsyncBlobStoreGet`.
         let got: anybytes::Bytes = {
@@ -409,8 +447,15 @@ fn transparent_async_get_fetches_through_reader() {
         );
         // The fetch landed in the *shared* store (a &self read mutated
         // Peer state), so a fresh local read now hits.
-        assert_eq!(weak_pin_count(&peer_b), 1, "fetch recorded the demand-born weak pin");
-        assert!(peer_b.try_local(hash).is_some(), "served locally on the next read");
+        assert_eq!(
+            weak_pin_count(&peer_b),
+            1,
+            "fetch recorded the demand-born weak pin"
+        );
+        assert!(
+            peer_b.try_local(hash).is_some(),
+            "served locally on the next read"
+        );
     });
 }
 
@@ -486,16 +531,23 @@ fn lazy_fetch_uses_gossip_known_publisher_without_dht() {
         let (branch_blob, _) = content_blob(0x31);
         let (orphan_blob, orphan_hash) = content_blob(0x32);
         let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
-        store_a.put::<SimpleArchive, _>(branch_blob.clone()).unwrap();
-        store_a.put::<SimpleArchive, _>(orphan_blob.clone()).unwrap();
         store_a
-            .update(Id::new([0x77; 16]).unwrap(), None, Some(branch_blob.get_handle()))
+            .put::<SimpleArchive, _>(branch_blob.clone())
+            .unwrap();
+        store_a
+            .put::<SimpleArchive, _>(orphan_blob.clone())
+            .unwrap();
+        store_a
+            .update(
+                Id::new([0x77; 16]).unwrap(),
+                None,
+                Some(branch_blob.get_handle()),
+            )
             .unwrap();
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let mut peer_b =
-            bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
 
         // Settle: A's refresh gossips the branch HEAD; B's host notes A
         // as a known publisher when the frame arrives.
@@ -555,10 +607,12 @@ fn fetch_deadline_bounds_unavailable_resolution() {
             60,
         )
         .await;
-        let reply = reply.expect(
-            "fetch must resolve within the overall budget, not hang to the DHT timeout",
+        let reply = reply
+            .expect("fetch must resolve within the overall budget, not hang to the DHT timeout");
+        assert!(
+            reply.is_none(),
+            "an expired budget is Unavailable, not bytes"
         );
-        assert!(reply.is_none(), "an expired budget is Unavailable, not bytes");
     });
 }
 
@@ -584,8 +638,7 @@ fn lazy_read_unavailable_under_partition_then_heals() {
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let mut peer_b =
-            bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -602,7 +655,10 @@ fn lazy_read_unavailable_under_partition_then_heals() {
             blocked.is_none(),
             "partitioned from the only holder → Unavailable"
         );
-        assert!(peer_b.try_local(hash).is_none(), "nothing landed from a failed fetch");
+        assert!(
+            peer_b.try_local(hash).is_none(),
+            "nothing landed from a failed fetch"
+        );
         assert_eq!(
             weak_pin_count(&peer_b),
             0,
@@ -641,8 +697,7 @@ fn lazy_read_unavailable_under_crash_then_revives() {
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let peer_b =
-            bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -704,7 +759,10 @@ fn fetched_blob_is_retained_second_read_hits_locally() {
 
         // The fetch landed weak-pinned: resident, evictable, retained.
         assert_eq!(weak_pin_count(&peer_b), 1, "fetch landed under a weak pin");
-        assert!(peer_b.try_local(hash).is_some(), "a local hit after the fetch");
+        assert!(
+            peer_b.try_local(hash).is_some(),
+            "a local hit after the fetch"
+        );
 
         // Crash the only holder: the second read must still succeed —
         // it is a local hit, not a re-fetch. `drive_future`'s on_step
@@ -752,8 +810,7 @@ fn lazy_fetch_under_partition_chaos_is_safe_and_recovers() {
             let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
             let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-            let peer_b =
-                bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+            let peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
 
             for _ in 0..40u32 {
                 SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -841,15 +898,17 @@ fn lazy_fetch_falls_back_to_a_second_holder() {
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
         let mut peer_c = bring_up(&net, &kc, store_c, team_root, self_cap_of(&cap_c.1), true);
-        let mut peer_b =
-            bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
 
         for _ in 0..50u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
             peer_c.refresh();
         }
-        assert!(peer_b.try_local(hash).is_none(), "precondition: B lacks the blob");
+        assert!(
+            peer_b.try_local(hash).is_none(),
+            "precondition: B lacks the blob"
+        );
 
         // Crash A. Both A and C are DHT providers; B must fall back to C.
         net.crash(pk(&ka));
@@ -888,8 +947,7 @@ fn run_lazy_fetch(seed: u64, config: SimConfig) -> (Option<Vec<u8>>, u32) {
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let peer_b =
-            bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -939,14 +997,16 @@ fn concurrent_transparent_reads_share_store_and_dedupe() {
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let mut peer_b =
-            bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
         }
-        assert!(peer_b.try_local(hash).is_none(), "precondition: B lacks the blob");
+        assert!(
+            peer_b.try_local(hash).is_none(),
+            "precondition: B lacks the blob"
+        );
 
         // Two independent readers off the same Peer — each owns a clone
         // of the store snapshot and a fetch capability into the *same*
@@ -996,7 +1056,10 @@ fn concurrent_transparent_reads_share_store_and_dedupe() {
             1,
             "concurrent lands of the same blob dedupe to a single weak pin"
         );
-        assert!(peer_b.try_local(hash).is_some(), "resident after the racing reads");
+        assert!(
+            peer_b.try_local(hash).is_some(),
+            "resident after the racing reads"
+        );
     });
 }
 
@@ -1021,8 +1084,7 @@ fn run_lazy_fetch_partition_recovery(seed: u64) -> (Option<Vec<u8>>, u32) {
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let peer_b =
-            bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -1146,8 +1208,7 @@ fn reconcile_tick_services_out_of_band_want() {
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
         // B: no gossip — a pure leecher; only the want-reconcile fetches.
-        let mut peer_b =
-            bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), false);
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), false);
 
         // Settle the mesh so A's blobs are announced to the DHT.
         for _ in 0..40u32 {
@@ -1162,10 +1223,12 @@ fn reconcile_tick_services_out_of_band_want() {
             .store()
             .pin_weak(Inline::<Handle<UnknownBlob>>::new(hash))
             .unwrap();
-        assert!(peer_b.try_local(hash).is_none(), "precondition: B lacks the blob");
+        assert!(
+            peer_b.try_local(hash).is_none(),
+            "precondition: B lacks the blob"
+        );
 
-        let a_pins_before: Vec<_> =
-            peer_a.store().pins().unwrap().map(Result::unwrap).collect();
+        let a_pins_before: Vec<_> = peer_a.store().pins().unwrap().map(Result::unwrap).collect();
         let a_weak_before = weak_pin_count(&peer_a);
         let b_pins_before = peer_b.store().pins().unwrap().count();
 
@@ -1186,8 +1249,12 @@ fn reconcile_tick_services_out_of_band_want() {
         );
         // ...still weak-pinned — the want-marker became the retention
         // marker (the reconciler records no pin state of its own)...
-        let weak: Vec<_> =
-            peer_b.store().weak_pins().unwrap().map(Result::unwrap).collect();
+        let weak: Vec<_> = peer_b
+            .store()
+            .weak_pins()
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
         assert_eq!(
             weak,
             vec![Inline::<Handle<UnknownBlob>>::new(hash)],
@@ -1200,10 +1267,13 @@ fn reconcile_tick_services_out_of_band_want() {
             "reconcile must not create strong pins"
         );
         // ...and A's retention is untouched.
-        let a_pins_after: Vec<_> =
-            peer_a.store().pins().unwrap().map(Result::unwrap).collect();
+        let a_pins_after: Vec<_> = peer_a.store().pins().unwrap().map(Result::unwrap).collect();
         assert_eq!(a_pins_after, a_pins_before, "A's strong pins untouched");
-        assert_eq!(weak_pin_count(&peer_a), a_weak_before, "A's weak pins untouched");
+        assert_eq!(
+            weak_pin_count(&peer_a),
+            a_weak_before,
+            "A's weak pins untouched"
+        );
     });
 }
 
@@ -1233,8 +1303,7 @@ fn reconcile_unsatisfiable_want_stays_pending() {
         let cap_a = admin_cap(&root, &ka);
 
         let store_a = store_with_caps(&[cap_a.clone()]);
-        let mut peer_a =
-            bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
 
         // A want for content nobody holds (an arbitrary content id).
         let hash = *blake3::hash(b"nobody holds this blob").as_bytes();
@@ -1279,8 +1348,12 @@ fn reconcile_unsatisfiable_want_stays_pending() {
 
         // Throughout: the want is still durably on record and the blob
         // still absent — nothing was dropped, nothing errored.
-        let weak: Vec<_> =
-            peer_a.store().weak_pins().unwrap().map(Result::unwrap).collect();
+        let weak: Vec<_> = peer_a
+            .store()
+            .weak_pins()
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
         assert_eq!(weak, vec![Inline::<Handle<UnknownBlob>>::new(hash)]);
         assert!(peer_a.try_local(hash).is_none());
     });

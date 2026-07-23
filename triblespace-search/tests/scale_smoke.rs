@@ -10,8 +10,8 @@ use triblespace_core::id::{Id, RawId};
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::hnsw::HNSWBuilder;
-use triblespace_search::testing::FlatBuilder;
 use triblespace_search::succinct::{SuccinctBM25Index, SuccinctHNSWIndex};
+use triblespace_search::testing::FlatBuilder;
 use triblespace_search::tokens::hash_tokens;
 
 /// Small pseudo-RNG (SplitMix64) — deterministic, no extra deps.
@@ -118,7 +118,7 @@ fn hnsw_1k_vectors_recall_against_flat() {
 
     use triblespace_core::blob::MemoryBlobStore;
     use triblespace_core::repo::BlobStore;
-    
+
     use triblespace_search::schemas::put_embedding;
 
     let mut rng = SplitMix64(0xFACE_FEED);
@@ -252,7 +252,7 @@ fn succinct_hnsw_1k_docs_matches_naive() {
 
     use triblespace_core::blob::MemoryBlobStore;
     use triblespace_core::repo::BlobStore;
-    
+
     use triblespace_search::schemas::put_embedding;
 
     let mut rng = SplitMix64(0xBADF00D);
@@ -427,7 +427,7 @@ fn flat_1k_vectors_threshold_finds_self() {
 
     use triblespace_core::blob::MemoryBlobStore;
     use triblespace_core::repo::BlobStore;
-    
+
     use triblespace_search::schemas::put_embedding;
 
     let mut rng = SplitMix64(0x1234_5678);
@@ -453,7 +453,10 @@ fn flat_1k_vectors_threshold_finds_self() {
 
     // Probing from the target handle at a very tight threshold
     // finds it (cos=1.0 against itself).
-    let hits = idx.attach(&reader).candidates_above(h_target, 0.999).unwrap();
+    let hits = idx
+        .attach(&reader)
+        .candidates_above(h_target, 0.999)
+        .unwrap();
     assert!(hits.contains(&h_target));
 
     // Sanity: byte_size grows linearly with handle count.

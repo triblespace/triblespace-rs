@@ -43,9 +43,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 use tokio::io::DuplexStream;
 use tokio::sync::mpsc;
 
@@ -351,10 +351,7 @@ impl SimNet {
 
 /// Forward from the unbounded internal channel to the bounded one the
 /// harness exposes.
-async fn bridge<T: Send + 'static>(
-    mut rx: mpsc::UnboundedReceiver<T>,
-    tx: mpsc::Sender<T>,
-) {
+async fn bridge<T: Send + 'static>(mut rx: mpsc::UnboundedReceiver<T>, tx: mpsc::Sender<T>) {
     while let Some(item) = rx.recv().await {
         if tx.send(item).await.is_err() {
             return;
@@ -381,8 +378,11 @@ impl Transport for SimTransport {
         let (latency, incoming_tx, stalled) = {
             let mut inner = self.net.inner.lock().unwrap();
             if inner.partitioned(&self.id, &peer) {
-                anyhow::bail!("simnet: {} -> {}: partitioned",
-                    hex_prefix(&self.id), hex_prefix(&peer));
+                anyhow::bail!(
+                    "simnet: {} -> {}: partitioned",
+                    hex_prefix(&self.id),
+                    hex_prefix(&peer)
+                );
             }
             let incoming_tx = {
                 let Some(slot) = inner.nodes.get(&peer) else {
@@ -487,20 +487,14 @@ impl GossipSink for SimGossip {
         // deliver outside it via delayed tasks on the paused wheel.
         let deliveries: Vec<(mpsc::UnboundedSender<GossipEvent>, Duration)> = {
             let mut inner = self.net.inner.lock().unwrap();
-            let me_up = inner
-                .nodes
-                .get(&self.from)
-                .map(|n| n.up)
-                .unwrap_or(false);
+            let me_up = inner.nodes.get(&self.from).map(|n| n.up).unwrap_or(false);
             if !me_up {
                 return Ok(()); // crashed nodes shout into the void
             }
             let targets: Vec<PeerId> = inner
                 .nodes
                 .iter()
-                .filter(|(id, slot)| {
-                    **id != self.from && slot.up && slot.gossip_tx.is_some()
-                })
+                .filter(|(id, slot)| **id != self.from && slot.up && slot.gossip_tx.is_some())
                 .map(|(id, _)| *id)
                 .collect();
             let dedupe = inner.config.gossip_dedupe;
@@ -682,7 +676,10 @@ mod tests {
             waiter.await.unwrap(),
             "close() must wake a parked accept_bi with None"
         );
-        assert!(dialer.open_bi().await.is_err(), "open_bi after close errors");
+        assert!(
+            dialer.open_bi().await.is_err(),
+            "open_bi after close errors"
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -272,7 +272,10 @@ impl fmt::Display for BudgetContractError {
                 write!(f, "dispatched input {input} carries no work grant")
             }
             Self::BaseCountMismatch { inputs, bases } => {
-                write!(f, "cohort submitted {inputs} inputs with {bases} resume bases")
+                write!(
+                    f,
+                    "cohort submitted {inputs} inputs with {bases} resume bases"
+                )
             }
             Self::ResumeBeyondInterval { input, base } => write!(
                 f,

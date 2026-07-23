@@ -7,12 +7,12 @@
 //! Default location: `$TRIBLESPACE_KEY` env, or `./self.key` in the
 //! current directory, or an explicit path.
 
-use std::path::Path;
-use std::fs;
 use anyhow::{Result, anyhow};
-use tracing::info;
 use ed25519_dalek::SigningKey;
 use iroh_base::SecretKey;
+use std::fs;
+use std::path::Path;
+use tracing::info;
 
 /// Load or create a persistent node identity.
 ///
@@ -48,8 +48,7 @@ pub fn iroh_secret(key: &SigningKey) -> SecretKey {
 }
 
 fn load_key_from_file(p: &Path) -> Result<SigningKey> {
-    let content = fs::read_to_string(p)
-        .map_err(|e| anyhow!("read key {}: {e}", p.display()))?;
+    let content = fs::read_to_string(p).map_err(|e| anyhow!("read key {}: {e}", p.display()))?;
     let hexstr = content.trim();
     if hexstr.len() != 64 || !hexstr.chars().all(|c| c.is_ascii_hexdigit()) {
         anyhow::bail!("key file {} is not valid 64-char hex", p.display());
@@ -62,7 +61,6 @@ fn load_key_from_file(p: &Path) -> Result<SigningKey> {
 
 fn generate_key() -> Result<SigningKey> {
     let mut seed = [0u8; 32];
-    getrandom::fill(&mut seed)
-        .map_err(|e| anyhow!("generate key: {e}"))?;
+    getrandom::fill(&mut seed).map_err(|e| anyhow!("generate key: {e}"))?;
     Ok(SigningKey::from_bytes(&seed))
 }

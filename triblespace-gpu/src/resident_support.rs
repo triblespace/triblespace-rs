@@ -20,11 +20,11 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
-use cubecl::prelude::*;
-use jerky::gpu::DeviceU32Buffer;
 use crate::query_program::{
     ProgramFrontier, ProgramPattern, ProgramTerm, ProgramVariable, QueryProgram,
 };
+use cubecl::prelude::*;
+use jerky::gpu::DeviceU32Buffer;
 use triblespace_core::blob::encodings::succinctarchive::{SuccinctRotation, Universe};
 
 use crate::resident_round::{

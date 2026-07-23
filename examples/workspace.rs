@@ -5,7 +5,12 @@ use triblespace::core::repo::Repository;
 use triblespace::prelude::*;
 
 fn main() {
-    let mut repo = Repository::new(MemoryRepo::default(), SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+    let mut repo = Repository::new(
+        MemoryRepo::default(),
+        SigningKey::generate(&mut OsRng),
+        TribleSet::new(),
+    )
+    .unwrap();
 
     // create a new branch and add a commit
     let branch_id = repo.create_branch("feature", None).expect("create branch");

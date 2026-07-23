@@ -60,13 +60,13 @@
 
 use std::env;
 
+use triblespace_core::blob::encodings::succinctarchive::Universe;
 use triblespace_core::inline::RawInline;
 use triblespace_core::query::{
     DispatchClass, ProgramPacing, ProgramPhysicalReceipt, ProgramRequest, ProgramRoute,
     ProgramSeedBatch, TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedResume,
     TypedSeedSink,
 };
-use triblespace_core::blob::encodings::succinctarchive::Universe;
 
 use crate::budgeted::{CohortGrants, CohortReceipts, PhysicalCursor};
 use crate::query_program::{
@@ -329,7 +329,13 @@ impl<'p, 'a, U: Universe> SuccinctProgramFamily<'p, 'a, U> {
                 "a family state's offset ran past its candidate interval"
             );
             let take = limit.min(interval - offset);
-            self.emit_rows(&mut outcome, input as u32, &full, target, offset..offset + take);
+            self.emit_rows(
+                &mut outcome,
+                input as u32,
+                &full,
+                target,
+                offset..offset + take,
+            );
             let resume = (offset + take < interval).then(|| SuccinctFrontierState {
                 offset: (offset + take) as u32,
                 ..state.clone()
@@ -409,7 +415,10 @@ impl<'p, 'a, U: Universe> SuccinctProgramFamily<'p, 'a, U> {
         // offset rides down as its resume base, so fresh and resumed states
         // share one budgeted submission.
         let first = states.first()?;
-        if states.iter().any(|state| state.variables != first.variables) {
+        if states
+            .iter()
+            .any(|state| state.variables != first.variables)
+        {
             return None;
         }
         let target = self.target(first)?;
@@ -430,7 +439,14 @@ impl<'p, 'a, U: Universe> SuccinctProgramFamily<'p, 'a, U> {
             .gpu
             .transition_on_budgeted_from(target, &parent, &grants, &bases)
             .ok()?;
-        self.outcome_from_device(arm.resident.identity(), &child, receipts, states, limits, target)
+        self.outcome_from_device(
+            arm.resident.identity(),
+            &child,
+            receipts,
+            states,
+            limits,
+            target,
+        )
     }
 
     /// Converts one validated device result into the family step outcome,
@@ -475,7 +491,13 @@ impl<'p, 'a, U: Universe> SuccinctProgramFamily<'p, 'a, U> {
             if consumed + produced > child.len() {
                 return None;
             }
-            self.emit_rows(&mut outcome, input, child, target, consumed..consumed + produced);
+            self.emit_rows(
+                &mut outcome,
+                input,
+                child,
+                target,
+                consumed..consumed + produced,
+            );
             consumed += produced;
             let resume = receipt.physical_cursor.map(|cursor: PhysicalCursor| {
                 // The sole legal cursor consumer: physical resume data
@@ -593,10 +615,7 @@ impl<'p, 'a, U: Universe> TypedProgramSpec for SuccinctProgramFamily<'p, 'a, U> 
         // Decline before mutating the borrowed transaction sink so the
         // adapter can execute the exact retained states on Native.
         let outcome = self.device_outcome(states, batch.limits)?;
-        let placement = ProgramPhysicalReceipt::new(
-            WGPU_RESIDENT_EXECUTOR,
-            TWO_BOUND_BUDGETED_OP,
-        );
+        let placement = ProgramPhysicalReceipt::new(WGPU_RESIDENT_EXECUTOR, TWO_BOUND_BUDGETED_OP);
         Self::write_outcome(outcome, effects);
         Some(placement)
     }
@@ -667,7 +686,9 @@ mod tests {
                         vec![e, a],
                         vec![
                             program.encode(&raw(entity)).expect("entity in domain"),
-                            program.encode(&raw(attribute)).expect("attribute in domain"),
+                            program
+                                .encode(&raw(attribute))
+                                .expect("attribute in domain"),
                         ],
                     )
                     .expect("fixture states are valid")
@@ -689,12 +710,8 @@ mod tests {
         program: &QueryProgram<'_, OrderedUniverse>,
         state: &SuccinctFrontierState,
     ) -> Vec<RawInline> {
-        let singleton = ProgramFrontier::new(
-            state.variables().to_vec(),
-            state.row().to_vec(),
-            1,
-        )
-        .unwrap();
+        let singleton =
+            ProgramFrontier::new(state.variables().to_vec(), state.row().to_vec(), 1).unwrap();
         let full = program
             .transition_on(ProgramVariable::new(2), &singleton)
             .unwrap();
@@ -705,11 +722,17 @@ mod tests {
 
     #[test]
     fn admission_policy_defaults_disabled_and_parses_activation_values() {
-        assert_eq!(BackendAdmissionPolicy::default(), BackendAdmissionPolicy::disabled());
+        assert_eq!(
+            BackendAdmissionPolicy::default(),
+            BackendAdmissionPolicy::disabled()
+        );
         assert!(!BackendAdmissionPolicy::disabled().routing_enabled());
         assert!(!BackendAdmissionPolicy::disabled().admits(usize::MAX));
 
-        assert_eq!(BackendAdmissionPolicy::route_from(0), BackendAdmissionPolicy::disabled());
+        assert_eq!(
+            BackendAdmissionPolicy::route_from(0),
+            BackendAdmissionPolicy::disabled()
+        );
         let routed = BackendAdmissionPolicy::route_from(4);
         assert!(routed.routing_enabled());
         assert!(!routed.admits(3));
@@ -816,10 +839,8 @@ mod tests {
             let mut consumed = Vec::new();
             let mut cursor = Some(state.clone());
             while let Some(current) = cursor.take() {
-                let outcome = family.native_outcome(
-                    std::slice::from_ref(&current),
-                    &[limits[input]],
-                );
+                let outcome =
+                    family.native_outcome(std::slice::from_ref(&current), &[limits[input]]);
                 consumed.extend(outcome.direct.iter().map(|(_, value)| *value));
                 cursor = outcome.pages.into_iter().next().unwrap().resume;
             }
@@ -928,8 +949,7 @@ mod tests {
         };
 
         // The lawful receipts segment exactly.
-        let receipts =
-            CohortReceipts::validate(brand, &grants, exhausted(&full_counts)).unwrap();
+        let receipts = CohortReceipts::validate(brand, &grants, exhausted(&full_counts)).unwrap();
         let outcome = family
             .outcome_from_device(brand, &child, receipts, &states, &limits, target)
             .expect("lawful receipts segment");
@@ -940,8 +960,7 @@ mod tests {
         );
 
         // Gate 4: a receipt branded for another snapshot is never trusted.
-        let receipts =
-            CohortReceipts::validate(brand, &grants, exhausted(&full_counts)).unwrap();
+        let receipts = CohortReceipts::validate(brand, &grants, exhausted(&full_counts)).unwrap();
         assert!(family
             .outcome_from_device(
                 ArchiveIdentity::test_brand(),
@@ -1147,11 +1166,8 @@ mod tests {
         for (input, value) in &first.direct {
             consumed[*input as usize].push(*value);
         }
-        let mut cursors: Vec<Option<SuccinctFrontierState>> = first
-            .pages
-            .into_iter()
-            .map(|page| page.resume)
-            .collect();
+        let mut cursors: Vec<Option<SuccinctFrontierState>> =
+            first.pages.into_iter().map(|page| page.resume).collect();
         while cursors.iter().any(|cursor| cursor.is_some()) {
             // Mixed cohorts: still-resumable states page on the device while
             // exhausted inputs are simply absent from the follow-up cohort.

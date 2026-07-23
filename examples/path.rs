@@ -18,8 +18,7 @@ fn main() {
     kb += entity! { &a @ social::follows: &b };
     kb += entity! { &b @ social::likes: &c };
 
-    for (s, e) in
-        find!((s: Inline<inlineencodings::GenId>, e: Inline<inlineencodings::GenId>), path!(kb.clone(), s (social::follows | social::likes)+ e))
+    for (s, e) in find!((s: Inline<inlineencodings::GenId>, e: Inline<inlineencodings::GenId>), path!(kb.clone(), s (social::follows | social::likes)+ e))
     {
         println!("{:?} -> {:?}", s, e);
     }

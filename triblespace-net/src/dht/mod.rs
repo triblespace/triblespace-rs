@@ -105,7 +105,7 @@ pub mod rpc {
     };
 
     use iroh::{Endpoint, EndpointAddr, EndpointId, PublicKey};
-    
+
     use irpc::{
         channel::{mpsc, oneshot},
         rpc_requests,
@@ -328,7 +328,10 @@ pub mod rpc {
             &self.0
         }
 
-        pub fn remote(endpoint: Endpoint, id: Id) -> std::result::Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        pub fn remote(
+            endpoint: Endpoint,
+            id: Id,
+        ) -> std::result::Result<Self, Box<dyn std::error::Error + Send + Sync>> {
             let id = iroh::EndpointId::from_bytes(&id)?;
             let client = irpc_iroh::client(endpoint, id, ALPN);
             Ok(Self::new(client))
@@ -393,7 +396,7 @@ pub mod api {
 
     use crate::dht::{
         now,
-        rpc::{Blake3Immutable, Id, Kind, Inline},
+        rpc::{Blake3Immutable, Id, Inline, Kind},
     };
 
     #[rpc_requests(message = ApiMessage)]
@@ -582,10 +585,7 @@ pub mod api {
         }
 
         /// Find nodes that provide the blob with the given blake3 hash.
-        pub async fn find_providers(
-            &self,
-            hash: blake3::Hash,
-        ) -> irpc::Result<Vec<EndpointId>> {
+        pub async fn find_providers(&self, hash: blake3::Hash) -> irpc::Result<Vec<EndpointId>> {
             let id = Id::from(*hash.as_bytes());
             let mut rx = self
                 .0
@@ -603,7 +603,11 @@ pub mod api {
             loop {
                 match rx.recv().await {
                     Ok(Some((_from, value))) => {
-                        if let Inline::Blake3Provider(super::rpc::Blake3Provider { endpoint_id, .. }) = value {
+                        if let Inline::Blake3Provider(super::rpc::Blake3Provider {
+                            endpoint_id,
+                            ..
+                        }) = value
+                        {
                             if let Ok(key) = iroh_base::PublicKey::from_bytes(&endpoint_id) {
                                 providers.push(EndpointId::from(key));
                             }
@@ -638,13 +642,12 @@ pub mod api {
 
     impl WeakApiClient {
         pub fn upgrade(&self) -> irpc::Result<ApiClient> {
-            self.0
-                .upgrade()
-                .map(ApiClient)
-                .ok_or(irpc::Error::Send {
-                    source: irpc::channel::SendError::ReceiverClosed { meta: Default::default() },
+            self.0.upgrade().map(ApiClient).ok_or(irpc::Error::Send {
+                source: irpc::channel::SendError::ReceiverClosed {
                     meta: Default::default(),
-                })
+                },
+                meta: Default::default(),
+            })
         }
 
         pub async fn nodes_dead(&self, ids: &[EndpointId]) -> irpc::Result<()> {
@@ -936,7 +939,7 @@ use crate::dht::{
     api::{ApiMessage, Lookup, NetworkGet, NetworkPut, WeakApiClient},
     pool::ClientPool,
     routing::{ALPHA, BUCKET_COUNT, Buckets, Distance, K, RoutingTable},
-    rpc::{Id, Kind, RpcClient, RpcMessage, SetResponse, Inline},
+    rpc::{Id, Inline, Kind, RpcClient, RpcMessage, SetResponse},
     u256::U256,
 };
 
@@ -1797,12 +1800,22 @@ where
 }
 
 impl<P: ClientPool> State<P> {
-    async fn lookup(self, initial: Vec<EndpointId>, msg: Lookup, tx: oneshot::Sender<Vec<EndpointId>>) {
+    async fn lookup(
+        self,
+        initial: Vec<EndpointId>,
+        msg: Lookup,
+        tx: oneshot::Sender<Vec<EndpointId>>,
+    ) {
         let ids = self.clone().iterative_find_node(msg.id, initial).await;
         tx.send(ids).await.ok();
     }
 
-    async fn network_put(self, initial: Vec<EndpointId>, msg: NetworkPut, tx: mpsc::Sender<EndpointId>) {
+    async fn network_put(
+        self,
+        initial: Vec<EndpointId>,
+        msg: NetworkPut,
+        tx: mpsc::Sender<EndpointId>,
+    ) {
         let ids = self.clone().iterative_find_node(msg.id, initial).await;
         stream::iter(ids)
             .for_each_concurrent(self.config.parallelism, |id| {
@@ -2068,11 +2081,14 @@ impl iroh_blobs::api::downloader::ContentDiscovery for DhtContentDiscovery {
     ) -> n0_future::stream::Boxed<iroh_base::EndpointId> {
         let api = self.api.clone();
         let blake3_hash = blake3::Hash::from_bytes(*hash.hash.as_bytes());
-        Box::pin(n0_future::stream::once_future(async move {
-            match api.find_providers(blake3_hash).await {
-                Ok(providers) => n0_future::stream::iter(providers),
-                Err(_) => n0_future::stream::iter(vec![]),
-            }
-        }).flatten())
+        Box::pin(
+            n0_future::stream::once_future(async move {
+                match api.find_providers(blake3_hash).await {
+                    Ok(providers) => n0_future::stream::iter(providers),
+                    Err(_) => n0_future::stream::iter(vec![]),
+                }
+            })
+            .flatten(),
+        )
     }
 }

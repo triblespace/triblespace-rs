@@ -108,7 +108,10 @@ impl RunStore {
             .levels
             .get_mut(level)
             .unwrap_or_else(|| panic!("proposal run level {level} overflowed"));
-        assert!(slot.replace(run).is_none(), "proposal run level was occupied");
+        assert!(
+            slot.replace(run).is_none(),
+            "proposal run level was occupied"
+        );
     }
 
     fn take_lowest(&mut self) -> Option<CandidatePayload> {
@@ -285,7 +288,10 @@ impl ProposalMaterializerState {
                 (examined, emitted, next)
             }
         };
-        assert!(examined <= grant, "proposal materializer exceeded its grant");
+        assert!(
+            examined <= grant,
+            "proposal materializer exceeded its grant"
+        );
         assert!(examined > 0, "live proposal materializer made no progress");
         let rank = previous_rank
             .checked_sub(examined as u128)
@@ -404,7 +410,10 @@ mod tests {
     fn drain(
         mut state: ProposalMaterializerState,
         grants: &[usize],
-    ) -> (Vec<RawInline>, Vec<(ProposalMaterializePhaseKind, usize, u128)>) {
+    ) -> (
+        Vec<RawInline>,
+        Vec<(ProposalMaterializePhaseKind, usize, u128)>,
+    ) {
         assert!(!grants.is_empty());
         let mut grants = grants.iter().copied().cycle();
         let mut output = Vec::new();

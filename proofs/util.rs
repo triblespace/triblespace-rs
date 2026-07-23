@@ -1,10 +1,10 @@
 #![cfg(kani)]
 
 use crate::id::{ExclusiveId, Id, ID_LEN};
-use crate::patch::Entry;
-use crate::trible::Trible;
 use crate::inline::encodings::UnknownInline;
 use crate::inline::{Inline, INLINE_LEN};
+use crate::patch::Entry;
+use crate::trible::Trible;
 use kani::BoundedArbitrary;
 
 /// Ensures the generated identifier is never nil by rejecting the sentinel.

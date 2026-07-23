@@ -15,11 +15,11 @@ use triblespace::prelude::View;
 use triblespace_core::blob::encodings::longstring::LongString;
 use triblespace_core::blob::IntoBlob;
 use triblespace_core::id::Id;
+use triblespace_core::inline::encodings::hash::{Blake3, Handle, Hash};
+use triblespace_core::inline::Inline;
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::Repository;
 use triblespace_core::trible::TribleSet;
-use triblespace_core::inline::encodings::hash::{Blake3, Handle, Hash};
-use triblespace_core::inline::Inline;
 
 use super::signing::load_signing_key;
 use triblespace_core::repo::BlobStoreMeta;
@@ -241,7 +241,8 @@ pub fn run(cmd: Command) -> Result<()> {
                     let records = scan_pile_records(&path)?;
                     let states = collapse_branch_states(&records);
 
-                    let mut rows: Vec<(Id, &BranchState)> = states.iter().map(|(id, s)| (*id, s)).collect();
+                    let mut rows: Vec<(Id, &BranchState)> =
+                        states.iter().map(|(id, s)| (*id, s)).collect();
                     rows.sort_by_key(|(id, _)| *id);
 
                     for (id, state) in rows {
@@ -306,8 +307,7 @@ pub fn run(cmd: Command) -> Result<()> {
                             Ok(meta) => {
                                 let name_attr = triblespace_core::metadata::name.id();
                                 let mut name_handle: Option<BranchNameHandle> = None;
-                                let mut head_handle: Option<Inline<Handle<SimpleArchive>>> =
-                                    None;
+                                let mut head_handle: Option<Inline<Handle<SimpleArchive>>> = None;
                                 for t in meta.iter() {
                                     if t.a() == &name_attr {
                                         let h: BranchNameHandle = *t.v();
@@ -381,7 +381,7 @@ pub fn run(cmd: Command) -> Result<()> {
         } => {
             use triblespace_core::repo::pile::Pile;
             use triblespace_core::repo::Repository;
-            
+
             let pile: Pile = Pile::open(&pile)?;
             let key = load_signing_key(&signing_key)?;
             let mut repo = Repository::new(pile, key, TribleSet::new())?;
@@ -405,11 +405,11 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace::prelude::blobencodings::SimpleArchive;
             use triblespace::prelude::inlineencodings::Handle;
 
-            use triblespace_core::repo::pile::Pile;
-            use triblespace_core::trible::TribleSet;
             use triblespace_core::inline::encodings::hash::Blake3;
             use triblespace_core::inline::encodings::hash::Hash;
             use triblespace_core::inline::Inline;
+            use triblespace_core::repo::pile::Pile;
+            use triblespace_core::trible::TribleSet;
 
             let mut pile: Pile = Pile::open(&pile)?;
             let res = (|| -> Result<(), anyhow::Error> {
@@ -478,7 +478,6 @@ pub fn run(cmd: Command) -> Result<()> {
         }
         Command::Delete { pile, branch } => {
             use triblespace_core::repo::pile::Pile;
-            
 
             let mut pile: Pile = Pile::open(&pile)?;
             let res = (|| -> Result<(), anyhow::Error> {
@@ -510,7 +509,7 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace::prelude::blobencodings::SimpleArchive;
             use triblespace::prelude::inlineencodings::Handle;
             use triblespace_core::repo::pile::Pile;
-            
+
             use triblespace_core::inline::Inline;
 
             let mut pile: Pile = Pile::open(&pile)?;
@@ -627,7 +626,7 @@ pub fn run(cmd: Command) -> Result<()> {
         } => {
             use triblespace_core::repo;
             use triblespace_core::repo::pile::Pile;
-            
+
             use triblespace_core::inline::encodings::hash::Handle;
             use triblespace_core::inline::Inline;
 
@@ -651,8 +650,7 @@ pub fn run(cmd: Command) -> Result<()> {
                 // Prepare a mapping from source handle raw -> destination handle for later lookup.
                 use std::collections::HashMap;
                 use triblespace_core::inline::INLINE_LEN;
-                let mut mapping: HashMap<[u8; INLINE_LEN], Inline<Handle<_>>> =
-                    HashMap::new();
+                let mut mapping: HashMap<[u8; INLINE_LEN], Inline<Handle<_>>> = HashMap::new();
 
                 let src_reader = src
                     .reader()
@@ -726,11 +724,11 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace::prelude::blobencodings::SimpleArchive;
             use triblespace::prelude::inlineencodings::Handle;
 
-            use triblespace_core::repo::pile::Pile;
-            use triblespace_core::trible::TribleSet;
             use triblespace_core::inline::encodings::hash::Blake3;
             use triblespace_core::inline::encodings::hash::Hash;
             use triblespace_core::inline::Inline;
+            use triblespace_core::repo::pile::Pile;
+            use triblespace_core::trible::TribleSet;
 
             let mut pile: Pile = Pile::open(&pile)?;
             let res = (|| -> Result<(), anyhow::Error> {
@@ -871,7 +869,7 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace_core::repo;
             use triblespace_core::repo::pile::Pile;
             use triblespace_core::repo::Repository;
-            
+
             use triblespace_core::inline::encodings::hash::Handle;
             use triblespace_core::inline::Inline;
 
@@ -980,7 +978,9 @@ pub fn run(cmd: Command) -> Result<()> {
 
             if by_name_include_deleted {
                 if out_name.is_some() {
-                    eprintln!("warning: --out-name is ignored when --by-name-include-deleted is set");
+                    eprintln!(
+                        "warning: --out-name is ignored when --by-name-include-deleted is set"
+                    );
                 }
 
                 let pile_path = pile;
@@ -998,15 +998,26 @@ pub fn run(cmd: Command) -> Result<()> {
                     let records = scan_pile_records(&pile_path)?;
                     let states = collapse_branch_states(&records);
 
-                    let n_active = states.values().filter(|s| s.kind == RecordKind::Set).count();
-                    let n_deleted = states.values().filter(|s| s.kind == RecordKind::Tombstone).count();
+                    let n_active = states
+                        .values()
+                        .filter(|s| s.kind == RecordKind::Set)
+                        .count();
+                    let n_deleted = states
+                        .values()
+                        .filter(|s| s.kind == RecordKind::Tombstone)
+                        .count();
                     println!(
                         "scanning pile: found {} unique branch IDs ({} active, {} tombstoned)",
-                        states.len(), n_active, n_deleted
+                        states.len(),
+                        n_active,
+                        n_deleted
                     );
 
                     // --- Phase 2: Name resolution & grouping ---
-                    let mut groups: BTreeMap<String, Vec<(Id, Option<Inline<Handle<SimpleArchive>>>)>> = BTreeMap::new();
+                    let mut groups: BTreeMap<
+                        String,
+                        Vec<(Id, Option<Inline<Handle<SimpleArchive>>>)>,
+                    > = BTreeMap::new();
 
                     for (bid, state) in &states {
                         let meta_handle = match state.kind {
@@ -1015,13 +1026,19 @@ pub fn run(cmd: Command) -> Result<()> {
                         };
 
                         let Some(mh) = meta_handle else {
-                            groups.entry("<unnamed>".to_string()).or_default().push((*bid, None));
+                            groups
+                                .entry("<unnamed>".to_string())
+                                .or_default()
+                                .push((*bid, None));
                             continue;
                         };
 
                         if reader.metadata(mh)?.is_none() {
                             eprintln!("warning: metadata blob missing for branch {bid:X}");
-                            groups.entry("<unnamed>".to_string()).or_default().push((*bid, None));
+                            groups
+                                .entry("<unnamed>".to_string())
+                                .or_default()
+                                .push((*bid, None));
                             continue;
                         }
 
@@ -1029,7 +1046,10 @@ pub fn run(cmd: Command) -> Result<()> {
                             Ok(ms) => ms,
                             Err(_) => {
                                 eprintln!("warning: failed to read metadata for branch {bid:X}");
-                                groups.entry("<unnamed>".to_string()).or_default().push((*bid, None));
+                                groups
+                                    .entry("<unnamed>".to_string())
+                                    .or_default()
+                                    .push((*bid, None));
                                 continue;
                             }
                         };
@@ -1044,16 +1064,24 @@ pub fn run(cmd: Command) -> Result<()> {
                     }
 
                     // --- Phase 3: Subsumption + merge per name group ---
-                    let statuses: HashMap<Id, &str> = states.iter().map(|(id, s)| {
-                        let label = match s.kind {
-                            RecordKind::Set => "active",
-                            RecordKind::Tombstone => "deleted",
-                        };
-                        (*id, label)
-                    }).collect();
+                    let statuses: HashMap<Id, &str> = states
+                        .iter()
+                        .map(|(id, s)| {
+                            let label = match s.kind {
+                                RecordKind::Set => "active",
+                                RecordKind::Tombstone => "deleted",
+                            };
+                            (*id, label)
+                        })
+                        .collect();
                     let created_count = consolidate_groups(
-                        &groups, &statuses, &reader, &mut repo, &key,
-                        dry_run, delete_sources,
+                        &groups,
+                        &statuses,
+                        &reader,
+                        &mut repo,
+                        &key,
+                        dry_run,
+                        delete_sources,
                     )?;
 
                     if dry_run {
@@ -1086,10 +1114,13 @@ pub fn run(cmd: Command) -> Result<()> {
                         .map_err(|e| anyhow::anyhow!("pile reader error: {e:?}"))?;
 
                     // Iterate active branches, resolve names, group.
-                    let mut groups: std::collections::BTreeMap<String, Vec<(Id, Option<Inline<Handle<SimpleArchive>>>)>> = std::collections::BTreeMap::new();
+                    let mut groups: std::collections::BTreeMap<
+                        String,
+                        Vec<(Id, Option<Inline<Handle<SimpleArchive>>>)>,
+                    > = std::collections::BTreeMap::new();
 
-                    let branch_ids: Vec<Id> = repo.storage_mut().pins()?
-                        .collect::<Result<Vec<_>, _>>()?;
+                    let branch_ids: Vec<Id> =
+                        repo.storage_mut().pins()?.collect::<Result<Vec<_>, _>>()?;
 
                     println!("found {} active branch(es)", branch_ids.len());
 
@@ -1100,7 +1131,10 @@ pub fn run(cmd: Command) -> Result<()> {
 
                         if reader.metadata(mh)?.is_none() {
                             eprintln!("warning: metadata blob missing for branch {bid:X}");
-                            groups.entry("<unnamed>".to_string()).or_default().push((*bid, None));
+                            groups
+                                .entry("<unnamed>".to_string())
+                                .or_default()
+                                .push((*bid, None));
                             continue;
                         }
 
@@ -1108,7 +1142,10 @@ pub fn run(cmd: Command) -> Result<()> {
                             Ok(ms) => ms,
                             Err(_) => {
                                 eprintln!("warning: failed to read metadata for branch {bid:X}");
-                                groups.entry("<unnamed>".to_string()).or_default().push((*bid, None));
+                                groups
+                                    .entry("<unnamed>".to_string())
+                                    .or_default()
+                                    .push((*bid, None));
                                 continue;
                             }
                         };
@@ -1122,12 +1159,16 @@ pub fn run(cmd: Command) -> Result<()> {
                         groups.entry(name).or_default().push((*bid, head));
                     }
 
-                    let statuses: HashMap<Id, &str> = branch_ids.iter()
-                        .map(|bid| (*bid, "active"))
-                        .collect();
+                    let statuses: HashMap<Id, &str> =
+                        branch_ids.iter().map(|bid| (*bid, "active")).collect();
                     let created_count = consolidate_groups(
-                        &groups, &statuses, &reader, &mut repo, &key,
-                        dry_run, delete_sources,
+                        &groups,
+                        &statuses,
+                        &reader,
+                        &mut repo,
+                        &key,
+                        dry_run,
+                        delete_sources,
                     )?;
 
                     if dry_run {
@@ -1241,7 +1282,9 @@ pub fn run(cmd: Command) -> Result<()> {
 
                     let new_id = *repo
                         .create_branch_with_key(&out, Some(commit_handle), key.clone())
-                        .map_err(|e| anyhow::anyhow!("failed to create consolidated branch: {e:?}"))?;
+                        .map_err(|e| {
+                            anyhow::anyhow!("failed to create consolidated branch: {e:?}")
+                        })?;
                     println!("created consolidated branch '{out}' with id {new_id:X}");
 
                     if delete_sources {
@@ -1357,11 +1400,10 @@ pub fn run(cmd: Command) -> Result<()> {
                         use triblespace_core::inline::encodings::time::Lower;
                         let lower: Lower = ts_val.try_from_inline().unwrap_or(Lower(0));
                         let epoch = hifitime::Epoch::from_tai_duration(
-                            hifitime::Duration::from_total_nanoseconds(lower.0));
-                        hifitime::efmt::Formatter::new(
-                            epoch,
-                            hifitime::efmt::consts::ISO8601,
-                        ).to_string()
+                            hifitime::Duration::from_total_nanoseconds(lower.0),
+                        );
+                        hifitime::efmt::Formatter::new(epoch, hifitime::efmt::consts::ISO8601)
+                            .to_string()
                     } else {
                         "?".to_string()
                     };
@@ -1378,12 +1420,20 @@ pub fn run(cmd: Command) -> Result<()> {
                         }
                         println!("Date:   {ts_str}");
                         if !info.parents.is_empty() {
-                            let parent_strs: Vec<String> = info.parents.iter().map(|p| {
-                                let ph: Inline<Hash<Blake3>> = Handle::to_hash(*p);
-                                let phex: String = ph.from_inline();
-                                phex[..16].to_string()
-                            }).collect();
-                            let label = if info.parents.len() > 1 { "Merge: " } else { "Parent:" };
+                            let parent_strs: Vec<String> = info
+                                .parents
+                                .iter()
+                                .map(|p| {
+                                    let ph: Inline<Hash<Blake3>> = Handle::to_hash(*p);
+                                    let phex: String = ph.from_inline();
+                                    phex[..16].to_string()
+                                })
+                                .collect();
+                            let label = if info.parents.len() > 1 {
+                                "Merge: "
+                            } else {
+                                "Parent:"
+                            };
                             println!("{label} {}", parent_strs.join(" "));
                         }
                         println!();
@@ -1406,8 +1456,7 @@ pub fn run(cmd: Command) -> Result<()> {
         Command::Show { pile, commit } => {
             use triblespace_core::repo::pile::Pile;
 
-            let commit_handle: Inline<Handle<SimpleArchive>> =
-                parse_blake3_handle(&commit)?;
+            let commit_handle: Inline<Handle<SimpleArchive>> = parse_blake3_handle(&commit)?;
 
             let mut pile: Pile = Pile::open(&pile)?;
             let res = (|| -> Result<(), anyhow::Error> {
@@ -1450,10 +1499,7 @@ pub fn run(cmd: Command) -> Result<()> {
                         let ph: Inline<Hash<Blake3>> = Handle::to_hash(*p);
                         let phex: String = ph.from_inline();
                         let present = reader.metadata(*p)?.is_some();
-                        println!(
-                            "  {phex} [{}]",
-                            if present { "present" } else { "missing" }
-                        );
+                        println!("  {phex} [{}]", if present { "present" } else { "missing" });
                     }
                 }
 
@@ -1462,7 +1508,10 @@ pub fn run(cmd: Command) -> Result<()> {
                     let ch_hash: Inline<Hash<Blake3>> = Handle::to_hash(ch);
                     let ch_hex: String = ch_hash.from_inline();
                     let present = reader.metadata(ch)?.is_some();
-                    print!("Content: {ch_hex} [{}]", if present { "present" } else { "missing" });
+                    print!(
+                        "Content: {ch_hex} [{}]",
+                        if present { "present" } else { "missing" }
+                    );
                     if present {
                         if let Ok(ts) = reader.get::<TribleSet, _>(ch) {
                             use std::collections::HashSet;
@@ -1586,8 +1635,7 @@ pub fn run(cmd: Command) -> Result<()> {
                                 if t.a() == &tag_attr {
                                     let v: Inline<triblespace::prelude::inlineencodings::GenId> =
                                         *t.v();
-                                    if let Ok(gid) =
-                                        v.try_from_inline::<triblespace_core::id::Id>()
+                                    if let Ok(gid) = v.try_from_inline::<triblespace_core::id::Id>()
                                     {
                                         if gid == kind_id {
                                             usage_entities.insert(*t.e());
@@ -1610,12 +1658,8 @@ pub fn run(cmd: Command) -> Result<()> {
                                         // Now find the name for this entity.
                                         for t2 in meta_set.iter() {
                                             if t2.e() == t.e() && t2.a() == &name_attr {
-                                                let nh: Inline<
-                                                    Handle<LongString>,
-                                                > = *t2.v();
-                                                if let Ok(view) =
-                                                    reader.get::<View<str>, _>(nh)
-                                                {
+                                                let nh: Inline<Handle<LongString>> = *t2.v();
+                                                if let Ok(view) = reader.get::<View<str>, _>(nh) {
                                                     attr_names.entry(described_id).or_insert_with(
                                                         || view.as_ref().to_string(),
                                                     );
@@ -1643,10 +1687,7 @@ pub fn run(cmd: Command) -> Result<()> {
                 sorted.sort_by(|a, b| b.1.trible_count.cmp(&a.1.trible_count));
 
                 for (attr_id, tally) in &sorted {
-                    let name = attr_names
-                        .get(attr_id)
-                        .map(|s| s.as_str())
-                        .unwrap_or("-");
+                    let name = attr_names.get(attr_id).map(|s| s.as_str()).unwrap_or("-");
                     if entities {
                         println!(
                             "{attr_id:X}  tribles={tc}  entities={ec}  {name}",
@@ -1654,10 +1695,7 @@ pub fn run(cmd: Command) -> Result<()> {
                             ec = tally.entity_ids.len(),
                         );
                     } else {
-                        println!(
-                            "{attr_id:X}  tribles={tc}  {name}",
-                            tc = tally.trible_count,
-                        );
+                        println!("{attr_id:X}  tribles={tc}  {name}", tc = tally.trible_count,);
                     }
                 }
 
@@ -1672,10 +1710,10 @@ pub fn run(cmd: Command) -> Result<()> {
             new_name,
             signing_key,
         } => {
-            use triblespace_core::repo::pile::Pile;
-            use triblespace_core::repo::branch as branch_mod;
-            use triblespace_core::query::find;
             use triblespace_core::macros::pattern;
+            use triblespace_core::query::find;
+            use triblespace_core::repo::branch as branch_mod;
+            use triblespace_core::repo::pile::Pile;
 
             let branch_id = parse_branch_id_hex(&branch)?;
             let key = load_signing_key(&signing_key)?;
@@ -1690,9 +1728,11 @@ pub fn run(cmd: Command) -> Result<()> {
 
                 loop {
                     // Load current branch metadata.
-                    let reader = pile.reader()
+                    let reader = pile
+                        .reader()
                         .map_err(|e| anyhow::anyhow!("reader: {e:?}"))?;
-                    let meta: TribleSet = reader.get(current_meta_handle)
+                    let meta: TribleSet = reader
+                        .get(current_meta_handle)
                         .map_err(|e| anyhow::anyhow!("read branch meta: {e:?}"))?;
 
                     // Extract current commit head from metadata.
@@ -1703,7 +1743,8 @@ pub fn run(cmd: Command) -> Result<()> {
 
                     // Build the commit head blob for re-signing (branch_metadata needs it).
                     let commit_blob = if let Some(h) = head_handle {
-                        let commit_set: TribleSet = reader.get(h)
+                        let commit_set: TribleSet = reader
+                            .get(h)
                             .map_err(|e| anyhow::anyhow!("read commit: {e:?}"))?;
                         Some(commit_set.to_blob())
                     } else {
@@ -1725,7 +1766,11 @@ pub fn run(cmd: Command) -> Result<()> {
                         .map_err(|e| anyhow::anyhow!("put branch meta: {e:?}"))?;
 
                     // CAS: swap old metadata for new.
-                    match pile.update(branch_id, Some(current_meta_handle), Some(new_meta_handle))? {
+                    match pile.update(
+                        branch_id,
+                        Some(current_meta_handle),
+                        Some(new_meta_handle),
+                    )? {
                         triblespace_core::repo::PushResult::Success() => {
                             println!("renamed {branch_id:X} → \"{new_name}\"");
                             return Ok(());
@@ -1788,8 +1833,8 @@ fn scan_pile_records(path: &std::path::Path) -> Result<Vec<RawBranchRecord>> {
 
     let mut records = Vec::new();
     for record in PileRecords::open(path)? {
-        let record = record
-            .map_err(|e| anyhow::anyhow!("scanning pile {}: {e}", path.display()))?;
+        let record =
+            record.map_err(|e| anyhow::anyhow!("scanning pile {}: {e}", path.display()))?;
         match record.content {
             PileRecordContent::Branch { branch_id, head } => records.push(RawBranchRecord {
                 offset: record.offset as u64,
@@ -1853,10 +1898,10 @@ struct CommitInfo {
 
 /// Parse a commit TribleSet into structured fields.
 fn read_commit_fields(commit: &TribleSet) -> CommitInfo {
-    use triblespace_core::repo;
     use triblespace_core::inline::encodings::ed25519 as ed;
     use triblespace_core::inline::encodings::shortstring::ShortString;
     use triblespace_core::inline::encodings::time::NsTAIInterval;
+    use triblespace_core::repo;
 
     let content_attr = repo::content.id();
     let metadata_attr = repo::metadata.id();
@@ -1879,8 +1924,7 @@ fn read_commit_fields(commit: &TribleSet) -> CommitInfo {
     for t in commit.iter() {
         let a = *t.a();
         if a == parent_attr {
-            info.parents
-                .push(*t.v::<Handle<SimpleArchive>>());
+            info.parents.push(*t.v::<Handle<SimpleArchive>>());
         } else if a == content_attr {
             info.content = Some(*t.v::<Handle<SimpleArchive>>());
         } else if a == metadata_attr {
@@ -1905,7 +1949,7 @@ fn extract_repo_head(meta: &TribleSet) -> Option<Inline<Handle<SimpleArchive>>> 
     use triblespace::prelude::blobencodings::SimpleArchive;
     use triblespace::prelude::inlineencodings::Handle;
     use triblespace_core::repo;
-    
+
     use triblespace_core::inline::Inline;
 
     let head_attr = repo::head.id();
@@ -1990,15 +2034,25 @@ fn consolidate_groups(
                 if cleaned > 0 {
                     println!("\nname group \"{name}\" ({} branches): all empty, cleaned up {cleaned} branch(es)", members.len());
                 } else {
-                    println!("\nname group \"{name}\" ({} branches): all empty, skipping", members.len());
+                    println!(
+                        "\nname group \"{name}\" ({} branches): all empty, skipping",
+                        members.len()
+                    );
                 }
             } else {
-                println!("\nname group \"{name}\" ({} branches): all empty, skipping", members.len());
+                println!(
+                    "\nname group \"{name}\" ({} branches): all empty, skipping",
+                    members.len()
+                );
             }
             continue;
         }
 
-        println!("\nname group \"{name}\" ({} branches, {} with heads):", members.len(), heads.len());
+        println!(
+            "\nname group \"{name}\" ({} branches, {} with heads):",
+            members.len(),
+            heads.len()
+        );
         for (bid, head) in members {
             let status = statuses.get(bid).copied().unwrap_or("?");
             if let Some(h) = head {
@@ -2013,7 +2067,11 @@ fn consolidate_groups(
         // Deduplicate heads (same commit on multiple branch IDs).
         let unique_heads: Vec<Inline<Handle<SimpleArchive>>> = {
             let mut seen: HashSet<[u8; 32]> = HashSet::new();
-            heads.iter().copied().filter(|h| seen.insert(h.raw)).collect()
+            heads
+                .iter()
+                .copied()
+                .filter(|h| seen.insert(h.raw))
+                .collect()
         };
 
         // Compute subsumption: a head is subsumed if another head
@@ -2021,10 +2079,16 @@ fn consolidate_groups(
         let mut subsumed: HashSet<[u8; 32]> = HashSet::new();
         if unique_heads.len() > 1 {
             for i in 0..unique_heads.len() {
-                if subsumed.contains(&unique_heads[i].raw) { continue; }
+                if subsumed.contains(&unique_heads[i].raw) {
+                    continue;
+                }
                 for j in 0..unique_heads.len() {
-                    if i == j { continue; }
-                    if subsumed.contains(&unique_heads[j].raw) { continue; }
+                    if i == j {
+                        continue;
+                    }
+                    if subsumed.contains(&unique_heads[j].raw) {
+                        continue;
+                    }
                     match is_ancestor_of(unique_heads[i], unique_heads[j], reader, &parent_attr) {
                         Ok(true) => {
                             subsumed.insert(unique_heads[i].raw);
@@ -2062,15 +2126,22 @@ fn consolidate_groups(
             });
             if already_active {
                 if dry_run {
-                    println!("  -> already consolidated (active branch has the sole non-subsumed head)");
+                    println!(
+                        "  -> already consolidated (active branch has the sole non-subsumed head)"
+                    );
                 } else if delete_sources {
-                    let keeper = members.iter().find(|(bid, head)| {
-                        head.as_ref() == Some(&dominated_head)
-                            && statuses.get(bid).copied() == Some("active")
-                    }).map(|(b, _)| *b);
+                    let keeper = members
+                        .iter()
+                        .find(|(bid, head)| {
+                            head.as_ref() == Some(&dominated_head)
+                                && statuses.get(bid).copied() == Some("active")
+                        })
+                        .map(|(b, _)| *b);
                     let cleaned = tombstone_branches(repo, members, keeper)?;
                     if cleaned > 0 {
-                        println!("  -> already consolidated, cleaned up {cleaned} redundant branch(es)");
+                        println!(
+                            "  -> already consolidated, cleaned up {cleaned} redundant branch(es)"
+                        );
                     } else {
                         println!("  -> already consolidated, skipping");
                     }
@@ -2082,7 +2153,10 @@ fn consolidate_groups(
         }
 
         if dry_run {
-            println!("  -> would merge {} non-subsumed head(s) into \"{name}\"", non_subsumed.len());
+            println!(
+                "  -> would merge {} non-subsumed head(s) into \"{name}\"",
+                non_subsumed.len()
+            );
             continue;
         }
 
@@ -2126,10 +2200,14 @@ fn tombstone_branches(
 ) -> Result<usize> {
     let mut count = 0;
     for (bid, _) in members {
-        if Some(*bid) == keeper { continue; }
+        if Some(*bid) == keeper {
+            continue;
+        }
         let old = repo.storage_mut().head(*bid)?;
         match repo.storage_mut().update(*bid, old, None)? {
-            triblespace_core::repo::PushResult::Success() => { count += 1; }
+            triblespace_core::repo::PushResult::Success() => {
+                count += 1;
+            }
             triblespace_core::repo::PushResult::Conflict(_) => {
                 eprintln!("  warning: branch {bid:X} advanced concurrently; skipping delete");
             }
@@ -2169,10 +2247,7 @@ fn is_ancestor_of(
     Ok(false)
 }
 
-fn load_branch_name(
-    reader: &impl BlobStoreGet,
-    meta: &TribleSet,
-) -> Result<Option<String>> {
+fn load_branch_name(reader: &impl BlobStoreGet, meta: &TribleSet) -> Result<Option<String>> {
     let name_attr = triblespace_core::metadata::name.id();
     let mut handle_opt: Option<BranchNameHandle> = None;
     for t in meta.iter() {

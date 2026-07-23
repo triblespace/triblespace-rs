@@ -45,18 +45,18 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use anybytes::Bytes;
 use ed25519_dalek::SigningKey;
 use iroh_base::EndpointId;
-use triblespace_core::blob::{BlobEncoding, IntoBlob, TryFromBlob};
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace_core::blob::{BlobEncoding, IntoBlob, TryFromBlob};
 use triblespace_core::id::Id;
+use triblespace_core::inline::Inline;
+use triblespace_core::inline::InlineEncoding;
+use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::lazy::WantRecordError;
 use triblespace_core::repo::{
     BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut, PinStore, PushResult,
     StorageFlush, WeakPinStore,
 };
-use triblespace_core::inline::Inline;
-use triblespace_core::inline::InlineEncoding;
-use triblespace_core::inline::encodings::hash::Handle;
 
 use crate::channel::{NetEvent, PublisherKey};
 use crate::host::{self, NetReceiver, NetSender, StoreSnapshot};
@@ -326,7 +326,11 @@ where
                         .expect("store mutex")
                         .put::<UnknownBlob, Bytes>(data);
                 }
-                NetEvent::Head { branch, head, publisher } => {
+                NetEvent::Head {
+                    branch,
+                    head,
+                    publisher,
+                } => {
                     if let Some(remote_id) = Id::new(branch) {
                         let mut store = self.store.lock().expect("store mutex");
                         match read_remote_name(&mut *store, &head) {
@@ -357,10 +361,17 @@ where
                         }
                     }
                 }
-                NetEvent::CapRequest { requester, partial_cap_bytes } => {
+                NetEvent::CapRequest {
+                    requester,
+                    partial_cap_bytes,
+                } => {
                     self.absorb_cap_request(requester, partial_cap_bytes);
                 }
-                NetEvent::CapDelivered { issuer, cap_bytes, sig_bytes } => {
+                NetEvent::CapDelivered {
+                    issuer,
+                    cap_bytes,
+                    sig_bytes,
+                } => {
                     // Verify the delivered chain against our configured
                     // team root, then store both blobs locally. Pinning
                     // them into a per-team-cap pin (so compaction
@@ -369,7 +380,10 @@ where
                     // as our own outgoing-cap blobs.
                     self.absorb_cap_delivery(issuer, cap_bytes, sig_bytes);
                 }
-                NetEvent::CapDeliveryConfirmed { subject, sig_handle } => {
+                NetEvent::CapDeliveryConfirmed {
+                    subject,
+                    sig_handle,
+                } => {
                     // The subject's daemon authenticated against us with
                     // a cap we dispatched. `sig_handle` is the signature
                     // blob handle (what OP_AUTH wires) — match by
@@ -382,20 +396,14 @@ where
                         Ok(k) => k,
                         Err(_) => continue,
                     };
-                    let sig_inline: Inline<Handle<SimpleArchive>> =
-                        Inline::new(sig_handle);
+                    let sig_inline: Inline<Handle<SimpleArchive>> = Inline::new(sig_handle);
                     let mut store = self.store.lock().expect("store mutex");
-                    if let Some(entry_id) =
-                        crate::policy::find_policy_entry_by_subject_and_sig(
-                            &mut *store,
-                            subject_key,
-                            sig_inline,
-                        )
-                    {
-                        let _ = crate::policy::mark_policy_delivered(
-                            &mut *store,
-                            entry_id,
-                        );
+                    if let Some(entry_id) = crate::policy::find_policy_entry_by_subject_and_sig(
+                        &mut *store,
+                        subject_key,
+                        sig_inline,
+                    ) {
+                        let _ = crate::policy::mark_policy_delivered(&mut *store, entry_id);
                         tracing::debug!(
                             subject = %hex::encode(&subject[..4]),
                             sig = %hex::encode(&sig_handle[..4]),
@@ -485,11 +493,7 @@ where
     /// branch. The entity id becomes the value `team approve <id>`
     /// consumes; the partial-cap blob is recoverable from the entity's
     /// `request_partial_cap` handle.
-    fn absorb_cap_request(
-        &mut self,
-        requester: PublisherKey,
-        partial_cap_bytes: anybytes::Bytes,
-    ) {
+    fn absorb_cap_request(&mut self, requester: PublisherKey, partial_cap_bytes: anybytes::Bytes) {
         use triblespace_core::blob::Blob;
         use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
         use triblespace_core::inline::TryToInline;
@@ -513,9 +517,7 @@ where
         // partial_cap_bytes is already an anybytes::Bytes — wrap it
         // into a typed Blob without re-allocating.
         let blob: Blob<SimpleArchive> = Blob::new(partial_cap_bytes);
-        let Ok(partial_cap_handle) = store
-            .put::<SimpleArchive, Blob<SimpleArchive>>(blob)
-        else {
+        let Ok(partial_cap_handle) = store.put::<SimpleArchive, Blob<SimpleArchive>>(blob) else {
             tracing::warn!("CapRequest: failed to store partial cap blob");
             return;
         };
@@ -592,8 +594,12 @@ where
             );
             return;
         };
-        if reader.get::<Blob<SimpleArchive>, SimpleArchive>(cap_handle).is_err()
-            || reader.get::<Blob<SimpleArchive>, SimpleArchive>(sig_handle).is_err()
+        if reader
+            .get::<Blob<SimpleArchive>, SimpleArchive>(cap_handle)
+            .is_err()
+            || reader
+                .get::<Blob<SimpleArchive>, SimpleArchive>(sig_handle)
+                .is_err()
         {
             tracing::warn!(
                 issuer = %hex::encode(&issuer[..4]),
@@ -602,12 +608,7 @@ where
             return;
         }
 
-        match crate::policy::pin_team_cap(
-            &mut *store,
-            self.team_root,
-            cap_handle,
-            sig_handle,
-        ) {
+        match crate::policy::pin_team_cap(&mut *store, self.team_root, cap_handle, sig_handle) {
             Some(_bid) => {
                 tracing::info!(
                     issuer = %hex::encode(&issuer[..4]),
@@ -627,8 +628,7 @@ where
     /// Cooldown for re-dispatching undelivered cap blobs. The daemon's
     /// tick cadence is sub-second; without this gate we'd hammer
     /// iroh-connect against a down peer 10× per second.
-    const UNDELIVERED_REDISPATCH_COOLDOWN: std::time::Duration =
-        std::time::Duration::from_secs(15);
+    const UNDELIVERED_REDISPATCH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(15);
 
     /// Re-dispatch the cap+sig pairs for every renewal-policy entry
     /// that's not yet been ack'd by its subject, rate-limited per
@@ -652,7 +652,9 @@ where
         }
 
         let now = crate::clock::mono_now();
-        let Ok(reader) = store.reader() else { return 0; };
+        let Ok(reader) = store.reader() else {
+            return 0;
+        };
 
         let mut dispatched = 0usize;
         for entry in entries {
@@ -663,13 +665,11 @@ where
                 }
             }
 
-            let Ok(cap_blob) = reader
-                .get::<Blob<SimpleArchive>, SimpleArchive>(entry.latest_cap)
+            let Ok(cap_blob) = reader.get::<Blob<SimpleArchive>, SimpleArchive>(entry.latest_cap)
             else {
                 continue;
             };
-            let Ok(sig_blob) = reader
-                .get::<Blob<SimpleArchive>, SimpleArchive>(entry.latest_sig)
+            let Ok(sig_blob) = reader.get::<Blob<SimpleArchive>, SimpleArchive>(entry.latest_sig)
             else {
                 continue;
             };
@@ -719,10 +719,10 @@ where
     /// cadence well under that; tune both together for production
     /// deployments.
     pub fn renewal_tick(&mut self, renewal_window: hifitime::Duration) -> usize {
-        use triblespace_core::blob::{Blob, TryFromBlob};
         use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-        use triblespace_core::inline::{Inline, TryToInline};
+        use triblespace_core::blob::{Blob, TryFromBlob};
         use triblespace_core::inline::encodings::hash::Handle;
+        use triblespace_core::inline::{Inline, TryToInline};
         use triblespace_core::repo::BlobStoreGet;
 
         let redispatched = self.redispatch_undelivered();
@@ -750,14 +750,14 @@ where
             tracing::warn!("renewal_tick: pile reader unavailable");
             return 0;
         };
-        let Ok(parent_cap_blob) = reader
-            .get::<Blob<SimpleArchive>, SimpleArchive>(parent_cap_handle)
+        let Ok(parent_cap_blob) =
+            reader.get::<Blob<SimpleArchive>, SimpleArchive>(parent_cap_handle)
         else {
             tracing::warn!("renewal_tick: parent cap blob missing");
             return 0;
         };
-        let Ok(parent_sig_blob) = reader
-            .get::<Blob<SimpleArchive>, SimpleArchive>(parent_sig_handle)
+        let Ok(parent_sig_blob) =
+            reader.get::<Blob<SimpleArchive>, SimpleArchive>(parent_sig_handle)
         else {
             tracing::warn!("renewal_tick: parent sig blob missing");
             return 0;
@@ -768,8 +768,8 @@ where
             // Re-derive scope_facts from the previous cap blob —
             // policy entries carry only the scope_root id, not the
             // facts hanging off it.
-            let Ok(prev_cap_blob) = reader
-                .get::<Blob<SimpleArchive>, SimpleArchive>(entry.latest_cap)
+            let Ok(prev_cap_blob) =
+                reader.get::<Blob<SimpleArchive>, SimpleArchive>(entry.latest_cap)
             else {
                 tracing::warn!(
                     entry = ?entry.id,
@@ -777,10 +777,9 @@ where
                 );
                 continue;
             };
-            let Ok(prev_set): Result<
-                triblespace_core::trible::TribleSet,
-                _,
-            > = TryFromBlob::try_from_blob(prev_cap_blob) else {
+            let Ok(prev_set): Result<triblespace_core::trible::TribleSet, _> =
+                TryFromBlob::try_from_blob(prev_cap_blob)
+            else {
                 continue;
             };
             // Extract all tribles hanging off the scope_root entity.
@@ -832,7 +831,8 @@ where
             let _ = store.put::<SimpleArchive, Blob<SimpleArchive>>(new_sig);
 
             // Dispatch over the wire.
-            self.sender.deliver_cap(entry.subject.to_bytes(), cap_bytes, sig_bytes);
+            self.sender
+                .deliver_cap(entry.subject.to_bytes(), cap_bytes, sig_bytes);
             // Record the attempt so the undelivered-redispatch path
             // doesn't immediately re-fire on the same entry within
             // its cooldown window.
@@ -986,8 +986,7 @@ where
     pub async fn get_or_fetch_async(
         &mut self,
         hash: RawHash,
-    ) -> Result<Option<Bytes>, WantRecordError<S::WeakPinError, <S as StorageFlush>::Error>>
-    {
+    ) -> Result<Option<Bytes>, WantRecordError<S::WeakPinError, <S as StorageFlush>::Error>> {
         if let Some(bytes) = self.try_local(hash) {
             return Ok(Some(bytes));
         }
@@ -1022,7 +1021,6 @@ where
         Ok(Some(bytes))
     }
 }
-
 
 // ── Trait delegations ───────────────────────────────────────────────
 //
@@ -1094,7 +1092,10 @@ where
     type UpdateError = S::UpdateError;
     // Collected eagerly: the inner store's iterator would borrow the
     // mutex guard, which cannot leave this call.
-    type ListIter<'a> = std::vec::IntoIter<Result<Id, S::PinsError>> where S: 'a;
+    type ListIter<'a>
+        = std::vec::IntoIter<Result<Id, S::PinsError>>
+    where
+        S: 'a;
 
     fn pins<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::PinsError> {
         self.refresh();
@@ -1103,10 +1104,7 @@ where
         Ok(ids.into_iter())
     }
 
-    fn head(
-        &mut self,
-        id: Id,
-    ) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError> {
+    fn head(&mut self, id: Id) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError> {
         self.refresh();
         self.store.lock().expect("store mutex").head(id)
     }
@@ -1152,8 +1150,8 @@ where
 /// branches mirrored from a remote peer).
 fn read_remote_name<S: BlobStore>(store: &mut S, head_hash: &RawHash) -> Option<String> {
     use triblespace_core::blob::encodings::longstring::LongString;
-    use triblespace_core::repo::BlobStoreGet;
     use triblespace_core::macros::{find, pattern};
+    use triblespace_core::repo::BlobStoreGet;
 
     let reader = store.reader().ok()?;
     let meta_handle = Inline::<Handle<SimpleArchive>>::new(*head_hash);
@@ -1175,7 +1173,6 @@ fn read_remote_name<S: BlobStore>(store: &mut S, head_hash: &RawHash) -> Option<
     let name_view: anybytes::View<str> = reader.get(name_handle).ok()?;
     Some(name_view.as_ref().to_string())
 }
-
 
 /// Extract every trible whose entity is `scope_root` from `set`,
 /// returning them as a fresh TribleSet. Used by `renewal_tick` to
@@ -1242,10 +1239,7 @@ trait StoreSink: Send + Sync {
     /// fetch, so a failed fetch — or an immediate process exit — leaves
     /// the outstanding demand on record. A failed record is an error the
     /// read must surface, never a warn-and-continue.
-    fn record_want(
-        &self,
-        hash: RawHash,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    fn record_want(&self, hash: RawHash) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
     /// Land fetched `bytes` as an `UnknownBlob` into the store.
     fn land(&self, bytes: Bytes);
 }
@@ -1257,19 +1251,18 @@ impl<S> StoreSink for SharedStore<S>
 where
     S: BlobStorePut + WeakPinStore + StorageFlush + Send + 'static,
 {
-    fn record_want(
-        &self,
-        hash: RawHash,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    fn record_want(&self, hash: RawHash) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut store = self.0.lock().expect("store mutex");
         store
             .pin_weak(Inline::<Handle<UnknownBlob>>::new(hash))
-            .map_err(|e| Box::new(WantRecordError::<_, <S as StorageFlush>::Error>::Pin(e))
-                as Box<dyn std::error::Error + Send + Sync>)?;
-        store
-            .flush()
-            .map_err(|e| Box::new(WantRecordError::<S::WeakPinError, _>::Flush(e))
-                as Box<dyn std::error::Error + Send + Sync>)?;
+            .map_err(|e| {
+                Box::new(WantRecordError::<_, <S as StorageFlush>::Error>::Pin(e))
+                    as Box<dyn std::error::Error + Send + Sync>
+            })?;
+        store.flush().map_err(|e| {
+            Box::new(WantRecordError::<S::WeakPinError, _>::Flush(e))
+                as Box<dyn std::error::Error + Send + Sync>
+        })?;
         Ok(())
     }
 
@@ -1367,7 +1360,10 @@ impl<L> BlobStoreList for PeerReader<L>
 where
     L: BlobStoreList,
 {
-    type Iter<'a> = L::Iter<'a> where L: 'a;
+    type Iter<'a>
+        = L::Iter<'a>
+    where
+        L: 'a;
     type Err = L::Err;
 
     fn blobs<'a>(&'a self) -> Self::Iter<'a> {
@@ -1393,8 +1389,7 @@ where
     fn get<T, S>(
         &self,
         handle: Inline<Handle<S>>,
-    ) -> impl std::future::Future<Output = Result<T, Self::GetError<<T as TryFromBlob<S>>::Error>>>
-           + Send
+    ) -> impl std::future::Future<Output = Result<T, Self::GetError<<T as TryFromBlob<S>>::Error>>> + Send
     where
         S: BlobEncoding + 'static,
         T: TryFromBlob<S>,
@@ -1411,37 +1406,36 @@ where
             // Universal byte read: the store snapshot locally, else the
             // swarm. Bytes-by-hash everywhere, so deserialization to the
             // requested schema happens once, below.
-            let bytes: Bytes =
-                if let Ok(b) = local.get::<Bytes, UnknownBlob>(Inline::new(raw)) {
-                    b
-                } else if let Some(cap) = fetch {
-                    // The demand-born weak pin: record the want durably
-                    // FIRST (pin + flush), then fetch. A failed fetch
-                    // leaves the pin — it remains an outstanding want. A
-                    // failed RECORD is an error: never fetch bytes whose
-                    // demand isn't on record.
-                    cap.sink
-                        .record_want(raw)
-                        .map_err(PeerReaderGetError::WantRecord)?;
-                    // Inline swarm fetch; the host verified
-                    // blake3(bytes) == raw before returning. Interactive
-                    // budget: a transparent read is a caller actively
-                    // waiting.
-                    match cap
-                        .sender
-                        .fetch_blob(raw, crate::host::INTERACTIVE_FETCH_DEADLINE)
-                        .await
-                    {
-                        Some(v) => {
-                            let b = Bytes::from(v);
-                            cap.sink.land(b.clone());
-                            b
-                        }
-                        None => return Err(PeerReaderGetError::Unavailable),
+            let bytes: Bytes = if let Ok(b) = local.get::<Bytes, UnknownBlob>(Inline::new(raw)) {
+                b
+            } else if let Some(cap) = fetch {
+                // The demand-born weak pin: record the want durably
+                // FIRST (pin + flush), then fetch. A failed fetch
+                // leaves the pin — it remains an outstanding want. A
+                // failed RECORD is an error: never fetch bytes whose
+                // demand isn't on record.
+                cap.sink
+                    .record_want(raw)
+                    .map_err(PeerReaderGetError::WantRecord)?;
+                // Inline swarm fetch; the host verified
+                // blake3(bytes) == raw before returning. Interactive
+                // budget: a transparent read is a caller actively
+                // waiting.
+                match cap
+                    .sender
+                    .fetch_blob(raw, crate::host::INTERACTIVE_FETCH_DEADLINE)
+                    .await
+                {
+                    Some(v) => {
+                        let b = Bytes::from(v);
+                        cap.sink.land(b.clone());
+                        b
                     }
-                } else {
-                    return Err(PeerReaderGetError::Unavailable);
-                };
+                    None => return Err(PeerReaderGetError::Unavailable),
+                }
+            } else {
+                return Err(PeerReaderGetError::Unavailable);
+            };
             triblespace_core::blob::Blob::<S>::new(bytes)
                 .try_from_blob()
                 .map_err(PeerReaderGetError::Conversion)

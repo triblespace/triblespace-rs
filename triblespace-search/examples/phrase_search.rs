@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::genid::GenId;
-use triblespace_core::inline::{TryFromInline, Inline};
+use triblespace_core::inline::{Inline, TryFromInline};
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::succinct::SuccinctBM25Index;
