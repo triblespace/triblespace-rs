@@ -959,13 +959,20 @@ struct PositiveSupportWorkGrant {
     child: ActivationId,
     generation: u64,
     granted: usize,
+    accounting: PositiveSupportWorkAccounting,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PositiveSupportWorkAccounting {
+    CountCredit,
+    GlobalServiceDebt,
 }
 
 /// Query-global custody of the experimental PositiveSupport service lease.
 ///
-/// This is intentionally separate from [`PositiveSupportWorkBudget`] and is
-/// not connected to [`DeltaScheduler`].  It makes the aggregate packet-debt
-/// law executable without changing the production count-credit policy.
+/// This remains separate from [`PositiveSupportWorkBudget`]: the production
+/// count-credit policy and the experimental service-debt policy never share
+/// admission currency.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PositiveSupportServiceLease {
@@ -1015,6 +1022,13 @@ struct PositiveSupportServiceDebtLedger {
     attribution_tainted: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PositiveSupportScheduling {
+    #[default]
+    CountCredit,
+    GlobalServiceDebt,
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 impl PositiveSupportServiceDebtLedger {
     fn dormant() -> Self {
@@ -1047,6 +1061,18 @@ impl PositiveSupportServiceDebtLedger {
         };
         self.assert_affine_custody();
         started
+    }
+
+    fn demand_arrived_from_empty(&mut self) -> bool {
+        if self.lease == PositiveSupportServiceLease::Retired {
+            *self = Self::dormant();
+        }
+        assert_eq!(
+            self.lease,
+            PositiveSupportServiceLease::Dormant,
+            "an empty-to-live Support transition crossed an unfinished service epoch"
+        );
+        self.demand_arrived()
     }
 
     fn support_is_admissible(&self, support_ready: bool) -> bool {
@@ -1305,6 +1331,9 @@ struct PositivePublicationLedger {
     support_children: SmallVec<[ActivationId; 1]>,
     /// Demand-bounded physical allowance shared by every linked Support child.
     support_work: PositiveSupportWorkBudget,
+    /// Independent start bit for the experimental query-global service
+    /// scheduler. It never mints or consumes production `D + C` credit.
+    service_support_started: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1951,6 +1980,7 @@ impl ProducerRegistry {
                 published: BTreeSet::new(),
                 support_children: SmallVec::new(),
                 support_work: PositiveSupportWorkBudget::default(),
+                service_support_started: false,
             })
         } else {
             PositivePublicationRegistration::Private {
@@ -2178,6 +2208,40 @@ impl ProducerRegistry {
         ledger.support_work.available()
     }
 
+    fn positive_support_service_is_started(&self, parent: PositiveConfirmParentId) -> bool {
+        if parent.brand != self.brand {
+            return false;
+        }
+        let Some(activation) = self.state.activations.get(&parent.activation) else {
+            return false;
+        };
+        let Some(PositivePublicationRegistration::Eligible(ledger)) =
+            activation.positive_publication.as_deref()
+        else {
+            return false;
+        };
+        ledger.open
+            && ledger
+                .authorization
+                .authorizes(PositivePublicationSource::SupportHedge)
+            && ledger.service_support_started
+            && self.live_positive_support_child(
+                parent.activation,
+                ledger.generation,
+                &ledger.support_children,
+            )
+    }
+
+    fn has_live_started_positive_support(&self) -> bool {
+        self.state.activations.iter().any(|(&activation, state)| {
+            matches!(&state.reducer, DeltaReducer::Confirm { .. })
+                && self.positive_support_service_is_started(PositiveConfirmParentId {
+                    brand: self.brand,
+                    activation,
+                })
+        })
+    }
+
     /// Assigns one public-pull demand token to one exact semantic parent.
     ///
     /// The scheduler selects a concrete parked child before entering this
@@ -2224,6 +2288,49 @@ impl ProducerRegistry {
         true
     }
 
+    /// Starts one parent in the experimental service scheduler without
+    /// minting production count credit.
+    fn start_positive_support_service(&mut self, parent: PositiveConfirmParentId) -> bool {
+        if parent.brand != self.brand {
+            return false;
+        }
+        let (generation, children) = {
+            let Some(activation) = self.state.activations.get(&parent.activation) else {
+                return false;
+            };
+            let Some(PositivePublicationRegistration::Eligible(ledger)) =
+                activation.positive_publication.as_deref()
+            else {
+                return false;
+            };
+            if !ledger.open
+                || !ledger
+                    .authorization
+                    .authorizes(PositivePublicationSource::SupportHedge)
+                || !ledger.certificate.eligible()
+            {
+                return false;
+            }
+            (ledger.generation, ledger.support_children.clone())
+        };
+        if !self.live_positive_support_child(parent.activation, generation, &children) {
+            return false;
+        }
+        let activation = self
+            .state
+            .activations
+            .get_mut(&parent.activation)
+            .expect("validated positive Support parent disappeared");
+        let Some(PositivePublicationRegistration::Eligible(ledger)) =
+            activation.positive_publication.as_deref_mut()
+        else {
+            unreachable!("validated positive Support parent lost its ledger")
+        };
+        assert!(ledger.open && ledger.generation == generation);
+        ledger.service_support_started = true;
+        true
+    }
+
     /// Reserves at most `requested` units immediately before physical Program
     /// dispatch. The returned grant is affine and must accompany this exact
     /// selected task until its validated receipt settles.
@@ -2262,6 +2369,47 @@ impl ProducerRegistry {
             child,
             generation: link.generation,
             granted,
+            accounting: PositiveSupportWorkAccounting::CountCredit,
+        })
+    }
+
+    /// Validates one service-debt Support dispatch without touching the
+    /// production `D + C` count ledger.
+    fn reserve_positive_support_service(
+        &self,
+        child: ActivationId,
+        requested: usize,
+    ) -> Option<PositiveSupportWorkGrant> {
+        if requested == 0 {
+            return None;
+        }
+        let activation = self.state.activations.get(&child)?;
+        let DeltaReducer::PositiveSupport { link, .. } = &activation.reducer else {
+            return None;
+        };
+        if link.child != child {
+            return None;
+        }
+        let parent = self.state.activations.get(&link.parent)?;
+        let PositivePublicationRegistration::Eligible(ledger) =
+            parent.positive_publication.as_deref()?
+        else {
+            return None;
+        };
+        if !ledger.open
+            || ledger.generation != link.generation
+            || !ledger.service_support_started
+            || !ledger.support_children.contains(&child)
+        {
+            return None;
+        }
+        Some(PositiveSupportWorkGrant {
+            brand: self.brand,
+            parent: link.parent,
+            child,
+            generation: link.generation,
+            granted: requested,
+            accounting: PositiveSupportWorkAccounting::GlobalServiceDebt,
         })
     }
 
@@ -2305,7 +2453,17 @@ impl ProducerRegistry {
             ledger.generation, grant.generation,
             "positive Support work settled across ledger generations"
         );
-        ledger.support_work.settle(grant.granted, examined);
+        match grant.accounting {
+            PositiveSupportWorkAccounting::CountCredit => {
+                ledger.support_work.settle(grant.granted, examined);
+            }
+            PositiveSupportWorkAccounting::GlobalServiceDebt => {
+                assert!(
+                    examined <= grant.granted,
+                    "positive Support service receipt exceeded its physical packet"
+                );
+            }
+        }
         examined
     }
 
@@ -4790,7 +4948,8 @@ impl ProgramServiceLane {
                         PositivePublicationRegistration::Eligible(ledger)
                             if ledger.generation == link.generation
                                 && ledger.support_children.contains(&activation)
-                                && ledger.support_work.started
+                                && (ledger.support_work.started
+                                    || ledger.service_support_started)
                     )
                 });
             return if started {
@@ -4799,11 +4958,25 @@ impl ProgramServiceLane {
                 Self::Neutral
             };
         }
-        if matches!(
-            state.positive_publication.as_deref(),
-            Some(PositivePublicationRegistration::Eligible(ledger))
-                if ledger.support_work.started
-        ) {
+        let started_live_support =
+            state
+                .positive_publication
+                .as_deref()
+                .is_some_and(|registration| {
+                    matches!(
+                        registration,
+                        PositivePublicationRegistration::Eligible(ledger)
+                            if matches!(&state.reducer, DeltaReducer::Confirm { .. })
+                                && (ledger.support_work.started
+                                    || ledger.service_support_started)
+                                && registry.live_positive_support_child(
+                                    activation,
+                                    ledger.generation,
+                                    &ledger.support_children,
+                                )
+                    )
+                });
+        if started_live_support {
             Self::Exact
         } else {
             Self::Neutral
@@ -6264,6 +6437,10 @@ pub(super) struct DeltaScheduler {
     /// becomes runnable. It is consumed only by a global Program pop, which
     /// may select a different canonical state from the ordinary hot tail.
     next_program_lane: Option<ProgramServiceLane>,
+    /// Mutually exclusive PositiveSupport admission currency.
+    positive_support_scheduling: PositiveSupportScheduling,
+    /// One aggregate affine lease for the opt-in global service policy.
+    positive_support_service_debt: PositiveSupportServiceDebtLedger,
     /// One public pull may carry one demand token while the machine searches
     /// for a concrete parked Support parent. Assignment consumes the token
     /// permanently into that parent's conservation ledger, while retaining
@@ -6297,6 +6474,8 @@ impl DeltaScheduler {
             parked_positive_support_worklist: ProgramWorklist::default(),
             program_lane_selection: ProgramLaneSelection::Unrestricted,
             next_program_lane: None,
+            positive_support_scheduling: PositiveSupportScheduling::CountCredit,
+            positive_support_service_debt: PositiveSupportServiceDebtLedger::dormant(),
             public_pull_demand: PublicPullDemandState::Closed,
             program_runtimes: AHashMap::new(),
             program_scratch: None,
@@ -6304,6 +6483,32 @@ impl DeltaScheduler {
             terminal_selection_slots: AHashMap::new(),
             terminal_selections: Vec::new(),
         }
+    }
+
+    pub(super) fn enable_positive_support_global_service_debt(&mut self) {
+        assert_eq!(
+            self.positive_support_scheduling,
+            PositiveSupportScheduling::CountCredit,
+            "PositiveSupport scheduling policy was already configured"
+        );
+        assert!(
+            self.registry.state.activations.is_empty()
+                && self.worklist.is_empty()
+                && self.source_worklist.is_empty()
+                && self.program_worklist.is_empty()
+                && self.parked_positive_support_worklist.is_empty(),
+            "PositiveSupport scheduling policy must be selected before execution"
+        );
+        self.positive_support_scheduling = PositiveSupportScheduling::GlobalServiceDebt;
+        self.program_lane_selection = ProgramLaneSelection::LanePure;
+    }
+
+    pub(super) fn global_service_epoch_is_active(&self) -> bool {
+        self.positive_support_scheduling == PositiveSupportScheduling::GlobalServiceDebt
+            && !matches!(
+                self.positive_support_service_debt.lease,
+                PositiveSupportServiceLease::Dormant | PositiveSupportServiceLease::Retired
+            )
     }
 
     /// Mints exact per-parent terminal receipts without filing sparse source
@@ -6808,7 +7013,9 @@ impl DeltaScheduler {
             // A newly assigned public demand token explicitly prefers the
             // Support hedge. Without demand the exact Confirm remains the
             // directed latency lineage and Support stays parked.
-            active: support_active.or(finalizer_active).or(graph_active),
+            active: (!self.global_service_epoch_is_active())
+                .then(|| support_active.or(finalizer_active).or(graph_active))
+                .flatten(),
             terminal_activations: Vec::new(),
             completed_activation_ids,
             terminal_family: None,
@@ -8185,9 +8392,15 @@ impl DeltaScheduler {
         &mut self,
         parent: PositiveConfirmParentId,
     ) -> Option<ActiveDeltaContinuation> {
-        if self.registry.positive_support_budget_available(parent) == 0
-            || self.has_runnable_positive_support_parent(parent)
-        {
+        let admitted = match self.positive_support_scheduling {
+            PositiveSupportScheduling::CountCredit => {
+                self.registry.positive_support_budget_available(parent) > 0
+            }
+            PositiveSupportScheduling::GlobalServiceDebt => {
+                self.registry.positive_support_service_is_started(parent)
+            }
+        };
+        if !admitted || self.has_runnable_positive_support_parent(parent) {
             return None;
         }
         let registry = &self.registry;
@@ -8235,15 +8448,44 @@ impl DeltaScheduler {
             }
         }
         for parent in parents.into_iter().rev() {
-            if !self.registry.mint_positive_support_demand(parent) {
+            let service_epoch_was_empty = self.positive_support_scheduling
+                == PositiveSupportScheduling::GlobalServiceDebt
+                && !self.registry.has_live_started_positive_support();
+            let started = match self.positive_support_scheduling {
+                PositiveSupportScheduling::CountCredit => {
+                    self.registry.mint_positive_support_demand(parent)
+                }
+                PositiveSupportScheduling::GlobalServiceDebt => {
+                    self.registry.start_positive_support_service(parent)
+                }
+            };
+            if !started {
                 continue;
             }
             self.public_pull_demand = PublicPullDemandState::Assigned;
-            stats.delta_positive_support_demand_assigned += 1;
-            return Some(
-                self.wake_one_positive_support_parent(parent)
-                    .expect("assigned positive Support demand failed to wake parked custody"),
-            );
+            match self.positive_support_scheduling {
+                PositiveSupportScheduling::CountCredit => {
+                    stats.delta_positive_support_demand_assigned += 1;
+                    return Some(
+                        self.wake_one_positive_support_parent(parent).expect(
+                            "assigned positive Support demand failed to wake parked custody",
+                        ),
+                    );
+                }
+                PositiveSupportScheduling::GlobalServiceDebt => {
+                    stats.delta_positive_support_service_parents_started += 1;
+                    let epoch_started = if service_epoch_was_empty {
+                        self.positive_support_service_debt
+                            .demand_arrived_from_empty()
+                    } else {
+                        self.positive_support_service_debt.demand_arrived()
+                    };
+                    if epoch_started {
+                        stats.delta_positive_support_service_epochs += 1;
+                    }
+                    return None;
+                }
+            }
         }
         None
     }
@@ -8282,6 +8524,162 @@ impl DeltaScheduler {
             woke |= self.wake_one_positive_support_parent(parent).is_some();
         }
         woke
+    }
+
+    fn has_service_support_work(&self) -> bool {
+        let is_started_support = |task: &ProgramTask| {
+            self.registry
+                .positive_support_parent_for_child(task.activation)
+                .is_some_and(|parent| self.registry.positive_support_service_is_started(parent))
+        };
+        self.program_worklist
+            .iter()
+            .any(|(_, bucket)| bucket.tasks.iter().any(is_started_support))
+            || self
+                .parked_positive_support_worklist
+                .iter()
+                .any(|(_, bucket)| bucket.tasks.iter().any(is_started_support))
+    }
+
+    /// Makes one queued task per started parent runnable so a global Support
+    /// packet can batch across parents without admitting a second task from
+    /// any one semantic race.
+    fn wake_global_service_support_lane(&mut self) {
+        let mut parents = BTreeSet::new();
+        for (_, bucket) in self.parked_positive_support_worklist.iter() {
+            for task in &bucket.tasks {
+                let Some(parent) = self
+                    .registry
+                    .positive_support_parent_for_child(task.activation)
+                else {
+                    continue;
+                };
+                if self.registry.positive_support_service_is_started(parent) {
+                    parents.insert(parent);
+                }
+            }
+        }
+        for parent in parents {
+            let _ = self.wake_one_positive_support_parent(parent);
+        }
+    }
+
+    /// Chooses the next attributable global Program lane. Exact owns ties;
+    /// Support receives one initial packet and thereafter only runs while its
+    /// cumulative validated service is strictly behind.
+    fn arm_global_service_lane(&mut self) {
+        if self.positive_support_scheduling != PositiveSupportScheduling::GlobalServiceDebt {
+            return;
+        }
+        self.next_program_lane = None;
+        let support_ready = self.has_service_support_work();
+        if self
+            .positive_support_service_debt
+            .support_is_admissible(support_ready)
+        {
+            self.wake_global_service_support_lane();
+            assert!(
+                self.program_worklist
+                    .last_id_in_lane(&self.registry, ProgramServiceLane::Support)
+                    .is_some(),
+                "admissible Support service lane lost its queued packet"
+            );
+            self.next_program_lane = Some(ProgramServiceLane::Support);
+        } else if self
+            .program_worklist
+            .last_id_in_lane(&self.registry, ProgramServiceLane::Exact)
+            .is_some()
+        {
+            self.next_program_lane = Some(ProgramServiceLane::Exact);
+        }
+    }
+
+    fn reserve_global_service_packet(
+        &mut self,
+        lane: ProgramServiceLane,
+    ) -> Option<PositiveSupportPacketReservation> {
+        match (self.positive_support_scheduling, lane) {
+            (PositiveSupportScheduling::GlobalServiceDebt, ProgramServiceLane::Support) => {
+                self.positive_support_service_debt.reserve_support(true)
+            }
+            _ => None,
+        }
+    }
+
+    fn settle_global_service_packet(
+        &mut self,
+        lane: ProgramServiceLane,
+        reservation: Option<PositiveSupportPacketReservation>,
+        examined: usize,
+        stats: &mut ResidualStateStats,
+    ) {
+        if self.positive_support_scheduling != PositiveSupportScheduling::GlobalServiceDebt
+            || lane == ProgramServiceLane::Neutral
+        {
+            assert!(
+                reservation.is_none(),
+                "neutral/count dispatch retained a global Support reservation"
+            );
+            return;
+        }
+        // A quiescent typed receipt may validate zero candidates while still
+        // consuming one physical dispatch. Service ticks are therefore
+        // `max(1, validated examined)`; zero-cost packets are forbidden by the
+        // debt theorem rather than silently becoming free.
+        let charged = examined.max(1);
+        let service = u64::try_from(charged).expect("Program service does not fit u64");
+        let remains_live = self.registry.has_live_started_positive_support();
+        match lane {
+            ProgramServiceLane::Exact => {
+                assert!(
+                    reservation.is_none(),
+                    "Exact packet received a Support reservation"
+                );
+                if !remains_live {
+                    self.positive_support_service_debt.cancel_support();
+                }
+                let prior_max = self.positive_support_service_debt.max_exact_packet;
+                self.positive_support_service_debt.settle_exact(service);
+                stats.delta_positive_support_service_exact_examined += charged;
+                stats.delta_positive_support_service_exact_packets += 1;
+                stats.max_delta_positive_support_service_exact_packet = stats
+                    .max_delta_positive_support_service_exact_packet
+                    .max(charged);
+                stats.delta_positive_support_service_exact_packet_allowance +=
+                    charged.saturating_sub(prior_max as usize);
+            }
+            ProgramServiceLane::Support => {
+                if !remains_live {
+                    self.positive_support_service_debt.cancel_support();
+                }
+                let prior_max = self.positive_support_service_debt.max_support_packet;
+                self.positive_support_service_debt.settle_support(
+                    reservation.expect("Support packet lost its global affine reservation"),
+                    service,
+                    remains_live,
+                );
+                stats.delta_positive_support_service_support_examined += charged;
+                stats.delta_positive_support_service_support_packets += 1;
+                stats.max_delta_positive_support_service_support_packet = stats
+                    .max_delta_positive_support_service_support_packet
+                    .max(charged);
+                stats.delta_positive_support_service_support_packet_allowance +=
+                    charged.saturating_sub(prior_max as usize);
+                let runnable: AHashSet<_> = self
+                    .program_worklist
+                    .iter()
+                    .flat_map(|(_, bucket)| bucket.tasks.iter())
+                    .filter(|task| {
+                        ProgramServiceLane::of(&self.registry, task.activation)
+                            == ProgramServiceLane::Support
+                    })
+                    .map(|task| task.activation)
+                    .collect();
+                self.park_positive_support_activations(&runnable);
+                self.next_program_lane = None;
+            }
+            ProgramServiceLane::Neutral => unreachable!(),
+        }
     }
 
     /// Moves already queued PositiveSupport tasks out of runnable selection
@@ -8608,6 +9006,10 @@ impl DeltaScheduler {
             .flatten();
         let preferred_state = preferred_lane
             .and_then(|lane| self.program_worklist.last_id_in_lane(&self.registry, lane));
+        assert!(
+            preferred_lane.is_none() || preferred_state.is_some(),
+            "preferred Program service lane disappeared before its global pop"
+        );
         let id = preferred_state
             .or_else(|| self.program_worklist.last_id())
             .expect("typed program pop requires live work");
@@ -8683,11 +9085,20 @@ impl DeltaScheduler {
                 selected_parents.insert(parent),
                 "one physical cohort selected two runnable Support tasks for one semantic parent"
             );
-            let grant = self
-                .registry
-                .reserve_positive_support_work(task.activation, *limit)
-                .expect("runnable PositiveSupport task had no available work allowance");
-            *limit = grant.granted;
+            let grant = match self.positive_support_scheduling {
+                PositiveSupportScheduling::CountCredit => {
+                    let grant = self
+                        .registry
+                        .reserve_positive_support_work(task.activation, *limit)
+                        .expect("runnable PositiveSupport task had no available work allowance");
+                    *limit = grant.granted;
+                    grant
+                }
+                PositiveSupportScheduling::GlobalServiceDebt => self
+                    .registry
+                    .reserve_positive_support_service(task.activation, *limit)
+                    .expect("runnable PositiveSupport task was outside the service epoch"),
+            };
             grants.push(Some(grant));
         }
         grants
@@ -9060,8 +9471,25 @@ impl DeltaScheduler {
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
     ) -> DeltaStepOutcome {
+        self.arm_global_service_lane();
         if !self.program_worklist.is_empty() {
             let (state, tasks, support_grants, dispatch) = self.pop_program_bounded(search_width);
+            let service_lane =
+                if self.positive_support_scheduling == PositiveSupportScheduling::GlobalServiceDebt
+                {
+                    let lane = ProgramServiceLane::of(&self.registry, tasks[0].activation);
+                    assert!(
+                        tasks.iter().all(|task| ProgramServiceLane::of(
+                            &self.registry,
+                            task.activation
+                        ) == lane),
+                        "global service packet crossed the lane-purity fence"
+                    );
+                    lane
+                } else {
+                    ProgramServiceLane::Neutral
+                };
+            let service_reservation = self.reserve_global_service_packet(service_lane);
             let examined_before = stats
                 .delta_source_candidates_examined
                 .saturating_add(stats.delta_transition_candidates_examined);
@@ -9076,6 +9504,17 @@ impl DeltaScheduler {
                 direct_terminal_publication_full,
                 stable,
                 stable_interner,
+                stats,
+            );
+            let examined_after = stats
+                .delta_source_candidates_examined
+                .saturating_add(stats.delta_transition_candidates_examined);
+            self.settle_global_service_packet(
+                service_lane,
+                service_reservation,
+                examined_after
+                    .checked_sub(examined_before)
+                    .expect("Program examined-work telemetry moved backwards"),
                 stats,
             );
             let retired_search_receipt = physical.retired_search_receipt;
@@ -9776,30 +10215,38 @@ impl DeltaScheduler {
             );
             let examined = validated_examined[input];
             if let Some(grant) = support_grant {
+                let accounting = grant.accounting;
                 let parent = PositiveConfirmParentId {
                     brand: self.registry.brand,
                     activation: grant.parent,
                 };
-                stats.delta_positive_support_examined += self
+                let settled = self
                     .registry
                     .settle_positive_support_work(grant, activation, examined);
+                if accounting == PositiveSupportWorkAccounting::CountCredit {
+                    stats.delta_positive_support_examined += settled;
+                }
                 // A short physical page refunds the unexamined reservation.
                 // Reconsider this parent only after every selected receipt has
                 // been replaced, refiled, and cancelled.
-                credited_support_parents.insert(parent);
-            } else {
-                let accounting = self
-                    .registry
-                    .account_positive_exact_work(activation, examined);
-                if accounting.paired {
-                    stats.delta_positive_support_exact_paired_examined += examined;
+                if accounting == PositiveSupportWorkAccounting::CountCredit {
+                    credited_support_parents.insert(parent);
                 }
-                if accounting.credited > 0 {
-                    stats.delta_positive_support_exact_credited += accounting.credited;
-                    credited_support_parents.insert(PositiveConfirmParentId {
-                        brand: self.registry.brand,
-                        activation,
-                    });
+            } else {
+                if self.positive_support_scheduling == PositiveSupportScheduling::CountCredit {
+                    let accounting = self
+                        .registry
+                        .account_positive_exact_work(activation, examined);
+                    if accounting.paired {
+                        stats.delta_positive_support_exact_paired_examined += examined;
+                    }
+                    if accounting.credited > 0 {
+                        stats.delta_positive_support_exact_credited += accounting.credited;
+                        credited_support_parents.insert(PositiveConfirmParentId {
+                            brand: self.registry.brand,
+                            activation,
+                        });
+                    }
                 }
             }
             // A real Program receipt has already spent the child's affine
@@ -10020,10 +10467,13 @@ impl DeltaScheduler {
                 self.registry.retire_orphaned_positive_support_work(parent);
         }
         let demand_preference = self.assign_public_pull_demand(stats);
-        let exact_credit_wake = self.wake_positive_support_parents(credited_support_parents);
+        let global_service_active = self.global_service_epoch_is_active();
+        let exact_credit_wake = self.positive_support_scheduling
+            == PositiveSupportScheduling::CountCredit
+            && self.wake_positive_support_parents(credited_support_parents);
         let release_directed_lease = directed_active
             && !directed_positive_support
-            && (demand_preference.is_some() || exact_credit_wake);
+            && (demand_preference.is_some() || global_service_active || exact_credit_wake);
         self.registry.assert_no_positive_support_reservations();
         children.clear();
         direct.clear();
@@ -10382,6 +10832,11 @@ impl DeltaScheduler {
             parked_positive_support_worklist,
             program_lane_selection: self.program_lane_selection,
             next_program_lane: self.next_program_lane,
+            positive_support_scheduling: self.positive_support_scheduling,
+            positive_support_service_debt: self
+                .positive_support_service_debt
+                .try_deep_clone()
+                .expect("cannot clone a scheduler across an in-flight Support packet"),
             public_pull_demand: self.public_pull_demand,
             program_runtimes: self.program_runtimes.clone(),
             program_scratch: None,
@@ -10389,6 +10844,14 @@ impl DeltaScheduler {
             terminal_selection_slots: AHashMap::new(),
             terminal_selections: Vec::new(),
         }
+    }
+
+    #[cfg(feature = "parallel")]
+    pub(super) fn empty_parallel_sibling(&self) -> Self {
+        let mut sibling = Self::new();
+        sibling.positive_support_scheduling = self.positive_support_scheduling;
+        sibling.program_lane_selection = self.program_lane_selection;
+        sibling
     }
 }
 
@@ -11373,6 +11836,122 @@ mod tests {
         assert_eq!(ordinary.len(), 1);
         assert_eq!(ordinary[0].activation, neutral_active.activation);
         assert!(grants[0].is_none());
+    }
+
+    #[test]
+    fn global_service_demand_never_mints_count_credit_and_arms_a_lane() {
+        let root = OneShotSupportProgram;
+        let mut scheduler = DeltaScheduler::new();
+        scheduler.enable_positive_support_global_service_debt();
+        let candidate = value(69);
+        let (_, parent, _, _) =
+            open_tapped_confirm_with_support(&mut scheduler.registry, [candidate], None, true);
+        let (support, _) =
+            queue_one_shot_positive_support(&mut scheduler, &root, parent, candidate, false);
+        scheduler.park_positive_support_activations(&AHashSet::from_iter([support]));
+
+        let mut stats = ResidualStateStats::default();
+        assert!(
+            scheduler.begin_public_pull_demand(&mut stats).is_none(),
+            "global service demand must not create an activation-local sprint"
+        );
+        let ledger = scheduler
+            .registry
+            .positive_publication_snapshot(parent)
+            .expect("service parent retained its publication ledger");
+        assert_eq!(ledger.support_work, PositiveSupportWorkBudget::default());
+        assert!(ledger.service_support_started);
+        assert_eq!(
+            (
+                stats.delta_positive_support_demand_assigned,
+                stats.delta_positive_support_examined,
+                stats.delta_positive_support_exact_credited,
+                stats.delta_positive_support_credit_retired,
+            ),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(stats.delta_positive_support_service_parents_started, 1);
+        assert_eq!(stats.delta_positive_support_service_epochs, 1);
+
+        scheduler.arm_global_service_lane();
+        assert_eq!(
+            scheduler.next_program_lane,
+            Some(ProgramServiceLane::Support)
+        );
+        assert!(scheduler.has_runnable_positive_support_parent(parent));
+    }
+
+    #[test]
+    fn global_service_runtime_settles_one_support_packet_and_preserves_count_zeros() {
+        let root = OneShotSupportProgram;
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let mut scheduler = DeltaScheduler::new();
+        scheduler.enable_positive_support_global_service_debt();
+        let candidate = value(70);
+        let (exact, parent, exact_credit, _) =
+            open_tapped_confirm_with_support(&mut scheduler.registry, [candidate], None, true);
+        let (support, support_active) =
+            queue_one_shot_positive_support(&mut scheduler, &root, parent, candidate, true);
+        scheduler.park_positive_support_activations(&AHashSet::from_iter([support]));
+        let _ =
+            queue_exact_confirm_credit(&mut scheduler, support_active.state, exact, exact_credit);
+        let mut stats = ResidualStateStats::default();
+        assert!(scheduler.begin_public_pull_demand(&mut stats).is_none());
+
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let outcome = scheduler.step_bounded(
+            &root,
+            &plan,
+            1,
+            Some(terminal_positive_full()),
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert!(outcome.has_stable_effect());
+        assert_eq!(stats.delta_positive_publication_support_wins, 1);
+        assert_eq!(
+            (
+                stats.delta_positive_support_demand_assigned,
+                stats.delta_positive_support_examined,
+                stats.delta_positive_support_exact_paired_examined,
+                stats.delta_positive_support_exact_credited,
+                stats.delta_positive_support_credit_retired,
+            ),
+            (0, 0, 0, 0, 0)
+        );
+        assert_eq!(stats.delta_positive_support_service_support_examined, 1);
+        assert_eq!(stats.delta_positive_support_service_support_packets, 1);
+        assert_eq!(
+            stats.delta_positive_support_service_support_packet_allowance,
+            1
+        );
+        assert_eq!(
+            scheduler.positive_support_service_debt.lease,
+            PositiveSupportServiceLease::Retired
+        );
+    }
+
+    #[test]
+    fn global_service_epoch_restarts_only_after_empty_retirement() {
+        let mut ledger = PositiveSupportServiceDebtLedger::dormant();
+        assert!(ledger.demand_arrived_from_empty());
+        let first_brand = ledger.brand;
+        let first = ledger
+            .reserve_support(true)
+            .expect("the first epoch owns one initial Support bypass");
+        ledger.settle_support(first, 7, false);
+        assert_eq!(ledger.lease, PositiveSupportServiceLease::Retired);
+
+        assert!(ledger.demand_arrived_from_empty());
+        assert_ne!(ledger.brand, first_brand);
+        assert_eq!((ledger.exact_service, ledger.support_service), (0, 0));
+        let second = ledger
+            .reserve_support(true)
+            .expect("a genuinely new epoch owns one fresh initial bypass");
+        ledger.settle_support(second, 3, false);
+        assert_eq!(ledger.support_service, 3);
     }
 
     #[test]

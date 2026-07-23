@@ -2550,6 +2550,31 @@ pub struct ResidualStateStats {
     /// Minted Support allowance burned on child exhaustion, cancellation, or
     /// semantic-parent closure before physical examination.
     pub delta_positive_support_credit_retired: usize,
+    /// Parents started under the independent query-global service policy.
+    /// This is not production demand credit `D`.
+    pub delta_positive_support_service_parents_started: usize,
+    /// Empty-to-live query-global Support service epochs.
+    pub delta_positive_support_service_epochs: usize,
+    /// Examined-service ticks charged to exact Confirm packets. A validated
+    /// zero-examined quiescence receipt costs one dispatch tick.
+    pub delta_positive_support_service_exact_examined: usize,
+    /// Examined-service ticks charged to Support packets. A validated
+    /// zero-examined quiescence receipt costs one dispatch tick.
+    pub delta_positive_support_service_support_examined: usize,
+    /// Exact Confirm packets settled by the query-global service ledger.
+    pub delta_positive_support_service_exact_packets: usize,
+    /// Support packets settled through its one affine query-global lease.
+    pub delta_positive_support_service_support_packets: usize,
+    /// Largest exact Confirm service packet observed.
+    pub max_delta_positive_support_service_exact_packet: usize,
+    /// Largest Support service packet observed.
+    pub max_delta_positive_support_service_support_packet: usize,
+    /// Sum, across completed/current epochs, of each epoch's largest exact
+    /// packet. This is the additive packet term for cumulative bounds.
+    pub delta_positive_support_service_exact_packet_allowance: usize,
+    /// Sum, across completed/current epochs, of each epoch's largest Support
+    /// packet. This is the additive packet term for cumulative bounds.
+    pub delta_positive_support_service_support_packet_allowance: usize,
     /// Positive-publication SET races won by an exact Confirm receipt.
     pub delta_positive_publication_exact_wins: usize,
     /// Positive-publication SET races won by a physical Support receipt.
@@ -11746,6 +11771,10 @@ impl ResidualStateMachine {
             // affine lineage before any cold stable cohort. It owns no work;
             // dropping the token merely returns scheduling to the global
             // source/transition worklists.
+            if self.delta.global_service_epoch_is_active() {
+                self.active_delta = None;
+                self.active_delta_after_yield = false;
+            }
             if self.continuation.is_none() {
                 if let Some(active) = self.active_delta.take() {
                     self.stats.delta_active_lease_steps += 1;
@@ -11925,10 +11954,15 @@ impl ResidualStateMachine {
         if self.emit_next >= self.emit_count && self.worklist.is_empty() && self.delta.is_empty() {
             return None;
         }
-        if let Some(support) = self.delta.begin_public_pull_demand(&mut self.stats) {
-            // Assigned public demand owns the latency preference. The exact
-            // Confirm lease remains ordinary runnable custody and returns to
-            // global arbitration.
+        let support_preference = self.delta.begin_public_pull_demand(&mut self.stats);
+        if self.delta.global_service_epoch_is_active() {
+            // The service scheduler owns a strict global lane preference,
+            // never an activation-local sprint.
+            self.active_delta = None;
+            self.active_delta_after_yield = false;
+        } else if let Some(support) = support_preference {
+            // Assigned production demand owns the activation-local latency
+            // preference. Exact remains ordinary runnable custody.
             self.active_delta = Some(support);
             self.active_delta_after_yield = false;
         }
@@ -12059,7 +12093,7 @@ impl ResidualStateMachine {
             next_activation: self.next_activation,
             interner: self.interner.clone(),
             worklist: Worklist::new(),
-            delta: DeltaScheduler::new(),
+            delta: self.delta.empty_parallel_sibling(),
             stats: ResidualStateStats::default(),
             binding: Binding::default(),
             emit_vars: Vec::new(),
@@ -12513,6 +12547,25 @@ impl<C, P: Fn(&Binding) -> Option<R>, R> ResidualStateIter<C, P, R> {
         self.state.cap = cap.max(1);
         self.state.width = self.state.width.min(self.state.cap);
         self.state.terminal_demand_width = self.state.terminal_demand_width.min(self.state.cap);
+        self
+    }
+
+    /// Runs PositiveSupport hedges under one query-global examined-service
+    /// debt ledger instead of the production per-parent count-credit policy.
+    ///
+    /// This experimental scheduler keeps exact and Support Program packets
+    /// lane-pure, gives Support one initial bounded packet, and thereafter
+    /// dispatches it only while its cumulative validated examined work is
+    /// strictly behind Exact. Exact owns ties. The policy changes physical
+    /// order only; raw projected tuple SET semantics are unchanged.
+    pub fn positive_support_global_service_debt(mut self) -> Self {
+        assert!(
+            !self.iteration_started,
+            "PositiveSupport scheduling policy cannot change after iteration begins"
+        );
+        self.state
+            .delta
+            .enable_positive_support_global_service_debt();
         self
     }
 

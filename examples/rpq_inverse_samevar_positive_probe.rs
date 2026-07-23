@@ -89,6 +89,7 @@ impl Case {
 #[derive(Clone, Copy)]
 enum Mode {
     Production,
+    ServiceDebt,
     ExactOnly,
 }
 
@@ -96,12 +97,13 @@ impl Mode {
     fn label(self) -> &'static str {
         match self {
             Self::Production => "production",
+            Self::ServiceDebt => "service-debt",
             Self::ExactOnly => "exact-only",
         }
     }
 }
 
-const MODES: [Mode; 2] = [Mode::Production, Mode::ExactOnly];
+const MODES: [Mode; 3] = [Mode::Production, Mode::ServiceDebt, Mode::ExactOnly];
 
 struct Fixture {
     shape: Shape,
@@ -132,7 +134,7 @@ struct Signature {
     hash: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 struct Attribution {
     positive_terminal: usize,
     positive_chunk_homomorphic: usize,
@@ -143,6 +145,16 @@ struct Attribution {
     exact_examined_total: usize,
     exact_credited: usize,
     credit_retired: usize,
+    service_parents_started: usize,
+    service_epochs: usize,
+    service_exact_examined: usize,
+    service_support_examined: usize,
+    service_exact_packets: usize,
+    service_support_packets: usize,
+    max_service_exact_packet: usize,
+    max_service_support_packet: usize,
+    service_exact_packet_allowance: usize,
+    service_support_packet_allowance: usize,
     direct_terminal_rows: usize,
     support_action_pops: usize,
     support_calls: usize,
@@ -186,6 +198,9 @@ struct Samples {
     first: Vec<Duration>,
     b0: Vec<Duration>,
     full: Vec<Duration>,
+    first_stats: Vec<Attribution>,
+    b0_stats: Vec<Attribution>,
+    full_stats: Vec<Attribution>,
 }
 
 struct BenchmarkContext<'a> {
@@ -683,7 +698,7 @@ fn make_root<'a>(fixture: &'a Fixture, path: DynConstraint<'a>) -> Root<'a> {
 fn make_query(fixture: &Fixture, mode: Mode) -> Query<Root<'_>, Project, RawInline> {
     let fallback = regular_path(fixture);
     let path: DynConstraint<'_> = match mode {
-        Mode::Production => Box::new(fallback),
+        Mode::Production | Mode::ServiceDebt => Box::new(fallback),
         Mode::ExactOnly => {
             let preferred = MaskedSupportRpq {
                 inner: regular_path(fixture),
@@ -697,11 +712,15 @@ fn make_query(fixture: &Fixture, mode: Mode) -> Query<Root<'_>, Project, RawInli
 }
 
 fn make_iter(fixture: &Fixture, mode: Mode, width: usize) -> ProbeIter<'_> {
-    make_query(fixture, mode)
+    let iter = make_query(fixture, mode)
         .solve_residual_state_lazy_with(LOWERING)
         .cap(width)
         .start_width(width)
-        .growth(2)
+        .growth(2);
+    match mode {
+        Mode::ServiceDebt => iter.positive_support_global_service_debt(),
+        Mode::Production | Mode::ExactOnly => iter,
+    }
 }
 
 fn signature(items: impl IntoIterator<Item = RawInline>) -> Signature {
@@ -726,6 +745,17 @@ fn attribution(stats: &ResidualStateStats) -> Attribution {
         exact_examined_total: stats.delta_positive_support_exact_paired_examined,
         exact_credited: stats.delta_positive_support_exact_credited,
         credit_retired: stats.delta_positive_support_credit_retired,
+        service_parents_started: stats.delta_positive_support_service_parents_started,
+        service_epochs: stats.delta_positive_support_service_epochs,
+        service_exact_examined: stats.delta_positive_support_service_exact_examined,
+        service_support_examined: stats.delta_positive_support_service_support_examined,
+        service_exact_packets: stats.delta_positive_support_service_exact_packets,
+        service_support_packets: stats.delta_positive_support_service_support_packets,
+        max_service_exact_packet: stats.max_delta_positive_support_service_exact_packet,
+        max_service_support_packet: stats.max_delta_positive_support_service_support_packet,
+        service_exact_packet_allowance: stats.delta_positive_support_service_exact_packet_allowance,
+        service_support_packet_allowance: stats
+            .delta_positive_support_service_support_packet_allowance,
         direct_terminal_rows: stats.delta_direct_terminal_publication_rows,
         support_action_pops: stats.support_action_pops,
         support_calls: stats.support_calls,
@@ -762,45 +792,77 @@ fn assert_accounting(
     stats: Attribution,
     completed: bool,
 ) {
-    assert!(
-        stats.support_examined <= stats.credited_work(),
-        "{} {} width {width} {phase}: S={} exceeded D+C={}",
-        fixture.label(),
-        mode.label(),
-        stats.support_examined,
-        stats.credited_work()
-    );
-    assert!(
-        stats.exact_credited <= stats.exact_examined_total,
-        "{} {} width {width} {phase}: C={} exceeded paired Exact={}",
-        fixture.label(),
-        mode.label(),
-        stats.exact_credited,
-        stats.exact_examined_total
-    );
-    if completed {
-        assert_eq!(
-            stats.credited_work(),
-            stats.support_examined + stats.credit_retired,
-            "{} {} width {width}: completed hedge violated D+C=S+retired",
-            fixture.label(),
-            mode.label()
-        );
-    }
-    if matches!(mode, Mode::ExactOnly) {
-        assert_eq!(
-            (
-                stats.demand_assigned,
+    match mode {
+        Mode::Production => {
+            assert!(
+                stats.support_examined <= stats.credited_work(),
+                "{} production width {width} {phase}: S={} exceeded D+C={}",
+                fixture.label(),
                 stats.support_examined,
-                stats.exact_examined_total,
-                stats.exact_credited,
-                stats.credit_retired,
-                stats.support_wins,
-            ),
-            (0, 0, 0, 0, 0, 0),
-            "{} exact-only width {width} {phase}: masked Support accrued hedge accounting",
-            fixture.label()
-        );
+                stats.credited_work()
+            );
+            assert!(stats.exact_credited <= stats.exact_examined_total);
+            if completed {
+                assert_eq!(
+                    stats.credited_work(),
+                    stats.support_examined + stats.credit_retired,
+                    "{} production width {width}: completed hedge violated D+C=S+retired",
+                    fixture.label()
+                );
+            }
+            assert_eq!(
+                (
+                    stats.service_parents_started,
+                    stats.service_epochs,
+                    stats.service_exact_examined,
+                    stats.service_support_examined,
+                ),
+                (0, 0, 0, 0),
+                "{} production width {width} {phase}: service accounting leaked into count mode",
+                fixture.label()
+            );
+        }
+        Mode::ServiceDebt => {
+            assert_eq!(
+                (
+                    stats.demand_assigned,
+                    stats.support_examined,
+                    stats.exact_examined_total,
+                    stats.exact_credited,
+                    stats.credit_retired,
+                ),
+                (0, 0, 0, 0, 0),
+                "{} service-debt width {width} {phase}: count accounting leaked into service mode",
+                fixture.label()
+            );
+            assert!(
+                stats.service_support_examined
+                    <= stats.service_exact_examined + stats.service_support_packet_allowance,
+                "{} service-debt width {width} {phase}: H={} exceeded E+ΣqH={}",
+                fixture.label(),
+                stats.service_support_examined,
+                stats.service_exact_examined + stats.service_support_packet_allowance
+            );
+        }
+        Mode::ExactOnly => {
+            assert_eq!(
+                (
+                    stats.demand_assigned,
+                    stats.support_examined,
+                    stats.exact_examined_total,
+                    stats.exact_credited,
+                    stats.credit_retired,
+                    stats.support_wins,
+                    stats.service_parents_started,
+                    stats.service_epochs,
+                    stats.service_exact_examined,
+                    stats.service_support_examined,
+                ),
+                (0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+                "{} exact-only width {width} {phase}: masked Support accrued hedge accounting",
+                fixture.label()
+            );
+        }
     }
 }
 
@@ -858,7 +920,7 @@ fn profile(
     );
 
     match mode {
-        Mode::Production if fixture.case.is_positive() => {
+        Mode::Production | Mode::ServiceDebt if fixture.case.is_positive() => {
             assert_eq!(
                 (
                     full_stats.positive_commits(),
@@ -874,7 +936,7 @@ fn profile(
                 fixture.label()
             );
         }
-        Mode::Production => {
+        Mode::Production | Mode::ServiceDebt => {
             assert_eq!(
                 (
                     full_stats.positive_commits(),
@@ -941,6 +1003,19 @@ fn total_nanoseconds(samples: &[Duration]) -> u128 {
     samples.iter().map(Duration::as_nanos).sum()
 }
 
+fn attribution_range(
+    samples: &[Attribution],
+    project: impl Fn(Attribution) -> usize,
+) -> (usize, usize) {
+    let mut values = samples.iter().copied().map(project);
+    let first = values
+        .next()
+        .expect("timed attribution distribution must be nonempty");
+    values.fold((first, first), |(min, max), value| {
+        (min.min(value), max.max(value))
+    })
+}
+
 fn print_tsv_header() {
     println!(
         "schema\trun_id\trevision\tnodes\tshape\tcase\tdistance\twidth\tmode\tphase\t\
@@ -948,7 +1023,13 @@ fn print_tsv_header() {
          rows_per_sec\tfirst_is_b0\tpositive_total\texact_wins\tsupport_wins\t\
          demand_assigned\texact_examined_total\texact_credited\tsupport_examined\t\
          credit_retired\tbound_slack\tsource_examined\ttransition_examined\t\
-         terminal_calls\tnonterminal_calls"
+         terminal_calls\tnonterminal_calls\tservice_parents_started\tservice_epochs\t\
+         service_exact_examined\tservice_support_examined\tservice_exact_packets\t\
+         service_support_packets\tmax_service_exact_packet\tmax_service_support_packet\t\
+         service_exact_packet_allowance\tservice_support_packet_allowance\t\
+         attribution_variants\tservice_exact_min\tservice_exact_max\tservice_support_min\t\
+         service_support_max\texact_wins_min\texact_wins_max\tsupport_wins_min\t\
+         support_wins_max"
     );
 }
 
@@ -960,6 +1041,7 @@ fn print_tsv_row(
     mode: Mode,
     phase: &str,
     samples: &[Duration],
+    timed_stats: &[Attribution],
     rows: usize,
     first_is_b0: bool,
     stats: Attribution,
@@ -967,9 +1049,22 @@ fn print_tsv_row(
     let total_ns = total_nanoseconds(samples);
     let operations_per_second = context.reps as f64 * 1_000_000_000.0 / total_ns as f64;
     let rows_per_second = context.reps as f64 * rows as f64 * 1_000_000_000.0 / total_ns as f64;
+    let attribution_variants = timed_stats
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    let (service_exact_min, service_exact_max) =
+        attribution_range(timed_stats, |stats| stats.service_exact_examined);
+    let (service_support_min, service_support_max) =
+        attribution_range(timed_stats, |stats| stats.service_support_examined);
+    let (exact_wins_min, exact_wins_max) = attribution_range(timed_stats, |stats| stats.exact_wins);
+    let (support_wins_min, support_wins_max) =
+        attribution_range(timed_stats, |stats| stats.support_wins);
     println!(
-        "rpq-hedge-v1\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t\
-         {:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "rpq-hedge-v2\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t\
+         {:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t\
+         {}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         context.run_id,
         context.revision,
         context.nodes,
@@ -1003,6 +1098,25 @@ fn print_tsv_row(
         stats.transition_candidates_examined,
         stats.terminal_calls,
         stats.nonterminal_calls,
+        stats.service_parents_started,
+        stats.service_epochs,
+        stats.service_exact_examined,
+        stats.service_support_examined,
+        stats.service_exact_packets,
+        stats.service_support_packets,
+        stats.max_service_exact_packet,
+        stats.max_service_support_packet,
+        stats.service_exact_packet_allowance,
+        stats.service_support_packet_allowance,
+        attribution_variants,
+        service_exact_min,
+        service_exact_max,
+        service_support_min,
+        service_support_max,
+        exact_wins_min,
+        exact_wins_max,
+        support_wins_min,
+        support_wins_max,
     );
 }
 
@@ -1043,6 +1157,9 @@ fn measure(fixture: &Fixture, width: usize, context: &BenchmarkContext<'_>) {
         first: Vec::with_capacity(reps),
         b0: Vec::with_capacity(reps),
         full: Vec::with_capacity(reps),
+        first_stats: Vec::with_capacity(reps),
+        b0_stats: Vec::with_capacity(reps),
+        full_stats: Vec::with_capacity(reps),
     });
     for repetition in 0..reps {
         for offset in 0..MODES.len() {
@@ -1053,6 +1170,9 @@ fn measure(fixture: &Fixture, width: usize, context: &BenchmarkContext<'_>) {
             let began = Instant::now();
             let first = black_box(first_iter.next());
             samples[index].first.push(began.elapsed());
+            let first_stats = attribution(first_iter.stats());
+            assert_accounting(fixture, mode, width, "timed-first", first_stats, false);
+            samples[index].first_stats.push(first_stats);
             assert!(
                 first.is_some_and(|value| oracle.contains(&value)),
                 "{} {} width {width}: first row escaped the result SET",
@@ -1065,6 +1185,9 @@ fn measure(fixture: &Fixture, width: usize, context: &BenchmarkContext<'_>) {
                 let began = Instant::now();
                 let position = black_box(b0_iter.by_ref().position(|value| value == fixture.b0));
                 samples[index].b0.push(began.elapsed());
+                let b0_stats = attribution(b0_iter.stats());
+                assert_accounting(fixture, mode, width, "timed-B0", b0_stats, false);
+                samples[index].b0_stats.push(b0_stats);
                 assert!(
                     position.is_some(),
                     "{} {} width {width}: timed run never emitted B[0]",
@@ -1077,6 +1200,9 @@ fn measure(fixture: &Fixture, width: usize, context: &BenchmarkContext<'_>) {
             let began = Instant::now();
             let full_signature = black_box(signature(full_iter.by_ref()));
             samples[index].full.push(began.elapsed());
+            let full_stats = attribution(full_iter.stats());
+            assert_accounting(fixture, mode, width, "timed-full", full_stats, true);
+            samples[index].full_stats.push(full_stats);
             assert_eq!(full_signature, oracle_signature);
         }
     }
@@ -1121,7 +1247,8 @@ fn measure(fixture: &Fixture, width: usize, context: &BenchmarkContext<'_>) {
             "    first: positive {}/{} direct_rows {} ordinary_support calls/rows {}/{} \
              confirm calls/rows {}/{} source pages/examined {}/{} \
              transition pages/examined {}/{} dispatches terminal/nonterminal {}/{} \
-             D/C/S/retired {}/{}/{}/{} wins exact/support {}/{}",
+             D/C/S/retired {}/{}/{}/{} service E/H {}/{} packets {}/{} qE/qH {}/{} \
+             wins exact/support {}/{}",
             profile.first_stats.positive_terminal,
             profile.first_stats.positive_chunk_homomorphic,
             profile.first_stats.direct_terminal_rows,
@@ -1139,6 +1266,12 @@ fn measure(fixture: &Fixture, width: usize, context: &BenchmarkContext<'_>) {
             profile.first_stats.exact_credited,
             profile.first_stats.support_examined,
             profile.first_stats.credit_retired,
+            profile.first_stats.service_exact_examined,
+            profile.first_stats.service_support_examined,
+            profile.first_stats.service_exact_packets,
+            profile.first_stats.service_support_packets,
+            profile.first_stats.max_service_exact_packet,
+            profile.first_stats.max_service_support_packet,
             profile.first_stats.exact_wins,
             profile.first_stats.support_wins,
         );
@@ -1146,7 +1279,8 @@ fn measure(fixture: &Fixture, width: usize, context: &BenchmarkContext<'_>) {
             "    full:  positive {}/{} direct_rows {} ordinary_support calls/rows {}/{} \
              confirm calls/rows {}/{} source pages/examined {}/{} \
              transition pages/examined {}/{} dispatches terminal/nonterminal {}/{} \
-             D/C/S/retired {}/{}/{}/{} wins exact/support {}/{}",
+             D/C/S/retired {}/{}/{}/{} service E/H {}/{} packets {}/{} qE/qH {}/{} \
+             wins exact/support {}/{}",
             profile.full_stats.positive_terminal,
             profile.full_stats.positive_chunk_homomorphic,
             profile.full_stats.direct_terminal_rows,
@@ -1164,6 +1298,12 @@ fn measure(fixture: &Fixture, width: usize, context: &BenchmarkContext<'_>) {
             profile.full_stats.exact_credited,
             profile.full_stats.support_examined,
             profile.full_stats.credit_retired,
+            profile.full_stats.service_exact_examined,
+            profile.full_stats.service_support_examined,
+            profile.full_stats.service_exact_packets,
+            profile.full_stats.service_support_packets,
+            profile.full_stats.max_service_exact_packet,
+            profile.full_stats.max_service_support_packet,
             profile.full_stats.exact_wins,
             profile.full_stats.support_wins,
         );
@@ -1176,6 +1316,7 @@ fn measure(fixture: &Fixture, width: usize, context: &BenchmarkContext<'_>) {
             *mode,
             "first",
             &samples[index].first,
+            &samples[index].first_stats,
             1,
             first_is_b0,
             profile.first_stats,
@@ -1188,6 +1329,7 @@ fn measure(fixture: &Fixture, width: usize, context: &BenchmarkContext<'_>) {
                 *mode,
                 "b0",
                 &samples[index].b0,
+                &samples[index].b0_stats,
                 profile
                     .b0_position
                     .expect("positive fixture profile omitted B[0]")
@@ -1205,6 +1347,7 @@ fn measure(fixture: &Fixture, width: usize, context: &BenchmarkContext<'_>) {
             *mode,
             "full",
             &samples[index].full,
+            &samples[index].full_stats,
             oracle_signature.count,
             first_is_b0,
             profile.full_stats,
@@ -1212,7 +1355,8 @@ fn measure(fixture: &Fixture, width: usize, context: &BenchmarkContext<'_>) {
     }
 
     let production = &profiles[0];
-    let confirm_only = &profiles[1];
+    let service_debt = &profiles[1];
+    let confirm_only = &profiles[2];
     eprintln!(
         "  production - exact-only full actual-work delta: \
          source_pages {:+} source_examined {:+} transition_pages {:+} \
@@ -1240,6 +1384,35 @@ fn measure(fixture: &Fixture, width: usize, context: &BenchmarkContext<'_>) {
         signed_delta(
             production.full_stats.nonterminal_calls,
             confirm_only.full_stats.nonterminal_calls
+        ),
+    );
+    eprintln!(
+        "  service-debt - production full actual-work delta: \
+         source_pages {:+} source_examined {:+} transition_pages {:+} \
+         transition_examined {:+} terminal_dispatches {:+} nonterminal_dispatches {:+}",
+        signed_delta(
+            service_debt.full_stats.source_pages,
+            production.full_stats.source_pages
+        ),
+        signed_delta(
+            service_debt.full_stats.source_candidates_examined,
+            production.full_stats.source_candidates_examined
+        ),
+        signed_delta(
+            service_debt.full_stats.transition_pages,
+            production.full_stats.transition_pages
+        ),
+        signed_delta(
+            service_debt.full_stats.transition_candidates_examined,
+            production.full_stats.transition_candidates_examined
+        ),
+        signed_delta(
+            service_debt.full_stats.terminal_calls,
+            production.full_stats.terminal_calls
+        ),
+        signed_delta(
+            service_debt.full_stats.nonterminal_calls,
+            production.full_stats.nonterminal_calls
         ),
     );
 }
@@ -1286,8 +1459,9 @@ fn main() {
          run={run_id} revision={revision}"
     );
     eprintln!(
-        "production is the unwrapped OpaqueLeaves+Production lane; exact-only keeps \
-         the same fallback exact Confirm Program but policy-defers only Support."
+        "production is the count-credit scheduler; service-debt keeps the same \
+         exact/Support programs under one query-global examined-service lease; \
+         exact-only policy-defers only Support."
     );
     for fixture in &fixtures {
         for width in WIDTHS {
