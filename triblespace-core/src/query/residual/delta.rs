@@ -961,6 +961,321 @@ struct PositiveSupportWorkGrant {
     granted: usize,
 }
 
+/// Query-global custody of the experimental PositiveSupport service lease.
+///
+/// This is intentionally separate from [`PositiveSupportWorkBudget`] and is
+/// not connected to [`DeltaScheduler`].  It makes the aggregate packet-debt
+/// law executable without changing the production count-credit policy.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PositiveSupportServiceLease {
+    Dormant,
+    Parked,
+    Reserved,
+    RetireAfterReceipt,
+    Retired,
+}
+
+/// Non-cloneable authority for exactly one dispatched Support packet.
+///
+/// Dropping this token leaves the ledger reserved, which is deliberately
+/// fail-closed: no second packet or deep clone can cross the missing receipt.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug)]
+#[must_use = "a Support service packet reservation must be settled exactly once"]
+struct PositiveSupportPacketReservation {
+    brand: RegistryBrand,
+    nonce: u64,
+}
+
+/// Experimental query-global service-debt account for PositiveSupport.
+///
+/// The first demand starts one epoch and authorizes one initial Support
+/// packet.  Later demand arrivals never restart the epoch or mint another
+/// bypass.  Once that packet settles, Support is admissible exactly while its
+/// attributed service is strictly behind Exact service; Exact therefore owns
+/// every tie.
+///
+/// One scalar account proves an aggregate one-Support-packet overshoot, but it
+/// deliberately cannot represent opposite parent-local debts.  A future
+/// runtime would need a separate parent-fairness policy if local latency
+/// matters.  This prototype is private and has no effect on query semantics.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Eq, PartialEq)]
+struct PositiveSupportServiceDebtLedger {
+    brand: RegistryBrand,
+    lease: PositiveSupportServiceLease,
+    initial_bypass_spent: bool,
+    exact_service: u64,
+    support_service: u64,
+    max_exact_packet: u64,
+    max_support_packet: u64,
+    next_packet_nonce: u64,
+    active_packet_nonce: Option<u64>,
+    attribution_tainted: bool,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl PositiveSupportServiceDebtLedger {
+    fn dormant() -> Self {
+        let ledger = Self {
+            brand: RegistryBrand::fresh(),
+            lease: PositiveSupportServiceLease::Dormant,
+            initial_bypass_spent: false,
+            exact_service: 0,
+            support_service: 0,
+            max_exact_packet: 0,
+            max_support_packet: 0,
+            next_packet_nonce: 0,
+            active_packet_nonce: None,
+            attribution_tainted: false,
+        };
+        ledger.assert_affine_custody();
+        ledger
+    }
+
+    /// Starts the one query-global epoch if it has not started already.
+    ///
+    /// The Boolean result is telemetry only: admission depends on the
+    /// persistent epoch state, not on the number of demand arrivals.
+    fn demand_arrived(&mut self) -> bool {
+        let started = if self.lease == PositiveSupportServiceLease::Dormant {
+            self.lease = PositiveSupportServiceLease::Parked;
+            true
+        } else {
+            false
+        };
+        self.assert_affine_custody();
+        started
+    }
+
+    fn support_is_admissible(&self, support_ready: bool) -> bool {
+        self.assert_affine_custody();
+        support_ready
+            && self.lease == PositiveSupportServiceLease::Parked
+            && !self.attribution_tainted
+            && (!self.initial_bypass_spent || self.support_service < self.exact_service)
+    }
+
+    fn reserve_support(&mut self, support_ready: bool) -> Option<PositiveSupportPacketReservation> {
+        if !self.support_is_admissible(support_ready) {
+            return None;
+        }
+
+        self.initial_bypass_spent = true;
+        let nonce = self.next_packet_nonce;
+        self.next_packet_nonce = self
+            .next_packet_nonce
+            .checked_add(1)
+            .expect("positive Support service packet nonce overflow");
+        self.active_packet_nonce = Some(nonce);
+        self.lease = PositiveSupportServiceLease::Reserved;
+        self.assert_affine_custody();
+        Some(PositiveSupportPacketReservation {
+            brand: self.brand,
+            nonce,
+        })
+    }
+
+    fn settle_support(
+        &mut self,
+        reservation: PositiveSupportPacketReservation,
+        service: u64,
+        remains_live: bool,
+    ) {
+        assert!(
+            service > 0,
+            "Support service packets must have positive cost"
+        );
+        assert_eq!(
+            reservation.brand, self.brand,
+            "Support service reservation belongs to another query branch"
+        );
+        assert_eq!(
+            self.active_packet_nonce,
+            Some(reservation.nonce),
+            "Support settled an unknown service packet reservation"
+        );
+        assert!(
+            matches!(
+                self.lease,
+                PositiveSupportServiceLease::Reserved
+                    | PositiveSupportServiceLease::RetireAfterReceipt
+            ),
+            "Support settled without affine packet custody"
+        );
+
+        self.support_service = self
+            .support_service
+            .checked_add(service)
+            .expect("positive Support cumulative service overflow");
+        self.max_support_packet = self.max_support_packet.max(service);
+        self.active_packet_nonce = None;
+        self.lease =
+            if remains_live && self.lease != PositiveSupportServiceLease::RetireAfterReceipt {
+                PositiveSupportServiceLease::Parked
+            } else {
+                PositiveSupportServiceLease::Retired
+            };
+        self.assert_affine_custody();
+        self.assert_packet_bounds_if_attributed();
+    }
+
+    fn settle_exact(&mut self, service: u64) {
+        assert!(service > 0, "Exact service packets must have positive cost");
+        assert_ne!(
+            self.lease,
+            PositiveSupportServiceLease::Dormant,
+            "Exact service cannot enter a PositiveSupport epoch before demand"
+        );
+        assert!(
+            !matches!(
+                self.lease,
+                PositiveSupportServiceLease::Reserved
+                    | PositiveSupportServiceLease::RetireAfterReceipt
+            ),
+            "Exact crossed an unsettled Support packet reservation"
+        );
+
+        self.exact_service = self
+            .exact_service
+            .checked_add(service)
+            .expect("positive Exact cumulative service overflow");
+        self.max_exact_packet = self.max_exact_packet.max(service);
+        self.assert_affine_custody();
+        self.assert_packet_bounds_if_attributed();
+    }
+
+    fn cancel_support(&mut self) {
+        self.lease = match self.lease {
+            PositiveSupportServiceLease::Dormant | PositiveSupportServiceLease::Parked => {
+                PositiveSupportServiceLease::Retired
+            }
+            PositiveSupportServiceLease::Reserved
+            | PositiveSupportServiceLease::RetireAfterReceipt => {
+                PositiveSupportServiceLease::RetireAfterReceipt
+            }
+            PositiveSupportServiceLease::Retired => PositiveSupportServiceLease::Retired,
+        };
+        self.assert_affine_custody();
+    }
+
+    /// Permanently invalidates this epoch's service proof.
+    ///
+    /// The missing charge may reverse which lane is behind, so demand cannot
+    /// reset this flag and no further Support packet is admitted from these
+    /// totals.  A weaker scheduler may still complete the exact spine.
+    fn taint_unattributed(&mut self) {
+        assert!(
+            !matches!(
+                self.lease,
+                PositiveSupportServiceLease::Reserved
+                    | PositiveSupportServiceLease::RetireAfterReceipt
+            ),
+            "service attribution cannot be lost across an unsettled Support receipt"
+        );
+        assert_ne!(
+            self.lease,
+            PositiveSupportServiceLease::Dormant,
+            "an unstarted PositiveSupport epoch cannot lose attribution"
+        );
+        self.attribution_tainted = true;
+        self.assert_affine_custody();
+    }
+
+    /// Deep-clones only a quiescent affine component and rebrands it.
+    fn try_deep_clone(&self) -> Option<Self> {
+        self.assert_affine_custody();
+        if self.active_packet_nonce.is_some() {
+            return None;
+        }
+        Some(Self {
+            brand: RegistryBrand::fresh(),
+            lease: self.lease,
+            initial_bypass_spent: self.initial_bypass_spent,
+            exact_service: self.exact_service,
+            support_service: self.support_service,
+            max_exact_packet: self.max_exact_packet,
+            max_support_packet: self.max_support_packet,
+            next_packet_nonce: self.next_packet_nonce,
+            active_packet_nonce: None,
+            attribution_tainted: self.attribution_tainted,
+        })
+    }
+
+    fn assert_affine_custody(&self) {
+        let reservation_live = matches!(
+            self.lease,
+            PositiveSupportServiceLease::Reserved | PositiveSupportServiceLease::RetireAfterReceipt
+        );
+        assert_eq!(
+            reservation_live,
+            self.active_packet_nonce.is_some(),
+            "PositiveSupport lease and packet reservation custody diverged"
+        );
+        if self.lease == PositiveSupportServiceLease::Dormant {
+            assert!(
+                !self.initial_bypass_spent
+                    && self.exact_service == 0
+                    && self.support_service == 0
+                    && self.max_exact_packet == 0
+                    && self.max_support_packet == 0
+                    && !self.attribution_tainted,
+                "dormant PositiveSupport epoch retained service history"
+            );
+        }
+        assert!(
+            self.support_service == 0 || self.initial_bypass_spent,
+            "Support service appeared before the initial affine bypass"
+        );
+        assert_eq!(
+            self.exact_service == 0,
+            self.max_exact_packet == 0,
+            "Exact service total and maximum packet presence diverged"
+        );
+        assert_eq!(
+            self.support_service == 0,
+            self.max_support_packet == 0,
+            "Support service total and maximum packet presence diverged"
+        );
+    }
+
+    fn assert_packet_bounds_if_attributed(&self) {
+        if self.attribution_tainted {
+            return;
+        }
+        self.assert_packet_bounds();
+    }
+
+    fn assert_packet_bounds(&self) {
+        assert!(
+            !self.attribution_tainted,
+            "an unattributed packet permanently tainted this service epoch"
+        );
+        assert!(
+            self.support_service
+                <= self
+                    .exact_service
+                    .checked_add(self.max_support_packet)
+                    .expect("Support service packet bound overflow"),
+            "Support crossed the query-global one-packet overshoot"
+        );
+        if !matches!(
+            self.lease,
+            PositiveSupportServiceLease::Dormant | PositiveSupportServiceLease::Retired
+        ) {
+            assert!(
+                self.exact_service
+                    <= self
+                        .support_service
+                        .checked_add(self.max_exact_packet)
+                        .expect("Exact service packet bound overflow"),
+                "Exact crossed one packet ahead while Support remained live"
+            );
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct PositiveExactWorkAccounting {
     paired: bool,
@@ -10063,6 +10378,248 @@ mod tests {
         assert_eq!(budget.retired, 3);
         assert_eq!(budget.available(), 0);
         budget.assert_conservation();
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum TestServiceLane {
+        Exact,
+        Support,
+    }
+
+    fn next_service_lane(ledger: &PositiveSupportServiceDebtLedger) -> TestServiceLane {
+        if ledger.support_is_admissible(true) {
+            TestServiceLane::Support
+        } else {
+            TestServiceLane::Exact
+        }
+    }
+
+    fn run_support_service_packet(
+        ledger: &mut PositiveSupportServiceDebtLedger,
+        service: u64,
+        remains_live: bool,
+        trace: &mut Vec<TestServiceLane>,
+    ) {
+        assert_eq!(next_service_lane(ledger), TestServiceLane::Support);
+        let reservation = ledger
+            .reserve_support(true)
+            .expect("selected Support packet must reserve the global lease");
+        ledger.settle_support(reservation, service, remains_live);
+        trace.push(TestServiceLane::Support);
+    }
+
+    fn run_exact_service_packet(
+        ledger: &mut PositiveSupportServiceDebtLedger,
+        service: u64,
+        trace: &mut Vec<TestServiceLane>,
+    ) {
+        assert_eq!(next_service_lane(ledger), TestServiceLane::Exact);
+        ledger.settle_exact(service);
+        trace.push(TestServiceLane::Exact);
+    }
+
+    #[test]
+    fn positive_support_service_debt_recycles_after_three_exact_packets() {
+        let mut ledger = PositiveSupportServiceDebtLedger::dormant();
+        let mut trace = Vec::new();
+        assert!(ledger.demand_arrived());
+
+        run_support_service_packet(&mut ledger, 5, true, &mut trace);
+        for _ in 0..3 {
+            run_exact_service_packet(&mut ledger, 2, &mut trace);
+        }
+        run_support_service_packet(&mut ledger, 1, true, &mut trace);
+
+        assert_eq!(
+            trace,
+            [
+                TestServiceLane::Support,
+                TestServiceLane::Exact,
+                TestServiceLane::Exact,
+                TestServiceLane::Exact,
+                TestServiceLane::Support,
+            ],
+            "H=5 / E=2,2,2 / H=1 is the mandatory aggregate-debt trace"
+        );
+        assert_eq!((ledger.support_service, ledger.exact_service), (6, 6));
+        assert_eq!((ledger.max_support_packet, ledger.max_exact_packet), (5, 2));
+        assert_eq!(
+            next_service_lane(&ledger),
+            TestServiceLane::Exact,
+            "Exact must own the restored service tie"
+        );
+        ledger.assert_packet_bounds();
+    }
+
+    #[test]
+    fn positive_support_service_debt_recycles_unit_support_until_exact_tie() {
+        let mut ledger = PositiveSupportServiceDebtLedger::dormant();
+        let mut trace = Vec::new();
+        assert!(ledger.demand_arrived());
+
+        run_support_service_packet(&mut ledger, 1, true, &mut trace);
+        run_exact_service_packet(&mut ledger, 8, &mut trace);
+        for _ in 0..7 {
+            run_support_service_packet(&mut ledger, 1, true, &mut trace);
+        }
+
+        assert_eq!((ledger.support_service, ledger.exact_service), (8, 8));
+        assert_eq!(trace.len(), 9);
+        assert_eq!(
+            trace[0..2],
+            [TestServiceLane::Support, TestServiceLane::Exact]
+        );
+        assert!(
+            trace[2..]
+                .iter()
+                .all(|lane| *lane == TestServiceLane::Support),
+            "one E=8 packet must recycle seven unit Support packets"
+        );
+        assert_eq!(next_service_lane(&ledger), TestServiceLane::Exact);
+        ledger.assert_packet_bounds();
+    }
+
+    #[test]
+    fn positive_support_service_debt_pays_one_large_initial_packet_only() {
+        let mut ledger = PositiveSupportServiceDebtLedger::dormant();
+        let mut trace = Vec::new();
+        assert!(ledger.demand_arrived());
+
+        run_support_service_packet(&mut ledger, 100, true, &mut trace);
+        for _ in 0..101 {
+            run_exact_service_packet(&mut ledger, 1, &mut trace);
+        }
+        run_support_service_packet(&mut ledger, 1, true, &mut trace);
+
+        assert_eq!((ledger.support_service, ledger.exact_service), (101, 101));
+        assert_eq!(trace.first(), Some(&TestServiceLane::Support));
+        assert_eq!(trace.last(), Some(&TestServiceLane::Support));
+        assert!(
+            trace[1..102]
+                .iter()
+                .all(|lane| *lane == TestServiceLane::Exact),
+            "H=100 must let 101 unit Exact packets cross the tie before H recycles"
+        );
+        assert_eq!(
+            (ledger.max_support_packet, ledger.max_exact_packet),
+            (100, 1)
+        );
+        ledger.assert_packet_bounds();
+    }
+
+    #[test]
+    fn positive_support_service_debt_has_one_bypass_across_demand_arrivals() {
+        let mut ledger = PositiveSupportServiceDebtLedger::dormant();
+        assert!(ledger.demand_arrived());
+        assert!(!ledger.demand_arrived());
+        assert!(!ledger.demand_arrived());
+
+        let initial = ledger
+            .reserve_support(true)
+            .expect("the first epoch demand authorizes one initial packet");
+        ledger.settle_support(initial, 5, true);
+        assert!(!ledger.demand_arrived());
+        assert!(!ledger.support_is_admissible(true));
+        assert!(
+            ledger.reserve_support(true).is_none(),
+            "later public pulls must not mint another query-global bypass"
+        );
+
+        ledger.settle_exact(6);
+        assert!(ledger.support_is_admissible(true));
+    }
+
+    #[test]
+    fn positive_support_service_debt_cancellation_waits_for_inflight_settlement() {
+        trait AmbiguousIfClone<Marker> {
+            fn marker() {}
+        }
+        impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+        struct CloneMarker;
+        impl<T: Clone> AmbiguousIfClone<CloneMarker> for T {}
+        let _ = <PositiveSupportPacketReservation as AmbiguousIfClone<_>>::marker;
+
+        let mut ledger = PositiveSupportServiceDebtLedger::dormant();
+        assert!(ledger.demand_arrived());
+        let original_brand = ledger.brand;
+        let reservation = ledger
+            .reserve_support(true)
+            .expect("initial Support packet reservation");
+
+        assert!(
+            ledger.reserve_support(true).is_none(),
+            "one affine lease cannot reserve two Support packets"
+        );
+        assert!(
+            ledger.try_deep_clone().is_none(),
+            "a query clone must not cross an unsettled Support receipt"
+        );
+        ledger.cancel_support();
+        assert_eq!(
+            ledger.lease,
+            PositiveSupportServiceLease::RetireAfterReceipt
+        );
+        assert!(ledger.active_packet_nonce.is_some());
+        assert!(ledger.try_deep_clone().is_none());
+
+        ledger.settle_support(reservation, 3, true);
+        assert_eq!(ledger.lease, PositiveSupportServiceLease::Retired);
+        assert_eq!(ledger.support_service, 3);
+        assert!(ledger.active_packet_nonce.is_none());
+
+        let clone = ledger
+            .try_deep_clone()
+            .expect("settled affine custody may be deep-cloned");
+        assert_ne!(clone.brand, original_brand);
+        assert_eq!(clone.lease, PositiveSupportServiceLease::Retired);
+        assert_eq!(clone.support_service, ledger.support_service);
+    }
+
+    #[test]
+    fn positive_support_service_debt_taint_is_permanent_and_fail_closed() {
+        let mut ledger = PositiveSupportServiceDebtLedger::dormant();
+        let mut trace = Vec::new();
+        assert!(ledger.demand_arrived());
+        run_support_service_packet(&mut ledger, 1, true, &mut trace);
+        run_exact_service_packet(&mut ledger, 3, &mut trace);
+        assert!(ledger.support_is_admissible(true));
+
+        ledger.taint_unattributed();
+        assert!(ledger.attribution_tainted);
+        assert!(!ledger.support_is_admissible(true));
+        assert!(!ledger.demand_arrived());
+        assert!(
+            ledger.reserve_support(true).is_none(),
+            "demand cannot revive a poisoned service epoch"
+        );
+
+        ledger.settle_exact(100);
+        assert!(
+            std::panic::catch_unwind(|| ledger.assert_packet_bounds()).is_err(),
+            "a tainted ledger must refuse to claim the packet theorem"
+        );
+        let clone = ledger
+            .try_deep_clone()
+            .expect("taint alone does not strand affine custody");
+        assert!(clone.attribution_tainted);
+        assert!(!clone.support_is_admissible(true));
+    }
+
+    #[test]
+    #[should_panic(expected = "Support service packets must have positive cost")]
+    fn positive_support_service_debt_rejects_zero_cost_packets() {
+        let mut ledger = PositiveSupportServiceDebtLedger::dormant();
+        assert!(ledger.demand_arrived());
+        let reservation = ledger.reserve_support(true).unwrap();
+        ledger.settle_support(reservation, 0, true);
+    }
+
+    #[test]
+    #[should_panic(expected = "Exact service packets must have positive cost")]
+    fn positive_support_service_debt_rejects_zero_cost_exact_packets() {
+        let mut ledger = PositiveSupportServiceDebtLedger::dormant();
+        assert!(ledger.demand_arrived());
+        ledger.settle_exact(0);
     }
 
     #[test]
