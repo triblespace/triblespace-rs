@@ -91,6 +91,34 @@ struct DemandGrant {
     parent: ParentId,
 }
 
+/// Query-global affine authority contributed by one active public pull.
+///
+/// Beginning is idempotent so recovery after a caught projection panic cannot
+/// duplicate demand. Assignment transfers the token to exactly one registered
+/// parent; an unassigned token may instead be retired when the pull returns.
+#[derive(Debug, Default)]
+struct PublicPullDemand {
+    unassigned: bool,
+}
+
+impl PublicPullDemand {
+    fn begin(&mut self) {
+        self.unassigned = true;
+    }
+
+    fn assign(&mut self, budget: &mut WorkBudget, parent: ParentId) -> bool {
+        if !std::mem::take(&mut self.unassigned) {
+            return false;
+        }
+        budget.assign_demand(DemandGrant { parent });
+        true
+    }
+
+    fn retire_unassigned(&mut self) -> bool {
+        std::mem::take(&mut self.unassigned)
+    }
+}
+
 /// Source-specific affine evidence minted by an incremental exact receipt.
 ///
 /// Its generation belongs only to the publication race. Exact completion has
@@ -254,6 +282,18 @@ impl WorkBudget {
             .parents
             .get(&parent)
             .expect("unknown positive-hedge parent")
+    }
+
+    fn assign_demand(&mut self, grant: DemandGrant) {
+        let account = self
+            .parents
+            .get_mut(&grant.parent)
+            .expect("public demand named an unknown positive-hedge parent");
+        account.demand_minted = account
+            .demand_minted
+            .checked_add(1)
+            .expect("demand-credit counter overflow");
+        self.assert_conserved();
     }
 
     fn available(&self, parent: ParentId) -> usize {
@@ -1129,6 +1169,44 @@ fn no_live_demand_creates_no_support_work() {
     ));
     hedge.settle_exact(exact.completion.take().unwrap());
     assert_eq!(hedge.observed_output(), BTreeSet::from([1, 2]));
+}
+
+#[test]
+fn one_public_pull_demand_assigns_to_exactly_one_parent_or_retires() {
+    let left = ParentId(1);
+    let right = ParentId(2);
+    let mut budget = WorkBudget::default();
+    budget.register(left, Vec::new());
+    budget.register(right, Vec::new());
+    let mut demand = PublicPullDemand::default();
+
+    // Re-entering after a caught projection panic preserves the same affine
+    // token instead of minting another one.
+    demand.begin();
+    demand.begin();
+    assert!(demand.assign(&mut budget, left));
+    assert!(
+        !demand.assign(&mut budget, right),
+        "one query-global pull sponsored two semantic parents"
+    );
+    assert_eq!(budget.available(left), 1);
+    assert_eq!(budget.available(right), 0);
+    budget.spend(left, 1);
+
+    demand.begin();
+    assert!(demand.retire_unassigned());
+    assert!(!demand.retire_unassigned());
+    assert!(
+        !demand.assign(&mut budget, right),
+        "retired unassigned demand was replayed"
+    );
+
+    demand.begin();
+    assert!(demand.assign(&mut budget, right));
+    assert_eq!(budget.available(left), 0);
+    assert_eq!(budget.available(right), 1);
+    budget.spend(right, 1);
+    budget.assert_conserved();
 }
 
 #[test]
