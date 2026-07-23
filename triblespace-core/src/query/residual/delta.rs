@@ -663,16 +663,56 @@ impl PositivePublicationCertificate {
     }
 }
 
-/// Borrow-free physical address for a future positive child.
+/// Borrow-free prevalidated semantic claim request for a future positive child.
 ///
 /// Equal values under one parent intentionally have equal addresses. The
 /// scheduler publishes by `(semantic parent, value)`, never by bag occurrence.
+///
+/// This copyable request is deliberately only the dormant typed seam. A
+/// production caller must instead supply a validated, non-Clone physical
+/// Support-child witness; that witness and its brand-bearing lifecycle are the
+/// next integration step.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PositiveChildAddress {
     parent: PositiveConfirmParentId,
     generation: u64,
     value: RawInline,
+}
+
+/// One semantic Terminal origin that must be introduced to the outer
+/// projected-yield ledger before a batch carrying it is staged.
+///
+/// This is affine propagation metadata, so it is intentionally neither
+/// [`Clone`] nor [`Copy`].
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug)]
+#[must_use = "a terminal origin registration must reach the yield ledger"]
+pub(super) struct TerminalOriginRegistration {
+    pub(super) family: StateId,
+    pub(super) origin: ActivationId,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+enum PositivePublicationRoute {
+    Terminal {
+        origin: ActivationId,
+        full: VariableSet,
+        registration: Option<TerminalOriginRegistration>,
+    },
+    ChunkHomomorphic,
+}
+
+/// Affine authority to release one value whose positive publication has
+/// already won its semantic parent's SET ledger.
+#[cfg_attr(not(test), allow(dead_code))]
+#[must_use = "a committed positive publication must be released exactly once"]
+struct PositivePublicationGrant {
+    value: RawInline,
+    /// Cloned only from the authoritative Confirm activation after every
+    /// release precondition has passed.
+    return_to: DeltaReturn,
+    route: PositivePublicationRoute,
 }
 
 /// Dormant scheduler-owned publication state attached to the authoritative
@@ -1075,8 +1115,10 @@ struct DeltaStreamingReturn {
 }
 
 /// Full-bound rows published by terminal streaming activations, with one
-/// exact affine origin per row.  Origin is physical evidence for the outer
-/// projected-yield ledger; it never enters canonical residual identity.
+/// exact affine origin per row. Origin is the semantic publication identity
+/// for the outer projected-yield ledger; it never enters canonical residual
+/// identity. Ordinary terminal streaming happens to use its physical
+/// activation as that semantic origin.
 #[derive(Debug)]
 pub(super) struct TerminalPublicationBatch {
     pub(super) rows: RowBatch,
@@ -1084,18 +1126,37 @@ pub(super) struct TerminalPublicationBatch {
     /// Keep that exact origin inline; wider/mixed cohorts spill only when
     /// they actually need more storage.
     pub(super) origins: SmallVec<[ActivationId; 1]>,
+    /// Semantic origins that must be registered before any row in this batch
+    /// is staged. Ordinary terminal batches carry none; the first positive
+    /// winner for one Confirm parent carries exactly one.
+    pub(super) registrations: SmallVec<[TerminalOriginRegistration; 1]>,
 }
 
 impl TerminalPublicationBatch {
     fn new(activation: ActivationId, rows: RowBatch) -> Self {
+        Self::new_with_registration(activation, rows, None)
+    }
+
+    fn new_with_registration(
+        activation: ActivationId,
+        rows: RowBatch,
+        registration: Option<TerminalOriginRegistration>,
+    ) -> Self {
         let mut origins = SmallVec::new();
         origins.resize(rows.row_count, activation);
-        Self { rows, origins }
+        let mut registrations = SmallVec::new();
+        registrations.extend(registration);
+        Self {
+            rows,
+            origins,
+            registrations,
+        }
     }
 
     fn append(&mut self, mut other: Self) {
         self.rows.append(other.rows);
         self.origins.extend(other.origins.drain(..));
+        self.registrations.extend(other.registrations.drain(..));
         debug_assert_eq!(self.origins.len(), self.rows.row_count);
     }
 }
@@ -1104,8 +1165,8 @@ impl TerminalPublicationBatch {
 struct DeltaStableEffects {
     continuation: Option<ContinuationToken>,
     /// Full-bound raw rows ready for the outer iterator's ordinary staging
-    /// buffer. This is a physical publication receipt, never a canonical
-    /// delta or stable state.
+    /// buffer. This is a semantic-origin-bearing publication receipt, never
+    /// a canonical delta or stable state.
     publication: Option<TerminalPublicationBatch>,
 }
 
@@ -1254,36 +1315,98 @@ impl ProducerRegistry {
     /// Parent identity, query-clone brand, generation, open Confirm reducer,
     /// fixed original candidate bag, and certificate are revalidated before
     /// the first `(parent, value)` insertion wins. Every later or malformed
-    /// hedge is an inert `false`.
+    /// hedge is an inert `None`.
+    ///
+    /// The current copyable `address` is only a prevalidated semantic claim
+    /// request for this dormant seam. This private method must remain dead
+    /// outside tests until a production caller can pass a validated, non-Clone
+    /// physical Support-child witness with the correct brand and lifecycle.
+    ///
+    /// The returned private grant is an affine contract, not runtime-enforced
+    /// linearity: that eventual production caller must consume it immediately
+    /// with `release_positive_publication`, before performing fallible work.
+    /// In particular, the outer `direct_terminal_full` must arrive here
+    /// unfiltered by the physical child activation's class.
     #[cfg_attr(not(test), allow(dead_code))]
     fn commit_positive_publication(
         &mut self,
         expected_parent: PositiveConfirmParentId,
         address: PositiveChildAddress,
-    ) -> bool {
+        direct_terminal_full: Option<VariableSet>,
+    ) -> Option<PositivePublicationGrant> {
         if address.parent != expected_parent || expected_parent.brand != self.brand {
-            return false;
+            return None;
         }
         let Some(activation) = self.state.activations.get_mut(&expected_parent.activation) else {
-            return false;
+            return None;
         };
         let DeltaReducer::Confirm { original } = &activation.reducer else {
-            return false;
+            return None;
+        };
+        let DeltaReturn::Stable {
+            desc,
+            parent,
+            set_admit_result,
+        } = &activation.return_to
+        else {
+            return None;
         };
         let Some(registration) = activation.positive_publication.as_deref_mut() else {
-            return false;
+            return None;
         };
         let PositivePublicationRegistration::Eligible(ledger) = registration else {
-            return false;
+            return None;
         };
         if !ledger.open
             || ledger.generation != address.generation
             || !ledger.certificate.eligible()
             || !original.one_parent_values().contains(&address.value)
+            || ledger.published.contains(&address.value)
+            || parent.len() != desc.bound.count()
+            || *set_admit_result != ledger.certificate.crosses_set_boundary
         {
-            return false;
+            return None;
         }
-        ledger.published.insert(address.value)
+        let route = match ledger.certificate.continuation {
+            ContinuationPublicationReceipt::Terminal => {
+                let full = direct_terminal_full?;
+                if !commits_final_checked_candidate(desc, full) {
+                    return None;
+                }
+                let registration =
+                    ledger
+                        .published
+                        .is_empty()
+                        .then_some(TerminalOriginRegistration {
+                            family: ledger.confirm_state,
+                            origin: expected_parent.activation,
+                        });
+                PositivePublicationRoute::Terminal {
+                    origin: expected_parent.activation,
+                    full,
+                    registration,
+                }
+            }
+            ContinuationPublicationReceipt::ChunkHomomorphic => {
+                if !ledger.certificate.crosses_set_boundary
+                    || !matches!(&desc.phase, ResidualPhase::Candidate { .. })
+                {
+                    return None;
+                }
+                PositivePublicationRoute::ChunkHomomorphic
+            }
+            ContinuationPublicationReceipt::Barrier => return None,
+        };
+        let return_to = activation.return_to.clone();
+        assert!(
+            ledger.published.insert(address.value),
+            "preflighted positive publication lost its first-winner race"
+        );
+        Some(PositivePublicationGrant {
+            value: address.value,
+            return_to,
+            route,
+        })
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -6009,6 +6132,79 @@ impl DeltaScheduler {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn release_positive_publication(
+        grant: PositivePublicationGrant,
+        plan: &ResidualPlan,
+        stable: &mut Worklist,
+        stable_interner: &mut StateInterner,
+        stats: &mut ResidualStateStats,
+    ) -> DeltaStableEffects {
+        let PositivePublicationGrant {
+            value,
+            return_to,
+            route,
+        } = grant;
+        let DeltaReturn::Stable { desc, parent, .. } = return_to else {
+            unreachable!("a preflighted positive publication lost its Stable return")
+        };
+        let batch = CandidateBatch {
+            parents: RowBatch {
+                rows: parent.into_vec(),
+                row_count: 1,
+            },
+            candidates: CandidatePayload::Values(vec![value]),
+        };
+        match route {
+            PositivePublicationRoute::Terminal {
+                origin,
+                full,
+                registration,
+            } => {
+                let ResidualPhase::Candidate { variable, .. } = &desc.phase else {
+                    unreachable!("a preflighted Terminal publication lost its Candidate return")
+                };
+                let (committed, rows) =
+                    committed_candidate_rows(desc.bound, *variable, batch);
+                debug_assert_eq!(
+                    committed, full,
+                    "a preflighted Terminal publication changed its full schema"
+                );
+                debug_assert_eq!(
+                    rows.row_count, 1,
+                    "a positive Terminal singleton did not commit exactly one row"
+                );
+                DeltaStableEffects {
+                    continuation: None,
+                    publication: Some(TerminalPublicationBatch::new_with_registration(
+                        origin,
+                        rows,
+                        registration,
+                    )),
+                }
+            }
+            PositivePublicationRoute::ChunkHomomorphic => {
+                // Preflight proved a Stable Candidate descriptor, and this
+                // function constructs exactly one parent with one candidate.
+                // `file_with_plan` can therefore return `None` only if that
+                // nonempty invariant was broken internally.
+                let continuation = file_with_plan(
+                    stable,
+                    stable_interner,
+                    plan,
+                    desc,
+                    StateBucket::Candidates(batch),
+                    stats,
+                )
+                .expect("a positive ChunkHomomorphic singleton filed no continuation");
+                DeltaStableEffects {
+                    continuation: Some(continuation),
+                    publication: None,
+                }
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn release_streaming(
         &mut self,
@@ -9555,11 +9751,14 @@ mod tests {
     }
 
     #[derive(Clone, Copy)]
-    struct PositiveCertificateLeaf;
+    struct PositiveCertificateLeaf {
+        variable: VariableId,
+        page_local: bool,
+    }
 
     impl Constraint<'static> for PositiveCertificateLeaf {
         fn variables(&self) -> VariableSet {
-            VariableSet::new_singleton(0)
+            VariableSet::new_singleton(self.variable)
         }
 
         fn fixed_denotation(&self) -> bool {
@@ -9572,7 +9771,7 @@ mod tests {
             view: &RowsView<'_>,
             out: &mut EstimateSink<'_>,
         ) -> bool {
-            if variable != 0 {
+            if variable != self.variable {
                 return false;
             }
             out.fill(1, view.len());
@@ -9594,10 +9793,65 @@ mod tests {
             _candidates: &mut CandidateSink<'_>,
         ) {
         }
+
+        fn residual_confirm_is_page_local(&self) -> bool {
+            self.page_local
+        }
+    }
+
+    fn positive_candidate_return(
+        parent: Vec<RawInline>,
+        bound: VariableSet,
+        variable: VariableId,
+        relevant: ChildSet,
+        checked: ChildSet,
+        set_admit_result: bool,
+    ) -> DeltaReturn {
+        DeltaReturn::Stable {
+            desc: StateDesc {
+                bound,
+                phase: ResidualPhase::Candidate {
+                    variable,
+                    relevant,
+                    checked,
+                },
+            },
+            parent: parent.into_boxed_slice(),
+            set_admit_result,
+        }
+    }
+
+    fn terminal_positive_return(parent: Vec<RawInline>) -> DeltaReturn {
+        let relevant = ChildSet::empty(1).with_inserted(0);
+        positive_candidate_return(
+            parent,
+            VariableSet::new_empty(),
+            0,
+            relevant.clone(),
+            relevant,
+            true,
+        )
+    }
+
+    fn terminal_positive_full() -> VariableSet {
+        VariableSet::new_singleton(0)
+    }
+
+    fn commit_terminal_positive(
+        registry: &mut ProducerRegistry,
+        parent: PositiveConfirmParentId,
+        address: PositiveChildAddress,
+    ) -> bool {
+        registry
+            .commit_positive_publication(parent, address, Some(terminal_positive_full()))
+            .is_some()
     }
 
     fn terminal_positive_certificate() -> PositivePublicationCertificate {
-        let root = PositiveCertificateLeaf;
+        let root = PositiveCertificateLeaf {
+            variable: 0,
+            page_local: false,
+        };
         let plan = ResidualPlan::compile(&root);
         let relevant = ChildSet::empty(plan.len()).with_inserted(0);
         let checked = ChildSet::empty(plan.len());
@@ -9627,15 +9881,87 @@ mod tests {
         )
     }
 
+    fn chunk_positive_fixture() -> (
+        ResidualPlan,
+        StateDesc,
+        PositivePublicationCertificate,
+        VariableSet,
+    ) {
+        let root = IntersectionConstraint::new(vec![
+            PositiveCertificateLeaf {
+                variable: 0,
+                page_local: false,
+            },
+            PositiveCertificateLeaf {
+                variable: 0,
+                page_local: true,
+            },
+            PositiveCertificateLeaf {
+                variable: 1,
+                page_local: false,
+            },
+        ]);
+        let plan = ResidualPlan::compile(&root);
+        let relevant = ChildSet::empty(plan.len())
+            .with_inserted(0)
+            .with_inserted(1);
+        let checked = ChildSet::empty(plan.len());
+        let previous = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Confirm {
+                variable: 0,
+                relevant: relevant.clone(),
+                checked: checked.clone(),
+                confirmer: 0,
+            },
+        };
+        let successor = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Candidate {
+                variable: 0,
+                relevant,
+                checked: checked.with_inserted(0),
+            },
+        };
+        let full = root.variables();
+        let certificate = PositivePublicationCertificate::from_confirm_transition(
+            &previous,
+            &successor,
+            full,
+            &plan,
+            &FormulaPcInterner::default(),
+        );
+        assert_eq!(
+            certificate.continuation,
+            ContinuationPublicationReceipt::ChunkHomomorphic
+        );
+        assert!(certificate.crosses_set_boundary);
+        (plan, successor, certificate, full)
+    }
+
     fn open_positive_confirm(
         registry: &mut ProducerRegistry,
         values: impl IntoIterator<Item = RawInline>,
         certificate: PositivePublicationCertificate,
     ) -> (ActivationId, PositiveConfirmParentId) {
+        open_positive_confirm_with_return(
+            registry,
+            values,
+            certificate,
+            terminal_positive_return(Vec::new()),
+        )
+    }
+
+    fn open_positive_confirm_with_return(
+        registry: &mut ProducerRegistry,
+        values: impl IntoIterator<Item = RawInline>,
+        certificate: PositivePublicationCertificate,
+        return_to: DeltaReturn,
+    ) -> (ActivationId, PositiveConfirmParentId) {
         let original = shared_one_parent_candidates(values.into_iter().collect());
         let activation = registry.open_program_activation(
             DeltaReducer::Confirm { original },
-            stable_return(Vec::new()),
+            return_to,
             None,
             None,
         );
@@ -9643,6 +9969,47 @@ mod tests {
             .open_positive_publication(activation, StateId(17), certificate)
             .expect("Confirm activation should register a semantic parent");
         (activation, parent)
+    }
+
+    fn terminal_positive_commit_fixture() -> (
+        ProducerRegistry,
+        ActivationId,
+        PositiveConfirmParentId,
+        PositiveChildAddress,
+    ) {
+        let candidate = value(6);
+        let mut registry = ProducerRegistry::new();
+        let (activation, parent) = open_positive_confirm(
+            &mut registry,
+            [candidate],
+            terminal_positive_certificate(),
+        );
+        let address = registry
+            .positive_child_address(parent, candidate)
+            .expect("eligible candidate should receive an address");
+        (registry, activation, parent, address)
+    }
+
+    fn assert_terminal_positive_preflight_rejected(
+        direct_terminal_full: Option<VariableSet>,
+        mutate: impl FnOnce(&mut ProducerRegistry, ActivationId),
+    ) {
+        let (mut registry, activation, parent, address) =
+            terminal_positive_commit_fixture();
+        mutate(&mut registry, activation);
+        assert!(
+            registry
+                .commit_positive_publication(parent, address, direct_terminal_full)
+                .is_none()
+        );
+        assert!(
+            registry
+                .positive_publication_snapshot(parent)
+                .expect("eligible parent retained its ledger")
+                .published
+                .is_empty(),
+            "a rejected preflight mutated P"
+        );
     }
 
     fn quiesce_confirm_with_accepted(
@@ -10572,6 +10939,374 @@ mod tests {
     }
 
     #[test]
+    fn positive_commit_preflights_release_before_first_winner() {
+        assert_terminal_positive_preflight_rejected(None, |_, _| {});
+        assert_terminal_positive_preflight_rejected(
+            Some(VariableSet::new_empty()),
+            |_, _| {},
+        );
+        assert_terminal_positive_preflight_rejected(
+            Some(terminal_positive_full()),
+            |registry, activation| {
+                let DeltaReturn::Stable {
+                    set_admit_result, ..
+                } = &mut registry
+                    .state
+                    .activations
+                    .get_mut(&activation)
+                    .unwrap()
+                    .return_to
+                else {
+                    unreachable!()
+                };
+                *set_admit_result = false;
+            },
+        );
+        assert_terminal_positive_preflight_rejected(
+            Some(terminal_positive_full()),
+            |registry, activation| {
+                let DeltaReturn::Stable { parent, .. } =
+                    &mut registry
+                        .state
+                        .activations
+                        .get_mut(&activation)
+                        .unwrap()
+                        .return_to
+                else {
+                    unreachable!()
+                };
+                *parent = vec![value(99)].into_boxed_slice();
+            },
+        );
+        assert_terminal_positive_preflight_rejected(
+            Some(terminal_positive_full()),
+            |registry, activation| {
+                let DeltaReturn::Stable { desc, .. } =
+                    &mut registry
+                        .state
+                        .activations
+                        .get_mut(&activation)
+                        .unwrap()
+                        .return_to
+                else {
+                    unreachable!()
+                };
+                let ResidualPhase::Candidate { checked, .. } = &mut desc.phase else {
+                    unreachable!()
+                };
+                *checked = ChildSet::empty(1);
+            },
+        );
+        assert_terminal_positive_preflight_rejected(
+            Some(terminal_positive_full()),
+            |registry, activation| {
+                registry.state.activations.get_mut(&activation).unwrap().return_to =
+                    DeltaReturn::Formula {
+                        bound: VariableSet::new_empty(),
+                        counter: FormulaPcId(0),
+                        batch: formula_or_reducer_batch(&[]),
+                    };
+            },
+        );
+        assert_terminal_positive_preflight_rejected(
+            Some(terminal_positive_full()),
+            |registry, activation| {
+                let Some(PositivePublicationRegistration::Eligible(ledger)) = registry
+                    .state
+                    .activations
+                    .get_mut(&activation)
+                    .unwrap()
+                    .positive_publication
+                    .as_deref_mut()
+                else {
+                    unreachable!()
+                };
+                ledger.certificate.continuation = ContinuationPublicationReceipt::Barrier;
+            },
+        );
+
+        let (mut registry, _, parent, address) = terminal_positive_commit_fixture();
+        let candidate = address.value;
+        let grant = registry
+            .commit_positive_publication(
+                parent,
+                address,
+                Some(terminal_positive_full()),
+            )
+            .expect("the completely preflighted first value must win");
+        assert!(matches!(
+            &grant.route,
+            PositivePublicationRoute::Terminal {
+                registration: Some(_),
+                ..
+            }
+        ));
+        let root = PositiveCertificateLeaf {
+            variable: 0,
+            page_local: false,
+        };
+        let plan = ResidualPlan::compile(&root);
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let release = DeltaScheduler::release_positive_publication(
+            grant,
+            &plan,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert!(release.publication.is_some());
+        assert_eq!(
+            registry
+                .positive_publication_snapshot(parent)
+                .unwrap()
+                .published,
+            BTreeSet::from([candidate])
+        );
+        assert!(
+            registry
+                .commit_positive_publication(
+                    parent,
+                    address,
+                    Some(terminal_positive_full()),
+                )
+                .is_none(),
+            "a committed grant cannot be minted twice"
+        );
+    }
+
+    #[test]
+    fn positive_terminal_release_registers_semantic_confirm_before_real_staging() {
+        let first = value(7);
+        let second = value(8);
+        let root = PositiveCertificateLeaf {
+            variable: 0,
+            page_local: false,
+        };
+        let plan = ResidualPlan::compile(&root);
+        let mut registry = ProducerRegistry::new();
+        let (_, parent) = open_positive_confirm(
+            &mut registry,
+            [first, second],
+            terminal_positive_certificate(),
+        );
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+
+        let first_grant = registry
+            .commit_positive_publication(
+                parent,
+                registry.positive_child_address(parent, first).unwrap(),
+                Some(terminal_positive_full()),
+            )
+            .expect("the first Terminal value should commit");
+        let first_release = DeltaScheduler::release_positive_publication(
+            first_grant,
+            &plan,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert!(first_release.continuation.is_none());
+        let mut publication = first_release
+            .publication
+            .expect("Terminal release must publish a complete row");
+        assert_eq!(publication.rows.rows, [first]);
+        assert_eq!(publication.rows.row_count, 1);
+        assert_eq!(publication.origins.as_slice(), [parent.activation]);
+        assert!(
+            !publication
+                .origins
+                .contains(&ActivationId::test(u64::MAX)),
+            "physical Support identity must not leak into semantic publication"
+        );
+        assert_eq!(publication.registrations.len(), 1);
+        let registration = &publication.registrations[0];
+        assert_eq!(registration.family, StateId(17));
+        assert_eq!(registration.origin, parent.activation);
+
+        let second_grant = registry
+            .commit_positive_publication(
+                parent,
+                registry.positive_child_address(parent, second).unwrap(),
+                Some(terminal_positive_full()),
+            )
+            .expect("a distinct later Terminal value should commit");
+        let second_release = DeltaScheduler::release_positive_publication(
+            second_grant,
+            &plan,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert!(
+            second_release
+                .publication
+                .as_ref()
+                .is_some_and(|batch| batch.registrations.is_empty()),
+            "one semantic parent may register its Terminal origin only once"
+        );
+        let second_publication = second_release
+            .publication
+            .expect("later Terminal values still publish complete rows");
+        assert_eq!(second_publication.rows.rows, [second]);
+        assert_eq!(second_publication.origins.as_slice(), [parent.activation]);
+        publication.append(second_publication);
+
+        let mut machine =
+            ResidualStateMachine::new(terminal_positive_full(), 1, Search::Done);
+        machine.stage_direct_terminal_publication(publication);
+        assert_eq!(machine.emit_rows, [first, second]);
+        assert_eq!(
+            machine.emit_origins.as_deref(),
+            Some([parent.activation, parent.activation].as_slice())
+        );
+        machine.terminal_yield.complete(parent.activation);
+        let origins = machine.emit_origins.clone().unwrap();
+        for origin in origins {
+            let mut attempt = machine.terminal_yield.begin_projection(origin);
+            attempt.mark_successful();
+        }
+        machine.emit_next = machine.emit_count;
+        let family = machine
+            .terminal_yield
+            .families
+            .get(&StateId(17))
+            .expect("semantic Confirm family was registered");
+        assert_eq!(family.admitted, 1);
+        assert_eq!(family.live, 0);
+        assert_eq!(family.completed, 1);
+        assert_eq!(family.projected, 2);
+        assert!(machine.terminal_yield.samples[parent.activation.index()].is_none());
+        assert!(stable.is_empty());
+    }
+
+    #[test]
+    fn positive_terminal_release_accepts_an_already_set_admitted_input() {
+        let candidate = value(9);
+        let mut certificate = terminal_positive_certificate();
+        certificate.crosses_set_boundary = false;
+        assert!(
+            certificate.eligible(),
+            "Terminal precedence must not require a fresh SET crossing"
+        );
+        let mut return_to = terminal_positive_return(Vec::new());
+        let DeltaReturn::Stable {
+            set_admit_result, ..
+        } = &mut return_to
+        else {
+            unreachable!()
+        };
+        *set_admit_result = false;
+
+        let mut registry = ProducerRegistry::new();
+        let (_, parent) = open_positive_confirm_with_return(
+            &mut registry,
+            [candidate],
+            certificate,
+            return_to,
+        );
+        let grant = registry
+            .commit_positive_publication(
+                parent,
+                registry
+                    .positive_child_address(parent, candidate)
+                    .unwrap(),
+                Some(terminal_positive_full()),
+            )
+            .expect("an already-SET Terminal successor should still publish");
+        let root = PositiveCertificateLeaf {
+            variable: 0,
+            page_local: false,
+        };
+        let plan = ResidualPlan::compile(&root);
+        let release = DeltaScheduler::release_positive_publication(
+            grant,
+            &plan,
+            &mut Worklist::new(),
+            &mut StateInterner::default(),
+            &mut ResidualStateStats::default(),
+        );
+        assert_eq!(
+            release
+                .publication
+                .expect("Terminal grant lost its publication")
+                .rows
+                .rows,
+            [candidate]
+        );
+    }
+
+    #[test]
+    fn positive_chunk_release_files_singleton_into_exact_saved_k() {
+        let candidate = value(11);
+        let (plan, successor, certificate, _full) = chunk_positive_fixture();
+        let mut registry = ProducerRegistry::new();
+        let return_to = DeltaReturn::Stable {
+            desc: successor.clone(),
+            parent: Vec::new().into_boxed_slice(),
+            set_admit_result: true,
+        };
+        let (activation, parent) = open_positive_confirm_with_return(
+            &mut registry,
+            [candidate],
+            certificate,
+            return_to,
+        );
+        let address = registry
+            .positive_child_address(parent, candidate)
+            .expect("ChunkHomomorphic candidate should receive an address");
+        let grant = registry
+            .commit_positive_publication(parent, address, None)
+            .expect("ChunkHomomorphic publication needs no Terminal capability");
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let release = DeltaScheduler::release_positive_publication(
+            grant,
+            &plan,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert!(release.publication.is_none());
+        let token = release
+            .continuation
+            .expect("one parent and one value make Chunk filing nonempty");
+        assert_eq!(stable_interner.get(token.state), &successor);
+        let StateBucket::Candidates(batch) = &stable[&token.rank][&token.state] else {
+            panic!("Chunk release filed the wrong payload kind")
+        };
+        assert_eq!(batch.parents.row_count, 1);
+        assert!(batch.parents.rows.is_empty());
+        assert_eq!(
+            batch.candidates.iter().collect::<Vec<_>>(),
+            [(0, candidate)]
+        );
+        assert_eq!(token.rows, 1);
+        assert_eq!(token.candidates, 1);
+        assert_eq!(
+            registry
+                .positive_publication_snapshot(parent)
+                .unwrap()
+                .published,
+            BTreeSet::from([candidate]),
+            "filing K is not a rollback point for P"
+        );
+
+        let proof = quiesce_confirm_with_accepted(&mut registry, activation, [candidate]);
+        let RegistrySettlement::ConfirmFinalizer(seed) = registry.settle_quiescence(proof) else {
+            panic!("nonempty original B should retain its ordinary finalizer")
+        };
+        assert!(
+            seed.state.accepted.is_empty(),
+            "the finalizer must receive G minus P independently of K's later result"
+        );
+    }
+
+    #[test]
     fn positive_publication_commit_has_one_winner_and_duplicate_open_is_inert() {
         let candidate = value(7);
         let certificate = terminal_positive_certificate();
@@ -10582,9 +11317,9 @@ mod tests {
             .expect("eligible candidate should receive an address");
         let hedge = first;
 
-        assert!(registry.commit_positive_publication(parent, first));
+        assert!(commit_terminal_positive(&mut registry, parent, first));
         assert!(
-            !registry.commit_positive_publication(parent, hedge),
+            !commit_terminal_positive(&mut registry, parent, hedge),
             "a later hedge for the same (parent, value) must be inert"
         );
         let before_reopen = registry.positive_publication_snapshot(parent).unwrap();
@@ -10611,8 +11346,16 @@ mod tests {
         let one_address = registry.positive_child_address(parent, one).unwrap();
         let two_address = registry.positive_child_address(parent, two).unwrap();
 
-        assert!(registry.commit_positive_publication(parent, two_address));
-        assert!(registry.commit_positive_publication(parent, one_address));
+        assert!(commit_terminal_positive(
+            &mut registry,
+            parent,
+            two_address
+        ));
+        assert!(commit_terminal_positive(
+            &mut registry,
+            parent,
+            one_address
+        ));
         assert_eq!(
             registry
                 .positive_publication_snapshot(parent)
@@ -10639,7 +11382,7 @@ mod tests {
             generation: before.generation,
             value: absent,
         };
-        assert!(!registry.commit_positive_publication(parent, invalid));
+        assert!(!commit_terminal_positive(&mut registry, parent, invalid));
         assert_eq!(
             registry.positive_publication_snapshot(parent),
             Some(before.clone())
@@ -10653,7 +11396,7 @@ mod tests {
             .unwrap()
             .reducer = DeltaReducer::Support { published: false };
         assert!(
-            !registry.commit_positive_publication(parent, valid),
+            !commit_terminal_positive(&mut registry, parent, valid),
             "a parent no longer owning a Confirm reducer must be inert"
         );
         assert_eq!(registry.positive_publication_snapshot(parent), Some(before));
@@ -10674,7 +11417,11 @@ mod tests {
             ..address
         };
         let open = registry.positive_publication_snapshot(parent).unwrap();
-        assert!(!registry.commit_positive_publication(parent, wrong_generation));
+        assert!(!commit_terminal_positive(
+            &mut registry,
+            parent,
+            wrong_generation
+        ));
         assert!(registry
             .close_and_snapshot_positive_publication(parent, wrong_generation.generation)
             .is_none());
@@ -10692,7 +11439,7 @@ mod tests {
             "settlement must advance the generation before freezing its snapshot"
         );
         assert!(
-            !registry.commit_positive_publication(parent, address),
+            !commit_terminal_positive(&mut registry, parent, address),
             "all outstanding physical children must be inert after close"
         );
         assert!(
@@ -10716,16 +11463,20 @@ mod tests {
         let right_before = registry.positive_publication_snapshot(right).unwrap();
 
         assert!(
-            !registry.commit_positive_publication(right, left_address),
+            !commit_terminal_positive(&mut registry, right, left_address),
             "an address from another semantic parent must be inert"
         );
         assert_eq!(
             registry.positive_publication_snapshot(right),
             Some(right_before)
         );
-        assert!(registry.commit_positive_publication(left, left_address));
+        assert!(commit_terminal_positive(
+            &mut registry,
+            left,
+            left_address
+        ));
         assert!(
-            registry.commit_positive_publication(right, right_address),
+            commit_terminal_positive(&mut registry, right, right_address),
             "independent parents may each publish the same value once"
         );
 
@@ -10733,7 +11484,8 @@ mod tests {
             brand: registry.brand,
             activation: ActivationId(u64::MAX),
         };
-        assert!(!registry.commit_positive_publication(
+        assert!(!commit_terminal_positive(
+            &mut registry,
             unknown,
             PositiveChildAddress {
                 parent: unknown,
@@ -10758,14 +11510,22 @@ mod tests {
             .expect("deep clone retained the Confirm activation");
         assert_ne!(parent, cloned_parent);
         assert!(
-            !cloned.commit_positive_publication(parent, pre_clone_address),
+            !commit_terminal_positive(&mut cloned, parent, pre_clone_address),
             "a pre-clone address must not cross registry brands"
         );
 
         let original_address = original.positive_child_address(parent, one).unwrap();
         let cloned_address = cloned.positive_child_address(cloned_parent, two).unwrap();
-        assert!(original.commit_positive_publication(parent, original_address));
-        assert!(cloned.commit_positive_publication(cloned_parent, cloned_address));
+        assert!(commit_terminal_positive(
+            &mut original,
+            parent,
+            original_address
+        ));
+        assert!(commit_terminal_positive(
+            &mut cloned,
+            cloned_parent,
+            cloned_address
+        ));
         assert_eq!(
             original
                 .positive_publication_snapshot(parent)
@@ -10809,8 +11569,9 @@ mod tests {
             "the authoritative original B preserves bag multiplicity"
         );
 
-        assert!(registry.commit_positive_publication(parent, address));
-        assert!(!registry.commit_positive_publication(
+        assert!(commit_terminal_positive(&mut registry, parent, address));
+        assert!(!commit_terminal_positive(
+            &mut registry,
             parent,
             PositiveChildAddress {
                 parent,
@@ -10845,7 +11606,7 @@ mod tests {
         ]);
         let started = registry.start_many(
             DeltaReducer::Confirm { original },
-            stable_return(Vec::new()),
+            terminal_positive_return(Vec::new()),
             [output(31, 0, true), output(32, 1, true), output(33, 2, true)],
         );
         let activation = started.activation;
@@ -10860,7 +11621,7 @@ mod tests {
             let address = registry
                 .positive_child_address(parent, published)
                 .expect("published test value belongs to original B");
-            assert!(registry.commit_positive_publication(parent, address));
+            assert!(commit_terminal_positive(&mut registry, parent, address));
         }
 
         let mut proof = None;
@@ -10945,7 +11706,7 @@ mod tests {
         let address = registry
             .positive_child_address(parent, published)
             .expect("published test value belongs to original B");
-        assert!(registry.commit_positive_publication(parent, address));
+        assert!(commit_terminal_positive(&mut registry, parent, address));
         let proof = quiesce_confirm_with_accepted(&mut registry, activation, [accepted]);
 
         assert!(
@@ -10991,8 +11752,16 @@ mod tests {
         let cloned_address = cloned
             .positive_child_address(cloned_parent, two)
             .unwrap();
-        assert!(original.commit_positive_publication(parent, original_address));
-        assert!(cloned.commit_positive_publication(cloned_parent, cloned_address));
+        assert!(commit_terminal_positive(
+            &mut original,
+            parent,
+            original_address
+        ));
+        assert!(commit_terminal_positive(
+            &mut cloned,
+            cloned_parent,
+            cloned_address
+        ));
 
         let original_proof =
             quiesce_confirm_with_accepted(&mut original, activation, [one, two]);
@@ -11053,7 +11822,7 @@ mod tests {
             registry.state.next_positive_generation > open.generation,
             "eager completion must generation-fence its empty publication domain"
         );
-        assert!(!registry.commit_positive_publication(parent, stale));
+        assert!(!commit_terminal_positive(&mut registry, parent, stale));
     }
 
     #[test]

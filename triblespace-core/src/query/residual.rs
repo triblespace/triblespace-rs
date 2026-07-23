@@ -10538,6 +10538,7 @@ impl ResidualStateMachine {
         let publication = (published.row_count > 0).then_some(TerminalPublicationBatch {
             rows: published,
             origins,
+            registrations: SmallVec::new(),
         });
         debug_assert!(receipts
             .iter()
@@ -11606,13 +11607,27 @@ impl ResidualStateMachine {
     }
 
     fn stage_direct_terminal_publication(&mut self, publication: TerminalPublicationBatch) {
-        let TerminalPublicationBatch { rows, origins } = publication;
+        let TerminalPublicationBatch {
+            rows,
+            origins,
+            registrations,
+        } = publication;
         assert!(rows.row_count > 0, "direct publication staged no rows");
         assert_eq!(
             origins.len(),
             rows.row_count,
             "direct publication lost activation origins"
         );
+        assert!(
+            registrations
+                .iter()
+                .all(|registration| origins.contains(&registration.origin)),
+            "direct publication registered an origin absent from its batch"
+        );
+        for registration in registrations {
+            self.terminal_yield
+                .register(registration.family, &[registration.origin]);
+        }
         self.terminal_yield.stage(&origins);
         self.stats.delta_direct_terminal_publication_batches += 1;
         self.stats.delta_direct_terminal_publication_rows += rows.row_count;
