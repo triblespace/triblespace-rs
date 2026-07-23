@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The sealed RPQ Confirm ProbeOne diagnostic now identifies the scheduler
+  selection behind every target batch.** Correctness-only receipts capture the
+  exact residual selection kind, continuation mode and token geometry,
+  ParentAtomic occupancy, and geometric search, activation, and terminal-demand
+  widths without changing routing or execution. The frozen C/O/H/J fragment,
+  SET, order, and ordinary-versus-typed receipts remain asserted.
 - **The sealed RPQ Confirm crossover now includes a request-local ProbeOne
   diagnostic.** J sends exactly the first concrete target CandidateBatch
   through ordinary Confirm, atomically consumes that request-local flag, and

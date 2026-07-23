@@ -10881,6 +10881,89 @@ impl ResidualStateMachine {
         state
     }
 
+    #[cfg(rpq_confirm_admission_probe)]
+    fn record_rpq_confirm_selection(
+        &self,
+        plan: &ResidualPlan,
+        task: &SelectedResidualTask,
+        selection: SelectionKind,
+        continuation: Option<(ContinuationToken, usize)>,
+        search_width: usize,
+    ) {
+        let (
+            ResidualPhase::Confirm {
+                variable,
+                confirmer,
+                ..
+            },
+            StateBucket::Candidates(batch),
+        ) = (&task.desc.phase, &task.bucket)
+        else {
+            return;
+        };
+        let candidate_occupancy_parent_atomic = grouped_delta_confirm_is_active(
+            &plan.grouped_delta_confirm_requirements[*confirmer],
+            *variable,
+            task.desc.bound,
+        );
+        let candidate_pages = task
+            .desc
+            .uses_candidate_pages(plan, &self.interner.formula_pcs);
+        let (selection, continuation_mode) = match selection {
+            SelectionKind::Full => (
+                super::regularpathconstraint::RpqConfirmSelectionKind::Full,
+                None,
+            ),
+            SelectionKind::Readiness => (
+                super::regularpathconstraint::RpqConfirmSelectionKind::Readiness,
+                None,
+            ),
+            SelectionKind::Continuation(ContinuationMode::Cohort) => (
+                super::regularpathconstraint::RpqConfirmSelectionKind::Continuation,
+                Some(super::regularpathconstraint::RpqConfirmContinuationMode::Cohort),
+            ),
+            SelectionKind::Continuation(ContinuationMode::ProbeOne) => (
+                super::regularpathconstraint::RpqConfirmSelectionKind::Continuation,
+                Some(super::regularpathconstraint::RpqConfirmContinuationMode::ProbeOne),
+            ),
+        };
+        let (
+            continuation_state,
+            continuation_rank,
+            continuation_occupancy,
+            continuation_rows,
+            continuation_candidates,
+        ) = continuation.map_or((None, None, None, None, None), |(token, occupancy)| {
+            (
+                Some(token.state.0),
+                Some(token.rank),
+                Some(occupancy),
+                Some(token.rows),
+                Some(token.candidates),
+            )
+        });
+        super::regularpathconstraint::rpq_confirm_admission_probe_record_selection(
+            super::regularpathconstraint::RpqConfirmSelectionReceipt {
+                state: task.state.0,
+                parents: batch.parents.row_count,
+                candidates: batch.candidate_count(),
+                selection,
+                continuation_mode,
+                continuation_state,
+                continuation_rank,
+                continuation_occupancy,
+                continuation_rows,
+                continuation_candidates,
+                selected_occupancy: task.bucket.occupancy(candidate_pages),
+                candidate_occupancy_parent_atomic,
+                search_width: search_width.max(1),
+                activation_width: self.delta.activation_width(),
+                terminal_demand_width: self.terminal_demand_width,
+                terminal_demand_consumed: self.terminal_demand_consumed,
+            },
+        );
+    }
+
     /// Removes one batch-filling chunk from the next state.
     ///
     /// The deepest bucket that can supply the complete desired actionable
@@ -10993,11 +11076,16 @@ impl ResidualStateMachine {
             self.stats.readiness_pops += 1;
             self.last_selection = SelectionKind::Readiness;
         }
-        Some(SelectedResidualTask {
+        let task = SelectedResidualTask {
             state: id,
             desc,
             bucket: chunk,
-        })
+        };
+        #[cfg(rpq_confirm_admission_probe)]
+        if let Some(plan) = plan {
+            self.record_rpq_confirm_selection(plan, &task, self.last_selection, None, width);
+        }
+        Some(task)
     }
 
     /// Removes one coalesced-receipt chunk from the current canonical tail.
@@ -11077,11 +11165,20 @@ impl ResidualStateMachine {
         if cohort_occupancy < width.max(1) {
             self.stats.underfilled_continuation_pops += 1;
         }
-        SelectedResidualTask {
+        let task = SelectedResidualTask {
             state: token.state,
             desc,
             bucket: chunk,
-        }
+        };
+        #[cfg(rpq_confirm_admission_probe)]
+        self.record_rpq_confirm_selection(
+            plan,
+            &task,
+            self.last_selection,
+            Some((token, cohort_occupancy)),
+            width,
+        );
+        task
     }
 
     /// Whether ordinary acyclic work can fill the current search width

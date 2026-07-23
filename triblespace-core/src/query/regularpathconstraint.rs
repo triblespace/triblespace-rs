@@ -1623,6 +1623,7 @@ thread_local! {
     static BOUND_CONFIRM_BATCHES: RefCell<Vec<(u32, usize, usize)>> = const { RefCell::new(Vec::new()) };
     static FORCED_CONFIRM_BATCHES: RefCell<Vec<(u32, usize, usize)>> = const { RefCell::new(Vec::new()) };
     static TARGET_CONFIRM_DECISIONS: RefCell<Vec<(u32, usize, usize, bool)>> = const { RefCell::new(Vec::new()) };
+    static TARGET_SELECTION_RECEIPTS: RefCell<Vec<RpqConfirmSelectionReceipt>> = const { RefCell::new(Vec::new()) };
     static LAST_ROUTE_WAS_FORCED: Cell<bool> = const { Cell::new(false) };
     static ORDINARY_CONFIRM_CALLS: Cell<usize> = const { Cell::new(0) };
     static ORDINARY_CONFIRM_ROWS: Cell<usize> = const { Cell::new(0) };
@@ -1684,6 +1685,57 @@ pub struct RpqConfirmAdmissionProbeSnapshot {
     pub bound_estimate_max: usize,
     pub bulk_transition_cohorts: usize,
     pub pageable_transition_pages: usize,
+}
+
+/// Probe-only copy of the residual scheduler's physical selection kind.
+///
+/// This never participates in query execution. It exists solely so the sealed
+/// RPQ Confirm harness can name which scheduler path selected each concrete
+/// target `CandidateBatch`.
+#[cfg(rpq_confirm_admission_probe)]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RpqConfirmSelectionKind {
+    Full,
+    Readiness,
+    Continuation,
+}
+
+/// Probe-only copy of the continuation mode attached to a selected target
+/// batch. Non-continuation selections carry no value of this type.
+#[cfg(rpq_confirm_admission_probe)]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RpqConfirmContinuationMode {
+    Cohort,
+    ProbeOne,
+}
+
+/// Exact scheduler receipt for one target bound-endpoint RPQ Confirm batch.
+///
+/// All values are captured at the worklist-pop boundary, before route
+/// selection. The optional timing panel disables selection-receipt collection
+/// together with the rest of the causal harness receipts.
+#[cfg(rpq_confirm_admission_probe)]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RpqConfirmSelectionReceipt {
+    pub state: u32,
+    pub parents: usize,
+    pub candidates: usize,
+    pub selection: RpqConfirmSelectionKind,
+    pub continuation_mode: Option<RpqConfirmContinuationMode>,
+    pub continuation_state: Option<u32>,
+    pub continuation_rank: Option<usize>,
+    pub continuation_occupancy: Option<usize>,
+    pub continuation_rows: Option<usize>,
+    pub continuation_candidates: Option<usize>,
+    pub selected_occupancy: usize,
+    pub candidate_occupancy_parent_atomic: bool,
+    pub search_width: usize,
+    pub activation_width: usize,
+    pub terminal_demand_width: usize,
+    pub terminal_demand_consumed: usize,
 }
 
 #[cfg(rpq_confirm_admission_probe)]
@@ -1766,6 +1818,22 @@ pub fn rpq_confirm_admission_probe_target_decisions() -> Vec<(u32, usize, usize,
 
 #[cfg(rpq_confirm_admission_probe)]
 #[doc(hidden)]
+pub fn rpq_confirm_admission_probe_selection_receipts() -> Vec<RpqConfirmSelectionReceipt> {
+    TARGET_SELECTION_RECEIPTS.with(|receipts| receipts.borrow().clone())
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+pub(crate) fn rpq_confirm_admission_probe_record_selection(receipt: RpqConfirmSelectionReceipt) {
+    if !RECORD_PROBE_RECEIPTS.with(Cell::get)
+        || TARGET_CONFIRM_TOKEN.with(Cell::get) != Some(receipt.state)
+    {
+        return;
+    }
+    TARGET_SELECTION_RECEIPTS.with(|receipts| receipts.borrow_mut().push(receipt));
+}
+
+#[cfg(rpq_confirm_admission_probe)]
+#[doc(hidden)]
 pub fn rpq_confirm_admission_probe_reset_callbacks() {
     TARGET_CONFIRM_TOKEN.with(|value| value.set(None));
     TARGET_CONFIRM_PARENTS.with(|value| value.set(0));
@@ -1781,6 +1849,7 @@ pub fn rpq_confirm_admission_probe_reset_callbacks() {
     BOUND_CONFIRM_BATCHES.with(|batches| batches.borrow_mut().clear());
     FORCED_CONFIRM_BATCHES.with(|batches| batches.borrow_mut().clear());
     TARGET_CONFIRM_DECISIONS.with(|decisions| decisions.borrow_mut().clear());
+    TARGET_SELECTION_RECEIPTS.with(|receipts| receipts.borrow_mut().clear());
     ORDINARY_CONFIRM_CALLS.with(|value| value.set(0));
     ORDINARY_CONFIRM_ROWS.with(|value| value.set(0));
     ORDINARY_CONFIRM_CANDIDATES_IN.with(|value| value.set(0));

@@ -4301,7 +4301,7 @@ impl DeltaScheduler {
         grew
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, rpq_confirm_admission_probe))]
     pub(super) fn activation_width(&self) -> usize {
         self.activation_width
     }

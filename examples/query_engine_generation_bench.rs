@@ -211,8 +211,10 @@ use triblespace::core::query::regularpathconstraint::{
     rpq_confirm_admission_probe_force_singleton_ordinary,
     rpq_confirm_admission_probe_forced_confirm_batches,
     rpq_confirm_admission_probe_record_receipts, rpq_confirm_admission_probe_reset_callbacks,
-    rpq_confirm_admission_probe_snapshot, rpq_confirm_admission_probe_target_action,
-    rpq_confirm_admission_probe_target_decisions, RpqConfirmAdmissionProbeSnapshot,
+    rpq_confirm_admission_probe_selection_receipts, rpq_confirm_admission_probe_snapshot,
+    rpq_confirm_admission_probe_target_action, rpq_confirm_admission_probe_target_decisions,
+    RpqConfirmAdmissionProbeSnapshot, RpqConfirmContinuationMode, RpqConfirmSelectionKind,
+    RpqConfirmSelectionReceipt,
 };
 #[cfg(rpq_confirm_admission_probe)]
 use triblespace::core::query::residual::{ResidualLowering, ResidualStateStats};
@@ -2336,6 +2338,7 @@ struct CrossoverRun {
     bound_confirm_batches: Vec<(u32, usize, usize)>,
     forced_confirm_batches: Vec<(u32, usize, usize)>,
     target_decisions: Vec<(u32, usize, usize, bool)>,
+    selection_receipts: Vec<RpqConfirmSelectionReceipt>,
 }
 
 #[cfg(rpq_confirm_admission_probe)]
@@ -2407,6 +2410,63 @@ fn assert_crossover_target_receipt(
         run.callbacks.target_batch_candidates,
         CROSSOVER_PARENT_COUNT * cell.width,
     );
+    assert_eq!(
+        run.selection_receipts.len(),
+        fragments.len(),
+        "{backend}/k={}: not every target CandidateBatch received one scheduler selection receipt",
+        cell.width,
+    );
+    for (fragment, receipt) in fragments.iter().zip(&run.selection_receipts) {
+        assert_eq!(
+            (receipt.state, receipt.parents, receipt.candidates),
+            (token, fragment.0, fragment.1),
+            "{backend}/k={}: scheduler receipt diverged from target CandidateBatch geometry",
+            cell.width,
+        );
+        assert!(
+            receipt.candidate_occupancy_parent_atomic,
+            "{backend}/k={}: target candidate occupancy lost ParentAtomic grouping",
+            cell.width,
+        );
+        assert_eq!(
+            receipt.selected_occupancy, receipt.parents,
+            "{backend}/k={}: ParentAtomic selection did not count parent rows",
+            cell.width,
+        );
+        assert!(receipt.search_width > 0);
+        assert!(receipt.activation_width > 0);
+        assert!(
+            receipt.terminal_demand_consumed <= receipt.terminal_demand_width,
+            "{backend}/k={}: terminal demand receipt overran its open window",
+            cell.width,
+        );
+        assert!(
+            receipt.selected_occupancy <= receipt.search_width,
+            "{backend}/k={}: selected target occupancy exceeded the geometric work window",
+            cell.width,
+        );
+        match receipt.selection {
+            RpqConfirmSelectionKind::Continuation => {
+                assert!(matches!(
+                    receipt.continuation_mode,
+                    Some(RpqConfirmContinuationMode::Cohort | RpqConfirmContinuationMode::ProbeOne)
+                ));
+                assert_eq!(receipt.continuation_state, Some(token));
+                assert!(receipt.continuation_rank.is_some());
+                assert!(receipt.continuation_occupancy.unwrap() >= receipt.selected_occupancy);
+                assert!(receipt.continuation_rows.unwrap() >= receipt.parents);
+                assert!(receipt.continuation_candidates.unwrap() >= receipt.candidates);
+            }
+            RpqConfirmSelectionKind::Full | RpqConfirmSelectionKind::Readiness => {
+                assert_eq!(receipt.continuation_mode, None);
+                assert_eq!(receipt.continuation_state, None);
+                assert_eq!(receipt.continuation_rank, None);
+                assert_eq!(receipt.continuation_occupancy, None);
+                assert_eq!(receipt.continuation_rows, None);
+                assert_eq!(receipt.continuation_candidates, None);
+            }
+        }
+    }
 }
 
 #[cfg(rpq_confirm_admission_probe)]
@@ -2465,6 +2525,7 @@ fn run_crossover_mode<S: TriblePattern>(
     let bound_confirm_batches = rpq_confirm_admission_probe_bound_confirm_batches();
     let forced_confirm_batches = rpq_confirm_admission_probe_forced_confirm_batches();
     let target_decisions = rpq_confirm_admission_probe_target_decisions();
+    let selection_receipts = rpq_confirm_admission_probe_selection_receipts();
     let (signature, order_digest) = probe_order_receipt(&rows);
     println!(
         "crossover_order backend={backend:?} width={} mode={} repeat={repeat} rows={} \
@@ -2496,7 +2557,8 @@ fn run_crossover_mode<S: TriblePattern>(
          probe_one_consumptions={} \
          target_batch_route_calls={} bound_estimate_samples={} bound_estimate_min={} \
          bound_estimate_max={} target_batch_parents={} target_batch_candidates={} \
-         bound_confirm_batches={:?} forced_confirm_batches={:?} target_decisions={:?}",
+         bound_confirm_batches={:?} forced_confirm_batches={:?} target_decisions={:?} \
+         selection_receipts={:?}",
         cell.width,
         mode.label(),
         stats.probe_formula_fingerprint,
@@ -2546,6 +2608,7 @@ fn run_crossover_mode<S: TriblePattern>(
         bound_confirm_batches,
         forced_confirm_batches,
         target_decisions,
+        selection_receipts,
     );
 
     CrossoverRun {
@@ -2556,6 +2619,7 @@ fn run_crossover_mode<S: TriblePattern>(
         bound_confirm_batches,
         forced_confirm_batches,
         target_decisions,
+        selection_receipts,
     }
 }
 
@@ -2950,6 +3014,35 @@ fn assert_probe_one_route(
         typed_work_per_parent * typed_parents,
         "J typed graph work did not equal frozen C's exact per-parent work",
     );
+    assert_eq!(
+        (
+            probe_one.selection_receipts[0].parents,
+            probe_one.selection_receipts[0].candidates,
+        ),
+        (1, cell.width),
+        "J's first target selection was not the sealed (1,k) CandidateBatch",
+    );
+    let first = probe_one.selection_receipts[0];
+    let second = probe_one.selection_receipts[1];
+    let wide_tail = probe_one.selection_receipts[3];
+    assert!(first.selected_occupancy <= first.search_width);
+    assert!(second.selected_occupancy <= second.search_width);
+    assert!(wide_tail.selected_occupancy <= wide_tail.search_width);
+    assert!(
+        first.candidates > first.search_width && second.candidates > second.search_width,
+        "J's first two raw candidate bags unexpectedly fit their geometric search widths",
+    );
+    assert!(
+        probe_one
+            .selection_receipts
+            .iter()
+            .filter(|receipt| receipt.selection == RpqConfirmSelectionKind::Continuation)
+            .all(|receipt| {
+                receipt.continuation_state == Some(target_token)
+                    && receipt.continuation_mode == Some(RpqConfirmContinuationMode::Cohort)
+            }),
+        "J's target continuation identity changed",
+    );
 
     println!(
         "probe_one_fragment_verdict backend={backend:?} width={} token={} decisions={decisions:?} \
@@ -2967,6 +3060,28 @@ fn assert_probe_one_route(
         crossover_target_fragments_for(hybrid, target_token).len(),
         fragments.len(),
         crossover_target_fragments_for(ordinary, target_token).len(),
+    );
+    println!(
+        "probe_one_selection_window backend={backend:?} width={} \
+         first_parent_occupancy={}/{} first_raw_candidates={}/{} \
+         second_parent_occupancy={}/{} second_raw_candidates={}/{} \
+         wide_tail_parent_occupancy={}/{} parent_atomic=true \
+         initial_parent_occupancy_fits=true initial_raw_candidate_bags_fit=false",
+        cell.width,
+        first.selected_occupancy,
+        first.search_width,
+        first.candidates,
+        first.search_width,
+        second.selected_occupancy,
+        second.search_width,
+        second.candidates,
+        second.search_width,
+        wide_tail.selected_occupancy,
+        wide_tail.search_width,
+    );
+    println!(
+        "probe_one_selection_trace backend={backend:?} width={} token={} receipts={:?}",
+        cell.width, target_token, probe_one.selection_receipts,
     );
 }
 
@@ -3146,6 +3261,10 @@ fn correctness_backend<S: TriblePattern>(
     assert_eq!(
         probe_one.forced_confirm_batches, probe_one_repeat.forced_confirm_batches,
         "J FALSIFIED: forced-batch receipt changed on repeat",
+    );
+    assert_eq!(
+        probe_one.selection_receipts, probe_one_repeat.selection_receipts,
+        "J FALSIFIED: scheduler selection receipt changed on repeat",
     );
     assert_crossover_target_receipt(
         backend,
