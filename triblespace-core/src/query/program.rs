@@ -1030,9 +1030,8 @@ pub trait TypedProgramSpec {
     /// [`ProgramGrouping`]'s V1 family-local planning contract.
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute>;
 
-    /// Certifies ordered positive-prefix trace equivalence between the
-    /// selected exact Confirm Program and its paired fully-bound Support
-    /// Program.
+    /// Certifies that the selected exact Confirm Program physically dominates
+    /// its paired fully-bound Support Program for first-positive publication.
     ///
     /// For the Confirm activation's immutable ordered candidate bag `B`, the
     /// certificate is consumed only for `B[0]`, after a real exact Program
@@ -1045,11 +1044,14 @@ pub trait TypedProgramSpec {
     ///   Confirm reports `accepted(B[0])` no later than the paired Support
     ///   route could report its first positive receipt.
     ///
-    /// This correctness implication plus no-later receipt law lets the engine
-    /// replace, rather than merely duplicate, the one-occurrence Support
-    /// feeder. The default is deliberately conservative: matching route keys
-    /// or Boolean denotations alone do not certify ordered trace equivalence.
-    fn certifies_confirm_support_positive_prefix(
+    /// This is a performance-elision receipt, not an equality requirement on
+    /// either Program's internal state or execution trace. Exact Confirm
+    /// acceptance is independently authoritative; returning `true` says only
+    /// that retaining the competing one-occurrence Support feeder cannot
+    /// improve its first-positive latency. The default is deliberately
+    /// conservative: matching route keys or Boolean denotations alone do not
+    /// prove physical dominance.
+    fn certifies_confirm_dominates_support_positive_prefix(
         &self,
         _confirm_request: ProgramRequest,
         _confirm_route: ProgramRoute,
@@ -1237,7 +1239,7 @@ trait ErasedProgramSpec {
 
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute>;
 
-    fn certifies_confirm_support_positive_prefix(
+    fn certifies_confirm_dominates_support_positive_prefix(
         &self,
         confirm_request: ProgramRequest,
         confirm_route: ProgramRoute,
@@ -1326,23 +1328,24 @@ impl<'a> ProgramRef<'a> {
         self.erased.route(request)
     }
 
-    pub(crate) fn same_spec(self, other: Self) -> bool {
+    pub(crate) fn same_implementation(self, other: Self) -> bool {
         std::ptr::eq(self.erased, other.erased)
     }
 
-    pub(crate) fn certifies_confirm_support_positive_prefix(
+    pub(crate) fn certifies_confirm_dominates_support_positive_prefix(
         self,
         confirm_request: ProgramRequest,
         confirm_route: ProgramRoute,
         support_request: ProgramRequest,
         support_route: ProgramRoute,
     ) -> bool {
-        self.erased.certifies_confirm_support_positive_prefix(
-            confirm_request,
-            confirm_route,
-            support_request,
-            support_route,
-        )
+        self.erased
+            .certifies_confirm_dominates_support_positive_prefix(
+                confirm_request,
+                confirm_route,
+                support_request,
+                support_route,
+            )
     }
 
     pub(crate) fn seed_batch(
@@ -1773,7 +1776,7 @@ where
         }
     }
 
-    fn certifies_confirm_support_positive_prefix(
+    fn certifies_confirm_dominates_support_positive_prefix(
         &self,
         confirm_request: ProgramRequest,
         confirm_route: ProgramRoute,
@@ -1785,7 +1788,7 @@ where
         }
         let (selected, confirm_key) = self.selected(confirm_route.key);
         let (_, support_key) = self.selected(support_route.key);
-        selected.certifies_confirm_support_positive_prefix(
+        selected.certifies_confirm_dominates_support_positive_prefix(
             confirm_request,
             ProgramRoute {
                 key: confirm_key,
@@ -1893,7 +1896,7 @@ where
         TypedProgramSpec::route(self, request)
     }
 
-    fn certifies_confirm_support_positive_prefix(
+    fn certifies_confirm_dominates_support_positive_prefix(
         &self,
         confirm_request: ProgramRequest,
         confirm_route: ProgramRoute,
@@ -1910,7 +1913,7 @@ where
             ProgramRouteArm::Direct,
             "a direct typed Program received a composed Support route arm"
         );
-        TypedProgramSpec::certifies_confirm_support_positive_prefix(
+        TypedProgramSpec::certifies_confirm_dominates_support_positive_prefix(
             self,
             confirm_request,
             confirm_route,

@@ -2758,7 +2758,7 @@ impl TypedProgramSpec for RegularPathConstraint {
         Some(route)
     }
 
-    fn certifies_confirm_support_positive_prefix(
+    fn certifies_confirm_dominates_support_positive_prefix(
         &self,
         confirm_request: ProgramRequest,
         confirm_route: ProgramRoute,
@@ -3498,13 +3498,13 @@ mod delta_program_tests {
         let inverse_route = path.route(confirm_inverse).unwrap();
         let support_route = path.route(support).unwrap();
 
-        assert!(path.certifies_confirm_support_positive_prefix(
+        assert!(path.certifies_confirm_dominates_support_positive_prefix(
             confirm_forward,
             forward_route,
             support,
             support_route,
         ));
-        assert!(!path.certifies_confirm_support_positive_prefix(
+        assert!(!path.certifies_confirm_dominates_support_positive_prefix(
             confirm_inverse,
             inverse_route,
             support,
@@ -3525,7 +3525,7 @@ mod delta_program_tests {
             action: ProgramAction::Support,
             bound: VariableSet::new_singleton(start.index),
         };
-        assert!(!same.certifies_confirm_support_positive_prefix(
+        assert!(!same.certifies_confirm_dominates_support_positive_prefix(
             same_confirm,
             same.route(same_confirm).unwrap(),
             same_support,

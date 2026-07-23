@@ -10831,51 +10831,47 @@ impl ResidualStateMachine {
             let mut support_bound = desc.bound;
             support_bound.set(variable);
             let support_variables = constraint.variables();
-            let positive_support = if support_variables.is_subset_of(&support_bound) {
+            let positive_publication = PositivePublicationSeed::exact_confirm_tap(
+                state,
+                &desc,
+                &successor,
+                self.full,
+                plan,
+                &self.interner.formula_pcs,
+            )
+            .map(|publication| {
+                if !support_variables.is_subset_of(&support_bound) {
+                    return publication;
+                }
                 let support_request = ProgramRequest {
                     action: ProgramAction::Support,
                     bound: support_bound,
                 };
-                match select_program(constraint, plan.program_scope, support_request) {
-                    ProgramOffer::Selected(support_spec, support_route) => {
-                        if spec.same_spec(support_spec)
-                            && spec.certifies_confirm_support_positive_prefix(
-                                program_request,
-                                route,
-                                support_request,
-                                support_route,
-                            )
-                        {
-                            PositivePublicationSeed::exact_confirm_tap(
-                                state,
-                                &desc,
-                                &successor,
-                                self.full,
-                                plan,
-                                &self.interner.formula_pcs,
-                            )
-                        } else {
-                            PositivePublicationSeed::support_hedge(
-                                support_spec,
-                                DeltaDesc::leaf(support_route.variable, confirmer),
-                                support_request,
-                                support_route,
-                                state,
-                                &desc,
-                                &successor,
-                                self.full,
-                                plan,
-                                &self.interner.formula_pcs,
-                                support_variables,
-                                self.direct_terminal_publication_full(),
-                            )
-                        }
-                    }
-                    ProgramOffer::Absent | ProgramOffer::Deferred => None,
+                let ProgramOffer::Selected(support_spec, support_route) =
+                    select_program(constraint, plan.program_scope, support_request)
+                else {
+                    return publication;
+                };
+                if spec.same_implementation(support_spec)
+                    && spec.certifies_confirm_dominates_support_positive_prefix(
+                        program_request,
+                        route,
+                        support_request,
+                        support_route,
+                    )
+                {
+                    publication
+                } else {
+                    publication.with_support_hedge(
+                        support_spec,
+                        DeltaDesc::leaf(support_route.variable, confirmer),
+                        support_request,
+                        support_route,
+                        support_variables,
+                        self.direct_terminal_publication_full(),
+                    )
                 }
-            } else {
-                None
-            };
+            });
             let outcome = self.delta.seed_program_confirms(
                 spec,
                 DeltaDesc::leaf(variable, confirmer),
@@ -10884,7 +10880,7 @@ impl ResidualStateMachine {
                 successor,
                 set_admit_result,
                 batch,
-                positive_support,
+                positive_publication,
             );
             return Ok(outcome);
         }
