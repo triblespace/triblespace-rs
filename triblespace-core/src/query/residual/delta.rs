@@ -669,6 +669,59 @@ impl PositivePublicationCertificate {
     }
 }
 
+/// Optional one-occurrence positive hedge attached to an exact Confirm seed.
+///
+/// The caller constructs this descriptor only after independently selecting a
+/// fully-bound Support route under the same Program exposure policy. Keeping
+/// the semantic Confirm state and publication certificate beside that route
+/// prevents the physical child from inventing either identity later.
+pub(super) struct PositiveSupportSeed<'a> {
+    spec: ProgramRef<'a>,
+    desc: DeltaDesc,
+    request: ProgramRequest,
+    route: ProgramRoute,
+    confirm_state: StateId,
+    certificate: PositivePublicationCertificate,
+    support_variables: VariableSet,
+    direct_terminal_full: Option<VariableSet>,
+}
+
+impl<'a> PositiveSupportSeed<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn from_confirm_transition(
+        spec: ProgramRef<'a>,
+        desc: DeltaDesc,
+        request: ProgramRequest,
+        route: ProgramRoute,
+        confirm_state: StateId,
+        previous: &StateDesc,
+        successor: &StateDesc,
+        full: VariableSet,
+        plan: &ResidualPlan,
+        formula_pcs: &FormulaPcInterner,
+        support_variables: VariableSet,
+        direct_terminal_full: Option<VariableSet>,
+    ) -> Option<Self> {
+        let certificate = PositivePublicationCertificate::from_confirm_transition(
+            previous,
+            successor,
+            full,
+            plan,
+            formula_pcs,
+        );
+        certificate.eligible().then_some(Self {
+            spec,
+            desc,
+            request,
+            route,
+            confirm_state,
+            certificate,
+            support_variables,
+            direct_terminal_full,
+        })
+    }
+}
+
 /// Clone-safe physical custody for one exact Support child.
 ///
 /// This payload deliberately carries no [`RegistryBrand`]: it lives inside
@@ -832,10 +885,11 @@ enum DeltaReducer {
     /// A fully-bound typed Support child proving one occurrence owned by an
     /// authoritative semantic Confirm parent.
     ///
-    /// Stage 1 deliberately supports only unjoined Program credits. RPQ's
-    /// exact fully-bound Support routes satisfy that law; generic
-    /// `AfterChildren` propagation remains outside this substrate until it can
-    /// carry semantic-commit evidence through the receipt-local join.
+    /// The first production feeder deliberately supports only unjoined
+    /// Program credits. RPQ's exact fully-bound Support routes satisfy that
+    /// law; generic `AfterChildren` propagation remains outside this substrate
+    /// until it can carry semantic-commit evidence through the receipt-local
+    /// join.
     PositiveSupport {
         link: Box<PositiveSupportLink>,
         witnessed: bool,
@@ -1355,12 +1409,11 @@ impl ProducerRegistry {
         Some(parent)
     }
 
-    /// Opens one dormant physical Support child and constructs its link only
-    /// after the child's activation identity has been allocated.
+    /// Opens one physical Support child and constructs its link only after the
+    /// child's activation identity has been allocated.
     ///
-    /// This is intentionally private and has no production caller in Stage 1.
-    /// The eventual feeder must already have selected an exact fully-bound
-    /// Support Program before entering this transaction.
+    /// The production feeder enters this transaction only after selecting an
+    /// exact fully-bound Support Program for an eligible live Confirm.
     #[cfg_attr(not(test), allow(dead_code))]
     fn open_positive_support_activation(
         &mut self,
@@ -1886,7 +1939,7 @@ impl ProducerRegistry {
         for seed in seeds {
             assert!(
                 !positive_support_reducer || seed.accepted.is_none(),
-                "Stage 1 PositiveSupport cannot turn initial acceptance into publication authority"
+                "PositiveSupport cannot turn initial acceptance into publication authority"
             );
             if let Some(value) = seed.accepted {
                 if self
@@ -5174,17 +5227,18 @@ impl DeltaScheduler {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn seed_program_confirms(
+    pub(super) fn seed_program_confirms<'a>(
         &mut self,
-        spec: ProgramRef<'_>,
+        spec: ProgramRef<'a>,
         desc: DeltaDesc,
         request: ProgramRequest,
         route: ProgramRoute,
         successor: StateDesc,
         set_admit_result: bool,
         batch: CandidateBatch,
-    ) -> Option<ActiveDeltaContinuation> {
-        let state = self.prepare_program(desc, route, spec);
+        positive_support: Option<PositiveSupportSeed<'a>>,
+    ) -> DeltaSeedOutcome {
+        let confirm_state = self.prepare_program(desc, route, spec);
         let stride = successor.bound.count();
         let parent_count = batch.parents.row_count;
         let (parents, candidate_groups) = batch.into_parent_candidates();
@@ -5194,8 +5248,9 @@ impl DeltaScheduler {
             let parent = parents.rows[start..start + stride]
                 .to_vec()
                 .into_boxed_slice();
+            let first_candidate = original.first().copied();
             let original = shared_one_parent_candidates(original);
-            activations.push(self.registry.open_program_activation(
+            let activation = self.registry.open_program_activation(
                 DeltaReducer::Confirm { original },
                 DeltaReturn::Stable {
                     desc: successor.clone(),
@@ -5204,18 +5259,19 @@ impl DeltaScheduler {
                 },
                 None,
                 None,
-            ));
+            );
+            activations.push((activation, first_candidate));
         }
         let program_activations: Vec<_> = activations
             .iter()
-            .map(|activation| ProgramActivation(activation.0))
+            .map(|(activation, _)| ProgramActivation(activation.0))
             .collect();
         let vars: Vec<_> = successor.bound.into_iter().collect();
         let view = rows_view(&vars, &parents.rows, parent_count);
         let mut seeded = ProgramSeedEffects::default();
         spec.seed_batch(
             self.program_runtimes
-                .get_mut(&state)
+                .get_mut(&confirm_state)
                 .expect("prepared program lost its runtime"),
             ProgramSeedBatch {
                 request,
@@ -5229,7 +5285,8 @@ impl DeltaScheduler {
         let mut tasks = Vec::with_capacity(seeded.work.len());
         let mut retired = Vec::new();
         let mut finalizer_active = None;
-        for (activation, range) in activations.into_iter().zip(ranges) {
+        let mut support_activations = Vec::new();
+        for ((activation, first_candidate), range) in activations.into_iter().zip(ranges) {
             let installed = self
                 .registry
                 .install_program_roots(activation, seeded.work[range].iter().cloned());
@@ -5252,19 +5309,155 @@ impl DeltaScheduler {
                     DeltaSettlement::Retargeted(active) => finalizer_active = Some(active),
                 }
                 retired.push(ProgramActivation(activation.0));
+            } else if let (Some(hedge), Some(value)) = (positive_support.as_ref(), first_candidate)
+            {
+                let parent = self
+                    .registry
+                    .open_positive_publication(activation, hedge.confirm_state, hedge.certificate)
+                    .expect("eligible live Confirm rejected its positive ledger");
+                let child = self
+                    .registry
+                    .open_positive_support_activation(
+                        parent,
+                        0,
+                        value,
+                        hedge.support_variables,
+                        hedge.direct_terminal_full,
+                    )
+                    .expect("eligible Confirm occurrence rejected its positive Support child");
+                support_activations.push(child);
             }
         }
         if !retired.is_empty() {
             spec.retire_activations(
                 self.program_runtimes
-                    .get_mut(&state)
+                    .get_mut(&confirm_state)
                     .expect("prepared program lost its runtime"),
                 route.key,
                 &retired,
             );
         }
-        let graph_active = self.file_program_state(state, tasks);
-        finalizer_active.or(graph_active)
+        // Exact Confirm work is never displaced by the hedge. Filing it first
+        // preserves the complete fallback while the subsequently prepared
+        // Support family receives the hot state/tail.
+        let graph_active = self.file_program_state(confirm_state, tasks);
+
+        let mut support_active = None;
+        let mut completed_activation_ids = Vec::new();
+        if let Some(hedge) = positive_support.filter(|_| !support_activations.is_empty()) {
+            let PositiveSupportSeed {
+                spec,
+                desc,
+                request,
+                route,
+                ..
+            } = hedge;
+            let support_state = self.prepare_program(desc, route, spec);
+            let mut rows = Vec::with_capacity(
+                support_activations
+                    .len()
+                    .checked_mul(request.bound.count())
+                    .expect("positive Support seed row capacity overflow"),
+            );
+            for &activation in &support_activations {
+                let (bound, row, candidates) = self.registry.source_context(activation);
+                assert_eq!(bound, request.bound);
+                assert!(
+                    candidates.is_none(),
+                    "positive Support child exposed a candidate set"
+                );
+                rows.extend_from_slice(row);
+            }
+            let vars: Vec<_> = request.bound.into_iter().collect();
+            let program_activations: Vec<_> = support_activations
+                .iter()
+                .map(|activation| ProgramActivation(activation.0))
+                .collect();
+            let view = rows_view(&vars, &rows, support_activations.len());
+            let mut seeded = ProgramSeedEffects::default();
+            spec.seed_batch(
+                self.program_runtimes
+                    .get_mut(&support_state)
+                    .expect("prepared positive Support program lost its runtime"),
+                ProgramSeedBatch {
+                    request,
+                    route,
+                    view,
+                    activations: &program_activations,
+                },
+                &mut seeded,
+            );
+            let ranges = program_seed_ranges(&seeded.work, support_activations.len());
+            let mut tasks = Vec::with_capacity(seeded.work.len());
+            let mut retired = Vec::new();
+            for (activation, range) in support_activations.into_iter().zip(ranges) {
+                let seeds = &seeded.work[range];
+                if seeds.iter().any(|seed| seed.accepted.is_some()) {
+                    // Nullable seed acceptance is not a runtime Support
+                    // witness. Affinely discard its uninstalled typed work,
+                    // then retire the creditless physical child through
+                    // ordinary quiescence.
+                    let program_activation = ProgramActivation(activation.0);
+                    let runtime = self
+                        .program_runtimes
+                        .get_mut(&support_state)
+                        .expect("positive Support program lost its runtime");
+                    for seed in seeds {
+                        spec.discard_work(runtime, route.key, program_activation, &seed.work);
+                    }
+                    let installed = self
+                        .registry
+                        .install_program_roots(activation, std::iter::empty());
+                    let proof = installed
+                        .quiescence
+                        .expect("empty positive Support install remained live");
+                    let completed = self.registry.finish(proof);
+                    assert_eq!(completed.effect, DeltaCompletion::Cleanup);
+                    completed_activation_ids.push(completed.activation);
+                    retired.push(ProgramActivation(activation.0));
+                    continue;
+                }
+                let installed = self
+                    .registry
+                    .install_program_roots(activation, seeds.iter().cloned());
+                tasks.extend(
+                    installed
+                        .roots
+                        .into_iter()
+                        .map(|(work, credit)| ProgramTask {
+                            activation,
+                            credit,
+                            work,
+                        }),
+                );
+                if let Some(proof) = installed.quiescence {
+                    let completed = self.registry.finish(proof);
+                    assert_eq!(completed.effect, DeltaCompletion::Cleanup);
+                    completed_activation_ids.push(completed.activation);
+                    retired.push(ProgramActivation(activation.0));
+                }
+            }
+            if !retired.is_empty() {
+                spec.retire_activations(
+                    self.program_runtimes
+                        .get_mut(&support_state)
+                        .expect("positive Support program lost its runtime"),
+                    route.key,
+                    &retired,
+                );
+            }
+            support_active = self.file_program_state(support_state, tasks);
+        }
+
+        DeltaSeedOutcome {
+            continuation: None,
+            publication: None,
+            active: support_active.or(finalizer_active).or(graph_active),
+            terminal_activations: Vec::new(),
+            completed_activation_ids,
+            terminal_family: None,
+            seeded_parents: parent_count,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7795,11 +7988,11 @@ impl DeltaScheduler {
                 supported_range.len() <= 1,
                 "one typed input page reported Boolean support more than once"
             );
-            let page_had_program_effect = !child_range.is_empty()
-                || (!private_direct && !direct_range.is_empty())
+            let had_child = !child_range.is_empty();
+            let raw_ordinary_program_effect = (!private_direct && !direct_range.is_empty())
                 || !accepted_range.is_empty()
                 || !supported_range.is_empty();
-            let outcome = self.registry.replace_program(
+            let mut outcome = self.registry.replace_program(
                 credit,
                 state,
                 &children[child_range],
@@ -7811,10 +8004,32 @@ impl DeltaScheduler {
                 source_telemetry_cohort,
                 page.resume,
             );
-            assert!(
-                !outcome.positive_support_reducer && outcome.positive_support.is_none(),
-                "dormant PositiveSupport activation reached the production scheduler before its Stage 2 feeder"
-            );
+            let positive_support_reducer = outcome.positive_support_reducer;
+            // A real Program receipt has already spent the child's affine
+            // credit. Commit its witness and consume any resulting grant
+            // immediately, before scheduling, settlement, or other fallible
+            // work can separate the semantic SET insertion from release.
+            let mut task_effects = DeltaStableEffects::default();
+            if let Some(witness) = outcome.positive_support.take() {
+                if let Some(grant) = self
+                    .registry
+                    .commit_positive_publication(*witness, direct_terminal_full)
+                {
+                    task_effects.absorb(Self::release_positive_publication(
+                        grant,
+                        plan,
+                        stable,
+                        stable_interner,
+                        stats,
+                    ));
+                }
+            }
+            // Raw accepted/supported reports from a PositiveSupport child are
+            // merely witness material. Only a successful semantic
+            // commit/release above is stable progress; independently retained
+            // child work remains ordinary physical progress.
+            let page_had_program_effect =
+                had_child || (!positive_support_reducer && raw_ordinary_program_effect);
             if outcome.raw_proposal_occurrences != 0 {
                 assert!(
                     outcome.raw_proposal_occurrences >= outcome.accepted.len(),
@@ -7838,8 +8053,7 @@ impl DeltaScheduler {
                 });
             }
 
-            let mut task_effects = DeltaStableEffects::default();
-            if !supported_range.is_empty() {
+            if !positive_support_reducer && !supported_range.is_empty() {
                 assert!(
                     outcome.accepted.is_empty(),
                     "one typed page mixed Boolean support with candidate acceptance"
@@ -11594,7 +11808,7 @@ mod tests {
     }
 
     #[test]
-    fn positive_support_stage_one_rejects_seed_success_and_after_children() {
+    fn positive_support_rejects_seed_success_and_after_children() {
         let candidate = value(93);
         let mut registry = ProducerRegistry::new();
         let (_, parent) =
@@ -11620,7 +11834,7 @@ mod tests {
                 );
             }))
             .is_err(),
-            "Stage 1 must not counterfeit a replacement witness from initial acceptance"
+            "PositiveSupport must not counterfeit a replacement witness from initial acceptance"
         );
         let mut installed = registry.install_program_roots(
             child,
@@ -11647,7 +11861,7 @@ mod tests {
                 );
             }))
             .is_err(),
-            "Stage 1 must not claim unsupported generic AfterChildren propagation"
+            "PositiveSupport must not claim unsupported generic AfterChildren propagation"
         );
     }
 
@@ -14377,7 +14591,9 @@ mod tests {
                     },
                     candidates: CandidatePayload::Tagged(vec![(0, value(7)), (1, value(8))]),
                 },
+                None,
             )
+            .active
             .expect("both Confirm parents must seed one live Program root");
         let stored_tasks = &scheduler.program_worklist[&active.state].tasks;
         let mut activation_ids: Vec<_> = stored_tasks.iter().map(|task| task.activation).collect();
@@ -14999,7 +15215,9 @@ mod tests {
                     parents: RowBatch::seed(),
                     candidates: CandidatePayload::Values(vec![value(7)]),
                 },
+                None,
             )
+            .active
             .expect("Confirm Program seeded one graph task");
 
         let mut stable = Worklist::new();
@@ -15097,7 +15315,9 @@ mod tests {
                     },
                     candidates: CandidatePayload::Tagged(vec![(0, value(7)), (1, value(8))]),
                 },
+                None,
             )
+            .active
             .expect("both Confirm parents must seed one live Program root");
 
         let mut stable = Worklist::new();

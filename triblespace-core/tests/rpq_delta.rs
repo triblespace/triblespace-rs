@@ -13,8 +13,10 @@ use triblespace_core::query::residual::{
 };
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
-    Binding, CandidateSink, Constraint, EstimateSink, PathOp, ProgramRef, Query,
-    RegularPathConstraint, RowsView, Variable, VariableId, VariableSet,
+    Binding, CandidateSink, Constraint, DispatchClass, EstimateSink, PathOp, PreferredProgram,
+    ProgramAction, ProgramRef, ProgramRequest, ProgramRoute, ProgramSeedBatch, ProposalCoverage,
+    Query, RegularPathConstraint, RowsView, TypedEffectSink, TypedProgramBatch, TypedProgramSpec,
+    TypedSeedSink, Variable, VariableId, VariableSet,
 };
 use triblespace_core::trible::{Trible, TribleSet};
 
@@ -350,6 +352,246 @@ impl<'a> Constraint<'a> for OrderedDomain {
 }
 
 #[derive(Clone)]
+struct CertifiedOrderedDomain(OrderedDomain);
+
+impl<'a> Constraint<'a> for CertifiedOrderedDomain {
+    fn variables(&self) -> VariableSet {
+        self.0.variables()
+    }
+
+    fn fixed_denotation(&self) -> bool {
+        true
+    }
+
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+        if variable == self.0.variable && !bound.is_set(variable) {
+            ProposalCoverage::Covering
+        } else {
+            ProposalCoverage::None
+        }
+    }
+
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        self.0.estimate(variable, view, out)
+    }
+
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.0.propose(variable, view, candidates);
+    }
+
+    fn confirm(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.0.confirm(variable, view, candidates);
+    }
+
+    fn estimate_certified(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        self.estimate(variable, view, out)
+    }
+
+    fn propose_certified(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.0.propose(variable, view, candidates);
+    }
+
+    fn confirm_certified(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.0.confirm(variable, view, candidates);
+    }
+
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        self.0.satisfied(view)
+    }
+
+    fn residual_confirm_is_page_local(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Clone)]
+struct SupportRouteProbe {
+    calls: Arc<AtomicUsize>,
+}
+
+impl TypedProgramSpec for SupportRouteProbe {
+    type State = ();
+    type NoveltyKey = ();
+    type Rank = ();
+
+    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+        if request.action == ProgramAction::Support {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+        }
+        None
+    }
+
+    fn dispatch(&self, _state: &Self::State) -> DispatchClass {
+        unreachable!("the route-only Support probe never owns work")
+    }
+
+    fn progress(&self, _state: &Self::State) -> Self::Rank {
+        unreachable!("the route-only Support probe never owns work")
+    }
+
+    fn seed_typed(
+        &self,
+        _batch: ProgramSeedBatch<'_>,
+        _effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+    ) {
+        unreachable!("the route-only Support probe is never seeded")
+    }
+
+    fn step_typed(
+        &self,
+        _states: &mut Vec<Self::State>,
+        _batch: TypedProgramBatch<'_>,
+        _effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+    ) {
+        unreachable!("the route-only Support probe is never stepped")
+    }
+}
+
+/// Observes Support route selection without changing the selected RPQ arm.
+///
+/// The preferred arm always declines after recording the request, so the real
+/// RPQ remains the exact typed executor. Most target-Confirm fixtures suppress
+/// its covering proposal certificate to isolate confirmation; the partial
+/// fixture retains it so the remaining endpoint can still be enumerated.
+struct ProbedConfirmRpq {
+    program: PreferredProgram<SupportRouteProbe, RegularPathConstraint>,
+    covering_proposals: bool,
+}
+
+impl<'a> Constraint<'a> for ProbedConfirmRpq {
+    fn variables(&self) -> VariableSet {
+        self.program.fallback().variables()
+    }
+
+    fn fixed_denotation(&self) -> bool {
+        self.program.fallback().fixed_denotation()
+    }
+
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+        if self.covering_proposals {
+            self.program.fallback().proposal_coverage(variable, bound)
+        } else {
+            ProposalCoverage::None
+        }
+    }
+
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        self.program.fallback().estimate(variable, view, out)
+    }
+
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.program.fallback().propose(variable, view, candidates);
+    }
+
+    fn confirm(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.program.fallback().confirm(variable, view, candidates);
+    }
+
+    fn estimate_certified(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        self.program
+            .fallback()
+            .estimate_certified(variable, view, out)
+    }
+
+    fn propose_certified(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.program
+            .fallback()
+            .propose_certified(variable, view, candidates);
+    }
+
+    fn confirm_certified(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.program
+            .fallback()
+            .confirm_certified(variable, view, candidates);
+    }
+
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        self.program.fallback().satisfied(view)
+    }
+
+    fn influence(&self, variable: VariableId) -> VariableSet {
+        self.program.fallback().influence(variable)
+    }
+
+    fn residual_confirm_is_page_local(&self) -> bool {
+        self.program.fallback().residual_confirm_is_page_local()
+    }
+
+    fn residual_delta_confirm_grouping_requirements(
+        &self,
+        variable: VariableId,
+    ) -> Option<VariableSet> {
+        self.program
+            .fallback()
+            .residual_delta_confirm_grouping_requirements(variable)
+    }
+
+    fn residual_program(&self) -> Option<ProgramRef<'_>> {
+        Some(ProgramRef::preferred(&self.program))
+    }
+}
+
+#[derive(Clone)]
 struct PageTraceFilter {
     variable: VariableId,
     estimate: usize,
@@ -606,6 +848,36 @@ fn target_confirm_root(
             values: candidates,
         }) as DynConstraint,
         Box::new(RegularPathConstraint::new(set, start_var, end_var, ops)) as DynConstraint,
+    ]))
+}
+
+fn certified_target_confirm_root(
+    set: TribleSet,
+    bound: Inline<GenId>,
+    candidates: Vec<RawInline>,
+    ops: &[PathOp],
+    support_routes: Arc<AtomicUsize>,
+) -> Root {
+    let start_var = Variable::<GenId>::new(START);
+    let end_var = Variable::<GenId>::new(END);
+    let rpq = RegularPathConstraint::new(set, start_var, end_var, ops);
+    Arc::new(IntersectionConstraint::new(vec![
+        Box::new(start_var.is(bound)) as DynConstraint,
+        Box::new(CertifiedOrderedDomain(OrderedDomain {
+            variable: END,
+            gate: START,
+            unbound_estimate: 4,
+            values: candidates,
+        })) as DynConstraint,
+        Box::new(ProbedConfirmRpq {
+            program: PreferredProgram::new(
+                SupportRouteProbe {
+                    calls: support_routes,
+                },
+                rpq,
+            ),
+            covering_proposals: false,
+        }) as DynConstraint,
     ]))
 }
 
@@ -3017,6 +3289,256 @@ fn target_confirm_traverses_once_and_set_admits_reachable_candidates() {
         expected.sort_unstable();
         assert_eq!(run(root, Scheduler::Residual, project), expected);
     }
+}
+
+#[test]
+fn target_confirm_positive_support_yields_occurrence_zero_then_exactly_drains() {
+    let mut graph = Graph::new(5, &[]);
+    let mut reachable: Vec<_> = (1..5).collect();
+    reachable.sort_unstable_by_key(|&node| graph.value(node).raw);
+    let mut chain = vec![0];
+    chain.extend(reachable.iter().copied());
+    for edge in chain.windows(2) {
+        graph.set.insert(&Trible::new(
+            &graph.nodes[edge[0]],
+            &graph.attribute,
+            &graph.value(edge[1]),
+        ));
+    }
+    let absent = [u8::MAX; 32];
+    let candidates = vec![
+        graph.value(reachable[2]).raw,
+        graph.value(reachable[3]).raw,
+        absent,
+        graph.value(reachable[1]).raw,
+        graph.value(reachable[0]).raw,
+        graph.value(reachable[0]).raw,
+    ];
+    let support_routes = Arc::new(AtomicUsize::new(0));
+    let make = || {
+        certified_target_confirm_root(
+            graph.set.clone(),
+            graph.value(0),
+            candidates.clone(),
+            &repeated(graph.attribute, false),
+            Arc::clone(&support_routes),
+        )
+    };
+    let mut control: Vec<_> = Query::new(make(), project_end)
+        .solve_residual_state_lazy_with(ResidualLowering::new(
+            FormulaScope::OpaqueLeaves,
+            ProgramScope::Disabled,
+        ))
+        .start_width(1)
+        .cap(1)
+        .collect();
+    control.sort_unstable();
+
+    let mut query = Query::new(make(), project_end)
+        .solve_residual_state_lazy_with(ResidualLowering::new(
+            FormulaScope::OpaqueLeaves,
+            ProgramScope::All,
+        ))
+        .start_width(1)
+        .cap(1);
+    let first = query
+        .next()
+        .expect("occurrence-zero Support should publish its exact witness");
+    assert_eq!(
+        query.stats().delta_direct_terminal_publication_batches,
+        1,
+        "the first result must come from positive direct publication"
+    );
+    assert_eq!(
+        query.stats().delta_direct_terminal_publication_rows,
+        1,
+        "one positive witness must publish exactly one row"
+    );
+    assert_eq!(support_routes.load(Ordering::Relaxed), 1);
+    let early_examined = query.stats().delta_transition_candidates_examined;
+
+    let mut actual = vec![first];
+    actual.extend(query.by_ref());
+    assert!(
+        query.stats().delta_transition_candidates_examined > early_examined,
+        "exact Confirm work must remain queued after the positive yield"
+    );
+    actual.sort_unstable();
+    assert_eq!(actual, control);
+    assert_eq!(
+        actual.iter().filter(|&&value| value == first).count(),
+        1,
+        "exact Confirm settlement must subtract the already-published value"
+    );
+    assert!(actual.contains(&graph.value(reachable[1]).raw));
+    assert!(actual.contains(&graph.value(reachable[3]).raw));
+}
+
+#[test]
+fn target_confirm_positive_support_does_not_feed_past_false_occurrence_zero() {
+    let graph = Graph::new(5, &[(0, 1), (1, 2), (2, 3), (3, 4)]);
+    let candidates = vec![[0; 32], graph.value(1).raw, [u8::MAX; 32]];
+    let support_routes = Arc::new(AtomicUsize::new(0));
+    let make = || {
+        certified_target_confirm_root(
+            graph.set.clone(),
+            graph.value(0),
+            candidates.clone(),
+            &repeated(graph.attribute, false),
+            Arc::clone(&support_routes),
+        )
+    };
+    let mut control: Vec<_> = Query::new(make(), project_end)
+        .solve_residual_state_lazy_with(ResidualLowering::new(
+            FormulaScope::OpaqueLeaves,
+            ProgramScope::Disabled,
+        ))
+        .start_width(3)
+        .cap(3)
+        .collect();
+    control.sort_unstable();
+
+    let mut query = Query::new(make(), project_end)
+        .solve_residual_state_lazy_with(ResidualLowering::new(
+            FormulaScope::OpaqueLeaves,
+            ProgramScope::All,
+        ))
+        .start_width(3)
+        .cap(3);
+    let mut actual: Vec<_> = query.by_ref().collect();
+    actual.sort_unstable();
+    assert_eq!(actual, control);
+    assert_eq!(
+        support_routes.load(Ordering::Relaxed),
+        1,
+        "v1 must select exactly one occurrence-zero Support route"
+    );
+    assert_eq!(
+        query.stats().delta_direct_terminal_publication_batches,
+        0,
+        "v1 must not feed occurrence one after occurrence-zero Support is false"
+    );
+    assert!(actual.contains(&graph.value(1).raw));
+    assert!(query.stats().delta_transition_candidates_examined > 0);
+}
+
+#[test]
+fn target_confirm_nullable_support_seed_is_not_publication_authority() {
+    let graph = Graph::new(2, &[(0, 1)]);
+    let start = graph.value(0).raw;
+    let candidates = vec![start, start, start];
+    let support_routes = Arc::new(AtomicUsize::new(0));
+    let make = || {
+        certified_target_confirm_root(
+            graph.set.clone(),
+            graph.value(0),
+            candidates.clone(),
+            &[PathOp::Attr(graph.attribute.raw()), PathOp::Star],
+            Arc::clone(&support_routes),
+        )
+    };
+    let control: Vec<_> = Query::new(make(), project_end)
+        .solve_residual_state_lazy_with(ResidualLowering::new(
+            FormulaScope::OpaqueLeaves,
+            ProgramScope::Disabled,
+        ))
+        .start_width(1)
+        .cap(1)
+        .collect();
+
+    let mut query = Query::new(make(), project_end)
+        .solve_residual_state_lazy_with(ResidualLowering::new(
+            FormulaScope::OpaqueLeaves,
+            ProgramScope::All,
+        ))
+        .start_width(1)
+        .cap(1);
+    let actual: Vec<_> = query.by_ref().collect();
+    assert_eq!(actual, control);
+    assert_eq!(actual, [start]);
+    assert_eq!(
+        support_routes.load(Ordering::Relaxed),
+        1,
+        "v1 must select only occurrence-zero Support"
+    );
+    assert_eq!(
+        query.stats().delta_direct_terminal_publication_batches,
+        0,
+        "nullable seed acceptance is not a runtime Support receipt"
+    );
+    assert!(query.stats().delta_transition_candidates_examined > 0);
+}
+
+#[test]
+fn positive_support_gate_precedes_partial_rpq_optimistic_support_selection() {
+    let graph = Graph::new(5, &[(4, 0), (1, 2), (2, 3)]);
+    let candidates = vec![graph.value(0).raw, graph.value(1).raw];
+    let support_routes = Arc::new(AtomicUsize::new(0));
+    let make = || {
+        let start = Variable::<GenId>::new(START);
+        let end = Variable::<GenId>::new(END);
+        let rpq = RegularPathConstraint::new(
+            graph.set.clone(),
+            start,
+            end,
+            &repeated(graph.attribute, false),
+        );
+        Arc::new(IntersectionConstraint::new(vec![
+            Box::new(CertifiedOrderedDomain(OrderedDomain {
+                variable: START,
+                gate: END,
+                unbound_estimate: 0,
+                values: candidates.clone(),
+            })) as DynConstraint,
+            Box::new(ProbedConfirmRpq {
+                program: PreferredProgram::new(
+                    SupportRouteProbe {
+                        calls: Arc::clone(&support_routes),
+                    },
+                    rpq,
+                ),
+                covering_proposals: true,
+            }) as DynConstraint,
+        ]))
+    };
+    let mut sequential: Vec<_> = Query::new(make(), project_pair).sequential().collect();
+    let mut disabled: Vec<_> = Query::new(make(), project_pair)
+        .solve_residual_state_lazy_with(ResidualLowering::new(
+            FormulaScope::OpaqueLeaves,
+            ProgramScope::Disabled,
+        ))
+        .collect();
+    sequential.sort_unstable();
+    disabled.sort_unstable();
+    assert_eq!(disabled, sequential);
+
+    let mut query = Query::new(make(), project_pair)
+        .solve_residual_state_lazy_with(ResidualLowering::new(
+            FormulaScope::OpaqueLeaves,
+            ProgramScope::All,
+        ))
+        .start_width(1)
+        .cap(1);
+    let mut actual: Vec<_> = query.by_ref().collect();
+    actual.sort_unstable();
+    assert_eq!(actual, disabled);
+    let mut expected = vec![
+        (graph.value(1).raw, graph.value(2).raw),
+        (graph.value(1).raw, graph.value(3).raw),
+    ];
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
+    assert_eq!(
+        support_routes.load(Ordering::Relaxed),
+        0,
+        "the full-bound gate must precede optimistic partial Support selection"
+    );
+    assert!(
+        query.stats().confirm_calls > 0
+            && query.stats().candidates_confirmed >= candidates.len()
+            && query.stats().delta_transition_candidates_examined > 0,
+        "the exact partial Confirm must still execute"
+    );
 }
 
 #[test]

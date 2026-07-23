@@ -9,19 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Residual Confirm activations now have a dormant positive-publication
-  ledger and physical-proof seam.** A generation-fenced semantic parent
-  ledger owns the first-value-wins map, while each allocated Support child
-  retains a clone-safe occurrence-indexed link to its exact original Confirm
-  candidate. Only replacement of a real branch-local producer credit can mint
-  the non-cloneable, registry-branded witness consumed by the publication
-  transaction. Ineligible parents own no ledger, query clones preserve links
-  while rebranding live credits independently, and rare physical-link and
-  returned-witness payloads are boxed: reducers and activations retain their
-  prior inline sizes, while the transient replacement outcome grows by 16 B.
-  Ordinary activations pay only one nullable ledger pointer. No positive work
-  is seeded or called by the production scheduler, so query behavior remains
-  unchanged.
+- **Eligible target-Confirm activations now run a one-occurrence positive
+  Support hedge.** The scheduler independently selects a fully-bound Support
+  route under the same Program policy, installs the complete exact Confirm
+  fallback first, and then seeds only occurrence zero. A generation-fenced
+  parent ledger and clone-safe occurrence link let replacement of one real
+  branch-local producer credit commit and immediately release the witness;
+  duplicate or stale receipts cannot publish twice, a false first occurrence
+  never feeds later candidates, and exact Confirm continues to quiescence with
+  SET subtraction. Nullable seed acceptance is deliberately declined and its
+  uninstalled typed state is affinely discarded before ordinary cleanup.
+  Ineligible continuations still acquire no ledger, and generic joined
+  `AfterChildren` propagation remains outside this first production caller.
 - **Residual Confirm continuations now carry an executable publication
   receipt.** The private three-valued proof distinguishes an exact terminal
   binding, a nonterminal chunk that first crosses the parent-local candidate

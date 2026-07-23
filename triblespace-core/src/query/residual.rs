@@ -101,7 +101,8 @@ mod materialize;
 mod set_admit;
 use delta::{
     ActivationId as DeltaActivationId, ActiveDeltaContinuation, ActiveDeltaStatus, DeltaDesc,
-    DeltaScheduler, DeltaSeedOutcome, DeltaStepOutcome, TerminalPublicationBatch,
+    DeltaScheduler, DeltaSeedOutcome, DeltaStepOutcome, PositiveSupportSeed,
+    TerminalPublicationBatch,
 };
 
 /// One deterministic route from the owned root to an opaque residual leaf.
@@ -10792,7 +10793,7 @@ impl ResidualStateMachine {
                 );
             }
             let SelectedResidualTask {
-                state: _,
+                state,
                 desc,
                 bucket,
             } = task;
@@ -10817,8 +10818,37 @@ impl ResidualStateMachine {
             };
             let set_admit_result =
                 crosses_candidate_set_boundary(&desc, &successor, plan, &self.interner.formula_pcs);
-            let seeded_parents = batch.parents.row_count;
-            let active = self.delta.seed_program_confirms(
+            let mut support_bound = desc.bound;
+            support_bound.set(variable);
+            let support_variables = constraint.variables();
+            let positive_support = if support_variables.is_subset_of(&support_bound) {
+                let support_request = ProgramRequest {
+                    action: ProgramAction::Support,
+                    bound: support_bound,
+                };
+                match select_program(constraint, plan.program_scope, support_request) {
+                    ProgramOffer::Selected(support_spec, support_route) => {
+                        PositiveSupportSeed::from_confirm_transition(
+                            support_spec,
+                            DeltaDesc::leaf(support_route.variable, confirmer),
+                            support_request,
+                            support_route,
+                            state,
+                            &desc,
+                            &successor,
+                            self.full,
+                            plan,
+                            &self.interner.formula_pcs,
+                            support_variables,
+                            self.direct_terminal_publication_full(),
+                        )
+                    }
+                    ProgramOffer::Absent | ProgramOffer::Deferred => None,
+                }
+            } else {
+                None
+            };
+            let outcome = self.delta.seed_program_confirms(
                 spec,
                 DeltaDesc::leaf(variable, confirmer),
                 program_request,
@@ -10826,16 +10856,9 @@ impl ResidualStateMachine {
                 successor,
                 set_admit_result,
                 batch,
+                positive_support,
             );
-            return Ok(DeltaSeedOutcome {
-                continuation: None,
-                publication: None,
-                active,
-                terminal_activations: Vec::new(),
-                completed_activation_ids: Vec::new(),
-                terminal_family: None,
-                seeded_parents,
-            });
+            return Ok(outcome);
         }
         if constraint.residual_delta_source_is_paged(variable, &view) {
             let SelectedResidualTask {

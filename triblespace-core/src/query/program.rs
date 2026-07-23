@@ -1223,6 +1223,14 @@ trait ErasedProgramSpec {
         effects: &mut ProgramBatchEffects,
     );
 
+    fn discard_work(
+        &self,
+        runtime: &mut ProgramRuntime,
+        key: ProgramKey,
+        activation: ProgramActivation,
+        work: &ProgramWork,
+    );
+
     fn try_complete_bounded(
         &self,
         batch: ProgramCompleteBatch<'_>,
@@ -1308,6 +1316,18 @@ impl<'a> ProgramRef<'a> {
         effects: &mut ProgramBatchEffects,
     ) {
         self.erased.step_batch(runtime, key, batch, effects);
+    }
+
+    /// Affinely discards typed work that policy declines before allocating a
+    /// producer credit for it.
+    pub(crate) fn discard_work(
+        self,
+        runtime: &mut ProgramRuntime,
+        key: ProgramKey,
+        activation: ProgramActivation,
+        work: &ProgramWork,
+    ) {
+        self.erased.discard_work(runtime, key, activation, work);
     }
 
     #[cold]
@@ -1523,6 +1543,10 @@ where
         }
     }
 
+    fn discard(&mut self, activation: ProgramActivation, work: &ProgramWork) {
+        drop(self.take(activation, work.handle.clone()));
+    }
+
     /// Admits one typed novelty key for an activation.
     ///
     /// The attached Boolean is the key's endpoint observation and must remain
@@ -1722,6 +1746,17 @@ where
     ) {
         let (selected, child_key) = self.selected(key);
         selected.step_batch(runtime, child_key, batch, effects);
+    }
+
+    fn discard_work(
+        &self,
+        runtime: &mut ProgramRuntime,
+        key: ProgramKey,
+        activation: ProgramActivation,
+        work: &ProgramWork,
+    ) {
+        let (selected, child_key) = self.selected(key);
+        selected.discard_work(runtime, child_key, activation, work);
     }
 
     #[cold]
@@ -2179,6 +2214,34 @@ where
         scratch.examined.clear();
         scratch.raw_effects.clear();
         runtime.scratch = Some(scratch);
+    }
+
+    fn discard_work(
+        &self,
+        runtime: &mut ProgramRuntime,
+        key: ProgramKey,
+        activation: ProgramActivation,
+        work: &ProgramWork,
+    ) {
+        assert_eq!(
+            key.arm,
+            ProgramRouteArm::Direct,
+            "a direct typed Program discard received a composed route arm"
+        );
+        assert_eq!(
+            runtime.family,
+            TypeId::of::<TypedProgramRuntime<T::State, T::NoveltyKey, T::Rank>>(),
+            "residual program discard expected family {}, received {}",
+            type_name::<TypedProgramRuntime<T::State, T::NoveltyKey, T::Rank>>(),
+            runtime.family_name
+        );
+        let runtime = runtime
+            .erased
+            .as_mut()
+            .as_any_mut()
+            .downcast_mut::<TypedProgramRuntime<T::State, T::NoveltyKey, T::Rank>>()
+            .expect("residual program discard received another family's runtime");
+        runtime.discard(activation, work);
     }
 
     #[cold]
