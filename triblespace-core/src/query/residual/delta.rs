@@ -5589,6 +5589,10 @@ struct PhysicalDispatch {
     kind: PhysicalDispatchKind,
     task_limits: Vec<usize>,
     remainder_tasks: usize,
+    /// Attribution chosen by the Program scheduler that formed this packet.
+    /// Carrying it with the physical receipt avoids reclassifying affine
+    /// reducers after selection.
+    program_service_lane: Option<ProgramServiceLane>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5654,7 +5658,13 @@ impl PhysicalDispatch {
             kind,
             task_limits,
             remainder_tasks,
+            program_service_lane: None,
         }
+    }
+
+    fn with_program_service_lane(mut self, lane: Option<ProgramServiceLane>) -> Self {
+        self.program_service_lane = lane;
+        self
     }
 
     fn work_budget(&self) -> usize {
@@ -6441,6 +6451,10 @@ pub(super) struct DeltaScheduler {
     /// becomes runnable. It is consumed only by a global Program pop, which
     /// may select a different canonical state from the ordinary hot tail.
     next_program_lane: Option<ProgramServiceLane>,
+    /// Exact state selected at the same scheduler boundary as
+    /// `next_program_lane`. Manual test policies may omit it and use the
+    /// ordinary lane lookup fallback.
+    next_program_state: Option<DeltaStateId>,
     /// Mutually exclusive PositiveSupport admission currency.
     positive_support_scheduling: PositiveSupportScheduling,
     /// One aggregate affine lease for the opt-in global service policy.
@@ -6478,6 +6492,7 @@ impl DeltaScheduler {
             parked_positive_support_worklist: ProgramWorklist::default(),
             program_lane_selection: ProgramLaneSelection::Unrestricted,
             next_program_lane: None,
+            next_program_state: None,
             positive_support_scheduling: PositiveSupportScheduling::CountCredit,
             positive_support_service_debt: PositiveSupportServiceDebtLedger::dormant(),
             public_pull_demand: PublicPullDemandState::Closed,
@@ -8433,6 +8448,7 @@ impl DeltaScheduler {
                 ProgramServiceLane::Support
             );
             self.next_program_lane = Some(ProgramServiceLane::Support);
+            self.next_program_state = Some(state);
         }
         Some(ActiveDeltaContinuation { state, activation })
     }
@@ -8570,27 +8586,28 @@ impl DeltaScheduler {
     fn arm_global_service_lane(&mut self) {
         if !self.global_service_epoch_is_active() {
             self.next_program_lane = None;
+            self.next_program_state = None;
             return;
         }
         self.next_program_lane = None;
+        self.next_program_state = None;
         if self
             .positive_support_service_debt
             .support_is_admissible(true)
         {
             self.wake_global_service_support_lane();
-            assert!(
-                self.program_worklist
-                    .last_id_in_lane(&self.registry, ProgramServiceLane::Support)
-                    .is_some(),
-                "admissible Support service lane lost its queued packet"
-            );
+            let state = self
+                .program_worklist
+                .last_id_in_lane(&self.registry, ProgramServiceLane::Support)
+                .expect("admissible Support service lane lost its queued packet");
             self.next_program_lane = Some(ProgramServiceLane::Support);
-        } else if self
+            self.next_program_state = Some(state);
+        } else if let Some(state) = self
             .program_worklist
             .last_id_in_lane(&self.registry, ProgramServiceLane::Exact)
-            .is_some()
         {
             self.next_program_lane = Some(ProgramServiceLane::Exact);
+            self.next_program_state = Some(state);
         }
     }
 
@@ -8675,6 +8692,7 @@ impl DeltaScheduler {
                     })
                 }));
                 self.next_program_lane = None;
+                self.next_program_state = None;
             }
             ProgramServiceLane::Neutral => unreachable!(),
         }
@@ -9003,8 +9021,10 @@ impl DeltaScheduler {
             .lane_selection_is_active()
             .then(|| self.next_program_lane.take())
             .flatten();
-        let preferred_state = preferred_lane
-            .and_then(|lane| self.program_worklist.last_id_in_lane(&self.registry, lane));
+        let planned_state = self.next_program_state.take();
+        let preferred_state = preferred_lane.and_then(|lane| {
+            planned_state.or_else(|| self.program_worklist.last_id_in_lane(&self.registry, lane))
+        });
         assert!(
             preferred_lane.is_none() || preferred_state.is_some(),
             "preferred Program service lane disappeared before its global pop"
@@ -9060,7 +9080,8 @@ impl DeltaScheduler {
             tasks.iter().map(|task| task.activation),
             limits,
             remainder_tasks,
-        );
+        )
+        .with_program_service_lane(lane);
         (id, tasks, support_grants, dispatch)
     }
 
@@ -9473,21 +9494,24 @@ impl DeltaScheduler {
         self.arm_global_service_lane();
         if !self.program_worklist.is_empty() {
             let (state, tasks, support_grants, dispatch) = self.pop_program_bounded(search_width);
-            let service_lane =
-                if self.positive_support_scheduling == PositiveSupportScheduling::GlobalServiceDebt
-                {
-                    let lane = ProgramServiceLane::of(&self.registry, tasks[0].activation);
-                    assert!(
-                        tasks.iter().all(|task| ProgramServiceLane::of(
-                            &self.registry,
-                            task.activation
-                        ) == lane),
-                        "global service packet crossed the lane-purity fence"
-                    );
-                    lane
-                } else {
-                    ProgramServiceLane::Neutral
-                };
+            let service_lane = if self.positive_support_scheduling
+                == PositiveSupportScheduling::GlobalServiceDebt
+            {
+                let lane = dispatch
+                    .program_service_lane
+                    .expect("global service packet lost its selected lane");
+                assert!(
+                    match lane {
+                        ProgramServiceLane::Support => support_grants.iter().all(Option::is_some),
+                        ProgramServiceLane::Exact => support_grants.iter().all(Option::is_none),
+                        ProgramServiceLane::Neutral => false,
+                    },
+                    "global service packet crossed its selected lane"
+                );
+                lane
+            } else {
+                ProgramServiceLane::Neutral
+            };
             let service_reservation = self.reserve_global_service_packet(service_lane);
             let examined_before = stats
                 .delta_source_candidates_examined
@@ -10834,6 +10858,7 @@ impl DeltaScheduler {
             parked_positive_support_worklist,
             program_lane_selection: self.program_lane_selection,
             next_program_lane: self.next_program_lane,
+            next_program_state: self.next_program_state,
             positive_support_scheduling: self.positive_support_scheduling,
             positive_support_service_debt: self
                 .positive_support_service_debt
