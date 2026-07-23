@@ -231,6 +231,21 @@ enum FormulaProposalStreamability {
     Barrier(FormulaProposalStreamBarrier),
 }
 
+/// Whether one value accepted by an exact Confirm transition may enter its
+/// continuation before the parent action has produced its complete result.
+///
+/// This is continuation evidence, not a constraint or physical-executor
+/// capability. `ChunkHomomorphic` begins only at the existing parent-local
+/// candidate SET boundary, so independently published chunks cannot bypass
+/// grouped or non-page-local work.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContinuationPublicationReceipt {
+    Terminal,
+    ChunkHomomorphic,
+    Barrier,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FormulaProposalStreamBarrier {
     NotSyntheticRoot,
@@ -3592,6 +3607,57 @@ fn crosses_candidate_set_boundary(
 ) -> bool {
     !candidate_payload_is_set_admitted(previous, plan, formula_pcs)
         && candidate_payload_is_set_admitted(successor, plan, formula_pcs)
+}
+
+/// Proves the publication class of one exact ordinary Confirm successor.
+///
+/// Terminal commitment is stronger than chunkability and therefore wins even
+/// when the input was already SET-admitted. A nonterminal chunk is licensed
+/// only by the transition that first turns the parent-local occurrence bag
+/// into a relation. Formula/control transitions and malformed historical
+/// pairs are conservatively barriers. `fixed_denotation` remains a caller-side
+/// hedge-eligibility gate and is deliberately outside this classifier.
+#[cfg_attr(not(test), allow(dead_code))]
+fn continuation_publication_receipt(
+    previous: &StateDesc,
+    successor: &StateDesc,
+    full: VariableSet,
+    plan: &ResidualPlan,
+    formula_pcs: &FormulaPcInterner,
+) -> ContinuationPublicationReceipt {
+    let (
+        ResidualPhase::Confirm {
+            variable,
+            relevant,
+            checked,
+            confirmer,
+        },
+        ResidualPhase::Candidate {
+            variable: successor_variable,
+            relevant: successor_relevant,
+            checked: successor_checked,
+        },
+    ) = (&previous.phase, &successor.phase)
+    else {
+        return ContinuationPublicationReceipt::Barrier;
+    };
+    let exact_successor = previous.bound == successor.bound
+        && variable == successor_variable
+        && relevant == successor_relevant
+        && relevant.contains(*confirmer)
+        && !checked.contains(*confirmer)
+        && successor_checked == &checked.clone().with_inserted(*confirmer);
+    if !exact_successor {
+        return ContinuationPublicationReceipt::Barrier;
+    }
+    if commits_final_checked_candidate(successor, full) {
+        return ContinuationPublicationReceipt::Terminal;
+    }
+    if crosses_candidate_set_boundary(previous, successor, plan, formula_pcs) {
+        ContinuationPublicationReceipt::ChunkHomomorphic
+    } else {
+        ContinuationPublicationReceipt::Barrier
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -20278,6 +20344,292 @@ mod tests {
             &plan,
             &formula_pcs
         ));
+    }
+
+    fn exact_confirm_transition(
+        plan: &ResidualPlan,
+        variable: VariableId,
+        relevant_children: &[usize],
+        checked_children: &[usize],
+        confirmer: usize,
+        bound: VariableSet,
+    ) -> (StateDesc, StateDesc) {
+        let mut relevant = ChildSet::empty(plan.len());
+        for &child in relevant_children {
+            relevant.insert(child);
+        }
+        let mut checked = ChildSet::empty(plan.len());
+        for &child in checked_children {
+            checked.insert(child);
+        }
+        let successor_checked = checked.clone().with_inserted(confirmer);
+        (
+            StateDesc {
+                bound,
+                phase: ResidualPhase::Confirm {
+                    variable,
+                    relevant: relevant.clone(),
+                    checked,
+                    confirmer,
+                },
+            },
+            StateDesc {
+                bound,
+                phase: ResidualPhase::Candidate {
+                    variable,
+                    relevant,
+                    checked: successor_checked,
+                },
+            },
+        )
+    }
+
+    #[test]
+    fn continuation_publication_receipt_recognizes_exact_terminal_commit() {
+        let root = CapabilityLeaf {
+            variable: 0,
+            page_local: true,
+        };
+        let plan = ResidualPlan::compile(&root);
+        let formula_pcs = FormulaPcInterner::default();
+        let (previous, successor) =
+            exact_confirm_transition(&plan, 0, &[0], &[], 0, VariableSet::new_empty());
+
+        assert_eq!(
+            continuation_publication_receipt(
+                &previous,
+                &successor,
+                root.variables(),
+                &plan,
+                &formula_pcs,
+            ),
+            ContinuationPublicationReceipt::Terminal,
+            "exact final binding is terminal even when its input was already SET-admitted",
+        );
+    }
+
+    #[test]
+    fn continuation_publication_receipt_requires_the_candidate_set_boundary() {
+        let page_local_root = IntersectionConstraint::new(vec![
+            Box::new(CapabilityLeaf {
+                variable: 0,
+                page_local: false,
+            }) as ShapeConstraint,
+            Box::new(CapabilityLeaf {
+                variable: 0,
+                page_local: true,
+            }),
+            shape_leaf(1),
+        ]);
+        let page_local_plan = ResidualPlan::compile(&page_local_root);
+        let formula_pcs = FormulaPcInterner::default();
+        let (previous, successor) = exact_confirm_transition(
+            &page_local_plan,
+            0,
+            &[0, 1],
+            &[],
+            0,
+            VariableSet::new_empty(),
+        );
+        assert_eq!(
+            continuation_publication_receipt(
+                &previous,
+                &successor,
+                page_local_root.variables(),
+                &page_local_plan,
+                &formula_pcs,
+            ),
+            ContinuationPublicationReceipt::ChunkHomomorphic,
+            "checking the atomic confirmer exposes a page-local remaining suffix",
+        );
+
+        let fully_checked_root = IntersectionConstraint::new(vec![
+            Box::new(CapabilityLeaf {
+                variable: 0,
+                page_local: false,
+            }) as ShapeConstraint,
+            shape_leaf(1),
+        ]);
+        let fully_checked_plan = ResidualPlan::compile(&fully_checked_root);
+        let (previous, successor) = exact_confirm_transition(
+            &fully_checked_plan,
+            0,
+            &[0],
+            &[],
+            0,
+            VariableSet::new_empty(),
+        );
+        assert_eq!(
+            continuation_publication_receipt(
+                &previous,
+                &successor,
+                fully_checked_root.variables(),
+                &fully_checked_plan,
+                &formula_pcs,
+            ),
+            ContinuationPublicationReceipt::ChunkHomomorphic,
+            "a fully checked candidate becomes an independent nonterminal parent row",
+        );
+
+        let already_pageable_root = IntersectionConstraint::new(vec![
+            Box::new(CapabilityLeaf {
+                variable: 0,
+                page_local: true,
+            }) as ShapeConstraint,
+            Box::new(CapabilityLeaf {
+                variable: 0,
+                page_local: true,
+            }),
+            shape_leaf(1),
+        ]);
+        let already_pageable_plan = ResidualPlan::compile(&already_pageable_root);
+        let (previous, successor) = exact_confirm_transition(
+            &already_pageable_plan,
+            0,
+            &[0, 1],
+            &[],
+            0,
+            VariableSet::new_empty(),
+        );
+        assert_eq!(
+            continuation_publication_receipt(
+                &previous,
+                &successor,
+                already_pageable_root.variables(),
+                &already_pageable_plan,
+                &formula_pcs,
+            ),
+            ContinuationPublicationReceipt::Barrier,
+            "the receipt names the boundary crossing, not arbitrary work after it",
+        );
+    }
+
+    #[test]
+    fn continuation_publication_receipt_barriers_atomic_and_control_work() {
+        let non_local_root = IntersectionConstraint::new(vec![
+            Box::new(CapabilityLeaf {
+                variable: 0,
+                page_local: false,
+            }) as ShapeConstraint,
+            Box::new(CapabilityLeaf {
+                variable: 0,
+                page_local: false,
+            }),
+            shape_leaf(1),
+        ]);
+        let non_local_plan = ResidualPlan::compile(&non_local_root);
+        let formula_pcs = FormulaPcInterner::default();
+        let (previous, successor) = exact_confirm_transition(
+            &non_local_plan,
+            0,
+            &[0, 1],
+            &[],
+            0,
+            VariableSet::new_empty(),
+        );
+        assert_eq!(
+            continuation_publication_receipt(
+                &previous,
+                &successor,
+                non_local_root.variables(),
+                &non_local_plan,
+                &formula_pcs,
+            ),
+            ContinuationPublicationReceipt::Barrier,
+            "a non-page-local remaining confirmer keeps the parent private",
+        );
+
+        let grouped_root = IntersectionConstraint::new(vec![
+            Box::new(CapabilityLeaf {
+                variable: 0,
+                page_local: false,
+            }) as ShapeConstraint,
+            Box::new(GroupedCapabilityLeaf(CapabilityLeaf {
+                variable: 0,
+                page_local: true,
+            })),
+            shape_leaf(1),
+        ]);
+        let grouped_plan = ResidualPlan::compile_lowering(
+            &grouped_root,
+            ResidualLowering::new(FormulaScope::OpaqueLeaves, ProgramScope::All),
+        );
+        let (previous, successor) =
+            exact_confirm_transition(&grouped_plan, 0, &[0, 1], &[], 0, VariableSet::new_empty());
+        assert_eq!(
+            continuation_publication_receipt(
+                &previous,
+                &successor,
+                grouped_root.variables(),
+                &grouped_plan,
+                &formula_pcs,
+            ),
+            ContinuationPublicationReceipt::Barrier,
+            "a grouped remaining confirmer keeps the parent private",
+        );
+
+        let formula_root = UnionConstraint::new(vec![shape_leaf(0), shape_leaf(0)]);
+        let formula_plan = ResidualPlan::compile_finite_unions(&formula_root);
+        let mut formula_pcs = FormulaPcInterner::default();
+        let formula_relevant = ChildSet::empty(formula_plan.len()).with_inserted(0);
+        let formula_checked = ChildSet::empty(formula_plan.len());
+        let formula_counter = formula_pcs.start(
+            &formula_plan.finite_formula,
+            0,
+            0,
+            UnionVerb::Confirm {
+                relevant: formula_relevant.clone(),
+                checked: formula_checked.clone(),
+            },
+        );
+        let formula_previous = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Confirm {
+                variable: 0,
+                relevant: formula_relevant,
+                checked: formula_checked,
+                confirmer: 0,
+            },
+        };
+        let formula_successor = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Formula {
+                counter: formula_counter,
+            },
+        };
+        formula_previous.validate(formula_plan.len(), &formula_pcs);
+        formula_successor.validate(formula_plan.len(), &formula_pcs);
+        assert_eq!(
+            continuation_publication_receipt(
+                &formula_previous,
+                &formula_successor,
+                formula_root.variables(),
+                &formula_plan,
+                &formula_pcs,
+            ),
+            ContinuationPublicationReceipt::Barrier,
+            "Formula control has no ordinary Confirm-successor receipt",
+        );
+
+        let malformed_control = StateDesc {
+            bound: successor.bound,
+            phase: ResidualPhase::Candidate {
+                variable: 0,
+                relevant: ChildSet::empty(grouped_plan.len()).with_inserted(0),
+                checked: ChildSet::empty(grouped_plan.len()).with_inserted(0),
+            },
+        };
+        assert_eq!(
+            continuation_publication_receipt(
+                &previous,
+                &malformed_control,
+                grouped_root.variables(),
+                &grouped_plan,
+                &formula_pcs,
+            ),
+            ContinuationPublicationReceipt::Barrier,
+            "a candidate state without the exact Confirm history is not licensed",
+        );
     }
 
     #[test]

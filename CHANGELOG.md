@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Residual Confirm continuations now carry an executable publication
+  receipt.** The private three-valued proof distinguishes an exact terminal
+  binding, a nonterminal chunk that first crosses the parent-local candidate
+  SET boundary into a page-local/non-grouped suffix, and a conservative
+  barrier. This adds no early-publication behavior or public constraint API;
+  it freezes the structural law for later PositiveHedge integration.
 - **Directed singleton Program chains can spend one scheduler grant locally.**
   An unjoined streaming activation may consume exact same-cohort sole children
   inside its producing receipt until the original work budget is exhausted or
