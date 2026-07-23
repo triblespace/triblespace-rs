@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Residual Confirm activations now have a dormant positive-publication
+  ledger seam.** A registry-branded affine parent address, generation-fenced
+  close-and-snapshot transaction, and scheduler-owned first-value-wins map
+  preserve fixed-denotation/continuation evidence without occurrence identity.
+  Ineligible parents own no ledger, query clones rebrand independently, and
+  ordinary activations pay only one nullable pointer. No positive work is
+  seeded and query behavior is unchanged.
 - **Residual Confirm continuations now carry an executable publication
   receipt.** The private three-valued proof distinguishes an exact terminal
   binding, a nonterminal chunk that first crosses the parent-local candidate

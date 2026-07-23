@@ -603,6 +603,109 @@ impl ActivationId {
     }
 }
 
+/// Affine semantic identity of one Confirm parent.
+///
+/// [`StateId`] identifies a canonical reducer shape and may cohort many parent
+/// rows, so it is validation metadata rather than publication identity. The
+/// registry brand makes pre-clone addresses inert in a cloned query, while the
+/// activation identifies the exact semantic parent without naming any
+/// physical candidate occurrence.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct PositiveConfirmParentId {
+    brand: RegistryBrand,
+    activation: ActivationId,
+}
+
+/// Semantic continuation evidence owned once by a Confirm activation.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PositivePublicationCertificate {
+    fixed_denotation: bool,
+    continuation: ContinuationPublicationReceipt,
+    crosses_set_boundary: bool,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl PositivePublicationCertificate {
+    fn from_confirm_transition(
+        previous: &StateDesc,
+        successor: &StateDesc,
+        full: VariableSet,
+        plan: &ResidualPlan,
+        formula_pcs: &FormulaPcInterner,
+    ) -> Self {
+        Self {
+            fixed_denotation: plan.certified_denotation,
+            continuation: continuation_publication_receipt(
+                previous,
+                successor,
+                full,
+                plan,
+                formula_pcs,
+            ),
+            crosses_set_boundary: crosses_candidate_set_boundary(
+                previous,
+                successor,
+                plan,
+                formula_pcs,
+            ),
+        }
+    }
+
+    fn eligible(self) -> bool {
+        self.fixed_denotation
+            && match self.continuation {
+                ContinuationPublicationReceipt::Terminal => true,
+                ContinuationPublicationReceipt::ChunkHomomorphic => self.crosses_set_boundary,
+                ContinuationPublicationReceipt::Barrier => false,
+            }
+    }
+}
+
+/// Borrow-free physical address for a future positive child.
+///
+/// Equal values under one parent intentionally have equal addresses. The
+/// scheduler publishes by `(semantic parent, value)`, never by bag occurrence.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PositiveChildAddress {
+    parent: PositiveConfirmParentId,
+    generation: u64,
+    value: RawInline,
+}
+
+/// Dormant scheduler-owned publication state attached to the authoritative
+/// Confirm activation.
+///
+/// The immutable original occurrence bag remains in [`DeltaReducer::Confirm`].
+/// This ledger therefore records only semantic evidence, lifecycle, and the
+/// relational values that won publication.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PositivePublicationLedger {
+    generation: u64,
+    open: bool,
+    /// Canonical state is retained only to validate which Confirm reducer
+    /// opened this affine parent; it is never a publication key.
+    confirm_state: StateId,
+    certificate: PositivePublicationCertificate,
+    published: BTreeSet<RawInline>,
+}
+
+/// Boxed registration keeps the dormant activation tax to one nullable
+/// pointer while retaining semantic evidence for parents that correctly own
+/// no ledger.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PositivePublicationRegistration {
+    Private {
+        confirm_state: StateId,
+        certificate: PositivePublicationCertificate,
+    },
+    Eligible(PositivePublicationLedger),
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct CreditNonce(u64);
 
@@ -806,6 +909,11 @@ struct ProgramJoinCompletion {
 struct Activation {
     reducer: DeltaReducer,
     return_to: DeltaReturn,
+    /// Optional boxed registration for this exact Confirm parent. Ordinary
+    /// execution leaves it absent; every dormant activation pays one nullable
+    /// pointer rather than an inline tree-set-bearing ledger.
+    #[cfg_attr(not(test), allow(dead_code))]
+    positive_publication: Option<Box<PositivePublicationRegistration>>,
     physical_class: DeltaPhysicalClass,
     /// Physical grant quantum for a terminal activation whose current sparse
     /// dispatch did not publish. This is engine-owned activation-local search evidence:
@@ -833,6 +941,8 @@ struct RegistryState {
     next_activation: u64,
     next_credit: u64,
     next_program_join: u64,
+    #[cfg_attr(not(test), allow(dead_code))]
+    next_positive_generation: u64,
     activations: AHashMap<ActivationId, Activation>,
 }
 
@@ -1038,9 +1148,208 @@ impl ProducerRegistry {
                 next_activation: 0,
                 next_credit: 0,
                 next_program_join: 0,
+                next_positive_generation: 0,
                 activations: AHashMap::new(),
             },
         }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn positive_parent(&self, activation: ActivationId) -> Option<PositiveConfirmParentId> {
+        self.state
+            .activations
+            .contains_key(&activation)
+            .then_some(PositiveConfirmParentId {
+                brand: self.brand,
+                activation,
+            })
+    }
+
+    /// Opens the optional ledger on one authoritative Confirm activation.
+    ///
+    /// One activation is one semantic parent and may register exactly once;
+    /// a duplicate open is inert rather than erasing published obligations.
+    /// Unfixed and Barrier parents retain their semantic certificate but
+    /// acquire no ledger.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn open_positive_publication(
+        &mut self,
+        activation: ActivationId,
+        confirm_state: StateId,
+        certificate: PositivePublicationCertificate,
+    ) -> Option<PositiveConfirmParentId> {
+        let parent = self.positive_parent(activation)?;
+        if !matches!(
+            &self.state.activations.get(&activation)?.reducer,
+            DeltaReducer::Confirm { .. }
+        ) {
+            return None;
+        }
+        if self
+            .state
+            .activations
+            .get(&activation)?
+            .positive_publication
+            .is_some()
+        {
+            return None;
+        }
+        let registration = if certificate.eligible() {
+            let generation = take_monotonic(
+                &mut self.state.next_positive_generation,
+                "positive-publication generation",
+            );
+            PositivePublicationRegistration::Eligible(PositivePublicationLedger {
+                generation,
+                open: true,
+                confirm_state,
+                certificate,
+                published: BTreeSet::new(),
+            })
+        } else {
+            PositivePublicationRegistration::Private {
+                confirm_state,
+                certificate,
+            }
+        };
+        let activation = self
+            .state
+            .activations
+            .get_mut(&activation)
+            .expect("validated Confirm activation disappeared");
+        activation.positive_publication = Some(Box::new(registration));
+        Some(parent)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn positive_child_address(
+        &self,
+        parent: PositiveConfirmParentId,
+        value: RawInline,
+    ) -> Option<PositiveChildAddress> {
+        if parent.brand != self.brand {
+            return None;
+        }
+        let activation = self.state.activations.get(&parent.activation)?;
+        let DeltaReducer::Confirm { original } = &activation.reducer else {
+            return None;
+        };
+        let PositivePublicationRegistration::Eligible(ledger) =
+            activation.positive_publication.as_deref()?
+        else {
+            return None;
+        };
+        (ledger.open && original.one_parent_values().contains(&value)).then_some(
+            PositiveChildAddress {
+                parent,
+                generation: ledger.generation,
+                value,
+            },
+        )
+    }
+
+    /// Sole positive-publication linearization point.
+    ///
+    /// This exclusive mutable registry borrow is the scheduler's CAS law.
+    /// Parent identity, query-clone brand, generation, open Confirm reducer,
+    /// fixed original candidate bag, and certificate are revalidated before
+    /// the first `(parent, value)` insertion wins. Every later or malformed
+    /// hedge is an inert `false`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn commit_positive_publication(
+        &mut self,
+        expected_parent: PositiveConfirmParentId,
+        address: PositiveChildAddress,
+    ) -> bool {
+        if address.parent != expected_parent || expected_parent.brand != self.brand {
+            return false;
+        }
+        let Some(activation) = self.state.activations.get_mut(&expected_parent.activation) else {
+            return false;
+        };
+        let DeltaReducer::Confirm { original } = &activation.reducer else {
+            return false;
+        };
+        let Some(registration) = activation.positive_publication.as_deref_mut() else {
+            return false;
+        };
+        let PositivePublicationRegistration::Eligible(ledger) = registration else {
+            return false;
+        };
+        if !ledger.open
+            || ledger.generation != address.generation
+            || !ledger.certificate.eligible()
+            || !original.one_parent_values().contains(&address.value)
+        {
+            return false;
+        }
+        ledger.published.insert(address.value)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn close_and_snapshot_positive_publication(
+        &mut self,
+        parent: PositiveConfirmParentId,
+        generation: u64,
+    ) -> Option<PositivePublicationLedger> {
+        if parent.brand != self.brand {
+            return None;
+        }
+        let Some(activation) = self.state.activations.get(&parent.activation) else {
+            return None;
+        };
+        if !matches!(&activation.reducer, DeltaReducer::Confirm { .. }) {
+            return None;
+        }
+        let Some(registration) = activation.positive_publication.as_deref() else {
+            return None;
+        };
+        let PositivePublicationRegistration::Eligible(ledger) = registration else {
+            return None;
+        };
+        if !ledger.open || ledger.generation != generation {
+            return None;
+        }
+        let closed_generation = take_monotonic(
+            &mut self.state.next_positive_generation,
+            "positive-publication generation",
+        );
+        let ledger = self
+            .state
+            .activations
+            .get_mut(&parent.activation)
+            .expect("validated Confirm activation disappeared")
+            .positive_publication
+            .as_deref_mut()
+            .and_then(|registration| match registration {
+                PositivePublicationRegistration::Eligible(ledger) => Some(ledger),
+                PositivePublicationRegistration::Private { .. } => None,
+            })
+            .expect("validated positive-publication ledger disappeared");
+        ledger.open = false;
+        ledger.generation = closed_generation;
+        Some(ledger.clone())
+    }
+
+    /// Test-only diagnostic snapshot. Production settlement uses the atomic
+    /// close-and-snapshot transaction above.
+    #[cfg(test)]
+    fn positive_publication_snapshot(
+        &self,
+        parent: PositiveConfirmParentId,
+    ) -> Option<PositivePublicationLedger> {
+        if parent.brand != self.brand {
+            return None;
+        }
+        self.state
+            .activations
+            .get(&parent.activation)?
+            .positive_publication
+            .as_deref()
+            .and_then(|registration| match registration {
+                PositivePublicationRegistration::Eligible(ledger) => Some(ledger.clone()),
+                PositivePublicationRegistration::Private { .. } => None,
+            })
     }
 
     /// Reserves query-local activation identities for a terminal cohort that
@@ -1137,6 +1446,7 @@ impl ProducerRegistry {
                     Activation {
                         reducer,
                         return_to,
+                        positive_publication: None,
                         physical_class,
                         terminal_sparse_quantum: 1,
                         source_candidates: None,
@@ -1208,6 +1518,7 @@ impl ProducerRegistry {
                     Activation {
                         reducer,
                         return_to,
+                        positive_publication: None,
                         physical_class,
                         terminal_sparse_quantum: 1,
                         source_candidates,
@@ -1249,6 +1560,7 @@ impl ProducerRegistry {
                     Activation {
                         reducer,
                         return_to,
+                        positive_publication: None,
                         physical_class,
                         terminal_sparse_quantum: 1,
                         source_candidates,
@@ -9167,6 +9479,97 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct PositiveCertificateLeaf;
+
+    impl Constraint<'static> for PositiveCertificateLeaf {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(0)
+        }
+
+        fn fixed_denotation(&self) -> bool {
+            true
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != 0 {
+                return false;
+            }
+            out.fill(1, view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+    }
+
+    fn terminal_positive_certificate() -> PositivePublicationCertificate {
+        let root = PositiveCertificateLeaf;
+        let plan = ResidualPlan::compile(&root);
+        let relevant = ChildSet::empty(plan.len()).with_inserted(0);
+        let checked = ChildSet::empty(plan.len());
+        let previous = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Confirm {
+                variable: 0,
+                relevant: relevant.clone(),
+                checked: checked.clone(),
+                confirmer: 0,
+            },
+        };
+        let successor = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Candidate {
+                variable: 0,
+                relevant,
+                checked: checked.with_inserted(0),
+            },
+        };
+        PositivePublicationCertificate::from_confirm_transition(
+            &previous,
+            &successor,
+            root.variables(),
+            &plan,
+            &FormulaPcInterner::default(),
+        )
+    }
+
+    fn open_positive_confirm(
+        registry: &mut ProducerRegistry,
+        values: impl IntoIterator<Item = RawInline>,
+        certificate: PositivePublicationCertificate,
+    ) -> (ActivationId, PositiveConfirmParentId) {
+        let original = shared_one_parent_candidates(values.into_iter().collect());
+        let activation = registry.open_program_activation(
+            DeltaReducer::Confirm { original },
+            stable_return(Vec::new()),
+            None,
+            None,
+        );
+        let parent = registry
+            .open_positive_publication(activation, StateId(17), certificate)
+            .expect("Confirm activation should register a semantic parent");
+        (activation, parent)
+    }
+
     fn formula_or_reducer_batch(values: &[u8]) -> FormulaBatch {
         let mut batch = FormulaBatch::from_proposal(
             RowBatch::seed(),
@@ -9981,6 +10384,351 @@ mod tests {
         assert_eq!(
             registry.reserve_terminal_receipts(1),
             [ActivationId::test(4)]
+        );
+    }
+
+    #[test]
+    fn positive_publication_certificate_keeps_terminal_boundary_evidence() {
+        assert_eq!(
+            std::mem::size_of::<Option<Box<PositivePublicationRegistration>>>(),
+            std::mem::size_of::<usize>(),
+            "dormant positive-publication state must cost one nullable pointer"
+        );
+        let certificate = terminal_positive_certificate();
+        assert!(certificate.fixed_denotation);
+        assert_eq!(
+            certificate.continuation,
+            ContinuationPublicationReceipt::Terminal
+        );
+        assert!(
+            certificate.crosses_set_boundary,
+            "Terminal precedence must not erase the semantic parent's SET-boundary fact"
+        );
+        assert!(certificate.eligible());
+    }
+
+    #[test]
+    fn positive_publication_ledger_requires_fixed_nonbarrier_parent() {
+        let eligible = terminal_positive_certificate();
+        let mut registry = ProducerRegistry::new();
+
+        let mut unfixed = eligible;
+        unfixed.fixed_denotation = false;
+        let (unfixed_activation, unfixed_parent) =
+            open_positive_confirm(&mut registry, [value(1)], unfixed);
+        assert!(matches!(
+            registry.state.activations[&unfixed_activation]
+                .positive_publication
+                .as_deref(),
+            Some(PositivePublicationRegistration::Private {
+                confirm_state: StateId(17),
+                certificate,
+            }) if *certificate == unfixed
+        ));
+        assert!(
+            registry
+                .positive_publication_snapshot(unfixed_parent)
+                .is_none(),
+            "an unfixed parent must not own a ledger"
+        );
+        assert!(registry
+            .positive_child_address(unfixed_parent, value(1))
+            .is_none());
+
+        let mut barrier = eligible;
+        barrier.continuation = ContinuationPublicationReceipt::Barrier;
+        let (barrier_activation, barrier_parent) =
+            open_positive_confirm(&mut registry, [value(2)], barrier);
+        assert!(matches!(
+            registry.state.activations[&barrier_activation]
+                .positive_publication
+                .as_deref(),
+            Some(PositivePublicationRegistration::Private {
+                confirm_state: StateId(17),
+                certificate,
+            }) if *certificate == barrier
+        ));
+        assert!(
+            registry
+                .positive_publication_snapshot(barrier_parent)
+                .is_none(),
+            "a Barrier parent must not own a ledger"
+        );
+        assert!(registry
+            .positive_child_address(barrier_parent, value(2))
+            .is_none());
+
+        let malformed_chunk = PositivePublicationCertificate {
+            fixed_denotation: true,
+            continuation: ContinuationPublicationReceipt::ChunkHomomorphic,
+            crosses_set_boundary: false,
+        };
+        let (_, malformed_parent) =
+            open_positive_confirm(&mut registry, [value(3)], malformed_chunk);
+        assert!(
+            registry
+                .positive_publication_snapshot(malformed_parent)
+                .is_none(),
+            "ChunkHomomorphic requires the semantic parent to cross the SET boundary"
+        );
+        assert!(registry
+            .positive_child_address(malformed_parent, value(3))
+            .is_none());
+    }
+
+    #[test]
+    fn positive_publication_commit_has_one_winner_and_duplicate_open_is_inert() {
+        let candidate = value(7);
+        let certificate = terminal_positive_certificate();
+        let mut registry = ProducerRegistry::new();
+        let (activation, parent) = open_positive_confirm(&mut registry, [candidate], certificate);
+        let first = registry
+            .positive_child_address(parent, candidate)
+            .expect("eligible candidate should receive an address");
+        let hedge = first;
+
+        assert!(registry.commit_positive_publication(parent, first));
+        assert!(
+            !registry.commit_positive_publication(parent, hedge),
+            "a later hedge for the same (parent, value) must be inert"
+        );
+        let before_reopen = registry.positive_publication_snapshot(parent).unwrap();
+        assert_eq!(before_reopen.published, BTreeSet::from([candidate]));
+        assert!(
+            registry
+                .open_positive_publication(activation, StateId(99), certificate)
+                .is_none(),
+            "one semantic parent must not reopen and erase committed obligations"
+        );
+        assert_eq!(
+            registry.positive_publication_snapshot(parent),
+            Some(before_reopen)
+        );
+    }
+
+    #[test]
+    fn positive_publication_commit_accepts_distinct_values_independently() {
+        let one = value(1);
+        let two = value(2);
+        let mut registry = ProducerRegistry::new();
+        let (_, parent) =
+            open_positive_confirm(&mut registry, [one, two], terminal_positive_certificate());
+        let one_address = registry.positive_child_address(parent, one).unwrap();
+        let two_address = registry.positive_child_address(parent, two).unwrap();
+
+        assert!(registry.commit_positive_publication(parent, two_address));
+        assert!(registry.commit_positive_publication(parent, one_address));
+        assert_eq!(
+            registry
+                .positive_publication_snapshot(parent)
+                .unwrap()
+                .published,
+            BTreeSet::from([one, two])
+        );
+    }
+
+    #[test]
+    fn positive_publication_commit_revalidates_frozen_original_b_and_confirm_reducer() {
+        let member = value(3);
+        let absent = value(4);
+        let mut registry = ProducerRegistry::new();
+        let (activation, parent) =
+            open_positive_confirm(&mut registry, [member], terminal_positive_certificate());
+        assert!(
+            registry.positive_child_address(parent, absent).is_none(),
+            "the scheduler must not issue an address outside original B"
+        );
+        let before = registry.positive_publication_snapshot(parent).unwrap();
+        let invalid = PositiveChildAddress {
+            parent,
+            generation: before.generation,
+            value: absent,
+        };
+        assert!(!registry.commit_positive_publication(parent, invalid));
+        assert_eq!(
+            registry.positive_publication_snapshot(parent),
+            Some(before.clone())
+        );
+
+        let valid = registry.positive_child_address(parent, member).unwrap();
+        registry
+            .state
+            .activations
+            .get_mut(&activation)
+            .unwrap()
+            .reducer = DeltaReducer::Support { published: false };
+        assert!(
+            !registry.commit_positive_publication(parent, valid),
+            "a parent no longer owning a Confirm reducer must be inert"
+        );
+        assert_eq!(registry.positive_publication_snapshot(parent), Some(before));
+    }
+
+    #[test]
+    fn positive_publication_generation_and_close_snapshot_fence_stale_addresses() {
+        let candidate = value(5);
+        let mut registry = ProducerRegistry::new();
+        let (_, parent) =
+            open_positive_confirm(&mut registry, [candidate], terminal_positive_certificate());
+        let address = registry.positive_child_address(parent, candidate).unwrap();
+        let wrong_generation = PositiveChildAddress {
+            generation: address
+                .generation
+                .checked_add(1)
+                .expect("test generation should have a successor"),
+            ..address
+        };
+        let open = registry.positive_publication_snapshot(parent).unwrap();
+        assert!(!registry.commit_positive_publication(parent, wrong_generation));
+        assert!(registry
+            .close_and_snapshot_positive_publication(parent, wrong_generation.generation)
+            .is_none());
+        assert_eq!(
+            registry.positive_publication_snapshot(parent),
+            Some(open.clone())
+        );
+
+        let closed = registry
+            .close_and_snapshot_positive_publication(parent, address.generation)
+            .expect("matching settlement authority should close and snapshot");
+        assert!(!closed.open);
+        assert_ne!(
+            closed.generation, address.generation,
+            "settlement must advance the generation before freezing its snapshot"
+        );
+        assert!(
+            !registry.commit_positive_publication(parent, address),
+            "all outstanding physical children must be inert after close"
+        );
+        assert!(
+            registry
+                .close_and_snapshot_positive_publication(parent, address.generation)
+                .is_none(),
+            "close-and-snapshot authority is affine"
+        );
+        assert_eq!(registry.positive_publication_snapshot(parent), Some(closed));
+    }
+
+    #[test]
+    fn positive_publication_addresses_are_parent_local_and_unknown_safe() {
+        let candidate = value(9);
+        let certificate = terminal_positive_certificate();
+        let mut registry = ProducerRegistry::new();
+        let (_, left) = open_positive_confirm(&mut registry, [candidate], certificate);
+        let (_, right) = open_positive_confirm(&mut registry, [candidate], certificate);
+        let left_address = registry.positive_child_address(left, candidate).unwrap();
+        let right_address = registry.positive_child_address(right, candidate).unwrap();
+        let right_before = registry.positive_publication_snapshot(right).unwrap();
+
+        assert!(
+            !registry.commit_positive_publication(right, left_address),
+            "an address from another semantic parent must be inert"
+        );
+        assert_eq!(
+            registry.positive_publication_snapshot(right),
+            Some(right_before)
+        );
+        assert!(registry.commit_positive_publication(left, left_address));
+        assert!(
+            registry.commit_positive_publication(right, right_address),
+            "independent parents may each publish the same value once"
+        );
+
+        let unknown = PositiveConfirmParentId {
+            brand: registry.brand,
+            activation: ActivationId(u64::MAX),
+        };
+        assert!(!registry.commit_positive_publication(
+            unknown,
+            PositiveChildAddress {
+                parent: unknown,
+                generation: left_address.generation,
+                value: candidate,
+            },
+        ));
+    }
+
+    #[test]
+    fn positive_publication_registry_clone_rebrands_and_diverges() {
+        let one = value(13);
+        let two = value(14);
+        let mut original = ProducerRegistry::new();
+        let (activation, parent) =
+            open_positive_confirm(&mut original, [one, two], terminal_positive_certificate());
+        let pre_clone_address = original.positive_child_address(parent, one).unwrap();
+        let (mut cloned, remap) = original.deep_clone();
+        assert!(remap.is_empty());
+        let cloned_parent = cloned
+            .positive_parent(activation)
+            .expect("deep clone retained the Confirm activation");
+        assert_ne!(parent, cloned_parent);
+        assert!(
+            !cloned.commit_positive_publication(parent, pre_clone_address),
+            "a pre-clone address must not cross registry brands"
+        );
+
+        let original_address = original.positive_child_address(parent, one).unwrap();
+        let cloned_address = cloned.positive_child_address(cloned_parent, two).unwrap();
+        assert!(original.commit_positive_publication(parent, original_address));
+        assert!(cloned.commit_positive_publication(cloned_parent, cloned_address));
+        assert_eq!(
+            original
+                .positive_publication_snapshot(parent)
+                .unwrap()
+                .published,
+            BTreeSet::from([one])
+        );
+        assert_eq!(
+            cloned
+                .positive_publication_snapshot(cloned_parent)
+                .unwrap()
+                .published,
+            BTreeSet::from([two])
+        );
+    }
+
+    #[test]
+    fn positive_publication_duplicate_b_needs_no_occurrence_identity() {
+        let candidate = value(21);
+        let mut registry = ProducerRegistry::new();
+        let (activation, parent) = open_positive_confirm(
+            &mut registry,
+            [candidate, candidate],
+            terminal_positive_certificate(),
+        );
+        let address = registry.positive_child_address(parent, candidate).unwrap();
+        let PositiveChildAddress {
+            parent: addressed_parent,
+            generation,
+            value: addressed_value,
+        } = address;
+        assert_eq!(addressed_parent, parent);
+        assert_eq!(addressed_value, candidate);
+        let DeltaReducer::Confirm { original } = &registry.state.activations[&activation].reducer
+        else {
+            panic!("positive parent lost its Confirm reducer")
+        };
+        assert_eq!(
+            original.one_parent_values(),
+            &[candidate, candidate],
+            "the authoritative original B preserves bag multiplicity"
+        );
+
+        assert!(registry.commit_positive_publication(parent, address));
+        assert!(!registry.commit_positive_publication(
+            parent,
+            PositiveChildAddress {
+                parent,
+                generation,
+                value: candidate,
+            },
+        ));
+        assert_eq!(
+            registry
+                .positive_publication_snapshot(parent)
+                .unwrap()
+                .published,
+            BTreeSet::from([candidate])
         );
     }
 
