@@ -669,21 +669,40 @@ impl PositivePublicationCertificate {
     }
 }
 
-/// Borrow-free prevalidated semantic claim request for a future positive child.
+/// Clone-safe physical custody for one exact Support child.
 ///
-/// Equal values under one parent intentionally have equal addresses. The
-/// scheduler publishes by `(semantic parent, value)`, never by bag occurrence.
+/// This payload deliberately carries no [`RegistryBrand`]: it lives inside
+/// cloneable registry state, while [`ProducerRegistry::deep_clone`] rebrands
+/// every live producer credit. Authority enters only when the current
+/// registry consumes one of those credits and mints a
+/// [`PositiveSupportWitness`].
 ///
-/// This copyable request is deliberately only the dormant typed seam. A
-/// production caller must instead supply a validated, non-Clone physical
-/// Support-child witness; that witness and its brand-bearing lifecycle are the
-/// next integration step.
+/// `occurrence` identifies one member of the semantic Confirm parent's
+/// immutable original bag. Publication remains value-keyed, so duplicate
+/// occurrences may own distinct links while racing for one `(parent, value)`
+/// ledger entry.
 #[cfg_attr(not(test), allow(dead_code))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PositiveChildAddress {
-    parent: PositiveConfirmParentId,
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PositiveSupportLink {
+    child: ActivationId,
+    parent: ActivationId,
     generation: u64,
+    occurrence: usize,
     value: RawInline,
+}
+
+/// Affine proof that one current-registry typed Support producer reported its
+/// first exact success and spent the credit carrying that receipt.
+///
+/// The cloneable link supplies structural provenance; the brand supplies
+/// branch-local authority. This type intentionally implements neither
+/// [`Clone`] nor [`Copy`] and has no constructor outside the registry.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug)]
+#[must_use = "a positive Support witness must be committed or deliberately discarded"]
+struct PositiveSupportWitness {
+    brand: RegistryBrand,
+    link: PositiveSupportLink,
 }
 
 /// One semantic Terminal origin that must be introduced to the outer
@@ -810,6 +829,17 @@ enum DeltaReducer {
     /// first witness releases `true` exactly once; only producer quiescence can
     /// release `false`.
     Support { published: bool },
+    /// A fully-bound typed Support child proving one occurrence owned by an
+    /// authoritative semantic Confirm parent.
+    ///
+    /// Stage 1 deliberately supports only unjoined Program credits. RPQ's
+    /// exact fully-bound Support routes satisfy that law; generic
+    /// `AfterChildren` propagation remains outside this substrate until it can
+    /// carry semantic-commit evidence through the receipt-local join.
+    PositiveSupport {
+        link: Box<PositiveSupportLink>,
+        witnessed: bool,
+    },
     Confirm {
         /// Immutable one-parent occurrence bag frozen at action opening.
         /// During graph execution this remains one contiguous Deferred leaf,
@@ -898,10 +928,51 @@ enum DeltaReturn {
         batch: FormulaBatch,
         counter: FormulaPcId,
     },
+    /// Minimal full-bound row retained by a physical PositiveSupport child.
+    ///
+    /// It is source context only. The semantic Confirm parent remains the
+    /// exclusive owner of B, G, P, and the ordinary Stable continuation.
+    PositiveSupport {
+        bound: VariableSet,
+        row: Box<[RawInline]>,
+    },
     SetAdmission {
         successor: StateDesc,
         destination: SetAdmissionDestination,
     },
+}
+
+/// Constructs the one authoritative physical row for a positive Support
+/// child from its semantic Confirm parent's Stable Candidate return.
+///
+/// Reusing the ordinary candidate-commit layout law here makes a mismatched
+/// `(bound, row, value)` tuple unrepresentable at the specialized opener.
+fn positive_support_child_context(
+    return_to: &DeltaReturn,
+    value: RawInline,
+) -> Option<(VariableSet, Box<[RawInline]>)> {
+    let DeltaReturn::Stable { desc, parent, .. } = return_to else {
+        return None;
+    };
+    let ResidualPhase::Candidate { variable, .. } = &desc.phase else {
+        return None;
+    };
+    if parent.len() != desc.bound.count() {
+        return None;
+    }
+    let (bound, rows) = committed_candidate_rows(
+        desc.bound,
+        *variable,
+        CandidateBatch {
+            parents: RowBatch {
+                rows: parent.to_vec(),
+                row_count: 1,
+            },
+            candidates: CandidatePayload::Values(vec![value]),
+        },
+    );
+    (rows.row_count == 1 && rows.rows.len() == bound.count())
+        .then(|| (bound, rows.rows.into_boxed_slice()))
 }
 
 #[derive(Clone)]
@@ -1043,6 +1114,12 @@ struct ProgramReplaceOutcome {
     /// activation-local SET admission. This remains telemetry only.
     raw_proposal_occurrences: usize,
     accepted: SmallVec<[RawInline; 1]>,
+    /// Identifies the distinct PositiveSupport reducer even after its affine
+    /// first-witness slot has already been spent.
+    positive_support_reducer: bool,
+    /// Present only for the first accepted-or-supported receipt, and only
+    /// after `replace_program` consumed the current registry's real credit.
+    positive_support: Option<Box<PositiveSupportWitness>>,
     dead_search_pages: usize,
     dead_source_telemetry_pages: usize,
     quiescence: Option<QuiescenceProof>,
@@ -1278,45 +1355,106 @@ impl ProducerRegistry {
         Some(parent)
     }
 
+    /// Opens one dormant physical Support child and constructs its link only
+    /// after the child's activation identity has been allocated.
+    ///
+    /// This is intentionally private and has no production caller in Stage 1.
+    /// The eventual feeder must already have selected an exact fully-bound
+    /// Support Program before entering this transaction.
     #[cfg_attr(not(test), allow(dead_code))]
-    fn positive_child_address(
-        &self,
+    fn open_positive_support_activation(
+        &mut self,
         parent: PositiveConfirmParentId,
+        occurrence: usize,
         value: RawInline,
-    ) -> Option<PositiveChildAddress> {
+        support_variables: VariableSet,
+        terminal_full: Option<VariableSet>,
+    ) -> Option<ActivationId> {
         if parent.brand != self.brand {
             return None;
         }
-        let activation = self.state.activations.get(&parent.activation)?;
-        let DeltaReducer::Confirm { original } = &activation.reducer else {
-            return None;
+        let (generation, bound, row, terminal) = {
+            let activation = self.state.activations.get(&parent.activation)?;
+            let DeltaReducer::Confirm { original } = &activation.reducer else {
+                return None;
+            };
+            if original.one_parent_values().get(occurrence) != Some(&value) {
+                return None;
+            }
+            let (bound, row) = positive_support_child_context(&activation.return_to, value)?;
+            if !support_variables.is_subset_of(&bound) {
+                return None;
+            }
+            let PositivePublicationRegistration::Eligible(ledger) =
+                activation.positive_publication.as_deref()?
+            else {
+                return None;
+            };
+            if !ledger.open || !ledger.certificate.eligible() {
+                return None;
+            }
+            let terminal = terminal_full.is_some_and(|full| {
+                ledger.certificate.continuation == ContinuationPublicationReceipt::Terminal
+                    && bound == full
+                    && matches!(
+                        &activation.return_to,
+                        DeltaReturn::Stable { desc, .. }
+                            if commits_final_checked_candidate(desc, full)
+                    )
+            });
+            (ledger.generation, bound, row, terminal)
         };
-        let PositivePublicationRegistration::Eligible(ledger) =
-            activation.positive_publication.as_deref()?
-        else {
-            return None;
+        let child = ActivationId(take_monotonic(
+            &mut self.state.next_activation,
+            "activation",
+        ));
+        let link = PositiveSupportLink {
+            child,
+            parent: parent.activation,
+            generation,
+            occurrence,
+            value,
         };
-        (ledger.open && original.one_parent_values().contains(&value)).then_some(
-            PositiveChildAddress {
-                parent,
-                generation: ledger.generation,
-                value,
-            },
-        )
+        assert!(
+            self.state
+                .activations
+                .insert(
+                    child,
+                    Activation {
+                        reducer: DeltaReducer::PositiveSupport {
+                            link: Box::new(link),
+                            witnessed: false,
+                        },
+                        return_to: DeltaReturn::PositiveSupport { bound, row },
+                        positive_publication: None,
+                        physical_class: if terminal {
+                            DeltaPhysicalClass::TerminalStreaming
+                        } else {
+                            DeltaPhysicalClass::General
+                        },
+                        terminal_sparse_quantum: 1,
+                        source_candidates: None,
+                        suspended_source_page: None,
+                        program_joins: AHashMap::new(),
+                        seen: AHashMap::new(),
+                        accepted: AHashSet::new(),
+                        live: AHashMap::new(),
+                        status: ActivationStatus::Open,
+                    },
+                )
+                .is_none(),
+            "positive Support activation identifier was reused"
+        );
+        Some(child)
     }
 
     /// Sole positive-publication linearization point.
     ///
     /// This exclusive mutable registry borrow is the scheduler's CAS law.
-    /// Parent identity, query-clone brand, generation, open Confirm reducer,
-    /// fixed original candidate bag, and certificate are revalidated before
-    /// the first `(parent, value)` insertion wins. Every later or malformed
-    /// hedge is an inert `None`.
-    ///
-    /// The current copyable `address` is only a prevalidated semantic claim
-    /// request for this dormant seam. This private method must remain dead
-    /// outside tests until a production caller can pass a validated, non-Clone
-    /// physical Support-child witness with the correct brand and lifecycle.
+    /// Current query-clone brand, physical child/link, generation, open
+    /// Confirm reducer, indexed original occurrence, and certificate are
+    /// revalidated before the first `(parent, value)` insertion wins. Every
+    /// later or malformed hedge is an inert `None`.
     ///
     /// The returned private grant is an affine contract, not runtime-enforced
     /// linearity: that eventual production caller must consume it immediately
@@ -1326,19 +1464,40 @@ impl ProducerRegistry {
     #[cfg_attr(not(test), allow(dead_code))]
     fn commit_positive_publication(
         &mut self,
-        expected_parent: PositiveConfirmParentId,
-        address: PositiveChildAddress,
+        witness: PositiveSupportWitness,
         direct_terminal_full: Option<VariableSet>,
     ) -> Option<PositivePublicationGrant> {
-        if address.parent != expected_parent || expected_parent.brand != self.brand {
+        if witness.brand != self.brand {
             return None;
         }
-        let Some(activation) = self.state.activations.get_mut(&expected_parent.activation) else {
+        let link = witness.link;
+        let Some(child) = self.state.activations.get(&link.child) else {
+            return None;
+        };
+        let DeltaReducer::PositiveSupport {
+            link: current_link,
+            witnessed: true,
+        } = &child.reducer
+        else {
+            return None;
+        };
+        if current_link.as_ref() != &link {
+            return None;
+        }
+        let child_context = match &child.return_to {
+            DeltaReturn::PositiveSupport { bound, row } => (*bound, row.clone()),
+            _ => return None,
+        };
+        let Some(activation) = self.state.activations.get_mut(&link.parent) else {
             return None;
         };
         let DeltaReducer::Confirm { original } = &activation.reducer else {
             return None;
         };
+        if positive_support_child_context(&activation.return_to, link.value) != Some(child_context)
+        {
+            return None;
+        }
         let DeltaReturn::Stable {
             desc,
             parent,
@@ -1354,10 +1513,10 @@ impl ProducerRegistry {
             return None;
         };
         if !ledger.open
-            || ledger.generation != address.generation
+            || ledger.generation != link.generation
             || !ledger.certificate.eligible()
-            || !original.one_parent_values().contains(&address.value)
-            || ledger.published.contains(&address.value)
+            || original.one_parent_values().get(link.occurrence) != Some(&link.value)
+            || ledger.published.contains(&link.value)
             || parent.len() != desc.bound.count()
             || *set_admit_result != ledger.certificate.crosses_set_boundary
         {
@@ -1375,10 +1534,10 @@ impl ProducerRegistry {
                         .is_empty()
                         .then_some(TerminalOriginRegistration {
                             family: ledger.confirm_state,
-                            origin: expected_parent.activation,
+                            origin: link.parent,
                         });
                 PositivePublicationRoute::Terminal {
-                    origin: expected_parent.activation,
+                    origin: link.parent,
                     full,
                     registration,
                 }
@@ -1395,11 +1554,11 @@ impl ProducerRegistry {
         };
         let return_to = activation.return_to.clone();
         assert!(
-            ledger.published.insert(address.value),
+            ledger.published.insert(link.value),
             "preflighted positive publication lost its first-winner race"
         );
         Some(PositivePublicationGrant {
-            value: address.value,
+            value: link.value,
             return_to,
             route,
         })
@@ -1715,7 +1874,20 @@ impl ProducerRegistry {
 
         let mut roots = Vec::new();
         let mut initial_accepted = Vec::new();
+        let positive_support_reducer = matches!(
+            &self
+                .state
+                .activations
+                .get(&activation_id)
+                .expect("unknown program activation")
+                .reducer,
+            DeltaReducer::PositiveSupport { .. }
+        );
         for seed in seeds {
+            assert!(
+                !positive_support_reducer || seed.accepted.is_none(),
+                "Stage 1 PositiveSupport cannot turn initial acceptance into publication authority"
+            );
             if let Some(value) = seed.accepted {
                 if self
                     .state
@@ -1961,6 +2133,7 @@ impl ProducerRegistry {
                 | DeltaReducer::StreamProposal
                 | DeltaReducer::StreamFormulaProposal => {}
                 DeltaReducer::Support { .. }
+                | DeltaReducer::PositiveSupport { .. }
                 | DeltaReducer::Confirm { .. }
                 | DeltaReducer::FinalizingConfirm { .. }
                 | DeltaReducer::FinalizingProposal { .. }
@@ -2208,18 +2381,41 @@ impl ProducerRegistry {
             "program credit crossed registries"
         );
         let activation_id = parent.key.activation;
-        let parent_join = {
+        let (parent_join, positive_support_reducer) = {
             let activation = self
                 .state
                 .activations
                 .get(&activation_id)
                 .expect("unknown program activation");
             assert_eq!(activation.status, ActivationStatus::Open);
-            match activation.live.get(&parent.key.nonce) {
+            let join = match activation.live.get(&parent.key.nonce) {
                 Some(CreditKind::Program { join }) => *join,
                 _ => panic!("unknown, replayed, or wrong-kind program credit"),
+            };
+            if let DeltaReducer::PositiveSupport { link, .. } = &activation.reducer {
+                assert_eq!(
+                    link.child, activation_id,
+                    "PositiveSupport activation retained a link to a different physical child"
+                );
             }
+            (
+                join,
+                matches!(&activation.reducer, DeltaReducer::PositiveSupport { .. }),
+            )
         };
+        if positive_support_reducer {
+            assert!(
+                parent_join.is_none(),
+                "PositiveSupport cannot consume a receipt-local joined Program credit"
+            );
+            assert!(
+                !matches!(
+                    &resume,
+                    Some(ProgramResume::AfterChildren(_) | ProgramResume::AfterChildrenDone)
+                ),
+                "PositiveSupport does not yet propagate commit evidence through AfterChildren"
+            );
+        }
 
         let mut prior_observed: SmallVec<[RawInline; 1]> = prior_observed.into_iter().collect();
         let observed: SmallVec<[RawInline; 1]> = observed.into_iter().collect();
@@ -2336,7 +2532,12 @@ impl ProducerRegistry {
                 | (DeltaReducer::SetAdmit { .. }, _) => {
                     panic!("engine reducer lost its exact affine return payload")
                 }
-                (DeltaReducer::Support { .. } | DeltaReducer::Confirm { .. }, _) => {
+                (
+                    DeltaReducer::Support { .. }
+                    | DeltaReducer::PositiveSupport { .. }
+                    | DeltaReducer::Confirm { .. },
+                    _,
+                ) => {
                     assert!(
                         prior_observed.is_empty() && direct.is_empty(),
                         "a non-proposal program reducer observed proposal candidates"
@@ -2363,6 +2564,8 @@ impl ProducerRegistry {
             }
         }
 
+        let reported_positive =
+            positive_support_reducer && (reported_support || !accepted.is_empty());
         let publishes_stable_effect = {
             let activation = self
                 .state
@@ -2376,6 +2579,7 @@ impl ProducerRegistry {
                 DeltaReducer::Support { published } => {
                     !*published && (reported_support || !accepted.is_empty())
                 }
+                DeltaReducer::PositiveSupport { .. } => false,
                 DeltaReducer::QuiescentProposal { .. }
                 | DeltaReducer::Confirm { .. }
                 | DeltaReducer::FinalizingConfirm { .. }
@@ -2507,10 +2711,40 @@ impl ProducerRegistry {
                 None
             }
         };
+        let positive_support = if reported_positive {
+            let activation = self
+                .state
+                .activations
+                .get_mut(&activation_id)
+                .expect("positive Support activation disappeared after replacement");
+            let DeltaReducer::PositiveSupport { link, witnessed } = &mut activation.reducer else {
+                unreachable!("positive Support replacement changed its reducer")
+            };
+            assert_eq!(
+                link.child, activation_id,
+                "PositiveSupport activation retained a link to a different physical child"
+            );
+            if std::mem::replace(witnessed, true) {
+                None
+            } else {
+                Some(PositiveSupportWitness {
+                    brand: self.brand,
+                    link: link.as_ref().clone(),
+                })
+            }
+        } else {
+            None
+        };
         ProgramReplaceOutcome {
             scheduled,
             raw_proposal_occurrences: raw_stream_occurrences,
-            accepted,
+            accepted: if positive_support_reducer {
+                SmallVec::new()
+            } else {
+                accepted
+            },
+            positive_support_reducer,
+            positive_support: positive_support.map(Box::new),
             dead_search_pages,
             dead_source_telemetry_pages,
             quiescence,
@@ -2592,6 +2826,7 @@ impl ProducerRegistry {
                 assert_eq!(batch.parents.row_count, 1);
                 (*bound, batch.parents.rows.as_slice())
             }
+            DeltaReturn::PositiveSupport { bound, row } => (*bound, row.as_ref()),
             DeltaReturn::SetAdmission {
                 successor,
                 destination,
@@ -2624,6 +2859,7 @@ impl ProducerRegistry {
             DeltaReturn::Formula { bound, .. }
             | DeltaReturn::FormulaOrAdmit { bound, .. }
             | DeltaReturn::FormulaOrEmit { bound, .. } => *bound,
+            DeltaReturn::PositiveSupport { bound, .. } => *bound,
             DeltaReturn::SetAdmission { successor, .. } => successor.bound,
         };
         (bound, Self::activation_candidates(activation).is_some())
@@ -2755,6 +2991,7 @@ impl ProducerRegistry {
                 DeltaStreamingEffect::Support
             }
             DeltaReducer::Support { .. }
+            | DeltaReducer::PositiveSupport { .. }
             | DeltaReducer::QuiescentProposal { .. }
             | DeltaReducer::Confirm { .. }
             | DeltaReducer::FinalizingConfirm { .. }
@@ -2826,6 +3063,12 @@ impl ProducerRegistry {
                     "an unpublished support reducer quiesced with a witness"
                 );
                 DeltaCompletion::Support(false)
+            }
+            DeltaReducer::PositiveSupport { .. } => {
+                // Truth or exhaustion belongs solely to the semantic positive
+                // publication transaction. Physical child completion never
+                // releases Formula false and never owns the Confirm result.
+                DeltaCompletion::Cleanup
             }
             DeltaReducer::Confirm { original } => {
                 let result = original
@@ -2923,6 +3166,7 @@ impl ProducerRegistry {
                 DeltaReturn::Formula { batch, .. } => batch.confirm_finalizer_capable(),
                 DeltaReturn::FormulaOrAdmit { .. }
                 | DeltaReturn::FormulaOrEmit { .. }
+                | DeltaReturn::PositiveSupport { .. }
                 | DeltaReturn::SetAdmission { .. } => false,
             };
             let handoff = match &activation.reducer {
@@ -5875,6 +6119,12 @@ impl DeltaScheduler {
             effect,
         } = completed;
         match (return_to, effect) {
+            (DeltaReturn::PositiveSupport { .. }, DeltaCompletion::Cleanup) => {
+                // Positive truth is released only by the semantic Confirm
+                // parent's affine publication grant. Its physical Support
+                // child always retires as an inert cleanup.
+                FormulaReducerDrain::default()
+            }
             (_, DeltaCompletion::Cleanup) => {
                 // A streaming activation has already resumed one affine copy
                 // of its continuation per semantic effect. Quiescence only
@@ -6037,6 +6287,7 @@ impl DeltaScheduler {
             }
             (DeltaReturn::FormulaOrAdmit { .. }, effect)
             | (DeltaReturn::FormulaOrEmit { .. }, effect)
+            | (DeltaReturn::PositiveSupport { .. }, effect)
             | (DeltaReturn::SetAdmission { .. }, effect) => {
                 panic!("engine reducer completed with incompatible effect: {effect:?}")
             }
@@ -6223,6 +6474,7 @@ impl DeltaScheduler {
             ),
             DeltaReturn::FormulaOrAdmit { .. }
             | DeltaReturn::FormulaOrEmit { .. }
+            | DeltaReturn::PositiveSupport { .. }
             | DeltaReturn::SetAdmission { .. } => {
                 panic!("a private engine reducer attempted streaming publication")
             }
@@ -6713,9 +6965,11 @@ impl DeltaScheduler {
             "one delta activation owns incompatible scheduler queue kinds simultaneously"
         );
 
-        let terminal = self.registry.physical_activation_class(active.activation)
-            == DeltaPhysicalClass::TerminalStreaming;
-        let direct_terminal_full = direct_terminal_publication_full.filter(|_| terminal);
+        // Keep the raw semantic full-result receipt alive through dispatch.
+        // Ordinary paths still gate it by their physical activation class at
+        // the exact release site; Stage 2's positive publication transaction
+        // will instead validate its semantic Confirm parent.
+        let direct_terminal_full = direct_terminal_publication_full;
         let examined_before = stats
             .delta_source_candidates_examined
             .saturating_add(stats.delta_transition_candidates_examined);
@@ -7556,6 +7810,10 @@ impl DeltaScheduler {
                 search_cohort,
                 source_telemetry_cohort,
                 page.resume,
+            );
+            assert!(
+                !outcome.positive_support_reducer && outcome.positive_support.is_none(),
+                "dormant PositiveSupport activation reached the production scheduler before its Stage 2 feeder"
             );
             if outcome.raw_proposal_occurrences != 0 {
                 assert!(
@@ -9694,12 +9952,110 @@ mod tests {
 
     fn commit_terminal_positive(
         registry: &mut ProducerRegistry,
-        parent: PositiveConfirmParentId,
-        address: PositiveChildAddress,
+        witness: PositiveSupportWitness,
     ) -> bool {
         registry
-            .commit_positive_publication(parent, address, Some(terminal_positive_full()))
+            .commit_positive_publication(witness, Some(terminal_positive_full()))
             .is_some()
+    }
+
+    fn positive_test_work(slot: u32) -> ProgramWork {
+        ProgramWork {
+            handle: ProgramWorkHandle::test(slot),
+            dispatch: DispatchClass::new(0),
+            pacing: ProgramPacing::Activation,
+        }
+    }
+
+    fn open_positive_support_credit(
+        registry: &mut ProducerRegistry,
+        parent: PositiveConfirmParentId,
+        occurrence: usize,
+        value: RawInline,
+        support_variables: VariableSet,
+        terminal_full: Option<VariableSet>,
+    ) -> (ActivationId, ProducerCredit) {
+        let child = registry
+            .open_positive_support_activation(
+                parent,
+                occurrence,
+                value,
+                support_variables,
+                terminal_full,
+            )
+            .expect("valid positive Support child should open");
+        let mut installed = registry.install_program_roots(
+            child,
+            [ProgramSeedWork {
+                parent: 0,
+                work: positive_test_work(0),
+                accepted: None,
+            }],
+        );
+        assert!(installed.initial_accepted.is_empty());
+        assert!(installed.quiescence.is_none());
+        let (_, credit) = installed.roots.pop().expect("one positive Support root");
+        (child, credit)
+    }
+
+    fn replace_positive_support_credit(
+        registry: &mut ProducerRegistry,
+        credit: ProducerCredit,
+        accepted: Option<RawInline>,
+        reported_support: bool,
+    ) -> (PositiveSupportWitness, QuiescenceProof) {
+        let mut outcome = registry.replace_program(
+            credit,
+            DeltaStateId(0),
+            &[],
+            std::iter::empty(),
+            accepted,
+            std::iter::empty(),
+            reported_support,
+            false,
+            false,
+            None,
+        );
+        assert!(outcome.positive_support_reducer);
+        assert_eq!(outcome.raw_proposal_occurrences, 0);
+        assert!(
+            outcome.accepted.is_empty(),
+            "positive Support must not leak proposal effects"
+        );
+        assert!(outcome.scheduled.is_empty());
+        (
+            *outcome
+                .positive_support
+                .take()
+                .expect("first real positive success should mint a witness"),
+            outcome
+                .quiescence
+                .expect("the sole positive Support credit should quiesce"),
+        )
+    }
+
+    fn terminal_positive_witness(
+        registry: &mut ProducerRegistry,
+        parent: PositiveConfirmParentId,
+        occurrence: usize,
+        value: RawInline,
+        reported_support: bool,
+    ) -> (ActivationId, PositiveSupportWitness, QuiescenceProof) {
+        let (child, credit) = open_positive_support_credit(
+            registry,
+            parent,
+            occurrence,
+            value,
+            VariableSet::new_singleton(0),
+            Some(terminal_positive_full()),
+        );
+        let (witness, proof) = replace_positive_support_credit(
+            registry,
+            credit,
+            (!reported_support).then_some(value),
+            reported_support,
+        );
+        (child, witness, proof)
     }
 
     fn terminal_positive_certificate() -> PositivePublicationCertificate {
@@ -9830,26 +10186,27 @@ mod tests {
         ProducerRegistry,
         ActivationId,
         PositiveConfirmParentId,
-        PositiveChildAddress,
+        ActivationId,
+        PositiveSupportWitness,
     ) {
         let candidate = value(6);
         let mut registry = ProducerRegistry::new();
         let (activation, parent) =
             open_positive_confirm(&mut registry, [candidate], terminal_positive_certificate());
-        let address = registry
-            .positive_child_address(parent, candidate)
-            .expect("eligible candidate should receive an address");
-        (registry, activation, parent, address)
+        let (child, witness, _) =
+            terminal_positive_witness(&mut registry, parent, 0, candidate, false);
+        (registry, activation, parent, child, witness)
     }
 
     fn assert_terminal_positive_preflight_rejected(
         direct_terminal_full: Option<VariableSet>,
         mutate: impl FnOnce(&mut ProducerRegistry, ActivationId),
     ) {
-        let (mut registry, activation, parent, address) = terminal_positive_commit_fixture();
+        let (mut registry, activation, parent, _child, witness) =
+            terminal_positive_commit_fixture();
         mutate(&mut registry, activation);
         assert!(registry
-            .commit_positive_publication(parent, address, direct_terminal_full)
+            .commit_positive_publication(witness, direct_terminal_full)
             .is_none());
         assert!(
             registry
@@ -10744,7 +11101,13 @@ mod tests {
             "an unfixed parent must not own a ledger"
         );
         assert!(registry
-            .positive_child_address(unfixed_parent, value(1))
+            .open_positive_support_activation(
+                unfixed_parent,
+                0,
+                value(1),
+                VariableSet::new_singleton(0),
+                Some(terminal_positive_full()),
+            )
             .is_none());
 
         let mut barrier = eligible;
@@ -10767,7 +11130,13 @@ mod tests {
             "a Barrier parent must not own a ledger"
         );
         assert!(registry
-            .positive_child_address(barrier_parent, value(2))
+            .open_positive_support_activation(
+                barrier_parent,
+                0,
+                value(2),
+                VariableSet::new_singleton(0),
+                Some(terminal_positive_full()),
+            )
             .is_none());
 
         let malformed_chunk = PositivePublicationCertificate {
@@ -10784,8 +11153,502 @@ mod tests {
             "ChunkHomomorphic requires the semantic parent to cross the SET boundary"
         );
         assert!(registry
-            .positive_child_address(malformed_parent, value(3))
+            .open_positive_support_activation(
+                malformed_parent,
+                0,
+                value(3),
+                VariableSet::new_singleton(0),
+                Some(terminal_positive_full()),
+            )
             .is_none());
+    }
+
+    #[test]
+    fn positive_support_opener_derives_exact_row_and_requires_every_support_variable() {
+        let parent_value = value(80);
+        let candidate = value(81);
+        let parent_bound = VariableSet::new_singleton(0);
+        let candidate_bound = parent_bound.union(VariableSet::new_singleton(1));
+        let relevant = ChildSet::empty(1).with_inserted(0);
+        let return_to = positive_candidate_return(
+            vec![parent_value],
+            parent_bound,
+            1,
+            relevant.clone(),
+            relevant,
+            true,
+        );
+        let mut registry = ProducerRegistry::new();
+        let (_, parent) = open_positive_confirm_with_return(
+            &mut registry,
+            [candidate],
+            terminal_positive_certificate(),
+            return_to,
+        );
+        let missing_required = candidate_bound.union(VariableSet::new_singleton(2));
+        assert!(
+            registry
+                .open_positive_support_activation(
+                    parent,
+                    0,
+                    candidate,
+                    missing_required,
+                    Some(candidate_bound),
+                )
+                .is_none(),
+            "a partially bound Support constraint must not become positive authority"
+        );
+
+        let child = registry
+            .open_positive_support_activation(
+                parent,
+                0,
+                candidate,
+                candidate_bound,
+                Some(candidate_bound),
+            )
+            .expect("a fully bound Support constraint should open");
+        let activation = &registry.state.activations[&child];
+        let DeltaReducer::PositiveSupport { link, witnessed } = &activation.reducer else {
+            panic!("specialized opener installed the wrong reducer")
+        };
+        assert_eq!(link.child, child);
+        assert_eq!(link.parent, parent.activation);
+        assert_eq!(link.occurrence, 0);
+        assert_eq!(link.value, candidate);
+        assert!(!witnessed);
+        let DeltaReturn::PositiveSupport { bound, row } = &activation.return_to else {
+            panic!("specialized opener installed the wrong return")
+        };
+        assert_eq!(*bound, candidate_bound);
+        assert_eq!(row.as_ref(), &[parent_value, candidate]);
+        let (source_bound, source_row, source_candidates) = registry.source_context(child);
+        assert_eq!(source_bound, candidate_bound);
+        assert_eq!(source_row, &[parent_value, candidate]);
+        assert!(source_candidates.is_none());
+        assert_eq!(
+            registry.source_dispatch_shape(child),
+            (candidate_bound, false)
+        );
+    }
+
+    #[test]
+    fn positive_support_opener_checks_the_exact_original_occurrence() {
+        let a = value(82);
+        let b = value(83);
+        let mut registry = ProducerRegistry::new();
+        let (_, parent) =
+            open_positive_confirm(&mut registry, [a, b, a], terminal_positive_certificate());
+        assert!(
+            registry
+                .open_positive_support_activation(
+                    parent,
+                    1,
+                    a,
+                    VariableSet::new_singleton(0),
+                    Some(terminal_positive_full()),
+                )
+                .is_none(),
+            "membership elsewhere in B must not validate the indexed occurrence"
+        );
+        assert!(registry
+            .open_positive_support_activation(
+                parent,
+                2,
+                a,
+                VariableSet::new_singleton(0),
+                Some(terminal_positive_full()),
+            )
+            .is_some());
+    }
+
+    #[test]
+    fn positive_support_commit_revalidates_the_linked_original_occurrence() {
+        let a = value(94);
+        let b = value(95);
+        let mut registry = ProducerRegistry::new();
+        let (activation, parent) =
+            open_positive_confirm(&mut registry, [a, b, a], terminal_positive_certificate());
+        let (_, witness, _) = terminal_positive_witness(&mut registry, parent, 2, a, false);
+        let DeltaReducer::Confirm { original } = &mut registry
+            .state
+            .activations
+            .get_mut(&activation)
+            .unwrap()
+            .reducer
+        else {
+            unreachable!()
+        };
+        *original = shared_one_parent_candidates(vec![a, b, b]);
+
+        assert!(
+            registry
+                .commit_positive_publication(witness, Some(terminal_positive_full()))
+                .is_none(),
+            "open-time membership must not replace commit-time indexed revalidation"
+        );
+        assert!(registry
+            .positive_publication_snapshot(parent)
+            .unwrap()
+            .published
+            .is_empty());
+    }
+
+    #[test]
+    fn positive_support_commit_requires_the_current_physical_child() {
+        let candidate = value(96);
+        let mut registry = ProducerRegistry::new();
+        let (_, parent) =
+            open_positive_confirm(&mut registry, [candidate], terminal_positive_certificate());
+        let (child, witness, proof) =
+            terminal_positive_witness(&mut registry, parent, 0, candidate, true);
+        assert_eq!(proof.activation, child);
+        let RegistrySettlement::Completed(completed) = registry.settle_quiescence(proof) else {
+            panic!("positive Support child must complete physically")
+        };
+        assert!(matches!(completed.effect, DeltaCompletion::Cleanup));
+        assert!(!registry.is_live(child));
+        assert!(
+            registry
+                .commit_positive_publication(witness, Some(terminal_positive_full()))
+                .is_none(),
+            "a witness cannot outlive its current physical child"
+        );
+        assert!(registry
+            .positive_publication_snapshot(parent)
+            .unwrap()
+            .published
+            .is_empty());
+    }
+
+    #[test]
+    fn positive_support_commit_rejects_corruption_in_each_child_row_region() {
+        let parent_value = value(84);
+        let candidate = value(85);
+        let parent_bound = VariableSet::new_singleton(0);
+        let full = parent_bound.union(VariableSet::new_singleton(1));
+        let relevant = ChildSet::empty(1).with_inserted(0);
+        let return_to = positive_candidate_return(
+            vec![parent_value],
+            parent_bound,
+            1,
+            relevant.clone(),
+            relevant,
+            true,
+        );
+        let mut registry = ProducerRegistry::new();
+        let (_, parent) = open_positive_confirm_with_return(
+            &mut registry,
+            [candidate],
+            terminal_positive_certificate(),
+            return_to,
+        );
+        let (candidate_child, candidate_credit) =
+            open_positive_support_credit(&mut registry, parent, 0, candidate, full, Some(full));
+        let (candidate_witness, _) = replace_positive_support_credit(
+            &mut registry,
+            candidate_credit,
+            Some(candidate),
+            false,
+        );
+        let (parent_child, parent_credit) =
+            open_positive_support_credit(&mut registry, parent, 0, candidate, full, Some(full));
+        let (parent_witness, _) =
+            replace_positive_support_credit(&mut registry, parent_credit, None, true);
+
+        let DeltaReturn::PositiveSupport { row, .. } = &mut registry
+            .state
+            .activations
+            .get_mut(&candidate_child)
+            .unwrap()
+            .return_to
+        else {
+            unreachable!()
+        };
+        row[1] = value(86);
+        assert!(
+            registry
+                .commit_positive_publication(candidate_witness, Some(full))
+                .is_none(),
+            "a corrupted candidate column must not publish"
+        );
+
+        let DeltaReturn::PositiveSupport { row, .. } = &mut registry
+            .state
+            .activations
+            .get_mut(&parent_child)
+            .unwrap()
+            .return_to
+        else {
+            unreachable!()
+        };
+        row[0] = value(87);
+        assert!(
+            registry
+                .commit_positive_publication(parent_witness, Some(full))
+                .is_none(),
+            "a corrupted preserved parent column must not publish"
+        );
+        assert!(registry
+            .positive_publication_snapshot(parent)
+            .unwrap()
+            .published
+            .is_empty());
+    }
+
+    #[test]
+    fn positive_support_link_child_corruption_panics_before_witness_minting() {
+        let candidate = value(88);
+        let mut registry = ProducerRegistry::new();
+        let (_, parent) =
+            open_positive_confirm(&mut registry, [candidate], terminal_positive_certificate());
+        let (child, credit) = open_positive_support_credit(
+            &mut registry,
+            parent,
+            0,
+            candidate,
+            VariableSet::new_singleton(0),
+            Some(terminal_positive_full()),
+        );
+        let DeltaReducer::PositiveSupport { link, .. } =
+            &mut registry.state.activations.get_mut(&child).unwrap().reducer
+        else {
+            unreachable!()
+        };
+        link.child = ActivationId::test(u64::MAX);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                registry.replace_program(
+                    credit,
+                    DeltaStateId(0),
+                    &[],
+                    std::iter::empty(),
+                    [candidate],
+                    std::iter::empty(),
+                    false,
+                    false,
+                    false,
+                    None,
+                );
+            }))
+            .is_err(),
+            "registry-owned physical custody corruption must fail loudly"
+        );
+    }
+
+    #[test]
+    fn positive_support_first_real_success_mints_once_and_replay_is_rejected() {
+        for supported_first in [false, true] {
+            let candidate = value(if supported_first { 89 } else { 90 });
+            let mut registry = ProducerRegistry::new();
+            let (_, parent) =
+                open_positive_confirm(&mut registry, [candidate], terminal_positive_certificate());
+            let child = registry
+                .open_positive_support_activation(
+                    parent,
+                    0,
+                    candidate,
+                    VariableSet::new_singleton(0),
+                    Some(terminal_positive_full()),
+                )
+                .unwrap();
+            let installed = registry.install_program_roots(
+                child,
+                [0, 1].map(|slot| ProgramSeedWork {
+                    parent: 0,
+                    work: positive_test_work(slot),
+                    accepted: None,
+                }),
+            );
+            assert!(matches!(
+                &registry.state.activations[&child].reducer,
+                DeltaReducer::PositiveSupport {
+                    witnessed: false,
+                    ..
+                }
+            ));
+            let mut roots = installed.roots.into_iter();
+            let (_, first_credit) = roots.next().unwrap();
+            let (_, later_credit) = roots.next().unwrap();
+            let replay_brand = first_credit.brand;
+            let replay_key = first_credit.key;
+            let mut first = registry.replace_program(
+                first_credit,
+                DeltaStateId(0),
+                &[],
+                std::iter::empty(),
+                (!supported_first).then_some(candidate),
+                std::iter::empty(),
+                supported_first,
+                false,
+                false,
+                None,
+            );
+            assert!(first.positive_support_reducer);
+            assert!(first.accepted.is_empty());
+            assert_eq!(first.raw_proposal_occurrences, 0);
+            assert!(first.quiescence.is_none());
+            let witness = *first
+                .positive_support
+                .take()
+                .expect("the first real success must mint exactly one witness");
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    registry.replace_program(
+                        ProducerCredit {
+                            brand: replay_brand,
+                            key: replay_key,
+                        },
+                        DeltaStateId(0),
+                        &[],
+                        std::iter::empty(),
+                        std::iter::empty(),
+                        std::iter::empty(),
+                        true,
+                        false,
+                        false,
+                        None,
+                    );
+                }))
+                .is_err(),
+                "a consumed producer credit must not replay"
+            );
+
+            let later = registry.replace_program(
+                later_credit,
+                DeltaStateId(0),
+                &[],
+                std::iter::empty(),
+                (!supported_first).then_some(candidate),
+                std::iter::empty(),
+                !supported_first,
+                false,
+                false,
+                None,
+            );
+            assert!(later.positive_support_reducer);
+            assert!(later.positive_support.is_none());
+            assert!(later.quiescence.is_some());
+            assert!(commit_terminal_positive(&mut registry, witness));
+        }
+    }
+
+    #[test]
+    fn positive_support_witnessed_and_unwitnessed_quiescence_release_cleanup() {
+        let root = PositiveCertificateLeaf {
+            variable: 0,
+            page_local: false,
+        };
+        let plan = ResidualPlan::compile(&root);
+        for witnessed in [false, true] {
+            let candidate = value(if witnessed { 91 } else { 92 });
+            let mut registry = ProducerRegistry::new();
+            let (_, parent) =
+                open_positive_confirm(&mut registry, [candidate], terminal_positive_certificate());
+            let (child, credit) = open_positive_support_credit(
+                &mut registry,
+                parent,
+                0,
+                candidate,
+                VariableSet::new_singleton(0),
+                Some(terminal_positive_full()),
+            );
+            let mut outcome = registry.replace_program(
+                credit,
+                DeltaStateId(0),
+                &[],
+                std::iter::empty(),
+                witnessed.then_some(candidate),
+                std::iter::empty(),
+                false,
+                false,
+                false,
+                None,
+            );
+            assert_eq!(outcome.positive_support.is_some(), witnessed);
+            if let Some(witness) = outcome.positive_support.take() {
+                assert!(commit_terminal_positive(&mut registry, *witness));
+            }
+            let proof = outcome.quiescence.expect("the sole credit should quiesce");
+            assert_eq!(proof.activation, child);
+            let RegistrySettlement::Completed(completed) = registry.settle_quiescence(proof) else {
+                panic!("positive Support child must complete physically")
+            };
+            assert!(matches!(
+                completed.return_to,
+                DeltaReturn::PositiveSupport { .. }
+            ));
+            assert!(matches!(completed.effect, DeltaCompletion::Cleanup));
+
+            let mut scheduler = DeltaScheduler::new();
+            let drained = scheduler.release_completion(
+                completed,
+                &plan,
+                &mut Worklist::new(),
+                &mut StateInterner::default(),
+                &mut ResidualStateStats::default(),
+            );
+            assert!(drained.continuation.is_none());
+            assert!(drained.active.is_none());
+        }
+    }
+
+    #[test]
+    fn positive_support_stage_one_rejects_seed_success_and_after_children() {
+        let candidate = value(93);
+        let mut registry = ProducerRegistry::new();
+        let (_, parent) =
+            open_positive_confirm(&mut registry, [candidate], terminal_positive_certificate());
+        let child = registry
+            .open_positive_support_activation(
+                parent,
+                0,
+                candidate,
+                VariableSet::new_singleton(0),
+                Some(terminal_positive_full()),
+            )
+            .unwrap();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                registry.install_program_roots(
+                    child,
+                    [ProgramSeedWork {
+                        parent: 0,
+                        work: positive_test_work(0),
+                        accepted: Some(candidate),
+                    }],
+                );
+            }))
+            .is_err(),
+            "Stage 1 must not counterfeit a replacement witness from initial acceptance"
+        );
+        let mut installed = registry.install_program_roots(
+            child,
+            [ProgramSeedWork {
+                parent: 0,
+                work: positive_test_work(1),
+                accepted: None,
+            }],
+        );
+        let (_, credit) = installed.roots.pop().unwrap();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                registry.replace_program(
+                    credit,
+                    DeltaStateId(0),
+                    &[],
+                    std::iter::empty(),
+                    std::iter::empty(),
+                    std::iter::empty(),
+                    false,
+                    false,
+                    false,
+                    Some(ProgramResume::AfterChildrenDone),
+                );
+            }))
+            .is_err(),
+            "Stage 1 must not claim unsupported generic AfterChildren propagation"
+        );
     }
 
     #[test]
@@ -10874,10 +11737,10 @@ mod tests {
             },
         );
 
-        let (mut registry, _, parent, address) = terminal_positive_commit_fixture();
-        let candidate = address.value;
+        let (mut registry, _, parent, _child, witness) = terminal_positive_commit_fixture();
+        let candidate = witness.link.value;
         let grant = registry
-            .commit_positive_publication(parent, address, Some(terminal_positive_full()))
+            .commit_positive_publication(witness, Some(terminal_positive_full()))
             .expect("the completely preflighted first value must win");
         assert!(matches!(
             &grant.route,
@@ -10909,11 +11772,12 @@ mod tests {
                 .published,
             BTreeSet::from([candidate])
         );
+        let (_, hedge, _) = terminal_positive_witness(&mut registry, parent, 0, candidate, true);
         assert!(
             registry
-                .commit_positive_publication(parent, address, Some(terminal_positive_full()),)
+                .commit_positive_publication(hedge, Some(terminal_positive_full()))
                 .is_none(),
-            "a committed grant cannot be minted twice"
+            "a later real hedge cannot mint the same grant twice"
         );
     }
 
@@ -10936,12 +11800,10 @@ mod tests {
         let mut stable_interner = StateInterner::default();
         let mut stats = ResidualStateStats::default();
 
+        let (_, first_witness, _) =
+            terminal_positive_witness(&mut registry, parent, 0, first, false);
         let first_grant = registry
-            .commit_positive_publication(
-                parent,
-                registry.positive_child_address(parent, first).unwrap(),
-                Some(terminal_positive_full()),
-            )
+            .commit_positive_publication(first_witness, Some(terminal_positive_full()))
             .expect("the first Terminal value should commit");
         let first_release = DeltaScheduler::release_positive_publication(
             first_grant,
@@ -10966,12 +11828,10 @@ mod tests {
         assert_eq!(registration.family, StateId(17));
         assert_eq!(registration.origin, parent.activation);
 
+        let (_, second_witness, _) =
+            terminal_positive_witness(&mut registry, parent, 1, second, true);
         let second_grant = registry
-            .commit_positive_publication(
-                parent,
-                registry.positive_child_address(parent, second).unwrap(),
-                Some(terminal_positive_full()),
-            )
+            .commit_positive_publication(second_witness, Some(terminal_positive_full()))
             .expect("a distinct later Terminal value should commit");
         let second_release = DeltaScheduler::release_positive_publication(
             second_grant,
@@ -11042,12 +11902,9 @@ mod tests {
         let mut registry = ProducerRegistry::new();
         let (_, parent) =
             open_positive_confirm_with_return(&mut registry, [candidate], certificate, return_to);
+        let (_, witness, _) = terminal_positive_witness(&mut registry, parent, 0, candidate, false);
         let grant = registry
-            .commit_positive_publication(
-                parent,
-                registry.positive_child_address(parent, candidate).unwrap(),
-                Some(terminal_positive_full()),
-            )
+            .commit_positive_publication(witness, Some(terminal_positive_full()))
             .expect("an already-SET Terminal successor should still publish");
         let root = PositiveCertificateLeaf {
             variable: 0,
@@ -11083,11 +11940,18 @@ mod tests {
         };
         let (activation, parent) =
             open_positive_confirm_with_return(&mut registry, [candidate], certificate, return_to);
-        let address = registry
-            .positive_child_address(parent, candidate)
-            .expect("ChunkHomomorphic candidate should receive an address");
+        let (_, credit) = open_positive_support_credit(
+            &mut registry,
+            parent,
+            0,
+            candidate,
+            VariableSet::new_singleton(0),
+            None,
+        );
+        let (witness, _) =
+            replace_positive_support_credit(&mut registry, credit, Some(candidate), false);
         let grant = registry
-            .commit_positive_publication(parent, address, None)
+            .commit_positive_publication(witness, None)
             .expect("ChunkHomomorphic publication needs no Terminal capability");
         let mut stable = Worklist::new();
         let mut stable_interner = StateInterner::default();
@@ -11140,14 +12004,12 @@ mod tests {
         let certificate = terminal_positive_certificate();
         let mut registry = ProducerRegistry::new();
         let (activation, parent) = open_positive_confirm(&mut registry, [candidate], certificate);
-        let first = registry
-            .positive_child_address(parent, candidate)
-            .expect("eligible candidate should receive an address");
-        let hedge = first;
+        let (_, first, _) = terminal_positive_witness(&mut registry, parent, 0, candidate, false);
+        let (_, hedge, _) = terminal_positive_witness(&mut registry, parent, 0, candidate, true);
 
-        assert!(commit_terminal_positive(&mut registry, parent, first));
+        assert!(commit_terminal_positive(&mut registry, first));
         assert!(
-            !commit_terminal_positive(&mut registry, parent, hedge),
+            !commit_terminal_positive(&mut registry, hedge),
             "a later hedge for the same (parent, value) must be inert"
         );
         let before_reopen = registry.positive_publication_snapshot(parent).unwrap();
@@ -11171,11 +12033,11 @@ mod tests {
         let mut registry = ProducerRegistry::new();
         let (_, parent) =
             open_positive_confirm(&mut registry, [one, two], terminal_positive_certificate());
-        let one_address = registry.positive_child_address(parent, one).unwrap();
-        let two_address = registry.positive_child_address(parent, two).unwrap();
+        let (_, one_witness, _) = terminal_positive_witness(&mut registry, parent, 0, one, false);
+        let (_, two_witness, _) = terminal_positive_witness(&mut registry, parent, 1, two, true);
 
-        assert!(commit_terminal_positive(&mut registry, parent, two_address));
-        assert!(commit_terminal_positive(&mut registry, parent, one_address));
+        assert!(commit_terminal_positive(&mut registry, two_witness));
+        assert!(commit_terminal_positive(&mut registry, one_witness));
         assert_eq!(
             registry
                 .positive_publication_snapshot(parent)
@@ -11193,22 +12055,28 @@ mod tests {
         let (activation, parent) =
             open_positive_confirm(&mut registry, [member], terminal_positive_certificate());
         assert!(
-            registry.positive_child_address(parent, absent).is_none(),
-            "the scheduler must not issue an address outside original B"
+            registry
+                .open_positive_support_activation(
+                    parent,
+                    0,
+                    absent,
+                    VariableSet::new_singleton(0),
+                    Some(terminal_positive_full()),
+                )
+                .is_none(),
+            "the registry must not open a physical child outside original B"
         );
+        assert!(registry
+            .open_positive_support_activation(
+                parent,
+                1,
+                member,
+                VariableSet::new_singleton(0),
+                Some(terminal_positive_full()),
+            )
+            .is_none());
         let before = registry.positive_publication_snapshot(parent).unwrap();
-        let invalid = PositiveChildAddress {
-            parent,
-            generation: before.generation,
-            value: absent,
-        };
-        assert!(!commit_terminal_positive(&mut registry, parent, invalid));
-        assert_eq!(
-            registry.positive_publication_snapshot(parent),
-            Some(before.clone())
-        );
-
-        let valid = registry.positive_child_address(parent, member).unwrap();
+        let (_, witness, _) = terminal_positive_witness(&mut registry, parent, 0, member, false);
         registry
             .state
             .activations
@@ -11216,34 +12084,26 @@ mod tests {
             .unwrap()
             .reducer = DeltaReducer::Support { published: false };
         assert!(
-            !commit_terminal_positive(&mut registry, parent, valid),
+            !commit_terminal_positive(&mut registry, witness),
             "a parent no longer owning a Confirm reducer must be inert"
         );
         assert_eq!(registry.positive_publication_snapshot(parent), Some(before));
     }
 
     #[test]
-    fn positive_publication_generation_and_close_snapshot_fence_stale_addresses() {
+    fn positive_publication_generation_and_close_snapshot_fence_stale_witnesses() {
         let candidate = value(5);
         let mut registry = ProducerRegistry::new();
         let (_, parent) =
             open_positive_confirm(&mut registry, [candidate], terminal_positive_certificate());
-        let address = registry.positive_child_address(parent, candidate).unwrap();
-        let wrong_generation = PositiveChildAddress {
-            generation: address
-                .generation
-                .checked_add(1)
-                .expect("test generation should have a successor"),
-            ..address
-        };
+        let (_, witness, _) = terminal_positive_witness(&mut registry, parent, 0, candidate, false);
+        let generation = witness.link.generation;
+        let wrong_generation = generation
+            .checked_add(1)
+            .expect("test generation should have a successor");
         let open = registry.positive_publication_snapshot(parent).unwrap();
-        assert!(!commit_terminal_positive(
-            &mut registry,
-            parent,
-            wrong_generation
-        ));
         assert!(registry
-            .close_and_snapshot_positive_publication(parent, wrong_generation.generation)
+            .close_and_snapshot_positive_publication(parent, wrong_generation)
             .is_none());
         assert_eq!(
             registry.positive_publication_snapshot(parent),
@@ -11251,20 +12111,20 @@ mod tests {
         );
 
         let closed = registry
-            .close_and_snapshot_positive_publication(parent, address.generation)
+            .close_and_snapshot_positive_publication(parent, generation)
             .expect("matching settlement authority should close and snapshot");
         assert!(!closed.open);
         assert_ne!(
-            closed.generation, address.generation,
+            closed.generation, generation,
             "settlement must advance the generation before freezing its snapshot"
         );
         assert!(
-            !commit_terminal_positive(&mut registry, parent, address),
+            !commit_terminal_positive(&mut registry, witness),
             "all outstanding physical children must be inert after close"
         );
         assert!(
             registry
-                .close_and_snapshot_positive_publication(parent, address.generation)
+                .close_and_snapshot_positive_publication(parent, generation)
                 .is_none(),
             "close-and-snapshot authority is affine"
         );
@@ -11272,94 +12132,101 @@ mod tests {
     }
 
     #[test]
-    fn positive_publication_addresses_are_parent_local_and_unknown_safe() {
+    fn positive_support_links_are_parent_local_and_unknown_safe() {
         let candidate = value(9);
         let certificate = terminal_positive_certificate();
         let mut registry = ProducerRegistry::new();
         let (_, left) = open_positive_confirm(&mut registry, [candidate], certificate);
         let (_, right) = open_positive_confirm(&mut registry, [candidate], certificate);
-        let left_address = registry.positive_child_address(left, candidate).unwrap();
-        let right_address = registry.positive_child_address(right, candidate).unwrap();
-        let right_before = registry.positive_publication_snapshot(right).unwrap();
+        let (_, left_witness, _) =
+            terminal_positive_witness(&mut registry, left, 0, candidate, false);
+        let (_, right_witness, _) =
+            terminal_positive_witness(&mut registry, right, 0, candidate, true);
 
+        assert_eq!(left_witness.link.parent, left.activation);
+        assert_eq!(right_witness.link.parent, right.activation);
+        assert_ne!(left_witness.link.child, right_witness.link.child);
+        assert!(commit_terminal_positive(&mut registry, left_witness));
         assert!(
-            !commit_terminal_positive(&mut registry, right, left_address),
-            "an address from another semantic parent must be inert"
-        );
-        assert_eq!(
-            registry.positive_publication_snapshot(right),
-            Some(right_before)
-        );
-        assert!(commit_terminal_positive(&mut registry, left, left_address));
-        assert!(
-            commit_terminal_positive(&mut registry, right, right_address),
+            commit_terminal_positive(&mut registry, right_witness),
             "independent parents may each publish the same value once"
         );
 
-        let unknown = PositiveConfirmParentId {
-            brand: registry.brand,
-            activation: ActivationId(u64::MAX),
-        };
-        assert!(!commit_terminal_positive(
-            &mut registry,
-            unknown,
-            PositiveChildAddress {
-                parent: unknown,
-                generation: left_address.generation,
-                value: candidate,
-            },
-        ));
+        let (gone_activation, gone_parent) =
+            open_positive_confirm(&mut registry, [candidate], certificate);
+        let (_, gone_witness, _) =
+            terminal_positive_witness(&mut registry, gone_parent, 0, candidate, false);
+        registry.state.activations.remove(&gone_activation).unwrap();
+        assert!(!commit_terminal_positive(&mut registry, gone_witness));
     }
 
     #[test]
-    fn positive_publication_registry_clone_rebrands_and_diverges() {
+    fn positive_support_registry_clone_keeps_links_rebrands_credits_and_diverges() {
         let one = value(13);
         let two = value(14);
         let mut original = ProducerRegistry::new();
         let (activation, parent) =
             open_positive_confirm(&mut original, [one, two], terminal_positive_certificate());
-        let pre_clone_address = original.positive_child_address(parent, one).unwrap();
-        let (mut cloned, remap) = original.deep_clone();
+        let (child, credit) = open_positive_support_credit(
+            &mut original,
+            parent,
+            0,
+            one,
+            VariableSet::new_singleton(0),
+            Some(terminal_positive_full()),
+        );
+        let credit_key = credit.key;
+        let original_link = match &original.state.activations[&child].reducer {
+            DeltaReducer::PositiveSupport { link, .. } => link.clone(),
+            _ => panic!("positive Support child lost its reducer"),
+        };
+        let (mut cloned, mut remap) = original.deep_clone();
+        let cloned_credit = remap
+            .remove(&credit_key)
+            .expect("deep clone rebranded the live positive Support credit");
         assert!(remap.is_empty());
         let cloned_parent = cloned
             .positive_parent(activation)
             .expect("deep clone retained the Confirm activation");
         assert_ne!(parent, cloned_parent);
-        assert!(
-            !commit_terminal_positive(&mut cloned, parent, pre_clone_address),
-            "a pre-clone address must not cross registry brands"
-        );
+        let cloned_link = match &cloned.state.activations[&child].reducer {
+            DeltaReducer::PositiveSupport { link, .. } => link.clone(),
+            _ => panic!("cloned positive Support child lost its reducer"),
+        };
+        assert_eq!(original_link, cloned_link);
+        assert_eq!(original_link.child, child);
 
-        let original_address = original.positive_child_address(parent, one).unwrap();
-        let cloned_address = cloned.positive_child_address(cloned_parent, two).unwrap();
-        assert!(commit_terminal_positive(
-            &mut original,
-            parent,
-            original_address
-        ));
-        assert!(commit_terminal_positive(
-            &mut cloned,
-            cloned_parent,
-            cloned_address
-        ));
+        let (original_witness, _) =
+            replace_positive_support_credit(&mut original, credit, Some(one), false);
+        let (cloned_witness, _) =
+            replace_positive_support_credit(&mut cloned, cloned_credit, None, true);
+        assert_eq!(original_witness.brand, original.brand);
+        assert_eq!(cloned_witness.brand, cloned.brand);
+        assert!(
+            !commit_terminal_positive(&mut cloned, original_witness),
+            "a post-replacement witness must not cross registry branches"
+        );
+        assert!(commit_terminal_positive(&mut cloned, cloned_witness));
+        let (_, original_two, _) = terminal_positive_witness(&mut original, parent, 1, two, false);
+        assert!(commit_terminal_positive(&mut original, original_two));
         assert_eq!(
             original
                 .positive_publication_snapshot(parent)
                 .unwrap()
                 .published,
-            BTreeSet::from([one])
+            BTreeSet::from([two])
         );
         assert_eq!(
             cloned
                 .positive_publication_snapshot(cloned_parent)
                 .unwrap()
                 .published,
-            BTreeSet::from([two])
+            BTreeSet::from([one])
         );
     }
 
     #[test]
-    fn positive_publication_duplicate_b_needs_no_occurrence_identity() {
+    fn positive_support_links_index_duplicate_occurrences_but_publication_is_a_set() {
         let candidate = value(21);
         let mut registry = ProducerRegistry::new();
         let (activation, parent) = open_positive_confirm(
@@ -11367,14 +12234,13 @@ mod tests {
             [candidate, candidate],
             terminal_positive_certificate(),
         );
-        let address = registry.positive_child_address(parent, candidate).unwrap();
-        let PositiveChildAddress {
-            parent: addressed_parent,
-            generation,
-            value: addressed_value,
-        } = address;
-        assert_eq!(addressed_parent, parent);
-        assert_eq!(addressed_value, candidate);
+        let (_, first, _) = terminal_positive_witness(&mut registry, parent, 0, candidate, false);
+        let (_, second, _) = terminal_positive_witness(&mut registry, parent, 1, candidate, true);
+        assert_eq!(first.link.parent, parent.activation);
+        assert_eq!(first.link.occurrence, 0);
+        assert_eq!(second.link.occurrence, 1);
+        assert_eq!(first.link.value, candidate);
+        assert_eq!(second.link.value, candidate);
         let DeltaReducer::Confirm { original } = &registry.state.activations[&activation].reducer
         else {
             panic!("positive parent lost its Confirm reducer")
@@ -11385,16 +12251,8 @@ mod tests {
             "the authoritative original B preserves bag multiplicity"
         );
 
-        assert!(commit_terminal_positive(&mut registry, parent, address));
-        assert!(!commit_terminal_positive(
-            &mut registry,
-            parent,
-            PositiveChildAddress {
-                parent,
-                generation,
-                value: candidate,
-            },
-        ));
+        assert!(commit_terminal_positive(&mut registry, first));
+        assert!(!commit_terminal_positive(&mut registry, second));
         assert_eq!(
             registry
                 .positive_publication_snapshot(parent)
@@ -11433,11 +12291,10 @@ mod tests {
         let parent = registry
             .open_positive_publication(activation, StateId(17), terminal_positive_certificate())
             .expect("Confirm activation should register a semantic parent");
-        for published in [published_one, published_two] {
-            let address = registry
-                .positive_child_address(parent, published)
-                .expect("published test value belongs to original B");
-            assert!(commit_terminal_positive(&mut registry, parent, address));
+        for (occurrence, published) in [(0, published_one), (2, published_two)] {
+            let (_, witness, _) =
+                terminal_positive_witness(&mut registry, parent, occurrence, published, false);
+            assert!(commit_terminal_positive(&mut registry, witness));
         }
 
         let mut proof = None;
@@ -11472,9 +12329,15 @@ mod tests {
         );
         assert!(
             registry
-                .positive_child_address(parent, published_one)
+                .open_positive_support_activation(
+                    parent,
+                    0,
+                    published_one,
+                    VariableSet::new_singleton(0),
+                    Some(terminal_positive_full()),
+                )
                 .is_none(),
-            "the finalizer handoff must fence every stale positive address"
+            "the finalizer handoff must fence every stale positive child"
         );
     }
 
@@ -11515,10 +12378,8 @@ mod tests {
             [published, accepted],
             terminal_positive_certificate(),
         );
-        let address = registry
-            .positive_child_address(parent, published)
-            .expect("published test value belongs to original B");
-        assert!(commit_terminal_positive(&mut registry, parent, address));
+        let (_, witness, _) = terminal_positive_witness(&mut registry, parent, 0, published, false);
+        assert!(commit_terminal_positive(&mut registry, witness));
         let proof = quiesce_confirm_with_accepted(&mut registry, activation, [accepted]);
 
         assert!(
@@ -11557,18 +12418,12 @@ mod tests {
             .positive_parent(activation)
             .expect("cloned Confirm retained its affine parent");
 
-        let original_address = original.positive_child_address(parent, one).unwrap();
-        let cloned_address = cloned.positive_child_address(cloned_parent, two).unwrap();
-        assert!(commit_terminal_positive(
-            &mut original,
-            parent,
-            original_address
-        ));
-        assert!(commit_terminal_positive(
-            &mut cloned,
-            cloned_parent,
-            cloned_address
-        ));
+        let (_, original_witness, _) =
+            terminal_positive_witness(&mut original, parent, 0, one, false);
+        let (_, cloned_witness, _) =
+            terminal_positive_witness(&mut cloned, cloned_parent, 1, two, true);
+        assert!(commit_terminal_positive(&mut original, original_witness));
+        assert!(commit_terminal_positive(&mut cloned, cloned_witness));
 
         let original_proof = quiesce_confirm_with_accepted(&mut original, activation, [one, two]);
         let cloned_proof = quiesce_confirm_with_accepted(&mut cloned, activation, [one, two]);
@@ -11608,11 +12463,15 @@ mod tests {
         let open = registry
             .positive_publication_snapshot(parent)
             .expect("empty eligible Confirm should still own an open ledger");
-        let stale = PositiveChildAddress {
-            parent,
-            generation: open.generation,
-            value: candidate,
-        };
+        assert!(registry
+            .open_positive_support_activation(
+                parent,
+                0,
+                candidate,
+                VariableSet::new_singleton(0),
+                Some(terminal_positive_full()),
+            )
+            .is_none());
         let proof = quiesce_confirm_with_accepted(&mut registry, activation, []);
 
         let RegistrySettlement::Completed(completed) = registry.settle_quiescence(proof) else {
@@ -11627,7 +12486,15 @@ mod tests {
             registry.state.next_positive_generation > open.generation,
             "eager completion must generation-fence its empty publication domain"
         );
-        assert!(!commit_terminal_positive(&mut registry, parent, stale));
+        assert!(registry
+            .open_positive_support_activation(
+                parent,
+                0,
+                candidate,
+                VariableSet::new_singleton(0),
+                Some(terminal_positive_full()),
+            )
+            .is_none());
     }
 
     #[test]

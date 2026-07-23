@@ -10,12 +10,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Residual Confirm activations now have a dormant positive-publication
-  ledger seam.** A registry-branded affine parent address, generation-fenced
-  close-and-snapshot transaction, and scheduler-owned first-value-wins map
-  preserve fixed-denotation/continuation evidence without occurrence identity.
-  Ineligible parents own no ledger, query clones rebrand independently, and
-  ordinary activations pay only one nullable pointer. No positive work is
-  seeded and query behavior is unchanged.
+  ledger and physical-proof seam.** A generation-fenced semantic parent
+  ledger owns the first-value-wins map, while each allocated Support child
+  retains a clone-safe occurrence-indexed link to its exact original Confirm
+  candidate. Only replacement of a real branch-local producer credit can mint
+  the non-cloneable, registry-branded witness consumed by the publication
+  transaction. Ineligible parents own no ledger, query clones preserve links
+  while rebranding live credits independently, and rare physical-link and
+  returned-witness payloads are boxed: reducers and activations retain their
+  prior inline sizes, while the transient replacement outcome grows by 16 B.
+  Ordinary activations pay only one nullable ledger pointer. No positive work
+  is seeded or called by the production scheduler, so query behavior remains
+  unchanged.
 - **Residual Confirm continuations now carry an executable publication
   receipt.** The private three-valued proof distinguishes an exact terminal
   binding, a nonterminal chunk that first crosses the parent-local candidate
