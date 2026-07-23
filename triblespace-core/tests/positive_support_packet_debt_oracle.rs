@@ -37,6 +37,7 @@ struct Oracle {
     max_support_packet: u64,
     lease: Lease,
     retire_after_receipt: bool,
+    service_proof_live: bool,
     trace: Vec<Lane>,
 }
 
@@ -50,6 +51,7 @@ impl Oracle {
             max_support_packet: 0,
             lease: Lease::Dormant,
             retire_after_receipt: false,
+            service_proof_live: true,
             trace: Vec::new(),
         }
     }
@@ -132,6 +134,14 @@ impl Oracle {
         }
     }
 
+    fn lose_service_attribution(&mut self) {
+        assert!(
+            !matches!(self.lease, Lease::Reserved | Lease::Settling),
+            "attribution mode cannot change across an unsettled receipt"
+        );
+        self.service_proof_live = false;
+    }
+
     fn deep_clone(&self, brand: u64) -> Self {
         assert_ne!(brand, self.brand, "a deep clone must rebrand authority");
         assert!(
@@ -165,6 +175,10 @@ impl Oracle {
     }
 
     fn assert_horizon(&self, horizon: Horizon) {
+        assert!(
+            self.service_proof_live,
+            "an unattributed packet permanently poisoned this service epoch"
+        );
         let total = self
             .exact_service
             .checked_add(self.support_service)
@@ -279,6 +293,21 @@ fn exhaustive_positive_packet_costs_obey_the_two_two_frontier() {
 }
 
 #[test]
+#[should_panic(expected = "unattributed packet permanently poisoned")]
+fn an_unattributed_cohort_cannot_resume_the_old_service_epoch() {
+    let mut oracle = Oracle::dormant(1);
+    oracle.demand();
+    assert_eq!(oracle.choose(true), Lane::Support);
+    oracle.run_support(1, true);
+    oracle.lose_service_attribution();
+
+    // A weaker fallback may keep making semantic progress, but the old
+    // V_E/V_H history can no longer justify a 2/2 service claim.
+    oracle.run_exact(1);
+    oracle.assert_horizon(Horizon::Exact);
+}
+
+#[test]
 fn exact_wins_service_ties_after_the_mandatory_support_packet() {
     let (oracle, horizon) = run_to_first_horizon(&[1, 1, 1], &[1, 1, 1], true);
     assert_eq!(horizon, Horizon::Exact);
@@ -292,6 +321,36 @@ fn exact_wins_service_ties_after_the_mandatory_support_packet() {
             Lane::Exact,
         ]
     );
+}
+
+#[test]
+fn a_ready_support_lane_strictly_preempts_exact_while_behind() {
+    let mut oracle = Oracle::dormant(1);
+    oracle.demand();
+    assert_eq!(oracle.choose(true), Lane::Support);
+    oracle.run_support(1, true);
+    oracle.run_exact(9);
+
+    for expected_support_service in 2..=9 {
+        assert_eq!(
+            oracle.choose(true),
+            Lane::Support,
+            "global arbitration ran Exact while its ready sibling was behind"
+        );
+        oracle.run_support(1, true);
+        assert_eq!(oracle.support_service, expected_support_service);
+    }
+    assert_eq!(oracle.choose(true), Lane::Exact, "Exact must own the tie");
+}
+
+#[test]
+#[should_panic(expected = "service packets must have positive cost")]
+fn zero_resolution_receipts_cannot_enter_the_service_ledger() {
+    let mut oracle = Oracle::dormant(1);
+    oracle.demand();
+    assert_eq!(oracle.choose(true), Lane::Support);
+    oracle.reserve_support();
+    oracle.finish_support_kernel(0);
 }
 
 #[test]
