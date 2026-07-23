@@ -9,15 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **A residual test-harness prototype now specifies monotone
-  first-completeness joins.** Equivalent executors tighten a finite
-  `must ⊆ answer ⊆ may` interval with sound positive, negative, or exact
-  evidence. Equality settles the scope, filters the immutable candidate
-  occurrence bag, and generation-fences every losing affine receipt. Streaming
-  receipts can publish only positives; negative and exact certificates require
-  an explicit child-quiescence boundary. Nested singleton scopes demonstrate
-  existential witness/exhaustion feeding a whole-arm completion without
-  conflating static complete-action admission with an online race.
+- **A residual test-harness prototype now specifies lazy-domain monotone
+  evidence joins.** Each parent freezes its raw candidate occurrence bag while
+  a budgeted cursor exposes distinct members into `seen`, positive, negative,
+  and pending sets. Candidate and mixed evidence closes only after actual EOF
+  with no pending members; a quiescent shared exact predicate may close
+  earlier and is projected as `B ∩ G`. Copyable addresses route streaming
+  positives only, negative and exact claims require affine quiescence
+  authority, candidate decisions fence locally, and a whole seal advances one
+  generation without claiming physical cancellation. Exhaustive domains of up
+  to three values cover legal cursor/evidence interleavings.
 - **Directed singleton Program chains can spend one scheduler grant locally.**
   An unjoined streaming activation may consume exact same-cohort sole children
   inside its producing receipt until the original work budget is exhausted or
