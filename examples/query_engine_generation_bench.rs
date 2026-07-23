@@ -3933,7 +3933,7 @@ fn present_child_physical_timing_backend<S: TriblePattern>(
                     MODES
                 } else {
                     [MODES[1], MODES[0]]
-            };
+                };
             let mut ordered = Duration::ZERO;
             let mut physical = Duration::ZERO;
             for mode in order {
@@ -3953,10 +3953,7 @@ fn present_child_physical_timing_backend<S: TriblePattern>(
                         assert!(black_box(priming_query.next()).is_some());
                     }
                     CrossoverTimingPoint::Full => {
-                        assert_eq!(
-                            black_box(tally(priming_query.by_ref())),
-                            expected_signature
-                        );
+                        assert_eq!(black_box(tally(priming_query.by_ref())), expected_signature);
                     }
                 }
                 drop(priming_query);
