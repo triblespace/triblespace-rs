@@ -3730,7 +3730,7 @@ fn target_confirm_positive_support_does_not_feed_past_false_occurrence_zero() {
 }
 
 #[test]
-fn mixed_arm_production_support_fallback_seeds_but_stays_parked_without_credit() {
+fn mixed_arm_production_support_fallback_spends_one_public_demand_step() {
     let graph = Graph::new(4, &[(0, 1), (1, 2), (2, 3)]);
     let first = graph.value(1).raw;
     let later = graph.value(3).raw;
@@ -3771,9 +3771,11 @@ fn mixed_arm_production_support_fallback_seeds_but_stays_parked_without_credit()
         assert_eq!(counters.seed_calls.load(Ordering::Relaxed), 1);
         assert_eq!(
             counters.step_calls.load(Ordering::Relaxed),
-            0,
-            "an uncredited Support hedge must remain live but non-runnable"
+            1,
+            "the public pull should assign and prefer exactly one Support step"
         );
+        assert_eq!(query.stats().delta_positive_support_demand_assigned, 1);
+        assert_eq!(query.stats().delta_positive_support_examined, 1);
         assert!(query.stats().delta_transition_candidates_examined > 0);
     }
 }
