@@ -2553,7 +2553,8 @@ pub struct ResidualStateStats {
     /// Parents started under the independent query-global service policy.
     /// This is not production demand credit `D`.
     pub delta_positive_support_service_parents_started: usize,
-    /// Empty-to-live query-global Support service epochs.
+    /// Iterator-global Support service ledgers started. This is at most one
+    /// for one serial iterator lineage, even across empty parent turnover.
     pub delta_positive_support_service_epochs: usize,
     /// Examined-service ticks charged to exact Confirm packets. A validated
     /// zero-examined quiescence receipt costs one dispatch tick.
@@ -2569,11 +2570,11 @@ pub struct ResidualStateStats {
     pub max_delta_positive_support_service_exact_packet: usize,
     /// Largest Support service packet observed.
     pub max_delta_positive_support_service_support_packet: usize,
-    /// Sum, across completed/current epochs, of each epoch's largest exact
-    /// packet. This is the additive packet term for cumulative bounds.
+    /// Largest exact packet across the iterator-global ledger. This is its
+    /// single additive packet term for the cumulative bound.
     pub delta_positive_support_service_exact_packet_allowance: usize,
-    /// Sum, across completed/current epochs, of each epoch's largest Support
-    /// packet. This is the additive packet term for cumulative bounds.
+    /// Largest Support packet across the iterator-global ledger. This is its
+    /// single additive packet term for the cumulative bound.
     pub delta_positive_support_service_support_packet_allowance: usize,
     /// Positive-publication SET races won by an exact Confirm receipt.
     pub delta_positive_publication_exact_wins: usize,
@@ -11771,7 +11772,7 @@ impl ResidualStateMachine {
             // affine lineage before any cold stable cohort. It owns no work;
             // dropping the token merely returns scheduling to the global
             // source/transition worklists.
-            if self.delta.global_service_epoch_is_active() {
+            if self.delta.global_service_lane_is_active() {
                 self.active_delta = None;
                 self.active_delta_after_yield = false;
             }
@@ -11955,7 +11956,7 @@ impl ResidualStateMachine {
             return None;
         }
         let support_preference = self.delta.begin_public_pull_demand(&mut self.stats);
-        if self.delta.global_service_epoch_is_active() {
+        if self.delta.global_service_lane_is_active() {
             // The service scheduler owns a strict global lane preference,
             // never an activation-local sprint.
             self.active_delta = None;
