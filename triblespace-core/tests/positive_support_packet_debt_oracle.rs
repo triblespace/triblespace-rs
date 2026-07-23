@@ -469,3 +469,46 @@ fn raw_set_semantics_are_invariant_under_cost_and_publication_order() {
         assert_eq!(public, exact_set);
     }
 }
+
+#[test]
+fn per_parent_initial_bypasses_do_not_imply_one_query_global_overshoot() {
+    let live_parents = 8u64;
+    let exact_to_target = 1u64;
+    let initial_support_packet = 100u64;
+    let aggregate_support = live_parents * initial_support_packet;
+    let aggregate_total = exact_to_target + aggregate_support;
+
+    assert!(
+        aggregate_total > 2 * exact_to_target + initial_support_packet,
+        "independent leases unexpectedly satisfied a one-packet aggregate bound"
+    );
+    assert!(
+        aggregate_total <= 2 * exact_to_target + live_parents * initial_support_packet,
+        "the honest per-parent sum-of-overshoots bound was violated"
+    );
+}
+
+#[test]
+fn one_global_scalar_cannot_also_encode_opposite_parent_local_debts() {
+    // Parent A has already overspent Support by eight units; parent B has
+    // accumulated eight units of Exact service and has never run Support.
+    let parent_a = (0u64, 8u64);
+    let parent_b = (8u64, 0u64);
+    assert!(parent_a.1 > parent_a.0);
+    assert!(parent_b.1 < parent_b.0);
+
+    let mut aggregate = Oracle::dormant(1);
+    aggregate.demand();
+    aggregate.exact_service = parent_a.0 + parent_b.0;
+    aggregate.support_service = parent_a.1 + parent_b.1;
+    aggregate.max_exact_packet = 8;
+    aggregate.max_support_packet = 8;
+    aggregate.lease = Lease::Parked;
+    aggregate.trace.push(Lane::Support);
+
+    assert_eq!(
+        aggregate.choose(true),
+        Lane::Exact,
+        "the aggregate tie must belong to Exact even though parent B is locally behind"
+    );
+}
