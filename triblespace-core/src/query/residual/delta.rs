@@ -6459,6 +6459,10 @@ pub(super) struct DeltaScheduler {
     /// packet but not yet selected. Zero is the allocation-free common path;
     /// a positive remainder is reparked after the selected receipt settles.
     global_service_woken_support_tasks: usize,
+    /// Reused deterministic parent set for one global Support wake. Sorting
+    /// and deduplicating this vector preserves the former `BTreeSet` order
+    /// without allocating a tree node for every unit packet.
+    global_service_parent_scratch: Vec<PositiveConfirmParentId>,
     /// Mutually exclusive PositiveSupport admission currency.
     positive_support_scheduling: PositiveSupportScheduling,
     /// One aggregate affine lease for the opt-in global service policy.
@@ -6498,6 +6502,7 @@ impl DeltaScheduler {
             next_program_lane: None,
             next_program_state: None,
             global_service_woken_support_tasks: 0,
+            global_service_parent_scratch: Vec::new(),
             positive_support_scheduling: PositiveSupportScheduling::CountCredit,
             positive_support_service_debt: PositiveSupportServiceDebtLedger::dormant(),
             public_pull_demand: PublicPullDemandState::Closed,
@@ -8566,7 +8571,7 @@ impl DeltaScheduler {
     /// packet can batch across parents without admitting a second task from
     /// any one semantic race.
     fn wake_global_service_support_lane(&mut self) -> usize {
-        let mut parents = BTreeSet::new();
+        self.global_service_parent_scratch.clear();
         for (_, bucket) in self.parked_positive_support_worklist.iter() {
             for task in &bucket.tasks {
                 let Some(parent) = self
@@ -8576,12 +8581,15 @@ impl DeltaScheduler {
                     continue;
                 };
                 if self.registry.positive_support_service_is_started(parent) {
-                    parents.insert(parent);
+                    self.global_service_parent_scratch.push(parent);
                 }
             }
         }
+        self.global_service_parent_scratch.sort_unstable();
+        self.global_service_parent_scratch.dedup();
         let mut woke = 0;
-        for parent in parents {
+        for index in 0..self.global_service_parent_scratch.len() {
+            let parent = self.global_service_parent_scratch[index];
             woke += usize::from(self.wake_one_positive_support_parent(parent).is_some());
         }
         woke
@@ -10899,6 +10907,7 @@ impl DeltaScheduler {
             next_program_lane: self.next_program_lane,
             next_program_state: self.next_program_state,
             global_service_woken_support_tasks: self.global_service_woken_support_tasks,
+            global_service_parent_scratch: Vec::new(),
             positive_support_scheduling: self.positive_support_scheduling,
             positive_support_service_debt: self
                 .positive_support_service_debt
