@@ -12318,6 +12318,147 @@ mod tests {
     }
 
     #[test]
+    fn global_service_runtime_restarts_after_the_last_parent_retires() {
+        let root = OneShotSupportProgram;
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let mut scheduler = DeltaScheduler::new();
+        scheduler.enable_positive_support_global_service_debt();
+        let mut stats = ResidualStateStats::default();
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+
+        let first_candidate = value(79);
+        let (_, first_parent, _, _) = open_tapped_confirm_with_support(
+            &mut scheduler.registry,
+            [first_candidate],
+            None,
+            true,
+        );
+        let (first_child, _) = queue_one_shot_positive_support(
+            &mut scheduler,
+            &root,
+            first_parent,
+            first_candidate,
+            false,
+        );
+        scheduler.park_positive_support_activations(&AHashSet::from_iter([first_child]));
+        assert!(scheduler.begin_public_pull_demand(&mut stats).is_none());
+        let first_brand = scheduler.positive_support_service_debt.brand;
+        let _ = scheduler.step_bounded(
+            &root,
+            &plan,
+            1,
+            Some(terminal_positive_full()),
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert_eq!(
+            scheduler.positive_support_service_debt.lease,
+            PositiveSupportServiceLease::Retired
+        );
+
+        scheduler.retire_unassigned_public_pull_demand();
+        let second_candidate = value(80);
+        let (_, second_parent, _, _) = open_tapped_confirm_with_support(
+            &mut scheduler.registry,
+            [second_candidate],
+            None,
+            true,
+        );
+        let (second_child, _) = queue_one_shot_positive_support(
+            &mut scheduler,
+            &root,
+            second_parent,
+            second_candidate,
+            false,
+        );
+        scheduler.park_positive_support_activations(&AHashSet::from_iter([second_child]));
+        assert!(scheduler.begin_public_pull_demand(&mut stats).is_none());
+        assert_ne!(scheduler.positive_support_service_debt.brand, first_brand);
+        assert_eq!(
+            (
+                scheduler.positive_support_service_debt.exact_service,
+                scheduler.positive_support_service_debt.support_service,
+            ),
+            (0, 0)
+        );
+        let _ = scheduler.step_bounded(
+            &root,
+            &plan,
+            1,
+            Some(terminal_positive_full()),
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        assert_eq!(stats.delta_positive_support_service_epochs, 2);
+        assert_eq!(
+            stats.delta_positive_support_service_support_packet_allowance, 2,
+            "cumulative telemetry must retain both epoch-local packet maxima"
+        );
+    }
+
+    #[test]
+    fn global_service_started_scheduler_clone_rebrands_and_diverges() {
+        let root = OneShotSupportProgram;
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let mut scheduler = DeltaScheduler::new();
+        scheduler.enable_positive_support_global_service_debt();
+        let candidate = value(81);
+        let (exact, parent, exact_credit, _) =
+            open_tapped_confirm_with_support(&mut scheduler.registry, [candidate], None, true);
+        let (support, support_active) =
+            queue_one_shot_positive_support(&mut scheduler, &root, parent, candidate, false);
+        scheduler.park_positive_support_activations(&AHashSet::from_iter([support]));
+        let _ =
+            queue_exact_confirm_credit(&mut scheduler, support_active.state, exact, exact_credit);
+        let mut stats = ResidualStateStats::default();
+        assert!(scheduler.begin_public_pull_demand(&mut stats).is_none());
+
+        let mut cloned = scheduler.deep_clone();
+        assert_ne!(cloned.registry.brand, scheduler.registry.brand);
+        assert_ne!(
+            cloned.positive_support_service_debt.brand,
+            scheduler.positive_support_service_debt.brand
+        );
+        assert_eq!(
+            cloned.positive_support_service_debt.lease,
+            PositiveSupportServiceLease::Parked
+        );
+        let cloned_parent = PositiveConfirmParentId {
+            brand: cloned.registry.brand,
+            activation: parent.activation,
+        };
+        assert!(cloned
+            .registry
+            .positive_support_service_is_started(cloned_parent));
+
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let mut clone_stats = ResidualStateStats::default();
+        let _ = cloned.step_bounded(
+            &root,
+            &plan,
+            1,
+            Some(terminal_positive_full()),
+            &mut stable,
+            &mut stable_interner,
+            &mut clone_stats,
+        );
+        assert_eq!(clone_stats.delta_positive_publication_support_wins, 1);
+        assert_eq!(
+            scheduler.positive_support_service_debt.lease,
+            PositiveSupportServiceLease::Parked,
+            "stepping the clone mutated the original service lease"
+        );
+        assert!(scheduler
+            .registry
+            .positive_support_service_is_started(parent));
+        assert_eq!(scheduler.parked_positive_support_worklist.len(), 1);
+    }
+
+    #[test]
     fn parked_positive_support_releases_its_lease_while_exact_remains_runnable() {
         let root = OneShotSupportProgram;
         let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
