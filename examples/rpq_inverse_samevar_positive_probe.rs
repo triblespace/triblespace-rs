@@ -90,19 +90,19 @@ impl Case {
 #[derive(Clone, Copy)]
 enum Mode {
     Production,
-    ConfirmOnly,
+    ExactOnly,
 }
 
 impl Mode {
     fn label(self) -> &'static str {
         match self {
             Self::Production => "production",
-            Self::ConfirmOnly => "confirm-only",
+            Self::ExactOnly => "exact-only",
         }
     }
 }
 
-const MODES: [Mode; 2] = [Mode::Production, Mode::ConfirmOnly];
+const MODES: [Mode; 2] = [Mode::Production, Mode::ExactOnly];
 
 struct Fixture {
     shape: Shape,
@@ -668,7 +668,7 @@ fn make_query(fixture: &Fixture, mode: Mode) -> Query<Root<'_>, Project, RawInli
     let fallback = regular_path(fixture);
     let path: DynConstraint<'_> = match mode {
         Mode::Production => Box::new(fallback),
-        Mode::ConfirmOnly => {
+        Mode::ExactOnly => {
             let preferred = MaskedSupportRpq {
                 inner: regular_path(fixture),
             };
@@ -791,7 +791,7 @@ fn profile(
             assert_eq!(
                 first_stats.positive_commits(),
                 1,
-                "{} width {width}: Support did not publish positive B[0]",
+                "{} width {width}: neither Exact nor Support published positive B[0]",
                 fixture.label()
             );
             assert_eq!(
@@ -809,11 +809,25 @@ fn profile(
                 fixture.label()
             );
         }
-        Mode::ConfirmOnly => {
+        Mode::ExactOnly if fixture.case.is_positive() => {
+            assert_eq!(
+                first_stats.positive_commits(),
+                1,
+                "{} width {width}: authoritative Exact tap did not publish positive B[0]",
+                fixture.label()
+            );
+            assert_eq!(
+                first,
+                fixture.b0,
+                "{} width {width}: Exact tap did not emit B[0]",
+                fixture.label()
+            );
+        }
+        Mode::ExactOnly => {
             assert_eq!(
                 full_stats.positive_commits(),
                 0,
-                "{} width {width}: masked Support still published",
+                "{} width {width}: miss B[0] acquired a positive publication",
                 fixture.label()
             );
         }
@@ -1008,7 +1022,7 @@ fn measure(fixture: &Fixture, width: usize, reps: usize) {
         support.full_after_first.granted_work,
     );
     println!(
-        "  production - confirm-only full actual-work delta: \
+        "  production - exact-only full actual-work delta: \
          source_pages {:+} source_examined {:+} transition_pages {:+} \
          transition_examined {:+} terminal_dispatches {:+} nonterminal_dispatches {:+}",
         signed_delta(
@@ -1058,7 +1072,7 @@ fn main() {
          nodes={node_count} reps={reps} distinct_hits={DISTINCT_HITS} widths={WIDTHS:?}"
     );
     println!(
-        "production is the unwrapped OpaqueLeaves+Production lane; confirm-only keeps \
+        "production is the unwrapped OpaqueLeaves+Production lane; exact-only keeps \
          the same fallback exact Confirm Program but policy-defers only Support."
     );
     println!(
