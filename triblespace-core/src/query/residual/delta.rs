@@ -8541,21 +8541,6 @@ impl DeltaScheduler {
         woke
     }
 
-    fn has_service_support_work(&self) -> bool {
-        let is_started_support = |task: &ProgramTask| {
-            self.registry
-                .positive_support_parent_for_child(task.activation)
-                .is_some_and(|parent| self.registry.positive_support_service_is_started(parent))
-        };
-        self.program_worklist
-            .iter()
-            .any(|(_, bucket)| bucket.tasks.iter().any(is_started_support))
-            || self
-                .parked_positive_support_worklist
-                .iter()
-                .any(|(_, bucket)| bucket.tasks.iter().any(is_started_support))
-    }
-
     /// Makes one queued task per started parent runnable so a global Support
     /// packet can batch across parents without admitting a second task from
     /// any one semantic race.
@@ -8588,10 +8573,9 @@ impl DeltaScheduler {
             return;
         }
         self.next_program_lane = None;
-        let support_ready = self.has_service_support_work();
         if self
             .positive_support_service_debt
-            .support_is_admissible(support_ready)
+            .support_is_admissible(true)
         {
             self.wake_global_service_support_lane();
             assert!(
@@ -8681,17 +8665,15 @@ impl DeltaScheduler {
                     .max(charged);
                 stats.delta_positive_support_service_support_packet_allowance +=
                     charged.saturating_sub(prior_max as usize);
-                let runnable: AHashSet<_> = self
-                    .program_worklist
-                    .iter()
-                    .flat_map(|(_, bucket)| bucket.tasks.iter())
-                    .filter(|task| {
+                // `step_program` files every live PositiveSupport recurrence
+                // directly into parked custody before this settlement. No
+                // global runnable scan or second repark pass is required.
+                debug_assert!(self.program_worklist.iter().all(|(_, bucket)| {
+                    bucket.tasks.iter().all(|task| {
                         ProgramServiceLane::of(&self.registry, task.activation)
-                            == ProgramServiceLane::Support
+                            != ProgramServiceLane::Support
                     })
-                    .map(|task| task.activation)
-                    .collect();
-                self.park_positive_support_activations(&runnable);
+                }));
                 self.next_program_lane = None;
             }
             ProgramServiceLane::Neutral => unreachable!(),
