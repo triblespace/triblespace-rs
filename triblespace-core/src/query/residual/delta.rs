@@ -854,6 +854,10 @@ struct PositivePublicationLedger {
     confirm_state: StateId,
     certificate: PositivePublicationCertificate,
     published: BTreeSet<RawInline>,
+    /// Physical hedges linked to this semantic parent. These identities are
+    /// cancellation custody only: they never participate in publication SET
+    /// identity or exact Confirm completeness.
+    support_children: SmallVec<[ActivationId; 1]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1435,7 +1439,7 @@ impl ProducerRegistry {
     /// Unfixed and Barrier parents retain their semantic certificate but
     /// acquire no ledger.
     #[cfg_attr(not(test), allow(dead_code))]
-    fn open_positive_publication(
+    fn open_exact_and_support_publication(
         &mut self,
         activation: ActivationId,
         confirm_state: StateId,
@@ -1449,7 +1453,7 @@ impl ProducerRegistry {
         )
     }
 
-    fn open_confirm_positive_publication(
+    fn open_exact_only_publication(
         &mut self,
         activation: ActivationId,
         confirm_state: StateId,
@@ -1498,6 +1502,7 @@ impl ProducerRegistry {
                 confirm_state,
                 certificate,
                 published: BTreeSet::new(),
+                support_children: SmallVec::new(),
             })
         } else {
             PositivePublicationRegistration::Private {
@@ -1608,7 +1613,43 @@ impl ProducerRegistry {
                 .is_none(),
             "positive Support activation identifier was reused"
         );
+        let parent_activation = self
+            .state
+            .activations
+            .get_mut(&parent.activation)
+            .expect("positive Support parent disappeared during child creation");
+        let Some(PositivePublicationRegistration::Eligible(ledger)) =
+            parent_activation.positive_publication.as_deref_mut()
+        else {
+            unreachable!("validated positive Support parent lost its eligible ledger")
+        };
+        assert!(
+            ledger.open && ledger.generation == generation,
+            "positive Support parent changed generation during child creation"
+        );
+        ledger.support_children.push(child);
         Some(child)
+    }
+
+    /// Returns the physical Support hedges currently owned by one semantic
+    /// Confirm parent. The copy is an affine-retirement target list, not
+    /// relational evidence.
+    fn positive_support_children(
+        &self,
+        parent: PositiveConfirmParentId,
+    ) -> SmallVec<[ActivationId; 1]> {
+        if parent.brand != self.brand {
+            return SmallVec::new();
+        }
+        let Some(activation) = self.state.activations.get(&parent.activation) else {
+            return SmallVec::new();
+        };
+        let Some(PositivePublicationRegistration::Eligible(ledger)) =
+            activation.positive_publication.as_deref()
+        else {
+            return SmallVec::new();
+        };
+        ledger.support_children.clone()
     }
 
     /// Commits a linked physical Support witness through the semantic parent's
@@ -2608,6 +2649,52 @@ impl ProducerRegistry {
         false
     }
 
+    /// Affinely retires one queued Program producer owned by a cancelled
+    /// PositiveSupport hedge.
+    ///
+    /// The scheduler must discard the corresponding typed [`ProgramWork`]
+    /// before entering this transaction. PositiveSupport deliberately admits
+    /// only unjoined Program credits, so removing the last queued producer is
+    /// sufficient to prove physical child quiescence without manufacturing a
+    /// semantic false result.
+    fn retire_positive_support_program_credit(
+        &mut self,
+        credit: ProducerCredit,
+    ) -> Option<QuiescenceProof> {
+        assert_eq!(
+            credit.brand, self.brand,
+            "positive Support cancellation credit crossed registries"
+        );
+        let activation_id = credit.key.activation;
+        let activation = self
+            .state
+            .activations
+            .get_mut(&activation_id)
+            .expect("positive Support cancellation named an unknown activation");
+        assert_eq!(activation.status, ActivationStatus::Open);
+        assert!(
+            matches!(&activation.reducer, DeltaReducer::PositiveSupport { .. }),
+            "only a PositiveSupport child may consume hedge-cancellation credit"
+        );
+        assert_eq!(
+            activation.live.remove(&credit.key.nonce),
+            Some(CreditKind::Program { join: None }),
+            "positive Support cancellation received an unknown, replayed, or joined credit"
+        );
+        assert!(
+            activation.program_joins.is_empty(),
+            "PositiveSupport cancellation crossed a receipt-local Program join"
+        );
+        if activation.live.is_empty() {
+            activation.status = ActivationStatus::Quiescent;
+            Some(QuiescenceProof {
+                activation: activation_id,
+            })
+        } else {
+            None
+        }
+    }
+
     /// Replaces one opaque typed producer through the single affine law.
     ///
     /// `prior_observed` contains accepting child endpoints from earlier pages
@@ -3225,6 +3312,15 @@ impl ProducerRegistry {
 
     fn is_live(&self, activation: ActivationId) -> bool {
         self.state.activations.contains_key(&activation)
+    }
+
+    fn is_live_positive_support(&self, activation: ActivationId) -> bool {
+        self.state
+            .activations
+            .get(&activation)
+            .is_some_and(|activation| {
+                matches!(&activation.reducer, DeltaReducer::PositiveSupport { .. })
+            })
     }
 
     /// Takes one activation-local early effect. Support mutates its reducer at
@@ -4020,6 +4116,50 @@ impl ProgramWorklist {
                     DeltaStateId(u32::try_from(index).expect("typed Program state id overflow"));
                 self.contains_key(&state).then_some((state, bucket))
             })
+    }
+
+    /// Removes every queued task owned by the selected physical activations,
+    /// retaining state grouping so each opaque handle can be discarded through
+    /// the exact Program runtime that created it.
+    fn take_activations(
+        &mut self,
+        activations: &AHashSet<ActivationId>,
+    ) -> Vec<(DeltaStateId, Vec<ProgramTask>)> {
+        if activations.is_empty() {
+            return Vec::new();
+        }
+        let states: Vec<_> = self
+            .iter()
+            .filter_map(|(state, bucket)| {
+                bucket
+                    .tasks
+                    .iter()
+                    .any(|task| activations.contains(&task.activation))
+                    .then_some(state)
+            })
+            .collect();
+        let mut removed = Vec::with_capacity(states.len());
+        for state in states {
+            let (tasks, empty) = {
+                let bucket = self
+                    .get_mut(&state)
+                    .expect("selected typed Program cancellation state disappeared");
+                let tasks =
+                    bucket.take_matching(usize::MAX, ProgramSelectionOrder::Append, |task| {
+                        activations.contains(&task.activation)
+                    });
+                (tasks, bucket.is_empty())
+            };
+            assert!(
+                !tasks.is_empty(),
+                "typed Program cancellation selected an empty state"
+            );
+            if empty {
+                self.deactivate(state);
+            }
+            removed.push((state, tasks));
+        }
+        removed
     }
 }
 
@@ -5520,13 +5660,13 @@ impl DeltaScheduler {
                 (positive_publication.as_ref(), first_candidate)
             {
                 let parent = if publication.support_hedge.is_some() {
-                    self.registry.open_positive_publication(
+                    self.registry.open_exact_and_support_publication(
                         activation,
                         publication.confirm_state,
                         publication.certificate,
                     )
                 } else {
-                    self.registry.open_confirm_positive_publication(
+                    self.registry.open_exact_only_publication(
                         activation,
                         publication.confirm_state,
                         publication.certificate,
@@ -7006,6 +7146,94 @@ impl DeltaScheduler {
         Some(ActiveDeltaContinuation { state, activation })
     }
 
+    /// Discards every queued opaque handle for the selected PositiveSupport
+    /// hedges, consumes their issued producer credits, and retires each child
+    /// through ordinary cleanup quiescence.
+    ///
+    /// Exact Confirm work is intentionally unreachable from this path. The
+    /// caller chooses children from a parent-owned link list, and both the
+    /// scheduler and registry revalidate the distinct PositiveSupport reducer
+    /// before consuming any physical custody.
+    fn retire_positive_support_activations<'a>(
+        &mut self,
+        root: &dyn Constraint<'a>,
+        plan: &ResidualPlan,
+        requested: &AHashSet<ActivationId>,
+    ) -> Vec<ActivationId> {
+        let live: AHashSet<_> = requested
+            .iter()
+            .copied()
+            .filter(|&activation| self.registry.is_live_positive_support(activation))
+            .collect();
+        if live.is_empty() {
+            return Vec::new();
+        }
+
+        let groups = self.program_worklist.take_activations(&live);
+        let mut completed = Vec::with_capacity(live.len());
+        for (state, tasks) in groups {
+            let address = self
+                .interner
+                .program(state)
+                .cloned()
+                .expect("cancelled PositiveSupport work occupied a legacy delta state");
+            let spec = address.resolve(root, plan);
+            let key = address.key();
+            let mut retired = Vec::new();
+            let mut seen = AHashSet::new();
+            let mut proofs = Vec::new();
+            {
+                let runtime = self
+                    .program_runtimes
+                    .get_mut(&state)
+                    .expect("cancelled PositiveSupport work lost its typed runtime");
+                for task in tasks {
+                    assert!(
+                        live.contains(&task.activation),
+                        "PositiveSupport cancellation removed an untargeted task"
+                    );
+                    let program_activation = ProgramActivation(task.activation.0);
+                    spec.discard_work(runtime, key, program_activation, &task.work);
+                    if seen.insert(task.activation) {
+                        retired.push(program_activation);
+                    }
+                    if let Some(proof) = self
+                        .registry
+                        .retire_positive_support_program_credit(task.credit)
+                    {
+                        proofs.push(proof);
+                    }
+                }
+                spec.retire_activations(runtime, key, &retired);
+            }
+            for proof in proofs {
+                let completed_activation = self.registry.finish(proof);
+                assert!(
+                    matches!(
+                        (
+                            &completed_activation.return_to,
+                            &completed_activation.effect
+                        ),
+                        (
+                            DeltaReturn::PositiveSupport { .. },
+                            DeltaCompletion::Cleanup
+                        )
+                    ),
+                    "cancelled PositiveSupport child released a semantic completion"
+                );
+                completed.push(completed_activation.activation);
+            }
+        }
+
+        for activation in live {
+            assert!(
+                !self.registry.is_live(activation),
+                "PositiveSupport cancellation left affine work outside the Program worklist"
+            );
+        }
+        completed
+    }
+
     fn has_active_source(&self, active: ActiveDeltaContinuation) -> bool {
         self.source_worklist
             .get(&active.state)
@@ -8172,6 +8400,7 @@ impl DeltaScheduler {
         let mut retired_search_receipts = 0usize;
         let mut completed_activations = 0usize;
         let mut terminal_publications = OrderedActivationSet::default();
+        let mut positive_support_retirements = AHashSet::new();
 
         scratch.retired_activations.clear();
         let ProgramSchedulerScratch {
@@ -8240,6 +8469,7 @@ impl DeltaScheduler {
             // work can separate the semantic SET insertion from release.
             let mut task_effects = DeltaStableEffects::default();
             if let Some(witness) = outcome.positive_support.take() {
+                let child = witness.link.child;
                 if let Some(grant) = self
                     .registry
                     .commit_positive_publication(*witness, direct_terminal_full)
@@ -8252,12 +8482,19 @@ impl DeltaScheduler {
                         stats,
                     ));
                 }
+                // A real positive receipt exhausts this fully-bound hedge
+                // regardless of whether it won the parent/value SET race.
+                // Exact Confirm remains live and solely owns completeness.
+                positive_support_retirements.insert(child);
             }
             if let Some(witness) = outcome.positive_confirm.take() {
+                let parent = witness.parent;
                 if let Some(grant) = self
                     .registry
                     .commit_confirm_positive_publication(*witness, direct_terminal_full)
                 {
+                    positive_support_retirements
+                        .extend(self.registry.positive_support_children(parent));
                     task_effects.absorb(Self::release_positive_publication(
                         grant,
                         plan,
@@ -8339,6 +8576,10 @@ impl DeltaScheduler {
             }
             if let Some(proof) = outcome.quiescence {
                 assert_eq!(proof.activation, activation);
+                if let Some(parent) = self.registry.positive_parent(proof.activation) {
+                    positive_support_retirements
+                        .extend(self.registry.positive_support_children(parent));
+                }
                 match self.settle_quiescence(proof) {
                     DeltaSettlement::Retargeted(active) => {
                         assert_eq!(active.activation, activation);
@@ -8403,6 +8644,10 @@ impl DeltaScheduler {
         }
 
         let _ = self.file_program_state(state, tasks);
+        let cancelled =
+            self.retire_positive_support_activations(root, plan, &positive_support_retirements);
+        completed_activations += cancelled.len();
+        completed_activation_ids.extend(cancelled);
         if !retired_activations.is_empty() {
             spec.retire_activations(
                 self.program_runtimes
@@ -9029,6 +9274,57 @@ mod tests {
         fn residual_program(&self) -> Option<ProgramRef<'_>> {
             Some(ProgramRef::new(self))
         }
+    }
+
+    fn queue_one_shot_positive_support(
+        scheduler: &mut DeltaScheduler,
+        root: &OneShotSupportProgram,
+        parent: PositiveConfirmParentId,
+        candidate: RawInline,
+        keep_cleanup_live: bool,
+    ) -> (ActivationId, ActiveDeltaContinuation) {
+        let child = scheduler
+            .registry
+            .open_positive_support_activation(
+                parent,
+                0,
+                candidate,
+                VariableSet::new_singleton(0),
+                Some(terminal_positive_full()),
+            )
+            .expect("the exact-and-Support parent should open its hedge");
+        let request = ProgramRequest {
+            action: ProgramAction::Support,
+            bound: VariableSet::new_singleton(0),
+        };
+        let spec = ProgramRef::new(root);
+        let route = spec
+            .route(request)
+            .expect("the one-shot Support Program should accept its route");
+        let state = scheduler.prepare_program(DeltaDesc::leaf(0, 0), route, spec);
+        let credit = scheduler
+            .registry
+            .issue_credit(child, CreditKind::Program { join: None });
+        let work = insert_engine_program_state(
+            root,
+            scheduler
+                .program_runtimes
+                .get_mut(&state)
+                .expect("prepared one-shot Support lost its runtime"),
+            ProgramActivation(child.0),
+            OneShotSupportState { keep_cleanup_live },
+        );
+        let active = scheduler
+            .file_program_state(
+                state,
+                vec![ProgramTask {
+                    activation: child,
+                    credit,
+                    work,
+                }],
+            )
+            .expect("the positive Support child filed one affine task");
+        (child, active)
     }
 
     #[test]
@@ -10634,7 +10930,7 @@ mod tests {
             None,
         );
         let parent = registry
-            .open_positive_publication(activation, StateId(17), certificate)
+            .open_exact_and_support_publication(activation, StateId(17), certificate)
             .expect("Confirm activation should register a semantic parent");
         (activation, parent)
     }
@@ -10679,13 +10975,13 @@ mod tests {
             }],
         );
         let parent = if support_authorized {
-            registry.open_positive_publication(
+            registry.open_exact_and_support_publication(
                 activation,
                 StateId(17),
                 terminal_positive_certificate(),
             )
         } else {
-            registry.open_confirm_positive_publication(
+            registry.open_exact_only_publication(
                 activation,
                 StateId(17),
                 terminal_positive_certificate(),
@@ -11463,6 +11759,199 @@ mod tests {
     }
 
     #[test]
+    fn positive_support_first_success_discards_its_queued_continuation_affinely() {
+        let root = OneShotSupportProgram;
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let mut scheduler = DeltaScheduler::new();
+        let candidate = value(6);
+        let (_parent_activation, parent, _exact_credit, initial) =
+            open_tapped_confirm_with_support(&mut scheduler.registry, [candidate], None, true);
+        assert!(initial.is_empty());
+        let (child, active) =
+            queue_one_shot_positive_support(&mut scheduler, &root, parent, candidate, true);
+        let state = active.state;
+
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let stepped = scheduler.step_active_bounded(
+            &root,
+            &plan,
+            active,
+            1,
+            Some(terminal_positive_full()),
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+
+        assert_eq!(stepped.status, ActiveDeltaStatus::Yielded);
+        assert!(stepped.resume.is_none());
+        assert_eq!(stepped.outcome.completed_activation_ids, [child]);
+        assert_eq!(
+            stepped
+                .outcome
+                .publication
+                .expect("the winning Support receipt should publish")
+                .rows
+                .rows,
+            [candidate]
+        );
+        assert!(
+            !scheduler.registry.is_live(child),
+            "the winning hedge retained its cleanup continuation"
+        );
+        assert!(
+            !scheduler.program_worklist.contains_key(&state),
+            "the discarded continuation remained runnable"
+        );
+        assert_eq!(
+            scheduler
+                .registry
+                .positive_publication_snapshot(parent)
+                .unwrap()
+                .published,
+            BTreeSet::from([candidate])
+        );
+        assert!(stable.is_empty());
+    }
+
+    #[test]
+    fn exact_quiescence_retires_queued_support_but_preserves_exact_finalization() {
+        let root = OneShotSupportProgram;
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let mut scheduler = DeltaScheduler::new();
+        let candidate = value(5);
+        let (parent_activation, parent, exact_credit, initial) =
+            open_tapped_confirm_with_support(&mut scheduler.registry, [candidate], None, true);
+        assert!(initial.is_empty());
+        let (child, support_active) =
+            queue_one_shot_positive_support(&mut scheduler, &root, parent, candidate, false);
+
+        let exact_page = scheduler.registry.replace_program(
+            exact_credit,
+            DeltaStateId(0),
+            &[],
+            std::iter::empty(),
+            std::iter::empty(),
+            std::iter::empty(),
+            false,
+            false,
+            false,
+            None,
+        );
+        assert!(exact_page.positive_confirm.is_none());
+        let targets: AHashSet<_> = scheduler
+            .registry
+            .positive_support_children(parent)
+            .into_iter()
+            .collect();
+        assert_eq!(targets, AHashSet::from_iter([child]));
+
+        let DeltaSettlement::Retargeted(finalizer) = scheduler.settle_quiescence(
+            exact_page
+                .quiescence
+                .expect("the exact miss should quiesce"),
+        ) else {
+            panic!("the exact Confirm must retain its pageable finalizer")
+        };
+        let completed = scheduler.retire_positive_support_activations(&root, &plan, &targets);
+
+        assert_eq!(completed, [child]);
+        assert!(
+            !scheduler.registry.is_live(child),
+            "exact quiescence left its Support hedge live"
+        );
+        assert!(
+            !scheduler.has_active_program(support_active),
+            "exact quiescence left the Support hedge runnable"
+        );
+        assert_eq!(finalizer.activation, parent_activation);
+        assert!(
+            scheduler.registry.is_live(parent_activation)
+                && scheduler.has_active_program(finalizer),
+            "Support retirement cancelled the exact Confirm finalizer"
+        );
+    }
+
+    #[test]
+    fn exact_positive_win_retires_queued_support_without_cancelling_exact() {
+        let root = OneShotSupportProgram;
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let mut scheduler = DeltaScheduler::new();
+        let candidate = value(4);
+        let (parent_activation, parent, exact_credit, initial) =
+            open_tapped_confirm_with_support(&mut scheduler.registry, [candidate], None, true);
+        assert!(initial.is_empty());
+        let (child, support_active) =
+            queue_one_shot_positive_support(&mut scheduler, &root, parent, candidate, false);
+
+        let mut exact_page = scheduler.registry.replace_program(
+            exact_credit,
+            DeltaStateId(0),
+            &[],
+            std::iter::empty(),
+            [candidate],
+            std::iter::empty(),
+            false,
+            false,
+            false,
+            None,
+        );
+        let witness = *exact_page
+            .positive_confirm
+            .take()
+            .expect("the exact replacement should mint its authoritative witness");
+        let grant = scheduler
+            .registry
+            .commit_confirm_positive_publication(witness, Some(terminal_positive_full()))
+            .expect("the exact replacement should win the parent/value SET");
+        let targets: AHashSet<_> = scheduler
+            .registry
+            .positive_support_children(parent)
+            .into_iter()
+            .collect();
+        let completed = scheduler.retire_positive_support_activations(&root, &plan, &targets);
+
+        assert_eq!(completed, [child]);
+        assert!(
+            !scheduler.has_active_program(support_active),
+            "the exact winner left its Support hedge runnable"
+        );
+        assert!(
+            scheduler.registry.is_live(parent_activation),
+            "Support retirement cancelled the exact Confirm parent"
+        );
+        let released = DeltaScheduler::release_positive_publication(
+            grant,
+            &plan,
+            &mut Worklist::new(),
+            &mut StateInterner::default(),
+            &mut ResidualStateStats::default(),
+        );
+        assert_eq!(
+            released
+                .publication
+                .expect("the exact winner should publish")
+                .rows
+                .rows,
+            [candidate]
+        );
+        let RegistrySettlement::ConfirmFinalizer(seed) = scheduler.registry.settle_quiescence(
+            exact_page
+                .quiescence
+                .expect("the exact page should quiesce"),
+        ) else {
+            panic!("the exact parent must retain finalization ownership")
+        };
+        assert_eq!(seed.activation, parent_activation);
+        assert!(
+            seed.state.accepted.is_empty(),
+            "the exact-published value must be removed from late G"
+        );
+    }
+
+    #[test]
     fn terminal_streaming_is_activation_payload_not_delta_state_identity() {
         let mut scheduler = DeltaScheduler::new();
         let full = VariableSet::new_singleton(0);
@@ -11763,9 +12252,88 @@ mod tests {
     }
 
     #[test]
+    fn support_wins_first_then_exact_settles_the_same_g_minus_p() {
+        let candidate = value(44);
+        let mut registry = ProducerRegistry::new();
+        let (activation, parent, exact_credit, initial) =
+            open_tapped_confirm_with_support(&mut registry, [candidate, candidate], None, true);
+        assert!(initial.is_empty());
+        let (support_child, support_witness, support_proof) =
+            terminal_positive_witness(&mut registry, parent, 0, candidate, true);
+
+        let grant = registry
+            .commit_positive_publication(support_witness, Some(terminal_positive_full()))
+            .expect("the Support source should win the shared value claim");
+        let exact_page = registry.replace_program(
+            exact_credit,
+            DeltaStateId(0),
+            &[],
+            std::iter::empty(),
+            [candidate],
+            std::iter::empty(),
+            false,
+            false,
+            false,
+            None,
+        );
+        assert!(
+            exact_page.positive_confirm.is_none(),
+            "a later exact acceptance must observe the existing SET winner rather than mint replay authority"
+        );
+        assert_eq!(exact_page.accepted.as_slice(), [candidate]);
+        assert_eq!(
+            registry
+                .positive_publication_snapshot(parent)
+                .unwrap()
+                .published,
+            BTreeSet::from([candidate])
+        );
+
+        let root = PositiveCertificateLeaf {
+            variable: 0,
+            page_local: false,
+        };
+        let plan = ResidualPlan::compile(&root);
+        let released = DeltaScheduler::release_positive_publication(
+            grant,
+            &plan,
+            &mut Worklist::new(),
+            &mut StateInterner::default(),
+            &mut ResidualStateStats::default(),
+        );
+        assert_eq!(
+            released
+                .publication
+                .expect("the Support winner must publish one Terminal row")
+                .rows
+                .rows,
+            [candidate]
+        );
+
+        let RegistrySettlement::Completed(completed) = registry.settle_quiescence(support_proof)
+        else {
+            panic!("the winning Support child must still retire as physical cleanup")
+        };
+        assert_eq!(completed.activation, support_child);
+        assert_eq!(completed.effect, DeltaCompletion::Cleanup);
+        let RegistrySettlement::ConfirmFinalizer(seed) = registry.settle_quiescence(
+            exact_page
+                .quiescence
+                .expect("the exact page should quiesce"),
+        ) else {
+            panic!("the exact parent must retain completeness ownership")
+        };
+        assert_eq!(seed.activation, activation);
+        assert!(
+            seed.state.accepted.is_empty(),
+            "G minus the Support-published raw value must remove every duplicate occurrence"
+        );
+    }
+
+    #[test]
     fn exact_confirm_tap_requires_b0_to_be_newly_accepted_by_a_replacement() {
-        let first = value(44);
-        let later = value(45);
+        let first = value(45);
+        let later = value(46);
 
         let mut wrong_value = ProducerRegistry::new();
         let (_, parent, credit, _) = open_tapped_confirm(&mut wrong_value, [first, later], None);
@@ -12802,7 +13370,7 @@ mod tests {
         assert_eq!(before_reopen.published, BTreeSet::from([candidate]));
         assert!(
             registry
-                .open_positive_publication(activation, StateId(99), certificate)
+                .open_exact_and_support_publication(activation, StateId(99), certificate)
                 .is_none(),
             "one semantic parent must not reopen and erase committed obligations"
         );
@@ -12861,8 +13429,8 @@ mod tests {
                 Some(terminal_positive_full()),
             )
             .is_none());
-        let before = registry.positive_publication_snapshot(parent).unwrap();
         let (_, witness, _) = terminal_positive_witness(&mut registry, parent, 0, member, false);
+        let before = registry.positive_publication_snapshot(parent).unwrap();
         registry
             .state
             .activations
@@ -13075,7 +13643,11 @@ mod tests {
         );
         let activation = started.activation;
         let parent = registry
-            .open_positive_publication(activation, StateId(17), terminal_positive_certificate())
+            .open_exact_and_support_publication(
+                activation,
+                StateId(17),
+                terminal_positive_certificate(),
+            )
             .expect("Confirm activation should register a semantic parent");
         for (occurrence, published) in [(0, published_one), (2, published_two)] {
             let (_, witness, _) =

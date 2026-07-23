@@ -10854,6 +10854,11 @@ impl ResidualStateMachine {
                 else {
                     return publication;
                 };
+                // V1 asks one implementation object to certify the cumulative
+                // work theorem for both routes. This pointer-identity guard is
+                // a conservative admission limitation, not part of the
+                // observable dominance theorem; future cross-implementation
+                // receipts may remove it without changing publication safety.
                 if spec.same_implementation(support_spec)
                     && spec.certifies_confirm_dominates_support_positive_prefix(
                         program_request,

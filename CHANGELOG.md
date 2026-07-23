@@ -11,20 +11,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Eligible target-Confirm activations can publish their first candidate from
   the authoritative exact traversal.** A new structural Program certificate
-  lets distinct-endpoint forward RPQ Confirm reuse a real replacement receipt
-  that newly accepts occurrence zero, avoiding the duplicate fully-bound
-  Support walk while exact Confirm remains the sole completeness owner. The
-  certificate promises ordered positive-prefix equivalence: an incremental
-  Confirm acceptance implies fully-bound Support truth and arrives no later
-  in the corresponding physical trace than its positive Support receipt.
-  Inverse, same-variable, mixed-family, and uncertified routes retain the
-  one-occurrence Support hedge. Both feeders share the generation-fenced
-  parent SET ledger and immediate grant/release path, so duplicate or stale
-  receipts cannot publish twice, a false first occurrence never feeds later
-  candidates, and quiescent finalization receives exactly `G \ P`. Nullable
-  seed acceptance remains deliberately ineligible for early publication. The
-  corresponding `ResidualStateStats` fields are now named
-  `delta_positive_publication_*` because they count either feeder.
+  lets every eligible exact RPQ Confirm reuse a real replacement receipt that
+  newly accepts occurrence zero while exact Confirm remains the sole
+  completeness owner. A separately authorized fully-bound Support hedge races
+  inverse, same-variable, mixed-family, and uncertified routes; a conservative
+  cumulative-work dominance receipt may elide it when retaining Support cannot
+  improve first-positive latency. That performance receipt requires no
+  internal state, page, ordering, or trace equality. Both feeders share the
+  generation-fenced parent/value SET ledger and immediate grant/release path,
+  so duplicate or stale receipts cannot publish twice, a false first
+  occurrence never feeds later candidates, and quiescent finalization receives
+  exactly `G \ P`. PositiveSupport now affinely discards queued typed handles,
+  consumes issued credits, and retires as inert cleanup after its first
+  positive receipt, an exact winner, or exact quiescence; exact work is never
+  cancelled. Nullable seed acceptance remains deliberately ineligible for
+  early publication. The corresponding `ResidualStateStats` fields are now
+  named `delta_positive_publication_*` because they count either feeder.
   Ineligible continuations still acquire no ledger, and generic joined
   `AfterChildren` propagation remains outside the Support fallback.
 - **Residual Confirm continuations now carry an executable publication

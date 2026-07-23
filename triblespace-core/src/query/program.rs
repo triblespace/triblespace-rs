@@ -1040,17 +1040,17 @@ pub trait TypedProgramSpec {
     ///
     /// - every incremental `accepted(B[0])` Confirm receipt implies that the
     ///   paired Support route is true for the row with `B[0]` bound; and
-    /// - under the same ordered physical work prefix and page budgets, exact
-    ///   Confirm reports `accepted(B[0])` no later than the paired Support
-    ///   route could report its first positive receipt.
+    /// - for every corresponding cumulative examined-work grant `w`, if the
+    ///   Support route could report its first positive receipt within `w`,
+    ///   exact Confirm reports `accepted(B[0])` within at most `w`.
     ///
     /// This is a performance-elision receipt, not an equality requirement on
-    /// either Program's internal state or execution trace. Exact Confirm
-    /// acceptance is independently authoritative; returning `true` says only
-    /// that retaining the competing one-occurrence Support feeder cannot
-    /// improve its first-positive latency. The default is deliberately
-    /// conservative: matching route keys or Boolean denotations alone do not
-    /// prove physical dominance.
+    /// either Program's internal state, page boundaries, ordering, or execution
+    /// trace. Exact Confirm acceptance is independently authoritative;
+    /// returning `true` says only that retaining the competing one-occurrence
+    /// Support feeder cannot improve its first-positive latency. The default is
+    /// deliberately conservative: matching route keys or Boolean denotations
+    /// alone do not prove physical dominance.
     fn certifies_confirm_dominates_support_positive_prefix(
         &self,
         _confirm_request: ProgramRequest,
@@ -1377,8 +1377,11 @@ impl<'a> ProgramRef<'a> {
         self.erased.step_batch(runtime, key, batch, effects);
     }
 
-    /// Affinely discards typed work that policy declines before allocating a
-    /// producer credit for it.
+    /// Affinely discards typed work that policy declines before execution.
+    ///
+    /// This consumes only the opaque typed handle. A caller that already
+    /// allocated a producer credit for the work must consume that separate
+    /// affine authority in the same scheduler transaction.
     pub(crate) fn discard_work(
         self,
         runtime: &mut ProgramRuntime,
