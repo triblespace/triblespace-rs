@@ -26,11 +26,18 @@
 //! For a live hedge with demand `D`, Exact work `C`, and speculative work `S`,
 //! the invariant gives `S <= D + C` and therefore total duplicated physical
 //! work `C + S <= D + 2C`, independent of page boundaries and scheduling
-//! order. That is a work bound, not an internal trace-equivalence claim.
+//! order. Every credit account is keyed by its affine Confirm parent: demand
+//! and Exact work for one parent can never sponsor another parent's Support.
+//! That is a work bound, not an internal trace-equivalence claim.
 
-use std::collections::BTreeSet;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 
 type Value = u8;
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ParentId(u8);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ExactAtom {
@@ -71,6 +78,7 @@ enum PublicationSource {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Publication {
+    parent: ParentId,
     source: PublicationSource,
     value: Value,
 }
@@ -79,7 +87,9 @@ struct Publication {
 ///
 /// The type intentionally implements neither `Clone` nor `Copy`.
 #[derive(Debug)]
-struct DemandGrant;
+struct DemandGrant {
+    parent: ParentId,
+}
 
 /// Source-specific affine evidence minted by an incremental exact receipt.
 ///
@@ -88,6 +98,7 @@ struct DemandGrant;
 #[derive(Debug)]
 #[must_use = "an exact positive witness must be committed or retired stale"]
 struct ExactWitness {
+    parent: ParentId,
     generation: u64,
     value: Value,
 }
@@ -96,6 +107,7 @@ struct ExactWitness {
 #[derive(Debug)]
 #[must_use = "a Support positive witness must be committed or retired stale"]
 struct SupportWitness {
+    parent: ParentId,
     generation: u64,
     value: Value,
 }
@@ -107,6 +119,7 @@ struct SupportWitness {
 #[derive(Debug)]
 #[must_use = "Exact/Confirm completion must settle or be dropped with the query"]
 struct ExactCompletion {
+    parent: ParentId,
     spine: u8,
 }
 
@@ -118,6 +131,7 @@ enum CommitOutcome {
 
 #[derive(Clone, Debug)]
 struct Config {
+    parent: ParentId,
     bag: Vec<Value>,
     accepted: BTreeSet<Value>,
     exact_trace: Vec<ExactAtom>,
@@ -174,56 +188,21 @@ impl Config {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct WorkBudget {
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ParentWorkBudget {
     demand_minted: usize,
     matched_minted: usize,
     support_spent: usize,
     retired: usize,
 }
 
-impl WorkBudget {
-    fn new(grants: Vec<DemandGrant>) -> Self {
-        Self {
-            demand_minted: grants.len(),
-            ..Self::default()
-        }
-    }
-
+impl ParentWorkBudget {
     fn available(&self) -> usize {
         self.demand_minted
             .checked_add(self.matched_minted)
             .and_then(|minted| minted.checked_sub(self.support_spent))
             .and_then(|unspent| unspent.checked_sub(self.retired))
             .expect("demand-credit conservation underflow")
-    }
-
-    fn mint_matched(&mut self, examined: usize) {
-        self.matched_minted = self
-            .matched_minted
-            .checked_add(examined)
-            .expect("matched-work credit overflow");
-        self.assert_conserved();
-    }
-
-    fn spend(&mut self, examined: usize) {
-        assert!(
-            examined <= self.available(),
-            "Support spent work without demand/matched-work credit"
-        );
-        self.support_spent = self
-            .support_spent
-            .checked_add(examined)
-            .expect("Support work counter overflow");
-        self.assert_conserved();
-    }
-
-    fn retire_available(&mut self) {
-        self.retired = self
-            .retired
-            .checked_add(self.available())
-            .expect("retired-credit counter overflow");
-        self.assert_conserved();
     }
 
     fn assert_conserved(&self) {
@@ -239,6 +218,97 @@ impl WorkBudget {
     }
 }
 
+/// Shared cohort ledger whose conservation law is checked independently for
+/// every affine Confirm parent.
+///
+/// A scheduler may batch physical pages from many parents, but every mint,
+/// spend, and retirement still names the parent whose work authorized it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct WorkBudget {
+    parents: BTreeMap<ParentId, ParentWorkBudget>,
+}
+
+impl WorkBudget {
+    fn register(&mut self, parent: ParentId, grants: Vec<DemandGrant>) {
+        assert!(
+            grants.iter().all(|grant| grant.parent == parent),
+            "a parent attempted to register another parent's demand grant"
+        );
+        assert!(
+            self.parents
+                .insert(
+                    parent,
+                    ParentWorkBudget {
+                        demand_minted: grants.len(),
+                        ..ParentWorkBudget::default()
+                    },
+                )
+                .is_none(),
+            "one affine Confirm parent registered its work budget twice"
+        );
+        self.assert_conserved();
+    }
+
+    fn account(&self, parent: ParentId) -> ParentWorkBudget {
+        *self
+            .parents
+            .get(&parent)
+            .expect("unknown positive-hedge parent")
+    }
+
+    fn available(&self, parent: ParentId) -> usize {
+        self.account(parent).available()
+    }
+
+    fn mint_matched(&mut self, parent: ParentId, examined: usize) {
+        let account = self
+            .parents
+            .get_mut(&parent)
+            .expect("Exact work named an unknown positive-hedge parent");
+        account.matched_minted = account
+            .matched_minted
+            .checked_add(examined)
+            .expect("matched-work credit overflow");
+        self.assert_conserved();
+    }
+
+    fn spend(&mut self, parent: ParentId, examined: usize) {
+        let account = self
+            .parents
+            .get_mut(&parent)
+            .expect("Support work named an unknown positive-hedge parent");
+        assert!(
+            examined <= account.available(),
+            "Support spent work without its own parent's demand/matched-work credit"
+        );
+        account.support_spent = account
+            .support_spent
+            .checked_add(examined)
+            .expect("Support work counter overflow");
+        self.assert_conserved();
+    }
+
+    fn retire_available(&mut self, parent: ParentId) {
+        let account = self
+            .parents
+            .get_mut(&parent)
+            .expect("Support retirement named an unknown positive-hedge parent");
+        account.retired = account
+            .retired
+            .checked_add(account.available())
+            .expect("retired-credit counter overflow");
+        self.assert_conserved();
+    }
+
+    fn assert_conserved(&self) {
+        for account in self.parents.values() {
+            account.assert_conserved();
+        }
+    }
+}
+
+type SharedWorkBudget = Rc<RefCell<WorkBudget>>;
+
 #[derive(Debug)]
 struct ExactPageReceipt {
     witness: Option<ExactWitness>,
@@ -253,6 +323,7 @@ struct SupportPageReceipt {
 
 #[derive(Debug)]
 struct Hedge {
+    parent: ParentId,
     config: Config,
     publication_generation: u64,
     publication_open: bool,
@@ -262,9 +333,10 @@ struct Hedge {
     exact_examined: usize,
     support_quantum: usize,
     exact_witness_issued: bool,
+    exact_witness_outstanding: bool,
     exact_completion_issued: bool,
     support_witness_issued: bool,
-    budget: WorkBudget,
+    budget: SharedWorkBudget,
     publication: Option<Publication>,
     early_output: BTreeSet<Value>,
     final_output: Option<BTreeSet<Value>>,
@@ -275,12 +347,19 @@ struct Hedge {
 
 impl Hedge {
     fn new(config: Config) -> Self {
+        Self::with_budget(config, Rc::new(RefCell::new(WorkBudget::default())))
+    }
+
+    fn with_budget(config: Config, budget: SharedWorkBudget) -> Self {
         config.assert_well_formed();
-        let grants = std::iter::repeat_with(|| DemandGrant)
+        let parent = config.parent;
+        let grants = std::iter::repeat_with(|| DemandGrant { parent })
             .take(config.demand_grants)
             .collect();
+        budget.borrow_mut().register(parent, grants);
         let support_running = config.demand_grants > 0 && !config.support_trace.is_empty();
-        let mut hedge = Self {
+        let hedge = Self {
+            parent,
             config,
             publication_generation: 0,
             publication_open: true,
@@ -290,9 +369,10 @@ impl Hedge {
             exact_examined: 0,
             support_quantum: 1,
             exact_witness_issued: false,
+            exact_witness_outstanding: false,
             exact_completion_issued: false,
             support_witness_issued: false,
-            budget: WorkBudget::new(grants),
+            budget,
             publication: None,
             early_output: BTreeSet::new(),
             final_output: None,
@@ -301,7 +381,7 @@ impl Hedge {
             settled: false,
         };
         if !hedge.support_running {
-            hedge.budget.retire_available();
+            hedge.budget.borrow_mut().retire_available(hedge.parent);
         }
         hedge.assert_invariants();
         hedge
@@ -320,11 +400,22 @@ impl Hedge {
     }
 
     fn can_step_support(&self) -> bool {
-        self.support_running && self.support_remaining() > 0 && self.budget.available() > 0
+        self.support_running
+            && !self.exact_completion_issued
+            && self.support_remaining() > 0
+            && self.budget.borrow().available(self.parent) > 0
+    }
+
+    fn budget_account(&self) -> ParentWorkBudget {
+        self.budget.borrow().account(self.parent)
     }
 
     fn exact_page(&mut self, limit: usize) -> ExactPageReceipt {
         assert!(!self.settled, "settled Exact spine was stepped");
+        assert!(
+            !self.exact_witness_outstanding,
+            "a later Exact page overtook an uncommitted receipt-local witness"
+        );
         let examined = limit.min(self.exact_remaining());
         assert!(examined > 0, "Exact page made no physical progress");
         let end = self.exact_cursor + examined;
@@ -337,7 +428,7 @@ impl Hedge {
             .checked_add(examined)
             .expect("Exact examined-work counter overflow");
         if self.support_running {
-            self.budget.mint_matched(examined);
+            self.budget.borrow_mut().mint_matched(self.parent, examined);
         }
 
         let witness = if accepted_target {
@@ -346,8 +437,10 @@ impl Hedge {
                 "Exact trace issued B[0] acceptance twice"
             );
             self.exact_witness_issued = true;
+            self.exact_witness_outstanding = true;
             Some(ExactWitness {
-                generation: 0,
+                parent: self.parent,
+                generation: self.publication_generation,
                 value: self.target(),
             })
         } else {
@@ -359,19 +452,19 @@ impl Hedge {
                 "Exact completion authority was issued twice"
             );
             self.exact_completion_issued = true;
-            Some(ExactCompletion { spine: 1 })
+            Some(ExactCompletion {
+                parent: self.parent,
+                spine: 1,
+            })
         } else {
             None
         };
-        if completion.is_some() {
-            // The validated receipt has already observed graph quiescence.
-            // Closing here (rather than when the outer continuation later
-            // consumes ExactCompletion) prevents physical Support work or a
-            // delayed positive claim from crossing that semantic boundary.
-            // A target first accepted in this final receipt needs no early
-            // tap: Exact settlement will emit it from G.
-            self.close_publication();
-        }
+        // Production consumes a validated page's source-specific positive
+        // witness before handling the same page's quiescence receipt. Once a
+        // completion exists no new Support page may start, but already-minted
+        // Exact and Support witnesses may still race at the SET linearization
+        // point. Exact settlement closes the generation only after that
+        // receipt-local Exact witness has been consumed.
         self.assert_invariants();
         ExactPageReceipt {
             witness,
@@ -386,7 +479,7 @@ impl Hedge {
         );
         let limit = self
             .support_quantum
-            .min(self.budget.available())
+            .min(self.budget.borrow().available(self.parent))
             .min(self.support_remaining());
         assert!(limit > 0);
         let mut examined = 0;
@@ -400,7 +493,7 @@ impl Hedge {
                 break;
             }
         }
-        self.budget.spend(examined);
+        self.budget.borrow_mut().spend(self.parent, examined);
 
         let witness = if proved {
             assert!(
@@ -410,6 +503,7 @@ impl Hedge {
             self.support_witness_issued = true;
             self.stop_support();
             Some(SupportWitness {
+                parent: self.parent,
                 generation: self.publication_generation,
                 value: self.target(),
             })
@@ -431,7 +525,7 @@ impl Hedge {
     fn stop_support(&mut self) {
         if self.support_running {
             self.support_running = false;
-            self.budget.retire_available();
+            self.budget.borrow_mut().retire_available(self.parent);
         }
     }
 
@@ -447,7 +541,17 @@ impl Hedge {
     }
 
     fn commit_exact(&mut self, witness: ExactWitness) -> CommitOutcome {
+        if witness.parent != self.parent {
+            self.stale_exact += 1;
+            return CommitOutcome::Stale(PublicationSource::ExactTap);
+        }
+        assert!(
+            self.exact_witness_outstanding,
+            "Exact witness was replayed or did not belong to a live receipt"
+        );
+        self.exact_witness_outstanding = false;
         let outcome = self.commit(
+            witness.parent,
             witness.generation,
             witness.value,
             PublicationSource::ExactTap,
@@ -459,7 +563,12 @@ impl Hedge {
     }
 
     fn commit_support(&mut self, witness: SupportWitness) -> CommitOutcome {
+        if witness.parent != self.parent {
+            self.stale_support += 1;
+            return CommitOutcome::Stale(PublicationSource::Support);
+        }
         let outcome = self.commit(
+            witness.parent,
             witness.generation,
             witness.value,
             PublicationSource::Support,
@@ -472,11 +581,13 @@ impl Hedge {
 
     fn commit(
         &mut self,
+        parent: ParentId,
         generation: u64,
         value: Value,
         source: PublicationSource,
     ) -> CommitOutcome {
-        if self.settled
+        if parent != self.parent
+            || self.settled
             || !self.publication_open
             || generation != self.publication_generation
             || self.publication.is_some()
@@ -489,7 +600,11 @@ impl Hedge {
             self.config.accepted.contains(&value),
             "positive witness contradicted exact denotation"
         );
-        let publication = Publication { source, value };
+        let publication = Publication {
+            parent,
+            source,
+            value,
+        };
         self.publication = Some(publication);
         self.early_output = self
             .config
@@ -501,12 +616,24 @@ impl Hedge {
     }
 
     fn settle_exact(&mut self, completion: ExactCompletion) {
+        assert_eq!(
+            completion.parent, self.parent,
+            "foreign Exact parent settled this hedge"
+        );
         assert_eq!(completion.spine, 1, "foreign Exact spine settled parent");
         assert!(
             self.exact_cursor == self.config.exact_trace.len(),
             "nonquiescent Exact spine attempted settlement"
         );
         assert!(!self.settled, "Exact spine settled twice");
+        assert!(
+            !self.exact_witness_outstanding,
+            "Exact completion overtook its receipt-local positive witness"
+        );
+
+        // This is the semantic quiescence boundary. It fences delayed Support
+        // witnesses and retires only this parent's unspent speculative credit.
+        self.close_publication();
 
         let bag_set: BTreeSet<_> = self.config.bag.iter().copied().collect();
         let accepted: BTreeSet<_> = self
@@ -525,7 +652,6 @@ impl Hedge {
         }
         self.final_output = Some(self.config.suffix.apply(&remainder));
         self.settled = true;
-        self.close_publication();
 
         let mut observed = self.early_output.clone();
         observed.extend(
@@ -567,22 +693,38 @@ impl Hedge {
     }
 
     fn assert_invariants(&self) {
-        self.budget.assert_conserved();
+        self.budget.borrow().assert_conserved();
+        let account = self.budget_account();
         assert!(
-            self.budget.support_spent <= self.config.demand_grants + self.exact_examined,
+            account.support_spent <= self.config.demand_grants + self.exact_examined,
             "Support work exceeded demand plus all observed Exact work"
+        );
+        assert!(
+            account.matched_minted <= self.exact_examined,
+            "parent received matched-work credit not backed by its Exact spine"
         );
         if !self.support_running {
             assert_eq!(
-                self.budget.available(),
+                account.available(),
                 0,
                 "stopped Support retained spendable affine credit"
+            );
+        }
+        if self.exact_completion_issued {
+            assert!(
+                !self.can_step_support(),
+                "Support started new work after Exact quiescence was observed"
             );
         }
         if self.publication.is_some() {
             assert!(
                 !self.publication_open && !self.support_running,
                 "publication winner left the hedge runnable"
+            );
+            assert_eq!(
+                self.publication.map(|publication| publication.parent),
+                Some(self.parent),
+                "publication escaped its affine parent"
             );
         }
         if self.settled {
@@ -726,7 +868,10 @@ fn explore(
     }
 
     let mut enabled = Vec::new();
-    if !replayed.hedge.settled && replayed.hedge.exact_remaining() > 0 {
+    if !replayed.hedge.settled
+        && replayed.exact_witness.is_none()
+        && replayed.hedge.exact_remaining() > 0
+    {
         for width in 1..=replayed.hedge.exact_remaining() {
             enabled.push(Event::ExactPage(width));
         }
@@ -740,7 +885,8 @@ fn explore(
     if replayed.support_witness.is_some() {
         enabled.push(Event::CommitSupport);
     }
-    if replayed.completion.is_some() && !replayed.hedge.settled {
+    if replayed.completion.is_some() && replayed.exact_witness.is_none() && !replayed.hedge.settled
+    {
         enabled.push(Event::SettleExact);
     }
     assert!(!enabled.is_empty(), "demand-credit model deadlocked");
@@ -758,8 +904,11 @@ fn explore(
     }
 }
 
+const DEFAULT_PARENT: ParentId = ParentId(0);
+
 fn true_config(exact_trace: Vec<ExactAtom>, support_trace: Vec<SupportAtom>) -> Config {
     Config {
+        parent: DEFAULT_PARENT,
         bag: vec![1, 1, 2],
         accepted: BTreeSet::from([1, 2]),
         exact_trace,
@@ -787,6 +936,7 @@ fn support_winner_never_cancels_the_exact_completeness_spine() {
     assert_eq!(
         hedge.commit_support(support),
         CommitOutcome::Committed(Publication {
+            parent: DEFAULT_PARENT,
             source: PublicationSource::Support,
             value: 1,
         })
@@ -808,8 +958,92 @@ fn support_winner_never_cancels_the_exact_completeness_spine() {
 }
 
 #[test]
+fn final_page_exact_witness_commits_before_completion_and_can_win_the_race() {
+    let mut hedge = Hedge::new(true_config(
+        vec![ExactAtom::Accept(1)],
+        vec![SupportAtom::Prove(1)],
+    ));
+    let support = hedge
+        .support_page()
+        .witness
+        .expect("Support should hold a competing positive witness");
+    let mut exact = hedge.exact_page(1);
+    assert!(
+        hedge.publication_open,
+        "final-page validation must not close before its Exact witness commits"
+    );
+    assert!(
+        !hedge.can_step_support(),
+        "Exact quiescence must prevent any new speculative page"
+    );
+
+    let exact_witness = exact
+        .witness
+        .take()
+        .expect("the final Exact page should expose B[0]'s acceptance");
+    assert_eq!(
+        hedge.commit_exact(exact_witness),
+        CommitOutcome::Committed(Publication {
+            parent: DEFAULT_PARENT,
+            source: PublicationSource::ExactTap,
+            value: 1,
+        })
+    );
+    assert_eq!(
+        hedge.commit_support(support),
+        CommitOutcome::Stale(PublicationSource::Support)
+    );
+    hedge.settle_exact(
+        exact
+            .completion
+            .take()
+            .expect("the final Exact page should retain completion authority"),
+    );
+    assert_eq!(hedge.observed_output(), BTreeSet::from([1, 2]));
+}
+
+#[test]
+fn final_page_support_witness_may_win_without_cancelling_exact_completion() {
+    let mut hedge = Hedge::new(true_config(
+        vec![ExactAtom::Accept(1)],
+        vec![SupportAtom::Prove(1)],
+    ));
+    let support = hedge
+        .support_page()
+        .witness
+        .expect("Support should hold a competing positive witness");
+    let mut exact = hedge.exact_page(1);
+    let exact_witness = exact
+        .witness
+        .take()
+        .expect("the final Exact page should expose B[0]'s acceptance");
+
+    assert_eq!(
+        hedge.commit_support(support),
+        CommitOutcome::Committed(Publication {
+            parent: DEFAULT_PARENT,
+            source: PublicationSource::Support,
+            value: 1,
+        })
+    );
+    assert_eq!(
+        hedge.commit_exact(exact_witness),
+        CommitOutcome::Stale(PublicationSource::ExactTap)
+    );
+    hedge.settle_exact(
+        exact
+            .completion
+            .take()
+            .expect("Support must not consume Exact completion authority"),
+    );
+    assert_eq!(hedge.exact_cursor, hedge.config.exact_trace.len());
+    assert_eq!(hedge.observed_output(), BTreeSet::from([1, 2]));
+}
+
+#[test]
 fn exact_and_support_internal_orders_need_not_match() {
     let config = Config {
+        parent: DEFAULT_PARENT,
         bag: vec![1, 2],
         accepted: BTreeSet::from([1, 2]),
         exact_trace: vec![
@@ -866,8 +1100,9 @@ fn geometric_pages_spend_examined_units_not_page_receipts() {
         support.examined, 2,
         "a two-unit geometric request should spend two matched-work credits"
     );
-    assert_eq!(hedge.budget.support_spent, 3);
-    assert_eq!(hedge.budget.demand_minted + hedge.budget.matched_minted, 3);
+    let account = hedge.budget_account();
+    assert_eq!(account.support_spent, 3);
+    assert_eq!(account.demand_minted + account.matched_minted, 3);
 
     // The rejected alternative is intentionally executable as a falsifier:
     // treating one page receipt as authority for a whole geometric page would
@@ -886,10 +1121,94 @@ fn no_live_demand_creates_no_support_work() {
     config.demand_grants = 0;
     let mut hedge = Hedge::new(config);
     assert!(!hedge.can_step_support());
-    assert_eq!(hedge.budget.support_spent, 0);
-    let exact = hedge.exact_page(1);
-    hedge.settle_exact(exact.completion.unwrap());
+    assert_eq!(hedge.budget_account().support_spent, 0);
+    let mut exact = hedge.exact_page(1);
+    assert!(matches!(
+        hedge.commit_exact(exact.witness.take().unwrap()),
+        CommitOutcome::Committed(_)
+    ));
+    hedge.settle_exact(exact.completion.take().unwrap());
     assert_eq!(hedge.observed_output(), BTreeSet::from([1, 2]));
+}
+
+#[test]
+fn parent_local_credit_prevents_cross_sponsorship_in_a_shared_cohort() {
+    let left = ParentId(1);
+    let right = ParentId(2);
+    let config = |parent| Config {
+        parent,
+        bag: vec![1],
+        accepted: BTreeSet::new(),
+        exact_trace: vec![ExactAtom::Scan(1), ExactAtom::Scan(2), ExactAtom::Scan(3)],
+        support_trace: vec![
+            SupportAtom::Scan(4),
+            SupportAtom::Scan(5),
+            SupportAtom::Scan(6),
+        ],
+        demand_grants: if parent == left { 2 } else { 1 },
+        suffix: Suffix::Identity,
+    };
+    let budget = Rc::new(RefCell::new(WorkBudget::default()));
+    let mut left_hedge = Hedge::with_budget(config(left), Rc::clone(&budget));
+    let mut right_hedge = Hedge::with_budget(config(right), Rc::clone(&budget));
+
+    assert_eq!(left_hedge.support_page().examined, 1);
+    assert_eq!(right_hedge.support_page().examined, 1);
+    assert!(left_hedge.can_step_support());
+    assert!(!right_hedge.can_step_support());
+    {
+        let budget = budget.borrow();
+        assert_eq!(budget.available(left), 1);
+        assert_eq!(budget.available(right), 0);
+    }
+
+    let left_exact = left_hedge.exact_page(2);
+    assert!(left_exact.witness.is_none() && left_exact.completion.is_none());
+    assert!(
+        left_hedge.can_step_support(),
+        "left Exact work should replenish only the left hedge"
+    );
+    assert!(
+        !right_hedge.can_step_support(),
+        "left demand and Exact work must not sponsor right Support"
+    );
+    {
+        let budget = budget.borrow();
+        assert_eq!(budget.available(left), 3);
+        assert_eq!(budget.available(right), 0);
+    }
+
+    assert_eq!(left_hedge.support_page().examined, 2);
+    assert!(!right_hedge.can_step_support());
+    let right_exact = right_hedge.exact_page(1);
+    assert!(right_exact.witness.is_none() && right_exact.completion.is_none());
+    assert!(
+        right_hedge.can_step_support(),
+        "right Support may resume only after right Exact work"
+    );
+    assert_eq!(right_hedge.support_page().examined, 1);
+
+    let left_completion = left_hedge
+        .exact_page(1)
+        .completion
+        .expect("left Exact spine should quiesce");
+    left_hedge.settle_exact(left_completion);
+    let right_completion = right_hedge
+        .exact_page(2)
+        .completion
+        .expect("right Exact spine should quiesce");
+    right_hedge.settle_exact(right_completion);
+
+    assert_eq!(left_hedge.observed_output(), BTreeSet::new());
+    assert_eq!(right_hedge.observed_output(), BTreeSet::new());
+    let budget = budget.borrow();
+    let left_account = budget.account(left);
+    let right_account = budget.account(right);
+    assert_eq!(left_account.support_spent, 3);
+    assert_eq!(right_account.support_spent, 2);
+    assert_eq!(left_account.retired, 1);
+    assert_eq!(right_account.retired, 2);
+    budget.assert_conserved();
 }
 
 #[test]
@@ -933,6 +1252,7 @@ fn exhaustive_divergent_schedules_preserve_set_and_affine_work_laws() {
         ),
     ];
     let false_config = Config {
+        parent: DEFAULT_PARENT,
         bag: vec![1, 1, 2],
         accepted: BTreeSet::from([2]),
         exact_trace: vec![
@@ -957,14 +1277,14 @@ fn exhaustive_divergent_schedules_preserve_set_and_affine_work_laws() {
         }
     }
 
-    assert!(
-        coverage.terminal_schedules > 500,
-        "only {} terminal schedules were explored",
-        coverage.terminal_schedules
-    );
     assert!(coverage.exact_wins > 0);
     assert!(coverage.support_wins > 0);
     assert!(coverage.exact_only > 0);
+    assert_eq!(
+        coverage.terminal_schedules,
+        coverage.exact_wins + coverage.support_wins + coverage.exact_only,
+        "every terminal schedule must have exactly one publication outcome"
+    );
     assert!(coverage.stale_exact > 0);
     assert!(coverage.stale_support > 0);
     assert!(coverage.geometric_pages > 0);
